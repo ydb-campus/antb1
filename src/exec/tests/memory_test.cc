@@ -173,6 +173,54 @@ TEST(SortBufferMemoryTest, ReportsRowReferences) {
   EXPECT_GE(buffer.memory_usage(), 1000 * 8);  // the sorted row references
 }
 
+// It counts the list of arrays it keeps per column: two buffers fed the same one-row chunks, one
+// of 40 columns and one of 1, differ by exactly the 39 lists more -- before any row, after 300
+// chunks and after Sort -- and Sort needs no more memory for the wider one.
+TEST(SortBufferMemoryTest, CountsEveryColumnsArraysOfItsChunks) {
+  constexpr int kWide = 40;
+  constexpr int64_t kChunks = 300;
+  const auto schema = [](int columns) {
+    arrow::FieldVector fields;
+    for (int c = 0; c < columns; ++c) {
+      fields.push_back(arrow::field("c" + std::to_string(c), arrow::int64()));
+    }
+    return arrow::schema(fields);
+  };
+  const auto buffer = [](const std::shared_ptr<arrow::Schema>& of) {
+    auto comparator = RowComparator::Make(
+        of, {{.column = Column(0, "c0", LogicalType::kBigInt), .descending = false}});
+    EXPECT_TRUE(comparator.ok()) << comparator.status().ToString();
+    return SortBuffer(std::move(*comparator), std::nullopt);
+  };
+  // A row of `of`'s width, held by the buffer it goes to alone.
+  const auto row = [](const std::shared_ptr<arrow::Schema>& of, int64_t value) {
+    return arrow::RecordBatch::Make(
+        of, 1, arrow::ArrayVector(static_cast<std::size_t>(of->num_fields()), Int64s({value})));
+  };
+  const auto wide_schema = schema(kWide);
+  const auto narrow_schema = schema(1);
+  SortBuffer wide = buffer(wide_schema);
+  SortBuffer narrow = buffer(narrow_schema);
+  using Arrays = std::vector<const arrow::Array*>;
+  constexpr auto kList = static_cast<int64_t>(sizeof(Arrays));
+  EXPECT_EQ(wide.memory_usage() - narrow.memory_usage(), (kWide - 1) * kList);
+
+  Arrays grown;  // a list grown one pointer at a time, as each of the buffer's lists is
+  for (int64_t i = 0; i < kChunks; ++i) {
+    ASSERT_TRUE(wide.Add(row(wide_schema, kChunks - i), arrow::default_memory_pool()).ok());
+    ASSERT_TRUE(narrow.Add(row(narrow_schema, kChunks - i), arrow::default_memory_pool()).ok());
+    grown.push_back(nullptr);
+  }
+  const int64_t lists =
+      (kWide - 1) * (kList + static_cast<int64_t>(grown.capacity() * sizeof(const arrow::Array*)));
+  EXPECT_EQ(wide.memory_usage() - narrow.memory_usage(), lists);
+  EXPECT_EQ(wide.sort_memory(), kChunks * 32);
+  EXPECT_EQ(narrow.sort_memory(), kChunks * 32);
+  ASSERT_TRUE(wide.Sort(arrow::default_memory_pool()).ok());
+  ASSERT_TRUE(narrow.Sort(arrow::default_memory_pool()).ok());
+  EXPECT_EQ(wide.memory_usage() - narrow.memory_usage(), lists);
+}
+
 TEST(GroupedStateMemoryTest, GrowsWithGroupsAndVarcharValues) {
   for (const plan::AggKind kind :
        {plan::AggKind::kCountStar, plan::AggKind::kCount, plan::AggKind::kSum, plan::AggKind::kAvg,

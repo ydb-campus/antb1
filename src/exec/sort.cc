@@ -18,6 +18,7 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 
+#include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
@@ -297,7 +298,31 @@ RowComparator::Prefix RowComparator::PrefixOf(const KeyArrays& keys, int64_t row
 // ---- SortBuffer ----
 
 SortBuffer::SortBuffer(RowComparator comparator, std::optional<int64_t> keep)
-    : comparator_(std::move(comparator)), keep_(keep) {}
+    : comparator_(std::move(comparator)),
+      keep_(keep),
+      column_arrays_(Narrow<std::size_t>(comparator_.schema()->num_fields())) {}
+
+void SortBuffer::PushChunk(std::shared_ptr<arrow::RecordBatch> rows,
+                           RowComparator::KeyArrays keys) {
+  // The batch's own vector: Arrow boxes each column once, under the batch's lock, and keeps it
+  // while the batch lives, so these pointers hold as long as the chunk is here.
+  const arrow::ArrayVector& columns = rows->columns();
+  ANTB1_CHECK(columns.size() == column_arrays_.size());
+  for (std::size_t c = 0; c < columns.size(); ++c) {
+    column_arrays_[c].push_back(columns[c].get());
+  }
+  chunks_.push_back(std::move(rows));
+  chunk_keys_.push_back(std::move(keys));
+}
+
+std::vector<std::shared_ptr<arrow::RecordBatch>> SortBuffer::ClearChunks() {
+  std::vector<std::shared_ptr<arrow::RecordBatch>> chunks = std::exchange(chunks_, {});
+  chunk_keys_.clear();
+  for (std::vector<const arrow::Array*>& arrays : column_arrays_) {
+    arrays.clear();
+  }
+  return chunks;
+}
 
 arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool) {
   if (rows == nullptr || rows->num_rows() == 0) {
@@ -339,8 +364,7 @@ arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::M
     }
   }
   rows_ += rows->num_rows();
-  chunks_.push_back(std::move(rows));
-  chunk_keys_.push_back(std::move(keys));
+  PushChunk(std::move(rows), std::move(keys));
   // Compact once the rows beyond `keep` outgrow `keep` (and a minimum, so that a small `keep` does
   // not sort every batch).
   constexpr int64_t kMinSlack = 4096;
@@ -351,29 +375,37 @@ arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::M
 }
 
 arrow::Status SortBuffer::Merge(SortBuffer& other, arrow::MemoryPool* pool) {
+  if (&other == this) {
+    return arrow::Status::Invalid("merge of a sort buffer into itself");
+  }
   if (!other.comparator_.schema()->Equals(*comparator_.schema(), /*check_metadata=*/false) ||
       other.keep_ != keep_) {
     return arrow::Status::Invalid("merge of sort buffers of different shapes");
   }
+  // `other` is emptied first, so that it names no chunk an Add below drops, even when one fails.
   // Unsorted chunks are in the other buffer's input order; a compacted chunk holds its first rows
   // in sorted order, which is also a valid input order for them (ties keep their order).
-  for (auto& chunk : other.chunks_) {
-    ARROW_RETURN_NOT_OK(Add(std::move(chunk), pool));
-  }
-  other.chunks_.clear();
-  other.chunk_keys_.clear();
+  std::vector<std::shared_ptr<arrow::RecordBatch>> chunks = other.ClearChunks();
   other.order_.clear();
   other.threshold_.reset();
   other.rows_ = 0;
+  other.sorted_ = false;
+  for (auto& chunk : chunks) {
+    ARROW_RETURN_NOT_OK(Add(std::move(chunk), pool));
+  }
   return arrow::Status::OK();
 }
 
 int64_t SortBuffer::memory_usage() const {
   std::size_t bytes = (chunks_.capacity() * sizeof(std::shared_ptr<arrow::RecordBatch>)) +
                       (chunk_keys_.capacity() * sizeof(RowComparator::KeyArrays)) +
+                      (column_arrays_.capacity() * sizeof(std::vector<const arrow::Array*>)) +
                       (order_.capacity() * sizeof(RowRef));
   for (const RowComparator::KeyArrays& keys : chunk_keys_) {
     bytes += keys.capacity() * sizeof(const arrow::Array*);
+  }
+  for (const std::vector<const arrow::Array*>& arrays : column_arrays_) {
+    bytes += arrays.capacity() * sizeof(const arrow::Array*);
   }
   return Narrow<int64_t>(bytes);
 }
@@ -461,14 +493,13 @@ arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {
   const int64_t limit = keep.value_or(rows_);
   const int64_t kept = std::min(rows_, limit);
   ARROW_ASSIGN_OR_RAISE(auto first, Slice(0, kept, pool));
-  chunks_.clear();
-  chunk_keys_.clear();
+  ClearChunks();
   order_.clear();
   threshold_.reset();
   rows_ = kept;
   if (kept > 0) {
-    chunk_keys_.push_back(comparator_.KeysOf(*first));
-    chunks_.push_back(std::move(first));
+    RowComparator::KeyArrays keys = comparator_.KeysOf(*first);
+    PushChunk(std::move(first), std::move(keys));
     for (int64_t r = 0; r < kept; ++r) {
       order_.push_back(RowRef{.chunk = 0, .row = Narrow<std::uint32_t>(r)});
     }
@@ -493,8 +524,10 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::Slice(
   const std::span<const RowRef> refs = std::span<const RowRef>(order_).subspan(
       Narrow<std::size_t>(begin), Narrow<std::size_t>(end - begin));
   for (int c = 0; c < schema.num_fields(); ++c) {
+    const std::vector<const arrow::Array*>& arrays = column_arrays_[Narrow<std::size_t>(c)];
+    ANTB1_CHECK(arrays.size() == chunks_.size());
     ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(schema.field(c)->type(), pool));
-    ARROW_RETURN_NOT_OK((GatherRows<false, RowRef>(chunks_, c, refs, *builder)));
+    ARROW_RETURN_NOT_OK((GatherRows<false, RowRef>(arrays, refs, *builder)));
     ARROW_ASSIGN_OR_RAISE(auto column, builder->Finish());
     columns.push_back(std::move(column));
   }

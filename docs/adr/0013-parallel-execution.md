@@ -236,8 +236,9 @@ subqueries; both amend this section where marked.
     a 15.2-15.4 s query; the 5.6 s of 17.6 s above is one profile of a build that predates #215-#222. The ANTI right
     join, whose gather is under 0.1 s, keeps its part_time (32.2-33.7 s at 16 threads, 52.3-53.1 s at 64).
   - The list holds 8 bytes per chunk and column of a build, charged to the budget, and is taken in the build's `finish`
-    (Q21's SEMI build: 10-20 ms more). The sort buffer still asks its chunks on each gather, once per batch it emits.
-    Measured at 16 and 64 threads, on the queries derived from TPC-H only.
+    (Q21's SEMI build: 10-20 ms more). Until [ADR 0011](0011-sorting-and-top-n.md)'s amendment of the same date, the
+    sort buffer still asked its chunks on each gather, once per batch it emitted. Measured at 16 and 64 threads, on the
+    queries derived from TPC-H only.
 - **Memory:** it grows with the window and the per-part partial states. High-cardinality grouping holds partial group
   tables for at most the window's parts.
 - **Tests:**
