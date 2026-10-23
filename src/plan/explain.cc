@@ -218,6 +218,10 @@ SharedNotes NotesOf(const LogicalPlan& plan) {
     if (placement.grouping_from_aggregated_side > 0) {
       note += std::format(", {} from the grouping set", placement.grouping_from_aggregated_side);
     }
+    if (placement.joins_down > 1) {
+      // Only below the nearest join, so output moves only where the chosen placement is deeper.
+      note += std::format(", {} joins down", placement.joins_down);
+    }
     if (placement.needs_identity) {
       note += ", padding";
     }

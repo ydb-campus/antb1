@@ -368,3 +368,144 @@ GROUP BY zn_city ORDER BY zn_city
 5	9263
 9	NULL
 NULL	1083.75
+
+# ---- a chain of joins: the exchange travels past the join the aggregate reads ----
+
+# The partial lands two joins below the aggregate, grouping `cities` by the key `riders` joins it on,
+# and the Compute of a computed argument travels down with it. Each of these was checked with
+# `antb1 explain` to hold two GroupAggregate nodes with the partial on `cities`, not one.
+#
+# `tr_tariff` is introduced ABOVE the candidate join, so the pre-grouping does not hold it. That is
+# the soundness claim of the whole rewrite: a partial joins to the rows above exactly as its member
+# rows would have, so the fan-out is unchanged and the final step groups again. `riders` repeats 8 of
+# its keys, so this really does fan out, and `tr_tariff` and `rd_tier` both hold NULLs.
+query TTI nosort
+SELECT tr_tariff, rd_tier, SUM(ct_pop) FROM trips, riders, cities
+WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY tr_tariff, rd_tier ORDER BY tr_tariff, rd_tier
+----
+(empty)	basic	10305000
+(empty)	gold	3945000
+(empty)	plus	3330000
+AIRPORT	basic	10230000
+AIRPORT	gold	3945000
+AIRPORT	plus	3120000
+NIGHT	basic	4140000
+NIGHT	gold	2505000
+NIGHT	plus	9600000
+POOL	basic	3750000
+POOL	gold	2640000
+POOL	plus	9840000
+STD	basic	10785000
+STD	gold	3810000
+STD	plus	3030000
+Std	basic	4320000
+Std	gold	2625000
+Std	plus	9600000
+XL	basic	3765000
+XL	gold	2505000
+XL	plus	9960000
+XL\x20	basic	3885000
+XL\x20	gold	2595000
+XL\x20	plus	9840000
+std	basic	10335000
+std	gold	3885000
+std	plus	3210000
+Ж-1	basic	10185000
+Ж-1	gold	3855000
+Ж-1	plus	3210000
+NULL	basic	3720000
+NULL	gold	1800000
+NULL	plus	4110000
+
+# A computed argument, which the written plan computes above both joins: the partial cannot aggregate
+# a column that does not exist below it, so its Compute moves down too.
+query TTI nosort
+SELECT tr_tariff, rd_tier, SUM(ct_pop * 2) FROM trips, riders, cities
+WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY tr_tariff, rd_tier ORDER BY tr_tariff, rd_tier
+----
+(empty)	basic	20610000
+(empty)	gold	7890000
+(empty)	plus	6660000
+AIRPORT	basic	20460000
+AIRPORT	gold	7890000
+AIRPORT	plus	6240000
+NIGHT	basic	8280000
+NIGHT	gold	5010000
+NIGHT	plus	19200000
+POOL	basic	7500000
+POOL	gold	5280000
+POOL	plus	19680000
+STD	basic	21570000
+STD	gold	7620000
+STD	plus	6060000
+Std	basic	8640000
+Std	gold	5250000
+Std	plus	19200000
+XL	basic	7530000
+XL	gold	5010000
+XL	plus	19920000
+XL\x20	basic	7770000
+XL\x20	gold	5190000
+XL\x20	plus	19680000
+std	basic	20670000
+std	gold	7770000
+std	plus	6420000
+Ж-1	basic	20370000
+Ж-1	gold	7710000
+Ж-1	plus	6420000
+NULL	basic	7440000
+NULL	gold	3600000
+NULL	plus	8220000
+
+# A count through the chain, which merges as a sum of counts, and MIN and MAX, which merge as
+# themselves. ct_pop holds a NULL, so COUNT(ct_pop) and COUNT(*) differ.
+query TTIII nosort
+SELECT tr_tariff, rd_tier, COUNT(ct_pop), MIN(ct_pop), MAX(ct_pop) FROM trips, riders, cities
+WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY tr_tariff, rd_tier ORDER BY tr_tariff, rd_tier
+----
+(empty)	basic	89	45000	120000
+(empty)	gold	89	30000	45000
+(empty)	plus	93	30000	120000
+AIRPORT	basic	89	45000	120000
+AIRPORT	gold	89	30000	45000
+AIRPORT	plus	92	30000	120000
+NIGHT	basic	87	45000	120000
+NIGHT	gold	83	30000	45000
+NIGHT	plus	80	120000	120000
+POOL	basic	80	45000	120000
+POOL	gold	87	30000	45000
+POOL	plus	82	120000	120000
+STD	basic	93	45000	120000
+STD	gold	86	30000	45000
+STD	plus	89	30000	120000
+Std	basic	91	45000	120000
+Std	gold	86	30000	45000
+Std	plus	80	120000	120000
+XL	basic	82	45000	120000
+XL	gold	83	30000	45000
+XL	plus	83	120000	120000
+XL\x20	basic	83	45000	120000
+XL\x20	gold	85	30000	45000
+XL\x20	plus	82	120000	120000
+std	basic	88	45000	120000
+std	gold	88	30000	45000
+std	plus	92	30000	120000
+Ж-1	basic	88	45000	120000
+Ж-1	gold	87	30000	45000
+Ж-1	plus	92	30000	120000
+NULL	basic	46	45000	120000
+NULL	gold	47	30000	45000
+NULL	plus	53	30000	120000
+
+# The same chain with the aggregated side's own grouping column, so the pre-grouping holds a column
+# of the grouping set as well as the join key (condition 3's second half, two joins down).
+query TIII nosort
+SELECT rd_tier, ct_id, COUNT(*), SUM(ct_pop) FROM trips, riders, cities
+WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY rd_tier, ct_id ORDER BY rd_tier, ct_id
+----
+basic	1	456	54720000
+basic	2	460	20700000
+gold	2	454	20430000
+gold	3	456	13680000
+plus	1	459	55080000
+plus	3	459	13770000

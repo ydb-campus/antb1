@@ -162,6 +162,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
      half of the natural discriminator that survives, and the half separating Q13 from Q3.
   5. **Real work must move**: `N_before / G'` at least about 3, **and** at least one join between the two
      positions has a build that is not unique on its key. The second clause is what refuses Q9.
+     **Or the pre-grouping is far cheaper per row than the grouping it feeds** -- G2d, which is this ADR's own
+     "weighted by what moves" applied to the one factor a logical plan knows exactly.
   6. **Do not destroy an existing prune**: the push must not remove a key filter the current plan relies on, nor
      flip a build-side choice. Refuses Q18 and Q21, and nothing else in the survey classifies those two
      correctly.
@@ -294,6 +296,71 @@ entirely, because a pre-grouped relation has exactly one row per key.
     them is a judgement and not a mechanism: ADR 0023's Path 2 admits only the calls that are not 0 over no
     rows, and a sum of counts is 0 over no rows by design, so it classifies there as a count. ADR 0014's
     merge-order rule takes it as order-independent, counts adding exactly and sums of them likewise.
+- **G2d, perf(plan): iterate the exchange along a chain of joins, and weight the gate by what moves.**
+  - Update (2026-10-23, G2d): **shipped.** The finder walks from the join the aggregate reads down the
+    aggregated side, yielding each join and asking the caller which side to descend into -- the side is the one
+    carrying every call's argument and is decided per join, so only the caller can answer. It reports **one**
+    placement per aggregate, the deepest the gate admits and otherwise the nearest, because the `EXPLAIN` note
+    is keyed by the aggregate node and appends. The rewrite rebuilds the path above the partial, matching each
+    node's child against the node it replaced rather than assuming a side.
+  - **The finder alone reached nothing, and the reason is the useful part of this item.** Across the 22 the walk
+    surfaces exactly two candidates no nearest-join finder saw -- Q05's at depths 2 and 3, and Q10's -- and the
+    gate refused Q10's **twice over**:
+
+    | Q10, two joins down | rows below | groups | ratio |
+    | --- | ---: | ---: | ---: |
+    | as the plan estimates them | 11,157,325 | 11,157,325 | **1.00x** |
+    | as they are | 11,463,171 | 3,884,218 | **2.95x** |
+
+    So condition 5's bar of 3 refuses it even handed the truth, and the estimate sees no reduction at all.
+  - **The estimate cannot be fixed here**, which is worth stating because it is the obvious first move.
+    `DistinctValues` reads a column's footer domain and caps it at the subtree's row estimate; `o_custkey`'s
+    domain over all orders exceeds the cap, so the cap is what it returns. Capping per column at the row
+    estimate of the subtree that *produced* the column changes nothing either: `EstimateRows` of a `Filter` is
+    its input's count by ADR 0026's rule, so the producing subtree estimates 150,000,000 where 5.7 million rows
+    survive. Seeing this reduction needs per-column filter selectivity, which is ADR 0026's territory and not
+    a quantity this gate can conjure.
+  - **So the sixth condition is this ADR's own "weighted by what moves", finally implemented.** The Decision
+    already said that *"a gate that counts rows without weighting by gather width and grouping-key width will
+    rank them wrongly"* -- and condition 5 as shipped counts rows only. It now also admits a placement whose
+    **pre-grouping is at least 8x cheaper per row than the grouping it feeds**, costing a column by its type: a
+    fixed-width type at its bytes, a VARCHAR well above the widest of them, because hashing one reads its bytes,
+    a collision memcmps them and the table copies them. Q10's two placements are 32x and 1.2x on that measure,
+    and the ADR measured the 1.2x one at 1.245x slower -- so the quantity orders them correctly where the row
+    ratio could not be estimated at all.
+  - **Measured** at SF 100 on four threads, release arms built from the same tree, answers byte-identical over
+    all 22. Q10 at **7 repeats interleaved and rotated**, the rest a 3-repeat control:
+
+    | | main | G2d |
+    | --- | ---: | ---: |
+    | Q10 | 6.320 s (max 6.557) | **5.907 s (max 6.130), 0.935x** |
+    | Q10's peak memory | 4,348 MiB | **3,528 MiB (0.81x)** |
+    | the 22 | 104.16 s | **103.24 s**, geomean 0.994x |
+    | the 22's peak memory | 14,027 MiB | 14,093 MiB -- Q18 still sets it |
+
+    Q10's spreads do not overlap, and this reproduces both the 0.945x this ADR recorded by hand for the
+    placement and the by-hand 0.939x of the implementation plan. **No other query moves**: the widest is Q9 at
+    0.977x, inside its own spread. The build above the customer join falls from 11,463,171 rows to 3,884,218,
+    which is where the memory goes.
+  - **It is a heuristic, and the only gate condition not founded on an estimate.** Where a reduction is genuinely
+    absent the partial is pure overhead. What bounds it rather than argues it away: the factor is large; the
+    cost is withheld rather than guessed when any pre-grouping column's type is unknown; conditions 3 and 4
+    still refuse; a placement that *reduces* keeps the verdict it has today, so nothing already admitted moves;
+    and the measured blast radius over the 22 is one query, Q05's new candidates being `below a filter` at both
+    depths. The verdict is reported distinctly -- `worth, a narrower pre-grouping` -- so `EXPLAIN` says which
+    of the two arguments carried a placement, which matters when the row figures beside it read 1:1.
+  - **Three refusals the chain needs that a single join did not.** A non-inner join anywhere on the path pads
+    rows no partial below it ever saw, which condition 5's `needs_identity` describes for the candidate's own
+    padding and not for one applied above it. A `Compute` on the path travels **down** with the partial -- a
+    partial cannot aggregate a column that does not exist below it -- which is sound only while nothing above
+    reads that column, so a `Compute` whose output a path join's key or the final grouping reads is refused
+    instead. And **a partial outputs its keys and its calls and nothing else**, so a node further up the path
+    that reads any other column of the aggregated side -- a join key, or a residual -- would read an id its
+    input no longer carries. Condition 3 covers the candidate's own keys and the grouping set and says nothing
+    about the rest of the path, so that case is refused explicitly. It was a crash and not a wrong answer
+    (`ResolvePositions` aborts), it is reachable from two inner joins over four columns, and **neither the 22
+    nor 6,000 `diff-random` queries produced the shape** -- it came out of reading the rebuild, which is worth
+    recording as the limit of what those gates cover.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
   - Update (2026-10-22, G3): **accepted, on one query of the 22 and on its memory rather than its time.**
     Everything below is SF 100, four threads, interleaved and rotated, both arms built from the same tree,
@@ -327,6 +394,8 @@ entirely, because a pre-grouped relation has exactly one row per key.
       placement two joins down, which this decision's single exchange does not reach; the placement it does
       reach is 1.245x slower and the gate refuses it. A second query would come from this and nothing else here
       will produce it.
+      - Update (2026-10-23, G2d): **done, and it needed a sixth gate condition this ADR had already argued for
+        and not implemented.** See G2d.
     - **`COUNT(*)` where the grouped side can go missing**, which answered 1 over the padded row and so wants a
       value supplied where every other spelling wants nothing. No query of the 22 has that shape.
   - **One error path changed** and is recorded under G2b: a group whose total fits a DECIMAL width while its

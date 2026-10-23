@@ -47,12 +47,63 @@ Catalog GateCatalog() {
   const auto twin = std::make_shared<testing::FakeTable>(
       arrow::schema({arrow::field("dk", arrow::int32())}), 1000);
   twin->WithDistinctCount(0, /*field=*/0, 1000);
+  // A chain of three, the shape the iterated walk was added for in miniature. The join order
+  // search picks `(deep JOIN mid) JOIN top` because `top` is the largest of the three, which is
+  // what puts `deep` two joins below the aggregate rather than one. `deep` holds two rows per key,
+  // so its pre-grouping reduces by two -- under the reduction the gate asks for, leaving the
+  // narrowing to carry it. `mid.g` declares no distinct count, so the nearest placement's group
+  // count is unknown exactly as the measured query's is.
+  const auto deep = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("mk", arrow::int32()), arrow::field("v", arrow::int32()),
+                     arrow::field("dw", arrow::binary()), arrow::field("ak", arrow::int32())}),
+      1000);
+  deep->WithDistinctCount(0, /*field=*/0, 500).WithDistinctCount(0, /*field=*/2, 500);
+  const auto mid = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("mk", arrow::int32()), arrow::field("tk", arrow::int32()),
+                     arrow::field("g", arrow::binary())}),
+      500);
+  mid->WithDistinctCount(0, /*field=*/0, 500).WithDistinctCount(0, /*field=*/1, 500);
+  const auto top = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("tk", arrow::int32()), arrow::field("w1", arrow::binary()),
+                     arrow::field("w2", arrow::binary()), arrow::field("w3", arrow::binary())}),
+      5000);
+  top->WithDistinctCount(0, /*field=*/0, 500);
   const auto must = [](const arrow::Status& status) { EXPECT_TRUE(status.ok()) << status; };
+  must(catalog.Register("deep", deep));
+  must(catalog.Register("mid", mid));
+  must(catalog.Register("top", top));
   must(catalog.Register("facts", facts));
   must(catalog.Register("wide", wide));
   must(catalog.Register("narrow", narrow));
   must(catalog.Register("twin", twin));
   return catalog;
+}
+
+// Placements over the gate's own catalog, which is where the chain fixture lives. The bound plan,
+// for the reason Verdicts gives.
+std::vector<std::string> GatePlacements(std::string_view sql) {
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  std::vector<std::string> out;
+  if (!plan.ok()) {
+    return out;
+  }
+  for (const AggregatePlacement& p : AggregatePlacements(*plan)) {
+    out.push_back(std::string(p.left_is_aggregated ? "left " : "right ") +
+                  std::to_string(p.pre_grouping.size()) + "+" +
+                  std::to_string(p.grouping_from_aggregated_side) +
+                  (p.joins_down > 1 ? " " + std::to_string(p.joins_down) + " down" : ""));
+  }
+  return out;
+}
+
+// The optimized plan of a gate-catalog query, to read the shape the exchange built.
+std::string GatePlan(std::string_view sql) {
+  static const Catalog catalog = GateCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  return plan.ok() ? Explain(Optimized(*plan)) : std::string();
 }
 
 std::vector<std::string> Verdicts(std::string_view sql) {
@@ -81,10 +132,17 @@ std::vector<std::string> Placements(std::string_view sql) {
     out.push_back(std::string(p.left_is_aggregated ? "left " : "right ") +
                   std::to_string(p.pre_grouping.size()) + "+" +
                   std::to_string(p.grouping_from_aggregated_side) +
-                  (p.needs_identity ? " padding" : ""));
+                  (p.needs_identity ? " padding" : "") +
+                  (p.joins_down > 1 ? " " + std::to_string(p.joins_down) + " down" : ""));
   }
   return out;
 }
+
+// The chain fixture's query: the aggregate reads `deep`, which the join order search puts two
+// joins below it, and groups by `top`'s three VARCHARs and `mid`'s one.
+constexpr std::string_view kChain =
+    "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
+    "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.w1, top.w2, top.w3, mid.g";
 
 // The shape ADR 0032 is written for: the aggregates read one input, the grouping key comes from the
 // other, and the pre-grouping is the join key alone. `ok` holds the aggregated side.
@@ -295,6 +353,91 @@ TEST(AggregatePlacementTest, DeclinesToBuild) {
        }) {
     EXPECT_EQ(Aggregates(c.sql), 1) << c.why << ": " << c.sql;
   }
+}
+
+// The chain, which is the query this walk was added for in miniature. The deeper placement is the
+// one reported: its pre-grouping is the join key alone, where the nearest one's holds a grouping
+// column as well and nothing estimates its groups. The three VARCHARs the query groups by come from
+// `top`, which the candidate is not below at all -- so they are simply not pre-grouped by, and the
+// answer still holds because the final step groups again.
+TEST(AggregatePlacementTest, ReportsTheDeeperPlacementOfAChain) {
+  EXPECT_EQ(GatePlacements(kChain), (std::vector<std::string>{"left 1+0 2 down"}));
+  EXPECT_EQ(Verdicts(kChain), (std::vector<std::string>{"worth, a narrower pre-grouping"}));
+  // The exchange performed: the partial two joins down, and what is LEFT reported above it -- the
+  // nearest placement, whose group count is unknown because `mid.g` declares no distinct count.
+  const std::string text = GatePlan(kChain);
+  EXPECT_NE(text.find("GroupAggregate keys=[deep.mk] SUM(deep.v)"), std::string::npos) << text;
+  EXPECT_NE(text.find("1 from the grouping set, unknown"), std::string::npos) << text;
+}
+
+// The narrowing is what carries that placement, and it is the one condition of the gate not founded
+// on an estimate -- so the same chain with a *wide* pre-grouping, at the same reduction, is
+// refused. Grouping by `deep.dw` as well puts a VARCHAR in the pre-grouping, and the ratio falls
+// from 32 to a little over 4 while the reduction stays under the bar. The two cases bracket
+// kLeastNarrowing, so moving it outside [5, 32] fails one of them.
+TEST(AggregatePlacementTest, AWidePreGroupingDoesNotEarnTheSamePlacement) {
+  static constexpr std::string_view kWide =
+      "SELECT top.w1, top.w2, top.w3, mid.g, deep.dw, SUM(deep.v) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.w1, top.w2, top.w3, mid.g, deep.dw";
+  // Nothing is reported two joins down, and nothing is built there: the only placement left is the
+  // nearest, whose groups are unknown for the reason the chain case gives.
+  EXPECT_EQ(GatePlacements(kWide), (std::vector<std::string>{"left 3+2"}));
+  EXPECT_EQ(Aggregates(kWide), 1);
+}
+
+// An outer join between the aggregate and a deeper candidate stops the walk: it pads rows no
+// partial below it ever saw, which `needs_identity` does not describe. The nearest placement is
+// still reported, so what this pins is that the walk does not travel THROUGH the outer join.
+TEST(AggregatePlacementTest, AnOuterJoinOnThePathStopsTheWalk) {
+  for (const std::string& placement :
+       GatePlacements("SELECT top.w1, top.w2, top.w3, SUM(deep.v) FROM deep JOIN mid "
+                      "ON deep.mk = mid.mk LEFT JOIN top ON mid.tk = top.tk "
+                      "GROUP BY top.w1, top.w2, top.w3")) {
+    EXPECT_EQ(placement.find(" down"), std::string::npos) << placement;
+  }
+}
+
+// The aggregate's argument is computed above both joins, so the Compute that defines it has to
+// travel down with the partial -- a partial cannot aggregate a column that does not exist below it.
+// The Compute lands on the aggregated side, under the partial, and nothing above reads its output
+// any more because the final call reads the partial's.
+TEST(AggregatePlacementTest, AComputedArgumentTravelsDownWithThePartial) {
+  const std::string text = GatePlan(
+      "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v * 2) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.w1, top.w2, top.w3, mid.g");
+  EXPECT_NE(text.find("GroupAggregate keys=[deep.mk] SUM("), std::string::npos) << text;
+  // The Compute below the partial, over the scan, and not above the join it came from.
+  const std::size_t partial = text.find("GroupAggregate keys=[deep.mk]");
+  const std::size_t compute = text.find("Compute");
+  ASSERT_NE(partial, std::string::npos) << text;
+  ASSERT_NE(compute, std::string::npos) << text;
+  EXPECT_GT(compute, partial) << text;
+}
+
+// A join ABOVE the candidate whose key reads the pre-grouping column. The partial defines a fresh
+// id for each key it groups by, so every node on the path that read the old one has to be pointed
+// at the new -- not only the candidate's own keys, which is all the single-join exchange had to do.
+TEST(AggregatePlacementTest, AnInterveningJoinKeyIsRenamed) {
+  static constexpr std::string_view kShared =
+      "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND top.tk = deep.mk GROUP BY top.w1, top.w2, top.w3, mid.g";
+  // It plans, which is the assertion: ResolvePositions rejects a plan whose node reads an id its
+  // input does not carry, so a missed rename fails here rather than answering wrongly.
+  EXPECT_FALSE(GatePlan(kShared).empty());
+}
+
+// A join above the candidate keying on a column of the aggregated side that the pre-grouping does
+// NOT hold. The partial outputs its keys and its calls and nothing else, so that column is gone
+// above it -- and condition 3 does not put it in the pre-grouping, since it is neither a key of the
+// candidate nor a grouping column. Refused, because the alternative is a plan whose join reads an
+// id its input does not carry: ResolvePositions aborts on that, so without this the shape is a
+// crash rather than a wrong answer.
+TEST(AggregatePlacementTest, AJoinAboveReadingADroppedColumnIsRefused) {
+  static constexpr std::string_view kDropped =
+      "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND top.tk = deep.ak GROUP BY top.w1, top.w2, top.w3, mid.g";
+  EXPECT_FALSE(GatePlan(kDropped).empty());
+  EXPECT_EQ(Aggregates(kDropped), 1);
 }
 
 // Every refusal. Each reports nothing, and reporting nothing is always safe -- but

@@ -64,7 +64,11 @@ struct AggregatePlacement {
   // this is a judgement about *whether to rewrite*, and the shape of its evidence is that a small
   // group count argues for one, so an unknown group count must argue against.
   enum class Verdict : std::uint8_t {
-    kWorth,        // every condition the gate can decide holds
+    kWorth,  // every condition the gate can decide holds
+    // Every condition holds but the reduction in rows, which the pre-grouping being far cheaper per
+    // row than the grouping it feeds carries instead. The gate's one condition not founded on an
+    // estimate; see Judge for what bounds it.
+    kWorthNarrower,
     kNoReduction,  // the pre-grouping makes about as many groups as it reads rows (conditions 2, 5)
     kBelowAFilter,  // the aggregate would read more rows there than it reads now (condition 3)
     kJoinDiscards,  // the joins above throw away most of the groups it would build (condition 4)
@@ -76,6 +80,23 @@ struct AggregatePlacement {
   std::optional<int64_t> rows_now;
   std::optional<int64_t> rows_below;
   std::optional<int64_t> groups;
+  // What a hash table pays per row for the pre-grouping and for the aggregate's own grouping, in
+  // GroupingCost's coarse units (a fixed-width type's bytes; a VARCHAR well above the widest of
+  // them). The second being many times the first is the other argument for a placement, beside a
+  // reduction in rows. The pre-grouping's is std::nullopt where one of its columns was computed
+  // above the join, whose type nothing here knows; the aggregate's keys always carry theirs.
+  std::optional<int64_t> pre_grouping_cost;
+  int64_t grouping_cost = 0;
+
+  // How far down the chain of joins this placement is: 1 is the join the aggregate reads, and more
+  // is a join that one's aggregated side reads, and so on. The exchange is iterated, because the
+  // placement that pays is often not the nearest -- on the query ADR 0032's correction is about,
+  // the nearest one groups by the same seven columns as the final step and measures 1.245x slower,
+  // while two joins down the pre-grouping is a single BIGINT.
+  std::size_t joins_down = 1;
+  // The nodes from the aggregate's input down to `join`, outermost first and `join` last, for the
+  // rewrite to rebuild over the join it splices a partial into.
+  std::vector<LogicalNodePtr> path;
 };
 
 // "worth", "no reduction", and so on.
