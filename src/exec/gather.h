@@ -20,13 +20,14 @@ namespace antb1::exec {
 // The chunk of a row reference that names no row: GatherRows<true> appends NULL for it.
 inline constexpr std::uint32_t kNoChunk = std::numeric_limits<std::uint32_t>::max();
 
-// The arrays of every column of a set of chunks (batches of one schema), taken once and kept
+// The arrays of every column of a fixed set of chunks (batches of one schema), taken once and kept
 // column by column, for GatherRows over the same chunks again and again: asking a batch for a
-// column (arrow::RecordBatch::column) locks the batch and counts a reference, and a gather over
-// chunks asks every chunk once per call, so a caller that gathers from many chunks many times -- a
-// hash join's build, gathered for every batch of rows its join emits -- would walk all of them each
-// time. The arrays are the ones each chunk keeps (arrow::RecordBatch::columns), so the chunks must
-// outlive it.
+// column (arrow::RecordBatch::column) locks the batch and counts a reference, so a caller that
+// gathers from many chunks many times -- a hash join's build, gathered for every batch of rows its
+// join emits -- would otherwise ask all of them for every gather. The arrays are the ones each
+// chunk keeps (arrow::RecordBatch::columns: Arrow boxes each column once and keeps it while the
+// batch lives), so the chunks must outlive it. A SortBuffer, whose chunks change as rows arrive,
+// keeps the same lists in step with its chunks instead.
 class ChunkColumns {
  public:
   ChunkColumns() = default;
@@ -56,11 +57,5 @@ class ChunkColumns {
 template <bool kWithNulls, class Ref>
 arrow::Status GatherRows(std::span<const arrow::Array* const> arrays, std::span<const Ref> refs,
                          arrow::ArrayBuilder& builder);
-
-// The same over column `column` of `chunks`, asking every chunk for it on every call (the sort
-// buffer's gather, once per batch it emits). Instantiated for <false, SortBuffer::RowRef> only.
-template <bool kWithNulls, class Ref>
-arrow::Status GatherRows(const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks, int column,
-                         std::span<const Ref> refs, arrow::ArrayBuilder& builder);
 
 }  // namespace antb1::exec

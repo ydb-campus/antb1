@@ -1,8 +1,8 @@
 // Gathering rows of several chunks into one array (gather.h): the arrays ChunkColumns takes once,
 // each the array its chunk keeps (also for a chunk that boxes its columns only when asked), and
-// GatherRows over them and over the chunks, for each type with a typed loop and for the slice path
-// (BOOLEAN), with NULLs in the data and, with kWithNulls, refs that name no row: always the rows
-// read one at a time.
+// GatherRows over them, for each type with a typed loop and for the slice path (BOOLEAN), with
+// NULLs in the data and, with kWithNulls, refs that name no row: always the rows read one at a
+// time.
 
 #include "../gather.h"
 
@@ -118,18 +118,6 @@ std::shared_ptr<arrow::Array> Gather(std::span<const arrow::Array* const> arrays
   return builder->Finish().ValueOrDie();
 }
 
-// The same over column `column` of `chunks`, which asks each chunk for it (the sort buffer's).
-template <bool kWithNulls, class Ref>
-std::shared_ptr<arrow::Array> Gather(const Chunks& chunks, int column,
-                                     const std::shared_ptr<arrow::DataType>& type,
-                                     const std::vector<Ref>& refs) {
-  std::unique_ptr<arrow::ArrayBuilder> builder = arrow::MakeBuilder(type).ValueOrDie();
-  const arrow::Status status =
-      GatherRows<kWithNulls, Ref>(chunks, column, std::span<const Ref>(refs), *builder);
-  EXPECT_TRUE(status.ok()) << status.ToString();
-  return builder->Finish().ValueOrDie();
-}
-
 // `gathered` holds the rows `refs` of column `column` of `chunks`, each read on its own (NULL for a
 // ref without a row).
 template <class Ref>
@@ -188,8 +176,7 @@ TEST(GatherTest, ChunkColumnsTakeTheArraysTheirChunksKeep) {
   EXPECT_TRUE(none.column(fields - 1).empty());
 }
 
-// Every type, gathered from a ChunkColumns with either kind of row reference, and from the chunks
-// with the sort buffer's.
+// Every type, gathered from a ChunkColumns with either kind of row reference.
 TEST(GatherTest, GathersEveryTypeAsReadRowByRow) {
   const Chunks chunks = MakeChunks();
   const ChunkColumns columns(chunks, chunks.front()->num_columns());
@@ -201,7 +188,6 @@ TEST(GatherTest, GathersEveryTypeAsReadRowByRow) {
     ExpectRows(*Gather<false>(columns.column(c), type, join_refs), chunks, c, join_refs);
     ExpectRows(*Gather<true>(columns.column(c), type, join_refs), chunks, c, join_refs);
     ExpectRows(*Gather<false>(columns.column(c), type, sort_refs), chunks, c, sort_refs);
-    ExpectRows(*Gather<false>(chunks, c, type, sort_refs), chunks, c, sort_refs);
   }
 }
 
@@ -233,7 +219,7 @@ TEST(GatherTest, NoRefsGatherAnEmptyArray) {
     SCOPED_TRACE(type->ToString());
     for (const std::shared_ptr<arrow::Array>& gathered :
          {Gather<false>(columns.column(c), type, refs), Gather<true>(none.column(c), type, refs),
-          Gather<false>(Chunks{}, c, type, sort_refs)}) {
+          Gather<false>(none.column(c), type, sort_refs)}) {
       EXPECT_EQ(gathered->length(), 0);
       EXPECT_TRUE(gathered->type()->Equals(*type));
     }

@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/exec/limit.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -319,6 +320,385 @@ TEST_F(SortTest, MergedBuffersEqualOneBuffer) {
     // The ids (column 0) name the rows; NaN keys would not compare equal.
     EXPECT_TRUE(a->column(0)->Equals(*b->column(0))) << "keep=" << keep.value_or(-1);
   }
+}
+
+// ---- reading the buffer: every column, from many chunks only the buffer holds ----
+
+// Rows of six columns kept as plain vectors, so that every batch made from them is held by the
+// sort buffer it is given to alone (a read of one the buffer dropped is a read of freed memory,
+// which ASan reports): a row id, a BIGINT key with NULLs and many ties, a BIGINT twin (a read of
+// another column's arrays shows), VARCHAR, DOUBLE and BOOLEAN (the gather's slice path).
+struct WideRows {
+  std::vector<std::optional<int64_t>> keys;
+  std::vector<std::optional<int64_t>> twins;
+  std::vector<std::optional<std::string>> strings;
+  std::vector<std::optional<double>> doubles;
+  std::vector<std::optional<bool>> bools;
+
+  static std::shared_ptr<arrow::Schema> Schema() {
+    return arrow::schema({arrow::field("id", arrow::int64()), arrow::field("k", arrow::int64()),
+                          arrow::field("twin", arrow::int64()), arrow::field("s", arrow::binary()),
+                          arrow::field("d", arrow::float64()),
+                          arrow::field("b", arrow::boolean())});
+  }
+
+  // Rows [begin, end) as a new batch that only the caller holds.
+  [[nodiscard]] std::shared_ptr<arrow::RecordBatch> Chunk(int64_t begin, int64_t end) const {
+    const auto rows = [begin, end](const auto& values) {
+      return std::vector(values.begin() + static_cast<std::ptrdiff_t>(begin),
+                         values.begin() + static_cast<std::ptrdiff_t>(end));
+    };
+    std::vector<std::optional<int64_t>> ids;
+    ids.reserve(static_cast<std::size_t>(end - begin));
+    for (int64_t id = begin; id < end; ++id) {
+      ids.emplace_back(id);
+    }
+    return arrow::RecordBatch::Make(
+        Schema(), end - begin,
+        {Int64s(ids), Int64s(rows(keys)), Int64s(rows(twins)), Strings(rows(strings)),
+         Doubles(rows(doubles)), testing::Bools(rows(bools))});
+  }
+};
+
+WideRows MakeWideRows(int64_t n, Rng& rng) {
+  WideRows rows;
+  const auto size = static_cast<std::size_t>(n);
+  rows.keys.reserve(size);
+  rows.twins.reserve(size);
+  rows.strings.reserve(size);
+  rows.doubles.reserve(size);
+  rows.bools.reserve(size);
+  for (int64_t i = 0; i < n; ++i) {
+    rows.keys.push_back(rng.Below(6) == 0 ? std::nullopt : std::optional(rng.Below(16)));
+    rows.twins.push_back(i % 11 == 5 ? std::nullopt : std::optional(((i * 7919) % 1009) - 500));
+    rows.strings.push_back(i % 8 == 3
+                               ? std::nullopt
+                               : std::optional("s" + std::to_string(i) +
+                                               std::string(static_cast<std::size_t>(i % 9), 'x')));
+    rows.doubles.push_back(i % 7 == 2 ? std::nullopt
+                                      : std::optional((static_cast<double>(i) / 2) - 3));
+    rows.bools.push_back(i % 5 == 1 ? std::nullopt : std::optional(i % 3 == 0));
+  }
+  return rows;
+}
+
+// The ids [0, n) in the order of a stable sort by the key.
+std::vector<int64_t> KeyOrder(const WideRows& rows, int64_t n, bool descending, bool nulls_first) {
+  std::vector<int64_t> order;
+  order.reserve(static_cast<std::size_t>(n));
+  for (int64_t id = 0; id < n; ++id) {
+    order.push_back(id);
+  }
+  std::ranges::stable_sort(order, [&](int64_t a, int64_t b) {
+    const std::optional<int64_t>& x = rows.keys[static_cast<std::size_t>(a)];
+    const std::optional<int64_t>& y = rows.keys[static_cast<std::size_t>(b)];
+    if (!x.has_value() || !y.has_value()) {  // NULLs first or last whatever the direction
+      return x.has_value() != y.has_value() && x.has_value() != nulls_first;
+    }
+    return descending ? *x > *y : *x < *y;
+  });
+  return order;
+}
+
+std::optional<int64_t> IntAt(const arrow::Array& array, int64_t i) {
+  return array.IsNull(i) ? std::nullopt
+                         : std::optional(static_cast<const arrow::Int64Array&>(array).Value(i));
+}
+
+std::optional<std::string> StringAt(const arrow::Array& array, int64_t i) {
+  return array.IsNull(i)
+             ? std::nullopt
+             : std::optional(static_cast<const arrow::BinaryArray&>(array).GetString(i));
+}
+
+std::optional<double> DoubleAt(const arrow::Array& array, int64_t i) {
+  return array.IsNull(i) ? std::nullopt
+                         : std::optional(static_cast<const arrow::DoubleArray&>(array).Value(i));
+}
+
+std::optional<bool> BoolAt(const arrow::Array& array, int64_t i) {
+  return array.IsNull(i) ? std::nullopt
+                         : std::optional(static_cast<const arrow::BooleanArray&>(array).Value(i));
+}
+
+// Every column of `got` holds the rows order[begin], order[begin + 1], ... of `rows`.
+void ExpectRowsOf(const arrow::RecordBatch& got, const WideRows& rows,
+                  const std::vector<int64_t>& order, int64_t begin) {
+  ASSERT_EQ(got.num_columns(), 6);
+  for (int64_t i = 0; i < got.num_rows(); ++i) {
+    const int64_t id = order[static_cast<std::size_t>(begin + i)];
+    const auto row = static_cast<std::size_t>(id);
+    ASSERT_EQ(IntAt(*got.column(0), i), id) << "row " << begin + i;
+    EXPECT_EQ(IntAt(*got.column(1), i), rows.keys[row]) << "id " << id;
+    EXPECT_EQ(IntAt(*got.column(2), i), rows.twins[row]) << "id " << id;
+    EXPECT_EQ(StringAt(*got.column(3), i), rows.strings[row]) << "id " << id;
+    EXPECT_EQ(DoubleAt(*got.column(4), i), rows.doubles[row]) << "id " << id;
+    EXPECT_EQ(BoolAt(*got.column(5), i), rows.bools[row]) << "id " << id;
+  }
+}
+
+// Reads the buffer's sorted rows in windows of 1, 5, 64 and all of them, and clamped past both
+// ends, each window checked against `order`, the ids the buffer should hold in their order.
+void ExpectWindows(const SortBuffer& buffer, const WideRows& rows,
+                   const std::vector<int64_t>& order) {
+  const int64_t n = buffer.num_rows();
+  ASSERT_EQ(n, static_cast<int64_t>(order.size()));
+  for (const int64_t size : {int64_t{1}, int64_t{5}, int64_t{64}, n}) {
+    for (int64_t begin = 0; begin < n; begin += size) {
+      const auto got = buffer.Slice(begin, begin + size, arrow::default_memory_pool());
+      ASSERT_TRUE(got.ok()) << got.status().ToString();
+      ASSERT_EQ((*got)->num_rows(), std::min(size, n - begin));
+      ExpectRowsOf(**got, rows, order, begin);
+    }
+  }
+  const auto head = buffer.Slice(-5, 3, arrow::default_memory_pool());
+  ASSERT_TRUE(head.ok()) << head.status().ToString();
+  ASSERT_EQ((*head)->num_rows(), std::min<int64_t>(3, n));
+  ExpectRowsOf(**head, rows, order, 0);
+  const auto tail = buffer.Slice(n - 2, n + 10, arrow::default_memory_pool());
+  ASSERT_TRUE(tail.ok()) << tail.status().ToString();
+  ASSERT_EQ((*tail)->num_rows(), std::min<int64_t>(2, n));
+  ExpectRowsOf(**tail, rows, order, std::max<int64_t>(n - 2, 0));
+  const auto past = buffer.Slice(n, n + 5, arrow::default_memory_pool());
+  ASSERT_TRUE(past.ok()) << past.status().ToString();
+  EXPECT_EQ((*past)->num_rows(), 0);
+}
+
+// Adds rows [begin, end) to `buffer` in chunks of 1 to `max_rows` rows, each held by it alone.
+void AddChunks(SortBuffer& buffer, const WideRows& rows, int64_t begin, int64_t end,
+               int64_t max_rows, Rng& rng) {
+  for (int64_t start = begin; start < end;) {
+    const int64_t stop = std::min(end, start + 1 + rng.Below(max_rows));
+    ASSERT_TRUE(buffer.Add(rows.Chunk(start, stop), arrow::default_memory_pool()).ok());
+    start = stop;
+  }
+}
+
+// Every window of every column is the model's, read from the arrays the buffer took as each chunk
+// arrived: over many chunks of 1-7 rows, in every direction and NULL order, again after more rows
+// (one per chunk) arrive and the buffer is sorted again, and from a buffer it was moved to.
+TEST_F(SortTest, EveryWindowOfEveryColumnIsTheModels) {
+  Rng rng(20261023);
+  const WideRows rows = MakeWideRows(400, rng);
+  for (unsigned flags = 0; flags < 4; ++flags) {
+    const bool descending = (flags & 1U) != 0;
+    const bool nulls_first = (flags & 2U) != 0;
+    SCOPED_TRACE(flags);
+    SortBuffer buffer(RowComparator::Make(WideRows::Schema(),
+                                          {Key(1, LogicalType::kBigInt, descending, nulls_first)})
+                          .ValueOrDie(),
+                      std::nullopt);
+    AddChunks(buffer, rows, 0, 300, 7, rng);
+    ASSERT_TRUE(buffer.Sort(arrow::default_memory_pool()).ok());
+    ExpectWindows(buffer, rows, KeyOrder(rows, 300, descending, nulls_first));
+
+    AddChunks(buffer, rows, 300, 400, 1, rng);
+    EXPECT_FALSE(buffer.Slice(0, 1, arrow::default_memory_pool()).ok()) << "unsorted again";
+    ASSERT_TRUE(buffer.Sort(arrow::default_memory_pool()).ok());
+    const std::vector<int64_t> order = KeyOrder(rows, 400, descending, nulls_first);
+    ExpectWindows(buffer, rows, order);
+    const SortBuffer moved = std::move(buffer);
+    ExpectWindows(moved, rows, order);
+  }
+}
+
+// A top-N is read from the one chunk its latest compaction made: right after an Add that compacted
+// the rows (they outgrew the slack), after Tighten, and after Sort. Once it has a threshold, a
+// batch only some of whose rows beat it is taken into a new batch, and read from that one. Every
+// window against the model's first rows of everything added so far.
+TEST_F(SortTest, EveryWindowOfATopNIsTheModels) {
+  Rng rng(4600);
+  WideRows rows = MakeWideRows(4600, rng);
+  // The last batch: two rows before every other row and one after every other value, so that only
+  // some of its rows beat the threshold, whatever value it is (the first rows hold no NULL).
+  rows.keys[4597] = -1;
+  rows.keys[4598] = 1000;
+  rows.keys[4599] = -2;
+  for (const int64_t keep : {int64_t{1}, int64_t{7}, int64_t{300}}) {
+    SCOPED_TRACE(keep);
+    SortBuffer buffer(
+        RowComparator::Make(WideRows::Schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), keep);
+    const auto expect_first = [&](int64_t added) {
+      std::vector<int64_t> order = KeyOrder(rows, added, false, false);
+      order.resize(static_cast<std::size_t>(std::min(keep, added)));
+      ExpectWindows(buffer, rows, order);
+    };
+    int64_t compactions = 0;
+    for (int64_t start = 0; start < 4597;) {
+      const int64_t stop = std::min<int64_t>(4597, start + 1 + rng.Below(7));
+      ASSERT_TRUE(buffer.Add(rows.Chunk(start, stop), arrow::default_memory_pool()).ok());
+      if (buffer.Slice(0, 0, arrow::default_memory_pool()).ok()) {  // this Add compacted
+        ++compactions;
+        expect_first(stop);
+      }
+      if (start < 4500 && stop >= 4500) {
+        ASSERT_TRUE(buffer.Tighten(arrow::default_memory_pool()).ok());
+        expect_first(stop);
+      }
+      start = stop;
+    }
+    EXPECT_GE(compactions, 1);
+    ASSERT_TRUE(buffer.Add(rows.Chunk(4597, 4600), arrow::default_memory_pool()).ok());
+    ASSERT_TRUE(buffer.Sort(arrow::default_memory_pool()).ok());
+    expect_first(4600);
+  }
+}
+
+using IdRows = arrow::Result<std::shared_ptr<arrow::RecordBatch>>;
+
+// Column 0 (the ids) of a buffer's rows.
+Ids IdsOf(const IdRows& rows) {
+  EXPECT_TRUE(rows.ok()) << rows.status().ToString();
+  Ids ids;
+  if (rows.ok()) {
+    const std::shared_ptr<arrow::Array> column = (*rows)->column(0);
+    for (int64_t i = 0; i < column->length(); ++i) {
+      ids.push_back(IntAt(*column, i));
+    }
+  }
+  return ids;
+}
+
+// A batch of (id, key) rows, ids from `first_id` on.
+std::shared_ptr<arrow::RecordBatch> IdKeys(int64_t first_id,
+                                           const std::vector<std::optional<int64_t>>& keys) {
+  std::vector<std::optional<int64_t>> ids;
+  ids.reserve(keys.size());
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    ids.emplace_back(first_id + static_cast<int64_t>(i));
+  }
+  return arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("k", arrow::int64())}),
+      static_cast<int64_t>(keys.size()), {Int64s(ids), Int64s(keys)});
+}
+
+SortBuffer IdKeyBuffer(std::optional<int64_t> keep) {
+  return {RowComparator::Make(IdKeys(0, {})->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(),
+          keep};
+}
+
+// The same, read by hand: a top-N reads as the rows its latest compaction kept, from Tighten and
+// from Adds that compacted, and as unsorted after any other Add.
+TEST_F(SortTest, ATopNIsReadFromItsLatestCompaction) {
+  arrow::MemoryPool* pool = arrow::default_memory_pool();
+  SortBuffer three = IdKeyBuffer(3);
+  ASSERT_TRUE(three.Add(IdKeys(0, {5, 3, 8, 1, 9}), pool).ok());
+  EXPECT_FALSE(three.Slice(0, 3, pool).ok());
+  ASSERT_TRUE(three.Tighten(pool).ok());
+  EXPECT_EQ(IdsOf(three.Slice(0, 3, pool)), (Ids{3, 1, 0}));  // keys 1, 3, 5: the threshold is 5
+  ASSERT_TRUE(three.Add(IdKeys(5, {4, 7, 2}), pool).ok());    // 4 and 2 beat it: a new batch
+  EXPECT_FALSE(three.Slice(0, 3, pool).ok());
+  ASSERT_TRUE(three.Tighten(pool).ok());
+  EXPECT_EQ(IdsOf(three.Slice(0, 3, pool)), (Ids{3, 7, 1}));
+  ASSERT_TRUE(three.Sort(pool).ok());
+  EXPECT_EQ(IdsOf(three.Slice(0, 3, pool)), (Ids{3, 7, 1}));
+
+  // Keep 2 compacts in the Add that brings more than 2 + 4096 rows.
+  SortBuffer two = IdKeyBuffer(2);
+  std::vector<std::optional<int64_t>> rising;
+  std::vector<std::optional<int64_t>> falling;
+  rising.reserve(4099);
+  falling.reserve(4097);
+  for (int64_t id = 0; id < 4099; ++id) {
+    rising.emplace_back(id);
+  }
+  for (int64_t id = 4099; id < 8196; ++id) {
+    falling.emplace_back(-id);
+  }
+  ASSERT_TRUE(two.Add(IdKeys(0, rising), pool).ok());
+  EXPECT_EQ(IdsOf(two.Slice(0, 2, pool)), (Ids{0, 1}));
+  ASSERT_TRUE(two.Add(IdKeys(4099, falling), pool).ok());  // every row beats key 1: all kept
+  EXPECT_EQ(IdsOf(two.Slice(0, 2, pool)), (Ids{8195, 8194}));
+  ASSERT_TRUE(two.Sort(pool).ok());
+  EXPECT_EQ(IdsOf(two.Slice(0, 2, pool)), (Ids{8195, 8194}));
+}
+
+// Parts filled on their own and merged in input order, every other one sorted first (a top-N part
+// is then one compacted chunk); with a limit the merged rows are tightened after every merge and
+// read right away. A merged part is left empty and unsorted, and reads as no rows once sorted, as
+// does a buffer that never had any, whatever its keep.
+TEST_F(SortTest, MergedPartsAreReadFromTheirLatestCompaction) {
+  arrow::MemoryPool* pool = arrow::default_memory_pool();
+  Rng rng(6);
+  const WideRows rows = MakeWideRows(600, rng);
+  const auto buffer = [](std::optional<int64_t> keep) {
+    return SortBuffer(
+        RowComparator::Make(WideRows::Schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), keep);
+  };
+  for (const std::optional<int64_t> keep : {std::optional<int64_t>{}, std::optional<int64_t>{5}}) {
+    SCOPED_TRACE(keep.value_or(-1));
+    SortBuffer merged = buffer(keep);
+    for (int64_t part = 0; part < 6; ++part) {
+      SortBuffer rows_of_part = buffer(keep);
+      AddChunks(rows_of_part, rows, part * 100, (part + 1) * 100, 7, rng);
+      if (part % 2 == 1) {
+        ASSERT_TRUE(rows_of_part.Sort(pool).ok());
+      }
+      ASSERT_TRUE(merged.Merge(rows_of_part, pool).ok());
+      EXPECT_EQ(rows_of_part.num_rows(), 0);
+      EXPECT_FALSE(rows_of_part.Slice(0, 1, pool).ok()) << "a merged part is unsorted";
+      ASSERT_TRUE(rows_of_part.Sort(pool).ok());
+      const auto none = rows_of_part.Slice(0, 5, pool);
+      ASSERT_TRUE(none.ok()) << none.status().ToString();
+      EXPECT_EQ((*none)->num_rows(), 0);
+      if (keep.has_value()) {
+        ASSERT_TRUE(merged.Tighten(pool).ok());
+        std::vector<int64_t> order = KeyOrder(rows, (part + 1) * 100, false, false);
+        order.resize(static_cast<std::size_t>(*keep));
+        ExpectWindows(merged, rows, order);
+      }
+    }
+    ASSERT_TRUE(merged.Sort(pool).ok());
+    std::vector<int64_t> order = KeyOrder(rows, 600, false, false);
+    order.resize(static_cast<std::size_t>(keep.value_or(600)));
+    ExpectWindows(merged, rows, order);
+  }
+  for (const std::optional<int64_t> keep :
+       {std::optional<int64_t>{}, std::optional<int64_t>{0}, std::optional<int64_t>{3}}) {
+    SortBuffer empty = buffer(keep);
+    ASSERT_TRUE(empty.Sort(pool).ok());
+    const auto none = empty.Slice(0, 5, pool);
+    ASSERT_TRUE(none.ok()) << none.status().ToString();
+    EXPECT_EQ((*none)->num_rows(), 0);
+    EXPECT_TRUE((*none)->schema()->Equals(*WideRows::Schema()));
+  }
+}
+
+// A merge that fails part way -- no memory for the batch of the rows that beat the threshold --
+// has still emptied the other buffer, which reads as unsorted and works as a new one. The chunk it
+// gave was held by it alone and was freed with the failed Add, so reading it would read freed
+// memory.
+TEST_F(SortTest, AFailedMergeLeavesTheOtherBufferNew) {
+  arrow::MemoryPool* pool = arrow::default_memory_pool();
+  SortBuffer merged = IdKeyBuffer(3);
+  ASSERT_TRUE(merged.Add(IdKeys(0, {10, 20, 30, 40}), pool).ok());
+  ASSERT_TRUE(merged.Tighten(pool).ok());  // keeps 10, 20, 30: the threshold is 30
+  SortBuffer other = IdKeyBuffer(3);
+  ASSERT_TRUE(other.Add(IdKeys(4, {5, 50, 25, 60}), pool).ok());
+  ASSERT_TRUE(other.Sort(pool).ok());  // one chunk: 5, 25, 50
+
+  MemoryBudget no_memory(0);
+  const arrow::Status failed = merged.Merge(other, &no_memory);
+  EXPECT_TRUE(failed.IsOutOfMemory()) << failed.ToString();
+  EXPECT_EQ(other.num_rows(), 0);
+  EXPECT_FALSE(other.Slice(0, 3, pool).ok());
+  ASSERT_TRUE(other.Add(IdKeys(8, {7, 1}), pool).ok());
+  ASSERT_TRUE(other.Sort(pool).ok());
+  EXPECT_EQ(IdsOf(other.Slice(0, 3, pool)), (Ids{9, 8}));
+  ASSERT_TRUE(merged.Sort(pool).ok());
+  EXPECT_EQ(IdsOf(merged.Slice(0, 3, pool)), (Ids{0, 1, 2}));
+}
+
+// A buffer is not merged into itself (Merge moves another buffer's rows behind its own, and would
+// only add these back, unsorted): refused, the rows kept.
+TEST_F(SortTest, ABufferDoesNotMergeIntoItself) {
+  arrow::MemoryPool* pool = arrow::default_memory_pool();
+  SortBuffer buffer = IdKeyBuffer(std::nullopt);
+  ASSERT_TRUE(buffer.Add(IdKeys(0, {2, 1}), pool).ok());
+  EXPECT_FALSE(buffer.Merge(buffer, pool).ok());
+  EXPECT_EQ(buffer.num_rows(), 2);
+  ASSERT_TRUE(buffer.Sort(pool).ok());
+  EXPECT_EQ(IdsOf(buffer.Slice(0, 2, pool)), (Ids{1, 0}));
 }
 
 // The first-key prefix never contradicts the comparator: a smaller (group, bits) sorts first, and
