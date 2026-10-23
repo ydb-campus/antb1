@@ -5,7 +5,9 @@
 // filter is carried down by ColumnId, and a hand-built plan leaves ids unset, so nothing would
 // match and the test would pass while testing nothing.
 
+#include <algorithm>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,17 +43,22 @@ class AggregateFilterTest : public testing::ExecTest {};
 // A fact table: `k` repeats, so a GROUP BY reduces, and `v` is what gets aggregated.
 std::shared_ptr<MemoryTable> Facts() {
   const auto schema =
-      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64()),
+                     arrow::field("ks", arrow::binary())});
   arrow::RecordBatchVector batches;
   for (int64_t part = 0; part < 3; ++part) {
     std::vector<std::optional<int64_t>> keys;
     std::vector<std::optional<int64_t>> values;
+    std::vector<std::optional<std::string>> names;
     for (int64_t r = 0; r < 30; ++r) {
       keys.emplace_back(((part * 30) + r) % 10);  // 10 groups over 90 rows
       values.emplace_back(r);
+      names.emplace_back(std::format("s{}", ((part * 30) + r) % 10));
     }
-    batches.push_back(arrow::RecordBatch::Make(
-        schema, 30, arrow::ArrayVector{testing::Int64s(keys), testing::Int64s(values)}));
+    batches.push_back(
+        arrow::RecordBatch::Make(schema, 30,
+                                 arrow::ArrayVector{testing::Int64s(keys), testing::Int64s(values),
+                                                    testing::Strings(names)}));
   }
   return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
 }
@@ -59,25 +66,43 @@ std::shared_ptr<MemoryTable> Facts() {
 // A dimension: `dk` joins the fact's `k`, and `flag` selects two of its ten rows.
 std::shared_ptr<MemoryTable> Dimension() {
   const auto schema =
-      arrow::schema({arrow::field("dk", arrow::int64()), arrow::field("flag", arrow::int64())});
+      arrow::schema({arrow::field("dk", arrow::int64()), arrow::field("flag", arrow::int64()),
+                     arrow::field("dks", arrow::binary())});
   std::vector<std::optional<int64_t>> keys;
   std::vector<std::optional<int64_t>> flags;
+  std::vector<std::optional<std::string>> names;
   for (int64_t i = 0; i < 10; ++i) {
     keys.emplace_back(i);
     flags.emplace_back(i < 2 ? 1 : 0);
+    names.emplace_back(std::format("s{}", i));
   }
   arrow::RecordBatchVector batches{arrow::RecordBatch::Make(
-      schema, 10, arrow::ArrayVector{testing::Int64s(keys), testing::Int64s(flags)})};
+      schema, 10,
+      arrow::ArrayVector{testing::Int64s(keys), testing::Int64s(flags), testing::Strings(names)})};
   return std::make_shared<MemoryTable>(schema, std::move(batches), /*split=*/true);
 }
 
 struct Run {
   std::shared_ptr<arrow::Table> rows;
-  int64_t dropped = 0;  // the rows every key filter of the plan rejected
+  int64_t dropped = 0;             // the rows every key filter of the plan rejected
+  std::vector<std::string> scans;  // every Scan's detail, which names the column of its candidate
 };
 
-// Every `key_dropped` of the profile, summed: the filter under the aggregate is the only one these
-// plans can attach, so a non-zero total means it fired.
+// Every Scan's detail, which carries the column a key filter could be applied to (`explain
+// --physical`): the one way to tell *which* join's keys reached a scan when a plan has more than
+// one.
+void ScansIn(const ProfileNode& node, std::vector<std::string>& out) {
+  if (node.name() == "Scan") {
+    out.push_back(node.detail());
+  }
+  for (const ProfileNode* child : node.children()) {
+    ScansIn(*child, out);
+  }
+}
+
+// Every `key_dropped` of the profile, summed: the filter under the aggregate is the only one most
+// of these plans can attach, so a non-zero total means it fired. A plan with a join of its own
+// below the aggregate has a second source and has to look at `scans` instead.
 int64_t DroppedIn(const ProfileNode& node) {
   int64_t dropped = 0;
   for (const ProfileMetric& metric : node.metrics()) {
@@ -108,7 +133,9 @@ arrow::Result<Run> Execute(std::string_view sql, const std::shared_ptr<MemoryTab
   MemoryBudget budget(int64_t{1024} * 1024 * 1024);
   ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> rows, Drain(*op, ctx));
-  return Run{.rows = std::move(rows), .dropped = DroppedIn(profile)};
+  std::vector<std::string> scans;
+  ScansIn(profile, scans);
+  return Run{.rows = std::move(rows), .dropped = DroppedIn(profile), .scans = std::move(scans)};
 }
 
 // The shape: a grouped aggregate joined to a filtered dimension on the key it groups by. Two of
@@ -184,6 +211,42 @@ TEST_F(AggregateFilterTest, YieldsToPredicatesPushedIntoTheScan) {
   auto run = Execute(kQuery, facts, Dimension());
   ASSERT_TRUE(run.ok()) << run.status().ToString();
   EXPECT_EQ(run->dropped, 0) << "a scan takes one filter and the pushed predicate holds it";
+
+  auto control = Execute(kQuery, Facts(), Dimension());
+  ASSERT_TRUE(control.ok()) << control.status().ToString();
+  ASSERT_NE(run->rows, nullptr);
+  ASSERT_NE(control->rows, nullptr);
+  EXPECT_TRUE(run->rows->Equals(*control->rows));
+}
+
+// The other limitation, and the one a plan pass now depends on: **the offer does not survive a join
+// on its way down.** The Builder threads an AggregateFilter only through the nodes that keep every
+// row, and its JoinNode arm forwards no inherited offer to its probe -- it passes the join's own.
+// So an aggregate whose input holds a join gets no filter however publishable the keys are and
+// however free the scan's filter slot is.
+//
+// This is pinned because ADR 0023's semi-join reduction reads exactly this fact: it restricts a
+// one-column correlation when the aggregation reads a join, on the grounds that D5 cannot.
+// Threading the offer through a join is a natural change to make, and the moment someone does, that
+// rewrite pays for a reduction D5 has already made -- which measured 1.420x when both fired.
+// Without this test that regression would come back with every other test still green.
+TEST_F(AggregateFilterTest, TheOfferDoesNotSurviveAJoinBelowTheAggregate) {
+  constexpr std::string_view kQuery =
+      "SELECT COUNT(*) FROM (SELECT f.k, SUM(f.v) AS s FROM f JOIN d AS i ON f.ks = i.dks "
+      "GROUP BY f.k) AS g, d WHERE g.k = d.dk AND d.flag = 1";
+  const auto facts = Facts();
+  facts->set_claimed_rows(20'000'000);  // the share gate would admit it
+  auto run = Execute(kQuery, facts, Dimension());
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  // **Nothing is offered to any scan of this plan at all**, which is the whole point: the inner
+  // join's key `ks` is VARCHAR, so no build can publish a filter for it (CanPublishKeyFilter) and
+  // nothing claimed the scan's one filter slot -- and the correlated key `k`, which the offer from
+  // the join above the aggregate would have brought and which the aggregate does group by, still
+  // never arrives. So the gate that reads this reads the join, not the slot.
+  for (const std::string& scan : run->scans) {
+    EXPECT_EQ(scan.find("candidate on"), std::string::npos)
+        << "nothing should reach this scan: " << scan;
+  }
 
   auto control = Execute(kQuery, Facts(), Dimension());
   ASSERT_TRUE(control.ok()) << control.status().ToString();
