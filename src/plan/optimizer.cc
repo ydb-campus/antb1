@@ -843,16 +843,27 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // is.
   //
   // **A join below the aggregation is the case where D5 cannot apply either**, and so is this
-  // rewrite's as much as more than one key is. A scan takes one filter, and a join in the
-  // aggregation's own input has already claimed it for its own key set, so the correlated key has
-  // nowhere to attach (ADR 0029's own deferred item: "a Filter whose predicates go into the scan
-  // ... hold the one filter slot a scan takes"). Measured on the query of the 22 shaped that way:
-  // **0.931x** and a peak of 483 MiB against 1,011, its aggregation building 47,107 groups over
-  // 64,000 rows where it built 11,829,402 over 16,042,800 -- with every other query of the 22 flat.
+  // rewrite's as much as more than one key is. The reason is not the scan's one filter slot: a join
+  // whose key is not publishable (CanPublishKeyFilter) leaves that slot free and D5 still cannot
+  // reach the scan. What happens is that **the offer does not survive a join** --
+  // physical_planner.cc's Builder threads an AggregateFilter down only through the nodes that keep
+  // every row, and its JoinNode arm forwards no inherited offer to its probe, passing the join's
+  // own instead. Past a pipeline breaker there is no offer at all, the aggregate then having no
+  // part pipeline for one to travel.
+  //
+  // So the test is total rather than incidental: LogicalNode has exactly two multi-input
+  // alternatives, so a subtree with no join *is* the chain an offer could travel, and ReadsAJoin is
+  // false exactly where one could arrive. src/exec/tests/aggregate_filter_test.cc pins that
+  // invariant, because threading the offer through a join is a natural change to make and would
+  // silently leave this gate paying for a reduction D5 had already made.
+  //
+  // Measured on the query of the 22 shaped this way: **0.931x** and a peak of 483 MiB against
+  // 1,011, its aggregation building 47,107 groups over 64,000 rows where it built 11,829,402 over
+  // 16,042,800 -- with every other query of the 22 flat.
   //
   // What a plan may *not* read off is the filter itself: ADR 0029's filters are attached by the
   // physical planner, long after this pass runs, which is why these two structural facts stand in
-  // for them. ADR 0030 states the hazard they guard against -- "before costing a shared sub-plan,
+  // for it. ADR 0030 states the hazard they guard against -- "before costing a shared sub-plan,
   // check whether a consumer is already pruned by one" -- and a wrong guess here is not a wrong
   // answer but a rewrite that pays twice for one reduction.
   if (equivalent.size() < 2 && !ReadsAJoin(input)) {

@@ -238,18 +238,14 @@ TEST_F(AggregateFilterTest, TheOfferDoesNotSurviveAJoinBelowTheAggregate) {
   facts->set_claimed_rows(20'000'000);  // the share gate would admit it
   auto run = Execute(kQuery, facts, Dimension());
   ASSERT_TRUE(run.ok()) << run.status().ToString();
-  // The scan under the aggregate carries the *inner* join's key, `v`, and never the correlated key
-  // `k` the offer would have brought: the offer did not arrive, whatever the filter slot holds.
-  for (const std::string& scan : run->scans) {
-    EXPECT_EQ(scan.find("candidate on k"), std::string::npos)
-        << "the offer survived a join below the aggregate: " << scan;
-  }
-  // And the slot is *free*: the inner join's key is VARCHAR, so no build can publish a filter for
-  // it (CanPublishKeyFilter) and nothing claimed the scan's one filter. The offer still did not
-  // arrive, which is why the gate reads the join and not the slot.
+  // **Nothing is offered to any scan of this plan at all**, which is the whole point: the inner
+  // join's key `ks` is VARCHAR, so no build can publish a filter for it (CanPublishKeyFilter) and
+  // nothing claimed the scan's one filter slot -- and the correlated key `k`, which the offer from
+  // the join above the aggregate would have brought and which the aggregate does group by, still
+  // never arrives. So the gate that reads this reads the join, not the slot.
   for (const std::string& scan : run->scans) {
     EXPECT_EQ(scan.find("candidate on"), std::string::npos)
-        << "nothing should be offered to this scan at all: " << scan;
+        << "nothing should reach this scan: " << scan;
   }
 
   auto control = Execute(kQuery, Facts(), Dimension());
