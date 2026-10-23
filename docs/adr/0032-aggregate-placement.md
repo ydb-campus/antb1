@@ -333,15 +333,21 @@ entirely, because a pre-grouped relation has exactly one row per key.
 
     | | main | G2d |
     | --- | ---: | ---: |
-    | Q10 | 6.320 s (max 6.557) | **5.907 s (max 6.130), 0.935x** |
-    | Q10's peak memory | 4,348 MiB | **3,528 MiB (0.81x)** |
-    | the 22 | 104.16 s | **103.24 s**, geomean 0.994x |
-    | the 22's peak memory | 14,027 MiB | 14,093 MiB -- Q18 still sets it |
+    | Q10 | 6.273 s (max 6.358) | **5.898 s (max 6.013), 0.940x** |
+    | Q10's peak memory | 4,268 MiB | **3,540 MiB (0.83x)** |
+    | the 22 | 104.86 s | **104.34 s**, geomean 0.996x |
+    | the 22's peak memory | 14,046 MiB | 13,920 MiB -- Q18 still sets it |
 
     Q10's spreads do not overlap, and this reproduces both the 0.945x this ADR recorded by hand for the
-    placement and the by-hand 0.939x of the implementation plan. **No other query moves**: the widest is Q9 at
-    0.977x, inside its own spread. The build above the customer join falls from 11,463,171 rows to 3,884,218,
-    which is where the memory goes.
+    placement and the by-hand 0.939x of the implementation plan. **No other query moves**: every one of the
+    other 21 lands within 0.994x to 1.004x. The build above the customer join falls from 11,463,171 rows to
+    3,884,218, which is where the memory goes.
+  - **Two measurement traps this item fell into**, recorded because both produced a number that looked
+    publishable. Measuring the **Debug** build read the query 4.6x slower AND moved the ratio by 2 to 4 points,
+    because Debug changes the balance between hashing and I/O, which is the balance this item shifts. And a
+    foreign parallel build on the host took a probe run 23% over its known-quiet value; a one-run reading taken
+    there would have been meaningless either way. Every figure above is from release arms on a host whose
+    single-run time matched its quiet-host baseline before the arms were started.
   - **It is a heuristic, and the only gate condition not founded on an estimate.** Where a reduction is genuinely
     absent the partial is pure overhead. What bounds it rather than argues it away: the factor is large; the
     cost is withheld rather than guessed when any pre-grouping column's type is unknown; conditions 3 and 4
