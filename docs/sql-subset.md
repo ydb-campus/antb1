@@ -711,17 +711,17 @@ It shows what no logical plan holds, because the physical planner is what decide
   ([ADR 0020](adr/0020-filter-pushdown.md));
 - a `Scan` a dynamic join filter could be applied to ([ADR 0029](adr/0029-dynamic-join-filters.md)):
   `, key filter candidate on <column>` where that filter could reject rows as the scan decodes them, and
-  `, part skip candidate on <column>` where it could only rule out a part whole — because the pushed
-  predicates hold the scan's one filter slot, or because the table has no filtered decoder for the fields this
-  scan reads. Neither appears for a key no build can publish a filter for, which is any key but a single
-  integer or DATE one.
+  `, part skip candidate on <column>` where it could only rule out a part whole, because the table has no
+  filtered decoder for the fields this scan reads. Pushed predicates no longer stand in the way: a scan applies
+  the conjunction of them and the key filter. Neither annotation appears for a key no build can publish a filter
+  for, which is any key but a single integer or DATE one.
 
 ```text
 Output: count_star():BIGINT
 PartAggregate Aggregate COUNT(*)
   HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
     Filter trips.tr_row >= 100
-      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, part skip candidate on tr_pickup
+      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, key filter candidate on tr_pickup
   HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
     Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
 ```
@@ -767,7 +767,9 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     one ([ADR 0029](adr/0029-dynamic-join-filters.md)): `key_filter` (1 where the scan applies the filter row by
     row), `key_dropped` (the rows it rejected, which the scan's own `rows` no longer counts) and `key_pruned` (the
     parts ruled out whole, because the build published no key their key column spans — those parts are not read at
-    all, so they contribute no time and no rows);
+    all, so they contribute no time and no rows). These appear beside `N pushed predicates` where a scan has both:
+    it applies their conjunction, so `key_dropped` counts the rows the keys cleared and no others — the bit is tested
+    before it is touched, whichever of the two reaches a row first;
   - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first
     rows hardly reduced);
   - `part_time` (the part tasks' time, summed);

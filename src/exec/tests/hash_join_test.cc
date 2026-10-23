@@ -3313,6 +3313,22 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& pl
   return Drain(*op, ctx);
 }
 
+// How many scans of the profile applied a key filter (ADR 0029's D1), summed: a scan reports it
+// whether or not it also pushed predicates of its own, so this tells the two arms of a filter test
+// apart.
+int64_t KeyFiltersIn(const ProfileNode& node) {
+  int64_t found = 0;
+  for (const ProfileMetric& metric : node.metrics()) {
+    if (metric.name == "key_filter") {
+      found += metric.value;
+    }
+  }
+  for (const ProfileNode* child : node.children()) {
+    found += KeyFiltersIn(*child);
+  }
+  return found;
+}
+
 // The names of the tables whose parts were scanned, in scan order (from any thread).
 class ScanLog {
  public:
@@ -3809,9 +3825,16 @@ TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
 // only remove rows the join removes anyway -- and a join that emits an unmatched probe row must not
 // be filtered at all, since there the dropped rows are the answer.
 //
-// The control runs the same join with an always-true predicate pushed into the probe's scan: a scan
-// takes one filter, so the static one takes the slot and no key filter is attached, which makes the
-// two arms differ in the key filter and nothing else (the same decoder, the same rows read).
+// The control runs the same join with an always-true predicate pushed into the probe's scan, so
+// that both arms decode through a filter and read the same rows, and with a probe that claims too
+// few rows for the share gate to admit the key filter -- which is what makes the arms differ in the
+// key filter and nothing else.
+//
+// **The claimed rows are what the control rests on, and that is deliberate.** It used to rest on
+// the predicate taking the scan's one filter slot; once a scan could apply both, the control
+// silently began running the key filter too, and this test compared two filtered arms -- a filter
+// that dropped rows the join must keep would have dropped them in both and stayed green. The metric
+// assertions below are what would have caught that, so they are not decoration.
 TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
   const auto pool = MakeThreadPool();
   const auto pk = MixedColumn("p", 0);
@@ -3836,20 +3859,25 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
       // filter would drop are exactly the rows it must keep: it must not be filtered.
       const bool filtered = kind != plan::JoinKind::kAnti;
       const auto one = MixedTable("p", 6, 80, probe_keys);
+      ProfileNode got_profile;
       auto got =
           RunPlan(PlanOf(JoinOf(kind, ScanOf(one, "p"), ScanOf(build, "b"), {pk}, {bk}), columns),
-                  ContextOf(executor));
+                  ContextOf(executor), &got_profile);
       ASSERT_TRUE(got.ok()) << got.status().ToString();
       EXPECT_EQ(one->filtered_scans(), filtered ? 6 : 0);
       const auto two = MixedTable("p", 6, 80, probe_keys);
+      two->set_claimed_rows(16);  // 16 / kFilterBuildShare is 1, under the 5 build rows: refused
+      ProfileNode control_profile;
       auto control = RunPlan(
           PlanOf(JoinOf(kind,
                         Node(plan::FilterNode{.input = ScanOf(two, "p"), .predicates = {always}}),
                         ScanOf(build, "b"), {pk}, {bk}),
                  columns),
-          ContextOf(executor));
+          ContextOf(executor), &control_profile);
       ASSERT_TRUE(control.ok()) << control.status().ToString();
       EXPECT_EQ(two->filtered_scans(), 6) << "the control's own predicate should be pushed";
+      EXPECT_EQ(KeyFiltersIn(control_profile), 0) << "the control must not filter on the keys";
+      EXPECT_EQ(KeyFiltersIn(got_profile), filtered ? 1 : 0);
       EXPECT_EQ(RowsOf(**got), RowsOf(**control));
       EXPECT_FALSE(RowsOf(**got).empty());
     }
@@ -3915,8 +3943,9 @@ TEST_F(HashJoinPlanTest, APartHoldingNoBuildKeyIsNotScanned) {
       EXPECT_EQ(RowsOf(**got), RowsOf(**control));
       EXPECT_FALSE(RowsOf(**got).empty());
     }
-    // A scan that already pushes a predicate of its own still skips the parts, though it can take
-    // no key filter: the one filter slot is the per-row test's concern and not the part test's.
+    // A scan that already pushes a predicate of its own still skips the parts. It takes the per-row
+    // filter too now, as the conjunction of the two, which is what the arms above measure; the part
+    // test never needed a filter of any kind and so never depended on that.
     const auto pushed = MixedTable("p", 6, 80, probe_keys);
     auto with_predicate = RunPlan(
         PlanOf(JoinOf(plan::JoinKind::kInner,
@@ -4078,7 +4107,7 @@ TEST_F(HashJoinPlanTest, FilterPushdownReachesEachSideWithItsOwnParts) {
       // with this join's keys, which is what `explain --physical` reports. The build's own pipeline
       // has no join above it and so has no candidate to name.
       const bool probe = detail.starts_with("Scan table=p ");
-      EXPECT_TRUE(detail.ends_with(probe ? ", 1 pushed predicate, part skip candidate on pk"
+      EXPECT_TRUE(detail.ends_with(probe ? ", 1 pushed predicate, key filter candidate on pk"
                                          : ", 1 pushed predicate"))
           << detail;
     }

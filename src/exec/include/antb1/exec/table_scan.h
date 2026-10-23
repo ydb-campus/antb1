@@ -47,11 +47,12 @@ class TableScanOperator final : public Operator {
   // (docs/adr/0029-dynamic-join-filters.md), over one field of it:
   //
   //   - `filter`, the key filter the scan drops rows with as it decodes them, so the join never
-  //     sees a row whose key the build cannot hold (D1). Null when the scan applies none: it takes
-  //     one filter, and pushed predicates have the first claim on it.
+  //     sees a row whose key the build cannot hold (D1). Null when the scan applies none. Where the
+  //     scan also has predicates pushed into it the two are applied together, as the conjunction a
+  //     scan's one ScanFilter can be (exec::MakeBothScanFilters), so neither displaces the other.
   //   - `part_has_no_key`, that this part holds no key the build published, so the scan reads
-  //     nothing at all -- no open, no decode, no filtering (D2). Independent of the filter slot,
-  //     which is why a scan with pushed predicates can still carry this.
+  //     nothing at all -- no open, no decode, no filtering (D2). It needs no filter of any kind,
+  //     which is why it survived even before the two could be applied together.
   struct KeyScan {
     std::shared_ptr<const KeyFilter> filter;
     int column = 0;  // a position in `fields`, of the probe's one key column

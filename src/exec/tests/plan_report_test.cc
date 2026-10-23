@@ -130,16 +130,17 @@ TEST_F(PlanReportTest, AProbeScanNamesTheKeyFilterItCouldTake) {
   EXPECT_TRUE(dimension.ends_with(", 1 pushed predicate")) << dimension;
 }
 
-// A scan takes one filter and the pushed predicates hold it, so no per-row key filter is ever
-// attached over them: all that is left for the published keys is skipping a part whole, which is
-// the narrower claim this annotation makes.
-TEST_F(PlanReportTest, PushedPredicatesLeaveOnlyAPartSkipCandidate) {
+// Pushed predicates no longer stand in the way of the key filter: the scan applies the conjunction
+// of the two (MakeBothScanFilters), so the annotation says the same thing here as on a scan with no
+// predicates of its own. Before this it said "part skip candidate", the part test being all that
+// could still apply.
+TEST_F(PlanReportTest, PushedPredicatesAndAKeyFilterBothReachTheScan) {
   ProfileNode profile;
   ASSERT_TRUE(PlanOnly("SELECT COUNT(*) FROM f, d WHERE f.k = d.dk AND f.v > 1", Facts(),
                        Dimension(), &profile)
                   .ok());
   const std::string facts = ScanDetail(profile, "f");
-  EXPECT_TRUE(facts.ends_with(", 1 pushed predicate, part skip candidate on k")) << facts;
+  EXPECT_TRUE(facts.ends_with(", 1 pushed predicate, key filter candidate on k")) << facts;
 }
 
 // A left outer join that builds on its right input emits an unmatched probe row, so dropping one

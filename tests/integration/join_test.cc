@@ -378,7 +378,7 @@ TEST_F(JoinTest, PruningAndPushdownOnBothSides) {
     // with this join's keys, which is what `explain --physical` reports; the build's own pipeline
     // has no join above it and so has no candidate to name.
     const bool probes = detail.starts_with("Scan table=trips ");
-    EXPECT_TRUE(detail.ends_with(probes ? ", 1 pushed predicate, part skip candidate on tr_pickup"
+    EXPECT_TRUE(detail.ends_with(probes ? ", 1 pushed predicate, key filter candidate on tr_pickup"
                                         : ", 1 pushed predicate"))
         << detail;
   }

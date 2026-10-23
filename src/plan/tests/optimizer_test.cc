@@ -1194,9 +1194,9 @@ TEST(OptimizerTest, TheSemiJoinReductionLeavesOneKeyToTheDynamicFilter) {
   EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
 }
 
-// **A join below the aggregation is the other case D5 cannot reach**, whatever the key count: a
-// scan takes one filter and the join has claimed it for its own key set, so a single correlated key
-// has nowhere to attach and this rewrite is what restricts it. Measured at 0.931x with a peak of
+// **A join below the aggregation is the other case D5 cannot reach**, whatever the key count: the
+// physical planner's offer does not survive a join on its way down, so a single correlated key has
+// nowhere to attach and this rewrite is what restricts it. Measured at 0.931x with a peak of
 // 483 MiB against 1,011 on the query of the 22 shaped that way.
 //
 // The pair of tests is the point: the same one key restricts over a join and does not over a scan,

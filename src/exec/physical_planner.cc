@@ -833,9 +833,9 @@ struct Builder {
     const std::optional<LateScan> late_scan =
         late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
     // A dynamic join filter, where this scan is the probe side of a join whose build published one
-    // (ADR 0029). The per-row filter is only ever attached here, on a scan with no predicates of
-    // its own, because a scan takes one filter; the part test has no such limit and so is also
-    // attached in the pushdown branch of the FilterNode below.
+    // (ADR 0029). Both halves are attached here and in the pushdown branch of the FilterNode below:
+    // a scan takes one ScanFilter, and where it also has predicates of its own it applies the
+    // conjunction of the two (MakeBothScanFilters).
     std::optional<TableScanOperator::KeyScan> key_scan;
     if (part.has_value()) {
       key_scan = KeyScanOf(node, builds, late_scan, *part);
@@ -918,29 +918,31 @@ struct Builder {
         }
         const std::optional<LateScan> late_scan =
             late == nullptr ? std::nullopt : std::optional<LateScan>(*late);
-        // What a key filter could do here, for `explain --physical`: only skip a part. The pushed
-        // predicates hold the one filter slot, so no per-row filter is ever attached over them --
-        // which is why this says part and the branch above says key filter.
+        // What a key filter could do here, for `explain --physical`, and it is the same as on a
+        // scan with no predicates of its own now that the two can be applied together.
         if (names_it) {
           if (const std::optional<int> column = KeyFilterCandidate(*scan, builds, late_scan);
               column.has_value()) {
             input_slot->set_detail(
                 input_slot->detail() +
-                std::format(", part skip candidate on {}", ScanFieldName(*scan, *column)));
+                std::format(", key filter candidate on {}", ScanFieldName(*scan, *column)));
           }
         }
-        // The part test, which these pushed predicates do not stand in the way of: a part no
-        // published key can be in is not read, so it needs neither the filter slot they take nor
-        // the filtered decoder they use (ADR 0029's D2). The per-row filter is dropped, because
-        // they hold the one slot.
+        // **Both halves of ADR 0029 over pushed predicates.** The part test never needed the filter
+        // slot -- a part no published key can be in is not read at all -- and the per-row filter no
+        // longer competes for it either: the scan applies the conjunction of the two
+        // (MakeBothScanFilters), which is the item that ADR deferred. A scan reaching here is
+        // already decoding with a filter because of its predicates, so the key filter adds its own
+        // cost and nothing else; measured 0.992x over the 22, with no query slower.
         std::optional<TableScanOperator::KeyScan> key_scan =
             KeyScanOf(*scan, builds, late_scan, *part);
-        if (key_scan.has_value() && !key_scan->part_has_no_key) {
-          key_scan.reset();
-        }
-        if (key_scan.has_value()) {
-          key_scan->filter = nullptr;
-          if (input_slot != nullptr) {
+        if (key_scan.has_value() && input_slot != nullptr) {
+          // The same two metrics as the branch above, now that the same two things can happen here:
+          // a filter that runs unreported is one no test can assert and no profile can explain.
+          if (key_scan->filter != nullptr) {
+            input_slot->Max("key_filter", MetricUnit::kCount, 1);
+          }
+          if (key_scan->part_has_no_key) {
             input_slot->Add("key_pruned", MetricUnit::kCount, 1);
           }
         }
@@ -953,8 +955,9 @@ struct Builder {
     }
     // `above` carried on: a Filter only removes rows, so it neither mints nor moves a ColumnId and
     // the key the aggregate below groups by is still the key the join above published (the field's
-    // own contract). The branch over this one cannot carry it: it hands the pushed predicates to
-    // the scan, and those hold the one filter slot a scan takes.
+    // own contract). The branch over this one does not read it -- it builds the scan itself, from
+    // the joins of the scan's own pipeline -- which is why an offer does not reach a scan whose
+    // predicates are pushed. Not the filter slot: a scan applies the conjunction of the two.
     ARROW_ASSIGN_OR_RAISE(auto input,
                           Build(node.input, part, Input(), late, nullptr, builds, above));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);

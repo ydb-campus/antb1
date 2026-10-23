@@ -16,6 +16,7 @@
 #include "antb1/plan/table.h"
 
 namespace antb1::exec {
+
 namespace {
 
 std::shared_ptr<arrow::Schema> FieldsOf(const plan::Table& table, const std::vector<int>& fields,
@@ -90,15 +91,23 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
       positioned_ = true;
     }
   } else if (part_.has_value()) {
+    // The predicates pushed into the scan (ADR 0020) and the key filter a join above published
+    // (ADR 0029's D1), in whichever combination this scan has: a scan used to take one or the
+    // other, because it takes one ScanFilter, and takes their conjunction now.
     std::shared_ptr<const plan::ScanFilter> filter;
+    std::shared_ptr<const plan::ScanFilter> keys;
     if (!pushed_.empty()) {
       ARROW_ASSIGN_OR_RAISE(filter, MakeScanFilter(pushed_, *schema_, ctx.pool));
-    } else if (key_scan_.has_value() && key_scan_->filter != nullptr) {
-      // A scan takes one filter, so this is only for a scan with no pushed predicates of its own;
-      // the planner attaches it on no other (ADR 0029's D1).
+    }
+    if (key_scan_.has_value() && key_scan_->filter != nullptr) {
       key_dropped_ = std::make_shared<std::atomic<int64_t>>(0);
-      ARROW_ASSIGN_OR_RAISE(filter,
+      ARROW_ASSIGN_OR_RAISE(keys,
                             MakeKeyScanFilter(key_scan_->filter, key_scan_->column, key_dropped_));
+    }
+    if (filter == nullptr) {
+      filter = std::move(keys);
+    } else if (keys != nullptr) {
+      ARROW_ASSIGN_OR_RAISE(filter, MakeBothScanFilters(std::move(filter), std::move(keys)));
     }
     ARROW_ASSIGN_OR_RAISE(reader_,
                           table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool, filter));

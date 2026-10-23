@@ -50,4 +50,19 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeKeyScanFilter(
     std::shared_ptr<const KeyFilter> filter, int column,
     std::shared_ptr<std::atomic<int64_t>> dropped = nullptr);
 
+// Both filters over one scan: the rows that pass are those that pass each. Its own column list is
+// the **union** of theirs -- each column once, as plan::ScanFilter requires, in `first`'s order and
+// then `second`'s new ones -- and Apply drives whichever of the two reads a column, or both where
+// they share one.
+//
+// **This is what lets a scan take a pushed predicate set and a key filter at once** -- ADR 0029
+// deferred it as "a plan::ScanFilter that is the conjunction of two" -- and it is sound because a
+// ScanFilter only ever *clears* bits of the mask it is given: applying both, in either order and
+// with either skipping rows the other already cleared, leaves exactly the rows that pass both.
+//
+// Invalid for a null filter. A table applies this as it applies any other, so a filter whose own
+// columns a table cannot serve is refused where it always was (Table::supports_scan_filter).
+arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeBothScanFilters(
+    std::shared_ptr<const plan::ScanFilter> first, std::shared_ptr<const plan::ScanFilter> second);
+
 }  // namespace antb1::exec
