@@ -1194,6 +1194,49 @@ TEST(OptimizerTest, TheSemiJoinReductionLeavesOneKeyToTheDynamicFilter) {
   EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input)) << Explain(plan);
 }
 
+// **A join below the aggregation is the other case D5 cannot reach**, whatever the key count: a
+// scan takes one filter and the join has claimed it for its own key set, so a single correlated key
+// has nowhere to attach and this rewrite is what restricts it. Measured at 0.931x with a peak of
+// 483 MiB against 1,011 on the query of the 22 shaped that way.
+//
+// The pair of tests is the point: the same one key restricts over a join and does not over a scan,
+// so the structural fact and not the key count alone is what the gate reads.
+TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverAJoin) {
+  const std::vector<ExprPtr> one = {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)};
+  const LogicalNodePtr joined =
+      Node(JoinNode{.kind = JoinKind::kInner,
+                    .left = FourFieldsRows(11, 1000),
+                    .right = FourFieldsRows(31, 1000),
+                    .keys = {JoinKey{.left = FieldOf(11, 2), .right = FieldOf(31, 2)}},
+                    .residual = {},
+                    .build = BuildSide::kRight,
+                    .estimate = 1000,
+                    .span = {}});
+  const LogicalPlan plan = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = FourFieldsRows(1, 10),
+          .right = Node(AggregateNode{.input = CorrelatedBlockOver(joined, one, 50),
+                                      .aggregates = {AggregateCall{.kind = AggKind::kMin,
+                                                                   .arg = FieldOf(11, 2),
+                                                                   .type = LogicalType::kBigInt,
+                                                                   .id = ColumnId{140}}}}),
+          .span = {}}),
+      1));
+  // The block's own join is also directly under the aggregate in this shape, so the assertions have
+  // to name what distinguishes the restriction from it: its kind, its build side, and a probe that
+  // is the block's join rather than a scan.
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi) << Explain(plan);
+  EXPECT_EQ(restriction->build, BuildSide::kRight) << Explain(plan);
+  EXPECT_TRUE(std::holds_alternative<JoinNode>(*restriction->left))
+      << "its probe is the block's own join: " << Explain(plan);
+  ASSERT_EQ(restriction->keys.size(), 1U) << Explain(plan);
+  EXPECT_EQ(restriction->keys[0].left.id, FieldOf(11, 1).id);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
 // The gate: an outer side the aggregation's input does not dwarf buys a build and a probe for
 // nothing, and an outer side nothing estimated cannot be shown to be small at all. Both leave
 // Path 2's plan exactly as it was, which is correct and is what shipped before this.

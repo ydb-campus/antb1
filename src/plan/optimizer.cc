@@ -795,6 +795,20 @@ bool RestrictionIsWorth(const std::optional<int64_t>& outer, const std::optional
   return Int128{*inner} >= Int128{kLeastRestriction} * Int128{*outer};
 }
 
+// Whether `node` reads a join: the aggregation's own input holding one is what tells this pass that
+// ADR 0029's filter cannot reach its scan, because the physical planner's offer does not survive a
+// join on the way down. A structural fact about the plan, which is the only kind available here --
+// and a total one, since a subtree with no join is exactly the chain an offer could travel.
+bool ReadsAJoin(const LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return false;
+  }
+  if (std::holds_alternative<JoinNode>(*node)) {
+    return true;
+  }
+  return std::ranges::any_of(InputsOf(*node), ReadsAJoin);
+}
+
 // ADR 0023's **semi-join reduction**: `input` restricted to the rows whose correlated key the outer
 // side binds, or `input` itself where the gate refuses or the pass cannot name a key.
 //
@@ -820,18 +834,28 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
                                       const std::map<ColumnId, ColumnId>& equivalent,
                                       const std::map<ColumnId, BoundColumn>& described,
                                       ColumnId& last_id) {
-  // **One correlated column is ADR 0029's D5 to restrict, not this.** D5 publishes the join's key
-  // set to the aggregation's own scan, which costs a filter rather than a build and a probe, and it
-  // takes exactly one key. Where it can apply, this rewrite can only repeat it: measured at SF 100
-  // on the query whose correlation is a single key, restricting it as well cost **1.420x** -- the
-  // aggregate's rows and groups did not move at all, because D5 had already removed the same rows,
-  // while the clone re-read the 600-million-row join its outer side is. More than one key is the
-  // case D5 structurally cannot reach, and it is this rewrite's.
+  // **One correlated column over a bare scan is ADR 0029's D5 to restrict, not this.** D5 publishes
+  // the join's key set to the aggregation's own scan, which costs a filter rather than a build and
+  // a probe, and it takes exactly one key. Where it can apply, this rewrite can only repeat it:
+  // measured at SF 100 on the query whose correlation is a single key over a scan, restricting it
+  // as well cost **1.420x** -- the aggregate's rows and groups did not move at all, because D5 had
+  // already removed the same rows, while the clone re-read the 600-million-row join its outer side
+  // is.
   //
-  // That is ADR 0030's lesson in its own words: "before costing a shared sub-plan, check whether a
-  // consumer is already pruned by one" -- and a plan cannot see ADR 0029's filters, which the
-  // physical planner attaches long after this runs, so the key count stands in for them.
-  if (equivalent.size() < 2) {
+  // **A join below the aggregation is the case where D5 cannot apply either**, and so is this
+  // rewrite's as much as more than one key is. A scan takes one filter, and a join in the
+  // aggregation's own input has already claimed it for its own key set, so the correlated key has
+  // nowhere to attach (ADR 0029's own deferred item: "a Filter whose predicates go into the scan
+  // ... hold the one filter slot a scan takes"). Measured on the query of the 22 shaped that way:
+  // **0.931x** and a peak of 483 MiB against 1,011, its aggregation building 47,107 groups over
+  // 64,000 rows where it built 11,829,402 over 16,042,800 -- with every other query of the 22 flat.
+  //
+  // What a plan may *not* read off is the filter itself: ADR 0029's filters are attached by the
+  // physical planner, long after this pass runs, which is why these two structural facts stand in
+  // for them. ADR 0030 states the hazard they guard against -- "before costing a shared sub-plan,
+  // check whether a consumer is already pruned by one" -- and a wrong guess here is not a wrong
+  // answer but a rewrite that pays twice for one reduction.
+  if (equivalent.size() < 2 && !ReadsAJoin(input)) {
     return input;
   }
   // **An outer side holding a dependent join is not cloned, and that is what bounds the copying.**

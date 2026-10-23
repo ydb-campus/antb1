@@ -348,16 +348,38 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
     the outer side whatever the estimates say. Measured at SF 100 on the query of the 22 that correlates on two
     columns: its aggregation reads 989,835 rows for 593,278 groups where it read 91,030,658 for 54,543,918, and the
     query is **0.674x** at **620 MiB against 6,869**.
-    - **One correlated column is left to [ADR 0029](0029-dynamic-join-filters.md)'s D5**, which restricts the same
-      rows for the price of a scan filter rather than a build and a probe, and which takes exactly one key. Doing
-      both measured **1.420x** on the query whose correlation is a single column: its aggregate's rows and groups did
-      not move at all, D5 having already removed them, while the clone re-read the 600-million-row join that query's
-      outer side is. So the key count is what the rewrite is gated on, which is ADR 0030's "before costing a shared
-      sub-plan, check whether a consumer is already pruned by one" — and a plan cannot see D5's filters, which the
-      physical planner attaches long after this pass runs.
-    - **What is left:** the one-column case where D5 cannot apply either, because the aggregation's scan has already
-      spent its one filter slot on another key. Measured by hand at **0.915x** and 467 MiB against 997 on the query
-      of the 22 where that happens; it needs two key filters on one scan, not this rewrite, and is not deferred here.
+    - **One correlated column over a bare scan is left to [ADR 0029](0029-dynamic-join-filters.md)'s D5**, which
+      restricts the same rows for the price of a scan filter rather than a build and a probe, and which takes exactly
+      one key. Doing both measured **1.420x** on the query whose correlation is a single column over a scan: its
+      aggregate's rows and groups did not move at all, D5 having already removed them, while the clone re-read the
+      600-million-row join that query's outer side is.
+    - **Extended 2026-10-23 to one column over a join**, which is the other case D5 cannot reach — and **this
+      reverses the reading the entry below had**, which said that case "needs two key filters on one scan, not this
+      rewrite". It does not: the rewrite reaches it, measured at **0.931x** with a peak of **483 MiB against 1,011**,
+      its aggregation building 47,107 groups over 64,000 rows where it built 11,829,402 over 16,042,800, and every
+      other query of the 22 flat (0.992x geomean).
+      - **The reason is not the scan's one filter slot.** A join whose key is not publishable leaves that slot free
+        and D5 still cannot reach the scan. What happens is that **the offer does not survive a join**: the physical
+        planner threads an `AggregateFilter` down only through the nodes that keep every row, and its `JoinNode` arm
+        forwards no inherited offer to its probe. Past a pipeline breaker there is no offer at all, the aggregate
+        having no part pipeline for one to travel. So the test is total rather than incidental — `LogicalNode` has
+        exactly two multi-input alternatives, so a subtree with no join *is* the chain an offer could travel — and
+        `src/exec/tests/aggregate_filter_test.cc` pins it, because threading the offer through a join is a natural
+        change to make and would silently make this rewrite pay for a reduction D5 had already made.
+      - The pair of structural facts — more than one key, or a join below the aggregation — is what the gate reads,
+        because a plan may not read off the filter itself: ADR 0029 attaches it in the physical planner, long after
+        this pass. ADR 0030 states the hazard they guard against, "before costing a shared sub-plan, check whether a
+        consumer is already pruned by one", and a wrong guess is not a wrong answer but a rewrite that pays twice.
+      - **Two consequences widen with it**, both recorded by the reduction's own item and now reachable for a single
+        correlated column: the restriction preempts ADR 0032's G2b exchange, which refuses a semi join below the
+        aggregate, and it creates an ADR 0030 sharing group, so an aggregate-topped outer side over at least ten
+        million rows whose result exceeds `MaterializedTable::kMaxBytes` would fail a query that answered before.
+        Neither is reached by any of the 22; declining the restriction for an aggregate-topped outer side would
+        remove the second, and is not done without a measurement behind it.
+    - **What is left:** the one-column case over a **bare scan** whose aggregation's scan has already spent its one
+      filter slot on pushed predicates (ADR 0020). `ReadsAJoin` is false there and D5 is off, so neither mechanism
+      restricts it; `src/exec/tests/aggregate_filter_test.cc`'s `YieldsToPredicatesPushedIntoTheScan` pins the
+      behaviour. It needs the conjunction of two scan filters, which is ADR 0029's own deferred item.
   - a semi or anti join with a residual keeps every build row (Q21), until profiles of Q21 at SF 10 or above ask for a
     smaller build — **fired 2026-10-15: profiles of Q21 at SF 100 show both its joins building the whole of the
     largest relation, [ADR 0026](0026-join-performance.md)**;
