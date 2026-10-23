@@ -349,6 +349,19 @@ entirely, because a pre-grouped relation has exactly one row per key.
     and the measured blast radius over the 22 is one query, Q05's new candidates being `below a filter` at both
     depths. The verdict is reported distinctly -- `worth, a narrower pre-grouping` -- so `EXPLAIN` says which
     of the two arguments carried a placement, which matters when the row figures beside it read 1:1.
+  - **One divergence from DuckDB, recorded as D25, and it is not chain-specific.** Dropping the
+    "`aggregate.input` IS the join" guard admits a `Compute` between the two positions, which the
+    single-join exchange declined -- so the `Compute` now travels down in that shape too, and is
+    computed for every row of the aggregated side rather than only the surviving ones. No answer can
+    differ, since a discarded row contributes to no group either way; **only an error can**, and
+    one does: an overflow in the moved expression now raises where this engine and DuckDB both
+    answered. That is the same class as divergences D14, D16, D23 and D24, each of which records
+    that this engine computes arithmetic for rows DuckDB does not, and it is beyond what
+    `diff-random` can find for the same reason -- its generator writes no arithmetic that can
+    overflow. Refusing it instead was measured as an option and rejected: the one query this item is
+    for computes a **capped** DECIMAL product (true width 31, declared 18), so a refusal founded on
+    declared types refuses it too and this item would fire on nothing. Proving the expression safe
+    from the footers' per-column ranges would keep both, and is not built.
   - **Three refusals the chain needs that a single join did not.** A non-inner join anywhere on the path pads
     rows no partial below it ever saw, which condition 5's `needs_identity` describes for the candidate's own
     padding and not for one applied above it. A `Compute` on the path travels **down** with the partial -- a

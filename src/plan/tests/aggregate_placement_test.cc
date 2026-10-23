@@ -389,12 +389,24 @@ TEST(AggregatePlacementTest, AWidePreGroupingDoesNotEarnTheSamePlacement) {
 // partial below it ever saw, which `needs_identity` does not describe. The nearest placement is
 // still reported, so what this pins is that the walk does not travel THROUGH the outer join.
 TEST(AggregatePlacementTest, AnOuterJoinOnThePathStopsTheWalk) {
-  for (const std::string& placement :
-       GatePlacements("SELECT top.w1, top.w2, top.w3, SUM(deep.v) FROM deep JOIN mid "
-                      "ON deep.mk = mid.mk LEFT JOIN top ON mid.tk = top.tk "
-                      "GROUP BY top.w1, top.w2, top.w3")) {
-    EXPECT_EQ(placement.find(" down"), std::string::npos) << placement;
-  }
+  // The full vector, not a scan of it: a scan holds under any mutation that reports nothing at all.
+  EXPECT_EQ(GatePlacements("SELECT top.w1, top.w2, top.w3, SUM(deep.v) FROM deep JOIN mid "
+                           "ON deep.mk = mid.mk LEFT JOIN top ON mid.tk = top.tk "
+                           "GROUP BY top.w1, top.w2, top.w3"),
+            (std::vector<std::string>{"left 1+0"}));
+}
+
+// Where the deepest admitted placement declines to build, a nearer admitted one is still performed.
+// Reporting one placement per aggregate is an EXPLAIN constraint, not a licence to lose a rewrite:
+// before the fallback, the deepest candidate's refusal left the plan untouched.
+TEST(AggregatePlacementTest, ANearerPlacementIsBuiltWhenTheDeepestDeclines) {
+  // `top.tk = deep.ak` reads a column of the aggregated side the pre-grouping cannot hold, so the
+  // two-joins-down candidate is admitted and then declined by the rebuild.
+  static constexpr std::string_view kDeclines =
+      "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND top.tk = deep.ak GROUP BY top.w1, top.w2, top.w3, mid.g";
+  EXPECT_EQ(GatePlacements(kDeclines), (std::vector<std::string>{"left 1+0 2 down"}));
+  EXPECT_EQ(Aggregates(kDeclines), 1);  // the nearest is not admitted here, so nothing is built
 }
 
 // The aggregate's argument is computed above both joins, so the Compute that defines it has to
@@ -421,8 +433,12 @@ TEST(AggregatePlacementTest, AnInterveningJoinKeyIsRenamed) {
   static constexpr std::string_view kShared =
       "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
       "WHERE deep.mk = mid.mk AND top.tk = deep.mk GROUP BY top.w1, top.w2, top.w3, mid.g";
-  // It plans, which is the assertion: ResolvePositions rejects a plan whose node reads an id its
-  // input does not carry, so a missed rename fails here rather than answering wrongly.
+  // The premise first -- a placement two joins down, actually built -- because without it this case
+  // would pass while exercising none of the rebuild's renaming.
+  EXPECT_EQ(GatePlacements(kShared), (std::vector<std::string>{"left 1+0 2 down"}));
+  EXPECT_EQ(Aggregates(kShared), 2);
+  // And then: ResolvePositions rejects a plan whose node reads an id its input does not carry, so a
+  // missed rename aborts here rather than answering wrongly.
   EXPECT_FALSE(GatePlan(kShared).empty());
 }
 

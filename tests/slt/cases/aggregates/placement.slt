@@ -375,10 +375,21 @@ NULL	1083.75
 # and the Compute of a computed argument travels down with it. Each of these was checked with
 # `antb1 explain` to hold two GroupAggregate nodes with the partial on `cities`, not one.
 #
-# `tr_tariff` is introduced ABOVE the candidate join, so the pre-grouping does not hold it. That is
-# the soundness claim of the whole rewrite: a partial joins to the rows above exactly as its member
-# rows would have, so the fan-out is unchanged and the final step groups again. `riders` repeats 8 of
-# its keys, so this really does fan out, and `tr_tariff` and `rd_tier` both hold NULLs.
+# What these add over the block above is the DEPTH, and one thing that only a chain has: `tr_tariff`
+# is introduced ABOVE the candidate join, so the pre-grouping does not hold it. That is the soundness
+# claim of the whole rewrite -- a partial joins to the rows above exactly as its member rows would
+# have, so the fan-out is unchanged and the final step groups again -- and `riders` repeats 8 of its
+# keys, so the fan-out above the partial is real. `tr_tariff` holds NULLs.
+#
+# **What they do NOT cover, stated so nobody reads more into them.** `cities.ct_id` is unique, so
+# every partial here holds exactly one row: merging several rows into one partial state, and a NULL
+# aggregate argument reaching a partial, are covered by the depth-1 block above, where `trips` is the
+# aggregated side with about 70 rows per `tr_pickup` and `tr_fare` holds NULLs. Nor is `rd_tier` ever
+# NULL (`tools/fixturegen/star.cc`): every NULL in these expectations is `tr_tariff`'s. A chain whose
+# AGGREGATED side has many rows per pre-grouping key is not reachable on this fixture, because the
+# join order search builds the smallest intermediate first and so never puts the fact table two
+# joins down -- the measured query gets that shape only because its own middle table is the large
+# one.
 query TTI nosort
 SELECT tr_tariff, rd_tier, SUM(ct_pop) FROM trips, riders, cities
 WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY tr_tariff, rd_tier ORDER BY tr_tariff, rd_tier
@@ -458,7 +469,8 @@ NULL	gold	3600000
 NULL	plus	8220000
 
 # A count through the chain, which merges as a sum of counts, and MIN and MAX, which merge as
-# themselves. ct_pop holds a NULL, so COUNT(ct_pop) and COUNT(*) differ.
+# themselves. `ct_pop`'s one NULL belongs to a city no rider is in, so it never joins: COUNT(ct_pop)
+# and COUNT(*) agree here, and the spelling that pins their difference is in the block above.
 query TTIII nosort
 SELECT tr_tariff, rd_tier, COUNT(ct_pop), MIN(ct_pop), MAX(ct_pop) FROM trips, riders, cities
 WHERE tr_rider = rd_id AND rd_city = ct_id GROUP BY tr_tariff, rd_tier ORDER BY tr_tariff, rd_tier
@@ -509,3 +521,40 @@ gold	2	454	20430000
 gold	3	456	13680000
 plus	1	459	55080000
 plus	3	459	13770000
+
+# ---- divergence D25: the moved Compute is computed for rows the joins above discard ----
+
+# The aggregate's argument is computed above the join, so the exchange moves its Compute down below
+# the partial -- a partial cannot aggregate a column that does not exist below it. It is then
+# computed for every row of the aggregated side, including the rows the join above throws away. No
+# ANSWER can differ, because those rows contribute to no group either way; only an ERROR can, and
+# this is that error.
+#
+# `cities` holds ct_id 1 to 6 and `riders.rd_city` only ever holds 1, 2 and 3, so the join discards
+# three rows. Multiplying ct_id 4, 5 or 6 by this constant overflows BIGINT; multiplying 1, 2 or 3
+# does not. So DuckDB -- and antb1 before the exchange reached this shape -- answers, and antb1 now
+# raises. Adding anything that refuses the placement makes antb1 answer too.
+onlyif antb1
+statement error Overflow in multiplication of BIGINT
+SELECT rd_tier, SUM(ct_id * 3000000000000000000) FROM riders, cities WHERE rd_city = ct_id
+GROUP BY rd_tier
+
+onlyif duckdb
+query TI nosort
+SELECT rd_tier, SUM(ct_id * 3000000000000000000) FROM riders, cities WHERE rd_city = ct_id
+GROUP BY rd_tier ORDER BY rd_tier
+----
+basic	342000000000000000000
+gold	585000000000000000000
+plus	468000000000000000000
+
+# The same query with a call the exchange refuses: the Compute stays above the join, the discarded
+# rows are never computed, and both engines answer. This is the control for the record above -- if a
+# later change stops moving the Compute, the first record fails and this one keeps passing.
+query TI nosort
+SELECT rd_tier, SUM(ct_id * 3000000000000000000) FROM riders, cities WHERE rd_city = ct_id
+GROUP BY rd_tier HAVING COUNT(DISTINCT ct_pop) > 0 ORDER BY rd_tier
+----
+basic	342000000000000000000
+gold	585000000000000000000
+plus	468000000000000000000

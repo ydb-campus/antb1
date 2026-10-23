@@ -8,8 +8,9 @@
 
 #include "antb1/plan/logical_plan.h"
 
-// A grouped aggregate computed on one input of the join below it
-// (docs/adr/0032-aggregate-placement.md). Two things live here: `AggregatePlacements` finds where
+// A grouped aggregate computed on one input of a join below it, which need not be the join it
+// reads: the finder walks a chain of them and reports the deepest placement the gate admits
+// (ADR 0032's G2d). Two things live here: `AggregatePlacements` finds where
 // the exchange is legal and what the gate makes of it, reporting only (item G1), and
 // `ExchangeAggregates` performs the ones the gate admits (item G2b). The finder shipped first on
 // the argument that a pass which only reports cannot give a wrong answer, and it earned that -- two
@@ -25,10 +26,11 @@
 
 namespace antb1::plan {
 
-// One legal placement of a grouped aggregate below the join it reads.
+// One legal placement of a grouped aggregate below a join on the chain beneath it: `joins_down` is
+// 1 for the join it reads and more for a deeper one.
 struct AggregatePlacement {
   LogicalNodePtr aggregate;  // the GroupAggregateNode, as a walk from the root meets it
-  LogicalNodePtr join;       // the JoinNode it reads, below any Compute between them
+  LogicalNodePtr join;       // the JoinNode this places it below, which `path` reaches
   // Which input of that join the aggregates read: the side a rewrite would pre-group. The other
   // side carries the grouping columns that do not come from this one.
   bool left_is_aggregated = false;
@@ -151,7 +153,8 @@ std::string_view ToString(AggregatePlacement::Verdict verdict);
 // than ADR 0032's gate and is why this reports rather than rewrites.
 std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 
-// `root` with every placement the gate calls `kWorth` performed: the aggregated side grouped by
+// `root` with every placement the gate admits (`kWorth` or `kWorthNarrower`) performed: the
+// aggregated side grouped by
 // `pre_grouping` into partial states, the join over those partials, and the original aggregate left
 // in place over them as the final step (ADR 0032's item G2b). `root` itself where none fires, which
 // is every plan the gate does not admit.
@@ -166,9 +169,16 @@ std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 //
 // What it declines to build, leaving the plan as it is even where the gate admits the placement:
 //
-//   - a `Compute` between the aggregate and the join. The aggregate's argument is then an
-//     expression over the aggregated side, so the `Compute` would have to travel down with the
-//     partial; sound, and not needed by the one placement of the 22 the gate admits.
+//   - a `Compute` on the path whose output anything above the partial reads -- a path join's key,
+//     or the final grouping. Such a `Compute` TRAVELS DOWN with the partial, because the
+//     aggregate's argument may be its output and a partial cannot aggregate a column that does not
+//     exist below it; moving it is sound only while nothing above still needs it. One whose
+//     expression reads a column the aggregated side does not carry is declined for the same reason.
+//   - a node further up the path reading any other column of the aggregated side, since a partial
+//     outputs its keys and its calls and nothing else. Condition 3 covers the candidate's own keys
+//     and the grouping set and says nothing about the rest of the path.
+//   - a non-inner join anywhere on the path, which pads rows no partial below it ever saw --
+//     `needs_identity` describes the candidate's own padding, not one applied above it.
 //   - `kAvg`, whose partial is a (SUM, COUNT) pair and whose final divides. Decomposable, but it
 //     is the one kind whose rewrite changes the node's output arity, and no query of the 22 has an
 //     AVG in a position the gate admits.

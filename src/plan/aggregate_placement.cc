@@ -488,6 +488,30 @@ std::optional<AggregatePlacement> PlacementOf(const LogicalNodePtr& node) {
   return best.has_value() ? best : nearest;
 }
 
+// Every placement of one aggregate the gate admits, deepest first. `PlacementOf` reports one for
+// EXPLAIN, because the note is keyed by the aggregate node and appends; the rewrite wants the
+// others as fallbacks, since the deepest can be admitted and still decline to build -- and then
+// leaving the plan alone would lose a nearer rewrite that was both admitted and buildable.
+std::vector<AggregatePlacement> AdmittedPlacements(const LogicalNodePtr& node) {
+  std::vector<AggregatePlacement> out;
+  const auto* aggregate = std::get_if<GroupAggregateNode>(node.get());
+  if (aggregate == nullptr || aggregate->aggregates.empty()) {
+    return out;
+  }
+  EachBelowAggregate(aggregate->input, [&](const Below& below) -> std::optional<bool> {
+    std::optional<AggregatePlacement> here = PlacementAt(node, *aggregate, below);
+    if (!here.has_value()) {
+      return std::nullopt;
+    }
+    if (Admitted(here->verdict)) {
+      out.push_back(*here);
+    }
+    return here->left_is_aggregated;
+  });
+  std::ranges::reverse(out);  // deepest first: the walk only ever goes down
+  return out;
+}
+
 void Walk(const LogicalNodePtr& node, std::vector<AggregatePlacement>& out) {
   if (node == nullptr) {
     return;
@@ -629,7 +653,11 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
   // argument may be one of its outputs and the partial has to compute it -- which is sound only
   // while nothing else reads that output, checked below. The joins are rebuilt above the partial,
   // each renaming whatever pre-grouping column its keys read.
-  IdSet read_above;  // ids the rebuilt path and the final grouping still read
+  // Ids the rebuilt path and the final grouping still read. A path join's RESIDUAL is not collected
+  // because every join the walk descended past passed `Exchangeable`, which refuses one -- so if
+  // that refusal is ever relaxed (its own comment contemplates the safe case), residual ids must be
+  // added here.
+  IdSet read_above;
   for (const BoundColumn& key : aggregate.keys) {
     read_above.insert(key.id);
   }
@@ -678,7 +706,11 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
     }
     for (const ColumnId id : compute->ids) {
       if (read_above.contains(id)) {
-        return std::nullopt;  // its output is read above the partial as well as by a call
+        // Read above the partial as well as by a call. This is also what refuses a grouping column
+        // computed two Compute layers deep, whose inner id `Reads` cannot resolve and so reads as
+        // kAbove: such a column IS a function of the aggregated side and must not be dropped from
+        // the pre-grouping, and it is refused here rather than reasoned about.
+        return std::nullopt;
       }
     }
     std::vector<ColumnId> reads;
@@ -770,9 +802,10 @@ LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id)
     input = std::move(rewritten);
   }
   LogicalNodePtr here = changed ? WithInputs(*root, std::move(inputs)) : root;
-  if (const std::optional<AggregatePlacement> placement = PlacementOf(here);
-      placement.has_value() && Admitted(placement->verdict)) {
-    if (std::optional<LogicalNodePtr> exchanged = Exchange(*placement, last_id);
+  // Deepest first, falling back to a nearer one: the gate admitting a placement does not mean the
+  // rewrite can build it, and the nearer candidate may be both.
+  for (const AggregatePlacement& placement : AdmittedPlacements(here)) {
+    if (std::optional<LogicalNodePtr> exchanged = Exchange(placement, last_id);
         exchanged.has_value()) {
       return *exchanged;
     }
