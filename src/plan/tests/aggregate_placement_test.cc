@@ -456,6 +456,65 @@ TEST(AggregatePlacementTest, AJoinAboveReadingADroppedColumnIsRefused) {
   EXPECT_EQ(Aggregates(kDropped), 1);
 }
 
+// A placement the rewrite declines mints no column id. It matters because the caller falls back to
+// a nearer placement when the deepest declines: ids burned on the way are gaps in a counter every
+// later pass keeps extending, and the only way to keep that honest is to put every refusal before
+// the first `Mint`.
+TEST(AggregatePlacementTest, ADeclinedPlacementMintsNoId) {
+  static const Catalog catalog = GateCatalog();
+  struct Case {
+    std::string_view sql;
+    bool builds;
+    std::string_view why;
+  };
+  for (const Case& c : {
+           // Admitted two joins down, then declined by the rebuild: the join above reads a column
+           // of the aggregated side the pre-grouping cannot hold.
+           Case{.sql = "SELECT top.w1, top.w2, top.w3, mid.g, SUM(deep.v) FROM deep, mid, top "
+                       "WHERE deep.mk = mid.mk AND top.tk = deep.ak "
+                       "GROUP BY top.w1, top.w2, top.w3, mid.g",
+                .builds = false,
+                .why = "the rebuild declines it"},
+           // The control: the same chain without that join, which IS built, so the case above is
+           // not passing merely because nothing was ever admitted.
+           Case{.sql = kChain, .builds = true, .why = "the chain is built"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    ColumnId last_id = MaxColumnId(*plan->root);
+    const ColumnId before = last_id;
+    const LogicalNodePtr out = ExchangeAggregates(plan->root, last_id);
+    EXPECT_EQ(out != plan->root, c.builds) << c.why << ": " << c.sql;
+    if (c.builds) {
+      EXPECT_NE(last_id, before) << c.why;
+    } else {
+      EXPECT_EQ(last_id, before) << c.why;
+    }
+  }
+}
+
+// What the cost model actually claims, pinned on the only thing it can be pinned on: that a VARCHAR
+// grouping column costs much more than a fixed-width one. Two VARCHARs are enough to make a
+// one-INTEGER pre-grouping worth taking at a reduction the row test refuses; two INTEGERs are not.
+// Without this pair the VARCHAR weight is free to fall to a BIGINT's and every other case still
+// passes -- the threshold is bracketed by the two cases above, but the weights were not. It pins
+// the weight STRICTLY ABOVE a fixed-width type's rather than at its exact value, which is the claim
+// the model makes and all it should be held to.
+TEST(AggregatePlacementTest, AVarcharGroupingColumnCostsMoreThanAFixedWidthOne) {
+  EXPECT_EQ(GatePlacements("SELECT top.w1, mid.g, SUM(deep.v) FROM deep, mid, top "
+                           "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.w1, mid.g"),
+            (std::vector<std::string>{"left 1+0 2 down"}));
+  EXPECT_EQ(Verdicts("SELECT top.w1, mid.g, SUM(deep.v) FROM deep, mid, top "
+                     "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.w1, mid.g"),
+            (std::vector<std::string>{"worth, a narrower pre-grouping"}));
+  // The same chain and the same reduction, grouped by two fixed-width columns instead: nothing is
+  // narrow enough to carry it, and nothing is built.
+  static constexpr std::string_view kFixed =
+      "SELECT top.tk, mid.tk, SUM(deep.v) FROM deep, mid, top "
+      "WHERE deep.mk = mid.mk AND mid.tk = top.tk GROUP BY top.tk, mid.tk";
+  EXPECT_EQ(Aggregates(kFixed), 1);
+}
+
 // Every refusal. Each reports nothing, and reporting nothing is always safe -- but
 // each is here because it is a shape that would otherwise look legal.
 TEST(AggregatePlacementTest, Refusals) {

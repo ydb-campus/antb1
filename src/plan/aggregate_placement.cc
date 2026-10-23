@@ -607,7 +607,102 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
   for (const BoundColumn& key : aggregate.keys) {
     known.Note(key);
   }
-  GroupAggregateNode partial{.input = placement.left_is_aggregated ? join->left : join->right,
+  const LogicalNodePtr& aggregated_side = placement.left_is_aggregated ? join->left : join->right;
+
+  // ---- Everything that can refuse comes first, so that a declined placement mints no id. The
+  // caller falls back to a nearer placement when this declines, and ids burned on the way would be
+  // gaps in a counter the next pass keeps extending.
+  IdSet pre_grouped;
+  std::vector<BoundColumn> pre_grouping;  // resolved once here, used by the minting below
+  pre_grouping.reserve(placement.pre_grouping.size());
+  for (const ColumnId id : placement.pre_grouping) {
+    const std::optional<BoundColumn> column = known.Of(id);
+    if (!column.has_value()) {
+      return std::nullopt;  // a column this cannot name is one it cannot group by
+    }
+    pre_grouped.insert(id);
+    pre_grouping.push_back(*column);
+  }
+
+  // A partial outputs its keys and its calls and nothing else, so every other column of the
+  // aggregated side is gone above it. A node on the path that reads one -- a join key or a residual
+  // -- would then read an id its input does not carry, which ResolvePositions aborts on rather than
+  // answers wrongly. Condition 3 covers the candidate's own keys and the grouping set; this covers
+  // the rest of the path, and refuses what it cannot rename.
+  const IdSet aggregated_ids = OutputSet(*aggregated_side);
+  for (const LogicalNodePtr& above : placement.path) {
+    const auto* join_above = std::get_if<JoinNode>(above.get());
+    if (join_above == nullptr || above == placement.join) {
+      continue;
+    }
+    std::vector<ColumnId> reads;
+    for (const JoinKey& key : join_above->keys) {
+      reads.push_back(key.left.id);
+      reads.push_back(key.right.id);
+    }
+    for (const ExprPtr& expr : join_above->residual) {
+      CollectColumnIds(*expr, reads);
+    }
+    for (const ColumnId id : reads) {
+      if (aggregated_ids.contains(id) && !pre_grouped.contains(id)) {
+        return std::nullopt;
+      }
+    }
+  }
+
+  // Ids the rebuilt path and the final grouping still read. A path join's RESIDUAL is not collected
+  // because every join the walk descended past passed `Exchangeable`, which refuses one -- so if
+  // that refusal is ever relaxed (its own comment contemplates the safe case), residual ids must be
+  // added here.
+  IdSet read_above;
+  for (const BoundColumn& key : aggregate.keys) {
+    read_above.insert(key.id);
+  }
+  for (const LogicalNodePtr& above : placement.path) {
+    if (const auto* join_above = std::get_if<JoinNode>(above.get())) {
+      for (const JoinKey& key : join_above->keys) {
+        read_above.insert(key.left.id);
+        read_above.insert(key.right.id);
+      }
+    }
+  }
+  // The Computes of the path, innermost first, each checked against what is available below it: a
+  // Compute travels DOWN with the partial, because the call argument may be its output and a
+  // partial cannot aggregate a column that does not exist below it.
+  std::vector<const ComputeNode*> moving;
+  {
+    IdSet available = aggregated_ids;
+    for (const LogicalNodePtr& above : std::ranges::reverse_view(placement.path)) {
+      const auto* compute = std::get_if<ComputeNode>(above.get());
+      if (compute == nullptr) {
+        continue;
+      }
+      for (const ColumnId id : compute->ids) {
+        if (read_above.contains(id)) {
+          // Read above the partial as well as by a call. This is also what refuses a grouping
+          // column computed two Compute layers deep, whose inner id `Reads` cannot resolve and so
+          // reads as kAbove: such a column IS a function of the aggregated side and must not be
+          // dropped from the pre-grouping, and it is refused here rather than reasoned about.
+          return std::nullopt;
+        }
+      }
+      std::vector<ColumnId> reads;
+      for (const ExprPtr& expr : compute->exprs) {
+        CollectColumnIds(*expr, reads);
+      }
+      if (std::ranges::any_of(
+              reads, [&available](const ColumnId id) { return !available.contains(id); })) {
+        return std::nullopt;  // it reads a column the aggregated side does not carry
+      }
+      for (const ColumnId id : compute->ids) {
+        available.insert(id);
+      }
+      moving.push_back(compute);
+    }
+  }
+
+  // ---- Nothing below this point declines, so minting starts here.
+  GroupAggregateNode partial{.input = aggregated_side,
                              .keys = {},
                              .key_ids = {},
                              .aggregates = {},
@@ -617,12 +712,9 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
   // final aggregate's keys can read one -- by condition 3 those are the only aggregated-side
   // columns it groups by -- since its calls read the partials instead.
   std::unordered_map<ColumnId, ColumnId> renamed;
-  for (const ColumnId id : placement.pre_grouping) {
-    const std::optional<BoundColumn> column = known.Of(id);
-    if (!column.has_value()) {
-      return std::nullopt;  // a column this cannot name is one it cannot group by
-    }
-    partial.keys.push_back(*column);
+  for (BoundColumn& column : pre_grouping) {
+    const ColumnId id = column.id;
+    partial.keys.push_back(std::move(column));
     partial.key_ids.push_back(Mint(last_id));
     renamed.emplace(id, partial.key_ids.back());
   }
@@ -649,83 +741,14 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
                     .type = below.type};
     finals.push_back(above);
   }
-  // The path, rebuilt. A Compute on it moves DOWN onto the aggregated side, because the call
-  // argument may be one of its outputs and the partial has to compute it -- which is sound only
-  // while nothing else reads that output, checked below. The joins are rebuilt above the partial,
-  // each renaming whatever pre-grouping column its keys read.
-  // Ids the rebuilt path and the final grouping still read. A path join's RESIDUAL is not collected
-  // because every join the walk descended past passed `Exchangeable`, which refuses one -- so if
-  // that refusal is ever relaxed (its own comment contemplates the safe case), residual ids must be
-  // added here.
-  IdSet read_above;
-  for (const BoundColumn& key : aggregate.keys) {
-    read_above.insert(key.id);
-  }
-  for (const LogicalNodePtr& above : placement.path) {
-    if (const auto* join_above = std::get_if<JoinNode>(above.get())) {
-      for (const JoinKey& key : join_above->keys) {
-        read_above.insert(key.left.id);
-        read_above.insert(key.right.id);
-      }
-    }
-  }
-  // A partial outputs its keys and its calls and nothing else, so every other column of the
-  // aggregated side is gone above it. A node on the path that reads one -- a join key or a residual
-  // -- would then read an id its input does not carry, which ResolvePositions aborts on rather than
-  // answers wrongly. Condition 3 covers the candidate's own keys and the grouping set; this covers
-  // the rest of the path, and refuses what it cannot rename.
-  const IdSet aggregated_ids = OutputSet(*partial.input);
-  for (const LogicalNodePtr& above : placement.path) {
-    const auto* join_above = std::get_if<JoinNode>(above.get());
-    if (join_above == nullptr || above == placement.join) {
-      continue;
-    }
-    std::vector<ColumnId> reads;
-    for (const JoinKey& key : join_above->keys) {
-      reads.push_back(key.left.id);
-      reads.push_back(key.right.id);
-    }
-    for (const ExprPtr& expr : join_above->residual) {
-      CollectColumnIds(*expr, reads);
-    }
-    for (const ColumnId id : reads) {
-      if (aggregated_ids.contains(id) && !renamed.contains(id)) {
-        return std::nullopt;
-      }
-    }
-  }
-
-  // Innermost first, so each Compute wraps the one below it as it did in the written plan, and so
-  // that a Compute reading a deeper one's output still finds it.
-  IdSet available = aggregated_ids;
+  // The path, rebuilt: the Computes on it travel down onto the aggregated side and the joins are
+  // rebuilt above the partial, each renaming whatever pre-grouping column its keys read.
+  // The Computes travel down, innermost first, so each wraps the one below it as it did in the
+  // written plan. Which ones move and whether moving them is sound was decided above.
   LogicalNodePtr moved_over = partial.input;
-  for (const LogicalNodePtr& above : std::ranges::reverse_view(placement.path)) {
-    const auto* compute = std::get_if<ComputeNode>(above.get());
-    if (compute == nullptr) {
-      continue;
-    }
-    for (const ColumnId id : compute->ids) {
-      if (read_above.contains(id)) {
-        // Read above the partial as well as by a call. This is also what refuses a grouping column
-        // computed two Compute layers deep, whose inner id `Reads` cannot resolve and so reads as
-        // kAbove: such a column IS a function of the aggregated side and must not be dropped from
-        // the pre-grouping, and it is refused here rather than reasoned about.
-        return std::nullopt;
-      }
-    }
-    std::vector<ColumnId> reads;
-    for (const ExprPtr& expr : compute->exprs) {
-      CollectColumnIds(*expr, reads);
-    }
-    if (std::ranges::any_of(reads,
-                            [&available](const ColumnId id) { return !available.contains(id); })) {
-      return std::nullopt;  // it reads a column the aggregated side does not carry
-    }
+  for (const ComputeNode* compute : moving) {
     ComputeNode moved = *compute;
     moved.input = moved_over;
-    for (const ColumnId id : moved.ids) {
-      available.insert(id);
-    }
     moved_over = std::make_shared<const LogicalNode>(std::move(moved));
   }
   partial.input = std::move(moved_over);
