@@ -373,6 +373,21 @@ class KeyScanFilter final : public plan::ScanFilter {
     // probe of Q16 at SF 100, scan time summed over parts: 1.443 s at 8 rows, 1.321 at 16, 1.228
     // at 32, 1.142 at 64, 1.125 at 128 and back up to 1.189 at 256, where the lines are evicted
     // before they are read.
+    //
+    // **It prefetches for every row, including rows another filter has already cleared, and that is
+    // not an oversight.** Where this filter shares a scan with pushed predicates
+    // (MakeBothScanFilters) most bits are clear by the time the key column arrives, so the obvious
+    // economy is to test the bit before issuing the prefetch. Measured, that is **1.010x over the
+    // 22 and 1.028x on the query it was meant to help** (7 repeats, interleaved and rotated, the
+    // guard the only change). A prefetch is a non-blocking hint whose line is evicted harmlessly if
+    // nothing reads it; the bitmap read needed to avoid issuing one is not. The lookup below is
+    // already behind the bit test, which is the half that pays.
+    //
+    // What is left on the table is the hashing, not the prefetching: KeyHashes runs over the whole
+    // array, so on that query it hashes 600,037,902 rows of which 148,067,261 are still selected --
+    // about 0.81 s summed over parts, 3% of the query. Taking it needs the selected values
+    // compacted before hashing and a threshold for when that is cheaper than hashing everything,
+    // which is its own change with its own measurement.
     constexpr int64_t kPrefetch = 128;
     int64_t dropped = 0;
     for (int64_t row = 0; row < values.rows; ++row) {

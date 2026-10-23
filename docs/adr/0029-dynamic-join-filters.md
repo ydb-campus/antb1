@@ -413,6 +413,16 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
         falls from 148,067,261 rows to 11,488,814 -- `key_dropped=136,578,447` -- and its join's `find` from
         2.936 s to 728 ms, while its scan goes 15.926 s to 17.181 s summed: **a 92% row prune is worth 4% and not
         more**, because reading the rows is the cost a row filter cannot avoid and that scan is the query.
+      - **Two economies that look obvious over a shared scan, measured.** The filter now often runs after a
+        predicate has cleared most bits, so both of these were put to the 22:
+        - **Testing the bit before issuing the prefetch is 1.010x, and 1.028x on the query it was for** (7
+          repeats, interleaved and rotated). A prefetch is a non-blocking hint whose line is evicted harmlessly;
+          the bitmap read that avoids issuing one is not. A single run had said 0.976x, which is what three
+          repeats are worth on a sub-5% effect. Not done, and recorded at the loop so it is not retried blind.
+        - **Hashing only the selected rows is worth about 3%** on that query -- `KeyHashes` runs over the whole
+          array, 600,037,902 rows of which 148,067,261 are still selected, about 0.81 s summed over parts. It
+          needs the selected values compacted before hashing and a threshold for when that beats hashing
+          everything. **Deferred as its own item**, with that sizing as its trigger.
       - **Not carried with it:** the filter a join above a grouped aggregate offers (D5) still yields to pushed
         predicates, because it is offered in the scan's own branch of the planner and a scan with predicates is
         built in the `FilterNode` branch. The same conjunction would serve it; it is not measured here, so it is
