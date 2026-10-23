@@ -511,6 +511,23 @@ std::vector<ColumnId> FreeVariables(const LogicalNode& node);
 // unnesting pass does, since it casts a correlated key's sides to one type.
 ColumnId MaxColumnId(const LogicalNode& node);
 
+// `node` again, with a fresh id for every column the subtree defines and every read of one of those
+// pointed at its new name: the same shape over the same tables, sharing no column with the
+// original.
+//
+// **A pass that has to read one subtree in two places has to clone it**, which is what this is for:
+// a plan is a tree, and `PositionMismatch` refuses a column defined twice, so the same node reached
+// twice is not a plan at all but an abort. ADR 0023's semi-join reduction needs the outer side both
+// as its join's input and as the domain that restricts the aggregate.
+//
+// An id the subtree reads but does not define -- a free variable -- is left as it is, so cloning a
+// dependent join's left input keeps its right input's references bound, and cloning any subtree
+// keeps the columns it reads from above it.
+//
+// `last_id` is the largest id in use and is advanced for each column this mints; the caller owns
+// it, because a plan's ids must stay unique across every pass that adds one (MaxColumnId).
+LogicalNodePtr CloneWithFreshIds(const LogicalNodePtr& node, ColumnId& last_id);
+
 // The plan with every reference's index set to the position of its id in the ids it reads (its
 // input's output ids); unchanged nodes keep their pointers, so the result of a resolved plan is the
 // plan itself. The last step of plan::Bind and plan::Optimize, which refer to columns by id only

@@ -7,6 +7,7 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -1057,6 +1058,158 @@ std::vector<ColumnId> FreeVariables(const LogicalNode& node) {
   std::vector<ColumnId> free;
   std::ranges::set_difference(reads, defines, std::back_inserter(free));
   return free;
+}
+
+namespace {
+
+// CloneWithFreshIds, one overload per node type so that a node type without one fails to compile,
+// as every walk of a plan does. The map carries each id the subtree defines to the id that stands
+// for it in the clone; inputs are cloned first, so a node's reads find whatever its inputs minted,
+// and an id the map does not hold is read from outside the subtree and left alone.
+//
+// It mirrors IdsOfNode above: a site that Defines there Mints here, and a site that Reads there
+// Renames. The two have to agree, and they are a screen apart for that reason.
+struct FreshIds {
+  std::map<ColumnId, ColumnId>* renamed;
+  ColumnId* last_id;
+
+  ColumnId Mint(ColumnId id) const {
+    if (id == kNoColumnId) {
+      return id;
+    }
+    *last_id = ColumnId{std::to_underlying(*last_id) + 1};
+    renamed->insert_or_assign(id, *last_id);  // assign, so the map agrees with what the node holds
+    return *last_id;
+  }
+  void Rename(BoundColumn& column) const {
+    if (const auto it = renamed->find(column.id); it != renamed->end()) {
+      column.id = it->second;
+    }
+  }
+  void Rename(std::optional<BoundColumn>& column) const {
+    if (column.has_value()) {
+      Rename(*column);
+    }
+  }
+  [[nodiscard]] ExprPtr Renamed(const ExprPtr& expr) const {
+    if (expr == nullptr) {
+      return expr;
+    }
+    return MapColumns(expr, [this](const ColumnExpr& read) {
+      ColumnExpr column = read;
+      if (const auto it = renamed->find(column.id); it != renamed->end()) {
+        column.id = it->second;
+      }
+      return column;
+    });
+  }
+  void Calls(std::vector<AggregateCall>& calls) const {
+    for (AggregateCall& call : calls) {
+      Rename(call.arg);
+      call.id = Mint(call.id);
+    }
+  }
+
+  LogicalNode operator()(ScanNode node) const {
+    for (ColumnId& id : node.ids) {
+      id = Mint(id);
+    }
+    return node;
+  }
+  LogicalNode operator()(FilterNode node) const {
+    for (Predicate& predicate : node.predicates) {
+      Rename(predicate.column);
+      Rename(predicate.other);
+    }
+    return node;
+  }
+  LogicalNode operator()(ComputeNode node) const {
+    for (ExprPtr& expr : node.exprs) {
+      expr = Renamed(expr);
+    }
+    for (ColumnId& id : node.ids) {
+      id = Mint(id);
+    }
+    return node;
+  }
+  LogicalNode operator()(ProjectNode node) const {
+    for (std::size_t i = 0; i < node.columns.size(); ++i) {
+      const ColumnId read = node.columns[i].id;
+      Rename(node.columns[i]);  // a constant column reads nothing, so renaming it does nothing
+      if (i >= node.ids.size()) {
+        continue;
+      }
+      // **A column that keeps the id it reads passes it through**, which is the rule
+      // ResolvePositions applies (it Defines only the others), so the clone has to pass the
+      // *renamed* id through rather than mint a second definition of it. Minting here instead
+      // would leave the clone's Project outputting an id that nothing above it was renamed to.
+      node.ids[i] =
+          node.ids[i] == read && read != kNoColumnId ? node.columns[i].id : Mint(node.ids[i]);
+    }
+    return node;
+  }
+  LogicalNode operator()(AggregateNode node) const {
+    Calls(node.aggregates);
+    return node;
+  }
+  LogicalNode operator()(GroupAggregateNode node) const {
+    for (BoundColumn& key : node.keys) {
+      Rename(key);
+    }
+    for (ColumnId& id : node.key_ids) {
+      id = Mint(id);
+    }
+    Calls(node.aggregates);
+    return node;
+  }
+  LogicalNode operator()(SortNode node) const {
+    for (SortKey& key : node.keys) {
+      Rename(key.column);
+    }
+    return node;
+  }
+  LogicalNode operator()(LimitNode node) const { return node; }
+  LogicalNode operator()(RowCountNode node) const {
+    node.id = Mint(node.id);
+    return node;
+  }
+  LogicalNode operator()(JoinNode node) const {
+    for (JoinKey& key : node.keys) {
+      Rename(key.left);
+      Rename(key.right);
+    }
+    for (ExprPtr& conjunct : node.residual) {
+      conjunct = Renamed(conjunct);
+    }
+    return node;
+  }
+  LogicalNode operator()(DependentJoinNode node) const {
+    node.mark = Mint(node.mark);
+    return node;
+  }
+};
+
+LogicalNodePtr Cloned(const LogicalNodePtr& node, std::map<ColumnId, ColumnId>& renamed,
+                      ColumnId& last_id) {
+  if (node == nullptr) {
+    return node;
+  }
+  // The inputs first: a node reads what they define, so their new ids have to be in the map before
+  // this node's reads are renamed. For a dependent join that also binds its right input's free
+  // variables to the clone's left input, since the left is cloned first.
+  std::vector<LogicalNodePtr> inputs;
+  for (const LogicalNodePtr& input : InputsOf(*node)) {
+    inputs.push_back(Cloned(input, renamed, last_id));
+  }
+  const LogicalNode here = std::visit(FreshIds{.renamed = &renamed, .last_id = &last_id}, *node);
+  return inputs.empty() ? MakeNode(here) : WithInputs(here, std::move(inputs));
+}
+
+}  // namespace
+
+LogicalNodePtr CloneWithFreshIds(const LogicalNodePtr& node, ColumnId& last_id) {
+  std::map<ColumnId, ColumnId> renamed;
+  return Cloned(node, renamed, last_id);
 }
 
 LogicalPlan ResolvePositions(const LogicalPlan& plan, std::source_location location) {

@@ -2057,6 +2057,28 @@ TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
   }
 }
 
+// Every subquery join of ADR 0022's J5 carries an upper bound on its rows: a semi or anti join
+// keeps a subset of its left input and a one-row join pairs each of its rows with one, so the left
+// input's estimate bounds all three. Without it the estimate was unknown, and an unknown estimate
+// travels: every pass above read the join's rows as unknown too, which left ADR 0023's semi-join
+// reduction unable to see the one query it gains most on, and left an anti join building the larger
+// side because nothing could show the smaller one was smaller.
+TEST(BinderTest, EverySubqueryJoinBoundsItsRows) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 = (SELECT MAX(i16) FROM ok)",
+       }) {
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    const JoinNode* join = testing::FirstJoin(*bound);
+    ASSERT_NE(join, nullptr) << sql;
+    EXPECT_EQ(join->estimate, std::optional<int64_t>(100))
+        << sql << ": t holds 100 rows, which bounds what the join keeps";
+  }
+}
+
 // A cross-relation equality whose sides differ in type gets one key type both widen to exactly,
 // and the side that is not of that type is cast on its own branch (ADR 0022's key casts). An
 // equality with no such type, and any other cross-relation conjunct, is a residual of the join.

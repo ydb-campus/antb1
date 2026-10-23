@@ -1,16 +1,19 @@
 // Column ids (ADR 0022): the ids each node outputs, plan::ResolvePositions, which sets every column
 // index from the ids, and plan::PositionMismatch, which names the first broken invariant.
 
+#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/optimizer.h"
 #include "antb1/plan/types.h"
@@ -534,6 +537,157 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   JoinNode twice = Join(JoinKind::kInner);
   twice.right = Scan({kD, kE, kA});  // #1 in both inputs
   EXPECT_EQ(PositionMismatch(Plan(Node(twice))), "Scan: column #1 is defined twice");
+}
+
+// ---- CloneWithFreshIds ----
+
+// The reason the function exists: a plan is a tree, so a pass that needs one subtree in two places
+// cannot reach the same node twice. The same `Scan` under both inputs of a join is not a plan --
+// PositionMismatch names it -- and the clone is what makes the pair legal.
+TEST(ColumnIdsTest, ACloneIsWhatLetsOneSubtreeBeReadTwice) {
+  const LogicalNodePtr shared = Scan();
+  EXPECT_EQ(PositionMismatch(
+                Plan(Node(JoinNode{.kind = JoinKind::kInner,
+                                   .left = shared,
+                                   .right = shared,
+                                   .keys = {JoinKey{.left = Column(kB, 1), .right = Column(kB, 1)}},
+                                   .span = {}}))),
+            "Scan: column #1 is defined twice");
+
+  ColumnId last = MaxColumnId(*shared);
+  const LogicalNodePtr clone = CloneWithFreshIds(shared, last);
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), 3U);
+  EXPECT_EQ(PositionMismatch(Plan(Node(
+                JoinNode{.kind = JoinKind::kInner,
+                         .left = shared,
+                         .right = clone,
+                         .keys = {JoinKey{.left = Column(kB, 1), .right = Column(cloned[1], 1)}},
+                         .span = {}}))),
+            std::nullopt);
+}
+
+// Every id the subtree defines is minted again, every read of one follows it, and `last_id` ends
+// past them all. The shape does not move: EXPLAIN prints columns by name, so the clone's text is
+// the original's.
+TEST(ColumnIdsTest, ACloneMintsEveryDefineAndFollowsEveryRead) {
+  const LogicalNodePtr original = Node(ProjectNode{
+      .input = Node(GroupAggregateNode{
+          .input = Node(ComputeNode{
+              .input = Scan(), .exprs = {Leaf(kA, 0)}, .ids = {ColumnId{10}}, .span = {}}),
+          .keys = {Column(ColumnId{10}, 3)},
+          .key_ids = {ColumnId{11}},
+          .aggregates = {AggregateCall{
+              .kind = AggKind::kSum, .arg = Column(kB, 1), .id = ColumnId{12}}},
+          .span = {}}),
+      .columns = {Column(ColumnId{11}, 0), Column(ColumnId{12}, 1)},
+      .constants = {},
+      .ids = {ColumnId{13}, ColumnId{14}},
+      .span = {}});
+  const LogicalPlan plan = Plan(original);
+  ASSERT_EQ(PositionMismatch(plan), std::nullopt);
+
+  ColumnId last = MaxColumnId(*original);
+  const ColumnId before = last;
+  const LogicalNodePtr clone = CloneWithFreshIds(original, last);
+  ASSERT_NE(clone, nullptr);
+
+  // Nothing is shared, and the ids are the ones this minted.
+  const std::vector<ColumnId> originals = OutputIds(*original);
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), originals.size());
+  for (const ColumnId id : cloned) {
+    EXPECT_GT(std::to_underlying(id), std::to_underlying(before)) << "not a fresh id";
+    EXPECT_EQ(std::ranges::find(originals, id), originals.end()) << "shared with the original";
+  }
+  EXPECT_EQ(MaxColumnId(*clone), last) << "last_id ends at the largest id the clone holds";
+  EXPECT_GT(std::to_underlying(last), std::to_underlying(before));
+
+  // The reads followed their defines: the clone resolves on its own, which it could not do if a
+  // key or an argument still named a column of the original.
+  EXPECT_EQ(PositionMismatch(Plan(clone)), std::nullopt);
+  EXPECT_EQ(Explain(Plan(clone)), Explain(plan)) << "the same plan, read by other names";
+}
+
+// A Project column that keeps the id it reads passes it through and defines nothing, which is the
+// rule ResolvePositions applies. The clone has to pass the *renamed* id through rather than mint a
+// second definition of it: minting would leave the clone's Project outputting an id that nothing
+// above it was renamed to, and the consumer above would read a column its input does not have --
+// an abort, which is the very thing this function exists to prevent.
+TEST(ColumnIdsTest, AClonePassesThroughAProjectsOwnPassThroughIds) {
+  const LogicalNodePtr passes = Node(ProjectNode{.input = Scan(),
+                                                 .columns = {Column(kA, 0), Column(kB, 1)},
+                                                 .constants = {},
+                                                 .ids = {kA, kB},  // the ids it reads: passed on
+                                                 .span = {}});
+  const LogicalNodePtr reader = Node(FilterNode{
+      .input = passes,
+      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull, .column = Column(kB, 1)}},
+      .span = {}});
+  ASSERT_EQ(PositionMismatch(Plan(reader)), std::nullopt);
+
+  ColumnId last = MaxColumnId(*reader);
+  const LogicalNodePtr clone = CloneWithFreshIds(reader, last);
+  EXPECT_EQ(PositionMismatch(Plan(clone)), std::nullopt) << Explain(Plan(clone));
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), 2U);
+  for (const ColumnId id : cloned) {
+    EXPECT_NE(id, kA);
+    EXPECT_NE(id, kB);
+  }
+  EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
+}
+
+// An id the subtree reads but does not define is read from outside it, so it is left alone: that is
+// what keeps a clone of a dependent join's left input binding the right input's references, and a
+// clone of any subtree reading the columns above it.
+TEST(ColumnIdsTest, ACloneKeepsTheIdsItReadsFromOutside) {
+  const LogicalNodePtr reads_outer =
+      Node(FilterNode{.input = Scan(),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                               .column = Column(kA, 0),
+                                               .other = Column(ColumnId{9}, 0)}},
+                      .span = {}});
+  ColumnId last = MaxColumnId(*reads_outer);
+  const LogicalNodePtr clone = CloneWithFreshIds(reads_outer, last);
+  EXPECT_EQ(FreeVariables(*clone), (std::vector<ColumnId>{ColumnId{9}}));
+  EXPECT_EQ(FreeVariables(*clone), FreeVariables(*reads_outer));
+}
+
+// Every node kind, including the ones that define a column other than a scan's: a RowCount's own
+// id, a dependent join's mark, and an aggregate call's result.
+TEST(ColumnIdsTest, ACloneCoversEveryNodeThatDefinesAColumn) {
+  // A RowCount defines its own id and has no input, so it is the only column minted.
+  const LogicalNodePtr row_count = Node(RowCountNode{
+      .table = std::make_shared<FakeTable>(AllTypesSchema(), 100), .id = ColumnId{20}});
+  auto last = ColumnId{20};
+  EXPECT_EQ(OutputIds(*CloneWithFreshIds(row_count, last)), (std::vector<ColumnId>{ColumnId{21}}));
+  EXPECT_EQ(last, ColumnId{21});
+
+  const LogicalNodePtr dependent = Node(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                          .left = Scan(),
+                                                          .right = Scan({kD}),
+                                                          .mark = ColumnId{30},
+                                                          .span = {}});
+  last = ColumnId{30};
+  const std::vector<ColumnId> cloned = OutputIds(*CloneWithFreshIds(dependent, last));
+  ASSERT_FALSE(cloned.empty());
+  EXPECT_EQ(cloned.back(), last) << "the mark is minted too";
+  EXPECT_EQ(std::ranges::find(cloned, ColumnId{30}), cloned.end());
+
+  // An aggregate call's result, which is minted after its input's columns rather than before.
+  const LogicalNodePtr global =
+      Node(AggregateNode{.input = Scan(),
+                         .aggregates = {AggregateCall{
+                             .kind = AggKind::kSum, .arg = Column(kB, 1), .id = ColumnId{40}}},
+                         .span = {}});
+  last = ColumnId{40};
+  const LogicalNodePtr cloned_global = CloneWithFreshIds(global, last);
+  EXPECT_EQ(OutputIds(*cloned_global), (std::vector<ColumnId>{last}));
+  EXPECT_EQ(std::to_underlying(last), 44) << "three scan columns, then the call";
+  EXPECT_EQ(PositionMismatch(Plan(cloned_global)), std::nullopt);
+
+  EXPECT_EQ(CloneWithFreshIds(nullptr, last), nullptr);
 }
 
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {

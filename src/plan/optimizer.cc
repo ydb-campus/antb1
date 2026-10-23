@@ -773,6 +773,119 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
   });
 }
 
+// How many times the aggregation's own input must exceed the outer side before restricting it to
+// the keys that side binds is worth a build and a probe (RestrictToTheOuterKeys below).
+//
+// Four, which is low on purpose, because the outer number is an **upper bound** and can be far
+// loose: on the query this gains most it is a semi join's 80,000,000 standing for the 868,888 rows
+// the join really yields. A loose bound makes the test refuse where it would have paid, never fire
+// where it would not, which is the safe direction for a rewrite that has to pay for itself.
+constexpr int64_t kLeastRestriction = 4;
+
+// Whether to restrict: both sides estimated, and the aggregation's input at least
+// kLeastRestriction times the outer side. An unknown estimate refuses, as ADR 0032's gate does and
+// for its reason -- a small outer side is what argues *for* the rewrite, so an unknown one has to
+// argue against. The groups the restriction would avoid building are the quantity that would
+// actually decide this, and nothing estimates a group count, so the rows standing in for them are
+// the proxy and this is the whole of the evidence.
+bool RestrictionIsWorth(const std::optional<int64_t>& outer, const std::optional<int64_t>& inner) {
+  if (!outer.has_value() || !inner.has_value() || *outer <= 0 || *inner <= 0) {
+    return false;
+  }
+  return Int128{*inner} >= Int128{kLeastRestriction} * Int128{*outer};
+}
+
+// ADR 0023's **semi-join reduction**: `input` restricted to the rows whose correlated key the outer
+// side binds, or `input` itself where the gate refuses or the pass cannot name a key.
+//
+// Path 2's substitution drops this restriction. The formalization's Lemma 4.2 puts a map where the
+// domain D was, which keeps the answer and loses what D carried, "because a map restricts nothing"
+// -- so the aggregation below builds a group for every key of its own table while the join above
+// reads a thousandth of them. This puts the restriction back, as the ADR's own deferred item asks.
+//
+// **A semi join rather than an inner join to a de-duplicated domain**, and each reason earned its
+// place in the measurements: it cannot multiply its probe's rows, so duplicate-freeness needs
+// neither an argument nor a GROUP BY to enforce it; ADR 0022 fixes its build side to its right
+// input, so the outer side is built whatever the estimates say, which is the difference between
+// 179 MB and 5.5 GB on the query this is for; and it outputs its probe's columns alone, so the
+// grouping above it reads exactly what it read before.
+//
+// The domain is a **clone** of the outer side, not the outer side: a plan is a tree, and the same
+// node under both the join and this restriction is a column defined twice, which aborts
+// (CloneWithFreshIds). So the outer side is computed twice, which the measurement includes.
+//
+// It removes only rows whose group no outer row reads, so no surviving group's value moves; and the
+// join above matches each outer row to at most one group, so no row count above it moves either.
+LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinNode& join,
+                                      const std::map<ColumnId, ColumnId>& equivalent,
+                                      const std::map<ColumnId, BoundColumn>& described,
+                                      ColumnId& last_id) {
+  // **One correlated column is ADR 0029's D5 to restrict, not this.** D5 publishes the join's key
+  // set to the aggregation's own scan, which costs a filter rather than a build and a probe, and it
+  // takes exactly one key. Where it can apply, this rewrite can only repeat it: measured at SF 100
+  // on the query whose correlation is a single key, restricting it as well cost **1.420x** -- the
+  // aggregate's rows and groups did not move at all, because D5 had already removed the same rows,
+  // while the clone re-read the 600-million-row join its outer side is. More than one key is the
+  // case D5 structurally cannot reach, and it is this rewrite's.
+  //
+  // That is ADR 0030's lesson in its own words: "before costing a shared sub-plan, check whether a
+  // consumer is already pruned by one" -- and a plan cannot see ADR 0029's filters, which the
+  // physical planner attaches long after this runs, so the key count stands in for them.
+  if (equivalent.size() < 2) {
+    return input;
+  }
+  // **An outer side holding a dependent join is not cloned, and that is what bounds the copying.**
+  // The pass is top-down, so a dependent join still in this one's left input is one this rewrite
+  // has not reached: cloning it would duplicate a rewrite that clones in turn, and k stacked
+  // correlated subqueries would cost 2^k nodes. Measured before this condition, on a query of k
+  // conjuncts over one correlation: 45 plan lines at k=1, 1,533 at k=8 and 24,573 at k=12, where
+  // planning alone took 1.3 s. With it, the outermost such join declines, then the next, down to
+  // the innermost, whose left input holds none and which clones once -- so a chain costs one clone
+  // and a plan's size stays linear in the rewrites, which is what ADR 0022's relation limit needs
+  // in order to go on bounding every walk of a plan.
+  //
+  // It also makes the Lemma 3.1 check below unreachable by construction: a free variable can only
+  // enter `join.left` through a dependent join, and the clone lands in the new join's right input,
+  // where a free variable would fail the query with an internal error rather than decline.
+  if (FirstDependentJoin(join.left) != nullptr || !FreeVariables(*join.left).empty()) {
+    return input;
+  }
+  if (!RestrictionIsWorth(EstimateRows(*join.left), EstimateRows(*input))) {
+    return input;
+  }
+  const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
+  const LogicalNodePtr domain = CloneWithFreshIds(join.left, last_id);
+  const std::vector<ColumnId> domain_ids = OutputIds(*domain);
+  if (domain_ids.size() != outer_ids.size()) {
+    return input;  // a clone outputs what it cloned: nothing to key on if it does not
+  }
+  std::vector<JoinKey> keys;
+  for (const auto& [outer_id, inner_id] : equivalent) {
+    const auto at = std::ranges::find(outer_ids, outer_id);
+    const auto inner = described.find(inner_id);
+    const auto outer = described.find(outer_id);
+    if (at == outer_ids.end() || inner == described.end() || outer == described.end() ||
+        inner->second.type != outer->second.type) {
+      return input;  // declining costs only speed: Path 2 without the restriction is the plan
+    }
+    BoundColumn key = outer->second;
+    key.id = domain_ids[Narrow<std::size_t>(at - outer_ids.begin())];
+    keys.push_back(JoinKey{.left = inner->second, .right = std::move(key)});
+  }
+  if (keys.empty()) {
+    return input;
+  }
+  const std::optional<int64_t> rows = EstimateRows(*input);
+  return Make(JoinNode{.kind = JoinKind::kSemi,
+                       .left = std::move(input),
+                       .right = domain,
+                       .keys = std::move(keys),
+                       .residual = {},
+                       .build = BuildSide::kRight,
+                       .estimate = rows,  // a semi join keeps a subset of its probe
+                       .span = join.span});
+}
+
 // Path 2's rewrite (ADR 0023, the formalization's Lemmas 4.14 and 4.2): each outer column is
 // replaced by its inner equivalent, so the correlated conjuncts read inner columns only and stay
 // below the aggregation; an equality that became c = c is dropped. The aggregation groups by the
@@ -945,7 +1058,7 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   }
   // The keys as the join will name them, taken before `grouped` is moved into its node.
   const std::vector<BoundColumn> group_keys = grouped.keys;
-  grouped.input = std::move(right);
+  grouped.input = RestrictToTheOuterKeys(std::move(right), join, equivalent, described, last_id);
   right = Make(std::move(grouped));
   // The select item over the aggregate, and the select list, rebuilt above it. A Compute passes
   // its input's columns through, but a Project outputs only its own, so the group's key columns
