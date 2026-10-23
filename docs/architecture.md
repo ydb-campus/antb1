@@ -270,7 +270,9 @@ The hash joins' operators (`src/exec/hash_join.h`) use it. An `exec::JoinBuild` 
 kind from a part pipeline (its parts on the pool through the part scheduler) or from any operator drained on the
 consumer thread, after the builds its own input probes (post-order); a one-row join's build must hold one row, whose
 values it then makes once as columns of up to `batch_size` rows (fewer for long VARCHAR values) that every probe
-slices. An `exec::BuildsFirstOperator` prepares a probe pipeline's builds when it is first pulled, then opens the
+slices. Every build also takes each chunk's array of each column once (`exec::JoinColumns`), and every gather of its
+rows reads those: asking a batch for a column locks the batch, so a gather over the chunks would lock every chunk on
+every call. An `exec::BuildsFirstOperator` prepares a probe pipeline's builds when it is first pulled, then opens the
 pipeline's sink, and releases them once the sink's parts are done (`exec::PartSink`'s callback). An
 `exec::HashJoinOperator` probes, by its build's kind: an inner join with a build of unique keys keeps the probe
 batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row, and its

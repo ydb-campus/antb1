@@ -68,6 +68,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_mask_test.cc
       tests/profile_test.cc
       tests/memory_test.cc
+      tests/gather_test.cc
       tests/hash_join_test.cc
     LIBS ArrowCompute::arrow_compute_shared
   )

@@ -785,10 +785,11 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     rows did keeps the probe's columns where they are and gathers the build for the window, and any other window
     gathers only the rows that matched, which is why a selective join's `gather` is near its output rather than near
     its probe — [ADR 0026](adr/0026-join-performance.md));
-  - a `HashBuild`'s `finish` (the table built from its parts, and a one-row join's values), `null_keys` (rows with a
-    NULL key, which no key's range holds and no lookup returns; a join that emits the build rows which did not match
-    keeps their rows apart from the table it indexes, since such a row is unmatched by definition), `unique` (1: no
-    key repeats) and `direct` (1: the table indexes its one integer key by value, ADR 0022);
+  - a `HashBuild`'s `finish` (the table built from its parts, the arrays of its columns that its gathers read, and a
+    one-row join's values), `null_keys` (rows with a NULL key, which no key's range holds and no lookup returns; a join
+    that emits the build rows which did not match keeps their rows apart from the table it indexes, since such a row is
+    unmatched by definition), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
+    value, ADR 0022);
   - a `RightJoin`'s `emitted` (the build rows it returned: those the probes marked for a semi join, those they did
     not plus the retained NULL-key ones for an anti join).
 - The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,

@@ -21,6 +21,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -43,6 +44,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
+#include "../gather.h"
 #include "../part_operators.h"
 #include "exec_test_util.h"
 
@@ -1740,6 +1742,112 @@ TEST_F(HashJoinTest, BuildsHoldNothingOnceTheirPartsAreDone) {
   }
 }
 
+// A build's columns (JoinColumns) follow its table: none before Prepare; after it every chunk's
+// array of every field, the very arrays the table's chunks keep, held with the table, their vector
+// charged to the budget; none after Release, while whoever took them (a probe, until its End)
+// keeps them and the table, and the budget gets everything back when the last holder lets go. A
+// rerun takes the new table's.
+TEST_F(HashJoinTest, BuildColumnsFollowTheTable) {
+  MemoryBudget budget(std::nullopt);
+  ExecContext ctx = ContextOf(nullptr, 3, &budget);
+  const auto table = KeyTable("b", 3, 4, [](int64_t i) -> std::optional<int64_t> { return i % 5; });
+  const int fields = table->schema()->num_fields();
+  const auto build = ScanBuild(table, {0});
+  EXPECT_EQ(build->columns(), nullptr);
+  ASSERT_TRUE(build->Prepare(ctx).ok());
+  std::shared_ptr<const JoinColumns> columns = build->columns();
+  ASSERT_NE(columns, nullptr);
+  ASSERT_NE(build->table(), nullptr);
+  EXPECT_EQ(columns->table, build->table());
+  const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks = columns->table->chunks();
+  ASSERT_FALSE(chunks.empty());
+  for (int c = 0; c < fields; ++c) {
+    const std::span<const arrow::Array* const> arrays = columns->arrays.column(c);
+    ASSERT_EQ(arrays.size(), chunks.size());
+    for (std::size_t k = 0; k < chunks.size(); ++k) {
+      EXPECT_EQ(arrays[k], chunks[k]->column(c).get()) << "column " << c << ", chunk " << k;
+    }
+  }
+  // One pointer per chunk and column, counted here rather than by ChunkColumns::MemoryUsage.
+  const auto pointers = static_cast<int64_t>(chunks.size() * static_cast<std::size_t>(fields) *
+                                             sizeof(arrow::Array*));
+  EXPECT_EQ(columns->memory.bytes(), pointers);
+  build->Release();
+  EXPECT_EQ(build->table(), nullptr);
+  EXPECT_EQ(build->columns(), nullptr);
+  // The holder keeps the table, whose chunks own the arrays, and the vector's charge: exactly its
+  // bytes come back when the columns go, and the table's when the table does.
+  std::shared_ptr<const JoinTable> held = columns->table;
+  EXPECT_EQ(columns->arrays.column(1).back(), held->chunks().back()->column(1).get());
+  const int64_t before = budget.bytes_allocated();
+  columns.reset();
+  EXPECT_EQ(before - budget.bytes_allocated(), pointers);
+  held.reset();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  ASSERT_TRUE(build->Prepare(ctx).ok());
+  ASSERT_NE(build->columns(), nullptr);
+  EXPECT_EQ(build->columns()->table, build->table());
+  build->Release();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+// Taking the columns is an inner build's last charge, and over enough chunks of enough columns it
+// is its peak: 256 chunks (one part of 256 rows, scanned a row at a time) of 128 BIGINT columns
+// take 256 KiB of array pointers, more than Finish frees (the rows pass from the parts to the
+// table; the pieces' containers of about 300 bytes per chunk, their hashes and the segments do
+// not). That premise is checked, without a limit, first. A limit one byte under the peak then
+// fails Prepare there -- past the parts, inside `finish` -- with OutOfMemory, and the build holds
+// nothing: no table, no columns, no byte. The peak itself fits.
+TEST_F(HashJoinTest, BuildColumnsThatDoNotFitFailThePrepare) {
+  constexpr int kFields = 128;
+  constexpr int64_t kRows = 256;
+  std::vector<std::string> names;
+  names.reserve(static_cast<std::size_t>(kFields));
+  for (int c = 0; c < kFields; ++c) {
+    names.push_back("c" + std::to_string(c));
+  }
+  const auto schema = Int64Schema(names);
+  std::vector<std::optional<int64_t>> keys;
+  keys.reserve(static_cast<std::size_t>(kRows));
+  for (int64_t row = 0; row < kRows; ++row) {
+    keys.emplace_back(row);
+  }
+  const arrow::ArrayVector columns(static_cast<std::size_t>(kFields), Int64s(keys));
+  const auto table = std::make_shared<MemoryTable>(
+      schema, arrow::RecordBatchVector{BatchOf(schema, columns)}, /*split=*/true);
+  MemoryBudget unlimited(std::nullopt);
+  ExecContext ctx = ContextOf(nullptr, /*batch_size=*/1, &unlimited);
+  const auto build = ScanBuild(table, {0});
+  ASSERT_TRUE(build->Prepare(ctx).ok());
+  ASSERT_NE(build->columns(), nullptr);
+  ASSERT_EQ(build->table()->chunks().size(), static_cast<std::size_t>(kRows));
+  ASSERT_EQ(build->columns()->memory.bytes(), kRows * kFields * int64_t{sizeof(arrow::Array*)});
+  const int64_t peak = unlimited.max_memory();
+  // Nothing is given back after the columns' charge: the build ends at its peak only if that
+  // charge made it.
+  ASSERT_EQ(unlimited.bytes_allocated(), peak) << "the columns' charge is not the build's peak";
+  build->Release();
+  EXPECT_EQ(unlimited.bytes_allocated(), 0);
+
+  ProfileNode profile;
+  MemoryBudget tight(peak - 1);
+  ExecContext small = ContextOf(nullptr, 1, &tight);
+  const auto failing = ScanBuild(table, {0}, &profile);
+  const arrow::Status status = failing->Prepare(small);
+  EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+  EXPECT_TRUE(MetricOf(profile, "finish").has_value()) << "failed before the table was finished";
+  EXPECT_EQ(failing->table(), nullptr);
+  EXPECT_EQ(failing->columns(), nullptr);
+  EXPECT_EQ(tight.bytes_allocated(), 0);
+
+  MemoryBudget exact(peak);
+  ExecContext enough = ContextOf(nullptr, 1, &exact);
+  ASSERT_TRUE(failing->Prepare(enough).ok());
+  EXPECT_NE(failing->columns(), nullptr);
+  failing->Release();
+  EXPECT_EQ(exact.bytes_allocated(), 0);
+}
+
 // ---- profiles ----
 
 // A build's profile node gets its time, the rows it holds (a batch per chunk) and its metrics; a
@@ -2161,6 +2269,7 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
     EXPECT_TRUE(result.status().IsInvalid()) << result.status().ToString();
     EXPECT_TRUE(probe_table->scanned_parts().empty());
     EXPECT_EQ(drained->table(), nullptr);
+    EXPECT_EQ(drained->columns(), nullptr);
     EXPECT_EQ(drained->values(), nullptr);
     // From the parts of a table (rows parts of one row), under a probe over a serial input.
     auto source = SourceOf(schema, {Int64s({1}), Int64s({2})});
@@ -2173,6 +2282,7 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
     EXPECT_TRUE(serial.status().IsInvalid()) << serial.status().ToString();
     EXPECT_EQ(probed.opens(), 0);
     EXPECT_EQ(scanned->table(), nullptr);
+    EXPECT_EQ(scanned->columns(), nullptr);
   }
 }
 
