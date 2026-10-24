@@ -44,13 +44,23 @@ class KeyFilter {
   // 14 MB are worth 0.73x to 0.96x on their queries, and a 45 MB one cost 17% on a query whose
   // build holds a sixth of its probe's keys -- so the boundary is between them.
   //
-  // **32 MiB, raised from 16 after re-measuring.** ADR 0032 refused this at 1.001x while a scan
-  // with pushed predicates could not also take a key filter, so no query of the 22 could spend the
-  // extra bytes; ADR 0029's conjunction lifted that, and the same change now measures **0.986x over
-  // the 22** -- two queries gain the filter their build had been too large for, at 0.795x and
-  // 0.911x, and no other query's plan moves.
+  // **32 MiB, raised from 16 after re-measuring.** ADR 0032 refused the raise at 1.001x while a
+  // scan with pushed predicates could not also take a key filter; ADR 0029's conjunction lifted
+  // that, and two queries of the 22 then had a refused candidate. Measured at SF 100 with both
+  // thread counts this project measures on, 7 repeats interleaved and rotated, spreads not
+  // overlapping: those two go **0.795x and 0.921x on 4 threads, 0.843x and 0.931x on 14**, and the
+  // 22 geomean 0.986x and 0.991x. 14 threads is the configuration the cap's own curve below was
+  // measured at, and the one least favourable to a bigger filter.
   //
-  // The bound is quantised, which is what keeps it from reaching the 45 MB shape: `bytes` rounds up
+  // **What this does and does not rest on.** It rests on those two builds, which are selective:
+  // their filters reject 99.0% and most of their probe rows. The quantisation below excludes the
+  // one query the +17% was measured on, and only that one -- it is not an argument about the band.
+  // A build inside the band whose keys cover nearly all of its probe's passes `kFilterBuildShare`
+  // (which bounds the build's ROWS against the probe table's, not its key coverage) and would now
+  // get a 32 MiB filter that rejects nothing. No query of the 22 has that shape, so it is
+  // unmeasured rather than refused, and ADR 0029 found no static quantity that separates it.
+  //
+  // The bound is quantised, so it cannot interpolate into the measured-bad size: `bytes` rounds up
   // to a power-of-two block count, so this admits builds of 8,388,609 to 16,777,216 keys and the
   // next size is 64 MiB. The query the 17% was measured on builds 22,760,819 keys, sizes to 64 MiB,
   // and stays refused -- verified, not assumed.

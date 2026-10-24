@@ -40,11 +40,16 @@ std::vector<Int128> Keys(std::size_t count, std::uint64_t seed, std::uint64_t ra
 // positive costs a probe row's work; a false negative would drop a row the join must keep, and no
 // benchmark would notice.
 TEST(KeyFilterTest, NeverMissesAHashItHolds) {
-  for (const int64_t keys : {int64_t{1}, int64_t{2}, int64_t{7}, int64_t{1024}, int64_t{200000}}) {
+  // The last size is the largest build kMaxBytes admits, sized for its key count but filled with a
+  // sample: it is the only case that exercises the widest block mask the cap now allows, which no
+  // size below it reaches. Filling it fully would cost a 32 MiB write for no extra property.
+  for (const int64_t keys : {int64_t{1}, int64_t{2}, int64_t{7}, int64_t{1024}, int64_t{200000},
+                             int64_t{16} * 1024 * 1024}) {
     auto filter = KeyFilter::Make(keys, nullptr);
     ASSERT_TRUE(filter.ok()) << filter.status().ToString();
     ASSERT_NE(*filter, nullptr) << keys;
-    const std::vector<std::uint64_t> hashes = Hashes(static_cast<std::size_t>(keys), 20261018);
+    const std::vector<std::uint64_t> hashes =
+        Hashes(static_cast<std::size_t>(std::min<int64_t>(keys, 200000)), 20261018);
     (*filter)->Add(hashes);
     for (const std::uint64_t h : hashes) {
       EXPECT_TRUE((*filter)->MayContain(h)) << keys << ": " << h;
@@ -120,6 +125,21 @@ TEST(KeyFilterTest, TheCapAdmitsAWholeSizeClassAndRefusesTheNext) {
     if (c.made && *filter != nullptr) {
       EXPECT_EQ((*filter)->bytes(), c.bytes) << c.why;
       EXPECT_LE((*filter)->bytes(), KeyFilter::kMaxBytes) << c.why;
+    }
+    // The same verdict under a budget that could afford the filter (1 GiB, so `limit / 8` is 128
+    // MiB and even the refused 64 MiB class fits): what refuses these is the cap and not the
+    // budget, and a refusal charges nothing. Worth pinning because the budget case below stopped
+    // covering the cap once its key count came under it -- this is the half that is about
+    // kMaxBytes. It does not pin the ORDER of the two checks: the reservation is scoped, so
+    // reversing them would unwind and leave this assertion green.
+    MemoryBudget budget(int64_t{1} * 1024 * 1024 * 1024);
+    const int64_t before = budget.bytes_allocated();
+    auto charged = KeyFilter::Make(c.keys, &budget);
+    ASSERT_TRUE(charged.ok()) << c.why << ": " << charged.status().ToString();
+    EXPECT_EQ(*charged != nullptr, c.made) << c.why << " with a budget that affords it";
+    if (!c.made) {
+      EXPECT_EQ(budget.bytes_allocated(), before)
+          << c.why << ": a refused filter charged the budget";
     }
   }
 }
