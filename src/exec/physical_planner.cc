@@ -677,17 +677,35 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   if (!scan.table->supports_scan_filter(ReadFields(scan, nullptr))) {
     return false;
   }
+  const std::shared_ptr<const JoinTable>& table = key.build->table();
+  const std::optional<int64_t> probe_rows = scan.table->exact_row_count();
+  if (table == nullptr || !probe_rows.has_value()) {
+    return false;
+  }
+  // **Not for a direct-layout build, whatever it would reject.** A direct probe is two loads of
+  // `offsets_` and no hash at all, about half a nanosecond a row, where the filter costs about five
+  // -- so it cannot pay there even when it rejects almost everything, and it is the one shape where
+  // it can lose badly. Measured (ADR 0029's D1): refusing it is 0.999x over the 22 **while removing
+  // filters that reject 137,992,368 and 58,293,472 probe rows**, which is the mechanism confirmed
+  // by removal rather than by addition; and a dense-key build of 5,000,000 keys under a
+  // 200,000,000-row probe it covers entirely goes 0.691x, the filter having cost 45% for nothing.
+  //
+  // This gates D1 only. The build still publishes its filter, so D2 keeps the interval it prunes
+  // parts with -- `KeyScanOf` asks `PartHasNoKey` separately, and a part that holds no key is still
+  // skipped whole.
+  if (table->layout() == JoinTable::Layout::kDirect) {
+    return false;
+  }
   // The build must be small against what it filters, or the filter holds so many keys that it
   // rejects nothing and the probe pays the hash for it. A build's rows are an upper bound on its
   // distinct keys, and the probe's table rows a lower bound on what the filter is asked about, so
   // the ratio errs towards refusing -- which is the right direction for a filter that is only ever
   // an optimisation. Measured: the four queries this helps build 0.01 to 0.02 of their probe's
   // rows, and the one it cost 14% builds 0.25 of them (every key of the probe's domain), so the
-  // share separates them by an order of magnitude either way.
-  const std::shared_ptr<const JoinTable>& table = key.build->table();
-  const std::optional<int64_t> probe_rows = scan.table->exact_row_count();
-  return table != nullptr && probe_rows.has_value() &&
-         table->num_rows() <= *probe_rows / kFilterBuildShare;
+  // share separates them by an order of magnitude either way. It bounds the build's ROWS against
+  // the probe table's and so says nothing about key coverage, which is why the layout test above
+  // does the work for the shape that covers everything.
+  return table->num_rows() <= *probe_rows / kFilterBuildShare;
 }
 
 // Whether part `part` of `scan` holds no key the innermost join's build published, so that it
