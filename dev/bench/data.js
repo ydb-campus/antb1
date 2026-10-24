@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792799827812,
+  "lastUpdate": 1792825956733,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -21492,6 +21492,258 @@ window.BENCHMARK_DATA = {
             "value": 2618.0903879999846,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2617.946391000004 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5d64b380a15774cf5a6579080e035176b4ebe148",
+          "message": "perf(exec): raise the key filter's size cap to 32 MiB (#230)\n\n## Summary\n\nOne constant: `KeyFilter::kMaxBytes` goes from 16 MiB to 32 MiB. That\ncap is ADR 0029's D1 gate\ncondition \"the filter must fit 16 MB\" — past it `KeyFilter::Make`\nreturns `nullptr` and the probe\nruns with no filter.\n\n**ADR 0032 refused this change at 1.001×, and its own second sentence\nsays why:**\n\n> Q3 still receives no filter, because what blocks it is **ADR 0029's\nuncarried offer through a\n> pushing `Filter`** and not the cap.\n\n**#227 removed exactly that blocker, the day after that measurement was\ntaken.** I verified the\nblocker is gone directly: Q3's orders scan now carries a filter\n(`key_dropped=58,293,472`) where it\ncould not then. That the 1.001× was therefore a null result on a tree\nwhere no query *could* spend\nthe extra bytes is an **inference from that null total**, not a filter\ncount on the pre-#227 tree —\na run containing either of today's two gains could not have read as\n1.001×. Both ADR hunks say so\nrather than asserting it.\n\nMeasured against `main` at `be6ad1a`, release arms from the same tree,\nat SF 100 **on both thread\ncounts this project measures on**. 14 threads is the configuration ADR\n0029's own cache curve came\nfrom, and the one least favourable to a bigger filter — fewer threads\nmeans less competition for the\nsame last-level cache, so 4 threads alone would have been the flattering\nhalf of the story. Targets\nat **7 repeats interleaved and rotated**, with a 3-repeat control over\nall 22:\n\n| | 4 threads | 14 threads |\n| --- | ---: | ---: |\n| **Q3** | 5.101 → **4.056 s — 0.795×** | 2.197 → **1.851 s — 0.843×** |\n| **Q7** | 5.235 → **4.819 s — 0.921×** | 2.184 → **2.034 s — 0.931×** |\n| Q5 | 1.001× — untouched by design | 1.004× |\n| the 22, geomean | **0.986×** | **0.991×** |\n| the 22's peak RSS | 14,150 → 14,092 MiB | 14,975 → 14,916 MiB |\n\nSpreads do not overlap on either gainer at either thread count. The\n22-query controls put the pair at\n0.786×/0.911× (4 threads) and 0.833×/0.933× (14). All 22 answers are\nbyte-identical to `be6ad1a`, and\nall 22 physical plans are identical to the binary the numbers came from.\n\nThe win shrinks at 14 threads, in exactly the direction the cap exists\nto guard — which is the\nuseful part of measuring there. On the 14-thread control Q18 reads\n1.048×, but its baseline spread\n`[3.884, 4.706]` entirely contains the branch's `[4.071, 4.195]` and its\nfilter count is unchanged,\nso that is the suite's 15 GB query being noisy rather than an effect.\n\n**The blast radius is two queries, checked by filter count rather than\nread off the timings** —\nbecause three queries sit within 1% of noise and it would be easy to\nmistake one for an effect:\n\n| | filters at 16 MiB | at 32 MiB |\n| --- | ---: | ---: |\n| Q3 | 1 | **2** |\n| Q7 | 3 | **4** |\n| Q5, Q9, Q18 | 2, 1, 2 | unchanged |\n\n## What the cap was refusing\n\nBoth winners had their **lineitem** scan's filter refused while their\nother scans' filters attached.\n\n| build | keys | filter | at 16 MiB | at 32 MiB |\n| --- | ---: | ---: | --- | --- |\n| Q3's customer build | 3,000,188 | 8 MiB | attached | attached |\n| **Q3's lineitem build** | **14,567,861** | **32 MiB** | refused |\n**attached — drops 320,299,622 of 323,494,519 probe rows (99.0%)** |\n| **Q7's build** | **11,997,461** | **32 MiB** | refused | **attached —\ndrops 167,683,698** |\n| Q5's build | 22,760,819 | 64 MiB | refused | **still refused** |\n\n## The band's worst case, measured\n\nADR 0029's curve is 6–14 MB worth 0.72×–0.96×, and a 45 MB filter\ncosting **+17%** on a query whose\nbuild held a sixth of its probe's keys. 32 MiB is in the untested\nmiddle. **The quantisation excludes\nthat one query and only that one** — `Make` rounds the block count up\nwith `std::bit_ceil`, so a\n32 MiB cap admits builds of exactly **8,388,609 to 16,777,216 keys** and\nthe next class is 64 MiB:\n\n```text\n8,388,608 keys -> 16 MiB   made\n16,777,216     -> 32 MiB   made        <- the largest the cap admits\n16,777,217     -> 64 MiB   refused\n22,760,819     -> 64 MiB   refused     <- the build the +17% was measured on\n```\n\nThat says nothing about the band itself, so the band got its own\nexperiment. The adversarial shape:\na build of **10,000,000 keys** — the largest filter the cap admits —\nunder a **200,000,000-row\nprobe every one of whose keys is in the build**, so the filter rejects\nnothing and is pure overhead.\nIt passes `kFilterBuildShare` (10M ≤ 200M/16), which bounds the build's\n*rows* against the probe\ntable's rows and not its key coverage. Synthetic, because no query of\nthe 22 has the shape;\nconfirmed by `key_filter=1 key_dropped=0` before timing it. 4 threads,\nrepeats rotated:\n\n| the same shape, zero rejection | probe cost | with a 32 MiB filter |\n| --- | ---: | ---: |\n| **hashed build** (`direct=0`) | `find` 68 ns/row | **1.070×** |\n| **direct build** (`direct=1`) | `find` 0.5 ns/row | **1.533×** |\n\n**1.070× is this change's own exposure**, and it sits inside the curve\nabove. **1.533× is not — it is\na pre-existing defect this cap neither creates nor fixes.** A direct\nbuild's probe is two offset\nloads, about 0.5 ns a row, so a ~5 ns/row filter cannot pay there **at\nany rejection rate**; `main`\nalready attaches one, verified on a 5,000,000-key direct build over the\nsame probe\n(`key_filter=1 key_dropped=0 direct=1`, filter 16 MiB, refused nothing).\nThe raise widens the key\nrange over which that can happen, it is not what makes it happen.\n\n**And the two queries that gain here both build `direct=0`** —\n14,567,861 and 11,997,461 rows, hashed\n— so the measured win and the measured 1.533× fall on opposite sides of\na flag the build already\ncomputes:\n\n| build | rows | layout | |\n| --- | ---: | --- | --- |\n| Q3's newly-filtered build | 14,567,861 | `direct=0` | gains 0.795× |\n| Q7's newly-filtered build | 11,997,461 | `direct=0` | gains 0.921× |\n| the adversarial case | 10,000,000 | `direct=1` | 1.533× |\n\nSo **the next item here is to refuse D1 for a direct-layout build**,\nwhich closes the 1.533× shape\noutright and keeps both gains. It is not in this PR because it also\nremoves a filter one of the 22\ncurrently carries on a small direct build (3,000,188 rows, dropping\n58,293,472 probe rows), and\nwhether that costs anything needs its own measurement — bundling it with\na one-constant change would\nmake neither measurable.\n\n## A test this silently weakened\n\n`ChargesTheBudgetAndDeclinesWhatItCannotAfford` passed `Make(16 * 1024 *\n1024)` — **16,777,216 keys,\nexactly the new top of the admitted band** — and expected no filter.\nAfter the raise it still passed,\nbut on its 1 MiB **budget** rather than on the cap its comment named\n(\"far more keys than the limit\nholds\"). Green, and no longer testing the thing it was written for.\n\nIt now passes 1,000,000 keys: 2 MiB of filter against a 1 MiB budget,\nwhich the cap permits and the\nbudget refuses. So that case exercises the budget whatever the cap is,\nand cannot be quietly turned\ninto a cap test again.\n\n## Tests\n\n`key_filter_test.cc` gains\n`TheCapAdmitsAWholeSizeClassAndRefusesTheNext`, pinning the band from\nboth\nsides: the size class below, the largest build admitted, one key more\n(which doubles the filter), and\nthe 22,760,819-key build the +17% was measured on. **Mutation-checked in\nboth directions** — it fails\nat 16 MiB (the band closes) and *also* at 64 MiB (the +17% shape would\nbe admitted). The quantisation\nargument the cap's own comment now relies on is therefore enforced\nrather than left as arithmetic in\na comment.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch.\n\n```text\n$ pixi run test                      # Debug, the full hermetic suite\n100% tests passed out of 2881        ANTB1-TESTS: PASS\n\n$ pixi run release\n100% tests passed out of 2882        (exit 0)\n\n$ for s in 20261106 20261107 20261108; do ANTB1_DIFF_SEED=$s pixi run diff-random; done\nDIFF: PASS queries=2000 failed=0 unsupported=0     # each of the three seeds\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' \\\n    src/exec/key_filter.cc src/exec/tests/key_filter_test.cc\nnothing in user code\n```\n\nclang-tidy was run on the changed **test** file as well as the source,\nand did catch one thing there\n(`readability-math-missing-parentheses` on the band's `16 * 1024 * 1024\n+ 1`).\n\nGates with no local substitute: `pixi run asan` (fails at discovery on a\npre-existing\n`curl_global_init` leak), `pixi run tidy` (fails on an unmodified `main`\non this host with 4\nmacOS-only findings, so clang-tidy was run per file) and\n`ci-gcc`/`codeql-build` (linux-64 only).\n\n**ClickBench is unexposed by construction**, so it was not measured: all\n43 queries are single-table\nover `hits`, and a key filter is published by a hash build for a\nprobe-side scan. No joins, no\nfilters to resize. That is a shape argument, not a run.\n\n## Type of change\n\n- [x] perf: performance improvement\n- [ ] feat / fix / refactor / docs / Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change\n- [x] Docs updated: **ADR 0029's D1 bullet** (the rule's home) records\nthe raise with the\nquantisation argument, and **ADR 0032's Alternatives entry** records the\nreversal — preserving\nwhat it originally said and adding why that measurement was of the\nblocker rather than of the\n      cap\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer. **Three\nCODEOWNERS files**, and the\n0029 hunk rewrites a *decision rule* (D1's third gate) rather than only\nrecording a\nmeasurement: `docs/adr/0029-dynamic-join-filters.md` (the rule's home,\nplus what the raise\nrests on and two consequences), `docs/adr/0032-aggregate-placement.md`\n(the reversal, and its\nStatus block, which still said \"refused\") and\n`docs/adr/0031-runtime-knobs.md` (a line\nreference this diff moved). @hor911 reviewed the measurement and asked\nfor this to ship\n\n\n## What the review round changed\n\nThe project's `reviewer` found no P0 and six P1s. Two needed work rather\nthan wording:\n\n- **The quantisation argument was doing duty as the safety argument.**\nIt only excludes the single\nquery the +17% was measured on, not the band the raise opens — and\n`kFilterBuildShare` bounds rows,\nnot key coverage, so a non-selective build inside the band is reachable.\nFirst reworded to say the\nband was unmeasured; **then the in-PR review's P2 named the same gap, so\nI built the shape and\nmeasured it** — 1.070× hashed, 1.533× direct, and the 1.533× turns out\nto be pre-existing on `main`\nrather than opened by this change. That section is now a measurement,\nnot a caveat, and it names\n  the follow-up it implies.\n- **The bound it replaces was measured at 14 threads; I had measured at\n4.** The cap exists for cache\nresidency, so 4 threads is the flattering configuration and the\namendment would have read as one\ncurve from one experiment. **Re-measured at 14**, and the win survives\nat 0.843× and 0.931×\n(geomean 0.991×). Both configurations are now recorded with SF, threads,\nrepeats and arm order.\n\nThe other four:\n\n- **ADR 0032's Status block still said the cap raise was \"measured and\nrefused\"**, contradicting the\nsame file's amended Alternatives entry. Now records both dates and\npoints at the sub-bullet.\n- **The per-query pair mixed two runs.** 0.795× was Q3 from the 7-repeat\nrun (whose Q7 was 0.921×);\n0.911× was Q7 from the 3-repeat control (whose Q3 was 0.786×). Written\nas one pair, they were\nattributed to a run that produced neither. Each run is now quoted with\nits own method and both of\n  its numbers.\n- **An inference was stated as fact.** \"No query of the 22 could spend\nthe extra bytes\" was never\nmeasured on the pre-#227 tree; it follows from the 1.001× null total,\nsince a run containing\neither of today's gains could not have read as a null. Both ADRs now say\nso.\n- **ADR 0031's line reference had rotted** — this diff pushed\n`kMaxPublishedKeys` down, and R014\nstrips the `:NN` suffix before checking, so no gate catches it. Fixed,\nand `kMaxBytes` added to\nthat candidate-knob list, since a constant that has now moved once on\nmeasurement is exactly the\n  profile of a knob.\n\nTwo test gaps it found, both closed:\n\n- **Nothing covered the cap refusing under a budget that could afford\nthe filter** — once the budget\ncase stopped declining on the cap, that half went uncovered. The band\ntest now repeats each case\nwith a 1 GiB budget and asserts a refusal charges nothing.\nMutation-checked: making the cap\nbudget-dependent fails it. The comment says what it does *not* pin (the\norder of the two checks —\nthe reservation is scoped, so reversing them would unwind and leave it\ngreen).\n- **The band's top was never exercised functionally.**\n`NeverMissesAHashItHolds` topped out at\n200,000 keys, so the widest block mask the new cap allows was untested.\nIt now includes a filter\nsized for the largest admitted build, filled with a sample rather than\nfully.\n\nIt also confirmed, by recomputing the sizing by hand, that every figure\nin the tests and both\ncomments checks out, that the weakened-test fix removes no real coverage\n(the old form never reached\nthe budget check at all), that there is no interaction with\n`MaterializedTable::kMaxBytes` or ADR\n0030 sharing, and that `kMaxPublishedKeys` cannot interact — builds in\nthe new band are far above\n65,536 keys, so only the interval is published. That last point is now\nrecorded as a consequence: a\nbuild that gains a filter also gains D2's part pruning.\n\n**None of this changed behaviour**: all 22 plans are identical to the\nbinary the numbers came from,\nand all 22 answers byte-identical to `be6ad1a`.\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) ran a\nprofile-driven survey of the\neight queries holding the DuckDB gap, with an adversarial pass over each\nproposal that killed\nall four it verified; this item came out of reading ADR 0032's *own*\nrefusal and noticing that\nits stated blocker had been removed by #227 a day later. It then\nverified the blocker was gone,\nmeasured the change behind a throwaway build before writing anything,\nfound that the raise had\nsilently weakened an existing test, and mutation-checked the new one in\nboth directions. The\nagent's first estimate of the gain was 0.9 s; the measured figure is\n1.46 s. The `reviewer`\nsubagent then found that the safety argument only covered one query\nrather than the band it\nopens, and that the bound being replaced was measured at a thread count\nI had not used — both\n      are addressed above by re-measuring rather than by caveat.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-24T10:08:21+03:00",
+          "tree_id": "49b62fafbbde384b6dfa0fe0d4896035f3f57b55",
+          "url": "https://github.com/ydb-campus/antb1/commit/5d64b380a15774cf5a6579080e035176b4ebe148"
+        },
+        "date": 1792825955711,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5050.699086271019,
+            "unit": "ns/iter",
+            "extra": "iterations: 137787\ncpu: 5050.113631910122 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84755.64629368248,
+            "unit": "ns/iter",
+            "extra": "iterations: 6381\ncpu: 84742.9037768375 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222574.61565382555,
+            "unit": "ns/iter",
+            "extra": "iterations: 3143\ncpu: 222538.50302258995 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 444501.1998730734,
+            "unit": "ns/iter",
+            "extra": "iterations: 1576\ncpu: 444472.4467005077 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 404887.90794017585,
+            "unit": "ns/iter",
+            "extra": "iterations: 1738\ncpu: 404810.0063291139 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2105652.9546826975,
+            "unit": "ns/iter",
+            "extra": "iterations: 331\ncpu: 2105597.75528701 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 54.60561538461661,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.59067830769234 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 46.99064253332684,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.974307133333326 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 215.96451633331526,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 215.89077300000054 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.18537208163269,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.184201693877542 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.881832969697218,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 20.878053454545462 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.38930672222634,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.387935611111125 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.6467863389021846,
+            "unit": "ms/iter",
+            "extra": "iterations: 419\ncpu: 1.6464609045346075 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 144.02786659998128,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 144.0196650000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.20514887999707,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.199929959999963 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.25858809090687,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.258047772727256 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 67.43857372726903,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 67.42535490909096 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 114.69561749999002,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 114.68616683333364 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 392.95516250001583,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 392.872238999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1822.4719099999902,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1822.2690520000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.76536684999587,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.7633729 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.380880888889656,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.37698222222213 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 68.8727361999895,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.86832779999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 141.92254560000492,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 141.8767694000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 452.90340600001855,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 452.863218000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2107.291342000053,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2107.023925 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.68077766666602,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.67876308333327 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.31282645454518,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.30575663636363 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 96.3201137142765,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 96.31105028571442 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 220.2028293333266,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 220.17464566666686 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 544.1100170000936,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 544.0383149999946 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2439.072634000013,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2438.819061000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.29036510000424,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.2781594000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 75.78239744443889,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.7807159999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 116.03212916666432,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 116.01309883333381 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 231.39994133331734,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 231.3560463333341 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 620.115812999984,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 620.009476 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2635.8313279999948,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2635.4839749999996 ms\nthreads: 1"
           }
         ]
       }
