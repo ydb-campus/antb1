@@ -705,6 +705,13 @@ arrow::Status JoinTable::BuildDirect(const Segments& segments,
   };
   // Each key's rows counted at offsets_[index + 2]; after the prefix sums offsets_[index + 1] is
   // where its rows start, and placing them moves it to where they end.
+  const std::size_t total = offsets_.size();
+  // Below this the serial scan costs less than handing out kJoinPartitions tasks: one million
+  // entries is 4 MiB, which a single core scans in well under a millisecond.
+  constexpr std::size_t kLeastParallelOffsets = std::size_t{1024} * 1024;
+  const std::size_t block = (total + kJoinPartitions - 1) / kJoinPartitions;
+  arrow::internal::Executor* const scan_executor =
+      total >= kLeastParallelOffsets ? executor : nullptr;
   std::array<bool, kJoinPartitions> repeats{};
   ARROW_RETURN_NOT_OK(ForEach(executor, kJoinPartitions, [&](std::size_t partition) {
     for_each_row(partition, [&](std::uint64_t index, JoinRowRef /*ref*/) {
@@ -715,7 +722,46 @@ arrow::Status JoinTable::BuildDirect(const Segments& segments,
     });
     return arrow::Status::OK();
   }));
-  std::partial_sum(offsets_.begin(), offsets_.end(), offsets_.begin());
+  // The prefix sum, in blocks rather than one sequential pass: each block scans its own slice and
+  // reports its total, then every block is offset by the exclusive scan of the totals before it.
+  // Integer addition is associative, so `offsets_` comes out bit-identical to `std::partial_sum`
+  // whatever order the blocks ran in -- which is why the arms of every direct-build test agree.
+  //
+  // It is worth blocking because this pass is the one part of a direct build that scales with the
+  // key SPAN rather than the rows: the span of the largest build of the 22 is 600,000,000, so the
+  // array is 2.24 GiB and one core scans it in about 152 ms of pure driving-thread wall clock,
+  // between two passes that were already parallel. Blocked it is about 60 ms.
+  {
+    std::array<std::uint32_t, kJoinPartitions> block_sum{};
+    ARROW_RETURN_NOT_OK(ForEach(scan_executor, kJoinPartitions, [&](std::size_t chunk) {
+      const std::size_t from = std::min(chunk * block, total);
+      const std::size_t to = std::min(from + block, total);
+      std::uint32_t sum = 0;
+      for (std::size_t i = from; i < to; ++i) {
+        sum += offsets_[i];
+        offsets_[i] = sum;
+      }
+      block_sum[chunk] = sum;
+      return arrow::Status::OK();
+    }));
+    std::array<std::uint32_t, kJoinPartitions> base{};
+    for (std::size_t c = 1; c < kJoinPartitions; ++c) {
+      base[c] = base[c - 1] + block_sum[c - 1];
+    }
+    ARROW_RETURN_NOT_OK(ForEach(scan_executor, kJoinPartitions, [&](std::size_t chunk) {
+      if (chunk == 0 || base[chunk] == 0) {
+        return arrow::Status::OK();
+      }
+      const std::size_t from = std::min(chunk * block, total);
+      const std::size_t to = std::min(from + block, total);
+      const std::uint32_t add = base[chunk];
+      for (std::size_t i = from; i < to; ++i) {
+        offsets_[i] += add;
+      }
+      return arrow::Status::OK();
+    }));
+  }
+
   ARROW_RETURN_NOT_OK(ForEach(executor, kJoinPartitions, [&](std::size_t partition) {
     for_each_row(partition,
                  [&](std::uint64_t index, JoinRowRef ref) { rows_[offsets_[index + 1]++] = ref; });

@@ -3925,6 +3925,55 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
   }
 }
 
+// The direct layout's prefix sum is handed to the executor above a span threshold, and every other
+// fixture in this file is orders of magnitude below it -- so without this case **the parallel path
+// is reached by no hermetic test at all**, only by a benchmark. Measured, not assumed: asserting
+// that the serial path is always taken passed all 2882 tests before this was added, and fails here.
+//
+// That, and not the blocking algebra, is what this case is for: the algebra is already covered,
+// since 64 blocks over even a tiny span leave several of them non-empty, and four existing cases
+// fail if a block's total is wrong. What only a real executor can expose is a race between the
+// blocks, so both arms are run and compared. The per-pair key check is cheap and pins the symptom
+// a bad offset produces -- a key's row refs landing in another key's range -- rather than leaving
+// the failure to show up as a row count.
+TEST_F(HashJoinPlanTest, TheDirectLayoutsBlockedPrefixSumAgreesWithTheSerialOne) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  // 50,000 build rows 25 apart: a span of 1,249,975, which is under 32 slots a row (so the layout
+  // is direct) and over the million entries above which the scan is handed to the executor.
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> { return i * 25; };
+  // Every probe key is a build key, so each probe row matches exactly one build row.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> { return (i * 25) % 1250000; };
+  const auto build = MixedTable("b", 10, 5000, build_keys);
+  Rows serial;
+  Rows parallel;
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    const auto probe = MixedTable("p", 4, 500, probe_keys);
+    ProfileNode profile;
+    auto got = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"), {pk}, {bk}),
+               6),
+        ContextOf(executor), &profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(DirectBuildsIn(profile), 1) << "the fixture must produce a direct build";
+    Rows rows = RowsOf(**got);
+    EXPECT_EQ(rows.size(), 2000U) << "every probe row matches one build row";
+    // Columns are the probe's three then the build's three, so cell 0 is the probe key and cell 3
+    // the build key. A prefix sum that placed the refs wrongly pairs a probe row with another
+    // key's rows.
+    for (const auto& row : rows) {
+      ASSERT_GE(row.size(), 4U);
+      EXPECT_EQ(row[0], row[3]) << "a pair whose keys differ means the row refs went to the wrong "
+                                   "range";
+    }
+    std::ranges::sort(rows);
+    (executor == nullptr ? serial : parallel) = std::move(rows);
+  }
+  EXPECT_EQ(serial, parallel) << "the blocked scan must not depend on how it was scheduled";
+  EXPECT_FALSE(serial.empty());
+}
+
 // D1 is refused for a direct-layout build, and D2 is NOT. The two live on one object -- a build
 // publishes one `KeyFilter` carrying both the per-row bits and the key interval the part test reads
 // -- so the obvious way to decline the per-row half, not publishing at all, would silently take
