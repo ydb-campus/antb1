@@ -97,9 +97,11 @@ class JoinBuildSpec {
   // that cannot compute the set passes.
   //
   // **A dropped column is a NullArray in `chunks()`**, not absent: positions stay as the schema
-  // says, so a `JoinRowRef` and a key index mean what they always did. Reading one is a programming
-  // error that `JoinTable::ChunkColumn` aborts on, never a NULL in an answer -- which is the rule
-  // `needed_above` is documented under, since an id it cannot know would otherwise answer wrongly.
+  // says, so a `JoinRowRef` and a key index mean what they always did. Every reader of a build's
+  // column data asks `retains()` first, and `ChunkColumns::column` aborts on a NULL-typed column as
+  // a backstop for one that forgets. **What makes a wrong set safe is upstream, not here:** the
+  // physical planner rejects a `needed_above` holding an id the join does not output, because a
+  // column wrongly dropped is a NULL that no gather can tell from a real one.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
       bool keep_null_keys = false, std::vector<bool> retain = {});

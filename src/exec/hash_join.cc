@@ -85,8 +85,13 @@ constexpr int64_t kOneRowWindowBytes = int64_t{1024} * 1024;
 
 // The values of the single row of `table` as columns of up to max(ctx.batch_size, 1) rows, fewer
 // when its VARCHAR values are long (kOneRowWindowBytes), from ctx.pool.
+// Reads every column of the row directly, asking neither `retains()` nor `ChunkColumns`, so a
+// dropped column would become a null-typed scalar rather than abort. It cannot happen today -- a
+// one-row join's spec comes from `Keyless`, which retains everything -- and the check below says
+// so, so that giving one a retain set has to deal with this reader too.
 arrow::Result<std::shared_ptr<const OneRowValues>> OneRowValuesOf(const JoinTable& table,
                                                                   const ExecContext& ctx) {
+  ANTB1_CHECK(table.spec().retains_all());
   const JoinRowRef ref = table.rows().front();
   const arrow::RecordBatch& chunk = *table.chunks()[ref.chunk];
   std::vector<std::shared_ptr<arrow::Scalar>> scalars;

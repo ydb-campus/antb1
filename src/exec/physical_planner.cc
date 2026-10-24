@@ -322,31 +322,32 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
     if (ids.size() != static_cast<std::size_t>(schema.num_fields())) {
       return retain;  // the build's operator does not output its node's columns one for one
     }
+    // **Verified, not trusted.** A column missing from `needed_above` reads as unneeded, so a set
+    // that does not describe THIS join would drop a live column -- and the paths that gather a
+    // build's output test `retains()` before they touch a chunk, so that would be a NULL in an
+    // answer rather than the abort `ChunkColumns` can give. `CloneWithFreshIds` mints ids no
+    // earlier pass can know, which is the shape to catch: if any recorded id is not one this join
+    // outputs, the set is about some other node and nothing is dropped.
+    const std::vector<plan::ColumnId> outputs = plan::OutputIds(plan::LogicalNode(join));
+    for (const plan::ColumnId id : join.needed_above) {
+      if (std::ranges::find(outputs, id) == outputs.end()) {
+        return retain;
+      }
+    }
     retain.resize(ids.size());
     for (std::size_t i = 0; i < ids.size(); ++i) {
       retain[i] = std::ranges::binary_search(join.needed_above, ids[i]);
     }
     // The join's own residual too, which `needed_above` excludes by construction: that set is what
-    // a node ABOVE reads, and a residual is evaluated here. Its columns are positions into the
-    // left input's output then the right's, whichever side the join builds on, so each is mapped
-    // back to a position in the build's own output before it is kept.
-    if (!join.residual.empty()) {
-      const bool builds_left = shape.build == join.left;
-      const auto left_width = static_cast<int>(plan::OutputIds(*join.left).size());
-      std::vector<plan::ColumnId> unused;
-      for (const plan::ExprPtr& conjunct : join.residual) {
-        std::vector<int> reads;
-        plan::CollectColumns(*conjunct, reads);
-        for (const int column : reads) {
-          const bool on_left = column < left_width;
-          if (on_left != builds_left) {
-            continue;  // the probe's column, which the probe side carries
-          }
-          const auto at = static_cast<std::size_t>(builds_left ? column : column - left_width);
-          if (at < retain.size()) {
-            retain[at] = true;
-          }
-        }
+    // a node ABOVE reads, and a residual is evaluated here. Matched by ID rather than by position:
+    // `ResolvePositions` gives every residual column an id that occurs once in the two inputs'
+    // outputs, so asking which of the BUILD's ids a conjunct reads needs neither the left input's
+    // width (which the probe and build operators may not agree on) nor a test of which side builds.
+    for (const plan::ExprPtr& conjunct : join.residual) {
+      std::vector<plan::ColumnId> reads;
+      plan::CollectColumnIds(*conjunct, reads);
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        retain[i] = retain[i] || std::ranges::find(reads, ids[i]) != reads.end();
       }
     }
     return retain;

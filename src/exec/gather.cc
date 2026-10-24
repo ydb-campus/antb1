@@ -44,11 +44,13 @@ std::span<const arrow::Array* const> ChunkColumns::column(int column) const {
   const std::span<const arrow::Array* const> out =
       std::span<const arrow::Array* const>(arrays_).subspan(first, chunks_);
   // A column a join build did not retain is a NullArray here (JoinBuildSpec's `retain`), and
-  // gathering it would put NULLs in an answer -- so it aborts instead. `needed_above`, which
-  // decides what is dropped, is recorded as ids and cannot know an id a later pass minted, so this
-  // is what turns that into a crash rather than a wrong column. `plan::ToArrow` maps no engine type
-  // to `null`, which is what makes the marker unambiguous: a NULL-typed column here was dropped.
-  // The first chunk settles it, every chunk of a column being dropped or kept together.
+  // gathering it would put NULLs in an answer. `plan::ToArrow` maps no engine type to `null`, so
+  // the marker is unambiguous and this aborts on it. **It is a backstop, not the safety net:**
+  // every caller that gathers a build's output asks `retains()` first and so never reaches here for
+  // a dropped column. What this catches is a future reader that forgets to ask -- not a wrong
+  // `needed_above`, which `retain_of` must reject before it is used, since a column wrongly dropped
+  // is a NULL no gather can tell from a real one. The first chunk settles it, every chunk of a
+  // column being dropped or kept together.
   if (!out.empty() && out.front() != nullptr) {
     ANTB1_CHECK(out.front()->type_id() != arrow::Type::NA);
   }

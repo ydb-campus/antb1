@@ -448,11 +448,13 @@ struct JoinNode {
   // join's own keys and residual to it; empty where nothing set it, which every hand-built plan and
   // every plan before Prune is.
   //
-  // **A consumer must treat this as advice and verify what it does with it.** Like `estimate` it is
-  // metadata rather than contract, but unlike `estimate` the unsafe direction is real: a column
-  // missing from the list reads as unneeded, so anything that DROPS on that basis must fail loudly
-  // when it turns out to be read -- never answer a NULL. `CloneWithFreshIds` mints ids this list
-  // cannot know, which is the case that makes the rule necessary rather than theoretical.
+  // **A consumer must verify that this set describes the join it is holding.** Like `estimate` it
+  // is metadata rather than contract, but unlike `estimate` the unsafe direction is real: a column
+  // missing from the list reads as unneeded, so dropping on that basis drops a live column -- and a
+  // dropped column is a NULL in an answer, which no gather can notice. `CloneWithFreshIds` mints
+  // ids this list cannot know, which is the case that makes the rule necessary rather than
+  // theoretical, so `physical_planner.cc`'s `retain_of` checks that every id here is one the join
+  // outputs and keeps everything when one is not. There is no runtime net below that check.
   std::vector<ColumnId> needed_above;
   SourceSpan span;  // the join in the query
 };

@@ -560,6 +560,12 @@ this profiling fires:
   node above the join reads, recorded in the moment before the join's own keys and residual are added to it.
   Q05's top join reports `carries 13 of 16 unread above`, and every join in that query carries some.
 
+  **It pays only where the build's input cannot prune itself**, which is worth stating because it bounds the item:
+  projection pruning already trims a Scan's fields to the keys and what is read above, so a build fed by a bare
+  scan has nothing left to drop. What is left is a build whose input is a **join subtree** -- Q05's is 14 columns
+  of which 9 are dead, and that is where the gigabytes are -- or a `Filter` whose predicate column dies there, or
+  a `Compute`. It is not a universal win and the table above is not a suite-wide one.
+
   **Dropped where the column is first copied, which is the only place early enough.** A build part takes its rows
   with `arrow::compute::Take`, which materialises every column it is given in partition order; a column not given
   costs neither the copy nor the bytes. Dropping later, when the table is built, was measured and is worth far
@@ -584,22 +590,28 @@ this profiling fires:
 
   - **A dropped column is a `NullArray`, not an absent one.** The batch keeps its width, so a `JoinRowRef`, a key
     index and `ChunkColumns` all mean what they did; only the field's type differs, and `plan::ToArrow` maps no
-    engine type to `null`, which makes that an unambiguous marker. `ChunkColumns::column` aborts on it. That
-    guard is the whole reason this is safe to build on an id-keyed set: a column missing from `needed_above`
-    reads as unneeded, and `CloneWithFreshIds` mints ids no earlier pass can know, so the failure has to be a
-    crash and not a NULL in an answer.
+    engine type to `null`, which makes that an unambiguous marker. `ChunkColumns::column` aborts on it -- **as a
+    backstop and not as the safety net**, which the first draft of this entry had the wrong way round. Every
+    caller that gathers a build's output asks `retains()` first and so never reaches that abort for a dropped
+    column; for an inner join the residual is evaluated on the materialized output batch, where a dropped column
+    is a real-typed all-NULL array and nothing can tell. So what makes a wrong set safe is **upstream**: the
+    physical planner keeps every column unless every id of `needed_above` is one the join outputs, which is
+    exactly the `CloneWithFreshIds` signature -- ids minted by a later pass that this set cannot know.
   - **Three things are held beyond what `needed_above` says**, and the first was a bug the guard caught. A
     **residual** is evaluated by the join, so its columns are needed here though `needed_above` -- what a node
     *above* reads -- excludes them by construction; the planner adds them, mapping each from a position in the
     join's output back to one in the build's own. A **key** is forced by `JoinBuildSpec::Make`, since the build
     hashes it and the direct layout indexes by it. And an **empty set** retains everything, which is every
     hand-built or unoptimized plan.
-  - **What the tests can and cannot reach.** The spec's own rules are unit-tested. Whether the right set reaches
-    a build is not: `src/exec/tests`' harness builds scans with fields and no column ids, so `OutputIds` of one
-    is empty and the planner keeps every column -- the feature is invisible there. The end-to-end property lives
-    in the `.slt` suite, which goes through the binder, and it earned its place: those cases are what aborted
-    when the residual was forgotten. `joins/inner.slt` gains three cases whose `cols_dropped` was read
-    individually, so each drops what its comment claims rather than passing by dropping nothing.
+  - **What the tests reach, and how.** The spec's own rules are unit-tested, and so is the executor half: a
+    build is handed a retain set directly, which needs no column ids and so works in `src/exec/tests` -- what
+    does not work there is deriving one, since that harness builds scans with no ids, so `OutputIds` of one is
+    empty and the planner keeps every column. That case pins the NullArray in the retained chunk, the key beside
+    it still gathering, the output presenting the dropped field with its declared type, and a sliced input batch.
+    The end-to-end property lives in the `.slt` suite, which goes through the binder, and it earned its place:
+    those cases are what aborted when the residual was forgotten. `joins/inner.slt` gains four, each with its
+    `cols_dropped` read individually -- three that drop a column, by the shapes named above, and one with a real
+    residual that drops nothing and pins that the mapping does not take what the join itself needs.
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.
