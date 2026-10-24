@@ -41,3 +41,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0030](0030-shared-sub-plans.md) | Shared sub-plans: computing an identical sub-plan once | Accepted |
 | [0031](0031-runtime-knobs.md) | Runtime knobs: a decision switchable without a rebuild, globally and per operator | Proposed |
 | [0032](0032-aggregate-placement.md) | Aggregate placement: computing a grouped aggregate below the join that reads it | Accepted |
+| [0033](0033-standalone-static-binary.md) | A standalone static binary for releases and performance work | Proposed |

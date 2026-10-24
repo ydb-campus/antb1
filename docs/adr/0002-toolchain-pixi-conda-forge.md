@@ -38,6 +38,9 @@ Accepted
   CI passes `-e` and `--frozen` explicitly. Tasks call CMake presets (`CMakePresets.json`), and build trees live in
   `build/<preset>`.
 - CMake finds dependencies with plain `find_package`, so a system installation of the same libraries also works.
+- Update (2026-10-25): [ADR 0033](0033-standalone-static-binary.md) adds a fourth environment, `static`, for the
+  standalone release binary. It keeps this toolchain but builds Arrow and its bundled dependencies from pinned
+  sources instead of taking conda-forge's Arrow; every other environment is unchanged.
 - Never `-stdlib=libc++` on Linux and never `_GLIBCXX_DEBUG`; the configure step rejects both in `CMAKE_CXX_FLAGS`.
   Debug builds use `_GLIBCXX_ASSERTIONS` (and libc++ hardening on macOS).
 - A new machine is set up with `bash scripts/agent-setup.sh` (Linux) or a pixi installation (macOS).

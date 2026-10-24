@@ -1,5 +1,6 @@
 # Nightly deep checks on main (advisory, never a merge gate): long fuzzing, ThreadSanitizer, the ClickBench data
-# tests under ASan and on ARM64, a long random differential run and shuffled test order. A failure opens one issue
+# tests under ASan and on ARM64, a long random differential run, shuffled test order, and the standalone static
+# build from scratch on its three targets plus every hermetic test against its static Arrow. A failure opens one issue
 # labelled nightly-failure (or comments on the open one) with the failing jobs and the commands that reproduce them.
 # Every job name contains its local command (docs/ci.md). The jobs only read caches (CI on main writes them).
 name: Nightly
@@ -250,12 +251,94 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # The standalone static build from scratch (docs/adr/0033-standalone-static-binary.md): no Arrow prefix cache, so
+  # every pinned source is downloaded again (a dead upstream URL shows here first) and built as a release would.
+  static-cold:
+    name: static-cold ${{ matrix.target }} (pixi run static)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+            parallel: 4
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            parallel: 4
+          - target: darwin-arm64
+            os: macos-15 # arm64: 3 cores, 7 GB RAM
+            parallel: 3
+    env:
+      ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          environments: static
+          locked: true
+          cache: false # a cold build; setup-pixi rejects a cache-key without caching
+          cache-write: false
+      - name: Build, package and check from scratch (pixi run static)
+        run: pixi run --frozen -e static static
+
+  # Every hermetic test built in build/static against the static Arrow (preset static), on the prefix that the
+  # static workflow saved from main.
+  static-test:
+    name: static-test (pixi run static-test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150 # every test executable is a ThinLTO link over the static Arrow: about 4 CPU-hours
+    permissions:
+      contents: read # checkout
+    env:
+      ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          environments: static
+          locked: true
+          cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
+          cache-write: false
+      - name: Arrow prefix key (pixi run static-arrow --print-key)
+        id: key
+        run: |
+          key=$(pixi run --frozen -e static static-arrow --print-key)
+          [[ "$key" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::static-arrow --print-key printed '$key'"; exit 1; }
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+      - name: Restore the Arrow prefix
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/arrow/${{ steps.key.outputs.key }}
+          key: static-arrow-linux-x86_64-${{ steps.key.outputs.key }}
+      - name: Build and run every hermetic test (pixi run static-test)
+        run: pixi run --frozen -e static static-test
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@6ef3fdcfcd5f0b5d14df3e659ef19b8c6820f93d # v6.6.1
+        with:
+          report_paths: build/static/junit.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+
   # Opens an issue (labels nightly-failure, agent-task) for a failed night, or comments on the open one, with the
   # failing jobs, the run URL and the local commands. Every value reaches the script through env:, never inline. A
   # job cancelled on its own (a timeout) counts as failed; a cancelled workflow run reports nothing.
   report:
     name: report
-    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle]
+    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle, static-cold, static-test]
     if: >-
       ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-slim
@@ -280,6 +363,8 @@ jobs:
             [arm64]='pixi run release && pixi run test-data (on linux-aarch64)'
             [diff-extended]="ANTB1_DIFF_SEED=$RUN_ID ANTB1_DIFF_COUNT=20000 pixi run diff-random"
             [ci-shuffle]='pixi run ci-shuffle'
+            [static-cold]='ANTB1_ARROW_DIR=<an empty directory> pixi run static (on each target)'
+            [static-test]='pixi run static-test'
           )
           body="$RUNNER_TEMP/nightly-failure.md"
           {

@@ -25,6 +25,8 @@
 
 #include <CLI/CLI.hpp>
 #include <arrow/api.h>
+#include <arrow/config.h>
+#include <arrow/util/compression.h>
 #include <arrow/util/config.h>
 
 #include "antb1/common/narrow.h"
@@ -35,6 +37,7 @@
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
+#include "allocator.h"
 #include "cli_internal.h"
 #include "memory_size.h"
 #include <spawn.h>
@@ -42,6 +45,58 @@
 #include <sys/wait.h>
 
 namespace antb1::cli {
+
+namespace {
+
+// What `antb1 version --verbose` prints after the version line, one "<key>: <value>" line each:
+// commit, build type, compiler, flavor, CPU baseline, target, Arrow's build (GetBuildInfo) and SIMD
+// levels, the availability of the five Parquet codecs, the memory pool and the mimalloc purge delay
+// in effect (docs/adr/0033).
+std::string VersionDetails() {
+#if defined(__linux__) && defined(__x86_64__)
+  constexpr std::string_view kTarget = "linux-x86_64";
+#elif defined(__linux__) && defined(__aarch64__)
+  constexpr std::string_view kTarget = "linux-aarch64";
+#elif defined(__APPLE__) && defined(__aarch64__)
+  constexpr std::string_view kTarget = "darwin-arm64";
+#else
+  constexpr std::string_view kTarget = "unknown";
+#endif
+  const arrow::BuildInfo& arrow_build = arrow::GetBuildInfo();
+  const arrow::RuntimeInfo runtime = arrow::GetRuntimeInfo();
+  std::string codecs;
+  for (const auto& [name, codec] :
+       {std::pair{"snappy", arrow::Compression::SNAPPY},
+        std::pair{"gzip", arrow::Compression::GZIP},
+        std::pair{"brotli", arrow::Compression::BROTLI},
+        std::pair{"zstd", arrow::Compression::ZSTD}, std::pair{"lz4", arrow::Compression::LZ4}}) {
+    codecs += std::format("{}{} {}", codecs.empty() ? "" : ", ", name,
+                          arrow::util::Codec::IsAvailable(codec) ? "yes" : "no");
+  }
+  const char* purge_delay = PurgeDelaySetting();  // the restart sets -1 (allocator.h)
+  std::string out;
+  out += std::format("commit: {}\n", GitSha().empty() ? "unknown" : GitSha());
+  out += std::format("build type: {}\n", BuildType());
+  out += std::format("compiler: {}\n", CompilerVersion());
+  out += std::format("flavor: {}\n", BuildFlavor());
+  out +=
+      std::format("cpu baseline: {}\n", CpuBaseline().empty() ? "compiler default" : CpuBaseline());
+  out += std::format("target: {}\n", kTarget);
+  out += std::format(
+      "arrow: {} (headers {}, {}, git {}, {} {})\n", arrow_build.version_string,
+      ARROW_VERSION_STRING,
+      arrow_build.package_kind.empty() ? "no package kind" : arrow_build.package_kind,
+      arrow_build.git_id.substr(0, 12), arrow_build.compiler_id, arrow_build.compiler_version);
+  out += std::format("arrow simd: {} in use, {} detected\n", runtime.simd_level,
+                     runtime.detected_simd_level);
+  out += std::format("codecs: {}\n", codecs);
+  out += std::format("memory pool: {}\n", arrow::default_memory_pool()->backend_name());
+  out +=
+      std::format("mimalloc purge delay: {}\n", purge_delay == nullptr ? "default" : purge_delay);
+  return out;
+}
+
+}  // namespace
 
 std::string_view ErrorKind(const arrow::Status& status) {
   if (auto detail = plan::GetSqlError(status)) {
@@ -87,6 +142,7 @@ struct Inputs {
   double build_side_ratio = 4.0;    // --build-side-ratio (query, explain and bench)
   std::string join_order = "cost";  // --join-order (query, explain and bench)
   BenchSettings bench;
+  bool verbose = false;  // version --verbose
 };
 
 // The default of --threads: the machine's hardware threads, as DuckDB's `threads` setting.
@@ -283,7 +339,7 @@ int Bench(engine::Session& session, const Inputs& in, double load_time, const Cl
 #endif
   BenchReport report{.date = hooks.today(),
                      .machine = in.bench.machine.empty() ? DefaultMachine() : in.bench.machine,
-                     .git_sha = in.bench.git_sha,
+                     .git_sha = in.bench.git_sha.empty() ? std::string(GitSha()) : in.bench.git_sha,
                      .batch_size = engine::SessionOptions{}.batch_size,
                      .threads = in.threads,
                      .memory_limit = session.options().memory_limit,
@@ -371,7 +427,9 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
       ->required()
       ->type_name("FILE");
   bench->add_option("--machine", in.bench.machine, "Machine description (default: this host)");
-  bench->add_option("--git-sha", in.bench.git_sha, "Commit of the build, recorded in the JSON");
+  bench->add_option(
+      "--git-sha", in.bench.git_sha,
+      "Commit of the build, recorded in the JSON (default: the one built in, if any)");
   bench->add_flag("--drop-caches", in.bench.drop_caches,
                   "Drop the page cache (sudo -n) before the first try of every query (Linux)");
   AddThreadsOption(bench, in);
@@ -379,7 +437,10 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
   AddBuildSideRatioOption(bench, in);
   AddJoinOrderOption(bench, in);
 
-  const auto* version = app.add_subcommand("version", "Print version information");
+  auto* version = app.add_subcommand("version", "Print version information");
+  version->add_flag("--verbose", in.verbose,
+                    "Also print how this binary was built: commit, flavor, compiler, CPU baseline, "
+                    "Arrow's build and codecs, the memory pool");
 
   std::vector<const char*> argv;
   argv.reserve(args.size());
@@ -399,6 +460,9 @@ int RunCli(std::span<const std::string> args, std::istream& in_stream, std::ostr
 
   if (version->parsed()) {
     out << std::format("antb1 {} (Apache Arrow {})\n", Version(), ARROW_VERSION_STRING);
+    if (in.verbose) {
+      out << VersionDetails();
+    }
     return kExitOk;
   }
 

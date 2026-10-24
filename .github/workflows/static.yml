@@ -1,0 +1,104 @@
+# Keep-green job of the standalone static build (docs/adr/0033-standalone-static-binary.md, docs/ci.md): on the
+# three release targets, build the static Arrow prefix and the standalone antb1, package it and check the packaged
+# file (`pixi run static`). Advisory: not part of `CI OK`. Runs on PRs that touch the build, on every push to main
+# and by hand; main and manual runs keep their tarballs 30 days for the perf hosts. Hardening as in ci.yml; the
+# Arrow prefix cache is written only from main.
+name: static
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - CMakeLists.txt
+      - "**/CMakeLists.txt"
+      - CMakePresets.json
+      - cmake/**
+      - pixi.lock
+      - pixi.toml
+      - scripts/static-arrow.sh
+      - scripts/static-check.sh
+      - scripts/static.sh
+      - scripts/static_gates.py
+      - src/cli/**
+      - src/common/**
+      - .github/workflows/static.yml
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  static:
+    name: static ${{ matrix.target }} (pixi run static)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+            parallel: 4
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            parallel: 4
+          - target: darwin-arm64
+            os: macos-15 # arm64: 3 cores, 7 GB RAM
+            parallel: 3
+    env:
+      ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel }}
+      CCACHE_MAXSIZE: 250M
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          environments: static
+          locked: true
+          cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
+          cache-write: false
+      - name: Arrow prefix key (pixi run static-arrow --print-key)
+        id: key
+        run: |
+          key=$(pixi run --frozen -e static static-arrow --print-key)
+          [[ "$key" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::static-arrow --print-key printed '$key'"; exit 1; }
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+      - name: Restore the Arrow prefix
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/arrow/${{ steps.key.outputs.key }}
+          key: static-arrow-${{ matrix.target }}-${{ steps.key.outputs.key }}
+      - name: Build the Arrow prefix (pixi run static-arrow)
+        run: pixi run --frozen -e static static-arrow
+      # Only a prefix that static-arrow completed (its gates passed) is saved; a failed build leaves no step to save.
+      - name: Save the Arrow prefix (main only)
+        if: >-
+          ${{ success() && steps.restore.outputs.cache-hit != 'true'
+          && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/arrow/${{ steps.key.outputs.key }}
+          key: static-arrow-${{ matrix.target }}-${{ steps.key.outputs.key }}
+      - name: Build, package and check (pixi run static)
+        run: pixi run --frozen -e static static
+      - name: Upload the package (main and manual runs, 30 days)
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antb1-${{ matrix.target }}
+          path: |
+            build/static/package/antb1-*.tar.gz
+            build/static/package/SHA256SUMS
+          retention-days: 30
+          if-no-files-found: error

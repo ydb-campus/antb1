@@ -3,7 +3,7 @@ add_library(antb1_fixturegen_lib STATIC hits_schema.cc fixtures.cc star.cc)
 target_include_directories(antb1_fixturegen_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   antb1_fixturegen_lib
-  PUBLIC Arrow::arrow_shared Parquet::parquet_shared
+  PUBLIC Arrow::arrow_${ANTB1_ARROW_LINKAGE} Parquet::parquet_${ANTB1_ARROW_LINKAGE}
   PRIVATE antb1::build_options
 )
 

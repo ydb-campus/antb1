@@ -23,6 +23,10 @@ bool NeedsAllocatorRestart(const EnvLookup& env);
 // is).
 bool IsSameProgram(std::string_view exe, std::string_view argv0);
 
+// The MIMALLOC_PURGE_DELAY this process runs with (the restart sets -1), or nullptr when it is
+// unset.
+const char* PurgeDelaySetting();
+
 // Restarts the process (the same executable, arguments and open files) with MIMALLOC_PURGE_DELAY=-1
 // when NeedsAllocatorRestart and IsSameProgram: mimalloc reads its options when Arrow is loaded,
 // before main, so a process cannot change them for itself. Returns only when no restart is needed

@@ -449,6 +449,11 @@ jobs:
             gh cache list -R "$REPO" --key "ccache-$leg-" --sort created_at --order desc --limit 100 --json id \
               --jq '.[1:][].id' | delete
           done
+          # The static Arrow prefix of each target (static.yml): only the newest key survives.
+          for target in linux-x86_64 linux-aarch64 darwin-arm64; do
+            gh cache list -R "$REPO" --key "static-arrow-$target-" --sort created_at --order desc --limit 100 --json id \
+              --jq '.[1:][].id' | delete
+          done
           gh cache list -R "$REPO" --limit 100 --json key,sizeInBytes \
             --jq '"### Caches after cache-gc", "", (.[] | "- \(.key): \(.sizeInBytes / 1048576 | floor) MiB")' \
             >> "$GITHUB_STEP_SUMMARY"

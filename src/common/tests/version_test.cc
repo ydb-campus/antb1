@@ -16,5 +16,15 @@ TEST(VersionTest, VersionCompilerAndBuildType) {
   EXPECT_FALSE(BuildType().empty());
 }
 
+TEST(VersionTest, BuildIdentity) {
+  EXPECT_TRUE(std::regex_match(std::string(GitSha()), std::regex(R"(([0-9a-f]{40}(-dirty)?)?)")))
+      << GitSha();
+  EXPECT_TRUE(BuildFlavor() == "dynamic" || BuildFlavor() == "static-thinlto") << BuildFlavor();
+  // Only the standalone build raises the CPU baseline (cmake/static/toolchain.cmake).
+  EXPECT_TRUE(CpuBaseline().empty() ||
+              (BuildFlavor() == "static-thinlto" && CpuBaseline().starts_with("-m")))
+      << CpuBaseline();
+}
+
 }  // namespace
 }  // namespace antb1

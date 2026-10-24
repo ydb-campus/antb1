@@ -18,6 +18,12 @@ std::string CompilerVersion() {
 #endif
 }
 
+std::string_view GitSha() { return ANTB1_GIT_SHA; }
+
+std::string_view BuildFlavor() { return ANTB1_BUILD_FLAVOR; }
+
+std::string_view CpuBaseline() { return ANTB1_CPU_BASELINE; }
+
 std::string_view BuildType() {
   constexpr std::string_view kBuildType = ANTB1_BUILD_TYPE;
   if constexpr (kBuildType.empty()) {

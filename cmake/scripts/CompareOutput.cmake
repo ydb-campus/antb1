@@ -16,6 +16,10 @@
 # so golden files hold no local paths. Regexes (CMake syntax) see the output without its final newline.
 # With ANTB1_UPDATE_GOLDENS=1 in the environment the golden files are rewritten instead of compared
 # (removed for empty output; review the diff); the exit code and the regexes are still checked.
+#
+# The CLI goldens pass -DANTB1_CLI=ON. For them, ANTB1_CLI_UNDER_TEST=<absolute path> in the environment runs that
+# file instead of the build tree's antb1: scripts/static.sh checks the packaged standalone binary this way. It is
+# refused together with ANTB1_UPDATE_GOLDENS, so goldens are only ever written from the build tree's binary.
 cmake_minimum_required(VERSION 3.28)
 
 set(_command "")
@@ -30,6 +34,22 @@ foreach(_i RANGE 0 ${_last})
 endforeach()
 if(NOT _command OR NOT DEFINED NAME OR NOT DEFINED GOLDEN_DIR OR NOT DEFINED EXIT_CODE)
   message(FATAL_ERROR "CompareOutput.cmake: needs -DNAME, -DGOLDEN_DIR, -DEXIT_CODE and a command after --")
+endif()
+
+if(ANTB1_CLI AND NOT "$ENV{ANTB1_CLI_UNDER_TEST}" STREQUAL "")
+  set(_under_test "$ENV{ANTB1_CLI_UNDER_TEST}")
+  if("$ENV{ANTB1_UPDATE_GOLDENS}" STREQUAL "1")
+    message(FATAL_ERROR "CompareOutput.cmake: ANTB1_CLI_UNDER_TEST is never used together with ANTB1_UPDATE_GOLDENS")
+  endif()
+  if(NOT IS_ABSOLUTE "${_under_test}" OR NOT EXISTS "${_under_test}" OR IS_DIRECTORY "${_under_test}")
+    message(
+      FATAL_ERROR
+      "CompareOutput.cmake: ANTB1_CLI_UNDER_TEST must be the absolute path of a file: '${_under_test}'"
+    )
+  endif()
+  list(POP_FRONT _command _replaced)
+  list(PREPEND _command "${_under_test}")
+  message("CompareOutput.cmake: ANTB1_CLI_UNDER_TEST=${_under_test} instead of ${_replaced}")
 endif()
 
 set(_input "")

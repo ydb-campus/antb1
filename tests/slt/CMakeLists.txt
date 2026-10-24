@@ -24,8 +24,8 @@ set_source_files_properties(runner/sha256.cc PROPERTIES COMPILE_OPTIONS "-O2")
 target_include_directories(antb1_slt_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/runner" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   antb1_slt_lib
-  PUBLIC antb1::engine antb1::io antb1::plan antb1::common Arrow::arrow_shared
-  PRIVATE antb1::build_options Parquet::parquet_shared
+  PUBLIC antb1::engine antb1::io antb1::plan antb1::common Arrow::arrow_${ANTB1_ARROW_LINKAGE}
+  PRIVATE antb1::build_options Parquet::parquet_${ANTB1_ARROW_LINKAGE}
 )
 if(ANTB1_HAVE_DUCKDB)
   target_sources(antb1_slt_lib PRIVATE runner/duckdb_engine.cc)
@@ -57,7 +57,7 @@ antb1_add_gtest(
     tests/slt_file_test.cc
     tests/supported_features_test.cc
     tests/tables_test.cc
-  LIBS antb1_slt_lib Parquet::parquet_shared
+  LIBS antb1_slt_lib Parquet::parquet_${ANTB1_ARROW_LINKAGE}
 )
 # fuzz/ for sql_parser_property.h: generated queries must keep the parser's round-trip property.
 target_include_directories(antb1_slt_tests PRIVATE "${PROJECT_SOURCE_DIR}/fuzz")

@@ -11,8 +11,8 @@ target_link_libraries(
     antb1::io
     antb1::exec
     antb1::common
-    ArrowCompute::arrow_compute_shared
-    Parquet::parquet_shared
+    ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
+    Parquet::parquet_${ANTB1_ARROW_LINKAGE}
     benchmark::benchmark
     antb1::build_options
 )

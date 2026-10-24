@@ -24,6 +24,7 @@ option(ANTB1_BUILD_TESTS "Build tests" ${PROJECT_IS_TOP_LEVEL})
 option(ANTB1_BUILD_BENCHMARKS "Build Google Benchmark micro benchmarks" OFF)
 option(ANTB1_CLANG_TIDY "Run clang-tidy on every translation unit" OFF)
 option(ANTB1_FUZZ_ONLY "Build only the Arrow-free modules (common, sql) and fuzz/: no Arrow, Parquet or CLI11" OFF)
+set(ANTB1_GIT_SHA "" CACHE STRING "Commit recorded in the binary (antb1 version --verbose); set by scripts/static.sh")
 
 include(Antb1Toolchain) # global flags: ccache, linker, sanitizers, coverage, compiler guard
 include(Antb1BuildOptions) # antb1::build_options (warnings) for our targets only

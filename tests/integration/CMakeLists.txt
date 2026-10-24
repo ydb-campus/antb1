@@ -6,5 +6,5 @@ antb1_add_fixture_gtest(
   LABEL integration
   PREFIX integration
   SOURCES session_test.cc parquet_errors_test.cc glob_test.cc scan_test.cc join_test.cc
-  LIBS antb1::engine antb1::exec antb1::io antb1::plan Arrow::arrow_shared
+  LIBS antb1::engine antb1::exec antb1::io antb1::plan Arrow::arrow_${ANTB1_ARROW_LINKAGE}
 )

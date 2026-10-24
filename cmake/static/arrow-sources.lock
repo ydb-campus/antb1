@@ -1,0 +1,19 @@
+# Sources of the static build (docs/adr/0033-standalone-static-binary.md), pinned by sha256 and size: Apache Arrow
+# 25.0.0, the version pixi.lock pins for env `default`, and the dependencies Arrow bundles for the features
+# cmake/static/arrow.cmake enables, at the versions and checksums of Arrow's cpp/thirdparty/versions.txt.
+# `pixi run static-arrow` (scripts/static-arrow.sh) downloads them once into $ANTB1_ARROW_DIR/src (default
+# ~/.cache/antb1/arrow/src) and points each <variable> (Arrow's ARROW_<DEP>_URL) at the local file, so the Arrow
+# build reads no network. An Arrow upgrade replaces every line (docs/recipes/dependency-update.md).
+# One file per line: <name> <sha256> <bytes> <url> <variable>; `-` for Arrow's own source.
+apache-arrow-25.0.0.tar.gz 12afc2dc8137bdd4a68876cec939f664c9d55cfc7b75f55b45163ebb4e344d81 17480910 https://archive.apache.org/dist/arrow/arrow-25.0.0/apache-arrow-25.0.0.tar.gz -
+brotli-v1.0.9.tar.gz f9e8d81d0405ba66d181529af42a3354f838c939095ff99930da6aa9cdf6fe46 486984 https://github.com/google/brotli/archive/v1.0.9.tar.gz ARROW_BROTLI_URL
+lz4-v1.10.0.tar.gz 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b 387114 https://github.com/lz4/lz4/archive/v1.10.0.tar.gz ARROW_LZ4_URL
+mimalloc-v3.3.1.tar.gz 42c16914168ac6741eeb407e83b93a12b2b7ee25a7e14e6b4807fab8b577a540 1408642 https://github.com/microsoft/mimalloc/archive/v3.3.1.tar.gz ARROW_MIMALLOC_URL
+rapidjson-232389d4f1012dddec4ef84861face2d2ba85709.tar.gz b9290a9a6d444c8e049bd589ab804e0ccf2b05dc5984a19ed5ae75d090064806 1107967 https://github.com/miloyip/rapidjson/archive/232389d4f1012dddec4ef84861face2d2ba85709.tar.gz ARROW_RAPIDJSON_URL
+re2-2023-03-01.tar.gz 7a9a4824958586980926a300b4717202485c4b4115ac031822e29aa4ef207e48 383282 https://github.com/google/re2/archive/2023-03-01.tar.gz ARROW_RE2_URL
+snappy-1.2.2.tar.gz 90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc 1108618 https://github.com/google/snappy/archive/1.2.2.tar.gz ARROW_SNAPPY_URL
+thrift-0.22.0.tar.gz 794a0e455787960d9f27ab92c38e34da27e8deeda7a5db0e59dc64a00df8a1e5 4422267 https://archive.apache.org/dist/thrift/0.22.0/thrift-0.22.0.tar.gz ARROW_THRIFT_URL
+utf8proc-v2.10.0.tar.gz 6f4f1b639daa6dca9f80bc5db1233e9cbaa31a67790887106160b33ef743f136 199045 https://github.com/JuliaStrings/utf8proc/archive/v2.10.0.tar.gz ARROW_UTF8PROC_URL
+xsimd-14.2.0.tar.gz 21e841ab684b05331e81e7f782431753a029ef7b7d9d6d3ddab837e7782a40ee 339961 https://github.com/xtensor-stack/xsimd/archive/14.2.0.tar.gz ARROW_XSIMD_URL
+zlib-1.3.1.tar.gz 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 1512791 https://zlib.net/fossils/zlib-1.3.1.tar.gz ARROW_ZLIB_URL
+zstd-1.5.7.tar.gz eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3 2434947 https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz ARROW_ZSTD_URL

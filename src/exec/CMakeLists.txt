@@ -37,8 +37,8 @@ antb1_add_module(
     row_count.cc
     physical_planner.cc
   PUBLIC_DEPS common plan
-  PUBLIC_LIBS Arrow::arrow_shared
-  PRIVATE_LIBS ArrowCompute::arrow_compute_shared
+  PUBLIC_LIBS Arrow::arrow_${ANTB1_ARROW_LINKAGE}
+  PRIVATE_LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
 )
 
 if(ANTB1_BUILD_TESTS)
@@ -70,7 +70,7 @@ if(ANTB1_BUILD_TESTS)
       tests/memory_test.cc
       tests/gather_test.cc
       tests/hash_join_test.cc
-    LIBS ArrowCompute::arrow_compute_shared
+    LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
   # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.
   # ThreadSanitizer's runtime defines them too: this one links without the sanitizer's C++ part, and the
@@ -80,7 +80,7 @@ if(ANTB1_BUILD_TESTS)
     LABEL unit
     PREFIX exec
     SOURCES tests/bad_alloc_test.cc
-    LIBS antb1::exec ArrowCompute::arrow_compute_shared
+    LIBS antb1::exec ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
   if("thread" IN_LIST ANTB1_SANITIZE)
     target_link_options(antb1_exec_bad_alloc_tests PRIVATE -fno-sanitize-link-c++-runtime)

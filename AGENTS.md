@@ -24,8 +24,8 @@ agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subse
 - Linux: `bash scripts/agent-setup.sh` installs pixi 0.81.0 if missing and the locked `default` and `lint` envs
   (add `--envs "default lint gcc"` for the GCC leg); put `pixi` on `PATH`, then run `pixi run doctor`. macOS (Apple
   silicon): install pixi 0.81.0 or newer from <https://pixi.prefix.dev>. Installed environments work offline.
-- Environments: `default` (Clang 23 with libstdc++ 15 on Linux and libc++ on macOS, Arrow 25, CLI11, GoogleTest,
-  DuckDB for tests), `gcc` (GCC 15, linux-64 only: `ci-gcc`, `codeql-build`, part of `check-full`), `lint` (linters).
+- Environments: `default` (Clang 23, libstdc++ 15 on Linux, libc++ on macOS, Arrow 25, CLI11, GoogleTest, DuckDB for
+  tests), `gcc` (GCC 15, linux-64: `ci-gcc`, `codeql-build`), `lint` (linters), `static` (own static Arrow, ADR 0033).
 
 ## Commands
 
@@ -38,7 +38,7 @@ agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subse
 | All Linux PR gates: `check` + `asan` + `tidy` + `coverage` + `fuzz-smoke` + `ci-gcc` | `pixi run check-full` |
 | Single legs (coverage floors: `tools/ci/coverage_thresholds.json`); CodeQL traced build (GCC, no tests) | `pixi run ci` · `pixi run asan` · `pixi run ci-gcc` · `pixi run release` · `pixi run tidy` · `pixi run coverage` · `pixi run fuzz-smoke` · `pixi run codeql-build` |
 | Rewrite `.slt` expectations from DuckDB (then review the diff); random differential test vs DuckDB, and its repro | `pixi run slt-complete` · `pixi run diff-random` · `ANTB1_DIFF_SEED=<s> ANTB1_DIFF_ONLY=<case> pixi run diff-random` |
-| Not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order; micro benchmarks (`build/bench/micro.json`) and ClickBench runs of `antb1 bench` (docs/benchmarks.md) | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` · `pixi run bench` · `pixi run bench-clickbench` |
+| Not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order; micro benchmarks (`build/bench/micro.json`) and ClickBench runs of `antb1 bench` (docs/benchmarks.md); the standalone static binary (`static-arrow`: NETWORK once; `build/static/package`, docs/ci.md), its checks and its full test run | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` · `pixi run bench` · `pixi run bench-clickbench` · `pixi run static-arrow` · `pixi run static` · `pixi run static-check` · `pixi run static-test` |
 | ClickBench (NETWORK; files in `~/.cache/antb1`, never committed): pinned download (`--full`: 14.7 GB, host only); redacted data tests (CI `clickbench-hits0`); their nightly ASan run | `pixi run fetch-data` · `pixi run test-data` · `pixi run asan-data` |
 | Environment status; delete build trees; optional git hook (lint on staged files) | `pixi run doctor` · `pixi run doctor --json` · `pixi run clean` · `pixi run install-git-hooks` |
 

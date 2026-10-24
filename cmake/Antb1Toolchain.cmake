@@ -32,7 +32,8 @@ endif()
 
 # macOS: conda-forge's libc++ headers mark newer library functions (e.g. floating-point std::from_chars) as
 # unavailable below the macOS release whose *system* libc++ ships them. antb1 links the pixi environment's own
-# libc++ (rpath from the conda clang config), which provides them, so the markup does not apply; see
+# libc++ (rpath from the conda clang config; the standalone binary links its libc++.a), which provides them, so the
+# markup does not apply; see
 # https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk. Builds against the system
 # libc++ (no conda libc++ next to the compiler) keep Apple's availability checks.
 if(APPLE AND DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/lib/libc++.1.dylib")
@@ -43,6 +44,42 @@ endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(CMAKE_LINKER_TYPE LLD)
 endif()
+
+# The `static` preset (docs/adr/0033-standalone-static-binary.md) links every executable with ThinLTO over the static
+# Arrow, and each link runs its code generation on every core: two links at a time keep a small CI runner's memory in
+# check. (A cache shared by all links does not pay: each executable imports and exports other symbols.)
+if(ANTB1_ARROW_LINKAGE STREQUAL "static")
+  set_property(GLOBAL APPEND PROPERTY JOB_POOLS antb1_thinlto_link=2)
+  set(CMAKE_JOB_POOL_LINK antb1_thinlto_link)
+endif()
+
+# antb1_link_standalone(<target>): link an executable that runs without the pixi environment, the release and perf
+# binary of the `static` preset. Its ThinLTO code generation caches under the build tree, so a relink after a change
+# in one module optimizes only what changed.
+# - Linux: fully static and non-PIE (glibc, libstdc++, libgcc): no loader, no dynamic section. Below glibc 2.34
+#   libstdc++ refers to pthread weakly, so libpthread.a is linked whole; otherwise the weak references stay
+#   undefined and std::call_once, shared_ptr and the thread pool run as single-threaded code.
+# - macOS: Apple ships no static executables. libc++ is linked statically; libSystem and libc++abi come from the
+#   OS. The conda clang config file is skipped on this link only, so the binary gets no LC_RPATH into the
+#   environment (removing one afterwards would break the linker's ad-hoc signature).
+function(antb1_link_standalone target)
+  set(_cache "${PROJECT_BINARY_DIR}/thinlto-cache")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(
+      ${target}
+      PRIVATE -static "LINKER:--gc-sections" "LINKER:--build-id=sha1" "LINKER:--thinlto-cache-dir=${_cache}"
+    )
+    target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,pthread>")
+  elseif(APPLE)
+    target_link_options(
+      ${target}
+      PRIVATE --no-default-config -nostdlib++ "LINKER:-dead_strip" "LINKER:-cache_path_lto,${_cache}"
+    )
+    target_link_libraries(${target} PRIVATE "$ENV{CONDA_PREFIX}/lib/libc++.a" c++abi)
+  else()
+    message(FATAL_ERROR "antb1_link_standalone: no standalone link for ${CMAKE_SYSTEM_NAME}")
+  endif()
+endfunction()
 
 if(ANTB1_SANITIZE)
   if("thread" IN_LIST ANTB1_SANITIZE AND "address" IN_LIST ANTB1_SANITIZE)

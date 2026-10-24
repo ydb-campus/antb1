@@ -4,8 +4,9 @@
 #   * TOML 1.0 only; installable standalone from pixi.toml + pixi.lock.
 #   * NO tasks and NO compilers in the default feature; every task name exists in exactly ONE environment (R001).
 #   * The pixi version 0.81.0 appears identically here, in workflows, scripts/agent-setup.sh and docs (R005).
-# Layout (kept by `tombi format`): the default feature (shared libraries), then one feature per environment with
-# its dependencies and tasks, then [environments]. Every task name exists in exactly one environment, so
+# Layout (kept by `tombi format`): the default feature (conda's Arrow), the task-less features `base` (build and test
+# tools) and `llvm` (the Clang toolchain) that several environments share, then one feature per environment with its
+# dependencies and tasks, then [environments]. Every task name exists in exactly one environment, so
 # `pixi run <task>` needs no `-e` (CI still passes `-e`). Arguments after the task name are forwarded
 # (`pixi run test -R sql`).
 
@@ -17,53 +18,59 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 requires-pixi = ">=0.81.0"
 
-# ---- default feature: libraries + build tools shared by the `default` and `gcc` environments ----
+# ---- default feature: conda's Arrow, for the `default` and `gcc` environments (env `static` builds its own) ----
 [dependencies]
-cmake = "4.4.*"
-ninja = "1.13.*"
-ccache = "4.14.*"
-curl = ">=8.10"                                     # host curl 7.68 lacks --retry-all-errors
-bash = "5.*"                                        # macOS /bin/bash is 3.2
 libarrow = { version = "25.0.*", build = "*cpu*" }  # never the stale arrow-cpp metapackage
 libarrow-compute = "25.0.*"
 libparquet = "25.0.*"
+
+# ---- base (no tasks): build and test tools of the `default`, `gcc` and `static` environments ----
+[feature.base.dependencies]
+cmake = "4.4.*"
+ninja = "1.13.*"
+ccache = "4.14.*"
+curl = ">=8.10"            # host curl 7.68 lacks --retry-all-errors
+bash = "5.*"               # macOS /bin/bash is 3.2
 cli11 = "2.7.*"
 gtest = "1.18.*"
 benchmark = "1.9.*"
-libduckdb-devel = "1.5.*"                           # DuckDB C API: TEST ORACLE ONLY, never linked into src/
+libduckdb-devel = "1.5.*"  # DuckDB C API: TEST ORACLE ONLY, never linked into src/
 duckdb-cli = "1.5.*"
 
 # TPC's dbgen (TPC EULA) for the TPC-H-derived test data only (ADR 0006). Linux only: on osx-arm64 pixi cannot
 # install the package, because re-signing the extension after prefix replacement fails on its DuckDB metadata trailer.
-[target.linux-64.dependencies]
+[feature.base.target.linux-64.dependencies]
 duckdb-extension-tpch = "1.5.*"
 
-[target.linux-aarch64.dependencies]
+[feature.base.target.linux-aarch64.dependencies]
 duckdb-extension-tpch = "1.5.*"
 
-# ---- clang toolchain -> env `default` (primary compiler on every platform) ----
-[feature.clang.dependencies]
+# ---- llvm (no tasks): the Clang toolchain of the `default` and `static` environments ----
+[feature.llvm.dependencies]
 clang = "23.1.*"
 clangxx = "23.1.*"
-clang-tools = "23.1.*"
 llvm-tools = "23.1.*"
 lld = "23.1.*"
 compiler-rt = "23.1.*"
-python = "3.14.*"       # run-clang-tidy, tools/ci/coverage.py
 
-[feature.clang.target.linux-64.dependencies]
+[feature.llvm.target.linux-64.dependencies]
 sysroot_linux-64 = "2.28.*"
 libstdcxx-devel_linux-64 = "15.*"  # clang uses conda libstdc++; NEVER -stdlib=libc++ with conda Arrow
 libgcc-devel_linux-64 = "15.*"     # keep in lockstep with libstdcxx-devel
 
-[feature.clang.target.linux-aarch64.dependencies]
+[feature.llvm.target.linux-aarch64.dependencies]
 sysroot_linux-aarch64 = "2.28.*"
 libstdcxx-devel_linux-aarch64 = "15.*"
 libgcc-devel_linux-aarch64 = "15.*"
 
-[feature.clang.activation.env]
+[feature.llvm.activation.env]
 CC = "clang"
 CXX = "clang++"
+
+# ---- clang -> env `default` (primary compiler on every platform: Clang from feature `llvm`) ----
+[feature.clang.dependencies]
+clang-tools = "23.1.*"
+python = "3.14.*"       # run-clang-tidy, tools/ci/coverage.py
 
 # ---- env `default` (clang) ----
 [feature.clang.tasks.configure]
@@ -192,6 +199,31 @@ cmd = "cmake --workflow --preset ci-gcc"
 description = "Clean, no-ccache GCC build of src/ as traced by CodeQL -> build/codeql"
 cmd = "cmake -E rm -rf build/codeql && cmake --workflow --preset codeql"
 
+# ---- env `static`: the standalone antb1 of releases and perf tests (ADR 0033). No conda Arrow: Arrow 25 and its
+# dependencies are built from the pins in cmake/static/ with the same Clang, -O3 and ThinLTO as antb1 ----
+[feature.static.dependencies]
+libboost-devel = "1.88.*"  # Boost's CMake package (Boost::headers) for Arrow's bundled Thrift; no Boost library is linked
+patch = "*"                # Arrow patches its bundled Thrift only when `patch` (or git) is found
+python = "3.14.*"          # scripts/static_gates.py
+
+[feature.static.tasks.static-arrow]
+description = "NETWORK on the first run: download the sources pinned in cmake/static/arrow-sources.lock (31 MB) and build Arrow 25 and its dependencies as static ThinLTO -O3 libraries into $ANTB1_ARROW_DIR (default ~/.cache/antb1/arrow), one prefix per key; a no-op while the key matches (--print-key, --print-prefix)"
+cmd = "bash scripts/static-arrow.sh"
+
+[feature.static.tasks.static]
+description = "The standalone antb1 (Release -O3 ThinLTO; fully static on Linux) against the static Arrow, checked by static-check and the CLI goldens -> build/static/package/antb1-<target>.tar.gz"
+cmd = "bash scripts/static.sh"
+depends-on = ["static-arrow"]
+
+[feature.static.tasks.static-check]
+description = "Checks of a standalone antb1 (default: the one packaged in build/static): linkage, build identity, allocator restart, codec, thread and error smoke tests"
+cmd = "bash scripts/static-check.sh"
+
+[feature.static.tasks.static-test]
+description = "Nightly static-test: every hermetic test in build/static, against the static Arrow -> build/static/junit.xml"
+cmd = "bash scripts/static.sh --test"
+depends-on = ["static-arrow"]
+
 # ---- lint -> env `lint` (no C++ deps) ----
 [feature.lint.dependencies]
 python = "3.14.*"
@@ -223,6 +255,7 @@ description = "Optional for humans: git uses .githooks/ (lint hooks on staged fi
 cmd = "git config core.hooksPath .githooks"
 
 [environments]
-default = { features = ["clang"] }
-gcc = { features = ["gcc"] }
+default = { features = ["base", "llvm", "clang"], solve-group = "clang" }
+gcc = { features = ["base", "gcc"] }
+static = { features = ["base", "llvm", "static"], no-default-feature = true, solve-group = "clang" }
 lint = { features = ["lint"], no-default-feature = true }
