@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792835969720,
+  "lastUpdate": 1792866225444,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -21996,6 +21996,258 @@ window.BENCHMARK_DATA = {
             "value": 2356.1827679999965,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2355.9194879999977 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ca666731c7387262c36aa52b1778c226197bf59a",
+          "message": "perf(exec): block the direct layout's prefix sum (#232)\n\n## Summary\n\nADR 0026's C5a direct-layout array is built in four passes over an array\nsized by the key **span**.\nTwo of them were serial on the driving thread, between two that already\nused the executor. This\nblocks the prefix sum.\n\nIt is the one part of a direct build whose cost scales with the span\nrather than the rows, so C5a's\nown example pays most for it: **Q5's 22.8 M-row build spans 600 M, the\narray is 2.24 GiB, and one\ncore scans it in 152 ms of pure wall clock.** Blocked over\n`kJoinPartitions` — each block scanning\nits slice, then offset by the exclusive scan of the blocks' totals —\nthat is about 60 ms.\n\nMeasured at SF 100 against the same tree, release arms. 3-repeat control\nover all 22, 7 repeats\ninterleaved and rotated on the queries that move. **All 22 answers\nbyte-identical at both thread\ncounts**, and all 22 physical plans identical to the binary the numbers\ncame from.\n\n| | 4 threads | 14 threads |\n| --- | ---: | ---: |\n| **Q5** | **0.958×** | **0.970×** |\n| Q9 | 0.995× | 0.982× |\n| Q21 | 0.979× | 1.001× |\n| **the 22, geomean** | **0.996×** | **0.997×** |\n\n**This is a modest item and the table is the whole claim.** Q5 is the\nonly query that moves\nconsistently; the suite geomean is under half a percent. Nothing\nregresses — the widest readings\nagainst the branch are Q6 1.011× and Q3 1.008× at 14 threads, both\nsub-second queries whose spreads\noverlap.\n\n## Why it is bit-identical\n\nThe values are `uint32_t` and the operation is integer addition, which\nis associative, so regrouping\nthe sums cannot change a result. No floating point, so no reassociation\ndrift. That is also why the\narms of every existing direct-build test agree without anything new\nbeing asserted about them.\n\nBelow a million entries (4 MiB) the blocks run inline, because a single\ncore scans that in well under\na millisecond and handing out 64 tasks costs more. The counting and\nscatter passes keep the\nunthresholded executor: they are bounded by rows rather than span and\nwere already parallel.\n\n## Two things the measurement says that the plan for it did not\n\n**The gain does not grow with threads.** Parallelising a serial pass\nshould pay more the more threads\nthere are; it pays less. At 14 threads the scan competes for memory\nbandwidth with 14 scan threads,\nand **Q21's sign flips between the two configurations** — 0.979× at 4\nthreads, 1.001× at 14. That\n1.001× is itself a correction: a first 7-repeat reading said 1.011×, and\nthe 3-repeat control put it\nat 1.001×, so the regression was noise. Recorded because it is the only\nquery whose direction is not\nstable.\n\n**The zero-fill half of this item does not exist at this price**, and I\nhad estimated it as the\nlarger half. `offsets_.assign(span + 3, 0)` costs 110–140 ms, and that\nis **page faults, not\nbandwidth** — re-zeroing the same 2.24 GiB over warm pages takes 9.6 ms,\nso the first touch is ~15×\nthe cost of the write. The fix would be to let the pages fault lazily\ninside the parallel counting\npass, which makes correctness depend on the allocator returning *fresh*\npages: a pooled allocator\nmay hand back a recycled dirty block and the index would be built on\ngarbage. Sound only with a\nguaranteed-fresh mapping outside the budget's allocator, which is a\nlarger change than this one and\nis not attempted. ADR 0026's C5b records it so the next reader does not\ntake the obvious route.\n\nMy first attempt did take it, and appeared to work: moving the fill into\na parallel `std::fill`\nmeasured 9.6 ms for 2.24 GiB, which is 233 GiB/s and therefore\nimpossible. `std::vector::resize`\nvalue-initialises, so the zeroing had moved into the allocation where\nthe timer could not see it and\nthe \"parallel fill\" was a redundant second pass over already-faulted\npages.\n\n## Tests\n\n**The parallel path was reached by no hermetic test at all.** Every\nfixture in `hash_join_test.cc`\nhas a span orders of magnitude below the threshold, so the blocked scan\nran only under the benchmark.\nVerified rather than assumed: an assertion that the serial path is\nalways taken **passed all 2882\ntests**, and fails on the new case.\n\n`TheDirectLayoutsBlockedPrefixSumAgreesWithTheSerialOne` builds a\n50,000-row direct table with keys\n25 apart — a span of 1,249,975, under 32 slots a row so the layout is\ndirect, and over the threshold\nso the scan is handed to the executor. It runs both arms, compares them,\nand checks every emitted\npair matches on the key, which is the symptom a misplaced block offset\nproduces.\n\n**What that case does *not* add, stated because I first claimed it\ndid:** the blocking algebra was\nalready covered. Four existing cases fail if a block's total is wrong,\nsince 64 blocks over even a\ntiny span leave several non-empty. What only a real executor can expose\nis a race between blocks,\nand that is what the two-arm comparison is for.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch.\n\n```text\n$ pixi run test                      # Debug, the full hermetic suite\n100% tests passed out of 2883        ANTB1-TESTS: PASS\n\n$ pixi run release\n100% tests passed out of 2884        (exit 0)\n\n$ ANTB1_DIFF_SEED=20261112 pixi run diff-random\nDIFF: PASS seed=20261112 queries=2000 failed=0 unsupported=0\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' src/exec/join_table.cc\nnothing in user code\n```\n\nclang-tidy on the changed test file reports 6 findings, all pre-existing\n— identical count on `main`,\nverified by stashing, none at a line this PR touches. It did catch two\nthings in my own code first: a\nsigned literal as a bitwise operand (`std::size_t{1} << 20`), and\n`typos` rejecting a word in a\ncomment — `_typos.toml` is an \"Ask a human first\" path, so the comment\nwas reworded rather than the\ndictionary extended.\n\nGates with no local substitute: `pixi run asan` (fails at discovery on a\npre-existing\n`curl_global_init` leak), `pixi run tidy` (fails on an unmodified `main`\non this host with 4\nmacOS-only findings, so clang-tidy was run per file) and\n`ci-gcc`/`codeql-build` (linux-64 only).\n\n## Type of change\n\n- [x] perf: performance improvement\n- [ ] feat / fix / refactor / docs / Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0026 gains **C5b** with both configurations'\nmeasurements, the thread-count\n      finding, and why the zero-fill half is not available\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/0026-join-performance.md`\nis CODEOWNERS; @hor911 asked for this item to be measured at both thread\ncounts and opened as a\n      PR with the results\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5)\ninstrumented the four passes of a\ndirect build to locate the serial ones, then measured rather than\nassumed at each step — which\ncaught its own first attempt reporting an impossible 233 GiB/s, and\ncaught that the new code\npath was covered by no test in the suite. Both are described above\nrather than quietly fixed.\nThe estimate that preceded the work was wrong about which half of the\nitem carried the gain.\n- Accountable human (has read and understands the whole diff): @hor911\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-24T21:19:31+03:00",
+          "tree_id": "1462b2c7dd361975d0522fb5033824329b06ca68",
+          "url": "https://github.com/ydb-campus/antb1/commit/ca666731c7387262c36aa52b1778c226197bf59a"
+        },
+        "date": 1792866224109,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5086.25592371975,
+            "unit": "ns/iter",
+            "extra": "iterations: 136654\ncpu: 5085.909406237653 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84362.73954151424,
+            "unit": "ns/iter",
+            "extra": "iterations: 7721\ncpu: 84356.22976298405 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 222140.18678527354,
+            "unit": "ns/iter",
+            "extra": "iterations: 3148\ncpu: 222132.09116899615 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 442725.1035353606,
+            "unit": "ns/iter",
+            "extra": "iterations: 1584\ncpu: 442685.876262626 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 401847.1021813923,
+            "unit": "ns/iter",
+            "extra": "iterations: 1742\ncpu: 401830.0459242249 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2088612.795180681,
+            "unit": "ns/iter",
+            "extra": "iterations: 332\ncpu: 2088450.5481927719 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.76237815384526,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.76020599999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.56149506666619,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.56069606666669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 211.27785699998944,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 211.27409833333328 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.137802200000351,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.136184560000018 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.515933529412344,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.5150972352941 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.869911277776204,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 37.86609322222222 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.9996443617020239,
+            "unit": "ms/iter",
+            "extra": "iterations: 329\ncpu: 1.999571705167175 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 112.98090079999383,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 112.9643250000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.083022759999494,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.080935440000022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.2557126818185,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.25226859090907 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 65.54804545454441,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.54134363636376 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 106.90265766666585,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 106.8851431666668 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 371.57940500000564,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 371.5261969999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1713.2704900000135,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1712.5365870000023 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.70165955000084,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.697717499999925 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.54934861110991,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.54421800000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 68.46450229999732,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.45208100000022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 135.4355948000034,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 135.41976699999978 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 431.7400980000059,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 431.66806999999886 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 2032.2265089999973,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2031.8405360000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.779714833335106,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.77078083333339 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 63.24629518181527,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 63.23725690909109 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 98.34496871428655,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.33096414285691 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 210.32009000000093,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 210.30479799999924 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 556.6792970000165,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 556.5646299999969 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2394.4166330000485,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2394.110834000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.06462960000022,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.04862280000026 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 76.16975188888848,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 76.15920111111132 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 115.77504100000624,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 115.74970566666684 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 240.21785200000068,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 240.1670423333329 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 581.2197930000025,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 581.1894510000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2528.6108939999963,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2528.2390639999976 ms\nthreads: 1"
           }
         ]
       }
