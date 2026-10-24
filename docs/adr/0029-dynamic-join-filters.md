@@ -237,6 +237,79 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       their left (`EmitsBuildRows`). An ANTI building on its right emits precisely the rows a filter would drop.
     - The build must hold at most a sixteenth of the probe's rows. Without this, a query whose build held every key
       of its probe's domain ran **1.138x**: the filter rejected nothing and the probe paid the hash for it.
+    - **The build must not use the direct layout** (added 2026-10-24). A direct probe is two loads of `offsets_`
+      and no hash at all, about half a nanosecond a row, where the filter costs about five -- so it cannot pay
+      there **whatever it would reject**, and it is the one shape where it loses badly. The share bullet above
+      does not cover it: that bounds the build's *rows* against the probe table's and says nothing about key
+      coverage, so a build that is small in rows and covers every key its probe holds passes it.
+      - **Measured by removal, which is the stronger direction, and it is worth more than it looks.** Refusing D1
+        for a direct build takes away filters that reject **137,992,368** and **58,293,472** probe rows -- and
+        the 22 get **faster**: geomean **0.979x on 4 threads and 0.988x on 14**. The geomean is a 3-repeat
+        control over all 22; the per-query rows below are 7 repeats interleaved and rotated over the queries
+        that move, with spreads not overlapping.
+
+        | | 4 threads | 14 threads |
+        | --- | ---: | ---: |
+        | Q11 | **0.838x** | 0.908x |
+        | Q22 | **0.886x** | 0.928x |
+        | Q2 | **0.923x** | 0.964x |
+        | Q16 | 0.949x | 0.970x |
+        | Q21 | 0.975x | 0.989x |
+        | the 22, geomean | **0.979x** | **0.988x** |
+
+        **Nothing regresses.** Q3 is the one to name: a 3-repeat control read it at 1.033x with separated
+        spreads, and 7 rotated repeats put it at **1.006x** with overlapping ones -- the first reading was noise,
+        and it is recorded because a 3% regression on the query this area was last tuned for is exactly what one
+        would want to believe. Those rejected rows were real and bought nothing, which is the mechanism rather
+        than an estimate of it.
+      - **What it fixes outright, measured across the whole direct band** -- 7 repeats interleaved and rotated,
+        4 threads, each shape confirmed from the profile before it was timed. "Whatever it would reject" is meant
+        literally: the filter loses at 0%, at 96.6% and at 99.6% rejection.
+
+        | a direct build under a 200,000,000-row probe | layout arm | it rejected | with this condition |
+        | --- | --- | ---: | ---: |
+        | 5,000,000 dense keys covering the probe entirely | dense | 0% | **0.705x** |
+        | 10,000,000 dense keys (a 32 MB filter) | dense | 0% | **0.718x** |
+        | 2,000,000 keys 30 apart, probe mostly out of range | sparse, 229 MB index | 99.6% | **0.594x** |
+        | the same, every probe key inside the range | sparse, 229 MB index | 96.6% | **0.765x** |
+
+        The first is the ordinary surrogate-key dimension under a fact table: the filter had been costing 42% for
+        nothing, and that was true before the cap moved. The last two are the shape this rule was challenged on
+        -- `kSparseDirectSlotsPerRow` admits 32 slots a row, so a direct index can be hundreds of megabytes and
+        its probe could have been a DRAM miss worth filtering for. It is not: `find` over 200,000,000 rows is
+        29.2 ms with the filter and 552.1 ms without it, summed over parts, so the filter saves half a second of
+        probe and spends about a second being probed. **Nothing beats not probing at all**, which is why the rule
+        is the layout and not the index's size.
+      - **It gates the probe-side arm and must not gate D2.** A build publishes ONE `KeyFilter`, carrying both
+        the per-row bits and the key interval the part test reads, so declining to publish would take part
+        pruning with it. The condition lives in `CanFilterRows` (`physical_planner.cc`), which `KeyScanOf`
+        consults separately from `PartHasNoKey`; a direct build still publishes and still skips a part holding no
+        key of its. Refusing at publication instead fails `APartIsSkippedOnADateKeyToo`, whose build is direct --
+        the D2 case that pins exactly this.
+      - **A cost this appears to leave on the table, and the reason it must be left.** A direct build still
+        sizes, charges and fills bits that this condition stops the probe-side scan from reading, so under a
+        tight `--memory-limit` it carries a reservation that looks wasted; `MakeKeyFilter` runs after `Merged()`
+        and before `Finish()`, so a values-only filter is buildable. **Do not build one.** D5 below reads exactly
+        those bits, and on a direct build they are worth **1.849x** -- publication cannot know whether a D5
+        consumer exists, so withholding the bits would turn that measured win into a loss of the same size. The
+        reservation is the price of not knowing, and this is the second mechanism in this ADR whose cost looks
+        obvious in isolation and reverses once the other consumer is measured.
+      - **D5 is a third path and still takes a direct build's filter.** The filter a join above a grouped
+        aggregate offers that aggregate's own scan carries its own copy of the share gate and no layout test, so
+        this condition does not reach it -- `aggregate_filter_test.cc` has the shape, with a two-row build whose
+        keys span 1. Deliberate rather than overlooked, and now **measured rather than argued**: extending this
+        refusal to D5 costs **1.849x**.
+
+        | a 1,000,000-key dense (direct) build above a grouped aggregate of 100,000,000 rows | |
+        | --- | ---: |
+        | D5's filter kept: it drops 89,908,100 rows, the aggregate builds ~1,000,000 groups | 0.628 s |
+        | D5's filter refused: the aggregate builds 10,091,900 groups | **1.162 s (1.849x)** |
+
+        So the two paths want opposite answers for the same build, and the reason is what each filter is racing:
+        D1's competes with a half-nanosecond probe, while D5's saves the aggregate ten million groups it would
+        otherwise build and throw away. **A cheap probe bounds the first and says nothing about the second.** No
+        query of the 22 has the D5-over-a-direct-build shape -- extending the refusal there changes none of their
+        plans -- so this is synthetic, 7 repeats interleaved and rotated, spreads not overlapping.
     - The filter must fit **32 MB** (16 MB until 2026-10-24). It is probed once a row with no locality at all, so
       it pays only while it stays in cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost
       **17%** on a query whose build held a sixth of its probe's keys.
@@ -270,6 +343,11 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
         | --- | ---: | ---: |
         | **hashed build** (sparse keys, `direct=0`) | `find` 68 ns/row | **1.070x** |
         | **direct build** (dense keys, `direct=1`) | `find` 0.5 ns/row | **1.533x** |
+
+        (That 1.533x is this shape with the cap raised against the same shape with no filter at all, on the
+        branch that raised the cap. The 0.718x recorded under the direct-layout condition above is its
+        reciprocal on the merged tree, 1.393x, measured on different builds a day apart -- the same effect, not
+        a second one.)
 
         **1.070x is the raise's own exposure**, and it is in line with this bullet's existing curve. **1.533x is
         not: it is a pre-existing defect this cap neither creates nor fixes.** A direct build's probe is two

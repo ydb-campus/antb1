@@ -3316,6 +3316,23 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& pl
 // How many scans of the profile applied a key filter (ADR 0029's D1), summed: a scan reports it
 // whether or not it also pushed predicates of its own, so this tells the two arms of a filter test
 // apart.
+// The builds' chosen layouts, summed: `hash_join.cc` records `direct` on each HashBuild node. The
+// tests below assert it because their own premise is which layout a fixture produces, and that is
+// arithmetic over two constants of `join_table.cc` -- a comment saying "span 160 over 5 rows, so
+// hashed" stops being true the moment either constant moves, and nothing would fail.
+int64_t DirectBuildsIn(const ProfileNode& node) {
+  int64_t found = 0;
+  for (const ProfileMetric& metric : node.metrics()) {
+    if (metric.name == "direct") {
+      found += metric.value;
+    }
+  }
+  for (const ProfileNode* child : node.children()) {
+    found += DirectBuildsIn(*child);
+  }
+  return found;
+}
+
 int64_t KeyFiltersIn(const ProfileNode& node) {
   int64_t found = 0;
   for (const ProfileMetric& metric : node.metrics()) {
@@ -3844,11 +3861,17 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
   const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
     return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
   };
-  const auto build_keys = [](int64_t i) -> std::optional<int64_t> { return i * 7; };
+  // Spread 40 apart so that **both** builds below come out HASHED, which D1 now requires: a direct
+  // build takes no per-row filter whatever it would reject, so at `i * 7` the small build's span of
+  // 28 over 5 rows made it direct and this case stopped exercising D1 at all, while the large one
+  // below would have been refused by the layout instead of by the share gate it is here to pin.
+  // At 40: spans 160 over 5 rows and 19,160 over 480, both at or above 32 slots a row.
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> { return i * 40; };
   for (arrow::internal::Executor* executor : Executors(pool.get())) {
     SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
     // 480 probe rows against 5 build rows: 480 / kFilterBuildShare is 30, well above 5, so the
-    // filter is taken. The build's keys are 0, 7, 14, 21 and 28, so most probe keys cannot match.
+    // filter is taken. The build's keys are 0, 40, 80, 120 and 160 against probe keys 0 to 59, so
+    // most probe rows cannot match and two keys can.
     const auto build = MixedTable("b", 1, 5, build_keys);
     for (const plan::JoinKind kind :
          {plan::JoinKind::kInner, plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
@@ -3878,18 +3901,72 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
       EXPECT_EQ(two->filtered_scans(), 6) << "the control's own predicate should be pushed";
       EXPECT_EQ(KeyFiltersIn(control_profile), 0) << "the control must not filter on the keys";
       EXPECT_EQ(KeyFiltersIn(got_profile), filtered ? 1 : 0);
+      // The premise, from the profile and not from the comment above: D1 is refused for a direct
+      // build, so this build must be hashed or the case tests nothing.
+      EXPECT_EQ(DirectBuildsIn(got_profile), 0) << "the build must be hashed for D1 to apply";
       EXPECT_EQ(RowsOf(**got), RowsOf(**control));
       EXPECT_FALSE(RowsOf(**got).empty());
     }
     // A build as large as what it would filter rejects too little to pay for the hash of every
-    // probe row, so it is refused: 480 rows against 480 is far past kFilterBuildShare.
+    // probe row, so it is refused: 480 rows against 480 is far past kFilterBuildShare. Its span is
+    // 19,160 over 480 rows, so it is hashed and the share gate is what refuses it -- the layout
+    // test would otherwise refuse it first and this case would pin nothing.
     const auto wide = MixedTable("p", 6, 80, probe_keys);
     const auto big = MixedTable("b", 6, 80, build_keys);
+    ProfileNode large_profile;
     auto large = RunPlan(
         PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(wide, "p"), ScanOf(big, "b"), {pk}, {bk}), 6),
-        ContextOf(executor));
+        ContextOf(executor), &large_profile);
     ASSERT_TRUE(large.ok()) << large.status().ToString();
     EXPECT_EQ(wide->filtered_scans(), 0) << "a build this size must not be filtered with";
+    // `filtered_scans() == 0` cannot say WHICH gate refused, so the premise is asserted too: this
+    // build must be hashed, or the layout test refuses it first and the share gate is untested.
+    EXPECT_EQ(DirectBuildsIn(large_profile), 0) << "the share gate must be what refuses it";
+  }
+}
+
+// D1 is refused for a direct-layout build, and D2 is NOT. The two live on one object -- a build
+// publishes one `KeyFilter` carrying both the per-row bits and the key interval the part test reads
+// -- so the obvious way to decline the per-row half, not publishing at all, would silently take
+// part pruning with it. Declining inside `CanFilterRows` is what keeps them apart, and this is the
+// case that says so: no per-row filter, every part without a build key still skipped, same answer.
+TEST_F(HashJoinPlanTest, ADirectBuildTakesNoRowFilterAndStillPrunesParts) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  // The probe tiles its key domain 80 to a part, as in the part test above.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> { return i; };
+  // Five keys inside a span of 35, so `span < kDirectSlotsPerRow * rows` holds and the build is
+  // DIRECT -- the layout whose probe is two offset loads and so cannot pay for a filter. They all
+  // fall in part 0, so parts 1 to 5 hold nothing the join can match.
+  const auto build_keys = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 10, 20, 30, 35};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto build = MixedTable("b", 1, 5, build_keys);
+    const auto one = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode profile;
+    auto got = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(one, "p"), ScanOf(build, "b"), {pk}, {bk}), 6),
+        ContextOf(executor), &profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    // The halves, in opposite directions.
+    EXPECT_EQ(DirectBuildsIn(profile), 1) << "the fixture must actually produce a direct build";
+    EXPECT_EQ(KeyFiltersIn(profile), 0) << "a direct build must publish no per-row filter";
+    EXPECT_EQ(one->filtered_scans(), 0) << "and so no part is scanned through a filter";
+    EXPECT_EQ(one->scanned_parts(), (std::vector<int64_t>{0})) << "but the parts are still pruned";
+    // The answer, against a table that reports no statistics and so prunes nothing.
+    const auto two = MixedTable("p", 6, 80, probe_keys);
+    two->set_stats(false);
+    auto control = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(two, "p"), ScanOf(build, "b"), {pk}, {bk}), 6),
+        ContextOf(executor));
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(two->scanned_parts(), (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
   }
 }
 
