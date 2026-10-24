@@ -687,10 +687,14 @@ Project RegionID, c
 
 A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI` or `ONE-ROW`), the input it builds
 on, its key pairs and, when it has any, its residual conditions; its left input follows, then its right input, both
-indented. A column whose binding the plan records is shown qualified, as `a.k`:
+indented. A column whose binding the plan records is shown qualified, as `a.k`. It ends with `carries N of M unread
+above` where the join's output holds columns no node above it reads -- its own keys and residual columns, usually,
+which its inputs must carry to it and no further (ADR 0026's C8a, and the `cols_dropped` metric below is what a build
+did about it). The clause is absent where there are none, and on a plan rendered before `Optimize` has pruned it,
+which records no such set:
 
 ```text
-Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)]
+Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)] carries 2 of 4 unread above
   Scan table=a source=parquet(files=1, rows=1000) columns=[k, x]
   Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
@@ -719,10 +723,10 @@ It shows what no logical plan holds, because the physical planner is what decide
 ```text
 Output: count_star():BIGINT
 PartAggregate Aggregate COUNT(*)
-  HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
+  HashJoin Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
     Filter trips.tr_row >= 100
       Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup], 1 pushed predicate, key filter candidate on tr_pickup
-  HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
+  HashBuild Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 4 of 5 unread above
     Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
 ```
 
@@ -792,8 +796,9 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - a `HashBuild`'s `finish` (the table built from its parts, the arrays of its columns that its gathers read, and a
     one-row join's values), `null_keys` (rows with a NULL key, which no key's range holds and no lookup returns; a join
     that emits the build rows which did not match keeps their rows apart from the table it indexes, since such a row is
-    unmatched by definition), `unique` (1: no key repeats) and `direct` (1: the table indexes its one integer key by
-    value, ADR 0022);
+    unmatched by definition), `unique` (1: no key repeats), `direct` (1: the table indexes its one integer key by
+    value, ADR 0022) and `cols_dropped` (columns of its input it did not have to hold, because nothing above the join
+    reads them: ADR 0026's C8a, and 0 for a build that holds them all);
   - a `RightJoin`'s `emitted` (the build rows it returned: those the probes marked for a semi join, those they did
     not plus the retained NULL-key ones for an anti join).
 - The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,

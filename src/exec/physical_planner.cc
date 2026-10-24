@@ -306,10 +306,58 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
   // fallback that rewrites a node with build=kRight runs before this, so the flag follows the side
   // the join really runs on, not the one the logical plan asked for.
   const bool keep_null_keys = EmitsUnmatchedBuildRows(join.kind, join.build);
+  // Which of the build's columns it has to hold: the ones a node above the join reads, which Prune
+  // recorded on the node, plus its keys (JoinBuildSpec::Make adds those itself). A column the join
+  // carries but nothing above reads costs the build its bytes for the build's whole life, and a
+  // large build of a wide input is where that is measured in gigabytes.
+  //
+  // Empty where the plan says nothing -- an unoptimized or hand-built plan, whose `needed_above` is
+  // empty -- and then every column is held, as it always was.
+  const auto retain_of = [&join, &shape](const arrow::Schema& schema) {
+    std::vector<bool> retain;
+    if (join.needed_above.empty()) {
+      return retain;
+    }
+    const std::vector<plan::ColumnId> ids = plan::OutputIds(*shape.build);
+    if (ids.size() != static_cast<std::size_t>(schema.num_fields())) {
+      return retain;  // the build's operator does not output its node's columns one for one
+    }
+    // **Verified, not trusted.** A column missing from `needed_above` reads as unneeded, so a set
+    // that does not describe THIS join would drop a live column -- and the paths that gather a
+    // build's output test `retains()` before they touch a chunk, so that would be a NULL in an
+    // answer rather than the abort `ChunkColumns` can give. `CloneWithFreshIds` mints ids no
+    // earlier pass can know, which is the shape to catch: if any recorded id is not one this join
+    // outputs, the set is about some other node and nothing is dropped.
+    const std::vector<plan::ColumnId> outputs = plan::OutputIds(plan::LogicalNode(join));
+    for (const plan::ColumnId id : join.needed_above) {
+      if (std::ranges::find(outputs, id) == outputs.end()) {
+        return retain;
+      }
+    }
+    retain.resize(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      retain[i] = std::ranges::binary_search(join.needed_above, ids[i]);
+    }
+    // The join's own residual too, which `needed_above` excludes by construction: that set is what
+    // a node ABOVE reads, and a residual is evaluated here. Matched by ID rather than by position:
+    // `ResolvePositions` gives every residual column an id that occurs once in the two inputs'
+    // outputs, so asking which of the BUILD's ids a conjunct reads needs neither the left input's
+    // width (which the probe and build operators may not agree on) nor a test of which side builds.
+    for (const plan::ExprPtr& conjunct : join.residual) {
+      std::vector<plan::ColumnId> reads;
+      plan::CollectColumnIds(*conjunct, reads);
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        retain[i] = retain[i] || std::ranges::find(reads, ids[i]) != reads.end();
+      }
+    }
+    return retain;
+  };
   const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
+    std::vector<bool> retain = retain_of(*schema);
     return join.kind == plan::JoinKind::kOneRow
                ? JoinBuildSpec::Keyless(std::move(schema))
-               : JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys);
+               : JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys,
+                                     std::move(retain));
   };
   if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
     ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));

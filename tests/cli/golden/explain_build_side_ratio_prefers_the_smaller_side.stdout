@@ -1,7 +1,7 @@
 Output: count_star():BIGINT
 Aggregate COUNT(*)
   Join INNER build=left keys=[b.tr_pickup = c.tr_pickup]
-    Join INNER build=left keys=[a.tr_pickup = b.tr_pickup]
+    Join INNER build=left keys=[a.tr_pickup = b.tr_pickup] carries 2 of 3 unread above
       Filter a.tr_row = 7
         Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup]  [shared #1 of 3, 2 fields]
       Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup]  [shared #1 of 3, 2 fields]

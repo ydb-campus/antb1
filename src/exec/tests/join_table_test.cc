@@ -1469,6 +1469,69 @@ TEST_F(JoinTableTest, RejectsWhatThePlannerMustNotSend) {
 
 // Every part, merge, finish and probe that passes the memory limit fails with OutOfMemory and
 // leaves nothing behind; a finished table holds its memory until it goes.
+// What `retain` means on a spec (ADR 0026's C8a). The set says which of the input's columns the
+// build must hold: a column the join carries but nothing above it reads costs the build its bytes
+// for the build's whole life, and the plan records which those are.
+//
+// Only the spec's own rules are here. Whether the right set reaches a build is a property of the
+// physical planner over a plan with column ids, which `src/exec/tests`' harness does not build --
+// its scans carry fields and no ids, so `OutputIds` of one is empty and the planner keeps every
+// column. The end-to-end property lives in the `.slt` suite, which goes through the binder, and it
+// earns its place: those cases are what aborted when the first implementation forgot that a
+// residual's columns are needed by the join itself.
+TEST_F(JoinTableTest, ASpecRetainsEveryKeyAndWhateverElseItWasGiven) {
+  BuildData data({LogicalType::kBigInt});  // two fields: the key `k0`, then `id`
+  // Nothing asked for: every column held, which is what every build did before this existed.
+  {
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys());
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains_all());
+    EXPECT_TRUE((*spec)->retains(0));
+    EXPECT_TRUE((*spec)->retains(1));
+  }
+  // The payload dropped, the key kept.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_FALSE((*spec)->retains_all());
+    EXPECT_TRUE((*spec)->retains(0));
+    EXPECT_FALSE((*spec)->retains(1));
+  }
+  // **A key is held whatever the set says**: the build hashes it and the direct layout indexes by
+  // it, so a spec that took this at its word would match nothing rather than answer a NULL.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {false, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains(0)) << "the key";
+    EXPECT_FALSE((*spec)->retains(1));
+  }
+  // Asking for everything is the same as asking for nothing, so a build with nothing to drop takes
+  // the path it always took rather than a second one that happens to agree.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, true});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains_all());
+  }
+  // A set of the wrong width is a planner bug: Invalid, never a silently ignored request.
+  {
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true});
+    EXPECT_FALSE(spec.ok());
+    EXPECT_EQ(spec.status().code(), arrow::StatusCode::Invalid);
+  }
+  // Out-of-range positions read as retained, so no caller can turn a bad index into a dropped
+  // column.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains(-1));
+    EXPECT_TRUE((*spec)->retains(2));
+  }
+}
+
 TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
   const auto pool = MakeThreadPool();
   const auto expect_oom = [](const arrow::Status& status) {

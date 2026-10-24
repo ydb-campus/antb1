@@ -324,6 +324,12 @@ struct Pruner {
   LogicalNodePtr operator()(const RowCountNode& /*rows*/) const { return node; }
 
   LogicalNodePtr operator()(const JoinNode& join) const {
+    JoinNode out = join;
+    // `needed` as it arrives is exactly what a node above this join reads, which is the one place
+    // that set exists: recorded before the join's own keys and residual join it below. Sorted so
+    // that the plan a pass produces is a function of its input and not of a hash order.
+    out.needed_above.assign(needed.begin(), needed.end());
+    std::ranges::sort(out.needed_above);
     for (const JoinKey& key : join.keys) {
       Need(needed, key.left);
       Need(needed, key.right);
@@ -333,7 +339,8 @@ struct Pruner {
       CollectColumnIds(*conjunct, reads);
       needed.insert(reads.begin(), reads.end());
     }
-    return WithInputs(*node, {Prune(join.left, needed), Prune(join.right, needed)});
+    const LogicalNodePtr with = Make(std::move(out));
+    return WithInputs(*with, {Prune(join.left, needed), Prune(join.right, needed)});
   }
   LogicalNodePtr operator()(const DependentJoinNode& /*join*/) const {
     // Prune nothing through a dependent join: its right input reads columns of its left input as
