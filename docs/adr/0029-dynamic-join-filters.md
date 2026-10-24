@@ -259,14 +259,30 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
         No other query's plan moves, which is checked by **filter count** and not read off the timings: of the 22
         only these two change (1 to 2 and 3 to 4 filters), the three that read within 1% of noise gain none, and
         the rest publish no key filter in either arm.
-      - **What the raise rests on, and what it does not.** Those two builds are selective -- their filters reject
-        99.0% and most of their probe rows. The quantisation below excludes the one query the 17% was measured on
-        and **only** that one; it is not an argument about the band. A build inside the band whose keys cover
-        nearly all of its probe's would pass the share gate above, which bounds the build's *rows* against the
-        probe table's and not its key coverage, and would get a 32 MB filter that rejects nothing -- the shape
-        this ADR measured at 1.138x, one size class larger. No query of the 22 has it, so it is **unmeasured
-        rather than refused**, and this ADR's own finding is that no static quantity separates it. If the band
-        ever needs defending rather than describing, the gate is selectivity-shaped, not a byte cap.
+      - **The band's worst case, measured rather than described.** The quantisation below excludes the one query
+        the 17% was measured on and **only** that one, so the band needed its own experiment: a build of
+        10,000,000 keys (the largest filter the cap admits, 32 MB) under a 200,000,000-row probe **every one of
+        whose keys is in the build**, so the filter rejects nothing and is pure overhead. It passes the share
+        gate above (10M <= 200M/16), which bounds the build's *rows* against the probe table's and not its key
+        coverage. Synthetic, since no query of the 22 has the shape; 4 threads, repeats interleaved and rotated:
+
+        | the same shape, zero rejection | probe cost | with a 32 MB filter |
+        | --- | ---: | ---: |
+        | **hashed build** (sparse keys, `direct=0`) | `find` 68 ns/row | **1.070x** |
+        | **direct build** (dense keys, `direct=1`) | `find` 0.5 ns/row | **1.533x** |
+
+        **1.070x is the raise's own exposure**, and it is in line with this bullet's existing curve. **1.533x is
+        not: it is a pre-existing defect this cap neither creates nor fixes.** A direct build's probe is two
+        offset loads, about 0.5 ns a row, so a filter costing ~5 ns a row cannot pay there **at any rejection
+        rate** -- and `main` already attaches one, verified on a 5,000,000-key direct build over the same probe
+        (`key_filter=1 key_dropped=0 direct=1`), where the filter is 16 MB and refused nothing. Raising the cap
+        widens the key range over which that can happen; it is not what makes it happen.
+      - **Both queries that gain here build `direct=0`** -- 14,567,861 and 11,997,461 rows, hashed -- so the
+        measured win and the measured 1.533x are on opposite sides of a flag the build already computes. **The
+        next item in this area is therefore to refuse D1 for a direct-layout build**, which would close the
+        1.533x shape outright and keep both gains. It is not in this change because it also removes a filter one
+        of the 22 currently carries on a small direct build, and whether that costs anything needs its own
+        measurement.
       - **Quantised, so it cannot interpolate into the measured-bad size**: `bytes` rounds up to a power-of-two
         block count, so 32 MB admits builds of 8,388,609 to 16,777,216 keys and the next size is 64 MB -- the
         query the 17% was measured on builds 22,760,819 keys and stays refused. `key_filter_test.cc` pins that

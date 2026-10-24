@@ -52,13 +52,14 @@ class KeyFilter {
   // 22 geomean 0.986x and 0.991x. 14 threads is the configuration the cap's own curve below was
   // measured at, and the one least favourable to a bigger filter.
   //
-  // **What this does and does not rest on.** It rests on those two builds, which are selective:
-  // their filters reject 99.0% and most of their probe rows. The quantisation below excludes the
-  // one query the +17% was measured on, and only that one -- it is not an argument about the band.
-  // A build inside the band whose keys cover nearly all of its probe's passes `kFilterBuildShare`
-  // (which bounds the build's ROWS against the probe table's, not its key coverage) and would now
-  // get a 32 MiB filter that rejects nothing. No query of the 22 has that shape, so it is
-  // unmeasured rather than refused, and ADR 0029 found no static quantity that separates it.
+  // **The band's worst case is measured, not assumed.** A build at the top of the band whose keys
+  // cover every key of a 200 M-row probe -- so the filter rejects nothing -- costs **1.070x where
+  // the build is hashed and 1.533x where it is direct** (ADR 0029 carries the construction). The
+  // first is this cap's own exposure and is in line with the curve above. The second is not: a
+  // direct probe is two offset loads, so a filter cannot pay there at any rejection rate, and the
+  // 16 MiB cap attached one to such builds already. Both queries that gain from this raise build
+  // hashed, so refusing D1 for a direct build would close the 1.533x shape and keep both gains --
+  // the next item here, and deliberately not bundled with a one-constant change.
   //
   // The bound is quantised, so it cannot interpolate into the measured-bad size: `bytes` rounds up
   // to a power-of-two block count, so this admits builds of 8,388,609 to 16,777,216 keys and the
