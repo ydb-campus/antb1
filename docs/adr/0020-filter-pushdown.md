@@ -193,3 +193,46 @@ Proposed
     them** (1198 shapes, 1.4 million pairs), the same enumeration that showed the comparator is exactly
     `cost / removed` compared over the rationals extended by the infinity at `removed == 0`, and so a strict
     weak ordering as `stable_sort` requires.
+
+- **Refused (2026-10-24): dropping a scan column whose only reader is a pushed predicate.** The waste is real
+  and visible in the code. A filter column is decoded for the predicate and then **also materialised for the
+  batch**: for a VARCHAR, `FilteredScanReader` pushes a row id and a `BinaryBuilder` append for every row still
+  selected *at that column's turn*, and `Finish` walks them a second time when a later column -- a key filter's
+  included -- rejected any of them (it returns the buffer directly otherwise, and this ADR's own ordering item
+  puts a VARCHAR last, so the second walk is the exception); for a fixed-width column `Compact` copies the
+  survivors. Where nothing above the scan reads that column, all of it is thrown away.
+  - **ADR 0016's late scan is the dual notion, not the same one.** A predicate-only column is *early* in
+    `LateSplit`'s terms, so it is already in what `ReadFields(scan, late)` returns -- the droppable set is a
+    subset of that, not its complement. And 0016's `NullArray` placeholder rides on a **narrowed `io` request**,
+    where this needs `io` to read a column and not return it: a contract that does not exist.
+  - **Measured, and it does not pay.** A prototype that skips materialising *every* filter column with no
+    gating leaves **7 of the 22** with correct answers -- Q1, Q5, Q9, Q11, Q13, Q14 and Q15, the queries no
+    filter column of which is read above the scan. At SF 100 on 4 threads, 5 repeats interleaved and rotated,
+    those 7 go **37.214 s to 36.883 s**: a saving of **0.331 s**, which against the suite's ~99 s is about
+    **0.997x over the 22**. Q1, the query this was proposed for, reads **0.997x** on its own; the largest clean
+    reading is Q14's 0.989x. Q15 reads 0.979x, the best of the seven, and **cannot have moved at all**: it has
+    no pushed predicate, its filter being on a derived table. One of the 7 is therefore noise and the honest
+    saving comes from 6.
+  - **That bound is per query the prototype answers correctly, not over the 22.** A query disqualified because
+    *one* of its filter columns is read above may hold others that are not; the labelled version a correct
+    implementation needs would drop those and gain there, while this prototype answers it wrongly and it enters
+    the figure above at 1.000x. So the ceiling on the other 15 is **unknown**, not 1.000x.
+  - **The expensive path is unmeasured on this workload rather than unreachable**, which is the distinction to
+    keep. The per-row `BinaryBuilder` append is the costly half, and the two queries with a droppable VARCHAR --
+    Q19's `l_shipinstruct` and `l_shipmode`, Q10's `l_returnflag` -- are both answered wrongly by the ungated
+    prototype, so its cost was never measured. Q19's pushed conjuncts are **re-read by the residual** that OR
+    factoring leaves above the scan (ADR 0022's J3 update records that shape), so its columns are not droppable
+    at all. Q10's `l_returnflag` **is** droppable: what disqualifies it is sharing a scan pipeline with a
+    key-filter column that is a grouping key, and since `MakeKeyScanFilter` refuses VARCHAR a key filter's
+    column is always fixed-width -- so a labelled version would drop the VARCHAR and keep the key column, and
+    would reach the path this measurement could not.
+  - **And `io` cannot decide this alone at all.** It is told which columns to read and which to filter on, never
+    which are read above the scan -- the prototype's 15 wrong answers are proof of that for pushed predicates by
+    themselves (`SELECT x FROM t WHERE x > 5` filters and projects the same column). ADR 0029's conjunction of a
+    pushed predicate set with a key filter adds a **second, independent** reason: a scan then sees one
+    `ScanFilter` and cannot tell a predicate's column from the join key's, and that column is read above by
+    construction -- as the join's key for D1, as the aggregate's grouping key for D5. So the planner would have
+    to label the droppable positions whatever happened to the conjunction.
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
+this implementation does not comply with all requirements of the TPC-H Benchmark.
