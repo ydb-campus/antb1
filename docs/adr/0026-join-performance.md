@@ -521,6 +521,39 @@ this profiling fires:
 - **Q2 and Q17** want the semi-join reduction, as C3a's update above establishes by measurement.
 - **Q5, 4.6x**, is the one that genuinely wants C5: its filters are visible and its order is still greedy left-deep
   from the largest relation.
+- **C5b, perf(exec): block the direct layout's prefix sum, done 2026-10-25.** C5a's array is built in four
+  passes and two of them were serial on the driving thread -- the zero-fill of `offsets_` and the
+  `std::partial_sum` over it -- between two that already used the executor. **This is the one part of a direct
+  build whose cost scales with the key SPAN rather than the rows**, so C5a's own example pays the most for it:
+  Q05's 22.8M-row build spans 600M, the array is 2.24 GiB, and one core scans it in 152 ms of pure wall clock.
+  Blocked over `kJoinPartitions` -- each block scanning its slice, then offset by the exclusive scan of the
+  blocks' totals -- that is about 60 ms. Integer addition is associative, so `offsets_` is bit-identical whatever
+  order the blocks ran in.
+
+  Measured at SF 100 against the same tree, 3-repeat control over the 22 and 7 rotated repeats on the queries
+  that move; all 22 answers byte-identical at both thread counts:
+
+  | | 4 threads | 14 threads |
+  | --- | ---: | ---: |
+  | Q05 | **0.958x** | **0.970x** |
+  | Q09 | 0.995x | 0.982x |
+  | Q21 | 0.979x | 1.001x |
+  | the 22, geomean | **0.996x** | **0.997x** |
+
+  **Two things this measurement says that the plan for it did not.** The gain does not grow with threads, which is
+  what one would expect of parallelising a serial pass -- at 14 threads the scan competes for memory bandwidth
+  with 14 scan threads, and Q21's sign flips between the two configurations (0.979x and 1.001x, the latter
+  confirmed against a 1.011x first reading that was noise). And **the zero-fill half is not available at this
+  price.** Its 110 to 140 ms is page faults rather than bandwidth -- re-zeroing the same 2.24 GiB over warm pages
+  takes 9.6 ms -- so the fix would be to let the pages fault lazily in the parallel counting pass. That makes
+  correctness depend on the allocator returning *fresh* pages: a pooled allocator may hand back a recycled dirty
+  block, and the index would be built on garbage. Sound only with a guaranteed-fresh mapping outside the budget's
+  allocator, which is a larger change than this item and is not attempted.
+
+  The parallel path is reached by **no** query of the 22 below a million-entry span, and by no unit fixture at
+  all -- asserting that it is never taken passed every test before `hash_join_test.cc` gained a case with a
+  1,249,975-entry span. The blocking algebra was already covered: four existing cases fail if a block's total is
+  wrong, because 64 blocks over even a tiny span leave several non-empty.
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.
