@@ -8,8 +8,9 @@ Accepted (G1, G2a, G2b and G2c built and measured; G3's entry carries the number
 aggregate that reads one input of the join below it is computed on that input where the gate admits it, which
 across the 22 is **one query** -- so this is accepted on what it does to that query's memory, **0.131x of its
 peak**, and not on throughput, where it is 0.973x of the 22. The mirror direction, a guard on the join shape and
-a larger key-filter cap were each measured and **refused**, not deferred; two things are left open and named in
-G3.)
+a larger key-filter cap were each measured and **refused**, not deferred -- **the cap refusal was reversed on
+2026-10-24**, once the blocker its own entry named was removed, and the entry carries both measurements; two
+things are left open and named in G3.)
 
 ## Context
 
@@ -435,3 +436,17 @@ entirely, because a pre-grouped relation has exactly one row per key.
   the 16 MiB cap. Measured 16 to 32 MiB at SF 100: **1.001x over the 22**, and Q3 still receives no filter,
   because what blocks it is ADR 0029's uncarried offer through a pushing `Filter` and not the cap. The cap is not
   the binding constraint for any query of the 22.
+  - **Reversed (2026-10-24), and this entry is why it was worth re-running.** Its own second sentence names the
+    blocker, and ADR 0029's conjunction of a pushed predicate set with a key filter removed that blocker the day
+    after this was written -- so the 1.001x was a null result measured on a tree where no query *could* spend the
+    extra bytes -- which is inferred from this entry's own null total rather than from a filter count on that
+    tree, since a run containing either of today's two gains could not have read as 1.001x. Re-measured with the
+    blocker gone, at SF 100 on both thread counts this project measures on: **the 22 geomean 0.986x on 4 threads
+    and 0.991x on 14**, peak memory flat on both. The two queries that gain a filter their build had been too
+    large for are **0.795x and 0.921x on 4 threads, 0.843x and 0.931x on 14**, each from a 7-repeat rotated run
+    of those queries with non-overlapping spreads; the 22-query controls put them at 0.786x/0.911x and
+    0.833x/0.933x. No other query's plan moved, checked by filter count rather than read off the timings, since
+    three queries read within 1% of noise and none of them gains a filter at all. ADR 0029's D1 bullet carries
+    what the raise rests on and the band it leaves unmeasured. The lesson for the next reader of an Alternatives
+    entry: **a refusal measured while something else blocks the mechanism is a measurement of the blocker**, and
+    this one said so in its own text without anyone noticing for two days.

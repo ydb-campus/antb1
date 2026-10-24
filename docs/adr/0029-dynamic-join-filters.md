@@ -237,9 +237,61 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       their left (`EmitsBuildRows`). An ANTI building on its right emits precisely the rows a filter would drop.
     - The build must hold at most a sixteenth of the probe's rows. Without this, a query whose build held every key
       of its probe's domain ran **1.138x**: the filter rejected nothing and the probe paid the hash for it.
-    - The filter must fit 16 MB. It is probed once a row with no locality at all, so it pays only while it stays in
-      cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost **17%** on a query whose build
-      held a sixth of its probe's keys.
+    - The filter must fit **32 MB** (16 MB until 2026-10-24). It is probed once a row with no locality at all, so
+      it pays only while it stays in cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost
+      **17%** on a query whose build held a sixth of its probe's keys.
+      - Update (2026-10-24): **raised to 32 MB, and the raise is the measurement this bullet had been missing.**
+        16 MB was the conservative side of that gap and nothing had measured the middle, because until D1 could
+        attach beside a pushed predicate set no query of the 22 had a refused candidate to spend the bytes on.
+        That is an inference from the 1.001x null total ADR 0032 recorded, not a filter count on the pre-#227
+        tree: had either of today's two gainers attached then, that run would have contained a 7 to 9% win and
+        could not have read as a null. With the conjunction shipped, two queries do have a refused candidate.
+        **Measured at SF 100, 7 repeats interleaved and rotated, spreads not overlapping, on both thread counts
+        this project measures on** -- 14 threads being where this bullet's own curve came from and the least
+        favourable to a bigger filter:
+
+        | | 4 threads | 14 threads |
+        | --- | ---: | ---: |
+        | the two gainers | **0.795x** and **0.921x** | **0.843x** and **0.931x** |
+        | the 22, geomean | 0.986x | 0.991x |
+        | the 22's peak memory | 14,150 -> 14,092 MiB | 14,975 -> 14,916 MiB |
+
+        No other query's plan moves, which is checked by **filter count** and not read off the timings: of the 22
+        only these two change (1 to 2 and 3 to 4 filters), the three that read within 1% of noise gain none, and
+        the rest publish no key filter in either arm.
+      - **The band's worst case, measured rather than described.** The quantisation below excludes the one query
+        the 17% was measured on and **only** that one, so the band needed its own experiment: a build of
+        10,000,000 keys (the largest filter the cap admits, 32 MB) under a 200,000,000-row probe **every one of
+        whose keys is in the build**, so the filter rejects nothing and is pure overhead. It passes the share
+        gate above (10M <= 200M/16), which bounds the build's *rows* against the probe table's and not its key
+        coverage. Synthetic, since no query of the 22 has the shape; 4 threads, repeats interleaved and rotated:
+
+        | the same shape, zero rejection | probe cost | with a 32 MB filter |
+        | --- | ---: | ---: |
+        | **hashed build** (sparse keys, `direct=0`) | `find` 68 ns/row | **1.070x** |
+        | **direct build** (dense keys, `direct=1`) | `find` 0.5 ns/row | **1.533x** |
+
+        **1.070x is the raise's own exposure**, and it is in line with this bullet's existing curve. **1.533x is
+        not: it is a pre-existing defect this cap neither creates nor fixes.** A direct build's probe is two
+        offset loads, about 0.5 ns a row, so a filter costing ~5 ns a row cannot pay there **at any rejection
+        rate** -- and `main` already attaches one, verified on a 5,000,000-key direct build over the same probe
+        (`key_filter=1 key_dropped=0 direct=1`), where the filter is 16 MB and refused nothing. Raising the cap
+        widens the key range over which that can happen; it is not what makes it happen.
+      - **Both queries that gain here build `direct=0`** -- 14,567,861 and 11,997,461 rows, hashed -- so the
+        measured win and the measured 1.533x are on opposite sides of a flag the build already computes. **The
+        next item in this area is therefore to refuse D1 for a direct-layout build**, which would close the
+        1.533x shape outright and keep both gains. It is not in this change because it also removes a filter one
+        of the 22 currently carries on a small direct build, and whether that costs anything needs its own
+        measurement.
+      - **Quantised, so it cannot interpolate into the measured-bad size**: `bytes` rounds up to a power-of-two
+        block count, so 32 MB admits builds of 8,388,609 to 16,777,216 keys and the next size is 64 MB -- the
+        query the 17% was measured on builds 22,760,819 keys and stays refused. `key_filter_test.cc` pins that
+        band from both sides.
+      - **Two consequences worth naming.** A filter that is now made where none was holds up to 32 MB against a
+        `MemoryBudget`, so under a tight `--memory-limit` a query that answered can fail on a later allocation,
+        and a 32 MB charge reaches `under_pressure()` sooner; the ceiling is still `limit/8`, so the kind is
+        unchanged and the magnitude doubles. And a build that now gets a filter also publishes its interval, so
+        D2's part pruning becomes available to it where it was not.
   - **The measurement**, arms alternating per query on one binary, best of three: the 22 go 62.96 s to 60.30 s,
     **0.958x**. Seven queries gain -- 0.724x, 0.851x, 0.890x, 0.927x, 0.931x, 0.947x and 0.966x -- and the largest
     of them is the query D0 left with a 291,130,673-row probe, which is the prize this plan predicted.

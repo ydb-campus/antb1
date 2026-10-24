@@ -42,9 +42,30 @@ class KeyFilter {
   // pays only while it stays in cache: past that every probe row costs a memory round trip, and the
   // filter loses more than the rows it rejects save. Measured at SF 100 on the 22: filters of 6 to
   // 14 MB are worth 0.73x to 0.96x on their queries, and a 45 MB one cost 17% on a query whose
-  // build holds a sixth of its probe's keys -- so the boundary is between them, and this is the
-  // conservative side of it.
-  static constexpr int64_t kMaxBytes = int64_t{16} * 1024 * 1024;
+  // build holds a sixth of its probe's keys -- so the boundary is between them.
+  //
+  // **32 MiB, raised from 16 after re-measuring.** ADR 0032 refused the raise at 1.001x while a
+  // scan with pushed predicates could not also take a key filter; ADR 0029's conjunction lifted
+  // that, and two queries of the 22 then had a refused candidate. Measured at SF 100 with both
+  // thread counts this project measures on, 7 repeats interleaved and rotated, spreads not
+  // overlapping: those two go **0.795x and 0.921x on 4 threads, 0.843x and 0.931x on 14**, and the
+  // 22 geomean 0.986x and 0.991x. 14 threads is the configuration the cap's own curve below was
+  // measured at, and the one least favourable to a bigger filter.
+  //
+  // **The band's worst case is measured, not assumed.** A build at the top of the band whose keys
+  // cover every key of a 200 M-row probe -- so the filter rejects nothing -- costs **1.070x where
+  // the build is hashed and 1.533x where it is direct** (ADR 0029 carries the construction). The
+  // first is this cap's own exposure and is in line with the curve above. The second is not: a
+  // direct probe is two offset loads, so a filter cannot pay there at any rejection rate, and the
+  // 16 MiB cap attached one to such builds already. Both queries that gain from this raise build
+  // hashed, so refusing D1 for a direct build would close the 1.533x shape and keep both gains --
+  // the next item here, and deliberately not bundled with a one-constant change.
+  //
+  // The bound is quantised, so it cannot interpolate into the measured-bad size: `bytes` rounds up
+  // to a power-of-two block count, so this admits builds of 8,388,609 to 16,777,216 keys and the
+  // next size is 64 MiB. The query the 17% was measured on builds 22,760,819 keys, sizes to 64 MiB,
+  // and stays refused -- verified, not assumed.
+  static constexpr int64_t kMaxBytes = int64_t{32} * 1024 * 1024;
 
   // The most keys published as values beside the bits (D2). A part's range is tested against them
   // with one binary search, which is free whether it prunes anything or not, so what has to be
