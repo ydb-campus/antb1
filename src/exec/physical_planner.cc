@@ -696,9 +696,11 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   // asks `PartHasNoKey` separately -- a direct build still skips a part that holds no key of its.
   // And D5, the filter a join above a grouped aggregate offers that aggregate's own scan, still
   // takes a direct build's filter (its own share gate is inline below): **the argument above does
-  // not transfer to it.** What D5 buys is groups the aggregate never builds, so what it has to beat
-  // is the aggregate's per-row cost and not the join probe's -- a cheap probe bounds neither. That
-  // it is right for D5 too is unmeasured, and `aggregate_filter_test.cc` has the shape.
+  // not transfer to it, measured.** What D5 buys is groups the aggregate never builds, so what it
+  // has to beat is the aggregate's per-row cost and not the join probe's -- a cheap probe bounds
+  // neither. Extending this refusal to D5 costs **1.849x** on a direct build above a grouped
+  // aggregate (ADR 0029 carries the construction), where refusing it here is worth 0.594x to
+  // 0.765x. The two paths want opposite answers for the same build.
   if (table->layout() == JoinTable::Layout::kDirect) {
     return false;
   }

@@ -286,19 +286,30 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
         consults separately from `PartHasNoKey`; a direct build still publishes and still skips a part holding no
         key of its. Refusing at publication instead fails `APartIsSkippedOnADateKeyToo`, whose build is direct --
         the D2 case that pins exactly this.
-      - **One cost this leaves on the table.** A direct build still sizes, charges and fills bits that no probe
-        scan will read (D2 needs only the interval and the values), so under a tight `--memory-limit` it carries
-        a reservation that now buys nothing. `MakeKeyFilter` runs after `Merged()` and before `Finish()`, so the
-        builder already holds the row count and the key interval the layout decision needs, and could publish a
-        values-only filter. Not done here: it would put the layout predicate in a second place, which is what the
-        seam above exists to avoid.
+      - **A cost this appears to leave on the table, and the reason it must be left.** A direct build still
+        sizes, charges and fills bits that this condition stops the probe-side scan from reading, so under a
+        tight `--memory-limit` it carries a reservation that looks wasted; `MakeKeyFilter` runs after `Merged()`
+        and before `Finish()`, so a values-only filter is buildable. **Do not build one.** D5 below reads exactly
+        those bits, and on a direct build they are worth **1.849x** -- publication cannot know whether a D5
+        consumer exists, so withholding the bits would turn that measured win into a loss of the same size. The
+        reservation is the price of not knowing, and this is the second mechanism in this ADR whose cost looks
+        obvious in isolation and reverses once the other consumer is measured.
       - **D5 is a third path and still takes a direct build's filter.** The filter a join above a grouped
         aggregate offers that aggregate's own scan carries its own copy of the share gate and no layout test, so
         this condition does not reach it -- `aggregate_filter_test.cc` has the shape, with a two-row build whose
-        keys span 1. Deliberate rather than overlooked: **the argument above does not transfer.** What D5 buys is
-        groups the aggregate never builds, so what it has to beat is the aggregate's per-row cost and not the
-        join probe's, and a cheap probe bounds neither. Whether the same refusal would pay for D5 is unmeasured,
-        and it is the obvious next question here.
+        keys span 1. Deliberate rather than overlooked, and now **measured rather than argued**: extending this
+        refusal to D5 costs **1.849x**.
+
+        | a 1,000,000-key dense (direct) build above a grouped aggregate of 100,000,000 rows | |
+        | --- | ---: |
+        | D5's filter kept: it drops 89,908,100 rows, the aggregate builds ~1,000,000 groups | 0.628 s |
+        | D5's filter refused: the aggregate builds 10,091,900 groups | **1.162 s (1.849x)** |
+
+        So the two paths want opposite answers for the same build, and the reason is what each filter is racing:
+        D1's competes with a half-nanosecond probe, while D5's saves the aggregate ten million groups it would
+        otherwise build and throw away. **A cheap probe bounds the first and says nothing about the second.** No
+        query of the 22 has the D5-over-a-direct-build shape -- extending the refusal there changes none of their
+        plans -- so this is synthetic, 7 repeats interleaved and rotated, spreads not overlapping.
     - The filter must fit **32 MB** (16 MB until 2026-10-24). It is probed once a row with no locality at all, so
       it pays only while it stays in cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost
       **17%** on a query whose build held a sixth of its probe's keys.
