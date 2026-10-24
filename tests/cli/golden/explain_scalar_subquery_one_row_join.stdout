@@ -1,7 +1,7 @@
 Output: count_star():BIGINT
 Aggregate COUNT(*)
   Filter "(tr_fare * 2)" > "avg(tr_fare)"
-    Join ONE-ROW build=right keys=[]
+    Join ONE-ROW build=right keys=[] carries 1 of 3 unread above
       Compute (tr_fare * 2)
         Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_fare]  [shared #1 of 2, 1 field]
       Aggregate AVG(tr_fare)

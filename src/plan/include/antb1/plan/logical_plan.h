@@ -443,6 +443,17 @@ struct JoinNode {
   // not reachable from a plan node (docs/adr/0026-join-performance.md). An estimate is never read
   // for an answer, only for a plan, so a stale or absent one costs speed and never correctness.
   std::optional<int64_t> estimate;
+  // The ids of this join's own output that a node ABOVE it reads: what its inputs must carry past
+  // it, and nothing more. Set by Prune, which has exactly this set in hand before it adds the
+  // join's own keys and residual to it; empty where nothing set it, which every hand-built plan and
+  // every plan before Prune is.
+  //
+  // **A consumer must treat this as advice and verify what it does with it.** Like `estimate` it is
+  // metadata rather than contract, but unlike `estimate` the unsafe direction is real: a column
+  // missing from the list reads as unneeded, so anything that DROPS on that basis must fail loudly
+  // when it turns out to be read -- never answer a NULL. `CloneWithFreshIds` mints ids this list
+  // cannot know, which is the case that makes the rule necessary rather than theoretical.
+  std::vector<ColumnId> needed_above;
   SourceSpan span;  // the join in the query
 };
 

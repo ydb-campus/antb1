@@ -3662,7 +3662,9 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
             "Output: i16:SMALLINT\n"
             "Project i16\n"
             "  Filter i32 = \"min(u.i32)\"\n"
-            "    Join INNER build=right keys=[\"t.i64\" = \"u.i64\"]\n"
+            // The join carries t.i64 and u.i64 -- its own keys -- past itself, which nothing
+            // above reads: the Filter reads i32 and the min, the Project i16.
+            "    Join INNER build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 5 unread above\n"
             "      Scan table=t source=fake columns=[i16, i32, i64]\n"
             "      GroupAggregate keys=[\"u.i64\"] MIN(i32)\n"
             "        Scan table=u source=fake columns=[i32, i64]\n");

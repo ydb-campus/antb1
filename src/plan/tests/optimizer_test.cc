@@ -581,6 +581,37 @@ const JoinNode& JoinBelowProject(const LogicalPlan& plan) {
   return std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);
 }
 
+// What `needed_above` records, which is the set no other pass computes: the join's own output ids
+// that something above it reads. Here the Project reads two columns and the join's keys and
+// residual read four more, so the keys and residual columns are carried past the join unread --
+// which is the opportunity it exists to name, and the set a consumer would prune a build by.
+//
+// **It is recorded as ids and must be verified by whoever drops on it.** A column missing from the
+// list reads as unneeded, and `CloneWithFreshIds` mints ids no earlier pass can know, so the only
+// safe consumer is one that fails loudly when it finds a dropped column is read after all.
+TEST(OptimizerTest, AJoinRecordsWhatIsReadAboveIt) {
+  const LogicalPlan plan = Optimized(ProjectOverJoin(
+      JoinKind::kInner, {FieldOf(11, 3), FieldOf(1, 0)}, {Less(FieldOf(1, 2), FieldOf(11, 2))}));
+  const JoinNode& join = JoinBelowProject(plan);
+  const std::vector<ColumnId> out = OutputIds(LogicalNode(join));
+  // Sorted, so that the plan a pass produces does not depend on a hash order.
+  EXPECT_TRUE(std::ranges::is_sorted(join.needed_above));
+  // Exactly the Project's two columns, and every one of them an output of this join.
+  const auto& project = std::get<ProjectNode>(*plan.root);
+  std::vector<ColumnId> read;
+  read.reserve(project.columns.size());
+  for (const BoundColumn& column : project.columns) {
+    read.push_back(column.id);
+  }
+  std::ranges::sort(read);
+  EXPECT_EQ(join.needed_above, read);
+  for (const ColumnId id : join.needed_above) {
+    EXPECT_NE(std::ranges::find(out, id), out.end()) << "an id this join does not output";
+  }
+  // And the rest of its output is carried unread: the keys and the residual's columns.
+  EXPECT_EQ(out.size() - join.needed_above.size(), 4U);
+}
+
 // Each input keeps the columns needed above, the keys and the residual's columns, in field order.
 TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
   const LogicalPlan plan = Optimized(ProjectOverJoin(
