@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792825956733,
+  "lastUpdate": 1792835969720,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -21744,6 +21744,258 @@ window.BENCHMARK_DATA = {
             "value": 2635.8313279999948,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2635.4839749999996 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "73874ac825ca084ab0be7e8656fc97ca09fe7eea",
+          "message": "perf(exec): refuse a key filter for a direct-layout build (#231)\n\n## Summary\n\nThree lines in `CanFilterRows`: ADR 0029's D1 per-row key filter is\nrefused when the build came out\nin the **direct** layout.\n\nA direct probe is two loads of `offsets_` and no hash — about 0.5 ns a\nrow — where the filter costs\nabout 5. So D1 cannot pay for a direct build **whatever it would\nreject**, and it is the shape where\nit loses badly. The existing share gate does not cover it: that bounds\nthe build's *rows* against the\nprobe table's rows and says nothing about key coverage, so a build small\nin rows that covers every\nkey its probe holds sails through.\n\nMeasured against `main` at `5d64b38`, release arms from the same tree,\nSF 100:\n\n| | 4 threads | 14 threads |\n| --- | ---: | ---: |\n| **Q11** | **0.838×** | 0.908× |\n| **Q22** | **0.886×** | 0.928× |\n| **Q2** | **0.923×** | 0.964× |\n| Q16 | 0.949× | 0.970× |\n| Q21 | 0.975× | 0.989× |\n| **the 22, geomean** | **0.979×** | **0.988×** |\n\nThe geomean is a 3-repeat control over all 22; the per-query rows are 7\nrepeats interleaved and\nrotated over the queries that move, spreads not overlapping. All 22\nanswers are byte-identical to\n`5d64b38`, and all 22 physical plans identical to the binary the numbers\ncame from.\n\n**This is measured by removal, which is the stronger direction.** It\n*takes away* filters that were\nrejecting **137,992,368** and **58,293,472** probe rows — and the suite\ngets faster. Those rejections\nwere real and bought nothing; that is the mechanism demonstrated rather\nthan estimated.\n\nFilter counts per query, `main` → branch: Q3 2→1, Q5 2→0, Q7 4→1, Q9\n1→0, Q10 1→1, Q18 2→2.\n\n## What it fixes outright\n\nSynthetic, because no query of the 22 has the shape. Each was confirmed\nfrom the profile\n(`key_filter=1`, and its `key_dropped`) before it was timed; 7 repeats\ninterleaved and rotated:\n\n| a direct build under a 200,000,000-row probe | arm | it rejected |\nwith this change |\n| --- | --- | ---: | ---: |\n| 5,000,000 dense keys covering the probe entirely | dense | 0% |\n**0.705×** |\n| 10,000,000 dense keys (a 32 MiB filter) | dense | 0% | **0.718×** |\n| 2,000,000 keys 30 apart, probe mostly out of range | sparse, 229 MiB\nindex | 99.6% | **0.594×** |\n| the same, every probe key inside the range | sparse, 229 MiB index |\n96.6% | **0.765×** |\n\nThe first is the ordinary surrogate-key dimension under a fact table —\nthe filter had been costing\n42% for nothing, and that was true before #230 moved the cap.\n\n**The last two are the shape the review challenged this rule on**, and\nthey are why \"whatever it\nwould reject\" is literal rather than extrapolated.\n`kSparseDirectSlotsPerRow` admits 32 slots a row,\nso a direct index can be hundreds of megabytes and its probe could have\nbeen a DRAM miss well worth\nfiltering for. It is not: `find` over 200,000,000 rows is 29.2 ms with\nthe filter and 552.1 ms\nwithout, summed over parts — so the filter saves half a second of probe\nand spends about a second\nbeing probed. **Nothing beats not probing at all**, which is why the\nrule is the layout and not the\nindex's size.\n\n## The seam, which mattered more than the rule\n\nA build publishes **one** `KeyFilter`, carrying both D1's per-row bits\nand the key interval D2 prunes\nwhole parts with. The obvious implementation — declining to publish —\nsilently takes part pruning\nwith it. My first throwaway did exactly that.\n\nThe condition therefore lives in `CanFilterRows`, which `KeyScanOf`\nconsults separately from\n`PartHasNoKey`: a direct build still publishes, and still skips a part\nthat holds no key of its.\nMutation-checked — refusing at publication fails\n`APartIsSkippedOnADateKeyToo`, the D2 case whose\nbuild is direct.\n\n**And `CanFilterRows` is not the only path, which the first revision of\nthis PR wrongly claimed it\nwas.** D5 — the filter a join above a grouped aggregate offers that\naggregate's own scan — carries\nits own copy of the share gate and no layout test, so a direct build's\nfilter still reaches a scan\nthere. That is deliberate rather than overlooked: **the argument above\ndoes not transfer.** What D5\nbuys is groups the aggregate never builds, so what it has to beat is the\naggregate's per-row cost,\nnot the join probe's, and a cheap probe bounds neither. Whether the same\nrefusal would pay for D5 is\nunmeasured, and both the comment and the ADR now say so.\n\n## Honest notes\n\n- **Q3 read 1.033× on three repeats, with non-overlapping spreads**, and\n1.006× on seven rotated\nones with overlapping spreads. I treat the first as noise and the ADR\nrecords both — it is exactly\nthe reading one would be tempted to accept, since Q3 is the query this\narea was last tuned for and\n  the change removes a filter that was dropping 39% of its probe.\n- **A cost this leaves on the table:** a direct build still sizes,\ncharges and fills bits no probe\nscan will read, so under a tight `--memory-limit` it carries a\nreservation that now buys nothing.\nPublishing a values-only filter would fix it, but it would put the\nlayout predicate in a second\nplace — which is what the seam above exists to avoid. Recorded in the\nADR, not done here.\n\n## Tests\n\n- `ADirectBuildTakesNoRowFilterAndStillPrunesParts` pins both halves: no\nper-row filter, no filtered\nscan, every part without a build key still skipped, and the same answer\nas a no-statistics\n  control. Mutation-checked — removing the guard fails it.\n- **A fixture that stopped testing what it claimed.**\n`AKeyFilterDropsProbeRowsAndKeepsTheAnswer`\nhad build keys `i * 7` (5 rows, span 28), which is *direct*, so after\nthis change it exercised D1\nnot at all. Its keys are now `i * 40`, so both of its builds come out\nhashed: the small one for\nthe D1 arm, and the 480-row one for the sub-case that pins the **share**\ngate — which would\n  otherwise have been refused by the layout instead and pinned nothing.\n- **Both of those premises are now asserted, not commented.** \"Span 160\nover 5 rows, so hashed\" is\narithmetic over two constants of `join_table.cc`, and stops being true\nthe moment either moves —\nwith the share-gate case staying green while testing nothing. A\n`DirectBuildsIn` helper reads the\n`direct` metric the profile already records, and raising\n`kSparseDirectSlotsPerRow` to 64 now fails\n  both arms.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch.\n\n```text\n$ pixi run test                      # Debug, the full hermetic suite\n100% tests passed out of 2882        ANTB1-TESTS: PASS\n\n$ pixi run release\n100% tests passed out of 2883        (exit 0)\n\n$ for s in 20261109 20261110 20261111; do ANTB1_DIFF_SEED=$s pixi run diff-random; done\nDIFF: PASS queries=2000 failed=0 unsupported=0     # each of the three seeds\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' \\\n    src/exec/physical_planner.cc src/exec/tests/plan_report_test.cc\nnothing in user code\n```\n\n`hash_join_test.cc` reports 6 clang-tidy findings, all pre-existing —\nthe count is identical on\n`main`, verified by stashing, and none is at a line this PR touches.\n\nGates with no local substitute: `pixi run asan` (fails at discovery on a\npre-existing\n`curl_global_init` leak), `pixi run tidy` (fails on an unmodified `main`\non this host with 4\nmacOS-only findings, so clang-tidy was run per file) and\n`ci-gcc`/`codeql-build` (linux-64 only).\n\n**ClickBench is unexposed by construction**: all 43 queries are\nsingle-table over `hits`, and a key\nfilter is published by a hash build for a probe-side scan. No joins, no\nfilters. A shape argument,\nnot a run.\n\n## Type of change\n\n- [x] perf: performance improvement\n- [ ] feat / fix / refactor / docs / Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change\n- [x] Docs updated: ADR 0029's D1 gate list gains the condition with its\nmeasurements, the D5\nexception and the cost it leaves open; **docs/sql-subset.md**'s\nuser-facing enumeration of the\n      run-time conditions behind a key filter goes from three to four\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/0029-dynamic-join-filters.md`\nis CODEOWNERS, and this hunk adds a **decision rule** to an accepted\nADR's gate list rather\nthan only recording a measurement; @hor911 asked for this item after\nreviewing its evidence\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) found\nthis item while closing a P2\non #230 — constructing the shape that PR left unmeasured turned up a\npre-existing 42%\nregression rather than a risk in that change. It tested the fix behind a\nthrowaway branch\nfirst, which is what exposed that the obvious implementation would have\ntaken D2's part\npruning with it. The project's `reviewer` then found that the rule's\npremise had been measured\nonly on the cheapest direct probe and that `CanFilterRows` was not the\nonly path; the first is\nanswered above by measuring the sparse arm rather than narrowing the\nrule, the second by\n      correcting the claim.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-24T12:55:18+03:00",
+          "tree_id": "7f3223f5ad304657723b64970c6684fda39f4c4d",
+          "url": "https://github.com/ydb-campus/antb1/commit/73874ac825ca084ab0be7e8656fc97ca09fe7eea"
+        },
+        "date": 1792835968227,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4948.344323096139,
+            "unit": "ns/iter",
+            "extra": "iterations: 141283\ncpu: 4947.960221682722 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 84175.56050051603,
+            "unit": "ns/iter",
+            "extra": "iterations: 7752\ncpu: 84172.29489164086 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 221928.96358454556,
+            "unit": "ns/iter",
+            "extra": "iterations: 3158\ncpu: 221908.18112729568 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 439483.7482737088,
+            "unit": "ns/iter",
+            "extra": "iterations: 1593\ncpu: 439341.83615819196 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 403535.4772596573,
+            "unit": "ns/iter",
+            "extra": "iterations: 1737\ncpu: 403394.66493955115 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2085751.3761194216,
+            "unit": "ns/iter",
+            "extra": "iterations: 335\ncpu: 2085326.2507462709 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.48999276923048,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.4824086923077 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.36670356250028,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.3607586875 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 188.72380625000318,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 188.6986687500003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.05104080000001,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.049313140000024 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 20.789725941175917,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.786301323529408 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 38.22303388888947,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.2179495 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.748925221105526,
+            "unit": "ms/iter",
+            "extra": "iterations: 398\ncpu: 1.7487887185929651 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 93.89882249999815,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 93.88561099999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 28.100223359999745,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.095705759999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 31.107544043478534,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 31.103830130434766 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 65.64941881818372,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.64372227272744 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 98.5205372857162,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.51747799999951 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 340.0204885000022,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 339.9876390000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1620.4674119999822,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1620.284594000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 34.67075504999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.66808035 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 39.312266111110716,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.30841555555552 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 67.71718540000222,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.7156815 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 122.74493833333129,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 122.73380833333351 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 401.33580049999296,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 401.31113850000054 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1879.8549610000066,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1879.6101599999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 58.693474083331886,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.6828175833333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 62.92920818181745,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.921482636363514 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 94.2478444285736,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 94.23738185714318 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 165.10743224999658,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 165.10054825000077 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 486.1440264999999,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 486.0975060000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2227.1629829999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2226.8159380000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 70.18635780000011,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 70.18201099999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 75.4696173333337,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.46256633333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 108.56467383333286,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 108.54405466666724 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 191.48767850001036,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 191.46240650000124 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 530.5578329999889,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 530.4915910000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2356.1827679999965,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2355.9194879999977 ms\nthreads: 1"
           }
         ]
       }
