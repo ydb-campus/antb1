@@ -271,15 +271,16 @@ void ForEachRowHash(const RowMask& mask, const RowHashes& hashed, const Visit& v
 
 JoinBuildSpec::JoinBuildSpec(std::shared_ptr<arrow::Schema> schema,
                              std::vector<plan::BoundColumn> keys, bool direct_candidate,
-                             bool keep_null_keys)
+                             bool keep_null_keys, std::vector<bool> retain)
     : schema_(std::move(schema)),
       keys_(std::move(keys)),
+      retain_(std::move(retain)),
       direct_candidate_(direct_candidate),
       keep_null_keys_(keep_null_keys) {}
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
-    std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-    bool keep_null_keys) {
+    std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys, bool keep_null_keys,
+    std::vector<bool> retain) {
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     if (schema == nullptr) {
       return arrow::Status::Invalid("a join build without a schema");
@@ -300,6 +301,20 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
                                       plan::ToString(key.type));
       }
     }
+    // A key is kept whatever the caller said: the build hashes it and the direct layout reads it.
+    // A set of the wrong width is a planner bug, not a NotImplemented.
+    if (!retain.empty()) {
+      if (retain.size() != static_cast<std::size_t>(schema->num_fields())) {
+        return arrow::Status::Invalid("a join build's retain set has ", retain.size(),
+                                      " entries for ", schema->num_fields(), " fields");
+      }
+      for (const plan::BoundColumn& key : keys) {
+        retain[static_cast<std::size_t>(key.index)] = true;
+      }
+      if (std::ranges::all_of(retain, std::identity{})) {
+        retain.clear();  // nothing to drop: take the path every build took before
+      }
+    }
     bool direct = false;
     if (keys.size() == 1) {
       switch (keys.front().type.id()) {
@@ -315,8 +330,8 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
           break;
       }
     }
-    return std::shared_ptr<const JoinBuildSpec>(
-        new JoinBuildSpec(std::move(schema), std::move(keys), direct, keep_null_keys));
+    return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(
+        std::move(schema), std::move(keys), direct, keep_null_keys, std::move(retain)));
   });
 }
 
@@ -328,7 +343,8 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(std::move(schema), {},
                                                                   /*direct_candidate=*/false,
-                                                                  /*keep_null_keys=*/false));
+                                                                  /*keep_null_keys=*/false,
+                                                                  /*retain=*/{}));
   });
 }
 
@@ -489,11 +505,39 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
     piece.hashes[at] = hash;
   });
   arrow::compute::ExecContext kernels(pool);
-  ARROW_ASSIGN_OR_RAISE(
-      const arrow::Datum taken,
-      arrow::compute::Take(batch.data, std::make_shared<arrow::UInt32Array>(kept, index_buffer),
-                           arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
-  piece.rows = taken.record_batch();
+  const auto index_array = std::make_shared<arrow::UInt32Array>(kept, index_buffer);
+  // A column the build does not retain is not taken at all: `Take` copies every column it is given
+  // into partition order, so skipping one costs neither the copy nor the bytes -- and it is the
+  // only place early enough to matter, a drop made when the table is built having already paid for
+  // both. The batch keeps its width, a NullArray standing in, so a JoinRowRef and a key index are
+  // unchanged and reading a dropped column aborts in ChunkColumns rather than answering a NULL.
+  if (!spec_->retains_all()) {
+    arrow::FieldVector fields;
+    arrow::ArrayVector arrays;
+    fields.reserve(static_cast<std::size_t>(batch.data->num_columns()));
+    arrays.reserve(static_cast<std::size_t>(batch.data->num_columns()));
+    for (int c = 0; c < batch.data->num_columns(); ++c) {
+      if (!spec_->retains(c)) {
+        fields.push_back(batch.data->schema()->field(c)->WithType(arrow::null()));
+        arrays.push_back(std::make_shared<arrow::NullArray>(kept));
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum one,
+          arrow::compute::Take(batch.data->column(c), index_array,
+                               arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+      fields.push_back(batch.data->schema()->field(c));
+      arrays.push_back(one.make_array());
+    }
+    piece.rows =
+        arrow::RecordBatch::Make(arrow::schema(std::move(fields)), kept, std::move(arrays));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(batch.data, index_array, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             &kernels));
+    piece.rows = taken.record_batch();
+  }
 
   // The smallest and largest key of a direct candidate (every kept key is a value).
   int64_t lowest = 0;
@@ -661,7 +705,7 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
   chunk_keys_.reserve(num_chunks * keys.size());
   for (const std::shared_ptr<const JoinBuildPart>& part : parts) {
     for (const JoinBuildPart::Piece& piece : part->pieces_) {
-      chunks_.push_back(piece.rows);
+      chunks_.push_back(piece.rows);  // already narrowed when the piece was taken
       for (std::size_t k = 0; k < keys.size(); ++k) {
         chunk_keys_.push_back(ViewOf(*piece.rows->column_data(keys[k].index), widths_[k]));
       }

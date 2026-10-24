@@ -554,6 +554,52 @@ this profiling fires:
   all -- asserting that it is never taken passed every test before `hash_join_test.cc` gained a case with a
   1,249,975-entry span. The blocking algebra was already covered: four existing cases fail if a block's total is
   wrong, because 64 blocks over even a tiny span leave several non-empty.
+- **C8a, perf(plan,exec): a build holds only the columns read above its join, done 2026-10-25.** A join's output
+  is both inputs' columns whatever is read above it, so a build retains columns nothing will look at -- for the
+  whole life of the build. `Prune` already computes the set that says which: `JoinNode::needed_above` is what a
+  node above the join reads, recorded in the moment before the join's own keys and residual are added to it.
+  Q05's top join reports `carries 13 of 16 unread above`, and every join in that query carries some.
+
+  **Dropped where the column is first copied, which is the only place early enough.** A build part takes its rows
+  with `arrow::compute::Take`, which materialises every column it is given in partition order; a column not given
+  costs neither the copy nor the bytes. Dropping later, when the table is built, was measured and is worth far
+  less -- Q05 went 5.46 to 5.31 GB that way against 4.34 GB this way, because the peak is reached while the input
+  batches are still alive. So this is a **time** win as much as a memory one, which the plan for it did not
+  expect:
+
+  | | 4 threads | 14 threads | peak memory |
+  | --- | ---: | ---: | --- |
+  | Q21 | **0.885x** | **0.784x** | 5,726 -> 4,886 MiB |
+  | Q05 | **0.912x** | 0.910x | 6,107 -> 4,874 MiB |
+  | Q02 | **0.921x** | 0.921x | |
+  | Q03 | 0.955x | 0.967x | 2,030 -> 1,557 MiB |
+  | Q09 | 0.966x | 0.952x | |
+  | Q07, Q08 | 0.974x, 0.971x | 0.959x, 0.962x | 1,496 -> 1,136, 1,043 -> 780 MiB |
+  | the 22, geomean | **0.976x** | **0.965x** | 14,156 -> 14,121 MiB |
+
+  Unlike every other item measured on both thread counts, this one is **better** at 14: the `Take` copies it
+  avoids are per-thread work. Nothing regresses at either count (the widest are Q19 1.006x on 4 and Q14 1.014x on
+  14, both inside their spreads). All 22 answers byte-identical at both. **The suite's peak barely moves** --
+  Q18 sets it and has nothing to drop -- so this is five queries' memory, not the headline figure.
+
+  - **A dropped column is a `NullArray`, not an absent one.** The batch keeps its width, so a `JoinRowRef`, a key
+    index and `ChunkColumns` all mean what they did; only the field's type differs, and `plan::ToArrow` maps no
+    engine type to `null`, which makes that an unambiguous marker. `ChunkColumns::column` aborts on it. That
+    guard is the whole reason this is safe to build on an id-keyed set: a column missing from `needed_above`
+    reads as unneeded, and `CloneWithFreshIds` mints ids no earlier pass can know, so the failure has to be a
+    crash and not a NULL in an answer.
+  - **Three things are held beyond what `needed_above` says**, and the first was a bug the guard caught. A
+    **residual** is evaluated by the join, so its columns are needed here though `needed_above` -- what a node
+    *above* reads -- excludes them by construction; the planner adds them, mapping each from a position in the
+    join's output back to one in the build's own. A **key** is forced by `JoinBuildSpec::Make`, since the build
+    hashes it and the direct layout indexes by it. And an **empty set** retains everything, which is every
+    hand-built or unoptimized plan.
+  - **What the tests can and cannot reach.** The spec's own rules are unit-tested. Whether the right set reaches
+    a build is not: `src/exec/tests`' harness builds scans with fields and no column ids, so `OutputIds` of one
+    is empty and the planner keeps every column -- the feature is invisible there. The end-to-end property lives
+    in the `.slt` suite, which goes through the binder, and it earned its place: those cases are what aborted
+    when the residual was forgotten. `joins/inner.slt` gains three cases whose `cols_dropped` was read
+    individually, so each drops what its comment claims rather than passing by dropping nothing.
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.

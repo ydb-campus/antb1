@@ -304,6 +304,56 @@ SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_row >= 2400 
 ----
 140
 
+# ---- a build holds only what is read above the join (ADR 0026's C8a) ----
+
+# A join carries both inputs' columns whatever is read above it, so a build keeps columns nothing
+# will look at -- for its whole life, which on a large build is measured in gigabytes. The planner
+# now tells it which it can let go, from the set Prune records on the join node.
+#
+# The answer is the only thing that can show a column was let go wrongly: a dropped column that
+# turns out to be read is a NULL, not an error. Each case groups or sums so that a lost column moves
+# a value rather than a width. The `cols_dropped` metric of `explain --analyze` was read for each of
+# these, so each really does drop what its comment claims rather than passing by dropping nothing.
+
+# One column dropped: of the three `zones` carries, the upper join needs zn_city and the lower one
+# zn_id, and zn_radius is read by nothing at all.
+query II rowsort
+SELECT ct_id, COUNT(*) FROM trips, zones, cities WHERE tr_pickup = zn_id AND zn_city = ct_id
+GROUP BY ct_id
+----
+1	559
+2	559
+3	490
+4	489
+5	558
+
+# The shape the first implementation got wrong, on a build wide enough to show it: rd_joined is read
+# by the join's own residual and by nothing above it, and rd_city by nothing at all. `needed_above`
+# is what a node ABOVE reads, so it excludes a residual's columns by construction -- and a build that
+# took that at its word dropped a column its own residual needs, which aborted this file's cases
+# rather than answering wrongly.
+query TI rowsort
+SELECT rd_tier, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND rd_joined > DATE '2025-01-01'
+GROUP BY rd_tier
+----
+basic	953
+gold	934
+plus	941
+
+# A residual over a column of the BUILD side, which is the half that has to be mapped back to a
+# position in the build's own output before it can be kept: here zn_radius is the residual's and
+# zn_city is read above, so neither is dropped and the probe's unread columns are.
+query IR rowsort
+SELECT zn_city, SUM(tr_distance) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius < 2
+GROUP BY zn_city
+----
+1	2026.25
+2	2681
+3	1978
+4	2026.375
+5	3326.125
+NULL	670.875
+
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a graph connected only through one exits 4) ----
 
 onlyif duckdb

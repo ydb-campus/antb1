@@ -41,7 +41,18 @@ int64_t ChunkColumns::MemoryUsage(std::size_t num_chunks, int num_columns) {
 std::span<const arrow::Array* const> ChunkColumns::column(int column) const {
   const auto first = Narrow<std::size_t>(column) * chunks_;
   ANTB1_CHECK(first + chunks_ <= arrays_.size());
-  return std::span<const arrow::Array* const>(arrays_).subspan(first, chunks_);
+  const std::span<const arrow::Array* const> out =
+      std::span<const arrow::Array* const>(arrays_).subspan(first, chunks_);
+  // A column a join build did not retain is a NullArray here (JoinBuildSpec's `retain`), and
+  // gathering it would put NULLs in an answer -- so it aborts instead. `needed_above`, which
+  // decides what is dropped, is recorded as ids and cannot know an id a later pass minted, so this
+  // is what turns that into a crash rather than a wrong column. `plan::ToArrow` maps no engine type
+  // to `null`, which is what makes the marker unambiguous: a NULL-typed column here was dropped.
+  // The first chunk settles it, every chunk of a column being dropped or kept together.
+  if (!out.empty() && out.front() != nullptr) {
+    ANTB1_CHECK(out.front()->type_id() != arrow::Type::NA);
+  }
+  return out;
 }
 
 namespace {

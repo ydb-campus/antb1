@@ -331,6 +331,13 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     profile_->Max("unique", MetricUnit::kCount, table_->unique() ? 1 : 0);
     profile_->Max("direct", MetricUnit::kCount,
                   table_->layout() == JoinTable::Layout::kDirect ? 1 : 0);
+    // How many of its input's columns the build did not have to hold (JoinBuildSpec's `retain`):
+    // the one number that says whether the plan's `needed_above` reached this build at all.
+    int dropped = 0;
+    for (int c = 0; c < spec_->schema()->num_fields(); ++c) {
+      dropped += spec_->retains(c) ? 0 : 1;
+    }
+    profile_->Max("cols_dropped", MetricUnit::kCount, dropped);
   }
   return arrow::Status::OK();
 }
@@ -509,7 +516,17 @@ arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
   const auto rows = static_cast<int64_t>(rows_.size());
   arrow::ArrayVector columns;
   columns.reserve(static_cast<std::size_t>(schema_->num_fields()));
+  const JoinBuildSpec& spec = build_columns->table->spec();
   for (int c = 0; c < schema_->num_fields(); ++c) {
+    // A column the build did not retain: the schema still has the field and nothing above the join
+    // reads it, which is why it was dropped, so NULLs of its type satisfy the contract without the
+    // build having held the data. Cheaper than the gather it replaces, not just smaller.
+    if (!spec.retains(c)) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
+                            arrow::MakeArrayOfNull(schema_->field(c)->type(), rows, pool_));
+      columns.push_back(std::move(null));
+      continue;
+    }
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
                           arrow::MakeBuilder(schema_->field(c)->type(), pool_));
     ARROW_RETURN_NOT_OK(
@@ -1400,6 +1417,14 @@ arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(int64_t rows) {
   arrow::ArrayVector columns;
   columns.reserve(static_cast<std::size_t>(schema.num_fields()));
   for (int c = 0; c < schema.num_fields(); ++c) {
+    // As in the sink above: a dropped column is NULLs of its type, which is what nothing above the
+    // join reading it means.
+    if (!table_->spec().retains(c)) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
+                            arrow::MakeArrayOfNull(schema.field(c)->type(), rows, ctx_.pool));
+      columns.push_back(std::move(null));
+      continue;
+    }
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
                           arrow::MakeBuilder(schema.field(c)->type(), ctx_.pool));
     ARROW_RETURN_NOT_OK(

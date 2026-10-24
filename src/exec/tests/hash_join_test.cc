@@ -3320,6 +3320,19 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& pl
 // tests below assert it because their own premise is which layout a fixture produces, and that is
 // arithmetic over two constants of `join_table.cc` -- a comment saying "span 160 over 5 rows, so
 // hashed" stops being true the moment either constant moves, and nothing would fail.
+int64_t DroppedColumnsIn(const ProfileNode& node) {
+  int64_t found = 0;
+  for (const ProfileMetric& metric : node.metrics()) {
+    if (metric.name == "cols_dropped") {
+      found += metric.value;
+    }
+  }
+  for (const ProfileNode* child : node.children()) {
+    found += DroppedColumnsIn(*child);
+  }
+  return found;
+}
+
 int64_t DirectBuildsIn(const ProfileNode& node) {
   int64_t found = 0;
   for (const ProfileMetric& metric : node.metrics()) {
