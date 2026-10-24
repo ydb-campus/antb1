@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -83,6 +84,46 @@ TEST(KeyFilterTest, HoldsNothingBeforeAnythingIsAdded) {
   }
 }
 
+// The largest build kMaxBytes admits, and the first it does not. `bytes` rounds up to a
+// power-of-two block count, so the cap does not interpolate: it admits a whole size class and
+// refuses the next. That quantisation is what the cap's own comment relies on to stay short of the
+// filter size ADR 0029 measured at +17%, so it is pinned here rather than left as arithmetic in a
+// comment.
+TEST(KeyFilterTest, TheCapAdmitsAWholeSizeClassAndRefusesTheNext) {
+  struct Case {
+    int64_t keys;
+    bool made;
+    int64_t bytes;  // 0 where it is refused
+    std::string_view why;
+  };
+  for (const Case& c : {
+           Case{.keys = int64_t{8} * 1024 * 1024,
+                .made = true,
+                .bytes = int64_t{16} * 1024 * 1024,
+                .why = "the size class below"},
+           Case{.keys = int64_t{16} * 1024 * 1024,
+                .made = true,
+                .bytes = int64_t{32} * 1024 * 1024,
+                .why = "the largest build the cap admits"},
+           Case{.keys = (int64_t{16} * 1024 * 1024) + 1,
+                .made = false,
+                .bytes = 0,
+                .why = "one key more doubles the filter to 64 MiB"},
+           // The build of the query ADR 0029 measured at +17% with a 45 MB filter. It sizes to
+           // 64 MiB and must stay refused: that it does is why raising the cap to 32 MiB needed no
+           // new gate of its own.
+           Case{.keys = 22'760'819, .made = false, .bytes = 0, .why = "the +17% shape"},
+       }) {
+    auto filter = KeyFilter::Make(c.keys, nullptr);
+    ASSERT_TRUE(filter.ok()) << c.why << ": " << filter.status().ToString();
+    EXPECT_EQ(*filter != nullptr, c.made) << c.why << ", keys=" << c.keys;
+    if (c.made && *filter != nullptr) {
+      EXPECT_EQ((*filter)->bytes(), c.bytes) << c.why;
+      EXPECT_LE((*filter)->bytes(), KeyFilter::kMaxBytes) << c.why;
+    }
+  }
+}
+
 TEST(KeyFilterTest, NoFilterWithoutKeys) {
   for (const int64_t keys : {int64_t{0}, int64_t{-1}}) {
     auto filter = KeyFilter::Make(keys, nullptr);
@@ -105,8 +146,11 @@ TEST(KeyFilterTest, ChargesTheBudgetAndDeclinesWhatItCannotAfford) {
     EXPECT_GE(budget.bytes_allocated(), before + (*filter)->bytes());
   }
   EXPECT_EQ(budget.bytes_allocated(), before) << "the reservation outlived the filter";
-  // Far more keys than the limit holds: no filter, no error, and nothing charged.
-  auto too_big = KeyFilter::Make(int64_t{16} * 1024 * 1024, &budget);
+  // More than the BUDGET holds, and a key count kMaxBytes itself permits (2 MiB of filter against a
+  // 1 MiB budget): no filter, no error, nothing charged. Chosen so that raising or lowering
+  // kMaxBytes cannot change what this case exercises -- it declined on the cap until the cap moved,
+  // which made it a test of the cap that read as a test of the budget.
+  auto too_big = KeyFilter::Make(1'000'000, &budget);
   ASSERT_TRUE(too_big.ok()) << too_big.status().ToString();
   EXPECT_EQ(*too_big, nullptr);
   EXPECT_EQ(budget.bytes_allocated(), before);

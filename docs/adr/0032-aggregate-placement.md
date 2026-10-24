@@ -435,3 +435,12 @@ entirely, because a pre-grouped relation has exactly one row per key.
   the 16 MiB cap. Measured 16 to 32 MiB at SF 100: **1.001x over the 22**, and Q3 still receives no filter,
   because what blocks it is ADR 0029's uncarried offer through a pushing `Filter` and not the cap. The cap is not
   the binding constraint for any query of the 22.
+  - **Reversed (2026-10-24), and this entry is why it was worth re-running.** Its own second sentence names the
+    blocker, and ADR 0029's conjunction of a pushed predicate set with a key filter removed that blocker the day
+    after this was written -- so the 1.001x was a null result measured on a tree where no query *could* spend the
+    extra bytes. Re-measured on the same 22 with the blocker gone: **0.986x**, two queries gaining the filter
+    their build had been too large for (0.795x and 0.911x), peak memory flat, and no other query's plan moved --
+    checked by filter count, not inferred from the timings, since three queries read within 1% of noise and none
+    of them gains a filter at all. The lesson for the next reader of an Alternatives entry: **a refusal measured
+    while something else blocks the mechanism is a measurement of the blocker**, and this one said so in its own
+    text without anyone noticing for two days.

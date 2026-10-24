@@ -237,9 +237,16 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
       their left (`EmitsBuildRows`). An ANTI building on its right emits precisely the rows a filter would drop.
     - The build must hold at most a sixteenth of the probe's rows. Without this, a query whose build held every key
       of its probe's domain ran **1.138x**: the filter rejected nothing and the probe paid the hash for it.
-    - The filter must fit 16 MB. It is probed once a row with no locality at all, so it pays only while it stays in
-      cache: filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost **17%** on a query whose build
-      held a sixth of its probe's keys.
+    - The filter must fit 16 MB -- **32 MiB since 2026-10-24, and the raise is the measurement this bullet had
+      been missing.** It is probed once a row with no locality at all, so it pays only while it stays in cache:
+      filters of 6 to 14 MB are worth 0.72x to 0.96x, and a 45 MB one cost **17%** on a query whose build held a
+      sixth of its probe's keys. 16 MB was the conservative side of that gap and nothing had measured the middle,
+      because until D1 could attach beside a pushed predicate set no query of the 22 had a refused candidate to
+      spend the bytes on. With that shipped, two do, and 16 to 32 MiB measures **0.986x over the 22** (0.795x and
+      0.911x on the two, peak memory flat, no other plan moved). The bound stays short of the 45 MB shape by
+      quantisation rather than by judgement: `bytes` rounds up to a power-of-two block count, so 32 MiB admits
+      builds of 8,388,609 to 16,777,216 keys and the next size is 64 MiB -- the query the 17% was measured on
+      builds 22,760,819 keys and stays refused.
   - **The measurement**, arms alternating per query on one binary, best of three: the 22 go 62.96 s to 60.30 s,
     **0.958x**. Seven queries gain -- 0.724x, 0.851x, 0.890x, 0.927x, 0.931x, 0.947x and 0.966x -- and the largest
     of them is the query D0 left with a 291,130,673-row probe, which is the prize this plan predicted.

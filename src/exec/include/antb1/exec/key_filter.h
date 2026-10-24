@@ -42,9 +42,19 @@ class KeyFilter {
   // pays only while it stays in cache: past that every probe row costs a memory round trip, and the
   // filter loses more than the rows it rejects save. Measured at SF 100 on the 22: filters of 6 to
   // 14 MB are worth 0.73x to 0.96x on their queries, and a 45 MB one cost 17% on a query whose
-  // build holds a sixth of its probe's keys -- so the boundary is between them, and this is the
-  // conservative side of it.
-  static constexpr int64_t kMaxBytes = int64_t{16} * 1024 * 1024;
+  // build holds a sixth of its probe's keys -- so the boundary is between them.
+  //
+  // **32 MiB, raised from 16 after re-measuring.** ADR 0032 refused this at 1.001x while a scan
+  // with pushed predicates could not also take a key filter, so no query of the 22 could spend the
+  // extra bytes; ADR 0029's conjunction lifted that, and the same change now measures **0.986x over
+  // the 22** -- two queries gain the filter their build had been too large for, at 0.795x and
+  // 0.911x, and no other query's plan moves.
+  //
+  // The bound is quantised, which is what keeps it from reaching the 45 MB shape: `bytes` rounds up
+  // to a power-of-two block count, so this admits builds of 8,388,609 to 16,777,216 keys and the
+  // next size is 64 MiB. The query the 17% was measured on builds 22,760,819 keys, sizes to 64 MiB,
+  // and stays refused -- verified, not assumed.
+  static constexpr int64_t kMaxBytes = int64_t{32} * 1024 * 1024;
 
   // The most keys published as values beside the bits (D2). A part's range is tested against them
   // with one binary search, which is free whether it prunes anything or not, so what has to be
