@@ -187,7 +187,7 @@ TEST_F(PlanReportTest, AScanBelowAGroupedAggregateNamesTheJoinsKey) {
 
 // No build can publish a filter for a key a Parquet scan would not decode to the values the build
 // hashed, which is one key of an integer or DATE type (CanPublishKeyFilter) -- so a VARCHAR key has
-// no candidate at all, neither mechanism. This is **not** one of the three run-time facts the word
+// no candidate at all, neither mechanism. This is **not** one of the four run-time facts the word
 // "candidate" covers: it is settled by the plan, and the old code enforced it only by accident,
 // through the null filter that ProbeKeyStructure no longer tests.
 TEST_F(PlanReportTest, NoCandidateForAKeyNoBuildCanPublish) {

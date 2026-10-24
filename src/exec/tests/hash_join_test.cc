@@ -3316,6 +3316,23 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& pl
 // How many scans of the profile applied a key filter (ADR 0029's D1), summed: a scan reports it
 // whether or not it also pushed predicates of its own, so this tells the two arms of a filter test
 // apart.
+// The builds' chosen layouts, summed: `hash_join.cc` records `direct` on each HashBuild node. The
+// tests below assert it because their own premise is which layout a fixture produces, and that is
+// arithmetic over two constants of `join_table.cc` -- a comment saying "span 160 over 5 rows, so
+// hashed" stops being true the moment either constant moves, and nothing would fail.
+int64_t DirectBuildsIn(const ProfileNode& node) {
+  int64_t found = 0;
+  for (const ProfileMetric& metric : node.metrics()) {
+    if (metric.name == "direct") {
+      found += metric.value;
+    }
+  }
+  for (const ProfileNode* child : node.children()) {
+    found += DirectBuildsIn(*child);
+  }
+  return found;
+}
+
 int64_t KeyFiltersIn(const ProfileNode& node) {
   int64_t found = 0;
   for (const ProfileMetric& metric : node.metrics()) {
@@ -3884,6 +3901,9 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
       EXPECT_EQ(two->filtered_scans(), 6) << "the control's own predicate should be pushed";
       EXPECT_EQ(KeyFiltersIn(control_profile), 0) << "the control must not filter on the keys";
       EXPECT_EQ(KeyFiltersIn(got_profile), filtered ? 1 : 0);
+      // The premise, from the profile and not from the comment above: D1 is refused for a direct
+      // build, so this build must be hashed or the case tests nothing.
+      EXPECT_EQ(DirectBuildsIn(got_profile), 0) << "the build must be hashed for D1 to apply";
       EXPECT_EQ(RowsOf(**got), RowsOf(**control));
       EXPECT_FALSE(RowsOf(**got).empty());
     }
@@ -3893,11 +3913,15 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
     // test would otherwise refuse it first and this case would pin nothing.
     const auto wide = MixedTable("p", 6, 80, probe_keys);
     const auto big = MixedTable("b", 6, 80, build_keys);
+    ProfileNode large_profile;
     auto large = RunPlan(
         PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(wide, "p"), ScanOf(big, "b"), {pk}, {bk}), 6),
-        ContextOf(executor));
+        ContextOf(executor), &large_profile);
     ASSERT_TRUE(large.ok()) << large.status().ToString();
     EXPECT_EQ(wide->filtered_scans(), 0) << "a build this size must not be filtered with";
+    // `filtered_scans() == 0` cannot say WHICH gate refused, so the premise is asserted too: this
+    // build must be hashed, or the layout test refuses it first and the share gate is untested.
+    EXPECT_EQ(DirectBuildsIn(large_profile), 0) << "the share gate must be what refuses it";
   }
 }
 
@@ -3929,6 +3953,7 @@ TEST_F(HashJoinPlanTest, ADirectBuildTakesNoRowFilterAndStillPrunesParts) {
         ContextOf(executor), &profile);
     ASSERT_TRUE(got.ok()) << got.status().ToString();
     // The halves, in opposite directions.
+    EXPECT_EQ(DirectBuildsIn(profile), 1) << "the fixture must actually produce a direct build";
     EXPECT_EQ(KeyFiltersIn(profile), 0) << "a direct build must publish no per-row filter";
     EXPECT_EQ(one->filtered_scans(), 0) << "and so no part is scanned through a filter";
     EXPECT_EQ(one->scanned_parts(), (std::vector<int64_t>{0})) << "but the parts are still pruned";

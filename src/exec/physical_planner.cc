@@ -651,10 +651,11 @@ std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBui
 }
 
 // The field of `scan` a key filter could be applied to, as a position in `scan.fields`: every
-// condition a plan decides holds, and none of the three only a run can test -- whether the build
-// published a filter at all, whether it stayed small enough for D1's share gate, and whether a
-// part's statistics exclude its keys. For `explain --physical`, which reports what the planner
-// decided and must not claim what it cannot know, so what this finds is a *candidate*.
+// condition a plan decides holds, and none of the four only a run can test -- whether the build
+// published a filter at all, whether it stayed small enough for D1's share gate, which layout it
+// chose (a direct build takes no per-row filter), and whether a part's statistics exclude its keys.
+// For `explain --physical`, which reports what the planner decided and must not claim what it
+// cannot know, so what this finds is a *candidate*.
 std::optional<int> KeyFilterCandidate(const plan::ScanNode& scan, const PipelineBuilds* builds,
                                       const std::optional<LateScan>& late) {
   const std::optional<ProbeKey> key = ProbeKeyStructure(scan, builds, late);
@@ -671,8 +672,8 @@ std::string ScanFieldName(const plan::ScanNode& scan, int column) {
 
 // Whether `scan` can reject rows with the build's filter, row by row as it decodes them (ADR
 // 0029's D1). Beyond ProbeKeyOf's conditions this needs the table to support a scan filter at all
-// over the fields it reads, and the build to be small enough that the filter's own cost is worth
-// paying.
+// over the fields it reads, the build to have come out hashed rather than direct, and the build to
+// be small enough that the filter's own cost is worth paying.
 bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   if (!scan.table->supports_scan_filter(ReadFields(scan, nullptr))) {
     return false;
@@ -690,9 +691,14 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   // by removal rather than by addition; and a dense-key build of 5,000,000 keys under a
   // 200,000,000-row probe it covers entirely goes 0.691x, the filter having cost 45% for nothing.
   //
-  // This gates D1 only. The build still publishes its filter, so D2 keeps the interval it prunes
-  // parts with -- `KeyScanOf` asks `PartHasNoKey` separately, and a part that holds no key is still
-  // skipped whole.
+  // **This gates the probe-side arm of D1, and deliberately not the other two paths.** D2 keeps the
+  // interval it prunes parts with, because the build still publishes its filter and `KeyScanOf`
+  // asks `PartHasNoKey` separately -- a direct build still skips a part that holds no key of its.
+  // And D5, the filter a join above a grouped aggregate offers that aggregate's own scan, still
+  // takes a direct build's filter (its own share gate is inline below): **the argument above does
+  // not transfer to it.** What D5 buys is groups the aggregate never builds, so what it has to beat
+  // is the aggregate's per-row cost and not the join probe's -- a cheap probe bounds neither. That
+  // it is right for D5 too is unmeasured, and `aggregate_filter_test.cc` has the shape.
   if (table->layout() == JoinTable::Layout::kDirect) {
     return false;
   }

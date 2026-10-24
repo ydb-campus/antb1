@@ -726,10 +726,12 @@ PartAggregate Aggregate COUNT(*)
     Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
 ```
 
-**A candidate is not a fact, and the word is load-bearing.** Three of the conditions behind a key filter are not
+**A candidate is not a fact, and the word is load-bearing.** Four of the conditions behind a key filter are not
 properties of a plan at all: whether the build really published a filter (it makes one as it finishes, and its keys
-may not fit the budget), whether it stayed small enough against the probe for the filter to be worth its cost, and
-whether a part's statistics exclude every published key. Everything a plan *can* settle — the join's kind, one key
+may not fit the budget), whether it stayed small enough against the probe for the filter to be worth its cost,
+**which layout the build chose** -- a build that came out in the direct layout takes no per-row filter, because its
+probe is two array loads and the filter costs more than they do -- and whether a part's statistics exclude every
+published key. Everything a plan *can* settle — the join's kind, one key
 of a type a build can publish, the chain of nodes down to the scan, and which of the two mechanisms the table
 supports — is settled before the line is printed, so a candidate is never offered where no run could attach one.
 What a run really did is in `--analyze`'s `key_filter`, `key_dropped` and `key_pruned` metrics below; a candidate
