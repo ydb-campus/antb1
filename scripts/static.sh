@@ -7,10 +7,13 @@
 #                          configures build/static and builds only those targets (the bench tasks: antb1,
 #                          antb1-bench-micro); nothing is packaged or checked.
 #   pixi run static        builds antb1 (Release, -O3, ThinLTO; fully static on Linux) and packages it into
-#                          build/static/package: antb1-<target>.tar.gz (the binary, its third-party notices,
-#                          BUILDINFO.json, README.txt), on Linux antb1-<target>.debug.tar.gz (its line tables), and
-#                          SHA256SUMS. Then it checks the packaged file, not the build tree's: static_gates.py
-#                          (linkage, link flags, identity, allocator restart, smoke tests) and every CLI golden
+#                          build/static/package: antb1-<target>.tar.gz (the binary, LICENSE, NOTICE, its
+#                          THIRD_PARTY_NOTICES.txt, BUILDINFO.json, README.txt), on Linux antb1-<target>.debug.tar.gz
+#                          (its line tables, with the same licence texts), and SHA256SUMS. The licence texts come from
+#                          scripts/static_package.py (docs/adr/0034-licence-and-static-sources.md); on Linux the
+#                          sources that go with the package are `pixi run static-sources`. Then it checks the package
+#                          (static_gates.py package) and the packaged file, not the build tree's: static_gates.py
+#                          binary (linkage, link flags, identity, allocator restart, smoke tests) and every CLI golden
 #                          (ANTB1_CLI_UNDER_TEST).
 #   pixi run static-test   builds every target of build/static and runs all hermetic tests against the static
 #                          Arrow -> build/static/junit.xml (nightly static-test).
@@ -69,6 +72,16 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) target=darwin-arm64 ;;
   *) echo "static: unsupported platform $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
+# The licence texts first, so a binary that fails a check below is kept with them (static.yml). On Linux this also
+# refuses a sysroot build whose glibc source is not pinned.
+notices="$build/notices"
+rm -rf "$notices"
+python scripts/static_package.py notices --target "$target" --prefix "$prefix" --env "$CONDA_PREFIX" --out "$notices"
+sysroot="" glibc_source=""
+if [ "$target" != darwin-arm64 ]; then
+  glibc=$(python scripts/static_package.py glibc --env "$CONDA_PREFIX")
+  read -r sysroot glibc_source <<<"$glibc"
+fi
 # The checks that need no run come first: a link that binds the wrong library fails here with the symbols, not
 # with a crash at start.
 python scripts/static_gates.py binary --bin "$build/bin/antb1" --env "$CONDA_PREFIX" --linkage-only
@@ -87,48 +100,53 @@ pkg="$build/package"
 name="antb1-$version-$target"
 rm -rf "$pkg"
 mkdir -p "$pkg/$name"
+cp "$notices"/* "$pkg/$name/"
 if [ "$target" = darwin-arm64 ]; then
   cp -p "$build/bin/antb1" "$pkg/$name/antb1" # stripping would break the linker's ad-hoc signature
 else
-  # The line tables go to a separate asset; the binary keeps its symbols and build-id for perf.
-  llvm-objcopy --only-keep-debug "$build/bin/antb1" "$pkg/antb1.debug"
-  llvm-objcopy --strip-debug --add-gnu-debuglink="$pkg/antb1.debug" "$build/bin/antb1" "$pkg/$name/antb1"
+  # The line tables go to a separate asset, which unpacks next to the binary (its debuglink); the binary keeps its
+  # symbols and build-id for perf.
+  debug="$pkg/debug/$name"
+  mkdir -p "$debug"
+  cp "$notices"/* "$debug/"
+  llvm-objcopy --only-keep-debug "$build/bin/antb1" "$debug/antb1.debug"
+  llvm-objcopy --strip-debug --add-gnu-debuglink="$debug/antb1.debug" "$build/bin/antb1" "$pkg/$name/antb1"
 fi
 
-notices="$pkg/$name/THIRD_PARTY_NOTICES.txt"
-licenses=("$prefix"/share/antb1-licenses/* cmake/static/licenses/*)
-if [ "$target" != darwin-arm64 ]; then
-  sysroot=$(find "$CONDA_PREFIX" -maxdepth 3 -type d -path "*-conda-linux-gnu/sysroot" | head -1)
-  licenses+=("$sysroot/usr/share/licenses/glibc/"* "$CONDA_PREFIX/share/licenses/libstdc++/RUNTIME.LIBRARY.EXCEPTION")
-fi
-{
-  echo "antb1 $version ($target) is linked statically with the libraries below; their licences follow."
-  echo "Apache Arrow's LICENSE and NOTICE also cover the code it bundles (docs/adr/0033-standalone-static-binary.md)."
-} >"$notices"
-for f in "${licenses[@]}"; do
-  if [ ! -s "$f" ]; then
-    echo "static: licence file missing or empty: $f" >&2
-    exit 1
-  fi
-  printf '\n==== %s ====\n\n' "$(basename "$f")" >>"$notices"
-  cat "$f" >>"$notices"
-done
-
+case "$sha" in
+  "" | *-dirty) source_url="" ;;
+  *) source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-ydb-campus/antb1}/tree/$sha" ;;
+esac
 python - "$pkg/$name/BUILDINFO.json" <<EOF
 import json, sys
-json.dump({
+info = {
     "name": "antb1",
     "version": "$version",
     "commit": "$sha",
     "target": "$target",
     "flavor": "static-thinlto",
+    "license": "Apache-2.0",
+    "source": "$source_url",
     "arrow_prefix": "$(basename "$(dirname "$prefix")")",
     "arrow_sources": "cmake/static/arrow-sources.lock",
+    "sysroot": "$sysroot",
+    "glibc_source": "$glibc_source",
     "pixi_lock_sha256": "$(cmake -E sha256sum pixi.lock | cut -c1-64)",
     "compiler": "$(clang++ --version | head -1)",
     "runner": "${ImageOS:-$(uname -s)} ${ImageVersion:-$(uname -r)}",
-}, open(sys.argv[1], "w"), indent=2)
+}
+for key in ("source", "sysroot", "glibc_source"):  # no source URL for a -dirty build; no glibc on macOS
+    if not info[key]:
+        del info[key]
+json.dump(info, open(sys.argv[1], "w"), indent=2)
 EOF
+glibc_note=""
+if [ -n "$glibc_source" ]; then
+  glibc_note="
+It contains the GNU C Library (${glibc_source%.src.rpm}), linked statically and licensed under the GNU LGPL 2.1
+or later. The sources of glibc, of antb1 and of every other library linked into it are in
+antb1-$target.sources.tar, published next to this package; THIRD_PARTY_NOTICES.txt says how to relink."
+fi
 cat >"$pkg/$name/README.txt" <<EOF
 antb1 $version for $target: one standalone executable (no pixi, no repository needed).
 
@@ -139,23 +157,26 @@ On Linux it re-executes itself once at start with MIMALLOC_PURGE_DELAY=-1 (the a
 0017). A renamed copy does that too; started through a symlink of another name it does not, and runs about 5%
 slower. macOS has no such restart.
 The CPU baseline is in \`version --verbose\`; an older CPU gets a message instead of a crash.
-Check the download against SHA256SUMS of the same release. No licence for antb1 itself is granted yet; the
-libraries linked into it are listed with their licences in THIRD_PARTY_NOTICES.txt.
+Check the download against SHA256SUMS of the same release.
+
+antb1 is licensed under the Apache License 2.0 (LICENSE, NOTICE). THIRD_PARTY_NOTICES.txt lists the libraries
+linked into it, with their licences.$glibc_note
 EOF
 
 (
   cd "$pkg"
   tar -czf "antb1-$target.tar.gz" "$name"
   assets=("antb1-$target.tar.gz")
-  if [ -f antb1.debug ]; then
-    tar -czf "antb1-$target.debug.tar.gz" antb1.debug
+  if [ -d debug ]; then
+    tar -czf "antb1-$target.debug.tar.gz" -C debug "$name"
     assets+=("antb1-$target.debug.tar.gz")
   fi
   cmake -E sha256sum "${assets[@]}" >SHA256SUMS
 )
 echo "static: packaged $pkg/antb1-$target.tar.gz"
 
-# ---- check the packaged file ----
+# ---- check the package and the packaged file ----
+python scripts/static_gates.py package --pkg "$pkg" --target "$target"
 python scripts/static_gates.py binary --bin "$pkg/$name/antb1" --env "$CONDA_PREFIX" --build-dir "$build"
 ANTB1_CLI_UNDER_TEST="$root/$pkg/$name/antb1" ctest --preset static -L '^cli$'
 echo "static: OK: $pkg"

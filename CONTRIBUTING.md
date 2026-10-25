@@ -120,4 +120,8 @@ Report security vulnerabilities privately as described in [SECURITY.md](SECURITY
 
 ## License
 
-The project has no license yet (see [README.md](README.md)).
+antb1 is licensed under the Apache License 2.0 ([LICENSE](LICENSE), [NOTICE](NOTICE)). A contribution is licensed
+under the same terms (Apache-2.0 section 5): there is no CLA and no sign-off. Submit only work you have the right to
+license. Code taken from elsewhere needs a licence compatible with Apache-2.0: keep its notices and name its origin in
+the PR. A newly linked library also needs its licence in the package and its source in the sources of the static
+binary ([ADR 0034](docs/adr/0034-licence-and-static-sources.md), docs/recipes/dependency-update.md).

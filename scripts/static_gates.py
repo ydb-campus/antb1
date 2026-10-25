@@ -9,6 +9,10 @@
           dynamic section, pthread linked whole, no NSS; macOS: only system libraries, no LC_RPATH, the deployment
           target, a valid signature), the link flags when its build tree is given, build identity, the allocator
           restart, and smoke tests of codecs, threads and errors on Parquet files that DuckDB writes at run time.
+  package the tarballs that scripts/static.sh packed: their exact members (regular files under one directory), the
+          licence texts of docs/adr/0034-licence-and-static-sources.md (LICENSE and NOTICE equal to the repository's,
+          the notice sections each target needs, on Linux the LGPL notice first), BUILDINFO.json, README.txt, and
+          SHA256SUMS.
 
 Prints one line per check and exits 1 when any fails.
 """
@@ -16,6 +20,7 @@ Prints one line per check and exits 1 when any fails.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -24,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -479,6 +485,103 @@ def gate_binary(args: argparse.Namespace) -> None:
         gate_smoke(env, binary, tmp)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# package
+
+REPO = Path(__file__).resolve().parent.parent
+LGPL_NOTICE_START = "This program contains the GNU C Library"  # as scripts/static_package.py writes it
+PACKAGE_TEXTS = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.txt"]
+# The notice sections each target needs (`==== <label> ====`), besides those of every library Arrow bundles.
+SECTIONS_ALL = [
+    r"Apache Arrow \S+: LICENSE\.txt",
+    r"Apache Arrow \S+: NOTICE\.txt",
+    r"Apache Thrift \S+: NOTICE",
+    r"CLI11 \S+: LICENSE",
+]
+SECTIONS_LINUX = [
+    r"GNU C Library \(glibc-\S+\): COPYING", r"GNU C Library \(glibc-\S+\): COPYING\.LIB",
+    r"GNU C Library \(glibc-\S+\): LICENSES",
+    r"GCC \S+ runtime libraries \(libstdc\+\+, libgcc\): RUNTIME\.LIBRARY\.EXCEPTION",
+]  # fmt: skip
+SECTIONS_DARWIN = [r"libc\+\+ \S+: LICENSE\.TXT"]
+
+
+def read_tarball(path: Path, texts: list[str]) -> tuple[dict[str, tarfile.TarInfo], dict[str, bytes]]:
+    """The members of a .tar.gz by name, and the contents of those whose base name is in `texts`."""
+    members: dict[str, tarfile.TarInfo] = {}
+    contents: dict[str, bytes] = {}
+    with tarfile.open(path, "r:gz") as tar:
+        for info in tar:
+            members[info.name] = info
+            if info.isreg() and info.name.rsplit("/", 1)[-1] in texts:
+                contents[info.name.rsplit("/", 1)[-1]] = tar.extractfile(info).read()
+    return members, contents
+
+
+def check_members(path: Path, members: dict[str, tarfile.TarInfo], top: str, files: list[str]) -> None:
+    expected = {top, *(f"{top}/{name}" for name in files)}
+    check(set(members) == expected, f"{path.name} holds exactly {top}/ with {', '.join(files)}",
+          f"extra {sorted(set(members) - expected)}, missing {sorted(expected - set(members))}")  # fmt: skip
+    for name, info in members.items():
+        safe = not name.startswith("/") and ".." not in name.split("/")
+        kind_ok = info.isdir() if name == top else info.isreg()
+        check(safe and kind_ok, f"{path.name}: {name} is a {'directory' if name == top else 'regular file'} inside")
+
+
+def gate_package(args: argparse.Namespace) -> None:
+    pkg, target = Path(args.pkg), args.target
+    linux = target.startswith("linux-")
+    assets = [f"antb1-{target}.tar.gz"] + ([f"antb1-{target}.debug.tar.gz"] if linux else [])
+    sums = dict(reversed(line.split(maxsplit=1)) for line in (pkg / "SHA256SUMS").read_text().splitlines())
+    check(sorted(sums) == sorted(assets), f"SHA256SUMS lists exactly {', '.join(assets)}", str(sorted(sums)))
+    for asset in assets:
+        digest = hashlib.sha256((pkg / asset).read_bytes()).hexdigest() if (pkg / asset).is_file() else ""
+        check(digest == sums.get(asset), f"{asset} matches SHA256SUMS")
+
+    texts = [*PACKAGE_TEXTS, "BUILDINFO.json", "README.txt"]
+    members, contents = read_tarball(pkg / assets[0], texts)
+    tops = sorted({name.split("/", 1)[0] for name in members})
+    try:
+        info = json.loads(contents.get("BUILDINFO.json", b""))
+    except ValueError:
+        info = {}
+    top = f"antb1-{info.get('version', '?')}-{target}"
+    check(tops == [top], f"{assets[0]} unpacks into {top}/", str(tops))
+    check_members(pkg / assets[0], members, top, ["antb1", *texts])
+    check(
+        bool(members.get(f"{top}/antb1")) and members[f"{top}/antb1"].mode & 0o111 != 0,
+        "the packaged antb1 is executable",
+    )
+    for name in ("LICENSE", "NOTICE"):
+        check(contents.get(name) == (REPO / name).read_bytes(), f"the package's {name} is the repository's")
+
+    notices = contents.get("THIRD_PARTY_NOTICES.txt", b"").decode(errors="replace")
+    labels = re.findall(r"^==== (.+) ====$", notices, re.MULTILINE)
+    needed = SECTIONS_ALL + (SECTIONS_LINUX if linux else SECTIONS_DARWIN)
+    missing = [pattern for pattern in needed if not any(re.fullmatch(pattern, label) for label in labels)]
+    check(not missing, "THIRD_PARTY_NOTICES.txt has the sections this target needs", f"none matches {missing}")
+    glibc_labels = [label for label in labels if label.startswith("GNU C Library")]
+    if linux:
+        source = info.get("glibc_source", "")
+        check(notices.startswith(LGPL_NOTICE_START) and bool(source) and source in notices.split("\n\n", 1)[0],
+              f"THIRD_PARTY_NOTICES.txt starts with the LGPL notice naming {source or 'the glibc source'}")  # fmt: skip
+        check(bool(info.get("sysroot")), "BUILDINFO.json names the sysroot build")
+    else:
+        check(not glibc_labels and LGPL_NOTICE_START not in notices, "THIRD_PARTY_NOTICES.txt names no glibc")
+    named = (info.get("target"), info.get("license"), info.get("flavor")) == (target, "Apache-2.0", "static-thinlto")
+    check(named, "BUILDINFO.json names the target, the licence and the flavor", str(info))
+    readme = contents.get("README.txt", b"").decode(errors="replace")
+    sources = f"antb1-{target}.sources.tar"
+    check("Apache License 2.0" in readme and (not linux or sources in readme),
+          f"README.txt names the licence{' and ' + sources if linux else ''}")  # fmt: skip
+
+    if linux:
+        members, debug = read_tarball(pkg / assets[1], PACKAGE_TEXTS)
+        check_members(pkg / assets[1], members, top, ["antb1.debug", *PACKAGE_TEXTS])
+        check(all(debug.get(name) == contents.get(name) for name in PACKAGE_TEXTS),
+              f"{assets[1]} carries the same licence texts")  # fmt: skip
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -493,9 +596,14 @@ def main() -> int:
     b.add_argument("--env", required=True)
     b.add_argument("--build-dir", help="the build tree of the binary: also check its link line")
     b.add_argument("--linkage-only", action="store_true", help="only the checks that need no run of the binary")
+    k = sub.add_parser("package")
+    k.add_argument("--pkg", required=True, help="the package directory (build/static/package)")
+    k.add_argument("--target", required=True, choices=["darwin-arm64", "linux-aarch64", "linux-x86_64"])
     args = parser.parse_args()
     if args.cmd == "prefix":
         gate_prefix(args)
+    elif args.cmd == "package":
+        gate_package(args)
     else:
         gate_binary(args)
     if FAILURES:

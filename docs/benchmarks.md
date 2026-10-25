@@ -209,8 +209,10 @@ Never commit ClickBench data, query text, results or result files, and never upl
 The package is one file, so a perf host needs only it, the data and a shell.
 
 1. **The binary.** Fetch the newest package from `main`: a `static.yml` artifact named `antb1-<target>`, with
-   targets `linux-x86_64`, `linux-aarch64` and `darwin-arm64`. Artifacts are kept 30 days; GitHub releases follow
-   with the project licence. Use any machine where `gh` is logged in:
+   targets `linux-x86_64`, `linux-aarch64` and `darwin-arm64`. Artifacts are kept 30 days; GitHub releases follow.
+   A Linux run also has `antb1-<target>-sources`, the sources that go with the package
+   ([ADR 0034](adr/0034-licence-and-static-sources.md)); a perf host does not need them. Use any machine where `gh`
+   is logged in:
 
    ```bash
    run=$(gh run list -R ydb-campus/antb1 -w static.yml -b main -e push -s success -L 1 --json databaseId -q '.[0].databaseId')

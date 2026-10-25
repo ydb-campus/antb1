@@ -12,7 +12,7 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `PR title` | `.github/workflows/pr-title.yml` | pull requests (opened, edited, reopened, synchronized), merge queue | Conventional Commits title; required check `PR title` |
 | `CodeQL` | `.github/workflows/codeql.yml` | every pull request to `main` (no paths filter), pushes to `main`, weekly, manual | code scanning of the C++ code and the workflows; a merge gate through the ruleset ([CodeQL](#codeql)) |
 | `Nightly` | `.github/workflows/nightly.yml` | daily schedule, manual | deep checks, advisory; a failure opens a `nightly-failure` issue ([Nightly](#nightly)) |
-| `static` | `.github/workflows/static.yml` | pull requests that change the build (`pixi.toml`, `pixi.lock`, presets, `cmake/**`, any `CMakeLists.txt`, `src/cli/**`, `src/common/**`, the static scripts, the workflow), pushes to `main`, manual | the standalone static binary on its three targets, advisory ([Standalone static build](#standalone-static-build)) |
+| `static` | `.github/workflows/static.yml` | pull requests that change the build (`pixi.toml`, `pixi.lock`, presets, `cmake/**`, any `CMakeLists.txt`, `src/cli/**`, `src/common/**`, `LICENSE`, `NOTICE`, the static scripts, the workflow), pushes to `main`, manual | the standalone static binary on its three targets and the sources of the Linux packages, advisory ([Standalone static build](#standalone-static-build)) |
 | `Security` | `.github/workflows/security.yml` | pushes and pull requests that change `.github/**`, weekly, manual | zizmor with its online audits, results in the Security tab; advisory |
 | `Scorecard` | `.github/workflows/scorecard.yml` | pushes to `main`, weekly, branch protection changes | OpenSSF Scorecard, results in the Security tab and on scorecard.dev; advisory |
 | `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
@@ -62,7 +62,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `static` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
-| `static <target> (pixi run static)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static` (on that platform) |
+| `static <target> (pixi run static && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, then `pixi run static-sources` (on that platform) |
 | `static urls (pixi run static-arrow --check-urls)` (advisory, PRs that change the lock) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
@@ -120,8 +120,9 @@ prefix-dev/setup-pixi.
 ### Standalone static build
 
 The release and performance binary ([ADR 0033](adr/0033-standalone-static-binary.md)) has its own environment,
-`static`, and six tasks: the four below, and the benchmarks `pixi run bench` and `pixi run bench-clickbench`, which
-build in `build/static` too ([benchmarks.md](benchmarks.md)).
+`static`, and seven tasks: the five below, and the benchmarks `pixi run bench` and `pixi run bench-clickbench`, which
+build in `build/static` too ([benchmarks.md](benchmarks.md)). The licence texts of the package and the sources that
+go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
 
 - `pixi run static-arrow` (network on the first run) downloads the sources pinned in
   `cmake/static/arrow-sources.lock` and builds Arrow 25 and the dependencies it bundles as static `-O3` ThinLTO
@@ -138,17 +139,30 @@ build in `build/static` too ([benchmarks.md](benchmarks.md)).
     resolve, a bad certificate, another HTTP error) fails. So does a file with fewer than two good URLs. The
     `static urls` job runs it on every PR that changes the lock, and the nightly `static-urls` job every night.
 - `pixi run static` builds antb1 in `build/static` against that prefix, packages it into `build/static/package`
-  (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the packaged file:
-  linkage, link flags, build identity, the allocator restart, smoke tests and every CLI golden.
+  (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the package and the
+  packaged file. The package checks cover the members, LICENSE and NOTICE, the notices, BUILDINFO.json and the
+  checksums; the file checks cover linkage, link flags, build identity, the allocator restart, smoke tests and every
+  CLI golden. Both tarballs carry LICENSE, NOTICE and `THIRD_PARTY_NOTICES.txt`, which on Linux starts with the LGPL
+  notice of the static glibc. Packaging refuses a sysroot build that has no line in
+  `cmake/static/glibc-source.lock`.
+- `pixi run static-sources` (network once, Linux; after `pixi run static`) writes
+  `build/static/sources/antb1-<target>.sources.tar` and its `.sha256`: the sources that go with the Linux package
+  (LGPL-2.1 section 6). It holds glibc's source RPM by `cmake/static/glibc-source.lock` (the AlmaLinux vault, then a
+  mirror), antb1's source at the packaged commit, the pins of `cmake/static/arrow-sources.lock`, and the conda-forge
+  archives of CLI11 and Boost's headers (conda-forge, then prefix.dev). The package must come from the clean checkout
+  it runs in. Downloads go through `scripts/static-sources.sh` into `$ANTB1_ARROW_DIR/src`; a whole pass is retried
+  once. On macOS there is nothing to do.
 - `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a
   downloaded package or a copy on a benchmark host.
 - `pixi run static-test` builds every target of `build/static` and runs all hermetic tests against the static Arrow.
 
-The `static` workflow runs `pixi run static` on linux-x86_64 (ubuntu-24.04), linux-aarch64 (ubuntu-24.04-arm)
-and darwin-arm64 (macos-15). It is advisory and not part of `CI OK`. Its pixi environment is not cached. The
-Arrow prefix is restored from `static-arrow-<target>-<key>` and saved from pushes to `main` only. Runs on `main`
-and manual runs upload the package as the `antb1-<target>` artifact. These runs are cold until `main` has saved a
-prefix (a cold build takes about a minute on a 64-core host; the CI runners are slower).
+The `static` workflow runs `pixi run static` and `pixi run static-sources` on linux-x86_64 (ubuntu-24.04),
+linux-aarch64 (ubuntu-24.04-arm) and darwin-arm64 (macos-15). It is advisory and not part of `CI OK`. Its pixi
+environment is not cached. The Arrow prefix is restored from `static-arrow-<target>-<key>` and saved from pushes to
+`main` only. Runs on `main` and manual runs upload the package as the `antb1-<target>` artifact; on Linux they first
+check and upload its sources as `antb1-<target>-sources`, so a package is never published without them. A failed
+macOS run keeps its binary, with the licence texts, as `failed-antb1-<target>`. These runs are cold until `main` has
+saved a prefix (a cold build takes about a minute on a 64-core host; the CI runners are slower).
 
 ## Nightly
 
@@ -201,8 +215,8 @@ dismiss the alert with a reason. Until then the ruleset blocks the merge (after 
   requests are skipped, because their token cannot upload results.
 - `Scorecard` runs OpenSSF Scorecard and publishes the results. Scorecard accepts published results only from a
   restricted workflow: no workflow-level `env` or write permissions, `id-token: write` only in its job, no job `env`,
-  and only checkout, upload-artifact, codeql-action/upload-sarif and scorecard-action as steps. The findings
-  accepted for now are the missing license (decided later) and the admin bypass of the ruleset.
+  and only checkout, upload-artifact, codeql-action/upload-sarif and scorecard-action as steps. The finding
+  accepted for now is the admin bypass of the ruleset.
 - `Agent bootstrap` checks the shared sandbox bootstrap from scratch, as a Claude, Codex or Copilot sandbox runs it:
   `bash scripts/agent-setup.sh --envs "default lint"` with `ANTB1_PIXI_SOURCE=github` and `ANTB1_PIXI_SOURCE=conda`,
   then `pixi run --as-is test` and `pixi run --as-is doctor --json`. It uses no caches on purpose.
@@ -228,10 +242,12 @@ measurements are recorded here once enough runs exist.
 | `scorecard-sarif` | `Scorecard` | always | 5 days |
 | `bench-results` | `bench-run` | always | 30 days |
 | `antb1-<target>` | `static <target>` | pushes to `main` and manual runs | 30 days |
+| `antb1-<target>-sources` (Linux) | `static <target>` | pushes to `main` and manual runs, before the package | 30 days |
+| `failed-antb1-<target>` (macOS) | `static <target>` | on failure, when the binary was built | 7 days |
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
-corpus, the benchmark results hold only timings and build facts (`version.txt`; never query text or results), and the
-data jobs
+corpus, the benchmark results hold only timings and build facts (`version.txt`; never query text or results), the
+sources of a package only source code (never an environment directory), and the data jobs
 (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the output of the
 tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers, counts and hashes;
 [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.

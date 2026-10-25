@@ -29,6 +29,9 @@ environment, why it is needed, and the alternatives you ruled out. Continue only
   `pixi run static`.
 - DuckDB is a test oracle only and is never linked into `src/`. A new external library for a module also needs the
   module allow-list in `cmake/Antb1Modules.cmake` and an ADR.
+- A library linked into antb1 needs a licence compatible with Apache-2.0, its notice in the package and its source in
+  the sources of the static binary; a new sysroot build needs its glibc source in `cmake/static/glibc-source.lock`
+  (ADR 0034, the recipe).
 - `duckdb-extension-tpch` (TPC's dbgen) depends on one exact `libduckdb` build: update it together with
   `libduckdb-devel` and `duckdb-cli`, never alone (ADR 0006).
 - GitHub Actions are pinned to a full commit SHA with a `# vX.Y.Z` comment and must be allowed by

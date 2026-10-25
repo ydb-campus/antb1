@@ -1,8 +1,9 @@
 # Keep-green job of the standalone static build (docs/adr/0033-standalone-static-binary.md, docs/ci.md): on the
 # three release targets, build the static Arrow prefix and the standalone antb1, package it and check the packaged
-# file (`pixi run static`). Advisory: not part of `CI OK`. Runs on PRs that touch the build, on every push to main
-# and by hand; main and manual runs keep their tarballs 30 days for the perf hosts. Hardening as in ci.yml; the
-# Arrow prefix cache is written only from main.
+# file (`pixi run static`), then gather the sources that go with a Linux package (`pixi run static-sources`, LGPL-2.1
+# section 6: docs/adr/0034-licence-and-static-sources.md). Advisory: not part of `CI OK`. Runs on PRs that touch the
+# build, on every push to main and by hand; main and manual runs keep their tarballs 30 days for the perf hosts, a
+# Linux package only next to its sources. Hardening as in ci.yml; the Arrow prefix cache is written only from main.
 name: static
 
 on:
@@ -12,6 +13,8 @@ on:
       - CMakeLists.txt
       - "**/CMakeLists.txt"
       - CMakePresets.json
+      - LICENSE
+      - NOTICE
       - cmake/**
       - pixi.lock
       - pixi.toml
@@ -20,6 +23,7 @@ on:
       - scripts/static-sources.sh
       - scripts/static.sh
       - scripts/static_gates.py
+      - scripts/static_package.py
       - src/cli/**
       - src/common/**
       - .github/workflows/static.yml
@@ -70,7 +74,7 @@ jobs:
         run: pixi run --frozen -e static static-arrow --check-urls
 
   static:
-    name: static ${{ matrix.target }} (pixi run static)
+    name: static ${{ matrix.target }} (pixi run static && pixi run static-sources)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -128,6 +132,9 @@ jobs:
           key: static-arrow-${{ matrix.target }}-${{ steps.key.outputs.key }}
       - name: Build, package and check (pixi run static)
         run: pixi run --frozen -e static static
+      # Linux: glibc's source RPM, antb1's source and the third-party sources (NETWORK); macOS: nothing to do.
+      - name: The sources of the package (pixi run static-sources)
+        run: pixi run --frozen -e static static-sources
       # A binary that links but does not run leaves no output of its own: show how it ends (on macOS a backtrace
       # and the crash report).
       - name: Diagnose the binary (failures only)
@@ -155,14 +162,37 @@ jobs:
               echo
             done
           fi
+      # The binary contains Arrow's code, so it is uploaded only with its licence texts: all of it or nothing.
+      - name: Collect the binary that failed with its licence texts (macOS)
+        if: ${{ failure() && runner.os == 'macOS' }}
+        run: |
+          if [ -x build/static/bin/antb1 ] && [ -s build/static/notices/THIRD_PARTY_NOTICES.txt ]; then
+            mkdir -p build/static/failed
+            cp build/static/bin/antb1 build/static/notices/* build/static/failed/
+          fi
       - name: Upload the binary that failed (macOS, 7 days)
         if: ${{ failure() && runner.os == 'macOS' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failed-antb1-${{ matrix.target }}
-          path: build/static/bin/antb1
+          path: build/static/failed/
           retention-days: 7
           if-no-files-found: ignore
+      # A Linux package goes up only after its sources (LGPL-2.1 section 6): every later step needs this one.
+      - name: Check the sources before the upload (Linux; main and manual runs)
+        if: ${{ github.event_name != 'pull_request' && runner.os == 'Linux' }}
+        working-directory: build/static/sources
+        run: sha256sum -c ./*.sources.tar.sha256
+      - name: Upload the sources (Linux; main and manual runs, 30 days)
+        if: ${{ github.event_name != 'pull_request' && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antb1-${{ matrix.target }}-sources
+          path: |
+            build/static/sources/antb1-*.sources.tar
+            build/static/sources/antb1-*.sources.tar.sha256
+          retention-days: 30
+          if-no-files-found: error
       - name: Upload the package (main and manual runs, 30 days)
         if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

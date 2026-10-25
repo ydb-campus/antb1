@@ -40,6 +40,10 @@ Continue only with explicit approval, and only with the approved change.
   - `libstdcxx-devel_*` and `libgcc-devel_*` (never `-stdlib=libc++` on Linux: conda Arrow uses libstdc++).
 - Tasks: a new task lives in exactly one environment and is documented in the AGENTS.md command table (lint checks
   both).
+- Licences ([ADR 0034](../adr/0034-licence-and-static-sources.md)): a library linked into antb1 needs a licence
+  compatible with Apache-2.0. Its licence goes into the package's notices (`scripts/static_package.py`) and its
+  source into the sources of the static binary: a pin in `cmake/static/arrow-sources.lock`, or, for a header-only
+  conda package, `COMPILED_PACKAGES` in `scripts/static_package.py`.
 
 ## 3. Lock and install
 
@@ -53,6 +57,10 @@ pixi install --locked -e lint
 - Lock only with pixi 0.81.0; the lock file must keep `version: 7` on its first line. Never edit `pixi.lock` by
   hand, and never let `pixi run` rewrite it silently (CI runs with `--frozen`).
 - Review the lock diff: only the packages you meant to change (and their required dependencies) should move.
+- A new sysroot build (`sysroot_linux-64` or `sysroot_linux-aarch64`, for example in the weekly lock refresh) fails
+  `tools/ci/tests/test_static_sources.py` until `cmake/static/glibc-source.lock` maps it to the glibc source RPM it
+  was built from: read the AlmaLinux version in the package's `info/recipe/meta.yaml`, take that version's source
+  RPM from the AlmaLinux vault, check its sha256 against the vault's `repodata`, and add the line (ADR 0034).
 
 ## 4. Verify
 
