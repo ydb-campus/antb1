@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792937627863,
+  "lastUpdate": 1792947305970,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -504,6 +504,258 @@ window.BENCHMARK_DATA = {
             "value": 2213.1052650000242,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2212.8083349999984 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4c931ec545d3e4a03a390c2c3e862c1e22e88ac3",
+          "message": "chore: license antb1 under apache-2.0 and ship the static binary's sources (#241)\n\n## Summary\n\nPR 3a of the static-build plan: antb1 gets a licence, and every Linux\nstandalone package gets the sources that\nLGPL-2.1 section 6 asks for, because it links glibc 2.28 statically.\nReleases (`release.yml`) follow in PR 3b and\nreuse these assets. Decision record: [ADR\n0034](docs/adr/0034-licence-and-static-sources.md), Proposed.\n\n- **Apache-2.0.**\n- `LICENSE` is the official text, byte for byte (sha256 `cfc7749b…`, the\nsame as the copy in Arrow's LICENSE.txt).\n- `NOTICE` is two lines: `antb1` and `Copyright 2026 Aleksandr\nKhoroshilov`.\n- README.md and CONTRIBUTING.md state the licence. Contributions come in\nunder the same terms (section 5), with\n    no CLA and no sign-off.\n- `/LICENSE` and `/NOTICE` become governance paths, in GOVERNANCE_PATHS,\nCODEOWNERS, AGENTS.md, the settings\n    ask rules and the lint test fixture (R012).\n- **The package carries its licences.** `scripts/static_package.py\nnotices` writes LICENSE, NOTICE and\nTHIRD_PARTY_NOTICES.txt into both the package and the `.debug` tarball.\nThe `.debug` tarball now unpacks next to\n  the binary, under the same directory.\n- THIRD_PARTY_NOTICES.txt has one section per linked library, labelled\nwith the library and its version\n(`brotli 1.0.9: LICENSE`, `GNU C Library (glibc-2.28-236.el8_9.13):\nCOPYING.LIB`). Boost's licence is new, and\n    so is libc++'s on macOS.\n- On Linux it starts with the LGPL notice. The notice names the glibc\nsource package, says where the sources\nare and how to relink, and says that the GCC runtime is not among them.\n  - A new gate, `static_gates.py package`, checks the packed tarballs:\n    - members, file types and paths;\n    - LICENSE and NOTICE against the repository's copies;\n    - the notice sections each target needs;\n    - BUILDINFO.json and README.txt;\n    - SHA256SUMS.\n- BUILDINFO.json gains `license`, `source`, `sysroot` and\n`glibc_source`.\n- **glibc's source.** `cmake/static/glibc-source.lock` maps both locked\nsysroot builds to AlmaLinux's\n`glibc-2.28-236.el8_9.13.src.rpm` (18,177,129 bytes). Both builds\nrepackage AlmaLinux 8.9's RPMs unchanged.\n- The pin matches the vault's repodata (primary.xml). A second operator,\nmirrors.aliyun.com, serves the same\n    bytes.\n- `pixi run static` refuses to package with a sysroot build that is not\nin this lock. A lint test also fails a\n    lock refresh that brings one in.\n- **`pixi run static-sources`** (new task, network once, Linux) runs\nafter `pixi run static`. It writes\n`build/static/sources/antb1-<target>.sources.tar` (66 MB) and its\n`.sha256`. The tarball holds:\n  - the SRPM;\n- `antb1-source.tar.gz`: `git archive` of the packaged commit, refused\nwhen the tree is dirty or the commit\n    differs;\n  - the 12 Arrow pins;\n  - the CLI11 and Boost-headers conda archives;\n- a README with the rebuild and relink steps. It also says that\ninstalling env `static` installs TPC's dbgen\n    under the TPC EULA.\n\nDownloads reuse `scripts/static-sources.sh --fetch`, with one retried\npass. `--check-urls` checks every copy of\n  these files.\n- **static.yml:**\n- Every leg now runs `pixi run static-sources`; macOS does nothing. The\njob is renamed `static <target> (pixi run\n    static && pixi run static-sources)`.\n- On main and manual runs, a Linux leg first checks and uploads\n`antb1-<target>-sources`, then the package.\n    A package therefore never goes up without its sources.\n- The macOS failure artifact now carries the licence texts with the\nbinary.\n- The `urls` job also runs `static-sources --check-urls` when the glibc\nlock or the script changes. That is the\n    case in this PR.\n- **Docs:** ADR 0034 (new) and ADR 0033 (in place, still Proposed);\ndocs/ci.md (task, job, artifacts, Scorecard);\ndocs/benchmarks.md; the dependency-update recipe and skill (licence and\nsysroot steps); AGENTS.md:41 and :112 and\n  CLAUDE.md, both in place.\n\nThe Arrow prefix key and pixi.lock do not change: no `*.cmake` file\nunder cmake/static changes, and\n`scripts/static-arrow.sh` is untouched.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nOn 88dd28c (main aaaa84a plus this change), linux-x86_64:\n\n```text\n$ pixi run check\nlint: PASS (201 tool tests; new: tools/ci/tests/test_static_package.py, more in test_static_sources.py)\n100% tests passed out of 2908\n\n$ pixi run static                       # existing prefix 1a64a30529ed3973, unchanged\nstatic-gates: OK (package: 27 checks, among them LICENSE/NOTICE equal, the LGPL notice first, every section)\n100% tests passed out of 91              # CLI goldens against the packaged binary\nstatic: OK: build/static/package\n\n$ pixi run static-sources\nstatic-sources: OK: build/static/sources/antb1-linux-x86_64.sources.tar (66 MB): glibc-2.28-236.el8_9.13.src.rpm,\n  antb1-source.tar.gz (88dd28c611ce) and 14 third-party files\n# sha256sum -c of the .sha256 and of the SHA256SUMS inside: OK; git get-tar-commit-id = the packaged commit;\n# entries owned by 0/0; a second run downloads nothing; a dirty tree and an unmapped sysroot build are refused\n\n$ pixi run static-sources --check-urls\nstatic-sources: OK: 6 of 6 URLs serve their pinned file\n```\n\nBoth reviews were run on the diff:\n- **The `reviewer` subagent:** five P1 findings.\n- **A five-lens review with an adversarial verifier per finding:** 15\nconfirmed, 2 rejected.\n\nBoth reviews' findings are fixed in bb405db, with one exception: a fully\nfaked hermetic test of static.sh's\npackaging mode. Instead, every real `pixi run static` runs the new\npackage gate, here and on all three CI legs.\n\nOn this PR, static.yml runs all three legs, with `static-sources`\nagainst the real hosts, and the `urls` job checks\nevery copy.\n\n## After the merge (maintainer)\n\n- **Delete the old Linux artifacts.** Main's `antb1-linux-*` artifacts\nfrom before this merge are still\ndownloadable, for up to 30 days. They carry neither a licence nor their\nsources. Once the first post-merge run has\n  uploaded a package with its sources:\n  - list the old artifacts:\n`gh api --paginate\n'repos/ydb-campus/antb1/actions/artifacts?per_page=100' --jq\n'.artifacts[] | select(.expired|not) | [.id,.name,.workflow_run.id] |\n@tsv'`;\n- delete every `antb1-linux-*` artifact whose run has no matching\n`-sources` artifact, and every old\n`failed-antb1-*`: `gh api -X DELETE\nrepos/ydb-campus/antb1/actions/artifacts/<id>`.\n- **Check the result:**\n- `gh api repos/ydb-campus/antb1 --jq .license.spdx_id` prints\n`Apache-2.0`;\n  - the next Scorecard run passes License.\n- **Not legal advice.** An open-source office or a lawyer should review\nthe LGPL route before the first public\nrelease (3b). ADR 0034 names the open question: whether the statically\nlinked GCC runtime archives count as the\ncompiler \"accompanying\" the executable. It also gives the fallback if\nthey do.\n\n## Not in this PR\n\n- **PR 3b:** release.yml, the tag rulesets, the `release` environment\n(both maintainers review, no self-review, no\nadmin bypass), immutable releases, SECURITY.md and the README install\nsection.\n- **Later:** the nightly `static-urls` check of the glibc lock;\nreproducible ownership in the binary tarballs; a\n  hermetic test of static.sh's packaging mode.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (tools/ci/tests: notices, sources, the\npackage gate, the repository's locks)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the approved plan for\n  PR 3a. The paths:\n- `pixi.toml`, `.github/workflows/static.yml` and `scorecard.yml`,\n`.github/CODEOWNERS`;\n  - `cmake/static/glibc-source.lock` and `licenses/{libcxx,Boost}-*`;\n- `tools/lint/check_repo.py` and its test fixture,\n`.claude/settings.json`, CLAUDE.md, `AGENTS.md:41` and `:112`;\n  - `docs/adr/0033`, `0034` and the ADR index;\n  - the dependency-update skill.\n- LICENSE and NOTICE themselves, with the copyright line chosen by the\nmaintainer.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5)\n- A five-lens investigation with a critic, and a Plan-agent review of\nthe plan.\n- The pins (the Apache text, the SRPM against the vault's repodata and a\nmirror, the libc++ and Boost licences).\n  - The change and its tests.\n- The `reviewer` subagent and a five-lens review with verifiers. Their\nfindings are fixed here.\n- Accountable human (has read and understands the whole diff): @\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T19:44:17+03:00",
+          "tree_id": "77dbe439302de2621061d310f3313cfdfd9f14dc",
+          "url": "https://github.com/ydb-campus/antb1/commit/4c931ec545d3e4a03a390c2c3e862c1e22e88ac3"
+        },
+        "date": 1792947305073,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4077.9817899087134,
+            "unit": "ns/iter",
+            "extra": "iterations: 171059\ncpu: 4077.3439690399214 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 69362.62462582577,
+            "unit": "ns/iter",
+            "extra": "iterations: 10022\ncpu: 69354.73997206146 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 85373.20500305682,
+            "unit": "ns/iter",
+            "extra": "iterations: 8195\ncpu: 85357.08285539964 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 223577.59615999385,
+            "unit": "ns/iter",
+            "extra": "iterations: 3125\ncpu: 223537.01791999995 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 498133.7473309622,
+            "unit": "ns/iter",
+            "extra": "iterations: 1405\ncpu: 498026.6434163699 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1444006.4041236932,
+            "unit": "ns/iter",
+            "extra": "iterations: 485\ncpu: 1443791.6371134014 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 50.37752715384595,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 50.36619638461539 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 52.28641646154021,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.27346984615383 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 189.6288702500044,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 189.6145800000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.721051800000623,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.718358120000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 25.68115530769214,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 25.6793362307692 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.815376235293435,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.80809335294124 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.1745084606059417,
+            "unit": "ms/iter",
+            "extra": "iterations: 330\ncpu: 2.1742275696969657 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 66.6788429090895,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 66.66206654545448 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 34.42128644999798,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.41521569999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 35.00997175000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 35.004180799999936 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 56.0577420000025,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 56.05127241666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 90.79877424999694,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 90.78017537499994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 265.13354433332853,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 265.1014826666665 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1218.1057199999827,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1217.7221019999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 47.044264399998305,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.03474760000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 49.60248978571258,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 49.596477071428524 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 66.28288689999522,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 66.26739170000029 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 116.48743920000015,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 116.47514819999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 340.9255605000112,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 340.86220050000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1542.8475109999908,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1542.3755780000015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 68.75911600000109,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.7483412999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 69.71634509999944,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.70114059999979 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 100.76675199999434,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 100.7579021428572 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 184.16606499999943,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 184.12969649999945 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 436.60347350001416,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 436.52842599999883 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1968.9851690000069,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1968.5520019999956 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 92.46341937500091,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 92.4458953749996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 93.96213071428454,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.95319728571495 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 129.59246240000084,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 129.56629100000043 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 227.10298933333206,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 227.0509219999989 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 586.7325950000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 586.6041099999961 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2274.751876000039,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2273.7224440000005 ms\nthreads: 1"
           }
         ]
       }
