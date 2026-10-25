@@ -72,6 +72,44 @@ Proposed
   git). It is 46 MB on linux-x86_64, 13 MB as a tarball, and starts in a twentieth of the time: `antb1 version`
   takes 3.0 ms with the allocator restart (1.5 ms without) against 63.5 ms (32.4 ms) for the dynamic `ci-release`
   build, medians of 300 interleaved runs on a 64-core Linux host (2026-10-25).
+- **What the flavour is worth on a workload, which is the comparison the Decision above makes a precondition of
+  moving the performance tests (measured 2026-10-25).** The baseline is the build being replaced: preset `bench`
+  (Release, `-O3`), not `ci-release` (RelWithDebInfo, `-O2 -g`), which an earlier draft of this entry used and
+  which flatters the static arm by about a point. Both arms from the same tree (`e9ee280`, which the static
+  binary records and the dynamic one does not: only `scripts/static.sh` sets `ANTB1_GIT_SHA`), TPC-H-derived
+  queries at scale factor 100, 5 repeats interleaved and rotated, on a 14-thread macOS arm64 host. Every figure
+  below is a **minimum over the 5 repeats**, and each peak memory the maximum over every query and repeat.
+
+  | | 4 threads | 14 threads |
+  | --- | ---: | ---: |
+  | total | 0.977x (94.914 s -> 92.762 s) | 0.965x (42.594 s -> 41.098 s) |
+  | geomean of the per-query ratios | 0.973x | 0.955x |
+  | **the same, net of start-up** | **0.984x** | **0.979x** |
+  | peak memory | 14,177 -> 14,145 MiB | 15,289 -> 15,165 MiB |
+
+  **The third row is the one to quote**, and the two above it are why. The harness times whole processes, and on
+  this host the static binary starts in **2.99 ms against 31.79 ms** (medians of 200 interleaved `antb1 version`
+  runs; no allocator restart happens here at all, `RestartForAllocator` being `#ifdef __linux__`). That fixed
+  28.8 ms is 1.4% of the average query at 14 threads and 0.7% at four, so it inflates the apparent win on the
+  short queries -- Q11 reads 0.897x at 14 threads and 0.967x once start-up is removed -- and it accounts for
+  **72% of the difference between the two configurations** (a 1.76-point raw gap in the geomeans becomes 0.50).
+  What is left is real and small: **1.6% of query time at four threads and 2.1% at 14.** Subtracting a median
+  start-up from a minimum query time is sound here only because the distribution is tight (dynamic min 31.22 ms,
+  p90 32.61); using the minima instead moves the net geomeans by 0.0001, and either way the bias is against the
+  static arm, never for it.
+
+  Uniform rather than concentrated: **no query of the 22 is slower at either thread count**, and that is exact
+  rather than a rounding -- the narrowest of the 44 readings is Q09 at 0.996x and 0.992x. Net of start-up the
+  range is Q01 0.953x to Q09 0.998x at four threads and Q19 0.960x to Q09 0.997x at 14.
+
+  So the move is supported, on a figure well under half of what the start-up numbers above suggest. What this
+  host cannot settle: it is macOS arm64 only, where there is no allocator restart and the loader is not glibc's;
+  the three differences the run cannot separate are ThinLTO, Arrow rebuilt with the same Clang 23 at `-O3`
+  (conda's macOS Arrow is Clang 21.1.8, so the "Clang instead of GCC" difference below is a **Linux** one, not a
+  cause here) and the CPU baseline -- and a difference this size can come from code layout alone, so the entry
+  claims the package rather than any cause. The 14-thread leg is also 14 threads on a 14-thread host, and the
+  run began while a build's load was still decaying; the interleaved minimum of 5 mitigates both, and the
+  thread-count difference it feeds into is 0.5 of a point.
 - ADR 0002 still holds for every other environment; only `static` takes Arrow from source. An Arrow upgrade updates
   `cmake/static/arrow-sources.lock` with pixi.lock (the dependency-update recipe), and any change of the inputs makes
   a new prefix, built from scratch (about a minute on a 64-core host).
@@ -90,3 +128,6 @@ Proposed
   sysroot for the vDSO (the environment's dynamic test executables would then need glibc 2.34 or newer on the host);
   `-static-pie` (no `rcrt1.o` in the aarch64 sysroot, and start-up relocations); full LTO (slower, more memory on
   CI runners than ThinLTO).
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
+this implementation does not comply with all requirements of the TPC-H Benchmark.
