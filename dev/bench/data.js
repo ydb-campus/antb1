@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792866225444,
+  "lastUpdate": 1792890965916,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -22248,6 +22248,258 @@ window.BENCHMARK_DATA = {
             "value": 2528.6108939999963,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2528.2390639999976 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32ede42f0a24304406afcc11ce503b7880e3a374",
+          "message": "build: add a standalone static build of antb1 (#235)\n\n## Summary\n\nA new build mode: one standalone antb1 per target (linux-x86_64,\nlinux-aarch64, darwin-arm64). It is built in a pixi\nenvironment but runs without pixi, the repository or a compatible glibc.\nIt is meant for GitHub releases and for every\nperformance measurement ([ADR\n0033](docs/adr/0033-standalone-static-binary.md), Proposed).\n\n- **Env `static`** (pixi.toml, pixi.lock): no conda Arrow. It shares the\nnew task-less features `base` (build and\ntest tools) and `llvm` (Clang 23) with `default`, in one solve group.\nThe regenerated lock only adds this env; no\n  package of `default`, `gcc` or `lint` changed.\n- **Arrow from pinned sources:** `pixi run static-arrow` builds Arrow\n25.0.0 and the 11 dependencies it bundles from\nsha256-pinned tarballs (`cmake/static/arrow-sources.lock`; network on\nthe first run only). Everything is static,\n`-O3` and ThinLTO, with the same Clang and CPU flags. Gates check the\nresult before it is used\n  (`scripts/static_gates.py prefix`).\n- **antb1 in preset `static`:** `ANTB1_ARROW_LINKAGE=static` switches\nevery target to `Arrow::arrow_static`, and\n  `antb1_link_standalone()` links the binary:\n  - Linux: fully static, non-PIE, glibc 2.28;\n- macOS: static libc++, only libSystem and libc++abi, deployment target\n13.0, and no exported symbols.\n\nCPU baseline x86-64-v3 / armv8.2-a, with a `.preinit_array` guard that\nprints a message on an older CPU instead of\n  crashing.\n- **Build identity:** `antb1 version --verbose` prints the commit,\nflavor, compiler, CPU baseline, Arrow's build,\ncodecs and memory pool. The bench JSON gains `flavor` and\n`cpu_baseline`, and `git_sha` defaults to the commit\n  built in. Plain `antb1 version` is unchanged.\n- **The shipped file is the tested file:** `pixi run static` packages\nthe binary with its third-party notices,\n`BUILDINFO.json`, a README, a split `.debug` asset and SHA256SUMS. It\nthen checks the packaged binary:\n  - linkage and link flags;\n  - build identity and the ADR 0017 allocator restart;\n  - codec, thread and error smoke tests;\n  - all CLI goldens, through the new `ANTB1_CLI_UNDER_TEST`.\n\n`pixi run static-test` runs every hermetic test against the static\nArrow.\n- **CI:**\n- `static.yml` runs the three targets on PRs that touch the build and on\nevery push to main. It is advisory; the\nArrow prefix cache is written from main only, and a failed run prints\nhow the binary ends.\n  - The nightly gains `static-cold` (no cache) and `static-test`.\n  - cache-gc keeps one prefix per target.\n\n### Fixed after the first CI run\n\n- **darwin-arm64: the binary aborted before `main()`.** The error was\n\"pointer being freed was not allocated\". An\n`ostringstream` that Arrow's static initializer built with the static\nlibc++ was destroyed by\n`/usr/lib/libc++.1.dylib`. Every macOS process loads the system's libc++\nwith the same `std::__1` names, and dyld\n  coalesced the binary's exported copies with it.\n  - The fix: the macOS link exports only `__mh_execute_header`.\n- The guard against regressions: `static_gates.py` fails on any\n`std::__1` symbol bound or exported, and runs those\n    checks before the binary's first start.\n- **linux-aarch64: one run timed out connecting to\n`archive.apache.org`.** It is Apache's single archive host, with\nno CDN. The next run passed. A follow-up PR adds verified fallback hosts\nand a CI cache for the source tarballs:\nArrow 25.0.0 and zlib 1.3.1 have byte-identical GitHub release assets,\nwhile Thrift 0.22.0 exists only on\n  `archive.apache.org`.\n\nMoving the perf tests onto this binary (after an A/B on an idle host)\nand GitHub releases (after a licence decision)\nare separate PRs.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nCI on 9a60163: every check green, `CI OK` with its full matrix, CodeQL,\nzizmor and the three `static` targets.\n\n```text\nstatic linux-x86_64  (ubuntu-24.04)      success  10 min, cold\nstatic linux-aarch64 (ubuntu-24.04-arm)  success   9 min, cold\nstatic darwin-arm64  (macos-15)          success  11 min, cold\ndarwin-arm64, packaged binary:\nstatic-gates: ok   only system libraries (libSystem, libc++abi)\nstatic-gates: ok   no LC_RPATH\nstatic-gates: ok   deployment target 13.0\nstatic-gates: ok   the signature verifies (codesign --verify --strict)\nstatic-gates: ok   no libc++ symbol (std::__1) is bound outside the binary\nstatic-gates: ok   no libc++ symbol (std::__1) is exported\nstatic-gates: ok   `env -i antb1 version` runs; flavor static-thinlto; every codec is available\nstatic-gates: ok   <6 codecs: query answer>; --threads 4 answers as --threads 1; a truncated file exits with 3\n100% tests passed out of 91   # the CLI goldens, run against the packaged binary\n```\n\nLocally on linux-x86_64 (64 cores):\n\n```text\n$ pixi run check-full     # on 74e004f: lint, ci, asan, tidy, coverage, fuzz-smoke, ci-gcc\nlint: PASS\nci:         100% tests passed out of 2892\nasan:       100% tests passed out of 2892\ntidy:       no findings\ncoverage:   100% tests passed out of 2892; coverage: PASS\nfuzz-smoke: 100% tests passed out of 2\nci-gcc:     100% tests passed out of 2892\n\n$ pixi lock                # pixi 0.81.0; per platform, no package of default, gcc or lint changed\nstatic   linux-64 80 / linux-aarch64 80 / osx-arm64 76 packages added, nothing else\n\n$ pixi run static-arrow    # cold\nstatic-gates: OK           # -O3 and -flto=thin in all 509 C/C++ files, local sources only, no foreign headers\nstatic-arrow: OK (65 s wall; prefix 211 MB with line tables. Without them: 62 s, 1,690 CPU-s, peak RSS 659 MB)\n\n$ pixi run static          # on 9a60163\nstatic-gates: ok   ELF type EXEC (static, not PIE); no PT_INTERP; no dynamic segment\nstatic-gates: ok   __pthread_key_create is defined (libpthread linked whole); no NSS function linked\nstatic-gates: ok   antb1's link line has -flto=thin -O3 -march=x86-64-v3 -static\nstatic-gates: ok   Arrow is the static build (package kind antb1-static); the restart sets MIMALLOC_PURGE_DELAY=-1\nstatic-gates: ok   the CPU guard of -march=x86-64-v3 runs from .preinit_array\nstatic-gates: OK\n100% tests passed out of 91\nstatic: OK: build/static/package   # binary 46 MB, antb1-linux-x86_64.tar.gz 13 MB\n\n$ pixi run static-test     # on 74e004f\n100% tests passed out of 2893   # a cold run is about 14,500 CPU-s: each of 20 executables is a ThinLTO link\n\n# start-up of `antb1 version`, medians of 300 interleaved runs (informational)\nstatic, with restart 3.04 ms (1.54 ms without) | dynamic ci-release 63.54 ms (32.38 ms without)\n```\n\nNot run yet: the nightly `static-cold` and `static-test` jobs, which run\non main only.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change:\n  - unit tests of the version, CLI and CPU guard;\n  - the `cli.version_verbose` golden;\n  - the `harness.cli.under_test*` self-tests;\n  - the static gates, including the archive parser's self-check.\n- [x] Docs updated:\n  - ADR 0033 (Proposed), and an update note in ADR 0002;\n  - AGENTS.md and CLAUDE.md;\n- docs/ci.md, testing.md, architecture.md, benchmarks.md and agents.md,\nand tests/README.md;\n  - the dependency-update skill and its recipe.\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer:\n  - pixi.toml and pixi.lock;\n  - CMakePresets.json and cmake/**;\n  - .github/workflows;\n  - AGENTS.md, CLAUDE.md and .claude/settings.json;\n  - .agents/skills;\n  - docs/adr.\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5) did the design study and wrote the change.\nIt ran the checks above, and a reviewer subagent's seven findings were\nfixed before the PR opened. Those fixes:\n  - the macOS archive symbol table;\n  - no cache save after a failed prefix build;\n  - an exact check of the CPU guard's entry;\n  - a `static_assert` for unknown baselines;\n  - a test of the guard's failure path;\n  - `static-check <BIN>` no longer pre-approved;\n  - a message when no package exists.\n- Accountable human (has read and understands the whole diff): @\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T04:12:59+03:00",
+          "tree_id": "61e951a383061485a628e86e215af38ef5a39182",
+          "url": "https://github.com/ydb-campus/antb1/commit/32ede42f0a24304406afcc11ce503b7880e3a374"
+        },
+        "date": 1792890964738,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3268.112157166801,
+            "unit": "ns/iter",
+            "extra": "iterations: 216687\ncpu: 3267.522832472645 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 79468.48130725355,
+            "unit": "ns/iter",
+            "extra": "iterations: 8078\ncpu: 79462.83845011142 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 80347.47127634779,
+            "unit": "ns/iter",
+            "extra": "iterations: 8634\ncpu: 80337.59520500348 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 283240.2911597716,
+            "unit": "ns/iter",
+            "extra": "iterations: 2466\ncpu: 283203.8799675589 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 332347.9178082179,
+            "unit": "ns/iter",
+            "extra": "iterations: 2117\ncpu: 332317.64808691567 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1956393.2156862936,
+            "unit": "ns/iter",
+            "extra": "iterations: 357\ncpu: 1956283.2212885167 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 40.89910405882419,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.89784523529413 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 37.780350736842124,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.76712678947364 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 168.08517724999916,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 168.05336525000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 10.116486104477865,
+            "unit": "ms/iter",
+            "extra": "iterations: 67\ncpu: 10.115807776119421 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 22.100127933332676,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 22.095641033333337 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.80603927777785,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 37.80169166666673 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 2.0262546862169937,
+            "unit": "ms/iter",
+            "extra": "iterations: 341\ncpu: 2.0259775835777116 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 49.02679461538311,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 49.02224207692313 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 11.075066792453175,
+            "unit": "ms/iter",
+            "extra": "iterations: 53\ncpu: 11.073258452830158 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 12.459044428571834,
+            "unit": "ms/iter",
+            "extra": "iterations: 56\ncpu: 12.456321857142866 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 36.00355400000036,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 35.99065989473681 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 71.3010361111104,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 71.28894788888869 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 250.38074833333704,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 250.33151633333262 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1307.5006669999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1307.3291980000015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 18.910643099999902,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 18.906979700000015 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 20.882499666666636,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 20.87044263636356 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 41.09587981250051,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 41.091674062500026 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 87.03650228571698,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 87.02681199999977 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 328.75568650000275,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 328.6973260000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1686.752154000004,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1686.5727359999987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 39.1506825999997,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 39.14871325 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 37.93730242105354,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.93398899999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 78.20410755555447,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 78.19469599999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 168.8635854999987,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 168.847725 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 463.80252599999494,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 462.7525625000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2112.3064399999976,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2111.390219999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 50.06450471428536,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.056063214286034 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 53.735895230770524,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.72770399999966 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 99.36688937499838,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 99.3564729999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 178.6647877499945,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 178.62368149999952 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 585.2511159999949,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 585.1885669999958 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2435.777032999994,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2435.2520910000026 ms\nthreads: 1"
           }
         ]
       }
