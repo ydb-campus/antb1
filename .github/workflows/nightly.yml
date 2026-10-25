@@ -289,6 +289,28 @@ jobs:
       - name: Build, package and check from scratch (pixi run static)
         run: pixi run --frozen -e static static
 
+  # Every URL of the static build's pinned sources against its pin (scripts/static-sources.sh): a dead copy, or one that
+  # serves other bytes, shows here before a cold build needs it. Single-server origins get a HEAD request only.
+  static-urls:
+    name: static-urls (pixi run static-arrow --check-urls)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          environments: static
+          locked: true
+          cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
+          cache-write: false
+      - name: Check every source URL (pixi run static-arrow --check-urls)
+        run: pixi run --frozen -e static static-arrow --check-urls
+
   # Every hermetic test built in build/static against the static Arrow (preset static), on the prefix that the
   # static workflow saved from main.
   static-test:
@@ -338,7 +360,7 @@ jobs:
   # job cancelled on its own (a timeout) counts as failed; a cancelled workflow run reports nothing.
   report:
     name: report
-    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle, static-cold, static-test]
+    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle, static-cold, static-urls, static-test]
     if: >-
       ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-slim
@@ -364,6 +386,7 @@ jobs:
             [diff-extended]="ANTB1_DIFF_SEED=$RUN_ID ANTB1_DIFF_COUNT=20000 pixi run diff-random"
             [ci-shuffle]='pixi run ci-shuffle'
             [static-cold]='ANTB1_ARROW_DIR=<an empty directory> pixi run static (on each target)'
+            [static-urls]='pixi run static-arrow --check-urls'
             [static-test]='pixi run static-test'
           )
           body="$RUNNER_TEMP/nightly-failure.md"

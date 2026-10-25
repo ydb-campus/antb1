@@ -31,6 +31,11 @@ Proposed
   the 11 dependencies Arrow bundles for the enabled features, from tarballs pinned by sha256 and size in
   `cmake/static/arrow-sources.lock` and downloaded once (network on the first run only, like `fetch-data`). The
   result is a static prefix under `~/.cache/antb1/arrow/<key>`, where the key hashes everything that decides it.
+  - The pins come only from the ASF release: Arrow's tarball checked against its `.sha512` and GPG signature, every
+    other pin from that tarball's `cpp/thirdparty/versions.txt`. Each file then lists byte-identical copies of at
+    least two operators, tried in order. Arrow 25.0.0 and Thrift 0.22.0 left Apache's mirrors, and
+    `archive.apache.org` is one throttled server, so it comes last. The copies stay out of the key, so a changed
+    copy rebuilds nothing; `--check-urls` checks them on PRs that change the lock, and nightly.
   - Only what antb1 uses is on: compute, Parquet with the snappy, gzip, brotli, zstd and lz4 codecs, RE2, utf8proc
     and mimalloc. jemalloc, Parquet encryption, the filesystems, glog, OpenTelemetry and backtraces are off, which
     also keeps every user of NSS and `dlopen` out of a static glibc link.

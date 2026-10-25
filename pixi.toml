@@ -207,7 +207,7 @@ patch = "*"                # Arrow patches its bundled Thrift only when `patch` 
 python = "3.14.*"          # scripts/static_gates.py
 
 [feature.static.tasks.static-arrow]
-description = "NETWORK on the first run: download the sources pinned in cmake/static/arrow-sources.lock (31 MB) and build Arrow 25 and its dependencies as static ThinLTO -O3 libraries into $ANTB1_ARROW_DIR (default ~/.cache/antb1/arrow), one prefix per key; a no-op while the key matches (--print-key, --print-prefix)"
+description = "NETWORK on the first run: download the sources pinned in cmake/static/arrow-sources.lock (31 MB, each from the first of its copies that serves the pinned bytes) and build Arrow 25 and its dependencies as static ThinLTO -O3 libraries into $ANTB1_ARROW_DIR (default ~/.cache/antb1/arrow), one prefix per key; a no-op while the key matches (--print-key, --print-prefix; --check-urls checks every copy against its pin)"
 cmd = "bash scripts/static-arrow.sh"
 
 [feature.static.tasks.static]

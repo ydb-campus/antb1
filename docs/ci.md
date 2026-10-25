@@ -63,6 +63,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `default` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series |
 | `static <target> (pixi run static)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static` (on that platform) |
+| `static urls (pixi run static-arrow --check-urls)` (advisory, PRs that change the lock) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -125,6 +126,16 @@ The release and performance binary ([ADR 0033](adr/0033-standalone-static-binary
   `cmake/static/arrow-sources.lock` and builds Arrow 25 and the dependencies it bundles as static `-O3` ThinLTO
   libraries into `$ANTB1_ARROW_DIR/<key>/prefix` (default `~/.cache/antb1/arrow`). A prefix whose key matches is
   reused; `--print-key` prints the key (the cache key below).
+  - Every pinned file lists byte-identical copies of at least two operators: an uploaded GitHub release asset first
+    where one exists, a single-server origin such as `archive.apache.org` last. `scripts/static-sources.sh` tries
+    them in order until one serves the pinned size and sha256. Each attempt is bounded: 10 s to connect, the pinned
+    size, 30 s plus 1 s per 64 KiB. Only an error that may pass gets a second attempt; a dead URL, a timeout or wrong
+    bytes move to the next copy.
+  - `pixi run static-arrow --check-urls` checks every URL against its pin. Single-server origins get a HEAD request
+    only. A dead URL or other bytes, a larger file included, fail the check at once. Any other failure gets one more
+    try after the pass: a timeout or an error that may pass is then a warning, anything else (a host that does not
+    resolve, a bad certificate, another HTTP error) fails. So does a file with fewer than two good URLs. The
+    `static urls` job runs it on every PR that changes the lock, and the nightly `static-urls` job every night.
 - `pixi run static` builds antb1 in `build/static` against that prefix, packages it into `build/static/package`
   (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the packaged file:
   linkage, link flags, build identity, the allocator restart, smoke tests and every CLI golden.
@@ -152,6 +163,7 @@ but every failure is tracked in an issue.
 | `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
 | `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
 | `static-cold <target>` | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `ANTB1_ARROW_DIR=<an empty directory> pixi run static` | the standalone static build from scratch, as a release builds it: every pinned source downloaded again |
+| `static-urls` | ubuntu-24.04 | `pixi run static-arrow --check-urls` | every URL of the static build's pinned sources against its pin (HEAD only for single-server origins): a dead or wrong copy shows before a cold build needs it |
 | `static-test` | ubuntu-24.04 | `pixi run static-test` | every hermetic test in `build/static`, against the static Arrow (the prefix `main` saved); each of its 20 executables is a ThinLTO link over that Arrow, about 4 CPU-hours in all |
 | `report` | ubuntu-slim | nothing to run | on any failed or timed-out job: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
 
