@@ -818,9 +818,10 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // the dictionary read, and rebuilt each time so that no view outlives the bytes it points at.
   std::vector<std::string_view> dict_views_;
   std::vector<std::int32_t> indices_;
+  // A last column with the rows' positions in the row group.
   bool positions_ = false;
-  int returned_ = 0;  // the columns the batches carry, the first of columns_         // a last
-                      // column with the rows' positions in the row group
+  // The columns the batches carry, the first of columns_; a later one is read to be filtered on.
+  int returned_ = 0;
   std::vector<int> filter_index_;  // per column: its position in filter_->columns(), or -1
   // The reader of the file outlives its row group's and columns' readers (Close, the destructor).
   std::unique_ptr<parquet::ParquetFileReader> file_reader_;
