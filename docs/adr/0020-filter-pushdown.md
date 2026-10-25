@@ -274,8 +274,10 @@ Proposed
   which flatters the branch): Q10 1.698x to about **1.340x**, Q19 1.632x to about **1.123x**,
   Q13 0.999x to **0.923x**, and the 22 from 1.249x to about **1.203x** of DuckDB's geomean. Q10 was
   the worst query in the suite and is no longer. These are compositions of two measured ratios and
-  not a measurement; the DuckDB arm was also a dynamic `ci-release` build, which ADR 0033 puts about
-  3.6% behind the static one, so the static standing is better than this by about that much.
+  not a measurement; and the DuckDB arm was a dynamic `ci-release` build where these figures are
+  static ones -- [ADR 0033](0033-standalone-static-binary.md) measures static at 0.973x of the
+  `bench` preset and `ci-release` within 1% of `bench` -- so the static standing against DuckDB is
+  about three points better than the number above.
 
   - **Why the refusal's 0.997x was right about what it measured and wrong about the item.** The
     refusal skipped the *copy into the batch* and kept everything else. That copy is the smaller
