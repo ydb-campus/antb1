@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792966908107,
+  "lastUpdate": 1792972696307,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -1008,6 +1008,258 @@ window.BENCHMARK_DATA = {
             "value": 2074.6535499999936,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2074.3223749999943 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6bbb26aaeb64e275cf7190cc8dbb6d1a0a70a7b3",
+          "message": "build(static): verify the package on a fresh runner and in an empty container (#243)\n\n## Summary\n\nPR 3b-1 of the static-build plan. It adds one check of \"what the shipped\ntarball must do\" that runs where pixi,\nDuckDB and the LLVM tools are absent, and from now on it runs on every\nstatic.yml leg. PR 3b-2 (GitHub releases)\nruns the same check on the release's fresh runners.\n\n- **`scripts/static_gates.py`** (standard library only):\n- **`kit --env E --out DIR`** writes the smoke kit: DuckDB writes the\nsix codec files from `range()`, plus a\ntruncated copy, and `kit.json` holds their digests and DuckDB's own\nanswer. `pixi run static` writes it to\n    `build/static/smoke-kit`.\n- **`verify`** checks a package as a user gets it. It needs Python 3.11\nor newer with tarfile's data filter, and\n    exits 2 when it cannot check the package on this runner. It checks:\n    - the digests against SHA256SUMS, and the kit against `kit.json`;\n- each tarball before anything is unpacked: one directory, exactly the\npackage's members, regular files only,\n      no member twice, no extended attributes;\n- the unpacked files: BUILDINFO.json, LICENSE and NOTICE, and on macOS\n`codesign --verify --strict`;\n- the binary gate's runs, with an empty environment, in an empty\ndirectory, with stdin from /dev/null;\n- on Linux with `--container docker|podman`, the same runs again in an\nimage imported from a root file system\nof only `/antb1` and `/kit`: `--network none --read-only --cap-drop ALL\n--security-opt no-new-privileges\n--user 65534:65534 --pull never`, never `-v` or `--mount`, and the image\nis removed afterwards.\n- **The runtime checks are now one function,** shared by the binary gate\nand verify. It adds two checks: a parse\n    error exits 1, and an unknown option exits 2.\n- **The package gate** also checks that every tarball member is\nbyte-equal to the staged file that the binary\n    gate ran.\n- **DuckDB runs with `-no-init`,** so a `~/.duckdbrc` cannot change the\nkit's answers.\n- **`pixi run static-check antb1-<target>.tar.gz`** runs verify locally.\nIt needs SHA256SUMS next to the tarball,\nand on Linux the `.debug` tarball too. It uses docker only on Linux, and\nonly when `docker info` answers. The\n  binary form is unchanged.\n- **`static.yml`:**\n- after `pixi run static`, every leg runs verify with the runner's own\n`python3 -I`, and both Linux legs also run\n    it in a Docker container;\n  - the job name now also carries the verify step's repro:\n`static <target> (pixi run static && pixi run static-check\nbuild/static/package/antb1-<target>.tar.gz && pixi\n    run static-sources)`.\n- **Docs:** docs/ci.md, ADR 0033 (in place, still Proposed),\ndocs/benchmarks.md, plus the static-check\n  description in pixi.toml and its line in CLAUDE.md.\n\nNot in this PR (3b-2): release.yml and its release script, the tag\nrulesets, the `release` environment, immutable\nreleases, SECURITY.md, the README install section and ADR 0035.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nOn 659e67c, linux-x86_64:\n\n```text\n$ pixi run check\nlint: PASS (253 tool tests; new: tools/ci/tests/test_static_verify.py, one more case in test_static_package.py)\n100% tests passed out of 2908\n\n$ pixi run static                       # existing prefix 1a64a30529ed3973, unchanged\nstatic-gates: ok   antb1-linux-x86_64.tar.gz holds the files that were checked in build/static/package/antb1-0.1.0-linux-x86_64\nstatic-gates: ok   antb1-linux-x86_64.debug.tar.gz holds the files that were checked in build/static/package/debug/antb1-0.1.0-linux-x86_64\nstatic-gates: ok   DuckDB answers 200000,19999900000,0,999,97 on the zstd file    # and on each other codec's file\nstatic-gates: ok   a parse error exits with 1\nstatic-gates: ok   an unknown option exits with 2\n100% tests passed out of 91              # CLI goldens against the packaged binary\nstatic: OK: build/static/package\n\n$ pixi run static-check build/static/package/antb1-linux-x86_64.tar.gz\nstatic-check: note: no container run (it needs docker on Linux); the binary runs on this host only\nstatic-gates: OK                         # 65 checks\n\n$ pixi run static-check <a copy with one byte flipped>/antb1-linux-x86_64.tar.gz\nstatic-gates: FAIL antb1-linux-x86_64.tar.gz matches SHA256SUMS: another digest     # exit 1, nothing unpacked\n```\n\nThis host has no Docker, so locally the container path ran only against\nthe test fake. It has since run for real in\nthis PR's static.yml run\n([40239069946](https://github.com/ydb-campus/antb1/actions/runs/40239069946)):\n- **linux-x86_64 and linux-aarch64:** verify passed its 18 runs on the\nrunner, and the same 18 in the container.\n  Docker imported the image, and verify removed it afterwards.\n- **macos-15:** verify passed with the image's own `python3`, so that\ninterpreter is 3.11 or newer with tarfile's\ndata filter. `codesign --verify --strict` passed on the unpacked binary.\n\nTwo reviews were run on the diff:\n- **The `reviewer` subagent:** four findings, fixed in 21a454d:\n  - the \"nothing was unpacked\" assertion could not fail;\n  - the container flags were compared with the module's own constant;\n  - four error paths had no test;\n  - the job name lacked the verify step's repro.\n\n  Its other four findings were the protected paths of the approved plan.\n- **A review workflow, four lenses (safety, runners, tests, docs), each\nwith a skeptic:** 9 findings confirmed and\n  fixed in 659e67c (7 after merging duplicates), 5 refuted:\n  - the `.debug` tarball's checks had no failing tests;\n  - two runtime checks had no failing tests either;\n  - `--version` was untested;\n  - DuckDB's init file could change the kit's answers;\n  - podman's docker banner on stderr;\n  - the Python floor;\n  - the tarball form's need for the `.debug` tarball.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (tools/ci/tests/test_static_verify.py, plus\na new case in test_static_package.py)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the approved 3b plan\n(`.github/workflows/static.yml`, `pixi.toml` (one description),\n`CLAUDE.md:27`, `docs/adr/0033`)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5)\n- A read-only design investigation (five lenses, a critic and a claims\nverifier), and a Plan-agent review of the\n    plan.\n  - The change and its tests.\n- The `reviewer` subagent and a review workflow with verifiers on the\ndiff.\n- Accountable human (has read and understands the whole diff): @\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-26T02:50:23+03:00",
+          "tree_id": "c17aa095f6016ce6f2f2586c9bc3f2988d8362cb",
+          "url": "https://github.com/ydb-campus/antb1/commit/6bbb26aaeb64e275cf7190cc8dbb6d1a0a70a7b3"
+        },
+        "date": 1792972694877,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2410.201414997625,
+            "unit": "ns/iter",
+            "extra": "iterations: 292580\ncpu: 2410.0485781666553 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 19460.079143079227,
+            "unit": "ns/iter",
+            "extra": "iterations: 36036\ncpu: 19458.726551226548 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 35841.26929206741,
+            "unit": "ns/iter",
+            "extra": "iterations: 19451\ncpu: 35837.31268315255 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 129380.18391883613,
+            "unit": "ns/iter",
+            "extra": "iterations: 5323\ncpu: 129367.75164380985 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 263141.27224334254,
+            "unit": "ns/iter",
+            "extra": "iterations: 2630\ncpu: 263133.98098859325 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 721525.6608606837,
+            "unit": "ns/iter",
+            "extra": "iterations: 976\ncpu: 721470.5409836067 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 21.286854939393322,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 21.28041463636362 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 26.689982269230175,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.687524999999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 138.71050899999773,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 138.693782 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.275081809523769,
+            "unit": "ms/iter",
+            "extra": "iterations: 84\ncpu: 8.274401999999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 9.643385680556252,
+            "unit": "ms/iter",
+            "extra": "iterations: 72\ncpu: 9.6415408888889 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 24.772951517242102,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.769815655172412 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.74820278980229,
+            "unit": "ms/iter",
+            "extra": "iterations: 961\ncpu: 0.748083505723205 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 73.00695033333366,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 72.99618011111106 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 13.606785219999438,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.605916019999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 16.194754363636125,
+            "unit": "ms/iter",
+            "extra": "iterations: 44\ncpu: 16.19281200000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 31.714083954545398,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.71164259090905 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 55.94814581818045,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 55.93436500000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 212.10628599999382,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 212.08194133333316 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1151.8144370000414,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1151.525627999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 16.711380952381475,
+            "unit": "ms/iter",
+            "extra": "iterations: 42\ncpu: 16.709615928571406 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 18.754333783784055,
+            "unit": "ms/iter",
+            "extra": "iterations: 37\ncpu: 18.750615027027063 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 34.75497066666765,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 34.751229238095235 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 67.75761709999983,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 67.7438899000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 284.63178199999106,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 284.57642050000055 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1429.1631940000116,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1428.9351960000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 32.439896095238076,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.43353761904747 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 34.91500135000081,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.91097095000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 53.28966476923387,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.27288300000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 142.67713824999362,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 142.656047 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 369.4068135000066,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 369.34271550000017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1674.2547220000006,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1673.9380460000034 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 38.55115216666465,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.53872599999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 41.36863817647321,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.366080941176286 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 68.05478772727466,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 68.04493100000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 146.61434060000147,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 146.6051240000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 378.93889750000653,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 378.8981124999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 1788.226452999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1787.930523 ms\nthreads: 1"
           }
         ]
       }
