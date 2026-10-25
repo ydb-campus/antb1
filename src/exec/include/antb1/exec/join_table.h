@@ -89,9 +89,27 @@ class JoinBuildSpec {
   // the table it indexes (JoinTable::null_chunks): a join that emits the build rows which did not
   // match needs them, since a NULL key never matches (ADR 0026's C2c). Every other join leaves them
   // behind, so it costs nothing unless it is asked for.
+  //
+  // `retain` says, per field of `schema`, whether the build keeps that column's data: a field the
+  // join's output carries but nothing above the join reads is held for the build's whole life for
+  // nothing, and the plan knows which those are (`JoinNode::needed_above`). A key is always kept
+  // whatever `retain` says, and an empty `retain` keeps everything -- which is what every caller
+  // that cannot compute the set passes.
+  //
+  // **A dropped column is a NullArray in `chunks()`**, not absent: positions stay as the schema
+  // says, so a `JoinRowRef` and a key index mean what they always did. Every reader of a build's
+  // column data asks `retains()` first, and `ChunkColumns::column` aborts on a NULL-typed column as
+  // a backstop for one that forgets. **What makes a wrong set safe is upstream, not here:** the
+  // physical planner rejects a `needed_above` holding an id the join does not output, because a
+  // column wrongly dropped is a NULL that no gather can tell from a real one.
+  //
+  // **In `null_chunks()` it is an all-NULL array of the field's declared type instead**, because
+  // those batches are emitted rather than gathered from: the operator relabels them with its own
+  // schema and `RecordBatch::Make` does not check, so a `null`-typed column there would later be
+  // read as a typed one. Both read NULL, which is the property that matters to a caller.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-      bool keep_null_keys = false);
+      bool keep_null_keys = false, std::vector<bool> retain = {});
   // The spec of a build without keys, a one-row join's. Invalid without a schema.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Keyless(
       std::shared_ptr<arrow::Schema> schema);
@@ -104,13 +122,26 @@ class JoinBuildSpec {
   [[nodiscard]] bool direct_candidate() const { return direct_candidate_; }
   // Whether the build retains the rows whose keys are NULL (JoinTable::null_chunks).
   [[nodiscard]] bool keep_null_keys() const { return keep_null_keys_; }
+  // Whether the build keeps field `field`'s data. True for every key and for every field when the
+  // caller gave no set.
+  [[nodiscard]] bool retains(int field) const {
+    if (retain_.empty() || field < 0) {
+      return true;
+    }
+    const auto at = static_cast<std::size_t>(field);
+    return at >= retain_.size() || retain_[at];
+  }
+  // Whether anything is dropped at all, so that a build with nothing to drop takes the path it
+  // always took.
+  [[nodiscard]] bool retains_all() const { return retain_.empty(); }
 
  private:
   JoinBuildSpec(std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-                bool direct_candidate, bool keep_null_keys);
+                bool direct_candidate, bool keep_null_keys, std::vector<bool> retain);
 
   std::shared_ptr<arrow::Schema> schema_;
   std::vector<plan::BoundColumn> keys_;
+  std::vector<bool> retain_;  // empty: every field
   bool direct_candidate_ = false;
   bool keep_null_keys_ = false;
 };

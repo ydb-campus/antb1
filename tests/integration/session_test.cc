@@ -2,16 +2,19 @@
 
 #include "antb1/engine/session.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/profile.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
@@ -142,6 +145,59 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   auto count = Count(*session, "SELECT COUNT(*) FROM hits_like");
   ASSERT_TRUE(count.ok()) << count.status().ToString();
   EXPECT_EQ(*count, 10'000);
+}
+
+// A build holds only the columns read above its join (ADR 0026's C8a), **through the whole chain**:
+// SQL, the binder, Prune's set, the physical planner's verification of it and the build itself. The
+// `cols_dropped` metric is the only place that chain is observable, and it is reachable only from a
+// session -- which is why this guard lives here rather than beside either half.
+//
+// It earned the place. The planner refuses the whole set when an id in it is not one the join
+// outputs, and the demand Prune carries is passed down both branches of every join, so at a nested
+// join it also holds an ancestor's other branch's ids: the set was refused on exactly the joins it
+// is worth the most on, every plan still printed the same, every answer was right, and 2,887 tests
+// passed. A query of three relations is the smallest shape that has a nested join at all.
+TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
+  auto session = engine::Session::Make().ValueOrDie();
+  // One fixture under three names: a self-join needs no second file and the shape is what matters.
+  for (const std::string_view name : {"a", "b", "c"}) {
+    ASSERT_TRUE(session->RegisterParquet(std::string(name), {Fixture("hits_like.parquet")}).ok())
+        << name;
+  }
+  // The lower join is a.WatchID = b.WatchID and the upper one joins c on a.UserID -- both keys are
+  // all but unique in this fixture, so neither join multiplies its input. Only a.RegionID is read
+  // above, so b.RegionID reaches a build through the Filter that needs it and dies there.
+  const auto profile = session->ExplainAnalyze(
+      "SELECT a.RegionID, COUNT(*) FROM a, b, c "
+      "WHERE a.WatchID = b.WatchID AND a.UserID = c.UserID AND b.RegionID > 100 "
+      "GROUP BY a.RegionID");
+  ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+  ASSERT_NE(profile->root, nullptr);
+  // Every HashBuild of the run with its depth, so that the assertion names which one dropped: the
+  // deeper build is the nested join's, and a plan whose join order flipped would fail here rather
+  // than keep passing while covering nothing.
+  std::vector<std::pair<int, int64_t>> builds;  // depth, cols_dropped
+  const auto walk = [&](const auto& self, const exec::ProfileNode& node, int depth) -> void {
+    if (node.name() == "HashBuild") {
+      int64_t dropped = 0;
+      for (const exec::ProfileMetric& metric : node.metrics()) {
+        if (metric.name == "cols_dropped") {
+          dropped = metric.value;
+        }
+      }
+      builds.emplace_back(depth, dropped);
+    }
+    for (const exec::ProfileNode* child : node.children()) {
+      self(self, *child, depth + 1);
+    }
+  };
+  walk(walk, *profile->root, 0);
+  ASSERT_EQ(builds.size(), 2U) << "one per join";
+  std::ranges::sort(builds);
+  EXPECT_EQ(builds.front().second, 0)
+      << "the upper join's build: every column of c is a key or read";
+  EXPECT_EQ(builds.back().second, 1)
+      << "the nested join's build dropped nothing: the retain set did not survive the chain";
 }
 
 }  // namespace

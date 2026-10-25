@@ -1469,6 +1469,110 @@ TEST_F(JoinTableTest, RejectsWhatThePlannerMustNotSend) {
 
 // Every part, merge, finish and probe that passes the memory limit fails with OutOfMemory and
 // leaves nothing behind; a finished table holds its memory until it goes.
+// What `retain` means on a spec (ADR 0026's C8a). The set says which of the input's columns the
+// build must hold: a column the join carries but nothing above it reads costs the build its bytes
+// for the build's whole life, and the plan records which those are.
+//
+// Only the spec's own rules are here. Whether the right set reaches a build is a property of the
+// physical planner over a plan with column ids, which `src/exec/tests`' harness does not build --
+// its scans carry fields and no ids, so `OutputIds` of one is empty and the planner keeps every
+// column. The end-to-end property lives in the `.slt` suite, which goes through the binder, and it
+// earns its place: those cases are what aborted when the first implementation forgot that a
+// residual's columns are needed by the join itself.
+TEST_F(JoinTableTest, ASpecRetainsEveryKeyAndWhateverElseItWasGiven) {
+  BuildData data({LogicalType::kBigInt});  // two fields: the key `k0`, then `id`
+  // Nothing asked for: every column held, which is what every build did before this existed.
+  {
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys());
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains_all());
+    EXPECT_TRUE((*spec)->retains(0));
+    EXPECT_TRUE((*spec)->retains(1));
+  }
+  // The payload dropped, the key kept.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_FALSE((*spec)->retains_all());
+    EXPECT_TRUE((*spec)->retains(0));
+    EXPECT_FALSE((*spec)->retains(1));
+  }
+  // **A key is held whatever the set says**: the build hashes it and the direct layout indexes by
+  // it, so a spec that took this at its word would match nothing rather than answer a NULL.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {false, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains(0)) << "the key";
+    EXPECT_FALSE((*spec)->retains(1));
+  }
+  // Asking for everything is the same as asking for nothing, so a build with nothing to drop takes
+  // the path it always took rather than a second one that happens to agree.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, true});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains_all());
+  }
+  // A set of the wrong width is a planner bug: Invalid, never a silently ignored request.
+  {
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true});
+    EXPECT_FALSE(spec.ok());
+    EXPECT_EQ(spec.status().code(), arrow::StatusCode::Invalid);
+  }
+  // Out-of-range positions read as retained, so no caller can turn a bad index into a dropped
+  // column.
+  {
+    auto spec =
+        JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/false, {true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    EXPECT_TRUE((*spec)->retains(-1));
+    EXPECT_TRUE((*spec)->retains(2));
+  }
+}
+
+// A build that retains NULL-keyed rows holds them in null_chunks, which a join emits **directly**
+// rather than through a gather -- so the two paths narrow differently and must still read the same.
+// A dropped column is a NullArray in a keyed chunk, where every reader asks retains() first; in a
+// null chunk it has to keep its declared type, since the batch reaches the output as it is. Both
+// read NULL. Without this the same column would read NULL for a row that matched and its real value
+// for one that did not, which is a difference no caller is looking for.
+TEST_F(JoinTableTest, ADroppedColumnIsNullInARetainedNullKeyedRowToo) {
+  // Keys 1 and NULL in one part, so one row is indexed and one is retained.
+  const auto data = [] {
+    BuildData out({LogicalType::kBigInt});
+    out.Add(0, {Int64s({1, std::nullopt})});
+    return out;
+  }();
+  const auto pool = MakeThreadPool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "serial" : "pooled");
+    // The key retained, the id dropped.
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/true,
+                                    std::vector<bool>{true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    auto parts = MakeParts(data, *spec, nullptr, arrow::default_memory_pool());
+    ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+    auto table = Assemble(*spec, *parts, executor, {}, nullptr);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    ASSERT_EQ((*table)->chunks().size(), 1U);
+    ASSERT_EQ((*table)->null_chunks().size(), 1U);
+    // The gathered path: a NullArray, which nothing reads because every reader asks retains().
+    const auto& keyed = *(*table)->chunks().front();
+    ASSERT_EQ(keyed.num_rows(), 1);
+    EXPECT_EQ(keyed.column(1)->type_id(), arrow::Type::NA) << "the dropped id of a matched row";
+    EXPECT_FALSE(keyed.column(0)->IsNull(0)) << "the key is retained whatever the set says";
+    // The emitted path: the declared type, so the batch can leave the join unchanged, all NULL.
+    const auto& retained = *(*table)->null_chunks().front();
+    ASSERT_EQ(retained.num_rows(), 1);
+    EXPECT_TRUE(retained.schema()->field(1)->type()->Equals(arrow::int64()))
+        << "an emitted batch keeps its declared type: " << retained.schema()->ToString();
+    EXPECT_TRUE(retained.column(1)->IsNull(0)) << "and reads NULL, as the matched row does";
+    EXPECT_TRUE(retained.column(0)->IsNull(0)) << "the row is here because its key is NULL";
+  }
+}
+
 TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
   const auto pool = MakeThreadPool();
   const auto expect_oom = [](const arrow::Status& status) {

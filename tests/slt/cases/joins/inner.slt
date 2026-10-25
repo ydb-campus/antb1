@@ -304,6 +304,72 @@ SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_row >= 2400 
 ----
 140
 
+# ---- a build holds only what is read above the join (ADR 0026's C8a) ----
+
+# A join carries both inputs' columns whatever is read above it, so a build keeps columns nothing
+# will look at -- for its whole life, which on a large build is measured in gigabytes. The planner
+# now tells it which it can let go, from the set Prune records on the join node.
+#
+# **A build fed by a bare Scan has nothing to let go**: projection pruning already trimmed that
+# scan's fields to the keys and what is read above. So these cases are shapes where the build's
+# input cannot do it itself -- a Filter whose predicate column is dead above it, or a join subtree.
+# The `cols_dropped` metric of `explain --analyze` was read for each, so each really does drop a
+# column rather than pass by dropping none.
+#
+# The answer is the only thing that can show a column was let go wrongly: a dropped column is a NULL
+# and no gather can tell it from a real one. Each case groups or sums so that a lost column moves a
+# value rather than a width.
+
+# The build's input is a join, which cannot drop a column of its own: of the columns `zones` and
+# `cities` carry, the upper join needs zn_city and ct_id and the lower one zn_id, and the rest is
+# carried for nothing.
+query II rowsort
+SELECT ct_id, COUNT(*) FROM trips, zones, cities WHERE tr_pickup = zn_id AND zn_city = ct_id
+GROUP BY ct_id
+----
+1	559
+2	559
+3	490
+4	489
+5	558
+
+# A Filter below the build, whose column dies there. In an inner join a conjunct over one relation
+# filters that relation's own branch rather than becoming a residual, so rd_joined reaches the build
+# and is read by nothing above it.
+query TI rowsort
+SELECT rd_tier, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND rd_joined > DATE '2025-01-01'
+GROUP BY rd_tier
+----
+basic	953
+gold	934
+plus	941
+
+# The same on the other side: zn_radius filters `zones` below the build and zn_city is read above,
+# so one of the two goes and one stays.
+query IR rowsort
+SELECT zn_city, SUM(tr_distance) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius < 2
+GROUP BY zn_city
+----
+1	2026.25
+2	2681
+3	1978
+4	2026.375
+5	3326.125
+NULL	670.875
+
+# A real residual -- a conjunct over both relations -- so the mapping that keeps a residual's own
+# columns runs. It drops nothing (every column of that build is a key, a residual's or read above),
+# so what it pins is that the mapping does not drop what the join itself needs: before that mapping
+# existed this file aborted. The retain-and-drop interaction is pinned directly by
+# `hash_join_test.cc`'s own case, which hands a build its set rather than deriving one.
+query TI rowsort
+SELECT rd_tier, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND tr_fare > rd_city
+GROUP BY rd_tier
+----
+basic	885
+gold	882
+plus	889
+
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a graph connected only through one exits 4) ----
 
 onlyif duckdb

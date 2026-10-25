@@ -310,8 +310,10 @@ std::shared_ptr<MemoryTable> KeyTable(const std::string& prefix, int64_t parts, 
 
 std::shared_ptr<const JoinBuildSpec> SpecOf(std::shared_ptr<arrow::Schema> schema,
                                             std::vector<plan::BoundColumn> keys,
-                                            bool keep_null_keys = false) {
-  auto spec = JoinBuildSpec::Make(std::move(schema), std::move(keys), keep_null_keys);
+                                            bool keep_null_keys = false,
+                                            std::vector<bool> retain = {}) {
+  auto spec =
+      JoinBuildSpec::Make(std::move(schema), std::move(keys), keep_null_keys, std::move(retain));
   EXPECT_TRUE(spec.ok()) << spec.status().ToString();
   return *spec;
 }
@@ -367,6 +369,25 @@ std::shared_ptr<JoinBuild> DrainedBuild(plan::JoinKind kind, std::unique_ptr<Ope
                                         ProfileNode* profile = nullptr) {
   auto spec = SpecOf(kind, source->output_schema(), keys);
   return std::make_shared<JoinBuild>(std::move(spec), std::move(source), profile, kind);
+}
+
+// An inner join's build of what `source` returns, holding only the columns of `retain` (and its
+// keys, which the spec forces). The physical planner derives that set from the plan's column ids;
+// a test hands it over directly, since the plans this file builds carry no ids at all.
+std::shared_ptr<JoinBuild> PrunedDrainedBuild(std::unique_ptr<Operator> source,
+                                              const std::vector<int>& keys,
+                                              std::vector<bool> retain,
+                                              ProfileNode* profile = nullptr) {
+  std::vector<plan::BoundColumn> columns;
+  columns.reserve(keys.size());
+  for (const int key : keys) {
+    columns.push_back(
+        Column(key, source->output_schema()->field(key)->name(), LogicalType::kBigInt));
+  }
+  auto spec = SpecOf(source->output_schema(), std::move(columns), /*keep_null_keys=*/false,
+                     std::move(retain));
+  return std::make_shared<JoinBuild>(std::move(spec), std::move(source), profile,
+                                     plan::JoinKind::kInner);
 }
 
 // An inner join's build of what `source` returns, on these BIGINT keys.
@@ -575,6 +596,75 @@ TEST_F(HashJoinTest, AWindowOfMostlyMissesGathersOnlyTheRowsThatMatched) {
 // not select matches nothing, and a window without a match is skipped). A window every row of which
 // matched is a slice of the probe -- its buffers, at an offset; one with a miss in it is compacted
 // instead, so its probe columns are a copy of the rows that matched (ADR 0026's C8).
+// The columns the builds below a node did not have to hold, summed: `hash_join.cc` records
+// `cols_dropped` on each HashBuild node.
+int64_t DroppedColumnsIn(const ProfileNode& node) {
+  int64_t found = 0;
+  for (const ProfileMetric& metric : node.metrics()) {
+    if (metric.name == "cols_dropped") {
+      found += metric.value;
+    }
+  }
+  for (const ProfileNode* child : node.children()) {
+    found += DroppedColumnsIn(*child);
+  }
+  return found;
+}
+
+// A build holds only the columns something above the join reads (ADR 0026's C8a). The set comes
+// from the plan -- `JoinNode::needed_above`, which Prune records -- but it reaches the build as a
+// per-field flag on the spec, so this drives it directly and needs no column ids.
+//
+// What this covers that the `.slt` cases cannot: that the dropped column is a NullArray in the
+// retained chunk rather than absent, that the key beside it still gathers, and that the join's
+// output presents the dropped field with its declared type. A sliced input batch too, since the
+// narrowed branch indexes the batch itself where the whole-batch branch let `Take` do it.
+TEST_F(HashJoinTest, APrunedBuildHoldsNullsForWhatNothingReadsAndGathersTheRest) {
+  const auto build_schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("kept", arrow::int64()),
+                     arrow::field("dropped", arrow::int64())});
+  // Two batches, the second sliced, so both the whole and the offset case run.
+  const auto whole =
+      BatchOf(build_schema, {Int64s({0, 1, 2}), Int64s({10, 11, 12}), Int64s({90, 91, 92})});
+  const auto sliced = BatchOf(
+      build_schema, {Int64s({7, 3, 4, 5}), Int64s({17, 13, 14, 15}), Int64s({97, 93, 94, 95})});
+  const std::vector<Batch> build_batches = {Batch{.data = whole, .selection = nullptr},
+                                            Batch{.data = sliced->Slice(1), .selection = nullptr}};
+  const auto probe_schema = arrow::schema({arrow::field("a", arrow::int64())});
+  const auto probe = BatchOf(probe_schema, {Int64s({0, 1, 2, 3, 4, 5, 99})});
+  const std::vector<bool> retain = {true, true, false};  // k, kept; not `dropped`
+  ProfileNode profile;
+  auto join =
+      MakeJoin(std::make_unique<ScriptedSource>(
+                   probe_schema, std::vector<Batch>{Batch{.data = probe, .selection = nullptr}}),
+               PrunedDrainedBuild(std::make_unique<ScriptedSource>(build_schema, build_batches),
+                                  {0}, retain, &profile),
+               {0}, /*prepares=*/true);
+  ASSERT_NE(join, nullptr);
+  auto batches = Batches(*join, ContextOf(nullptr, 64));
+  ASSERT_TRUE(batches.ok()) << batches.status().ToString();
+  EXPECT_EQ(DroppedColumnsIn(profile), 1) << "one column the build did not have to hold";
+  // The output keeps the field and its type: the join's contract is unchanged, and nothing above
+  // reads it, which is the whole reason NULLs there are sound.
+  ASSERT_EQ(join->output_schema()->num_fields(), 4);
+  EXPECT_TRUE(join->output_schema()->field(3)->type()->Equals(arrow::int64()));
+  int64_t rows = 0;
+  for (const Batch& batch : *batches) {
+    rows += batch.data->num_rows();
+    const auto& kept = static_cast<const arrow::Int64Array&>(*batch.data->column(2));
+    const auto& dropped = static_cast<const arrow::Int64Array&>(*batch.data->column(3));
+    const auto& key = static_cast<const arrow::Int64Array&>(*batch.data->column(1));
+    for (int64_t r = 0; r < batch.data->num_rows(); ++r) {
+      // The key and the retained column still carry their values, paired as they were.
+      ASSERT_FALSE(key.IsNull(r));
+      ASSERT_FALSE(kept.IsNull(r)) << "a retained column must still gather";
+      EXPECT_EQ(kept.Value(r), key.Value(r) + 10);
+      EXPECT_TRUE(dropped.IsNull(r)) << "a dropped column gathers as NULL";
+    }
+  }
+  EXPECT_EQ(rows, 6) << "probe keys 0 to 5 match; 99 does not";
+}
+
 TEST_F(HashJoinTest, OneToOnePathKeepsTheProbeColumnsOfAWhollyMatchedWindow) {
   // The build's and the probe's second columns are not nullable: the join's build column is.
   const auto build_schema = arrow::schema(
@@ -3320,6 +3410,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& pl
 // tests below assert it because their own premise is which layout a fixture produces, and that is
 // arithmetic over two constants of `join_table.cc` -- a comment saying "span 160 over 5 rows, so
 // hashed" stops being true the moment either constant moves, and nothing would fail.
+
 int64_t DirectBuildsIn(const ProfileNode& node) {
   int64_t found = 0;
   for (const ProfileMetric& metric : node.metrics()) {

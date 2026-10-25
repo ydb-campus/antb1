@@ -1,9 +1,9 @@
 Output: count_star():BIGINT
 Aggregate COUNT(*)
   Join NULL-AWARE ANTI build=right keys=[tr_rider = rd_id]
-    Join SEMI build=right keys=["CAST(tr_driver AS BIGINT)" = dv_id]
+    Join SEMI build=right keys=["CAST(tr_driver AS BIGINT)" = dv_id] carries 4 of 5 unread above
       Compute CAST(tr_driver AS BIGINT)
-        Join INNER build=right keys=[trips.tr_pickup = zones.zn_id]
+        Join INNER build=right keys=[trips.tr_pickup = zones.zn_id] carries 2 of 4 unread above
           Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_rider, tr_driver, tr_pickup]
           Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
       Project dv_id

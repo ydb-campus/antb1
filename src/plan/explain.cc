@@ -175,6 +175,21 @@ struct NodeLine {
                   node.residual, [](const ExprPtr& e) { return EscapeText(e->name, '\0'); }, ", ") +
               "]";
     }
+    // The columns this join carries that nothing above it reads -- its inputs produce them, it
+    // gathers them into every output batch, and a build on that side holds them for its lifetime.
+    // Reported rather than acted on: `needed_above` is Prune's record of what is read above, so an
+    // empty one means Prune has not run (a hand-built plan, or one rendered before the pass) and
+    // the count would be the whole output rather than nothing.
+    if (!node.needed_above.empty()) {
+      const std::vector<ColumnId> out = OutputIds(LogicalNode(node));
+      const auto dead =
+          static_cast<std::size_t>(std::ranges::count_if(out, [&node](const ColumnId id) {
+            return !std::ranges::binary_search(node.needed_above, id);
+          }));
+      if (dead > 0) {
+        line += std::format(" carries {} of {} unread above", dead, out.size());
+      }
+    }
     return line;
   }
   std::string operator()(const DependentJoinNode& node) const {

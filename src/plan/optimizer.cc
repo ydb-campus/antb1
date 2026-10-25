@@ -324,6 +324,26 @@ struct Pruner {
   LogicalNodePtr operator()(const RowCountNode& /*rows*/) const { return node; }
 
   LogicalNodePtr operator()(const JoinNode& join) const {
+    JoinNode out = join;
+    // `needed` as it arrives is the demand this join is under, recorded before the join's own keys
+    // and residual join it below -- but it is **not** a set of this join's columns. The same set is
+    // carried down both branches of every join above, so at a nested join it also holds the ids of
+    // an ancestor's other branch. Intersecting with this join's own outputs is what makes the field
+    // mean what its name says, and it is load-bearing rather than tidy: the consumer refuses the
+    // whole set when an id in it is not one the join outputs, so leaving a sibling's id in it
+    // disabled the pruning on exactly the nested joins it is worth the most on.
+    //
+    // Sorted, and **replacing** whatever the field held: `out` is a copy of a node that may have
+    // been pruned before (`Optimize` is idempotent and the tests assert it), and appending to an
+    // already-recorded set would leave every id twice. Nothing reads the field by position, so that
+    // would answer the same -- and go unnoticed, since EXPLAIN prints only what is *not* in it.
+    out.needed_above.clear();
+    for (const ColumnId id : OutputIds(*node)) {
+      if (needed.contains(id)) {
+        out.needed_above.push_back(id);
+      }
+    }
+    std::ranges::sort(out.needed_above);
     for (const JoinKey& key : join.keys) {
       Need(needed, key.left);
       Need(needed, key.right);
@@ -333,7 +353,8 @@ struct Pruner {
       CollectColumnIds(*conjunct, reads);
       needed.insert(reads.begin(), reads.end());
     }
-    return WithInputs(*node, {Prune(join.left, needed), Prune(join.right, needed)});
+    const LogicalNodePtr with = Make(std::move(out));
+    return WithInputs(*with, {Prune(join.left, needed), Prune(join.right, needed)});
   }
   LogicalNodePtr operator()(const DependentJoinNode& /*join*/) const {
     // Prune nothing through a dependent join: its right input reads columns of its left input as
