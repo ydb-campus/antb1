@@ -89,6 +89,8 @@ GOVERNANCE_PATHS: tuple[str, ...] = (
     "/ruff.toml",
     "/.gersemirc",
     "/tombi.toml",
+    "/LICENSE",
+    "/NOTICE",
 )
 # Owned in CODEOWNERS in addition to G.
 CODEOWNERS_EXTRA_PATHS: tuple[str, ...] = ("/pixi.lock", "/docs/adr/")

@@ -1,8 +1,9 @@
 # Keep-green job of the standalone static build (docs/adr/0033-standalone-static-binary.md, docs/ci.md): on the
 # three release targets, build the static Arrow prefix and the standalone antb1, package it and check the packaged
-# file (`pixi run static`). Advisory: not part of `CI OK`. Runs on PRs that touch the build, on every push to main
-# and by hand; main and manual runs keep their tarballs 30 days for the perf hosts. Hardening as in ci.yml; the
-# Arrow prefix cache is written only from main.
+# file (`pixi run static`), then gather the sources that go with a Linux package (`pixi run static-sources`, LGPL-2.1
+# section 6: docs/adr/0034-licence-and-static-sources.md). Advisory: not part of `CI OK`. Runs on PRs that touch the
+# build, on every push to main and by hand; main and manual runs keep their tarballs 30 days for the perf hosts, a
+# Linux package only next to its sources. Hardening as in ci.yml; the Arrow prefix cache is written only from main.
 name: static
 
 on:
@@ -12,6 +13,8 @@ on:
       - CMakeLists.txt
       - "**/CMakeLists.txt"
       - CMakePresets.json
+      - LICENSE
+      - NOTICE
       - cmake/**
       - pixi.lock
       - pixi.toml
@@ -20,6 +23,7 @@ on:
       - scripts/static-sources.sh
       - scripts/static.sh
       - scripts/static_gates.py
+      - scripts/static_package.py
       - src/cli/**
       - src/common/**
       - .github/workflows/static.yml
@@ -35,9 +39,11 @@ concurrency:
 
 jobs:
   # A PR that changes the pinned sources: every URL of the lock against its pin, so a wrong or dead copy fails here
-  # and not in a later cold build. The merge commit's first parent is the base, so the diff is the PR's own change.
+  # and not in a later cold build. The packaged sources only ever download a file's first good copy, so a PR that
+  # changes glibc's lock or scripts/static_package.py checks all of its copies (and of the conda packages) here. The
+  # merge commit's first parent is the base, so the diff is the PR's own change.
   urls:
-    name: static urls (pixi run static-arrow --check-urls)
+    name: static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -48,17 +54,21 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - name: Did the PR change cmake/static/arrow-sources.lock?
+      - name: Did the PR change a lock of the pinned sources?
         id: lock
         run: |
-          if git diff --quiet HEAD^1 HEAD -- cmake/static/arrow-sources.lock; then
-            echo "changed=false" >>"$GITHUB_OUTPUT"
-            echo "cmake/static/arrow-sources.lock is unchanged: nothing to check"
-          else
-            echo "changed=true" >>"$GITHUB_OUTPUT"
-          fi
+          for lock in arrow:cmake/static/arrow-sources.lock "glibc:cmake/static/glibc-source.lock scripts/static_package.py"; do
+            name=${lock%%:*}
+            # shellcheck disable=SC2086 # the paths are words
+            if git diff --quiet HEAD^1 HEAD -- ${lock#*:}; then
+              echo "$name=false" >>"$GITHUB_OUTPUT"
+              echo "${lock#*:}: unchanged, nothing to check"
+            else
+              echo "$name=true" >>"$GITHUB_OUTPUT"
+            fi
+          done
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
-        if: ${{ steps.lock.outputs.changed == 'true' }}
+        if: ${{ steps.lock.outputs.arrow == 'true' || steps.lock.outputs.glibc == 'true' }}
         with:
           pixi-version: v0.81.0
           environments: static
@@ -66,11 +76,14 @@ jobs:
           cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
           cache-write: false
       - name: Check every source URL (pixi run static-arrow --check-urls)
-        if: ${{ steps.lock.outputs.changed == 'true' }}
+        if: ${{ steps.lock.outputs.arrow == 'true' }}
         run: pixi run --frozen -e static static-arrow --check-urls
+      - name: Check every copy of glibc's source and the conda packages (pixi run static-sources --check-urls)
+        if: ${{ steps.lock.outputs.glibc == 'true' }}
+        run: pixi run --frozen -e static static-sources --check-urls
 
   static:
-    name: static ${{ matrix.target }} (pixi run static)
+    name: static ${{ matrix.target }} (pixi run static && pixi run static-sources)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -128,6 +141,9 @@ jobs:
           key: static-arrow-${{ matrix.target }}-${{ steps.key.outputs.key }}
       - name: Build, package and check (pixi run static)
         run: pixi run --frozen -e static static
+      # Linux: glibc's source RPM, antb1's source and the third-party sources (NETWORK); macOS: nothing to do.
+      - name: The sources of the package (pixi run static-sources)
+        run: pixi run --frozen -e static static-sources
       # A binary that links but does not run leaves no output of its own: show how it ends (on macOS a backtrace
       # and the crash report).
       - name: Diagnose the binary (failures only)
@@ -155,14 +171,37 @@ jobs:
               echo
             done
           fi
+      # The binary contains Arrow's code, so it is uploaded only with its licence texts: all of it or nothing.
+      - name: Collect the binary that failed with its licence texts (macOS)
+        if: ${{ failure() && runner.os == 'macOS' }}
+        run: |
+          if [ -x build/static/bin/antb1 ] && [ -s build/static/notices/THIRD_PARTY_NOTICES.txt ]; then
+            mkdir -p build/static/failed
+            cp build/static/bin/antb1 build/static/notices/* build/static/failed/
+          fi
       - name: Upload the binary that failed (macOS, 7 days)
         if: ${{ failure() && runner.os == 'macOS' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failed-antb1-${{ matrix.target }}
-          path: build/static/bin/antb1
+          path: build/static/failed/
           retention-days: 7
           if-no-files-found: ignore
+      # A Linux package goes up only after its sources (LGPL-2.1 section 6): every later step needs this one.
+      - name: Check the sources before the upload (Linux; main and manual runs)
+        if: ${{ github.event_name != 'pull_request' && runner.os == 'Linux' }}
+        working-directory: build/static/sources
+        run: sha256sum -c ./*.sources.tar.sha256
+      - name: Upload the sources (Linux; main and manual runs, 30 days)
+        if: ${{ github.event_name != 'pull_request' && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antb1-${{ matrix.target }}-sources
+          path: |
+            build/static/sources/antb1-*.sources.tar
+            build/static/sources/antb1-*.sources.tar.sha256
+          retention-days: 30
+          if-no-files-found: error
       - name: Upload the package (main and manual runs, 30 days)
         if: ${{ github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -2,7 +2,7 @@
 # scorecard.dev. Advisory. Publishing requires Scorecard's workflow restrictions: no top-level env or defaults, no
 # workflow-level write permissions, id-token only in this job, no job env, and only checkout, upload-artifact,
 # codeql-action/upload-sarif and scorecard-action as steps. branch_protection_rule does not fire on ruleset edits;
-# the weekly run covers them. Accepted findings: License (decided later) and admin bypass.
+# the weekly run covers them. Accepted finding: admin bypass.
 name: Scorecard
 
 on:

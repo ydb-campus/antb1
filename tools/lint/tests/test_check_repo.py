@@ -151,7 +151,7 @@ BASELINE: dict[str, str] = {
         `.pre-commit-config.yaml`, `.clang-format`, `.clang-tidy`, `tests/.clang-tidy`, `scripts/ctest.sh`,
         `scripts/agent-setup.sh`, `tests/data/clickbench_status.json`, `scripts/lint.sh`, `scripts/fmt.sh`,
         `tools/sanitizers/`, `.markdownlint-cli2.yaml`, `_typos.toml`, `ruff.toml`, `.gersemirc`, `tombi.toml`,
-        `tests/data/tpch_status.json`.
+        `tests/data/tpch_status.json`, `/LICENSE`, `/NOTICE`.
 
         ## Code Review Rules
 

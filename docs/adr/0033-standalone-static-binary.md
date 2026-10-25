@@ -61,17 +61,19 @@ Proposed
     checks the CPU, so a guard compiled for the base ISA runs from `.preinit_array`, before every constructor, and
     exits with a message instead of a SIGILL.
   - The allocator restart of ADR 0017 is kept unchanged: mimalloc still reads its options in a constructor.
-- **The shipped binary is the tested binary.** `pixi run static` packages the binary with its third-party notices,
-  `BUILDINFO.json` and a README (on Linux the line tables go to a separate `.debug` asset; the binary keeps its
-  symbols for perf), then checks the packaged file: linkage, link flags, build identity (`antb1 version --verbose`),
-  the restart, codec, thread and error smoke tests on files DuckDB writes at run time, and every CLI golden
-  (`ANTB1_CLI_UNDER_TEST`). `pixi run static-test` runs every hermetic test against the static Arrow.
+- **The shipped binary is the tested binary.** `pixi run static` packages the binary with LICENSE, NOTICE, its
+  third-party notices, `BUILDINFO.json` and a README (on Linux the line tables go to a separate `.debug` asset; the
+  binary keeps its symbols for perf), then checks the package and the packaged file: linkage, link flags, build
+  identity (`antb1 version --verbose`), the restart, codec, thread and error smoke tests on files DuckDB writes at
+  run time, and every CLI golden (`ANTB1_CLI_UNDER_TEST`). `pixi run static-test` runs every hermetic test against
+  the static Arrow.
 - **CI:** `static.yml` builds the three targets on PRs that touch the build and on every push to main (advisory, not
   part of `CI OK`; the prefix cache is written from main only); the nightly builds them from scratch and runs
   `static-test`. Every performance test runs on this binary since 2026-10-25, after the comparisons in Consequences:
   `pixi run bench` and `pixi run bench-clickbench` build in `build/static`, `bench.yml` publishes the series
-  `dev/bench-static`, and the dynamic `bench` preset is gone (docs/benchmarks.md). Publishing the binary with GitHub
-  releases (after the maintainers choose a project licence) follows separately.
+  `dev/bench-static`, and the dynamic `bench` preset is gone (docs/benchmarks.md). The project licence and the
+  sources that go with every Linux package (`pixi run static-sources`) are
+  [ADR 0034](0034-licence-and-static-sources.md); publishing the binary with GitHub releases follows separately.
 
 ## Consequences
 
@@ -143,6 +145,9 @@ Proposed
 - The binary needs a CPU from the baseline on (Haswell and newer on x86-64, Neoverse N1 or Graviton 2 and newer on
   aarch64). The guard turns an older CPU into a message; a portable build is one environment variable away
   (`ANTB1_STATIC_CPU_FLAGS`).
+- Static glibc is LGPL-2.1, so every Linux package comes with the sources of glibc, of antb1 and of every other
+  library linked into it except the GCC runtime, which comes with the compiler
+  ([ADR 0034](0034-licence-and-static-sources.md)).
 - Static glibc cannot load NSS modules or gconv converters from the host, and clock reads are system calls. antb1
   uses none of the former. The latter was measured before the perf tests moved (2026-10-25; Linux 5.4, clocksource
   tsc, on the Xeon host of the Linux entry above):
@@ -156,10 +161,10 @@ Proposed
   renamed copy restarts, since the check compares the names of `/proc/self/exe` and `argv[0]`.
   `pixi run bench-clickbench` runs a given binary by its resolved path and refuses one whose restart did not happen.
 - Alternatives considered: conda-forge's static archives (none exist for Arrow, snappy, brotli, re2, utf8proc or
-  thrift); linking glibc dynamically (keeps the loader and a host glibc requirement; it stays the fallback); a newer
-  sysroot for the vDSO (the environment's dynamic test executables would then need glibc 2.34 or newer on the host);
-  `-static-pie` (no `rcrt1.o` in the aarch64 sysroot, and start-up relocations); full LTO (slower, more memory on
-  CI runners than ThinLTO).
+  thrift); linking glibc dynamically (keeps the loader and a host glibc requirement; it stays the fallback, also if
+  the LGPL route of ADR 0034 becomes impractical); a newer sysroot for the vDSO (the environment's dynamic test
+  executables would then need glibc 2.34 or newer on the host); `-static-pie` (no `rcrt1.o` in the aarch64 sysroot,
+  and start-up relocations); full LTO (slower, more memory on CI runners than ThinLTO).
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
 this implementation does not comply with all requirements of the TPC-H Benchmark.

@@ -113,7 +113,9 @@
       "Edit(/_typos.toml)",
       "Edit(/ruff.toml)",
       "Edit(/.gersemirc)",
-      "Edit(/tombi.toml)"
+      "Edit(/tombi.toml)",
+      "Edit(/LICENSE)",
+      "Edit(/NOTICE)"
     ],
     "deny": [
       "Edit(/pixi.lock)",

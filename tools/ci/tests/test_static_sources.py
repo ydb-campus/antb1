@@ -10,63 +10,30 @@ answers from a table, so nothing reaches the network.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+import yaml
+from fakes import FAKE_CMAKE, FAKE_CURL, FakeNet, install
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = [REPO / "scripts" / "static-arrow.sh", REPO / "scripts" / "static-sources.sh"]
 LOCK = REPO / "cmake" / "static" / "arrow-sources.lock"
+GLIBC_LOCK = REPO / "cmake" / "static" / "glibc-source.lock"
 
 pytestmark = pytest.mark.skipif(
     f"{platform.system()}-{platform.machine()}" not in {"Linux-x86_64", "Linux-aarch64", "Darwin-arm64"},
     reason="static-arrow.sh supports the three release targets only",
 )
 
-# The fake curl answers each URL from the JSON table $FAKE_CURL_MAP: {"file": path} serves those bytes (with -I only
-# their size), {"exit": n, "code": status} fails like curl -f, {"nofile": true} exits 0 without writing, and
-# {"turns": [answer, ...]} gives the n-th request of that URL the n-th answer (the last one from then on). It honours
-# --max-filesize (exit 63), prints the HTTP status for -w, and logs "GET <url>" or "HEAD <url>" to $FAKE_CURL_LOG.
-FAKE_CURL = """#!{python} -I
-import json, os, shutil, sys
-args = sys.argv[1:]
-url, head = args[-1], "-I" in args or any(a.startswith("-") and not a.startswith("--") and "I" in a for a in args)
-with open(os.environ["FAKE_CURL_LOG"]) as log:
-    turn = sum(1 for line in log if line.split(" ", 1)[1] == url + "\\n")
-with open(os.environ["FAKE_CURL_LOG"], "a") as log:
-    log.write(("HEAD " if head else "GET ") + url + "\\n")
-with open(os.environ["FAKE_CURL_MAP"]) as f:
-    answer = json.load(f).get(url, {{"exit": 6, "code": 0}})
-if "turns" in answer:
-    answer = answer["turns"][min(turn, len(answer["turns"]) - 1)]
-code = answer.get("code", 200 if "file" in answer or answer.get("nofile") else 0)
-if "-w" in args:
-    sys.stdout.write("%03d" % code)
-if "file" in answer:
-    size = os.path.getsize(answer["file"])
-    if head:
-        with open(args[args.index("-D") + 1], "w") as h:
-            h.write("HTTP/1.1 %d OK\\r\\nContent-Length: %d\\r\\n\\r\\n" % (code, size))
-    else:
-        if "--max-filesize" in args and size > int(args[args.index("--max-filesize") + 1]):
-            sys.exit(63)
-        shutil.copyfile(answer["file"], args[args.index("-o") + 1])
-sys.exit(answer.get("exit", 0))
-"""
-FAKE_CMAKE = """#!{python} -I
-import hashlib, sys
-assert sys.argv[1:3] == ["-E", "sha256sum"], sys.argv
-with open(sys.argv[3], "rb") as f:
-    print(hashlib.sha256(f.read()).hexdigest(), sys.argv[3])
-"""
 # The fake tar is the first command of static-arrow's build: it writes its arguments and the ARROW_*_URL variables it
 # sees to $FAKE_TAR_LOG and exits 97, so a run that reaches the build ends there.
 FAKE_TAR = """#!{python} -I
@@ -78,11 +45,11 @@ sys.exit(97)
 BUILD_STARTED = 97
 
 
-class Sandbox:
+class Sandbox(FakeNet):
     """Copies of the scripts in a fake repository, a fake pixi environment, a fake curl and cmake."""
 
     def __init__(self, tmp: Path) -> None:
-        self.tmp = tmp
+        super().__init__(tmp)
         self.root = tmp / "root"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "cmake" / "static").mkdir(parents=True)
@@ -94,55 +61,20 @@ class Sandbox:
         self.arrow_dir = tmp / "arrow"
         self.src = self.arrow_dir / "src"
         self.bin = tmp / "bin"
-        self.bin.mkdir()
-        for name, text in (("curl", FAKE_CURL), ("cmake", FAKE_CMAKE), ("tar", FAKE_TAR)):
-            path = self.bin / name
-            path.write_text(text.format(python=sys.executable))
-            path.chmod(0o755)
-        self.answers: dict[str, dict[str, object]] = {}
-        self.served = 0
-
-    def bytes_answer(self, data: bytes) -> dict[str, object]:
-        self.served += 1
-        path = self.tmp / f"served-{self.served}"
-        path.write_bytes(data)
-        return {"file": str(path)}
-
-    def serve(self, url: str, data: bytes) -> str:
-        self.answers[url] = self.bytes_answer(data)
-        return url
-
-    def fail(self, url: str, curl_exit: int, code: int = 0) -> str:
-        self.answers[url] = {"exit": curl_exit, "code": code}
-        return url
-
-    def no_file(self, url: str) -> str:
-        self.answers[url] = {"nofile": True}
-        return url
-
-    def in_turn(self, url: str, *answers: dict[str, object]) -> str:
-        self.answers[url] = {"turns": list(answers)}
-        return url
-
-    @staticmethod
-    def pin(name: str, data: bytes, variable: str, *urls: str) -> str:
-        return f"{name} {hashlib.sha256(data).hexdigest()} {len(data)} {variable} {' '.join(urls)}".rstrip()
+        install(self.bin, {"curl": FAKE_CURL, "cmake": FAKE_CMAKE, "tar": FAKE_TAR})
 
     def write_lock(self, *lines: str) -> None:
         self.lock.write_text("# test lock\n" + "".join(line + "\n" for line in lines))
 
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        (self.tmp / "map.json").write_text(json.dumps(self.answers))
-        (self.tmp / "curl.log").write_text("")
         env = {
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.tmp),
             "CONDA_PREFIX": str(self.tmp / "env"),
             "ANTB1_ARROW_DIR": str(self.arrow_dir),
             "ANTB1_SOURCES_RETRY_DELAY": "0",
-            "FAKE_CURL_MAP": str(self.tmp / "map.json"),
-            "FAKE_CURL_LOG": str(self.tmp / "curl.log"),
             "FAKE_TAR_LOG": str(self.tmp / "tar.json"),
+            **self.curl_env(),
         }
         bash = shutil.which("bash")
         assert bash is not None
@@ -154,9 +86,6 @@ class Sandbox:
             timeout=60,
             check=False,
         )
-
-    def requested(self) -> list[str]:
-        return (self.tmp / "curl.log").read_text().splitlines()
 
     def build_input(self) -> dict[str, object]:
         """The fake tar's record: the arguments and ARROW_*_URL variables that static-arrow's build started with."""
@@ -454,6 +383,56 @@ def test_the_repository_lock_lists_two_operators_per_file() -> None:
         names.add(name)
         variables.add(variable)
     assert "-" in variables
-    # Every tarball whose licence static-arrow.sh packages is one of the pinned files.
+    # static-arrow.sh packages the licence of every pinned file but Arrow's own (Arrow's LICENSE and NOTICE come from
+    # its source tree), and of nothing else.
     licensed = re.findall(r"^(\S+\.tar\.gz) \S+$", (REPO / "scripts" / "static-arrow.sh").read_text(), re.MULTILINE)
-    assert licensed and set(licensed) <= names, set(licensed) - names
+    arrow = {name for name in names if name.startswith("apache-arrow-")}
+    assert licensed and set(licensed) == names - arrow, set(licensed) ^ (names - arrow)
+
+
+def load_static_package():
+    spec = importlib.util.spec_from_file_location("static_package", REPO / "scripts" / "static_package.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_packaged_licence_gets_a_label_from_its_pin() -> None:
+    """scripts/static_package.py labels each licence file of the prefix by the pin of the same library."""
+    static_package = load_static_package()
+    pins = static_package.arrow_pins()
+    files = ["arrow-LICENSE.txt", "arrow-NOTICE.txt"]
+    for name, member in re.findall(r"^(\S+\.tar\.gz) (\S+)$", (REPO / "scripts" / "static-arrow.sh").read_text(), re.M):
+        files.append(f"{re.split(r'-[0-9v]', name, maxsplit=1)[0]}-{member.rsplit('/', 1)[-1]}")
+    labels = [static_package.prefix_label(Path(f), pins) for f in files]
+    assert "Apache Arrow 25.0.0: LICENSE.txt" in labels and "Apache Thrift 0.22.0: NOTICE" in labels, labels
+    assert all(re.fullmatch(r"\S+( \S+)? [0-9a-f.-]+: \S+", label) for label in labels), labels
+
+
+def test_the_glibc_source_lock_maps_every_sysroot_build_that_env_static_locks() -> None:
+    """A lock refresh that brings another sysroot build fails here until its glibc source RPM is pinned."""
+    pins: dict[str, tuple[str, str, str]] = {}
+    sources: dict[str, tuple[str, str]] = {}
+    for no, line in enumerate(GLIBC_LOCK.read_text().splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        build, source, sha, size, *urls = line.split()
+        assert build not in pins and re.fullmatch(r"sysroot_linux-(64|aarch64)-\S+", build), f"line {no}"
+        assert re.fullmatch(r"glibc-[0-9.]+-\S+\.src\.rpm", source), f"line {no}"
+        assert re.fullmatch(r"[0-9a-f]{64}", sha) and int(size) > 0, f"line {no}"
+        assert urls and all(u.startswith("https://") for u in urls) and len(set(urls)) == len(urls), f"line {no}"
+        assert sources.setdefault(source, (sha, size)) == (sha, size), f"line {no}: {source} with another pin"
+        pins[build] = (source, sha, size)
+    lock = yaml.load((REPO / "pixi.lock").read_text(), Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+    packages = lock["environments"]["static"]["packages"]
+    locked = {
+        Path(urlsplit(entry["conda"]).path).name.removesuffix(".conda")
+        for platform_name in ("linux-64", "linux-aarch64")
+        for entry in packages[platform_name]
+        if "conda" in entry and Path(urlsplit(entry["conda"]).path).name.startswith("sysroot_linux-")
+    }
+    assert len(locked) == 2, locked
+    assert locked <= set(pins), (
+        f"no glibc source pinned for {sorted(locked - set(pins))} (docs/recipes/dependency-update.md)"
+    )

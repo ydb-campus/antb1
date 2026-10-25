@@ -1,0 +1,15 @@
+# The source of the GNU C Library 2.28 that the Linux standalone binary links statically (LGPL-2.1-or-later;
+# docs/adr/0034-licence-and-static-sources.md). Every Linux package comes with it: `pixi run static-sources`
+# (scripts/static_package.py) puts it into antb1-<target>.sources.tar, and `pixi run static` refuses to package
+# with a sysroot build that has no line here.
+#
+# One line per sysroot build that env `static` may lock: <sysroot build> <source file> <sha256> <bytes> <url> [<url>...]
+# - <sysroot build> is the conda package's file name without `.conda` (its conda-meta name). conda-forge's
+#   linux-sysroot-feedstock repackages AlmaLinux's binary RPMs unchanged; its recipe (info/recipe/meta.yaml in the
+#   package) names their version, and the source file is AlmaLinux's source RPM of that version.
+# - The pin is the vault's file, checked against the vault's repodata (repodata/*-primary.xml.gz); the URLs are
+#   byte-identical copies, tried in order like those of arrow-sources.lock.
+# - A lock refresh that changes the sysroot build fails tools/ci/tests/test_static_sources.py until its line is here
+#   (docs/recipes/dependency-update.md).
+sysroot_linux-64-2.28-h4ee821c_9 glibc-2.28-236.el8_9.13.src.rpm 471828a3273bc3ea60ce2d3a67a9bb2ef0921ca9152df3cc15c046dde5bb3263 18177129 https://vault.almalinux.org/8.9/BaseOS/Source/Packages/glibc-2.28-236.el8_9.13.src.rpm https://mirrors.aliyun.com/almalinux-vault/8.9/BaseOS/Source/Packages/glibc-2.28-236.el8_9.13.src.rpm
+sysroot_linux-aarch64-2.28-h585391f_9 glibc-2.28-236.el8_9.13.src.rpm 471828a3273bc3ea60ce2d3a67a9bb2ef0921ca9152df3cc15c046dde5bb3263 18177129 https://vault.almalinux.org/8.9/BaseOS/Source/Packages/glibc-2.28-236.el8_9.13.src.rpm https://mirrors.aliyun.com/almalinux-vault/8.9/BaseOS/Source/Packages/glibc-2.28-236.el8_9.13.src.rpm
