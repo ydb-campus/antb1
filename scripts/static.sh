@@ -145,8 +145,8 @@ if [ -n "$glibc_source" ]; then
   glibc_note="
 It contains the GNU C Library (${glibc_source%.src.rpm}), linked statically and licensed under the GNU LGPL 2.1
 or later. The sources of glibc, of antb1 and of every other library linked into it, except the GCC runtime
-(libstdc++, libgcc) that comes with the compiler, are in antb1-$target.sources.tar, published next to this package;
-the README.txt in that file says how to relink."
+(libstdc++, libgcc) that comes with the compiler, are in antb1-$target.sources.tar, published next to this
+package; the README.txt in that file says how to relink."
 fi
 cat >"$pkg/$name/README.txt" <<EOF
 antb1 $version for $target: one standalone executable (no pixi, no repository needed).

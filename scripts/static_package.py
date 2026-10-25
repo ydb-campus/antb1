@@ -363,8 +363,8 @@ Relink it with a modified glibc: build glibc from the source package (rpmbuild -
 archive and start file of its glibc-static and glibc-devel packages (usr/lib64: libc.a, libpthread.a, librt.a,
 libdl.a, crt1.o, crti.o, crtn.o, and libm.a with what it names: on x86_64 a linker script for libm-{glibc}.a and
 libmvec.a) into the environment's sysroot (.pixi/envs/static/<arch>-conda-linux-gnu/sysroot/usr/lib64) with
-`cp --remove-destination`: pixi hard-links those files to its package cache, so a plain `cp` would write the modified
-glibc into that cache and into every environment installed from it. Then run `pixi run static` again.
+`cp --remove-destination`: pixi hard-links those files to its package cache, so a plain `cp` would write the
+modified glibc into that cache and into every environment installed from it. Then run `pixi run static` again.
 """
 
 
