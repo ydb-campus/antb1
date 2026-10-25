@@ -18,17 +18,18 @@ access or a container, and you should not use host compilers or host CMake.
 3. Build and test with `pixi run test`.
 
 The environments are `default` (Clang 23; every build and test task), `gcc` (GCC 15, linux-64 only; the
-compatibility leg and the CodeQL build) and `lint` (formatters and linters). Every task exists in exactly one
+compatibility leg and the CodeQL build), `static` (the standalone static build, its tests and the benchmarks; ADR 0033)
+and `lint` (formatters and linters). Every task exists in exactly one
 environment, so `pixi run <task>` never needs `-e`; pixi installs a missing environment on first use.
 
 `pixi.toml` and `pixi.lock` define the toolchain. Never edit `pixi.lock` by hand; a maintainer re-locks with pixi
 0.81.0 when dependencies change.
 
-On Linux, the `default` and `gcc` environments include `duckdb-extension-tpch` (`lint` does not), which contains TPC's
-dbgen under the TPC End User License Agreement v2.2. The tests use it only to generate data derived from TPC-H at test
-time. Installing such an environment, on your machine or on a CI runner, installs it and accepts that EULA; nothing
-derived from TPC-H is ever committed ([ADR 0006](docs/adr/0006-test-strategy-and-data-policy.md)). pixi cannot install
-the package on macOS, so the TPC-H-derived tests run on Linux only.
+On Linux, the `default`, `gcc` and `static` environments include `duckdb-extension-tpch` (`lint` does not), which
+contains TPC's dbgen under the TPC End User License Agreement v2.2. The tests use it only to generate data derived
+from TPC-H at test time. Installing such an environment, on your machine or on a CI runner, installs it and accepts
+that EULA; nothing derived from TPC-H is ever committed ([ADR 0006](docs/adr/0006-test-strategy-and-data-policy.md)).
+pixi cannot install the package on macOS, so the TPC-H-derived tests run on Linux only.
 
 ## Everyday commands
 
@@ -44,7 +45,7 @@ the package on macOS, so the TPC-H-derived tests run on Linux only.
 | Every Linux PR gate except the ClickBench data tests and CodeQL (ASan/UBSan, clang-tidy, coverage floors, fuzz smoke, GCC leg) | `pixi run check-full` |
 | ClickBench data tests (downloads 122 MB once into `~/.cache/antb1`; redacted output) | `pixi run test-data` |
 | Toolchain, build and data status | `pixi run doctor` |
-| Benchmarks (never gating; [docs/benchmarks.md](docs/benchmarks.md)) | `pixi run bench` · `pixi run bench-clickbench` |
+| Benchmarks on the standalone static build (env `static`; NETWORK on the first run; never gating; [docs/benchmarks.md](docs/benchmarks.md)) | `pixi run bench` · `pixi run bench-clickbench` |
 
 [docs/ci.md](docs/ci.md) maps every CI job to the local command that reproduces it, and
 [docs/testing.md](docs/testing.md) explains how tests are organized.

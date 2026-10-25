@@ -27,7 +27,9 @@ Policy: [ADR 0006](../../../docs/adr/0006-test-strategy-and-data-policy.md).
   `pixi run doctor` shows whether `hits_0.parquet` is there.
 - `pixi run fetch-data` downloads the pinned files (`tools/data/clickbench.lock`, sha256-verified) into that
   directory, and `pixi run test-data` runs the redacted data tests (ctest label `data`, CI job `clickbench-hits0`);
-  `pixi run asan-data` repeats them under ASan. No other code, script or test may download the data.
+  `pixi run asan-data` repeats them under ASan. No other code, script or test may download the data; by hand, only
+  the recipe for a host without the repository (docs/benchmarks.md) fetches the same pinned files, checked the same
+  way.
 - Agents never look at the data: do not print rows or query results over it and do not write ClickBench query text
   into files. Run your own queries and discard stdout, so only the exit code, errors and timing remain:
   `pixi run antb1 query --clickbench -f my.sql --table hits=<file> --timing >/dev/null`.

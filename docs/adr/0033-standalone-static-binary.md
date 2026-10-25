@@ -49,9 +49,10 @@ Proposed
   target from `Arrow::arrow_shared` to `Arrow::arrow_static`, and the same for ArrowCompute and Parquet).
   - **Linux:** fully static and non-PIE, on the locked glibc 2.28 sysroot: no loader, no dynamic section, any
     distribution with kernel 3.2 (x86-64) or 3.7 (aarch64). Below glibc 2.34 libstdc++ refers to pthread weakly, so
-    `libpthread.a` is linked whole. Static glibc 2.28 does not use the vDSO, so a clock read is a system call; antb1
-    reads the clock only for `explain --analyze` and `bench`, and mimalloc only while purging, which the restart
-    turns off.
+    `libpthread.a` is linked whole. Static glibc 2.28 does not use the vDSO, so a clock read is a system call. antb1
+    reads the clock a few times per query (7 times per run in `bench`, about once more per join build), twice per
+    operator and batch under `explain --analyze`, and mimalloc only while purging, which the restart turns off;
+    Consequences give the measured cost.
   - **macOS:** Apple ships no static executables. libc++ is linked statically; libSystem and libc++abi come from the
     OS; deployment target 13.0, the floor the lock was solved for; the linker's ad-hoc signature, without an
     LC_RPATH into the environment.
@@ -67,8 +68,10 @@ Proposed
   (`ANTB1_CLI_UNDER_TEST`). `pixi run static-test` runs every hermetic test against the static Arrow.
 - **CI:** `static.yml` builds the three targets on PRs that touch the build and on every push to main (advisory, not
   part of `CI OK`; the prefix cache is written from main only); the nightly builds them from scratch and runs
-  `static-test`. Moving every performance test to this binary (after a measured comparison with today's `bench`
-  build) and publishing it with GitHub releases (after the maintainers choose a project licence) follow separately.
+  `static-test`. Every performance test runs on this binary since 2026-10-25, after the comparisons in Consequences:
+  `pixi run bench` and `pixi run bench-clickbench` build in `build/static`, `bench.yml` publishes the series
+  `dev/bench-static`, and the dynamic `bench` preset is gone (docs/benchmarks.md). Publishing the binary with GitHub
+  releases (after the maintainers choose a project licence) follows separately.
 
 ## Consequences
 
@@ -77,6 +80,22 @@ Proposed
   git). It is 46 MB on linux-x86_64, 13 MB as a tarball, and starts in a twentieth of the time: `antb1 version`
   takes 3.0 ms with the allocator restart (1.5 ms without) against 63.5 ms (32.4 ms) for the dynamic `ci-release`
   build, medians of 300 interleaved runs on a 64-core Linux host (2026-10-25).
+- **What the flavour is worth on Linux (ClickBench, measured 2026-10-25).** The setup:
+  - 43 ClickBench queries on the 100 files, hot in the page cache, on a two-socket Xeon Gold 6338 host (64 cores,
+    128 threads, AVX-512);
+  - three builds of one commit, every answer equal;
+  - each query in a fresh process with three tries, its time the faster of tries 2 and 3, the builds in a balanced
+    order.
+
+  Summed over the queries, the static binary took 0.822 of preset `bench`'s time at 1 thread, 0.854 at 16, 0.940
+  at 64 and 0.950 at 128 (`ci-release`, `-O2`, was within 1% of `bench`).
+  - It executes 28-29% fewer user-mode instructions on every query, and its lower IPC gives part of that back.
+  - At 1 and 16 threads 42 of the 43 queries are faster beyond the run's noise. At 64 and 128 threads the gain is
+    real in sum but small per query.
+  - Each process also spends about 0.08 s less outside the query timer.
+
+  The run cannot separate ThinLTO, Arrow built by Clang at `-O3`, the x86-64-v3 baseline and static linking: like
+  the entry below, it claims the package, not a cause.
 - **What the flavour is worth on a workload, which is the comparison the Decision above makes a precondition of
   moving the performance tests (measured 2026-10-25).** The baseline is the build being replaced: preset `bench`
   (Release, `-O3`), not `ci-release` (RelWithDebInfo, `-O2 -g`), which an earlier draft of this entry used and
@@ -125,9 +144,17 @@ Proposed
   aarch64). The guard turns an older CPU into a message; a portable build is one environment variable away
   (`ANTB1_STATIC_CPU_FLAGS`).
 - Static glibc cannot load NSS modules or gconv converters from the host, and clock reads are system calls. antb1
-  uses none of the former, and the cost of the latter is measured before the perf tests move.
-- A renamed copy of the binary skips the restart and runs about 5% slower (ADR 0017); the package ships it as
-  `antb1`.
+  uses none of the former. The latter was measured before the perf tests moved (2026-10-25; Linux 5.4, clocksource
+  tsc, on the Xeon host of the Linux entry above):
+  - `antb1 bench` makes 912 `clock_gettime` calls for the 43 ClickBench queries × 3 tries, on one file or on the
+    100, at 1 to 128 threads: 9 at start and 7 per run of a query.
+  - Each call costs 0.34 µs more than a vDSO read, about 2.4 µs per run.
+  - `explain --analyze` makes up to 55,000 calls for one query. That is at most about 4% of its time on the worst
+    cases measured: the 100 files at 16 threads, and the queries derived from TPC-H on 2048-row row groups at 4
+    threads. The bound charges every call to the wall time. Profiles are diagnostics.
+- Started through a symlink of another name, the binary skips the restart and runs about 5% slower (ADR 0017); a
+  renamed copy restarts, since the check compares the names of `/proc/self/exe` and `argv[0]`.
+  `pixi run bench-clickbench` runs a given binary by its resolved path and refuses one whose restart did not happen.
 - Alternatives considered: conda-forge's static archives (none exist for Arrow, snappy, brotli, re2, utf8proc or
   thrift); linking glibc dynamically (keeps the loader and a host glibc requirement; it stays the fallback); a newer
   sysroot for the vDSO (the environment's dynamic test executables would then need glibc 2.34 or newer on the host);

@@ -153,8 +153,11 @@ Why it looks like this:
 - It is self-contained because it runs before Claude, from an unknown working directory, and it must never fail
   the session: every step has a timeout and the script always exits 0. Its worst case is about 290 seconds, within
   the setup time limit of about 5 minutes.
-- GitHub downloads of other projects are blocked (HTTP 403) in cloud sessions, so `pixi run static-arrow` (whose
-  pinned sources are mostly on GitHub) runs only in CI and on local hosts.
+- No sandbox installs env `static` (this script, Copilot's setup and Codex's install `default` and `lint`), so
+  `pixi run static-arrow`, `pixi run static` and the benchmarks (`pixi run bench`, `pixi run bench-clickbench`) run
+  only in CI and on local hosts. Every pinned source has a copy off GitHub, so GitHub's 403 for other projects'
+  downloads in cloud sessions is no longer the obstacle. Where env `static` is installed, `pixi run bench-clickbench`
+  with `ANTB1_BENCH_BIN` runs a downloaded package without building anything.
 - GitHub release downloads of other projects are blocked (HTTP 403) in cloud sessions, so it installs pixi 0.81.0
   from conda-forge and checks the file's sha256 (the same pin as `scripts/agent-setup.sh`). The conda-forge build
   needs glibc and OpenSSL 3, which the cloud image has.
@@ -192,7 +195,9 @@ In ChatGPT Codex, open **Settings** → **Environments** → **Create environmen
   release and the locked `default` (Clang 23) and `lint` environments. `--persist-bashrc` puts pixi on `PATH` in the
   first line of `~/.bashrc` and `~/.profile` (before the early return for non-interactive shells) and, as root,
   links `/usr/local/bin/pixi`.
-- The agent itself runs offline. Every task works offline once the environments exist.
+- The agent itself runs offline. Every task of the installed environments works offline once they exist, except
+  the ClickBench downloads (`fetch-data`, and `test-data` and `asan-data` until the data is cached); the static build
+  and the benchmarks need env `static` and, on their first run, the network.
 - Add `gcc` to `--envs` if Codex should run `pixi run ci-gcc` or `pixi run check-full`; it makes the setup bigger.
 
 ### Native Codex review

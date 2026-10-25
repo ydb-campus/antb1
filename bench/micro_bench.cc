@@ -1,7 +1,7 @@
 // Micro benchmarks of antb1's hot paths (Google Benchmark; docs/benchmarks.md). `pixi run bench`
-// runs them on the Release `bench` preset and writes build/bench/micro.json; bench.yml publishes
-// the numbers from main. Numbers never gate a PR. Inputs are synthetic (splitmix64), never
-// ClickBench data.
+// runs them in build/static (preset `static`: the static Arrow, -O3, ThinLTO) and writes
+// micro.json into build/static/bench-results; bench.yml publishes the numbers from main. Numbers
+// never gate a PR. Inputs are synthetic (splitmix64), never ClickBench data.
 
 #include <algorithm>
 #include <cstddef>
@@ -23,6 +23,7 @@
 #include <benchmark/benchmark.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/common/version.h"
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/join_table.h"
 #include "antb1/exec/operator.h"
@@ -743,6 +744,13 @@ int main(int argc, char** argv) {
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
   }
+  // The build these numbers come from, in the report's context (antb1_ keys next to Google
+  // Benchmark's own): the binary is not antb1, so it cannot print `version --verbose`.
+  const std::string_view commit = antb1::GitSha();
+  benchmark::AddCustomContext("antb1_commit", commit.empty() ? "unknown" : std::string(commit));
+  benchmark::AddCustomContext("antb1_flavor", std::string(antb1::BuildFlavor()));
+  benchmark::AddCustomContext("antb1_cpu_baseline", std::string(antb1::CpuBaseline()));
+  benchmark::AddCustomContext("antb1_build_type", std::string(antb1::BuildType()));
   benchmark::RunSpecifiedBenchmarks();
   benchmark::Shutdown();
   std::error_code ec;
