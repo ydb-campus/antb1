@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792947305970,
+  "lastUpdate": 1792966908107,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -756,6 +756,258 @@ window.BENCHMARK_DATA = {
             "value": 2274.751876000039,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2273.7224440000005 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "11b031270ec4d9ada43cd2032b750704aab35661",
+          "message": "perf(exec): take a key filter from any join of the pipeline (#242)\n\n## Summary\n\nA left-deep pipeline's scan is probed by **every** join above it, so\neach of them has a key filter to offer it\n([ADR 0029](docs/adr/0029-dynamic-join-filters.md)'s D1) — and D1 asked\nonly the deepest. Where that one's build is\ntoo large to publish anything (past `KeyFilter::kMaxBytes`, which a\n150,000,000-row build is), the scan ran\nunfiltered past a selective build sitting one level up.\n\n`ProbeKeyOf` now walks innermost-outwards. The innermost join's key\nwhere it published a filter, which keeps every\ndecision this made before; otherwise the first join above it whose\nfilter is worth reading.\n\n- **The key's position is the hazard, answered rather than avoided.** A\nkey from a join above the innermost is a\nposition in *that* join's probe input, not in the scan, so the walk\nsubtracts each intervening join's prefix on\nthe way down. It refuses a chain it cannot map: through a join that\nemits its build rows (dropping a probe row\nthere would *add* an output row), or into the right input of one whose\noutput holds its left input's columns\nalone. A key naming some other input's column lands outside the scan's\nfields and the two bounds refuse it.\n- **A direct-layout build is read here, which D1 refuses outright.**\nWhat a rejected row saves is then the work of\nevery join below the publisher and not one cheap probe — the same\ndistinction D5 turns on. Ungated that is\n**1.005x** over the 22 (five sub-second queries losing 4–6.5% to buy one\nquery's 15%), so it is gated on the\nshare of its own key range the build covers (`JoinTable::key_span`,\nnew): under an eighth it pays.\n- **`explain --physical` names every candidate now**, innermost first\n(`key filter candidate on v or k`), since\nwhich one a run reads follows from conditions no plan can settle. Naming\nthe first alone misreported the one\n  query this item changes.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [x] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n`explain --physical` prints an extra candidate column where a scan sits\nunder several joins. No `.slt`\nexpectation, golden or ratchet changes, and no answer changes.\n\n## For the maintainer: two things I did not do myself\n\n1. **`docs/adr/0029-dynamic-join-filters.md` is a CODEOWNERS path.** The\nD6 entry is in this diff and needs your\napproval; say the word and I will take it out and hand you the text\ninstead.\n2. **The ADR's Status line is now stale and I left it alone**, because\nchanging it is an ADR status change. It\nreads `Accepted (D0-D3 and D5 built and measured; ...)`. If you want it\nupdated, the minimal edit is\n   `D0-D3, D5 and D6 built and measured`.\n\n## Verification\n\nScope established from the engine's own plans rather than from timings:\n**one query of the 22 changes**, and its\n`lineitem` scan drops 567,376,329 of 600,037,902 rows. The filtered\nscans of the other 21 are byte-identical\nbetween the two binaries, so their timing differences are noise by\nconstruction. All 43 ClickBench physical plans\nare byte-identical — this ADR's required control, answered by plan\nidentity rather than a timing run.\n\nBoth arms `pixi run static` from the same tree, arms interleaved and\nrotated, answers compared in-process:\n\n| TPC-H SF 100 | base | this | ratio |\n| --- | ---: | ---: | ---: |\n| Q09, 14 threads, best of 5 | 5.443 s | **4.617 s** | **0.848x** |\n| Q09, 4 threads, best of 7 | 11.037 s | **9.825 s** | **0.890x** |\n| the other 21 | | | plans byte-identical |\n\nSix runs over the item's development span 0.842x to 0.861x. The 4-thread\nfigure is from one commit earlier, whose\nQ09 plan is identical to the final one by the same row counts.\n\n**Eight mutation checks**, each reverting one mechanism and watching the\nintended test fail: the direct-layout\nwaiver, the key-span gate, the walk past the innermost join, the prefix\nsubtraction, the candidate list, the two\nbounds that refuse a key naming another input's column, and D2's part\ntest on a non-innermost key. The bounds are\nwhat stand between this and a wrong answer, so each has a case of its\nown.\n\n```text\n$ pixi run check\n100% tests passed out of 2915\nlint: everything passes except 38 pre-existing shellcheck SC2218 findings in tools/github/apply-settings.sh,\n      which fail identically on clean main on this host (macOS)\n\n$ pixi run release\n100% tests passed out of 2914\n\n$ ANTB1_DIFF_SEED=20261025 pixi run diff-random\nDIFF: PASS seed=20261025 queries=2000 failed=0 unsupported=0\n\n$ clang-tidy -p build/tidy --warnings-as-errors='*' <each changed file, tests too>\nphysical_planner.cc clean; hash_join_test.cc's findings are the pre-existing macOS cluster, none in the\nadded ranges\n```\n\n**Not run on this host, and CI's:** `pixi run asan` (fails at discovery\non a pre-existing `curl_global_init`\nleak) — the gate most likely to catch a lifetime mistake, though this\nchange adds no allocation or ownership;\n`pixi run ci-gcc` and `codeql-build` (linux-64 only), so GCC-only\nwarnings reach me only through CI.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (6 new cases across `hash_join_test.cc`,\n`join_table_test.cc` and\n      `plan_report_test.cc`, every one mutation-checked)\n- [x] Docs updated where behavior, commands or architecture changed (ADR\n0029's D6, docs/sql-subset.md's\n      `explain --physical` section)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer — **see the two items\nabove: the ADR 0029 entry is in this diff and needs your approval**\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) wrote\nthe change, the tests and the ADR entry,\nran every gate and measurement above, and reviewed its own diff with the\nrepository's `reviewer` subagent —\nwhose three P1 findings are addressed here (the two uncovered bounds and\nD2's new reach each got a\nmutation-checked test; the stale `KeyFilterCandidate` reference in the\npublic header is fixed).\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-26T01:10:08+03:00",
+          "tree_id": "a45a4761d2529a7efadf0d155dd52673a5dea7e7",
+          "url": "https://github.com/ydb-campus/antb1/commit/11b031270ec4d9ada43cd2032b750704aab35661"
+        },
+        "date": 1792966906357,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4735.215229958425,
+            "unit": "ns/iter",
+            "extra": "iterations: 148418\ncpu: 4735.017086876254 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 28875.183743254,
+            "unit": "ns/iter",
+            "extra": "iterations: 24273\ncpu: 28873.09850451119 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 51773.33631062151,
+            "unit": "ns/iter",
+            "extra": "iterations: 13547\ncpu: 51770.601166309854 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 234762.32677810235,
+            "unit": "ns/iter",
+            "extra": "iterations: 3051\ncpu: 234725.66142248438 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 494633.53710248653,
+            "unit": "ns/iter",
+            "extra": "iterations: 1415\ncpu: 494642.01837455883 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1496167.724731119,
+            "unit": "ns/iter",
+            "extra": "iterations: 465\ncpu: 1496170.109677419 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 40.54130905882403,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.538421176470536 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 45.17617459999883,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 45.17068913333334 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 197.1993783333422,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 197.1838246666664 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.7936872978724,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.792351255319138 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 19.122985000000387,
+            "unit": "ms/iter",
+            "extra": "iterations: 36\ncpu: 19.122446305555535 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 35.79913357894707,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 35.79387005263154 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.2178479075043667,
+            "unit": "ms/iter",
+            "extra": "iterations: 573\ncpu: 1.2178068307155319 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 113.58440200000548,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 113.45574483333347 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 22.762353870968084,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.761753064516096 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 24.684663714286412,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 24.68238421428572 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 52.36731961538838,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.357950999999815 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 78.44804988889109,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 78.43725588888894 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 264.547612333331,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 264.5157176666674 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1298.203075999993,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1298.033286999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 27.62108659999967,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.619189480000017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 30.843099363636384,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 30.83428809090918 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 53.77229776922832,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.77135246153841 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 98.95743657143286,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 98.9428008571426 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 376.5146019999861,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 376.50202300000046 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1552.3780279999642,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1552.1634609999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 56.0175602307665,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 56.00636676923079 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 58.466826833334075,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.46527216666667 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 84.11448287499468,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 84.09563412500009 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 151.11002160000453,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 151.09126499999945 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 417.9321865000247,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 417.8683764999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1911.256428999991,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1910.974881999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 64.91358272727543,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 64.91025545454544 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 68.34524089999832,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.3296194999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 97.161271142852,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 97.15260142857167 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 171.26096700000915,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 171.24146699999977 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 440.40140050000787,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 440.3095609999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2074.6535499999936,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2074.3223749999943 ms\nthreads: 1"
           }
         ]
       }
