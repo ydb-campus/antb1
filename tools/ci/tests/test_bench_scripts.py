@@ -314,6 +314,13 @@ def test_hits_lists_and_outputs_are_checked_before_anything_is_built(box: Sandbo
         r = box.run(script, ANTB1_BENCH_OUT=str(box.tmp / "a-file"))
         assert r.returncode == 2
         assert "is not a writable directory" in r.stderr and box.ran() == []
+    # A relative output stays inside the results directory: one with `..` segments is refused, and nothing created.
+    for script in ("bench-clickbench.sh", "bench-micro.sh"):
+        for escape in ("../../escape", "a/../../b", ".."):
+            r = box.run(script, ANTB1_BENCH_OUT=escape)
+            assert r.returncode == 2, (script, escape)
+            assert "leaves build/static/bench-results" in r.stderr and box.ran() == []
+    assert not (box.root / "build" / "escape").exists() and not (box.root / "build" / "static" / "b").exists()
     # A glob is antb1's to expand, so it is passed on unchecked.
     r = box.run("bench-clickbench.sh", ANTB1_HITS_FILES=f"{box.data}/hits_0.parquet,{box.data}/hits_*.parquet")
     assert r.returncode == 0, r.stderr

@@ -46,6 +46,10 @@ results="$root/build/static/bench-results"
 case "${ANTB1_BENCH_OUT:-}" in
   "") out=$results ;;
   /*) out=$ANTB1_BENCH_OUT ;;
+  */../* | ../* | */.. | ..)
+    echo "bench-clickbench: ANTB1_BENCH_OUT=$ANTB1_BENCH_OUT leaves build/static/bench-results; give an absolute path" >&2
+    exit 2
+    ;;
   *) out="$results/$ANTB1_BENCH_OUT" ;;
 esac
 any_build="${ANTB1_BENCH_ANY_BUILD:-0}"

@@ -24,6 +24,10 @@ results="$root/build/static/bench-results"
 case "${ANTB1_BENCH_OUT:-}" in
   "") out=$results ;;
   /*) out=$ANTB1_BENCH_OUT ;;
+  */../* | ../* | */.. | ..)
+    echo "bench: ANTB1_BENCH_OUT=$ANTB1_BENCH_OUT leaves build/static/bench-results; give an absolute path" >&2
+    exit 2
+    ;;
   *) out="$results/$ANTB1_BENCH_OUT" ;;
 esac
 if ! mkdir -p "$out" 2>/dev/null || [ ! -w "$out" ]; then
