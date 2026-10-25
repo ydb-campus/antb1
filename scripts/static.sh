@@ -53,9 +53,13 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) target=darwin-arm64 ;;
   *) echo "static: unsupported platform $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
-version=$("$build/bin/antb1" version | sed -n 's/^antb1 \([^ ]*\) (Apache Arrow .*)$/\1/p')
-if [ -z "$version" ]; then
-  echo "static: cannot read the version of $build/bin/antb1" >&2
+# The first run of the new binary: a binary that does not start says so here, with its own output and status.
+status=0
+first_run=$("$build/bin/antb1" version 2>&1) || status=$?
+version=$(sed -n 's/^antb1 \([^ ]*\) (Apache Arrow .*)$/\1/p' <<<"$first_run")
+if [ "$status" != 0 ] || [ -z "$version" ]; then
+  echo "static: $build/bin/antb1 version exited with $status and printed:" >&2
+  echo "$first_run" >&2
   exit 1
 fi
 
