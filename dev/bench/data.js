@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792890965916,
+  "lastUpdate": 1792891528784,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks": [
@@ -22500,6 +22500,258 @@ window.BENCHMARK_DATA = {
             "value": 2435.777032999994,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2435.2520910000026 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e9ee2804c4ed836a0d386da04171a06607319a98",
+          "message": "perf(plan,exec): a join build holds only the columns read above it (#234)\n\n## Summary\n\nA join's output is both inputs' columns whatever is read above it, so a\n**build retains columns\nnothing will look at** — for the whole life of the build, which on a\nlarge one is gigabytes.\n`Prune` already computes the set that says which:\n`JoinNode::needed_above` is what a node above the\njoin reads, recorded in the moment before the join's own keys and\nresidual are added to it.\n\nMeasured against `main` at `ca66673` (`#233`, the only commit since, is\ndocs-only), release arms,\nSF 100. All 22 answers byte-identical at both thread counts, and all 22\nphysical plans identical to\nthe binary the timings came from.\n\n| | 4 threads | 14 threads | peak memory |\n| --- | ---: | ---: | --- |\n| **Q21** | **0.885×** | **0.784×** | 5,726 → 4,886 MiB |\n| **Q5** | **0.912×** | 0.910× | 6,107 → 4,874 MiB |\n| **Q2** | **0.921×** | 0.921× | |\n| Q3 | 0.955× | 0.967× | 2,030 → 1,557 MiB |\n| Q9 | 0.966× | 0.952× | |\n| Q7, Q8 | 0.974×, 0.971× | 0.959×, 0.962× | 1,496 → 1,136, 1,043 → 780\nMiB |\n| **the 22, geomean** | **0.976×** | **0.965×** | 14,156 → 14,121 MiB |\n\nThe per-query figures are 7 repeats interleaved and rotated; the geomean\nis a 3-repeat control over\nall 22. **Unlike every other item measured on both thread counts, this\none is better at 14** — the\n`Take` copies it avoids are per-thread work. Nothing regresses at either\ncount: the widest readings\nare Q19 1.006× on 4 threads and Q14 1.014× on 14, both inside their\nspreads.\n\n**Stated plainly: the suite's peak barely moves.** Q18 sets it (14,156\nMiB) and has nothing to drop.\nThis is five queries' memory plus a suite-wide time win, not a headline\npeak reduction.\n\n**The table above was re-earned after the first review round broke it**,\nwhich is the main thing to\nread this PR for; see the last section. The shipped tree re-measures at\n0.974× / Q21 0.881× /\nQ5 0.910× (4 threads, 3 repeats), and `cols_dropped` was checked **per\njoin across all 22** against\nthe binary the table came from — identical everywhere.\n\n## Where it drops, which turned out to matter more than what it drops\n\nA build part takes its rows with `arrow::compute::Take`, which\nmaterialises **every column it is\ngiven** in partition order. A column not given to it costs neither the\ncopy nor the bytes — so the\ndrop happens there.\n\nMy first version dropped later, when the table is built, and that is\nworth far less: **5.46 → 5.31 GB\non Q5, against 4.34 GB this way.** The peak is reached while the input\nbatches are still alive, so a\nlate drop releases memory nobody was short of. That is also what turned\na memory item into a time\nitem, which the plan for this did not expect.\n\n**The NULL-keyed rows a left-outer or anti build retains are narrowed\ntoo, and differently.** They\nare emitted directly by the join that reports unmatched build rows\nrather than gathered from, so the\nstand-in is an all-NULL array of the column's **declared** type where a\nkeyed chunk uses the `null`\none. Worth doing for the consistency more than the bytes — a handful of\nrows is all a build keeps\nthis way — since otherwise one column reads NULL for a row that matched\nand its real value for one\nthat did not.\n\n## Why a wrong set is safe, and where the safety actually is\n\n**The safety is upstream, in the planner — not in the executor.**\n`retain_of` keeps every column\nunless **every** id of `needed_above` is one the join outputs. That is\nexactly the\n`CloneWithFreshIds` signature: ids minted by a pass that ran after\n`Prune` and that the set cannot\nknow.\n\nThat matters because the obvious net does not work, and the first draft\nof this PR said it did.\n`ChunkColumns::column` does abort on a NULL-typed column — but every\ncaller that gathers a build's\noutput asks `retains()` **before** touching a chunk, so it never reaches\nthat abort for a dropped\ncolumn. Worse, for an **inner** join the residual is evaluated on the\nmaterialised output batch,\nwhere a dropped column is a real-typed all-NULL array and nothing can\ntell it from a real one. So\nthe abort is a backstop against a future reader that forgets to ask, and\nthe comments now say that\ninstead of claiming it catches a wrong set.\n\nA dropped column is a `NullArray` rather than an absent one, so a\n`JoinRowRef`, a key index and\n`ChunkColumns` all mean exactly what they did; `plan::ToArrow` maps no\nengine type to `null`, which\nmakes the marker unambiguous. `OneRowValuesOf` is a fourth reader that\nasks neither `retains()` nor\n`ChunkColumns` — safe only because a one-row join's spec comes from\n`Keyless` — and now carries a\ncheck that says so.\n\n**Three things are held beyond what `needed_above` says**, and the first\nwas a bug:\n\n- **A residual** is evaluated *by* the join, so its columns are needed\nhere although `needed_above`\n— what a node *above* reads — excludes them by construction. The first\nimplementation dropped a\ncolumn its own residual needed and the `.slt` suite **aborted**. They\nare matched by **id**, not\nby position: that drops a pointer-identity test for which side builds,\nand a left width taken\nfrom the logical plan where the operator takes it from the physical\nschema. Neither was reachable;\n  both were fragile.\n- **A key** is forced by `JoinBuildSpec::Make`, since the build hashes\nit and the direct layout\n  indexes by it.\n- **An empty set** retains everything, which is every hand-built or\nunoptimized plan.\n\n## What bounds the item\n\nWorth stating because it explains why this is five queries and not the\nwhole suite: **a build fed by\na bare `Scan` has nothing to drop**, because projection pruning already\ntrimmed that scan's fields\nto the keys and what is read above. What is left is a build whose input\n*cannot* prune itself — a\n**join subtree** (Q5's is 14 columns of which 9 are dead, and that is\nwhere the gigabytes are), a\n`Filter` whose predicate column dies there, or a `Compute`.\n\n## The commits\n\n**`14a6961` records the set and consumes nothing.** `Prune` captures it,\n`JoinNode` keeps it, and\nEXPLAIN reports `carries N of M unread above` — Q5's top join says `13\nof 16`, and every join in\nthat query carries some. No answer could move. The 13 CLI goldens and\none plan test that assert a\njoin line gained the suffix, and each was checked to differ by **that\nalone** (stripping the suffix\nreproduces the committed file byte-for-byte).\n\n**`d72f744` consumes it.** Split that way on the project's own\nsequencing habit — the finder before\nthe gate, ADR 0032's phrase — so that the subtle half (the id→position\nmapping) is reviewable before\nanything depends on it.\n\nThen four commits of review response: `1811100` makes the planner verify\nthe set rather than infer\nfrom it, `f94eede` keeps that verification from refusing every nested\njoin, `58f218c` narrows the\nNULL-keyed rows, and `f0d9861` stops the set being appended to on a\nsecond pass.\n\n## Tests\n\n**The executor half is tested directly.** Handing a build its retain set\nneeds no column ids — only\n*deriving* one does — so `hash_join_test.cc` drives it and pins the\n`NullArray` in the retained\nchunk, the key beside it still gathering, the join's output presenting\nthe dropped field with its\ndeclared type, and a **sliced** input batch (the narrowed branch indexes\nthe batch itself where the\nwhole-batch branch let `Take` do it). `join_table_test.cc` pins the two\nnarrowings against each\nother on one build, both executor arms: a dropped column is `null`-typed\nin the keyed chunk and\ndeclared-typed-all-NULL in the retained one, and reads NULL either way.\n\nI had deleted three exec tests claiming the feature was untestable\nthere. That was wrong, and the\nreview caught it: what the harness cannot do is *derive* a set, since\nits scans carry no column ids,\nso `OutputIds` of one is empty and the planner keeps everything. My\nfirst attempts also\n`const_cast` a node held behind `shared_ptr<const LogicalNode>` and\nmutated it — undefined, and it\ntrapped with no message in a hardened build.\n\n`join_table_test.cc` unit-tests the spec's rules: a key is retained\nwhatever the set says, a\nwrong-width set is `Invalid`, an all-true set collapses to empty, an\nout-of-range position reads as\nretained.\n\n`joins/inner.slt` gains four cases, each with its `cols_dropped` read\nindividually. Three drop a\ncolumn, by the shapes named above; the fourth has a **real** residual\nand drops nothing, pinning\nthat the mapping does not take what the join itself needs. The comments\npreviously claimed residuals\nwhere an inner join's single-relation `ON` conjunct is in fact a\n`Filter` below the build — corrected.\n\n**The two cases added last are the ones this PR most needed**, and only\nthe regression below\nexplains why: `optimizer_test.cc`'s\n`ANestedJoinRecordsOnlyItsOwnColumns`, which asserts at a nested\njoin that nothing in the set is foreign to it, and\n`tests/integration/session_test.cc`'s\n`ANestedJoinsBuildDropsWhatNothingReadsAboveIt`, which reads\n`cols_dropped` after a three-relation\nquery through a session. The second is the **only** end-to-end\nobservation of the chain from SQL to\nthe build; every other test sees a half of it. Every new case here was\nmutation-checked — reverted\nthe fix, watched the case fail, restored it.\n\n## Verification\n\n`pixi run check` cannot complete on this macOS host: its `lint` leg\nstops on 36 pre-existing\nshellcheck SC2218 findings in files this PR does not touch.\n\n```text\n$ pixi run test                      # Debug, the full hermetic suite\n100% tests passed out of 2889        ANTB1-TESTS: PASS\n\n$ pixi run release                   # RelWithDebInfo, -Werror\n100% tests passed out of 2890\n\n$ for s in 20261114 20261115 20261117 20261118; do ANTB1_DIFF_SEED=$s pixi run diff-random; done\nDIFF: PASS queries=2000 failed=0 unsupported=0     # all four seeds\n\n$ pixi run lint\nevery linter Passed except shellcheck (36 pre-existing SC2218, none in a file this PR touches)\n\n$ ./.pixi/envs/default/bin/clang-tidy -p build/tidy --warnings-as-errors='*' \\\n    src/exec/join_table.cc src/exec/gather.cc src/exec/physical_planner.cc src/exec/hash_join.cc \\\n    src/plan/optimizer.cc src/plan/explain.cc src/exec/tests/join_table_test.cc \\\n    src/plan/tests/optimizer_test.cc tests/integration/session_test.cc\nnothing in user code\n```\n\nclang-tidy caught four things in my own code along the way, including a\nsigned/unsigned comparison in\nthe new `retains()` and a `!(a && b)` it wanted restructured.\n\n**The gate I would most want for this is one I cannot run.** `pixi run\nasan` fails at discovery on\nthis host on a pre-existing `curl_global_init` leak, and ASan is the leg\nmost likely to catch a\nlifetime mistake in the `NullArray` substitution — a buffer released\nwhile something still points at\nit. CI is the gate for that, and for `tidy` and `ci-gcc`/`codeql-build`\n(linux-64 only).\n\n## What the review rounds changed\n\n### The second round found that my answer to the first had silently\nswitched the item off\n\nThe first round's biggest finding was that the executor's guard was\nnominal and the real safety had\nto be upstream. The fix — `retain_of` refusing the whole set when an id\nin `needed_above` is not one\nthe join outputs — is right, and I shipped it with a defect that **cost\nthe item most of what it\nwas worth**.\n\n`Prune` carries one demand set down **both** branches of every join. So\nby the time it reaches a\njoin inside another join's input, that set also holds the ids of the\nother branch — ids this join\ndoes not output, and which the verification cannot tell from a re-minted\none. It refused the set on\nexactly the nested joins the item exists for. Q21's build went back to\n5,723 MiB from 4,886 and\n1.128× slower.\n\n**Nothing saw it:**\n\n- every answer was right — dropping fewer columns cannot move a value;\n- all 22 **physical plans were byte-identical**, because the EXPLAIN\ncount reports `outputs` minus\n  the set, so a foreign id in the set changes nothing it prints;\n- `pixi run test` passed 2,887 tests, `diff-random` passed 2,000\nqueries, `lint` and clang-tidy were\n  clean;\n- and the `.slt` cases that \"cover\" this read `cols_dropped` **by hand\nduring development**, which\n  is not an assertion.\n\nIt surfaced only because I re-measured after an unrelated fix and the\npeak memory had moved back.\n`Prune` now intersects the set with the join's own outputs, which is\nwhat makes the field mean what\nits name says; the two cases named above close the hole, and the ADR\nrecords the whole episode\nrather than just the fix.\n\n### The second round's other finding\n\nNull-keyed build pieces were still taken with every column. Fixed as\ndescribed above, with a case\nthat pins the two narrowings against each other.\n\n### The third round, on the fix for the second\n\nTwo P1s, no P0. **The intersection appended instead of replacing.**\n`Prune` rewrites a *copy* of the\njoin node, so pruning an already-pruned plan left every id twice. It\nanswers the same — nothing\nreads the field by position — and once again the existing idempotence\nassertions could not see it,\nbecause `Explain` prints only what is *not* in the set and duplicates do\nnot change that. The new\ncase compares the set across two passes, and `Optimize` is run twice on\nthe same plan elsewhere in\nthat file, so this was reachable rather than hypothetical.\n\nThe second is **the ADR hunk needing maintainer approval** — flagged\nbelow rather than assumed.\n\nThree non-blocking notes taken as well: the session case now asserts\n*per build* (so a flipped join\norder fails rather than passing while covering nothing),\n`join_table.h`'s retain contract records\nthe `null_chunks()` half where a caller looks for it rather than only in\nthe ADR, and `OutputIds` is\ncalled on the `Pruner`'s own node instead of a fresh variant copy.\n\nThe round also confirmed by reading what I had argued above:\nintersecting against the *pre-prune*\ninputs is the conservative direction (`Prune` drops an id only when it\nis not in `needed`, so\n`needed_above ⊆ OutputIds` still holds at physical-planning time), the\ncollapse-to-empty case lands\non \"keep everything\", and `MakeArrayOfNull` covers every type\n`plan::ToArrow` can produce with the\nsame ownership as the `Take` it replaces. It also found the reason the\ndeclared type is not merely\ntidy: `NextNullKeyed` relabels the slice with the operator's schema\nthrough `RecordBatch::Make`,\nwhich does not validate, so a `null`-typed array there would later be\nread as a typed one.\n\n### The first round, for the record\n\nSix findings, no P0, and one of them makes the measured table worth\nreading sceptically.\n\n**The `-Werror` leg did not compile, and I claimed it passed.**\n`DroppedColumnsIn` was dead code\nleft behind by the three exec tests I had deleted, and\n`-Wunneeded-internal-declaration` rejects it.\nMy verification grepped `pixi run release` for \"tests passed\", the grep\nprinted **nothing**, and I\nrecorded \"100% tests passed out of 2886\" anyway — a number I never saw.\nBoth halves are fixed: the\nhelper is used by a real test, a second unused helper is gone, and the\nrelease leg is now verified\nby reading its output rather than by matching a string whose absence I\nfailed to notice.\n\n**The guard was nominal**, and **the executor half had no test and the\ndeleted tests were\nreachable** — both described above.\n\nThree more: `docs/sql-subset.md` documented neither output change (the\n`Join` line's new clause or\nthe `cols_dropped` metric) and its `explain --physical` example no\nlonger matched the golden;\n`cols_dropped` was missing from `profile_format.cc`'s metric order, so\nit sorted after everything\nknown; and the `.slt` comments misdescribed their own plans.\n\nThe first round also confirmed, by reading, three things I had asserted:\nthe id→position mapping is\nsound for every plan `Optimize` produces (`Prune` is the last structural\npass, `CloneWithFreshIds`\nruns before it, and every node's operator output is positionally its\n`OutputIds`); the `null` marker\nis unambiguous; and there is no lifetime bug for ASan to find, the\n`NullArray`s being owned by the\nsame batches `ChunkColumns` already pointed into.\n\n## Type of change\n\n- [x] perf: performance improvement\n- [ ] feat / fix / refactor / docs / Breaking change\n\n## Checklist\n\n- [ ] `pixi run check` passes locally — unchecked for the reason above,\nnot because it was skipped\n- [x] Tests cover the change, with what they cannot reach stated above\n- [x] Docs updated: ADR 0026 gains **C8a** with both configurations'\nmeasurements, where the drop\nhas to happen and why, the three things held beyond the set, the two\nnarrowings, and the\n      nested-join regression with what hid it and what now catches it\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H is committed: no query text, data,\nanswers or EXPLAIN output\n- [x] Changes to governance paths were agreed with a maintainer —\n`docs/adr/0026-join-performance.md`\nis CODEOWNERS; @hor911 asked for this item, reviewed its sizing before\nit was written, and\nasked for both steps in one change. **The ADR hunks still want an\nexplicit look**: C8a's\nmeasurement tables, the regression note and the NULL-keyed paragraph are\nall new text under\n      `/docs/adr/`, which is an \"Ask a human first\" path\n\n## AI assistance\n\n- [x] AI-assisted. Tools and what they did: Claude Code (Opus 5) sized\nthe item with a throwaway\nprototype before writing anything, which is what showed the drop has to\nhappen at the `Take`\nrather than at the build. Two of its own stated premises were wrong and\nare corrected above:\nthat the demand already existed in `exec` (it did not — `pair_build_` is\nresidual-only), and\nthat the suite peak would fall (it does not). It also wrote three tests\nthat could not work,\ndiagnosed why, and deleted them — wrongly, as the review showed. It\nrecorded a release-leg\nresult it had never seen, which the review caught. And its fix for the\nfirst round's main\nfinding switched most of the optimization off while every gate stayed\ngreen; it found that by\nre-measuring rather than by reasoning, and the lesson — assert the\nmetric, do not read it by\nhand — is now a test and an ADR paragraph rather than a note in a PR.\nIts fix for *that* then\nhad an idempotence bug of the same kind, caught by the next review\nround; both are described\n      above rather than quietly corrected.\n- Accountable human (has read and understands the whole diff): @hor911\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-25T04:21:44+03:00",
+          "tree_id": "dae180b911347c7fa3c7ffe60b195868fcb7ae15",
+          "url": "https://github.com/ydb-campus/antb1/commit/e9ee2804c4ed836a0d386da04171a06607319a98"
+        },
+        "date": 1792891527888,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 4567.326847463853,
+            "unit": "ns/iter",
+            "extra": "iterations: 153616\ncpu: 4567.039702895531 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 94619.24719897787,
+            "unit": "ns/iter",
+            "extra": "iterations: 7051\ncpu: 94601.03687420224 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 124656.0208928571,
+            "unit": "ns/iter",
+            "extra": "iterations: 5600\ncpu: 124611.79589285712 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 485118.235620234,
+            "unit": "ns/iter",
+            "extra": "iterations: 1443\ncpu: 485006.6881496884 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 454853.24870130565,
+            "unit": "ns/iter",
+            "extra": "iterations: 1540\ncpu: 454802.6064935064 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 2222912.987341711,
+            "unit": "ns/iter",
+            "extra": "iterations: 316\ncpu: 2222737.8892405084 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 53.97401353846257,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.969919846153886 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.11426339999988,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 48.08524766666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 209.192595666669,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 209.18160199999986 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 14.925334872339983,
+            "unit": "ms/iter",
+            "extra": "iterations: 47\ncpu: 14.924342212765962 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 17.97715373170765,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 17.975061292682913 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 40.69035958823473,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 40.68717482352939 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.481270455882338,
+            "unit": "ms/iter",
+            "extra": "iterations: 476\ncpu: 1.4811809390756314 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 69.53583933333283,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 69.53169066666653 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 26.766914192307922,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 26.764270884615396 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 29.710410666666576,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.70836354166669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 62.96494090909216,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.95388063636376 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 100.51678514285608,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 100.5079951428571 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 337.2373345000028,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 337.2112754999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1631.4795049999873,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1631.2617980000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 33.14047123809533,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.137690809523924 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 37.45556689473592,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.45114821052628 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 65.78443209999989,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 65.77710860000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 128.65085799999747,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 128.63278499999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 408.9449889999912,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 408.9097269999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1975.633049999999,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1975.347426999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 55.287259307693134,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 55.282124461538565 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 58.85102641666625,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.84697816666673 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 90.19023975000096,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 90.18028712499992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 172.59032874999747,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 172.56160824999967 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 508.75335699998914,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 508.676985000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 2263.210442000002,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2262.6791 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 65.31059163636532,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.30527254545471 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 71.18949910000083,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 71.17810849999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 105.77623066666793,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 105.76365833333294 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 197.0432369999955,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 197.0097580000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 540.4445329999987,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 540.4000439999948 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2435.294137,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2435.0041290000063 ms\nthreads: 1"
           }
         ]
       }
