@@ -66,7 +66,11 @@ Proposed
   binary keeps its symbols for perf), then checks the package and the packaged file: linkage, link flags, build
   identity (`antb1 version --verbose`), the restart, codec, thread and error smoke tests on files DuckDB writes at
   run time, and every CLI golden (`ANTB1_CLI_UNDER_TEST`). `pixi run static-test` runs every hermetic test against
-  the static Arrow.
+  the static Arrow. Each tarball member is the staged file those checks ran, and the package is checked again as a
+  fresh runner gets it (`scripts/static_gates.py verify`, standard library only, so a runner without pixi or DuckDB
+  can run it): unpacked with tarfile's data filter, with the same runs on the smoke kit that `pixi run static` writes,
+  and on Linux also in a container of an image that holds only the binary and the kit. `static.yml` runs it with the
+  runner's own `python3` on every leg (`pixi run static-check <tarball>` locally).
 - **CI:** `static.yml` builds the three targets on PRs that touch the build and on every push to main (advisory, not
   part of `CI OK`; the prefix cache is written from main only); the nightly builds them from scratch and runs
   `static-test`. Every performance test runs on this binary since 2026-10-25, after the comparisons in Consequences:

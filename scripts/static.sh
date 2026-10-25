@@ -13,8 +13,9 @@
 #                          scripts/static_package.py (docs/adr/0034-licence-and-static-sources.md); on Linux the
 #                          sources that go with the package are `pixi run static-sources`. Then it checks the package
 #                          (static_gates.py package) and the packaged file, not the build tree's: static_gates.py
-#                          binary (linkage, link flags, identity, allocator restart, smoke tests) and every CLI golden
-#                          (ANTB1_CLI_UNDER_TEST).
+#                          binary (linkage, link flags, identity, allocator restart, smoke tests on the smoke kit that
+#                          static_gates.py kit writes to build/static/smoke-kit, which verify takes to fresh runners)
+#                          and every CLI golden (ANTB1_CLI_UNDER_TEST).
 #   pixi run static-test   builds every target of build/static and runs all hermetic tests against the static
 #                          Arrow -> build/static/junit.xml (nightly static-test).
 #
@@ -178,6 +179,10 @@ echo "static: packaged $pkg/antb1-$target.tar.gz"
 
 # ---- check the package and the packaged file ----
 python scripts/static_gates.py package --pkg "$pkg" --target "$target"
-python scripts/static_gates.py binary --bin "$pkg/$name/antb1" --env "$CONDA_PREFIX" --build-dir "$build"
+# The files the smoke tests query, written by DuckDB; verify (static_gates.py) takes them to runners without it.
+kit="$build/smoke-kit"
+rm -rf "$kit"
+python scripts/static_gates.py kit --env "$CONDA_PREFIX" --out "$kit"
+python scripts/static_gates.py binary --bin "$pkg/$name/antb1" --env "$CONDA_PREFIX" --build-dir "$build" --kit "$kit"
 ANTB1_CLI_UNDER_TEST="$root/$pkg/$name/antb1" ctest --preset static -L '^cli$'
 echo "static: OK: $pkg"

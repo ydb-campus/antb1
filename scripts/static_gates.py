@@ -7,12 +7,25 @@
           and native members of each archive.
   binary  a standalone antb1 (scripts/static-check.sh): linkage (Linux: a static ELF executable without loader or
           dynamic section, pthread linked whole, no NSS; macOS: only system libraries, no LC_RPATH, the deployment
-          target, a valid signature), the link flags when its build tree is given, build identity, the allocator
-          restart, and smoke tests of codecs, threads and errors on Parquet files that DuckDB writes at run time.
-  package the tarballs that scripts/static.sh packed: their exact members (regular files under one directory), the
-          licence texts of docs/adr/0034-licence-and-static-sources.md (LICENSE and NOTICE equal to the repository's,
-          the notice sections each target needs, on Linux the LGPL notice first), BUILDINFO.json, README.txt, and
-          SHA256SUMS.
+          target, a valid signature), the link flags when its build tree is given, then the runs every standalone
+          antb1 must pass (build identity, the allocator restart, the smoke kit's codecs, threads, and the exit codes
+          of a truncated file, a parse error and an unknown option) on the smoke kit (`--kit`, or one it writes).
+  package the tarballs that scripts/static.sh packed: their exact members (regular files under one directory, each
+          the file the binary gate ran), the licence texts of docs/adr/0034-licence-and-static-sources.md (LICENSE
+          and NOTICE equal to the repository's, the notice sections each target needs, on Linux the LGPL notice
+          first), BUILDINFO.json, README.txt, and SHA256SUMS.
+  kit     the smoke kit (scripts/static.sh writes build/static/smoke-kit): Parquet files that DuckDB writes from
+          range() with each codec, a truncated copy, and kit.json with their digests; DuckDB must give the answer
+          the binary must give.
+  verify  a package as a user gets it, on a runner without pixi, DuckDB or the LLVM tools (the static workflow, the
+          release's fresh runners; `pixi run static-check <tarball>`). Standard library only, Python 3.11 or newer
+          with tarfile's data filter (exit 2 without it, on a runner of another target, or when the container engine
+          does not answer). The target's tarballs against SHA256SUMS and the kit against kit.json; each tarball
+          before anything is unpacked (one directory, exactly the package's members, regular files only, no
+          extended attributes); then unpacked with the data filter: BUILDINFO.json, LICENSE and NOTICE, on macOS the
+          signature, and the binary gate's runs with an empty environment in an empty directory. On Linux,
+          `--container docker|podman` repeats the runs in an image that holds only the binary and the kit: no
+          network, no capabilities, a read-only root, user nobody.
 
 Prints one line per check and exits 1 when any fails.
 """
@@ -21,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import platform
@@ -31,9 +45,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 from pathlib import Path
+from typing import BinaryIO
 
 FAILURES: list[str] = []
+TARGETS = ["darwin-arm64", "linux-aarch64", "linux-x86_64"]
 
 
 def check(ok: bool, what: str, detail: str = "") -> bool:
@@ -351,52 +368,228 @@ def gate_link_flags(env: Path, build_dir: Path) -> None:
     check(bool(argv) and not missing, f"antb1's link line has {' '.join(want)}", "missing " + " ".join(missing))
 
 
-def run_bin(binary: str, args: list[str], env: dict[str, str] | None = None, cwd: str | None = None):
-    return subprocess.run(
-        [binary, *args], capture_output=True, text=True, errors="replace", env=env or {}, cwd=cwd, timeout=600
+# The smoke kit: Parquet files that DuckDB writes from range() with each codec, a truncated copy, and kit.json with
+# their digests. `pixi run static` writes it to build/static/smoke-kit; verify takes it to runners without DuckDB.
+CODECS = ["uncompressed", "snappy", "gzip", "zstd", "lz4_raw", "brotli"]
+SMOKE_SELECT = "SELECT COUNT(*), SUM(a), MIN(b), MAX(b), COUNT(DISTINCT c)"
+SMOKE_SQL = f"{SMOKE_SELECT} FROM t"
+SMOKE_ANSWER = "200000,19999900000,0,999,97"
+KIT_COPY = (
+    "COPY (SELECT range AS a, (range * 7) % 1000 AS b, 'k' || (range % 97) AS c FROM range(200000)) "
+    "TO '{path}' (FORMAT parquet, COMPRESSION {codec}, ROW_GROUP_SIZE 10000)"
+)
+KIT_FILES = [*(f"{codec}.parquet" for codec in CODECS), "truncated.parquet"]
+KIT_JSON = "kit.json"
+PARSE_ERROR_SQL = "SELECT COUNT(*) FROM"
+
+
+def sha256_stream(stream: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1 << 20), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    with open(path, "rb") as f:
+        return sha256_stream(f)
+
+
+def gate_kit(env: Path, out: Path) -> None:
+    """Writes the smoke kit into `out`, a new or empty directory. DuckDB must give SMOKE_ANSWER on each codec file."""
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        check(False, f"the kit goes into a new or empty directory: {out}")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    duckdb = tool(env, "duckdb")
+    for codec in CODECS:
+        path = out / f"{codec}.parquet"
+        wrote = run([duckdb, "-c", KIT_COPY.format(path=path, codec=codec)])
+        if not check(wrote.returncode == 0 and path.is_file(), f"DuckDB writes a {codec} file", wrote.stderr[:200]):
+            continue
+        answer = run([duckdb, "-csv", "-noheader", "-c", f"{SMOKE_SELECT} FROM '{path}'"])
+        check(
+            answer.returncode == 0 and answer.stdout.strip() == SMOKE_ANSWER,
+            f"DuckDB answers {SMOKE_ANSWER} on the {codec} file",
+            (answer.stdout + answer.stderr).strip()[:200],
+        )
+    if (out / "zstd.parquet").is_file():
+        data = (out / "zstd.parquet").read_bytes()
+        (out / "truncated.parquet").write_bytes(data[: len(data) // 2])
+    files = {
+        name: {"sha256": sha256_file(out / name), "bytes": (out / name).stat().st_size}
+        for name in KIT_FILES
+        if (out / name).is_file()
+    }
+    writer = run([duckdb, "-version"]).stdout.strip() or "duckdb"
+    meta = {"kit": 1, "writer": f"DuckDB {writer}", "sql": SMOKE_SQL, "answer": SMOKE_ANSWER, "files": files}
+    (out / KIT_JSON).write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def read_kit(kit: Path) -> bool:
+    """Checks a smoke kit against its kit.json and this script's query and answer; false when it cannot be used."""
+    try:
+        meta = json.loads((kit / KIT_JSON).read_text())
+    except (OSError, ValueError) as e:
+        return check(False, f"the kit's {KIT_JSON} is readable", str(e))
+    if not check(
+        isinstance(meta, dict)
+        and (meta.get("kit"), meta.get("sql"), meta.get("answer")) == (1, SMOKE_SQL, SMOKE_ANSWER),
+        "the kit is version 1 with this script's query and answer",
+        str({key: meta.get(key) for key in ("kit", "sql", "answer")} if isinstance(meta, dict) else meta)[:200],
+    ):
+        return False
+    files = meta.get("files")
+    names = sorted(path.name for path in kit.iterdir() if path.name != KIT_JSON)
+    ok = check(
+        isinstance(files, dict) and sorted(files) == names == sorted(KIT_FILES),
+        f"the kit holds exactly {', '.join(KIT_FILES)}",
+        str(names),
     )
+    for name in KIT_FILES:
+        want = files.get(name) if isinstance(files, dict) else None
+        path = kit / name
+        got = {"sha256": sha256_file(path), "bytes": path.stat().st_size} if path.is_file() else None
+        ok = check(got is not None and got == want, f"the kit's {name} matches {KIT_JSON}") and ok
+    return ok
 
 
-def gate_identity(binary: str, tmp: str) -> None:
-    plain = run_bin(binary, ["version"], cwd=tmp)
+def timed_out(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(cmd, -1, "", f"timed out after {timeout} s")
+
+
+class Host:
+    """Runs the binary on this host with an empty environment (unless one is given), in an empty directory, with
+    /dev/null as stdin; `kit` is the smoke kit's directory as the binary sees it."""
+
+    def __init__(self, binary: str, cwd: str, kit: str, timeout: int = 600, label: str = "") -> None:
+        self.binary, self.cwd, self.kit, self.timeout, self.label = binary, cwd, kit, timeout, label
+
+    def __call__(self, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        cmd = [self.binary, *args]
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", env=env or {}, cwd=self.cwd,
+                stdin=subprocess.DEVNULL, timeout=self.timeout,
+            )  # fmt: skip
+        except subprocess.TimeoutExpired:
+            return timed_out(cmd, self.timeout)
+        except OSError as e:  # not executable, or no such file
+            return subprocess.CompletedProcess(cmd, -1, "", f"cannot run: {e}")
+
+
+# A container that can do nothing but run the binary: no network, no capabilities, no privilege gain, a read-only
+# root file system, user nobody (verify --container).
+CONTAINER_FLAGS = [
+    "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--user", "65534:65534",
+]  # fmt: skip
+
+
+class Container:
+    """Runs /antb1 in a new container of an image that holds only it and the kit (import_image)."""
+
+    def __init__(self, engine: str, image: str, timeout: int) -> None:
+        self.engine, self.image, self.timeout, self.kit, self.label = engine, image, timeout, "/kit", " in a container"
+        self.runs = 0
+
+    def __call__(self, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        self.runs += 1
+        name = f"antb1-verify-{os.getpid()}-{self.runs}"
+        cmd = [self.engine, "run", "--rm", "--name", name, *CONTAINER_FLAGS]
+        for key, value in (env or {}).items():
+            cmd += ["--env", f"{key}={value}"]
+        cmd += [self.image, "/antb1", *args]
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=self.timeout
+            )
+        except subprocess.TimeoutExpired:
+            run([self.engine, "rm", "--force", name])
+            return timed_out(cmd, self.timeout)
+
+
+def gate_runs(antb1: Host | Container, target: str, version: str = "", commit: str = "") -> None:
+    """What every standalone antb1 must do wherever it runs: say what it is; restart its allocator (Linux); answer
+    each file of the smoke kit, with one thread as with four; exit with the CLI's codes (src/cli/include/antb1/cli/
+    cli.h) on a truncated file (3), a parse error (1) and an unknown option (2)."""
+    at, kit = antb1.label, antb1.kit
+    plain = antb1(["version"])
+    first = re.fullmatch(r"antb1 (\S+) \(Apache Arrow \d+\.\d+\.\d+\)\n", plain.stdout)
     check(
-        plain.returncode == 0 and re.fullmatch(r"antb1 \S+ \(Apache Arrow \d+\.\d+\.\d+\)\n", plain.stdout) is not None,
-        "`env -i antb1 version` runs",
+        plain.returncode == 0 and first is not None and version in ("", first.group(1)),
+        f"`antb1 version` runs{at}" + (f" and says {version}" if version else ""),
         (plain.stdout + plain.stderr).strip()[:200],
     )
-    verbose = run_bin(binary, ["version", "--verbose"], cwd=tmp)
+    verbose = antb1(["version", "--verbose"])
     fields = dict(ln.split(": ", 1) for ln in verbose.stdout.splitlines()[1:] if ": " in ln)
     check(
         verbose.returncode == 0 and fields.get("flavor") == "static-thinlto",
-        "flavor static-thinlto",
+        f"flavor static-thinlto{at}",
         fields.get("flavor", verbose.stderr.strip()[:200]),
     )
     check(
         "antb1-static" in fields.get("arrow", ""),
-        "Arrow is the static build (package kind antb1-static)",
+        f"Arrow is the static build (package kind antb1-static){at}",
         fields.get("arrow", ""),
     )
     codecs = fields.get("codecs", "")
-    check(bool(codecs) and " no" not in codecs, "every codec is available", codecs)
-    if platform.system() == "Linux":
+    check(bool(codecs) and " no" not in codecs, f"every codec is available{at}", codecs)
+    check(fields.get("target") == target, f"target {target}{at}", fields.get("target", ""))
+    if commit:
+        check(fields.get("commit") == commit, f"commit {commit}{at}", fields.get("commit", ""))
+    if target.startswith("linux-"):
         # mimalloc prints its options when it starts; after the restart (ADR 0017) purge_delay is -1.
-        restart = run_bin(binary, ["version"], env={"MIMALLOC_VERBOSE": "1"}, cwd=tmp)
+        restart = antb1(["version"], env={"MIMALLOC_VERBOSE": "1"})
         check(
             re.search(r"option 'purge_delay': -1\b", restart.stderr) is not None,
-            "the allocator restart sets MIMALLOC_PURGE_DELAY=-1",
+            f"the allocator restart sets MIMALLOC_PURGE_DELAY=-1{at}",
             "no purge_delay -1 in mimalloc's output",
         )
         check(
             fields.get("mimalloc purge delay") == "-1",
-            "version --verbose reports the purge delay -1",
+            f"version --verbose reports the purge delay -1{at}",
             fields.get("mimalloc purge delay", ""),
         )
+    for codec in CODECS:
+        res = antb1(["query", "-c", SMOKE_SQL, "--table", f"t={kit}/{codec}.parquet", "--format", "csv"])
+        rows = res.stdout.strip().splitlines()
+        check(
+            res.returncode == 0 and rows[-1:] == [SMOKE_ANSWER],
+            f"{codec}: query answer{at}",
+            (res.stdout + res.stderr).strip()[-200:],
+        )
+    one = antb1(["query", "-c", SMOKE_SQL, "--table", f"t={kit}/zstd.parquet", "--threads", "1"])
+    four = antb1(["query", "-c", SMOKE_SQL, "--table", f"t={kit}/zstd.parquet", "--threads", "4"])
+    check(
+        one.returncode == 0 and one.stdout == four.stdout,
+        f"--threads 4 answers as --threads 1{at}",
+        (four.stdout + four.stderr).strip()[-200:],
+    )
+    bad = antb1(["query", "-c", SMOKE_SQL, "--table", f"t={kit}/truncated.parquet"])
+    check(
+        bad.returncode == 3,
+        f"a truncated file exits with 3 (an exception through the static unwinder){at}",
+        f"exit {bad.returncode}: {bad.stderr.strip()[:200]}",
+    )
+    parse = antb1(["query", "-c", PARSE_ERROR_SQL, "--table", f"t={kit}/zstd.parquet"])
+    check(
+        parse.returncode == 1 and parse.stderr.startswith("antb1: parse error: "),
+        f"a parse error exits with 1{at}",
+        f"exit {parse.returncode}: {parse.stderr.strip()[:200]}",
+    )
+    usage = antb1(["version", "--bogus"])
+    check(
+        usage.returncode == 2 and not usage.stdout and "--bogus" in usage.stderr,
+        f"an unknown option exits with 2{at}",
+        f"exit {usage.returncode}: {(usage.stdout + usage.stderr).strip()[:200]}",
+    )
 
 
-def gate_cpu_guard(env: Path, binary: str, tmp: str) -> None:
+def gate_cpu_guard(env: Path, binary: str, antb1: Host) -> None:
     """A raised CPU baseline comes with the guard of src/cli/cpu_guard.cc: GuardCpu must be an entry of .preinit_array
     (the section alone proves nothing: glibc 2.28's libpthread.a puts its own initializer there)."""
-    verbose = run_bin(binary, ["version", "--verbose"], cwd=tmp).stdout
+    verbose = antb1(["version", "--verbose"]).stdout
     baseline = re.search(r"^cpu baseline: (.*)$", verbose, re.MULTILINE)
     if platform.system() != "Linux" or not baseline or baseline.group(1) in ("compiler default", "-march=x86-64"):
         return
@@ -421,46 +614,6 @@ def gate_cpu_guard(env: Path, binary: str, tmp: str) -> None:
     )
 
 
-CODECS = ["uncompressed", "snappy", "gzip", "zstd", "lz4_raw", "brotli"]
-SMOKE_SQL = "SELECT COUNT(*), SUM(a), MIN(b), MAX(b), COUNT(DISTINCT c) FROM t"
-
-
-def gate_smoke(env: Path, binary: str, tmp: str) -> None:
-    duckdb = tool(env, "duckdb")
-    for codec in CODECS:
-        sql = (
-            f"COPY (SELECT range AS a, (range * 7) % 1000 AS b, 'k' || (range % 97) AS c FROM range(200000)) "
-            f"TO '{tmp}/{codec}.parquet' (FORMAT parquet, COMPRESSION {codec}, ROW_GROUP_SIZE 10000)"
-        )
-        out = run([duckdb, "-c", sql])
-        if not check(out.returncode == 0, f"DuckDB writes a {codec} file", out.stderr.strip()[:200]):
-            continue
-        res = run_bin(
-            binary, ["query", "-c", SMOKE_SQL, "--table", f"t={tmp}/{codec}.parquet", "--format", "csv"], cwd=tmp
-        )
-        rows = res.stdout.strip().splitlines()
-        check(
-            res.returncode == 0 and rows[-1:] == ["200000,19999900000,0,999,97"],
-            f"{codec}: query answer",
-            (res.stdout + res.stderr).strip()[-200:],
-        )
-    one = run_bin(binary, ["query", "-c", SMOKE_SQL, "--table", f"t={tmp}/zstd.parquet", "--threads", "1"], cwd=tmp)
-    four = run_bin(binary, ["query", "-c", SMOKE_SQL, "--table", f"t={tmp}/zstd.parquet", "--threads", "4"], cwd=tmp)
-    check(
-        one.returncode == 0 and one.stdout == four.stdout,
-        "--threads 4 answers as --threads 1",
-        (four.stdout + four.stderr).strip()[-200:],
-    )
-    data = Path(f"{tmp}/zstd.parquet").read_bytes()
-    Path(f"{tmp}/truncated.parquet").write_bytes(data[: len(data) // 2])
-    bad = run_bin(binary, ["query", "-c", SMOKE_SQL, "--table", f"t={tmp}/truncated.parquet"], cwd=tmp)
-    check(
-        bad.returncode == 3,
-        "a truncated file exits with 3 (an exception through the static unwinder)",
-        f"exit {bad.returncode}: {bad.stderr.strip()[:200]}",
-    )
-
-
 def gate_linkage(env: Path, binary: str) -> bool:
     """The checks that need no run of the binary; false when it is no executable at all."""
     if not check(os.access(binary, os.X_OK), f"{binary} is an executable"):
@@ -472,6 +625,13 @@ def gate_linkage(env: Path, binary: str) -> bool:
     return True
 
 
+def host_target() -> str:
+    """This host's target, as static.sh names it; empty for any other host."""
+    machine = (platform.system(), platform.machine())
+    return {("Linux", "x86_64"): "linux-x86_64", ("Linux", "aarch64"): "linux-aarch64",
+            ("Darwin", "arm64"): "darwin-arm64"}.get(machine, "")  # fmt: skip
+
+
 def gate_binary(args: argparse.Namespace) -> None:
     env = Path(args.env)
     binary = os.path.abspath(args.bin)
@@ -480,9 +640,15 @@ def gate_binary(args: argparse.Namespace) -> None:
     if args.build_dir:
         gate_link_flags(env, Path(args.build_dir))
     with tempfile.TemporaryDirectory(prefix="antb1-static-check-") as tmp:
-        gate_identity(binary, tmp)
-        gate_cpu_guard(env, binary, tmp)
-        gate_smoke(env, binary, tmp)
+        kit = Path(args.kit).resolve() if args.kit else Path(tmp, "kit")
+        if not args.kit:
+            gate_kit(env, kit)
+        cwd = Path(tmp, "cwd")
+        cwd.mkdir()
+        antb1 = Host(binary, str(cwd), str(kit))
+        gate_cpu_guard(env, binary, antb1)
+        if read_kit(kit):
+            gate_runs(antb1, host_target())
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -529,6 +695,22 @@ def check_members(path: Path, members: dict[str, tarfile.TarInfo], top: str, fil
         check(safe and kind_ok, f"{path.name}: {name} is a {'directory' if name == top else 'regular file'} inside")
 
 
+def check_staged(path: Path, staged: Path) -> None:
+    """Every file of a packed tarball holds the bytes of the staged file it was packed from, so the files that the
+    binary gate ran are the shipped ones. Unsafe or unexpected members are check_members' to fail."""
+    differ = []
+    with tarfile.open(path, "r:gz") as tar:
+        for info in tar:
+            parts = info.name.split("/")
+            if not info.isreg() or len(parts) != 2 or parts[1] in ("", ".", ".."):
+                continue
+            source = staged / parts[1]
+            member = tar.extractfile(info)
+            if member is None or not source.is_file() or sha256_stream(member) != sha256_file(source):
+                differ.append(parts[1])
+    check(not differ, f"{path.name} holds the files that were checked in {staged}", "differ: " + ", ".join(differ))
+
+
 def gate_package(args: argparse.Namespace) -> None:
     pkg, target = Path(args.pkg), args.target
     linux = target.startswith("linux-")
@@ -549,6 +731,7 @@ def gate_package(args: argparse.Namespace) -> None:
     top = f"antb1-{info.get('version', '?')}-{target}"
     check(tops == [top], f"{assets[0]} unpacks into {top}/", str(tops))
     check_members(pkg / assets[0], members, top, ["antb1", *texts])
+    check_staged(pkg / assets[0], pkg / top)
     check(
         bool(members.get(f"{top}/antb1")) and members[f"{top}/antb1"].mode & 0o111 != 0,
         "the packaged antb1 is executable",
@@ -579,11 +762,174 @@ def gate_package(args: argparse.Namespace) -> None:
     if linux:
         members, debug = read_tarball(pkg / assets[1], PACKAGE_TEXTS)
         check_members(pkg / assets[1], members, top, ["antb1.debug", *PACKAGE_TEXTS])
+        check_staged(pkg / assets[1], pkg / "debug" / top)
         check(all(debug.get(name) == contents.get(name) for name in PACKAGE_TEXTS),
               f"{assets[1]} carries the same licence texts")  # fmt: skip
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------------------------------------------------
+# verify
+
+
+class CannotVerify(Exception):
+    """verify cannot check the package on this runner (exit 2), which is not a failed check."""
+
+
+CODESIGN = "/usr/bin/codesign"
+RUN_TIMEOUT = 120  # seconds for each run of the binary
+PACKAGE_FILES = ["antb1", *PACKAGE_TEXTS, "BUILDINFO.json", "README.txt"]
+DEBUG_FILES = ["antb1.debug", *PACKAGE_TEXTS]
+XATTR_HEADERS = ("SCHILY.xattr.", "LIBARCHIVE.xattr.")  # the pax keys of extended attributes
+SUM_LINE = re.compile(r"([0-9a-f]{64}) [ *]([A-Za-z0-9._-]+)")
+
+
+def read_sums(path: Path) -> dict[str, str]:
+    """name -> sha256 of a SHA256SUMS file in sha256sum's format (`cmake -E sha256sum` writes it)."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        check(False, f"{path} is readable", str(e))
+        return {}
+    matches = [SUM_LINE.fullmatch(line) for line in lines]
+    sums = {m.group(2): m.group(1) for m in matches if m}
+    check(
+        bool(lines) and all(matches) and len(sums) == len(lines),
+        f"{path.name} has one '<sha256>  <file>' line per file",
+        "; ".join(line for line, m in zip(lines, matches, strict=True) if not m)[:200],
+    )
+    return sums
+
+
+def check_tarball(path: Path, files: list[str], target: str, version: str) -> str:
+    """Checks a package tarball before anything is extracted: one directory antb1-<version>-<target>/ holding exactly
+    `files`, each a regular file, no member twice, no extended attribute. Returns the directory's version ("" when a
+    check failed); `version` is the one it must have, if given."""
+    before = len(FAILURES)
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            infos = tar.getmembers()
+    except (OSError, EOFError, tarfile.TarError, zlib.error) as e:
+        check(False, f"{path.name} is a readable .tar.gz", str(e))
+        return ""
+    tops = sorted({info.name.split("/", 1)[0] for info in infos})
+    found = re.fullmatch(rf"antb1-(\S+)-{re.escape(target)}", tops[0]) if len(tops) == 1 else None
+    check(
+        found is not None and version in ("", found.group(1)),
+        f"{path.name} unpacks into antb1-{version or '<version>'}-{target}/",
+        str(tops)[:200],
+    )
+    top = tops[0] if found else f"antb1-{version}-{target}"
+    names = [info.name for info in infos]
+    check(len(names) == len(set(names)), f"{path.name} holds each member once", str(sorted(names))[:200])
+    check_members(path, {info.name: info for info in infos}, top, files)
+    xattrs = sorted({key for info in infos for key in info.pax_headers if key.startswith(XATTR_HEADERS)})
+    check(not xattrs, f"{path.name} carries no extended attributes", ", ".join(xattrs)[:200])
+    return found.group(1) if found and len(FAILURES) == before else ""
+
+
+def tar_entry(name: str, kind: bytes, mode: int, size: int = 0) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type, info.mode, info.size = kind, mode, size
+    return info
+
+
+def import_image(engine: str, binary: Path, kit: Path) -> str:
+    """Imports an image whose root holds only /antb1 and the kit's Parquet files in /kit (read-only); returns its id,
+    or "" when the engine refused it."""
+    rootfs = io.BytesIO()
+    with tarfile.open(fileobj=rootfs, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        tar.addfile(tar_entry("kit", tarfile.DIRTYPE, 0o755))
+        with open(binary, "rb") as f:
+            tar.addfile(tar_entry("antb1", tarfile.REGTYPE, 0o755, binary.stat().st_size), f)
+        for name in KIT_FILES:
+            with open(kit / name, "rb") as f:
+                tar.addfile(tar_entry(f"kit/{name}", tarfile.REGTYPE, 0o444, (kit / name).stat().st_size), f)
+    try:
+        out = subprocess.run([engine, "import", "-"], input=rootfs.getvalue(), capture_output=True, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        check(False, "the engine imports an image of /antb1 and /kit", f"timed out after {RUN_TIMEOUT} s")
+        return ""
+    image = out.stdout.decode(errors="replace").split()
+    ok = check(
+        out.returncode == 0 and len(image) == 1,
+        "the engine imports an image of /antb1 and /kit",
+        out.stderr.decode(errors="replace").strip()[:200],
+    )
+    return image[0] if ok else ""
+
+
+def gate_verify(args: argparse.Namespace) -> None:
+    """The package as a user gets it, on a runner without pixi, DuckDB or a build: see the module docstring."""
+    target, engine = args.target, args.container
+    linux = target.startswith("linux-")
+    if not hasattr(tarfile, "data_filter"):
+        raise CannotVerify(f"{sys.executable} (Python {platform.python_version()}) has no tarfile.data_filter")
+    if host_target() != target:
+        raise CannotVerify(f"this runner ({platform.system()} {platform.machine()}) does not run {target}")
+    exe = ""
+    if engine != "none":
+        if not linux:
+            raise CannotVerify(f"--container {engine} is for the Linux targets")
+        exe = shutil.which(engine) or ""
+        probe = run([exe, "info"]) if exe else None
+        if probe is None or probe.returncode != 0:
+            raise CannotVerify(f"`{engine} info` fails: " + (probe.stderr.strip()[:200] if probe else "not on PATH"))
+    assets, kit = Path(args.assets), Path(args.kit).resolve()
+    files = [f"antb1-{target}.tar.gz"] + ([f"antb1-{target}.debug.tar.gz"] if linux else [])
+    sums = read_sums(Path(args.sums))
+    for name in files:
+        path = assets / name
+        check(path.is_file() and sums.get(name) == sha256_file(path), f"{name} matches {Path(args.sums).name}")
+    read_kit(kit)
+    if FAILURES:
+        return  # nothing is unpacked from a file that is not the published one, nor run without its kit
+    version = check_tarball(assets / files[0], PACKAGE_FILES, target, args.version or "")
+    if linux and version:
+        check_tarball(assets / files[1], DEBUG_FILES, target, version)
+    if FAILURES:
+        return
+    with tempfile.TemporaryDirectory(prefix="antb1-verify-") as tmp:
+        try:
+            with tarfile.open(assets / files[0], "r:gz") as tar:
+                tar.extractall(Path(tmp, "package"), filter="data")
+        except (OSError, EOFError, tarfile.TarError, zlib.error) as e:
+            check(False, f"{files[0]} unpacks with tarfile's data filter", str(e))
+            return
+        top = Path(tmp, "package", f"antb1-{version}-{target}")
+        try:
+            info = json.loads((top / "BUILDINFO.json").read_text())
+        except (OSError, ValueError):
+            info = {}
+        named = [info.get(key) for key in ("target", "version", "flavor", "license")] if isinstance(info, dict) else []
+        check(
+            named == [target, version, "static-thinlto", "Apache-2.0"],
+            f"BUILDINFO.json names {target}, {version}, static-thinlto and Apache-2.0",
+            str(named),
+        )
+        if args.commit:
+            check(isinstance(info, dict) and info.get("commit") == args.commit, f"BUILDINFO.json names {args.commit}")
+        for name in ("LICENSE", "NOTICE") if args.texts else ():
+            want = Path(args.texts, name)
+            check(want.is_file() and (top / name).read_bytes() == want.read_bytes(), f"the package's {name} is {want}")
+        binary = top / "antb1"
+        check(os.access(binary, os.X_OK), "the unpacked antb1 is executable")
+        if target == "darwin-arm64":
+            signed = run([CODESIGN, "--verify", "--strict", str(binary)]) if os.path.exists(CODESIGN) else None
+            check(signed is not None and signed.returncode == 0, "the signature verifies (codesign --verify --strict)",
+                  signed.stderr.strip()[:200] if signed else f"no {CODESIGN}")  # fmt: skip
+        cwd = Path(tmp, "cwd")
+        cwd.mkdir()
+        gate_runs(Host(str(binary), str(cwd), str(kit), RUN_TIMEOUT, " on this runner"), target, version, args.commit)
+        if exe:
+            image = import_image(exe, binary, kit)
+            if image:
+                try:
+                    gate_runs(Container(exe, image, RUN_TIMEOUT), target, version, args.commit)
+                finally:
+                    run([exe, "rmi", "--force", image])
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prefix")
@@ -597,16 +943,38 @@ def main() -> int:
     b.add_argument("--env", required=True)
     b.add_argument("--build-dir", help="the build tree of the binary: also check its link line")
     b.add_argument("--linkage-only", action="store_true", help="only the checks that need no run of the binary")
+    b.add_argument("--kit", help="the smoke kit to query (default: one written with the env's DuckDB)")
     k = sub.add_parser("package")
     k.add_argument("--pkg", required=True, help="the package directory (build/static/package)")
-    k.add_argument("--target", required=True, choices=["darwin-arm64", "linux-aarch64", "linux-x86_64"])
-    args = parser.parse_args()
-    if args.cmd == "prefix":
-        gate_prefix(args)
-    elif args.cmd == "package":
-        gate_package(args)
-    else:
-        gate_binary(args)
+    k.add_argument("--target", required=True, choices=TARGETS)
+    s = sub.add_parser("kit")
+    s.add_argument("--env", required=True)
+    s.add_argument("--out", required=True, help="a new or empty directory")
+    v = sub.add_parser("verify")
+    v.add_argument("--assets", required=True, help="the directory of the target's tarballs")
+    v.add_argument("--sums", required=True, help="a SHA256SUMS with the target's lines (other targets' may follow)")
+    v.add_argument("--kit", required=True, help="the smoke kit (kit)")
+    v.add_argument("--target", required=True, choices=TARGETS)
+    v.add_argument("--version", help="the version the package must have")
+    v.add_argument("--commit", default="", help="the commit the package must name")
+    v.add_argument("--texts", help="a directory with the LICENSE and NOTICE the package must carry")
+    v.add_argument("--container", choices=["docker", "podman", "none"], default="none",
+                   help="Linux: also run the binary in an image that holds only it and the kit")  # fmt: skip
+    args = parser.parse_args(argv)
+    try:
+        if args.cmd == "prefix":
+            gate_prefix(args)
+        elif args.cmd == "package":
+            gate_package(args)
+        elif args.cmd == "kit":
+            gate_kit(Path(args.env), Path(args.out))
+        elif args.cmd == "verify":
+            gate_verify(args)
+        else:
+            gate_binary(args)
+    except CannotVerify as e:
+        print(f"static-gates: cannot verify: {e}", file=sys.stderr)
+        return 2
     if FAILURES:
         print(f"static-gates: FAIL ({len(FAILURES)}): " + "; ".join(FAILURES), file=sys.stderr)
         return 1
