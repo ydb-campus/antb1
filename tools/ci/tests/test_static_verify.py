@@ -95,9 +95,11 @@ class Sandbox:
             monkeypatch.setattr(tarfile.TarFile, method, recorded)
 
     def kit(self) -> Path:
+        """The smoke kit, written once per test by the real `kit` with the fake DuckDB."""
         out = self.box.tmp / "kit"
-        result = self.box.run("static_gates.py", "kit", "--env", str(self.box.env), "--out", str(out))
-        assert result.returncode == 0, result.stdout + result.stderr
+        if not out.exists():
+            result = self.box.run("static_gates.py", "kit", "--env", str(self.box.env), "--out", str(out))
+            assert result.returncode == 0, result.stdout + result.stderr
         return out
 
     def package(self, target: str = LINUX, break_it: str = "", fake_target: str = "", **fake: str) -> Path:
@@ -213,6 +215,8 @@ def test_verify_without_an_engine_runs_the_binary_on_the_runner_only(v: Sandbox)
     ("fake", "failure"),
     [
         ({"wrong": "flavor"}, "flavor static-thinlto on this runner"),
+        ({"wrong": "arrow"}, "Arrow is the static build (package kind antb1-static) on this runner"),
+        ({"wrong": "purge-field"}, "version --verbose reports the purge delay -1 on this runner"),
         ({"wrong": "codec"}, "every codec is available on this runner"),
         ({"wrong": "restart"}, "the allocator restart sets MIMALLOC_PURGE_DELAY=-1 on this runner"),
         ({"wrong": "answer"}, "zstd: query answer on this runner"),
@@ -232,7 +236,17 @@ def test_verify_fails_each_wrong_answer_on_its_own(v: Sandbox, fake: dict[str, s
 
 def test_verify_checks_the_digests_and_the_kit_before_it_unpacks_anything(v: Sandbox) -> None:
     code, out, _ = v.verify(v.package(break_it="bad-sum"), v.kit())
-    assert code == 1 and fails(out) == ["static-gates: FAIL antb1-linux-x86_64.tar.gz matches SHA256SUMS"]
+    assert code == 1 and fails(out) == [
+        "static-gates: FAIL antb1-linux-x86_64.tar.gz matches SHA256SUMS: another digest"
+    ]
+    code, out, _ = v.verify(v.package(break_it="debug-bad-sum"), v.kit())
+    assert code == 1
+    assert fails(out) == ["static-gates: FAIL antb1-linux-x86_64.debug.tar.gz matches SHA256SUMS: another digest"]
+    (v.box.tmp / "package" / "antb1-linux-x86_64.debug.tar.gz").unlink()
+    code, out, _ = v.verify(v.box.tmp / "package", v.kit())
+    assert code == 1 and fails(out) == [
+        "static-gates: FAIL antb1-linux-x86_64.debug.tar.gz matches SHA256SUMS: missing"
+    ]
     kit = v.box.tmp / "kit"
     (kit / "zstd.parquet").write_bytes(b"other bytes")
     code, out, _ = v.verify(v.package(), kit)
@@ -271,6 +285,7 @@ def test_verify_fails_a_tarball_it_cannot_read(v: Sandbox) -> None:
         ("duplicate", "holds each member once"),
         ("xattr", "carries no extended attributes"),
         ("no-license", "holds exactly"),
+        ("debug-without-notices", "antb1-linux-x86_64.debug.tar.gz holds exactly"),
     ],
 )
 def test_verify_refuses_an_unsafe_or_incomplete_tarball_before_it_unpacks_it(
@@ -294,6 +309,17 @@ def test_verify_checks_what_the_package_says_and_carries(v: Sandbox, break_it: s
     assert code == 1 and any(failure in line for line in fails(out)), out
 
 
+def test_verify_checks_the_version_it_is_given(v: Sandbox) -> None:
+    code, out, _ = v.verify(v.package(), v.kit(), LINUX, "--version", "0.2.0")
+    assert code == 1
+    unpacks = "antb1-linux-x86_64.tar.gz unpacks into antb1-0.2.0-linux-x86_64/"
+    assert fails(out) == [f"static-gates: FAIL {unpacks}: ['antb1-0.1.0-linux-x86_64']"]
+    assert not v.runs() and not v.unpacked
+    code, out, _ = v.verify(v.package(break_it="buildinfo-other-version"), v.kit())
+    assert code == 1 and len(fails(out)) == 1
+    assert "BUILDINFO.json names linux-x86_64, 0.1.0, static-thinlto and Apache-2.0" in fails(out)[0]
+
+
 def test_verify_checks_the_commit_in_buildinfo_and_in_the_binary(v: Sandbox) -> None:
     other = "e" * 40
     code, out, _ = v.verify(v.package(), v.kit(), LINUX, "--commit", other)
@@ -308,7 +334,14 @@ def test_verify_cannot_run_without_the_data_filter(v: Sandbox, monkeypatch: pyte
     pkg, kit = v.package(), v.kit()
     monkeypatch.delattr(tarfile, "data_filter")
     code, _, err = v.verify(pkg, kit)
-    assert code == 2 and "has no tarfile.data_filter" in err and sys.executable in err
+    assert code == 2 and "is not Python 3.11 or newer with tarfile.data_filter" in err and sys.executable in err
+
+
+def test_verify_cannot_run_on_a_python_older_than_3_11(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    pkg, kit = v.package(), v.kit()
+    monkeypatch.setattr(sys, "version_info", (3, 10, 12, "final", 0))  # has the backported data filter
+    code, _, err = v.verify(pkg, kit)
+    assert code == 2 and "is not Python 3.11 or newer" in err
 
 
 def test_verify_cannot_run_another_targets_binary(v: Sandbox) -> None:
@@ -337,6 +370,13 @@ def test_a_container_that_fails_still_has_its_image_removed(v: Sandbox, monkeypa
     code, out, _ = v.verify(pkg, kit, container="docker")
     assert code == 1 and "static-gates: FAIL `antb1 version` runs in a container and says 0.1.0" in out
     assert v.docker_calls()[-1] == ["rmi", "--force", FAKE_DOCKER_IMAGE]
+
+
+def test_verify_reads_past_what_the_engine_prints_first(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    pkg, kit = v.package(), v.kit()
+    monkeypatch.setenv("FAKE_DOCKER_BANNER", "1")  # podman's docker emulation prints a banner on every call
+    code, out, err = v.verify(pkg, kit, container="docker")
+    assert code == 0, out + err
 
 
 def test_a_container_that_hangs_is_removed(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,6 +469,9 @@ def test_static_check_takes_only_a_package_tarball_with_its_sums(v: Sandbox) -> 
     pkg = v.package()
     result = v.box.bash("static-check.sh", str(pkg / "antb1-linux-x86_64.debug.tar.gz"), **v.fake_env)
     assert result.returncode == 2 and "is not a package" in result.stderr
+    (pkg / "antb1-linux-x86_64.debug.tar.gz").rename(v.box.tmp / "debug.tar.gz")
+    result = v.box.bash("static-check.sh", str(pkg / "antb1-linux-x86_64.tar.gz"), **v.fake_env)
+    assert result.returncode == 2 and "no antb1-linux-x86_64.debug.tar.gz next to" in result.stderr
     (pkg / "SHA256SUMS").unlink()
     result = v.box.bash("static-check.sh", str(pkg / "antb1-linux-x86_64.tar.gz"), **v.fake_env)
     assert result.returncode == 2 and "no SHA256SUMS next to" in result.stderr

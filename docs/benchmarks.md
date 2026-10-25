@@ -187,8 +187,8 @@ that cannot be dropped stop the run (exit code 3).
     about 5% slower (ADR 0017). A `MIMALLOC_PURGE_DELAY` you set yourself, or a pool other than mimalloc, is printed
     and accepted.
 - **Once per downloaded package,** `pixi run static-check <BIN>` checks it fully: linkage, identity, restart and smoke
-  tests. `pixi run static-check antb1-<target>.tar.gz`, with its `SHA256SUMS` next to it, checks the tarball first,
-  as a fresh runner does ([ci.md](ci.md#standalone-static-build)).
+  tests. `pixi run static-check antb1-<target>.tar.gz`, with its `SHA256SUMS` (and on Linux its `.debug` tarball)
+  next to it, checks the tarball first, as a fresh runner does ([ci.md](ci.md#standalone-static-build)).
 
 It drops the page cache (cold runs, a machine-wide effect) only on Linux when `sudo -n true` works and
 `ANTB1_BENCH_COLD` is not `0`; otherwise the JSON records `"cache": "lukewarm"`. The pinned inputs (the ClickBench

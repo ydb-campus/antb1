@@ -217,6 +217,8 @@ def make_package(
     info |= {"license": "Apache-2.0"} | ({"sysroot": SYSROOT, "glibc_source": SRPM} if linux else {})
     if break_it == "other-srpm":
         info["glibc_source"] = "glibc-2.28-236.el8_9.13.src.rpm"
+    if break_it == "buildinfo-other-version":
+        info["version"] = "0.2.0"
     if break_it in ("no-license-key", "no-sysroot"):
         del info[{"no-license-key": "license", "no-sysroot": "sysroot"}[break_it]]
     readme = b"antb1 is licensed under the Apache License 2.0.\n"
@@ -247,10 +249,16 @@ def make_package(
             debug["THIRD_PARTY_NOTICES.txt"] = notices + (b"changed\n" if break_it == "debug-other-notices" else b"")
         assets.append(f"antb1-{target}.debug.tar.gz")
         pack(pkg / assets[1], top, debug)
-        stage(pkg / "debug" / top, debug)
+        stage(
+            pkg / "debug" / top,
+            debug | ({"antb1.debug": b"other tables"} if break_it == "debug-staged-differs" else {}),
+        )
     sums = "".join(f"{hashlib.sha256((pkg / name).read_bytes()).hexdigest()}  {name}\n" for name in assets)
     if break_it == "bad-sum":
         sums = "00000000" + sums[8:]
+    if break_it == "debug-bad-sum":
+        main, debug_line = sums.splitlines(keepends=True)
+        sums = main + "00000000" + debug_line[8:]
     if break_it == "extra-sum":
         sums += f"{'0' * 64}  antb1-{target}.sources.tar\n"
     (pkg / "SHA256SUMS").write_text(sums)

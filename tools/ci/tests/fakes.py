@@ -51,12 +51,17 @@ with open(sys.argv[3], "rb") as f:
 """
 
 
-# The fake DuckDB of `static_gates.py kit`: `-c "COPY (...) TO '<path>' (... COMPRESSION <codec> ...)"` writes stand-in
-# bytes, `-csv -noheader -c "SELECT ... FROM '<path>'"` answers the smoke tests' answer (another one for the files
-# named in $FAKE_DUCKDB_WRONG), `-version` prints a version; anything else exits 99.
+# The fake DuckDB of `static_gates.py kit`, which must pass -no-init first (no ~/.duckdbrc): `-c "COPY (...) TO
+# '<path>' (... COMPRESSION <codec> ...)"` writes stand-in bytes, `-csv -noheader -c "SELECT ... FROM '<path>'"`
+# answers the smoke tests' answer (another one for the files named in $FAKE_DUCKDB_WRONG), `-version` prints a
+# version; anything else exits 99.
 FAKE_DUCKDB = """#!{python} -I
 import os, re, sys
 args = sys.argv[1:]
+if args[:1] != ["-no-init"]:
+    sys.stderr.write("fake duckdb: no -no-init in " + repr(args) + "\\n")
+    sys.exit(99)
+args = args[1:]
 if args == ["-version"]:
     print("v0.0.0 (fake)")
     sys.exit(0)
@@ -78,6 +83,7 @@ else:
 # reads (rootfs.tar, unpacked in rootfs/) and prints the image id, or fails when $FAKE_DOCKER_IMPORT_FAIL is set;
 # `run --rm ... [--env K=V]... <image> /antb1 ARGS` runs rootfs/antb1 with only those variables and /kit/ mapped to
 # rootfs/kit/ (exit 125 when $FAKE_DOCKER_FAIL is set); `rm --force` and `rmi --force` succeed; anything else exits 99.
+# With $FAKE_DOCKER_BANNER set, every call first prints the banner of podman's docker emulation to stderr.
 FAKE_DOCKER_IMAGE = "sha256:" + "ab" * 32
 FAKE_DOCKER = """#!{python} -I
 import io, json, os, subprocess, sys, tarfile
@@ -85,6 +91,9 @@ state = os.environ["FAKE_DOCKER_DIR"]
 args = sys.argv[1:]
 with open(os.path.join(state, "calls.jsonl"), "a") as log:
     log.write(json.dumps(args) + "\\n")
+if os.environ.get("FAKE_DOCKER_BANNER"):
+    sys.stderr.write("Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\\n")
+    sys.stderr.flush()
 image, root = "sha256:" + "ab" * 32, os.path.join(state, "rootfs")
 if args == ["info"]:
     sys.exit(1 if os.environ.get("FAKE_DOCKER_DOWN") else 0)
@@ -127,7 +136,8 @@ printf '%s\\n' "$*" >>"$FAKE_PYTHON_LOG"
 exec {python} -I "$@"
 """
 # A standalone antb1 as the smoke tests see it. verify and the binary gate run it with an empty environment, so its
-# answers are fixed when it is made (fake_antb1); `wrong` names the one answer it gets wrong.
+# answers are fixed when it is made (fake_antb1); `wrong` names the one answer it gets wrong. As the real one
+# (src/cli/allocator.cc), it restarts its allocator only on Linux.
 FAKE_ANTB1 = """#!{python} -I
 import json, os, sys
 LOG, TARGET, VERSION, COMMIT, WRONG = {log!r}, {target!r}, {version!r}, {commit!r}, {wrong!r}
@@ -143,19 +153,22 @@ def say(out="", err="", code=0):
     sys.exit(code)
 
 
+LINUX = TARGET.startswith("linux-")
 if os.environ.get("MIMALLOC_VERBOSE") == "1":
-    sys.stderr.write("mimalloc: option 'purge_delay': " + ("0" if WRONG == "restart" else "-1") + "\\n")
+    restarted = LINUX and WRONG != "restart"
+    sys.stderr.write("mimalloc: option 'purge_delay': " + ("-1" if restarted else "10") + "\\n")
 first = "antb1 " + VERSION + " (Apache Arrow 25.0.0)\\n"
 if args == ["version"]:
     say(first)
 if args == ["version", "--verbose"]:
+    kind = "no package kind" if WRONG == "arrow" else "antb1-static"
     fields = [
         ("commit", COMMIT or "unknown"),
         ("flavor", "dynamic" if WRONG == "flavor" else "static-thinlto"),
         ("target", TARGET),
-        ("arrow", "25.0.0 (headers 25.0.0, antb1-static, git 0123456789ab, Clang 23.1.3)"),
+        ("arrow", "25.0.0 (headers 25.0.0, " + kind + ", git 0123456789ab, Clang 23.1.3)"),
         ("codecs", "snappy yes, gzip yes, brotli " + ("no" if WRONG == "codec" else "yes") + ", zstd yes, lz4 yes"),
-        ("mimalloc purge delay", "-1"),
+        ("mimalloc purge delay", "-1" if LINUX and WRONG != "purge-field" else "default"),
     ]
     say(first + "".join(key + ": " + value + "\\n" for key, value in fields))
 if args == ["version", "--bogus"]:

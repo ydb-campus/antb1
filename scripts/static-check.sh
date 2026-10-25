@@ -6,11 +6,11 @@
 #            on Parquet files that DuckDB writes at run time. BIN defaults to the binary that `pixi run static`
 #            packaged; for that one the link line in build/static is checked too. Any binary works, e.g. a perf
 #            campaign's copy.
-#   TARBALL  a package, antb1-<target>.tar.gz with its SHA256SUMS next to it (scripts/static_gates.py verify): the
-#            package as a user gets it, as the static workflow checks it on fresh runners: its digest and members, then
-#            unpacked with tarfile's data filter, BUILDINFO.json, LICENSE and NOTICE against this checkout and the same
-#            runs; on Linux also in a container of an image that holds only the binary and the smoke kit, when
-#            `docker info` answers.
+#   TARBALL  a package, antb1-<target>.tar.gz with its SHA256SUMS (and on Linux antb1-<target>.debug.tar.gz) next to
+#            it (scripts/static_gates.py verify): the package as a user gets it, as the static workflow checks it on
+#            fresh runners: the digests and members, then unpacked with tarfile's data filter, BUILDINFO.json, LICENSE
+#            and NOTICE against this checkout and the same runs; on Linux also in a container of an image that holds
+#            only the binary and the smoke kit, when `docker info` answers.
 set -euo pipefail
 [ "${1:-}" = "--" ] && shift
 
@@ -31,6 +31,10 @@ case "${1:-}" in
     dir=$(cd "$(dirname "$1")" && pwd)
     if [ ! -f "$dir/SHA256SUMS" ]; then
       echo "static-check: no SHA256SUMS next to $1: download it with the package" >&2
+      exit 2
+    fi
+    if [[ "$target" == linux-* && ! -f "$dir/antb1-$target.debug.tar.gz" ]]; then
+      echo "static-check: no antb1-$target.debug.tar.gz next to $1: a Linux package comes with it" >&2
       exit 2
     fi
     engine=none

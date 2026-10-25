@@ -158,13 +158,16 @@ go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
   the conda archives instead, as `--check-urls` does for Arrow's pins; the `static urls` job runs it on every PR that
   changes `cmake/static/glibc-source.lock` or `scripts/static_package.py`.
 - `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a copy on
-  a benchmark host. `pixi run static-check antb1-<target>.tar.gz`, with `SHA256SUMS` next to it, checks a package as
-  a fresh runner does (`scripts/static_gates.py verify`): the digests, each tarball before anything is unpacked (one
-  directory, exactly the package's members, regular files only, no extended attributes), then the unpacked files
-  (BUILDINFO.json, LICENSE and NOTICE against the checkout, on macOS the signature) and the smoke tests with an empty
-  environment in an empty directory; on Linux, when `docker info` answers, the smoke tests again in a container of
-  an image that holds only the binary and the kit (no network, no capabilities, a read-only root, user nobody).
-  verify uses only Python's standard library (3.11 or newer with tarfile's data filter); it exits 2 when it cannot
+  a benchmark host. `pixi run static-check antb1-<target>.tar.gz`, with `SHA256SUMS` next to it (and on Linux
+  `antb1-<target>.debug.tar.gz`), checks a package as a fresh runner does (`scripts/static_gates.py verify`):
+  - the digests, then each tarball before anything is unpacked: one directory, exactly the package's members,
+    regular files only, no extended attributes;
+  - then the unpacked files (BUILDINFO.json, LICENSE and NOTICE against the checkout, on macOS the signature) and the
+    smoke tests, with an empty environment in an empty directory;
+  - on Linux, when `docker info` answers, the smoke tests again in a container of an image that holds only the binary
+    and the kit: no network, no capabilities, a read-only root, user nobody.
+
+  verify uses only Python's standard library (3.11 or newer with tarfile's data filter). It exits 2 when it cannot
   check the package where it runs.
 - `pixi run static-test` builds every target of `build/static` and runs all hermetic tests against the static Arrow.
 

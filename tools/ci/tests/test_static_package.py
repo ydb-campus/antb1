@@ -267,6 +267,7 @@ def test_the_package_gate_passes_a_package_as_static_sh_packs_it(box: Box, targe
         ("bad-sum", "matches SHA256SUMS"),
         ("extra-sum", "SHA256SUMS lists exactly"),
         ("staged-differs", "antb1-linux-x86_64.tar.gz holds the files that were checked"),
+        ("debug-staged-differs", "antb1-linux-x86_64.debug.tar.gz holds the files that were checked"),
     ],
 )
 def test_the_package_gate_fails_a_broken_package(box: Box, break_it: str, failure: str) -> None:

@@ -212,7 +212,7 @@ description = "NETWORK once, after `pixi run static`: the sources of everything 
 cmd = "python scripts/static_package.py sources"
 
 [feature.static.tasks.static-check]
-description = "Checks of a standalone antb1 (default: the one packaged in build/static): linkage, build identity, allocator restart, codec, thread and error smoke tests; given a package antb1-<target>.tar.gz with its SHA256SUMS, the checks of a fresh runner (scripts/static_gates.py verify; on Linux also in a container when docker answers)"
+description = "Checks of a standalone antb1 (default: the one packaged in build/static): linkage, build identity, allocator restart, codec, thread and error smoke tests; given a package antb1-<target>.tar.gz with its SHA256SUMS (on Linux also its .debug tarball), the checks of a fresh runner (scripts/static_gates.py verify; on Linux also in a container when docker answers)"
 cmd = "bash scripts/static-check.sh"
 
 [feature.static.tasks.static-test]

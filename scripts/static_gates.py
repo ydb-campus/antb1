@@ -401,13 +401,13 @@ def gate_kit(env: Path, out: Path) -> None:
         check(False, f"the kit goes into a new or empty directory: {out}")
         return
     out.mkdir(parents=True, exist_ok=True)
-    duckdb = tool(env, "duckdb")
+    duckdb = tool(env, "duckdb")  # -no-init: a ~/.duckdbrc must not change what DuckDB prints
     for codec in CODECS:
         path = out / f"{codec}.parquet"
-        wrote = run([duckdb, "-c", KIT_COPY.format(path=path, codec=codec)])
+        wrote = run([duckdb, "-no-init", "-c", KIT_COPY.format(path=path, codec=codec)])
         if not check(wrote.returncode == 0 and path.is_file(), f"DuckDB writes a {codec} file", wrote.stderr[:200]):
             continue
-        answer = run([duckdb, "-csv", "-noheader", "-c", f"{SMOKE_SELECT} FROM '{path}'"])
+        answer = run([duckdb, "-no-init", "-csv", "-noheader", "-c", f"{SMOKE_SELECT} FROM '{path}'"])
         check(
             answer.returncode == 0 and answer.stdout.strip() == SMOKE_ANSWER,
             f"DuckDB answers {SMOKE_ANSWER} on the {codec} file",
@@ -421,7 +421,7 @@ def gate_kit(env: Path, out: Path) -> None:
         for name in KIT_FILES
         if (out / name).is_file()
     }
-    writer = run([duckdb, "-version"]).stdout.strip() or "duckdb"
+    writer = run([duckdb, "-no-init", "-version"]).stdout.strip() or "duckdb"
     meta = {"kit": 1, "writer": f"DuckDB {writer}", "sql": SMOKE_SQL, "answer": SMOKE_ANSWER, "files": files}
     (out / KIT_JSON).write_text(json.dumps(meta, indent=2) + "\n")
 
@@ -574,7 +574,7 @@ def gate_runs(antb1: Host | Container, target: str, version: str = "", commit: s
     )
     parse = antb1(["query", "-c", PARSE_ERROR_SQL, "--table", f"t={kit}/zstd.parquet"])
     check(
-        parse.returncode == 1 and parse.stderr.startswith("antb1: parse error: "),
+        parse.returncode == 1 and re.search(r"^antb1: parse error: ", parse.stderr, re.MULTILINE) is not None,
         f"a parse error exits with 1{at}",
         f"exit {parse.returncode}: {parse.stderr.strip()[:200]}",
     )
@@ -862,8 +862,9 @@ def gate_verify(args: argparse.Namespace) -> None:
     """The package as a user gets it, on a runner without pixi, DuckDB or a build: see the module docstring."""
     target, engine = args.target, args.container
     linux = target.startswith("linux-")
-    if not hasattr(tarfile, "data_filter"):
-        raise CannotVerify(f"{sys.executable} (Python {platform.python_version()}) has no tarfile.data_filter")
+    if sys.version_info < (3, 11) or not hasattr(tarfile, "data_filter"):
+        python = f"{sys.executable} (Python {platform.python_version()})"
+        raise CannotVerify(f"{python} is not Python 3.11 or newer with tarfile.data_filter")
     if host_target() != target:
         raise CannotVerify(f"this runner ({platform.system()} {platform.machine()}) does not run {target}")
     exe = ""
@@ -879,7 +880,9 @@ def gate_verify(args: argparse.Namespace) -> None:
     sums = read_sums(Path(args.sums))
     for name in files:
         path = assets / name
-        check(path.is_file() and sums.get(name) == sha256_file(path), f"{name} matches {Path(args.sums).name}")
+        digest = sha256_file(path) if path.is_file() else ""
+        why = "missing" if not digest else "not listed" if name not in sums else "another digest"
+        check(bool(digest) and sums.get(name) == digest, f"{name} matches {Path(args.sums).name}", why)
     read_kit(kit)
     if FAILURES:
         return  # nothing is unpacked from a file that is not the published one, nor run without its kit
