@@ -577,6 +577,61 @@ lesson of [ADR 0027](0027-string-views.md)'s S1, which was planned as a win whos
     by the shapes it would *answer* (COUNT, OR) rather than by this query's speed. The two do not conflict; if the
     general algorithm later restricts such an aggregate exactly, this filter finds nothing left to drop and the
     build-share gate refuses it.
+- **D6, perf(exec): take the key filter of any join of the pipeline, not only the innermost.** A left-deep
+  pipeline's scan is probed by every join above it, so each of them has a filter to offer it, and D1 asked only the
+  deepest. Where that one's build is too large to publish anything -- past `KeyFilter::kMaxBytes`, which a
+  150,000,000-row build is -- the scan ran unfiltered past a selective build sitting one level up.
+  - Update (2026-10-25, D6): **shipped. One query of the 22 changes, and it goes 0.861x.**
+    - **The scope is a plan fact and not a timing.** Of the 22, Q09 gains a filtered scan -- its `lineitem` scan
+      drops **567,376,329 of 600,037,902** rows -- and the filtered scans of the other 21 are byte-identical to
+      the ones before this. So the suite's total moves by Q09's delta alone, and the other 21 timings are noise by
+      construction rather than by argument. Measured on the binary that shipped, arms interleaved and
+      rotated, both arms `pixi run static`: **0.848x at 14 threads**, best of five (5.443 s to 4.617 s).
+      Six runs over the item's development span **0.842x to 0.861x**, which is the figure's own spread on
+      this host. At **four threads it is 0.890x** (11.037 s to 9.825 s, best of seven) -- measured one commit
+      earlier, on a binary whose Q09 plan is identical to the final one by the same row counts. Answers
+      identical in every run.
+    - **ClickBench is unchanged by construction**: its 43 queries are single-table, so no join publishes anything
+      and all 43 physical plans are byte-identical between the two binaries. That is this ADR's required control,
+      answered by plan identity rather than by a timing run.
+    - **A direct-layout build is read here, which D1 refuses, and the gate that makes it pay is new.** D1's
+      refusal prices a rejected row at the one probe it skips, which is the whole benefit only at the innermost
+      join; a filter from further up also spares every join below it, the same reasoning D5 turns on. Ungated,
+      that is **1.005x** geomean over the 22 -- five sub-second queries losing 4% to 6.5% to buy Q09's 15%. The
+      gate is the share of its own key range the build covers (`JoinTable::key_span`, new): Q09's covers **0.054**
+      of its span and pays, Q05's covers **0.200**, rejects 480,000,000 of 600,037,902 probe rows all the same and
+      **still loses 6%**. With the gate the suite is 0.993x and Q09 keeps all of its gain; Q05 attaches no filter
+      in either arm, which is why its plan is one of the 21 that did not move.
+    - **Why Q05 loses while rejecting 80% of its probe.** Its scan pays **5.2 s** of summed filter time and the
+      two joins above it save 2.1 s and 1.0 s of summed self time: +2.1 s summed, about +150 ms of wall clock on
+      a 2.1 s query, and the measurement said +205 ms. Q09's scan pays **nothing measurable** -- 26.03 s to
+      25.85 s summed -- because the rows it rejects are rows it then does not assemble into batches, and the four
+      joins above it lose **17 s** of summed self time. The cost is fixed per probe row and the benefit scales
+      with what is rejected and with what runs above: two numbers, and the key-span share is the one of them a
+      build knows about itself.
+    - **The position of the key is the hazard, and it is answered rather than avoided.** A key published by a join
+      above the innermost is a position in *that* join's probe input, not in the scan: every join in between
+      prepends the columns of the input it does not probe, which `LeadingKeyField` states as a reason to refuse
+      such a chain outright. The walk subtracts each prefix instead -- **except for a join that emits one side
+      alone.** SEMI, ANTI and null-aware ANTI output their left input's columns whatever side they build on
+      (plan's `JoinIds`), so where one of them builds on its left the pipeline runs through its right and the
+      scan's columns are not in its output at all: there is no position to map, and subtracting a width would
+      name a column the filter was never built from, which drops rows that match. The width is read from the ids
+      a node reports and a node reporting none ends the walk, so the one quiet failure mode is a missed filter
+      and not a wrong answer.
+    - **`explain --physical` names every candidate now**, innermost first ("key filter candidate on v or k").
+      Which one a run reads depends on which builds publish and on what each would reject, neither of which a
+      plan knows, so naming the first alone read as a claim about the one in use -- and did, on Q09, where it
+      named a key whose build publishes nothing while the filter that ran was another join's.
+    - **D2 reaches further with it, which is an addition and not a change.** The part test follows the same key,
+      so a part holding none of the outer join's keys is now skipped whole -- where before there was no key to
+      skip it with, the innermost join having published nothing. It cannot narrow what D2 did before: where this
+      looks past the innermost join at all, that join published no filter and so pruned no part either.
+    - **Eight mechanisms, eight mutation checks.** The direct-layout waiver, the key-span gate, the walk past the
+      innermost join, the prefix subtraction, the candidate list, the two bounds that refuse a key naming some
+      other input's column, and the part test above: each reverted in turn, and the test that must fail did.
+      The two bounds are what stand between this and a wrong answer -- a position that got through would filter
+      one column with a filter built from another -- so each has a case of its own rather than a shared one.
 - **D4, docs(adr): record what D0-D2 measured**, and either accept this ADR or defer it with the numbers.
   - Update (2026-10-19, D4): **the cumulative measurement, taken fresh end to end rather than chained.** Each item
     above was measured against its own contemporaneous baseline, and those baselines drift between sessions, so

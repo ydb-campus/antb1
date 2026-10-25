@@ -3341,8 +3341,20 @@ std::optional<int64_t> ProbeKey(int64_t i) {
   return i % 13;
 }
 
-plan::LogicalNodePtr ScanOf(const std::shared_ptr<plan::Table>& table, const std::string& name) {
-  return Node(plan::ScanNode{.table = table, .table_name = name, .fields = AllFields(*table)});
+// `first_id` names the columns `first_id`, `first_id + 1` and so on, as the ids a bound plan
+// carries; none by default, for the plans below that have no need of them. Ids must be unique
+// across a plan, so two scans of one plan take ranges that do not meet, and none may be
+// `kNoColumnId` -- which is zero, so a range starts at one.
+plan::LogicalNodePtr ScanOf(const std::shared_ptr<plan::Table>& table, const std::string& name,
+                            std::optional<std::uint32_t> first_id = std::nullopt) {
+  plan::ScanNode scan{.table = table, .table_name = name, .fields = AllFields(*table)};
+  if (first_id.has_value()) {
+    EXPECT_GT(*first_id, 0U) << "zero is kNoColumnId, which names no column";
+    for (std::size_t i = 0; i < scan.fields.size(); ++i) {
+      scan.ids.push_back(static_cast<plan::ColumnId>(*first_id + i));
+    }
+  }
+  return Node(std::move(scan));
 }
 
 // The inner join of `probe` and `build` where probe_keys[k] (a column of the probe's output) equals
@@ -4063,6 +4075,284 @@ TEST_F(HashJoinPlanTest, TheDirectLayoutsBlockedPrefixSumAgreesWithTheSerialOne)
   }
   EXPECT_EQ(serial, parallel) << "the blocked scan must not depend on how it was scheduled";
   EXPECT_FALSE(serial.empty());
+}
+
+// A pipeline of two joins whose INNERMOST build can publish nothing -- its key is a VARCHAR, which
+// no build hashes the way a scan would (CanPublishKeyFilter) -- takes the filter of the join above
+// it instead. Before this, the scan asked the innermost join alone and so ran unfiltered through
+// every row the second join was about to reject.
+//
+// Two arms, and the second is the premise rather than a comment: the same plan without the outer
+// join must filter nothing at all, or the filter the first arm counts could be the string join's
+// and this case would be testing the behaviour it already had. The control is the same two-join
+// plan over a probe that claims too few rows for D1's share gate, so its answer comes out of an
+// unfiltered scan: a filter that dropped a row the joins must keep shows up as a difference.
+TEST_F(HashJoinPlanTest, AFilterComesFromTheJoinAboveWhenTheInnermostPublishesNone) {
+  const auto pool = MakeThreadPool();
+  const auto ps = MixedColumn("p", 1);  // p_s VARCHAR: the innermost join's key, never filtered on
+  const auto bs = MixedColumn("b", 1);
+  const auto pk = MixedColumn("p", 0);  // p_k BIGINT, at 0 of the string join's output too
+  const auto ck = MixedColumn("c", 0);
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
+  };
+  // Five keys inside a span of 51, so the build is DIRECT (under 32 slots a row) and covers 5 of
+  // 51 slots -- under the eighth kFilterKeySpanShare allows, so the filter is read. The keys are
+  // 0, 10, 20, 30 and 50 against probe keys 0 to 59: most probe rows cannot match.
+  const auto sparse = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 10, 20, 30, 50};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto strings = MixedTable("b", 1, 5, probe_keys);
+    const auto keyed = MixedTable("c", 1, 5, sparse);
+    const auto one = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode got_profile;
+    auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                     JoinOf(plan::JoinKind::kInner, ScanOf(one, "p"),
+                                            ScanOf(strings, "b"), {ps}, {bs}),
+                                     ScanOf(keyed, "c"), {pk}, {ck}),
+                              9),
+                       ContextOf(executor), &got_profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(KeyFiltersIn(got_profile), 1) << "the outer join's build must filter the scan";
+    EXPECT_EQ(one->filtered_scans(), 6);
+    EXPECT_GE(DirectBuildsIn(got_profile), 1) << "the fixture must produce the direct build";
+    // The premise: the innermost join on its own filters nothing, so the filter above is new.
+    const auto alone = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode alone_profile;
+    auto inner = RunPlan(
+        PlanOf(JoinOf(plan::JoinKind::kInner, ScanOf(alone, "p"), ScanOf(strings, "b"), {ps}, {bs}),
+               6),
+        ContextOf(executor), &alone_profile);
+    ASSERT_TRUE(inner.ok()) << inner.status().ToString();
+    EXPECT_EQ(KeyFiltersIn(alone_profile), 0) << "a VARCHAR key can publish no filter";
+    EXPECT_EQ(alone->filtered_scans(), 0);
+    // The answer, from a plan whose share gate refuses the filter.
+    const auto two = MixedTable("p", 6, 80, probe_keys);
+    two->set_claimed_rows(16);  // 16 / kFilterBuildShare is 1, under the 5 build rows: refused
+    ProfileNode control_profile;
+    auto control = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                         JoinOf(plan::JoinKind::kInner, ScanOf(two, "p"),
+                                                ScanOf(strings, "b"), {ps}, {bs}),
+                                         ScanOf(keyed, "c"), {pk}, {ck}),
+                                  9),
+                           ContextOf(executor), &control_profile);
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(KeyFiltersIn(control_profile), 0) << "the control must not filter on the keys";
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
+  }
+}
+
+// The key's position comes from the join that publishes the filter, where it is a position in that
+// join's probe input and not in the scan: a join below that the pipeline runs through the RIGHT
+// input of -- a build=left join, ADR 0026's C2b shape -- puts the scan's columns behind its build's
+// and shifts every position by that width. The walk takes it off again.
+//
+// Mutation-checked, because an index is the one thing here that fails quietly: with the subtraction
+// gone the position lands past this scan's three fields and no filter is attached at all, so the
+// count below falls to 0. The answer comparison is what would catch a position that is wrong but
+// still in range -- a filter built from one column and read against another drops rows that match.
+TEST_F(HashJoinPlanTest, AFilterFromAboveAJoinThatProbesItsRightInputFindsTheKeyAnyway) {
+  const auto pool = MakeThreadPool();
+  const auto bs = MixedColumn("b", 1);  // the innermost join's keys, each in its own input
+  const auto ps = MixedColumn("p", 1);
+  // p_k BIGINT at 3 of the join below's output, which puts its build's three columns first.
+  const auto pk = MixedColumn("p", 0, 3);
+  const auto ck = MixedColumn("c", 0);
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
+  };
+  const auto sparse = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 10, 20, 30, 50};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto strings = MixedTable("b", 1, 5, probe_keys);
+    const auto keyed = MixedTable("c", 1, 5, sparse);
+    const auto one = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode got_profile;
+    auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                     JoinOf(ScanOf(one, "p", 1), ScanOf(strings, "b", 11), {ps},
+                                            {bs}, BuildSide::kLeft),
+                                     ScanOf(keyed, "c", 21), {pk}, {ck}),
+                              9),
+                       ContextOf(executor), &got_profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(KeyFiltersIn(got_profile), 1) << "the key is at 3 above and at 0 in the scan";
+    EXPECT_EQ(one->filtered_scans(), 6);
+    const auto two = MixedTable("p", 6, 80, probe_keys);
+    two->set_claimed_rows(16);  // under D1's share gate: the same answer, unfiltered
+    ProfileNode control_profile;
+    auto control = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                         JoinOf(ScanOf(two, "p", 1), ScanOf(strings, "b", 11), {ps},
+                                                {bs}, BuildSide::kLeft),
+                                         ScanOf(keyed, "c", 21), {pk}, {ck}),
+                                  9),
+                           ContextOf(executor), &control_profile);
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(KeyFiltersIn(control_profile), 0);
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
+  }
+}
+
+// D2 follows the same key, so a part of the probe holding none of the OUTER join's keys is now
+// skipped whole where before this there was no key to skip it with -- the innermost join published
+// nothing. An addition, not a change, and the one that can lose rows rather than merely read too
+// many: the control is the same plan over a table that reports no statistics, so it scans every
+// part, and the answers must agree.
+TEST_F(HashJoinPlanTest, APartHoldingNoKeyOfTheJoinAboveIsNotScannedEither) {
+  const auto pool = MakeThreadPool();
+  const auto ps = MixedColumn("p", 1);
+  const auto bs = MixedColumn("b", 1);
+  const auto pk = MixedColumn("p", 0);
+  const auto ck = MixedColumn("c", 0);
+  // The probe's 6 parts tile the key domain 80 at a time: part 0 holds 0..79, part 1 80..159 and
+  // so on, which is the shape a sorted Parquet column has.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> { return i; };
+  // Five keys inside part 0, spread so the build is direct and covers 5 of 51 slots: parts 1 to 5
+  // hold nothing this join can match, and the per-row filter is read as well.
+  const auto sparse = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 10, 20, 30, 50};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto strings = MixedTable("b", 1, 5, probe_keys);
+    const auto keyed = MixedTable("c", 1, 5, sparse);
+    const auto one = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode got_profile;
+    auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                     JoinOf(plan::JoinKind::kInner, ScanOf(one, "p"),
+                                            ScanOf(strings, "b"), {ps}, {bs}),
+                                     ScanOf(keyed, "c"), {pk}, {ck}),
+                              9),
+                       ContextOf(executor), &got_profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(one->scanned_parts(), (std::vector<int64_t>{0})) << "only part 0 holds a build key";
+    EXPECT_EQ(KeyFiltersIn(got_profile), 1) << "and the rows of that part are filtered too";
+    // The answer, from a table whose statistics prune nothing: a part wrongly skipped loses rows.
+    const auto two = MixedTable("p", 6, 80, probe_keys);
+    two->set_stats(false);
+    auto control = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                         JoinOf(plan::JoinKind::kInner, ScanOf(two, "p"),
+                                                ScanOf(strings, "b"), {ps}, {bs}),
+                                         ScanOf(keyed, "c"), {pk}, {ck}),
+                                  9),
+                           ContextOf(executor));
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(two->scanned_parts(), (std::vector<int64_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
+  }
+}
+
+// A key of the join above that names a column of the join BELOW's build side is not this scan's at
+// all, and the walk's two bounds are what refuse it: the position lands past the scan's fields, or
+// under zero where a prefix came off. Both arms here, because a position that got through would
+// filter one column with a filter built from another and drop rows that match -- and the bounds are
+// the whole argument that it cannot, so neither may go untested.
+TEST_F(HashJoinPlanTest, AKeyNamingABuildColumnOfTheJoinBelowIsNoCandidate) {
+  const auto pool = MakeThreadPool();
+  const auto ps = MixedColumn("p", 1);
+  const auto bs = MixedColumn("b", 1);
+  const auto ck = MixedColumn("c", 0);
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
+  };
+  const auto sparse = [](int64_t i) -> std::optional<int64_t> {
+    constexpr std::array<int64_t, 5> kKeys = {0, 10, 20, 30, 50};
+    return kKeys[static_cast<std::size_t>(i % 5)];
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    for (const BuildSide below : {BuildSide::kRight, BuildSide::kLeft}) {
+      SCOPED_TRACE(below == BuildSide::kLeft ? "the join below builds left" : "builds right");
+      // The outer join's key is `b_k`, the inner join's BUILD table's own key column. Where the
+      // join below builds on its right the position is 3 -- past this scan's three fields -- and
+      // where it builds on its left it is 0, which the prefix takes under zero.
+      const auto bk = MixedColumn("b", 0, below == BuildSide::kLeft ? 0 : 3);
+      const auto strings = MixedTable("b", 1, 5, probe_keys);
+      const auto keyed = MixedTable("c", 1, 5, sparse);
+      const auto one = MixedTable("p", 6, 80, probe_keys);
+      ProfileNode got_profile;
+      auto got = RunPlan(
+          PlanOf(JoinOf(plan::JoinKind::kInner,
+                        JoinOf(ScanOf(one, "p", 1), ScanOf(strings, "b", 11), {ps}, {bs}, below),
+                        ScanOf(keyed, "c", 21), {bk}, {ck}),
+                 9),
+          ContextOf(executor), &got_profile);
+      ASSERT_TRUE(got.ok()) << got.status().ToString();
+      EXPECT_EQ(KeyFiltersIn(got_profile), 0) << "the key is no column of this scan";
+      EXPECT_EQ(one->filtered_scans(), 0);
+      // And the answer is the one an unfiltered run gives, which is what a wrong position would
+      // break rather than merely a count.
+      const auto two = MixedTable("p", 6, 80, probe_keys);
+      two->set_claimed_rows(16);
+      auto control = RunPlan(
+          PlanOf(JoinOf(plan::JoinKind::kInner,
+                        JoinOf(ScanOf(two, "p", 1), ScanOf(strings, "b", 11), {ps}, {bs}, below),
+                        ScanOf(keyed, "c", 21), {bk}, {ck}),
+                 9),
+          ContextOf(executor));
+      ASSERT_TRUE(control.ok()) << control.status().ToString();
+      EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+      EXPECT_FALSE(RowsOf(**got).empty());
+    }
+  }
+}
+
+// The same pipeline, with a direct build that covers its whole key range instead of an eighth of
+// it: refused. What the filter costs is paid on every probe row and what it saves scales with the
+// keys it rejects, so a build holding every key of its own span is the shape that pays the cost for
+// nothing -- the 6% ADR 0029's D1 records. The answer is the same either way, which is what says
+// the refusal costs correctness nothing.
+TEST_F(HashJoinPlanTest, ADirectBuildCoveringItsKeyRangeTakesNoFilterFromAboveEither) {
+  const auto pool = MakeThreadPool();
+  const auto ps = MixedColumn("p", 1);
+  const auto bs = MixedColumn("b", 1);
+  const auto pk = MixedColumn("p", 0);
+  const auto ck = MixedColumn("c", 0);
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return i % 37 == 11 ? std::optional<int64_t>{} : std::optional<int64_t>(i % 60);
+  };
+  // Five keys 0 to 4: a span of 5 slots holding 5 keys, so the filter would reject none of its own
+  // range. Direct, as the sparse fixture above is, so the layout is not what separates them.
+  const auto dense = [](int64_t i) -> std::optional<int64_t> { return i % 5; };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+    const auto strings = MixedTable("b", 1, 5, probe_keys);
+    const auto keyed = MixedTable("c", 1, 5, dense);
+    const auto one = MixedTable("p", 6, 80, probe_keys);
+    ProfileNode got_profile;
+    auto got = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                     JoinOf(plan::JoinKind::kInner, ScanOf(one, "p"),
+                                            ScanOf(strings, "b"), {ps}, {bs}),
+                                     ScanOf(keyed, "c"), {pk}, {ck}),
+                              9),
+                       ContextOf(executor), &got_profile);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_GE(DirectBuildsIn(got_profile), 1) << "the fixture must produce the direct build";
+    EXPECT_EQ(KeyFiltersIn(got_profile), 0) << "a build covering its own span is not read";
+    EXPECT_EQ(one->filtered_scans(), 0);
+    // The answer, against the same plan over a table that reports no statistics and so prunes
+    // nothing either: the refusal must not have changed what the joins answer.
+    const auto two = MixedTable("p", 6, 80, probe_keys);
+    two->set_stats(false);
+    auto control = RunPlan(PlanOf(JoinOf(plan::JoinKind::kInner,
+                                         JoinOf(plan::JoinKind::kInner, ScanOf(two, "p"),
+                                                ScanOf(strings, "b"), {ps}, {bs}),
+                                         ScanOf(keyed, "c"), {pk}, {ck}),
+                                  9),
+                           ContextOf(executor));
+    ASSERT_TRUE(control.ok()) << control.status().ToString();
+    EXPECT_EQ(RowsOf(**got), RowsOf(**control));
+    EXPECT_FALSE(RowsOf(**got).empty());
+  }
 }
 
 // D1 is refused for a direct-layout build, and D2 is NOT. The two live on one object -- a build
