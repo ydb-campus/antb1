@@ -85,7 +85,9 @@ jobs:
         run: pixi run --frozen -e static static-sources --check-urls
 
   static:
-    name: static ${{ matrix.target }} (pixi run static && pixi run static-sources)
+    name: >-
+      static ${{ matrix.target }} (pixi run static
+      && pixi run static-check build/static/package/antb1-${{ matrix.target }}.tar.gz && pixi run static-sources)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:

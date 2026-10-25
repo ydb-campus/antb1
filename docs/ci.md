@@ -62,7 +62,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `static` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
-| `static <target> (pixi run static && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, then `pixi run static-check build/static/package/antb1-<target>.tar.gz` (its verify step) and `pixi run static-sources` (on that platform) |
+| `static <target> (pixi run static && pixi run static-check build/static/package/antb1-<target>.tar.gz && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, `pixi run static-check build/static/package/antb1-<target>.tar.gz` (the verify step; on Linux with docker when it answers), then `pixi run static-sources` (on that platform) |
 | `static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)` (advisory, PRs that change a lock of the pinned sources) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` · `pixi run static-sources --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 

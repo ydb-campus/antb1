@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import platform
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -41,6 +42,11 @@ GATES = REPO / "scripts" / "static_gates.py"
 LINUX, MACOS = "linux-x86_64", "darwin-arm64"
 HOSTS = {LINUX: ("Linux", "x86_64"), MACOS: ("Darwin", "arm64"), "linux-aarch64": ("Linux", "aarch64")}
 PYTHON_SETS = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}  # what the fake's own Python adds to an empty environment
+# What docs/ci.md promises the container: no network, no capabilities, no privilege gain, read-only, user nobody.
+HARDENING = [
+    "--pull", "never", "--network", "none", "--read-only", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--user", "65534:65534",
+]  # fmt: skip
 
 
 def load_gates() -> ModuleType:
@@ -77,6 +83,16 @@ class Sandbox:
             monkeypatch.setenv(key, value)
         monkeypatch.setattr(tempfile, "tempdir", str(self.box.tmpdir))
         assert_fakes_first(path, self.box.bin, ["docker", "python", "curl", "cmake"])
+        # Every unpack of a tarball in this process, so a test can tell that nothing was unpacked.
+        self.unpacked: list[str] = []
+        for method in ("extractall", "extract"):
+            original = getattr(tarfile.TarFile, method)
+
+            def recorded(tar: tarfile.TarFile, *args: object, _original=original, **kw: object) -> object:
+                self.unpacked.append(Path(str(tar.name)).name)
+                return _original(tar, *args, **kw)
+
+            monkeypatch.setattr(tarfile.TarFile, method, recorded)
 
     def kit(self) -> Path:
         out = self.box.tmp / "kit"
@@ -168,10 +184,9 @@ def test_verify_passes_a_package_on_the_runner_and_in_a_container(v: Sandbox) ->
     assert not fails(out) and "static-gates: OK" in out
     calls = v.docker_calls()
     assert calls[0] == ["info"] and [call for call in calls if call[0] == "import"] == [["import", "-"]]
-    flags = GATES_MODULE.CONTAINER_FLAGS
     runs = [call for call in calls if call[0] == "run"]
     for call in runs:
-        assert call[:3] == ["run", "--rm", "--name"] and call[4 : 4 + len(flags)] == flags
+        assert call[:3] == ["run", "--rm", "--name"] and call[4 : 4 + len(HARDENING)] == HARDENING
         assert not {"-v", "--volume", "--mount", "--privileged"} & set(call)
         assert call[call.index(FAKE_DOCKER_IMAGE) + 1] == "/antb1"
     assert calls[-1] == ["rmi", "--force", FAKE_DOCKER_IMAGE]
@@ -185,6 +200,7 @@ def test_verify_passes_a_package_on_the_runner_and_in_a_container(v: Sandbox) ->
     for run in on_runner + inside:
         assert set(run["env"]) <= {"MIMALLOC_VERBOSE", *PYTHON_SETS}, run  # nothing of the runner's environment
     assert {Path(str(run["cwd"])).name for run in on_runner} == {"cwd"}  # a new, empty directory
+    assert v.unpacked == ["antb1-linux-x86_64.tar.gz"]  # once, after every check of the tarballs
 
 
 def test_verify_without_an_engine_runs_the_binary_on_the_runner_only(v: Sandbox) -> None:
@@ -215,14 +231,35 @@ def test_verify_fails_each_wrong_answer_on_its_own(v: Sandbox, fake: dict[str, s
 
 
 def test_verify_checks_the_digests_and_the_kit_before_it_unpacks_anything(v: Sandbox) -> None:
-    before = sorted(v.box.tmpdir.iterdir())
     code, out, _ = v.verify(v.package(break_it="bad-sum"), v.kit())
     assert code == 1 and fails(out) == ["static-gates: FAIL antb1-linux-x86_64.tar.gz matches SHA256SUMS"]
     kit = v.box.tmp / "kit"
     (kit / "zstd.parquet").write_bytes(b"other bytes")
     code, out, _ = v.verify(v.package(), kit)
     assert code == 1 and fails(out) == ["static-gates: FAIL the kit's zstd.parquet matches kit.json"]
-    assert not v.runs() and sorted(v.box.tmpdir.iterdir()) == before
+    assert not v.runs() and not v.unpacked
+
+
+def test_verify_reads_only_sha256sum_lines(v: Sandbox) -> None:
+    pkg = v.package()
+    digest = hashlib.sha256((pkg / "antb1-linux-x86_64.tar.gz").read_bytes()).hexdigest()
+    (pkg / "SHA256SUMS").write_text(f"SHA256 (antb1-linux-x86_64.tar.gz) = {digest}\n")  # shasum --tag
+    code, out, _ = v.verify(pkg, v.kit())
+    assert code == 1 and any("SHA256SUMS has one '<sha256>  <file>' line per file" in line for line in fails(out)), out
+    assert not v.runs() and not v.unpacked
+
+
+def test_verify_fails_a_tarball_it_cannot_read(v: Sandbox) -> None:
+    pkg = v.package()
+    (pkg / "antb1-linux-x86_64.tar.gz").write_bytes(b"not a gzip file at all")
+    lines = [
+        f"{hashlib.sha256((pkg / name).read_bytes()).hexdigest()}  {name}"
+        for name in ("antb1-linux-x86_64.tar.gz", "antb1-linux-x86_64.debug.tar.gz")
+    ]
+    (pkg / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+    code, out, _ = v.verify(pkg, v.kit())
+    assert code == 1 and any("antb1-linux-x86_64.tar.gz is a readable .tar.gz" in line for line in fails(out)), out
+    assert not v.runs() and not v.unpacked
 
 
 @pytest.mark.parametrize(
@@ -239,10 +276,9 @@ def test_verify_checks_the_digests_and_the_kit_before_it_unpacks_anything(v: San
 def test_verify_refuses_an_unsafe_or_incomplete_tarball_before_it_unpacks_it(
     v: Sandbox, break_it: str, failure: str
 ) -> None:
-    before = sorted(v.box.tmpdir.iterdir())
     code, out, _ = v.verify(v.package(break_it=break_it), v.kit())
     assert code == 1 and any(failure in line for line in fails(out)), out
-    assert not v.runs() and sorted(v.box.tmpdir.iterdir()) == before  # nothing was unpacked
+    assert not v.runs() and not v.unpacked
 
 
 @pytest.mark.parametrize(
@@ -303,6 +339,33 @@ def test_a_container_that_fails_still_has_its_image_removed(v: Sandbox, monkeypa
     assert v.docker_calls()[-1] == ["rmi", "--force", FAKE_DOCKER_IMAGE]
 
 
+def test_a_container_that_hangs_is_removed(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    pkg, kit = v.package(), v.kit()
+    real_run = subprocess.run
+
+    def run(cmd: list[str], *args: object, **kw: object) -> subprocess.CompletedProcess:
+        if Path(cmd[0]).name == "docker" and cmd[1] == "run":  # no sleep: the timeout itself is simulated
+            raise subprocess.TimeoutExpired(cmd, 120)
+        return real_run(cmd, *args, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    code, out, _ = v.verify(pkg, kit, container="docker")
+    assert code == 1
+    assert "static-gates: FAIL `antb1 version` runs in a container and says 0.1.0: timed out after 120 s" in out
+    removed = [call for call in v.docker_calls() if call[:2] == ["rm", "--force"]]
+    assert removed and all(call[2].startswith("antb1-verify-") for call in removed)
+    assert v.docker_calls()[-1] == ["rmi", "--force", FAKE_DOCKER_IMAGE]
+
+
+def test_an_image_the_engine_refuses_is_never_run(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    pkg, kit = v.package(), v.kit()
+    monkeypatch.setenv("FAKE_DOCKER_IMPORT_FAIL", "1")
+    code, out, _ = v.verify(pkg, kit, container="docker")
+    assert code == 1
+    assert fails(out) == ["static-gates: FAIL the engine imports an image of /antb1 and /kit: fake docker: no import"]
+    assert [call[0] for call in v.docker_calls()] == ["info", "import"]  # no run, nothing to remove
+
+
 def test_verify_checks_the_signature_on_macos(v: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
     pkg, kit = v.package(MACOS), v.kit()
     code, out, err = v.verify(pkg, kit, MACOS)
@@ -350,6 +413,7 @@ def test_the_static_workflow_verifies_each_package_with_the_runners_python() -> 
     assert '--container "$ENGINE"' in step["run"] and step["env"]["ENGINE"] == "${{ matrix.engine }}"
     assert at < min(i for i, run in enumerate(runs) if "static-sources" in run)  # before the sources and uploads
     assert "pixi run static-check build/static/package/antb1-" in step["name"]  # the local repro
+    assert "pixi run static-check build/static/package/antb1-${{ matrix.target }}.tar.gz" in job["name"]
 
 
 # ---------------------------------------------------------------------------------------------------------------------

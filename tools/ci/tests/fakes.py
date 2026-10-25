@@ -75,9 +75,9 @@ else:
 """
 # The fake container engine of `static_gates.py verify --container`: every call's argv goes to
 # $FAKE_DOCKER_DIR/calls.jsonl. `info` fails when $FAKE_DOCKER_DOWN is set; `import -` keeps the root file system it
-# reads (rootfs.tar, unpacked in rootfs/) and prints the image id; `run --rm ... [--env K=V]... <image> /antb1 ARGS`
-# runs rootfs/antb1 with only those variables and /kit/ mapped to rootfs/kit/ (exit 125 when $FAKE_DOCKER_FAIL is
-# set); `rm --force` and `rmi --force` succeed; anything else exits 99.
+# reads (rootfs.tar, unpacked in rootfs/) and prints the image id, or fails when $FAKE_DOCKER_IMPORT_FAIL is set;
+# `run --rm ... [--env K=V]... <image> /antb1 ARGS` runs rootfs/antb1 with only those variables and /kit/ mapped to
+# rootfs/kit/ (exit 125 when $FAKE_DOCKER_FAIL is set); `rm --force` and `rmi --force` succeed; anything else exits 99.
 FAKE_DOCKER_IMAGE = "sha256:" + "ab" * 32
 FAKE_DOCKER = """#!{python} -I
 import io, json, os, subprocess, sys, tarfile
@@ -89,6 +89,9 @@ image, root = "sha256:" + "ab" * 32, os.path.join(state, "rootfs")
 if args == ["info"]:
     sys.exit(1 if os.environ.get("FAKE_DOCKER_DOWN") else 0)
 if args == ["import", "-"]:
+    if os.environ.get("FAKE_DOCKER_IMPORT_FAIL"):
+        sys.stderr.write("fake docker: no import\\n")
+        sys.exit(1)
     data = sys.stdin.buffer.read()
     with open(os.path.join(state, "rootfs.tar"), "wb") as f:
         f.write(data)
