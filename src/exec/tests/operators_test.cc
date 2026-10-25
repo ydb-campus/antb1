@@ -169,7 +169,7 @@ class PreparedFilteredTable final : public plan::Table {
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
       arrow::MemoryPool* /*pool*/, const std::shared_ptr<const plan::ScanFilter>& /*filter*/,
-      bool /*positions*/) const override {
+      bool /*positions*/, int /*returned*/) const override {
     return std::make_unique<testing::VectorReader>(batches_.front()->schema(), batches_);
   }
 

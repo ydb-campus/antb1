@@ -555,5 +555,61 @@ TEST_F(ScanFilterTest, RejectsMalformedPredicatesAndValues) {
   EXPECT_EQ(selected, 0xff) << "a failed call clears nothing";
 }
 
+// The second shape plan::ScanValues allows for a VARCHAR column: a dictionary and one index a row,
+// with **no views at all**. That is what a column no batch carries is read as -- its views would
+// exist only to be compared -- and it is admissible only where the dictionary is certain to answer
+// the predicate, because the per-row path would otherwise read values nobody wrote.
+TEST_F(ScanFilterTest, AVarcharColumnMayArriveAsADictionaryWithNoViews) {
+  const auto filter = MakeScanFilter({testing::Compare(S(), CompareOp::kEq, Text("a"))},
+                                     *Batch()->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  const std::vector<std::string_view> dictionary = {"a", "b", "c"};
+  const std::vector<std::int32_t> indices = {0, 1, 0, 2};
+
+  // No views, a dictionary smaller than the piece: accepted, and it answers.
+  std::uint8_t selected = 0x0f;
+  const plan::ScanValues by_dictionary{.array = nullptr,
+                                       .strings = {},
+                                       .validity = nullptr,
+                                       .rows = 4,
+                                       .dictionary = std::span<const std::string_view>(dictionary),
+                                       .indices = std::span<const std::int32_t>(indices)};
+  ASSERT_TRUE((*filter)->Apply(0, by_dictionary, 0, &selected).ok());
+  EXPECT_EQ(selected, 0x05) << "rows 0 and 2 hold 'a'";
+
+  // Neither shape: Invalid rather than a read of nothing.
+  selected = 0x0f;
+  const plan::ScanValues neither{.array = nullptr, .strings = {}, .validity = nullptr, .rows = 4};
+  EXPECT_TRUE((*filter)->Apply(0, neither, 0, &selected).IsInvalid()) << "no views, no dictionary";
+  EXPECT_EQ(selected, 0x0f) << "a failed call clears nothing";
+
+  // **A dictionary larger than the piece with no views is refused**, which is the trap this check
+  // exists for: the per-row path is the one that would be taken, and it has nothing to read. A
+  // table must not produce this, and the refusal is what says so rather than a comment.
+  const std::vector<std::string_view> big = {"a", "b", "c", "d", "e"};
+  const std::vector<std::int32_t> two = {0, 1};
+  const plan::ScanValues larger{.array = nullptr,
+                                .strings = {},
+                                .validity = nullptr,
+                                .rows = 2,
+                                .dictionary = std::span<const std::string_view>(big),
+                                .indices = std::span<const std::int32_t>(two)};
+  EXPECT_TRUE((*filter)->Apply(0, larger, 0, &selected).IsInvalid())
+      << "a dictionary bigger than the piece falls back to the views that are not there";
+
+  // With views as well it is the ordinary shape, whatever the dictionary's size: the fallback has
+  // something to read.
+  const std::vector<std::string_view> views = {"a", "b"};
+  selected = 0x03;
+  const plan::ScanValues both{.array = nullptr,
+                              .strings = std::span<const std::string_view>(views),
+                              .validity = nullptr,
+                              .rows = 2,
+                              .dictionary = std::span<const std::string_view>(big),
+                              .indices = std::span<const std::int32_t>(two)};
+  ASSERT_TRUE((*filter)->Apply(0, both, 0, &selected).ok());
+  EXPECT_EQ(selected, 0x01);
+}
+
 }  // namespace
 }  // namespace antb1::exec

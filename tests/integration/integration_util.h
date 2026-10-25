@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <arrow/api.h>
 
 #include "antb1/engine/session.h"
+#include "antb1/exec/profile.h"
 
 #include "fixtures.h"
 
@@ -44,6 +46,30 @@ inline arrow::Result<int64_t> Count(engine::Session& session, const std::string&
 
 inline std::string FromPath(const std::string& path) {
   return "SELECT COUNT(*) FROM '" + path + "'";
+}
+
+// The first node named `name` of `node`'s tree (depth first); nullptr if none.
+inline const exec::ProfileNode* FindNode(const exec::ProfileNode& node, const std::string& name) {
+  if (node.name() == name) {
+    return &node;
+  }
+  for (const exec::ProfileNode* child : node.children()) {
+    if (const exec::ProfileNode* found = FindNode(*child, name)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+// Metric `name` of `node`, if it has one. What a metric is for is a property of a run that no
+// result shows, so a test that wants one of those asks here.
+inline std::optional<int64_t> MetricOf(const exec::ProfileNode& node, const std::string& name) {
+  for (const exec::ProfileMetric& metric : node.metrics()) {
+    if (metric.name == name) {
+      return metric.value;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace antb1::integration

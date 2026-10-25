@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -13,8 +14,16 @@
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
+#include <parquet/column_reader.h>
+#include <parquet/file_reader.h>
+#include <parquet/metadata.h>
 
 #include "antb1/exec/profile.h"
+
+#ifdef ANTB1_INTEGRATION_HAVE_DUCKDB
+#include <duckdb.h>
+#endif
+
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
@@ -199,6 +208,73 @@ TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
   EXPECT_EQ(builds.back().second, 1)
       << "the nested join's build dropped nothing: the retain set did not survive the chain";
 }
+
+#ifdef ANTB1_INTEGRATION_HAVE_DUCKDB
+// A VARCHAR column read so that a pushed predicate can be applied to it, and by nothing above the
+// scan, is read as dictionary indices and never copied into a batch (ADR 0020). **On a file whose
+// column chunks carry no `encoding_stats`**, which is the case the change exists for and the only
+// one no other test can reach: Arrow exposes a dictionary only for a chunk it proves fully
+// dictionary-encoded and proves it from that optional field alone, so its own door declines here
+// and `io` decides from the required `encodings` instead.
+//
+// Arrow's writer always emits `encoding_stats`, so the file is written by the test oracle, which
+// never does -- the same way scripts/static_gates.py makes its smoke-test files.
+TEST(Session, ADictionaryPredicateOnAFileWithNoEncodingStats) {
+  const auto dir = std::filesystem::path(::testing::TempDir()) / "antb1_no_encoding_stats";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string path = (dir / "t.parquet").string();
+  {
+    duckdb_database db = nullptr;
+    duckdb_connection conn = nullptr;
+    ASSERT_EQ(duckdb_open(nullptr, &db), DuckDBSuccess);
+    ASSERT_EQ(duckdb_connect(db, &conn), DuckDBSuccess);
+    // Four distinct values over 20,000 rows: a dictionary that never outgrows its page, and a
+    // numeric column that is read above the scan so that the batches carry something.
+    const std::string sql =
+        "COPY (SELECT ('v' || (i % 4))::VARCHAR AS s, i::BIGINT AS n FROM range(20000) t(i)) TO '" +
+        path + "' (FORMAT parquet, ROW_GROUP_SIZE 5000)";
+    duckdb_result result;
+    const auto state = duckdb_query(conn, sql.c_str(), &result);
+    duckdb_destroy_result(&result);
+    duckdb_disconnect(&conn);
+    duckdb_close(&db);
+    ASSERT_EQ(state, DuckDBSuccess) << "the oracle writes the file";
+  }
+  // The situation, asserted rather than assumed: no encoding_stats, so Arrow's door declines.
+  {
+    auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+    ASSERT_GT(reader->metadata()->num_row_groups(), 0);
+    const auto chunk = reader->metadata()->RowGroup(0)->ColumnChunk(0);
+    EXPECT_TRUE(chunk->encoding_stats().empty()) << "this writer emits none";
+    auto group = reader->RowGroup(0);
+    EXPECT_NE(group->ColumnWithExposeEncoding(0, parquet::ExposedEncoding::DICTIONARY)
+                  ->GetExposedEncoding(),
+              parquet::ExposedEncoding::DICTIONARY)
+        << "Arrow declines without encoding_stats, which is what this test is about";
+  }
+  auto session = engine::Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path}).ok());
+  const std::string sql = "SELECT SUM(n) FROM t WHERE s = 'v1'";
+  const auto result = session->Execute(sql);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  ASSERT_EQ(result->table->num_rows(), 1);
+  // i % 4 == 1 over 0..19999: 1 + 5 + ... + 19997, which is 5000 terms averaging 9999.
+  const auto sum = std::static_pointer_cast<arrow::Int64Array>(result->table->column(0)->chunk(0));
+  ASSERT_EQ(sum->length(), 1);
+  EXPECT_EQ(sum->Value(0), 49'995'000);
+
+  const auto profile = session->ExplainAnalyze(sql);
+  ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+  ASSERT_NE(profile->root, nullptr);
+  const exec::ProfileNode* scan = FindNode(*profile->root, "Scan");
+  ASSERT_NE(scan, nullptr);
+  EXPECT_EQ(MetricOf(*scan, "cols_filter_only"), 1)
+      << "s is read to be compared and nothing above the scan reads it";
+  EXPECT_GT(MetricOf(*scan, "dict_pieces").value_or(0), 0)
+      << "its predicate was asked once per distinct value, which Arrow's door alone would refuse";
+}
+#endif  // ANTB1_INTEGRATION_HAVE_DUCKDB
 
 }  // namespace
 }  // namespace antb1::integration

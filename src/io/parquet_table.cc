@@ -827,7 +827,7 @@ bool ParquetTable::supports_scan_filter(const std::vector<int>& fields) const {
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPartFiltered(
     int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-    const std::shared_ptr<const plan::ScanFilter>& filter, bool positions) const {
+    const std::shared_ptr<const plan::ScanFilter>& filter, bool positions, int returned) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
@@ -849,7 +849,10 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
       return arrow::Status::NotImplemented("a filtered scan cannot read field ", field);
     }
     columns.push_back(*std::move(column));
-    engine_fields.push_back(schema_->field(field));
+    // Only a returned field is in the batches' schema; the rest are read to be filtered on.
+    if (std::cmp_less(engine_fields.size(), returned)) {
+      engine_fields.push_back(schema_->field(field));
+    }
   }
   return MakeFilteredScan(Segment{.path = files_[p.file],
                                   .metadata = metadata_[p.file],
@@ -857,7 +860,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
                                   .footer = footers_[p.file],
                                   .row_groups = std::vector<int>{p.row_group}},
                           std::move(columns), arrow::schema(std::move(engine_fields)), batch_size,
-                          pool, filter, positions);
+                          pool, filter, positions, returned);
 }
 
 bool ParquetTable::StoredAsFloat(int field) const {

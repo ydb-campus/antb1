@@ -432,13 +432,19 @@ class MemoryTable final : public plan::Table {
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions) const override {
+      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions,
+      int returned) const override {
     if (!split_ || !scan_filter_) {
-      return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter, positions);
+      return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter, positions,
+                                             returned);
     }
     ++filtered_scans_;
     ARROW_ASSIGN_OR_RAISE(auto reader, DoScanPart(part, fields, batch_size, pool));
     auto schema = reader->schema();
+    // A field past `returned` is read, filtered on, and dropped before the batch leaves -- as a
+    // Parquet table never materialises it at all. The fake pays for it and then throws it away,
+    // which costs nothing a test cares about and keeps the contract the same one.
+    const int dropped = static_cast<int>(fields.size()) - returned;
     if (positions) {
       ARROW_ASSIGN_OR_RAISE(
           schema, schema->AddField(schema->num_fields(),
@@ -504,8 +510,17 @@ class MemoryTable final : public plan::Table {
           const arrow::Datum kept,
           arrow::compute::Filter(batch, mask, arrow::compute::FilterOptions::Defaults(), &kernels));
       if (kept.record_batch()->num_rows() > 0) {
-        out.push_back(kept.record_batch());
+        std::shared_ptr<arrow::RecordBatch> narrowed = kept.record_batch();
+        for (int i = 0; i < dropped; ++i) {
+          // The returned fields come first, so the ones to drop are at `returned`, and with
+          // `positions` the position column follows them and has to stay.
+          ARROW_ASSIGN_OR_RAISE(narrowed, narrowed->RemoveColumn(returned));
+        }
+        out.push_back(std::move(narrowed));
       }
+    }
+    for (int i = 0; i < dropped; ++i) {
+      ARROW_ASSIGN_OR_RAISE(schema, schema->RemoveField(returned));
     }
     return std::make_unique<VectorReader>(std::move(schema), std::move(out));
   }

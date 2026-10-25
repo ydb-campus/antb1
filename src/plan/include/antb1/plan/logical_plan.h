@@ -311,6 +311,22 @@ struct ScanNode {
 struct FilterNode {
   LogicalNodePtr input;
   std::vector<Predicate> predicates;
+  // The ids of this Filter's own output that a node ABOVE it reads: what its input must carry past
+  // it, and nothing more. A column the predicates read and this list does not is read to be
+  // compared and for nothing else, which is what lets a scan decline to copy it into every batch
+  // (ADR 0020). Set by Prune and intersected with the node's own output there, so an id of some
+  // other branch of a join above cannot appear.
+  //
+  // **std::nullopt where no pass recorded it, which an empty list does not mean.** An empty list
+  // is the common and most valuable case -- `COUNT(*)` with a `WHERE` reads nothing above the
+  // Filter, so every column of the scan is read to be compared and for nothing else -- and
+  // JoinNode::needed_above, which conflates the two in a plain vector, gives that case up.
+  //
+  // **A consumer must verify that this set describes the node it is holding**, exactly as
+  // JoinNode::needed_above must be: a column missing from the list reads as unneeded, so dropping
+  // on that basis drops a live column, and a dropped column is a NULL in an answer that no later
+  // check can notice. `CloneWithFreshIds` mints ids this list cannot know.
+  std::optional<std::vector<ColumnId>> needed_above;
   SourceSpan span;  // the WHERE conjunction
 };
 

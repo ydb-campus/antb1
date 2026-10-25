@@ -43,17 +43,49 @@ std::shared_ptr<arrow::Schema> FieldsOf(const plan::Table& table, const std::vec
 TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                                      std::optional<int64_t> part, std::optional<LateScan> late,
                                      std::vector<plan::Predicate> pushed,
-                                     std::optional<KeyScan> key_scan)
+                                     std::optional<KeyScan> key_scan, std::vector<bool> filter_only)
     : table_(std::move(table)),
       fields_(std::move(fields)),
       part_(part),
       late_(std::move(late)),
       pushed_(std::move(pushed)),
       key_scan_(std::move(key_scan)),
+      filter_only_(std::move(filter_only)),
       schema_(FieldsOf(*table_, fields_, late_)) {
   for (std::size_t i = 0; i < fields_.size(); ++i) {
     if (!late_.has_value() || i >= late_->late.size() || !late_->late[i]) {
       read_.push_back(fields_[i]);
+    }
+  }
+  // The request a filtered scan gets: the fields it returns first, in their own order, then the
+  // fields it reads only to filter on. Ordered that way because a table is told how many of the
+  // fields it returns and not which, and because the returned ones keep the positions every
+  // operator above already resolved. The predicates are rebound once here rather than per Open --
+  // the inverse of NarrowFilter, which rebinds them to a list narrower than the output.
+  const auto marked = [&](std::size_t i) { return i < filter_only_.size() && filter_only_[i]; };
+  std::vector<int> position(fields_.size(), -1);  // per field: its place in scan_fields_
+  arrow::FieldVector scan_fields;
+  for (const bool pass : {false, true}) {
+    for (std::size_t i = 0; i < fields_.size(); ++i) {
+      if (marked(i) != pass) {
+        continue;
+      }
+      position[i] = static_cast<int>(scan_fields_.size());
+      scan_fields_.push_back(fields_[i]);
+      const arrow::Schema& table_schema = *table_->schema();
+      const int f = fields_[i];
+      scan_fields.push_back(f >= 0 && f < table_schema.num_fields()
+                                ? table_schema.field(f)
+                                : arrow::field("?", arrow::null()));
+      returned_ += pass ? 0 : 1;
+    }
+  }
+  scan_schema_ = arrow::schema(std::move(scan_fields));
+  scan_pushed_ = pushed_;
+  for (plan::Predicate& p : scan_pushed_) {
+    if (p.column.has_value() && p.column->index >= 0 &&
+        std::cmp_less(p.column->index, position.size())) {
+      p.column->index = position[static_cast<std::size_t>(p.column->index)];
     }
   }
 }
@@ -97,7 +129,19 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     std::shared_ptr<const plan::ScanFilter> filter;
     std::shared_ptr<const plan::ScanFilter> keys;
     if (!pushed_.empty()) {
-      ARROW_ASSIGN_OR_RAISE(filter, MakeScanFilter(pushed_, *schema_, ctx.pool));
+      // Counted, and reported, only where a predicate is on a VARCHAR column: that is the only
+      // place a dictionary is read, so elsewhere the number would be a zero on every scan of every
+      // plan rather than an answer to a question anyone asked.
+      const bool on_strings = std::ranges::any_of(scan_pushed_, [&](const plan::Predicate& p) {
+        return p.column.has_value() && p.column->index >= 0 &&
+               p.column->index < scan_schema_->num_fields() &&
+               scan_schema_->field(p.column->index)->type()->id() == arrow::Type::BINARY;
+      });
+      if (on_strings) {
+        dictionary_pieces_ = std::make_shared<std::atomic<int64_t>>(0);
+      }
+      ARROW_ASSIGN_OR_RAISE(
+          filter, MakeScanFilter(scan_pushed_, *scan_schema_, ctx.pool, dictionary_pieces_));
     }
     if (key_scan_.has_value() && key_scan_->filter != nullptr) {
       key_dropped_ = std::make_shared<std::atomic<int64_t>>(0);
@@ -110,7 +154,8 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
       ARROW_ASSIGN_OR_RAISE(filter, MakeBothScanFilters(std::move(filter), std::move(keys)));
     }
     ARROW_ASSIGN_OR_RAISE(reader_,
-                          table_->ScanPart(*part_, fields_, ctx.batch_size, ctx.pool, filter));
+                          table_->ScanPart(*part_, scan_fields_, ctx.batch_size, ctx.pool, filter,
+                                           /*positions=*/false, returned_));
   } else {
     ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool));
   }
@@ -132,11 +177,46 @@ arrow::Result<Batch> TableScanOperator::Next() {
   if (late_.has_value()) {
     return Narrow(*batch, late_.value());
   }
+  if (std::cmp_less(returned_, fields_.size())) {
+    ARROW_ASSIGN_OR_RAISE(batch, WithPlaceholders(*batch));
+  }
   if (!batch->schema()->Equals(*schema_, /*check_metadata=*/false)) {
     // Same types under other names (e.g. an in-memory table); a type mismatch is an error.
     ARROW_ASSIGN_OR_RAISE(batch, batch->ReplaceSchema(schema_));
   }
   return Batch{.data = std::move(batch), .selection = {}};
+}
+
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> TableScanOperator::WithPlaceholders(
+    const arrow::RecordBatch& read) const {
+  // `read` holds the returned fields in their own order; this puts them back at the positions
+  // output_schema() gives them, with an all-NULL array of the field's **declared** type where a
+  // field was read only to filter on.
+  //
+  // **Declared, not the `null` type ADR 0016's late split uses.** A late column is re-read by a
+  // node that knows it is a placeholder; this one can flow anywhere a real column can -- into a
+  // join build, which may carry it past the join and gather it -- and a reader that meets the
+  // `null` type there has no way to proceed. An ANTB1_CHECK in the gather said so on the first
+  // run, which is the one place this could have been got wrong quietly. The saving is unaffected:
+  // what cost the scan was the bytes and a view a row, and neither is here.
+  arrow::ArrayVector columns;
+  columns.reserve(fields_.size());
+  int next = 0;
+  for (std::size_t i = 0; i < fields_.size(); ++i) {
+    if (i < filter_only_.size() && filter_only_[i]) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> absent,
+                            arrow::MakeArrayOfNull(schema_->field(static_cast<int>(i))->type(),
+                                                   read.num_rows(), pool_));
+      columns.push_back(std::move(absent));
+      continue;
+    }
+    if (next >= read.num_columns()) {
+      return arrow::Status::Invalid("a filtered scan returned ", read.num_columns(),
+                                    " columns for ", returned_, " returned fields");
+    }
+    columns.push_back(read.column(next++));
+  }
+  return arrow::RecordBatch::Make(schema_, read.num_rows(), std::move(columns));
 }
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> TableScanOperator::NarrowFilter(
@@ -211,6 +291,17 @@ arrow::Status TableScanOperator::Close() {
   if (profile() != nullptr && key_dropped_ != nullptr) {
     profile()->Add("key_dropped", MetricUnit::kCount,
                    key_dropped_->load(std::memory_order_relaxed));
+  }
+  // Which question each pushed predicate was asked, and how many columns were read for a predicate
+  // and nothing else: neither is visible in a result, and both are the whole of what this part of
+  // ADR 0020 does.
+  if (profile() != nullptr && dictionary_pieces_ != nullptr) {
+    profile()->Add("dict_pieces", MetricUnit::kCount,
+                   dictionary_pieces_->load(std::memory_order_relaxed));
+  }
+  if (profile() != nullptr && std::cmp_less(returned_, scan_fields_.size())) {
+    profile()->Max("cols_filter_only", MetricUnit::kCount,
+                   static_cast<int64_t>(scan_fields_.size()) - returned_);
   }
   if (reader_ == nullptr) {
     return arrow::Status::OK();

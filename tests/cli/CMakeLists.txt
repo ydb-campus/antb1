@@ -783,8 +783,12 @@ string(
   "local_rows=[0-9]+[]]\n"
   "      Filter IsMobile = 1  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
   "self=${_d}[]]\n"
+  # cols_filter_only: IsMobile is read so that the pushed predicate can be applied and by nothing
+  # above the scan, so no batch carries it (ADR 0020). Asserted here rather than read by hand,
+  # because a scan that stops doing it answers exactly the same.
   "        Scan table=t source=parquet[(]files=4, rows=10000[)] columns=[[]RegionID, IsMobile[]], "
-  "1 pushed predicate  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)][]]$"
+  "1 pushed predicate  [[]rows=5064 batches=11 parts=11 time=${_d} [(]summed over parts[)] "
+  "cols_filter_only=1[]]$"
 )
 antb1_add_cli_golden(
   explain_analyze
@@ -820,7 +824,9 @@ string(
   "\"inputs\":[[]"
   "[{]\"name\":\"Scan\",\"detail\":\"Scan table=t source=parquet[(]files=4, rows=10000[)] "
   "columns=[[]RegionID[]], 1 pushed predicate\",\"per_part\":true,\"runs\":11,\"rows\":9640,\"batches\":11,"
-  "\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{][}],\"inputs\":[[][]]"
+  # COUNT(*) reads nothing above the Filter, so every column the scan reads is read to be compared
+  # and for nothing else -- the case an empty `needed_above` names, and the most valuable one.
+  "\"time_ns\":${_n},\"self_time_ns\":${_n},\"metrics\":[{]\"cols_filter_only\":1[}],\"inputs\":[[][]]"
   "[}][]][}][]][}][}]$"
 )
 antb1_add_cli_golden(

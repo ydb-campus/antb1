@@ -39,13 +39,22 @@ struct ScanValues {
                                               // nullptr: no row is NULL
   int64_t rows = 0;
   // VARCHAR, and only when every data page of the column chunk is dictionary-encoded: the chunk's
-  // distinct values, and one index into them per row. `strings` is filled either way, so a reader
-  // of these is free to ignore them; what they are for is evaluating a predicate once per distinct
-  // value instead of once per row ([ADR 0020](../../../../../docs/adr/0020-filter-pushdown.md)).
+  // distinct values, and one index into them per row. What they are for is evaluating a predicate
+  // once per distinct value instead of once per row
+  // ([ADR 0020](../../../../../docs/adr/0020-filter-pushdown.md)).
   //
   // Empty when the chunk has a plain-encoded data page, which a writer produces once its
   // dictionary outgrows its page limit. A NULL row's index is not meaningful -- it has no value --
   // so `validity` decides a row before its index is read.
+  //
+  // **A VARCHAR column arrives in one of two shapes, and a reader has to accept both.** Either
+  // `strings` holds one view per row, with these two filled as well where the encoding allows it;
+  // or `strings` is **empty** and these two are the only values there are. The second shape is
+  // what a column nothing above the scan reads looks like: its views exist only to be compared, so
+  // where the dictionary can answer the predicate the table does not spend a write a row on them.
+  // A table produces that shape only when `dictionary` is no larger than `rows`, which is the
+  // condition under which a predicate is known to take the dictionary; a reader that would fall
+  // back to the per-row path for any other reason must not be given it.
   std::span<const std::string_view> dictionary;
   std::span<const std::int32_t> indices;
 };
@@ -122,16 +131,33 @@ class Table {
   // one more column after the fields, `position` (INT64, not null): each row's position in the
   // part, counting every row of the part (they increase). NotImplemented where
   // supports_scan_filter(fields) is false; Invalid for `positions` without a filter.
+  //
+  // `returned` is how many of `fields`, from the first, the batches carry; the rest are read and
+  // filtered on and **never put in a batch**. std::nullopt (the default) returns every field.
+  // A column a predicate reads and nothing above the scan does is otherwise copied into every
+  // batch for no reader at all, which on a VARCHAR column is the greater part of the scan's work
+  // ([ADR 0020](../../../../../docs/adr/0020-filter-pushdown.md)); the caller knows which those
+  // are and a table cannot. Invalid for a `returned` larger than `fields` or negative, and the
+  // filter's columns may name any field, returned or not. The `position` column of `positions`
+  // follows the returned ones.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const ScanFilter>& filter, bool positions = false) const {
+      const std::shared_ptr<const ScanFilter>& filter, bool positions = false,
+      std::optional<int> returned = std::nullopt) const {
+    if (returned.has_value() && (*returned < 0 || std::cmp_greater(*returned, fields.size()))) {
+      return arrow::Status::Invalid("a scan returns ", *returned, " of ", fields.size(), " fields");
+    }
     if (filter == nullptr) {
       if (positions) {
         return arrow::Status::Invalid("a scan reports row positions only with a filter");
       }
+      if (returned.has_value() && std::cmp_less(*returned, fields.size())) {
+        return arrow::Status::Invalid("a scan reads a field it does not return only to filter on");
+      }
       return DoScanPart(part, fields, batch_size, pool);
     }
-    return DoScanPartFiltered(part, fields, batch_size, pool, filter, positions);
+    return DoScanPartFiltered(part, fields, batch_size, pool, filter, positions,
+                              returned.value_or(static_cast<int>(fields.size())));
   }
 
   // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
@@ -183,7 +209,7 @@ class Table {
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
       arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/,
-      bool /*positions*/) const {
+      bool /*positions*/, int /*returned*/) const {
     return arrow::Status::NotImplemented("this table cannot filter while it scans");
   }
 };

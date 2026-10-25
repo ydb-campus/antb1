@@ -694,6 +694,106 @@ TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
   EXPECT_EQ(std::get<ScanNode>(*JoinBelowProject(semi).right).fields, (std::vector<int>{1}));
 }
 
+// What `FilterNode::needed_above` records, which is what lets a scan read a column to compare it
+// and never copy it (ADR 0020). Three properties, each of which was a review finding on
+// JoinNode::needed_above before it was one here.
+// A recorded needed_above, for comparing the whole optional at once: whether Prune set it and what
+// it holds are one question, and an optional compared as a whole answers both without a
+// dereference to justify.
+std::optional<std::vector<ColumnId>> Ids(std::vector<ColumnId> ids) { return ids; }
+
+TEST(OptimizerTest, AFilterRecordsWhatIsReadAboveIt) {
+  // Project [t1.i16] over Filter(t1.i32 > 0) over Scan t1: i32 is read by the predicate and by
+  // nothing above, i16 only above.
+  const auto plan_of = [](const std::vector<BoundColumn>& columns) {
+    return PlanOver(Node(ProjectNode{
+        .input = Node(FilterNode{
+            .input = FourFields(1),
+            .predicates = {Predicate{
+                .kind = Predicate::Kind::kCompare,
+                .column = FieldOf(1, 1),
+                .op = CompareOp::kGt,
+                .constant = Constant{.type = LogicalType::kInteger, .value = Int128{0}}}},
+            .span = {}}),
+        .columns = columns,
+        .constants = {},
+        .ids = {ColumnId{100}},
+        .span = {}}));
+  };
+  const LogicalPlan plan = Optimized(plan_of({FieldOf(1, 0)}));
+  const auto& filter = std::get<FilterNode>(*std::get<ProjectNode>(*plan.root).input);
+  // The whole optional at once: that Prune recorded it, and what it recorded.
+  EXPECT_EQ(filter.needed_above, Ids({FieldOf(1, 0).id}))
+      << "the Project's column, and not the predicate's";
+  EXPECT_TRUE(std::ranges::is_sorted(filter.needed_above.value_or(std::vector<ColumnId>{})));
+  // Recording it twice records the same set, not a longer one: Prune rewrites a copy of the node,
+  // so a pass that appended would leave every id twice and answer the same.
+  const LogicalPlan again = Optimized(plan);
+  EXPECT_EQ(std::get<FilterNode>(*std::get<ProjectNode>(*again.root).input).needed_above,
+            filter.needed_above);
+}
+
+// **An empty set is not an absent one**, and it is the valuable case: a query that reads nothing
+// above its Filter -- COUNT(*) with a WHERE -- leaves every column of the scan read to be compared
+// and for nothing else. JoinNode::needed_above cannot tell the two apart, which is why this one is
+// an optional.
+TEST(OptimizerTest, AFilterNothingReadsAboveRecordsAnEmptySet) {
+  const LogicalPlan plan = Optimized(PlanOver(Node(AggregateNode{
+      .input = Node(
+          FilterNode{.input = FourFieldsRows(1, 10),
+                     .predicates = {Predicate{
+                         .kind = Predicate::Kind::kCompare,
+                         .column = FieldOf(1, 1),
+                         .op = CompareOp::kGt,
+                         .constant = Constant{.type = LogicalType::kInteger, .value = Int128{0}}}},
+                     .span = {}}),
+      .aggregates = {AggregateCall{.kind = AggKind::kCountStar, .id = ColumnId{20}}},
+      .span = {}})));
+  const auto* filter = Find<FilterNode>(std::get<AggregateNode>(*plan.root).input);
+  ASSERT_NE(filter, nullptr);
+  EXPECT_EQ(filter->needed_above, Ids({}))
+      << "set and empty, which is not the same as unset: COUNT(*) reads no column of the Filter";
+}
+
+// The same set at a Filter under one branch of a join, which is where a plain vector went wrong on
+// JoinNode::needed_above: Prune carries one demand set down both branches, so without the
+// intersection this Filter would hold the ids of the join's other input and a consumer that
+// verifies the set would refuse it -- silently, since nothing else reads the field.
+TEST(OptimizerTest, AFilterUnderAJoinRecordsOnlyItsOwnColumns) {
+  const LogicalNodePtr filtered =
+      Node(FilterNode{.input = FourFields(1),
+                      .predicates = {Predicate{
+                          .kind = Predicate::Kind::kCompare,
+                          .column = FieldOf(1, 1),
+                          .op = CompareOp::kGt,
+                          .constant = Constant{.type = LogicalType::kInteger, .value = Int128{0}}}},
+                      .span = {}});
+  const LogicalPlan plan = Optimized(PlanOver(Node(ProjectNode{
+      .input = Node(JoinNode{.kind = JoinKind::kInner,
+                             .left = filtered,
+                             .right = FourFields(11),
+                             .keys = {JoinKey{.left = FieldOf(1, 2), .right = FieldOf(11, 2)}},
+                             .residual = {},
+                             .build = BuildSide::kRight,
+                             .span = {}}),
+      .columns = {FieldOf(1, 0), FieldOf(11, 0)},
+      .constants = {},
+      .ids = {ColumnId{100}, ColumnId{101}},
+      .span = {}})));
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  const auto& join = std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);
+  const auto* filter = Find<FilterNode>(join.left);
+  ASSERT_NE(filter, nullptr);
+  ASSERT_TRUE(filter->needed_above.has_value());
+  const std::vector<ColumnId> outputs = OutputIds(LogicalNode(*filter));
+  for (const ColumnId id : filter->needed_above.value_or(std::vector<ColumnId>{})) {
+    EXPECT_NE(std::ranges::find(outputs, id), outputs.end()) << "an id this Filter does not output";
+  }
+  // t1.i16 is read above and t1.i64 is the join's key, which this Filter must also carry; nothing
+  // of t11 belongs here though the demand it was pruned under held two of t11's columns.
+  EXPECT_EQ(filter->needed_above.value_or(std::vector<ColumnId>{}).size(), 2U);
+}
+
 // COUNT(*) of a whole table inside a join input still becomes RowCount; above a join it does not.
 TEST(OptimizerTest, CountStarInsideAJoinInputBecomesRowCount) {
   const LogicalNodePtr count = Node(

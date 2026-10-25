@@ -134,6 +134,15 @@ Proposed
     dictionary path is exercised by the fixtures and by any file from a writer that emits `encoding_stats`.
     Reaching it for the rest means decoding the pages without Arrow's reader, which is a larger decision than
     this item and the same one ADR 0021's residual narrowing pass wants.
+    - **Correction (2026-10-25): it does not, and the reason given above for not deciding this ourselves was
+      wrong on a point of fact.** This entry said "a second gate of our own could only disagree with Arrow's,
+      and Arrow's is the one that governs whether `ReadBatchWithDictionary` throws". Arrow's gate and the throw
+      are not the same question. `ColumnWithExposeEncoding` reads `encoding_stats` and, when it is satisfied,
+      sets one field: `exposed_encoding_`, which Arrow 25's reader **sets, returns and acts on nowhere else**
+      (`column_reader.cc:941,977,986` are its only three occurrences). What governs the throw is
+      `current_encoding_ != RLE_DICTIONARY`, tested per data page. So the advisory flag can be left to Arrow
+      while the real question -- has this chunk a page that would throw -- is answered from `encodings`, which
+      Parquet **requires** of every column chunk where `encoding_stats` is optional. See the item below.
 - **Ordering the columns a scan filters: built 2026-10-21.** The scan applies the filter's columns one at a
   time, each narrowing the selection the next one sees, so a column placed late does its per-row predicate work
   only over the rows the earlier ones left. Until this item the order was the order the predicates appeared in
@@ -233,6 +242,84 @@ Proposed
     `ScanFilter` and cannot tell a predicate's column from the join key's, and that column is read above by
     construction -- as the join's key for D1, as the aggregate's grouping key for D5. So the planner would have
     to label the droppable positions whatever happened to the conjunction.
+
+- **Taken after all (2026-10-25): a VARCHAR column read only by a pushed predicate is read as
+  dictionary indices and never materialised.** The labelled version the refusal above named, which
+  that entry could not measure, and it is worth far more than the ceiling the unlabelled prototype
+  put on it: **0.971x of the 22** at four threads against 0.997x, because the two halves pay only
+  together.
+
+  | | 4 threads | 14 threads |
+  | --- | ---: | ---: |
+  | Q19 | **0.759x** | **0.804x** |
+  | Q10 | **0.829x** | **0.862x** |
+  | Q13 | 0.928x | 0.934x |
+  | Q06, Q21 | 0.969x, 0.969x | 0.990x, 0.973x |
+  | the 22, geomean | **0.971x** | **0.975x** |
+
+  5 repeats interleaved and rotated, both arms from one tree built by `pixi run static` (ADR 0033),
+  all 22 answers byte-identical at both thread counts. Peak memory does not move (14,088 to 14,167
+  MiB at four threads, 15,193 to 14,933 at 14): Q18 sets it and has no droppable VARCHAR. Nothing
+  regresses beyond the host's +-1.4% noise -- the widest are Q01 1.017x and Q04 1.011x, both with no
+  VARCHAR predicate at all, which is what calibrates that floor.
+
+  **Against DuckDB this moves the suite's two worst queries off the top of the list.** Composing
+  these ratios with a same-session DuckDB comparison (rather than dividing arms across sessions,
+  which flatters the branch by three points): Q10 1.698x to **1.408x**, Q19 1.632x to **1.239x**,
+  Q13 0.999x to **0.927x**, and the 22 from 1.249x to about **1.213x** of DuckDB's geomean. Q10 was
+  the worst query in the suite and is no longer.
+
+  - **Why the refusal's 0.997x was right about what it measured and wrong about the item.** The
+    refusal skipped the *copy into the batch* and kept everything else. That copy is the smaller
+    half: on a 4-value dictionary column over 600 million rows, one equality predicate measures
+    2.49 ns a row through views against 0.99 ns through the dictionary, while **materialising the
+    column densely is 10.83** -- so skipping the copy alone leaves the per-row view fill and the
+    compare in place. Doing both, which is possible only where a dictionary answers the predicate,
+    measures **0.646x** on that scan. Each half alone is noise; the item is their conjunction, and
+    the refusal had no way to see that because it never reached a dictionary on this data.
+  - **Three things had to be true at once**, which is why it took a correction to this ADR to find:
+    1. **`io` must reach the dictionary at all.** It could not on any file this project benchmarks,
+       for the reason the correction above records: Arrow's door reads the optional `encoding_stats`
+       and DuckDB, which wrote this data, emits none. `io` now decides from the **required**
+       `encodings` where Arrow declines (`EveryDataPageIsDictionary`). Only a **v1** dictionary page
+       proves it -- v1 marks the dictionary page and its data pages alike, so a chunk listing
+       `PLAIN_DICTIONARY` and nothing else holds no plain page, whereas v2 marks the dictionary page
+       `PLAIN` and leaves `{PLAIN, RLE_DICTIONARY}` ambiguous. v2 files keep Arrow's door, which
+       grants them, so the two paths do not overlap and neither is dead.
+    2. **The planner must say which columns nothing above reads.** `FilterNode::needed_above`, the
+       demand recorded in the moment before the Filter's own predicates join it -- the same field and
+       the same capture point as ADR 0026's `JoinNode::needed_above`, with both of that item's
+       review findings built in from the start (intersected with the node's own outputs, and
+       replaced rather than appended). It is a **std::optional**, where the join's is a plain vector,
+       because an empty set is the *valuable* case and not the missing one: a `COUNT(*)` with a
+       `WHERE` reads nothing above its Filter, so every column its scan reads is read to be compared
+       and for nothing else. The join's field gives that case up.
+    3. **The position must survive.** Every operator above reads a column by the position
+       `ResolvePositions` gave it, so a column cannot simply be removed from the middle of a scan's
+       output. `plan::Table::ScanPart` takes a `returned` count and the table puts the returned
+       fields first; the operator then puts them back where they belong, with an all-NULL array of
+       the field's **declared** type in each gap. Not the `null` type ADR 0016's late split uses: a
+       late column is re-read by a node that knows it is a placeholder, where this one can flow into
+       a join build and be gathered past the join, and an `ANTB1_CHECK` in the gather said so on the
+       first run.
+  - **Where an empty `strings` is a trap, and why the condition is the consumer's.** With a
+    dictionary the filter reads `dictionary` and `indices` and never `strings`, so the views need not
+    be written at all -- but `KeepByDictionary` **declines** when the dictionary holds more distinct
+    values than the piece has rows, falling back to one compare a row. Skipped views under any
+    weaker condition would leave that fallback reading values nobody wrote. So `io` skips them per
+    piece under exactly that condition, `ScanFilter::Apply` accepts the second shape only when it
+    holds, and refuses a dictionary larger than the piece with no views -- a shape no table may
+    produce, asserted rather than commented.
+  - **What the tests reach.** The proof itself is unit-tested over the four shapes Arrow's writer
+    can produce (v1 dictionary, v2 dictionary, a real fallback, no dictionary), each asserted against
+    **both** doors, with the invariant that between them they reach every fully dictionary-encoded
+    chunk. The chain from SQL to the metric is pinned by an integration case over a file the **test
+    oracle** writes, because Arrow's writer cannot produce one without `encoding_stats` and that is
+    the only situation in which the new proof decides anything: it asserts that Arrow's door declines
+    for that file and that `cols_filter_only` and `dict_pieces` are what they should be. Removing
+    either half of the item fails that one case. Both metrics exist for the reason ADR 0026's C8a
+    learned the hard way -- a scan that quietly stops doing this answers exactly the same -- and the
+    `explain --analyze` goldens now assert them rather than a reader checking once.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
 this implementation does not comply with all requirements of the TPC-H Benchmark.
