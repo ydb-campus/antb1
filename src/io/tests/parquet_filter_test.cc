@@ -22,6 +22,7 @@
 #include <arrow/util/bit_util.h>
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/properties.h>
 
@@ -538,6 +539,85 @@ TEST_F(ParquetFilterErrorsTest, UnsupportedColumnsAndBadRequests) {
       std::vector<int>{3}, std::vector<Predicate>{[](const Value&) { return true; }});
   EXPECT_TRUE(
       (*table)->ScanPart(0, {2}, 10, arrow::default_memory_pool(), beyond).status().IsInvalid());
+}
+
+// The proof that lets a chunk be read as dictionary indices where Arrow's own door declines
+// (ADR 0020). It reads the REQUIRED `encodings`, and only a v1 dictionary page proves anything --
+// the four writer shapes below are the whole of the reasoning, and three of them must decline.
+//
+// The point of the two doors is that they do not overlap, so each case asserts BOTH: what Arrow
+// grants from the optional `encoding_stats` and what the metadata proves without it.
+TEST_F(ParquetFilterErrorsTest, EveryDataPageIsDictionaryProvesWhatArrowsDoorCannot) {
+  // Two tables: one whose column has four distinct values, so its dictionary never outgrows a
+  // page, and one whose every value is distinct, which forces a writer to fall back to plain
+  // pages once the dictionary fills. Which table a case uses is what makes it that case.
+  const auto table_of = [](bool distinct) {
+    arrow::StringBuilder s;
+    arrow::Int64Builder n;
+    for (int i = 0; i < 2000; ++i) {
+      EXPECT_TRUE(
+          s.Append(distinct ? "value-" + std::to_string(i) : "v" + std::to_string(i % 4)).ok());
+      EXPECT_TRUE(n.Append(i).ok());
+    }
+    return arrow::Table::Make(
+        arrow::schema({arrow::field("s", arrow::utf8()), arrow::field("n", arrow::int64())}),
+        {s.Finish().ValueOrDie(), n.Finish().ValueOrDie()});
+  };
+  // Each shape with the one writer property that produces it, and what each door says.
+  struct Case {
+    std::string name;
+    bool v1 = false;
+    bool dictionary = true;
+    bool distinct = false;      // every value distinct, so the dictionary fills and falls back
+    bool proof = false;         // EveryDataPageIsDictionary
+    bool arrow_grants = false;  // ColumnWithExposeEncoding
+  };
+  const std::vector<Case> cases = {
+      // v1 marks the dictionary page and its data pages alike, so nothing else is listed.
+      {.name = "v1 dictionary", .v1 = true, .proof = true, .arrow_grants = true},
+      // v2 marks the dictionary page PLAIN, which a fallback page is also marked: ambiguous, so
+      // this declines and leaves it to Arrow, which has encoding_stats and grants it.
+      {.name = "v2 dictionary", .proof = false, .arrow_grants = true},
+      // More distinct values than a dictionary page holds: real plain data pages, and neither door
+      // grants it. This is the case that makes the proof a proof rather than a guess.
+      {.name = "v1 fallback", .v1 = true, .distinct = true, .proof = false},
+      // No dictionary at all.
+      {.name = "plain", .dictionary = false, .proof = false},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    const std::string path = (dir_ / (c.name + ".parquet")).string();
+    parquet::WriterProperties::Builder props;
+    props.data_pagesize(1024)->write_batch_size(64);
+    if (c.v1) {
+      props.version(parquet::ParquetVersion::PARQUET_1_0);
+    }
+    if (!c.dictionary) {
+      props.disable_dictionary();
+    }
+    if (c.distinct) {
+      props.dictionary_pagesize_limit(64);
+    }
+    auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table_of(c.distinct), arrow::default_memory_pool(), out,
+                                           1000, props.build())
+                    .ok());
+    ASSERT_TRUE(out->Close().ok());
+    auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+    ASSERT_GT(reader->metadata()->num_row_groups(), 0);
+    auto group = reader->RowGroup(0);
+    EXPECT_EQ(EveryDataPageIsDictionary(*group->metadata()->ColumnChunk(0)), c.proof)
+        << "the string column";
+    EXPECT_EQ(group->ColumnWithExposeEncoding(0, parquet::ExposedEncoding::DICTIONARY)
+                      ->GetExposedEncoding() == parquet::ExposedEncoding::DICTIONARY,
+              c.arrow_grants)
+        << "Arrow's own door";
+    // Between them the two doors reach every dictionary-encoded shape this writer produces, which
+    // is the claim that makes deciding it ourselves worth the code.
+    EXPECT_EQ(c.proof || c.arrow_grants, c.dictionary && !c.distinct);
+    // The proof knows nothing about types -- a numeric chunk can satisfy it too. What keeps this
+    // off a numeric column is the caller, which asks only for a BYTE_ARRAY one.
+  }
 }
 
 TEST_F(ParquetFilterErrorsTest, FilterErrorsAndChangedFiles) {

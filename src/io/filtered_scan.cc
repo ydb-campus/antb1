@@ -229,16 +229,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> FixedArray(
 }
 
 // A column being read: its reader, as the right typed reader.
-// Whether every DATA page of this column chunk is dictionary-encoded, so that the chunk can be
-// read as indices into one dictionary (ADR 0020). A writer falls back to plain encoding once its
-// dictionary outgrows its page limit, and parquet::TypedColumnReader::ReadBatchWithDictionary
-// THROWS on the first such page rather than degrading -- so this is decided from the metadata
-// before any page is read, never caught after.
-//
 struct ColumnState {
   FilteredColumn column;
   int16_t max_def = 0;
   bool dictionary = false;  // read as indices into the chunk's dictionary
+  bool returned = true;     // whether the batches carry it, or it is read only to filter on
   std::shared_ptr<parquet::ColumnReader> reader;
   // The last batch read, of the column's physical type (kept: the next batch reuses its memory).
   Decoded<int32_t> int32s;
@@ -252,16 +247,20 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   FilteredScanReader(Segment segment, std::vector<FilteredColumn> columns,
                      std::shared_ptr<arrow::Schema> schema, int64_t batch_size,
                      arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
-                     bool positions)
+                     bool positions, int returned)
       : segment_(std::move(segment)),
         schema_(std::move(schema)),
         batch_size_(batch_size),
         pool_(pool),
         filter_(std::move(filter)),
-        positions_(positions) {
+        positions_(positions),
+        returned_(returned) {
     for (FilteredColumn& column : columns) {
+      // The batches carry the first `returned` columns; a later one is read to be filtered on.
+      const bool carried = std::cmp_less(columns_.size(), returned_);
       columns_.push_back(ColumnState{.column = std::move(column),
                                      .max_def = 0,
+                                     .returned = carried,
                                      .reader = nullptr,
                                      .int32s = {},
                                      .int64s = {},
@@ -332,19 +331,20 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       // once per distinct value rather than once per row (ADR 0020). Nothing else gains: a
       // fixed-width column's predicate is already one compare a value.
       //
-      // Arrow decides whether to grant it and is strict about when: it exposes the dictionary only
-      // for a chunk it can PROVE is fully dictionary-encoded, which it reads from the optional
-      // encoding_stats metadata and declines when that is absent -- so a file whose chunk is
-      // dictionary-encoded but carries no encoding_stats takes the plain path. Asking and then
-      // reading the answer is the whole of the decision; a second gate of our own could only
-      // disagree with Arrow's, and Arrow's is the one that governs whether
-      // ReadBatchWithDictionary throws.
+      // Arrow decides whether to grant it from the OPTIONAL encoding_stats and declines whenever
+      // that is absent, which no writer is obliged to emit and DuckDB does not -- so every file
+      // this project benchmarks took the plain path, and the dictionary read had never run on one.
+      // Where Arrow declines we decide from the REQUIRED `encodings` instead
+      // (EveryDataPageIsDictionary above, which says why that is a different question rather than
+      // a second opinion on the same one).
       const bool string_column = state.column.physical == Physical::kByteArray;
       state.reader = string_column ? row_group_->ColumnWithExposeEncoding(
                                          state.column.leaf, parquet::ExposedEncoding::DICTIONARY)
                                    : row_group_->Column(state.column.leaf);
-      state.dictionary = string_column &&
-                         state.reader->GetExposedEncoding() == parquet::ExposedEncoding::DICTIONARY;
+      state.dictionary =
+          string_column &&
+          (state.reader->GetExposedEncoding() == parquet::ExposedEncoding::DICTIONARY ||
+           EveryDataPageIsDictionary(*row_group_->metadata()->ColumnChunk(state.column.leaf)));
       state.max_def =
           segment_.metadata->schema()->Column(state.column.leaf)->max_definition_level();
     }
@@ -380,7 +380,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
                           arrow::AllocateBitmap(rows, pool_));
     std::uint8_t* selected = selection->mutable_data();
     arrow::bit_util::SetBitsTo(selected, 0, rows, true);
-    std::vector<std::shared_ptr<arrow::Array>> arrays(columns_.size());
+    std::vector<std::shared_ptr<arrow::Array>> arrays(static_cast<std::size_t>(returned_));
     // The filter's columns: fixed-width ones whole, strings piece by piece (the views of a piece
     // live until the next read), keeping the values of the rows still selected.
     std::vector<std::unique_ptr<Candidates>> candidates(columns_.size());
@@ -390,7 +390,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       ColumnState& state = columns_[p];
       const int index = filter_index_[p];
       if (state.column.physical == Physical::kByteArray) {
-        candidates[p] = std::make_unique<Candidates>(pool_);
+        candidates[p] = std::make_unique<Candidates>(pool_, state.returned);
         ARROW_RETURN_NOT_OK(candidates[p]->Reserve(rows));
         ARROW_RETURN_NOT_OK(FilterStrings(state, index, rows, selected, *candidates[p]));
       } else {
@@ -404,6 +404,9 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     const int64_t count = arrow::internal::CountSetBits(selected, 0, rows);
     for (std::size_t p = 0; p < columns_.size(); ++p) {
       ColumnState& state = columns_[p];
+      if (!state.returned) {
+        continue;  // read and filtered on above; no batch carries it
+      }
       if (filter_index_[p] >= 0) {
         if (count == 0) {
           continue;
@@ -456,16 +459,20 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // The values a filter's string column kept for the rows still selected after its own
   // predicates: the rows (in order) and their values.
   struct Candidates {
-    explicit Candidates(arrow::MemoryPool* pool) : values(pool) {}
+    Candidates(arrow::MemoryPool* pool, bool keep) : values(pool), keep_values(keep) {}
 
     // Room for `rows` values.
     arrow::Status Reserve(int64_t count) {
       rows.reserve(static_cast<std::size_t>(count));
-      return values.Reserve(count);
+      return keep_values ? values.Reserve(count) : arrow::Status::OK();
     }
 
     std::vector<int64_t> rows;
     arrow::BinaryBuilder values;  // in the query's pool, so that the budget sees the bytes
+    // Whether the values are kept at all. A column no batch carries is read to be compared and
+    // for nothing else, so its bytes are never appended here -- on a VARCHAR column that copy is
+    // the greater part of what the scan does with it.
+    bool keep_values = true;
 
     // The values of the rows selected in the end.
     arrow::Result<std::shared_ptr<arrow::Array>> Finish(const std::uint8_t* selected, int64_t count,
@@ -501,7 +508,8 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       ARROW_RETURN_NOT_OK(filter_->Apply(
           index,
           plan::ScanValues{.array = nullptr,
-                           .strings = std::span<const std::string_view>(views_),
+                           .strings = piece_views_ ? std::span<const std::string_view>(views_)
+                                                   : std::span<const std::string_view>(),
                            .validity = piece_nulls_ ? piece_valid_.data() : nullptr,
                            .rows = piece,
                            .dictionary = state.dictionary
@@ -510,6 +518,16 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
                            .indices = state.dictionary ? std::span<const std::int32_t>(indices_)
                                                        : std::span<const std::int32_t>()},
           done, selected));
+      if (!kept.keep_values) {
+        // Only which rows passed; no batch carries this column's values.
+        arrow::internal::VisitSetBitRunsVoid(selected, done, piece, [&](int64_t row, int64_t run) {
+          for (int64_t i = 0; i < run; ++i) {
+            kept.rows.push_back(row + i);
+          }
+        });
+        done += piece;
+        continue;
+      }
       ARROW_RETURN_NOT_OK(kept.values.ReserveData(SelectedBytes(selected, done)));
       for (int64_t i = 0; i < piece; ++i) {
         if (BitAt(selected, done + i)) {
@@ -568,7 +586,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // filled either way; the dictionary read additionally fills dict_views_ and indices_.
   arrow::Status ReadPiece(const ColumnState& state, parquet::ByteArrayReader& reader,
                           int64_t rows) {
-    return state.dictionary ? ReadDictionaryPiece(reader, state.max_def, rows)
+    return state.dictionary ? ReadDictionaryPiece(reader, state.max_def, rows, state.returned)
                             : ReadStringPiece(reader, state.max_def, rows);
   }
 
@@ -577,8 +595,8 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // consumer of it is unchanged; what this adds is dict_views_ and indices_, which let a predicate
   // be asked once per distinct value. Only called when the metadata said every data page of the
   // chunk is dictionary-encoded, because ReadBatchWithDictionary throws on one that is not.
-  arrow::Status ReadDictionaryPiece(parquet::ByteArrayReader& reader, int16_t max_def,
-                                    int64_t rows) {
+  arrow::Status ReadDictionaryPiece(parquet::ByteArrayReader& reader, int16_t max_def, int64_t rows,
+                                    bool returned) {
     levels_.resize(static_cast<std::size_t>(rows));
     indices_.resize(static_cast<std::size_t>(rows));
     const parquet::ByteArray* dict = nullptr;
@@ -603,6 +621,14 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       dict_views_[static_cast<std::size_t>(d)] =
           std::string_view(reinterpret_cast<const char*>(dict[d].ptr), dict[d].len);
     }
+    // **Whether to spend a view a row at all.** A column no batch carries is read to be compared
+    // and for nothing else, and where the predicate can be answered from the dictionary the views
+    // have no reader -- so they are not written. The condition is the consumer's, not a guess:
+    // exec's filter takes the dictionary only when it holds no more distinct values than the piece
+    // has rows (the dictionary belongs to the whole column chunk, a piece to one page of it), and
+    // falls back to one compare a row otherwise. Were the views skipped under any weaker
+    // condition, that fallback would read values nobody wrote.
+    piece_views_ = returned || std::cmp_greater(dict_views_.size(), levels);
     views_.resize(static_cast<std::size_t>(levels));
     piece_nulls_ = indices_read < levels;
     if (piece_nulls_) {
@@ -617,13 +643,17 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       if (!piece_nulls_ || levels_[row] == max_def) {
         const std::int32_t index = indices_[static_cast<std::size_t>(--next)];
         indices_[row] = index;
-        views_[row] = dict_views_[static_cast<std::size_t>(index)];
+        if (piece_views_) {
+          views_[row] = dict_views_[static_cast<std::size_t>(index)];
+        }
         if (piece_nulls_) {
           SetBitAt(piece_valid_.data(), i);
         }
       } else {
         indices_[row] = 0;
-        views_[row] = std::string_view();
+        if (piece_views_) {
+          views_[row] = std::string_view();
+        }
       }
     }
     indices_.resize(static_cast<std::size_t>(levels));
@@ -633,6 +663,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // Reads the next piece (at most `rows` rows, within one page) of a string column into views_,
   // one view per row, with piece_valid_ when some row is NULL.
   arrow::Status ReadStringPiece(parquet::ByteArrayReader& reader, int16_t max_def, int64_t rows) {
+    piece_views_ = true;  // without a dictionary the compare has nothing else to read
     levels_.resize(static_cast<std::size_t>(rows));
     values_.resize(static_cast<std::size_t>(rows));
     int64_t values_read = 0;
@@ -766,7 +797,9 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // the dictionary read, and rebuilt each time so that no view outlives the bytes it points at.
   std::vector<std::string_view> dict_views_;
   std::vector<std::int32_t> indices_;
-  bool positions_ = false;         // a last column with the rows' positions in the row group
+  bool positions_ = false;
+  int returned_ = 0;  // the columns the batches carry, the first of columns_         // a last
+                      // column with the rows' positions in the row group
   std::vector<int> filter_index_;  // per column: its position in filter_->columns(), or -1
   // The reader of the file outlives its row group's and columns' readers (Close, the destructor).
   std::unique_ptr<parquet::ParquetFileReader> file_reader_;
@@ -781,6 +814,10 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   std::vector<std::string_view> views_;
   std::vector<std::uint8_t> piece_valid_;
   bool piece_nulls_ = false;
+  // Whether views_ holds this piece's values. False only for a column no batch carries whose
+  // predicate the dictionary can answer: plan::ScanValues then carries the dictionary and the
+  // indices alone, which is a shape its contract names.
+  bool piece_views_ = true;
 };
 
 }  // namespace
@@ -888,15 +925,64 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
   return std::nullopt;
 }
 
+// Whether every DATA page of this column chunk is dictionary-encoded, so that the chunk can be
+// read as indices into one dictionary (ADR 0020). A writer falls back to plain encoding once its
+// dictionary outgrows its page limit, and parquet::TypedColumnReader::ReadBatchWithDictionary
+// THROWS on the first such page rather than degrading -- so this is decided from the metadata
+// before any page is read, never caught after.
+//
+// This reads `encodings`, which Parquet REQUIRES of every column chunk, where Arrow's own door
+// (parquet::RowGroupReader::ColumnWithExposeEncoding) reads the OPTIONAL `encoding_stats` and
+// declines whenever that is absent. **The two are not the same question**, which is what makes
+// this worth deciding rather than a second opinion on Arrow's: `encoding_stats` gates only
+// Arrow's ExposedEncoding flag, which the reader sets, returns and acts on nowhere, while what
+// governs the throw is the encoding of the data page in hand. A chunk whose `encodings` name no
+// value encoding but the v1 dictionary one has no page that could throw.
+//
+// **Only a v1 dictionary page is proof.** v1 marks the dictionary page and the data pages that
+// index it alike, PLAIN_DICTIONARY, so a chunk listing that and nothing else cannot hold a plain
+// data page. v2 marks the dictionary page PLAIN and the data pages RLE_DICTIONARY, which leaves
+// `{PLAIN, RLE_DICTIONARY}` ambiguous -- that PLAIN is either the dictionary page or a page the
+// writer fell back to, and the metadata cannot say which. Those files are left to Arrow's door,
+// which grants them: a writer that emits v2 pages emits `encoding_stats` too, this repository's
+// own fixtures among them. So the two paths do not overlap and neither is dead.
+bool EveryDataPageIsDictionary(const parquet::ColumnChunkMetaData& chunk) {
+  bool dictionary = false;
+  for (const parquet::Encoding::type encoding : chunk.encodings()) {
+    switch (encoding) {
+      case parquet::Encoding::PLAIN_DICTIONARY:
+        dictionary = true;
+        break;
+      case parquet::Encoding::RLE:
+      case parquet::Encoding::BIT_PACKED:
+        break;  // a level encoding, not a value one
+      default:
+        return false;  // a value encoding that is not the v1 dictionary: a page may be plain
+    }
+  }
+  return dictionary;
+}
+
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
     Segment segment, std::vector<FilteredColumn> columns, std::shared_ptr<arrow::Schema> schema,
     int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
-    bool positions) {
+    bool positions, int returned) {
   if (batch_size < 1) {
     return arrow::Status::Invalid("the scan batch size must be positive, not ", batch_size);
   }
   if (segment.row_groups.size() != 1) {
     return arrow::Status::Invalid("a filtered scan reads one row group");
+  }
+  if (returned < 0) {
+    returned = static_cast<int>(columns.size());
+  }
+  if (std::cmp_greater(returned, columns.size())) {
+    return arrow::Status::Invalid("a filtered scan returns ", returned, " of ", columns.size(),
+                                  " columns");
+  }
+  if (std::cmp_not_equal(returned, schema->num_fields())) {
+    return arrow::Status::Invalid("a filtered scan's schema has ", schema->num_fields(),
+                                  " fields for ", returned, " returned columns");
   }
   std::vector<bool> seen(columns.size(), false);
   for (const int column : filter->columns()) {
@@ -913,7 +999,7 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
   }
   return std::make_unique<FilteredScanReader>(std::move(segment), std::move(columns),
                                               std::move(schema), batch_size, pool,
-                                              std::move(filter), positions);
+                                              std::move(filter), positions, returned);
 }
 
 }  // namespace antb1::io
