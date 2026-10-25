@@ -806,6 +806,12 @@ std::optional<ProbeKey> ProbeKeyAt(const plan::ScanNode& scan, const PipelineBui
       // nothing and leave the position naming another column -- the quiet half of this hazard,
       // which drops rows that match rather than failing. An unnamed column cannot be counted on,
       // so it ends the walk instead.
+      //
+      // **What this trusts is one id per output column**, which is ADR 0023's one output-id
+      // contract and what `plan::JoinIds` builds. It is the one assumption the bounds below cannot
+      // check: a vector of the wrong length subtracts the wrong width and can land inside this
+      // scan's fields, where no later test can tell it from the right answer. Every other way of
+      // getting the width wrong ends up outside them.
       const std::vector<plan::ColumnId> prefix = plan::OutputIds(*below->left);
       if (prefix.empty() || std::ranges::contains(prefix, plan::kNoColumnId)) {
         return std::nullopt;
