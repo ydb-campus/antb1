@@ -12,6 +12,7 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `PR title` | `.github/workflows/pr-title.yml` | pull requests (opened, edited, reopened, synchronized), merge queue | Conventional Commits title; required check `PR title` |
 | `CodeQL` | `.github/workflows/codeql.yml` | every pull request to `main` (no paths filter), pushes to `main`, weekly, manual | code scanning of the C++ code and the workflows; a merge gate through the ruleset ([CodeQL](#codeql)) |
 | `Nightly` | `.github/workflows/nightly.yml` | daily schedule, manual | deep checks, advisory; a failure opens a `nightly-failure` issue ([Nightly](#nightly)) |
+| `static` | `.github/workflows/static.yml` | pull requests that change the build (`pixi.toml`, `pixi.lock`, presets, `cmake/**`, any `CMakeLists.txt`, `src/cli/**`, `src/common/**`, the static scripts, the workflow), pushes to `main`, manual | the standalone static binary on its three targets, advisory ([Standalone static build](#standalone-static-build)) |
 | `Security` | `.github/workflows/security.yml` | pushes and pull requests that change `.github/**`, weekly, manual | zizmor with its online audits, results in the Security tab; advisory |
 | `Scorecard` | `.github/workflows/scorecard.yml` | pushes to `main`, weekly, branch protection changes | OpenSSF Scorecard, results in the Security tab and on scorecard.dev; advisory |
 | `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
@@ -61,6 +62,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `default` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series |
+| `static <target> (pixi run static)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static` (on that platform) |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -101,7 +103,8 @@ Advisory jobs (not required):
   Fork PRs get no comment (their token cannot write); the table is still in the job summary.
 - `cache-gc` runs after every run on `main` (never on pull requests or in the merge queue) with `actions: write`. It
   deletes the pixi caches of other `pixi.lock` generations, the data caches of other `tools/data/clickbench.lock`
-  files and all but the newest ccache of each leg, then lists what is left in the job summary. A run whose commit is
+  files, all but the newest ccache of each leg and all but the newest static Arrow prefix of each target, then lists
+what is left in the job summary. A run whose commit is
   no longer the head of `main` deletes nothing, so it never removes the caches of a newer lock. Pull requests still
   on an older `pixi.lock` install their environments without a cache until they merge `main`.
 - `pixi run ci` (Clang Debug `-Werror` plus tests) is not a separate job; it is the fast local gate inside
@@ -112,6 +115,28 @@ Advisory jobs (not required):
 CI always calls tasks with an explicit environment and a frozen lock, for example
 `pixi run --frozen -e default asan` or `pixi run --frozen -e gcc ci-gcc`, after installing pixi 0.81.0 with
 prefix-dev/setup-pixi.
+
+### Standalone static build
+
+The release and performance binary ([ADR 0033](adr/0033-standalone-static-binary.md)) has its own environment,
+`static`, and four tasks:
+
+- `pixi run static-arrow` (network on the first run) downloads the sources pinned in
+  `cmake/static/arrow-sources.lock` and builds Arrow 25 and the dependencies it bundles as static `-O3` ThinLTO
+  libraries into `$ANTB1_ARROW_DIR/<key>/prefix` (default `~/.cache/antb1/arrow`). A prefix whose key matches is
+  reused; `--print-key` prints the key (the cache key below).
+- `pixi run static` builds antb1 in `build/static` against that prefix, packages it into `build/static/package`
+  (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the packaged file:
+  linkage, link flags, build identity, the allocator restart, smoke tests and every CLI golden.
+- `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a
+  downloaded package or a copy on a benchmark host.
+- `pixi run static-test` builds every target of `build/static` and runs all hermetic tests against the static Arrow.
+
+The `static` workflow runs `pixi run static` on linux-x86_64 (ubuntu-24.04), linux-aarch64 (ubuntu-24.04-arm)
+and darwin-arm64 (macos-15). It is advisory and not part of `CI OK`. Its pixi environment is not cached. The
+Arrow prefix is restored from `static-arrow-<target>-<key>` and saved from pushes to `main` only. Runs on `main`
+and manual runs upload the package as the `antb1-<target>` artifact. These runs are cold until `main` has saved a
+prefix (a cold build takes about a minute on a 64-core host; the CI runners are slower).
 
 ## Nightly
 
@@ -126,6 +151,8 @@ but every failure is tracked in an issue.
 | `arm64` | ubuntu-24.04-arm | `pixi run release` then `pixi run test-data` | Linux ARM64: the release build, the hermetic tests and the data tests |
 | `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
 | `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
+| `static-cold <target>` | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `ANTB1_ARROW_DIR=<an empty directory> pixi run static` | the standalone static build from scratch, as a release builds it: every pinned source downloaded again |
+| `static-test` | ubuntu-24.04 | `pixi run static-test` | every hermetic test in `build/static`, against the static Arrow (the prefix `main` saved); each of its 20 executables is a ThinLTO link over that Arrow, about 4 CPU-hours in all |
 | `report` | ubuntu-slim | nothing to run | on any failed or timed-out job: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
 
 The nightly jobs only read caches: pixi environments and ccache come from the runs on `main` (`asan-data` reuses
@@ -187,6 +214,7 @@ measurements are recorded here once enough runs exist.
 | `fuzz-long-artifacts` | nightly `fuzz-long` | when long fuzzing fails | 14 days |
 | `scorecard-sarif` | `Scorecard` | always | 5 days |
 | `bench-results` | `bench-run` | always | 30 days |
+| `antb1-<target>` | `static <target>` | pushes to `main` and manual runs | 30 days |
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
 corpus, the benchmark results hold only timings (never query text or results), and the data jobs
@@ -204,6 +232,9 @@ tests over the data derived from TPC-H, which is redacted like the data tests' (
   ccache.
 - ClickBench data: `.cache/clickbench` under the key `clickbench-<hash of tools/data/clickbench.lock>`, saved by
   `clickbench-hits0` on `main` after a miss and read by every data job.
+- The static Arrow prefix: `.cache/arrow/<key>` under the key `static-arrow-<target>-<key>`, where the key is
+  `pixi run static-arrow --print-key`. The `static` workflow saves it from pushes to `main`. The nightly
+  `static-test` reads it; `static-cold` never does.
 - `cache-gc` removes stale entries after each run on `main` (see above).
 - A run on a pull request is cancelled when a newer push to the same PR arrives; runs on `main` are never
   cancelled.

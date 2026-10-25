@@ -851,6 +851,15 @@ antb1_add_cli_golden(
   STDOUT_REGEX "^antb1 [0-9]+[.][0-9]+[.][0-9]+[^ ]* [(]Apache Arrow [0-9]+[.][0-9]+[.][0-9]+[)]$"
   ARGS version
 )
+# The build behind a binary (docs/adr/0033): the same first line, then one "<key>: <value>" line per fact. The
+# values differ between builds (dynamic, static-thinlto), except that every codec must be there.
+set(_line "[^\n]+\n")
+set(_verbose "^antb1 [0-9]+[.][0-9]+[.][0-9]+[^ ]* [(]Apache Arrow [0-9]+[.][0-9]+[.][0-9]+[)]\n")
+string(APPEND _verbose "commit: ${_line}build type: ${_line}compiler: ${_line}flavor: (dynamic|static-thinlto)\n")
+string(APPEND _verbose "cpu baseline: ${_line}target: ${_line}arrow: ${_line}arrow simd: ${_line}")
+string(APPEND _verbose "codecs: snappy yes, gzip yes, brotli yes, zstd yes, lz4 yes\nmemory pool: ${_line}")
+string(APPEND _verbose "mimalloc purge delay: [^\n]+$")
+antb1_add_cli_golden(version_verbose STDOUT_REGEX "${_verbose}" ARGS version --verbose)
 
 # Self-tests of the golden comparison (label harness): a changed stdout and a changed exit code must fail.
 # selftest/changed_stdout.stdout is text the CLI never prints (not a plausible wrong answer such as an
@@ -883,5 +892,41 @@ foreach(case IN ITEMS changed_stdout changed_exit_code)
       "${_t}"
       --format
       csv
+  )
+endforeach()
+
+# Self-tests of ANTB1_CLI_UNDER_TEST, which runs the CLI goldens against another binary (the packaged standalone
+# antb1, scripts/static.sh): the file it names runs instead of the build tree's antb1 (CMake stands in, so the
+# test fails unless the override is honoured), and it is refused together with ANTB1_UPDATE_GOLDENS.
+foreach(case IN ITEMS under_test under_test_update)
+  set(_exit 0)
+  set(_env "ANTB1_CLI_UNDER_TEST=${CMAKE_COMMAND}")
+  set(_require "ANTB1_CLI_UNDER_TEST=.* instead of ")
+  if(case STREQUAL "under_test_update")
+    set(_exit 1)
+    set(_env ${_env} ANTB1_UPDATE_GOLDENS=1)
+    set(_require "never used together with[ \n]+ANTB1_UPDATE_GOLDENS") # CMake wraps the message
+  endif()
+  antb1_add_expect_test(
+    harness.cli.${case}
+    LABELS harness
+    EXIT_CODE ${_exit}
+    REQUIRE "${_require}"
+    COMMAND
+      ${CMAKE_COMMAND}
+      -E
+      env
+      ${_env}
+      ${CMAKE_COMMAND}
+      -DANTB1_CLI=ON
+      -DNAME=under_test
+      "-DGOLDEN_DIR=${CMAKE_CURRENT_SOURCE_DIR}/selftest"
+      -DEXIT_CODE=0
+      "-DSTDOUT_REGEX=^cmake version "
+      -P
+      "${PROJECT_SOURCE_DIR}/cmake/scripts/CompareOutput.cmake"
+      --
+      $<TARGET_FILE:antb1>
+      --version
   )
 endforeach()

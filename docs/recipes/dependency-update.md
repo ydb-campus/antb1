@@ -20,13 +20,17 @@ Continue only with explicit approval, and only with the approved change.
 
 ## 2. Where things go in `pixi.toml`
 
-- Libraries and build tools shared by the `default` (Clang) and `gcc` environments: the default feature
-  (`[dependencies]`).
-- Compilers and compiler-specific tools: the environment's own feature (`clang` for `default`, `gcc` for `gcc`).
+- conda's Arrow (`libarrow`, `libarrow-compute`, `libparquet`) of the `default` and `gcc` environments: the default
+  feature (`[dependencies]`). Env `static` builds its own Arrow from `cmake/static/arrow-sources.lock` instead.
+- Build and test tools and libraries of `default`, `gcc` and `static`: feature `base`. The Clang toolchain of
+  `default` and `static`: feature `llvm` (`default` and `static` share a solve group, so they get the same versions).
+- Other compiler-specific tools: the environment's own feature (`clang` for `default`, `gcc` for `gcc`, `static`).
 - Formatters and linters: the `lint` feature (no C++ dependencies there).
 - DuckDB is a test oracle only (never linked into `src/`); new test-only packages follow the same rule.
 - Pin the minor version, for example `"25.0.*"`, and keep lockstep groups together:
-  - `libarrow`, `libarrow-compute` and `libparquet` (always the CPU builds);
+  - `libarrow`, `libarrow-compute` and `libparquet` (always the CPU builds), and with them the static build's pins:
+    an Arrow upgrade replaces every line of `cmake/static/arrow-sources.lock` (Arrow's source tarball, and the
+    dependency versions and sha256 of its `cpp/thirdparty/versions.txt`), then `pixi run static` must pass;
   - `clang`, `clangxx`, `clang-tools`, `llvm-tools`, `lld` and `compiler-rt`;
   - `libstdcxx-devel_*` and `libgcc-devel_*` (never `-stdlib=libc++` on Linux: conda Arrow uses libstdc++).
 - Tasks: a new task lives in exactly one environment and is documented in the AGENTS.md command table (lint checks

@@ -124,6 +124,9 @@ std::string ClickBenchJson(const BenchReport& report) {
   out += std::format("    \"compiler\": {},\n", JsonString(CompilerVersion()));
   out += std::format("    \"arrow\": {},\n", JsonString(ARROW_VERSION_STRING));
   out += std::format("    \"build_type\": {},\n", JsonString(BuildType()));
+  out += std::format("    \"flavor\": {},\n", JsonString(BuildFlavor()));
+  out += std::format("    \"cpu_baseline\": {},\n",
+                     CpuBaseline().empty() ? "null" : JsonString(CpuBaseline()));
   out += std::format("    \"cache\": \"{}\",\n", report.cold ? "cold" : "lukewarm");
   out += std::format("    \"tries\": {},\n", report.tries);
   out += std::format("    \"batch_size\": {},\n", report.batch_size);

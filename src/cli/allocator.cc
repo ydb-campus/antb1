@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,6 +42,15 @@ bool NeedsAllocatorRestart(const EnvLookup& env) {
 #else
   static_cast<void>(env);
   return false;
+#endif
+}
+
+const char* PurgeDelaySetting() {
+#ifdef __linux__
+  return FromEnviron(kPurgeDelay);
+#else
+  // NOLINTNEXTLINE(concurrency-mt-unsafe): nothing changes the environment while antb1 runs
+  return std::getenv("MIMALLOC_PURGE_DELAY");
 #endif
 }
 

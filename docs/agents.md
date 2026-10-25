@@ -153,6 +153,8 @@ Why it looks like this:
 - It is self-contained because it runs before Claude, from an unknown working directory, and it must never fail
   the session: every step has a timeout and the script always exits 0. Its worst case is about 290 seconds, within
   the setup time limit of about 5 minutes.
+- GitHub downloads of other projects are blocked (HTTP 403) in cloud sessions, so `pixi run static-arrow` (whose
+  pinned sources are mostly on GitHub) runs only in CI and on local hosts.
 - GitHub release downloads of other projects are blocked (HTTP 403) in cloud sessions, so it installs pixi 0.81.0
   from conda-forge and checks the file's sha256 (the same pin as `scripts/agent-setup.sh`). The conda-forge build
   needs glibc and OpenSSL 3, which the cloud image has.

@@ -17,7 +17,7 @@ antb1_add_module(
     shared_sub_plans.cc
     explain.cc
   PUBLIC_DEPS common sql
-  PUBLIC_LIBS Arrow::arrow_shared
+  PUBLIC_LIBS Arrow::arrow_${ANTB1_ARROW_LINKAGE}
 )
 
 if(ANTB1_BUILD_TESTS)

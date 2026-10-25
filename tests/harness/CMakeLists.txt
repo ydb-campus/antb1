@@ -3,7 +3,7 @@ add_library(antb1_fixture_digest_lib STATIC fixture_digest.cc)
 target_include_directories(antb1_fixture_digest_lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(
   antb1_fixture_digest_lib
-  PUBLIC Arrow::arrow_shared Parquet::parquet_shared antb1_slt_lib
+  PUBLIC Arrow::arrow_${ANTB1_ARROW_LINKAGE} Parquet::parquet_${ANTB1_ARROW_LINKAGE} antb1_slt_lib
   PRIVATE antb1::build_options
 )
 

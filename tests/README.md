@@ -77,6 +77,10 @@ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli
 
 Exit codes are never rewritten: change `EXIT_CODE` in `cli/CMakeLists.txt` deliberately.
 
+`ANTB1_CLI_UNDER_TEST=<absolute path>` runs every golden against another binary, such as the packaged standalone
+antb1 that `pixi run static` checks (`harness.cli.under_test*` prove that it is honoured and that it is refused
+together with `ANTB1_UPDATE_GOLDENS`).
+
 ## Harness self-tests (label `harness`)
 
 - `harness.slt.mutate.<kind>` and `harness.diff.mutate.<kind>`: corrupting antb1's answers (`--mutate`) must

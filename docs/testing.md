@@ -247,15 +247,21 @@ ANTB1_UPDATE_GOLDENS=1 pixi run test -L cli
 
 Exit codes are never rewritten: change `EXIT_CODE` in `tests/cli/CMakeLists.txt` deliberately.
 
+`ANTB1_CLI_UNDER_TEST=<absolute path>` runs the goldens against that binary instead of the build tree's `antb1`.
+`pixi run static` checks the packaged standalone binary this way ([ci.md](ci.md#standalone-static-build)). The
+variable is refused together with `ANTB1_UPDATE_GOLDENS`, so goldens are only written from the build tree's binary.
+`pixi run static-test` runs every hermetic test in `build/static`, against the static Arrow of that binary.
+
 ## Harness self-tests
 
 The `harness` label proves that the harness catches failures: every corruption of antb1's answers (`--mutate`) must
 make the slt runner and the differential test fail; `--redact` output never contains SQL, values or error messages
 (the canaries in `tests/slt/canary/`), and neither does the output of `answers` or of a run over tables marked
 `redact` in their tables file, which is redacted without `--redact`; the golden comparison catches changed output and
-exit codes; the fuzz replay catches a broken unparser; the fixtures match their digest; every `pending` record of the
-`.slt` files still gets Unsupported from antb1 (`harness.slt.pending`), and the check fails when antb1 answers the
-pending records of `tests/slt/selftest/pending.slt` (`harness.slt.pending.mutate.*`). A change to the harness comes
+exit codes and honours `ANTB1_CLI_UNDER_TEST`, never together with `ANTB1_UPDATE_GOLDENS`; the fuzz replay catches a
+broken unparser; the fixtures match their digest; every `pending` record of the `.slt` files still gets Unsupported
+from antb1 (`harness.slt.pending`), and the check fails when antb1 answers the pending records of
+`tests/slt/selftest/pending.slt` (`harness.slt.pending.mutate.*`). A change to the harness comes
 with a self-test that fails without it.
 
 ## Coverage
@@ -478,7 +484,8 @@ implementation does not comply with all requirements of the TPC-H Benchmark.
 
 - Put unit tests in `src/<module>/tests/<topic>_test.cc` and add the file to `antb1_add_module_tests(...)` in
   that module's `CMakeLists.txt`. Extra libraries go under `LIBS`: modules reachable through the allow-list (for
-  example `antb1::plan` in the `cli` tests) and libraries that build test data (for example `Parquet::parquet_shared`).
+  example `antb1::plan` in the `cli` tests) and libraries that build test data (for example
+  `Parquet::parquet_${ANTB1_ARROW_LINKAGE}`: Arrow's targets end in the linkage, shared or static).
   Tests of `common` and `sql` stay Arrow-free.
 - A test that replaces the global `operator new` (the allocation-failure hook of
   `src/exec/tests/bad_alloc_test.cc`, which fails chosen allocations of one call with `std::bad_alloc`) is an

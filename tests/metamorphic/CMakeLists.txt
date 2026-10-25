@@ -11,5 +11,5 @@ antb1_add_fixture_gtest(
   LABEL metamorphic
   PREFIX metamorphic
   SOURCES metamorphic_test.cc
-  LIBS antb1_metamorphic_lib Parquet::parquet_shared
+  LIBS antb1_metamorphic_lib Parquet::parquet_${ANTB1_ARROW_LINKAGE}
 )

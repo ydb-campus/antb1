@@ -22,13 +22,14 @@ set(ANTB1_DEPS_exec "common;plan") # never io: exec scans through plan::Table
 set(ANTB1_DEPS_engine "common;sql;plan;io;exec")
 set(ANTB1_DEPS_cli "common;engine")
 
+# Arrow's targets end in the linkage, shared or static (ANTB1_ARROW_LINKAGE, cmake/Antb1Dependencies.cmake).
 set(ANTB1_EXT_common "")
 set(ANTB1_EXT_sql "")
-set(ANTB1_EXT_plan "Arrow::arrow_shared")
-set(ANTB1_EXT_io "Arrow::arrow_shared;Parquet::parquet_shared")
-set(ANTB1_EXT_exec "Arrow::arrow_shared;ArrowCompute::arrow_compute_shared")
-set(ANTB1_EXT_engine "Arrow::arrow_shared;ArrowCompute::arrow_compute_shared")
-set(ANTB1_EXT_cli "Arrow::arrow_shared;CLI11::CLI11")
+set(ANTB1_EXT_plan "Arrow::arrow_${ANTB1_ARROW_LINKAGE}")
+set(ANTB1_EXT_io "Arrow::arrow_${ANTB1_ARROW_LINKAGE};Parquet::parquet_${ANTB1_ARROW_LINKAGE}")
+set(ANTB1_EXT_exec "Arrow::arrow_${ANTB1_ARROW_LINKAGE};ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}")
+set(ANTB1_EXT_engine "Arrow::arrow_${ANTB1_ARROW_LINKAGE};ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}")
+set(ANTB1_EXT_cli "Arrow::arrow_${ANTB1_ARROW_LINKAGE};CLI11::CLI11")
 
 # antb1_add_module(<name> SOURCES ... [PUBLIC_DEPS ...] [PRIVATE_DEPS ...] [PUBLIC_LIBS ...] [PRIVATE_LIBS ...])
 # Creates STATIC library antb1_<name> (alias antb1::<name>) with public headers in include/antb1/<name>/.

@@ -77,6 +77,20 @@
       }
     },
     {
+      "name": "static",
+      "displayName": "Standalone antb1 (pixi run static, ADR 0033): Release -O3 ThinLTO -Werror against the static Arrow of ANTB1_ARROW_PREFIX, tests and benchmarks",
+      "inherits": ["werror", "clang-only", "base"],
+      "toolchainFile": "${sourceDir}/cmake/static/toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PROJECT_INCLUDE": "${sourceDir}/cmake/static/project-include.cmake",
+        "CMAKE_PREFIX_PATH": "$env{ANTB1_ARROW_PREFIX};$env{CONDA_PREFIX}",
+        "ANTB1_ARROW_PREFIX": "$env{ANTB1_ARROW_PREFIX}",
+        "ANTB1_ARROW_LINKAGE": "static",
+        "ANTB1_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
       "name": "tsan",
       "displayName": "Nightly tsan: ThreadSanitizer, RelWithDebInfo",
       "inherits": ["clang-only", "base"],
@@ -104,6 +118,7 @@
     { "name": "coverage", "configurePreset": "coverage", "inherits": ["build-base"] },
     { "name": "fuzz", "configurePreset": "fuzz", "inherits": ["build-base"] },
     { "name": "bench", "configurePreset": "bench", "inherits": ["build-base"] },
+    { "name": "static", "configurePreset": "static", "inherits": ["build-base"] },
     { "name": "tsan", "configurePreset": "tsan", "inherits": ["build-base"] }
   ],
   "testPresets": [
@@ -141,6 +156,7 @@
     { "name": "ci-asan", "configurePreset": "ci-asan", "inherits": ["sanitizer-env", "hermetic"] },
     { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["hermetic"] },
     { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["hermetic"] },
+    { "name": "static", "configurePreset": "static", "inherits": ["hermetic"] },
     {
       "name": "coverage",
       "configurePreset": "coverage",
@@ -282,6 +298,14 @@
         { "type": "configure", "name": "ci" },
         { "type": "build", "name": "ci" },
         { "type": "test", "name": "ci-shuffle" }
+      ]
+    },
+    {
+      "name": "static-test",
+      "steps": [
+        { "type": "configure", "name": "static" },
+        { "type": "build", "name": "static" },
+        { "type": "test", "name": "static" }
       ]
     }
   ]

@@ -96,6 +96,8 @@ The JSON (timings shortened):
     "compiler": "Clang 23.1.2",
     "arrow": "25.0.0",
     "build_type": "Release",
+    "flavor": "dynamic",
+    "cpu_baseline": null,
     "cache": "lukewarm",
     "tries": 3,
     "batch_size": 65536,
@@ -105,6 +107,11 @@ The JSON (timings shortened):
   }
 }
 ```
+
+`flavor` is `dynamic` (conda's shared Arrow) or `static-thinlto` (the standalone binary of `pixi run static`,
+[ADR 0033](adr/0033-standalone-static-binary.md)), and `cpu_baseline` its CPU baseline (`null`: the compiler's
+default). Without `--git-sha`, `git_sha` is the commit built into the binary, if any, so a copy on a host without
+the repository still names its commit; `antb1 version --verbose` prints the same facts and Arrow's own build.
 
 Timings are plain fixed-point seconds. The exit code is 0 when every query ran or failed as outside the subset
 (`parse`, `bind` or `unsupported`); any other failure (`io`, `execution`, `internal`) sets the exit code of the first

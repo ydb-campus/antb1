@@ -271,6 +271,37 @@ TEST_F(CliTest, ExplainAndVersion) {
   EXPECT_NE(r.out.find("Apache Arrow 25."), std::string::npos) << r.out;
 }
 
+TEST_F(CliTest, VersionVerboseNamesTheBuild) {
+  const auto plain = Invoke({"version"});
+  const auto r = Invoke({"version", "--verbose"});
+  ASSERT_EQ(r.code, kExitOk) << r.err;
+  ASSERT_TRUE(r.out.starts_with(plain.out)) << "the first line is plain `version`'s: " << r.out;
+  std::vector<std::string> keys;
+  std::istringstream lines(r.out.substr(plain.out.size()));
+  for (std::string line; std::getline(lines, line);) {
+    const auto colon = line.find(": ");
+    ASSERT_NE(colon, std::string::npos) << line;
+    keys.push_back(line.substr(0, colon));
+    const std::string value = line.substr(colon + 2);
+    if (keys.back() == "commit") {
+      EXPECT_EQ(value, GitSha().empty() ? "unknown" : GitSha());
+    } else if (keys.back() == "flavor") {
+      EXPECT_EQ(value, BuildFlavor());
+    } else if (keys.back() == "cpu baseline") {
+      EXPECT_EQ(value, CpuBaseline().empty() ? "compiler default" : CpuBaseline());
+    } else if (keys.back() == "codecs") {
+      EXPECT_EQ(value, "snappy yes, gzip yes, brotli yes, zstd yes, lz4 yes");
+    } else if (keys.back() == "arrow") {
+      EXPECT_TRUE(value.starts_with(
+          std::format("{} (headers {}, ", ARROW_VERSION_STRING, ARROW_VERSION_STRING)))
+          << value;
+    }
+  }
+  EXPECT_EQ(keys, (std::vector<std::string>{"commit", "build type", "compiler", "flavor",
+                                            "cpu baseline", "target", "arrow", "arrow simd",
+                                            "codecs", "memory pool", "mimalloc purge delay"}));
+}
+
 TEST_F(CliTest, QueriesRunEveryShape) {
   auto r = Invoke({"query", "--clickbench", "-c",
                    "SELECT COUNT(*), MIN(EventDate), SUM(EventDate + 1) FROM t", "--table",
@@ -336,6 +367,8 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
     "compiler": "{}",
     "arrow": "{}",
     "build_type": "{}",
+    "flavor": "{}",
+    "cpu_baseline": {},
     "cache": "{}",
     "tries": 2,
     "batch_size": 65536,
@@ -346,6 +379,7 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
 }}
 )",
       fs::file_size(path_), Version(), CompilerVersion(), ARROW_VERSION_STRING, BuildType(),
+      BuildFlavor(), CpuBaseline().empty() ? "null" : std::format("\"{}\"", CpuBaseline()),
       kCanDropCaches ? "cold" : "lukewarm");
   EXPECT_EQ(ReadFile(out), expected);
 }
@@ -358,7 +392,10 @@ TEST_F(CliTest, BenchFailuresAndExitCodes) {
                   "", FakeHooks(drops));
   EXPECT_EQ(r.code, kExitOk) << r.err;
   EXPECT_NE(r.out.find("\"result\": [],\n"), std::string::npos) << r.out;
-  EXPECT_NE(r.out.find("\"git_sha\": null"), std::string::npos) << r.out;
+  // Without --git-sha the commit built into the binary, if any (only the standalone build records
+  // one).
+  const std::string git_sha = GitSha().empty() ? "null" : std::format("\"{}\"", GitSha());
+  EXPECT_NE(r.out.find("\"git_sha\": " + git_sha + ","), std::string::npos) << r.out;
   EXPECT_NE(r.out.find("\"cache\": \"lukewarm\""), std::string::npos) << r.out;
   EXPECT_NE(r.out.find("\"failed\": []"), std::string::npos) << r.out;
   EXPECT_EQ(*drops, 0);

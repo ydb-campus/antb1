@@ -24,6 +24,10 @@ external libraries it may link. `antb1_add_module()` fails the configure step on
 | `engine` | `common`, `sql`, `plan`, `io`, `exec` | Arrow, ArrowCompute |
 | `cli` | `common`, `engine` | Arrow, CLI11 |
 
+The table names CMake packages. Arrow's targets also carry the linkage (`ANTB1_ARROW_LINKAGE`): `Arrow::arrow_shared`,
+conda's shared libraries, in every preset but one, and `Arrow::arrow_static` in preset `static`, the standalone release
+binary, which links Arrow and its dependencies statically ([ADR 0033](adr/0033-standalone-static-binary.md)).
+
 Responsibilities:
 
 - `common`: invariant checks (`ANTB1_CHECK`, `ANTB1_DCHECK`), checked integer narrowing (`TryNarrow`, `Narrow`),
@@ -66,8 +70,9 @@ Responsibilities:
 - `engine`: `engine::Session` (owns the catalog, calls `arrow::compute::Initialize()`, runs parse, bind, plan and
   execute) and the canonical value formatter used for every output format.
 - `cli`: the CLI11 command line (`query`, `explain`, `schema`, `bench`, `version`), error reporting and exit codes;
-  `bench` writes ClickBench's result JSON ([benchmarks.md](benchmarks.md)). The `antb1` executable is
-  `src/cli/main.cc`.
+  `bench` writes ClickBench's result JSON ([benchmarks.md](benchmarks.md)), and `version --verbose` names the build
+  behind a binary (commit, flavor, compiler, CPU baseline, Arrow's build and codecs; ADR 0033). The `antb1`
+  executable is `src/cli/main.cc` with `src/cli/cpu_guard.cc`, the check of a raised CPU baseline.
 
 `common` and `sql` never include Arrow, so the front end stays small, fast to build and easy to fuzz.
 

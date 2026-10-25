@@ -18,7 +18,7 @@
 add_executable(antb1-data-metamorphic data_metamorphic.cc hits_relations.cc)
 target_link_libraries(
   antb1-data-metamorphic
-  PRIVATE antb1_metamorphic_lib antb1_slt_lib Parquet::parquet_shared CLI11::CLI11 antb1::build_options
+  PRIVATE antb1_metamorphic_lib antb1_slt_lib Parquet::parquet_${ANTB1_ARROW_LINKAGE} CLI11::CLI11 antb1::build_options
 )
 
 set(_verify "${PROJECT_SOURCE_DIR}/cmake/scripts/VerifyData.cmake")

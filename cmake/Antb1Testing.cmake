@@ -95,7 +95,8 @@ endfunction()
 # cmake/scripts/CompareOutput.cmake. The exit code must be EXIT_CODE (default 0); stdout must equal
 # tests/cli/golden/<case>.stdout (or match STDOUT_REGEX); with STDERR stderr must equal <case>.stderr,
 # with STDERR_REGEX it must match. Outputs are normalized (fixtures dir -> ${FIXTURES}, source dir ->
-# ${SOURCE}). ANTB1_UPDATE_GOLDENS=1 rewrites the golden files.
+# ${SOURCE}). ANTB1_UPDATE_GOLDENS=1 rewrites the golden files. ANTB1_CLI_UNDER_TEST=<absolute path> runs
+# that binary instead of the build tree's antb1 (the packaged standalone binary: scripts/static.sh).
 function(antb1_add_cli_golden case)
   cmake_parse_arguments(ARG "STDERR" "EXIT_CODE;STDOUT_REGEX;STDERR_REGEX;INPUT" "ARGS" ${ARGN})
   if(NOT DEFINED ARG_EXIT_CODE)
@@ -103,6 +104,7 @@ function(antb1_add_cli_golden case)
   endif()
   set(
     _defs
+    "-DANTB1_CLI=ON"
     "-DNAME=${case}"
     "-DGOLDEN_DIR=${PROJECT_SOURCE_DIR}/tests/cli/golden"
     "-DEXIT_CODE=${ARG_EXIT_CODE}"

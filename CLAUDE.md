@@ -23,7 +23,9 @@ task) and never block, except the Stop hook below.
 ## Permissions
 
 - Pre-approved: the named tasks of the AGENTS.md command table except `pixi run bench`,
-  `pixi run bench-clickbench` and `pixi run install-git-hooks`, which prompt; `pixi install --locked`, read-only
+  `pixi run bench-clickbench`, `pixi run install-git-hooks` and the static build's `pixi run static-arrow`
+  (network), `pixi run static`, `pixi run static-test` and `pixi run static-check <BIN>` (it runs that file), which
+  prompt; `pixi install --locked`, read-only
   git and gh, plus `git switch` (its `-f`, `--force` and `--discard-changes` forms prompt), `git fetch origin`,
   `git add` and `git commit`. Never widen this to `pixi run *` (in personal settings too): `pixi run` executes any
   command, so a wildcard would bypass every other rule.
