@@ -658,6 +658,14 @@ TEST(OptimizerTest, ANestedJoinRecordsOnlyItsOwnColumns) {
   // And it is not empty, which is what an over-eager intersection would leave: the top join reads
   // t1.i16 above and t1.i64 as its own key, both of which the nested join must carry.
   EXPECT_EQ(nested.needed_above.size(), 2U);
+  // Pruning an already-pruned plan records the same set, not a longer one: `Prune` copies the node
+  // it rewrites, so a pass that appended would leave every id twice. Nothing reads the field by
+  // position, so that answers the same -- and `Explain` prints only what is *not* in the set, so
+  // the idempotence assertions elsewhere in this file cannot see it either.
+  const LogicalPlan again = Optimized(plan);
+  const auto& top_again = std::get<JoinNode>(*std::get<ProjectNode>(*again.root).input);
+  EXPECT_EQ(top_again.needed_above, top.needed_above);
+  EXPECT_EQ(std::get<JoinNode>(*top_again.left).needed_above, nested.needed_above);
 }
 
 // Each input keeps the columns needed above, the keys and the residual's columns, in field order.

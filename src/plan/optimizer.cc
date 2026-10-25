@@ -333,8 +333,12 @@ struct Pruner {
     // whole set when an id in it is not one the join outputs, so leaving a sibling's id in it
     // disabled the pruning on exactly the nested joins it is worth the most on.
     //
-    // Sorted so that the plan a pass produces is a function of its input and not of a hash order.
-    for (const ColumnId id : OutputIds(LogicalNode(join))) {
+    // Sorted, and **replacing** whatever the field held: `out` is a copy of a node that may have
+    // been pruned before (`Optimize` is idempotent and the tests assert it), and appending to an
+    // already-recorded set would leave every id twice. Nothing reads the field by position, so that
+    // would answer the same -- and go unnoticed, since EXPLAIN prints only what is *not* in it.
+    out.needed_above.clear();
+    for (const ColumnId id : OutputIds(*node)) {
       if (needed.contains(id)) {
         out.needed_above.push_back(id);
       }

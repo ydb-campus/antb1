@@ -102,6 +102,11 @@ class JoinBuildSpec {
   // a backstop for one that forgets. **What makes a wrong set safe is upstream, not here:** the
   // physical planner rejects a `needed_above` holding an id the join does not output, because a
   // column wrongly dropped is a NULL that no gather can tell from a real one.
+  //
+  // **In `null_chunks()` it is an all-NULL array of the field's declared type instead**, because
+  // those batches are emitted rather than gathered from: the operator relabels them with its own
+  // schema and `RecordBatch::Make` does not check, so a `null`-typed column there would later be
+  // read as a typed one. Both read NULL, which is the property that matters to a caller.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
       bool keep_null_keys = false, std::vector<bool> retain = {});

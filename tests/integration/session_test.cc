@@ -2,11 +2,13 @@
 
 #include "antb1/engine/session.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <arrow/api.h>
@@ -171,25 +173,31 @@ TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
       "GROUP BY a.RegionID");
   ASSERT_TRUE(profile.ok()) << profile.status().ToString();
   ASSERT_NE(profile->root, nullptr);
-  // Every HashBuild of the run, and at least one of them let a column go.
-  int64_t builds = 0;
-  int64_t dropping = 0;
-  const auto walk = [&](const auto& self, const exec::ProfileNode& node) -> void {
+  // Every HashBuild of the run with its depth, so that the assertion names which one dropped: the
+  // deeper build is the nested join's, and a plan whose join order flipped would fail here rather
+  // than keep passing while covering nothing.
+  std::vector<std::pair<int, int64_t>> builds;  // depth, cols_dropped
+  const auto walk = [&](const auto& self, const exec::ProfileNode& node, int depth) -> void {
     if (node.name() == "HashBuild") {
-      ++builds;
+      int64_t dropped = 0;
       for (const exec::ProfileMetric& metric : node.metrics()) {
-        if (metric.name == "cols_dropped" && metric.value > 0) {
-          ++dropping;
+        if (metric.name == "cols_dropped") {
+          dropped = metric.value;
         }
       }
+      builds.emplace_back(depth, dropped);
     }
     for (const exec::ProfileNode* child : node.children()) {
-      self(self, *child);
+      self(self, *child, depth + 1);
     }
   };
-  walk(walk, *profile->root);
-  EXPECT_EQ(builds, 2) << "one per join";
-  EXPECT_GT(dropping, 0) << "no build dropped a column: the retain set did not survive the chain";
+  walk(walk, *profile->root, 0);
+  ASSERT_EQ(builds.size(), 2U) << "one per join";
+  std::ranges::sort(builds);
+  EXPECT_EQ(builds.front().second, 0)
+      << "the upper join's build: every column of c is a key or read";
+  EXPECT_EQ(builds.back().second, 1)
+      << "the nested join's build dropped nothing: the retain set did not survive the chain";
 }
 
 }  // namespace
