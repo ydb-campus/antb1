@@ -325,10 +325,20 @@ struct Pruner {
 
   LogicalNodePtr operator()(const JoinNode& join) const {
     JoinNode out = join;
-    // `needed` as it arrives is exactly what a node above this join reads, which is the one place
-    // that set exists: recorded before the join's own keys and residual join it below. Sorted so
-    // that the plan a pass produces is a function of its input and not of a hash order.
-    out.needed_above.assign(needed.begin(), needed.end());
+    // `needed` as it arrives is the demand this join is under, recorded before the join's own keys
+    // and residual join it below -- but it is **not** a set of this join's columns. The same set is
+    // carried down both branches of every join above, so at a nested join it also holds the ids of
+    // an ancestor's other branch. Intersecting with this join's own outputs is what makes the field
+    // mean what its name says, and it is load-bearing rather than tidy: the consumer refuses the
+    // whole set when an id in it is not one the join outputs, so leaving a sibling's id in it
+    // disabled the pruning on exactly the nested joins it is worth the most on.
+    //
+    // Sorted so that the plan a pass produces is a function of its input and not of a hash order.
+    for (const ColumnId id : OutputIds(LogicalNode(join))) {
+      if (needed.contains(id)) {
+        out.needed_above.push_back(id);
+      }
+    }
     std::ranges::sort(out.needed_above);
     for (const JoinKey& key : join.keys) {
       Need(needed, key.left);

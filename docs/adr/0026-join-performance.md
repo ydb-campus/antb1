@@ -597,6 +597,19 @@ this profiling fires:
     is a real-typed all-NULL array and nothing can tell. So what makes a wrong set safe is **upstream**: the
     physical planner keeps every column unless every id of `needed_above` is one the join outputs, which is
     exactly the `CloneWithFreshIds` signature -- ids minted by a later pass that this set cannot know.
+
+    **That guard costs the whole item unless `Prune` intersects the set with the join's own outputs**, and the
+    first implementation of it did not. The demand `Prune` carries is passed down **both** branches of every
+    join, so at a nested join it also holds the ids of an ancestor's other branch -- ids this join does not
+    output, which the guard cannot tell from a re-minted one, so it kept every column. The EXPLAIN count hides
+    this: it reports `outputs` minus the set, so a foreign id in the set changes nothing it prints, and the plans
+    of all 22 were identical while `cols_dropped` had fallen to 0 on the nested joins -- Q21's build back to
+    5,723 MiB from 4,886 and 1.128x slower. Found by re-measuring after an unrelated fix rather than by any test:
+    every answer was right, and the planner tests that cover the guard build their joins flat, where the two sets
+    coincide. Two cases close that. One asserts at a **nested** join that nothing in the set is foreign to it.
+    The other is the end-to-end one the whole item lacked -- `cols_dropped` after a three-relation query through
+    a session, which is the only place the chain from SQL to the build is observable, and the only metric that
+    distinguishes "dropped nothing" from "dropped what it could".
   - **Three things are held beyond what `needed_above` says**, and the first was a bug the guard caught. A
     **residual** is evaluated by the join, so its columns are needed here though `needed_above` -- what a node
     *above* reads -- excludes them by construction; the planner adds them, mapping each from a position in the
@@ -611,7 +624,9 @@ this profiling fires:
     The end-to-end property lives in the `.slt` suite, which goes through the binder, and it earned its place:
     those cases are what aborted when the residual was forgotten. `joins/inner.slt` gains four, each with its
     `cols_dropped` read individually -- three that drop a column, by the shapes named above, and one with a real
-    residual that drops nothing and pins that the mapping does not take what the join itself needs.
+    residual that drops nothing and pins that the mapping does not take what the join itself needs. **Read by
+    hand is not asserted**, which is how the guard above went unnoticed: dropping fewer columns never moves an
+    answer, so the `.slt` suite cannot see it, and the session case named above is what now does.
 - **C6, feat(io): DECIMAL columns in the filtered scan.** ADR 0021's decimal64 item, or — cheaper and strictly
   better — `supports_scan_filter` per column, so a scan pushes what it can and decodes the rest for surviving rows
   only. Low measured value; last of the engine work, and the thing runtime join filters wait for.

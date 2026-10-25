@@ -2,6 +2,8 @@
 
 #include "antb1/engine/session.h"
 
+#include "antb1/exec/profile.h"
+
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -142,6 +144,54 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   auto count = Count(*session, "SELECT COUNT(*) FROM hits_like");
   ASSERT_TRUE(count.ok()) << count.status().ToString();
   EXPECT_EQ(*count, 10'000);
+}
+
+// A build holds only the columns read above its join (ADR 0026's C8a), **through the whole chain**:
+// SQL, the binder, Prune's set, the physical planner's verification of it and the build itself. The
+// `cols_dropped` metric is the only place that chain is observable, and it is reachable only from a
+// session -- which is why this guard lives here rather than beside either half.
+//
+// It earned the place. The planner refuses the whole set when an id in it is not one the join
+// outputs, and the demand Prune carries is passed down both branches of every join, so at a nested
+// join it also holds an ancestor's other branch's ids: the set was refused on exactly the joins it
+// is worth the most on, every plan still printed the same, every answer was right, and 2,887 tests
+// passed. A query of three relations is the smallest shape that has a nested join at all.
+TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
+  auto session = engine::Session::Make().ValueOrDie();
+  // One fixture under three names: a self-join needs no second file and the shape is what matters.
+  for (const std::string_view name : {"a", "b", "c"}) {
+    ASSERT_TRUE(
+        session->RegisterParquet(std::string(name), {Fixture("hits_like.parquet")}).ok() )
+        << name;
+  }
+  // The lower join is a.WatchID = b.WatchID and the upper one joins c on a.UserID -- both keys are
+  // all but unique in this fixture, so neither join multiplies its input. Only a.RegionID is read
+  // above, so b.RegionID reaches a build through the Filter that needs it and dies there.
+  const auto profile = session->ExplainAnalyze(
+      "SELECT a.RegionID, COUNT(*) FROM a, b, c "
+      "WHERE a.WatchID = b.WatchID AND a.UserID = c.UserID AND b.RegionID > 100 "
+      "GROUP BY a.RegionID");
+  ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+  ASSERT_NE(profile->root, nullptr);
+  // Every HashBuild of the run, and at least one of them let a column go.
+  int64_t builds = 0;
+  int64_t dropping = 0;
+  const auto walk = [&](const auto& self, const exec::ProfileNode& node) -> void {
+    if (node.name() == "HashBuild") {
+      ++builds;
+      for (const exec::ProfileMetric& metric : node.metrics()) {
+        if (metric.name == "cols_dropped" && metric.value > 0) {
+          ++dropping;
+        }
+      }
+    }
+    for (const exec::ProfileNode* child : node.children()) {
+      self(self, *child);
+    }
+  };
+  walk(walk, *profile->root);
+  EXPECT_EQ(builds, 2) << "one per join";
+  EXPECT_GT(dropping, 0) << "no build dropped a column: the retain set did not survive the chain";
 }
 
 }  // namespace

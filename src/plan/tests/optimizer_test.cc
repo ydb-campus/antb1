@@ -612,6 +612,53 @@ TEST(OptimizerTest, AJoinRecordsWhatIsReadAboveIt) {
   EXPECT_EQ(out.size() - join.needed_above.size(), 4U);
 }
 
+// The same set at a **nested** join, which is where it is worth anything and where it was wrong.
+// `Prune` carries one demand set down both branches of every join, so by the time it reaches a join
+// in the left input of another it also holds the ids of that other join's right input. Those are not
+// this join's columns, and a consumer that verifies the set -- which it must, since a missing id
+// reads as unneeded -- cannot tell a foreign id from one a later pass re-minted, so it refuses the
+// whole set and drops nothing. The flat case above cannot catch that: there, the two sets coincide.
+TEST(OptimizerTest, ANestedJoinRecordsOnlyItsOwnColumns) {
+  // Project [t1.i16, t21.i16] over Join(Join(t1, t11) on i32, t21) on t1.i64 = t21.i64: the top
+  // join reads a column of t21, so t21's ids are in the demand the nested join is pruned under.
+  const LogicalNodePtr inner =
+      Node(JoinNode{.kind = JoinKind::kInner,
+                    .left = FourFields(1),
+                    .right = FourFields(11),
+                    .keys = {JoinKey{.left = FieldOf(1, 1), .right = FieldOf(11, 1)}},
+                    .residual = {},
+                    .build = BuildSide::kRight,
+                    .span = {}});
+  ProjectNode project{.input = Node(JoinNode{.kind = JoinKind::kInner,
+                                             .left = inner,
+                                             .right = FourFields(21),
+                                             .keys = {JoinKey{.left = FieldOf(1, 2),
+                                                              .right = FieldOf(21, 2)}},
+                                             .residual = {},
+                                             .build = BuildSide::kRight,
+                                             .span = {}}),
+                      .columns = {FieldOf(1, 0), FieldOf(21, 0)},
+                      .constants = {},
+                      .ids = {ColumnId{100}, ColumnId{101}},
+                      .span = {}};
+  const LogicalPlan plan = Optimized(PlanOver(Node(std::move(project))));
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  const auto& top = std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);
+  const auto& nested = std::get<JoinNode>(*top.left);
+  // Every id of either set is an output of the join that holds it. Nothing of t21 is in the nested
+  // join's, though the demand it was pruned under held two of t21's columns.
+  for (const JoinNode* join : {&top, &nested}) {
+    const std::vector<ColumnId> out = OutputIds(LogicalNode(*join));
+    EXPECT_TRUE(std::ranges::is_sorted(join->needed_above));
+    for (const ColumnId id : join->needed_above) {
+      EXPECT_NE(std::ranges::find(out, id), out.end()) << "an id this join does not output";
+    }
+  }
+  // And it is not empty, which is what an over-eager intersection would leave: the top join reads
+  // t1.i16 above and t1.i64 as its own key, both of which the nested join must carry.
+  EXPECT_EQ(nested.needed_above.size(), 2U);
+}
+
 // Each input keeps the columns needed above, the keys and the residual's columns, in field order.
 TEST(OptimizerTest, PrunesThroughBothInputsOfAJoin) {
   const LogicalPlan plan = Optimized(ProjectOverJoin(
