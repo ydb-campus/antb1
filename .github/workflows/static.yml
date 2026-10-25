@@ -1,9 +1,11 @@
 # Keep-green job of the standalone static build (docs/adr/0033-standalone-static-binary.md, docs/ci.md): on the
 # three release targets, build the static Arrow prefix and the standalone antb1, package it and check the packaged
-# file (`pixi run static`), then gather the sources that go with a Linux package (`pixi run static-sources`, LGPL-2.1
-# section 6: docs/adr/0034-licence-and-static-sources.md). Advisory: not part of `CI OK`. Runs on PRs that touch the
-# build, on every push to main and by hand; main and manual runs keep their tarballs 30 days for the perf hosts, a
-# Linux package only next to its sources. Hardening as in ci.yml; the Arrow prefix cache is written only from main.
+# file (`pixi run static`), check the package again as a fresh runner without pixi sees it (scripts/static_gates.py
+# verify under the runner's own python3; on Linux also in a container of an image that holds only the binary and its
+# smoke kit), then gather the sources that go with a Linux package (`pixi run static-sources`, LGPL-2.1 section 6:
+# docs/adr/0034-licence-and-static-sources.md). Advisory: not part of `CI OK`. Runs on PRs that touch the build, on
+# every push to main and by hand; main and manual runs keep their tarballs 30 days for the perf hosts, a Linux package
+# only next to its sources. Hardening as in ci.yml; the Arrow prefix cache is written only from main.
 name: static
 
 on:
@@ -83,7 +85,9 @@ jobs:
         run: pixi run --frozen -e static static-sources --check-urls
 
   static:
-    name: static ${{ matrix.target }} (pixi run static && pixi run static-sources)
+    name: >-
+      static ${{ matrix.target }} (pixi run static
+      && pixi run static-check build/static/package/antb1-${{ matrix.target }}.tar.gz && pixi run static-sources)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -95,12 +99,15 @@ jobs:
           - target: linux-x86_64
             os: ubuntu-24.04
             parallel: 4
+            engine: docker # verify's container run
           - target: linux-aarch64
             os: ubuntu-24.04-arm
             parallel: 4
+            engine: docker
           - target: darwin-arm64
             os: macos-15 # arm64: 3 cores, 7 GB RAM
             parallel: 3
+            engine: none # no container engine on the macOS images
     env:
       ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel }}
@@ -141,6 +148,17 @@ jobs:
           key: static-arrow-${{ matrix.target }}-${{ steps.key.outputs.key }}
       - name: Build, package and check (pixi run static)
         run: pixi run --frozen -e static static
+      # The package as a user gets it, checked as on a runner without pixi: the runner's own python3 (the script uses
+      # only the standard library), the kit that `pixi run static` wrote, an empty environment; on Linux the same runs
+      # in a container that has no network and no capabilities and holds only the binary and the kit.
+      - name: Verify the package (pixi run static-check build/static/package/antb1-${{ matrix.target }}.tar.gz)
+        env:
+          TARGET: ${{ matrix.target }}
+          ENGINE: ${{ matrix.engine }}
+        run: >-
+          python3 -I scripts/static_gates.py verify --assets build/static/package
+          --sums build/static/package/SHA256SUMS --kit build/static/smoke-kit --target "$TARGET"
+          --commit "$GITHUB_SHA" --texts . --container "$ENGINE"
       # Linux: glibc's source RPM, antb1's source and the third-party sources (NETWORK); macOS: nothing to do.
       - name: The sources of the package (pixi run static-sources)
         run: pixi run --frozen -e static static-sources

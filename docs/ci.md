@@ -62,7 +62,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `static` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
-| `static <target> (pixi run static && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, then `pixi run static-sources` (on that platform) |
+| `static <target> (pixi run static && pixi run static-check build/static/package/antb1-<target>.tar.gz && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, `pixi run static-check build/static/package/antb1-<target>.tar.gz` (the verify step; on Linux with docker when it answers), then `pixi run static-sources` (on that platform) |
 | `static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)` (advisory, PRs that change a lock of the pinned sources) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` · `pixi run static-sources --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
@@ -140,11 +140,13 @@ go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
     `static urls` job runs it on every PR that changes the lock, and the nightly `static-urls` job every night.
 - `pixi run static` builds antb1 in `build/static` against that prefix, packages it into `build/static/package`
   (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the package and the
-  packaged file. The package checks cover the members, LICENSE and NOTICE, the notices, BUILDINFO.json and the
-  checksums; the file checks cover linkage, link flags, build identity, the allocator restart, smoke tests and every
-  CLI golden. Both tarballs carry LICENSE, NOTICE and `THIRD_PARTY_NOTICES.txt`, which on Linux starts with the LGPL
-  notice of the static glibc. Packaging refuses a sysroot build that has no line in
-  `cmake/static/glibc-source.lock`.
+  packaged file. The package checks cover the members (each the staged file the file checks ran), LICENSE and
+  NOTICE, the notices, BUILDINFO.json and the checksums; the file checks cover linkage, link flags, build identity,
+  the allocator restart, smoke tests and every CLI golden. Both tarballs carry LICENSE, NOTICE and
+  `THIRD_PARTY_NOTICES.txt`, which on Linux starts with the LGPL notice of the static glibc. Packaging refuses a
+  sysroot build that has no line in `cmake/static/glibc-source.lock`. The smoke tests query the smoke kit in
+  `build/static/smoke-kit`: Parquet files that DuckDB writes from `range()` with each codec, a truncated copy, and
+  `kit.json` with their digests and DuckDB's own answer (`scripts/static_gates.py kit`). It holds no other data.
 - `pixi run static-sources` (network once, Linux; after `pixi run static`) writes
   `build/static/sources/antb1-<target>.sources.tar` and its `.sha256`: the sources that go with the Linux package
   (LGPL-2.1 section 6). It holds glibc's source RPM by `cmake/static/glibc-source.lock` (the AlmaLinux vault, then a
@@ -155,17 +157,29 @@ go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
   that pixi.lock pins (ADR 0034). `pixi run static-sources --check-urls` checks every copy of the source RPMs and of
   the conda archives instead, as `--check-urls` does for Arrow's pins; the `static urls` job runs it on every PR that
   changes `cmake/static/glibc-source.lock` or `scripts/static_package.py`.
-- `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a
-  downloaded package or a copy on a benchmark host.
+- `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a copy on
+  a benchmark host. `pixi run static-check antb1-<target>.tar.gz`, with `SHA256SUMS` next to it (and on Linux
+  `antb1-<target>.debug.tar.gz`), checks a package as a fresh runner does (`scripts/static_gates.py verify`):
+  - the digests, then each tarball before anything is unpacked: one directory, exactly the package's members,
+    regular files only, no extended attributes;
+  - then the unpacked files (BUILDINFO.json, LICENSE and NOTICE against the checkout, on macOS the signature) and the
+    smoke tests, with an empty environment in an empty directory;
+  - on Linux, when `docker info` answers, the smoke tests again in a container of an image that holds only the binary
+    and the kit: no network, no capabilities, a read-only root, user nobody.
+
+  verify uses only Python's standard library (3.11 or newer with tarfile's data filter). It exits 2 when it cannot
+  check the package where it runs.
 - `pixi run static-test` builds every target of `build/static` and runs all hermetic tests against the static Arrow.
 
 The `static` workflow runs `pixi run static` and `pixi run static-sources` on linux-x86_64 (ubuntu-24.04),
-linux-aarch64 (ubuntu-24.04-arm) and darwin-arm64 (macos-15). It is advisory and not part of `CI OK`. Its pixi
-environment is not cached. The Arrow prefix is restored from `static-arrow-<target>-<key>` and saved from pushes to
-`main` only. Runs on `main` and manual runs upload the package as the `antb1-<target>` artifact; on Linux they first
-check and upload its sources as `antb1-<target>-sources`, so a package is never published without them. A failed
-macOS run keeps its binary, with the licence texts, as `failed-antb1-<target>`. These runs are cold until `main` has
-saved a prefix (a cold build takes about a minute on a 64-core host; the CI runners are slower).
+linux-aarch64 (ubuntu-24.04-arm) and darwin-arm64 (macos-15). Between the two, it verifies the package with the
+runner's own `python3`, not pixi's, as a runner without pixi would, with the Linux packages also in a Docker
+container. It is advisory and not part of `CI OK`. Its pixi environment is not cached. The Arrow prefix is restored
+from `static-arrow-<target>-<key>` and saved from pushes to `main` only. Runs on `main` and manual runs upload the
+package as the `antb1-<target>` artifact; on Linux they first check and upload its sources as
+`antb1-<target>-sources`, so a package is never published without them. A failed macOS run keeps its binary, with
+the licence texts, as `failed-antb1-<target>`. These runs are cold until `main` has saved a prefix (a cold build
+takes about a minute on a 64-core host; the CI runners are slower).
 
 ## Nightly
 
