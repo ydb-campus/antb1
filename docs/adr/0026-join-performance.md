@@ -616,11 +616,18 @@ this profiling fires:
     join's output back to one in the build's own. A **key** is forced by `JoinBuildSpec::Make`, since the build
     hashes it and the direct layout indexes by it. And an **empty set** retains everything, which is every
     hand-built or unoptimized plan.
+  - **The NULL-keyed rows a C2c build retains are narrowed too, and differently.** They are emitted directly by
+    the join that reports unmatched build rows rather than gathered from, so the stand-in has to be an all-NULL
+    array of the column's **declared** type where a keyed chunk uses the `null` one. Worth doing for the
+    consistency more than the bytes -- a handful of rows is all a build keeps this way -- since otherwise one
+    column reads NULL for a row that matched and its real value for one that did not, which nothing above the
+    join looks at today and would be a trap for whatever looks first.
   - **What the tests reach, and how.** The spec's own rules are unit-tested, and so is the executor half: a
     build is handed a retain set directly, which needs no column ids and so works in `src/exec/tests` -- what
     does not work there is deriving one, since that harness builds scans with no ids, so `OutputIds` of one is
     empty and the planner keeps every column. That case pins the NullArray in the retained chunk, the key beside
     it still gathering, the output presenting the dropped field with its declared type, and a sliced input batch.
+    A table-level case pins the two narrowings against each other on one build, both executor arms.
     The end-to-end property lives in the `.slt` suite, which goes through the binder, and it earned its place:
     those cases are what aborted when the residual was forgotten. `joins/inner.slt` gains four, each with its
     `cols_dropped` read individually -- three that drop a column, by the shapes named above, and one with a real

@@ -2,8 +2,6 @@
 
 #include "antb1/engine/session.h"
 
-#include "antb1/exec/profile.h"
-
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -14,6 +12,7 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/exec/profile.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
@@ -160,8 +159,7 @@ TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
   auto session = engine::Session::Make().ValueOrDie();
   // One fixture under three names: a self-join needs no second file and the shape is what matters.
   for (const std::string_view name : {"a", "b", "c"}) {
-    ASSERT_TRUE(
-        session->RegisterParquet(std::string(name), {Fixture("hits_like.parquet")}).ok() )
+    ASSERT_TRUE(session->RegisterParquet(std::string(name), {Fixture("hits_like.parquet")}).ok())
         << name;
   }
   // The lower join is a.WatchID = b.WatchID and the upper one joins c on a.UserID -- both keys are

@@ -1532,6 +1532,47 @@ TEST_F(JoinTableTest, ASpecRetainsEveryKeyAndWhateverElseItWasGiven) {
   }
 }
 
+// A build that retains NULL-keyed rows holds them in null_chunks, which a join emits **directly**
+// rather than through a gather -- so the two paths narrow differently and must still read the same.
+// A dropped column is a NullArray in a keyed chunk, where every reader asks retains() first; in a
+// null chunk it has to keep its declared type, since the batch reaches the output as it is. Both
+// read NULL. Without this the same column would read NULL for a row that matched and its real value
+// for one that did not, which is a difference no caller is looking for.
+TEST_F(JoinTableTest, ADroppedColumnIsNullInARetainedNullKeyedRowToo) {
+  // Keys 1 and NULL in one part, so one row is indexed and one is retained.
+  const auto data = [] {
+    BuildData out({LogicalType::kBigInt});
+    out.Add(0, {Int64s({1, std::nullopt})});
+    return out;
+  }();
+  const auto pool = MakeThreadPool();
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "serial" : "pooled");
+    // The key retained, the id dropped.
+    auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), /*keep_null_keys=*/true,
+                                    std::vector<bool>{true, false});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    auto parts = MakeParts(data, *spec, nullptr, arrow::default_memory_pool());
+    ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+    auto table = Assemble(*spec, *parts, executor, {}, nullptr);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    ASSERT_EQ((*table)->chunks().size(), 1U);
+    ASSERT_EQ((*table)->null_chunks().size(), 1U);
+    // The gathered path: a NullArray, which nothing reads because every reader asks retains().
+    const auto& keyed = *(*table)->chunks().front();
+    ASSERT_EQ(keyed.num_rows(), 1);
+    EXPECT_EQ(keyed.column(1)->type_id(), arrow::Type::NA) << "the dropped id of a matched row";
+    EXPECT_FALSE(keyed.column(0)->IsNull(0)) << "the key is retained whatever the set says";
+    // The emitted path: the declared type, so the batch can leave the join unchanged, all NULL.
+    const auto& retained = *(*table)->null_chunks().front();
+    ASSERT_EQ(retained.num_rows(), 1);
+    EXPECT_TRUE(retained.schema()->field(1)->type()->Equals(arrow::int64()))
+        << "an emitted batch keeps its declared type: " << retained.schema()->ToString();
+    EXPECT_TRUE(retained.column(1)->IsNull(0)) << "and reads NULL, as the matched row does";
+    EXPECT_TRUE(retained.column(0)->IsNull(0)) << "the row is here because its key is NULL";
+  }
+}
+
 TEST_F(JoinTableTest, RunsOutOfMemoryCleanly) {
   const auto pool = MakeThreadPool();
   const auto expect_oom = [](const arrow::Status& status) {

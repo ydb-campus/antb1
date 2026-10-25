@@ -614,10 +614,11 @@ TEST(OptimizerTest, AJoinRecordsWhatIsReadAboveIt) {
 
 // The same set at a **nested** join, which is where it is worth anything and where it was wrong.
 // `Prune` carries one demand set down both branches of every join, so by the time it reaches a join
-// in the left input of another it also holds the ids of that other join's right input. Those are not
-// this join's columns, and a consumer that verifies the set -- which it must, since a missing id
-// reads as unneeded -- cannot tell a foreign id from one a later pass re-minted, so it refuses the
-// whole set and drops nothing. The flat case above cannot catch that: there, the two sets coincide.
+// in the left input of another it also holds the ids of that other join's right input. Those are
+// not this join's columns, and a consumer that verifies the set -- which it must, since a missing
+// id reads as unneeded -- cannot tell a foreign id from one a later pass re-minted, so it refuses
+// the whole set and drops nothing. The flat case above cannot catch that: there, the two sets
+// coincide.
 TEST(OptimizerTest, ANestedJoinRecordsOnlyItsOwnColumns) {
   // Project [t1.i16, t21.i16] over Join(Join(t1, t11) on i32, t21) on t1.i64 = t21.i64: the top
   // join reads a column of t21, so t21's ids are in the demand the nested join is pruned under.
@@ -629,18 +630,18 @@ TEST(OptimizerTest, ANestedJoinRecordsOnlyItsOwnColumns) {
                     .residual = {},
                     .build = BuildSide::kRight,
                     .span = {}});
-  ProjectNode project{.input = Node(JoinNode{.kind = JoinKind::kInner,
-                                             .left = inner,
-                                             .right = FourFields(21),
-                                             .keys = {JoinKey{.left = FieldOf(1, 2),
-                                                              .right = FieldOf(21, 2)}},
-                                             .residual = {},
-                                             .build = BuildSide::kRight,
-                                             .span = {}}),
-                      .columns = {FieldOf(1, 0), FieldOf(21, 0)},
-                      .constants = {},
-                      .ids = {ColumnId{100}, ColumnId{101}},
-                      .span = {}};
+  ProjectNode project{
+      .input = Node(JoinNode{.kind = JoinKind::kInner,
+                             .left = inner,
+                             .right = FourFields(21),
+                             .keys = {JoinKey{.left = FieldOf(1, 2), .right = FieldOf(21, 2)}},
+                             .residual = {},
+                             .build = BuildSide::kRight,
+                             .span = {}}),
+      .columns = {FieldOf(1, 0), FieldOf(21, 0)},
+      .constants = {},
+      .ids = {ColumnId{100}, ColumnId{101}},
+      .span = {}};
   const LogicalPlan plan = Optimized(PlanOver(Node(std::move(project))));
   EXPECT_EQ(PositionMismatch(plan), std::nullopt);
   const auto& top = std::get<JoinNode>(*std::get<ProjectNode>(*plan.root).input);

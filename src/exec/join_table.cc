@@ -425,11 +425,40 @@ arrow::Status JoinBuildPart::AppendNullKeys(const Batch& batch, int64_t remainin
   ARROW_RETURN_NOT_OK(memory_.Resize(MemoryUsage(pieces_.capacity(), capacity)));
   null_pieces_.reserve(capacity);
   arrow::compute::ExecContext kernels(pool);
+  const auto index_array = std::make_shared<arrow::UInt32Array>(remaining, index_buffer);
+  // A column the build does not retain is not taken here either. These pieces are EMITTED rather
+  // than gathered from (`NextNullKeyed` hands the batch on as it is), so the stand-in has to be of
+  // the declared type rather than the `null` one a keyed chunk uses -- which costs one all-NULL
+  // array of the NULL-keyed rows, and those are the rows a build keeps only to emit as unmatched.
+  //
+  // Worth doing for the consistency more than the bytes: without it the same column reads NULL for
+  // a row that matched and its real value for one that did not, which nothing above the join looks
+  // at today and which would be a trap for whatever looks first.
+  if (!spec_->retains_all()) {
+    arrow::ArrayVector arrays;
+    arrays.reserve(static_cast<std::size_t>(batch.data->num_columns()));
+    for (int c = 0; c < batch.data->num_columns(); ++c) {
+      if (!spec_->retains(c)) {
+        ARROW_ASSIGN_OR_RAISE(
+            std::shared_ptr<arrow::Array> null,
+            arrow::MakeArrayOfNull(batch.data->schema()->field(c)->type(), remaining, pool));
+        arrays.push_back(std::move(null));
+        continue;
+      }
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum one,
+          arrow::compute::Take(batch.data->column(c), index_array,
+                               arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+      arrays.push_back(one.make_array());
+    }
+    null_pieces_.push_back(
+        arrow::RecordBatch::Make(batch.data->schema(), remaining, std::move(arrays)));
+    return arrow::Status::OK();
+  }
   ARROW_ASSIGN_OR_RAISE(
       const arrow::Datum taken,
-      arrow::compute::Take(batch.data,
-                           std::make_shared<arrow::UInt32Array>(remaining, index_buffer),
-                           arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+      arrow::compute::Take(batch.data, index_array, arrow::compute::TakeOptions::NoBoundsCheck(),
+                           &kernels));
   null_pieces_.push_back(taken.record_batch());
   return arrow::Status::OK();
 }
