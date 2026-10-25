@@ -718,7 +718,9 @@ It shows what no logical plan holds, because the physical planner is what decide
   `, part skip candidate on <column>` where it could only rule out a part whole, because the table has no
   filtered decoder for the fields this scan reads. Pushed predicates no longer stand in the way: a scan applies
   the conjunction of them and the key filter. Neither annotation appears for a key no build can publish a filter
-  for, which is any key but a single integer or DATE one.
+  for, which is any key but a single integer or DATE one. **Several columns, as `<column> or <column>`,** where
+  more than one join of the pipeline probes this scan: every join above it has a filter to offer, a run takes the
+  innermost that published one worth reading, and these are listed in that order.
 
 ```text
 Output: count_star():BIGINT
@@ -733,9 +735,12 @@ PartAggregate Aggregate COUNT(*)
 **A candidate is not a fact, and the word is load-bearing.** Four of the conditions behind a key filter are not
 properties of a plan at all: whether the build really published a filter (it makes one as it finishes, and its keys
 may not fit the budget), whether it stayed small enough against the probe for the filter to be worth its cost,
-**which layout the build chose** -- a build that came out in the direct layout takes no per-row filter, because its
-probe is two array loads and the filter costs more than they do -- and whether a part's statistics exclude every
-published key. Everything a plan *can* settle — the join's kind, one key
+**which layout the build chose** -- a build that came out in the direct layout takes no per-row filter at the
+innermost join, because its probe is two array loads and the filter costs more than they do, and takes one from a
+join further up only where it covers a small enough share of its own key range to reject nearly every probe row --
+and whether a part's statistics exclude every published key. It is also why a scan under several joins names
+several columns: which of them a run reads follows from those conditions, so a plan naming one alone would be
+read as a claim it cannot make. Everything a plan *can* settle — the join's kind, one key
 of a type a build can publish, the chain of nodes down to the scan, and which of the two mechanisms the table
 supports — is settled before the line is printed, so a candidate is never offered where no run could attach one.
 What a run really did is in `--analyze`'s `key_filter`, `key_dropped` and `key_pruned` metrics below; a candidate

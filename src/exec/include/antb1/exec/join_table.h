@@ -151,7 +151,7 @@ class JoinBuildSpec {
 //
 // **A fact of the plan, not of the run**, which is why it has a name: the physical planner reads it
 // to say whether a scan could take ADR 0029's filter before any build exists (`explain --physical`,
-// physical_planner.cc's KeyFilterCandidate), while whether a filter was really made -- its keys
+// physical_planner.cc's KeyFilterCandidates), while whether a filter was really made -- its keys
 // collected, its bits afforded -- stays the build's own answer.
 bool CanPublishKeyFilter(const std::shared_ptr<const JoinBuildSpec>& spec);
 
@@ -301,6 +301,14 @@ class JoinTable {
   }
   [[nodiscard]] const JoinBuildSpec& spec() const { return *spec_; }
   [[nodiscard]] Layout layout() const { return layout_; }
+  // The key values the direct layout covers, from its smallest key to its largest: the count of
+  // slots, so every key outside it is one this build does not hold. Zero for the hashed layout,
+  // which stores no range, and for an empty build. Together with num_rows(), an upper bound on the
+  // share of its own key range the build occupies -- and so a lower bound on what a filter of it
+  // rejects, which is what ADR 0029's D1 weighs a per-row filter's cost against.
+  [[nodiscard]] int64_t key_span() const {
+    return layout_ == Layout::kDirect && !rows_.empty() ? static_cast<int64_t>(span_) + 1 : 0;
+  }
   // The rows inserted (rows().size()).
   [[nodiscard]] int64_t num_rows() const { return static_cast<int64_t>(rows_.size()); }
   // The selected rows of the build input, NULL keys included.

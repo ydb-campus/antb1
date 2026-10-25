@@ -653,13 +653,21 @@ std::vector<bool> FilterOnlyFields(const plan::FilterNode& filter, const plan::S
 // D1).
 constexpr int64_t kFilterBuildShare = 16;
 
-// What a scan of this part pipeline may be filtered by: the key filter the innermost join's build
-// published, and the position of the probe key in `scan`'s field list; none when no join of the
-// pipeline offers one this scan can apply. The conditions, in order:
+// The most of its own key range a direct-layout build may cover and still be worth filtering with
+// when it publishes to a join above the innermost: the filter's cost is paid on every probe row,
+// so what it rejects has to be nearly all of them (CanFilterRows carries the two measurements).
+constexpr int64_t kFilterKeySpanShare = 8;
+
+// What a scan of this part pipeline may be filtered by: the key filter one join's build published,
+// and the position of the probe key in `scan`'s field list; none when no join of the pipeline
+// offers one this scan can apply. The conditions, in order:
 //
-//   - only the innermost join is a candidate. The chain from any other one's probe input passes
-//     through a join, which prepends the other side's width, so a column index above it is not a
-//     column index at the scan -- the same hazard LeadingKeyField states.
+//   - any join of the pipeline is a candidate, and `ProbeKeyOf` chooses among them. A key index
+//     from a join above the innermost is not a column index at the scan as it stands: the chain
+//     down passes through joins, each of which prepends its left input's width where the pipeline
+//     continues into its right, so the walk subtracts that width as it descends -- the hazard
+//     LeadingKeyField states, answered rather than avoided. Only FilterNodes and JoinNodes may
+//     stand in the chain; a Compute appends and a Project reorders, so either ends the walk.
 //   - the join must not emit an unmatched probe row, or dropping one would lose an answer. INNER
 //     and SEMI never do; ANTI and LEFT only when they build on their left and emit build rows
 //     (EmitsBuildRows), which is the form ADR 0026's C2b gave them. A null-aware anti join is
@@ -676,26 +684,41 @@ constexpr int64_t kFilterBuildShare = 16;
 //
 // Called per part, from the part's own pipeline build, which is why the build has already finished
 // and `key_filter()` is there to read (hash_join.cc's PrepareBuilds). The last condition is the
-// only one of these a plan cannot decide, which is why it is a step of its own
-// (ProbeKeyStructure) -- and why the type test has to be stated there rather than ridden in on a
-// null filter, which is how it used to be enforced.
+// only one of these a plan cannot decide, which is why it is a step of its own (ProbeKeyAt) --
+// and why the type test has to be stated there rather than ridden in on a null filter, which is
+// how it used to be enforced.
 struct ProbeKey {
   const JoinBuild* build = nullptr;  // from ProbeKeyOf: its key_filter() is published and not null
   int column = 0;                    // a position in scan.fields, of the probe's one key
+  // Whether joins of this pipeline run BELOW the one that published the filter. Where they do, a
+  // row the filter clears is a row those joins never probe and never gather either, so what the
+  // filter has to beat is their cost and not only the publishing join's -- which is the same
+  // distinction ADR 0029 draws for D5 and the reason a direct-layout build can be worth reading
+  // here where it is not worth reading at the innermost join.
+  bool joins_below = false;
 };
 
 // ProbeKeyOf's conditions on the join and on the chain down to the scan, every one of them a fact
 // of the plan. The one condition that is not -- the build having published its filter, which it
 // makes in its finish -- is ProbeKeyOf's own, and so **the key this returns may have no filter to
-// read**: only ProbeKeyOf, for a run, and KeyFilterCandidate, for a report of what the planner
+// read**: only ProbeKeyOf, for a run, and KeyFilterCandidates, for a report of what the planner
 // decided, may call it.
-std::optional<ProbeKey> ProbeKeyStructure(const plan::ScanNode& scan, const PipelineBuilds* builds,
-                                          const std::optional<LateScan>& late) {
+// The probe key of one join of the pipeline, `from_innermost` levels above the deepest. Every join
+// of a left-deep pipeline probes the same scan, so each of them has a filter to offer it; the
+// deepest is not always the one worth taking, since a pipeline whose innermost join reduces nothing
+// offers a filter that rejects nothing while the selective build sits a level or two up.
+std::optional<ProbeKey> ProbeKeyAt(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                   const std::optional<LateScan>& late,
+                                   std::size_t from_innermost) {
   if (builds == nullptr || builds->joins.empty() || builds->builds.empty() || late.has_value()) {
     return std::nullopt;  // a narrow scan reads other fields: its indices are the late scan's
   }
-  const plan::JoinNode* join = builds->joins.back();
-  const std::shared_ptr<JoinBuild>& build = builds->builds.back();
+  if (from_innermost >= builds->joins.size()) {
+    return std::nullopt;
+  }
+  const std::size_t at = builds->joins.size() - 1 - from_innermost;
+  const plan::JoinNode* join = builds->joins[at];
+  const std::shared_ptr<JoinBuild>& build = builds->builds[at];
   if (join == nullptr || build == nullptr) {
     return std::nullopt;
   }
@@ -718,32 +741,92 @@ std::optional<ProbeKey> ProbeKeyStructure(const plan::ScanNode& scan, const Pipe
   if (!shape.ok() || shape->probe_keys.size() != 1) {
     return std::nullopt;
   }
-  const int column = shape->probe_keys.front();
-  if (column < 0 || std::cmp_greater_equal(column, scan.fields.size())) {
+  int column = shape->probe_keys.front();
+  if (column < 0) {
     return std::nullopt;
   }
-  // Only FilterNodes between the join's probe input and the scan preserve a column's index.
-  for (const plan::LogicalNode* n = PipelineInput(*join); n != nullptr; n = PipelineInput(*n)) {
+  // From the join's probe input down to the scan, carrying the key's position with it: a position
+  // in the probe input's output, which is the scan's own only at the innermost join. A Filter only
+  // removes rows, so it leaves the position alone. A Join the pipeline continues into the LEFT
+  // input of leaves it alone too, its output beginning with that input's columns; one continued
+  // into the RIGHT input carries them behind the left's, so the left's width comes off -- the
+  // hazard LeadingKeyField states, answered rather than avoided.
+  //
+  // **A column that is not this scan's at all is caught by the bounds.** The outer join's key may
+  // name a column of some input the chain does not run through -- a build side's -- and the walk
+  // carries that position down all the same. It cannot land inside this scan's fields: a position
+  // at or past a node's output width stays at or past the width of the input it descends into, so
+  // such a key ends at or past `scan.fields.size()` and is refused below (or under zero, where a
+  // prefix came off). The two bounds are the whole of that argument, so each has a test.
+  //
+  // Nothing but a Filter and a Join may stand in the chain: a Compute appends, a Project reorders
+  // and an aggregate replaces the row, so any of them ends the walk.
+  for (const plan::LogicalNode* n = PipelineInput(*join); n != nullptr;) {
     if (std::holds_alternative<plan::ScanNode>(*n)) {
       if (&std::get<plan::ScanNode>(*n) != &scan) {
         return std::nullopt;  // another scan of the pipeline, not this one
       }
       break;
     }
-    if (!std::holds_alternative<plan::FilterNode>(*n)) {
+    if (std::holds_alternative<plan::FilterNode>(*n)) {
+      n = PipelineInput(*n);
+      continue;
+    }
+    const auto* below = std::get_if<plan::JoinNode>(n);
+    const plan::LogicalNode* next = below == nullptr ? nullptr : PipelineInput(*below);
+    if (next == nullptr) {
       return std::nullopt;
     }
+    // **A join that emits its build rows is never passed.** Such a join emits the build rows that
+    // found no match, so a probe row removed before it reaches one turns a matched build row into
+    // an unmatched one and ADDS a row to the answer -- the one way dropping probe rows can do
+    // anything but drop output. The publishing join is already refused this shape (the kind test
+    // above); this refuses it anywhere in between, so the argument is local to this walk rather
+    // than resting on `IsRightJoin` ending every pipeline such a join tops.
+    if (IsRightJoin(*n)) {
+      return std::nullopt;
+    }
+    // Which input the pipeline descends into, asked of the join and not of the pointer: the two
+    // inputs of a join are distinct nodes today, and `next == below->right.get()` would be the
+    // same test, but it leans on that where `build` says it outright.
+    if (below->build == plan::BuildSide::kLeft) {
+      // Its output must put its left input's columns first for the subtraction below to mean
+      // anything, and SEMI, ANTI and null-aware ANTI put their left input's columns and no others
+      // there whatever side they build on (plan's `JoinIds`). **Unreachable as the code stands**,
+      // and kept because what makes it so lives in two other files: a non-inner join building on
+      // its left satisfies `EmitsBuildRows`, so `IsRightJoin` above has already ended the walk,
+      // and `HashJoinOperator::Make` admits build=left for INNER and SEMI alone. A descent to the
+      // right therefore implies a kind whose output concatenates -- by proof, not by construction,
+      // which is the kind of reasoning worth one comparison to not depend on.
+      if (below->kind != plan::JoinKind::kInner && below->kind != plan::JoinKind::kLeft &&
+          below->kind != plan::JoinKind::kOneRow) {
+        return std::nullopt;
+      }
+      // The width comes from the ids the node reports, so a node that reports none would subtract
+      // nothing and leave the position naming another column -- the quiet half of this hazard,
+      // which drops rows that match rather than failing. An unnamed column cannot be counted on,
+      // so it ends the walk instead.
+      //
+      // **What this trusts is one id per output column**, which is ADR 0023's one output-id
+      // contract and what `plan::JoinIds` builds. It is the one assumption the bounds below cannot
+      // check: a vector of the wrong length subtracts the wrong width and can land inside this
+      // scan's fields, where no later test can tell it from the right answer. Every other way of
+      // getting the width wrong ends up outside them.
+      const std::vector<plan::ColumnId> prefix = plan::OutputIds(*below->left);
+      if (prefix.empty() || std::ranges::contains(prefix, plan::kNoColumnId)) {
+        return std::nullopt;
+      }
+      column -= static_cast<int>(prefix.size());
+      if (column < 0) {
+        return std::nullopt;
+      }
+    }
+    n = next;
   }
-  return ProbeKey{.build = build.get(), .column = column};
-}
-
-std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
-                                   const std::optional<LateScan>& late) {
-  const std::optional<ProbeKey> key = ProbeKeyStructure(scan, builds, late);
-  if (!key.has_value() || key->build->key_filter() == nullptr) {
+  if (std::cmp_greater_equal(column, scan.fields.size())) {
     return std::nullopt;
   }
-  return key;
+  return ProbeKey{.build = build.get(), .column = column, .joins_below = from_innermost > 0};
 }
 
 // The field of `scan` a key filter could be applied to, as a position in `scan.fields`: every
@@ -752,10 +835,17 @@ std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBui
 // chose (a direct build takes no per-row filter), and whether a part's statistics exclude its keys.
 // For `explain --physical`, which reports what the planner decided and must not claim what it
 // cannot know, so what this finds is a *candidate*.
-std::optional<int> KeyFilterCandidate(const plan::ScanNode& scan, const PipelineBuilds* builds,
-                                      const std::optional<LateScan>& late) {
-  const std::optional<ProbeKey> key = ProbeKeyStructure(scan, builds, late);
-  return key.has_value() ? std::optional<int>(key->column) : std::nullopt;
+std::vector<int> KeyFilterCandidates(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                     const std::optional<LateScan>& late) {
+  const std::size_t joins = builds == nullptr ? 0 : builds->joins.size();
+  std::vector<int> out;
+  for (std::size_t i = 0; i < joins; ++i) {
+    const std::optional<ProbeKey> key = ProbeKeyAt(scan, builds, late, i);
+    if (key.has_value() && std::ranges::find(out, key->column) == out.end()) {
+      out.push_back(key->column);
+    }
+  }
+  return out;
 }
 
 // A scan field's name as EXPLAIN writes a column (plan/explain.cc's Name): a plain identifier as
@@ -797,8 +887,34 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   // neither. Extending this refusal to D5 costs **1.849x** on a direct build above a grouped
   // aggregate (ADR 0029 carries the construction), where refusing it here is worth 0.594x to
   // 0.765x. The two paths want opposite answers for the same build.
+  //
+  // **One exception, and the gate it needs.** The argument above prices a rejected row at the one
+  // probe it skips. That is the whole benefit only at the innermost join, where nothing of the
+  // pipeline runs between the scan and the probe; a filter a join FURTHER UP offers also spares
+  // every join below it, which is the same "what it has to beat is not this probe's cost" that D5
+  // turns on. So a direct build is read there -- but only when it rejects nearly every key,
+  // because the filter's cost is paid on every probe row whether it rejects or not while the
+  // benefit scales with what it rejects.
+  //
+  // The share of its own key range the build occupies estimates that, and `key_span` is the one
+  // measure of it to hand: no statistics, and `num_rows() >= distinct keys`, so it reads high and
+  // the gate errs towards refusing. It is exact where the two sides draw their keys from the same
+  // domain, which a foreign key does, and pessimistic for a build whose range is far narrower than
+  // the probe's -- that case keeps D2, which prunes whole parts from the same interval, and is not
+  // what this is weighing. Measured over the 22 at 14 threads, both sides of the gate: Q09, where
+  // the build covers 0.054 of its span, goes **0.849x**, four joins above the scan losing 17s of
+  // summed self time; Q05, where it covers 0.200, rejects 480,000,000 of 600,037,902 probe rows
+  // all the same and still **loses 6%** -- its scan pays 5.2s of summed filter time for 3.1s saved
+  // at the two cheap probes above it. Ungated, admitting this case is 1.005x geomean over the 22
+  // and gated it is 0.993x, with Q09 keeping all of its 0.849x.
   if (table->layout() == JoinTable::Layout::kDirect) {
-    return false;
+    if (!key.joins_below) {
+      return false;
+    }
+    const int64_t span = table->key_span();
+    if (span <= 0 || table->num_rows() > span / kFilterKeySpanShare) {
+      return false;
+    }
   }
   // The build must be small against what it filters, or the filter holds so many keys that it
   // rejects nothing and the probe pays the hash for it. A build's rows are an upper bound on its
@@ -812,8 +928,31 @@ bool CanFilterRows(const plan::ScanNode& scan, const ProbeKey& key) {
   return table->num_rows() <= *probe_rows / kFilterBuildShare;
 }
 
-// Whether part `part` of `scan` holds no key the innermost join's build published, so that it
-// matches nothing and need not be read at all: no open, no decode, no filtering (ADR 0029's D2).
+// The key filter the pipeline offers `scan`, the innermost join's first: that is the only one
+// today's answer can be, and taking it unconditionally keeps every decision this already made.
+// Only where the innermost join published no filter at all -- a build past `KeyFilter::kMaxBytes`,
+// so no filter and no part pruning either, which is Q05's and Q09's 150,000,000-row `orders` build
+// -- does this look further up, and then it takes a key only when the filter would actually be
+// read: `CanFilterRows` prices the case, and a candidate that cannot pay leaves the scan as it was
+// rather than trading its rows for a worse plan. D2's part pruning follows the same key, which is
+// an addition and not a change -- where this looks up at all, there was no key to prune with.
+std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBuilds* builds,
+                                   const std::optional<LateScan>& late) {
+  const std::size_t joins = builds == nullptr ? 0 : builds->joins.size();
+  for (std::size_t i = 0; i < joins; ++i) {
+    const std::optional<ProbeKey> key = ProbeKeyAt(scan, builds, late, i);
+    if (!key.has_value() || key->build->key_filter() == nullptr) {
+      continue;
+    }
+    if (i == 0 || CanFilterRows(scan, *key)) {
+      return key;
+    }
+  }
+  return std::nullopt;
+}
+
+// Whether part `part` of `scan` holds no key the build `key` names published, so that it matches
+// nothing and need not be read at all: no open, no decode, no filtering (ADR 0029's D2).
 //
 // It asks less of the scan than the per-row filter does, and deliberately so. A part that is never
 // read needs no filtered decoder, so `supports_scan_filter` is beside the point; it takes none of
@@ -920,32 +1059,38 @@ struct Builder {
     }
   }
 
-  // The field of `node` a key filter could be applied to, from either source a run would take one
-  // from: a join of this pipeline (ADR 0029's D1 and D2, KeyFilterCandidate) or a join above the
+  // The fields of `node` a key filter could be applied to, from either source a run would take one
+  // from: a join of this pipeline (ADR 0029's D1 and D2, KeyFilterCandidates) or a join above the
   // grouped aggregate this scan feeds. Only the conditions a plan decides, so the answer is a
   // candidate and never a fact; none outside a part pipeline, which is the only place either is
   // attached.
-  [[nodiscard]] std::optional<int> CandidateKeyField(
+  //
+  // More than one where the pipeline has joins above the innermost whose keys also reach the scan:
+  // which of them a run reads depends on which builds publish a filter and on what each would
+  // reject, neither of which a plan can know, so a report that named only the first would be read
+  // as a claim about the one in use. In `ProbeKeyOf`'s order, the innermost first.
+  [[nodiscard]] std::vector<int> CandidateKeyFields(
       const plan::ScanNode& node, const std::optional<LateScan>& late_scan) const {
     if (!part.has_value()) {
-      return std::nullopt;
+      return {};
     }
-    if (const std::optional<int> column = KeyFilterCandidate(node, builds, late_scan);
-        column.has_value()) {
-      return column;
+    if (std::vector<int> columns = KeyFilterCandidates(node, builds, late_scan); !columns.empty()) {
+      return columns;
     }
-    // CanPublishKeyFilter here too, and for the same reason it is in ProbeKeyStructure: this arm
+    // CanPublishKeyFilter here too, and for the same reason it is in ProbeKeyAt: this arm
     // reads its filter from a build as well, so a key no build can publish for has no candidate on
     // either of them. The run path tests it through `above->build->key_filter()`, which is null for
     // such a key -- the very implication a report cannot lean on.
     if (above == nullptr || above->build == nullptr || late_scan.has_value() ||
         !CanPublishKeyFilter(above->build->spec()) ||
         !node.table->supports_scan_filter(ReadFields(node, nullptr))) {
-      return std::nullopt;
+      return {};
     }
     const auto at = std::ranges::find(node.ids, above->key);
-    return at == node.ids.end() ? std::nullopt
-                                : std::optional<int>(static_cast<int>(at - node.ids.begin()));
+    if (at == node.ids.end()) {
+      return {};
+    }
+    return {static_cast<int>(at - node.ids.begin())};
   }
 
   OperatorResult operator()(const plan::ScanNode& node) const {
@@ -990,16 +1135,19 @@ struct Builder {
     // the node is rewrapped for ExplainNode because a visitor sees the alternative and not the
     // LogicalNode holding it -- a copy of a scan's vectors, once per scan, at planning time.
     if (slot != nullptr && slot->detail().empty()) {
-      if (const std::optional<int> column = CandidateKeyField(node, late_scan);
-          column.has_value()) {
+      if (const std::vector<int> columns = CandidateKeyFields(node, late_scan); !columns.empty()) {
         // Which of the two mechanisms this scan could take, which is not the same question as
         // whether a key reaches it: the per-row filter needs a filtered decoder over the fields
         // this scan reads, and a part the published keys are not in is skipped whole and needs
         // none (ADR 0029's D2). Without that decoder the honest claim is the narrower one.
         const bool rows = node.table->supports_scan_filter(ReadFields(node, nullptr));
-        slot->set_detail(
-            std::format("{}, {} candidate on {}", plan::ExplainNode(plan::LogicalNode(node)),
-                        rows ? "key filter" : "part skip", ScanFieldName(node, *column)));
+        std::string on;
+        for (const int column : columns) {
+          on += (on.empty() ? "" : " or ") + ScanFieldName(node, column);
+        }
+        slot->set_detail(std::format("{}, {} candidate on {}",
+                                     plan::ExplainNode(plan::LogicalNode(node)),
+                                     rows ? "key filter" : "part skip", on));
       }
     }
     // Per part, so a reader can see the filter is in use. It is a metric and not the node's detail
@@ -1043,11 +1191,13 @@ struct Builder {
         // What a key filter could do here, for `explain --physical`, and it is the same as on a
         // scan with no predicates of its own now that the two can be applied together.
         if (names_it) {
-          if (const std::optional<int> column = KeyFilterCandidate(*scan, builds, late_scan);
-              column.has_value()) {
-            input_slot->set_detail(
-                input_slot->detail() +
-                std::format(", key filter candidate on {}", ScanFieldName(*scan, *column)));
+          std::string on;
+          for (const int column : KeyFilterCandidates(*scan, builds, late_scan)) {
+            on += (on.empty() ? "" : " or ") + ScanFieldName(*scan, column);
+          }
+          if (!on.empty()) {
+            input_slot->set_detail(input_slot->detail() +
+                                   std::format(", key filter candidate on {}", on));
           }
         }
         // **Both halves of ADR 0029 over pushed predicates.** The part test never needed the filter

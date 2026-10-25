@@ -130,6 +130,19 @@ TEST_F(PlanReportTest, AProbeScanNamesTheKeyFilterItCouldTake) {
   EXPECT_TRUE(dimension.ends_with(", 1 pushed predicate")) << dimension;
 }
 
+// A pipeline of two joins over one scan has two keys to offer it, and the report names both: which
+// one a run reads depends on which builds publish a filter and on what each would reject, neither
+// of which a plan can know, so naming the first alone would be read as a claim about the one in
+// use. In the order a run asks them, the innermost join's first.
+TEST_F(PlanReportTest, AScanUnderTwoJoinsNamesEveryKeyFilterItCouldTake) {
+  ProfileNode profile;
+  ASSERT_TRUE(PlanOnly("SELECT COUNT(*) FROM f, d AS d1, d AS d2 WHERE f.k = d1.dk AND f.v = d2.dk",
+                       Facts(), Dimension(), &profile)
+                  .ok());
+  const std::string facts = ScanDetail(profile, "f");
+  EXPECT_TRUE(facts.ends_with(", key filter candidate on v or k")) << facts;
+}
+
 // Pushed predicates no longer stand in the way of the key filter: the scan applies the conjunction
 // of the two (MakeBothScanFilters), so the annotation says the same thing here as on a scan with no
 // predicates of its own. Before this it said "part skip candidate", the part test being all that
@@ -189,7 +202,7 @@ TEST_F(PlanReportTest, AScanBelowAGroupedAggregateNamesTheJoinsKey) {
 // hashed, which is one key of an integer or DATE type (CanPublishKeyFilter) -- so a VARCHAR key has
 // no candidate at all, neither mechanism. This is **not** one of the four run-time facts the word
 // "candidate" covers: it is settled by the plan, and the old code enforced it only by accident,
-// through the null filter that ProbeKeyStructure no longer tests.
+// through the null filter that ProbeKeyAt no longer tests.
 TEST_F(PlanReportTest, NoCandidateForAKeyNoBuildCanPublish) {
   for (const std::string_view sql :
        {"SELECT COUNT(*) FROM f, d WHERE f.ks = d.dks",

@@ -514,6 +514,36 @@ TEST_F(JoinTableTest, DirectLayoutBoundaries) {
   }
 }
 
+// `key_span` is the slot count of the direct layout's index, from its smallest key to its largest:
+// what a caller weighing a filter of this build against the keys it would reject divides its rows
+// by (ADR 0029's D1). Zero where there is no index to measure -- the hashed layout and an empty
+// build -- so that a caller cannot read "covers everything" out of a table that has no range.
+TEST_F(JoinTableTest, KeySpanCountsTheDirectIndexSlotsAndIsZeroWithoutOne) {
+  const auto span = [](const std::vector<std::optional<int64_t>>& keys) {
+    BuildData data({LogicalType::kBigInt});
+    data.Add(0, {Int64s(keys)});
+    auto table = BuildTable(data, nullptr);
+    EXPECT_TRUE(table.ok()) << table.status().ToString();
+    return table.ok() ? std::pair((*table)->layout(), (*table)->key_span())
+                      : std::pair(JoinTable::Layout::kHashed, int64_t{-1});
+  };
+  // Four keys from 0 to 3: four slots, one a key, so a filter of it rejects nothing of its range.
+  EXPECT_EQ(span({0, 1, 2, 3}), std::pair(JoinTable::Layout::kDirect, int64_t{4}));
+  // Four keys inside 100: still direct (a span under 32 a row) and now 100 slots for 4 rows, the
+  // shape D1 reads as a filter that rejects the other 96.
+  EXPECT_EQ(span({0, 9, 40, 99}), std::pair(JoinTable::Layout::kDirect, int64_t{100}));
+  // One key is one slot, and negative keys measure the same: the span is a count, not a bound.
+  EXPECT_EQ(span({7, 7, 7}), std::pair(JoinTable::Layout::kDirect, int64_t{1}));
+  EXPECT_EQ(span({-20, -18, -11}), std::pair(JoinTable::Layout::kDirect, int64_t{10}));
+  // A NULL key is in no range at all, so it widens nothing.
+  EXPECT_EQ(span({0, std::nullopt, 3}), std::pair(JoinTable::Layout::kDirect, int64_t{4}));
+  // Hashed: there is no index, whatever the keys would have spanned.
+  EXPECT_EQ(span({0, 1, 2, 10'000}), std::pair(JoinTable::Layout::kHashed, int64_t{0}));
+  // No key at all: no range to report, which a caller must not read as a span of one.
+  EXPECT_EQ(span({}), std::pair(JoinTable::Layout::kHashed, int64_t{0}));
+  EXPECT_EQ(span({std::nullopt, std::nullopt}), std::pair(JoinTable::Layout::kHashed, int64_t{0}));
+}
+
 // Only the sparse half of the rule asks the budget (ADR 0026's C5a): an index of more than an
 // eighth of the limit, or one that does not fit in what is still free, is not taken, because a
 // build that would fail its budget on an index is better hashed than failed. A key dense enough for
