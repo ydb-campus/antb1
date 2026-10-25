@@ -59,7 +59,7 @@ Data policy:
 Data policy for the data derived from TPC-H (amendment, 2026-10-02):
 
 - **Source:** the conda-forge package `duckdb-extension-tpch`, locked at the same version and build as `libduckdb`.
-  It contains TPC's dbgen under the TPC EULA v2.2. Installing the `default` or `gcc` environment (the `lint`
+  It contains TPC's dbgen under the TPC EULA v2.2. Installing the `default`, `gcc` or `static` environment (the `lint`
   environment does not contain it), on a contributor's machine, an agent's or a hosted CI runner, installs it and
   accepts that EULA; the maintainers accepted this exposure, as DuckDB and DataFusion do. Correctness is judged by
   the live DuckDB oracle on the same files, never by TPC's official answers: the extension's text columns differ from
