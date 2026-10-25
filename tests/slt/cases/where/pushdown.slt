@@ -91,3 +91,42 @@ SELECT RegionID, Title, URL FROM hits_like_nulls WHERE Title LIKE '%o%' AND User
 query I nosort
 SELECT ResolutionWidth FROM hits_like WHERE RegionID < 0 AND (ResolutionWidth > 0 OR ResolutionHeight > 0) LIMIT 1 OFFSET 0
 ----
+
+# ---- a column read only so that a pushed predicate can be applied to it (ADR 0020) ----
+
+# Such a column is read as dictionary indices and never copied into a batch. The answer is the only
+# thing that can show one was dropped wrongly, so each case below reads a column that the one above
+# it drops. `cols_filter_only` and `dict_pieces` are asserted, rather than read once by hand, in
+# tests/integration/session_test.cc, which is the only place a metric is observable.
+
+# Nothing above the Filter reads anything: every column the scan reads is read to be compared, and
+# the predicate is a VARCHAR one, which is the shape the whole item is for.
+query I nosort
+SELECT COUNT(*) FROM hits_like_split WHERE URL LIKE '%a%'
+----
+9805
+
+# The same column read above the scan as well: it must be carried, values and all.
+query TI nosort
+SELECT MIN(URL), COUNT(*) FROM hits_like_split WHERE URL LIKE '%a%'
+----
+https://www.example.org/alpha/10360?q=музыка	9805
+
+# One predicate pushed and one left for the Filter over the same column (a comparison of two
+# columns cannot be pushed), so the column is read by a predicate the Filter still evaluates and is
+# not droppable.
+query I nosort
+SELECT COUNT(*) FROM hits_like_split WHERE URL LIKE '%a%' AND URL > Title
+----
+4624
+
+# Two VARCHAR columns, one droppable and one read above, with a NULL in each: a dropped column's
+# NULLs cannot reach the answer and the kept one's must.
+query TI rowsort
+SELECT Title, COUNT(*) FROM hits_like_nulls WHERE SearchPhrase <> '' GROUP BY Title ORDER BY Title LIMIT 5
+----
+(empty)	425
+alpha	6
+alpha beta	1
+alpha beta café	1
+alpha beta pixel alpha	1

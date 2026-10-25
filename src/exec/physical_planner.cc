@@ -600,6 +600,54 @@ std::vector<int> ReadFields(const plan::ScanNode& scan, const LateScan* late) {
   return read;
 }
 
+// Which of a scan's fields a pushed predicate reads and nothing else does, so that the scan can
+// read and filter on them without putting them in a batch (ADR 0020). Empty where none is, where
+// anything is uncertain, or where a late scan already narrows the same request.
+//
+// **The safety is here and nowhere below.** A field wrongly marked is a column missing from every
+// batch, which the operators above would read as the wrong type or not at all, so the set is built
+// from three things that must all hold: the field's id is read by a predicate the scan takes; it is
+// read by no predicate left for the Filter above; and it is not in the Filter's `needed_above`. The
+// last is a recorded set, so as with JoinNode::needed_above it is **verified rather than trusted**
+// -- every id in it must be one this Filter outputs, and the whole set is abandoned when one is
+// not, because `CloneWithFreshIds` mints ids no earlier pass can know.
+std::vector<bool> FilterOnlyFields(const plan::FilterNode& filter, const plan::ScanNode& scan,
+                                   const std::vector<plan::Predicate>& pushed,
+                                   const std::vector<plan::Predicate>& rest, const LateScan* late) {
+  if (late != nullptr || !filter.needed_above.has_value() ||
+      scan.ids.size() != scan.fields.size()) {
+    return {};  // nothing recorded, or a request already narrowed for another reason
+  }
+  // An EMPTY set is the valuable case, not the missing one: COUNT(*) with a WHERE reads nothing
+  // above the Filter, so every column the scan reads is read to be compared and for nothing else.
+  const std::vector<plan::ColumnId>& needed_above = *filter.needed_above;
+  const std::vector<plan::ColumnId> outputs = plan::OutputIds(plan::LogicalNode(filter));
+  for (const plan::ColumnId id : needed_above) {
+    if (std::ranges::find(outputs, id) == outputs.end()) {
+      return {};  // the set describes some other shape of this node
+    }
+  }
+  const auto reads = [](const std::vector<plan::Predicate>& predicates, plan::ColumnId id) {
+    return std::ranges::any_of(predicates, [&](const plan::Predicate& p) {
+      return (p.column.has_value() && p.column->id == id) ||
+             (p.other.has_value() && p.other->id == id);
+    });
+  };
+  std::vector<bool> out(scan.fields.size(), false);
+  bool any = false;
+  for (std::size_t i = 0; i < scan.ids.size(); ++i) {
+    const plan::ColumnId id = scan.ids[i];
+    // `find`, not `binary_search`: the set is sorted only by Prune's convention and nothing here
+    // verifies the order. A linear scan over a handful of ids costs nothing and cannot miss one,
+    // where a binary search over an unsorted set would -- and a missed id marks a live column
+    // filter-only, which puts NULLs in an answer that no later check can notice.
+    out[i] = reads(pushed, id) && !reads(rest, id) &&
+             std::ranges::find(needed_above, id) == needed_above.end();
+    any = any || out[i];
+  }
+  return any ? out : std::vector<bool>{};
+}
+
 // The most of a probe's rows a build may hold and still be worth filtering with: a build of more
 // than this share of them rejects too little to pay for the hash of every probe row (ADR 0029's
 // D1).
@@ -1020,10 +1068,12 @@ struct Builder {
             input_slot->Add("key_pruned", MetricUnit::kCount, 1);
           }
         }
-        ARROW_ASSIGN_OR_RAISE(auto input, Profiled(std::make_unique<TableScanOperator>(
-                                                       scan->table, scan->fields, part, late_scan,
-                                                       std::move(pushed), std::move(key_scan)),
-                                                   node.input, input_slot));
+        std::vector<bool> filter_only = FilterOnlyFields(node, *scan, pushed, rest, late);
+        ARROW_ASSIGN_OR_RAISE(
+            auto input, Profiled(std::make_unique<TableScanOperator>(
+                                     scan->table, scan->fields, part, late_scan, std::move(pushed),
+                                     std::move(key_scan), std::move(filter_only)),
+                                 node.input, input_slot));
         return std::make_unique<FilterOperator>(std::move(input), std::move(rest));
       }
     }

@@ -756,7 +756,8 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
   - its metrics.
 - A `Scan` that applies predicates of the `Filter` above it while it reads (filter pushdown,
   [ADR 0020](adr/0020-filter-pushdown.md)) says so after its EXPLAIN text, `, N pushed predicates`; its `rows` are
-  then those that passed them.
+  then those that passed them. A column such a predicate reads and nothing above the scan does is read and
+  compared and never copied into a batch, which the `cols_filter_only` metric of `--analyze` counts.
 - A hash join (any `Join` the executor runs) shows two lines, each with the join's EXPLAIN text:
   - `HashJoin`, its probe, where the input it does not build on is read: in that input's part pipeline (per part),
     or over it when it is no part pipeline;
@@ -776,6 +777,12 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     all, so they contribute no time and no rows). These appear beside `N pushed predicates` where a scan has both:
     it applies their conjunction, so `key_dropped` counts the rows the keys cleared and no others — the bit is tested
     before it is touched, whichever of the two reaches a row first;
+  - of a scan with pushed predicates ([ADR 0020](adr/0020-filter-pushdown.md)): `cols_filter_only`, the columns
+    read so that a predicate can be applied to them and that no batch carries, because nothing above the scan
+    reads them; and `dict_pieces`, how many (column, piece) pairs had a VARCHAR predicate asked once per distinct
+    value of the column chunk's dictionary rather than once per row. `dict_pieces` appears only where a predicate
+    is on a VARCHAR column, and a 0 there means the chunk's encoding did not allow it. Neither is visible in a
+    result, which is why both are reported: a scan that stops doing either answers exactly the same;
   - `raw_parts`, `raw_rows` (a GROUP BY's parts that sent rows straight to the partitions, because their first
     rows hardly reduced);
   - `part_time` (the part tasks' time, summed);

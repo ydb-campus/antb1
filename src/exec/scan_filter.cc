@@ -1,6 +1,7 @@
 #include "antb1/exec/scan_filter.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -274,8 +275,12 @@ struct ColumnPredicates {
 class PredicateScanFilter final : public plan::ScanFilter {
  public:
   PredicateScanFilter(std::vector<int> columns, std::vector<ColumnPredicates> predicates,
-                      arrow::MemoryPool* pool)
-      : columns_(std::move(columns)), predicates_(std::move(predicates)), pool_(pool) {}
+                      arrow::MemoryPool* pool,
+                      std::shared_ptr<std::atomic<int64_t>> dictionary_pieces)
+      : columns_(std::move(columns)),
+        predicates_(std::move(predicates)),
+        pool_(pool),
+        dictionary_pieces_(std::move(dictionary_pieces)) {}
 
   [[nodiscard]] const std::vector<int>& columns() const override { return columns_; }
 
@@ -286,8 +291,31 @@ class PredicateScanFilter final : public plan::ScanFilter {
     }
     const ColumnPredicates& c = predicates_[static_cast<std::size_t>(column)];
     if (c.strings) {
-      if (values.array != nullptr || std::cmp_not_equal(values.strings.size(), values.rows)) {
-        return arrow::Status::Invalid("scan filter: a VARCHAR column needs one view per row");
+      // Either shape plan::ScanValues documents: one view per row, or a dictionary and one index
+      // per row with no views at all -- which is what a column no batch carries is read as, since
+      // its views would exist only to be compared. The second shape is admissible only when
+      // KeepByDictionary will certainly take it, because the per-row fallback would otherwise read
+      // views nobody wrote; the table produces it under that same condition and this re-checks it
+      // rather than trusting it.
+      if (values.array != nullptr) {
+        return arrow::Status::Invalid("scan filter: a VARCHAR column is not an array");
+      }
+      const bool views = std::cmp_equal(values.strings.size(), values.rows);
+      const bool by_dictionary = !values.dictionary.empty() &&
+                                 values.indices.size() == static_cast<std::size_t>(values.rows) &&
+                                 std::cmp_less_equal(values.dictionary.size(), values.rows);
+      if (!views && !by_dictionary) {
+        return arrow::Status::Invalid(
+            "scan filter: a VARCHAR column needs one view per row, or a dictionary no larger than "
+            "the piece with one index per row");
+      }
+      // Counted here because nothing above the scan can see it: whether a predicate was asked once
+      // a distinct value or once a row is decided per piece, by the encoding of the chunk it came
+      // from, and a scan that silently stops asking the cheap question looks exactly like one that
+      // still asks it. One add a piece, not a row, and atomic because a ScanFilter is applied by
+      // several parts at once.
+      if (by_dictionary && dictionary_pieces_ != nullptr) {
+        dictionary_pieces_->fetch_add(1, std::memory_order_relaxed);
       }
       for (const StringPredicate& p : c.on_strings) {
         p.Apply(values, offset, selected);
@@ -326,6 +354,9 @@ class PredicateScanFilter final : public plan::ScanFilter {
   std::vector<int> columns_;
   std::vector<ColumnPredicates> predicates_;  // per position of columns_
   arrow::MemoryPool* pool_;
+  // How many (column, piece) pairs took the dictionary rather than one compare a row; nullptr:
+  // not counted.
+  std::shared_ptr<std::atomic<int64_t>> dictionary_pieces_;
 };
 
 // A hash join's key filter as a scan filter: one column, and a hash per row computed with the very
@@ -618,7 +649,7 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeKeyScanFilter(
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
     const std::vector<plan::Predicate>& predicates, const arrow::Schema& schema,
-    arrow::MemoryPool* pool) {
+    arrow::MemoryPool* pool, std::shared_ptr<std::atomic<int64_t>> dictionary_pieces) {
   std::vector<int> columns;
   std::vector<ColumnPredicates> per_column;
   for (const plan::Predicate& p : predicates) {
@@ -657,7 +688,7 @@ arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
   }
   Order(columns, per_column);
   return std::make_shared<const PredicateScanFilter>(std::move(columns), std::move(per_column),
-                                                     pool);
+                                                     pool, std::move(dictionary_pieces));
 }
 
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeBothScanFilters(

@@ -21,9 +21,11 @@
 #include "antb1/common/int128.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/key_filter.h"
+#include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
+#include "../group_table.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -553,6 +555,124 @@ TEST_F(ScanFilterTest, RejectsMalformedPredicatesAndValues) {
       .array = Strings({"1", "2"}), .strings = {}, .validity = nullptr, .rows = 2};
   EXPECT_TRUE((*filter)->Apply(1, other_type, 0, &selected).IsInvalid()) << "another type";
   EXPECT_EQ(selected, 0xff) << "a failed call clears nothing";
+}
+
+// The second shape plan::ScanValues allows for a VARCHAR column: a dictionary and one index a row,
+// with **no views at all**. That is what a column no batch carries is read as -- its views would
+// exist only to be compared -- and it is admissible only where the dictionary is certain to answer
+// the predicate, because the per-row path would otherwise read values nobody wrote.
+TEST_F(ScanFilterTest, AVarcharColumnMayArriveAsADictionaryWithNoViews) {
+  const auto filter = MakeScanFilter({testing::Compare(S(), CompareOp::kEq, Text("a"))},
+                                     *Batch()->schema(), arrow::default_memory_pool());
+  ASSERT_TRUE(filter.ok()) << filter.status().ToString();
+  const std::vector<std::string_view> dictionary = {"a", "b", "c"};
+  const std::vector<std::int32_t> indices = {0, 1, 0, 2};
+
+  // No views, a dictionary smaller than the piece: accepted, and it answers.
+  std::uint8_t selected = 0x0f;
+  const plan::ScanValues by_dictionary{.array = nullptr,
+                                       .strings = {},
+                                       .validity = nullptr,
+                                       .rows = 4,
+                                       .dictionary = std::span<const std::string_view>(dictionary),
+                                       .indices = std::span<const std::int32_t>(indices)};
+  ASSERT_TRUE((*filter)->Apply(0, by_dictionary, 0, &selected).ok());
+  EXPECT_EQ(selected, 0x05) << "rows 0 and 2 hold 'a'";
+
+  // Neither shape: Invalid rather than a read of nothing.
+  selected = 0x0f;
+  const plan::ScanValues neither{.array = nullptr, .strings = {}, .validity = nullptr, .rows = 4};
+  EXPECT_TRUE((*filter)->Apply(0, neither, 0, &selected).IsInvalid()) << "no views, no dictionary";
+  EXPECT_EQ(selected, 0x0f) << "a failed call clears nothing";
+
+  // **A dictionary larger than the piece with no views is refused**, which is the trap this check
+  // exists for: the per-row path is the one that would be taken, and it has nothing to read. A
+  // table must not produce this, and the refusal is what says so rather than a comment.
+  const std::vector<std::string_view> big = {"a", "b", "c", "d", "e"};
+  const std::vector<std::int32_t> two = {0, 1};
+  const plan::ScanValues larger{.array = nullptr,
+                                .strings = {},
+                                .validity = nullptr,
+                                .rows = 2,
+                                .dictionary = std::span<const std::string_view>(big),
+                                .indices = std::span<const std::int32_t>(two)};
+  EXPECT_TRUE((*filter)->Apply(0, larger, 0, &selected).IsInvalid())
+      << "a dictionary bigger than the piece falls back to the views that are not there";
+
+  // With views as well it is the ordinary shape, whatever the dictionary's size: the fallback has
+  // something to read.
+  const std::vector<std::string_view> views = {"a", "b"};
+  selected = 0x03;
+  const plan::ScanValues both{.array = nullptr,
+                              .strings = std::span<const std::string_view>(views),
+                              .validity = nullptr,
+                              .rows = 2,
+                              .dictionary = std::span<const std::string_view>(big),
+                              .indices = std::span<const std::int32_t>(two)};
+  ASSERT_TRUE((*filter)->Apply(0, both, 0, &selected).ok());
+  EXPECT_EQ(selected, 0x01);
+}
+
+// A scan that both pushes predicates and applies ADR 0029's key filter, over a field list that a
+// filter-only column reorders. **The key column is never dropped** -- the join above reads it --
+// but it MOVES, because the fields a table is asked for put the returned ones first, and a key
+// filter names its column by position in that list. An index left unmapped there filters on
+// another column: on a VARCHAR one it is an error, and on a second fixed-width one it would hash
+// the wrong values and drop rows the join must keep, with nothing to show for it in the plan.
+TEST_F(ScanFilterTest, AKeyFilterColumnMovesWhenAFieldIsReadOnlyToFilterOn) {
+  // Two columns: a VARCHAR to push a predicate on, and a BIGINT the key filter tests. The VARCHAR
+  // is read only to filter on, so the scan asks for the BIGINT first and the VARCHAR last.
+  const std::vector<std::string> texts = {"keep", "drop", "keep", "drop", "keep"};
+  const std::vector<std::optional<int64_t>> keys = {1, 2, 3, 4, 5};
+  arrow::BinaryBuilder text;
+  for (const std::string& v : texts) {
+    ASSERT_TRUE(text.Append(v).ok());
+  }
+  const auto batch = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("s", arrow::binary()), arrow::field("k", arrow::int64())}),
+      static_cast<int64_t>(texts.size()), {text.Finish().ValueOrDie(), Int64s(keys)});
+  auto table =
+      std::make_shared<testing::MemoryTable>(batch->schema(), arrow::RecordBatchVector{batch},
+                                             /*split=*/true);
+  table->set_scan_filter(true);
+
+  // The key filter holds keys 1 and 5 only, so of the three rows whose text is 'keep' (keys 1, 3
+  // and 5) it clears the one keyed 3.
+  auto built = KeyFilter::Make(/*num_keys=*/2, /*budget=*/nullptr);
+  ASSERT_TRUE(built.ok()) << built.status().ToString();
+  // The same hash the build uses and the key scan filter asks with (ADR 0029): a hash of our own
+  // would make the filter miss every row and the test pass for the wrong reason.
+  auto hashes = KeyHashes(arrow::compute::ExecBatch({Int64s({1, 5})}, 2));
+  ASSERT_TRUE(hashes.ok()) << hashes.status().ToString();
+  (*built)->Add(std::span<const std::uint64_t>(*hashes));
+
+  std::vector<plan::Predicate> pushed = {
+      testing::Compare(Column(0, "s", LogicalType::kVarchar), CompareOp::kEq, Text("keep"))};
+  // `filter_only` marks field 0 (`s`), so the operator asks for {k, s} and returns {k} alone.
+  TableScanOperator scan(
+      table, std::vector<int>{0, 1}, /*part=*/int64_t{0}, std::nullopt, std::move(pushed),
+      TableScanOperator::KeyScan{.filter = *built, .column = 1}, std::vector<bool>{true, false});
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 16};
+  ASSERT_TRUE(scan.Open(ctx).ok());
+  std::vector<std::optional<int64_t>> kept;
+  while (true) {
+    auto batch_out = scan.Next();
+    ASSERT_TRUE(batch_out.ok()) << batch_out.status().ToString();
+    if (batch_out->end()) {
+      break;
+    }
+    // output_schema() keeps both fields; `s` is the placeholder, all NULL.
+    ASSERT_EQ(batch_out->data->num_columns(), 2);
+    EXPECT_EQ(batch_out->data->column(0)->null_count(), batch_out->data->num_rows())
+        << "the column read only to filter on carries no value";
+    const auto& column = static_cast<const arrow::Int64Array&>(*batch_out->data->column(1));
+    for (int64_t i = 0; i < column.length(); ++i) {
+      kept.push_back(column.IsNull(i) ? std::nullopt : std::optional<int64_t>(column.Value(i)));
+    }
+  }
+  ASSERT_TRUE(scan.Close().ok());
+  EXPECT_EQ(kept, (std::vector<std::optional<int64_t>>{1, 5}))
+      << "the predicate keeps keys 1, 3 and 5 and the key filter clears 3";
 }
 
 }  // namespace

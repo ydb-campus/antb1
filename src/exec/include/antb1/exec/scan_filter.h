@@ -28,9 +28,14 @@ namespace antb1::exec {
 // a row passes when every predicate is true, as in FilterOperator. Fixed-width columns are
 // evaluated with PredicateEvaluator (its kernels allocate from `pool`), VARCHAR views in place with
 // the same results: LIKE as LikePattern, `<op>` and IN bytewise, NULL fails.
+//
+// `dictionary_pieces` (nullptr: not counted) is added to once per (column, piece) whose predicate
+// was asked once per distinct value of the chunk's dictionary rather than once per row (ADR 0020).
+// It is counted here because nothing above the scan can see which question was asked, and a scan
+// that silently stops asking the cheap one looks exactly like one that still does.
 arrow::Result<std::shared_ptr<const plan::ScanFilter>> MakeScanFilter(
     const std::vector<plan::Predicate>& predicates, const arrow::Schema& schema,
-    arrow::MemoryPool* pool);
+    arrow::MemoryPool* pool, std::shared_ptr<std::atomic<int64_t>> dictionary_pieces = nullptr);
 
 // The plan::ScanFilter of a hash join's key filter over field `column` of the scan
 // (docs/adr/0029-dynamic-join-filters.md, D1): it clears the rows whose key the build certainly

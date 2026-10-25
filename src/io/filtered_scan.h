@@ -39,6 +39,13 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
                                                const arrow::DataType& storage,
                                                const arrow::DataType& engine);
 
+// Whether every DATA page of `chunk` is dictionary-encoded, from the chunk's REQUIRED `encodings`
+// rather than the optional `encoding_stats` Arrow's own door needs (ADR 0020). Only a v1
+// dictionary page proves it; filtered_scan.cc says why, and why the two doors do not overlap.
+// Here rather than in the .cc so that the proof itself can be tested over a file's metadata,
+// which is the only way to reach the shapes a writer produces.
+bool EveryDataPageIsDictionary(const parquet::ColumnChunkMetaData& chunk);
+
 // Reads row group `segment.row_groups[0]` of `columns` (the scan's fields, in order) in batches
 // of at most `batch_size` rows and returns only the rows that pass `filter`: for every batch, the
 // filter's columns are decoded first and the filter applied to them as they are decoded (strings
@@ -46,9 +53,13 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
 // batch, for every column. A batch that loses every row is not returned. Batches have `schema`,
 // and with `positions` one more column, `position` (INT64, not null): each row's position in the
 // row group (plan::Table::ScanPart).
+//
+// `returned` is how many of `columns`, from the first, the batches carry, and `schema` has exactly
+// those fields; -1 means all of them. A later column is read and filtered on and never copied,
+// which is what a column only a predicate reads costs nothing for (ADR 0020).
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MakeFilteredScan(
     Segment segment, std::vector<FilteredColumn> columns, std::shared_ptr<arrow::Schema> schema,
     int64_t batch_size, arrow::MemoryPool* pool, std::shared_ptr<const plan::ScanFilter> filter,
-    bool positions = false);
+    bool positions = false, int returned = -1);
 
 }  // namespace antb1::io

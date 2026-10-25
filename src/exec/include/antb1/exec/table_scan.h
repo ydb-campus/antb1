@@ -59,11 +59,24 @@ class TableScanOperator final : public Operator {
     bool part_has_no_key = false;
   };
 
+  // `filter_only` (empty: none) marks, per field, a field read only so that a pushed predicate can
+  // be applied to it (ADR 0020): the table reads and filters on it and never copies it, and this
+  // operator puts an all-NULL array in its place.
+  //
+  // **Its position is kept, not removed**, and output_schema() keeps the field's own type. Every
+  // operator above reads a column by the position plan::ResolvePositions gave it, so removing one
+  // from the middle would move every later column out from under them. The placeholder is of the
+  // field's DECLARED type -- not the `null` type ADR 0016's late split uses, because a late column
+  // is re-read by a node that knows it is a placeholder where this one can flow into a join build
+  // and be gathered past the join. It costs one zeroed buffer a batch from the query's pool, where
+  // the column itself would cost its bytes and a view a row. Nothing above reads the column by
+  // construction, so nothing reads the placeholder's value. Not combined with a late scan.
   TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                     std::optional<int64_t> part = std::nullopt,
                     std::optional<LateScan> late = std::nullopt,
                     std::vector<plan::Predicate> pushed = {},
-                    std::optional<KeyScan> key_scan = std::nullopt);
+                    std::optional<KeyScan> key_scan = std::nullopt,
+                    std::vector<bool> filter_only = {});
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
     return schema_;
@@ -80,6 +93,18 @@ class TableScanOperator final : public Operator {
   std::vector<plan::Predicate> pushed_;
   std::optional<KeyScan> key_scan_;
   std::vector<int> read_;  // the fields read: fields_ but the late ones
+  // The fields a filtered scan is asked for: the returned ones in their own order, then the ones
+  // read only to filter on. `returned_` is how many of them the batches carry, so the predicates
+  // are rebound to positions in this list rather than in fields_.
+  std::vector<int> scan_fields_;
+  std::vector<plan::Predicate> scan_pushed_;    // pushed_, rebound to scan_fields_
+  std::shared_ptr<arrow::Schema> scan_schema_;  // the types of scan_fields_, for the filter
+  std::vector<bool> filter_only_;               // per field of fields_
+  // Per field of fields_: its place in scan_fields_. Identity without filter_only_, and the one
+  // mapping anything that names a field by position has to go through -- the pushed predicates and
+  // ADR 0029's key column alike.
+  std::vector<int> scan_position_;
+  int returned_ = 0;
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<arrow::RecordBatchReader> reader_;
   int64_t offset_ = 0;       // with late_: the position in the part of the next batch's first row
@@ -88,8 +113,17 @@ class TableScanOperator final : public Operator {
   // The rows the key filter cleared, which only the filter can count (the operators above see the
   // survivors alone): shared with the filter, and reported on Close (ADR 0029's D3).
   std::shared_ptr<std::atomic<int64_t>> key_dropped_;
+  // How many (column, piece) pairs had their predicate asked once per distinct value of a chunk's
+  // dictionary rather than once per row: shared with the filter, reported on Close (ADR 0020).
+  std::shared_ptr<std::atomic<int64_t>> dictionary_pieces_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 
+  // The place of field `field` of fields_ in the list a filtered scan is asked for.
+  [[nodiscard]] int ScanPositionOf(int field) const;
+  // A batch of the returned fields as output_schema() describes it: the fields back at their own
+  // positions, with a NullArray for each read only to filter on.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> WithPlaceholders(
+      const arrow::RecordBatch& read) const;
   // The filter of the pushed predicates over the narrow scan's read fields.
   arrow::Result<std::shared_ptr<const plan::ScanFilter>> NarrowFilter(
       const LateScan& late, arrow::MemoryPool* pool) const;

@@ -1345,5 +1345,82 @@ TEST_F(PhysicalPlannerTest, ADependentJoinIsUnsupportedAndNotABug) {
   EXPECT_EQ(plan::GetSqlError(status)->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
 }
 
+// The first Scan of a profile tree, depth first.
+const ProfileNode* FindScan(const ProfileNode& node) {
+  if (node.name() == "Scan") {
+    return &node;
+  }
+  for (const ProfileNode* child : node.children()) {
+    if (const ProfileNode* found = FindScan(*child)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+// The guard between a recorded `needed_above` and a dropped live column (ADR 0020). The set is ids,
+// so a consumer has to establish that it describes the node it is holding: if any id in it is not
+// one the Filter outputs, the set was recorded against some other shape of this plan and **every**
+// column is kept. Without that, an id the set does not mention reads as unneeded, and a column
+// dropped on that basis is a NULL in an answer that nothing downstream can notice.
+TEST_F(PhysicalPlannerTest, AFilterWhoseRecordedSetNamesAForeignIdKeepsEveryColumn) {
+  auto table = Table(/*split=*/true);
+  table->set_scan_filter(true);
+  const auto scan_of = [&](std::optional<std::vector<plan::ColumnId>> needed_above) {
+    auto scan = Node(plan::ScanNode{.table = table,
+                                    .table_name = "t",
+                                    .fields = {0, 1},
+                                    .ids = {plan::ColumnId{1}, plan::ColumnId{2}},
+                                    .span = {}});
+    // x > 0 over field 0, which nothing above reads: droppable exactly when the set is trusted.
+    plan::Predicate greater{
+        .kind = plan::Predicate::Kind::kCompare,
+        .column = plan::BoundColumn{.index = 0,
+                                    .id = plan::ColumnId{1},
+                                    .name = "x",
+                                    .type = plan::LogicalType::kBigInt},
+        .op = plan::CompareOp::kGt,
+        .constant = plan::Constant{.type = plan::LogicalType::kBigInt, .value = Int128{0}}};
+    return Node(plan::FilterNode{.input = std::move(scan),
+                                 .predicates = {std::move(greater)},
+                                 .needed_above = std::move(needed_above),
+                                 .span = {}});
+  };
+  // The set as Prune would record it: the second column is read above, the first by the predicate
+  // alone. Then the same set with one id this Filter does not output.
+  for (const bool foreign : {false, true}) {
+    SCOPED_TRACE(foreign ? "an id the Filter does not output" : "a set of its own ids");
+    std::vector<plan::ColumnId> needed = {plan::ColumnId{2}};
+    if (foreign) {
+      needed.push_back(plan::ColumnId{99});
+    }
+    ProfileNode root;
+    auto op = BuildPhysicalPlan(PlanOf(scan_of(needed), 2), &root);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 64};
+    auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    // `y` is read above and carries its values either way -- a dropped live column would show up
+    // here as a NULL, which is the failure this guard exists to prevent.
+    EXPECT_EQ(Int64Column(**rows, 1),
+              (std::vector<std::optional<int64_t>>{10, 20, std::nullopt, 40, 50, std::nullopt, 70,
+                                                   80, std::nullopt}));
+    // `x` is the predicate's own column: dropped where the set is trusted, carried where it is not.
+    const std::vector<std::optional<int64_t>> absent(9, std::nullopt);
+    const std::vector<std::optional<int64_t>> present = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    EXPECT_EQ(Int64Column(**rows, 0), foreign ? present : absent);
+    const ProfileNode* scan = FindScan(root);
+    ASSERT_NE(scan, nullptr);
+    int64_t filter_only = 0;
+    for (const ProfileMetric& metric : scan->metrics()) {
+      if (metric.name == "cols_filter_only") {
+        filter_only = metric.value;
+      }
+    }
+    EXPECT_EQ(filter_only, foreign ? 0 : 1)
+        << "a foreign id abandons the whole set rather than dropping what it does not mention";
+  }
+}
+
 }  // namespace
 }  // namespace antb1::exec

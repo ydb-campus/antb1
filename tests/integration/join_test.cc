@@ -197,28 +197,6 @@ arrow::Result<Rows> RunPlan(const plan::LogicalNodePtr& root, std::size_t width,
   return RowsOf(*table);
 }
 
-// The first node named `name` of `node`'s tree (depth first); nullptr if none.
-const exec::ProfileNode* FindNode(const exec::ProfileNode& node, const std::string& name) {
-  if (node.name() == name) {
-    return &node;
-  }
-  for (const exec::ProfileNode* child : node.children()) {
-    if (const exec::ProfileNode* found = FindNode(*child, name)) {
-      return found;
-    }
-  }
-  return nullptr;
-}
-
-std::optional<int64_t> MetricOf(const exec::ProfileNode& node, const std::string& name) {
-  for (const exec::ProfileMetric& metric : node.metrics()) {
-    if (metric.name == name) {
-      return metric.value;
-    }
-  }
-  return std::nullopt;
-}
-
 // trips joins zones on tr_pickup = zn_id: zones' ids are 1..40, unique and dense, so the build
 // has the direct layout; pickups 41 to 43 match no zone.
 TEST_F(JoinTest, DenseKeysUseTheDirectLayout) {

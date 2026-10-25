@@ -54,12 +54,15 @@ std::string MetricKey(const exec::ProfileMetric& metric) {
 // residual and window_rows; its build parts, skipped, part_time, wait, lanes_tail and finish,
 // then what its table holds: null_keys, unique, direct and cols_dropped.
 std::vector<exec::ProfileMetric> Ordered(const exec::ProfileNode& node) {
-  static constexpr std::array<std::string_view, 27> kOrder = {
-      "parts",       "skipped",      "sample_parts", "heavy_keys", "part_time",    "raw_parts",
-      "raw_rows",    "wait",         "merge",        "find",       "gather",       "residual",
-      "window_rows", "late_columns", "late_parts",   "late_fetch", "lanes_tail",   "finish",
-      "outer",       "build",        "sort",         "groups",     "heavy_groups", "null_keys",
-      "unique",      "direct",       "cols_dropped"};
+  static constexpr std::array<std::string_view, 29> kOrder = {
+      "parts",        "skipped",    "sample_parts", "heavy_keys",
+      "part_time",    "raw_parts",  "raw_rows",     "cols_filter_only",
+      "dict_pieces",  "wait",       "merge",        "find",
+      "gather",       "residual",   "window_rows",  "late_columns",
+      "late_parts",   "late_fetch", "lanes_tail",   "finish",
+      "outer",        "build",      "sort",         "groups",
+      "heavy_groups", "null_keys",  "unique",       "direct",
+      "cols_dropped"};
   const auto rank = [](const exec::ProfileMetric& metric) {
     const auto* it = std::ranges::find(kOrder, metric.name);
     return static_cast<std::size_t>(it - kOrder.begin());

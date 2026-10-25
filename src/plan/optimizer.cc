@@ -252,6 +252,23 @@ struct Pruner {
   }
 
   LogicalNodePtr operator()(const FilterNode& filter) const {
+    FilterNode out = filter;
+    // `needed` as it arrives is the demand this Filter is under, recorded before its own
+    // predicates join it below -- and **intersected with this node's own outputs**, because the
+    // same set is carried down both branches of every join above, so under one of those it also
+    // holds the ids of an ancestor's other branch. Replaced rather than appended to: `out` is a
+    // copy of a node that may have been pruned before, and `Optimize` is idempotent. Both of those
+    // were review findings on JoinNode::needed_above, the first of which silently disabled that
+    // item wherever it was worth the most. Sorted, so a pass is a function of its input and not of
+    // a hash order.
+    std::vector<ColumnId> above;
+    for (const ColumnId id : OutputIds(*node)) {
+      if (needed.contains(id)) {
+        above.push_back(id);
+      }
+    }
+    std::ranges::sort(above);
+    out.needed_above = std::move(above);  // set, and empty where nothing above reads a column
     for (const Predicate& p : filter.predicates) {
       if (p.column.has_value()) {
         Need(needed, *p.column);
@@ -260,7 +277,8 @@ struct Pruner {
         Need(needed, *p.other);
       }
     }
-    return Over(std::move(needed));
+    const LogicalNodePtr with = Make(std::move(out));
+    return WithInputs(*with, {Prune(filter.input, std::move(needed))});
   }
 
   // Keeps the needed expressions; the input keeps the needed columns and what they read.

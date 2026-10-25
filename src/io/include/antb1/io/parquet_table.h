@@ -82,11 +82,13 @@ class ParquetTable final : public plan::Table {
       int64_t part, const std::vector<int>& fields, int64_t batch_size,
       arrow::MemoryPool* pool) const override;
   // ScanPart with a filter: the row group through Parquet's column readers, the filter's columns
-  // first (strings as views into the decoded pages), then only the rows that pass of every
-  // column (filtered_scan.h).
+  // first (strings as views into the decoded pages), then only the rows that pass of the first
+  // `returned` columns (filtered_scan.h). A field past `returned` is read and filtered on and
+  // never copied into a batch.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions) const override;
+      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions,
+      int returned) const override;
 
  private:
   // One row group of one file.

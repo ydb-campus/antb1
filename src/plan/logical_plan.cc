@@ -1121,6 +1121,13 @@ struct FreshIds {
       Rename(predicate.column);
       Rename(predicate.other);
     }
+    // The clone's columns are not the original's, so a set recorded against those ids describes
+    // nothing here: dropped rather than renamed, because `needed_above` is what some node ABOVE
+    // reads and this clone has no such node yet -- renaming would assert a demand that does not
+    // exist. Its consumers treat std::nullopt as "nothing recorded" and keep every column, and
+    // Prune records it again for whatever plan the clone ends up in. Nothing clones after Prune
+    // today, so this is the hazard the field's own comment names rather than one in flight.
+    node.needed_above.reset();
     return node;
   }
   LogicalNode operator()(ComputeNode node) const {
