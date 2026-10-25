@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# `pixi run static-arrow [--print-key | --print-prefix] [--keep-build]` (NETWORK on the first run): builds Apache
-# Arrow 25 and the dependencies it bundles as static libraries, with the Clang of env `static`, -O3, ThinLTO and the
-# CPU baseline of cmake/static/toolchain.cmake, into $ANTB1_ARROW_DIR/<key>/prefix (default ~/.cache/antb1/arrow;
-# a relative path is relative to the repository root). `pixi run static` and `pixi run static-test` run it first and
-# link antb1 against that prefix (docs/adr/0033-standalone-static-binary.md).
+# `pixi run static-arrow [--print-key | --print-prefix | --check-urls] [--keep-build]` (NETWORK on the first run):
+# builds Apache Arrow 25 and the dependencies it bundles as static libraries, with the Clang of env `static`, -O3,
+# ThinLTO and the CPU baseline of cmake/static/toolchain.cmake, into $ANTB1_ARROW_DIR/<key>/prefix (default
+# ~/.cache/antb1/arrow; a relative path is relative to the repository root). `pixi run static` and
+# `pixi run static-test` run it first and link antb1 against that prefix (docs/adr/0033-standalone-static-binary.md).
 #
-# - The sources are pinned by sha256 and size in cmake/static/arrow-sources.lock and downloaded once into
-#   $ANTB1_ARROW_DIR/src, the way scripts/fetch-data.sh downloads (a file that matches its pin is kept). Arrow then
-#   reads every bundled dependency from that local copy (ARROW_<DEP>_URL), so its build needs no network.
-# - The key hashes what decides the result: the pins, cmake/static/*, this script, the environment's packages
-#   (conda-meta), the target and the CPU overrides. A complete prefix with the same key is reused; a new key always
-#   builds from scratch. The prefix survives `pixi run clean`.
+# - The sources are pinned by sha256 and size in cmake/static/arrow-sources.lock, each with several byte-identical
+#   copies, and downloaded once into $ANTB1_ARROW_DIR/src (a file that matches its pin is kept): scripts/static-sources.sh
+#   tries a file's URLs in order, each attempt bounded, until one serves the pinned bytes. Arrow then reads every
+#   bundled dependency from that local copy (ARROW_<DEP>_URL), so its build needs no network.
+# - The key hashes what decides the result: the pins (not their URLs), cmake/static/*, this script, the environment's
+#   packages (conda-meta), the target and the CPU overrides. A complete prefix with the same key is reused; a new key
+#   always builds from scratch. The prefix survives `pixi run clean`.
 # - Before the prefix is marked complete, scripts/static_gates.py checks it: static archives only; every C and C++
 #   file of Arrow and of each bundled dependency compiled with -O3 and -flto=thin; no header of a bundled library
 #   read from the environment (zstd.h only while it is the pinned version); every download a local file; Arrow's
@@ -18,6 +19,10 @@
 #
 #   --print-key     print the key and exit (the CI cache key)
 #   --print-prefix  print the prefix directory and exit
+#   --check-urls    check every URL of every pin against its pin (scripts/static-sources.sh) and exit 1 when one is
+#                   dead or serves other bytes, when another failure is still there on a second pass (a timeout or
+#                   an error that may pass only warns), or when a file has fewer than two good URLs (CI: on PRs that
+#                   change the lock, and nightly); it builds nothing and leaves src alone
 #   --keep-build    keep the build tree ($ANTB1_ARROW_DIR/<key>/build) after a successful build
 #
 #   ANTB1_STATIC_CPU_FLAGS    compiler flags instead of the target's CPU baseline, e.g. "-march=x86-64"
@@ -28,11 +33,13 @@ set -euo pipefail
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
 
 print=""
+check=0
 keep_build=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --print-key) print=key ;;
     --print-prefix) print=prefix ;;
+    --check-urls) check=1 ;;
     --keep-build) keep_build=1 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "static-arrow: unknown option '$1'" >&2; usage >&2; exit 2 ;;
@@ -42,6 +49,11 @@ done
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lock="$root/cmake/static/arrow-sources.lock"
+sources="$root/scripts/static-sources.sh"
+if [ "$check" = 1 ]; then
+  exec bash "$sources" "$lock" --check-urls
+fi
+pins=$(bash "$sources" "$lock" --pins) # also validates the lock
 if [ -z "${CONDA_PREFIX:-}" ] || [ ! -d "$CONDA_PREFIX/conda-meta" ]; then
   echo "static-arrow: run it through pixi (\`pixi run static-arrow\`): CONDA_PREFIX is not a pixi environment" >&2
   exit 2
@@ -81,7 +93,6 @@ case "$arrow_dir/" in
 esac
 
 sha256_of() { cmake -E sha256sum "$1" | awk '{ print $1 }'; }
-size_of() { wc -c <"$1" | tr -d ' '; }
 
 # The key: one line per input, hashed; 16 hex digits name the prefix directory.
 manifest=$(mktemp)
@@ -90,7 +101,8 @@ trap 'rm -f "$manifest"' EXIT
   echo "target $target"
   echo "cpu-flags ${ANTB1_STATIC_CPU_FLAGS-<default>}"
   echo "simd $simd"
-  for f in "$lock" "$root"/cmake/static/*.cmake "$root/scripts/static-arrow.sh"; do
+  echo "$pins"
+  for f in "$root"/cmake/static/*.cmake "$root/scripts/static-arrow.sh"; do
     echo "file ${f#"$root"/} $(sha256_of "$f")"
   done
   for f in "$CONDA_PREFIX"/conda-meta/*.json; do
@@ -112,49 +124,16 @@ fi
 
 # ---- sources ----
 src="$arrow_dir/src"
-mkdir -p "$src"
+bash "$sources" "$lock" --fetch "$src"
 arrow_tarball=""
-while read -r name sha bytes url var extra; do
-  case "$name" in "" | "#"*) continue ;; esac
-  if [ -z "${var:-}" ] || [ -n "${extra:-}" ] || [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]] ||
-    [[ ! "$bytes" =~ ^[0-9]+$ ]] || [[ "$name" == */* ]] || [[ "$url" != https://* ]]; then
-    echo "static-arrow: $lock: malformed line for '$name'" \
-      "(expected: <name> <sha256> <bytes> <https url> <variable>)" >&2
-    exit 2
-  fi
-  dest="$src/$name"
-  if [ -f "$dest" ] && [ "$(size_of "$dest")" = "$bytes" ] && [ "$(sha256_of "$dest")" = "$sha" ]; then
-    echo "static-arrow: $name: ok (cached, size and sha256 match the pin)"
-  else
-    rm -f "$dest.part"
-    echo "static-arrow: downloading $url"
-    # As scripts/fetch-data.sh: HTTPS only, retries, a stalled transfer is aborted and retried.
-    if ! curl -fL --proto '=https' --proto-redir '=https' --retry 5 --retry-all-errors --retry-delay 5 \
-      --connect-timeout 30 --speed-limit 1024 --speed-time 120 --no-progress-meter -o "$dest.part" "$url"; then
-      rm -f "$dest.part"
-      echo "static-arrow: download failed: $url" >&2
-      exit 1
-    fi
-    got_bytes=$(size_of "$dest.part")
-    got_sha=$(sha256_of "$dest.part")
-    if [ "$got_bytes" != "$bytes" ] || [ "$got_sha" != "$sha" ]; then
-      rm -f "$dest.part"
-      echo "static-arrow: $url: $got_bytes bytes, sha256 $got_sha; the pin says $bytes bytes, sha256 $sha" >&2
-      exit 1
-    fi
-    mv -f "$dest.part" "$dest"
-    echo "static-arrow: $name: downloaded ($bytes bytes, sha256 $sha)"
-  fi
+variables=$(bash "$sources" "$lock" --variables "$src")
+while IFS='=' read -r var path; do
   if [ "$var" = "-" ]; then
-    arrow_tarball="$dest"
+    arrow_tarball=$path
   else
-    export "$var=$dest"
+    export "$var=$path"
   fi
-done <"$lock"
-if [ -z "$arrow_tarball" ]; then
-  echo "static-arrow: $lock pins no Arrow source (variable '-')" >&2
-  exit 2
-fi
+done <<<"$variables"
 
 # ---- build ----
 rm -rf "$work"

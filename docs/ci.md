@@ -22,7 +22,7 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `Codex harness audit` | `.github/workflows/codex-review.yml` | pull requests opened, ready for review or reopened; label `codex-review` | advisory: read-only Codex audit, one sticky comment |
 | `Copilot Setup Steps` | `.github/workflows/copilot-setup-steps.yml` | every Copilot coding-agent task; manual; changes to itself, `pixi.toml` or `pixi.lock` | prepares Copilot's environment (`default` and `lint`, dev build) |
 | `pixi.lock update` | `.github/workflows/pixi-lock-update.yml` | weekly (Monday), manual | PR `build(deps): update pixi.lock` from the antb1-bot App |
-| `Benchmarks` | `.github/workflows/bench.yml` | pushes to `main` that touch `src/`, `bench/`, `tools/fixturegen/` or `pixi.lock`; pull requests labeled `performance`; manual | micro benchmarks and ClickBench timings; publishes the series from `main` to `gh-pages`; advisory, never gating ([benchmarks.md](benchmarks.md)) |
+| `Benchmarks` | `.github/workflows/bench.yml` | pushes to `main` that touch `src/`, `bench/`, `tools/fixturegen/`, `cmake/`, `CMakeLists.txt`, `CMakePresets.json`, `pixi.toml`, `pixi.lock`, the static and bench scripts or `bench.yml`; pull requests labeled `performance`; manual | micro benchmarks and ClickBench timings on the standalone static build; publishes the micro series from `main` to `gh-pages` (`dev/bench-static`); advisory, never gating ([benchmarks.md](benchmarks.md)) |
 
 The AI and bot workflows (Claude, Claude review, Codex harness audit, Copilot Setup Steps, pixi.lock update) and
 `Benchmarks` are advisory: they are not required checks and not part of `CI OK`, and their failures never block a
@@ -60,9 +60,10 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `coverage-comment` (advisory) | ubuntu-slim | none | read `build/coverage/summary.md` after `pixi run coverage` |
 | `cache-gc` (`main` only) | ubuntu-slim | none | nothing to run |
 | `CI OK` | ubuntu-slim | none | aggregator, nothing to run |
-| `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `default` | `pixi run bench` · `pixi run bench-clickbench` |
-| `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series |
+| `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `static` | `pixi run bench` · `pixi run bench-clickbench` |
+| `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
 | `static <target> (pixi run static)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static` (on that platform) |
+| `static urls (pixi run static-arrow --check-urls)` (advisory, PRs that change the lock) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -119,12 +120,23 @@ prefix-dev/setup-pixi.
 ### Standalone static build
 
 The release and performance binary ([ADR 0033](adr/0033-standalone-static-binary.md)) has its own environment,
-`static`, and four tasks:
+`static`, and six tasks: the four below, and the benchmarks `pixi run bench` and `pixi run bench-clickbench`, which
+build in `build/static` too ([benchmarks.md](benchmarks.md)).
 
 - `pixi run static-arrow` (network on the first run) downloads the sources pinned in
   `cmake/static/arrow-sources.lock` and builds Arrow 25 and the dependencies it bundles as static `-O3` ThinLTO
   libraries into `$ANTB1_ARROW_DIR/<key>/prefix` (default `~/.cache/antb1/arrow`). A prefix whose key matches is
   reused; `--print-key` prints the key (the cache key below).
+  - Every pinned file lists byte-identical copies of at least two operators: an uploaded GitHub release asset first
+    where one exists, a single-server origin such as `archive.apache.org` last. `scripts/static-sources.sh` tries
+    them in order until one serves the pinned size and sha256. Each attempt is bounded: 10 s to connect, the pinned
+    size, 30 s plus 1 s per 64 KiB. Only an error that may pass gets a second attempt; a dead URL, a timeout or wrong
+    bytes move to the next copy.
+  - `pixi run static-arrow --check-urls` checks every URL against its pin. Single-server origins get a HEAD request
+    only. A dead URL or other bytes, a larger file included, fail the check at once. Any other failure gets one more
+    try after the pass: a timeout or an error that may pass is then a warning, anything else (a host that does not
+    resolve, a bad certificate, another HTTP error) fails. So does a file with fewer than two good URLs. The
+    `static urls` job runs it on every PR that changes the lock, and the nightly `static-urls` job every night.
 - `pixi run static` builds antb1 in `build/static` against that prefix, packages it into `build/static/package`
   (`antb1-<target>.tar.gz`, on Linux `antb1-<target>.debug.tar.gz`, `SHA256SUMS`) and checks the packaged file:
   linkage, link flags, build identity, the allocator restart, smoke tests and every CLI golden.
@@ -151,7 +163,8 @@ but every failure is tracked in an issue.
 | `arm64` | ubuntu-24.04-arm | `pixi run release` then `pixi run test-data` | Linux ARM64: the release build, the hermetic tests and the data tests |
 | `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
 | `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
-| `static-cold <target>` | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `ANTB1_ARROW_DIR=<an empty directory> pixi run static` | the standalone static build from scratch, as a release builds it: every pinned source downloaded again |
+| `static-cold <target>` | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `ANTB1_ARROW_DIR=<an empty directory> pixi run static`, then `pixi run bench --benchmark_dry_run=true` with the same `ANTB1_ARROW_DIR` | the standalone static build from scratch, as a release builds it: every pinned source downloaded again; then the micro benchmarks against the static Arrow, one iteration each (nothing else builds them on macOS and aarch64) |
+| `static-urls` | ubuntu-24.04 | `pixi run static-arrow --check-urls` | every URL of the static build's pinned sources against its pin (HEAD only for single-server origins): a dead or wrong copy shows before a cold build needs it |
 | `static-test` | ubuntu-24.04 | `pixi run static-test` | every hermetic test in `build/static`, against the static Arrow (the prefix `main` saved); each of its 20 executables is a ThinLTO link over that Arrow, about 4 CPU-hours in all |
 | `report` | ubuntu-slim | nothing to run | on any failed or timed-out job: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
 
@@ -217,7 +230,8 @@ measurements are recorded here once enough runs exist.
 | `antb1-<target>` | `static <target>` | pushes to `main` and manual runs | 30 days |
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
-corpus, the benchmark results hold only timings (never query text or results), and the data jobs
+corpus, the benchmark results hold only timings and build facts (`version.txt`; never query text or results), and the
+data jobs
 (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the output of the
 tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers, counts and hashes;
 [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.
@@ -234,7 +248,8 @@ tests over the data derived from TPC-H, which is redacted like the data tests' (
   `clickbench-hits0` on `main` after a miss and read by every data job.
 - The static Arrow prefix: `.cache/arrow/<key>` under the key `static-arrow-<target>-<key>`, where the key is
   `pixi run static-arrow --print-key`. The `static` workflow saves it from pushes to `main`. The nightly
-  `static-test` reads it; `static-cold` never does.
+  `static-test` and the benchmarks' `bench-run` only read it (on a miss they build the prefix cold and save
+  nothing); `static-cold` never reads it.
 - `cache-gc` removes stale entries after each run on `main` (see above).
 - A run on a pull request is cancelled when a newer push to the same PR arrives; runs on `main` are never
   cancelled.

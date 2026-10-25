@@ -23,7 +23,9 @@ and the "Data policy" section of [testing.md](../testing.md#data-policy); the sk
   `pixi run doctor` shows whether `hits_0.parquet` (the first partition, about 122 MB) is present.
 - `pixi run fetch-data` downloads the pinned files (`tools/data/clickbench.lock`) into the data directory,
   `pixi run test-data` runs the redacted data tests (ctest label `data`), and the CI job `clickbench-hits0` runs
-  them on `hits_0.parquet`. Never add another download path to code, scripts or tests.
+  them on `hits_0.parquet`. Never add another download path to code, scripts or tests. By hand, only the recipe for
+  a host without the repository ([benchmarks.md](../benchmarks.md#on-a-host-without-the-repository-or-pixi))
+  fetches the same pinned files, and it checks them the same way.
 - The full dataset (100 partitions, about 14 GB) is for local host runs only, never CI.
 
 ## Agents and the data

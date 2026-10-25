@@ -1,6 +1,7 @@
-# Google Benchmark micro benchmarks (docs/benchmarks.md). `pixi run bench` builds them in the Release `bench`
-# preset (tests OFF) and writes build/bench/micro.json. Presets with tests and ANTB1_BUILD_BENCHMARKS (ci-release)
-# also run bench.micro.smoke (label bench-smoke): every benchmark once, so they keep building and running.
+# Google Benchmark micro benchmarks (docs/benchmarks.md). `pixi run bench` builds them in preset `static` (against
+# the static Arrow) and writes micro.json into build/static/bench-results. Presets with tests and
+# ANTB1_BUILD_BENCHMARKS (ci-release, static) also run bench.micro.smoke (label bench-smoke): every benchmark once, so
+# they keep building and running.
 # Benchmark numbers never gate a PR.
 add_executable(antb1-bench-micro micro_bench.cc)
 target_link_libraries(

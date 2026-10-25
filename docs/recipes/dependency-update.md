@@ -29,8 +29,13 @@ Continue only with explicit approval, and only with the approved change.
 - DuckDB is a test oracle only (never linked into `src/`); new test-only packages follow the same rule.
 - Pin the minor version, for example `"25.0.*"`, and keep lockstep groups together:
   - `libarrow`, `libarrow-compute` and `libparquet` (always the CPU builds), and with them the static build's pins:
-    an Arrow upgrade replaces every line of `cmake/static/arrow-sources.lock` (Arrow's source tarball, and the
-    dependency versions and sha256 of its `cpp/thirdparty/versions.txt`), then `pixi run static` must pass;
+    an Arrow upgrade replaces every line of `cmake/static/arrow-sources.lock`, then `pixi run static` must pass.
+    - The pins come only from the ASF release. Check `apache-arrow-<v>.tar.gz` against its `.sha512` and run
+      `gpg --verify` on its `.asc` with <https://downloads.apache.org/arrow/KEYS>. Every other pin comes from that
+      tarball's `cpp/thirdparty/versions.txt`. Never take a pin from a mirror: `--check-urls` checks each URL
+      against the pin, not the pin itself.
+    - Then list each file's byte-identical copies, at least two operators each, in the lock header's order. Download
+      each one and compare it with the pin; a file name proves nothing. `pixi run static-arrow --check-urls` must pass;
   - `clang`, `clangxx`, `clang-tools`, `llvm-tools`, `lld` and `compiler-rt`;
   - `libstdcxx-devel_*` and `libgcc-devel_*` (never `-stdlib=libc++` on Linux: conda Arrow uses libstdc++).
 - Tasks: a new task lives in exactly one environment and is documented in the AGENTS.md command table (lint checks

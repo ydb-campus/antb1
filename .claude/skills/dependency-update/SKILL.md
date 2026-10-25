@@ -24,7 +24,9 @@ environment, why it is needed, and the alternatives you ruled out. Continue only
 - Pin the minor version (`"25.0.*"`) and keep lockstep groups together: libarrow, libarrow-compute and libparquet;
   the Clang 23 packages; libstdcxx-devel and libgcc-devel. conda's Arrow goes into the default feature (`default`
   and `gcc`), build and test tools into `base`, the Clang toolchain into `llvm`, lint tools into `lint`. An Arrow
-  upgrade also replaces the static build's pins (`cmake/static/arrow-sources.lock`) and must pass `pixi run static`.
+  upgrade also replaces the static build's pins (`cmake/static/arrow-sources.lock`: pins only from the ASF release
+  and its versions.txt, copies of two operators each) and must pass `pixi run static-arrow --check-urls` and
+  `pixi run static`.
 - DuckDB is a test oracle only and is never linked into `src/`. A new external library for a module also needs the
   module allow-list in `cmake/Antb1Modules.cmake` and an ADR.
 - `duckdb-extension-tpch` (TPC's dbgen) depends on one exact `libduckdb` build: update it together with
