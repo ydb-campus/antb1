@@ -52,10 +52,10 @@ table must match it (`pixi run lint` compares them).
 | `fuzz` | in use | `fuzz.sql_parser.smoke`: a short libFuzzer run with a fixed seed (Clang `fuzz` preset only) |
 | `setup` | in use | `fixtures.generate` and `fixtures.tpch`: write the Parquet fixtures (and the data derived from TPC-H) before any test that needs them |
 | `data` | in use | ClickBench data tests (`data.*`, [below](#clickbench-data-tests)): downloaded data, always redacted; only the `data` and `asan-data` test presets run them |
-| `bench-smoke` | in use | `bench.micro.smoke`: every micro benchmark once (presets with benchmarks: `ci-release`); numbers never gate |
+| `bench-smoke` | in use | `bench.micro.smoke`: every micro benchmark once (presets with benchmarks: `ci-release`, `static`); numbers never gate |
 
-The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`) exclude
-the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
+The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`,
+`static`) exclude the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
 
 ## Running tests
 
@@ -465,7 +465,8 @@ Each query is logged as `Q<n>: running` before it runs, and `run_redacted.cmake`
 the ctest timeout (900 seconds), so the log of a run that hangs names the query. `ANTB1_TPCH_TIMES=1` adds each
 query's seconds and the geometric mean of the passing queries when set in the environment of a local run
 (`ANTB1_TPCH_TIMES=1 pixi run test -R 'tpch\.status'`); no preset and no CI job sets it, and the self-tests unset
-it. A failure prints the query number, hashes and an unredacted repro command to run locally.
+it. These are times of the dev build, for orientation only: performance numbers come from the static build
+([benchmarks.md](benchmarks.md)). A failure prints the query number, hashes and an unredacted repro command to run locally.
 
 The seed of the differential test is fixed. DuckDB 1.5.5 and 1.5.6 leak the state of a string `MIN` or `MAX` over many
 groups without `ORDER BY`, so a new seed is checked with `pixi run asan` first, and one whose queries make DuckDB leak
@@ -537,8 +538,8 @@ answers at test time into the build tree. A separate duckdb CLI process loads it
 loads extensions. Never commit or paste TPC-H data, answers, query text in any dialect (fragments included) or EXPLAIN
 output of those queries; refer to queries by number. The tests are described in
 [Data derived from TPC-H](#data-derived-from-tpc-h). The package is installed on Linux only (pixi cannot re-sign the
-osx-arm64 build), so these tests run on Linux and are not registered on macOS. Installing the `default` or `gcc`
-environment on Linux, also on CI runners, installs dbgen and accepts its EULA. Timings of these queries may appear
+osx-arm64 build), so these tests run on Linux and are not registered on macOS. Installing the `default`, `gcc` or
+`static` environment on Linux, also on CI runners, installs dbgen and accepts its EULA. Timings of these queries may appear
 anywhere, CI logs included, but never as TPC-H Benchmark results: no TPC metrics such as QphH, no comparison with
 official TPC results. This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H
 Benchmark results, as this implementation does not comply with all requirements of the TPC-H Benchmark.

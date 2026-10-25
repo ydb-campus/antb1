@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# `pixi run static` and `pixi run static-test` (env static; docs/adr/0033-standalone-static-binary.md). Both run
-# `pixi run static-arrow` first and configure build/static (preset `static`) against the prefix it built.
+# `pixi run static` and `pixi run static-test` (env static; docs/adr/0033-standalone-static-binary.md). It needs a
+# complete prefix from `pixi run static-arrow` (both tasks depend on it; the bench scripts run it themselves) and
+# configures build/static (preset `static`) against it; nothing else configures that build tree.
 #
+#   bash scripts/static.sh --build TARGET...
+#                          configures build/static and builds only those targets (the bench tasks: antb1,
+#                          antb1-bench-micro); nothing is packaged or checked.
 #   pixi run static        builds antb1 (Release, -O3, ThinLTO; fully static on Linux) and packages it into
 #                          build/static/package: antb1-<target>.tar.gz (the binary, its third-party notices,
 #                          BUILDINFO.json, README.txt), on Linux antb1-<target>.debug.tar.gz (its line tables), and
@@ -17,10 +21,19 @@ set -euo pipefail
 [ "${1:-}" = "--" ] && shift
 
 test=0
+targets=()
 case "${1:-}" in
   "") ;;
   --test) test=1 ;;
-  *) echo "static: unknown option '$1' (expected none, or --test)" >&2; exit 2 ;;
+  --build)
+    shift
+    targets=("$@")
+    if [ "${#targets[@]}" = 0 ]; then
+      echo "static: --build needs at least one target" >&2
+      exit 2
+    fi
+    ;;
+  *) echo "static: unknown option '$1' (expected none, --test or --build TARGET...)" >&2; exit 2 ;;
 esac
 
 root="${PIXI_PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -40,6 +53,9 @@ if [ -z "$sha" ] && sha=$(git rev-parse HEAD 2>/dev/null); then
 fi
 cmake --preset static -DANTB1_GIT_SHA="$sha"
 
+if [ "${#targets[@]}" != 0 ]; then
+  exec cmake --build --preset static --target "${targets[@]}"
+fi
 if [ "$test" = 1 ]; then
   cmake --build --preset static
   exec ctest --preset static
@@ -119,8 +135,9 @@ antb1 $version for $target: one standalone executable (no pixi, no repository ne
   ./antb1 version --verbose      what this build is: commit, flavor, compiler, CPU baseline, Arrow, codecs
   ./antb1 query -c "SELECT COUNT(*) FROM t" --table t=/path/to/file.parquet
 
-Keep the file name antb1: at start it re-executes itself once with MIMALLOC_PURGE_DELAY=-1 (the allocator keeps
-its memory, ADR 0017), and a renamed copy or a symlink of another name skips that and runs about 5% slower.
+On Linux it re-executes itself once at start with MIMALLOC_PURGE_DELAY=-1 (the allocator keeps its memory, ADR
+0017). A renamed copy does that too; started through a symlink of another name it does not, and runs about 5%
+slower. macOS has no such restart.
 The CPU baseline is in \`version --verbose\`; an older CPU gets a message instead of a crash.
 Check the download against SHA256SUMS of the same release. No licence for antb1 itself is granted yet; the
 libraries linked into it are listed with their licences in THIRD_PARTY_NOTICES.txt.

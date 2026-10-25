@@ -1,7 +1,9 @@
-# Benchmarks (advisory, never gating; docs/benchmarks.md). `bench-run` runs the micro benchmarks and, when the
-# ClickBench data is in the cache, `antb1 bench` on hits_0; it uploads only timings. `bench-publish` (pushes to main
-# only) appends the micro benchmark series to the gh-pages branch (dev/bench) and comments on a commit whose numbers
-# regress by more than 50%. Hardening as in ci.yml (R010/R015, zizmor, actionlint).
+# Benchmarks (advisory, never gating; docs/benchmarks.md) on the standalone static build (env static; ADR 0033).
+# `bench-run` runs the micro benchmarks and, when the ClickBench data is in the cache, `antb1 bench` on hits_0; it
+# uploads timings and build facts (version.txt). `bench-publish` (pushes to main only) appends the micro benchmark
+# series to the gh-pages branch (dev/bench-static; dev/bench is the dynamic build's series, kept and no longer
+# extended) and comments on a commit whose numbers regress by more than 50%. Hardening as in ci.yml (R010/R015,
+# zizmor, actionlint).
 name: Benchmarks
 
 on:
@@ -11,7 +13,15 @@ on:
       - "src/**"
       - "bench/**"
       - "tools/fixturegen/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "pixi.toml"
       - "pixi.lock"
+      - "scripts/static.sh"
+      - "scripts/static-arrow.sh"
+      - "scripts/bench-*.sh"
+      - ".github/workflows/bench.yml"
   pull_request:
     branches: [main]
     types: [labeled, synchronize]
@@ -20,20 +30,29 @@ on:
 permissions: {}
 
 concurrency:
-  # PRs share one group per PR number; every other event gets its own group (runs on main are never dropped).
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  # PRs share one group per PR number; every other event gets its own group (runs on main are never dropped), and so
+  # does a pull request's `labeled` event for any label but `performance`: the group is evaluated before any job's
+  # `if`, so it would otherwise cancel a running bench although its own jobs are all skipped.
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request'
+    && (github.event.action != 'labeled' || github.event.label.name == 'performance')
+    && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bench-run:
     name: bench-run (pixi run bench && pixi run bench-clickbench)
-    # Pull requests only with the `performance` label.
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'performance') }}
+    # Pull requests only with the `performance` label, and of the `labeled` events only the one adding it.
+    if: >-
+      ${{ github.event_name != 'pull_request'
+      || (contains(github.event.pull_request.labels.*.name, 'performance')
+      && (github.event.action != 'labeled' || github.event.label.name == 'performance')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read # checkout
     env:
+      ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow
       ANTB1_DATA_DIR: ${{ github.workspace }}/.cache/clickbench
       CMAKE_BUILD_PARALLEL_LEVEL: 4
     steps:
@@ -43,11 +62,26 @@ jobs:
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           pixi-version: v0.81.0
-          environments: default
+          environments: static
           locked: true
-          cache: true
-          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
+          cache-write: false
+      - name: Arrow prefix key (pixi run static-arrow --print-key)
+        id: key
+        run: |
+          key=$(pixi run --frozen -e static static-arrow --print-key)
+          [[ "$key" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::static-arrow --print-key printed '$key'"; exit 1; }
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+      # Read-only, as the data below: static.yml saves the prefix from main. On a miss (a key that main has not built
+      # yet) the next step builds it cold, about 8 minutes, and nothing saves it.
+      - name: Restore the Arrow prefix
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/arrow/${{ steps.key.outputs.key }}
+          key: static-arrow-linux-x86_64-${{ steps.key.outputs.key }}
+      - name: Build the Arrow prefix (pixi run static-arrow)
+        run: pixi run --frozen -e static static-arrow
       # Read-only: the data PR's clickbench-hits0 job fills this cache from main. Nothing here writes a cache.
       - name: Restore ClickBench data
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -56,32 +90,41 @@ jobs:
           key: clickbench-${{ hashFiles('tools/data/clickbench.lock') }}
       - name: Micro benchmarks (pixi run bench)
         shell: bash # -eo pipefail: tee must not hide a failure
-        run: pixi run --frozen -e default bench | tee bench-micro.txt
+        run: pixi run --frozen -e static bench | tee bench-micro.txt
       - name: ClickBench on hits_0 (pixi run bench-clickbench)
         run: |
           if [ -f "$ANTB1_DATA_DIR/hits_0.parquet" ] && [ -f "$ANTB1_DATA_DIR/queries.sql" ]; then
-            pixi run --frozen -e default bench-clickbench
+            pixi run --frozen -e static bench-clickbench
           else
             echo "No ClickBench data in the cache: bench-clickbench skipped." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
       - name: Summary
         if: ${{ !cancelled() }}
+        env:
+          PREFIX_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
         run: |
           {
+            echo '### Build'
+            echo "CPU: $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1)"
+            echo "Arrow prefix restored from main's cache: ${PREFIX_CACHE_HIT:-false}"
+            if [ -f build/static/bench-results/version.txt ]; then
+              echo '```text'
+              cat build/static/bench-results/version.txt
+              echo '```'
+            fi
             echo '### Micro benchmarks'
             echo '```text'
             grep -E '^(Benchmark|BM_|-+$)' bench-micro.txt || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      # Timings only: micro.json and ClickBench's result JSON hold no data, query text or results.
+      # Timings and build facts only: micro.json, ClickBench's result JSON and version.txt hold no data, query text
+      # or results. One directory, so the artifact's root stays it and bench-publish finds micro.json at its top.
       - name: Upload timings
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bench-results
-          path: |
-            build/bench/micro.json
-            build/bench/clickbench.json
+          path: build/static/bench-results/
           retention-days: 30
           if-no-files-found: warn
 
@@ -105,14 +148,14 @@ jobs:
         with:
           name: bench-results
           path: bench-results
-      - name: Publish the micro benchmark series (gh-pages dev/bench)
+      - name: Publish the micro benchmark series (gh-pages dev/bench-static)
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
-          name: antb1 micro benchmarks
+          name: antb1 micro benchmarks (static build)
           tool: googlecpp
           output-file-path: bench-results/micro.json
           gh-pages-branch: gh-pages
-          benchmark-data-dir-path: dev/bench
+          benchmark-data-dir-path: dev/bench-static
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
           alert-threshold: "150%"

@@ -254,7 +254,7 @@ jobs:
   # The standalone static build from scratch (docs/adr/0033-standalone-static-binary.md): no Arrow prefix cache, so
   # every pinned source is downloaded again (a dead upstream URL shows here first) and built as a release would.
   static-cold:
-    name: static-cold ${{ matrix.target }} (pixi run static)
+    name: static-cold ${{ matrix.target }} (pixi run static && pixi run bench --benchmark_dry_run=true)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
@@ -288,6 +288,9 @@ jobs:
           cache-write: false
       - name: Build, package and check from scratch (pixi run static)
         run: pixi run --frozen -e static static
+      # The micro benchmarks against the static Arrow, one iteration each: nothing else builds them on macOS or aarch64.
+      - name: Micro benchmarks, one iteration each (pixi run bench --benchmark_dry_run=true)
+        run: pixi run --frozen -e static bench --benchmark_dry_run=true
 
   # Every URL of the static build's pinned sources against its pin (scripts/static-sources.sh): a dead copy, or one that
   # serves other bytes, shows here before a cold build needs it. Single-server origins get a HEAD request only.
@@ -385,7 +388,7 @@ jobs:
             [arm64]='pixi run release && pixi run test-data (on linux-aarch64)'
             [diff-extended]="ANTB1_DIFF_SEED=$RUN_ID ANTB1_DIFF_COUNT=20000 pixi run diff-random"
             [ci-shuffle]='pixi run ci-shuffle'
-            [static-cold]='ANTB1_ARROW_DIR=<an empty directory> pixi run static (on each target)'
+            [static-cold]='ANTB1_ARROW_DIR=<an empty directory> pixi run static && ANTB1_ARROW_DIR=<the same directory> pixi run bench --benchmark_dry_run=true (on each target)'
             [static-urls]='pixi run static-arrow --check-urls'
             [static-test]='pixi run static-test'
           )
