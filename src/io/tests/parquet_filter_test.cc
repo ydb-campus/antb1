@@ -582,7 +582,7 @@ TEST_F(ParquetFilterErrorsTest, EveryDataPageIsDictionaryProvesWhatArrowsDoorCan
         {s.Finish().ValueOrDie(), n.Finish().ValueOrDie()});
   };
   // Each shape with the one writer property that produces it, and what each door says.
-  struct Case {
+  struct Shape {
     std::string name;
     bool v1 = false;
     bool dictionary = true;
@@ -590,7 +590,7 @@ TEST_F(ParquetFilterErrorsTest, EveryDataPageIsDictionaryProvesWhatArrowsDoorCan
     bool proof = false;         // EveryDataPageIsDictionary
     bool arrow_grants = false;  // ColumnWithExposeEncoding
   };
-  const std::vector<Case> cases = {
+  const std::vector<Shape> shapes = {
       // v1 marks the dictionary page and its data pages alike, so nothing else is listed.
       {.name = "v1 dictionary", .v1 = true, .proof = true, .arrow_grants = true},
       // v2 marks the dictionary page PLAIN, which a fallback page is also marked: ambiguous, so
@@ -602,7 +602,7 @@ TEST_F(ParquetFilterErrorsTest, EveryDataPageIsDictionaryProvesWhatArrowsDoorCan
       // No dictionary at all.
       {.name = "plain", .dictionary = false, .proof = false},
   };
-  for (const Case& c : cases) {
+  for (const Shape& c : shapes) {
     SCOPED_TRACE(c.name);
     const std::string path = (dir_ / (c.name + ".parquet")).string();
     parquet::WriterProperties::Builder props;
