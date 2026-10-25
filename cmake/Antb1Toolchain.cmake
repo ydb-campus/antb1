@@ -61,7 +61,10 @@ endif()
 #   undefined and std::call_once, shared_ptr and the thread pool run as single-threaded code.
 # - macOS: Apple ships no static executables. libc++ is linked statically; libSystem and libc++abi come from the
 #   OS. The conda clang config file is skipped on this link only, so the binary gets no LC_RPATH into the
-#   environment (removing one afterwards would break the linker's ad-hoc signature).
+#   environment (removing one afterwards would break the linker's ad-hoc signature). The binary exports nothing:
+#   every macOS process also loads the system's libc++, whose std::__1 symbols have the same names, and dyld
+#   coalesces exported weak C++ definitions across images by name, so an exported copy can be bound to the
+#   system's while the rest of the static libc++ runs (an iostream built by one and freed by the other aborts).
 function(antb1_link_standalone target)
   set(_cache "${PROJECT_BINARY_DIR}/thinlto-cache")
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -71,9 +74,16 @@ function(antb1_link_standalone target)
     )
     target_link_libraries(${target} PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,pthread>")
   elseif(APPLE)
+    set(_exports "${PROJECT_BINARY_DIR}/antb1-exports.txt")
+    file(WRITE "${_exports}" "__mh_execute_header\n")
     target_link_options(
       ${target}
-      PRIVATE --no-default-config -nostdlib++ "LINKER:-dead_strip" "LINKER:-cache_path_lto,${_cache}"
+      PRIVATE
+        --no-default-config
+        -nostdlib++
+        "LINKER:-dead_strip"
+        "LINKER:-cache_path_lto,${_cache}"
+        "LINKER:-exported_symbols_list,${_exports}"
     )
     target_link_libraries(${target} PRIVATE "$ENV{CONDA_PREFIX}/lib/libc++.a" c++abi)
   else()

@@ -53,6 +53,9 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) target=darwin-arm64 ;;
   *) echo "static: unsupported platform $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
+# The checks that need no run come first: a link that binds the wrong library fails here with the symbols, not
+# with a crash at start.
+python scripts/static_gates.py binary --bin "$build/bin/antb1" --env "$CONDA_PREFIX" --linkage-only
 # The first run of the new binary: a binary that does not start says so here, with its own output and status.
 status=0
 first_run=$("$build/bin/antb1" version 2>&1) || status=$?

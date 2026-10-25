@@ -316,6 +316,20 @@ def gate_macos_linkage(env: Path, binary: str) -> None:
 
     ours, conda = abi_imports(binary), abi_imports(str(env / "lib" / "libc++.1.dylib"))
     check(ours <= conda, "libc++abi imports within those of conda's libc++", ", ".join(sorted(ours - conda)[:6]))
+    # The static libc++ must be the only one this binary calls. Every macOS process also loads the system's
+    # libc++ with the same std::__1 names, and any bind of one of them (regular, lazy, weak or a chained fixup)
+    # lets dyld resolve it there: an iostream built by one libc++ and freed by the other aborts at start.
+    objdump = tool(env, "llvm-objdump")
+    binds = run([objdump, "--macho", "--bind", "--lazy-bind", "--weak-bind", "--dyld-info", binary]).stdout
+    std_binds = sorted({ln.split()[-1] for ln in binds.splitlines() if ln.split() and "St3__1" in ln.split()[-1]})
+    check(
+        not std_binds,
+        "no libc++ symbol (std::__1) is bound outside the binary",
+        f"{len(std_binds)}: " + ", ".join(std_binds[:8]),
+    )
+    exports = run([objdump, "--macho", "--exports-trie", binary]).stdout
+    std_exports = [ln for ln in exports.splitlines() if "St3__1" in ln]
+    check(not std_exports, "no libc++ symbol (std::__1) is exported", f"{len(std_exports)} exported")
 
 
 def gate_link_flags(env: Path, build_dir: Path) -> None:
@@ -441,15 +455,22 @@ def gate_smoke(env: Path, binary: str, tmp: str) -> None:
     )
 
 
-def gate_binary(args: argparse.Namespace) -> None:
-    env = Path(args.env)
-    binary = os.path.abspath(args.bin)
+def gate_linkage(env: Path, binary: str) -> bool:
+    """The checks that need no run of the binary; false when it is no executable at all."""
     if not check(os.access(binary, os.X_OK), f"{binary} is an executable"):
-        return
+        return False
     if platform.system() == "Linux":
         gate_linux_linkage(env, binary)
     elif platform.system() == "Darwin":
         gate_macos_linkage(env, binary)
+    return True
+
+
+def gate_binary(args: argparse.Namespace) -> None:
+    env = Path(args.env)
+    binary = os.path.abspath(args.bin)
+    if not gate_linkage(env, binary) or args.linkage_only:
+        return
     if args.build_dir:
         gate_link_flags(env, Path(args.build_dir))
     with tempfile.TemporaryDirectory(prefix="antb1-static-check-") as tmp:
@@ -471,6 +492,7 @@ def main() -> int:
     b.add_argument("--bin", required=True)
     b.add_argument("--env", required=True)
     b.add_argument("--build-dir", help="the build tree of the binary: also check its link line")
+    b.add_argument("--linkage-only", action="store_true", help="only the checks that need no run of the binary")
     args = parser.parse_args()
     if args.cmd == "prefix":
         gate_prefix(args)
