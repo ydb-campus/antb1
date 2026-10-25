@@ -231,8 +231,10 @@ TEST(Session, ADictionaryPredicateOnAFileWithNoEncodingStats) {
     ASSERT_EQ(duckdb_connect(db, &conn), DuckDBSuccess);
     // Four distinct values over 20,000 rows: a dictionary that never outgrows its page, and a
     // numeric column that is read above the scan so that the batches carry something.
+    // One thread: a test adds no parallelism of its own (AGENTS.md's hermetic rules).
     const std::string sql =
-        "COPY (SELECT ('v' || (i % 4))::VARCHAR AS s, i::BIGINT AS n FROM range(20000) t(i)) TO '" +
+        "SET threads TO 1; COPY (SELECT ('v' || (i % 4))::VARCHAR AS s, i::BIGINT AS n FROM "
+        "range(20000) t(i)) TO '" +
         path + "' (FORMAT parquet, ROW_GROUP_SIZE 5000)";
     duckdb_result result;
     const auto state = duckdb_query(conn, sql.c_str(), &result);

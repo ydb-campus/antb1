@@ -463,8 +463,11 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
 
     // Room for `rows` values.
     arrow::Status Reserve(int64_t count) {
+      if (!keep_values) {
+        return arrow::Status::OK();  // neither the values nor the rows are read
+      }
       rows.reserve(static_cast<std::size_t>(count));
-      return keep_values ? values.Reserve(count) : arrow::Status::OK();
+      return values.Reserve(count);
     }
 
     std::vector<int64_t> rows;
@@ -504,12 +507,13 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     int64_t done = 0;
     while (done < rows) {
       ARROW_RETURN_NOT_OK(ReadPiece(state, reader, rows - done));
-      const auto piece = static_cast<int64_t>(views_.size());
+      // Not views_.size(): a piece whose views nothing will read leaves that empty, which is the
+      // whole point of the second shape, so the row count has to come from the read itself.
+      const int64_t piece = piece_rows_;
       ARROW_RETURN_NOT_OK(filter_->Apply(
           index,
           plan::ScanValues{.array = nullptr,
-                           .strings = piece_views_ ? std::span<const std::string_view>(views_)
-                                                   : std::span<const std::string_view>(),
+                           .strings = std::span<const std::string_view>(views_),
                            .validity = piece_nulls_ ? piece_valid_.data() : nullptr,
                            .rows = piece,
                            .dictionary = state.dictionary
@@ -519,12 +523,11 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
                                                        : std::span<const std::int32_t>()},
           done, selected));
       if (!kept.keep_values) {
-        // Only which rows passed; no batch carries this column's values.
-        arrow::internal::VisitSetBitRunsVoid(selected, done, piece, [&](int64_t row, int64_t run) {
-          for (int64_t i = 0; i < run; ++i) {
-            kept.rows.push_back(row + i);
-          }
-        });
+        // Nothing reads this column's rows either: ReadBatch finishes no array for it, so the row
+        // list would be written and never looked at -- which is the same per-row work this item
+        // exists to remove. (An earlier version filled it, with positions relative to the piece
+        // where the other path uses absolute ones, so whoever read it next would have been wrong
+        // by `done` as well.)
         done += piece;
         continue;
       }
@@ -623,13 +626,31 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
     }
     // **Whether to spend a view a row at all.** A column no batch carries is read to be compared
     // and for nothing else, and where the predicate can be answered from the dictionary the views
-    // have no reader -- so they are not written. The condition is the consumer's, not a guess:
-    // exec's filter takes the dictionary only when it holds no more distinct values than the piece
-    // has rows (the dictionary belongs to the whole column chunk, a piece to one page of it), and
-    // falls back to one compare a row otherwise. Were the views skipped under any weaker
-    // condition, that fallback would read values nobody wrote.
-    piece_views_ = returned || std::cmp_greater(dict_views_.size(), levels);
-    views_.resize(static_cast<std::size_t>(levels));
+    // have no reader -- so they are not written, and views_ is left EMPTY rather than merely
+    // unfilled. Empty is what plan::ScanValues' second shape is: a reader can tell it from a piece
+    // whose views are there, where a vector of the right size holding nothing would look exactly
+    // like one holding values and would be read as such.
+    //
+    // The condition is the consumer's, not a guess: exec's filter takes the dictionary only when it
+    // holds no more distinct values than the piece has rows (the dictionary belongs to the whole
+    // column chunk, a piece to one page of it), and falls back to one compare a row otherwise. The
+    // two are complementary by construction, so that fallback can never meet a piece without views.
+    //
+    // **An empty dictionary is one of the cases that needs them**, and it is reachable: a chunk
+    // whose every value is NULL still gets a dictionary page, of no entries, and both doors grant
+    // it -- so the filter would decline a dictionary it cannot test and find no views either. It
+    // has to be named rather than left to the size comparison, which `0 > levels` fails. (It would
+    // not have changed an answer today: an empty dictionary means every row is NULL, and a NULL row
+    // is rejected on its validity before any predicate reads its value. That is a coincidence of
+    // the predicate kinds a scan can apply, not a property anything states.)
+    piece_rows_ = levels;
+    const bool views =
+        returned || dict_views_.empty() || std::cmp_greater(dict_views_.size(), levels);
+    if (views) {
+      views_.resize(static_cast<std::size_t>(levels));
+    } else {
+      views_.clear();
+    }
     piece_nulls_ = indices_read < levels;
     if (piece_nulls_) {
       piece_valid_.assign(static_cast<std::size_t>(arrow::bit_util::BytesForBits(levels)), 0);
@@ -643,7 +664,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       if (!piece_nulls_ || levels_[row] == max_def) {
         const std::int32_t index = indices_[static_cast<std::size_t>(--next)];
         indices_[row] = index;
-        if (piece_views_) {
+        if (views) {
           views_[row] = dict_views_[static_cast<std::size_t>(index)];
         }
         if (piece_nulls_) {
@@ -651,7 +672,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
         }
       } else {
         indices_[row] = 0;
-        if (piece_views_) {
+        if (views) {
           views_[row] = std::string_view();
         }
       }
@@ -663,7 +684,6 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   // Reads the next piece (at most `rows` rows, within one page) of a string column into views_,
   // one view per row, with piece_valid_ when some row is NULL.
   arrow::Status ReadStringPiece(parquet::ByteArrayReader& reader, int16_t max_def, int64_t rows) {
-    piece_views_ = true;  // without a dictionary the compare has nothing else to read
     levels_.resize(static_cast<std::size_t>(rows));
     values_.resize(static_cast<std::size_t>(rows));
     int64_t values_read = 0;
@@ -673,6 +693,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
       return arrow::Status::IOError("a column chunk holds fewer rows than its row group");
     }
     views_.resize(static_cast<std::size_t>(levels));
+    piece_rows_ = levels;  // without a dictionary the compare has nothing but the views
     piece_nulls_ = values_read < levels;
     if (piece_nulls_) {
       piece_valid_.assign(static_cast<std::size_t>(arrow::bit_util::BytesForBits(levels)), 0);
@@ -814,10 +835,7 @@ class FilteredScanReader final : public arrow::RecordBatchReader {
   std::vector<std::string_view> views_;
   std::vector<std::uint8_t> piece_valid_;
   bool piece_nulls_ = false;
-  // Whether views_ holds this piece's values. False only for a column no batch carries whose
-  // predicate the dictionary can answer: plan::ScanValues then carries the dictionary and the
-  // indices alone, which is a shape its contract names.
-  bool piece_views_ = true;
+  int64_t piece_rows_ = 0;  // the rows of the current piece, whether or not views_ holds them
 };
 
 }  // namespace

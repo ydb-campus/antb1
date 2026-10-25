@@ -68,6 +68,17 @@ class TestFilter final : public plan::ScanFilter {
       // can say which path it exercised, and checked here against the views, which are filled
       // either way -- a dictionary whose indices disagreed with them would answer differently in
       // the engine and identically in this double.
+      const bool views = std::cmp_equal(values.strings.size(), values.rows);
+      if (!views) {
+        // The second shape plan::ScanValues allows: a dictionary and one index a row, and no views
+        // at all, which is how a column no batch carries is read. Admissible only where a
+        // dictionary can answer the predicate, so this double holds the engine's filter to the
+        // same bargain rather than quietly coping.
+        saw_dictionary_only_ = true;
+        EXPECT_FALSE(values.dictionary.empty()) << "no views and no dictionary is no values";
+        EXPECT_LE(values.dictionary.size(), static_cast<std::size_t>(values.rows))
+            << "a dictionary this big makes the engine's filter fall back to views";
+      }
       if (values.dictionary.empty()) {
         saw_views_ = true;
       } else {
@@ -80,7 +91,7 @@ class TestFilter final : public plan::ScanFilter {
           }
           const auto index = static_cast<std::size_t>(values.indices[static_cast<std::size_t>(i)]);
           EXPECT_LT(index, values.dictionary.size());
-          if (index < values.dictionary.size()) {
+          if (views && index < values.dictionary.size()) {
             EXPECT_EQ(values.dictionary[index], values.strings[static_cast<std::size_t>(i)])
                 << "the dictionary index disagrees with the view at row " << i;
           }
@@ -103,6 +114,9 @@ class TestFilter final : public plan::ScanFilter {
   void Fail() { fail_ = true; }
   [[nodiscard]] bool saw_dictionary() const { return saw_dictionary_; }
   [[nodiscard]] bool saw_views() const { return saw_views_; }
+  // A piece that arrived with a dictionary and no views at all: what a column read only so that a
+  // predicate can be applied to it looks like.
+  [[nodiscard]] bool saw_dictionary_only() const { return saw_dictionary_only_; }
 
   static Value ValueOf(const arrow::Array& array, int64_t i) {
     Value v;
@@ -146,7 +160,10 @@ class TestFilter final : public plan::ScanFilter {
       return v;
     }
     v.null = false;
-    v.text = values.strings[static_cast<std::size_t>(i)];
+    const auto row = static_cast<std::size_t>(i);
+    v.text = std::cmp_equal(values.strings.size(), values.rows)
+                 ? values.strings[row]
+                 : values.dictionary[static_cast<std::size_t>(values.indices[row])];
     return v;
   }
 
@@ -155,6 +172,7 @@ class TestFilter final : public plan::ScanFilter {
   bool fail_ = false;
   mutable bool saw_dictionary_ = false;
   mutable bool saw_views_ = false;
+  mutable bool saw_dictionary_only_ = false;
 };
 
 constexpr int64_t kRows = 3000;
@@ -618,6 +636,109 @@ TEST_F(ParquetFilterErrorsTest, EveryDataPageIsDictionaryProvesWhatArrowsDoorCan
     // The proof knows nothing about types -- a numeric chunk can satisfy it too. What keeps this
     // off a numeric column is the caller, which asks only for a BYTE_ARRAY one.
   }
+}
+
+// A VARCHAR chunk whose every value is NULL still gets a dictionary page -- of no entries -- and
+// both doors grant it. So a filter-only column can arrive with an EMPTY dictionary, which the
+// filter will not use (it has nothing to test) and which therefore needs its views after all. The
+// size comparison that decides this does not cover that case on its own: 0 is not greater than the
+// piece's rows, so without naming it the scan would write no views, the filter would find neither
+// shape, and a query that answered correctly before would fail.
+TEST_F(ParquetFilterErrorsTest, AFilterOnlyColumnWhoseChunkHasAnEmptyDictionary) {
+  const std::string path = (dir_ / "all_null.parquet").string();
+  arrow::StringBuilder s;
+  arrow::Int64Builder n;
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_TRUE(s.AppendNull().ok());  // every value NULL: a dictionary page of no entries
+    ASSERT_TRUE(n.Append(i).ok());
+  }
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("s", arrow::utf8()), arrow::field("n", arrow::int64())}),
+      {s.Finish().ValueOrDie(), n.Finish().ValueOrDie()});
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  parquet::WriterProperties::Builder props;
+  props.data_pagesize(1024)->write_batch_size(64)->version(parquet::ParquetVersion::PARQUET_1_0);
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 1000, props.build())
+          .ok());
+  ASSERT_TRUE(out->Close().ok());
+  {
+    auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+    auto group = reader->RowGroup(0);
+    EXPECT_TRUE(EveryDataPageIsDictionary(*group->metadata()->ColumnChunk(0)))
+        << "a page of no entries is still a dictionary page";
+  }
+
+  auto table_of = ParquetTable::Open({path});
+  ASSERT_TRUE(table_of.ok()) << table_of.status().ToString();
+  // `s` is read for the predicate and no batch carries it; `n` is returned. Every row is NULL, so
+  // the predicate keeps none of them -- the answer is no rows, not an error.
+  // The returned fields come first, so `n` leads and `s` is the one a `returned` of 1 drops --
+  // which is the order TableScanOperator builds for exactly this reason.
+  const std::vector<int> fields = {1, 0};
+  ASSERT_TRUE((*table_of)->supports_scan_filter(fields));
+  for (const int returned : {2, 1}) {
+    SCOPED_TRACE(returned == 2 ? "every field returned" : "s read only to filter on");
+    // IS NOT NULL over the string column, which is position 1 of `fields`: every row fails it.
+    auto filter = std::make_shared<TestFilter>(
+        std::vector<int>{1}, std::vector<Predicate>{[](const Value& v) { return !v.null; }});
+    auto reader = (*table_of)->ScanPart(0, fields, 64, arrow::default_memory_pool(), filter,
+                                        /*positions=*/false, returned);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    int64_t rows = 0;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      const arrow::Status status = (*reader)->ReadNext(&batch);
+      ASSERT_TRUE(status.ok()) << status.ToString();
+      if (batch == nullptr) {
+        break;
+      }
+      rows += batch->num_rows();
+      EXPECT_EQ(batch->num_columns(), returned);
+    }
+    EXPECT_EQ(rows, 0) << "IS NOT NULL keeps no row of an all-NULL column";
+    // Which shape the piece arrived in, which is the whole of what the condition decides.
+    EXPECT_TRUE(filter->saw_views()) << "an empty dictionary cannot answer a predicate";
+    EXPECT_FALSE(filter->saw_dictionary_only());
+  }
+}
+
+// The refusals of the `returned` contract (plan::Table::ScanPart and MakeFilteredScan): a request
+// a planner could only make by mistake is Invalid, never a silently narrowed scan.
+TEST_F(ParquetFilterErrorsTest, ReturnedFewerFieldsThanReadIsCheckedBothWays) {
+  const std::string path = Write(Encoding::kDictionary);
+  auto table = Open(path);
+  const std::vector<int> fields = {0, 3};
+  auto filter = std::make_shared<TestFilter>(
+      std::vector<int>{1}, std::vector<Predicate>{[](const Value&) { return true; }});
+  auto* pool = arrow::default_memory_pool();
+  // More returned than read, and a negative count.
+  EXPECT_TRUE(table->ScanPart(0, fields, 64, pool, filter, false, 3).status().IsInvalid());
+  EXPECT_TRUE(table->ScanPart(0, fields, 64, pool, filter, false, -1).status().IsInvalid());
+  // Reading a field only to filter on it needs a filter to filter with.
+  EXPECT_TRUE(table->ScanPart(0, fields, 64, pool, nullptr, false, 1).status().IsInvalid());
+  // Every field returned, with or without saying so, is the ordinary scan.
+  EXPECT_TRUE(table->ScanPart(0, fields, 64, pool, filter, false, 2).ok());
+  EXPECT_TRUE(table->ScanPart(0, fields, 64, pool, filter).ok());
+  // And MakeFilteredScan refuses a schema that does not match the count, which is the one way a
+  // caller inside io could get this wrong.
+  auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+  std::vector<FilteredColumn> columns;
+  for (const int leaf : {0, 3}) {
+    const auto column =
+        FilteredColumnOf(*reader->metadata(), leaf, *table->schema()->field(leaf)->type(),
+                         *table->schema()->field(leaf)->type());
+    ASSERT_TRUE(column.has_value());
+    columns.push_back(column.value_or(FilteredColumn{}));
+  }
+  const auto two = arrow::schema({table->schema()->field(0), table->schema()->field(3)});
+  auto bad = MakeFilteredScan(Segment{.path = path,
+                                      .metadata = reader->metadata(),
+                                      .bytes = 0,
+                                      .footer = nullptr,
+                                      .row_groups = std::vector<int>{0}},
+                              columns, two, 64, pool, filter, /*positions=*/false, /*returned=*/1);
+  EXPECT_TRUE(bad.status().IsInvalid()) << "two fields of schema for one returned column";
 }
 
 TEST_F(ParquetFilterErrorsTest, FilterErrorsAndChangedFiles) {

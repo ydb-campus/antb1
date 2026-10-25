@@ -63,14 +63,14 @@ TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::ve
   // operator above already resolved. The predicates are rebound once here rather than per Open --
   // the inverse of NarrowFilter, which rebinds them to a list narrower than the output.
   const auto marked = [&](std::size_t i) { return i < filter_only_.size() && filter_only_[i]; };
-  std::vector<int> position(fields_.size(), -1);  // per field: its place in scan_fields_
+  scan_position_.assign(fields_.size(), -1);
   arrow::FieldVector scan_fields;
   for (const bool pass : {false, true}) {
     for (std::size_t i = 0; i < fields_.size(); ++i) {
       if (marked(i) != pass) {
         continue;
       }
-      position[i] = static_cast<int>(scan_fields_.size());
+      scan_position_[i] = static_cast<int>(scan_fields_.size());
       scan_fields_.push_back(fields_[i]);
       const arrow::Schema& table_schema = *table_->schema();
       const int f = fields_[i];
@@ -83,11 +83,22 @@ TableScanOperator::TableScanOperator(std::shared_ptr<plan::Table> table, std::ve
   scan_schema_ = arrow::schema(std::move(scan_fields));
   scan_pushed_ = pushed_;
   for (plan::Predicate& p : scan_pushed_) {
-    if (p.column.has_value() && p.column->index >= 0 &&
-        std::cmp_less(p.column->index, position.size())) {
-      p.column->index = position[static_cast<std::size_t>(p.column->index)];
+    if (p.column.has_value()) {
+      p.column->index = ScanPositionOf(p.column->index);
     }
   }
+}
+
+int TableScanOperator::ScanPositionOf(int field) const {
+  // A field's place in the list a filtered scan is asked for. **Everything that names a field by
+  // position goes through here**, which is the whole of the risk in reordering that list: a key
+  // filter's column (ADR 0029) is never dropped -- the join reads it -- but it moves when a field
+  // before it is read only to filter on, and a stale index there filters on another column and
+  // changes the answer.
+  if (field < 0 || std::cmp_greater_equal(field, scan_position_.size())) {
+    return field;
+  }
+  return scan_position_[static_cast<std::size_t>(field)];
 }
 
 arrow::Status TableScanOperator::Open(ExecContext& ctx) {
@@ -145,8 +156,9 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     }
     if (key_scan_.has_value() && key_scan_->filter != nullptr) {
       key_dropped_ = std::make_shared<std::atomic<int64_t>>(0);
-      ARROW_ASSIGN_OR_RAISE(keys,
-                            MakeKeyScanFilter(key_scan_->filter, key_scan_->column, key_dropped_));
+      ARROW_ASSIGN_OR_RAISE(
+          keys,
+          MakeKeyScanFilter(key_scan_->filter, ScanPositionOf(key_scan_->column), key_dropped_));
     }
     if (filter == nullptr) {
       filter = std::move(keys);

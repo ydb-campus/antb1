@@ -61,14 +61,16 @@ class TableScanOperator final : public Operator {
 
   // `filter_only` (empty: none) marks, per field, a field read only so that a pushed predicate can
   // be applied to it (ADR 0020): the table reads and filters on it and never copies it, and this
-  // operator puts a NullArray in its place.
+  // operator puts an all-NULL array in its place.
   //
-  // **Its position is kept, not removed.** Every operator above reads a column by the position
-  // plan::ResolvePositions gave it, so removing one from the middle would move every later column
-  // out from under them -- which is why output_schema() names the field with the `null` type
-  // instead, as ADR 0016's late split already does for a column it defers. Nothing above reads the
-  // column by construction, so nothing reads the placeholder; it costs no buffer, a NullArray
-  // having none. Not combined with a late scan.
+  // **Its position is kept, not removed**, and output_schema() keeps the field's own type. Every
+  // operator above reads a column by the position plan::ResolvePositions gave it, so removing one
+  // from the middle would move every later column out from under them. The placeholder is of the
+  // field's DECLARED type -- not the `null` type ADR 0016's late split uses, because a late column
+  // is re-read by a node that knows it is a placeholder where this one can flow into a join build
+  // and be gathered past the join. It costs one zeroed buffer a batch from the query's pool, where
+  // the column itself would cost its bytes and a view a row. Nothing above reads the column by
+  // construction, so nothing reads the placeholder's value. Not combined with a late scan.
   TableScanOperator(std::shared_ptr<plan::Table> table, std::vector<int> fields,
                     std::optional<int64_t> part = std::nullopt,
                     std::optional<LateScan> late = std::nullopt,
@@ -98,6 +100,10 @@ class TableScanOperator final : public Operator {
   std::vector<plan::Predicate> scan_pushed_;    // pushed_, rebound to scan_fields_
   std::shared_ptr<arrow::Schema> scan_schema_;  // the types of scan_fields_, for the filter
   std::vector<bool> filter_only_;               // per field of fields_
+  // Per field of fields_: its place in scan_fields_. Identity without filter_only_, and the one
+  // mapping anything that names a field by position has to go through -- the pushed predicates and
+  // ADR 0029's key column alike.
+  std::vector<int> scan_position_;
   int returned_ = 0;
   std::shared_ptr<arrow::Schema> schema_;
   std::unique_ptr<arrow::RecordBatchReader> reader_;
@@ -112,6 +118,8 @@ class TableScanOperator final : public Operator {
   std::shared_ptr<std::atomic<int64_t>> dictionary_pieces_;
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
 
+  // The place of field `field` of fields_ in the list a filtered scan is asked for.
+  [[nodiscard]] int ScanPositionOf(int field) const;
   // A batch of the returned fields as output_schema() describes it: the fields back at their own
   // positions, with a NullArray for each read only to filter on.
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> WithPlaceholders(

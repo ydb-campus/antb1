@@ -637,7 +637,12 @@ std::vector<bool> FilterOnlyFields(const plan::FilterNode& filter, const plan::S
   bool any = false;
   for (std::size_t i = 0; i < scan.ids.size(); ++i) {
     const plan::ColumnId id = scan.ids[i];
-    out[i] = reads(pushed, id) && !reads(rest, id) && !std::ranges::binary_search(needed_above, id);
+    // `find`, not `binary_search`: the set is sorted only by Prune's convention and nothing here
+    // verifies the order. A linear scan over a handful of ids costs nothing and cannot miss one,
+    // where a binary search over an unsorted set would -- and a missed id marks a live column
+    // filter-only, which puts NULLs in an answer that no later check can notice.
+    out[i] = reads(pushed, id) && !reads(rest, id) &&
+             std::ranges::find(needed_above, id) == needed_above.end();
     any = any || out[i];
   }
   return any ? out : std::vector<bool>{};

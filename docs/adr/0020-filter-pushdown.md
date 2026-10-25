@@ -251,23 +251,31 @@ Proposed
 
   | | 4 threads | 14 threads |
   | --- | ---: | ---: |
-  | Q19 | **0.759x** | **0.804x** |
-  | Q10 | **0.829x** | **0.862x** |
-  | Q13 | 0.928x | 0.934x |
-  | Q06, Q21 | 0.969x, 0.969x | 0.990x, 0.973x |
-  | the 22, geomean | **0.971x** | **0.975x** |
+  | Q19 | **0.688x** | **0.771x** |
+  | Q10 | **0.789x** | **0.824x** |
+  | Q13 | 0.924x | 0.930x |
+  | Q21, Q06 | 0.960x, 0.968x | 0.961x, 0.990x |
+  | the 22, geomean | **0.963x** | **0.972x** |
 
   5 repeats interleaved and rotated, both arms from one tree built by `pixi run static` (ADR 0033),
-  all 22 answers byte-identical at both thread counts. Peak memory does not move (14,088 to 14,167
-  MiB at four threads, 15,193 to 14,933 at 14): Q18 sets it and has no droppable VARCHAR. Nothing
-  regresses beyond the host's +-1.4% noise -- the widest are Q01 1.017x and Q04 1.011x, both with no
+  all 22 answers byte-identical at both thread counts. Peak memory does not move (14,161 to 14,201
+  MiB at four threads, 15,154 to 15,188 at 14): Q18 sets it and has no droppable VARCHAR. Nothing
+  regresses beyond the host's +-1.4% noise -- the widest are Q01 1.019x and Q04 1.008x, both with no
   VARCHAR predicate at all, which is what calibrates that floor.
+
+  **A review round moved these figures, which is worth recording because the direction is unusual.**
+  The first implementation measured 0.971x and 0.759x on Q19; the version here is 0.963x and 0.688x,
+  because a finding pointed out that the branch which skips a column's values still filled a list of
+  its surviving rows -- write-only, since no array is finished for such a column, and so exactly the
+  per-row work the item exists to remove.
 
   **Against DuckDB this moves the suite's two worst queries off the top of the list.** Composing
   these ratios with a same-session DuckDB comparison (rather than dividing arms across sessions,
-  which flatters the branch by three points): Q10 1.698x to **1.408x**, Q19 1.632x to **1.239x**,
-  Q13 0.999x to **0.927x**, and the 22 from 1.249x to about **1.213x** of DuckDB's geomean. Q10 was
-  the worst query in the suite and is no longer.
+  which flatters the branch): Q10 1.698x to about **1.340x**, Q19 1.632x to about **1.123x**,
+  Q13 0.999x to **0.923x**, and the 22 from 1.249x to about **1.203x** of DuckDB's geomean. Q10 was
+  the worst query in the suite and is no longer. These are compositions of two measured ratios and
+  not a measurement; the DuckDB arm was also a dynamic `ci-release` build, which ADR 0033 puts about
+  3.6% behind the static one, so the static standing is better than this by about that much.
 
   - **Why the refusal's 0.997x was right about what it measured and wrong about the item.** The
     refusal skipped the *copy into the batch* and kept everything else. That copy is the smaller
