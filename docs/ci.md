@@ -63,7 +63,7 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `bench-run (pixi run bench && pixi run bench-clickbench)` (advisory) | ubuntu-24.04 | `static` | `pixi run bench` · `pixi run bench-clickbench` |
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
 | `static <target> (pixi run static && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, then `pixi run static-sources` (on that platform) |
-| `static urls (pixi run static-arrow --check-urls)` (advisory, PRs that change the lock) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` |
+| `static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)` (advisory, PRs that change a lock of the pinned sources) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` · `pixi run static-sources --check-urls` |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -151,7 +151,10 @@ go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
   mirror), antb1's source at the packaged commit, the pins of `cmake/static/arrow-sources.lock`, and the conda-forge
   archives of CLI11 and Boost's headers (conda-forge, then prefix.dev). The package must come from the clean checkout
   it runs in. Downloads go through `scripts/static-sources.sh` into `$ANTB1_ARROW_DIR/src`; a whole pass is retried
-  once. On macOS there is nothing to do.
+  once. On macOS there is nothing to do. The GCC runtime (libstdc++, libgcc) is left out: it comes with the compiler
+  that pixi.lock pins (ADR 0034). `pixi run static-sources --check-urls` checks every copy of the source RPMs and of
+  the conda archives instead, as `--check-urls` does for Arrow's pins; the `static urls` job runs it on every PR that
+  changes `cmake/static/glibc-source.lock` or `scripts/static_package.py`.
 - `pixi run static-check [BIN]` runs those checks, except the goldens, on any standalone binary, such as a
   downloaded package or a copy on a benchmark host.
 - `pixi run static-test` builds every target of `build/static` and runs all hermetic tests against the static Arrow.

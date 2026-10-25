@@ -208,7 +208,7 @@ cmd = "bash scripts/static.sh"
 depends-on = ["static-arrow"]
 
 [feature.static.tasks.static-sources]
-description = "NETWORK once, after `pixi run static`: the sources of everything linked into the Linux standalone binary, as LGPL-2.1 section 6 asks for the static glibc (docs/adr/0034-licence-and-static-sources.md): glibc's source RPM (cmake/static/glibc-source.lock), antb1's source at the packaged commit and the third-party sources -> build/static/sources/antb1-<target>.sources.tar; nothing on macOS"
+description = "NETWORK once, after `pixi run static`: the sources of everything linked into the Linux standalone binary but the GCC runtime, as LGPL-2.1 section 6 asks for the static glibc (docs/adr/0034-licence-and-static-sources.md): glibc's source RPM (cmake/static/glibc-source.lock), antb1's source at the packaged commit and the third-party sources -> build/static/sources/antb1-<target>.sources.tar; nothing on macOS (--check-urls checks every copy of the glibc source RPMs and the conda packages)"
 cmd = "python scripts/static_package.py sources"
 
 [feature.static.tasks.static-check]

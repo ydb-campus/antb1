@@ -146,7 +146,8 @@ Proposed
   aarch64). The guard turns an older CPU into a message; a portable build is one environment variable away
   (`ANTB1_STATIC_CPU_FLAGS`).
 - Static glibc is LGPL-2.1, so every Linux package comes with the sources of glibc, of antb1 and of every other
-  library linked into it ([ADR 0034](0034-licence-and-static-sources.md)).
+  library linked into it except the GCC runtime, which comes with the compiler
+  ([ADR 0034](0034-licence-and-static-sources.md)).
 - Static glibc cannot load NSS modules or gconv converters from the host, and clock reads are system calls. antb1
   uses none of the former. The latter was measured before the perf tests moved (2026-10-25; Linux 5.4, clocksource
   tsc, on the Xeon host of the Linux entry above):

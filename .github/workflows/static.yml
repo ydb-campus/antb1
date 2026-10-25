@@ -39,9 +39,11 @@ concurrency:
 
 jobs:
   # A PR that changes the pinned sources: every URL of the lock against its pin, so a wrong or dead copy fails here
-  # and not in a later cold build. The merge commit's first parent is the base, so the diff is the PR's own change.
+  # and not in a later cold build. The packaged sources only ever download a file's first good copy, so a PR that
+  # changes glibc's lock or scripts/static_package.py checks all of its copies (and of the conda packages) here. The
+  # merge commit's first parent is the base, so the diff is the PR's own change.
   urls:
-    name: static urls (pixi run static-arrow --check-urls)
+    name: static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -52,17 +54,21 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - name: Did the PR change cmake/static/arrow-sources.lock?
+      - name: Did the PR change a lock of the pinned sources?
         id: lock
         run: |
-          if git diff --quiet HEAD^1 HEAD -- cmake/static/arrow-sources.lock; then
-            echo "changed=false" >>"$GITHUB_OUTPUT"
-            echo "cmake/static/arrow-sources.lock is unchanged: nothing to check"
-          else
-            echo "changed=true" >>"$GITHUB_OUTPUT"
-          fi
+          for lock in arrow:cmake/static/arrow-sources.lock "glibc:cmake/static/glibc-source.lock scripts/static_package.py"; do
+            name=${lock%%:*}
+            # shellcheck disable=SC2086 # the paths are words
+            if git diff --quiet HEAD^1 HEAD -- ${lock#*:}; then
+              echo "$name=false" >>"$GITHUB_OUTPUT"
+              echo "${lock#*:}: unchanged, nothing to check"
+            else
+              echo "$name=true" >>"$GITHUB_OUTPUT"
+            fi
+          done
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
-        if: ${{ steps.lock.outputs.changed == 'true' }}
+        if: ${{ steps.lock.outputs.arrow == 'true' || steps.lock.outputs.glibc == 'true' }}
         with:
           pixi-version: v0.81.0
           environments: static
@@ -70,8 +76,11 @@ jobs:
           cache: false # not cached (cache budget); setup-pixi rejects a cache-key without caching
           cache-write: false
       - name: Check every source URL (pixi run static-arrow --check-urls)
-        if: ${{ steps.lock.outputs.changed == 'true' }}
+        if: ${{ steps.lock.outputs.arrow == 'true' }}
         run: pixi run --frozen -e static static-arrow --check-urls
+      - name: Check every copy of glibc's source and the conda packages (pixi run static-sources --check-urls)
+        if: ${{ steps.lock.outputs.glibc == 'true' }}
+        run: pixi run --frozen -e static static-sources --check-urls
 
   static:
     name: static ${{ matrix.target }} (pixi run static && pixi run static-sources)

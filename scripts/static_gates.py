@@ -497,6 +497,7 @@ SECTIONS_ALL = [
     r"Apache Arrow \S+: NOTICE\.txt",
     r"Apache Thrift \S+: NOTICE",
     r"CLI11 \S+: LICENSE",
+    r"Boost \S+: LICENSE_1_0\.txt",
 ]
 SECTIONS_LINUX = [
     r"GNU C Library \(glibc-\S+\): COPYING", r"GNU C Library \(glibc-\S+\): COPYING\.LIB",

@@ -9,10 +9,12 @@
            cmake/static/glibc-source.lock, so a package never names another source than the one linked.
   glibc    prints `<sysroot build> <source file>` of the environment (Linux), for BUILDINFO.json and README.txt.
   sources  `pixi run static-sources` (NETWORK once; Linux), after `pixi run static`: the sources of everything linked
-           into the packaged binary, as LGPL-2.1 section 6 asks, in build/static/sources/antb1-<target>.sources.tar
-           with its .sha256: glibc's source RPM, antb1's source at the packaged commit and the third-party sources
-           (the pins of cmake/static/arrow-sources.lock and the conda packages compiled in). Every download goes
-           through scripts/static-sources.sh into $ANTB1_ARROW_DIR/src, where a file that matches its pin is kept.
+           into the packaged binary but the GCC runtime that comes with the compiler, as LGPL-2.1 section 6 asks, in
+           build/static/sources/antb1-<target>.sources.tar with its .sha256: glibc's source RPM, antb1's source at
+           the packaged commit and the third-party sources (the pins of cmake/static/arrow-sources.lock and the conda
+           packages compiled in). Every download goes through scripts/static-sources.sh into $ANTB1_ARROW_DIR/src,
+           where a file that matches its pin is kept. With --check-urls it only checks every copy of glibc's source
+           RPMs and of the conda packages (scripts/static-sources.sh --check-urls).
 """
 
 from __future__ import annotations
@@ -120,17 +122,19 @@ def prefix_label(path: Path, pins: list[str]) -> str:
     return f"{NAMES.get(library, library)} {version}: {member}"
 
 
-def lgpl_notice(target: str, source: str) -> str:
+def lgpl_notice(target: str, source: str, gcc: str) -> str:
     version = source.split("-")[1]
     return paragraph(
         f"{LGPL_NOTICE_START} (glibc) {version}, linked statically: AlmaLinux's build from the source package "
         f"{source}. glibc is licensed under the GNU Lesser General Public License, version 2.1 or (at your option) "
         "any later version; its text is the COPYING.LIB section below. The complete source code of glibc, of antb1 and "
-        f"of every other library linked into this program is in antb1-{target}.sources.tar, published next to this "
-        f"package (in the same release or workflow run as antb1-{target}.tar.gz). You may modify glibc and relink "
-        "this program with it: the README.txt in that file says how (`pixi run static` in antb1's source tree builds "
-        "it). The licences of antb1 and of every library linked into it permit modification of this program for your "
-        "own use and reverse engineering to debug such modifications."
+        f"of every other library linked into this program, except the GCC {gcc} runtime libraries (libstdc++, libgcc), "
+        f"is in antb1-{target}.sources.tar, published next to this package (in the same release or workflow run as "
+        f"antb1-{target}.tar.gz). The GCC runtime comes with the compiler: the pixi.lock in antb1's source pins it "
+        f"(conda-forge's libstdcxx-devel and libgcc-devel {gcc}), `pixi run static` links that build again, and its "
+        "licence is the RUNTIME.LIBRARY.EXCEPTION section below. You may modify glibc and relink this program with "
+        "it: the README.txt in that file says how. The licences of antb1 and of every library linked into it permit "
+        "modification of this program for your own use and reverse engineering to debug such modifications."
     )
 
 
@@ -144,6 +148,8 @@ def cmd_notices(args: argparse.Namespace) -> None:
         (prefix_label(path, arrow_pins()), path) for path in sorted((prefix / "share/antb1-licenses").iterdir())
     ]
     sections.append((f"CLI11 {conda_meta(env, 'cli11')['version']}: LICENSE", LICENSES / "CLI11-LICENSE.txt"))
+    boost = conda_meta(env, "libboost-headers")["version"]  # Arrow's bundled Thrift compiles Boost's headers in
+    sections.append((f"Boost {boost}: LICENSE_1_0.txt", LICENSES / "Boost-LICENSE_1_0.txt"))
     head = ""
     if args.target.startswith("linux-"):
         source = glibc_source(env)[1]
@@ -156,7 +162,7 @@ def cmd_notices(args: argparse.Namespace) -> None:
         gcc = conda_meta(env, "libstdcxx-devel_")["version"]  # the libstdc++ and libgcc that are linked
         exception = env / "share/licenses/libstdc++/RUNTIME.LIBRARY.EXCEPTION"
         sections.append((f"GCC {gcc} runtime libraries (libstdc++, libgcc): RUNTIME.LIBRARY.EXCEPTION", exception))
-        head = lgpl_notice(args.target, source)
+        head = lgpl_notice(args.target, source, gcc)
     else:
         libcxx = conda_meta(env, "libcxx-devel")["version"]
         sections.append((f"libc++ {libcxx}: LICENSE.TXT", LICENSES / "libcxx-LICENSE.txt"))
@@ -217,14 +223,41 @@ def fetch(lock: Path, cache: Path) -> None:
              "a copy", "static-sources")  # fmt: skip
 
 
+def conda_pin(meta: dict) -> str:
+    """A conda package as a pin of scripts/static-sources.sh: conda-forge's file, then prefix.dev's copy."""
+    copy = f"https://prefix.dev/conda-forge/{meta['subdir']}/{meta['fn']}"
+    return f"{meta['fn']} {meta['sha256']} {meta['size']} - {meta['url']} {copy}"
+
+
+def check_urls(env: Path, linux: bool) -> None:
+    """Every copy of every source RPM in cmake/static/glibc-source.lock and, on Linux, of the conda packages."""
+    urls: dict[str, tuple[str, int, list[str]]] = {}
+    for source, sha, size, copies in glibc_pins().values():
+        known = urls.setdefault(source, (sha, size, []))
+        known[2].extend(url for url in copies if url not in known[2])
+    lines = [f"{source} {sha} {size} - {' '.join(copies)}" for source, (sha, size, copies) in sorted(urls.items())]
+    if linux:
+        lines += [conda_pin(conda_meta(env, name)) for name in COMPILED_PACKAGES]
+    with tempfile.TemporaryDirectory(prefix="antb1-static-sources-") as tmp:
+        lock = Path(tmp) / "package-sources.lock"
+        lock.write_text("".join(line + "\n" for line in lines))
+        cmd = ["bash", str(ROOT / "scripts/static-sources.sh"), str(lock), "--check-urls"]
+        if subprocess.run(cmd).returncode != 0:
+            fail("a copy of a source RPM in cmake/static/glibc-source.lock or of a conda package is dead or serves "
+                 "other bytes", "static-sources")  # fmt: skip
+
+
 def cmd_sources(args: argparse.Namespace) -> None:
     target = args.target or TARGETS.get((platform.system(), platform.machine()))
     if target is None:
         fail(f"unsupported platform {platform.system()} {platform.machine()}", "static-sources")
+    env = Path(os.environ.get("CONDA_PREFIX", ""))
+    if args.check_urls:
+        check_urls(env, target.startswith("linux-"))
+        return
     if not target.startswith("linux-"):
         print(f"static-sources: {target} links no library under the LGPL: no sources to package")
         return
-    env = Path(os.environ.get("CONDA_PREFIX", ""))
     infos = sorted(Path(args.pkg).glob(f"antb1-*-{target}/BUILDINFO.json"))
     if len(infos) != 1:
         fail(f"{len(infos)} packages for {target} in {args.pkg}: run `pixi run static` first", "static-sources")
@@ -247,9 +280,8 @@ def cmd_sources(args: argparse.Namespace) -> None:
             third_party[line.split()[0]] = line.split()[1]
     for name in COMPILED_PACKAGES:
         meta = conda_meta(env, name)
-        copy = f"https://prefix.dev/conda-forge/{meta['subdir']}/{meta['fn']}"
         third_party[meta["fn"]] = meta["sha256"]
-        files[meta["fn"]] = (meta["sha256"], f"{meta['fn']} {meta['sha256']} {meta['size']} - {meta['url']} {copy}")
+        files[meta["fn"]] = (meta["sha256"], conda_pin(meta))
     cache = arrow_src()
     fetch(ARROW_LOCK, cache)
     with tempfile.TemporaryDirectory(prefix="antb1-static-sources-") as tmp:
@@ -299,11 +331,14 @@ def tar_info(name: str, size: int, mtime: int, kind: bytes = tarfile.REGTYPE, mo
 
 
 def sources_readme(target: str, version: str, commit: str, build: str, srpm: str) -> str:
+    glibc = srpm.split("-")[1]
     return f"""\
 The sources of antb1-{target}.tar.gz: antb1 {version}, commit {commit}.
 
 That binary links the GNU C Library (glibc) statically, which the GNU LGPL 2.1 (section 6) allows when the sources
-of the library and of the program that uses it come with it. They are all here; SHA256SUMS lists their digests.
+of the library and of the program that uses it come with it. They are here, except the GCC runtime libraries
+(libstdc++, libgcc), which come with the compiler that pixi installs from antb1's pixi.lock. SHA256SUMS lists their
+digests.
 
   {srpm}
       glibc, licensed under the LGPL 2.1 or later: AlmaLinux's source package of the static archives in the binary.
@@ -312,18 +347,24 @@ of the library and of the program that uses it come with it. They are all here; 
   antb1-source.tar.gz
       antb1 at commit {commit}, licensed under the Apache License 2.0.
   third-party/
-      everything else compiled into the binary: Apache Arrow and the libraries it bundles, pinned in
+      the other libraries compiled into the binary: Apache Arrow and the libraries it bundles, pinned in
       cmake/static/arrow-sources.lock, and the conda-forge packages of CLI11 and Boost's headers.
 
-Rebuild the binary on Linux (pixi 0.81.0 or newer installs the toolchain; the Arrow sources come from here):
+Rebuild the binary on Linux (pixi 0.81.0 or newer installs the toolchain; the Arrow sources come from here). The
+environment it installs, `static`, also contains duckdb-extension-tpch: TPC's dbgen under the TPC End User License
+Agreement v2.2. Only antb1's tests use it, but the build configures with it, and installing the environment installs
+it and accepts that EULA (CONTRIBUTING.md, docs/adr/0006-test-strategy-and-data-policy.md).
 
   tar -xzf antb1-source.tar.gz && cd antb1-{version}
   mkdir -p ~/.cache/antb1/arrow/src && cp ../third-party/*.tar.gz ~/.cache/antb1/arrow/src/
   pixi run static          # the package is then in build/static/package
 
-Relink it with a modified glibc: build glibc from the source package, put its static archives and start files
-(libc.a, libpthread.a, libm.a, librt.a, libdl.a, crt1.o, crti.o, crtn.o) into the environment's sysroot
-(.pixi/envs/static/<arch>-conda-linux-gnu/sysroot/usr/lib64), then run `pixi run static` again.
+Relink it with a modified glibc: build glibc from the source package (rpmbuild --rebuild), then copy every static
+archive and start file of its glibc-static and glibc-devel packages (usr/lib64: libc.a, libpthread.a, librt.a,
+libdl.a, crt1.o, crti.o, crtn.o, and libm.a with what it names: on x86_64 a linker script for libm-{glibc}.a and
+libmvec.a) into the environment's sysroot (.pixi/envs/static/<arch>-conda-linux-gnu/sysroot/usr/lib64) with
+`cp --remove-destination`: pixi hard-links those files to its package cache, so a plain `cp` would write the modified
+glibc into that cache and into every environment installed from it. Then run `pixi run static` again.
 """
 
 
@@ -341,6 +382,7 @@ def main() -> int:
     s.add_argument("--target", choices=sorted(TARGETS.values()), help="default: this host's")
     s.add_argument("--pkg", default=str(ROOT / "build/static/package"), help="the output of `pixi run static`")
     s.add_argument("--out", default=str(ROOT / "build/static/sources"))
+    s.add_argument("--check-urls", action="store_true", help="only check every copy of the downloaded sources")
     args = parser.parse_args()
     {"notices": cmd_notices, "glibc": cmd_glibc, "sources": cmd_sources}[args.cmd](args)
     return 0

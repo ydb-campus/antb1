@@ -56,11 +56,24 @@ Proposed
     - antb1's source at the packaged commit, which must be clean and checked out;
     - `third-party/`: the pins of `cmake/static/arrow-sources.lock`, and the conda-forge archives of CLI11 and
       Boost's headers, by the environment's own conda-meta;
-    - a README with the rebuild and relink steps.
+    - a README with the rebuild and relink steps. It says that they install env `static`, and with it TPC's dbgen
+      under the TPC EULA v2.2 ([ADR 0006](0006-test-strategy-and-data-policy.md)).
   - **How it is offered:** from the same place as the binary. `static.yml` uploads a Linux package only after
     `antb1-<target>-sources`, in the same run, and so will the GitHub releases.
-  - The materials leave out the compiler and its runtime libraries (libstdc++, libgcc). LGPL-2.1 exempts what
-    is normally distributed with the compiler.
+  - **The copies are checked:** every copy of the source RPM and of the conda archives
+    (`pixi run static-sources --check-urls`) is checked in the `static urls` job of every PR that changes the lock
+    or the script.
+  - **The GCC runtime is left out.** The binary also links GCC 15.3's libstdc++.a, libgcc.a, libgcc_eh.a,
+    crtbeginT.o and crtend.o (conda-forge's libstdcxx-devel and libgcc-devel, pinned in pixi.lock). The notices say
+    so, and say that `pixi run static` links that build again. LGPL-2.1 exempts from the materials "anything that is
+    normally distributed (in either source or binary form) with the major components (compiler, kernel, and so on)
+    of the operating system on which the executable runs, unless that component itself accompanies the
+    executable". Whether statically linked runtime archives count as the compiler accompanying the executable is
+    an open question for the legal review below.
+    - If it finds that they do, the sources tarball adds the two conda archives (object code, about 24 MB on
+      linux-64; `COMPILED_PACKAGES`).
+    - It also needs directions to GCC 15.3.0's corresponding source, which GPL-3 section 6 then asks for, and the
+      notice would say "source or object code".
 - **macOS links no LGPL library.** Its package adds libc++'s licence; the LLVM exception would not require it.
 
 ## Consequences
@@ -70,6 +83,8 @@ Proposed
   64 MB on a CI runner, nothing locally once the cache `$ANTB1_ARROW_DIR/src` holds it.
 - The SRPM has two copies, the AlmaLinux vault and one mirror. If neither serves it, the Linux legs of
   `static.yml` fail (they are advisory), and earlier artifacts stay.
+- The Linux packages that `main` uploaded before this change carry neither a licence nor their sources. The
+  maintainers delete them once this change is on `main` and the first run has uploaded packages with sources.
 - **A lock refresh can block on the sysroot.** pixi.toml allows any 2.28 build. One that changes the sysroot build
   blocks until `glibc-source.lock` names its source (docs/recipes/dependency-update.md). A newly linked library
   needs a compatible licence, its notice in the package and its source in the sources tarball.

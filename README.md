@@ -69,4 +69,4 @@ antb1 is licensed under the [Apache License 2.0](LICENSE); see also [NOTICE](NOT
 ([ADR 0033](docs/adr/0033-standalone-static-binary.md)) contain third-party libraries, listed with their licences in
 each package's `THIRD_PARTY_NOTICES.txt`. The Linux binaries link the GNU C Library statically (LGPL-2.1-or-later),
 so each one comes with `antb1-<target>.sources.tar`: the sources of glibc, of antb1 and of every other library linked
-into it ([ADR 0034](docs/adr/0034-licence-and-static-sources.md)).
+into it except the GCC runtime, which comes with the compiler ([ADR 0034](docs/adr/0034-licence-and-static-sources.md)).
