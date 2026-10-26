@@ -517,6 +517,56 @@ with exit code 4. The PR ids are the roadmap's, not divergence ids.
           still has.
         - Three mutations confirm the collapsed cases still bite: a narrow append truncated to 32 bits, a
           MIN/MAX answer left at the kernel's width, and a narrow sort prefix carrying no information.
+    - **The narrowing pass is gone, perf(io): 2026-10-26, and the premise that kept it was wrong.** The
+      entry above said removing it "means decoding Parquet without Arrow's Parquet-to-Arrow transfer on the
+      unfiltered path too, which is a larger change than this item". **Arrow's own reader does it**:
+      `parquet::ArrowReaderProperties::set_smallest_decimal_enabled` makes the transfer produce decimal64 for
+      10 to 18 digits directly, so `ConversionFor` answers `kNone` and there is no pass to make cheap. The
+      option was named in N3's own plan as something to set "at all three type-inference and read sites" and
+      was never set at any of them: all three took `parquet::default_arrow_reader_properties()`.
+      - **Measured** on the 22 at SF 100, four threads, best of three, arms interleaved and rotated, both
+        `pixi run static`, answers compared: geomean **0.992x**, total 0.987x, **nothing slower outside the
+        +-1.4% noise floor**. The gains are Q09 **0.929x**, Q05 0.971x and Q11 0.972x.
+      - **It confirms this ADR's own prediction, which is the part worth recording.** The entry above listed
+        what N3 left slower and attributed it to this pass: Q05 1.018x, Q07 1.018x, Q21 1.013x, Q18 1.009x,
+        Q09 1.008x. Removing the pass returns Q05 to 0.971x, Q07 to 0.997x, Q21 to 0.997x and Q18 to 1.002x,
+        and takes Q09 well past recovery. An attribution made by a sampling profiler a week earlier predicted
+        five queries and got five.
+      - **The mechanism was verified and not assumed**, by the same tool that found it: `sample` over both
+        arms on one decimal query shows `(anonymous namespace)::Convert` in **11 samples of the old arm,
+        every one of them with an `arrow::AllocateBuffer` beneath it** -- a fresh buffer a batch a column --
+        against **one** of the new arm, in that function's own prologue with nothing under it, which is what
+        a dispatcher that now hands the array back unchanged looks like. `Decimal128Array` frames are
+        replaced by `Decimal64Array` throughout. Peak memory does not move (Q09 12,003 MiB against 11,988,
+        the max of three each): the pass allocated per batch and freed per batch, so it was never held.
+      - **Nine digits or fewer keep a conversion, and nearly lost their filtered path.** Arrow's smallest is
+        decimal32 there and the engine reads decimal64, so `kDecimal32To64` still runs -- but
+        `FilteredColumnOf` admitted decimal128 and decimal64 storage only, so such a column would have fallen
+        silently off the filtered path, which is the pushdown this ADR records losing once already. It now
+        admits every decimal width of the right precision and scale, since that path reads the Parquet
+        column's own integer and the storage type tells it nothing about how the value travels.
+        Mutation-checked against the existing `DecimalColumnsReadAsTheUnfilteredScanReadsThem`.
+      - **One behaviour changes, and it reaches the exit code.** A BYTE_ARRAY decimal carrying more bytes
+        than the narrow target holds -- malformed, and the case this ADR settled as "io names the column
+        instead of truncating" -- now fails in the reader rather than in io's pass. Two consequences, both
+        asserted rather than discovered:
+        - Arrow's text names the decimal width and never the column, so io names the columns the read was
+          asked for: four of them and a count of the rest, because a `SELECT *` over a wide table would
+          otherwise put a schema in an error. A scan of no fields says "no columns".
+        - **The status kind moves from `Invalid` to `IOError`, so the CLI's exit code for such a file goes
+          1 to 3** (`kExitQueryError` to `kExitIo`, cli.cc's `ExitCodeFor`). IOError is the kind
+          `parquet_table.h` already promises for every Parquet read failure,
+          so the new one is the stated contract and the old one was the exception -- but it is a visible
+          change and neither side was pinned before, which is why both the kind and the message now are.
+        That error is also **the option's only signature outside a measurement**: every engine type and
+        every value is identical either way, which the new case says in as many words so that a later reader
+        does not take its dependence on the option for an accident.
+      - **What it does not touch, measured.** Q01 and Q06 push predicates on `lineitem`, so their scans take
+        the filtered path and never paid this; Q01 moves 0.988x and Q06 0.999x. The decimal gap that is left
+        is the **accumulator**, not the scan: at four threads over 600,037,902 rows a `SUM` of a DECIMAL(15,2)
+        column costs 0.61 s against 0.46 s for a `SUM` of a BIGINT column of the same INT64 storage, while
+        DuckDB's decimal sum (0.20 s) is *cheaper* than its integer one (0.43 s) -- which is where
+        `grouped_aggregate_state.cc`'s own "only the Int128 accumulator for now" points.
     - **Part statistics for DECIMAL, feat(plan,io,exec): built 2026-10-21.** A predicate, a top-N bound or a
       published key set on a DECIMAL column can now skip whole row groups, which ADR 0020's Consequences and
       this ADR's both recorded as missing. Four gates had to open, and the shape of that is the finding:
