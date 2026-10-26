@@ -125,6 +125,16 @@ def test_the_signing_job_runs_no_repository_code() -> None:
     assert subjects["env"]["SUBJECTS"] == "${{ needs.assemble.outputs.subjects }}"  # a job output, not an artifact
 
 
+def test_every_job_checks_out_the_commit_of_the_run() -> None:
+    # checkout's default is GITHUB_SHA, the commit preflight checked (a re-run keeps it); a `ref` taken from a job
+    # output is what CodeQL's actions/untrusted-checkout flags, and there is nothing else it could name.
+    for name in JOBS:
+        for step in steps(name):
+            if step.get("uses", "").startswith("actions/checkout"):
+                assert "ref" not in step.get("with", {}), name
+                assert step["with"]["persist-credentials"] is False, name
+
+
 def test_the_writing_jobs_check_out_only_the_release_script() -> None:
     for name in ("draft", "publish"):
         checkout = next(step for step in steps(name) if step.get("uses", "").startswith("actions/checkout"))

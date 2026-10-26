@@ -8,10 +8,11 @@
 # it as README.md tells a user. A manual run is a dry run of its ref: preflight (its checks as warnings), build,
 # assemble and verify; nothing is attested, drafted or published. The logic is .github/scripts/release.py and
 # scripts/static_gates.py (standard library only), run by the runner's own python3 -I from the commit being
-# released; every job name contains the command that reproduces it. Hardening as in ci.yml (R010/R015, zizmor,
-# actionlint): the jobs that can write check out nothing but release.py, the signing job runs no repository code,
-# and the attested digests travel as a job output, which no later job can replace (an artifact can be replaced by
-# any job of the run).
+# released; every job name contains the command that reproduces it. Every checkout is the run's own commit
+# (GITHUB_SHA, checkout's default; a re-run keeps it), the one preflight checked. Hardening as in ci.yml (R010/R015,
+# zizmor, actionlint): the jobs that can write check out nothing but release.py, the signing job runs no repository
+# code, and the attested digests travel as a job output, which no later job can replace (an artifact can be
+# replaced by any job of the run).
 name: Release
 
 on:
@@ -99,7 +100,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
       - name: A cold start (no Arrow prefix, no ccache directory)
         run: test ! -e "$ANTB1_ARROW_DIR" && test ! -e .cache/ccache
@@ -170,7 +170,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
             /.github/scripts/release.py
@@ -238,7 +237,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
             /scripts/static_gates.py
@@ -328,7 +326,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
           sparse-checkout: /.github/scripts/release.py
           sparse-checkout-cone-mode: false
@@ -385,7 +382,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
           sparse-checkout: /.github/scripts/release.py
           sparse-checkout-cone-mode: false
@@ -431,7 +427,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.preflight.outputs.sha }}
           persist-credentials: false
           sparse-checkout: |
             /.github/scripts/release.py
