@@ -868,7 +868,7 @@ def render_notes(rel: Release, files: dict[str, tuple[str, int]], tag: Tag | Non
             "On macOS download with curl, not a browser (a browser adds the quarantine attribute).", "",
             "## Verify", "", "```sh",
             f"gh attestation verify {sample} --repo {rel.repo} --signer-workflow {rel.repo}/{RELEASE_WORKFLOW} \\",
-            f"  --source-ref refs/tags/{rel.tag} --deny-self-hosted-runners    # offline: add --bundle {BUNDLE}",
+            f"  --source-ref refs/tags/{rel.tag} --deny-self-hosted-runners    # offline: see SECURITY.md",
             f"gh release verify {rel.tag} --repo {rel.repo}",
             f"gh release verify-asset {rel.tag} {sample} --repo {rel.repo}", "```", "",
             "## Platforms", "",
