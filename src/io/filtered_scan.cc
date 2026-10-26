@@ -890,12 +890,19 @@ std::optional<FilteredColumn> FilteredColumnOf(const parquet::FileMetaData& meta
       }
       break;
     case arrow::Type::DECIMAL64: {
-      // ADR 0021's decimal64 item. The storage Arrow type is decimal128 for an INT32- or
-      // INT64-backed column unless an ARROW:schema restored it narrower, so both are admitted;
-      // what matters is that the precision and scale agree, since this path rescales nothing, and
-      // that the physical column is an integer, which is the restriction this path already made.
+      // ADR 0021's decimal64 item. **Every decimal width of the same precision and scale is
+      // admitted here**, because this path reads the Parquet column's own integer and writes the
+      // engine's width: the storage type tells it the precision and scale to agree on and nothing
+      // about how the value travels. All three widths really occur -- decimal64 for 10 to 18
+      // digits and decimal32 for 9 or fewer are what `ReaderProperties`'s smallest decimal
+      // produces (parquet_table.cc), and decimal128 is what a file's own ARROW:schema can restore
+      // -- and a column of nine digits or fewer reaching this case is why decimal32 is here:
+      // without it that column would quietly lose the filtered path, which is the pushdown ADR
+      // 0021 records losing once already. What stays required is an integer physical column, the
+      // restriction this path already made.
       const auto& want = static_cast<const arrow::DecimalType&>(engine);
-      if (s != arrow::Type::DECIMAL128 && s != arrow::Type::DECIMAL64) {
+      if (s != arrow::Type::DECIMAL128 && s != arrow::Type::DECIMAL64 &&
+          s != arrow::Type::DECIMAL32) {
         break;
       }
       const auto& have = static_cast<const arrow::DecimalType&>(storage);

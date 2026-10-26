@@ -49,6 +49,26 @@ struct FileInfo {
   int64_t bytes = 0;
 };
 
+// The reader properties every read of this module uses, differing from Arrow's defaults in one
+// thing: **the smallest decimal**. Arrow's default decodes a DECIMAL column to decimal128 whatever
+// its precision, so an INT64-stored DECIMAL(15,2) -- what this engine's benchmark data is full of
+// -- arrives sixteen bytes a value and is then narrowed to the eight the engine reads it at (ADR
+// 0021's decimal64 item), a pass over every value of every decimal column. With this on Arrow
+// decodes it at eight bytes directly and the pass has nothing to do: `ConversionFor` answers
+// `kNone` where the storage already equals the engine type.
+//
+// It is not a narrowing of what this reads. Arrow's smallest is decimal32 at nine digits or fewer,
+// where the engine reads decimal64, so those columns keep a conversion (`kDecimal32To64`) -- and
+// `FilteredColumnOf` admits decimal32 storage so they keep the filtered path too. A file whose
+// ARROW:schema records a width of its own still restores that width, which is what the other
+// decimal conversions are for. **Every site that infers or reads a type takes this**, because the
+// schema this module records must be the one its arrays actually arrive in.
+parquet::ArrowReaderProperties ReaderProperties(bool use_threads = false) {
+  parquet::ArrowReaderProperties properties(use_threads);
+  properties.set_smallest_decimal_enabled(true);
+  return properties;
+}
+
 // The footer as stored at the end of a Parquet file: the serialized FileMetaData (`metadata`,
 // already parsed), its 4-byte length and the magic. It holds the offsets and types of every column
 // chunk, so a scan compares it with the file to decode the file only with the footer it was
@@ -74,9 +94,9 @@ arrow::Result<FileInfo> ReadFooter(const std::string& path) {
     for (int row_group = 0; row_group < info.metadata->num_row_groups(); ++row_group) {
       info.row_group_rows.push_back(info.metadata->RowGroup(row_group)->num_rows());
     }
-    ARROW_RETURN_NOT_OK(parquet::arrow::FromParquetSchema(
-        info.metadata->schema(), parquet::default_arrow_reader_properties(),
-        info.metadata->key_value_metadata(), &info.schema));
+    ARROW_RETURN_NOT_OK(
+        parquet::arrow::FromParquetSchema(info.metadata->schema(), ReaderProperties(),
+                                          info.metadata->key_value_metadata(), &info.schema));
     return info;
   } catch (const parquet::ParquetException& e) {
     return arrow::Status::IOError("cannot read Parquet file '", path, "': ", e.what());
@@ -281,9 +301,11 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecimalToInt64(
   const std::span<const uint8_t> in(data.GetValues<uint8_t>(1, 0), Narrow<std::size_t>(end) * kIn);
   const uint8_t* const valid = data.buffers[0] != nullptr ? data.buffers[0]->data() : nullptr;
   // The low word IS the value; the words above it must be its sign extension, which is one 64-bit
-  // comparison each rather than kIn - 8 byte comparisons. This runs over every value of every
-  // narrowed column of a scan that pushes no predicate, so what it costs is what the
-  // representation costs on that path (ADR 0021's decimal64 item).
+  // comparison each rather than kIn - 8 byte comparisons. It used to run over every value of every
+  // narrowed column of a scan that pushes no predicate, which is what made its cost worth this
+  // much care; since `ReaderProperties` asks for the smallest decimal it runs only where a file's
+  // ARROW:schema restores a storage wider than the engine reads (ADR 0021's decimal64 item), so the
+  // care is now insurance rather than a hot path.
   const auto word_at = [&](std::size_t row, std::size_t word) {
     int64_t value = 0;
     std::memcpy(&value, in.data() + (row * kIn) + (word * sizeof(value)), sizeof(value));
@@ -492,7 +514,7 @@ class ScanReader final : public arrow::RecordBatchReader {
     parquet::arrow::FileReaderBuilder builder;
     ARROW_RETURN_NOT_OK(builder.Open(input, parquet::ReaderProperties(pool_), segment.metadata));
     builder.memory_pool(pool_);
-    parquet::ArrowReaderProperties properties(/*use_threads=*/false);
+    parquet::ArrowReaderProperties properties = ReaderProperties();
     properties.set_batch_size(batch_size_);
     // No pre-buffering (on by default): its read cache keeps every column chunk it has read until
     // the FileReader closes, so memory would grow with the file (every row group of the scanned
@@ -522,8 +544,30 @@ class ScanReader final : public arrow::RecordBatchReader {
     if (status.ok() || status.IsOutOfMemory()) {
       return status;
     }
-    return arrow::Status::IOError("cannot read Parquet file '", current_file_,
-                                  "': ", status.message());
+    return arrow::Status::IOError("cannot read Parquet file '", current_file_, "' (", ColumnsRead(),
+                                  "): ", status.message());
+  }
+
+  // The columns this reader was asked for, for an error that happened while decoding them. Arrow's
+  // own message names the type it could not decode a value into and not the column it came from --
+  // a BYTE_ARRAY decimal carrying more bytes than its precision admits says only which decimal
+  // width was wanted -- and a file with several decimal columns of one width would leave a reader
+  // with nothing to go on. Four names at most: a message is not a schema.
+  //
+  // No columns is a real scan and not a degenerate one: a scan of no fields carries row counts
+  // alone (parquet_table.h) and fails like any other, so it says so rather than naming a column it
+  // never asked for. The null schema beside it is a guard and not a case -- a reader is never made
+  // without one -- and is here so that an error path cannot be the thing that dereferences null.
+  [[nodiscard]] std::string ColumnsRead() const {
+    const int fields = schema_ == nullptr ? 0 : schema_->num_fields();
+    if (fields == 0) {
+      return "no columns";
+    }
+    std::string out = fields == 1 ? "column " : "columns ";
+    for (int f = 0; f < std::min(fields, 4); ++f) {
+      out += (f == 0 ? "'" : ", '") + schema_->field(f)->name() + "'";
+    }
+    return fields > 4 ? out + " and " + std::to_string(fields - 4) + " more" : out;
   }
 
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> ToEngine(
@@ -680,7 +724,7 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
     const auto& first = table->metadata_.front();
     parquet::arrow::SchemaManifest manifest;
     if (parquet::arrow::SchemaManifest::Make(first->schema(), first->key_value_metadata(),
-                                             parquet::default_arrow_reader_properties(), &manifest)
+                                             ReaderProperties(), &manifest)
             .ok()) {
       for (std::size_t f = 0; f < manifest.schema_fields.size() && f < table->leaf_of_field_.size();
            ++f) {

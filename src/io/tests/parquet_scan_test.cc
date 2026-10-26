@@ -652,6 +652,11 @@ TEST_F(ParquetScanTest, BrokenFilesAreIOErrors) {
   fs::remove(b);
   st = scan_error({0});
   EXPECT_TRUE(st.IsIOError()) << st.ToString();
+  // And a scan of NO fields, which carries only row counts and is as much a read as any other: its
+  // error names the file and says so rather than naming a column it never asked for.
+  st = scan_error({});
+  EXPECT_TRUE(st.IsIOError()) << st.ToString();
+  EXPECT_NE(st.message().find("no columns"), std::string::npos) << st.ToString();
 }
 
 // Corrupt data pages behind an intact footer: Open succeeds, the scan fails with an IOError that
@@ -924,6 +929,95 @@ TEST_F(ParquetScanTest, NarrowingAByteArrayDecimal) {
     const arrow::Status st = (*reader)->ReadNext(&batch);
     EXPECT_FALSE(st.ok()) << "a value no int64 holds was read as one";
     EXPECT_NE(st.message().find("'d'"), std::string::npos) << st.ToString();
+    // **An IOError, which is a kind and therefore a CLI exit code.** This used to be an `Invalid`
+    // from io's own narrowing pass and is now the reader's own failure wrapped by `FileError`; the
+    // header's contract is that every Parquet read failure leaves this module as an IOError, so the
+    // new kind is the stated one and the old one was the exception. Asserted because the exit code
+    // a malformed file produces is not something to discover from a diff.
+    EXPECT_TRUE(st.IsIOError()) << st.ToString();
+  }
+}
+
+// The column names in that message, which is all a reader of such a file has to go on: Arrow's own
+// text names the decimal width it could not decode a value into and never the column it came from,
+// so io adds the columns the read was asked for. Bounded, because a `SELECT *` over a wide table
+// would otherwise put a schema in an error: four names and a count of the rest.
+//
+// **It pins the narrow decode target as well, and that is worth knowing rather than discovering.**
+// This text is io wrapping the *reader's* failure, which is the path a value too wide for its
+// target takes only because `ReaderProperties` asks for the smallest decimal (parquet_table.cc):
+// with the wider target the reader accepts nine bytes and io's own narrowing pass answers instead,
+// in its own words. So this case fails if that option is ever turned off -- which is the only
+// signature that option has outside a measurement, every engine type and value being identical
+// either way.
+TEST_F(ParquetScanTest, AFailedReadNamesTheColumnsItWasAskedFor) {
+  using parquet::schema::GroupNode;
+  using parquet::schema::PrimitiveNode;
+  // Six BYTE_ARRAY decimal columns, every one of them carrying the same nine bytes -- 2^64, which
+  // no int64 holds, so the read of any of them fails. Nine bytes is a real file's shape: a writer
+  // that stores a decimal as bytes is free to use more of them than the precision needs.
+  parquet::schema::NodeVector nodes;
+  for (int c = 0; c < 6; ++c) {
+    nodes.push_back(PrimitiveNode::Make(std::format("c{}", c), parquet::Repetition::OPTIONAL,
+                                        parquet::LogicalType::Decimal(15, 2),
+                                        parquet::Type::BYTE_ARRAY));
+  }
+  const auto schema = std::static_pointer_cast<GroupNode>(
+      GroupNode::Make("schema", parquet::Repetition::REQUIRED, nodes));
+  const std::string path = (dir_ / "wide_byte_array.parquet").string();
+  auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  auto writer = parquet::ParquetFileWriter::Open(out, schema);
+  auto* group = writer->AppendRowGroup();
+  const std::vector<std::uint8_t> nine = {0x01, 0, 0, 0, 0, 0, 0, 0, 0};
+  for (int c = 0; c < 6; ++c) {
+    auto* values_out = static_cast<parquet::ByteArrayWriter*>(group->NextColumn());
+    const parquet::ByteArray value(static_cast<std::uint32_t>(nine.size()), nine.data());
+    const std::int16_t definition = 1;
+    values_out->WriteBatch(1, &definition, nullptr, &value);
+  }
+  writer->Close();
+  ASSERT_TRUE(out->Close().ok());
+
+  auto table = ParquetTable::Open({path}, ParquetTableOptions{});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  const auto fail = [&](const std::vector<int>& fields) {
+    auto reader = (*table)->Scan(fields, 8);
+    EXPECT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    return reader.ok() ? (*reader)->ReadNext(&batch).message() : std::string{};
+  };
+  {  // one column: singular, and the name
+    const std::string message = fail({2});
+    EXPECT_NE(message.find("column 'c2'"), std::string::npos) << message;
+    EXPECT_EQ(message.find("columns"), std::string::npos) << message;
+  }
+  {  // three: plural, every one named, and no count
+    const std::string message = fail({0, 1, 2});
+    EXPECT_NE(message.find("columns 'c0', 'c1', 'c2'"), std::string::npos) << message;
+    EXPECT_EQ(message.find("more"), std::string::npos) << message;
+  }
+  {  // four: the cap itself, every name and still no count
+    const std::string message = fail({0, 1, 2, 3});
+    EXPECT_NE(message.find("columns 'c0', 'c1', 'c2', 'c3'"), std::string::npos) << message;
+    EXPECT_EQ(message.find("more"), std::string::npos) << message;
+  }
+  {  // five: one past it, so the count appears and is singular in number if not in words
+    const std::string message = fail({0, 1, 2, 3, 4});
+    EXPECT_NE(message.find("columns 'c0', 'c1', 'c2', 'c3' and 1 more"), std::string::npos)
+        << message;
+  }
+  {  // six: four names and a count of the rest, so the message stays bounded
+    const std::string message = fail({0, 1, 2, 3, 4, 5});
+    EXPECT_NE(message.find("columns 'c0', 'c1', 'c2', 'c3' and 2 more"), std::string::npos)
+        << message;
+    EXPECT_EQ(message.find("'c4'"), std::string::npos) << message;
+  }
+  // Every one of them an IOError: the kind is what the CLI turns into an exit code.
+  {
+    auto reader = (*table)->Scan({0}, 8);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    EXPECT_TRUE((*reader)->ReadNext(&batch).IsIOError());
   }
 }
 
