@@ -77,7 +77,8 @@ Proposed
   `pixi run bench` and `pixi run bench-clickbench` build in `build/static`, `bench.yml` publishes the series
   `dev/bench-static`, and the dynamic `bench` preset is gone (docs/benchmarks.md). The project licence and the
   sources that go with every Linux package (`pixi run static-sources`) are
-  [ADR 0034](0034-licence-and-static-sources.md); publishing the binary with GitHub releases follows separately.
+  [ADR 0034](0034-licence-and-static-sources.md); tagged GitHub releases publish the binary
+  ([ADR 0035](0035-github-releases.md)).
 
 ## Consequences
 

@@ -7,6 +7,7 @@ name: Copilot Setup Steps
 on:
   workflow_dispatch:
   push:
+    branches: ["**"] # never on a tag push (path filters do not apply to tags; release.yml builds those)
     paths:
       - .github/workflows/copilot-setup-steps.yml
       - pixi.toml

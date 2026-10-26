@@ -189,6 +189,38 @@ say("", "fake antb1: unexpected " + repr(args) + "\\n", 99)
 """
 
 
+# A curl for README.md's install block (`curl -fsSLO URL`), which runs with a minimal environment: it serves each URL
+# from served/<the URL without https://, "/" as "_">, writes it under the URL's base name like -O, logs every argv,
+# and fails like `curl -f` on a URL it does not serve. Its paths are fixed when it is made (fake_download).
+FAKE_DOWNLOAD = """#!{python} -I
+import os, shutil, sys
+SERVED, LOG = {served!r}, {log!r}
+args = sys.argv[1:]
+with open(LOG, "a") as log:
+    log.write(" ".join(args) + "\\n")
+flags = "".join(a[1:] for a in args[:-1] if a.startswith("-") and not a.startswith("--"))
+url = args[-1] if args else ""
+if "O" not in flags or "f" not in flags or not url.startswith("https://"):
+    sys.stderr.write("fake curl: unexpected " + repr(args) + "\\n")
+    sys.exit(99)
+path = os.path.join(SERVED, url[len("https://") :].replace("/", "_"))
+if not os.path.isfile(path):
+    sys.stderr.write("curl: (22) The requested URL returned error: 404\\n")
+    sys.exit(22)
+shutil.copyfile(path, os.path.basename(url))
+"""
+
+
+def fake_download(served: Path, log: Path) -> str:
+    """FAKE_DOWNLOAD serving from `served` and logging to `log` (install() then fills in the interpreter)."""
+    return FAKE_DOWNLOAD.replace("{served!r}", repr(str(served))).replace("{log!r}", repr(str(log)))
+
+
+def serve(served: Path, url: str, data: bytes) -> None:
+    served.mkdir(parents=True, exist_ok=True)
+    (served / url.removeprefix("https://").replace("/", "_")).write_bytes(data)
+
+
 def fake_antb1(log: Path, target: str, version: str, commit: str = "", wrong: str = "") -> bytes:
     """The bytes of a FAKE_ANTB1 that logs each run ({argv, env, cwd}) to `log`."""
     script = FAKE_ANTB1.format(

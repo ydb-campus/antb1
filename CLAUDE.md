@@ -26,9 +26,10 @@ task) and never block, except the Stop hook below.
   `pixi run bench-clickbench`, `pixi run install-git-hooks` and the static build's `pixi run static-arrow`
   (network), `pixi run static`, `pixi run static-test`, `pixi run static-check <BIN or tarball>` (it runs that
   file) and `pixi run static-sources` (network), which prompt; `pixi install --locked`, read-only
-  git and gh, plus `git switch` (its `-f`, `--force` and `--discard-changes` forms prompt), `git fetch origin`,
-  `git add` and `git commit`. Never widen this to `pixi run *` (in personal settings too): `pixi run` executes any
-  command, so a wildcard would bypass every other rule.
+  git and gh (`gh release view`, `list`, `verify` and `verify-asset`, `gh attestation verify` included), plus
+  `git switch` (its `-f`, `--force` and `--discard-changes` forms prompt), `git fetch origin`, `git add` and
+  `git commit`. Never widen this to `pixi run *` (in personal settings too): `pixi run` executes any command, so a
+  wildcard would bypass every other rule.
 - Ask (you are prompted): dependency changes (`pixi add`, `pixi remove`, `pixi update`, `pixi upgrade`, `pixi lock`),
   `pixi run -x`, `pixi exec`, `git push`, `gh pr create`, `gh pr merge`, and editing any path listed under
   "Ask a human first" in AGENTS.md. A `pixi run` command with a single quote inside double quotes prompts too: pixi
@@ -36,6 +37,9 @@ task) and never block, except the Stop hook below.
   Pass SQL with `-f file.sql` or `-c -` (stdin) instead.
 - Denied: editing `pixi.lock`, reading `.env` files, `sudo` and other package managers (apt, brew, pip, uv, conda,
   mamba, `pixi global`), `--manifest-path`, force pushes, `git reset --hard`, `git clean` and `git commit --no-verify`.
+  Releases are the maintainers' (docs/ci.md#releases): tag pushes, `gh release create`, `upload`, `edit` and
+  `delete`, `gh workflow run release.yml` and deployment approvals (`pending_deployments`) are denied; a maintainer
+  runs them in their own shell (with `!` in this session).
 - The rules match command text, so they are a convenience, not a security boundary; CI is the gate. A prompt for an
   "Ask a human first" path means: stop and ask the human, do not work around it.
 

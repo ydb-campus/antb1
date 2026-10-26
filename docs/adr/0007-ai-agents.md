@@ -46,6 +46,9 @@ Accepted
 - Every PR discloses AI assistance in its template and names the accountable human.
 - `pixi run lint` keeps the agent-facing files honest: commands in the docs must exist, links must resolve, and
   AGENTS.md must stay within its size limits and contain the Code Review Rules.
+- Update (2026-10-26): [ADR 0035](0035-github-releases.md) leaves releases to the maintainers: no agent pushes a tag or
+  starts a GitHub release (AGENTS.md golden rule 4), or approves, edits or publishes one, and `.claude/settings.json`
+  denies tag pushes, `gh release` writes, `gh workflow run release.yml` and deployment approvals.
 
 ## Consequences
 

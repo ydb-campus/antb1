@@ -171,7 +171,7 @@ that cannot be dropped stop the run (exit code 3).
 | `ANTB1_BENCH_TRIES` | `3` | runs of every query |
 | `ANTB1_BENCH_COLD` | `auto` | `auto`: cold runs when `sudo -n true` works; `0`: never drop the page cache |
 | `ANTB1_BENCH_OUT` | `build/static/bench-results` | the results directory (also for `pixi run bench`); a relative path is a directory inside the default one, so results never land in the work tree. Give every arm or commit its own |
-| `ANTB1_BENCH_BIN` | none | absolute path of an `antb1` to run instead of building one: a downloaded package or a campaign arm |
+| `ANTB1_BENCH_BIN` | none | absolute path of an `antb1` to run instead of building one: a release binary, a `static.yml` artifact or a campaign arm |
 | `ANTB1_BENCH_ANY_BUILD` | `0` | `1`: run a binary that is not the standalone static Release build anyway, with a warning |
 | `ANTB1_ARROW_DIR` | `~/.cache/antb1/arrow` | where `static-arrow` keeps the static Arrow prefixes |
 
@@ -209,24 +209,37 @@ Never commit ClickBench data, query text, results or result files, and never upl
 
 The package is one file, so a perf host needs only it, the data and a shell.
 
-1. **The binary.** Fetch the newest package from `main`: a `static.yml` artifact named `antb1-<target>`, with
-   targets `linux-x86_64`, `linux-aarch64` and `darwin-arm64`. Artifacts are kept 30 days; GitHub releases follow.
-   A Linux run also has `antb1-<target>-sources`, the sources that go with the package
-   ([ADR 0034](adr/0034-licence-and-static-sources.md)); a perf host does not need them. Use any machine where `gh`
-   is logged in:
+1. **The binary.** Take a release ([README.md](../README.md#install)), with the target `linux-x86_64`,
+   `linux-aarch64` or `darwin-arm64`. The asset names carry no version: `releases/download/<tag>` serves a given
+   release and `releases/latest/download` the latest stable one. No `gh` is needed:
+
+   ```bash
+   t=linux-x86_64
+   url=https://github.com/ydb-campus/antb1/releases/download/v0.1.0   # the release to measure
+   mkdir -p pkg && (cd pkg && curl -fsSLO "$url/antb1-$t.tar.gz" && curl -fsSLO "$url/SHA256SUMS" &&
+     sha256sum --ignore-missing -c SHA256SUMS)   # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
+   tar -xzf "pkg/antb1-$t.tar.gz"
+   bin=$(cd antb1-*-"$t" && pwd)/antb1
+   "$bin" version --verbose     # its commit, CPU baseline and "mimalloc purge delay: -1"
+   ```
+
+   `SHA256SUMS` proves the download intact, and the build provenance proves that `release.yml` built the file from
+   the release's tag ([SECURITY.md](../SECURITY.md#verifying-a-release)).
+
+   For a commit of `main` that no release has yet, take its `static.yml` artifact `antb1-<target>` instead, kept 30
+   days. A Linux run also has `antb1-<target>-sources`, the sources that go with the package
+   ([ADR 0034](adr/0034-licence-and-static-sources.md)); a perf host does not need them. Download it on any machine
+   where `gh` is logged in, then unpack it as above:
 
    ```bash
    run=$(gh run list -R ydb-campus/antb1 -w static.yml -b main -e push -s success -L 1 --json databaseId -q '.[0].databaseId')
    gh run download "$run" -R ydb-campus/antb1 -n antb1-linux-x86_64 -D pkg
-   (cd pkg && grep ' antb1-linux-x86_64.tar.gz$' SHA256SUMS | sha256sum -c -)   # macOS: shasum -a 256 -c -
-   tar -xzf pkg/antb1-linux-x86_64.tar.gz
-   bin=$(cd antb1-*-linux-x86_64 && pwd)/antb1
-   "$bin" version --verbose     # its commit, CPU baseline and "mimalloc purge delay: -1"
+   (cd pkg && sha256sum --ignore-missing -c SHA256SUMS)   # macOS: shasum -a 256 --ignore-missing -c SHA256SUMS
    ```
 
-   SHA256SUMS comes from the same run, so it proves the download is intact, not who built it. `version --verbose`
-   and the package's BUILDINFO.json name the commit. Fetch with `gh` or `curl`, not a browser: macOS quarantines
-   browser downloads.
+   That `SHA256SUMS` comes from the same run, so it proves the download intact, not who built it. Either way,
+   `version --verbose` and the package's BUILDINFO.json name the commit. Fetch with `curl` or `gh`, not a browser:
+   macOS quarantines browser downloads.
 2. **The data.** Fetch the pinned files of `tools/data/clickbench.lock` at the binary's commit, and check each one's
    size and sha256 before use: a file is kept only when both match. A data directory already checked on another
    host can be copied instead.
@@ -258,8 +271,8 @@ The package is one file, so a perf host needs only it, the data and a shell.
      --threads 16 --out clickbench.json
    ```
 
-Keep the package, SHA256SUMS, version.txt and the result JSON together. Only the timings may be shared; the data,
-the query text and query results stay on the host.
+Keep the package, SHA256SUMS, its release tag (or the run id), version.txt and the result JSON together. Only the
+timings may be shared; the data, the query text and query results stay on the host.
 
 ### The series break of 2026-10-25
 

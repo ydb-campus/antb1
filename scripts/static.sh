@@ -118,29 +118,11 @@ case "$sha" in
   "" | *-dirty) source_url="" ;;
   *) source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-ydb-campus/antb1}/tree/$sha" ;;
 esac
-python - "$pkg/$name/BUILDINFO.json" <<EOF
-import json, sys
-info = {
-    "name": "antb1",
-    "version": "$version",
-    "commit": "$sha",
-    "target": "$target",
-    "flavor": "static-thinlto",
-    "license": "Apache-2.0",
-    "source": "$source_url",
-    "arrow_prefix": "$(basename "$(dirname "$prefix")")",
-    "arrow_sources": "cmake/static/arrow-sources.lock",
-    "sysroot": "$sysroot",
-    "glibc_source": "$glibc_source",
-    "pixi_lock_sha256": "$(cmake -E sha256sum pixi.lock | cut -c1-64)",
-    "compiler": "$(clang++ --version | head -1)",
-    "runner": "${ImageOS:-$(uname -s)} ${ImageVersion:-$(uname -r)}",
-}
-for key in ("source", "sysroot", "glibc_source"):  # no source URL for a -dirty build; no glibc on macOS
-    if not info[key]:
-        del info[key]
-json.dump(info, open(sys.argv[1], "w"), indent=2)
-EOF
+# BUILDINFO.json, with the tag on a tag run (static_package.py buildinfo).
+python scripts/static_package.py buildinfo --out "$pkg/$name/BUILDINFO.json" --version "$version" --commit "$sha" \
+  --target "$target" --source "$source_url" --arrow-prefix "$(basename "$(dirname "$prefix")")" \
+  --sysroot "$sysroot" --glibc-source "$glibc_source" --compiler "$(clang++ --version | head -1)" \
+  --runner "${ImageOS:-$(uname -s)} ${ImageVersion:-$(uname -r)}"
 glibc_note=""
 if [ -n "$glibc_source" ]; then
   glibc_note="
