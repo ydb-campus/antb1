@@ -381,10 +381,13 @@ def list_releases(repo: str) -> list[dict[str, Any]]:
     return pages(f"repos/{repo}/releases")
 
 
-def release_by_id(repo: str, release_id: str) -> dict[str, Any]:
+RERUN_DRAFT = "re-run the draft job (Re-run this job): it uploads a new draft, and publish runs again"
+
+
+def release_by_id(repo: str, release_id: str, hint: str = "re-run the failed jobs of this run") -> dict[str, Any]:
     got = api("GET", f"repos/{repo}/releases/{release_id}")
     if got.status == 404:
-        fail(f"release {release_id} no longer exists (deleted by hand?): re-run the failed jobs of this run")
+        fail(f"release {release_id} no longer exists (deleted by hand?): {hint}")
     return got.ok().json()
 
 
@@ -480,25 +483,29 @@ def check_on_main(repo: str, sha: str, checks: Checks) -> None:
 
 
 def check_ci_ok(repo: str, sha: str, checks: Checks) -> None:
-    path = f"repos/{repo}/commits/{sha}/check-runs?check_name=CI%20OK&app_id={ACTIONS_APP_ID}&filter=all"
-    runs = [run for run in pages(path, "check_runs")
-            if run.get("name") == CI_CHECK and (run.get("app") or {}).get("id") == ACTIONS_APP_ID]  # fmt: skip
+    """The newest run of .github/workflows/ci.yml on the commit (a push, schedule, dispatch or merge-queue run; not a
+    pull request's, which tests a merge commit) is completed and its `CI OK` job is green. Read from the Actions API,
+    never from check runs: any workflow's token can create a check run named CI OK as app 15368, and GitHub files it
+    under any Actions check suite of the commit, ci.yml's included."""
+    path = f"repos/{repo}/actions/workflows/{CI_WORKFLOW.rsplit('/', 1)[1]}/runs?head_sha={sha}"
+    ours = (CI_WORKFLOW, sha)
+    runs = [run for run in pages(path, "workflow_runs")
+            if (run.get("path"), run.get("head_sha")) == ours and run.get("event") in CI_EVENTS]  # fmt: skip
     if not runs:
-        checks.miss("CI OK", f"has not reported on {sha[:12]} yet: re-run this workflow once it is green")
+        checks.miss("CI OK", f"{CI_WORKFLOW} has not run on {sha[:12]} yet: re-run this workflow once it is green")
         return
-    newest = max(runs, key=lambda run: (run.get("started_at") or "", run["id"]))
-    if newest.get("status") != "completed" or newest.get("conclusion") != "success":
-        state = newest.get("conclusion") or newest.get("status")
-        checks.miss("CI OK", f"the newest run on {sha[:12]} is {state} ({newest.get('details_url')})")
+    newest = max(runs, key=lambda run: (run.get("run_started_at") or run.get("created_at") or "", run["id"]))
+    where = f"the newest {CI_WORKFLOW} run on {sha[:12]} ({newest.get('event')}, {newest.get('html_url')})"
+    if newest.get("status") != "completed":
+        checks.miss("CI OK", f"{where} is {newest.get('status')}: re-run this workflow once it is green")
         return
-    suite = (newest.get("check_suite") or {}).get("id")
-    found = api("GET", f"repos/{repo}/actions/runs?check_suite_id={suite}").ok().json().get("workflow_runs") or []
-    run = found[0] if len(found) == 1 else {}
-    if run.get("path") != CI_WORKFLOW or run.get("head_sha") != sha or run.get("event") not in CI_EVENTS:
-        checks.miss("CI OK", f"the newest green one is not from a {CI_WORKFLOW} run on {sha[:12]}: "
-                             f"{[(r.get('path'), r.get('event'), r.get('head_sha')) for r in found]}")  # fmt: skip
+    jobs = [job for job in pages(f"repos/{repo}/actions/runs/{newest['id']}/jobs?filter=latest", "jobs")
+            if job.get("name") == CI_CHECK]  # fmt: skip
+    if len(jobs) != 1 or jobs[0].get("status") != "completed" or jobs[0].get("conclusion") != "success":
+        state = [job.get("conclusion") or job.get("status") for job in jobs]
+        checks.miss("CI OK", f"{where} has its {CI_CHECK} job {state or 'missing'}")
         return
-    checks.ok("CI OK", f"green in {CI_WORKFLOW} ({run.get('event')}, {run.get('html_url', run.get('id'))})")
+    checks.ok("CI OK", f"green in {where}")
 
 
 def check_unreleased(repo: str, tag: str, checks: Checks) -> None:
@@ -1032,12 +1039,15 @@ def cmd_draft(args: argparse.Namespace) -> None:
 
 
 def make_latest(rel: Release, releases: list[dict[str, Any]]) -> str:
-    """Sent explicitly (the API's default is true): true only for a stable version above every published stable."""
+    """Sent explicitly (the API's default is true): true only for a stable version above every other published
+    stable one."""
     if rel.prerelease:
         return "false"
     stable = []
     for release in releases:
         match = TAG_RE.fullmatch(release.get("tag_name", ""))
+        if release.get("tag_name") == rel.tag:
+            continue  # the release itself, published by an earlier attempt of this job
         if match and not match["rc"] and not release.get("draft") and not release.get("prerelease"):
             stable.append(version_key(match["version"]))
     return "true" if all(version_key(rel.version) > other for other in stable) else "false"
@@ -1074,7 +1084,7 @@ def download_and_verify(
 
 def wait_published(rel: Release, release_id: str) -> dict[str, Any]:
     for attempt in range(RETRIES):
-        got = release_by_id(rel.repo, release_id)
+        got = release_by_id(rel.repo, release_id, RERUN_DRAFT)
         if not got.get("draft") and got.get("immutable") is True:
             return got
         if attempt + 1 < RETRIES:
@@ -1117,7 +1127,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
     require_tag_push(rel)
     release_id, tag_object = env("RELEASE_ID", ID_RE), env("RELEASE_TAG_OBJECT", SHA_RE)
     subjects, work = subjects_from_env(), Path(args.work)
-    got = release_by_id(rel.repo, release_id)
+    got = release_by_id(rel.repo, release_id, RERUN_DRAFT)
     if got.get("tag_name") != rel.tag:
         fail(f"release {release_id} is for {got.get('tag_name')}, not {rel.tag}")
     if got.get("draft"):
@@ -1130,28 +1140,28 @@ def cmd_publish(args: argparse.Namespace) -> None:
             other.ok()
             fail(f"another release of {rel.tag} is published: {other.json().get('html_url')}")
         files = download_and_verify(rel, got, work, subjects)
-        latest = make_latest(rel, list_releases(rel.repo))
-        check_release(release_by_id(rel.repo, release_id), rel, files, draft=True)  # the last look before the PATCH
+        check_release(release_by_id(rel.repo, release_id, RERUN_DRAFT), rel, files, draft=True)  # the last look
+        # Published without becoming the latest release: README.md's install block serves the latest one, so this
+        # one takes that place only after it proved immutable and attested (below).
         patched = api("PATCH", f"repos/{rel.repo}/releases/{release_id}",
-                      {"draft": False, "prerelease": rel.prerelease, "make_latest": latest})  # fmt: skip
+                      {"draft": False, "prerelease": rel.prerelease, "make_latest": "false"})  # fmt: skip
         if patched.status in (403, 404):
             fail(f"publishing {rel.tag}: HTTP {patched.status} {patched.message()} ({WORKFLOW_RULE})")
         patched.ok()
-        log(f"published {rel.tag} (make_latest={latest})")
+        log(f"published {rel.tag}, not yet the latest release")
     else:
         log(f"release {release_id} of {rel.tag} is already published (a re-run): verifying it only")
         files = download_and_verify(rel, got, work, subjects)
-        latest = "true" if got.get("id") == latest_release_id(rel.repo) else "false"
     done = wait_published(rel, release_id)
     check_release(done, rel, files, draft=False)
     check_release_attestation(rel, tag_object, release_id, files)
-    summary(f"### Published {rel.tag}\n\n{done.get('html_url')} (immutable)")
+    latest = make_latest(rel, list_releases(rel.repo))
+    if latest == "true":
+        api("PATCH", f"repos/{rel.repo}/releases/{release_id}", {"make_latest": "true"}).ok()
+        log(f"{rel.tag} is the latest release now")
+    state = "immutable, the latest release" if latest == "true" else "immutable"
+    summary(f"### Published {rel.tag}\n\n{done.get('html_url')} ({state})")
     outputs(latest=latest)
-
-
-def latest_release_id(repo: str) -> int | None:
-    got = api("GET", f"repos/{repo}/releases/latest")
-    return None if got.status == 404 else got.ok().json().get("id")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1190,6 +1200,7 @@ def cmd_check_published(args: argparse.Namespace) -> None:
     if latest:
         runs["latest"] = block  # as a user pastes it
     tarball = f"antb1-{target}.tar.gz"
+    assets = {a.get("name"): a for a in got.get("assets", [])}
     for label, code in runs.items():
         directory = work / label
         directory.mkdir(parents=True)
@@ -1202,11 +1213,11 @@ def cmd_check_published(args: argparse.Namespace) -> None:
         for want in (f"antb1 {rel.version} ", f"commit: {rel.sha}", f"target: {target}", "flavor: static-thinlto"):
             if want not in said:
                 fail(f"README.md's install block ({label}) ran a binary that does not say {want!r}: {said[-1500:]}")
+        downloaded = directory / tarball  # each run's, so `latest` cannot pass with another release's file
+        if not downloaded.is_file() or f"sha256:{sha256_file(downloaded)}" != (assets.get(tarball) or {}).get("digest"):
+            fail(f"README.md's install block ({label}) downloaded a {tarball} that is not {rel.tag}'s asset")
         log(f"README.md's install block ({label}): antb1 {rel.version} for {target} installed and runs")
     path = work / "tag" / tarball
-    assets = {a.get("name"): a for a in got.get("assets", [])}
-    if not path.is_file() or f"sha256:{sha256_file(path)}" != (assets.get(tarball) or {}).get("digest"):
-        fail(f"{tarball} that the install block downloaded is not the release's asset")
     files = {name: (a["digest"].removeprefix("sha256:"), a.get("size")) for name, a in assets.items()}
     check_release_attestation(rel, tag.object_sha, str(got["id"]), files)
     gh("release", "verify-asset", rel.tag, str(path), "--repo", rel.repo)

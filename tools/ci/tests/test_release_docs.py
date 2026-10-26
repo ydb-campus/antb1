@@ -21,7 +21,7 @@ from types import ModuleType
 
 import pytest
 import yaml
-from fakes import fake_antb1, fake_download, install, serve
+from fakes import assert_fakes_first, fake_antb1, fake_download, install, serve
 
 ROOT = Path(__file__).resolve().parents[3]
 DOCS = ["README.md", "SECURITY.md", "CONTRIBUTING.md", "docs/ci.md", "docs/benchmarks.md", "docs/agents.md",
@@ -80,6 +80,7 @@ def run_install_block(tmp: Path, target: str, corrupt: bool = False) -> subproce
     uname = f'#!/bin/sh\ncase "$1" in -s) echo {system} ;; -m) echo {machine} ;; *) exit 99 ;; esac\n'
     install(bin_dir, {"curl": fake_download(served, tmp / "curl.log"), "uname": uname})
     env = {"PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(tmp), "LC_ALL": "C"}
+    assert_fakes_first(env["PATH"], bin_dir, ["curl", "uname"])  # never the network, never the host's uname
     block = RELEASE.install_block(ROOT)
     return subprocess.run(["sh", "-e", "-c", block], cwd=work, env=env, capture_output=True, text=True, timeout=60,
                           check=False)  # fmt: skip
@@ -108,6 +109,7 @@ def test_the_install_block_refuses_another_platform(tmp_path: Path) -> None:
     install(bin_dir, {"curl": fake_download(served, tmp_path / "curl.log"),
                       "uname": '#!/bin/sh\ncase "$1" in -s) echo FreeBSD ;; -m) echo amd64 ;; esac\n'})  # fmt: skip
     env = {"PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(tmp_path), "LC_ALL": "C"}
+    assert_fakes_first(env["PATH"], bin_dir, ["curl", "uname"])
     result = subprocess.run(["sh", "-e", "-c", RELEASE.install_block(ROOT)], cwd=tmp_path, env=env, text=True,
                             capture_output=True, timeout=60, check=False)  # fmt: skip
     assert result.returncode != 0 and "no antb1 release for FreeBSD amd64" in result.stderr

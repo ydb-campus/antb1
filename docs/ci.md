@@ -229,8 +229,8 @@ release attestation that it is an asset of the published release.
 - SemVer 0.x: the minor number grows with features and breaking changes, the patch number with fixes only. Nothing
   is backported (SECURITY.md).
 - A release is the annotated tag `v<VERSION>`. A tag `v<VERSION>-rc.<N>`, with N counting from 1, is a release
-  candidate of that version: a prerelease, never the latest release. `BUILDINFO.json` records no tag, so an rc's
-  package names the same version as the final release.
+  candidate of that version: a prerelease, never the latest release. Its binary reports the final version, and its
+  `BUILDINFO.json` records the tag (`tag`), so an rc's package names its release.
 - Tags never move: nobody, admins included, updates or deletes a `v*` tag, and the tag of a deleted immutable release
   can never be used again. So a mistake costs a version: a wrong tagged commit is followed by the next version (or
   the next rc), never by a moved tag.
@@ -277,7 +277,9 @@ publish requires the published release to be immutable.
 
    Merge nothing that changes `.github/workflows/` until the release is published: GitHub's Releases API may refuse
    the workflow token a release whose commit differs from `main` in `.github/workflows/` (preflight warns).
-4. **The run.** preflight checks the tag, the version, `main`, `CI OK` and the settings. The three targets are built
+4. **The run.** preflight checks the tag, the version, `main`, `CI OK` and the settings. It takes `CI OK` from the
+   newest `ci.yml` run on the commit and that run's `CI OK` job, through the Actions API, never from check runs:
+   any workflow can create a check run named `CI OK`. The three targets are built
    from scratch. assemble checks every file against its checksums, the pins and the commit, and writes the one
    `SHA256SUMS` and the notes. verify checks each package on fresh runners without pixi: ubuntu-24.04 and
    ubuntu-24.04-arm, there also in a FROM-scratch container without network, macos-15 and macos-26. Only then does
@@ -292,13 +294,19 @@ publish requires the published release to be immutable.
    - for the first release, that the LGPL review of [ADR 0034](adr/0034-licence-and-static-sources.md) is done.
 
    Then approve the deployment on the run's page ("Review deployments"), or reject it
-   ([When a release fails](#when-a-release-fails)). A deployment that waits longer than 30 days fails.
+   ([When a release fails](#when-a-release-fails)). Approve or reject within 30 days: a deployment that waits
+   longer fails, and the run can then no longer be re-run.
 6. **Publication.** publish checks every asset of the draft once more against assemble's digests and the
-   provenance, publishes the draft (as the latest release only when it is the highest stable version) and checks
-   that the release is immutable (`gh release verify`). Then check-published runs README.md's install block on each
-   target's runner, as a user does, and the checks that SECURITY.md documents. Last, read the tag's rule suite,
-   which shows how both rulesets judged the push:
-   `gh api -X GET repos/ydb-campus/antb1/rulesets/rule-suites -f ref=refs/tags/<tag>`.
+   provenance and publishes the draft. Then it checks two things: that the API reports the release immutable, and
+   GitHub's release attestation (`gh release verify`). Only then does the release become the latest one, and only
+   when it is the highest stable version: README.md's install block downloads the latest release. Then
+   check-published runs that block on each target's runner, as a user does, and the checks that SECURITY.md
+   documents.
+7. **The rulesets' verdict.** Look up the push's rule suite, then read its rule evaluations: the list covers the
+   last day unless asked for a month, and only a suite's own page shows each ruleset's result.
+   `gh api -X GET repos/ydb-campus/antb1/rulesets/rule-suites -f ref=refs/tags/<tag> -f time_period=month` gives
+   its id, and `gh api repos/ydb-campus/antb1/rulesets/rule-suites/<id>` must show `release-tags`'
+   `required_status_checks` with result `pass`.
 
 ### The first release
 
@@ -310,7 +318,7 @@ publish:
 2. `CI OK` is green on its merge commit, and a dry run (`gh workflow run release.yml --ref main`) passes.
 3. The LGPL review of ADR 0034 (an open-source office or a lawyer) is done: a prerelease is public too.
 4. An admin pushes the annotated tag `v0.1.0-rc.1` alone, checks the draft, approves the `release` environment,
-   waits for check-published and reads the tag's rule suite.
+   waits for check-published and reads the tag's rule suite (step 7 above).
 5. Then `v0.1.0`, the same way. It needs no version PR: `main` already names 0.1.0.
 
 ### Release notes
@@ -335,13 +343,22 @@ characters. They stay editable after publishing; the assets and the tag do not.
 - If the tagged commit itself is wrong, reject the deployment, delete the draft, fix `main` and release the next
   version (or the next rc). The tag stays. Do not leave the run waiting: release runs go one at a time, so it would
   hold up the run of the next tag.
-- "Published but not immutable" (publish fails after publishing): delete that mutable release, turn immutability on
-  (`bash tools/github/apply-settings.sh --apply --release`), then re-run all jobs: the release is built and signed
-  again.
+- publish fails after publishing: first ask the API whether the release is immutable
+  (`gh api repos/ydb-campus/antb1/releases/tags/<tag> --jq .immutable`).
+  - `false`: immutability was off. Delete that mutable release, turn immutability on
+    (`bash tools/github/apply-settings.sh --apply --release`), then re-run all jobs: the release is built and signed
+    again. It never became the latest release.
+  - `true`: the release is published and stays. "Re-run failed jobs": publish then only verifies it (a late release
+    attestation passes then), makes it the latest release if it should be, and check-published follows. Never
+    delete it: an immutable release's tag can never be used again.
+- publish says its draft is gone (deleted by hand): re-run the draft job ("Re-run this job"), which uploads a new
+  draft and runs publish again.
 - After publishing, never delete the release: fix forward with the next version.
 - Push one tag at a time: a push of more than three tags at once starts no workflow, and release runs go one at a
   time, so a third tag would replace the second one, which waits for the first.
-- A publish job that nobody approves fails after 30 days; "Re-run failed jobs" asks again.
+- A publish job that nobody approves fails after 30 days, and GitHub re-runs jobs only within 30 days of a run's
+  start, while a `v*` tag can never be pushed again: that tag is spent. Delete its draft and release the next rc or
+  version.
 
 ## Nightly
 

@@ -24,7 +24,7 @@ from types import ModuleType
 
 import pytest
 import yaml
-from fakes import fake_antb1, fake_download, install, serve
+from fakes import assert_fakes_first, fake_antb1, fake_download, install, serve
 
 REPO = Path(__file__).resolve().parents[3]
 RELEASE = REPO / ".github" / "scripts" / "release.py"
@@ -48,6 +48,16 @@ runpy.run_path({path!r}, run_name="__main__")
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def ci_run(run_id: int, status: str, started: str, path: str = ".github/workflows/ci.yml", event: str = "push") -> dict:
+    """A run of a workflow on the commit, as GET actions/workflows/<file>/runs lists it."""
+    return {"id": run_id, "path": path, "head_sha": SHA, "event": event, "status": status, "run_started_at": started,
+            "html_url": f"https://ci.test/{run_id}"}  # fmt: skip
+
+
+def ci_job(conclusion: str | None) -> dict:
+    return {"name": "CI OK", "status": "completed" if conclusion else "in_progress", "conclusion": conclusion}
 
 
 def load_release() -> ModuleType:
@@ -132,23 +142,29 @@ class World:
             info["tag"] = tag
         return info
 
-    def package(self, target: str, info: dict[str, str]) -> bytes:
+    def package(self, target: str, info: dict[str, str], commit: str = SHA) -> bytes:
         top = f"antb1-{VERSION}-{target}"
-        binary = fake_antb1(self.antb1_log, target, VERSION, SHA)
+        binary = fake_antb1(self.antb1_log, target, VERSION, commit)
         return tar_bytes({f"{top}/antb1": binary, f"{top}/BUILDINFO.json": json.dumps(info).encode()}, dirs=(top,))
 
-    def sources(self, target: str, commit: str = SHA, extra: dict[str, bytes] | None = None) -> bytes:
+    def sources(self, target: str, commit: str = SHA, extra: dict[str, bytes] | None = None, change: str = "") -> bytes:
+        """antb1-<target>.sources.tar as scripts/static_package.py sources packs it, broken in one way if asked."""
         top = f"antb1-{target}-sources"
-        source = tar_bytes({f"antb1-{VERSION}/LICENSE": (self.root / "LICENSE").read_bytes()},
-                           pax_headers={"comment": commit})  # fmt: skip
+        licence = b"another licence\n" if change == "licence" else (self.root / "LICENSE").read_bytes()
+        source = tar_bytes({f"antb1-{VERSION}/LICENSE": licence}, pax_headers={"comment": commit})
         files = {SRPM: GLIBC, "antb1-source.tar.gz": source, **{f"third-party/{n}": d for n, d in ARROW.items()}}
         for name, version in CONDA.items():
-            files[f"third-party/{name}-{version}-h0_0.conda"] = conda_archive(name, SUBDIR[target])
+            subdir = "linux-aarch64" if change == "conda-other-subdir" else SUBDIR[target]
+            if not (change == "no-cli11" and name == "cli11"):
+                files[f"third-party/{name}-{version}-h0_0.conda"] = conda_archive(name, subdir)
         files |= extra or {}
         sums = "".join(f"{sha256(data)}  {name}\n" for name, data in sorted(files.items()))
+        if change == "inner-sums":
+            sums = "0" * 64 + sums[64:]
         members = {f"{top}/{name}": data for name, data in files.items()}
         members[f"{top}/SHA256SUMS"] = sums.encode()
-        members[f"{top}/README.txt"] = f"The sources of commit {commit}: {SRPM} and more.\n".encode()
+        named = OTHER if change == "readme" else commit
+        members[f"{top}/README.txt"] = f"The sources of commit {named}: {SRPM} and more.\n".encode()
         return tar_bytes(members, mode="w", dirs=(top, f"{top}/third-party"))
 
     def artifacts(self, tag: str | None = TAG, *, change: str = "") -> Path:
@@ -165,6 +181,10 @@ class World:
                 info["sysroot"] = SYSROOT["linux-x86_64"]
             if change == "lock" and target == "linux-aarch64":
                 info["pixi_lock_sha256"] = "0" * 64
+            if change == "glibc-source" and target == "linux-x86_64":
+                info["glibc_source"] = "glibc-2.28-236.el8_9.13.src.rpm"
+            if change == "sysroot" and target == "linux-x86_64":
+                info["sysroot"] = "sysroot_linux-64-2.28-hother_1"
             names = {f"antb1-{target}.tar.gz": self.package(target, info)}
             if target in SUBDIR:
                 names[f"antb1-{target}.debug.tar.gz"] = tar_bytes({f"antb1-{VERSION}-{target}/antb1.debug": b"tables"})
@@ -178,7 +198,8 @@ class World:
                 extra = {"notes.txt": b"x"} if change == "sources-extra" and target == "linux-x86_64" else None
                 if change == "srpm" and target == "linux-x86_64":
                     extra = {SRPM: b"another srpm"}
-                data = self.sources(target, OTHER if change == "source-commit" else SHA, extra)
+                inside = change if target == "linux-x86_64" else ""
+                data = self.sources(target, OTHER if change == "source-commit" else SHA, extra, inside)
                 name = f"antb1-{target}.sources.tar"
                 (src / name).write_bytes(data)
                 (src / f"{name}.sha256").write_text(f"{sha256(data)}  {name}\n")
@@ -232,21 +253,8 @@ class World:
                 },
             },
             "compare": {f"{SHA}...main": {"status": "identical", "ahead_by": 0, "behind_by": 0, "files": []}},
-            "check_runs": {
-                SHA: [
-                    {
-                        "id": 7,
-                        "name": "CI OK",
-                        "app": {"id": 15368},
-                        "status": "completed",
-                        "conclusion": "success",
-                        "started_at": "2026-10-26T01:00:00Z",
-                        "check_suite": {"id": 70},
-                        "details_url": "https://ci.test/7",
-                    }
-                ]
-            },
-            "suites": {"70": [{"id": 9, "path": ".github/workflows/ci.yml", "head_sha": SHA, "event": "push"}]},
+            "workflow_runs": [ci_run(9, "completed", "2026-10-26T01:00:00Z")],
+            "jobs": {"9": [ci_job("success")]},
             "environments": {"release": environment},
             "branch_policies": {"release": [{"id": 1, "name": "v*", "type": "tag"}]},
             "rulesets": rulesets,
@@ -267,9 +275,13 @@ class World:
         (self.tmp / "state.json").write_text(json.dumps(self.state))
         output, summary = self.tmp / f"output-{self.runs}", self.tmp / f"summary-{self.runs}"
         self.runs += 1
+        path = f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin"
+        assert_fakes_first(path, self.bin, ["gh", "curl"])  # never the host's own gh or curl
         env = {
-            "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+            "PATH": path,
             "HOME": str(self.tmp),
+            "GH_HOST": "gh.invalid",  # a real gh, were it ever reached, could not talk to GitHub
+            "GH_CONFIG_DIR": str(self.tmp / "gh-config"),
             "FAKE_GH_STATE": str(self.tmp / "state.json"),
             "FAKE_GH_DIR": str(self.blobs),
             "FAKE_GH_LOG": str(self.tmp / "gh.log"),
@@ -431,9 +443,12 @@ def test_a_release_runs_from_preflight_to_an_immutable_release(world: World) -> 
     release = world.state["releases"][0]
     assert (release["draft"], release["immutable"], release["prerelease"]) == (False, True, False)
     assert world.state["latest"] == release["id"] and world.outputs == {"latest": "true"}
-    patch = [call for call in world.gh_calls() if call[3:4] == ["PATCH"]]
-    assert patch == [["api", "--include", "--method", "PATCH", f"repos/{UPSTREAM}/releases/{run.release_id}",
-                      "-F", "draft=false", "-F", "prerelease=false", "-f", "make_latest=true"]]  # fmt: skip
+    patch = [call[4:] for call in world.gh_calls() if call[3:4] == ["PATCH"]]
+    url = f"repos/{UPSTREAM}/releases/{run.release_id}"
+    assert patch == [  # published first, the latest release only once it proved immutable and attested
+        [url, "-F", "draft=false", "-F", "prerelease=false", "-f", "make_latest=false"],
+        [url, "-f", "make_latest=true"],
+    ]
 
 
 def test_a_release_candidate_is_a_prerelease_that_is_never_latest(world: World) -> None:
@@ -447,20 +462,39 @@ def test_a_release_candidate_is_a_prerelease_that_is_never_latest(world: World) 
     assert "A release candidate of antb1 0.1.0" in (run.meta / "notes.md").read_text()
 
 
-@pytest.mark.skipif(not HOST_TARGET, reason="the install block runs only on a release target")
-@pytest.mark.parametrize("latest", ["true", "false"])
-def test_check_published_installs_and_verifies_as_a_user(world: World, latest: str) -> None:
+def published(world: World) -> Run:
+    """A release published by the run, its assets served at the tag's and the latest URLs, its bundle online."""
     run = Run(world)
     run.through("publish")
-    release = world.state["releases"][0]
     world.state["attestations"] = [json.loads(run.bundle_path.read_text())]  # what the attestations API finds
-    for asset in release["assets"]:
+    for asset in world.state["releases"][0]["assets"]:
         data = (world.blobs / str(asset["id"])).read_bytes()
         for base in (f"releases/download/{TAG}", "releases/latest/download"):
             serve(world.served, f"https://github.com/{UPSTREAM}/{base}/{asset['name']}", data)
+    return run
+
+
+def check_published(world: World, run: Run, latest: str = "false") -> subprocess.CompletedProcess[str]:
+    return world.run("check-published", "--target", HOST_TARGET, "--work", str(world.tmp / f"check-{world.runs}"),
+                     "--root", str(world.root), **run.rel, RELEASE_LATEST=latest)  # fmt: skip
+
+
+def serve_package(world: World, base: str, commit: str = SHA, runner: str = "") -> None:
+    """Another package for this host at `base` with a SHA256SUMS that matches it: what the install block downloads then
+    passes its checksum, so only check-published's own checks can stop it."""
+    info = world.buildinfo(HOST_TARGET, TAG) | ({"runner": runner} if runner else {})
+    data = world.package(HOST_TARGET, info, commit)
+    name = f"antb1-{HOST_TARGET}.tar.gz"
+    serve(world.served, f"https://github.com/{UPSTREAM}/{base}/{name}", data)
+    serve(world.served, f"https://github.com/{UPSTREAM}/{base}/SHA256SUMS", f"{sha256(data)}  {name}\n".encode())
+
+
+@pytest.mark.skipif(not HOST_TARGET, reason="the install block runs only on a release target")
+@pytest.mark.parametrize("latest", ["true", "false"])
+def test_check_published_installs_and_verifies_as_a_user(world: World, latest: str) -> None:
+    run = published(world)
     before = len(world.gh_calls())
-    result = world.run("check-published", "--target", HOST_TARGET, "--work", str(world.tmp / "check"),
-                       "--root", str(world.root), **run.rel, RELEASE_LATEST=latest)  # fmt: skip
+    result = check_published(world, run, latest)
     assert result.returncode == 0, result.stdout + result.stderr
     downloads = (world.tmp / "curl.log").read_text()
     assert f"/releases/download/{TAG}/antb1-{HOST_TARGET}.tar.gz" in downloads
@@ -471,39 +505,81 @@ def test_check_published_installs_and_verifies_as_a_user(world: World, latest: s
     assert ["release", "verify"] in kinds and ["release", "verify-asset"] in kinds
 
 
+def break_published(world: World, how: str) -> str:
+    """Breaks a published release in one way; returns RELEASE_LATEST for the check."""
+    release = world.state["releases"][0]
+    if how == "mutable":
+        release["immutable"] = False
+    elif how == "prerelease":
+        release["prerelease"] = True
+    elif how == "lightweight":
+        world.state["refs"][TAG] = {"type": "commit", "sha": SHA}
+    elif how == "no-latest-url":
+        readme = world.root / "README.md"
+        readme.write_text(readme.read_text().replace("releases/latest/download", f"releases/download/{TAG}"))
+    elif how == "other-commit":
+        serve_package(world, f"releases/download/{TAG}", commit=OTHER)
+    elif how == "other-tarball":
+        serve_package(world, f"releases/download/{TAG}", runner="elsewhere")
+    elif how == "latest-other":
+        serve_package(world, "releases/latest/download", runner="an older release")
+        return "true"
+    elif how == "verify-asset":
+        world.state["fail"] = {"verify_asset": True}
+    elif how == "release-attestation":
+        world.state["fail"] = {"attestation": "extra-asset"}
+    elif how == "no-provenance":
+        world.state["attestations"] = []
+    else:
+        raise AssertionError(how)
+    return "false"
+
+
+@pytest.mark.skipif(not HOST_TARGET, reason="the install block runs only on a release target")
+@pytest.mark.parametrize(
+    ("how", "message"),
+    [
+        ("mutable", "immutable=False"),
+        ("prerelease", "prerelease=True"),
+        ("lightweight", "is not the annotated tag on"),
+        ("no-latest-url", "does not download from /ydb-campus/antb1/releases/latest/download"),
+        ("other-commit", f"does not say 'commit: {SHA}'"),
+        ("other-tarball", "install block (tag) downloaded a"),
+        ("latest-other", "install block (latest) downloaded a"),
+        ("verify-asset", "release verify-asset"),
+        ("release-attestation", "lists other assets"),
+        ("no-provenance", "does not verify"),
+    ],
+)
+def test_check_published_refuses_what_a_user_should_not_get(world: World, how: str, message: str) -> None:
+    run = published(world)
+    result = check_published(world, run, break_published(world, how))
+    assert failed(result, message), result.stdout + result.stderr
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # preflight
 
 
 def test_a_dry_run_reads_only_and_never_publishes(world: World) -> None:
-    world.state["check_runs"] = {}
+    world.state["workflow_runs"] = []
     del world.state["environments"]["release"]
     result = world.run("preflight", "--root", str(world.root), event="workflow_dispatch", ref="refs/heads/main",
                        GITHUB_ACTIONS="true")  # fmt: skip
     assert result.returncode == 0, result.stderr
     assert world.outputs["publish"] == "false" and world.outputs["tag"] == TAG
-    assert "::warning::CI OK: has not reported" in result.stdout
+    assert "::warning::CI OK: .github/workflows/ci.yml has not run on" in result.stdout
     assert "::warning::environment: there is no `release` environment" in result.stdout
     assert all(call[3] == "GET" for call in world.gh_calls())
 
 
-def set_ci(world: World, *runs: tuple[str, str, str], workflow: str = ".github/workflows/ci.yml",
+def set_ci(world: World, *runs: tuple[str, str | None, str], workflow: str = ".github/workflows/ci.yml",
            event: str = "push") -> None:  # fmt: skip
-    check_runs = []
+    """ci.yml's runs on the commit: (run status, its CI OK job's conclusion, started at), oldest first."""
+    world.state["workflow_runs"], world.state["jobs"] = [], {}
     for number, (status, conclusion, started) in enumerate(runs, 1):
-        check_runs.append(
-            {
-                "id": number,
-                "name": "CI OK",
-                "app": {"id": 15368},
-                "status": status,
-                "conclusion": conclusion,
-                "started_at": started,
-                "check_suite": {"id": 70 + number},
-            }
-        )
-        world.state["suites"][str(70 + number)] = [{"path": workflow, "head_sha": SHA, "event": event}]
-    world.state["check_runs"] = {SHA: check_runs}
+        world.state["workflow_runs"].append(ci_run(number, status, started, workflow, event))
+        world.state["jobs"][str(number)] = [ci_job(conclusion)] if conclusion != "no-job" else []
 
 
 def break_github(world: World, how: str) -> None:
@@ -524,10 +600,21 @@ def break_github(world: World, how: str) -> None:
         set_ci(
             world, ("completed", "success", "2026-10-26T01:00:00Z"), ("completed", "failure", "2026-10-26T02:00:00Z")
         )
+    elif how == "ci-no-job":
+        set_ci(world, ("completed", "no-job", "2026-10-26T01:00:00Z"))
     elif how == "ci-elsewhere":
         set_ci(world, ("completed", "success", "2026-10-26T01:00:00Z"), workflow=".github/workflows/other.yml")
     elif how == "ci-pull-request":
         set_ci(world, ("completed", "success", "2026-10-26T01:00:00Z"), event="pull_request")
+    elif how == "environment-wait":
+        s["environments"]["release"]["protection_rules"].append({"type": "wait_timer", "wait_timer": 5})
+    elif how == "ruleset-include":
+        s["rulesets"][1]["conditions"] = {"ref_name": {"include": ["refs/tags/*"], "exclude": []}}
+    elif how == "ruleset-on-create":
+        checks = next(r for r in s["rulesets"][1]["rules"] if r["type"] == "required_status_checks")
+        checks["parameters"]["do_not_enforce_on_create"] = True
+    elif how == "ruleset-extra-rule":
+        s["rulesets"][0]["rules"].append({"type": "required_signatures"})
     elif how == "released":
         s["releases"].append({"id": 1, "tag_name": TAG, "draft": False, "prerelease": False, "immutable": True,
                               "assets": [], "html_url": "https://github.test/v0.1.0"})  # fmt: skip
@@ -560,11 +647,16 @@ def break_github(world: World, how: str) -> None:
         ("elsewhere", f"peels to {OTHER}"),
         ("tag-of-tag", "points at a tag"),
         ("off-main", "is not on main"),
-        ("no-ci", "has not reported"),
+        ("no-ci", ".github/workflows/ci.yml has not run on"),
         ("ci-running", "is in_progress"),
-        ("ci-failed", "is failure"),
-        ("ci-elsewhere", "is not from a .github/workflows/ci.yml run"),
-        ("ci-pull-request", "is not from a .github/workflows/ci.yml run"),
+        ("ci-failed", "has its CI OK job ['failure']"),
+        ("ci-no-job", "has its CI OK job missing"),
+        ("ci-elsewhere", ".github/workflows/ci.yml has not run on"),
+        ("ci-pull-request", ".github/workflows/ci.yml has not run on"),
+        ("environment-wait", "differs from tools/github/environment-release.json in {'wait_timer': 5}"),
+        ("ruleset-include", "`release-tags` differs from tools/github/ruleset-release-tags.json in {'conditions'"),
+        ("ruleset-on-create", "'required_status_checks': {'do_not_enforce_on_create': True}"),
+        ("ruleset-extra-rule", "`tags` differs from tools/github/ruleset-tags.json in {'rules'"),
         ("released", "is already released"),
         ("released-403", "HTTP 403"),
         ("no-environment", "there is no `release` environment"),
@@ -587,6 +679,7 @@ def test_preflight_refuses_a_tag_push(world: World, how: str, message: str) -> N
 def test_preflight_takes_the_newest_ci_ok(world: World) -> None:
     set_ci(world, ("completed", "failure", "2026-10-26T01:00:00Z"), ("completed", "success", "2026-10-26T02:00:00Z"))
     assert world.run("preflight", "--root", str(world.root)).returncode == 0
+    assert not [call for call in world.gh_calls() if "check-runs" in " ".join(call)]  # any workflow can forge those
 
 
 @pytest.mark.parametrize("tag", ["v0.1", "v0.2.0", "v0.1.0-rc.0", "v0.1.0-beta.1", "0.1.0"])
@@ -632,6 +725,13 @@ def test_preflight_only_warns_when_main_changed_workflows(world: World) -> None:
         ("sources-extra", "unexpected member antb1-linux-x86_64-sources/notes.txt"),
         ("srpm", f"{SRPM} is not the file the lock pins"),
         ("source-commit", "is not `git archive` of"),
+        ("conda-other-subdir", "third-party/cli11-2.7.2-h0_0.conda is not the linux-64 archive that pixi.lock pins"),
+        ("no-cli11", "or a conda archive of ('cli11', 'libboost-headers')"),
+        ("inner-sums", "its SHA256SUMS does not list exactly its files"),
+        ("readme", "README.txt does not name commit"),
+        ("licence", "has another LICENSE than the commit"),
+        ("glibc-source", "names glibc source 'glibc-2.28-236.el8_9.13.src.rpm'"),
+        ("sysroot", "sysroot build 'sysroot_linux-64-2.28-hother_1' has no line"),
     ],
 )
 def test_assemble_refuses_artifacts_that_are_not_the_release(world: World, change: str, message: str) -> None:
@@ -819,8 +919,40 @@ def test_a_rerun_of_publish_only_verifies(world: World) -> None:
     result = run.publish()
     assert result.returncode == 0, result.stderr
     assert "already published (a re-run): verifying it only" in result.stdout
-    assert not [call for call in world.gh_calls()[calls:] if call[3:4] == ["PATCH"]]
+    patched = [call for call in world.gh_calls()[calls:] if call[3:4] == ["PATCH"]]
+    assert all("draft=false" not in call for call in patched)  # never published twice; latest again is harmless
     assert world.outputs == {"latest": "true"}
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("tag-object", "expected the tag object"),
+        ("extra-asset", "lists other assets"),
+        ("predicate", "is about ('https://example.invalid/other'"),
+    ],
+)
+def test_publish_refuses_a_release_attestation_that_is_not_this_release(world: World, fault: str, message: str) -> None:
+    run = Run(world)
+    run.through("draft")
+    world.state["fail"] = {"attestation": fault}
+    assert failed(run.publish(), message)
+    assert world.state["latest"] is None  # published, but not served as the latest release
+
+
+def test_a_release_that_is_not_immutable_never_becomes_the_latest(world: World) -> None:
+    run = Run(world)
+    run.through("draft")
+    world.state["immutable"] = False
+    assert failed(run.publish(), "immutable releases are off")
+    assert world.state["releases"][0]["draft"] is False and world.state["latest"] is None
+
+
+def test_publish_says_to_rerun_the_draft_job_when_its_draft_is_gone(world: World) -> None:
+    run = Run(world)
+    run.through("draft")
+    world.state["releases"] = []
+    assert failed(run.publish(), "re-run the draft job (Re-run this job)")
 
 
 def test_make_latest_is_true_only_above_every_stable_release() -> None:

@@ -368,9 +368,44 @@ modified glibc into that cache and into every environment installed from it. The
 """
 
 
+def cmd_buildinfo(args: argparse.Namespace) -> None:
+    """BUILDINFO.json of the package (scripts/static.sh): what the binary is and how it was built. A tag run (the
+    Release workflow; GitHub sets GITHUB_REF_TYPE=tag) records its tag, so a release candidate's package names its
+    release; .github/scripts/release.py's assemble requires it on a tag push."""
+    tag = os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else ""
+    info = {
+        "name": "antb1",
+        "version": args.version,
+        "commit": args.commit,
+        "target": args.target,
+        "flavor": "static-thinlto",
+        "license": "Apache-2.0",
+        "source": args.source,
+        "arrow_prefix": args.arrow_prefix,
+        "arrow_sources": "cmake/static/arrow-sources.lock",
+        "sysroot": args.sysroot,
+        "glibc_source": args.glibc_source,
+        "pixi_lock_sha256": sha256(ROOT / "pixi.lock"),
+        "compiler": args.compiler,
+        "runner": args.runner,
+        "tag": tag,
+    }
+    for key in ("source", "sysroot", "glibc_source", "tag"):  # no source URL for a -dirty build; no glibc on macOS
+        if not info[key]:
+            del info[key]
+    Path(args.out).write_text(json.dumps(info, indent=2))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("buildinfo")
+    b.add_argument("--out", required=True)
+    b.add_argument("--target", required=True, choices=sorted(TARGETS.values()))
+    for name in ("version", "commit", "arrow-prefix", "compiler", "runner"):
+        b.add_argument(f"--{name}", required=True)
+    for name in ("source", "sysroot", "glibc-source"):  # empty for a -dirty build, and for macOS
+        b.add_argument(f"--{name}", default="")
     n = sub.add_parser("notices")
     n.add_argument("--target", required=True, choices=sorted(TARGETS.values()))
     n.add_argument("--prefix", required=True, help="the static Arrow prefix (scripts/static-arrow.sh)")
@@ -384,7 +419,7 @@ def main() -> int:
     s.add_argument("--out", default=str(ROOT / "build/static/sources"))
     s.add_argument("--check-urls", action="store_true", help="only check every copy of the downloaded sources")
     args = parser.parse_args()
-    {"notices": cmd_notices, "glibc": cmd_glibc, "sources": cmd_sources}[args.cmd](args)
+    {"buildinfo": cmd_buildinfo, "notices": cmd_notices, "glibc": cmd_glibc, "sources": cmd_sources}[args.cmd](args)
     return 0
 
 

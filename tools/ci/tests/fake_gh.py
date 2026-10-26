@@ -20,14 +20,15 @@ when an upload fails; publishing (PATCH draft=false) makes the release immutable
 on; the release attestation names the tag's ref object (the tag object of an annotated tag) and every asset.
 
 State ($FAKE_GH_STATE): repo, scope ("read"/"write"), immutable (the setting), refs {tag: {type, sha}}, tags {sha:
-git tag object}, compare {"<base>...<head>": body}, check_runs {sha: [...]}, suites {suite id: [workflow runs]},
+git tag object}, compare {"<base>...<head>": body}, workflow_runs [workflow runs], jobs {run id: [jobs]},
 environments {name: body}, branch_policies {name: [policies]}, rulesets [full rulesets], releases [...], latest,
 next_id, attestations [bundles the online lookup finds], fail {upload: asset name, corrupt: asset name, verify: n
-(release verify fails n times first), create: "403" (create refused), patch: 403 (PATCH refused), http: {"<METHOD>
-<path in the repo>": status}}. Asset bytes: $FAKE_GH_DIR/<asset id>. Log:
-one JSON argv per call in $FAKE_GH_LOG. A fake bundle is JSON {"fake": "signed", repo, workflow, ref, sha, hosted,
-subjects}; it verifies when every identity flag matches and the file's sha256 is a subject, so a test models a forged
-or foreign bundle by changing one field.
+(release verify fails n times first), attestation: "tag-object"|"extra-asset"|"predicate" (a release attestation
+that names another tag object, one more asset or another predicate), verify_asset: true, create: "403" (create
+refused), patch: 403 (PATCH refused), http: {"<METHOD> <path in the repo>": status}}. Asset bytes:
+$FAKE_GH_DIR/<asset id>. Log: one JSON argv per call in $FAKE_GH_LOG. A fake bundle is JSON {"fake": "signed", repo,
+workflow, ref, sha, hosted, subjects}; it verifies when every identity flag matches and the file's sha256 is a
+subject, so a test models a forged or foreign bundle by changing one field.
 """
 
 from __future__ import annotations
@@ -138,16 +139,15 @@ def api(state: dict, args: list[str]) -> None:
     elif method == "GET" and path[:1] == ["compare"] and len(path) == 2:
         body = state["compare"].get(path[1])
         respond(200, body) if body else respond(404, {"message": "Not Found"})
-    elif method == "GET" and path[:1] == ["commits"] and path[2:] == ["check-runs"]:
-        runs = [r for r in state["check_runs"].get(path[1], [])
-                if r["name"] == query.get("check_name", r["name"])
-                and str(r["app"]["id"]) == query.get("app_id", str(r["app"]["id"]))]  # fmt: skip
-        if query.get("filter") != "all":
-            unexpected(args)  # release.py always asks for every run, then picks the newest itself
-        respond(200, {"total_count": len(runs), "check_runs": paged(runs)})
-    elif method == "GET" and path == ["actions", "runs"]:
-        runs = state["suites"].get(query.get("check_suite_id", ""), [])
-        respond(200, {"total_count": len(runs), "workflow_runs": runs})
+    elif method == "GET" and path[:2] == ["actions", "workflows"] and path[3:] == ["runs"]:
+        runs = [r for r in state["workflow_runs"] if r["path"].endswith("/" + path[2])
+                and r["head_sha"] == query.get("head_sha", r["head_sha"])]  # fmt: skip
+        respond(200, {"total_count": len(runs), "workflow_runs": paged(runs)})
+    elif method == "GET" and path[:2] == ["actions", "runs"] and path[3:] == ["jobs"]:
+        if query.get("filter") != "latest":
+            unexpected(args)  # release.py reads the latest attempt's jobs
+        jobs = state["jobs"].get(path[2], [])
+        respond(200, {"total_count": len(jobs), "jobs": paged(jobs)})
     elif method == "GET" and path[:1] == ["environments"] and len(path) == 2:
         body = state["environments"].get(path[1])
         respond(200, body) if body else respond(404, {"message": "Not Found"})
@@ -163,9 +163,6 @@ def api(state: dict, args: list[str]) -> None:
     elif method == "GET" and path == ["releases"]:
         shown = [release_view(r) for r in sorted(state["releases"], key=lambda r: -r["id"]) if visible(state, r)]
         respond(200, paged(shown))
-    elif method == "GET" and path == ["releases", "latest"]:
-        found = [r for r in state["releases"] if r["id"] == state.get("latest") and not r["draft"]]
-        respond(200, release_view(found[0])) if found else respond(404, {"message": "Not Found"})
     elif method == "GET" and path[:2] == ["releases", "tags"] and len(path) == 3:
         found = [r for r in state["releases"] if r["tag_name"] == path[2] and not r["draft"]]
         respond(200, release_view(found[0])) if found else respond(404, {"message": "Not Found"})
@@ -252,12 +249,16 @@ def release_verify(state: dict, args: list[str]) -> None:
     if release is None:
         print(f"no attestations found for release {positional[0]}", file=sys.stderr)
         sys.exit(1)
-    ref = state["refs"][positional[0]]
-    subjects = [{"uri": f"pkg:github/{state['repo']}@{release['tag_name']}", "digest": {"sha1": ref["sha"]}}]
+    ref, fault = state["refs"][positional[0]], state["fail"].get("attestation", "")
+    subjects = [{"uri": f"pkg:github/{state['repo']}@{release['tag_name']}",
+                 "digest": {"sha1": "0" * 40 if fault == "tag-object" else ref["sha"]}}]  # fmt: skip
     subjects += [{"name": a["name"], "digest": {"sha256": a["digest"].removeprefix("sha256:")}}
                  for a in release["assets"]]  # fmt: skip
+    if fault == "extra-asset":
+        subjects.append({"name": "extra.txt", "digest": {"sha256": "0" * 64}})
     predicate = {"tag": release["tag_name"], "repository": state["repo"], "databaseId": str(release["id"])}
-    print(json.dumps({"verificationResult": {"statement": {"predicateType": RELEASE, "subject": subjects,
+    kind = "https://example.invalid/other" if fault == "predicate" else RELEASE
+    print(json.dumps({"verificationResult": {"statement": {"predicateType": kind, "subject": subjects,
                                                            "predicate": predicate}}}))  # fmt: skip
 
 
@@ -267,7 +268,8 @@ def release_verify_asset(state: dict, args: list[str]) -> None:
         unexpected(args)
     release = published(state, positional[0])
     digest = "sha256:" + hashlib.sha256(Path(positional[1]).read_bytes()).hexdigest()
-    if release is None or not any(a["digest"] == digest for a in release["assets"]):
+    listed = release is not None and any(a["digest"] == digest for a in release["assets"])
+    if not listed or state["fail"].get("verify_asset"):
         print(f"no attestation for {positional[1]} in release {positional[0]}", file=sys.stderr)
         sys.exit(1)
     print(f"Verified asset {Path(positional[1]).name} of {positional[0]}")

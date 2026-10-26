@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import subprocess
 import tarfile
 from pathlib import Path
@@ -230,6 +231,44 @@ def test_check_urls_needs_two_good_copies_of_every_source_rpm_and_conda_archive(
     assert result.returncode == 0, result.stdout + result.stderr
     assert {f"GET {url}" for url in box.glibc_urls} <= set(box.requested())  # every copy, not just the first
     assert not (box.root / "build" / "static" / "sources").exists()  # nothing is packaged
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# static_package.py buildinfo
+
+BUILDINFO_KEYS = ["name", "version", "commit", "target", "flavor", "license", "source", "arrow_prefix", "arrow_sources",
+                  "sysroot", "glibc_source", "pixi_lock_sha256", "compiler", "runner"]  # fmt: skip
+
+
+def buildinfo(box: Box, *extra: str, **env: str) -> dict[str, str]:
+    (box.root / "pixi.lock").write_text("version: 7\n")
+    out = box.tmp / "BUILDINFO.json"
+    args = ["buildinfo", "--out", str(out), "--version", VERSION, "--commit", box.commit, "--target", TARGET,
+            "--source", f"https://github.com/ydb-campus/antb1/tree/{box.commit}", "--arrow-prefix", "1a64a30529ed3973",
+            "--sysroot", SYSROOT, "--glibc-source", SRPM, "--compiler", "clang version 23.1.3",
+            "--runner", "ubuntu24 20261020.1", *extra]  # fmt: skip
+    result = box.run("static_package.py", *args, **env)
+    assert result.returncode == 0, result.stderr
+    return json.loads(out.read_text())
+
+
+@pytest.mark.parametrize(
+    ("env", "tag"),
+    [({"GITHUB_REF_TYPE": "tag", "GITHUB_REF_NAME": "v0.1.0-rc.1"}, "v0.1.0-rc.1"),
+     ({"GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "main"}, None), ({}, None)],
+)  # fmt: skip
+def test_buildinfo_records_the_tag_only_on_a_tag_run(box: Box, env: dict[str, str], tag: str | None) -> None:
+    info = buildinfo(box, **env)
+    assert info.get("tag") == tag  # .github/scripts/release.py's assemble requires it on a tag push
+    assert list(info) == BUILDINFO_KEYS + (["tag"] if tag else [])
+    assert info["pixi_lock_sha256"] == hashlib.sha256(b"version: 7\n").hexdigest()
+    assert (info["commit"], info["target"], info["flavor"], info["license"]) == (box.commit, TARGET, "static-thinlto",
+                                                                                "Apache-2.0")  # fmt: skip
+
+
+def test_buildinfo_leaves_out_what_a_dirty_or_macos_build_has_not(box: Box) -> None:
+    info = buildinfo(box, "--source", "", "--sysroot", "", "--glibc-source", "")
+    assert not {"source", "sysroot", "glibc_source", "tag"} & set(info)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

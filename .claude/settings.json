@@ -152,6 +152,7 @@
       "Bash(git push --follow-tags*)",
       "Bash(git push * --follow-tags*)",
       "Bash(git push * refs/tags/*)",
+      "Bash(git push *:refs/tags/*)",
       "Bash(git push * v*)",
       "Bash(git push * tag *)",
       "Bash(gh release create*)",

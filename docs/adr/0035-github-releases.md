@@ -35,8 +35,9 @@ Proposed
   rehearses the whole path in this repository after the settings, this
   change, a passing dry run and ADR 0034's LGPL review; `v0.1.0` follows ([docs/ci.md](../ci.md#releases)).
 - **`preflight` refuses a tag push** (a dry run only warns): from a fork; for a tag that is not `v<VERSION>` or
-  `v<VERSION>-rc.<N>`, is lightweight or does not peel to the run's commit; for a commit not on `main`; when its newest
-  `CI OK` is missing, running, red or not from a `ci.yml` run of it; when a published release has the tag; and when the
+  `v<VERSION>-rc.<N>`, is lightweight or does not peel to the run's commit; for a commit not on `main`; when the newest
+  `ci.yml` run on it is missing or running, or its `CI OK` job is not green (read from the Actions API, never from check
+  runs, which any workflow can create); when a published release has the tag; and when the
   `release` environment or the rulesets differ from `tools/github/`. It fails a dry run too when `CMakeLists.txt` and
   `pixi.toml` disagree. It only warns when `main` changed `.github/workflows/` since: the Releases API's rule should
   not apply to an existing tag, but the maintainers tag the head of `main` and merge no workflow change before
@@ -53,8 +54,9 @@ Proposed
   artifact, no later job can replace.
 - **Draft, approval, publication:** `draft` uploads every asset to a draft release for the approver to read. `publish`
   waits for the environment `release`, then trusts no artifact: it downloads each asset of the draft, checks it against
-  the API digest, the job output and the draft's bundle, publishes with an explicit `make_latest` (true only for a
-  stable version above every published one) and requires an immutable release that `gh release verify` accepts.
+  the API digest, the job output and the draft's bundle, publishes it without making it the latest release, and
+  requires an immutable release that `gh release verify` accepts. Only then does a stable version above every
+  published one become the latest release, which README.md's install block downloads.
   `check-published` then runs README.md's install block and the documented checks on each target's runner.
 - **Nine assets, about 217 MB,** without the version in their names, so the latest release's URLs never change:
   `antb1-<target>.tar.gz` per target, `antb1-<target>.debug.tar.gz` and `antb1-<target>.sources.tar` per Linux target,

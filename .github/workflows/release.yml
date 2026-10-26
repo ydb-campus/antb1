@@ -30,18 +30,18 @@ concurrency:
 jobs:
   # Fails fast with the fix in its message (a dry run reports the same checks as warnings and sets publish=false):
   # this repository; CMake's VERSION equal to pixi.toml's; the tag is v<VERSION>[-rc.<N>], annotated, and peels to
-  # GITHUB_SHA; the commit is on main (a warning when main changed .github/workflows/ since); its newest `CI OK`
-  # (app 15368, from a ci.yml run of that commit) is completed and green; no published release has the tag; the
-  # `release` environment and the two tag rulesets match their files in tools/github/ (reviewers, self-review,
-  # no admin bypass, only the v* tag policy; bypass actors are not visible to this token).
+  # GITHUB_SHA; the commit is on main (a warning when main changed .github/workflows/ since); the newest ci.yml run
+  # on it (push, schedule, dispatch or merge queue) is completed with its `CI OK` job green, read from the Actions
+  # API, never from check runs, which any workflow can create; no published release has the tag; the `release`
+  # environment and the two tag rulesets match their files in tools/github/ (reviewers, self-review, no admin
+  # bypass, only the v* tag policy; bypass actors are not visible to this token).
   preflight:
     name: preflight (python3 -I .github/scripts/release.py preflight)
     runs-on: ubuntu-slim # 15-minute cap: preflight never waits for CI
     timeout-minutes: 10
     permissions:
       contents: read # checkout; the git tag, compare and releases APIs
-      checks: read # the CI OK check runs of the commit
-      actions: read # the workflow run behind a check run; the release environment and its tag policy
+      actions: read # ci.yml's runs and jobs on the commit; the release environment and its tag policy
     outputs:
       sha: ${{ steps.check.outputs.sha }}
       version: ${{ steps.check.outputs.version }}

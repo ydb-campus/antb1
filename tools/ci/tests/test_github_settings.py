@@ -132,10 +132,12 @@ def writes(calls: list[dict]) -> list[tuple[str, str]]:
 
 def test_the_tag_rulesets_and_the_environment_say_what_adr_0035_decides() -> None:
     tags, release, env = load("ruleset-tags.json"), load("ruleset-release-tags.json"), load("environment-release.json")
-    assert (tags["target"], tags["conditions"]["ref_name"]["include"]) == ("tag", ["~ALL"])
+    assert tags["enforcement"] == release["enforcement"] == "active"  # "evaluate" would only report
+    assert (tags["target"], tags["conditions"]) == ("tag", {"ref_name": {"include": ["~ALL"], "exclude": []}})
     assert sorted(r["type"] for r in tags["rules"]) == ["creation", "deletion", "non_fast_forward", "update"]
     assert tags["bypass_actors"] == [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
-    assert (release["target"], release["conditions"]["ref_name"]["include"]) == ("tag", ["refs/tags/v*"])
+    v_tags = {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}}
+    assert (release["target"], release["conditions"]) == ("tag", v_tags)
     assert release["bypass_actors"] == []  # nobody, admins included, moves or deletes a v* tag
     rules = {r["type"]: r.get("parameters") for r in release["rules"]}
     assert sorted(rules) == ["deletion", "non_fast_forward", "required_status_checks", "update"]
@@ -146,7 +148,7 @@ def test_the_tag_rulesets_and_the_environment_say_what_adr_0035_decides() -> Non
     assert checks["required_status_checks"] == ci_ok  # the same check, from the same App (GitHub Actions)
     # Both maintainers review; the one who pushed the tag may approve it (self-approval); admins cannot bypass.
     assert env["can_admins_bypass"] is False and env["prevent_self_review"] is False and env["wait_timer"] == 0
-    assert [r["type"] for r in env["reviewers"]] == ["User", "User"] and len({r["id"] for r in env["reviewers"]}) == 2
+    assert env["reviewers"] == [{"type": "User", "id": 24967150}, {"type": "User", "id": 33665449}]  # the maintainers
     assert env["deployment_branch_policy"] == {"protected_branches": False, "custom_branch_policies": True}
 
 

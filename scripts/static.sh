@@ -118,34 +118,11 @@ case "$sha" in
   "" | *-dirty) source_url="" ;;
   *) source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-ydb-campus/antb1}/tree/$sha" ;;
 esac
-# A tag run (the Release workflow) records its tag, so a release candidate's package names its release; the tag
-# reaches Python through the environment, never through this here-document.
-build_tag=""
-if [ "${GITHUB_REF_TYPE:-}" = tag ]; then build_tag="${GITHUB_REF_NAME:-}"; fi
-ANTB1_BUILD_TAG="$build_tag" python - "$pkg/$name/BUILDINFO.json" <<EOF
-import json, os, sys
-info = {
-    "name": "antb1",
-    "version": "$version",
-    "commit": "$sha",
-    "target": "$target",
-    "flavor": "static-thinlto",
-    "license": "Apache-2.0",
-    "source": "$source_url",
-    "arrow_prefix": "$(basename "$(dirname "$prefix")")",
-    "arrow_sources": "cmake/static/arrow-sources.lock",
-    "sysroot": "$sysroot",
-    "glibc_source": "$glibc_source",
-    "pixi_lock_sha256": "$(cmake -E sha256sum pixi.lock | cut -c1-64)",
-    "compiler": "$(clang++ --version | head -1)",
-    "runner": "${ImageOS:-$(uname -s)} ${ImageVersion:-$(uname -r)}",
-    "tag": os.environ["ANTB1_BUILD_TAG"],
-}
-for key in ("source", "sysroot", "glibc_source", "tag"):  # no source URL for a -dirty build; no glibc on macOS
-    if not info[key]:
-        del info[key]
-json.dump(info, open(sys.argv[1], "w"), indent=2)
-EOF
+# BUILDINFO.json, with the tag on a tag run (static_package.py buildinfo).
+python scripts/static_package.py buildinfo --out "$pkg/$name/BUILDINFO.json" --version "$version" --commit "$sha" \
+  --target "$target" --source "$source_url" --arrow-prefix "$(basename "$(dirname "$prefix")")" \
+  --sysroot "$sysroot" --glibc-source "$glibc_source" --compiler "$(clang++ --version | head -1)" \
+  --runner "${ImageOS:-$(uname -s)} ${ImageVersion:-$(uname -r)}"
 glibc_note=""
 if [ -n "$glibc_source" ]; then
   glibc_note="

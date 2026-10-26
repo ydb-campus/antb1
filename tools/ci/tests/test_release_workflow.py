@@ -19,7 +19,7 @@ GUARD = (
     "'refs/tags/v') && needs.preflight.outputs.publish == 'true' }}"
 )
 PERMISSIONS = {
-    "preflight": {"contents": "read", "checks": "read", "actions": "read"},
+    "preflight": {"contents": "read", "actions": "read"},
     "build": {"contents": "read"},
     "assemble": {"contents": "read"},
     "verify": {"contents": "read"},
@@ -27,6 +27,22 @@ PERMISSIONS = {
     "draft": {"contents": "write"},
     "publish": {"contents": "write", "attestations": "read"},
     "check-published": {"contents": "read", "attestations": "read"},
+}
+# The RELEASE_* variables each subcommand of release.py reads, and the job output each comes from; and the outputs each
+# job declares, which test_release.py checks the subcommand writes.
+BASE = {"TAG": "preflight.tag", "SHA": "preflight.sha", "VERSION": "preflight.version",
+        "PRERELEASE": "preflight.prerelease", "PUBLISH": "preflight.publish"}  # fmt: skip
+INPUTS = {
+    "assemble": BASE,
+    "draft": BASE | {"SUBJECTS": "assemble.subjects"},
+    "publish": BASE | {"SUBJECTS": "assemble.subjects", "ID": "draft.release_id", "TAG_OBJECT": "preflight.tag_object"},
+    "check-published": BASE | {"LATEST": "publish.latest"},
+}
+OUTPUTS = {
+    "preflight": {"sha", "version", "tag", "tag_object", "prerelease", "publish"},
+    "assemble": {"subjects"},
+    "draft": {"release_id"},
+    "publish": {"latest"},
 }
 NEEDS = {
     "preflight": [],
@@ -162,3 +178,30 @@ def test_no_other_workflow_starts_on_a_tag_push() -> None:
         assert "branches" in push or "branches-ignore" in push, (
             f"{path.name}: a push trigger without branches runs on tags"
         )
+
+
+def release_step(job: str) -> dict[str, Any]:
+    (step,) = [step for step in steps(job) if ".github/scripts/release.py" in step.get("run", "")]
+    return step
+
+
+def test_each_release_step_gets_what_its_subcommand_reads() -> None:
+    script = (ROOT / ".github/scripts/release.py").read_text()
+    for job in ("preflight", *INPUTS):
+        step = release_step(job)
+        assert f"release.py {job}" in step["run"], job
+        assert step["env"]["GH_TOKEN"] == "${{ github.token }}", job
+        for flag in re.findall(r"(--[a-z-]+)", step["run"]):
+            assert f'add_argument("{flag}"' in script, (job, flag)
+    for job, inputs in INPUTS.items():
+        env = release_step(job)["env"]
+        for name, source in inputs.items():
+            producer, key = source.split(".")
+            assert env[f"RELEASE_{name}"] == f"${{{{ needs.{producer}.outputs.{key} }}}}", (job, name)
+            assert producer in NEEDS[job], (job, producer)
+
+
+def test_each_job_output_comes_from_its_release_step() -> None:
+    for job, keys in OUTPUTS.items():
+        step = release_step(job)
+        assert JOBS[job]["outputs"] == {key: f"${{{{ steps.{step['id']}.outputs.{key} }}}}" for key in keys}, job
