@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792977479540,
+  "lastUpdate": 1793056061663,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -1512,6 +1512,258 @@ window.BENCHMARK_DATA = {
             "value": 2012.5377599999865,
             "unit": "ms/iter",
             "extra": "iterations: 1\ncpu: 2012.3279170000003 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "848c8a0d6e60053de8673b18f7342acbc60b67ad",
+          "message": "ci: publish the standalone binary as tagged github releases (#245)\n\n## Summary\n\nPR 3b-2, the last step of the static-build plan: tagged GitHub releases\nof the standalone binary. 3b-1 (#243) added\nthe fresh-runner check that this workflow runs. Decision record: [ADR\n0035](docs/adr/0035-github-releases.md),\nProposed.\n\n- **`.github/workflows/release.yml`.** A release starts when an admin\npushes an annotated tag `v<VERSION>`\n(`v<VERSION>-rc.<N>` is a prerelease, never the latest) on a green\ncommit of `main`. A manual run is a dry run,\n  which never attests, drafts or publishes.\n\n  | Job | What it does |\n  | --- | --- |\n| `preflight` | Checks the tag, the version, that the commit is on\n`main`, its newest `CI OK`, that no published release has the tag, and\nthat the `release` environment and both tag rulesets equal\n`tools/github/*.json`. |\n| `build` ×3 | Cold, like nightly `static-cold`: no cache, ccache off,\nan empty Arrow directory. Runs `pixi run static`, then `pixi run\nstatic-sources`. |\n| `assemble` | Checks every file against its checksums, BUILDINFO.json\nagainst the commit and tag, and each sources tarball against the pins\nand the commit. Writes one SHA256SUMS and the notes. The attestation's\nsubjects travel as a job output. |\n| `verify` ×4 | 3b-1's verify on fresh runners: ubuntu-24.04 and -arm\n(both also in a container), macos-15 and macos-26. |\n| `attest` | `actions/attest`, SLSA build provenance. It runs no\nrepository code and is the only job with `id-token: write`. |\n  | `draft` | Uploads everything to a draft release. |\n| `publish` | Behind the `release` environment. It trusts no artifact:\nit re-downloads every asset and checks it against the API digest, the\njob output and the draft's own bundle. Then it publishes with an\nexplicit `make_latest` and requires an immutable release that `gh\nrelease verify` accepts. |\n| `check-published` ×3 | Runs README.md's install block as a user would,\nthen the documented verify commands. |\n\n  There are 9 assets, about 217 MB, with no version in their names:\n- the three packages, the two `.debug` tarballs and the two Linux\nsources tarballs;\n  - `SHA256SUMS`;\n  - `antb1.sigstore.json`, the provenance bundle.\n- **`.github/scripts/release.py`.** The workflow's logic: standard\nlibrary only, run with each runner's own\n`python3 -I`. Every GitHub call goes through `gh`, and the script fails\nclosed on any unexpected response.\n- **Settings as code** in `tools/github/`, applied with\n`apply-settings.sh --release` (a dry run unless `--apply`; the\n  read-back exits 1 on any difference):\n  - `ruleset-tags.json`: only admins create, move or delete a tag;\n- `ruleset-release-tags.json`: `v*` tags never move and are never\ndeleted (no bypass for anyone), and creating one\n    needs a green `CI OK`;\n- `environment-release.json`: both maintainers are reviewers, and the\nmaintainer who pushed the tag may approve\nit (self-approval). Admins cannot bypass it, and it accepts deployments\nfrom `v*` tags only;\n  - immutable releases turned on.\n- **Also in this PR:**\n- BUILDINFO.json records the tag on tag runs, so an rc package names its\nrelease;\n- `copilot-setup-steps.yml` no longer starts on tag pushes (path filters\ndo not apply to tags);\n- agents never release: AGENTS.md golden rule 4, and\n`.claude/settings.json` denies tag pushes,\n`gh release create`, `upload`, `edit` and `delete`, `gh workflow run\nrelease.yml` and deployment approvals;\n- docs: docs/ci.md#releases, README.md#install,\nSECURITY.md#verifying-a-release, CONTRIBUTING.md,\ndocs/benchmarks.md, docs/agents.md, the fix-ci-failure recipe and skill,\nthe bug form, and pointers in ADRs\n    0007, 0009, 0033 and 0034.\n\n## Before merging (maintainer)\n\nThe settings must be live before `release.yml` is on `main`. A workflow\nthat names a missing environment creates it\nwithout protection, and immutability covers only releases published\nafter it is turned on.\n\n1. `bash tools/github/apply-settings.sh --release`: a dry run that\nprints the five planned writes.\n2. `bash tools/github/apply-settings.sh --apply --release`, then paste\nthe read-back here. It must show `OK` five times\n   and no `DIFF`.\n3. Merge.\n\n## After merging (maintainer; each step is yours)\n\n1. CI OK goes green on the merge commit.\n2. `gh workflow run release.yml --ref main` (the dry run) passes.\n3. The LGPL review of ADR 0034, by an open-source office or a lawyer,\nbefore the first public release.\n4. `git tag -a v0.1.0-rc.1 -m \"...\" && git push origin v0.1.0-rc.1`,\npushed on its own. Check the draft, approve the\n   `release` environment, and wait for check-published to pass. Then\n`gh api -X GET repos/ydb-campus/antb1/rulesets/rule-suites -f\nref=refs/tags/v0.1.0-rc.1` shows how the CI OK rule\n   treated an annotated tag.\n5. `v0.1.0`, the same way.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\nOn the final tree (main 6bbb26a plus this PR), linux-x86_64:\n\n```text\n$ pixi run check\nlint: PASS (384 tool tests; new: test_release.py, test_release_workflow.py, test_github_settings.py,\n  test_release_docs.py, and more in test_static_package.py)\n100% tests passed out of 2915\n\n$ pixi run static                      # existing prefix 1a64a30529ed3973, unchanged\nstatic: OK: build/static/package       # BUILDINFO.json written by static_package.py buildinfo\n# Before that refactor, a tag run (GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v0.1.0-rc.1 pixi run static) recorded\n# \"tag\": \"v0.1.0-rc.1\"; the helper's tag logic now has its own tests.\n\n$ gh run download 40246545600 -R ydb-campus/antb1 -p 'antb1-*' -D artifacts   # main's static run of 6bbb26a\n$ GITHUB_REPOSITORY=ydb-campus/antb1 RELEASE_TAG=v0.1.0 RELEASE_SHA=6bbb26aa... RELEASE_VERSION=0.1.0 \\\n  RELEASE_PRERELEASE=false RELEASE_PUBLISH=false \\\n  pixi run -e lint python -I .github/scripts/release.py assemble --in artifacts --out meta\nrelease: checked 7 tarballs; wrote SHA256SUMS and notes.md\n# all 7 tarballs against their checksums, BUILDINFO.json against the commit and pixi.lock, every member of both\n# sources tarballs against the pins, antb1-source.tar.gz against the commit\n```\n\nNothing here has touched real GitHub releases, attestations, the\nenvironment or the rulesets. The post-merge dry\nrun checks preflight's reads (the environment, the rulesets, ci.yml's\nruns) on the real API, and the\n`v0.1.0-rc.1` rehearsal checks the rest.\n\nTwo reviews were run on the diff, and their findings are fixed in the\nthird commit:\n\n- **The `reviewer` subagent:** five P1 findings, all fixed:\n- a refspec tag push (`git push origin HEAD:refs/tags/v…`) slipped past\nthe deny rules; `git push *:refs/tags/*`\n    now catches it;\n- check-published's `latest` run did not compare its download with this\nrelease's asset;\n  - docs/ci.md still said BUILDINFO.json records no tag;\n- check-published and the release-attestation check had no tests that\nmake them refuse;\n- the BUILDINFO `tag` field had no test. BUILDINFO.json now comes from\n`static_package.py buildinfo`, which the\n    tests cover.\n- **A review workflow with four lenses, each followed by a skeptic:** 13\nfindings confirmed and 3 refuted. Among the\n  fixes:\n- **CI OK could be forged.** Any workflow's token can create a check run\nnamed `CI OK`, and GitHub may file it in\nci.yml's check suite. preflight now reads ci.yml's own runs and their\n`CI OK` job through the Actions API and\nnever reads check runs. preflight's `checks: read` permission is\ndropped.\n- publish publishes first and makes the release the latest one only\nafter it is immutable and its attestation\nchecks out, so a failure never leaves an unverified release behind\n`releases/latest`.\n  - Runbook fixes:\n- the 30-day window: after a timeout the run can't be re-run, and the\ntag is spent;\n    - the rule-suite check needs two calls;\n- the recovery steps now tell a mutable failed release from an immutable\none;\n    - if publish's draft is gone, re-run the draft job.\n  - More tests:\n- the settings files are pinned (enforcement, conditions, the reviewer\nids);\n    - every difference in the environment and rulesets has a test;\n- every assemble check of the sources tarballs and BUILDINFO has a test;\n- the workflow's env and output wiring is checked against the script;\n    - guards ensure no test can reach the host's real gh, curl or uname.\n\n## Checklist\n\n- [x] `pixi run check` passes locally (lint + clang Debug -Werror +\nhermetic tests)\n- [x] Tests cover the change (tools/ci/tests: test_release.py,\ntest_release_workflow.py, test_github_settings.py,\n  test_release_docs.py, fake_gh.py)\n- [x] Docs updated where behavior, commands or architecture changed\n(AGENTS.md, `docs/`, an ADR), or not needed\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H is committed: no query text or\nfragments, data, answers or TPC tools (ADR-0006)\n- [x] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the approved 3b plan\n(`.github/workflows/release.yml`, `.github/scripts/release.py`,\n`.github/workflows/copilot-setup-steps.yml`,\n`.github/ISSUE_TEMPLATE/bug.yml`, `tools/github/*`,\n`.claude/settings.json`, `CLAUDE.md`, `AGENTS.md:16`,\n`docs/adr/0035` (new), `0033`, `0034`, `0007`, `0009`, the ADR index,\nthe fix-ci-failure skill)\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5)\n- A design investigation (five lenses, a critic, a verifier of 44\nclaims), and a Plan-agent review of the plan.\n  - The workflow, the release script, the settings and the tests.\n  - The docs, drafted by a workflow and cross-checked by a critic.\n- The `reviewer` subagent and a review workflow with verifiers on the\ndiff.\n- Accountable human (has read and understands the whole diff): @\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-27T01:58:30+03:00",
+          "tree_id": "b724b08a8647cd68f05bbc55e0b5f405f41b645d",
+          "url": "https://github.com/ydb-campus/antb1/commit/848c8a0d6e60053de8673b18f7342acbc60b67ad"
+        },
+        "date": 1793056059540,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3549.247606268572,
+            "unit": "ns/iter",
+            "extra": "iterations: 197495\ncpu: 3548.722853743132 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 25278.918340802178,
+            "unit": "ns/iter",
+            "extra": "iterations: 27676\ncpu: 25272.535771065188 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 46330.699741839955,
+            "unit": "ns/iter",
+            "extra": "iterations: 15107\ncpu: 46311.01734295361 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 191064.88981906115,
+            "unit": "ns/iter",
+            "extra": "iterations: 3703\ncpu: 191018.66594652992 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 380605.7771739021,
+            "unit": "ns/iter",
+            "extra": "iterations: 1840\ncpu: 380539.5353260873 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1172367.8207704744,
+            "unit": "ns/iter",
+            "extra": "iterations: 597\ncpu: 1172153.6264656608 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 33.406768238096774,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.39752542857145 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 38.37943944444393,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.36964294444442 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 194.20893350000767,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 194.16714574999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 11.545781066665958,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.54395793333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 14.782668270833929,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.779111166666674 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 31.483945181817447,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.479069681818167 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.9725024937413496,
+            "unit": "ms/iter",
+            "extra": "iterations: 719\ncpu: 0.972316842837273 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 67.7402685555598,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 67.73153977777785 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 19.71361639999876,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 19.710353914285708 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 21.445646939393253,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 21.443982878787846 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 45.04661643749941,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 45.041646124999836 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 74.81325199999844,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 74.80907525000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 256.31421366667456,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 256.2694073333335 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1283.913288000008,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1283.7679100000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 23.580935466666613,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.577846900000072 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 26.541948407407713,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 26.53784322222221 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 46.49679513333164,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.49197693333349 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 97.10485257142766,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 97.08459857142871 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 296.634355000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 296.59976249999966 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1454.8821599999542,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1454.6733029999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 43.30001674999906,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 43.294710812499915 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 44.9814945,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.978364062500106 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 68.15499180000302,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.14423619999985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 136.55383500000653,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 136.5280826000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 371.0909959999924,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 371.0251145000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1759.74461200002,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1759.430897999998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 51.325905785712884,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 51.31742300000042 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 53.903915846153545,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.89485092307704 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 80.1572703333338,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 80.1478888888888 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 150.74282780000203,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 150.71570100000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 392.20772150000016,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 392.14471749999905 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 1888.1811080000261,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1887.8294189999992 ms\nthreads: 1"
           }
         ]
       }
