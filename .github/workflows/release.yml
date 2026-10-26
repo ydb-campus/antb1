@@ -1,0 +1,450 @@
+# Release (docs/ci.md#releases; ADRs 0033, 0034 and 0035): an admin pushes an annotated tag v<project VERSION>
+# (v<VERSION>-rc.<N> is a prerelease) on a commit of main whose `CI OK` is green. The three standalone binaries and
+# the sources of the Linux ones are built from scratch (no cache is read or written: no actions/cache, no setup-pixi
+# cache, ccache disabled, an empty Arrow directory); each package is checked again on fresh runners without pixi (an
+# empty environment; on Linux also in a container of an image that holds only the binary and its smoke kit); the
+# release's files are attested, uploaded to a draft release and published once a maintainer approves the `release`
+# environment (the one who pushed the tag may). The published release is immutable; a last job installs and verifies
+# it as README.md tells a user. A manual run is a dry run of its ref: preflight (its checks as warnings), build,
+# assemble and verify; nothing is attested, drafted or published. The logic is .github/scripts/release.py and
+# scripts/static_gates.py (standard library only), run by the runner's own python3 -I from the commit being
+# released; every job name contains the command that reproduces it. Hardening as in ci.yml (R010/R015, zizmor,
+# actionlint): the jobs that can write check out nothing but release.py, the signing job runs no repository code,
+# and the attested digests travel as a job output, which no later job can replace (an artifact can be replaced by
+# any job of the run).
+name: Release
+
+on:
+  push:
+    tags: ["v*"] # preflight accepts only v<project VERSION>[-rc.<N>]; push one tag at a time, never from the UI
+  workflow_dispatch: # a dry run of the chosen ref; no inputs, never publishes
+
+permissions: {}
+
+# One release at a time, never cancelled: a second tag waits until the first is published or fails (a third would
+# replace the waiting one). Dry runs queue in their own group, so a dry run never replaces a waiting release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  # Fails fast with the fix in its message (a dry run reports the same checks as warnings and sets publish=false):
+  # this repository; CMake's VERSION equal to pixi.toml's; the tag is v<VERSION>[-rc.<N>], annotated, and peels to
+  # GITHUB_SHA; the commit is on main (a warning when main changed .github/workflows/ since); its newest `CI OK`
+  # (app 15368, from a ci.yml run of that commit) is completed and green; no published release has the tag; the
+  # `release` environment and the two tag rulesets match their files in tools/github/ (reviewers, self-review,
+  # no admin bypass, only the v* tag policy; bypass actors are not visible to this token).
+  preflight:
+    name: preflight (python3 -I .github/scripts/release.py preflight)
+    runs-on: ubuntu-slim # 15-minute cap: preflight never waits for CI
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout; the git tag, compare and releases APIs
+      checks: read # the CI OK check runs of the commit
+      actions: read # the workflow run behind a check run; the release environment and its tag policy
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      tag_object: ${{ steps.check.outputs.tag_object }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/scripts/release.py
+            /CMakeLists.txt
+            /pixi.toml
+            /tools/github/environment-release.json
+            /tools/github/ruleset-release-tags.json
+            /tools/github/ruleset-tags.json
+          sparse-checkout-cone-mode: false
+      # release.py reads GITHUB_REPOSITORY, GITHUB_EVENT_NAME, GITHUB_REF and GITHUB_SHA from the runner.
+      - name: Tag, version, main, CI OK, the release environment and the tag rulesets
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/release.py preflight
+
+  # The nightly static-cold build plus the sources, on the commit that preflight checked. `pixi run static` also
+  # writes the smoke kit (build/static/smoke-kit: Parquet files that DuckDB writes from range(), with their digests),
+  # which the verify job takes to runners without DuckDB, and records the tag in BUILDINFO.json. Uploads in
+  # static.yml's names and order: a Linux package goes up only after its sources (LGPL-2.1 section 6, ADR 0034).
+  build:
+    name: build ${{ matrix.target }} (pixi run static && pixi run static-sources)
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read # checkout
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+            parallel: 4
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            parallel: 4
+          - target: darwin-arm64
+            os: macos-15 # arm64: 3 cores, 7 GB RAM
+            parallel: 3
+    env:
+      ANTB1_ARROW_DIR: ${{ github.workspace }}/.cache/arrow # git-ignored; asserted absent below
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel }}
+      CCACHE_DISABLE: "1" # the static preset launches ccache; this makes it call the compiler without a cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+      - name: A cold start (no Arrow prefix, no ccache directory)
+        run: test ! -e "$ANTB1_ARROW_DIR" && test ! -e .cache/ccache
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          environments: static
+          locked: true
+          cache: false # a release reads no cache (zizmor cache-poisoning); setup-pixi rejects a cache-key without it
+          cache-write: false
+      - name: Build, package and check from scratch (pixi run static)
+        run: pixi run --frozen -e static static
+      # Linux: glibc's source RPM, antb1's source at this commit and the third-party sources (NETWORK); macOS: nothing.
+      - name: The sources of the package (pixi run static-sources)
+        run: pixi run --frozen -e static static-sources
+      # The binary records GITHUB_SHA without "-dirty", so the tree it was built from must be that commit.
+      - name: The checkout is still the commit
+        run: git diff --quiet HEAD && test -z "$(git ls-files --others --exclude-standard)"
+      - name: Check the sources before the upload (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        working-directory: build/static/sources
+        run: sha256sum -c ./*.sources.tar.sha256
+      - name: Upload the sources (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antb1-${{ matrix.target }}-sources
+          path: |
+            build/static/sources/antb1-*.sources.tar
+            build/static/sources/antb1-*.sources.tar.sha256
+          retention-days: ${{ github.event_name == 'push' && 30 || 7 }}
+          if-no-files-found: error
+          overwrite: true # a re-run of this leg replaces its own upload
+      - name: Upload the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antb1-${{ matrix.target }}
+          path: |
+            build/static/package/antb1-*.tar.gz
+            build/static/package/SHA256SUMS
+          retention-days: ${{ github.event_name == 'push' && 30 || 7 }}
+          if-no-files-found: error
+          overwrite: true
+      # Synthetic files for the fresh runners, which have neither pixi nor DuckDB; never a release asset.
+      - name: Upload the smoke kit
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-kit-${{ matrix.target }}
+          path: build/static/smoke-kit/
+          retention-days: ${{ github.event_name == 'push' && 30 || 7 }}
+          if-no-files-found: error
+          overwrite: true
+
+  # Checks every file against its target's SHA256SUMS or .sha256, the exact file sets, BUILDINFO.json (this commit,
+  # version, tag, target, pixi.lock), every member of a sources tarball against the committed pins
+  # (cmake/static/*.lock, pixi.lock) and its antb1-source.tar.gz against the commit. Writes the release's one
+  # SHA256SUMS and its notes (release-meta) and, as the job output `subjects`, the eight lines that attest signs: the
+  # seven tarballs and SHA256SUMS.
+  assemble:
+    name: assemble (python3 -I .github/scripts/release.py assemble)
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout of the pins; the tag's annotation for the notes
+    outputs:
+      subjects: ${{ steps.assemble.outputs.subjects }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/scripts/release.py
+            /CMakeLists.txt
+            /LICENSE
+            /pixi.lock
+            /pixi.toml
+            /cmake/static/arrow-sources.lock
+            /cmake/static/glibc-source.lock
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: antb1-*
+          path: ${{ runner.temp }}/artifacts # antb1-<target>/ and antb1-<target>-sources/, one directory each
+      - name: Check the files, write SHA256SUMS, the notes and the attestation's subjects
+        id: assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          RELEASE_PUBLISH: ${{ needs.preflight.outputs.publish }}
+        run: python3 -I .github/scripts/release.py assemble --in "$RUNNER_TEMP/artifacts" --out "$RUNNER_TEMP/meta"
+      - name: Upload SHA256SUMS and the notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-meta
+          path: ${{ runner.temp }}/meta/
+          retention-days: ${{ github.event_name == 'push' && 30 || 7 }}
+          if-no-files-found: error
+          overwrite: true
+
+  # The packaged files on fresh runners without pixi or a build, against the SHA256SUMS that attest signs: unpack
+  # (tarfile's data filter, links and xattrs refused), then with an empty environment in an empty directory: version,
+  # version --verbose (this commit and version, static-thinlto, every codec), the allocator restart (Linux), the kit's
+  # queries, --threads 4 equal to 1, the exit codes of a truncated file, a parse error and an unknown option. Linux
+  # repeats the runs in a container of an image that holds only the binary and the kit (no network, no capabilities,
+  # read-only, user nobody); macOS checks the signature. ubuntu-26.04 joins once the lint env's actionlint knows its
+  # labels.
+  verify:
+    name: verify ${{ matrix.target }} on ${{ matrix.os }} (pixi run static-check antb1-${{ matrix.target }}.tar.gz)
+    needs: [preflight, assemble]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read # the sparse checkout of the gate script and the licence texts it compares
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+            engine: docker
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+            engine: docker
+          - target: darwin-arm64
+            os: macos-15
+            engine: none # no container engine on the macOS images
+          - target: darwin-arm64
+            os: macos-26
+            engine: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /scripts/static_gates.py
+            /LICENSE
+            /NOTICE
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: antb1-${{ matrix.target }}
+          path: ${{ runner.temp }}/package
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: smoke-kit-${{ matrix.target }}
+          path: ${{ runner.temp }}/kit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-meta
+          path: ${{ runner.temp }}/meta
+      - name: The packaged file on a fresh runner
+        env:
+          TARGET: ${{ matrix.target }}
+          ENGINE: ${{ matrix.engine }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+        run: >-
+          python3 -I scripts/static_gates.py verify --assets "$RUNNER_TEMP/package"
+          --sums "$RUNNER_TEMP/meta/SHA256SUMS" --kit "$RUNNER_TEMP/kit" --texts . --target "$TARGET"
+          --version "$RELEASE_VERSION" --commit "$RELEASE_SHA" --container "$ENGINE"
+
+  # Tag pushes only, after every check passed: one SLSA build provenance attestation (public-good Sigstore) of the
+  # release's own files, from assemble's job output. No checkout, no repository code: only actions/attest and the
+  # upload hold the OIDC token. The bundle becomes the asset antb1.sigstore.json (gh attestation verify --bundle).
+  attest:
+    name: attest (actions/attest)
+    needs: [preflight, assemble, verify]
+    if: >-
+      ${{ github.repository == 'ydb-campus/antb1' && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v') && needs.preflight.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write # the Sigstore signing certificate (OIDC)
+      attestations: write # store the attestation in the repository
+    steps:
+      - name: The subjects (seven tarballs and SHA256SUMS)
+        env:
+          SUBJECTS: ${{ needs.assemble.outputs.subjects }}
+        run: |
+          printf '%s\n' "$SUBJECTS" >"$RUNNER_TEMP/subjects.sha256"
+          test "$(grep -Ecx '[0-9a-f]{64}  [A-Za-z0-9._-]+' "$RUNNER_TEMP/subjects.sha256")" = 8
+          test "$(wc -l <"$RUNNER_TEMP/subjects.sha256")" -eq 8
+      - name: Build provenance of the release's files
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/subjects.sha256
+      - name: Keep the bundle for the release
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: mkdir -p "$RUNNER_TEMP/provenance" && cp "$BUNDLE" "$RUNNER_TEMP/provenance/antb1.sigstore.json"
+      - name: Upload the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-provenance
+          path: ${{ runner.temp }}/provenance/antb1.sigstore.json
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+  # Ungated, so whoever approves sees exactly what the draft page shows. Refuses when a published release has the
+  # tag; checks every file against the job output and the bundle (gh attestation verify --bundle, pinned to this
+  # workflow, the tag, the commit and GitHub-hosted runners); deletes every earlier draft of the tag (a re-run); then
+  # `gh release create --verify-tag --draft` with the notes, the eight files and the bundle (never --target, --latest
+  # or --generate-notes), and compares every uploaded asset's state, size and digest. Output: the draft's id.
+  draft:
+    name: draft (python3 -I .github/scripts/release.py draft)
+    needs: [preflight, assemble, attest]
+    if: >-
+      ${{ github.repository == 'ydb-campus/antb1' && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v') && needs.preflight.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # delete stale drafts of the tag, create the draft release and upload its assets
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: /.github/scripts/release.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: antb1-*
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-meta
+          path: ${{ runner.temp }}/meta
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-provenance
+          path: ${{ runner.temp }}/provenance
+      - name: A draft release with every asset
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          RELEASE_PUBLISH: ${{ needs.preflight.outputs.publish }}
+          RELEASE_SUBJECTS: ${{ needs.assemble.outputs.subjects }}
+        run: >-
+          python3 -I .github/scripts/release.py draft --artifacts "$RUNNER_TEMP/artifacts" --meta "$RUNNER_TEMP/meta"
+          --bundle "$RUNNER_TEMP/provenance/antb1.sigstore.json"
+
+  # Waits for the `release` environment: either maintainer approves, the one who pushed the tag included
+  # (self-approval; ADR 0035); no admin bypass; v* tags only; an unapproved job fails after 30 days. Trusts no
+  # artifact: by release id it re-checks that the release is still a draft of this tag, that the tag still is the
+  # annotated tag object preflight saw on this commit, that no other release of the tag is published, then downloads
+  # every asset and checks its bytes against the API digest, the job output and the draft's own antb1.sigstore.json
+  # (gh attestation verify --bundle, pinned). PATCH draft=false with an explicit make_latest (true only for the
+  # highest stable version); then immutable must be true and `gh release verify` must name the tag object and exactly
+  # these assets. A re-run on a release that is already published only verifies.
+  publish:
+    name: publish (python3 -I .github/scripts/release.py publish)
+    needs: [preflight, assemble, draft]
+    if: >-
+      ${{ github.repository == 'ydb-campus/antb1' && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v') && needs.preflight.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.preflight.outputs.tag }}
+    permissions:
+      contents: write # publish the draft; from then on the release is immutable
+      attestations: read # gh release verify reads the release attestation
+    outputs:
+      latest: ${{ steps.publish.outputs.latest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: /.github/scripts/release.py
+          sparse-checkout-cone-mode: false
+      - name: Re-check the draft, publish it, verify the immutable release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          RELEASE_PUBLISH: ${{ needs.preflight.outputs.publish }}
+          RELEASE_SUBJECTS: ${{ needs.assemble.outputs.subjects }}
+          RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+        run: python3 -I .github/scripts/release.py publish --work "$RUNNER_TEMP/published"
+
+  # Read-only, on each target's own runner, as a user: README.md's install block (between its install markers) with
+  # releases/download/<tag> (and, when publish made the release latest, releases/latest/download as written), no
+  # token; then gh release verify, gh release verify-asset and gh attestation verify, online and with the bundle,
+  # with the flags README.md and SECURITY.md document.
+  check-published:
+    name: check-published ${{ matrix.target }} (python3 -I .github/scripts/release.py check-published)
+    needs: [preflight, publish]
+    if: >-
+      ${{ github.repository == 'ydb-campus/antb1' && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v') && needs.preflight.outputs.publish == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read # the sparse checkout; the published release
+      attestations: read # gh attestation verify and gh release verify read the attestations
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-24.04
+          - target: linux-aarch64
+            os: ubuntu-24.04-arm
+          - target: darwin-arm64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/scripts/release.py
+            /README.md
+          sparse-checkout-cone-mode: false
+      - name: The published release, as README.md tells a user to install and verify it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          RELEASE_PUBLISH: ${{ needs.preflight.outputs.publish }}
+          RELEASE_LATEST: ${{ needs.publish.outputs.latest }}
+        run: python3 -I .github/scripts/release.py check-published --target "$TARGET" --work "$RUNNER_TEMP/check"

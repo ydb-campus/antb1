@@ -7,6 +7,9 @@ Every CI gate runs a `pixi run <task>` that you can run locally, and every job n
 
 - Reproduce first, then fix the cause. A rerun is justified only for an infrastructure failure (network, runner,
   cache service), and the PR should say so.
+- The `Release` workflow (`.github/workflows/release.yml`) belongs to the maintainers ([ci.md](../ci.md#releases)):
+  report its failure to them (the run, the job, the failing step) and never re-run it, not even after an
+  infrastructure failure. A re-run of a release can rebuild its tarballs and sign a second, permanent attestation.
 - Never weaken a gate: no disabled or skipped tests, silenced warnings, sanitizer suppressions, clang-tidy
   exclusions or bare `NOLINT` (AGENTS.md, golden rule 6).
 - Never paste ClickBench data, anything derived from TPC-H (query text, data, answers) or unredacted data-test output

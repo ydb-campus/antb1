@@ -20,10 +20,13 @@ body:
     id: repro
     attributes:
       label: Reproduction
-      description: The exact commands, starting from a clean checkout. Put SQL with quotes in a file (`-f q.sql`).
+      description: >-
+        The exact commands, starting from a clean checkout or from an unpacked release binary. Put SQL with quotes in
+        a file (`-f q.sql`).
       render: shell
       placeholder: |
         pixi run antb1 query -f q.sql --table t=path/to/file.parquet --format csv
+        ./antb1-0.1.0-linux-x86_64/antb1 query -f q.sql --table t=path/to/file.parquet --format csv
     validations:
       required: true
   - type: textarea
@@ -44,14 +47,18 @@ body:
     id: doctor
     attributes:
       label: Environment
-      description: Output of `pixi run doctor --json`.
-      render: json
+      description: >-
+        For a release binary, the output of `antb1 version --verbose`; for a checkout, the output of
+        `pixi run doctor --json`.
+      render: text
     validations:
       required: true
   - type: input
     id: commit
     attributes:
-      label: Commit
-      description: Output of `git rev-parse --short HEAD`.
+      label: Release or commit
+      description: >-
+        For a release binary, its tag and asset (for example `v0.1.0`, `antb1-linux-x86_64.tar.gz`); for a checkout,
+        the output of `git rev-parse --short HEAD`.
     validations:
       required: false

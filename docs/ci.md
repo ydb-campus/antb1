@@ -13,6 +13,7 @@ behind this setup are in [ADR 0009](adr/0009-ci-and-governance.md).
 | `CodeQL` | `.github/workflows/codeql.yml` | every pull request to `main` (no paths filter), pushes to `main`, weekly, manual | code scanning of the C++ code and the workflows; a merge gate through the ruleset ([CodeQL](#codeql)) |
 | `Nightly` | `.github/workflows/nightly.yml` | daily schedule, manual | deep checks, advisory; a failure opens a `nightly-failure` issue ([Nightly](#nightly)) |
 | `static` | `.github/workflows/static.yml` | pull requests that change the build (`pixi.toml`, `pixi.lock`, presets, `cmake/**`, any `CMakeLists.txt`, `src/cli/**`, `src/common/**`, `LICENSE`, `NOTICE`, the static scripts, the workflow), pushes to `main`, manual | the standalone static binary on its three targets and the sources of the Linux packages, advisory ([Standalone static build](#standalone-static-build)) |
+| `Release` | `.github/workflows/release.yml` | pushes of `v*` tags (only admins create tags); manual runs, which are dry runs | a GitHub release of the standalone binary: preflight, a cold build, checks on fresh runners, provenance, a draft, a maintainer's approval, publication and a user's install on each target; never on pull requests ([Releases](#releases)) |
 | `Security` | `.github/workflows/security.yml` | pushes and pull requests that change `.github/**`, weekly, manual | zizmor with its online audits, results in the Security tab; advisory |
 | `Scorecard` | `.github/workflows/scorecard.yml` | pushes to `main`, weekly, branch protection changes | OpenSSF Scorecard, results in the Security tab and on scorecard.dev; advisory |
 | `Agent bootstrap` | `.github/workflows/agent-bootstrap.yml` | pull requests that change `scripts/agent-setup.sh`, `pixi.toml`, `pixi.lock` or the workflow; weekly; manual | a cold `scripts/agent-setup.sh` from both pixi sources, then the tests; advisory |
@@ -64,6 +65,14 @@ a merge queue (`merge_group` is already wired) can take over when PR volume need
 | `bench-publish` (advisory, `main` only) | ubuntu-24.04 | none | nothing to reproduce: appends `micro.json` to the `gh-pages` series `dev/bench-static` |
 | `static <target> (pixi run static && pixi run static-check build/static/package/antb1-<target>.tar.gz && pixi run static-sources)` (advisory) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | `pixi run static`, `pixi run static-check build/static/package/antb1-<target>.tar.gz` (the verify step; on Linux with docker when it answers), then `pixi run static-sources` (on that platform) |
 | `static urls (pixi run static-arrow --check-urls && pixi run static-sources --check-urls)` (advisory, PRs that change a lock of the pinned sources) | ubuntu-24.04 | `static` | `pixi run static-arrow --check-urls` · `pixi run static-sources --check-urls` |
+| `preflight (python3 -I .github/scripts/release.py preflight)` (`Release`) | ubuntu-slim | none | in a checkout of the commit, with `gh` logged in: `GITHUB_REPOSITORY=ydb-campus/antb1 GITHUB_EVENT_NAME=push GITHUB_REF=refs/tags/<tag> GITHUB_SHA=<commit> pixi run -e lint python -I .github/scripts/release.py preflight` (it only reads; `GITHUB_EVENT_NAME=workflow_dispatch` with `GITHUB_REF=refs/heads/main` gives a dry run's warnings) |
+| `build <target> (pixi run static && pixi run static-sources)` (`Release`) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | `static` | in a clean checkout of the commit (network): `CCACHE_DISABLE=1 ANTB1_ARROW_DIR=<an empty directory> pixi run static`, then on Linux `pixi run static-sources` with the same `ANTB1_ARROW_DIR` |
+| `assemble (python3 -I .github/scripts/release.py assemble)` (`Release`) | ubuntu-24.04 | none | `gh run download <run> -R ydb-campus/antb1 -p 'antb1-*' -D <dir>`, then, in a checkout of the commit, `pixi run -e lint python -I .github/scripts/release.py assemble --in <dir> --out <a new directory>` with `GITHUB_REPOSITORY=ydb-campus/antb1` and preflight's outputs as `RELEASE_TAG`, `RELEASE_SHA`, `RELEASE_VERSION`, `RELEASE_PRERELEASE` and `RELEASE_PUBLISH`, and `gh` logged in |
+| `verify <target> on <os> (pixi run static-check antb1-<target>.tar.gz)` (`Release`) | ubuntu-24.04 and ubuntu-24.04-arm (both with docker), macos-15, macos-26 | none (the runner's `python3`) | `pixi run static-check build/static/package/antb1-<target>.tar.gz` after `pixi run static` on that platform; for the run's own files `gh run download <run> -R ydb-campus/antb1 -n antb1-<target> -D <dir>`, then `pixi run static-check <dir>/antb1-<target>.tar.gz` |
+| `attest (actions/attest)` (`Release`, tag runs only) | ubuntu-24.04 | none | nothing to reproduce: tag runs only |
+| `draft (python3 -I .github/scripts/release.py draft)` (`Release`, tag runs only) | ubuntu-24.04 | none | nothing to reproduce: tag runs only |
+| `publish (python3 -I .github/scripts/release.py publish)` (`Release`, tag runs only) | ubuntu-24.04 | none | nothing to reproduce: tag runs only; it waits for a maintainer's approval of the `release` environment |
+| `check-published <target> (python3 -I .github/scripts/release.py check-published)` (`Release`, tag runs only) | ubuntu-24.04, ubuntu-24.04-arm, macos-15 | none | on that platform, in a checkout of the tag, with `gh` logged in: `GITHUB_REPOSITORY=ydb-campus/antb1 RELEASE_TAG=<tag> RELEASE_SHA=<commit> RELEASE_VERSION=<version> RELEASE_PRERELEASE=<true for an rc, else false> RELEASE_PUBLISH=true RELEASE_LATEST=<true or false> pixi run -e lint python -I .github/scripts/release.py check-published --target <target> --work <a new directory>`; it only reads, so it checks any published release |
 | `PR title` | ubuntu-slim | none | check the title against the rules above |
 
 Advisory jobs (not required):
@@ -179,7 +188,160 @@ from `static-arrow-<target>-<key>` and saved from pushes to `main` only. Runs on
 package as the `antb1-<target>` artifact; on Linux they first check and upload its sources as
 `antb1-<target>-sources`, so a package is never published without them. A failed macOS run keeps its binary, with
 the licence texts, as `failed-antb1-<target>`. These runs are cold until `main` has saved a prefix (a cold build
-takes about a minute on a 64-core host; the CI runners are slower).
+takes about a minute on a 64-core host; the CI runners are slower). The artifacts of `main` serve the perf hosts
+between releases; a release never reuses them: `release.yml` builds its own from scratch ([Releases](#releases)).
+
+## Releases
+
+A GitHub release publishes the standalone binary of a commit of `main` for its three targets, with the sources of
+the Linux packages ([ADR 0035](adr/0035-github-releases.md)). Releases come only from `.github/workflows/release.yml`,
+whose logic is `.github/scripts/release.py` and `scripts/static_gates.py`, run by the runner's own `python3`;
+`pixi run release`, the RelWithDebInfo test leg, has nothing to do with them. The maintainers cut releases: an admin
+pushes the tag and a maintainer approves the publication. That may be the same person, so one maintainer can release
+alone. Agents never push a tag or start a GitHub release (AGENTS.md), and the Claude Code settings deny tag pushes,
+`gh release` writes, `gh workflow run release.yml` and deployment approvals (CLAUDE.md).
+
+### What a release holds
+
+Nine assets, whose names carry no version:
+
+| Asset | What it holds |
+| --- | --- |
+| `antb1-linux-x86_64.tar.gz`, `antb1-linux-aarch64.tar.gz`, `antb1-darwin-arm64.tar.gz` | the package of `pixi run static`, in one directory `antb1-<version>-<target>/`: `antb1`, `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.txt`, `BUILDINFO.json` and `README.txt` |
+| `antb1-linux-x86_64.debug.tar.gz`, `antb1-linux-aarch64.debug.tar.gz` | the line tables of the Linux binary, `antb1.debug` with the same licence texts, which unpack next to the binary |
+| `antb1-linux-x86_64.sources.tar`, `antb1-linux-aarch64.sources.tar` | the sources that go with a Linux package (`pixi run static-sources`; LGPL-2.1 section 6, [ADR 0034](adr/0034-licence-and-static-sources.md)), in `antb1-<target>-sources/`: glibc's source RPM, antb1's source at the commit, the third-party sources and a `README.txt` on how to rebuild and relink |
+| `SHA256SUMS` | the sha256 of the seven tarballs |
+| `antb1.sigstore.json` | the Sigstore bundle of the build provenance of the seven tarballs and `SHA256SUMS`, for checks without network |
+
+The bundle itself is neither a subject of the provenance nor in `SHA256SUMS`, and glibc's source RPM is no asset of
+its own: both sources tarballs hold it. As the names carry no version, the link to a file of the latest stable
+release never changes, for example `https://github.com/ydb-campus/antb1/releases/latest/download/SHA256SUMS`;
+README.md's install block downloads from there. A prerelease is never the latest release.
+
+Users check a download as [SECURITY.md](../SECURITY.md#verifying-a-release) describes: `SHA256SUMS` shows that the
+file is intact, the provenance that `release.yml` built it from the tag on a GitHub-hosted runner, and GitHub's
+release attestation that it is an asset of the published release.
+
+### Versions
+
+- The version is `project(VERSION)` in `CMakeLists.txt`, which `antb1 version` prints. `version` in `pixi.toml`
+  must be the same; preflight checks both. The first version is 0.1.0, which both files already name.
+- SemVer 0.x: the minor number grows with features and breaking changes, the patch number with fixes only. Nothing
+  is backported (SECURITY.md).
+- A release is the annotated tag `v<VERSION>`. A tag `v<VERSION>-rc.<N>`, with N counting from 1, is a release
+  candidate of that version: a prerelease, never the latest release. `BUILDINFO.json` records no tag, so an rc's
+  package names the same version as the final release.
+- Tags never move: nobody, admins included, updates or deletes a `v*` tag, and the tag of a deleted immutable release
+  can never be used again. So a mistake costs a version: a wrong tagged commit is followed by the next version (or
+  the next rc), never by a moved tag.
+- Between releases, builds of `main` report the last version; `antb1 version --verbose` and `BUILDINFO.json` name
+  their commit.
+
+### Release settings
+
+They are files in `tools/github/`, applied by `tools/github/apply-settings.sh --release`:
+
+- `tools/github/ruleset-tags.json`, the ruleset `tags`: only admins create, update or delete a tag, any tag, so
+  nobody else can start a release or publish one on a new tag that would take over the latest release.
+- `tools/github/ruleset-release-tags.json`, the ruleset `release-tags`: nobody, admins included, updates or deletes a
+  `v*` tag, and a new `v*` tag needs a green `CI OK` on its commit.
+- `tools/github/environment-release.json`, the environment `release`: the publish job waits until one of its
+  reviewers, the two maintainers, approves. Self-approval is allowed (`prevent_self_review` is false), so the admin
+  who pushed the tag may approve the run. Admins cannot bypass the approval, and only `v*` tags deploy to it.
+  Two-person approval can come back with a settings PR that sets `prevent_self_review` to true.
+- Immutable releases: once a release is published, its assets and its tag never change; its title and notes stay
+  editable.
+
+An admin applies them right before a PR that changes them merges, the first time before the PR that adds
+`release.yml`: `bash tools/github/apply-settings.sh --release` is a dry run that prints every write and reads back
+what GitHub has, then `--apply --release` applies them, and its read-back must show no `DIFF`. In this order no tag
+meets `release.yml` without its settings; a run that names a missing environment would create it without any
+protection. preflight compares the environment and the two rulesets with their files and fails a tag push on any
+difference. It cannot see the bypass lists or the immutability setting: the admin's read-back shows those, and
+publish requires the published release to be immutable.
+
+### Cutting a release
+
+1. **The version.** `main` names it ([Versions](#versions)). For a new version, a PR `chore(release): <version>`
+   changes `CMakeLists.txt` and `pixi.toml`.
+2. **A dry run.** `gh workflow run release.yml --ref main`, then wait until it passes. preflight reports as warnings
+   what a tag push would refuse; build, assemble and verify run in full; nothing is attested, drafted or published.
+3. **The tag.** Right after `CI OK` is green on the head of `main`, an admin tags that commit with an annotated tag,
+   whose message opens the release notes, and pushes the tag alone:
+
+   ```bash
+   git fetch origin
+   git tag -a v0.2.0 -m "antb1 0.2.0" -m "<what changed for users, with every breaking change>" <commit>
+   git push origin v0.2.0
+   ```
+
+   Merge nothing that changes `.github/workflows/` until the release is published: GitHub's Releases API may refuse
+   the workflow token a release whose commit differs from `main` in `.github/workflows/` (preflight warns).
+4. **The run.** preflight checks the tag, the version, `main`, `CI OK` and the settings. The three targets are built
+   from scratch. assemble checks every file against its checksums, the pins and the commit, and writes the one
+   `SHA256SUMS` and the notes. verify checks each package on fresh runners without pixi: ubuntu-24.04 and
+   ubuntu-24.04-arm, there also in a FROM-scratch container without network, macos-15 and macos-26. Only then does
+   attest sign the provenance and draft upload the nine assets to a draft release. The digests reach attest, draft
+   and publish as assemble's job output, which no later job can replace (any job of the run can overwrite an
+   artifact).
+5. **The approval.** publish waits for the `release` environment. Whoever approves, the admin who pushed the tag
+   included, checks first:
+   - the release path since the last release, because `release.yml` runs as the tagged commit has it:
+     `git diff <last tag> <tag> -- .github/ scripts/ cmake/ tools/github/ CMakePresets.json pixi.toml pixi.lock`;
+   - the draft on the releases page (only collaborators with write access see drafts): its nine assets and its notes;
+   - for the first release, that the LGPL review of [ADR 0034](adr/0034-licence-and-static-sources.md) is done.
+
+   Then approve the deployment on the run's page ("Review deployments"), or reject it
+   ([When a release fails](#when-a-release-fails)). A deployment that waits longer than 30 days fails.
+6. **Publication.** publish checks every asset of the draft once more against assemble's digests and the
+   provenance, publishes the draft (as the latest release only when it is the highest stable version) and checks
+   that the release is immutable (`gh release verify`). Then check-published runs README.md's install block on each
+   target's runner, as a user does, and the checks that SECURITY.md documents. Last, read the tag's rule suite,
+   which shows how both rulesets judged the push:
+   `gh api -X GET repos/ydb-campus/antb1/rulesets/rule-suites -f ref=refs/tags/<tag>`.
+
+### The first release
+
+The first release, v0.1.0, comes after a release candidate, since only a tag runs attest, draft, the approval and
+publish:
+
+1. Right before the PR that adds `release.yml` merges, an admin applies the settings (`--release`, then
+   `--apply --release`) and pastes the clean read-back into the PR. That PR may merge with the admin bypass.
+2. `CI OK` is green on its merge commit, and a dry run (`gh workflow run release.yml --ref main`) passes.
+3. The LGPL review of ADR 0034 (an open-source office or a lawyer) is done: a prerelease is public too.
+4. An admin pushes the annotated tag `v0.1.0-rc.1` alone, checks the draft, approves the `release` environment,
+   waits for check-published and reads the tag's rule suite.
+5. Then `v0.1.0`, the same way. It needs no version PR: `main` already names 0.1.0.
+
+### Release notes
+
+assemble writes the notes (`notes.md` in `release-meta`), and the draft carries them:
+
+- the tag's message, without a signature, and for an rc a note that it is a prerelease;
+- fixed sections: the assets with their digests, the platforms and their floors (x86-64-v3, Armv8.2-A, macOS 13.0),
+  the install commands (curl and the checksum), how to verify (the commands of SECURITY.md) and the licences
+  (Apache-2.0, `THIRD_PARTY_NOTICES.txt`, glibc under LGPL-2.1 and where its sources are).
+
+The tag message is the only free text, so its author keeps the rules: what changed for a user, with every breaking
+change; no measured figures, no benchmark wording and no list of pull requests. The notes hold at most 125,000
+characters. They stay editable after publishing; the assets and the tag do not.
+
+### When a release fails
+
+- Before publishing, re-run only the failed jobs ("Re-run failed jobs"). Never "Re-run all jobs": it builds tarballs
+  with other bytes and signs a second attestation for the same tag. A re-run of draft first deletes the tag's
+  earlier drafts.
+- A dry run that fails blocks the tag: fix `main` first.
+- If the tagged commit itself is wrong, reject the deployment, delete the draft, fix `main` and release the next
+  version (or the next rc). The tag stays. Do not leave the run waiting: release runs go one at a time, so it would
+  hold up the run of the next tag.
+- "Published but not immutable" (publish fails after publishing): delete that mutable release, turn immutability on
+  (`bash tools/github/apply-settings.sh --apply --release`), then re-run all jobs: the release is built and signed
+  again.
+- After publishing, never delete the release: fix forward with the next version.
+- Push one tag at a time: a push of more than three tags at once starts no workflow, and release runs go one at a
+  time, so a third tag would replace the second one, which waits for the first.
+- A publish job that nobody approves fails after 30 days; "Re-run failed jobs" asks again.
 
 ## Nightly
 
@@ -261,13 +423,20 @@ measurements are recorded here once enough runs exist.
 | `antb1-<target>` | `static <target>` | pushes to `main` and manual runs | 30 days |
 | `antb1-<target>-sources` (Linux) | `static <target>` | pushes to `main` and manual runs, before the package | 30 days |
 | `failed-antb1-<target>` (macOS) | `static <target>` | on failure, when the binary was built | 7 days |
+| `antb1-<target>` | `build <target>` (`Release`) | tag runs and dry runs, after the sources on Linux | 30 days on tags, 7 on dry runs |
+| `antb1-<target>-sources` (Linux) | `build <target>` (`Release`) | tag runs and dry runs, before the package | 30 days on tags, 7 on dry runs |
+| `smoke-kit-<target>` | `build <target>` (`Release`) | tag runs and dry runs; never a release asset | 30 days on tags, 7 on dry runs |
+| `release-meta` | `assemble` (`Release`) | tag runs and dry runs | 30 days on tags, 7 on dry runs |
+| `release-provenance` | `attest` (`Release`) | tag runs | 30 days |
 
 Artifacts never contain data: the coverage summary holds only percentages, fuzz inputs grow from our own seed
 corpus, the benchmark results hold only timings and build facts (`version.txt`; never query text or results), the
-sources of a package only source code (never an environment directory), and the data jobs
-(`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the output of the
-tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers, counts and hashes;
-[testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.
+sources of a package only source code (never an environment directory), a smoke kit only the Parquet files that
+DuckDB writes from `range()` and `kit.json` with their digests and DuckDB's answers (never a release asset),
+`release-meta` only `SHA256SUMS` and the release notes, `release-provenance` only the Sigstore bundle, and the
+data jobs (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the
+output of the tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers,
+counts and hashes; [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.
 
 ## Caches
 
@@ -283,9 +452,12 @@ tests over the data derived from TPC-H, which is redacted like the data tests' (
   `pixi run static-arrow --print-key`. The `static` workflow saves it from pushes to `main`. The nightly
   `static-test` and the benchmarks' `bench-run` only read it (on a miss they build the prefix cold and save
   nothing); `static-cold` never reads it.
+- `release.yml` reads and writes no cache: setup-pixi runs with `cache: false`, `CCACHE_DISABLE=1` turns ccache
+  off, and the build checks that `ANTB1_ARROW_DIR` does not exist yet, so every pinned source is downloaded and
+  the Arrow prefix built again. What a release ships depends only on the tagged commit and its pins.
 - `cache-gc` removes stale entries after each run on `main` (see above).
-- A run on a pull request is cancelled when a newer push to the same PR arrives; runs on `main` are never
-  cancelled.
+- A run on a pull request is cancelled when a newer push to the same PR arrives; runs on `main` and release runs
+  are never cancelled.
 
 ## Reproducing a failure
 
@@ -305,6 +477,8 @@ tests over the data derived from TPC-H, which is redacted like the data tests' (
    failure prints; it shows the SQL and the values on your machine only. Never paste them into the PR or an issue.
    An unexpected ClickBench pass or fail means the ratchet and the docs/sql-subset.md table need updating
    ([testing.md](testing.md#the-clickbench-ratchet)).
+10. A failed `Release` run is the maintainers': its jobs reproduce with the commands in the table above, and only
+    a maintainer re-runs one, as [When a release fails](#when-a-release-fails) describes.
 
 ## Workflow security rules
 
@@ -318,10 +492,17 @@ enforces them:
 - the checkout action with `persist-credentials: false`;
 - no `pull_request_target` or `workflow_run` triggers, and no `${{ github.event.* }}` expressions inside `run:`
   (values are passed through `env:`);
-- caches are written only from `main`;
+- caches are written only from `main`, and `release.yml` reads none;
 - a job with a write permission never runs code from a pull request: `coverage-comment` (`pull-requests: write`),
   `cache-gc` (`actions: write`, `main` only), the nightly `report` (`issues: write`) and `bench-publish`
-  (`contents: write` for the `gh-pages` series, pushes to `main` only) check out nothing from a PR.
+  (`contents: write` for the `gh-pages` series, pushes to `main` only) check out nothing from a PR. The release
+  jobs that write run only for a `v*` tag pushed to this repository, after its preflight passed, on the tag's
+  commit of `main`, and take the digests they sign or compare from assemble's job output: `attest` (`id-token: write`
+  for the Sigstore signing certificate, `attestations: write` to store the attestation) checks out nothing and runs
+  no code of the repository; `draft` (`contents: write` to delete earlier drafts of the tag, create the draft and
+  upload its assets) and `publish` (`contents: write` to publish the draft; it waits for the `release`
+  environment) check out only `.github/scripts/release.py`. `pixi run lint` runs
+  `tools/ci/tests/test_release_workflow.py`, which pins these permissions, the guards and the absence of caches.
   The analyses that upload results (`CodeQL`, `Security`, `Scorecard`) hold only `security-events: write` (Scorecard
   also `id-token: write`, on `main`); on fork pull requests GitHub makes their token read-only.
 
@@ -331,4 +512,5 @@ that has nothing but `pull-requests: write`. The AI jobs skip pull requests from
 [docs/agents.md](agents.md).
 
 The repository settings (`tools/github/apply-settings.sh`) add the rest: workflow runs from external contributors'
-forks need a maintainer's approval, and GitHub Actions cannot approve pull requests.
+forks need a maintainer's approval, and GitHub Actions cannot approve pull requests. Its `--release` mode adds the
+tag rulesets, the `release` environment and immutable releases ([Release settings](#release-settings)).

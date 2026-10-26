@@ -13,6 +13,9 @@ Step-by-step details per job: [docs/recipes/fix-ci-failure.md](../../../docs/rec
 - Reproduce before you fix, and fix the cause. Never rerun a job blindly, and never weaken a gate: no disabled or
   skipped tests, silenced warnings, sanitizer suppressions, clang-tidy exclusions or bare `NOLINT`.
 - `CI OK` only aggregates the other jobs: find the job that failed.
+- The `Release` workflow (`.github/workflows/release.yml`) belongs to the maintainers: report its failure (the run,
+  the job, the failing step) and never re-run it, not even after an infrastructure failure
+  ([docs/ci.md](../../../docs/ci.md#releases)).
 - Every job name contains the command that reproduces it, for example `clang-asan (pixi run asan)`.
 - Never paste ClickBench data, anything derived from TPC-H (query text, data, answers) or unredacted data-test output
   into a PR, an issue or a prompt. Timings of the TPC-H-derived queries are fine, never as TPC-H Benchmark results.
@@ -39,4 +42,5 @@ Step-by-step details per job: [docs/recipes/fix-ci-failure.md](../../../docs/rec
    `pixi run test -R '^<name>$' --repeat until-fail:20 --schedule-random`.
 4. Fix the code; for a bug, add a test that fails without the fix.
 5. Rerun the failing command, then `pixi run check` (all Linux gates: `pixi run check-full`), and push.
-6. Only an infrastructure failure (network, runner, cache service) justifies a rerun; say so in the PR.
+6. Only an infrastructure failure (network, runner, cache service) justifies a rerun, and never one of the Release
+   workflow; say so in the PR.

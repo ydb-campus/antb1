@@ -44,6 +44,10 @@ Accepted
   `tools/github/apply-settings.sh`, which is a dry run unless asked to apply.
 - Automated dependency PRs (the weekly `pixi.lock` refresh, `.github/workflows/pixi-lock-update.yml`) come from a
   dedicated organization GitHub App (antb1-bot), so they trigger CI like any other PR without a personal token.
+- Update (2026-10-26): [ADR 0035](0035-github-releases.md) adds the release settings to `tools/github/`, applied by
+  `tools/github/apply-settings.sh --release` (a dry run unless asked to apply): two tag rulesets
+  (`tools/github/ruleset-tags.json`, `tools/github/ruleset-release-tags.json`), the `release` environment
+  (`tools/github/environment-release.json`) and immutable releases.
 
 ## Consequences
 

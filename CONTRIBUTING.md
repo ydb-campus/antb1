@@ -89,6 +89,9 @@ Commits inside a branch can be messy; only the PR title and description end up o
   in `.github/CODEOWNERS`) automatically request review from the maintainers. Discuss such changes first.
 - Never weaken a gate to get a PR green: no disabled tests, silenced warnings or sanitizer and clang-tidy exclusions
   without a documented reason and a maintainer's agreement.
+- Releases are the maintainers' ([docs/ci.md](docs/ci.md#releases)): an admin pushes the annotated tag `v<version>`
+  on a commit of `main`, and a maintainer, who may be that admin, approves its publication. Contributors and agents
+  never push tags, and never create, edit or publish a release.
 
 ## AI assistance
 
@@ -115,7 +118,8 @@ as `pixi run lint`, on staged files only, with tools from the pixi `lint` enviro
 
 ## Reporting issues
 
-Use the issue forms: bug reports should include the exact command and the output of `pixi run doctor --json`.
+Use the issue forms: bug reports should include the exact command and the output of `pixi run doctor --json`, or,
+for a release binary, the release tag, the asset name and the output of `antb1 version --verbose`.
 Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
 
 ## License

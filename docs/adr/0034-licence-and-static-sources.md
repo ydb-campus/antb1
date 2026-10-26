@@ -59,7 +59,8 @@ Proposed
     - a README with the rebuild and relink steps. It says that they install env `static`, and with it TPC's dbgen
       under the TPC EULA v2.2 ([ADR 0006](0006-test-strategy-and-data-policy.md)).
   - **How it is offered:** from the same place as the binary. `static.yml` uploads a Linux package only after
-    `antb1-<target>-sources`, in the same run, and so will the GitHub releases.
+    `antb1-<target>-sources`, in the same run, and every GitHub release ([ADR 0035](0035-github-releases.md)) carries
+    both sources tarballs, `antb1-linux-x86_64.sources.tar` and `antb1-linux-aarch64.sources.tar`, next to the packages.
   - **The copies are checked:** every copy of the source RPM and of the conda archives
     (`pixi run static-sources --check-urls`) is checked in the `static urls` job of every PR that changes the lock
     or the script.
