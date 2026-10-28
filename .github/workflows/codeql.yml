@@ -45,7 +45,7 @@ jobs:
       # The gcc environment, activated for the later steps: the build below runs cmake directly, because CodeQL's
       # tracer does not follow processes through the static pixi binary (`pixi run codeql-build` locally).
       - if: matrix.build-mode == 'manual'
-        uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           pixi-version: v0.81.0
           environments: gcc
@@ -54,7 +54,7 @@ jobs:
           cache: true
           cache-key: pixi-${{ hashFiles('pixi.lock') }}-
           cache-write: false
-      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -62,7 +62,7 @@ jobs:
       - name: Traced GCC build (the commands of pixi run codeql-build)
         if: matrix.build-mode == 'manual'
         run: cmake -E rm -rf build/codeql && cmake --workflow --preset codeql
-      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: /language:${{ matrix.language }}
           upload: never
@@ -72,7 +72,7 @@ jobs:
       # on compiled languages, so the results are filtered here before the upload.
       - name: Drop results in third-party code (tools/ci/filter_sarif.py)
         run: python3 tools/ci/filter_sarif.py sarif-results --exclude '.pixi/*' --exclude 'build/*'
-      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: sarif-results
           category: /language:${{ matrix.language }}
