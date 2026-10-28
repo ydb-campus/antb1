@@ -26,6 +26,7 @@
 #include "antb1/common/version.h"
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/join_table.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/sort.h"
 #include "antb1/io/parquet_table.h"
@@ -34,6 +35,7 @@
 #include "antb1/plan/types.h"
 #include "antb1/sql/parser.h"
 
+#include "group_loops.h"
 #include <unistd.h>
 
 namespace antb1::bench {
@@ -579,10 +581,12 @@ BENCHMARK(BM_JoinTableProbe)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
 // ---- Grouping: arrow::compute::Grouper, which GroupTable uses to turn key rows into group ids
 // ----
 //
-// The baseline for the table of docs/adr/0019-own-aggregation-hash-table.md, whose gate is 1.3x
-// this on every shape at 1000, 1 M and 4 M groups. A prototype of that table was 1.17-1.30x at 1-4
-// M groups and 0.22-0.70x at 1000, so the small counts are the ones to watch, not the large: a
-// table that wins only where the groups do not fit in cache is the prototype again.
+// The baseline for the table of docs/adr/0019-own-aggregation-hash-table.md, whose gate (as its
+// 2026-10-18 update restates it) is 1.3x this on every shape at 1000, 16 Ki, 256 Ki and 1 Mi
+// groups, the band the engine's partitioned tables sit in, with 4 Mi reported. A prototype of that
+// table was 1.17-1.30x at 1-4 M groups and 0.22-0.70x at 1000, so the small counts are the ones to
+// watch, not only the large: a table that wins only where the groups do not fit in cache is the
+// prototype again.
 //
 // Rows, not groups, are what a benchmark iteration costs, so every shape reads kGroupRows of them
 // and the group count is the argument. At 4 M groups there is one row per group; at 1000 about four
@@ -594,11 +598,21 @@ constexpr int64_t kGroupRows =
     int64_t{4} * 1024 * 1024;  // 64 batches of 64Ki rows, enough for 4 M groups
 
 // The rows a group count needs: kGroupRows, or one row per group once there are more groups than
-// that. ClickBench's grouped queries reach 18-100 M groups, well past the 4 M the gates of
-// docs/adr/0019-own-aggregation-hash-table.md name, and a table's cost per row is not flat in its
-// size -- which is the point of measuring the curve rather than one point on it.
+// that. A table's cost per row is not flat in its size -- which is the point of measuring the curve
+// rather than one point on it.
 int64_t GroupRowsFor(int64_t groups) {
   return arrow::bit_util::RoundUpToPowerOf2(std::max(kGroupRows, groups), kBatchSize);
+}
+
+// A row's group id is row * kGroupStride modulo the group count: every group is visited, since the
+// stride is coprime with every count registered here (it is odd and not a multiple of 5, and the
+// counts are 1000 and powers of two), and consecutive rows land far apart. Unlike random ids, the
+// ids are a permutation: no group repeats until every group has been seen, which a table that
+// estimates its size from the rows it has seen must not rely on.
+constexpr uint64_t kGroupStride = 0x9E3779B1ULL;
+
+uint64_t GroupIdOf(int64_t row, int64_t groups) {
+  return (static_cast<uint64_t>(row) * kGroupStride) % static_cast<uint64_t>(groups);
 }
 
 // Which key columns a shape groups by. The gate's four: one and two fixed-width keys, a string, and
@@ -631,17 +645,14 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
   const bool has_int32 = shape == GroupShape::kInt64Int32;
   const bool has_string = shape == GroupShape::kString || shape == GroupShape::kInt64String;
   arrow::RecordBatchVector out;
-  // An odd stride modulo the count: every group is visited (kGroupRows is a power of two, so any
-  // odd stride is coprime with it) and consecutive rows land far apart, as a random id would.
-  constexpr uint64_t kStride = 0x9E3779B1ULL;
   for (int64_t start = 0; start < rows; start += kBatchSize) {
     arrow::Int64Builder keys;
     arrow::Int32Builder seconds;
     arrow::BinaryBuilder strings;
     for (int64_t row = start; row < start + kBatchSize; ++row) {
-      const uint64_t id = (static_cast<uint64_t>(row) * kStride) % static_cast<uint64_t>(groups);
-      // A two-key shape splits the id between its columns, so that neither alone separates the
-      // groups and the grouper has to read both.
+      const uint64_t id = GroupIdOf(row, groups);
+      // A two-key shape splits the id between its columns (id / 1024, id % 1024), so that from 1024
+      // groups on neither column alone separates the groups and the grouper has to read both.
       if (has_int64 && !keys.Append(static_cast<int64_t>(has_int32 ? id / 1024U : id)).ok()) {
         return {};
       }
@@ -670,8 +681,9 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
   return out;
 }
 
-// One grouper over every batch, as GroupTable::Consume does per part.
-void GroupKeys(benchmark::State& state, GroupShape shape) {
+// One grouper over every batch, as GroupTable::Consume does per part; with `budgeted`, its buffers
+// come from a MemoryBudget without a limit, as the engine's do (engine::Session's pool).
+void GroupKeys(benchmark::State& state, GroupShape shape, bool budgeted = false) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
   const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows);
@@ -684,9 +696,12 @@ void GroupKeys(benchmark::State& state, GroupShape shape) {
   for (const auto& field : batches.front()->schema()->fields()) {
     types.emplace_back(field->type());
   }
+  exec::MemoryBudget budget(std::nullopt);
+  arrow::compute::ExecContext budgeted_ctx(&budget);
   uint32_t made = 0;
   for (auto _ : state) {
-    auto grouper = arrow::compute::Grouper::Make(types);
+    auto grouper = budgeted ? arrow::compute::Grouper::Make(types, &budgeted_ctx)
+                            : arrow::compute::Grouper::Make(types);
     if (!grouper.ok()) {
       state.SkipWithError(grouper.status().ToString());
       return;
@@ -716,10 +731,151 @@ void BM_GroupInt64(benchmark::State& state) { GroupKeys(state, GroupShape::kInt6
 void BM_GroupInt64Int32(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64Int32); }
 void BM_GroupString(benchmark::State& state) { GroupKeys(state, GroupShape::kString); }
 void BM_GroupInt64String(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64String); }
+void BM_GroupInt64Budget(benchmark::State& state) { GroupKeys(state, GroupShape::kInt64, true); }
+void BM_GroupInt64Int32Budget(benchmark::State& state) {
+  GroupKeys(state, GroupShape::kInt64Int32, true);
+}
 
-// The gate's three counts (1000, 1 M, 4 M: cached, past cache, about one row a group) with the
-// steps between and above them, so the shape of the cost per row is visible rather than inferred.
-// 16 M is ClickBench's own range (q33 groups 18 M URLs, q32 100 M pairs).
+// ---- Step 0: candidate loops of our own for fixed-width keys (bench/group_loops.h) ----
+//
+// The same inputs and counters as BM_Group*, under a MemoryBudget as BM_Group*Budget, so their
+// ns_per_row compare directly; the go for a shape is 1.3x the budgeted grouper at every count from
+// 1000 to 1 Mi groups. Each variant is first checked once per benchmark name: one group per key,
+// and every row of a group given that group's id.
+
+step0::Int64Key::Columns ColumnsOf(const arrow::RecordBatch& batch, step0::Int64Key* /*tag*/) {
+  return {.k = batch.column_data(0)->GetValues<std::int64_t>(1)};
+}
+step0::Int64Int32Key::Columns ColumnsOf(const arrow::RecordBatch& batch,
+                                        step0::Int64Int32Key* /*tag*/) {
+  return {.k = batch.column_data(0)->GetValues<std::int64_t>(1),
+          .j = batch.column_data(1)->GetValues<std::int32_t>(1)};
+}
+
+template <class Key, step0::Slots kSlots>
+arrow::Status Step0Consume(step0::FixedTable<Key, kSlots>& table, const arrow::RecordBatch& batch,
+                           std::uint32_t* ids) {
+  return table.ConsumeChunked(ColumnsOf(batch, static_cast<Key*>(nullptr)),
+                              static_cast<std::size_t>(batch.num_rows()), ids);
+}
+
+// One table over every batch: an empty string, or what is wrong with its ids.
+template <class Key, step0::Slots kSlots>
+std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups,
+                       step0::TableOptions options, bool presized) {
+  exec::MemoryBudget budget(std::nullopt);
+  step0::FixedTable<Key, kSlots> table(&budget, options);
+  if (presized) {
+    if (auto status = table.Reserve(static_cast<std::size_t>(groups)); !status.ok()) {
+      return status.ToString();
+    }
+  }
+  std::vector<std::uint32_t> ids(static_cast<std::size_t>(kBatchSize));
+  // The table's id of each true group, and back: both must be one to one.
+  std::vector<int64_t> ours(static_cast<std::size_t>(groups), -1);
+  std::vector<int64_t> theirs(static_cast<std::size_t>(groups), -1);
+  int64_t row = 0;
+  for (const auto& batch : batches) {
+    if (auto status = Step0Consume(table, *batch, ids.data()); !status.ok()) {
+      return status.ToString();
+    }
+    for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
+      const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups));
+      const std::uint32_t id = ids[static_cast<std::size_t>(i)];
+      if (id >= static_cast<std::uint64_t>(groups)) {
+        return "id " + std::to_string(id) + " past the group count";
+      }
+      int64_t& mine = ours[truth];
+      int64_t& back = theirs[id];
+      if (mine == -1 && back == -1) {
+        mine = id;
+        back = static_cast<int64_t>(truth);
+      } else if (mine != id || back != static_cast<int64_t>(truth)) {
+        return "row " + std::to_string(row) + " has id " + std::to_string(id) +
+               " but its group has " + std::to_string(mine);
+      }
+    }
+  }
+  if (table.num_groups() != groups) {
+    return std::to_string(table.num_groups()) + " groups for " + std::to_string(groups);
+  }
+  if (budget.bytes_allocated() <= 0) {
+    return "nothing was charged to the budget";
+  }
+  return {};
+}
+
+template <class Key, step0::Slots kSlots>
+void Step0Keys(benchmark::State& state, GroupShape shape, step0::TableOptions options,
+               bool presized = false) {
+  const int64_t groups = state.range(0);
+  const int64_t rows = GroupRowsFor(groups);
+  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows);
+  if (batches.empty()) {
+    state.SkipWithError("cannot build the grouping input");
+    return;
+  }
+  static std::vector<std::string>
+      checked;  // Google Benchmark calls this once per run, not per name
+  if (std::ranges::find(checked, state.name()) == checked.end()) {
+    if (const std::string wrong = Step0Check<Key, kSlots>(batches, groups, options, presized);
+        !wrong.empty()) {
+      state.SkipWithError("wrong ids: " + wrong);
+      return;
+    }
+    checked.push_back(state.name());
+  }
+  exec::MemoryBudget budget(std::nullopt);
+  std::vector<std::uint32_t> ids(static_cast<std::size_t>(kBatchSize));
+  uint32_t made = 0;
+  for (auto _ : state) {
+    step0::FixedTable<Key, kSlots> table(&budget, options);
+    if (presized) {
+      if (auto status = table.Reserve(static_cast<std::size_t>(groups)); !status.ok()) {
+        state.SkipWithError(status.ToString());
+        return;
+      }
+    }
+    for (const auto& batch : batches) {
+      if (auto status = Step0Consume(table, *batch, ids.data()); !status.ok()) {
+        state.SkipWithError(status.ToString());
+        return;
+      }
+      benchmark::DoNotOptimize(ids.data());
+    }
+    made = table.num_groups();
+    benchmark::DoNotOptimize(made);
+  }
+  state.SetItemsProcessed(state.iterations() * rows);
+  state.counters["groups"] = static_cast<double>(made);
+  state.counters["rows"] = static_cast<double>(rows);
+  state.counters["ns_per_row"] =
+      benchmark::Counter(static_cast<double>(rows), benchmark::Counter::kIsIterationInvariantRate |
+                                                        benchmark::Counter::kInvert);
+}
+
+// BM_S0<shape>_<slots>[_Presized]: the chunked loop (a room check and a hash pass per 256 rows,
+// then the probes, prefetching the buckets of the row 8 places on) at load 7/8. Indirect: the id
+// alone in a 4-byte slot, re-placed in id order on growth; Hash32: 32 hash bits beside the id in an
+// 8-byte slot, re-placed in slot order. Presized: every group reserved before the first row, the
+// floor growth can reach (a diagnostic: the engine may size a table only from its own data).
+// Step 0's runs also measured a per-row loop, the key or a 64-bit hash in the slot, prefetch
+// distances of 16 and 32, load 1/2 and 4x growth; each lost to these on this host.
+#define ANTB1_STEP0(name, Key, shape, slots, presized)                                          \
+  void BM_S0##name(benchmark::State& state) {                                                   \
+    Step0Keys<step0::Key, step0::Slots::slots>(state, GroupShape::shape, step0::TableOptions{}, \
+                                               presized);                                       \
+  }
+ANTB1_STEP0(Int64_Indirect, Int64Key, kInt64, kIndirect, false)
+ANTB1_STEP0(Int64_Hash32, Int64Key, kInt64, kHash32, false)
+ANTB1_STEP0(Int64_Hash32_Presized, Int64Key, kInt64, kHash32, true)
+ANTB1_STEP0(Int64Int32_Indirect, Int64Int32Key, kInt64Int32, kIndirect, false)
+ANTB1_STEP0(Int64Int32_Hash32, Int64Int32Key, kInt64Int32, kHash32, false)
+ANTB1_STEP0(Int64Int32_Hash32_Presized, Int64Int32Key, kInt64Int32, kHash32, true)
+#undef ANTB1_STEP0
+
+// The gate's counts (1000 to 1 Mi: cached to past cache) with 4 Mi (about one row a group) and 16
+// Mi above them, so the shape of the cost per row is visible rather than inferred.
 #define ANTB1_GROUP_COUNTS   \
   Arg(1000)                  \
       ->Arg(16 * 1024)       \
@@ -732,6 +888,19 @@ BENCHMARK(BM_GroupInt64Int32)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond)
 BENCHMARK(BM_GroupString)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64String)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_GROUP_COUNTS
+
+// Step 0's counts: the gate's 1000 to 1 Mi and 4 Mi reported (docs/adr/0019's band update).
+#define ANTB1_STEP0_COUNTS \
+  Arg(1000)->Arg(16 * 1024)->Arg(256 * 1024)->Arg(1024 * 1024)->Arg(4 * 1024 * 1024)
+BENCHMARK(BM_GroupInt64Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64Int32Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+#undef ANTB1_STEP0_COUNTS
 
 }  // namespace
 }  // namespace antb1::bench
