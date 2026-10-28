@@ -112,6 +112,8 @@ struct TableOptions {
   std::size_t load_num = 7;  // the share of slots filled before the table doubles
   std::size_t load_den = 8;
   std::size_t ahead = 8;  // how many rows ahead the chunked loop prefetches; 0 for none
+  // Size the table from its own data after its second Consume (Estimate below).
+  bool estimate = false;
 };
 
 template <class Key, Slots kSlots>
@@ -141,6 +143,7 @@ class FixedTable {
   arrow::Status ConsumeChunked(const typename Key::Columns& columns, std::size_t rows,
                                std::uint32_t* ids) {
     const std::size_t ahead = options_.ahead;
+    const std::uint32_t before = num_groups();
     for (std::size_t start = 0; start < rows; start += kChunk) {
       const std::size_t count = std::min(kChunk, rows - start);
       ARROW_RETURN_NOT_OK(MakeRoom(count));
@@ -157,10 +160,45 @@ class FixedTable {
         ids[start + i] = FindOrInsert(chunk_keys_[i], chunk_hashes_[i]);
       }
     }
-    return arrow::Status::OK();
+    return options_.estimate ? Estimate(before, rows, ids) : arrow::Status::OK();
   }
 
  private:
+  // Below this many hits the second call says too little about the groups to size the table by.
+  static constexpr std::size_t kMinHits = 64;
+  // A reservation never passes this many times the groups already seen.
+  static constexpr std::size_t kMaxGrowth = 8;
+
+  // After the first call, remembers its groups. After the second, the share of that call's rows
+  // whose group the first call made estimates (the first call's groups / all groups) when rows hit
+  // groups in proportion to their frequency: a capture-recapture (Lincoln-Petersen) estimate. The
+  // table then reserves 9/8 of it. It fails small: too few hits reserve nothing (ids that never
+  // repeat early, sorted or clustered keys), skew lowers the estimate (heavy groups take more
+  // hits), and kMaxGrowth bounds an overestimate. It reads only the table's own input, so it is
+  // the same on any number of threads.
+  arrow::Status Estimate(std::uint32_t before, std::size_t rows, const std::uint32_t* ids) {
+    if (calls_ >= 2) {
+      return arrow::Status::OK();
+    }
+    if (++calls_ == 1) {
+      first_groups_ = num_groups();
+      return arrow::Status::OK();
+    }
+    if (before != first_groups_ || first_groups_ == 0) {
+      return arrow::Status::OK();
+    }
+    std::size_t hits = 0;
+    for (std::size_t row = 0; row < rows; ++row) {
+      hits += ids[row] < first_groups_ ? 1U : 0U;
+    }
+    if (hits < kMinHits) {
+      return arrow::Status::OK();
+    }
+    const std::size_t estimate = std::min(first_groups_ * rows / hits * 9 / 8,
+                                          static_cast<std::size_t>(num_groups()) * kMaxGrowth);
+    return estimate > num_groups() ? MakeRoom(estimate - num_groups()) : arrow::Status::OK();
+  }
+
   struct Hash32Slot {
     std::uint32_t hash;  // bits 32 to 63 of the hash
     std::uint32_t group;
@@ -313,6 +351,8 @@ class FixedTable {
   std::size_t capacity_ = 0;
   std::size_t mask_ = 0;
   std::size_t grow_at_ = 0;
+  std::size_t calls_ = 0;         // Consume calls seen while estimating
+  std::size_t first_groups_ = 0;  // the groups after the first call
   std::array<Key, kChunk> chunk_keys_{};
   std::array<std::uint64_t, kChunk> chunk_hashes_{};
 };

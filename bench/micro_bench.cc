@@ -611,7 +611,16 @@ int64_t GroupRowsFor(int64_t groups) {
 // estimates its size from the rows it has seen must not rely on.
 constexpr uint64_t kGroupStride = 0x9E3779B1ULL;
 
-uint64_t GroupIdOf(int64_t row, int64_t groups) {
+// How rows pick their group: the permutation above, or splitmix64 of the row number modulo the
+// count, where groups repeat early as in real data (and some go unseen: about 37% of them when the
+// rows equal the groups, so the `groups` counter is then below the argument).
+enum class GroupIds : std::uint8_t { kPermutation, kRandom };
+
+uint64_t GroupIdOf(int64_t row, int64_t groups, GroupIds ids = GroupIds::kPermutation) {
+  if (ids == GroupIds::kRandom) {
+    uint64_t state = static_cast<uint64_t>(row);
+    return SplitMix64(state) % static_cast<uint64_t>(groups);
+  }
   return (static_cast<uint64_t>(row) * kGroupStride) % static_cast<uint64_t>(groups);
 }
 
@@ -622,9 +631,10 @@ enum class GroupShape : std::uint8_t { kInt64, kInt64Int32, kString, kInt64Strin
 // `rows` rows of `shape`'s key columns, in 64Ki-row batches, with keys over `groups` values; an
 // empty vector if they cannot be built. Each row's keys come from one group id, so a shape's
 // columns agree on which group a row belongs to and the group count is the id count. `rows` is at
-// least `groups` (GroupRowsFor), so every group is reached and the count the grouper reports is the
-// argument exactly -- which the `groups` counter shows.
-arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t rows) {
+// least `groups` (GroupRowsFor), so with the permutation every group is reached and the count the
+// grouper reports is the argument exactly -- which the `groups` counter shows.
+arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t rows,
+                                    GroupIds ids = GroupIds::kPermutation) {
   arrow::FieldVector fields;
   switch (shape) {
     case GroupShape::kInt64:
@@ -650,7 +660,7 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
     arrow::Int32Builder seconds;
     arrow::BinaryBuilder strings;
     for (int64_t row = start; row < start + kBatchSize; ++row) {
-      const uint64_t id = GroupIdOf(row, groups);
+      const uint64_t id = GroupIdOf(row, groups, ids);
       // A two-key shape splits the id between its columns (id / 1024, id % 1024), so that from 1024
       // groups on neither column alone separates the groups and the grouper has to read both.
       if (has_int64 && !keys.Append(static_cast<int64_t>(has_int32 ? id / 1024U : id)).ok()) {
@@ -683,10 +693,11 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
 
 // One grouper over every batch, as GroupTable::Consume does per part; with `budgeted`, its buffers
 // come from a MemoryBudget without a limit, as the engine's do (engine::Session's pool).
-void GroupKeys(benchmark::State& state, GroupShape shape, bool budgeted = false) {
+void GroupKeys(benchmark::State& state, GroupShape shape, bool budgeted = false,
+               GroupIds ids_mode = GroupIds::kPermutation) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
-  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows);
+  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows, ids_mode);
   if (batches.empty()) {
     state.SkipWithError("cannot build the grouping input");
     return;
@@ -735,6 +746,12 @@ void BM_GroupInt64Budget(benchmark::State& state) { GroupKeys(state, GroupShape:
 void BM_GroupInt64Int32Budget(benchmark::State& state) {
   GroupKeys(state, GroupShape::kInt64Int32, true);
 }
+void BM_GroupInt64BudgetRandom(benchmark::State& state) {
+  GroupKeys(state, GroupShape::kInt64, true, GroupIds::kRandom);
+}
+void BM_GroupInt64Int32BudgetRandom(benchmark::State& state) {
+  GroupKeys(state, GroupShape::kInt64Int32, true, GroupIds::kRandom);
+}
 
 // ---- Step 0: candidate loops of our own for fixed-width keys (bench/group_loops.h) ----
 //
@@ -761,7 +778,7 @@ arrow::Status Step0Consume(step0::FixedTable<Key, kSlots>& table, const arrow::R
 
 // One table over every batch: an empty string, or what is wrong with its ids.
 template <class Key, step0::Slots kSlots>
-std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups,
+std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, GroupIds ids_mode,
                        step0::TableOptions options, bool presized) {
   exec::MemoryBudget budget(std::nullopt);
   step0::FixedTable<Key, kSlots> table(&budget, options);
@@ -780,7 +797,7 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups,
       return status.ToString();
     }
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
-      const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups));
+      const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode));
       const std::uint32_t id = ids[static_cast<std::size_t>(i)];
       if (id >= static_cast<std::uint64_t>(groups)) {
         return "id " + std::to_string(id) + " past the group count";
@@ -796,8 +813,9 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups,
       }
     }
   }
-  if (table.num_groups() != groups) {
-    return std::to_string(table.num_groups()) + " groups for " + std::to_string(groups);
+  const auto seen = std::ranges::count_if(ours, [](int64_t id) { return id != -1; });
+  if (static_cast<int64_t>(table.num_groups()) != seen) {
+    return std::to_string(table.num_groups()) + " groups for " + std::to_string(seen);
   }
   if (budget.bytes_allocated() <= 0) {
     return "nothing was charged to the budget";
@@ -806,19 +824,20 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups,
 }
 
 template <class Key, step0::Slots kSlots>
-void Step0Keys(benchmark::State& state, GroupShape shape, step0::TableOptions options,
-               bool presized = false) {
+void Step0Keys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
+               step0::TableOptions options, bool presized) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
-  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows);
+  const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows, ids_mode);
   if (batches.empty()) {
     state.SkipWithError("cannot build the grouping input");
     return;
   }
-  static std::vector<std::string>
-      checked;  // Google Benchmark calls this once per run, not per name
+  // Google Benchmark calls this once per run, not once per name.
+  static std::vector<std::string> checked;
   if (std::ranges::find(checked, state.name()) == checked.end()) {
-    if (const std::string wrong = Step0Check<Key, kSlots>(batches, groups, options, presized);
+    if (const std::string wrong =
+            Step0Check<Key, kSlots>(batches, groups, ids_mode, options, presized);
         !wrong.empty()) {
       state.SkipWithError("wrong ids: " + wrong);
       return;
@@ -854,24 +873,51 @@ void Step0Keys(benchmark::State& state, GroupShape shape, step0::TableOptions op
                                                         benchmark::Counter::kInvert);
 }
 
-// BM_S0<shape>_<slots>[_Presized]: the chunked loop (a room check and a hash pass per 256 rows,
-// then the probes, prefetching the buckets of the row 8 places on) at load 7/8. Indirect: the id
-// alone in a 4-byte slot, re-placed in id order on growth; Hash32: 32 hash bits beside the id in an
-// 8-byte slot, re-placed in slot order. Presized: every group reserved before the first row, the
-// floor growth can reach (a diagnostic: the engine may size a table only from its own data).
-// Step 0's runs also measured a per-row loop, the key or a 64-bit hash in the slot, prefetch
-// distances of 16 and 32, load 1/2 and 4x growth; each lost to these on this host.
-#define ANTB1_STEP0(name, Key, shape, slots, presized)                                          \
-  void BM_S0##name(benchmark::State& state) {                                                   \
-    Step0Keys<step0::Key, step0::Slots::slots>(state, GroupShape::shape, step0::TableOptions{}, \
-                                               presized);                                       \
+// BM_S0<shape>_<slots>[_Presized | _Estimate][_Random]: the chunked loop (a room check and a hash
+// pass per 256 rows, then the probes, prefetching the buckets of the row 8 places on) at load 7/8.
+// Indirect: the id alone in a 4-byte slot, re-placed in id order on growth; Hash32: 32 hash bits
+// beside the id in an 8-byte slot, re-placed in slot order. Presized: every group reserved before
+// the first row, the floor growth can reach (a diagnostic: the engine may size a table only from
+// its own data). Estimate: sized after the second batch from the table's own rows
+// (step0::FixedTable::Estimate). Random: ids that repeat at random (GroupIds::kRandom), compared
+// with BM_Group<shape>BudgetRandom; the others use the permutation, where no id repeats early and
+// Estimate must leave the table alone. Step 0's runs also measured a per-row loop, the key or a
+// 64-bit hash in the slot, prefetch distances of 16 and 32, load 1/2 and 4x growth; each lost to
+// these on the Xeon host.
+#define ANTB1_STEP0(name, Key, shape, slots, presized, ids, ...)                           \
+  void BM_S0##name(benchmark::State& state) {                                              \
+    Step0Keys<step0::Key, step0::Slots::slots>(state, GroupShape::shape, GroupIds::ids,    \
+                                               step0::TableOptions __VA_ARGS__, presized); \
   }
-ANTB1_STEP0(Int64_Indirect, Int64Key, kInt64, kIndirect, false)
-ANTB1_STEP0(Int64_Hash32, Int64Key, kInt64, kHash32, false)
-ANTB1_STEP0(Int64_Hash32_Presized, Int64Key, kInt64, kHash32, true)
-ANTB1_STEP0(Int64Int32_Indirect, Int64Int32Key, kInt64Int32, kIndirect, false)
-ANTB1_STEP0(Int64Int32_Hash32, Int64Int32Key, kInt64Int32, kHash32, false)
-ANTB1_STEP0(Int64Int32_Hash32_Presized, Int64Int32Key, kInt64Int32, kHash32, true)
+ANTB1_STEP0(Int64_Indirect, Int64Key, kInt64, kIndirect, false, kPermutation, {})
+ANTB1_STEP0(Int64_Hash32, Int64Key, kInt64, kHash32, false, kPermutation, {})
+ANTB1_STEP0(Int64_Indirect_Presized, Int64Key, kInt64, kIndirect, true, kPermutation, {})
+ANTB1_STEP0(Int64_Hash32_Presized, Int64Key, kInt64, kHash32, true, kPermutation, {})
+ANTB1_STEP0(Int64_Indirect_Estimate, Int64Key, kInt64, kIndirect, false, kPermutation,
+            {.estimate = true})
+ANTB1_STEP0(Int64_Hash32_Estimate, Int64Key, kInt64, kHash32, false, kPermutation,
+            {.estimate = true})
+ANTB1_STEP0(Int64_Indirect_Random, Int64Key, kInt64, kIndirect, false, kRandom, {})
+ANTB1_STEP0(Int64_Hash32_Random, Int64Key, kInt64, kHash32, false, kRandom, {})
+ANTB1_STEP0(Int64_Indirect_Estimate_Random, Int64Key, kInt64, kIndirect, false, kRandom,
+            {.estimate = true})
+ANTB1_STEP0(Int64_Hash32_Estimate_Random, Int64Key, kInt64, kHash32, false, kRandom,
+            {.estimate = true})
+ANTB1_STEP0(Int64Int32_Indirect, Int64Int32Key, kInt64Int32, kIndirect, false, kPermutation, {})
+ANTB1_STEP0(Int64Int32_Hash32, Int64Int32Key, kInt64Int32, kHash32, false, kPermutation, {})
+ANTB1_STEP0(Int64Int32_Indirect_Presized, Int64Int32Key, kInt64Int32, kIndirect, true, kPermutation,
+            {})
+ANTB1_STEP0(Int64Int32_Hash32_Presized, Int64Int32Key, kInt64Int32, kHash32, true, kPermutation, {})
+ANTB1_STEP0(Int64Int32_Indirect_Estimate, Int64Int32Key, kInt64Int32, kIndirect, false,
+            kPermutation, {.estimate = true})
+ANTB1_STEP0(Int64Int32_Hash32_Estimate, Int64Int32Key, kInt64Int32, kHash32, false, kPermutation,
+            {.estimate = true})
+ANTB1_STEP0(Int64Int32_Indirect_Random, Int64Int32Key, kInt64Int32, kIndirect, false, kRandom, {})
+ANTB1_STEP0(Int64Int32_Hash32_Random, Int64Int32Key, kInt64Int32, kHash32, false, kRandom, {})
+ANTB1_STEP0(Int64Int32_Indirect_Estimate_Random, Int64Int32Key, kInt64Int32, kIndirect, false,
+            kRandom, {.estimate = true})
+ANTB1_STEP0(Int64Int32_Hash32_Estimate_Random, Int64Int32Key, kInt64Int32, kHash32, false, kRandom,
+            {.estimate = true})
 #undef ANTB1_STEP0
 
 // The gate's counts (1000 to 1 Mi: cached to past cache) with 4 Mi (about one row a group) and 16
@@ -894,12 +940,30 @@ BENCHMARK(BM_GroupInt64String)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond
   Arg(1000)->Arg(16 * 1024)->Arg(256 * 1024)->Arg(1024 * 1024)->Arg(4 * 1024 * 1024)
 BENCHMARK(BM_GroupInt64Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64Int32Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64Int32BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Hash32_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Indirect_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Hash32_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Indirect_Estimate_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64_Hash32_Estimate_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Hash32_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Indirect_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Hash32_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Indirect_Estimate_Random)
+    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_S0Int64Int32_Hash32_Estimate_Random)
+    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_STEP0_COUNTS
 
 }  // namespace
