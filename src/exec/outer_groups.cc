@@ -180,6 +180,13 @@ arrow::Status OuterGroups::EnsureGroup() {
   return Resize(1);
 }
 
+arrow::Status OuterGroups::CheckFinalize() const {
+  for (const auto& state : states_) {
+    ARROW_RETURN_NOT_OK(state->CheckFinalize());
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::vector<std::uint64_t>> OuterGroups::Hashes() const {
   ANTB1_CHECK(grouper_ != nullptr);
   ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, grouper_->GetUniques());

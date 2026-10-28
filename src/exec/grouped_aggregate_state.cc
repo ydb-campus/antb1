@@ -100,6 +100,24 @@ arrow::Result<std::shared_ptr<arrow::Array>> Int64s(std::span<const std::int64_t
   return builder.Finish();
 }
 
+// The error of a sum outside its 38-digit type, HUGEINT or DECIMAL(38, s).
+arrow::Status SumOutOfRange(plan::LogicalType type) {
+  return arrow::Status::ExecutionError("SUM overflow: the result is outside the range of ",
+                                       plan::ToString(type), " (38 decimal digits)");
+}
+
+// OK when every group with values has its sum within `type` (HugeInts would succeed).
+arrow::Status CheckSumRange(std::span<const Int128> sums, std::span<const std::int64_t> counts,
+                            plan::LogicalType type) {
+  const plan::IntegerRange range = plan::RangeOf(type);
+  for (std::size_t g = 0; g < sums.size(); ++g) {
+    if (counts[g] != 0 && (sums[g] < range.min || sums[g] > range.max)) {
+      return SumOutOfRange(type);
+    }
+  }
+  return arrow::Status::OK();
+}
+
 // Exact sums as their 38-digit type, HUGEINT or DECIMAL(38, s) (decimal128 within +-(10^38 - 1));
 // NULL for a group without values.
 arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(std::span<const Int128> sums,
@@ -115,8 +133,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> HugeInts(std::span<const Int128> su
       continue;
     }
     if (sums[g] < range.min || sums[g] > range.max) {
-      return arrow::Status::ExecutionError("SUM overflow: the result is outside the range of ",
-                                           plan::ToString(type), " (38 decimal digits)");
+      return SumOutOfRange(type);
     }
     const auto bits = static_cast<UInt128>(sums[g]);
     builder.UnsafeAppend(arrow::Decimal128(static_cast<std::int64_t>(bits >> 64U),
@@ -319,6 +336,14 @@ class GroupedSumCounts final : public GroupedAggregateState {
     }
     return Int64s(totals, pool);
   }
+  [[nodiscard]] arrow::Status CheckFinalize() const override {
+    for (const Int128 sum : sums_) {
+      if (!Int128ToInt64(sum).has_value()) {
+        return arrow::Status::Invalid("SUM of counts outside BIGINT");
+      }
+    }
+    return arrow::Status::OK();
+  }
 
  private:
   std::vector<Int128> sums_;
@@ -447,6 +472,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     return FinalizeAs(average_, begin, end, pool);
   }
+  [[nodiscard]] arrow::Status CheckFinalize() const override { return CheckAs(average_); }
 
   // This accumulator as either SUM or AVG, which is what lets one of the two read the other's
   // state instead of adding the same column again (grouped_sum_alias.h). The sums and the counts
@@ -455,18 +481,29 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       bool average, std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
-    if (input_ != plan::LogicalType::kDecimal) {
-      return average ? Averages(sums, counts, pool)
-                     : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
+    if (average) {
+      return input_ != plan::LogicalType::kDecimal ? Averages(sums, counts, pool)
+                                                   : DecimalAverages(sums, counts, input_, pool);
     }
-    return average ? DecimalAverages(sums, counts, input_, pool)
-                   : HugeInts(sums, counts,
-                              plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth,
-                                                         input_.scale()),
-                              pool);
+    return HugeInts(sums, counts, SumType(), pool);
+  }
+  // CheckFinalize of FinalizeAs(average, ...) over every group: only a SUM can fail, and only of
+  // values beyond 18 digits (fewer than 2^63 values below 10^18 sum to less than 10^37), so the
+  // pass over every group is skipped for the narrow decimals that most sums are of.
+  [[nodiscard]] arrow::Status CheckAs(bool average) const {
+    const bool narrow = input_ == plan::LogicalType::kDecimal &&
+                        input_.width() <= plan::LogicalType::kMaxNarrowDecimalWidth;
+    return average || narrow ? arrow::Status::OK() : CheckSumRange(sums_, counts_, SumType());
   }
 
  private:
+  // The type of the SUM: HUGEINT, or DECIMAL(38, s) for a decimal input of scale s.
+  [[nodiscard]] plan::LogicalType SumType() const {
+    return input_ != plan::LogicalType::kDecimal
+               ? plan::LogicalType(plan::LogicalType::kHugeInt)
+               : plan::LogicalType::Decimal(plan::LogicalType::kMaxDecimalWidth, input_.scale());
+  }
+
   // The unscaled value of row `row` of a buffer of `kBytes`-wide values. A decimal64's eight bytes
   // are its value in two's complement, little-endian on both targets, so they widen by sign
   // extension (ADR 0021's decimal64 item).
@@ -560,6 +597,7 @@ class GroupedSumAlias final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     return owner_->FinalizeAs(average_, begin, end, pool);
   }
+  [[nodiscard]] arrow::Status CheckFinalize() const override { return owner_->CheckAs(average_); }
 
  private:
   const GroupedHugeIntSum* owner_;

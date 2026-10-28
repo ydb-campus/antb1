@@ -279,6 +279,30 @@ TEST_F(GroupedSumAliasTest, TheAggregatesKeepTheirOwnWidthsAndMergeToOnePass) {
   }
 }
 
+// A SUM that reads an AVG's accumulator still checks its range before output (CheckFinalize), and
+// the AVG that owns the accumulator, which cannot fail, does not.
+TEST_F(GroupedSumAliasTest, ASumReadingAnAvgChecksItsRange) {
+  const LogicalType wide = LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 0);
+  const std::string half = "60000000000000000000000000000000000000";
+  const auto rows = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", plan::ToArrow(wide))}), 2,
+      {testing::Int64s({1, 1}), testing::Decimals(wide, {half, half})});
+  const auto key = Column(0, "k", LogicalType::kBigInt);
+  auto table = GroupTable::Make({key},
+                                {Call(plan::AggKind::kAvg, 1, wide, LogicalType::kDouble),
+                                 Call(plan::AggKind::kSum, 1, wide, wide)},
+                                rows->num_columns(), arrow::default_memory_pool(), nullptr);
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_TRUE((*table)->Consume(*rows).ok());
+  EXPECT_EQ((*table)->state(1).memory_usage(), 0) << "the SUM must read the AVG's accumulator";
+  EXPECT_TRUE((*table)->state(0).CheckFinalize().ok());
+  const arrow::Status check = (*table)->state(1).CheckFinalize();
+  EXPECT_TRUE(check.IsExecutionError()) << check.ToString();
+  EXPECT_EQ((*table)->CheckFinalize().ToString(), check.ToString());
+  const auto finalized = (*table)->state(1).Finalize(arrow::default_memory_pool());
+  EXPECT_EQ(finalized.status().ToString(), check.ToString());
+}
+
 // The question ADR 0021's plan left open for step 4: a DECIMAL grouping key is hashed over its
 // bytes, so a narrow one is hashed over eight where a wide one is hashed over sixteen, and the
 // hash decides which partition a group lands in. Nothing observable may change -- the groups and

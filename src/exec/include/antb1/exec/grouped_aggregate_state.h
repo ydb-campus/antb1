@@ -60,6 +60,10 @@ class GroupedAggregateState {
   // array).
   [[nodiscard]] virtual arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const = 0;
+  // OK when Finalize would succeed for every group; otherwise Finalize's error. Operators call it
+  // before their first output batch, so an error in a group that a LIMIT never reads still fails
+  // the query, the same on any number of threads. It allocates nothing; most states cannot fail.
+  [[nodiscard]] virtual arrow::Status CheckFinalize() const { return arrow::Status::OK(); }
   // Every group.
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       arrow::MemoryPool* pool) const {
