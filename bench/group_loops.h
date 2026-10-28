@@ -100,13 +100,16 @@ struct ControlGroup {
   std::uint64_t word;
 };
 
-// What a slot holds beside the control byte: the group id alone, the key then read from the
-// id-ordered key array (4-byte slots), or 32 bits of the hash beside the id (8-byte slots), which a
-// probe compares before reading the key and which lets the table grow by walking its old slots in
-// order: a group's new position is its old home or that plus the old capacity, so the writes stream
-// instead of landing at random as they do when the groups are re-placed in id order. Step 0 also
-// measured the key beside the id and the whole 64-bit hash beside it; both lost to these.
-enum class Slots : std::uint8_t { kIndirect, kHash32 };
+// What a slot holds beside the control byte, and how the table grows:
+//   - kIndirect: the group id alone (4 bytes), the key then read from the id-ordered key array;
+//     growth re-places the groups in id order, so its writes land at random in the new slots.
+//   - kIndirectSlotOrder: the same slot, but growth walks the old slots in order and recomputes
+//     each hash from its key: the key reads are random (and prefetched), the writes stream, since
+//     a group's new position is its old home or that plus the old capacity.
+//   - kHash32: 32 bits of the hash beside the id (8 bytes), which a probe compares before reading
+//     the key and growth reads instead of the key, walking the old slots in order.
+// Step 0 also measured the key beside the id and the whole 64-bit hash beside it; both lost.
+enum class Slots : std::uint8_t { kIndirect, kIndirectSlotOrder, kHash32 };
 
 struct TableOptions {
   std::size_t load_num = 7;  // the share of slots filled before the table doubles
@@ -205,6 +208,8 @@ class FixedTable {
   };
   using Slot = std::conditional_t<kSlots == Slots::kHash32, Hash32Slot, std::uint32_t>;
   static constexpr bool kStoresHash = kSlots == Slots::kHash32;
+  static constexpr bool kGrowsInSlotOrder = kSlots != Slots::kIndirect;
+  static constexpr std::size_t kRehashAhead = 8;  // how far ahead slot-order growth prefetches keys
 
   [[nodiscard]] std::size_t Position(std::uint64_t hash) const {
     return static_cast<std::size_t>(hash >> 32U) & mask_;
@@ -269,6 +274,17 @@ class FixedTable {
       for (std::size_t old = 0; old < old_capacity; ++old) {  // `control` and `slots` are the old
         if (control[old] != kEmpty) {
           const std::uint64_t hash = StoredHash(slots[old]);
+          Place(FirstEmpty(hash), Tag(hash), slots[old]);
+        }
+      }
+    } else if constexpr (kGrowsInSlotOrder) {
+      for (std::size_t old = 0; old < old_capacity; ++old) {
+        if (const std::size_t ahead = old + kRehashAhead;
+            ahead < old_capacity && control[ahead] != kEmpty) {
+          __builtin_prefetch(keys_.data() + slots[ahead]);
+        }
+        if (control[old] != kEmpty) {
+          const std::uint64_t hash = keys_[slots[old]].Hash();
           Place(FirstEmpty(hash), Tag(hash), slots[old]);
         }
       }
