@@ -97,7 +97,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false # the action configures git with the Claude App token itself
-      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           pixi-version: v0.81.0
           environments: default
@@ -107,7 +107,7 @@ jobs:
           cache-write: false # only CI on main writes caches
       - name: Install the lint environment (pixi run lint, fmt and check)
         run: pixi install --locked -e lint
-      - uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      - uses: anthropics/claude-code-action@aa8a7738e48bf30a40ee499ce818bef081c5ab5e # v1.0.257
         with:
           # A repository secret, not an environment secret: review events run this job on the PR's merge ref, and an
           # environment that PR refs may use protects nothing. The gate above refuses forks and outsiders.
