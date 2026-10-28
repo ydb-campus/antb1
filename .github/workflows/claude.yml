@@ -12,7 +12,8 @@
 #   - every event value reaches the shell through `env:`, never through `${{ }}` inside `run:`.
 # Not a sandbox: `pixi run build`/`test` execute the branch's code with this job's credentials, which is why the gate
 # requires write access for the author as well as the sender.
-# Requirements: the Claude GitHub App is installed on the repository, the CLAUDE_CODE_OAUTH_TOKEN secret exists and
+# Billed as API usage through the ANTHROPIC_API_KEY secret (a key in a spend-capped Console workspace).
+# Requirements: the Claude GitHub App is installed on the repository, the ANTHROPIC_API_KEY secret exists and
 # this file is on the default branch (the token exchange fails with workflow_not_found_on_default_branch otherwise).
 name: Claude
 
@@ -62,7 +63,7 @@ jobs:
           AUTHOR_TYPE: ${{ github.event.issue.user.type || github.event.pull_request.user.type }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
-          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+          HAS_TOKEN: ${{ secrets.ANTHROPIC_API_KEY != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
         run: |
           require_write() {
             local perm
@@ -89,7 +90,7 @@ jobs:
             fi
           fi
           if [ "$HAS_TOKEN" != true ]; then
-            echo "::error::the CLAUDE_CODE_OAUTH_TOKEN secret is not set (docs/agents.md, Claude GitHub App and token)"
+            echo "::error::the ANTHROPIC_API_KEY secret is not set (docs/agents.md, Claude GitHub App and API key)"
             exit 1
           fi
           echo "gate: OK (sender $SENDER, author $AUTHOR)"
@@ -111,7 +112,7 @@ jobs:
         with:
           # A repository secret, not an environment secret: review events run this job on the PR's merge ref, and an
           # environment that PR refs may use protects nothing. The gate above refuses forks and outsiders.
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
           use_sticky_comment: true
           additional_permissions: |
             actions: read
