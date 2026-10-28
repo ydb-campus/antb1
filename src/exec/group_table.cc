@@ -592,6 +592,13 @@ arrow::Status GroupTable::Account() {
   return memory_.Resize(bytes);
 }
 
+arrow::Status GroupTable::CheckFinalize() const {
+  for (const auto& state : states_) {
+    ARROW_RETURN_NOT_OK(state->CheckFinalize());
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> GroupTable::NextChunk(
     const std::shared_ptr<arrow::Schema>& schema) {
   ANTB1_CHECK(keep_first_keys_ || keys_.empty());

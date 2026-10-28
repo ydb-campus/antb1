@@ -434,6 +434,11 @@ arrow::Result<Batch> PartGroupAggregateOperator::Next() {
     merged_ = true;
     scheduler_.reset();
     PartsDone();
+    // Every partition's finalize errors before the first row: BuildRows builds the partitions
+    // lazily, as many at a time as threads, and a LIMIT may stop before the failing one.
+    for (const auto& table : tables_) {
+      ARROW_RETURN_NOT_OK(table->CheckFinalize());
+    }
     rows_.assign(tables_.size(), {});
     if (profile() != nullptr) {
       int64_t groups = 0;
@@ -865,6 +870,10 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   if (global_) {
     ARROW_RETURN_NOT_OK(heavy_table_->EnsureGroup());
   }
+  // The light groups are finalized in Outer; the heavy ones only after every light row, which a
+  // LIMIT may never read. No call TwoLevelAggregation accepts can fail today (its sums are of exact
+  // integers), so this guards a wider rule.
+  ARROW_RETURN_NOT_OK(heavy_table_->CheckFinalize());
   if (profile() != nullptr) {
     profile()->Add("groups", MetricUnit::kCount, light + heavy_table_->num_groups());
     profile()->Add("heavy_groups", MetricUnit::kCount, heavy_table_->num_groups());

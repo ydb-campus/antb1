@@ -1106,6 +1106,49 @@ TEST_F(PartOperatorsTest, PartitionMergeErrors) {
   EXPECT_TRUE((*op)->Next().status().IsInvalid());
 }
 
+// A group sum outside the 38-digit range fails the query even when a LIMIT reads only the first
+// partition's rows: the failing group is in partition 1 to 3, built at once on 4 threads but never
+// on one thread if the partitions were built only as the consumer reaches them.
+TEST_F(PartOperatorsTest, GroupRangeErrorsDoNotDependOnALimit) {
+  const auto pool = Pool();
+  const auto partition_of = [](int64_t key) {
+    const arrow::compute::ExecBatch batch({arrow::Datum(Int64s({key}))}, 1);
+    const auto hashes = KeyHashes(batch);
+    EXPECT_TRUE(hashes.ok()) << hashes.status().ToString();
+    return (*hashes)[0] & (GroupTable::kPartitions - 1);
+  };
+  int64_t failing = 0;
+  while (partition_of(failing) == 0 || partition_of(failing) >= kThreads) {
+    ++failing;
+  }
+  ASSERT_EQ(partition_of(3), 0U);  // the golden of PartitionsFollowTheKeyHash
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("h", arrow::decimal128(38, 0))});
+  arrow::RecordBatchVector batches;
+  for (int part = 0; part < 2; ++part) {
+    arrow::Decimal128Builder h(arrow::decimal128(38, 0));
+    ASSERT_TRUE(h.Append(arrow::Decimal128("60000000000000000000000000000000000000")).ok());
+    ASSERT_TRUE(h.Append(arrow::Decimal128(1)).ok());
+    batches.push_back(
+        arrow::RecordBatch::Make(schema, 2, {Int64s({failing, 3}), h.Finish().ValueOrDie()}));
+  }
+  const auto table = std::make_shared<MemoryTable>(schema, batches, /*split=*/true);
+  const auto aggregate = Node(plan::GroupAggregateNode{
+      .input = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
+      .keys = {Column(0, "k", LogicalType::kBigInt)},
+      .aggregates = {{.kind = plan::AggKind::kSum,
+                      .arg = Column(1, "h", LogicalType::kHugeInt),
+                      .type = LogicalType::kHugeInt}}});
+  const auto plan = PlanOf(Node(plan::LimitNode{.input = aggregate, .limit = 1}), 2);
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto result = Run(plan, executor);
+    EXPECT_TRUE(result.status().IsExecutionError())
+        << (executor == nullptr ? "1 thread: " : "4 threads: ") << result.status().ToString();
+  }
+}
+
 // A merge failure (a HUGEINT sum overflowing when part 1 merges into part 0) and a failed read of
 // part i: the query reports the earlier part's failure, the same on any number of threads.
 TEST_F(PartOperatorsTest, MergeAndReadFailuresFollowPartOrder) {

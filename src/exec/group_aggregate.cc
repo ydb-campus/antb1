@@ -76,6 +76,8 @@ arrow::Result<Batch> GroupAggregateOperator::Next() {
       }
     }
     done_ = true;
+    // Every group's finalize errors before the first chunk, which a LIMIT may stop after.
+    ARROW_RETURN_NOT_OK(table_->CheckFinalize());
   }
   // Chunks of new groups, joined (GroupTable::NextChunk): their keys as first seen, the aggregates
   // of those groups.

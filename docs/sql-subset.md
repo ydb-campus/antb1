@@ -900,7 +900,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - SUM: over integer columns it accumulates in 128 bits and returns HUGEINT (decimal128(38, 0)), exactly like
   DuckDB, so it never overflows or wraps; Arrow's 64-bit `sum` kernel is never used. A result outside HUGEINT's
   range is an execution error (divergence D9); no column is HUGEINT, so only a `SUM` of a HUGEINT expression (one
-  with an integer literal beyond BIGINT) or arithmetic on a `SUM` can reach it.
+  with an integer literal beyond BIGINT) or arithmetic on a `SUM` can reach it. Every group's result is checked
+  before the first row comes out, so a `LIMIT` that reads only some groups still fails the query, on any number of
+  threads (likewise for DECIMAL, D18).
   Over DOUBLE it returns DOUBLE: it adds each row group's values (of each group), then the row group sums in order
   (the same for any number of threads; see Execution below). DOUBLE `AVG` sums the same way.
 - AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so

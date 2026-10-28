@@ -535,6 +535,34 @@ TEST_F(GroupedAggregateTest, HugeIntSumIsCheckedAgainstTheRange) {
       sum->Consume(huge_ints({big, "2"}).get(), kBoth).ok());  // 10^38 + 1: fits in 128 bits
   const auto result = sum->Finalize(arrow::default_memory_pool());
   EXPECT_TRUE(result.status().IsExecutionError()) << result.status().ToString();
+  EXPECT_EQ(sum->CheckFinalize().ToString(), result.status().ToString());
+  // The same sums as an AVG, a DECIMAL(38, 2) SUM, and a group without values.
+  auto avg = MakeGrouped(
+      {.kind = AggKind::kAvg, .input = LogicalType::kHugeInt, .result = LogicalType::kDouble});
+  avg->Resize(2);
+  ASSERT_TRUE(avg->Consume(huge_ints({big, "2"}).get(), kBoth).ok());
+  EXPECT_TRUE(avg->CheckFinalize().ok());
+  const LogicalType wide_decimal = LogicalType::Decimal(LogicalType::kMaxDecimalWidth, 2);
+  auto decimal =
+      MakeGrouped({.kind = AggKind::kSum, .input = wide_decimal, .result = wide_decimal});
+  decimal->Resize(2);
+  ASSERT_TRUE(decimal->Consume(testing::Decimals(wide_decimal, {big}).get(), kFirst).ok());
+  EXPECT_TRUE(decimal->CheckFinalize().ok()) << "10^38 - 1 and an empty group are in range";
+  ASSERT_TRUE(decimal->Consume(testing::Decimals(wide_decimal, {"1"}).get(), kFirst).ok());
+  const auto decimal_result = decimal->Finalize(arrow::default_memory_pool());
+  EXPECT_TRUE(decimal_result.status().IsExecutionError()) << decimal_result.status().ToString();
+  EXPECT_EQ(decimal->CheckFinalize().ToString(), decimal_result.status().ToString());
+  // A SUM of counts past BIGINT, which only CheckFinalize and Finalize report.
+  auto counts = MakeGrouped(
+      {.kind = AggKind::kSumCounts, .input = LogicalType::kBigInt, .result = LogicalType::kBigInt});
+  counts->Resize(1);
+  const auto most = testing::Int64s({std::numeric_limits<std::int64_t>::max()});
+  ASSERT_TRUE(counts->Consume(most.get(), kFirst).ok());
+  EXPECT_TRUE(counts->CheckFinalize().ok());
+  ASSERT_TRUE(counts->Consume(most.get(), kFirst).ok());
+  const auto counts_result = counts->Finalize(arrow::default_memory_pool());
+  EXPECT_TRUE(counts_result.status().IsInvalid()) << counts_result.status().ToString();
+  EXPECT_EQ(counts->CheckFinalize().ToString(), counts_result.status().ToString());
   auto wide = MakeGrouped(call);
   wide->Resize(1);
   EXPECT_TRUE(wide->Consume(huge_ints({big, big}).get(), kBoth).IsExecutionError());
@@ -723,6 +751,40 @@ TEST_F(GroupedAggregateTest, EmitsOneBatchPerChunkOfNewGroups) {
     std::ranges::sort(lines);
     EXPECT_EQ(lines, (std::vector<std::string>{"1|3", "2|3", "3|1", "4|1"}));
   }
+}
+
+// A group sum outside its range fails the query at the first batch, though that batch is an earlier
+// chunk of groups: a LIMIT reading one batch must not hide it.
+TEST_F(GroupedAggregateTest, RangeErrorsFailBeforeTheFirstChunk) {
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("h", arrow::decimal128(38, 0))});
+  const auto key_count = static_cast<std::int64_t>(GroupTable::kMaxMergeChunk);
+  std::vector<std::optional<std::int64_t>> keys;
+  std::vector<std::optional<std::string>> values;
+  for (std::int64_t k = 0; k < key_count; ++k) {
+    keys.emplace_back(k);
+    values.emplace_back("1");
+  }
+  const auto first = arrow::RecordBatch::Make(
+      schema, key_count,
+      {testing::Int64s(keys), testing::Decimals(LogicalType::Decimal(38, 0), values)});
+  const std::string half = "60000000000000000000000000000000000000";
+  const auto second =
+      arrow::RecordBatch::Make(schema, 2,
+                               {testing::Int64s({key_count, key_count}),
+                                testing::Decimals(LogicalType::Decimal(38, 0), {half, half})});
+  GroupAggregateOperator op(
+      std::make_unique<ScriptedSource>(
+          schema, std::vector<Batch>{Batch{.data = first}, Batch{.data = second}}),
+      {Column(0, "k", LogicalType::kBigInt)},
+      {plan::AggregateCall{.kind = AggKind::kSum,
+                           .arg = Column(1, "h", LogicalType::Decimal(38, 0)),
+                           .type = LogicalType::Decimal(38, 0)}});
+  ExecContext ctx;
+  ASSERT_TRUE(op.Open(ctx).ok());
+  const auto batch = op.Next();
+  EXPECT_TRUE(batch.status().IsExecutionError()) << batch.status().ToString();
+  ASSERT_TRUE(op.Close().ok());
 }
 
 // Chunks whose keys are large are not joined past kMaxJoinedKeyBytes.

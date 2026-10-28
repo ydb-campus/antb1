@@ -64,6 +64,9 @@ class OuterGroups {
   arrow::Status EnsureGroup();
 
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
+  // OK when Rows would finalize every group's plain calls without an error; otherwise the first
+  // call's error (GroupedAggregateState::CheckFinalize).
+  [[nodiscard]] arrow::Status CheckFinalize() const;
   // The hash (KeyHashes) of each group's keys, in group order (with keys only).
   [[nodiscard]] arrow::Result<std::vector<std::uint64_t>> Hashes() const;
   // The groups `groups` (ascending, in [begin, end), end - begin at most

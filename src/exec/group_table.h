@@ -103,6 +103,9 @@ class GroupTable {
   arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
 
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
+  // OK when NextChunk would finalize every group without an error; otherwise the first call's error
+  // (GroupedAggregateState::CheckFinalize).
+  [[nodiscard]] arrow::Status CheckFinalize() const;
   // The next groups as one batch (the keys as first seen, then one column per call, in `schema`),
   // or nullptr after the last: a chunk of new groups, joined with the chunks after it up to
   // kMaxMergeChunk groups and kMaxJoinedKeyBytes of keys. Moves the keys out: call it after the
