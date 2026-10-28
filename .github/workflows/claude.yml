@@ -12,8 +12,7 @@
 #   - every event value reaches the shell through `env:`, never through `${{ }}` inside `run:`.
 # Not a sandbox: `pixi run build`/`test` execute the branch's code with this job's credentials, which is why the gate
 # requires write access for the author as well as the sender.
-# Billed as API usage through the ANTHROPIC_API_KEY secret (a key in a spend-capped Console workspace).
-# Requirements: the Claude GitHub App is installed on the repository, the ANTHROPIC_API_KEY secret exists and
+# Requirements: the Claude GitHub App is installed on the repository, the CLAUDE_CODE_OAUTH_TOKEN secret exists and
 # this file is on the default branch (the token exchange fails with workflow_not_found_on_default_branch otherwise).
 name: Claude
 
@@ -63,7 +62,7 @@ jobs:
           AUTHOR_TYPE: ${{ github.event.issue.user.type || github.event.pull_request.user.type }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           IS_PR: ${{ (github.event.issue.pull_request || github.event.pull_request) && 'true' || 'false' }}
-          HAS_TOKEN: ${{ secrets.ANTHROPIC_API_KEY != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
         run: |
           require_write() {
             local perm
@@ -90,7 +89,7 @@ jobs:
             fi
           fi
           if [ "$HAS_TOKEN" != true ]; then
-            echo "::error::the ANTHROPIC_API_KEY secret is not set (docs/agents.md, Claude GitHub App and API key)"
+            echo "::error::the CLAUDE_CODE_OAUTH_TOKEN secret is not set (docs/agents.md, Claude GitHub App and token)"
             exit 1
           fi
           echo "gate: OK (sender $SENDER, author $AUTHOR)"
@@ -108,12 +107,11 @@ jobs:
           cache-write: false # only CI on main writes caches
       - name: Install the lint environment (pixi run lint, fmt and check)
         run: pixi install --locked -e lint
-      - id: claude
-        uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+      - uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
         with:
           # A repository secret, not an environment secret: review events run this job on the PR's merge ref, and an
           # environment that PR refs may use protects nothing. The gate above refuses forks and outsiders.
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
           use_sticky_comment: true
           additional_permissions: |
             actions: read
@@ -123,66 +121,3 @@ jobs:
             --max-turns 100
             --settings '{"disableAllHooks":true}'
             --allowedTools "Bash(pixi run configure),Bash(pixi run build),Bash(pixi run test),Bash(pixi run ci),Bash(pixi run asan),Bash(pixi run lint),Bash(pixi run fmt),Bash(pixi run check),Bash(pixi run doctor),Bash(git status),Bash(git diff),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr checks *),Bash(gh run view *),Bash(gh run list *),Bash(gh issue view *)"
-      # The action hides Claude's output; on a failed run this step shows why (an API error such as an invalid key or
-      # no credit, or Claude's last message) in the job summary and the log. The API key itself is never printed.
-      - name: Report why Claude failed
-        if: failure() && steps.claude.outcome == 'failure'
-        env:
-          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
-        run: |
-          python3 - <<'PY'
-          import json, os, secrets
-
-          path = os.environ.get("EXECUTION_FILE", "")
-          lines = ["### Claude run failed", ""]
-          try:
-              with open(path, encoding="utf-8") as f:
-                  messages = json.load(f)
-          except (OSError, ValueError) as e:
-              messages = []
-              lines.append(f"No readable execution file ({type(e).__name__}): the action stopped before Claude ran.")
-          if not isinstance(messages, list):
-              messages = []
-
-
-          def clip(text, limit=2000):
-              text = str(text)
-              text = text if len(text) <= limit else text[:limit] + "..."
-              return text.replace("```", "'''")
-
-
-          # API errors arrive as an `error` field or as the text of the last assistant message ("API Error: ...").
-          errors = [clip(m["error"]) for m in messages if isinstance(m, dict) and m.get("error")]
-          texts = [
-              c.get("text")
-              for m in messages
-              if isinstance(m, dict) and m.get("type") == "assistant"
-              for c in ((m.get("message") or {}).get("content") or [])
-              if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
-          ]
-          result = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("type") == "result"), None)
-          if result is not None:
-              lines.append(
-                  f"Result: subtype `{result.get('subtype')}`, is_error `{result.get('is_error')}`, "
-                  f"turns {result.get('num_turns')}, cost (USD) {result.get('total_cost_usd')}"
-              )
-              if result.get("result"):
-                  errors.append(clip(result["result"]))
-              for key in ("errors", "api_error_status"):
-                  if result.get(key):
-                      errors.append(clip(f"{key}: {json.dumps(result[key])}"))
-          if errors:
-              lines += ["", "Errors:", "", "```text", *errors, "```"]
-          if texts:
-              lines += ["", "Claude's last message:", "", "```text", clip(texts[-1]), "```"]
-          if not errors and not texts and messages:
-              lines += ["", "No error text in the execution file. Its last entries:", "", "```text"]
-              lines += [clip(json.dumps(m), 500) for m in messages[-3:]]
-              lines.append("```")
-          report = "\n".join(lines) + "\n"
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write(report)
-          # Model and API text: workflow commands stay off while the report is printed.
-          token = secrets.token_hex(16)
-          print(f"::stop-commands::{token}\n{report}::{token}::", flush=True)
-          PY
