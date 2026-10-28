@@ -360,7 +360,7 @@ Local notes:
 | `@claude` run fails in its first step | the sender or the author lacks write access, the PR comes from a fork, or `ANTHROPIC_API_KEY` is not set; the error says which |
 | Claude review ends with a notice and no comments | `ANTHROPIC_API_KEY` is not set |
 | Claude workflows fail with `workflow_not_found_on_default_branch` | the workflow is not on `main` yet |
-| Claude workflows fail to authenticate or report no credit | `ANTHROPIC_API_KEY` was deleted or its workspace hit its spend limit or ran out of credit (a failed `@claude` run shows the API error in its job summary); rotate the key or check the Console |
+| Claude workflows fail to authenticate or report no credit | `ANTHROPIC_API_KEY` was deleted or its workspace hit its spend limit or ran out of credit; rotate the key or check the Console |
 | Codex audit ends with a notice and no comment | `OPENAI_API_KEY` is not set, or the base commit predates the prompt |
 | The audit did not re-run after adding `codex-review` | the label was already present; remove it and add it again |
 | `pixi.lock update` is skipped | the variable `BOT_CLIENT_ID` is not set |
