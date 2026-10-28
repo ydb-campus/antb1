@@ -15,9 +15,7 @@
 # prints Claude's last message and fails the job, so an unfinished review never looks like a clean one (a run in
 # which the action skipped Claude, as on a PR that changes this file, only warns).
 # The workflow token is read-only: comments are posted with the Claude GitHub App token (OIDC exchange).
-# Billed as API usage through the ANTHROPIC_API_KEY secret (a key in a spend-capped Console workspace), like
-# `@claude` (.github/workflows/claude.yml).
-# Requirements: the Claude GitHub App, the ANTHROPIC_API_KEY secret and this file on the default branch.
+# Requirements: the Claude GitHub App, the CLAUDE_CODE_OAUTH_TOKEN secret and this file on the default branch.
 name: Claude review
 
 on:
@@ -46,14 +44,14 @@ jobs:
       id-token: write # OIDC token exchanged for the Claude GitHub App token, which posts the comments
     steps:
       - id: token
-        name: Check that the ANTHROPIC_API_KEY secret exists
+        name: Check that the CLAUDE_CODE_OAUTH_TOKEN secret exists
         env:
-          HAS_TOKEN: ${{ secrets.ANTHROPIC_API_KEY != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }} # zizmor: ignore[secrets-outside-env] only a boolean
         run: |
           if [ "$HAS_TOKEN" = true ]; then
             echo "run=true" >>"$GITHUB_OUTPUT"
           else
-            echo "::notice::the ANTHROPIC_API_KEY secret is not set, so the Claude review is skipped (docs/agents.md)"
+            echo "::notice::the CLAUDE_CODE_OAUTH_TOKEN secret is not set, so the Claude review is skipped (docs/agents.md)"
             echo "run=false" >>"$GITHUB_OUTPUT"
           fi
       - if: steps.token.outputs.run == 'true'
@@ -67,7 +65,7 @@ jobs:
         with:
           # A repository secret, not an environment secret: this job runs on PR branches, and an environment that
           # PR branches may use protects nothing. Forks never get it (the job skips them and GitHub withholds it).
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }} # zizmor: ignore[secrets-outside-env]
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # zizmor: ignore[secrets-outside-env]
           allowed_bots: Copilot
           track_progress: true
           # Post each inline comment when Claude makes it; the prompt allows no test comments.

@@ -11,7 +11,7 @@ hardening is described in [docs/ci.md](ci.md).
 | Agent | Where it runs | Reads | Setup |
 | --- | --- | --- | --- |
 | Claude Code | your terminal; cloud sessions on claude.ai/code | CLAUDE.md, which imports AGENTS.md | [Claude Code cloud environment](#claude-code-cloud-environment) |
-| Claude in GitHub Actions | `@claude` on issues and PRs; one automatic review per PR | the same | [Claude GitHub App and API key](#claude-github-app-and-api-key) |
+| Claude in GitHub Actions | `@claude` on issues and PRs; one automatic review per PR | the same | [Claude GitHub App and token](#claude-github-app-and-token) |
 | Codex | Codex CLI; ChatGPT Codex cloud tasks; `@codex review` on PRs | AGENTS.md | [Codex](#codex) |
 | Codex harness audit | GitHub Actions, one audit per PR | base-commit prompt and AGENTS.md | [Codex harness audit and API key](#codex-harness-audit-and-api-key) |
 | Copilot | coding agent and code review on github.com | `.github/copilot-instructions.md`, AGENTS.md | [Copilot](#copilot) |
@@ -24,8 +24,8 @@ merge. They follow the workflow security rules in [docs/ci.md](ci.md).
 
 | Workflow | Triggers | What it does | Secret or variable |
 | --- | --- | --- | --- |
-| `Claude` ([claude.yml](../.github/workflows/claude.yml)) | `@claude` in an issue comment, PR comment, review or review comment; an issue opened with `@claude`; the issue label `claude` | Claude Code answers or works on the issue or PR, runs allowed tasks, pushes a branch and keeps one reply comment up to date | `ANTHROPIC_API_KEY` |
-| `Claude review` ([claude-review.yml](../.github/workflows/claude-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots except Copilot) | Claude applies the AGENTS.md Code Review Rules from the base branch to the diff: inline comments for P0/P1 problems and one summary comment per run (the action's progress comment, updated even when the run fails); the job summary and the log list denied tool calls | `ANTHROPIC_API_KEY` |
+| `Claude` ([claude.yml](../.github/workflows/claude.yml)) | `@claude` in an issue comment, PR comment, review or review comment; an issue opened with `@claude`; the issue label `claude` | Claude Code answers or works on the issue or PR, runs allowed tasks, pushes a branch and keeps one reply comment up to date | `CLAUDE_CODE_OAUTH_TOKEN` |
+| `Claude review` ([claude-review.yml](../.github/workflows/claude-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots except Copilot) | Claude applies the AGENTS.md Code Review Rules from the base branch to the diff: inline comments for P0/P1 problems and one summary comment per run (the action's progress comment, updated even when the run fails); the job summary and the log list denied tool calls | `CLAUDE_CODE_OAUTH_TOKEN` |
 | `Codex harness audit` ([codex-review.yml](../.github/workflows/codex-review.yml)) | PR opened, ready for review or reopened (same repository, not a draft, no bots); the label `codex-review` | Codex CLI 0.155.1, read-only and without sudo, checks the diff against the harness rules and posts one sticky comment | `OPENAI_API_KEY` |
 | `Copilot Setup Steps` ([copilot-setup-steps.yml](../.github/workflows/copilot-setup-steps.yml)) | before every Copilot coding-agent task; manual; PRs and pushes that change it, `pixi.toml` or `pixi.lock` | installs the locked `default` and `lint` environments and builds `build/dev` | none |
 | `pixi.lock update` ([pixi-lock-update.yml](../.github/workflows/pixi-lock-update.yml)) | Mondays 05:00 UTC; manual | `pixi update` with pixi 0.81.0, then a PR `build(deps): update pixi.lock` from antb1-bot | `BOT_CLIENT_ID` (variable), `BOT_PRIVATE_KEY` (environment `automation`) |
@@ -65,13 +65,13 @@ a separate job with only `pull-requests: write` posts its comment. The lock upda
   `pixi run tidy` are left to CI.
 - Claude's commits go through a PR, CI and a human approval like everyone else's; the Claude App cannot push to
   `main` or create a tag. Paths under "Ask a human first" in AGENTS.md still need a maintainer's agreement.
-- Every run is billed to the API workspace behind `ANTHROPIC_API_KEY`; keep requests focused.
+- Every run draws on the Claude subscription behind `CLAUDE_CODE_OAUTH_TOKEN`; keep requests focused.
 
 ## Setup order
 
 A repository admin does this once, in this order (the steps are detailed below):
 
-1. Install the Claude GitHub App and set `ANTHROPIC_API_KEY`.
+1. Install the Claude GitHub App and set `CLAUDE_CODE_OAUTH_TOKEN`.
 2. Create a spend-capped OpenAI project key and set `OPENAI_API_KEY`.
 3. After the AI workflows are on `main`: set up the Codex connection, cloud environment and review; the Claude Code
    cloud environment; and Copilot, if the organization has seats.
@@ -81,21 +81,31 @@ A repository admin does this once, in this order (the steps are detailed below):
 
 Each collaborator then completes the [per-person prerequisites](#per-person-prerequisites).
 
-## Claude GitHub App and API key
+## Claude GitHub App and token
 
 1. An organization owner opens <https://github.com/apps/claude>, chooses **Install** (or **Configure**), selects
    the `ydb-campus` organization, picks **Only select repositories**, selects `antb1` and confirms. Do not use
    `/install-github-app` in Claude Code for this: it opens a PR with its own workflow files, and ours already exist.
-2. In the Anthropic Console organization that pays for the automation, create a workspace with a monthly spend
-   limit and an API key in that workspace. Both Claude workflows are billed as API usage of that workspace.
-3. Store the key without echoing it to the terminal history:
+2. On a machine with Claude Code, the owner of the Claude subscription that pays for the automation runs
+   `claude setup-token`, signs in in the browser, and copies the printed token. It is valid for about one year.
+3. Store it without echoing it to the terminal history:
 
    ```bash
-   gh secret set ANTHROPIC_API_KEY -R ydb-campus/antb1   # paste the key at the prompt
+   gh secret set CLAUDE_CODE_OAUTH_TOKEN -R ydb-campus/antb1   # paste the token at the prompt
    ```
 
-4. Both Claude workflows work only once they are on `main`: before that (and on the PR that adds them) the token
+4. Put a renewal reminder in the calendar about 11 months ahead; renewal repeats steps 2 and 3. An expired token
+   makes both Claude workflows fail with an authentication error.
+5. Both Claude workflows work only once they are on `main`: before that (and on the PR that adds them) the token
    exchange fails with `workflow_not_found_on_default_branch`.
+
+One subscription serves all members' `@claude` requests and the automatic reviews. If its rate limits or policy
+become a problem, switch to API billing:
+
+1. Create an API key in the Anthropic Console, in a workspace with a spend limit.
+2. Store it with `gh secret set ANTHROPIC_API_KEY -R ydb-campus/antb1`.
+3. In both Claude workflows, replace the input `claude_code_oauth_token` with
+   `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}` (a `.github/` change, reviewed like any other).
 
 ## Claude Code cloud environment
 
@@ -284,7 +294,7 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
 
 | Name | Kind | Used by | Reachable from |
 | --- | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | repository secret | Claude, Claude review | workflows of this repository's events and same-repo branches; never fork PRs |
+| `CLAUDE_CODE_OAUTH_TOKEN` | repository secret | Claude, Claude review | workflows of this repository's events and same-repo branches; never fork PRs |
 | `OPENAI_API_KEY` | repository secret | Codex harness audit | the same |
 | `BOT_PRIVATE_KEY` | secret of the environment `automation` | pixi.lock update | only jobs that run on `main` and name the environment |
 | `BOT_CLIENT_ID` | repository variable (not secret) | pixi.lock update | any workflow; useless without the key |
@@ -293,9 +303,9 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
   forks need a maintainer's approval, and every AI job also skips fork PRs.
 - Anyone with write access can push a branch whose workflow change reads a repository secret in a PR run. That is
   inherent to repository secrets; the mitigations are that only organization members have write access,
-  `.github/` changes request review from the code owners, the OpenAI and Anthropic keys are spend-capped, and every
-  secret can be rotated in minutes. `BOT_PRIVATE_KEY` is out of reach for PR branches because the `automation`
-  environment deploys from `main` only.
+  `.github/` changes request review from the code owners, the OpenAI key is spend-capped, the Claude token only
+  draws on a subscription, and every secret can be rotated in minutes. `BOT_PRIVATE_KEY` is out of reach for PR
+  branches because the `automation` environment deploys from `main` only.
 - Prompt injection (instructions hidden in issues, PRs, comments or files) is handled in depth: `@claude` requires
   write access for both the sender and the author and refuses forks; the review workflows run only on same-repo,
   non-draft PRs; Claude runs with hooks disabled, a fixed tool allowlist and `.claude/` and CLAUDE.md restored from
@@ -327,8 +337,9 @@ no changes while the PR is still open, the PR is closed and its branch deleted.
 
 To rotate a secret (and immediately after any suspected leak):
 
-- `ANTHROPIC_API_KEY`: create a new key in the same Console workspace, store it with `gh secret set`, then delete
-  the old key in the Console and check the workspace's usage.
+- `CLAUDE_CODE_OAUTH_TOKEN`: run `claude setup-token` again and store the new token with
+  `gh secret set CLAUDE_CODE_OAUTH_TOKEN -R ydb-campus/antb1`. If the old token may have leaked, revoke it through
+  the Claude account that created it and watch that subscription's usage.
 - `OPENAI_API_KEY`: create a new key in the OpenAI project, store it with `gh secret set`, then delete the old key
   in the project and check the project's usage.
 - `BOT_PRIVATE_KEY`: generate a new private key on the App's page, store it with
@@ -357,10 +368,10 @@ Local notes:
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `@claude` run fails in its first step | the sender or the author lacks write access, the PR comes from a fork, or `ANTHROPIC_API_KEY` is not set; the error says which |
-| Claude review ends with a notice and no comments | `ANTHROPIC_API_KEY` is not set |
+| `@claude` run fails in its first step | the sender or the author lacks write access, the PR comes from a fork, or `CLAUDE_CODE_OAUTH_TOKEN` is not set; the error says which |
+| Claude review ends with a notice and no comments | `CLAUDE_CODE_OAUTH_TOKEN` is not set |
 | Claude workflows fail with `workflow_not_found_on_default_branch` | the workflow is not on `main` yet |
-| Claude workflows fail to authenticate or report no credit | `ANTHROPIC_API_KEY` was deleted or its workspace hit its spend limit or ran out of credit; rotate the key or check the Console |
+| Claude workflows fail to authenticate | `CLAUDE_CODE_OAUTH_TOKEN` expired or is missing; renew it |
 | Codex audit ends with a notice and no comment | `OPENAI_API_KEY` is not set, or the base commit predates the prompt |
 | The audit did not re-run after adding `codex-review` | the label was already present; remove it and add it again |
 | `pixi.lock update` is skipped | the variable `BOT_CLIENT_ID` is not set |
