@@ -487,9 +487,13 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     }
     return HugeInts(sums, counts, SumType(), pool);
   }
-  // CheckFinalize of FinalizeAs(average, ...) over every group: only a SUM can fail.
+  // CheckFinalize of FinalizeAs(average, ...) over every group: only a SUM can fail, and only of
+  // values beyond 18 digits (fewer than 2^63 values below 10^18 sum to less than 10^37), so the
+  // pass over every group is skipped for the narrow decimals that most sums are of.
   [[nodiscard]] arrow::Status CheckAs(bool average) const {
-    return average ? arrow::Status::OK() : CheckSumRange(sums_, counts_, SumType());
+    const bool narrow = input_ == plan::LogicalType::kDecimal &&
+                        input_.width() <= plan::LogicalType::kMaxNarrowDecimalWidth;
+    return average || narrow ? arrow::Status::OK() : CheckSumRange(sums_, counts_, SumType());
   }
 
  private:
