@@ -199,7 +199,15 @@ class FixedTable {
     }
     const std::size_t estimate = std::min(first_groups_ * rows / hits * 9 / 8,
                                           static_cast<std::size_t>(num_groups()) * kMaxGrowth);
-    return estimate > num_groups() ? MakeRoom(estimate - num_groups()) : arrow::Status::OK();
+    if (estimate <= num_groups()) {
+      return arrow::Status::OK();
+    }
+    // The reservation is a guess about rows to come, so a budget that refuses it (or a size past
+    // kMaxCapacity) does not fail the table: it keeps growing as it would without the estimate.
+    // MakeRoom charges each allocation before making it, so a refusal leaves a whole table: at most
+    // its slots have grown, and its groups and ids are untouched.
+    const arrow::Status reserved = MakeRoom(estimate - num_groups());
+    return reserved.IsOutOfMemory() || reserved.IsCapacityError() ? arrow::Status::OK() : reserved;
   }
 
   struct Hash32Slot {

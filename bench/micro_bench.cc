@@ -820,6 +820,31 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, 
   if (budget.bytes_allocated() <= 0) {
     return "nothing was charged to the budget";
   }
+  // The estimate fails small on memory too: under a budget that holds only what the first two
+  // batches need without an estimate, its reservation is refused and the table carries on with the
+  // same groups.
+  if (options.estimate && !presized && batches.size() >= 2) {
+    step0::TableOptions plain = options;
+    plain.estimate = false;
+    exec::MemoryBudget open(std::nullopt);
+    step0::FixedTable<Key, kSlots> grown(&open, plain);
+    for (std::size_t b = 0; b < 2; ++b) {
+      if (auto status = Step0Consume(grown, *batches[b], ids.data()); !status.ok()) {
+        return status.ToString();
+      }
+    }
+    exec::MemoryBudget tight(open.max_memory() + (open.max_memory() / 8));
+    step0::FixedTable<Key, kSlots> sized(&tight, options);
+    for (std::size_t b = 0; b < 2; ++b) {
+      if (auto status = Step0Consume(sized, *batches[b], ids.data()); !status.ok()) {
+        return "under a tight budget the estimate failed the table: " + status.ToString();
+      }
+    }
+    if (sized.num_groups() != grown.num_groups()) {
+      return "under a tight budget: " + std::to_string(sized.num_groups()) + " groups for " +
+             std::to_string(grown.num_groups());
+    }
+  }
   return {};
 }
 
