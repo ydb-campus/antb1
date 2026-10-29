@@ -898,67 +898,41 @@ void Step0Keys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
                                                         benchmark::Counter::kInvert);
 }
 
-// BM_S0<shape>_<slots>[_Presized | _Estimate][_Random]: the chunked loop (a room check and a hash
-// pass per 256 rows, then the probes, prefetching the buckets of the row 8 places on) at load 7/8.
-// Indirect: the id alone in a 4-byte slot, re-placed in id order on growth; IndirectSlotOrder: the
-// same slot, re-placed in slot order with each hash recomputed from its key; Hash32: 32 hash bits
-// beside the id in an 8-byte slot, re-placed in slot order. Presized: every group reserved before
-// the first row, the floor growth can reach (a diagnostic: the engine may size a table only from
-// its own data). Estimate: sized after the second batch from the table's own rows
-// (step0::FixedTable::Estimate). Random: ids that repeat at random (GroupIds::kRandom), compared
-// with BM_Group<shape>BudgetRandom; the others use the permutation, where no id repeats early and
-// Estimate must leave the table alone. Step 0's runs also measured a per-row loop, the key or a
-// 64-bit hash in the slot, prefetch distances of 16 and 32, load 1/2 and 4x growth; each lost to
-// these on the Xeon host.
+// BM_S0<shape>_<growth>_<Estimate | Presized>[_Random]: the chunked loop step 0 chose (a room
+// check and a hash pass per 256 rows, then the probes, prefetching the buckets of the row 8 places
+// on) at load 7/8, with the group id alone in a 4-byte slot. Indirect grows by re-placing the
+// groups in id order, IndirectSlotOrder by walking its old slots in order and rehashing each key.
+// Estimate: sized after the second batch from the table's own rows (step0::FixedTable::Estimate).
+// Presized: every group reserved before the first row, the floor growth can reach (a diagnostic:
+// the engine may size a table only from its own data). Random: ids that repeat at random
+// (GroupIds::kRandom), compared with BM_Group<shape>BudgetRandom; the others use the permutation,
+// where no id repeats early and the estimate must leave the table alone. The variants step 0
+// measured and dropped (a per-row loop, 8 to 24-byte slots, other prefetch distances, load factors
+// and growth factors) are in the history of PR #253.
 #define ANTB1_STEP0(name, Key, shape, slots, presized, ids, ...)                           \
   void BM_S0##name(benchmark::State& state) {                                              \
     Step0Keys<step0::Key, step0::Slots::slots>(state, GroupShape::shape, GroupIds::ids,    \
                                                step0::TableOptions __VA_ARGS__, presized); \
   }
-ANTB1_STEP0(Int64_Indirect, Int64Key, kInt64, kIndirect, false, kPermutation, {})
-ANTB1_STEP0(Int64_IndirectSlotOrder, Int64Key, kInt64, kIndirectSlotOrder, false, kPermutation, {})
-ANTB1_STEP0(Int64_Hash32, Int64Key, kInt64, kHash32, false, kPermutation, {})
 ANTB1_STEP0(Int64_Indirect_Presized, Int64Key, kInt64, kIndirect, true, kPermutation, {})
-ANTB1_STEP0(Int64_Hash32_Presized, Int64Key, kInt64, kHash32, true, kPermutation, {})
 ANTB1_STEP0(Int64_Indirect_Estimate, Int64Key, kInt64, kIndirect, false, kPermutation,
             {.estimate = true})
 ANTB1_STEP0(Int64_IndirectSlotOrder_Estimate, Int64Key, kInt64, kIndirectSlotOrder, false,
             kPermutation, {.estimate = true})
-ANTB1_STEP0(Int64_Hash32_Estimate, Int64Key, kInt64, kHash32, false, kPermutation,
-            {.estimate = true})
-ANTB1_STEP0(Int64_Indirect_Random, Int64Key, kInt64, kIndirect, false, kRandom, {})
-ANTB1_STEP0(Int64_IndirectSlotOrder_Random, Int64Key, kInt64, kIndirectSlotOrder, false, kRandom,
-            {})
-ANTB1_STEP0(Int64_Hash32_Random, Int64Key, kInt64, kHash32, false, kRandom, {})
 ANTB1_STEP0(Int64_Indirect_Estimate_Random, Int64Key, kInt64, kIndirect, false, kRandom,
             {.estimate = true})
 ANTB1_STEP0(Int64_IndirectSlotOrder_Estimate_Random, Int64Key, kInt64, kIndirectSlotOrder, false,
             kRandom, {.estimate = true})
-ANTB1_STEP0(Int64_Hash32_Estimate_Random, Int64Key, kInt64, kHash32, false, kRandom,
-            {.estimate = true})
-ANTB1_STEP0(Int64Int32_Indirect, Int64Int32Key, kInt64Int32, kIndirect, false, kPermutation, {})
-ANTB1_STEP0(Int64Int32_IndirectSlotOrder, Int64Int32Key, kInt64Int32, kIndirectSlotOrder, false,
-            kPermutation, {})
-ANTB1_STEP0(Int64Int32_Hash32, Int64Int32Key, kInt64Int32, kHash32, false, kPermutation, {})
 ANTB1_STEP0(Int64Int32_Indirect_Presized, Int64Int32Key, kInt64Int32, kIndirect, true, kPermutation,
             {})
-ANTB1_STEP0(Int64Int32_Hash32_Presized, Int64Int32Key, kInt64Int32, kHash32, true, kPermutation, {})
 ANTB1_STEP0(Int64Int32_Indirect_Estimate, Int64Int32Key, kInt64Int32, kIndirect, false,
             kPermutation, {.estimate = true})
 ANTB1_STEP0(Int64Int32_IndirectSlotOrder_Estimate, Int64Int32Key, kInt64Int32, kIndirectSlotOrder,
             false, kPermutation, {.estimate = true})
-ANTB1_STEP0(Int64Int32_Hash32_Estimate, Int64Int32Key, kInt64Int32, kHash32, false, kPermutation,
-            {.estimate = true})
-ANTB1_STEP0(Int64Int32_Indirect_Random, Int64Int32Key, kInt64Int32, kIndirect, false, kRandom, {})
-ANTB1_STEP0(Int64Int32_IndirectSlotOrder_Random, Int64Int32Key, kInt64Int32, kIndirectSlotOrder,
-            false, kRandom, {})
-ANTB1_STEP0(Int64Int32_Hash32_Random, Int64Int32Key, kInt64Int32, kHash32, false, kRandom, {})
 ANTB1_STEP0(Int64Int32_Indirect_Estimate_Random, Int64Int32Key, kInt64Int32, kIndirect, false,
             kRandom, {.estimate = true})
 ANTB1_STEP0(Int64Int32_IndirectSlotOrder_Estimate_Random, Int64Int32Key, kInt64Int32,
             kIndirectSlotOrder, false, kRandom, {.estimate = true})
-ANTB1_STEP0(Int64Int32_Hash32_Estimate_Random, Int64Int32Key, kInt64Int32, kHash32, false, kRandom,
-            {.estimate = true})
 #undef ANTB1_STEP0
 
 // The gate's counts (1000 to 1 Mi: cached to past cache) with 4 Mi (about one row a group) and 16
@@ -983,39 +957,19 @@ BENCHMARK(BM_GroupInt64Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond
 BENCHMARK(BM_GroupInt64Int32Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64Int32BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_IndirectSlotOrder)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_IndirectSlotOrder_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Hash32_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Indirect_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_IndirectSlotOrder_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Hash32_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_Indirect_Estimate_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64_IndirectSlotOrder_Estimate_Random)
     ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Hash32_Estimate_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Indirect)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Hash32)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Hash32_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Estimate)
     ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Hash32_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Indirect_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Random)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Hash32_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_Indirect_Estimate_Random)
     ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Hash32_Estimate_Random)
     ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_STEP0_COUNTS
 

@@ -1,7 +1,8 @@
 // Step 0 of the GROUP BY key tables (follow-up of docs/adr/0019-own-aggregation-hash-table.md):
-// candidate loops that number fixed-width keys, benchmarked in micro_bench.cc against
-// arrow::compute::Grouper on the same inputs. Not engine code: the tables here only turn key rows
-// into dense first-seen group ids, without NULLs, and exist to decide which loop step 1 builds.
+// the loop that numbers fixed-width keys which step 0 chose, benchmarked in micro_bench.cc against
+// arrow::compute::Grouper on the same inputs (PR #253 holds the measurements and the variants that
+// lost). Not engine code: the table only turns key rows into dense first-seen group ids, without
+// NULLs; step 1 builds the engine's table from it and replaces this file.
 //
 // What they share: a fixed-seed one-multiply hash (foldhash's fast tier), 7-bit tags matched eight
 // at a time in a 64-bit word (SWAR), control bytes whose first eight are mirrored past the end so
@@ -10,8 +11,8 @@
 // MemoryBudget before it is allocated, never per insert. The loop works a chunk of rows at a time:
 // one room check, one pass that hashes the chunk, then the probes, each prefetching the buckets of
 // the row a few places on (a loop of one row at a time with a room check per row, DataFusion's
-// shape, lost to it). What varies is the slot (Slots below); TableOptions holds the prefetch
-// distance and the load factor at which the table doubles.
+// shape, lost to it). What varies is how the table grows (Slots below); TableOptions holds the
+// prefetch distance, the load factor at which the table doubles, and the size estimate.
 
 #pragma once
 
@@ -21,7 +22,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <type_traits>
 #include <vector>
 
 #include <arrow/status.h>
@@ -100,16 +100,18 @@ struct ControlGroup {
   std::uint64_t word;
 };
 
-// What a slot holds beside the control byte, and how the table grows:
-//   - kIndirect: the group id alone (4 bytes), the key then read from the id-ordered key array;
-//     growth re-places the groups in id order, so its writes land at random in the new slots.
-//   - kIndirectSlotOrder: the same slot, but growth walks the old slots in order and recomputes
-//     each hash from its key: the key reads are random (and prefetched), the writes stream, since
-//     a group's new position is its old home or that plus the old capacity.
-//   - kHash32: 32 bits of the hash beside the id (8 bytes), which a probe compares before reading
-//     the key and growth reads instead of the key, walking the old slots in order.
-// Step 0 also measured the key beside the id and the whole 64-bit hash beside it; both lost.
-enum class Slots : std::uint8_t { kIndirect, kIndirectSlotOrder, kHash32 };
+// A slot holds the group id alone (4 bytes); a probe reads the key from the id-ordered key array.
+// How the table grows:
+//   - kIndirect: it re-places the groups in id order, so its writes land at random in the new
+//   slots;
+//   - kIndirectSlotOrder: it walks the old slots in order and recomputes each hash from its key, so
+//     the key reads are random (and prefetched) but the writes stream, since a group's new position
+//     is its old home or that plus the old capacity.
+// Neither changes an id. On a Xeon id order fell below arrow's grouper at 4 Mi groups when ids
+// never repeat early, and on an M4 Pro it was 10-48% faster from 256 Ki groups up. Step 0 also
+// measured the key, a 32-bit or the whole 64-bit hash beside the id (8 to 24-byte slots); each lost
+// (PR #253).
+enum class Slots : std::uint8_t { kIndirect, kIndirectSlotOrder };
 
 struct TableOptions {
   std::size_t load_num = 7;  // the share of slots filled before the table doubles
@@ -124,8 +126,8 @@ class FixedTable {
  public:
   static constexpr std::uint8_t kEmpty = 0x80;
   static constexpr std::size_t kChunk = 256;  // rows per room check and hash pass
-  // Positions come from hash bits 32 and up and tags from bits 57 to 63, so a 32-bit stored hash
-  // rebuilds both; the two stay apart up to 2^25 slots.
+  // Positions come from hash bits 32 and up and tags from bits 57 to 63: the two stay apart up to
+  // 2^25 slots.
   static constexpr std::size_t kMaxCapacity = std::size_t{1} << 25U;
 
   FixedTable(exec::MemoryBudget* budget, TableOptions options) : options_(options) {
@@ -210,31 +212,13 @@ class FixedTable {
     return reserved.IsOutOfMemory() || reserved.IsCapacityError() ? arrow::Status::OK() : reserved;
   }
 
-  struct Hash32Slot {
-    std::uint32_t hash;  // bits 32 to 63 of the hash
-    std::uint32_t group;
-  };
-  using Slot = std::conditional_t<kSlots == Slots::kHash32, Hash32Slot, std::uint32_t>;
-  static constexpr bool kStoresHash = kSlots == Slots::kHash32;
-  static constexpr bool kGrowsInSlotOrder = kSlots != Slots::kIndirect;
+  using Slot = std::uint32_t;                     // the group id
   static constexpr std::size_t kRehashAhead = 8;  // how far ahead slot-order growth prefetches keys
 
   [[nodiscard]] std::size_t Position(std::uint64_t hash) const {
     return static_cast<std::size_t>(hash >> 32U) & mask_;
   }
   static std::uint8_t Tag(std::uint64_t hash) { return static_cast<std::uint8_t>(hash >> 57U); }
-
-  static Slot MakeSlot(std::uint64_t hash, std::uint32_t group) {
-    if constexpr (kStoresHash) {
-      return Hash32Slot{static_cast<std::uint32_t>(hash >> 32U), group};
-    } else {
-      return group;
-    }
-  }
-  // The hash a slot keeps, as far as positions and tags need it.
-  static std::uint64_t StoredHash(const Slot& slot) {
-    return static_cast<std::uint64_t>(slot.hash) << 32U;
-  }
 
   // The bytes the table holds with `capacity` slots and room for `keys` keys.
   [[nodiscard]] static std::int64_t BytesFor(std::size_t capacity, std::size_t keys) {
@@ -278,15 +262,8 @@ class FixedTable {
     capacity_ = capacity;
     mask_ = capacity - 1;
     grow_at_ = capacity * options_.load_num / options_.load_den;
-    if constexpr (kStoresHash) {
+    if constexpr (kSlots == Slots::kIndirectSlotOrder) {
       for (std::size_t old = 0; old < old_capacity; ++old) {  // `control` and `slots` are the old
-        if (control[old] != kEmpty) {
-          const std::uint64_t hash = StoredHash(slots[old]);
-          Place(FirstEmpty(hash), Tag(hash), slots[old]);
-        }
-      }
-    } else if constexpr (kGrowsInSlotOrder) {
-      for (std::size_t old = 0; old < old_capacity; ++old) {
         if (const std::size_t ahead = old + kRehashAhead;
             ahead < old_capacity && control[ahead] != kEmpty) {
           __builtin_prefetch(keys_.data() + slots[ahead]);
@@ -300,7 +277,7 @@ class FixedTable {
       for (std::uint32_t group = 0; group < keys_.size(); ++group) {
         const Key& key = keys_[group];
         const std::uint64_t hash = key.Hash();
-        Place(FirstEmpty(hash), Tag(hash), MakeSlot(hash, group));
+        Place(FirstEmpty(hash), Tag(hash), group);
       }
     }
     control.clear();
@@ -321,28 +298,16 @@ class FixedTable {
     }
   }
 
-  void Place(std::size_t slot, std::uint8_t tag, const Slot& value) {
+  void Place(std::size_t slot, std::uint8_t tag, Slot group) {
     control_[slot] = tag;
     if (slot < ControlGroup::kWidth) {
       control_[capacity_ + slot] = tag;  // the mirror an unaligned load past the end reads
     }
-    slots_[slot] = value;
+    slots_[slot] = group;
   }
 
-  [[nodiscard]] bool Holds(std::size_t slot, const Key& key, std::uint64_t hash) const {
-    if constexpr (kStoresHash) {
-      return slots_[slot].hash == static_cast<std::uint32_t>(hash >> 32U) &&
-             keys_[slots_[slot].group] == key;
-    } else {
-      return keys_[slots_[slot]] == key;
-    }
-  }
-  [[nodiscard]] std::uint32_t GroupAt(std::size_t slot) const {
-    if constexpr (kStoresHash) {
-      return slots_[slot].group;
-    } else {
-      return slots_[slot];
-    }
+  [[nodiscard]] bool Holds(std::size_t slot, const Key& key) const {
+    return keys_[slots_[slot]] == key;
   }
 
   // The group of `key`, inserted as the next id when it is new; MakeRoom has made room.
@@ -353,14 +318,14 @@ class FixedTable {
       const ControlGroup group = ControlGroup::Load(control_.data() + pos);
       for (std::uint64_t match = group.Match(tag); match != 0; match &= match - 1) {
         const std::size_t slot = (pos + ControlGroup::Index(match)) & mask_;
-        if (Holds(slot, key, hash)) {
-          return GroupAt(slot);
+        if (Holds(slot, key)) {
+          return slots_[slot];
         }
       }
       if (const std::uint64_t empty = group.MatchEmpty(); empty != 0) {
         const auto id = static_cast<std::uint32_t>(keys_.size());
         keys_.push_back(key);  // within the reserved capacity
-        Place((pos + ControlGroup::Index(empty)) & mask_, tag, MakeSlot(hash, id));
+        Place((pos + ControlGroup::Index(empty)) & mask_, tag, id);
         return id;
       }
       pos = (pos + stride) & mask_;
