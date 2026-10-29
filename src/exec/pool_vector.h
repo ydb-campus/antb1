@@ -83,8 +83,9 @@ class PoolVector {
       return arrow::Status::OutOfMemory("an array of ", n, " values");
     }
     const auto bytes = static_cast<std::int64_t>(n * sizeof(T));
-    if (buffer_ == nullptr) {
-      ARROW_ASSIGN_OR_RAISE(buffer_, arrow::AllocateResizableBuffer(0, pool_));
+    if (buffer_ == nullptr) {  // one allocation, not an empty buffer and then its growth
+      ARROW_ASSIGN_OR_RAISE(buffer_, arrow::AllocateResizableBuffer(bytes, pool_));
+      return arrow::Status::OK();
     }
     return buffer_->Reserve(bytes);
   }

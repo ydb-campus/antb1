@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -39,7 +41,8 @@ using testing::Column;
 using testing::Int32s;
 using testing::Int64s;
 
-constexpr std::array kKinds = {KeyTableKind::kGrouper};
+constexpr std::array kKinds = {KeyTableKind::kGrouper, KeyTableKind::kFixed,
+                               KeyTableKind::kFixedIdOrder};
 
 std::string_view KindName(KeyTableKind kind) {
   switch (kind) {
@@ -47,6 +50,10 @@ std::string_view KindName(KeyTableKind kind) {
       return "Auto";
     case KeyTableKind::kGrouper:
       return "Grouper";
+    case KeyTableKind::kFixed:
+      return "Fixed";
+    case KeyTableKind::kFixedIdOrder:
+      return "FixedIdOrder";
   }
   return "Unknown";
 }
@@ -402,6 +409,56 @@ TEST_P(KeyTableTest, ManyGroupsInOneCallAndAcrossCalls) {
   Check({BatchOf({Int64s(wide), Int32s(narrow)}), BatchOf({Int64s(wide), Int32s(narrow)})});
 }
 
+// DOUBLE keys through a GroupTable, which normalizes them for its key table (double_key.h): -0.0
+// groups with 0.0 and every NaN with every other NaN, as in DuckDB, and a group keeps the value of
+// its first row as it came (-0.0, the first NaN's bits).
+TEST_P(KeyTableTest, DoubleKeysGroupAsNormalizedThroughAGroupTable) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double payload = std::bit_cast<double>(std::uint64_t{0x7ff8000000000123ULL});
+  const double negative = std::bit_cast<double>(std::uint64_t{0xfff8000000000000ULL});
+  const auto schema = arrow::schema({arrow::field("d", arrow::float64())});
+  const auto out =
+      arrow::schema({arrow::field("d", arrow::float64()), arrow::field("count", arrow::int64())});
+  auto table = GroupTable::Make(
+      {Column(0, "d", LogicalType::kDouble)},
+      {{.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}}, 1,
+      arrow::default_memory_pool(), nullptr, /*first_keys=*/true, GroupTable::kPartitions,
+      {.kind = GetParam()});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  for (const auto& values :
+       std::vector<std::vector<std::optional<double>>>{{-0.0, nan, 1.5, 0.0, payload, std::nullopt},
+                                                       {0.0, negative, std::nullopt, 1.5, -0.0}}) {
+    const auto batch = arrow::RecordBatch::Make(schema, static_cast<std::int64_t>(values.size()),
+                                                {Doubles(values)});
+    ASSERT_TRUE((*table)->Consume(*batch).ok());
+  }
+  std::vector<std::string> rows;
+  while (true) {
+    const auto chunk = (*table)->NextChunk(out);
+    ASSERT_TRUE(chunk.ok()) << chunk.status().ToString();
+    if (*chunk == nullptr) {
+      break;
+    }
+    const auto& keys = static_cast<const arrow::DoubleArray&>(*(*chunk)->column(0));
+    const auto& counts = static_cast<const arrow::Int64Array&>(*(*chunk)->column(1));
+    for (std::int64_t r = 0; r < (*chunk)->num_rows(); ++r) {
+      rows.push_back((keys.IsNull(r) ? std::string("NULL")
+                                     : Printable(std::string(
+                                           reinterpret_cast<const char*>(keys.raw_values() + r),
+                                           sizeof(double)))) +
+                     "|" + std::to_string(counts.Value(r)));
+    }
+  }
+  std::ranges::sort(rows);
+  const auto bytes_of = [](double value) {
+    return Printable(std::string(reinterpret_cast<const char*>(&value), sizeof(value)));
+  };
+  std::vector<std::string> expected = {bytes_of(-0.0) + "|4", bytes_of(nan) + "|3",
+                                       bytes_of(1.5) + "|2", "NULL|2"};
+  std::ranges::sort(expected);
+  EXPECT_EQ(rows, expected);
+}
+
 // KeyHashes of a group's uniques row is the hash of each of its input rows: the partition of a
 // group (Partition) and of its rows (RouteRows) agree.
 TEST_P(KeyTableTest, KeyHashesOfUniquesAreTheHashesOfTheirRows) {
@@ -459,7 +516,7 @@ TEST_P(KeyTableTest, ATinyBudgetFailsWithItsOwnErrorAndLeavesNothing) {
 
 // The rows of a GROUP BY (COUNT(*) and SUM per key), through part tables of the kind whose
 // partitions merge into lane tables of the kind, and through one serial table of the kind: both
-// are the keys' own counts and sums.
+// are the keys' own counts and sums, in chunks of the sizes the Grouper's tables make.
 TEST_P(KeyTableTest, AGroupByGivesTheSameRowsWithEveryKind) {
   const std::vector<plan::BoundColumn> keys = {Column(0, "k", LogicalType::kBigInt)};
   const std::vector<plan::AggregateCall> calls = {
@@ -516,59 +573,71 @@ TEST_P(KeyTableTest, AGroupByGivesTheSameRowsWithEveryKind) {
     }
   };
 
-  // Parallel: a table per part (keeping no first keys, as a part without a DOUBLE key does),
-  // partitioned, merged in part order into a lane table per partition.
-  std::vector<std::unique_ptr<GroupTable>> part_tables;
-  for (const auto& batches : parts) {
-    auto table = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
-                                  /*first_keys=*/false, GroupTable::kPartitions, kind);
-    ASSERT_TRUE(table.ok()) << table.status().ToString();
-    for (const auto& batch : batches) {
-      ASSERT_TRUE((*table)->Consume(*batch).ok());
-    }
-    ASSERT_TRUE((*table)->Partition().ok());
-    part_tables.push_back(std::move(*table));
-  }
-  std::vector<std::string> merged;
-  for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
-    auto lane = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
-                                 /*first_keys=*/true, GroupTable::kPartitions, kind);
-    ASSERT_TRUE(lane.ok()) << lane.status().ToString();
-    for (const auto& part : part_tables) {
-      ASSERT_TRUE((*lane)->MergePartition(*part, p).ok());
-    }
+  // The rows a GROUP BY gives with `kind`, and the sizes of the chunks NextChunk returns, through
+  // part tables (keeping no first keys, as a part without a DOUBLE key does) partitioned and merged
+  // in part order into a lane table per partition, and through one serial table.
+  struct Run {
+    std::vector<std::string> merged;
+    std::vector<std::int64_t> merged_chunks;
+    std::vector<std::string> single;
+    std::vector<std::int64_t> single_chunks;
+  };
+  const auto drain = [&](GroupTable& table, std::vector<std::string>& rows,
+                         std::vector<std::int64_t>& chunks) {
     while (true) {
-      const auto chunk = (*lane)->NextChunk(out);
+      const auto chunk = table.NextChunk(out);
       ASSERT_TRUE(chunk.ok()) << chunk.status().ToString();
       if (*chunk == nullptr) {
-        break;
+        return;
       }
-      rows_of(**chunk, merged);
+      chunks.push_back((*chunk)->num_rows());
+      rows_of(**chunk, rows);
     }
-  }
-  std::ranges::sort(merged);
-  EXPECT_EQ(merged, expected);
-
-  // Serial: one table over every batch.
-  auto serial = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
-                                 /*first_keys=*/true, GroupTable::kPartitions, kind);
-  ASSERT_TRUE(serial.ok()) << serial.status().ToString();
-  for (const auto& batches : parts) {
-    for (const auto& batch : batches) {
-      ASSERT_TRUE((*serial)->Consume(*batch).ok());
+  };
+  const auto run = [&](KeyTableKind kind_of_run, Run& result) {
+    const KeyTableOptions options{.kind = kind_of_run};
+    std::vector<std::unique_ptr<GroupTable>> part_tables;
+    for (const auto& batches : parts) {
+      auto table = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
+                                    /*first_keys=*/false, GroupTable::kPartitions, options);
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      for (const auto& batch : batches) {
+        ASSERT_TRUE((*table)->Consume(*batch).ok());
+      }
+      ASSERT_TRUE((*table)->Partition().ok());
+      part_tables.push_back(std::move(*table));
     }
-  }
-  std::vector<std::string> single;
-  while (true) {
-    const auto chunk = (*serial)->NextChunk(out);
-    ASSERT_TRUE(chunk.ok()) << chunk.status().ToString();
-    if (*chunk == nullptr) {
-      break;
+    for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+      auto lane = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
+                                   /*first_keys=*/true, GroupTable::kPartitions,
+                                   {.kind = kind_of_run, .estimate = false});
+      ASSERT_TRUE(lane.ok()) << lane.status().ToString();
+      for (const auto& part : part_tables) {
+        ASSERT_TRUE((*lane)->MergePartition(*part, p).ok());
+      }
+      ASSERT_NO_FATAL_FAILURE(drain(**lane, result.merged, result.merged_chunks));
     }
-    rows_of(**chunk, single);
-  }
-  std::ranges::sort(single);
-  EXPECT_EQ(single, expected);
+    std::ranges::sort(result.merged);
+    auto serial = GroupTable::Make(keys, calls, 2, arrow::default_memory_pool(), nullptr,
+                                   /*first_keys=*/true, GroupTable::kPartitions, options);
+    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+    for (const auto& batches : parts) {
+      for (const auto& batch : batches) {
+        ASSERT_TRUE((*serial)->Consume(*batch).ok());
+      }
+    }
+    ASSERT_NO_FATAL_FAILURE(drain(**serial, result.single, result.single_chunks));
+    std::ranges::sort(result.single);
+  };
+  Run ours;
+  ASSERT_NO_FATAL_FAILURE(run(kind.kind, ours));
+  EXPECT_EQ(ours.merged, expected);
+  EXPECT_EQ(ours.single, expected);
+  // A chunk is the groups one call made, whichever table numbers them.
+  Run grouper;
+  ASSERT_NO_FATAL_FAILURE(run(KeyTableKind::kGrouper, grouper));
+  EXPECT_EQ(ours.merged_chunks, grouper.merged_chunks);
+  EXPECT_EQ(ours.single_chunks, grouper.single_chunks);
 }
 
 INSTANTIATE_TEST_SUITE_P(, KeyTableTest, ::testing::ValuesIn(kKinds), ParamName);

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <new>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -18,20 +18,10 @@
 
 #include "antb1/common/check.h"
 
+#include "fixed_key_table.h"
+
 namespace antb1::exec {
 namespace {
-
-// `body()`, with a std::bad_alloc from an allocation outside the pool (Arrow's small objects) as
-// OutOfMemory: no exception leaves exec, and GroupAggregateOperator makes its table in Open, which
-// nothing converts (as join_table.cc does for the join).
-template <class Body>
-auto NoBadAlloc(const Body& body) -> decltype(body()) {
-  try {
-    return body();
-  } catch (const std::bad_alloc&) {
-    return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
-  }
-}
 
 // A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
 // only NULLs.
@@ -101,12 +91,20 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options) {
   ANTB1_CHECK(!key_types.empty());
-  // Every key shape is the Grouper's until a table of our own takes one
-  // (docs/adr/0019-own-aggregation-hash-table.md).
-  const bool known_kind =
-      options.kind == KeyTableKind::kAuto || options.kind == KeyTableKind::kGrouper;
-  ANTB1_CHECK(known_kind);
   return NoBadAlloc([&] -> arrow::Result<std::unique_ptr<KeyTable>> {
+    // The shapes of our own tables (docs/adr/0019-own-aggregation-hash-table.md); the Grouper
+    // takes every other.
+    if (options.kind != KeyTableKind::kGrouper) {
+      if (std::optional<FixedKeyLayout> layout = FixedKeyLayoutOf(key_types); layout.has_value()) {
+        const Growth growth =
+            options.kind == KeyTableKind::kFixedIdOrder ? Growth::kIdOrder : Growth::kSlotOrder;
+        return MakeFixedKeyTable(*std::move(layout), growth, ctx->memory_pool(), options);
+      }
+      if (options.kind != KeyTableKind::kAuto) {
+        return arrow::Status::Invalid("a fixed-width key table cannot take ", key_types.size(),
+                                      " keys of these types");
+      }
+    }
     ARROW_ASSIGN_OR_RAISE(auto grouper, arrow::compute::Grouper::Make(key_types, ctx));
     return std::make_unique<GrouperKeyTable>(std::move(grouper), ctx->memory_pool());
   });

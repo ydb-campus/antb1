@@ -14,10 +14,12 @@ namespace antb1::exec {
 class GroupTable;  // src/exec/group_table.h
 
 // Grouped aggregation (GROUP BY). Materializes the selected rows of each input batch, maps their
-// keys to group ids with arrow::compute::Grouper (NULL is a key value; DOUBLE keys are normalized
+// keys to group ids with a key table (antb1's own for one or two fixed-width keys,
+// arrow::compute::Grouper for the other shapes; NULL is a key value; DOUBLE keys are normalized
 // first, so -0.0 groups with 0.0 and every NaN with every other NaN) and feeds the rows to one
-// GroupedAggregateState per call. After the input ends it emits the groups in the grouper's id
-// order (deterministic for a given input, not the order of first appearance): the keys of each
+// GroupedAggregateState per call. After the input ends it emits the groups in the key table's id
+// order (deterministic for a given input; for fixed-width keys the order of first appearance, not
+// promised for the others): the keys of each
 // group as first seen, then one column per call, one batch per input batch that made new groups
 // (so neither VARCHAR keys nor VARCHAR MIN/MAX values are gathered past the 2 GiB of one binary
 // array). Over no input rows it emits nothing. Without keys (GROUP BY constants only) every row is

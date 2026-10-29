@@ -126,6 +126,7 @@ namespace antb1::exec {
 namespace {
 
 using plan::LogicalType;
+using testing::Int32s;
 using testing::Int64s;
 using testing::ThrowingExecutor;
 
@@ -1158,67 +1159,127 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
 
-// Making a key table and consuming keys (also a column of NULLs with no values buffer, which the
-// table mends first) give OutOfMemory for any heap allocation that fails in them, never an
-// exception, and leave nothing in the budget once the table is gone. Not Uniques: a heap failure
-// inside arrow's Grouper::GetUniques unwinds into a noexcept frame of Arrow's own and ends the
-// process before any caller can catch it, with or without the key table.
+// Making a key table of each kind and consuming keys (one key with a NULL, a column of NULLs with
+// no values buffer, two keys with NULLs) give OutOfMemory for any heap allocation that fails in
+// them, never an exception, and leave nothing in the budget once the table is gone. The Grouper's
+// Uniques is not swept: a heap failure inside arrow's Grouper::GetUniques unwinds into a noexcept
+// frame of Arrow's own and ends the process before any caller can catch it, with or without the
+// key table.
 TEST_F(KeyTableBadAllocTest, MakingAndConsumingRunOutOfMemoryCleanly) {
-  const std::vector<arrow::TypeHolder> types = {arrow::int64()};
   const arrow::compute::ExecBatch keys({Int64s({1, 2, std::nullopt, 1})}, 4);
   auto bitmap = arrow::AllocateBitmap(4).ValueOrDie();
   std::fill_n(bitmap->mutable_data(), bitmap->size(), 0);
   const arrow::compute::ExecBatch nulls(
       {arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), 4, {bitmap, nullptr}, 4))}, 4);
+  const arrow::compute::ExecBatch pairs(
+      {Int64s({1, std::nullopt, 1, 2}), Int32s({std::nullopt, 3, std::nullopt, 3})}, 4);
 
-  Sweep([&](std::int64_t skip) {
-    MemoryBudget budget(std::nullopt);
-    bool fired = false;
-    {
-      arrow::compute::ExecContext ctx(&budget);
-      std::optional<arrow::Result<std::unique_ptr<KeyTable>>> table;
-      {
-        const FailAllocations fail(skip);
-        table.emplace(MakeKeyTable(types, &ctx));
-        fired = fail.failed() > 0;
-      }
-      if (!table->ok()) {
-        EXPECT_TRUE(fired) << table->status().ToString();
-        EXPECT_TRUE(table->status().IsOutOfMemory()) << table->status().ToString();
-      }
-    }
-    EXPECT_EQ(budget.bytes_allocated(), 0);
-    return fired;
-  });
-
-  for (const arrow::compute::ExecBatch* batch : {&keys, &nulls}) {
-    SCOPED_TRACE(batch == &keys ? "keys" : "NULLs without values");
+  const std::vector<arrow::TypeHolder> one_key = {arrow::int64()};
+  for (const KeyTableKind kind :
+       {KeyTableKind::kGrouper, KeyTableKind::kFixed, KeyTableKind::kFixedIdOrder}) {
+    SCOPED_TRACE("kind " + std::to_string(static_cast<int>(kind)));
     Sweep([&](std::int64_t skip) {
       MemoryBudget budget(std::nullopt);
       bool fired = false;
       {
         arrow::compute::ExecContext ctx(&budget);
-        auto table = MakeKeyTable(types, &ctx);
-        EXPECT_TRUE(table.ok()) << table.status().ToString();
-        if (!table.ok()) {
-          return false;
-        }
-        std::optional<arrow::Result<KeyIds>> ids;
+        std::optional<arrow::Result<std::unique_ptr<KeyTable>>> table;
         {
           const FailAllocations fail(skip);
-          ids.emplace((*table)->Consume(*batch));
+          table.emplace(MakeKeyTable(one_key, &ctx, {.kind = kind}));
           fired = fail.failed() > 0;
         }
-        if (!ids->ok()) {
-          EXPECT_TRUE(fired) << ids->status().ToString();
-          EXPECT_TRUE(ids->status().IsOutOfMemory()) << ids->status().ToString();
-        } else {
-          EXPECT_EQ((*ids)->ids.size(), 4U);
+        if (!table->ok()) {
+          EXPECT_TRUE(fired) << table->status().ToString();
+          EXPECT_TRUE(table->status().IsOutOfMemory()) << table->status().ToString();
         }
       }
       EXPECT_EQ(budget.bytes_allocated(), 0);
       return fired;
     });
+
+    for (const arrow::compute::ExecBatch* batch : {&keys, &nulls, &pairs}) {
+      SCOPED_TRACE(batch == &keys ? "keys" : batch == &nulls ? "NULLs without values" : "pairs");
+      std::vector<arrow::TypeHolder> types;
+      for (const arrow::Datum& column : batch->values) {
+        types.emplace_back(column.type());
+      }
+      Sweep([&](std::int64_t skip) {
+        MemoryBudget budget(std::nullopt);
+        bool fired = false;
+        {
+          arrow::compute::ExecContext ctx(&budget);
+          auto table = MakeKeyTable(types, &ctx, {.kind = kind});
+          EXPECT_TRUE(table.ok()) << table.status().ToString();
+          if (!table.ok()) {
+            return false;
+          }
+          std::optional<arrow::Result<KeyIds>> ids;
+          {
+            const FailAllocations fail(skip);
+            ids.emplace((*table)->Consume(*batch));
+            fired = fail.failed() > 0;
+          }
+          if (!ids->ok()) {
+            EXPECT_TRUE(fired) << ids->status().ToString();
+            EXPECT_TRUE(ids->status().IsOutOfMemory()) << ids->status().ToString();
+          } else {
+            EXPECT_EQ((*ids)->ids.size(), 4U);
+          }
+        }
+        EXPECT_EQ(budget.bytes_allocated(), 0);
+        return fired;
+      });
+    }
+  }
+}
+
+// A fixed-width key table's Uniques (one key with its NULL group, two keys with NULLs) gives
+// OutOfMemory for any heap allocation that fails in it, and leaves the table as it was: the
+// uniques after the failure are the keys.
+TEST_F(KeyTableBadAllocTest, FixedUniquesRunOutOfMemoryCleanly) {
+  const arrow::compute::ExecBatch keys({Int64s({1, 2, std::nullopt, 1})}, 4);
+  const arrow::compute::ExecBatch pairs(
+      {Int64s({1, std::nullopt, 1, 2}), Int32s({std::nullopt, 3, std::nullopt, 3})}, 4);
+  for (const KeyTableKind kind : {KeyTableKind::kFixed, KeyTableKind::kFixedIdOrder}) {
+    for (const arrow::compute::ExecBatch* batch : {&keys, &pairs}) {
+      SCOPED_TRACE(batch == &keys ? "keys" : "pairs");
+      std::vector<arrow::TypeHolder> types;
+      for (const arrow::Datum& column : batch->values) {
+        types.emplace_back(column.type());
+      }
+      Sweep([&](std::int64_t skip) {
+        MemoryBudget budget(std::nullopt);
+        bool fired = false;
+        {
+          arrow::compute::ExecContext ctx(&budget);
+          auto table = MakeKeyTable(types, &ctx, {.kind = kind});
+          EXPECT_TRUE(table.ok()) << table.status().ToString();
+          if (!table.ok()) {
+            return false;
+          }
+          const auto ids = (*table)->Consume(*batch);
+          EXPECT_TRUE(ids.ok()) << ids.status().ToString();
+          std::optional<arrow::Result<arrow::compute::ExecBatch>> uniques;
+          {
+            const FailAllocations fail(skip);
+            uniques.emplace((*table)->Uniques());
+            fired = fail.failed() > 0;
+          }
+          if (!uniques->ok()) {
+            EXPECT_TRUE(fired) << uniques->status().ToString();
+            EXPECT_TRUE(uniques->status().IsOutOfMemory()) << uniques->status().ToString();
+          }
+          const auto again = (*table)->Uniques();
+          EXPECT_TRUE(again.ok()) << again.status().ToString();
+          if (again.ok()) {
+            EXPECT_EQ(again->length, 3);
+          }
+        }
+        EXPECT_EQ(budget.bytes_allocated(), 0);
+        return fired;
+      });
+    }
   }
 }
 

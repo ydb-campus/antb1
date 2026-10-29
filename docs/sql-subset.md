@@ -919,8 +919,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - GROUP BY: one row per distinct combination of the keys; the aggregates of a group are exactly those of the same
   rows without `GROUP BY`. NULL is a key value (all NULLs form one group). A DOUBLE key groups `-0.0` with `0.0` and
   every NaN together, as DuckDB does, and the group shows the key as first seen. Over zero input rows there is no
-  group, so no row. Groups come in no particular order (deterministic in antb1, not the order of first appearance),
-  and the tests compare grouped results without regard to order; with `LIMIT` any groups are a right answer.
+  group, so no row. Groups come in no particular order (deterministic in antb1, not promised to be the order of first
+  appearance), and the tests compare grouped results without regard to order; with `LIMIT` any groups are a right
+  answer.
 - Arithmetic: integer `+`, `-`, `*` and unary `-` compute in the result type, and an overflow fails the query with an
   execution error (exit code 1), as in DuckDB; HUGEINT (a `SUM` result) stays within -(10^38 - 1) to 10^38 - 1
   (divergence D9). `/` divides in DOUBLE: `x / 0` is `inf` or `-inf` and `0 / 0` NaN. `//` truncates toward zero

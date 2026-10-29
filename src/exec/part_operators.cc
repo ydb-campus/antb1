@@ -389,8 +389,12 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     if (lanes == nullptr) {
       tables_.reserve(partitions);
       for (std::size_t p = 0; p < partitions; ++p) {
-        ARROW_ASSIGN_OR_RAISE(auto table,
-                              GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+        // A lane grows from the groups merged so far: its calls are each a part's distinct keys,
+        // never a sample of the rows to come (KeyTableOptions::estimate).
+        ARROW_ASSIGN_OR_RAISE(
+            auto table,
+            GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_,
+                             /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
         tables_.push_back(std::move(table));
       }
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
@@ -551,23 +555,26 @@ struct InnerSpec {
 
 // One inner table per distinct column (keys K and the column, no calls), then the plain table (K,
 // the plain calls) if there are plain calls. They keep no first-seen keys: the outer level reads
-// their normalized keys, and no key it outputs is DOUBLE.
+// their normalized keys, and no key it outputs is DOUBLE. A part's tables size themselves from
+// their rows (`estimate`); the merged tables grow from the groups merged so far.
 arrow::Result<std::vector<std::unique_ptr<GroupTable>>> MakeInnerTables(const InnerSpec& spec,
                                                                         arrow::MemoryPool* pool,
-                                                                        MemoryBudget* budget) {
+                                                                        MemoryBudget* budget,
+                                                                        bool estimate) {
+  const KeyTableOptions key_table{.estimate = estimate};
   std::vector<std::unique_ptr<GroupTable>> tables;
   for (const plan::BoundColumn& column : spec.distinct) {
     std::vector<plan::BoundColumn> keys = spec.keys;
     keys.push_back(column);
     ARROW_ASSIGN_OR_RAISE(auto table,
                           GroupTable::Make(std::move(keys), {}, spec.width, pool, budget,
-                                           /*first_keys=*/false, kTwoLevelPartitions));
+                                           /*first_keys=*/false, kTwoLevelPartitions, key_table));
     tables.push_back(std::move(table));
   }
   if (!spec.plain.empty()) {
     ARROW_ASSIGN_OR_RAISE(auto table,
                           GroupTable::Make(spec.keys, spec.plain, spec.width, pool, budget,
-                                           /*first_keys=*/false, kTwoLevelPartitions));
+                                           /*first_keys=*/false, kTwoLevelPartitions, key_table));
     tables.push_back(std::move(table));
   }
   return tables;
@@ -731,7 +738,8 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
                     int64_t i, const std::atomic<bool>& stop) -> arrow::Result<PartTables> {
       const ProfileTimer part_time(profile, "part_time");
       auto part = std::make_shared<InnerPart>();
-      ARROW_ASSIGN_OR_RAISE(part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget));
+      ARROW_ASSIGN_OR_RAISE(part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget,
+                                                          /*estimate=*/true));
       ARROW_RETURN_NOT_OK(RunPart(
           *pipeline, first + i, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
             ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
@@ -760,7 +768,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   // Per inner table, one merged table per partition.
   tables_.clear();
   for (std::size_t p = 0; p < kTwoLevelPartitions; ++p) {
-    ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_));
+    ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_, /*estimate=*/false));
     tables_.resize(made.size());
     for (std::size_t t = 0; t < made.size(); ++t) {
       tables_[t].push_back(std::move(made[t]));

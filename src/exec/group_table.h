@@ -36,8 +36,9 @@ arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBa
 // GroupedAggregateState per call, and each group's key values as first seen, in chunks of new
 // groups. GroupAggregateOperator consumes its whole input into one table;
 // PartGroupAggregateOperator consumes each part into its own and merges them in part order
-// (docs/adr/0013-parallel-execution.md). Groups are numbered by the key table (deterministic for a
-// given input; arrow's Grouper does not number them in the order of first appearance). Without keys
+// (docs/adr/0013-parallel-execution.md). Groups are numbered by the key table, deterministically
+// for a given input: in the order of their first rows by a FixedKeyTable (one or two fixed-width
+// keys), in an order of its own by arrow's Grouper (every other shape). Without keys
 // every row is in one group. The states' own containers are charged to the budget, and the key
 // table allocates from the budget's pool. Single-threaded.
 class GroupTable {

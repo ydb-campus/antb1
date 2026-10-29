@@ -1,13 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <new>
 #include <span>
 #include <vector>
 
 #include <arrow/buffer.h>
 #include <arrow/compute/exec.h>
 #include <arrow/result.h>
+#include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
 namespace arrow::compute {
@@ -49,20 +52,46 @@ class KeyTable {
 };
 
 // Which table numbers the keys. kAuto is the engine's choice, a function of the key types only
-// (never of the budget, the threads or the environment); the others name a table, for tests.
+// (never of the budget, the threads or the environment): kFixed for the keys a FixedKeyTable takes
+// (one or two fixed-width keys, fixed_key_table.h), kGrouper for the others. The others name a
+// table, for tests and benchmarks.
 enum class KeyTableKind : std::uint8_t {
   kAuto,
-  kGrouper,  // arrow::compute::Grouper, for every key shape
+  kGrouper,       // arrow::compute::Grouper, for every key shape
+  kFixed,         // FixedKeyTable, growing in slot order
+  kFixedIdOrder,  // FixedKeyTable, growing in id order: a policy only tests run
 };
+
+// The most groups a FixedKeyTable holds: ids are 32-bit, and one value above them is its marker.
+inline constexpr std::uint32_t kMaxKeyTableGroups = std::numeric_limits<std::uint32_t>::max() - 1;
 
 struct KeyTableOptions {
   KeyTableKind kind = KeyTableKind::kAuto;
+  // Whether a FixedKeyTable sizes its slots from its own first two calls of rows. Off for a table
+  // that grows by merging other tables' groups (a lane, the two-level merge), whose calls are each
+  // distinct keys, so that its size follows only the groups merged so far.
+  bool estimate = true;
+  // The groups past which a FixedKeyTable fails with OutOfMemory; lower only in tests.
+  std::uint32_t max_groups = kMaxKeyTableGroups;
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`
-// itself must outlive the table: arrow's Grouper keeps it.
+// itself must outlive the table: arrow's Grouper keeps it. An explicit kind that does not take the
+// keys is Invalid.
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options = {});
+
+// `body()`, with a std::bad_alloc from an allocation outside the pool (Arrow's small objects) as
+// OutOfMemory: no exception leaves a key table, and GroupAggregateOperator makes its table in
+// Open, which nothing converts (as join_table.cc does for the join).
+template <class Body>
+auto NoBadAlloc(const Body& body) -> decltype(body()) {
+  try {
+    return body();
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
+  }
+}
 
 }  // namespace antb1::exec

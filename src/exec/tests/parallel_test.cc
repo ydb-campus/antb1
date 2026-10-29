@@ -1061,6 +1061,79 @@ TEST_F(PartOperatorsTest, PartitionsFollowTheKeyHash) {
   EXPECT_EQ(golden, "24 13 0 22 28 12 | 26 30 5 3 12 ");
 }
 
+// A part whose key table runs out of memory on a worker runs again alone and gives the same
+// groups: each part fills a GroupTable of the kind on a pool that fails every allocation off the
+// test's thread, so the scheduler runs every part again alone on it, and the parts merged in order
+// count every key. Lanes and BuildRows allocate on workers with no rerun, so the parts merge here
+// rather than in an operator.
+TEST_F(PartOperatorsTest, AKeyTableOutOfMemoryOnAWorkerRunsItsPartAgainAlone) {
+  const auto pool = Pool();
+  constexpr int64_t kParts = 8;
+  constexpr int64_t kRows = 500;
+  const std::vector<plan::BoundColumn> keys = {Column(0, "k", LogicalType::kBigInt)};
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt}};
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto out =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("count", arrow::int64())});
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  std::map<std::optional<int64_t>, int64_t> expected;
+  for (int64_t part = 0; part < kParts; ++part) {
+    std::vector<std::optional<int64_t>> k;
+    k.reserve(kRows);
+    for (int64_t r = 0; r < kRows; ++r) {
+      const int64_t row = (part * kRows) + r;
+      k.push_back(row % 13 == 0 ? std::nullopt : std::optional<int64_t>((row * 7) % 301));
+      ++expected[k.back()];
+    }
+    batches.push_back(arrow::RecordBatch::Make(schema, kRows, {Int64s(k)}));
+  }
+  for (const KeyTableKind kind : {KeyTableKind::kFixed, KeyTableKind::kGrouper}) {
+    SCOPED_TRACE(kind == KeyTableKind::kFixed ? "fixed" : "grouper");
+    MemoryBudget budget(std::nullopt);
+    testing::WorkerFailingPool failing(&budget);
+    std::map<std::optional<int64_t>, int64_t> counts;
+    {
+      const KeyTableOptions options{.kind = kind};
+      PartScheduler<std::shared_ptr<GroupTable>> scheduler(
+          kParts,
+          [&](int64_t part,
+              const std::atomic<bool>& /*stop*/) -> arrow::Result<std::shared_ptr<GroupTable>> {
+            ARROW_ASSIGN_OR_RAISE(
+                std::shared_ptr<GroupTable> table,
+                GroupTable::Make(keys, calls, 1, &failing, &budget,
+                                 /*first_keys=*/true, GroupTable::kPartitions, options));
+            ARROW_RETURN_NOT_OK(table->Consume(*batches[static_cast<std::size_t>(part)]));
+            return table;
+          },
+          pool.get(), 4, &budget);
+      auto merged = GroupTable::Make(keys, calls, 1, &failing, &budget, /*first_keys=*/true,
+                                     GroupTable::kPartitions, options);
+      ASSERT_TRUE(merged.ok()) << merged.status().ToString();
+      while (!scheduler.done()) {
+        const auto part = scheduler.Next();
+        ASSERT_TRUE(part.ok()) << part.status().ToString();
+        ASSERT_TRUE((*merged)->Merge(**part).ok());
+      }
+      while (true) {
+        const auto chunk = (*merged)->NextChunk(out);
+        ASSERT_TRUE(chunk.ok()) << chunk.status().ToString();
+        if (*chunk == nullptr) {
+          break;
+        }
+        const auto& k = static_cast<const arrow::Int64Array&>(*(*chunk)->column(0));
+        const auto& c = static_cast<const arrow::Int64Array&>(*(*chunk)->column(1));
+        for (int64_t r = 0; r < (*chunk)->num_rows(); ++r) {
+          counts[k.IsNull(r) ? std::nullopt : std::optional<int64_t>(k.Value(r))] += c.Value(r);
+        }
+      }
+    }
+    EXPECT_GE(failing.failures(), kParts);  // every part failed on a worker first
+    EXPECT_EQ(counts, expected);
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
 // A partition merge that fails on the executor (here: a HUGEINT sum past its range, reached only
 // when two parts' sums are added) fails the query with the same error on any number of threads;
 // a bad partition is Invalid; the operator is Invalid after Close.

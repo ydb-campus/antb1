@@ -18,6 +18,7 @@
 
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
+#include <arrow/compute/exec.h>
 #include <arrow/io/file.h>
 #include <arrow/util/bit_util.h>
 #include <benchmark/benchmark.h>
@@ -35,7 +36,7 @@
 #include "antb1/plan/types.h"
 #include "antb1/sql/parser.h"
 
-#include "group_loops.h"
+#include "../src/exec/key_table.h"
 #include <unistd.h>
 
 namespace antb1::bench {
@@ -578,8 +579,8 @@ void BM_JoinTableProbe(benchmark::State& state) {
 }
 BENCHMARK(BM_JoinTableProbe)->Arg(0)->Arg(1)->Unit(benchmark::kMillisecond);
 
-// ---- Grouping: arrow::compute::Grouper, which GroupTable uses to turn key rows into group ids
-// ----
+// ---- Grouping: arrow::compute::Grouper, GroupTable's key table for the shapes FixedKeyTable does
+// not take ----
 //
 // The baseline for the table of docs/adr/0019-own-aggregation-hash-table.md, whose gate (as its
 // 2026-10-18 update restates it) is 1.3x this on every shape at 1000, 16 Ki, 256 Ki and 1 Mi
@@ -691,8 +692,9 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
   return out;
 }
 
-// One grouper over every batch, as GroupTable::Consume does per part; with `budgeted`, its buffers
-// come from a MemoryBudget without a limit, as the engine's do (engine::Session's pool).
+// One grouper over every batch, as GroupTable::Consume runs its key table per part; with
+// `budgeted`, its buffers come from a MemoryBudget without a limit, as the engine's do
+// (engine::Session's pool).
 void GroupKeys(benchmark::State& state, GroupShape shape, bool budgeted = false,
                GroupIds ids_mode = GroupIds::kPermutation) {
   const int64_t groups = state.range(0);
@@ -753,54 +755,69 @@ void BM_GroupInt64Int32BudgetRandom(benchmark::State& state) {
   GroupKeys(state, GroupShape::kInt64Int32, true, GroupIds::kRandom);
 }
 
-// ---- Step 0: candidate loops of our own for fixed-width keys (bench/group_loops.h) ----
+// ---- The engine's key table of fixed-width keys (exec::FixedKeyTable, step 1) ----
 //
-// The same inputs and counters as BM_Group*, under a MemoryBudget as BM_Group*Budget, so their
-// ns_per_row compare directly; the go for a shape is 1.3x the budgeted grouper at every count from
-// 1000 to 1 Mi groups. Each variant is first checked once per benchmark name: one group per key,
-// and every row of a group given that group's id.
+// Each table runs as GroupTable runs it: made by exec::MakeKeyTable on an ExecContext over a
+// MemoryBudget, one Consume per batch, each call's ids in a buffer of its own. The inputs and
+// counters are BM_Group*'s and the budget BM_Group*Budget's, so ns_per_row compares directly with
+// the budgeted grouper of the same run and ids: ADR 0019's micro gate for a shape is 1.3x at every
+// count from 1000 to 1 Mi groups. Each benchmark name is checked once first: dense ids in
+// first-seen order, one group per key, each group's uniques row the key of its rows, and the size
+// estimate failing small on memory.
 
-step0::Int64Key::Columns ColumnsOf(const arrow::RecordBatch& batch, step0::Int64Key* /*tag*/) {
-  return {.k = batch.column_data(0)->GetValues<std::int64_t>(1)};
-}
-step0::Int64Int32Key::Columns ColumnsOf(const arrow::RecordBatch& batch,
-                                        step0::Int64Int32Key* /*tag*/) {
-  return {.k = batch.column_data(0)->GetValues<std::int64_t>(1),
-          .j = batch.column_data(1)->GetValues<std::int32_t>(1)};
-}
-
-template <class Key, step0::Slots kSlots>
-arrow::Status Step0Consume(step0::FixedTable<Key, kSlots>& table, const arrow::RecordBatch& batch,
-                           std::uint32_t* ids) {
-  return table.ConsumeChunked(ColumnsOf(batch, static_cast<Key*>(nullptr)),
-                              static_cast<std::size_t>(batch.num_rows()), ids);
-}
-
-// One table over every batch: an empty string, or what is wrong with its ids.
-template <class Key, step0::Slots kSlots>
-std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, GroupIds ids_mode,
-                       step0::TableOptions options, bool presized) {
-  exec::MemoryBudget budget(std::nullopt);
-  step0::FixedTable<Key, kSlots> table(&budget, options);
-  if (presized) {
-    if (auto status = table.Reserve(static_cast<std::size_t>(groups)); !status.ok()) {
-      return status.ToString();
-    }
+std::vector<arrow::TypeHolder> KeyTypesOf(const arrow::RecordBatch& batch) {
+  std::vector<arrow::TypeHolder> types;
+  types.reserve(static_cast<std::size_t>(batch.num_columns()));
+  for (const auto& field : batch.schema()->fields()) {
+    types.emplace_back(field->type());
   }
-  std::vector<std::uint32_t> ids(static_cast<std::size_t>(kBatchSize));
-  // The table's id of each true group, and back: both must be one to one, a new group must take
-  // the next id (dense, in first-seen order), and the table must keep each group's key.
+  return types;
+}
+
+// Row `row`'s key: its BIGINT, and its INTEGER for the two-key shape (0 without).
+std::pair<int64_t, int32_t> KeyAt(const arrow::compute::ExecBatch& keys, int64_t row) {
+  const int64_t k = keys.values[0].array()->GetValues<int64_t>(1)[row];
+  const int32_t j = keys.values.size() > 1 ? keys.values[1].array()->GetValues<int32_t>(1)[row] : 0;
+  return {k, j};
+}
+
+// The groups of the first `count` batches through a table of `kind` on `budget`, or an error.
+arrow::Result<uint32_t> GroupsOfFirst(const arrow::RecordBatchVector& batches, std::size_t count,
+                                      exec::MemoryBudget& budget,
+                                      const exec::KeyTableOptions& options) {
+  arrow::compute::ExecContext ctx(&budget);
+  ARROW_ASSIGN_OR_RAISE(auto table,
+                        exec::MakeKeyTable(KeyTypesOf(*batches.front()), &ctx, options));
+  for (std::size_t b = 0; b < count; ++b) {
+    ARROW_RETURN_NOT_OK(table->Consume(arrow::compute::ExecBatch(*batches[b])).status());
+  }
+  return table->num_groups();
+}
+
+// One table of `kind` over every batch: an empty string, or what is wrong with its ids.
+std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t groups,
+                          GroupIds ids_mode, exec::KeyTableKind kind) {
+  exec::MemoryBudget budget(std::nullopt);
+  arrow::compute::ExecContext ctx(&budget);
+  auto made = exec::MakeKeyTable(KeyTypesOf(*batches.front()), &ctx, {.kind = kind});
+  if (!made.ok()) {
+    return made.status().ToString();
+  }
+  exec::KeyTable& table = **made;
+  // The table's id of each true group, and back: both must be one to one, and a new group must
+  // take the next id (dense, in first-seen order).
   std::vector<int64_t> ours(static_cast<std::size_t>(groups), -1);
   std::vector<int64_t> theirs(static_cast<std::size_t>(groups), -1);
   int64_t row = 0;
   std::uint32_t next = 0;
   for (const auto& batch : batches) {
-    if (auto status = Step0Consume(table, *batch, ids.data()); !status.ok()) {
-      return status.ToString();
+    const auto ids = table.Consume(arrow::compute::ExecBatch(*batch));
+    if (!ids.ok()) {
+      return ids.status().ToString();
     }
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
       const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode));
-      const std::uint32_t id = ids[static_cast<std::size_t>(i)];
+      const std::uint32_t id = ids->ids[static_cast<std::size_t>(i)];
       if (id >= static_cast<std::uint64_t>(groups)) {
         return "id " + std::to_string(id) + " past the group count";
       }
@@ -820,14 +837,17 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, 
       }
     }
   }
-  // Every group's key, as the table keeps it, is the key of the rows given its id.
+  // Every group's uniques row is the key of the rows given its id.
+  const auto uniques = table.Uniques();
+  if (!uniques.ok()) {
+    return uniques.status().ToString();
+  }
   row = 0;
   for (const auto& batch : batches) {
-    const auto columns = ColumnsOf(*batch, static_cast<Key*>(nullptr));
+    const arrow::compute::ExecBatch keys(*batch);
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
-      const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode));
-      const auto id = static_cast<std::size_t>(ours[truth]);
-      if (!(table.keys().at(id) == Key::At(columns, static_cast<std::size_t>(i)))) {
+      const int64_t id = ours[static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode))];
+      if (KeyAt(*uniques, id) != KeyAt(keys, i)) {
         return "group " + std::to_string(id) + " keeps a key other than its rows'";
       }
     }
@@ -842,34 +862,25 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, 
   // The estimate fails small on memory too: under a budget that holds only what the first two
   // batches need without an estimate, its reservation is refused and the table carries on with the
   // same groups.
-  if (options.estimate && !presized && batches.size() >= 2) {
-    step0::TableOptions plain = options;
-    plain.estimate = false;
+  if (batches.size() >= 2) {
     exec::MemoryBudget open(std::nullopt);
-    step0::FixedTable<Key, kSlots> grown(&open, plain);
-    for (std::size_t b = 0; b < 2; ++b) {
-      if (auto status = Step0Consume(grown, *batches[b], ids.data()); !status.ok()) {
-        return status.ToString();
-      }
-    }
+    const auto grown = GroupsOfFirst(batches, 2, open, {.kind = kind, .estimate = false});
     exec::MemoryBudget tight(open.max_memory() + (open.max_memory() / 8));
-    step0::FixedTable<Key, kSlots> sized(&tight, options);
-    for (std::size_t b = 0; b < 2; ++b) {
-      if (auto status = Step0Consume(sized, *batches[b], ids.data()); !status.ok()) {
-        return "under a tight budget the estimate failed the table: " + status.ToString();
-      }
+    const auto sized = GroupsOfFirst(batches, 2, tight, {.kind = kind});
+    if (!grown.ok() || !sized.ok()) {
+      return "under a tight budget the estimate failed the table: " +
+             (grown.ok() ? sized.status() : grown.status()).ToString();
     }
-    if (sized.num_groups() != grown.num_groups()) {
-      return "under a tight budget: " + std::to_string(sized.num_groups()) + " groups for " +
-             std::to_string(grown.num_groups());
+    if (*sized != *grown) {
+      return "under a tight budget: " + std::to_string(*sized) + " groups for " +
+             std::to_string(*grown);
     }
   }
   return {};
 }
 
-template <class Key, step0::Slots kSlots>
-void Step0Keys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
-               step0::TableOptions options, bool presized) {
+void KeyTableKeys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
+                  exec::KeyTableKind kind) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
   const arrow::RecordBatchVector batches = GroupInput(shape, groups, rows, ids_mode);
@@ -880,33 +891,32 @@ void Step0Keys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
   // Google Benchmark calls this once per run, not once per name.
   static std::vector<std::string> checked;
   if (std::ranges::find(checked, state.name()) == checked.end()) {
-    if (const std::string wrong =
-            Step0Check<Key, kSlots>(batches, groups, ids_mode, options, presized);
-        !wrong.empty()) {
+    if (const std::string wrong = KeyTableCheck(batches, groups, ids_mode, kind); !wrong.empty()) {
       state.SkipWithError("wrong ids: " + wrong);
       return;
     }
     checked.push_back(state.name());
   }
+  const std::vector<arrow::TypeHolder> types = KeyTypesOf(*batches.front());
   exec::MemoryBudget budget(std::nullopt);
-  std::vector<std::uint32_t> ids(static_cast<std::size_t>(kBatchSize));
+  arrow::compute::ExecContext ctx(&budget);
   uint32_t made = 0;
   for (auto _ : state) {
-    step0::FixedTable<Key, kSlots> table(&budget, options);
-    if (presized) {
-      if (auto status = table.Reserve(static_cast<std::size_t>(groups)); !status.ok()) {
-        state.SkipWithError(status.ToString());
-        return;
-      }
+    auto table = exec::MakeKeyTable(types, &ctx, {.kind = kind});
+    if (!table.ok()) {
+      state.SkipWithError(table.status().ToString());
+      return;
     }
     for (const auto& batch : batches) {
-      if (auto status = Step0Consume(table, *batch, ids.data()); !status.ok()) {
-        state.SkipWithError(status.ToString());
+      const arrow::compute::ExecBatch keys(*batch);
+      const auto ids = (*table)->Consume(keys);
+      if (!ids.ok()) {
+        state.SkipWithError(ids.status().ToString());
         return;
       }
-      benchmark::DoNotOptimize(ids.data());
+      benchmark::DoNotOptimize(ids->ids.data());
     }
-    made = table.num_groups();
+    made = (*table)->num_groups();
     benchmark::DoNotOptimize(made);
   }
   state.SetItemsProcessed(state.iterations() * rows);
@@ -917,42 +927,24 @@ void Step0Keys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
                                                         benchmark::Counter::kInvert);
 }
 
-// BM_S0<shape>_<growth>_<Estimate | Presized>[_Random]: the chunked loop step 0 chose (a room
-// check and a hash pass per 256 rows, then the probes, prefetching the buckets of the row 8 places
-// on) at load 7/8, with the group id alone in a 4-byte slot. Indirect grows by re-placing the
-// groups in id order, IndirectSlotOrder by walking its old slots in order and rehashing each key.
-// Estimate: sized after the second batch from the table's own rows (step0::FixedTable::Estimate).
-// Presized: every group reserved before the first row, the floor growth can reach (a diagnostic:
-// the engine may size a table only from its own data). Random: ids that repeat at random
-// (GroupIds::kRandom), compared with BM_Group<shape>BudgetRandom; the others use the permutation,
-// where no id repeats early and the estimate must leave the table alone. The variants step 0
-// measured and dropped (a per-row loop, 8 to 24-byte slots, other prefetch distances, load factors
-// and growth factors) are in the history of PR #253.
-#define ANTB1_STEP0(name, Key, shape, slots, presized, ids, ...)                           \
-  void BM_S0##name(benchmark::State& state) {                                              \
-    Step0Keys<step0::Key, step0::Slots::slots>(state, GroupShape::shape, GroupIds::ids,    \
-                                               step0::TableOptions __VA_ARGS__, presized); \
+// BM_KeyTable_<shape>_<growth>[_Random]: exec::FixedKeyTable for one BIGINT key or a BIGINT and an
+// INTEGER, growing in slot order (the engine's, KeyTableKind::kFixed) or in id order
+// (kFixedIdOrder, which only tests run), sized by its estimate after its second batch. Random: ids
+// that repeat at random (GroupIds::kRandom), compared with BM_Group<shape>BudgetRandom; the others
+// use the permutation, where no id repeats early and the estimate must leave the table alone.
+#define ANTB1_KEY_TABLE(name, shape, kind, ids)                                      \
+  void BM_KeyTable_##name(benchmark::State& state) {                                 \
+    KeyTableKeys(state, GroupShape::shape, GroupIds::ids, exec::KeyTableKind::kind); \
   }
-ANTB1_STEP0(Int64_Indirect_Presized, Int64Key, kInt64, kIndirect, true, kPermutation, {})
-ANTB1_STEP0(Int64_Indirect_Estimate, Int64Key, kInt64, kIndirect, false, kPermutation,
-            {.estimate = true})
-ANTB1_STEP0(Int64_IndirectSlotOrder_Estimate, Int64Key, kInt64, kIndirectSlotOrder, false,
-            kPermutation, {.estimate = true})
-ANTB1_STEP0(Int64_Indirect_Estimate_Random, Int64Key, kInt64, kIndirect, false, kRandom,
-            {.estimate = true})
-ANTB1_STEP0(Int64_IndirectSlotOrder_Estimate_Random, Int64Key, kInt64, kIndirectSlotOrder, false,
-            kRandom, {.estimate = true})
-ANTB1_STEP0(Int64Int32_Indirect_Presized, Int64Int32Key, kInt64Int32, kIndirect, true, kPermutation,
-            {})
-ANTB1_STEP0(Int64Int32_Indirect_Estimate, Int64Int32Key, kInt64Int32, kIndirect, false,
-            kPermutation, {.estimate = true})
-ANTB1_STEP0(Int64Int32_IndirectSlotOrder_Estimate, Int64Int32Key, kInt64Int32, kIndirectSlotOrder,
-            false, kPermutation, {.estimate = true})
-ANTB1_STEP0(Int64Int32_Indirect_Estimate_Random, Int64Int32Key, kInt64Int32, kIndirect, false,
-            kRandom, {.estimate = true})
-ANTB1_STEP0(Int64Int32_IndirectSlotOrder_Estimate_Random, Int64Int32Key, kInt64Int32,
-            kIndirectSlotOrder, false, kRandom, {.estimate = true})
-#undef ANTB1_STEP0
+ANTB1_KEY_TABLE(Int64_SlotOrder, kInt64, kFixed, kPermutation)
+ANTB1_KEY_TABLE(Int64_IdOrder, kInt64, kFixedIdOrder, kPermutation)
+ANTB1_KEY_TABLE(Int64_SlotOrder_Random, kInt64, kFixed, kRandom)
+ANTB1_KEY_TABLE(Int64_IdOrder_Random, kInt64, kFixedIdOrder, kRandom)
+ANTB1_KEY_TABLE(Int64Int32_SlotOrder, kInt64Int32, kFixed, kPermutation)
+ANTB1_KEY_TABLE(Int64Int32_IdOrder, kInt64Int32, kFixedIdOrder, kPermutation)
+ANTB1_KEY_TABLE(Int64Int32_SlotOrder_Random, kInt64Int32, kFixed, kRandom)
+ANTB1_KEY_TABLE(Int64Int32_IdOrder_Random, kInt64Int32, kFixedIdOrder, kRandom)
+#undef ANTB1_KEY_TABLE
 
 // The gate's counts (1000 to 1 Mi: cached to past cache) with 4 Mi (about one row a group) and 16
 // Mi above them, so the shape of the cost per row is visible rather than inferred.
@@ -969,28 +961,25 @@ BENCHMARK(BM_GroupString)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_GroupInt64String)->ANTB1_GROUP_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_GROUP_COUNTS
 
-// Step 0's counts: the gate's 1000 to 1 Mi and 4 Mi reported (docs/adr/0019's band update).
-#define ANTB1_STEP0_COUNTS \
+// The key tables' counts: the gate's 1000 to 1 Mi, and 4 Mi reported (docs/adr/0019's band update).
+#define ANTB1_KEY_TABLE_COUNTS \
   Arg(1000)->Arg(16 * 1024)->Arg(256 * 1024)->Arg(1024 * 1024)->Arg(4 * 1024 * 1024)
-BENCHMARK(BM_GroupInt64Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_GroupInt64Int32Budget)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_GroupInt64BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_GroupInt64Int32BudgetRandom)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_IndirectSlotOrder_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_Indirect_Estimate_Random)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64_IndirectSlotOrder_Estimate_Random)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Indirect_Presized)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Indirect_Estimate)->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Estimate)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_Indirect_Estimate_Random)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random)
-    ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
-#undef ANTB1_STEP0_COUNTS
+BENCHMARK(BM_GroupInt64Budget)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64Int32Budget)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64BudgetRandom)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_GroupInt64Int32BudgetRandom)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64_SlotOrder)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64_IdOrder)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64_SlotOrder_Random)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64_IdOrder_Random)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32_SlotOrder)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32_IdOrder)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32_SlotOrder_Random)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32_IdOrder_Random)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+#undef ANTB1_KEY_TABLE_COUNTS
 
 }  // namespace
 }  // namespace antb1::bench
