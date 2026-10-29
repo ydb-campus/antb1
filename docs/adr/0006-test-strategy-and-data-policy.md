@@ -103,8 +103,8 @@ differences.
 - **Corpus:** the 99 query texts that the pinned package's `tpcds_queries()` returns, numbered 1 to 99, one statement
   each. A DuckDB update that changes them (DuckDB 2.0 moves to a TPC-DS v4 generator, with other data and other
   texts) is a new baseline: the digests, the ratchet and its status table are redone in the same PR.
-- **No stored answers:** in the pinned version `tpcds_answers()` fails on every scan (it also covers scale
-  factor 10, for which it has no answers), so the generator never calls it. The live DuckDB oracle on the same Parquet files is
+- **No stored answers:** in the pinned version `tpcds_answers()` fails on every scan (it also covers scale factor 10,
+  for which it has no answers), so the generator never calls it. The live DuckDB oracle on the same Parquet files is
   the only judge.
 - **Never committed or pasted, may be committed, generation and output:** as for TPC-H, with dsdgen, its
   distribution files and the TPC-DS query templates in place of dbgen and qgen, and text copied from the TPC-DS
