@@ -104,6 +104,7 @@ if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
   # prefix that holds libduckdb, so their DuckDB versions match. Required wherever the oracle is required (ON), except
   # on macOS: pixi cannot install the package there (pixi.toml), so the TPC-H-derived tests run on Linux only.
   set(ANTB1_HAVE_TPCH OFF)
+  set(ANTB1_HAVE_TPCDS OFF)
   if(ANTB1_HAVE_DUCKDB)
     get_filename_component(_antb1_duckdb_prefix "${ANTB1_DUCKDB_LIBRARY}" DIRECTORY)
     get_filename_component(_antb1_duckdb_prefix "${_antb1_duckdb_prefix}" DIRECTORY)
@@ -122,6 +123,23 @@ if(ANTB1_BUILD_TESTS AND NOT ANTB1_FUZZ_ONLY)
       )
     else()
       message(STATUS "antb1: duckdb CLI or tpch extension not found; TPC-H-derived tests are not registered")
+    endif()
+    # Data derived from TPC-DS (ADR 0006): TPC's dsdgen from the pinned duckdb-extension-tpcds package, found and
+    # required exactly as the tpch extension above.
+    file(GLOB _antb1_tpcds_extension "${_antb1_duckdb_prefix}/duckdb/extensions/v*/*/tpcds.duckdb_extension")
+    list(LENGTH _antb1_tpcds_extension _antb1_tpcds_count)
+    if(ANTB1_DUCKDB_CLI AND _antb1_tpcds_count EQUAL 1)
+      set(ANTB1_TPCDS_EXTENSION "${_antb1_tpcds_extension}")
+      set(ANTB1_HAVE_TPCDS ON)
+      message(STATUS "antb1: TPC-DS dsdgen extension ${ANTB1_TPCDS_EXTENSION}")
+    elseif(ANTB1_WITH_DUCKDB STREQUAL "ON" AND NOT APPLE)
+      message(
+        FATAL_ERROR
+        "ANTB1_WITH_DUCKDB=ON, but the duckdb CLI or exactly one tpcds extension was not found in ${_antb1_duckdb_prefix}"
+        " (pixi: duckdb-cli, duckdb-extension-tpcds)"
+      )
+    else()
+      message(STATUS "antb1: duckdb CLI or tpcds extension not found; TPC-DS-derived tests are not registered")
     endif()
   endif()
 endif()

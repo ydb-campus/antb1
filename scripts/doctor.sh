@@ -29,10 +29,16 @@ for f in "${CONDA_PREFIX:-}"/duckdb/extensions/v*/*/tpch.duckdb_extension; do
   [ -f "$f" ] && tpch_ext="$f" && break
 done
 tpch=$([ -n "$tpch_ext" ] && echo present || echo absent)
+# TPC's dsdgen for the TPC-DS-derived test data (ADR 0006), from the pinned duckdb-extension-tpcds package.
+tpcds_ext=""
+for f in "${CONDA_PREFIX:-}"/duckdb/extensions/v*/*/tpcds.duckdb_extension; do
+  [ -f "$f" ] && tpcds_ext="$f" && break
+done
+tpcds=$([ -n "$tpcds_ext" ] && echo present || echo absent)
 if [ $json -eq 1 ]; then
-  printf '{"pixi":"%s","env":"%s","envs_installed":"%s","lock_version":"%s","cxx":"%s","cmake":"%s","arrow":"%s","build_dev":"%s","last_full_test_pass":"%s","hits_0":"%s","data_dir":"%s","tpch_extension":"%s"}\n' \
+  printf '{"pixi":"%s","env":"%s","envs_installed":"%s","lock_version":"%s","cxx":"%s","cmake":"%s","arrow":"%s","build_dev":"%s","last_full_test_pass":"%s","hits_0":"%s","data_dir":"%s","tpch_extension":"%s","tpcds_extension":"%s"}\n' \
     "$pixi_version" "${PIXI_ENVIRONMENT_NAME:-}" "$envs" "$lock_version" "$cxx" "$cmake_v" "$arrow_v" \
-    "$dev_build" "$last_pass" "$hits0" "$data_dir" "$tpch"
+    "$dev_build" "$last_pass" "$hits0" "$data_dir" "$tpch" "$tpcds"
 else
   cat <<EOT
 pixi            $pixi_version (lock file version $lock_version)
@@ -43,5 +49,6 @@ arrow           $arrow_v
 build/dev       $dev_build; last full passing 'pixi run test': $last_pass
 hits_0.parquet  $hits0 ($data_dir)
 tpch extension  $tpch${tpch_ext:+ ($tpch_ext)}
+tpcds extension $tpcds${tpcds_ext:+ ($tpcds_ext)}
 EOT
 fi

@@ -17,6 +17,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
 | `tpch/` | `tpch.status.*`, `parallel.tpch.status.sf0_1`, `harness.tpch.*`, `diff.tpch`, `parallel.diff.tpch` | `oracle`, `harness`, `diff`, `parallel` | the data derived from TPC-H (Linux only, redacted): the ratchet of the 22 queries on antb1 against DuckDB, DuckDB's answers on the generated files, antb1 against DuckDB on generated queries over them |
+| `tpcds/` | `harness.tpcds.extension` | `harness` | the data derived from TPC-DS (Linux only): so far the smoke test of the pinned dsdgen extension |
 
 ```bash
 pixi run test -L diff          # one label
@@ -108,6 +109,7 @@ together with `ANTB1_UPDATE_GOLDENS`).
   fixture generator and digest.
 - `harness.tpch.extension`: the pinned `duckdb-extension-tpch` package loads into the duckdb CLI by absolute path
   (one thread, no extension auto-install or auto-load) and provides the 22 query texts derived from TPC-H.
+  `harness.tpcds.extension` does the same for `duckdb-extension-tpcds` and the 99 query texts derived from TPC-DS.
 - `harness.tpch.answers.sf0_01`, `harness.tpch.answers.sf0_1`: the 22 queries derived from TPC-H on the DuckDB oracle
   equal DuckDB's stored answers on the generated files; `harness.tpch.answers.redact`: with `--mutate canary` every
   query fails and the report leaks nothing; `harness.tpch.drift`: query texts that differ from

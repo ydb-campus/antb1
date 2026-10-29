@@ -32,8 +32,9 @@ environment, why it is needed, and the alternatives you ruled out. Continue only
 - A library linked into antb1 needs a licence compatible with Apache-2.0, its notice in the package and its source in
   the sources of the static binary; a new sysroot build needs its glibc source in `cmake/static/glibc-source.lock`
   (ADR 0034, the recipe).
-- `duckdb-extension-tpch` (TPC's dbgen) depends on one exact `libduckdb` build: update it together with
-  `libduckdb-devel` and `duckdb-cli`, never alone (ADR 0006).
+- `duckdb-extension-tpch` (TPC's dbgen) and `duckdb-extension-tpcds` (TPC's dsdgen) each depend on one exact
+  `libduckdb` build: update them together with `libduckdb-devel` and `duckdb-cli`, never alone (ADR 0006). A new
+  TPC-DS corpus also means new digests and a new ratchet baseline.
 - GitHub Actions are pinned to a full commit SHA with a `# vX.Y.Z` comment and must be allowed by
   `tools/github/allowed-actions.json`; a new or bumped action is a `.github/` change for a maintainer.
 

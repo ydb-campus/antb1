@@ -57,7 +57,7 @@ Proposed
     - `third-party/`: the pins of `cmake/static/arrow-sources.lock`, and the conda-forge archives of CLI11 and
       Boost's headers, by the environment's own conda-meta;
     - a README with the rebuild and relink steps. It says that they install env `static`, and with it TPC's dbgen
-      under the TPC EULA v2.2 ([ADR 0006](0006-test-strategy-and-data-policy.md)).
+      and dsdgen under the TPC EULA v2.2 ([ADR 0006](0006-test-strategy-and-data-policy.md)).
   - **How it is offered:** from the same place as the binary. `static.yml` uploads a Linux package only after
     `antb1-<target>-sources`, in the same run, and every GitHub release ([ADR 0035](0035-github-releases.md)) carries
     both sources tarballs, `antb1-linux-x86_64.sources.tar` and `antb1-linux-aarch64.sources.tar`, next to the packages.
