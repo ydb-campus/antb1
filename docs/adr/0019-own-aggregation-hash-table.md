@@ -115,6 +115,41 @@ Proposed
     through `GetUniques`.
   - **Sizing:** the part tables sized from `part_rows`, the partition tables from the groups merged so far.
   - **Memory:** from the query's pool and charged to the budget, with `OutOfMemory` (not exceptions) at the limit.
+  - Update (2026-10-29, **step 0 chose the loop**; #253, `bench/group_loops.h`): before any engine change, a
+    benchmark of loops of our own against the grouper under a `MemoryBudget` picked the design for fixed-width keys:
+    - **A chunked pass, the fused pass the Consequences below ask for.** Each 256 rows get one room check and one
+      hash pass, then the probes. Most probes prefetch the buckets of the row 8 places on; the last 8 of a chunk do
+      not. Apart from the probe, the only per-row branch is that predictable prefetch check. It needed no SIMD
+      instructions: the tag matching is SWAR, plain 64-bit arithmetic, so the pass keeps the one portable arithmetic
+      definition the 2026-10-18 update below expected a vectorized pass to give up.
+    - **A fixed-seed one-multiply hash** (a folded multiply, the scheme of foldhash's fast tier, with hex digits of pi
+      as its constants), with positions from hash bits 32 and up and the tag from the top 7 bits.
+    - **SIMD tag probing as SWAR:** eight 7-bit tags per 64-bit word, control bytes mirrored past the end, and a
+      triangular probe. This is hashbrown's design, written from its description, with no code copied (ADR 0034).
+    - **A 4-byte slot holding the group id alone,** with the keys in an id-ordered array. This replaces "packed
+      fixed-width keys … compared as words" in the slot: the key beside the id, or a 32- or 64-bit hash beside it
+      (8-24-byte slots), each lost.
+    - **Sizing from the table's own data.** It replaces "part tables sized from `part_rows`": that bullet would charge
+      slots for every unfiltered row of every part in flight. A table estimates its group count after its second
+      batch from the share of that batch's rows that hit its first batch's groups (a capture-recapture estimate), and
+      reserves 9/8 of it. It fails small: below 64 hits it reserves nothing, it never reserves more than 8× the
+      groups seen, it never falls back to a row count, and a budget that refuses the reservation leaves the table
+      growing as before. Partition tables size from the groups merged so far, as before.
+    - **How the table grows is a template parameter** in step 0's code, with no default: walking the old slots in
+      order and rehashing each key, or re-placing the groups in id order. Step 1 defaults it to slot order. The
+      choice moves no id, so it cannot change a result; the measurements are in the Consequences.
+    - **Memory: Arrow pool buffers,** as the bullet above says (decided 2026-10-29). Step 1 holds the control bytes,
+      slots and keys in buffers from the query's pool (the `MemoryBudget`), behind a small typed wrapper:
+      - every allocation is charged before it happens, with no separate bookkeeping to get wrong;
+      - running out of memory is an `OutOfMemory` `Status`, never `std::bad_alloc`;
+      - large arrays come from mimalloc instead of glibc's fresh pages;
+      - a chunk's keys can leave the table as a slice, without a copy.
+
+      Small per-chunk scratch stays in fixed-size members. Step 0's `std::vector`s with a `MemoryReservation`
+      charged before each allocation (old and new buffers both, never per insert) were a benchmark convenience. The
+      choice is made; step 1 only reports how the pool compares with vectors, and a large loss would come back here.
+    - **Keys and aggregate states in one row layout** is not part of steps 1-4. It is reconsidered at step 5 (the
+      states), with these numbers.
 - **Gates before any PR replaces the grouper:**
   - **Micro benchmark, one thread:** at least 1.3× faster than Arrow's grouper on every shape (`int64`,
     `int64`+`int32`, string, `int64`+string) at 1000, 1 M and 4 M groups.
@@ -138,6 +173,29 @@ Proposed
     in the same runs as the drift control. The 2026-10-01 baseline was a 100-partition dataset at 128 threads and is
     not comparable. Q4 and Q5 join the end-to-end gate as well, since a global COUNT(DISTINCT) runs through this
     table.
+  - Update (2026-10-29, **gates per step**): the table replaces the grouper one key shape at a time — step 1 one or
+    two fixed-width keys, step 3 one VARCHAR key, step 4 a fixed-width key with a VARCHAR — and the grouper stays as
+    the fallback and the test oracle. Each step is gated on its own shapes; a single gate over every shape would
+    block step 1 on string keys it does not touch. A key table alone has room for about 9% of Q32's CPU and 4.5% of
+    Q18's, so those two are reported rather than gated.
+    - **Micro, one thread:** at least 1.3× **the budgeted grouper of the same run and the same ids** at 1000,
+      16 Ki, 256 Ki and 1 Mi groups, with 4 Mi reported. The inputs include random ids (groups repeat early, as in
+      real data) beside the permutation. The absolute targets above are void: on the benchmark host (2 × Xeon Gold
+      6338) the grouper itself takes about 4× the ns/row of the Context table above, which measured it on the earlier
+      host (10.55 against 2.70 at 1000 groups for one `int64`). The static build and the conda build of Arrow agree
+      (10.55 and 10.75), so the gap is the host, not the build.
+    - **End to end:** step 1 on Q4 for one key, and on Q30 and Q31 for two (the condition of the two-key go in the
+      Consequences), with Q15, Q35 and Q32 reported; step 3 on Q5, Q33 and Q34; step 4 on Q16 and Q17, with Q18
+      reported.
+    - **The end-to-end terms** (decided 2026-10-29):
+      - every gated query at least 10% faster, not a total or a geomean;
+      - no query of all 43 more than 3% slower;
+      - the benchmark host at 8 and 32 threads on one socket, best of three, both arms from one static build, with
+        DuckDB as the drift control.
+
+      14 threads matched the earlier host. At 64 threads this host swung 3-5× between rounds of one binary on a quiet
+      machine, so 64 gates nothing.
+    - **Results** stay as above: identical, first-seen keys, DOUBLE normalization, NULL keys and every test.
 
 ## Consequences
 
@@ -185,12 +243,59 @@ Proposed
     failed **26** integration tests, because a reused pack buffer kept a row position's NULL bit from an earlier
     batch and collapsed distinct keys into the NULL group. A differential test over single batches cannot see that;
     the engine's own suite saw it immediately.
+- Update (2026-10-29, **step 0: a go for one fixed-width key, a conditional go for two**; #253): the loop chosen in
+  the Decision above, measured against the budgeted grouper of the same run and the same ids. Below is the minimum
+  speed-up over 1000 to 1 Mi groups, with the size estimate, on random ids (where groups repeat early) and on the
+  permutation (where no id repeats early, so the estimate cannot fire):
+
+  | | one `int64`, random | one `int64`, permuted | `int64` + `int32`, random | `int64` + `int32`, permuted |
+  | --- | --: | --: | --: | --: |
+  | Xeon Gold 6338, growth in slot order | 1.60× | 1.32× | 1.50× | **1.25×** |
+  | Xeon Gold 6338, growth in id order | 1.63× | 1.11× | 1.50× | 1.11× |
+  | Apple M4 Pro, growth in slot order | 1.34× | 1.58× | 1.45× | 1.46× |
+  | Apple M4 Pro, growth in id order | 1.35× | 1.63× | 1.47× | 1.48× |
+
+  - **The verdict** (the maintainer's, 2026-10-29): one `int64` passes every cell with slot-order growth, so it goes.
+    `int64` + `int32` passes on random ids on both hosts but reaches only 1.25× on the permutation at 1 Mi on the
+    Xeon, below the 1.3× gate. It is a **conditional go**: step 1 ships both shapes, records that cell as a known
+    limit, and gates the two-key shape end to end on Q30 and Q31 as well (see the gates above). Q32 stays
+    reported, since a key table alone has room for about 9% of its CPU.
+
+  - **What changed since 2026-10-18's parity:**
+    - the chunked pass took the small tables from 0.43× to about 2×;
+    - charging the budget on capacity changes only removed the +360%;
+    - the estimate took 1 Mi groups from 1.13× to 1.78× (one `int64`, Xeon), because growth was half the time there:
+      pre-sized, the same loop reaches 2.1-3.1× at 1 Mi.
+  - **The growth choice splits by host:**
+    - with ids that never repeat early (the permutation, standing in for sorted or clustered keys), the estimate
+      cannot fire. Then, at 4 Mi groups, id-order growth falls to 0.79-0.87× on the Xeon, while slot-order growth
+      holds 1.07-1.10×;
+    - on the M4 Pro, id-order growth is 10-48% faster from 256 Ki groups up, and slot-order growth reaches 1.14-1.17×
+      at 4 Mi.
+
+    Slot order is the default because its worst case on either host is 1.07×. Step 1 decides it end to end.
+  - **What lost:** one row at a time (DataFusion's shape), the key or a 32- or 64-bit hash beside the id (a 32-bit
+    hash beside the id failed the gate on the M4 Pro), prefetching 16 or 32 rows ahead, a load factor of 1/2, and 4×
+    growth.
+  - **Known limit:** `int64` + `int32` with ids that never repeat early (sorted or clustered keys) reaches 1.25× at
+    1 Mi on the Xeon with slot-order growth, and 1.11× with id-order growth.
+  - **Arrow's SIMD:** the Xeon's grouper runs AVX2 kernels, which this ADR's original host did not. They make it
+    1.6-1.8× *slower* at 1000-16 Ki groups and about 10% faster from 1 Mi up. But switching them off made eight
+    GROUP BY queries 1-2% slower in total at 1-32 threads, so that is no lever, and the baseline stays the grouper as
+    the engine runs it.
+  - **Not covered by step 0:** NULL keys, DOUBLE normalization, string keys, threads sharing a cache, and the engine
+    end to end. Step 1 wires the table into `GroupTable` behind an exec-private interface, under plan mode, and
+    replaces `bench/group_loops.h` with the engine's table.
 - **For now:** GROUP BY keeps `arrow::compute::Grouper`. The engine's other levers (partitioned merge, routing,
   partition top-N, dependent keys) stay as they are and carry over to the new table.
 - **When the work starts:** it begins with that micro benchmark and the prototype's lessons:
   - avoid per-row branches in the probe loop;
   - keep the table's memory on the Arrow pool;
   - specialize per key shape.
+  - Update (2026-10-29): step 0 is done (#253) and went. The grouper now serves every key shape without a table of
+    our own and is the oracle in tests. Step 1 comes next, under the per-step gates above, and the lessons still
+    hold: no per-row branches in the probe loop; keep the table's memory on the Arrow pool; charge it on capacity
+    changes, before allocating; specialize per key shape; and re-measure against the grouper in the same run.
 - **Other gaps:** the string scan gap (Q20-Q22: the Parquet decoder copies every string; decoding into `BINARY_VIEW`
   saved only 10-16%) is a separate, later decision.
   - Update (2026-10-15): that decision is [ADR 0027](0027-string-views.md), which keeps the Parquet side deferred on
