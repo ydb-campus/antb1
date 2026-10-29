@@ -23,6 +23,7 @@ internals are described next to the code in [tests/README.md](../tests/README.md
 | Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
 | ClickBench data tests | `tests/data/` | antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the ClickBench ratchet, with redacted output | in use |
 | Data derived from TPC-H | `tests/tpch/` | data, query texts and answers generated at test time; DuckDB's answers on the generated files, and antb1 against DuckDB on generated queries over them, with redacted output (Linux only) | in use |
+| Data derived from TPC-DS | `tests/tpcds/` | the pinned dsdgen extension loads and provides the 99 query texts; data generation and the ratchet are next (Linux only) | started |
 | Benchmark smoke tests | `bench/` | every micro benchmark runs once (`pixi run release`), so they keep building and running | in use |
 
 Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`), the
@@ -399,6 +400,14 @@ trust-on-first-use: their sha256 is recorded in `full/SHA256SUMS` on the first d
 and checked on every later run. `ANTB1_HITS_FILES` takes a file, a glob in the file name or a comma-separated list;
 `data.hits0.verify` then skips the pinned `hits_0` with a warning. The published full-dataset answers are compared
 by hand with the CLI, never committed.
+
+## Data derived from TPC-DS
+
+`tests/tpcds/` will test the engine on data derived from TPC-DS, under the same rules as the data derived from TPC-H
+below, with the differences of ADR 0006's TPC-DS amendment: no stored answers (the live DuckDB oracle is the only
+judge). So far it holds `harness.tpcds.extension`: the pinned `duckdb-extension-tpcds` package loads into the duckdb
+CLI by absolute path (one thread, no extension auto-install or auto-load) and provides the 99 query texts, of which
+only the count is printed. Linux only, as for TPC-H.
 
 ## Data derived from TPC-H
 

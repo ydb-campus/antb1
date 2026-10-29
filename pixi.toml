@@ -37,13 +37,16 @@ benchmark = "1.9.*"
 libduckdb-devel = "1.5.*"  # DuckDB C API: TEST ORACLE ONLY, never linked into src/
 duckdb-cli = "1.5.*"
 
-# TPC's dbgen (TPC EULA) for the TPC-H-derived test data only (ADR 0006). Linux only: on osx-arm64 pixi cannot
-# install the package, because re-signing the extension after prefix replacement fails on its DuckDB metadata trailer.
+# TPC's dbgen and dsdgen (TPC EULA) for the TPC-H- and TPC-DS-derived test data only (ADR 0006). Linux only: on
+# osx-arm64 pixi cannot install these packages, because re-signing an extension after prefix replacement fails on its
+# DuckDB metadata trailer.
 [feature.base.target.linux-64.dependencies]
 duckdb-extension-tpch = "1.5.*"
+duckdb-extension-tpcds = "1.5.*"
 
 [feature.base.target.linux-aarch64.dependencies]
 duckdb-extension-tpch = "1.5.*"
+duckdb-extension-tpcds = "1.5.*"
 
 # ---- llvm (no tasks): the Clang toolchain of the `default` and `static` environments ----
 [feature.llvm.dependencies]

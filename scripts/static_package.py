@@ -351,9 +351,10 @@ digests.
       cmake/static/arrow-sources.lock, and the conda-forge packages of CLI11 and Boost's headers.
 
 Rebuild the binary on Linux (pixi 0.81.0 or newer installs the toolchain; the Arrow sources come from here). The
-environment it installs, `static`, also contains duckdb-extension-tpch: TPC's dbgen under the TPC End User License
-Agreement v2.2. Only antb1's tests use it, but the build configures with it, and installing the environment installs
-it and accepts that EULA (CONTRIBUTING.md, docs/adr/0006-test-strategy-and-data-policy.md).
+environment it installs, `static`, also contains duckdb-extension-tpch and duckdb-extension-tpcds: TPC's dbgen and
+dsdgen under the TPC End User License Agreement v2.2. Only antb1's tests use them, but the build configures with
+them, and installing the environment installs them and accepts that EULA (CONTRIBUTING.md,
+docs/adr/0006-test-strategy-and-data-policy.md).
 
   tar -xzf antb1-source.tar.gz && cd antb1-{version}
   mkdir -p ~/.cache/antb1/arrow/src && cp ../third-party/*.tar.gz ~/.cache/antb1/arrow/src/
