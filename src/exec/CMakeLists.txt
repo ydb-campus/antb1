@@ -23,6 +23,7 @@ antb1_add_module(
     profiled_operator.cc
     heavy_hitters.cc
     outer_groups.cc
+    key_table.cc
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
@@ -70,6 +71,8 @@ if(ANTB1_BUILD_TESTS)
       tests/memory_test.cc
       tests/gather_test.cc
       tests/hash_join_test.cc
+      tests/pool_vector_test.cc
+      tests/key_table_test.cc
     LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
   # Replaces the global operator new and delete (an allocation-failure hook), so it is an executable of its own.

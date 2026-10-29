@@ -17,35 +17,35 @@
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "key_table.h"
+
 namespace arrow::compute {
 class ExecContext;
-class Grouper;
 }  // namespace arrow::compute
 
 namespace antb1::exec {
 
-// A hash of every row's key values (the columns of `keys`, normalized as a grouper keeps them),
+// A hash of every row's key values (the columns of `keys`, normalized as a key table keeps them),
 // the same on every run and build of this Arrow version: each value's bytes through Arrow's string
 // hash (a fixed-width value's bytes, a binary value's bytes, a constant for NULL), combined over
 // the keys. Without columns every row has the same hash.
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys);
 
-// The groups of a GROUP BY: a grouper over the keys (NULL is a key value; DOUBLE keys are
-// normalized first, so -0.0 groups with 0.0 and every NaN with every other NaN), one
+// The groups of a GROUP BY: a key table over the keys (key_table.h; NULL is a key value; DOUBLE
+// keys are normalized first, so -0.0 groups with 0.0 and every NaN with every other NaN), one
 // GroupedAggregateState per call, and each group's key values as first seen, in chunks of new
 // groups. GroupAggregateOperator consumes its whole input into one table;
 // PartGroupAggregateOperator consumes each part into its own and merges them in part order
-// (docs/adr/0013-parallel-execution.md). Groups are numbered by the grouper (deterministic for a
-// given input, not the order of first appearance). Without keys every row is in one group. The
-// states' own containers are charged to the budget. Single-threaded.
+// (docs/adr/0013-parallel-execution.md). Groups are numbered by the key table (deterministic for a
+// given input; arrow's Grouper does not number them in the order of first appearance). Without keys
+// every row is in one group. The states' own containers are charged to the budget, and the key
+// table allocates from the budget's pool. Single-threaded.
 class GroupTable {
  public:
   // The most new groups a Merge adds as one chunk (one output batch).
   static constexpr std::size_t kMaxMergeChunk = std::size_t{64} * 1024;
   // The most key bytes NextChunk joins from several chunks into one batch.
   static constexpr int64_t kMaxJoinedKeyBytes = int64_t{16} * 1024 * 1024;
-  // The partitions of a partitioned merge: a constant, never the number of threads, so that the
-  // result is the same for any number of threads.
   // The partitions a table's groups merge through: a constant, never the number of threads, so
   // that the result is the same for any number of threads (docs/adr/0013-parallel-execution.md).
   // 32 rather than 64 because the fixed cost of a partition is paid once per part per partition --
@@ -56,11 +56,12 @@ class GroupTable {
 
   // Checks the keys and calls against an input `input_width` columns wide. Without
   // `first_keys` the table keeps no first-seen key values (NextChunk is then unavailable): its
-  // groups are read through uniques(), which holds the normalized keys.
+  // groups are read through uniques(), which holds the normalized keys. `key_table` picks the key
+  // table (MakeKeyTable); operators leave it to the engine.
   static arrow::Result<std::unique_ptr<GroupTable>> Make(
       std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
       int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
-      std::size_t partitions = kPartitions);
+      std::size_t partitions = kPartitions, const KeyTableOptions& key_table = {});
   GroupTable(const GroupTable&) = delete;
   GroupTable& operator=(const GroupTable&) = delete;
   GroupTable(GroupTable&&) = delete;
@@ -84,7 +85,7 @@ class GroupTable {
   arrow::Status Partition(std::size_t prefix, std::span<const std::uint64_t> heavy);
   // The rows of `rows` (a batch of this table's input) split as Partition splits their groups:
   // per partition, the rows whose keys' group Partition() puts there, in input order.
-  // For a table with keys; DOUBLE keys are normalized for the hash, as the grouper does.
+  // For a table with keys; DOUBLE keys are normalized for the hash, as the key table sees them.
   arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> RouteRows(
       const arrow::RecordBatch& rows) const;
   // The hash (KeyHashes) of each group's first `prefix` keys, in group order (with keys only).
@@ -99,7 +100,10 @@ class GroupTable {
     return partition_groups_.at(partition);
   }
   // Adds the groups of partition `partition` of `part` (partitioned) as Merge adds all of them.
-  // Tables that merge different partitions of the same parts can run on different threads.
+  // Tables that merge different partitions of the same parts can run on different threads: they
+  // read part only through its partitions' groups and keys, its first-seen keys and its states,
+  // never through its key table, which is single-threaded (so uniques() and PrefixHashes() must
+  // not run on a part the lanes share).
   arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
 
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
@@ -143,7 +147,7 @@ class GroupTable {
   bool keep_first_keys_;
   std::size_t partitions_ = kPartitions;  // this table's partition count
   std::unique_ptr<arrow::compute::ExecContext> kernels_;
-  std::unique_ptr<arrow::compute::Grouper> grouper_;  // nullptr without keys
+  std::unique_ptr<KeyTable> key_table_;  // nullptr without keys
   std::vector<std::unique_ptr<GroupedAggregateState>> states_;
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, per chunk
   std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
