@@ -4,15 +4,17 @@
 // lost). Not engine code: the table only turns key rows into dense first-seen group ids, without
 // NULLs; step 1 builds the engine's table from it and replaces this file.
 //
-// What they share: a fixed-seed one-multiply hash (foldhash's fast tier), 7-bit tags matched eight
-// at a time in a 64-bit word (SWAR), control bytes whose first eight are mirrored past the end so
-// that an unaligned group load never wraps (hashbrown's layout), a triangular probe that stops at
-// the first group holding an empty slot (there are no deletions), and every byte charged to a
-// MemoryBudget before it is allocated, never per insert. The loop works a chunk of rows at a time:
-// one room check, one pass that hashes the chunk, then the probes, each prefetching the buckets of
-// the row a few places on (a loop of one row at a time with a room check per row, DataFusion's
-// shape, lost to it). What varies is how the table grows (Slots below); TableOptions holds the
-// prefetch distance, the load factor at which the table doubles, and the size estimate.
+// It uses a fixed-seed one-multiply hash (the scheme of foldhash's fast tier, Mix below), 7-bit
+// tags matched eight at a time in a 64-bit word (SWAR, the well-known zero-byte test), control
+// bytes whose first eight are mirrored past the end so that an unaligned group load never wraps,
+// and a triangular probe that stops at the first group holding an empty slot (there are no
+// deletions): the design of Rust's hashbrown, written here from its description, not its code. It
+// charges every byte to a MemoryBudget before it is allocated, never per insert. The loop works a
+// chunk of rows at a time: one room check, one pass that hashes the chunk, then the probes, each
+// prefetching the buckets of the row a few places on (a loop of one row at a time with a room check
+// per row, DataFusion's shape, lost to it). What varies is how the table grows (Slots below);
+// TableOptions holds the prefetch distance, the load factor at which the table doubles, and the
+// size estimate.
 
 #pragma once
 
@@ -31,9 +33,11 @@
 
 namespace antb1::bench::step0 {
 
-// After foldhash 0.2.0 (fast.rs, lib.rs; Zlib licence): fold(x, y) is the low xor the high half
-// of the 128-bit product, and a word mixes in as fold(v ^ prev ^ A3, A6), prev being the seed for
-// the first word. The seed is fixed, so a table's ids are a function of its input.
+// The mixing scheme of foldhash 0.2.0's fast tier: fold(x, y) is the low xor the high half of the
+// 128-bit product (a folded multiply, as wyhash and others use), and a word mixes in as
+// fold(v ^ prev ^ A3, A6), prev being the seed for the first word. The three constants are
+// hexadecimal digits of pi, the ones foldhash picks for the same roles. The seed is fixed, so a
+// table's ids are a function of its input.
 inline constexpr std::uint64_t kFoldA3 = 0x082efa98ec4e6c89ULL;
 inline constexpr std::uint64_t kFoldA6 = 0xc0ac29b7c97c50ddULL;
 inline constexpr std::uint64_t kSeed = 0x243f6a8885a308d3ULL;
@@ -228,8 +232,9 @@ class FixedTable {
   }
 
   // Room for `extra` more groups without a check: the slots double until the groups fit the load
-  // factor and the key array doubles, each charged before it is allocated (the old and the new
-  // slots both, while they coexist).
+  // factor and the key array doubles, each charged before it is allocated, the old and the new
+  // buffers both while they coexist (Rehash for the slots, here for the keys, which reserve()
+  // copies before it frees the old buffer).
   arrow::Status MakeRoom(std::size_t extra) {
     const std::size_t need = keys_.size() + extra;
     if (need > grow_at_) {
@@ -245,8 +250,9 @@ class FixedTable {
     if (need > keys_.capacity()) {
       const std::size_t keys =
           std::max<std::size_t>(need, std::max<std::size_t>(16, keys_.capacity() * 2));
-      ARROW_RETURN_NOT_OK(reservation_.Resize(BytesFor(capacity_, keys)));
+      ARROW_RETURN_NOT_OK(reservation_.Resize(BytesFor(capacity_, keys_.capacity() + keys)));
       keys_.reserve(keys);
+      ARROW_RETURN_NOT_OK(reservation_.Resize(BytesFor(capacity_, keys)));  // only shrinks
     }
     return arrow::Status::OK();
   }

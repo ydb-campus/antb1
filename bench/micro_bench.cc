@@ -788,10 +788,12 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, 
     }
   }
   std::vector<std::uint32_t> ids(static_cast<std::size_t>(kBatchSize));
-  // The table's id of each true group, and back: both must be one to one.
+  // The table's id of each true group, and back: both must be one to one, a new group must take
+  // the next id (dense, in first-seen order), and the table must keep each group's key.
   std::vector<int64_t> ours(static_cast<std::size_t>(groups), -1);
   std::vector<int64_t> theirs(static_cast<std::size_t>(groups), -1);
   int64_t row = 0;
+  std::uint32_t next = 0;
   for (const auto& batch : batches) {
     if (auto status = Step0Consume(table, *batch, ids.data()); !status.ok()) {
       return status.ToString();
@@ -805,11 +807,28 @@ std::string Step0Check(const arrow::RecordBatchVector& batches, int64_t groups, 
       int64_t& mine = ours[truth];
       int64_t& back = theirs[id];
       if (mine == -1 && back == -1) {
+        if (id != next) {
+          return "row " + std::to_string(row) + " starts a group with id " + std::to_string(id) +
+                 " where the next id is " + std::to_string(next);
+        }
+        ++next;
         mine = id;
         back = static_cast<int64_t>(truth);
       } else if (mine != id || back != static_cast<int64_t>(truth)) {
         return "row " + std::to_string(row) + " has id " + std::to_string(id) +
                " but its group has " + std::to_string(mine);
+      }
+    }
+  }
+  // Every group's key, as the table keeps it, is the key of the rows given its id.
+  row = 0;
+  for (const auto& batch : batches) {
+    const auto columns = ColumnsOf(*batch, static_cast<Key*>(nullptr));
+    for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
+      const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode));
+      const auto id = static_cast<std::size_t>(ours[truth]);
+      if (!(table.keys().at(id) == Key::At(columns, static_cast<std::size_t>(i)))) {
+        return "group " + std::to_string(id) + " keeps a key other than its rows'";
       }
     }
   }
