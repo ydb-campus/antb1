@@ -1459,7 +1459,12 @@ class Parser {
           case Context::kGroupBy:
             return Syntax(token.span, "aggregate functions are not allowed in GROUP BY");
           case Context::kAggregateArg:
-            return Syntax(token.span, "aggregate function calls cannot be nested");
+            // Valid DuckDB only when the enclosing call is a window function (SUM(SUM(x)) OVER ()),
+            // whose OVER is refused after the call, as every OVER is.
+            if (!OverAfterAggregate()) {
+              return Syntax(token.span, "aggregate function calls cannot be nested");
+            }
+            break;
           case Context::kSelect:
           case Context::kHaving:
           case Context::kOrderBy:
@@ -1584,7 +1589,11 @@ class Parser {
       }
       return Syntax(arg.span, "expected a column in " + std::string(ToString(kind)) + "()");
     } else {
+      const std::size_t outer_parens = std::exchange(aggregate_parens_, open_parens_);
+      const std::optional<bool> outer_over = std::exchange(over_after_aggregate_, std::nullopt);
       auto expr = ParseExpr(Context::kAggregateArg);
+      aggregate_parens_ = outer_parens;
+      over_after_aggregate_ = outer_over;
       if (!expr) {
         return std::unexpected(std::move(expr.error()));
       }
@@ -2811,13 +2820,54 @@ class Parser {
     Token token = std::move(tokens_.front());
     tokens_.pop_front();
     last_end_ = token.span.offset + token.span.length;
+    if (token.kind == TokenKind::kLeftParen) {
+      ++open_parens_;
+    } else if (token.kind == TokenKind::kRightParen && open_parens_ > 0) {
+      --open_parens_;
+    }
     return token;
+  }
+
+  // Inside the argument of an aggregate call: whether OVER follows the ')' that closes that call,
+  // found by lookahead once per call (nothing is consumed). False if the text ends first, also at
+  // a lexer error, which is dropped: the caller then fails before it consumes that far.
+  bool OverAfterAggregate() {
+    if (!over_after_aggregate_.has_value()) {
+      const bool had_lex_error = lex_error_.has_value();
+      over_after_aggregate_ = LookAheadForOver();
+      if (!had_lex_error && lex_error_.has_value()) {
+        lex_error_.reset();
+        over_after_aggregate_ = false;
+      }
+    }
+    return *over_after_aggregate_;
+  }
+
+  bool LookAheadForOver() {
+    std::size_t open = open_parens_;
+    for (std::size_t ahead = 0;; ++ahead) {
+      const Token& token = PeekAt(ahead);
+      if (token.kind == TokenKind::kEnd) {
+        return false;
+      }
+      if (token.kind == TokenKind::kLeftParen) {
+        ++open;
+      } else if (token.kind == TokenKind::kRightParen) {
+        if (open == aggregate_parens_) {
+          return PeekAt(ahead + 1).IsKeyword("OVER");
+        }
+        --open;
+      }
+    }
   }
 
   Lexer lexer_;
   std::deque<Token> tokens_;
   std::optional<ParseError> lex_error_;
   std::size_t last_end_ = 0;
+  std::size_t open_parens_ = 0;               // '(' consumed minus ')' consumed
+  std::size_t aggregate_parens_ = 0;          // open_parens_ inside the aggregate call being parsed
+  std::optional<bool> over_after_aggregate_;  // OverAfterAggregate() of that call, once known
   std::size_t depth_ = 0;  // levels of the nested queries and the expression being parsed
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
   bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps

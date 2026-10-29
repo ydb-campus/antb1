@@ -146,6 +146,8 @@ parenthesized operand does not), and so does a `NOT` that is the right operand o
 `LIKE` pattern or a `BETWEEN` bound (`a = NOT b` is `a = (NOT b)`). The canonical form writes an `ON`, `WHERE` or
 `HAVING` predicate with a top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed
 in the select list, `HAVING` and `ORDER BY`, and cannot be nested; one in `ON`, `WHERE` or `GROUP BY` is a syntax error.
+A nested call is unsupported rather than a syntax error when `OVER` follows the outer call (`SUM(SUM(a)) OVER ()`,
+a window function over an aggregate, as DuckDB takes it).
 
 The FROM list is flat ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each item after the first records how it joins
 the items before it. A `JOIN` binds tighter than a comma and associates to the left, as in DuckDB, so `a, b JOIN c ON
