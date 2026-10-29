@@ -243,11 +243,12 @@ alone. The partition lanes of a GROUP BY hold at most as many parts as the windo
 before the consumer waits for them to merge, and they finish merging before a part runs again alone. A
 `std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `exec::ForEach` (in
 its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task), around the
-part scheduler's `Submit`, in `Drain`, in every call of the join hash table and in a join build's `Prepare`, and
-becomes `OutOfMemory` too. Three places in Arrow still end the process on one: its thread pool's `Spawn`, where an
-OpenTelemetry call allocates in a `noexcept` function, a compute function's call, which allocates its tracing span
-where an exception cannot pass, and the making of an `arrow::Result` from a `Status`, whose `noexcept` constructor
-copies it.
+part scheduler's `Submit`, in `Drain`, in every call of the join hash table, in a join build's `Prepare` and in
+making a GROUP BY's key table and its calls, and becomes `OutOfMemory` too. Four places in Arrow still end the
+process on one: its thread pool's `Spawn`, where an OpenTelemetry call allocates in a `noexcept` function, a compute
+function's call, which allocates its tracing span where an exception cannot pass, the making of an `arrow::Result`
+from a `Status`, whose `noexcept` constructor copies it, and the Grouper's `GetUniques` (reached by a `GroupTable`'s
+`Merge`, `Partition`, `PrefixHashes` and `uniques()`), which cannot unwind out of its own `noexcept` frames.
 
 The budget's pool is Arrow's default pool, mimalloc. On Linux the `antb1` executable restarts itself once with
 `MIMALLOC_PURGE_DELAY=-1` (`cli::RestartForAllocator`, ADR 0017), so that mimalloc keeps the memory a query frees

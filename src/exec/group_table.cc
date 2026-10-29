@@ -16,7 +16,6 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
-#include <arrow/compute/row/grouper.h>
 #include <arrow/util/byte_size.h>
 #include <arrow/util/hashing.h>
 
@@ -33,12 +32,9 @@
 namespace antb1::exec {
 namespace {
 
-std::span<const std::uint32_t> IdsOf(const arrow::UInt32Array& ids) {
-  return {ids.raw_values(), static_cast<std::size_t>(ids.length())};
-}
-
 // For each group new since `before` (ids before .. after - 1), the first position in `ids` that
-// maps to it: the grouper numbers new groups in an order of its own, so they are found per id.
+// maps to it: a key table may number new groups in an order of its own (arrow's Grouper does), so
+// they are found per id.
 arrow::Result<std::shared_ptr<arrow::Array>> FirstPositions(std::span<const std::uint32_t> ids,
                                                             std::uint32_t before,
                                                             std::uint32_t after,
@@ -144,7 +140,7 @@ GroupTable::~GroupTable() = default;
 arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
     std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
     int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
-    std::size_t partitions) {
+    std::size_t partitions, const KeyTableOptions& key_table) {
   std::unique_ptr<GroupTable> table(
       new GroupTable(std::move(keys), std::move(aggregates), pool, first_keys));
   ANTB1_CHECK(std::has_single_bit(partitions));  // PartitionOf masks
@@ -195,8 +191,8 @@ arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
   }
   table->kernels_ = std::make_unique<arrow::compute::ExecContext>(pool);
   if (!table->keys_.empty()) {
-    ARROW_ASSIGN_OR_RAISE(table->grouper_,
-                          arrow::compute::Grouper::Make(key_types, table->kernels_.get()));
+    ARROW_ASSIGN_OR_RAISE(table->key_table_,
+                          MakeKeyTable(key_types, table->kernels_.get(), key_table));
   }
   table->first_keys_.assign(table->keys_.size(), {});
   return table;
@@ -218,7 +214,7 @@ arrow::Status GroupTable::AddGroups(std::uint32_t after,
 arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
   const std::int64_t n = rows.num_rows();
   std::vector<std::uint32_t> no_keys;
-  std::shared_ptr<arrow::UInt32Array> ids;
+  KeyIds ids;  // holds the group ids until the states have consumed the rows
   std::span<const std::uint32_t> group_ids;
   if (keys_.empty()) {  // one group of every row
     if (num_groups_ == 0) {
@@ -237,11 +233,9 @@ arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
       keys.emplace_back(std::move(column));
     }
     const arrow::compute::ExecBatch key_batch(std::move(keys), n);
-    ARROW_ASSIGN_OR_RAISE(const arrow::Datum id_datum,
-                          grouper_->Consume(arrow::compute::ExecSpan(key_batch)));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
-    group_ids = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(key_batch));
+    group_ids = ids.ids;
+    const std::uint32_t after = ids.after;
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
     } else if (after > num_groups_) {
@@ -275,7 +269,7 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     return arrow::Status::OK();
   }
   std::vector<std::uint32_t> no_keys;
-  std::shared_ptr<arrow::UInt32Array> ids;
+  KeyIds ids;
   std::span<const std::uint32_t> group_map;
   if (keys_.empty()) {
     if (num_groups_ == 0) {
@@ -285,12 +279,10 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     group_map = no_keys;
   } else {
     // Part's groups in its own order, by their normalized keys: the map from its groups to ours.
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, part.grouper_->GetUniques());
-    ARROW_ASSIGN_OR_RAISE(const arrow::Datum id_datum,
-                          grouper_->Consume(arrow::compute::ExecSpan(uniques)));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
-    group_map = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, part.key_table_->Uniques());
+    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(uniques));
+    group_map = ids.ids;
+    const std::uint32_t after = ids.after;
     if (after > num_groups_ && !part.keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques, group_map, after));
     } else if (after > num_groups_) {
@@ -380,8 +372,8 @@ arrow::Status GroupTable::AddPartGroups(const GroupTable& part, std::span<const 
 
 arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                           std::span<const std::uint32_t> to, std::uint32_t after) {
-  // The row of `keys` each new group's keys are in, by group: the grouper numbers new groups in an
-  // order of its own, not the order it first sees them, so they are placed per id as in Consume.
+  // The row of `keys` each new group's keys are in, by group: a key table may number new groups in
+  // an order of its own, not the order it first sees them, so they are placed per id as in Consume.
   // A row index, like a group, is a uint32: `keys` is one part's groups, or one partition of them.
   const auto groups = static_cast<std::size_t>(after - num_groups_);
   std::vector<std::uint32_t> positions(groups, 0);
@@ -422,9 +414,9 @@ arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
 arrow::Status GroupTable::Partition() { return Partition(keys_.size(), {}); }
 
 arrow::Result<std::vector<std::uint64_t>> GroupTable::PrefixHashes(std::size_t prefix) const {
-  ANTB1_CHECK(grouper_ != nullptr);
+  ANTB1_CHECK(key_table_ != nullptr);
   ANTB1_CHECK(prefix <= keys_.size());
-  ARROW_ASSIGN_OR_RAISE(arrow::compute::ExecBatch keys, grouper_->GetUniques());
+  ARROW_ASSIGN_OR_RAISE(arrow::compute::ExecBatch keys, key_table_->Uniques());
   keys.values.resize(prefix);
   return KeyHashes(keys);
 }
@@ -479,8 +471,8 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
 }
 
 arrow::Result<arrow::compute::ExecBatch> GroupTable::uniques() const {
-  ANTB1_CHECK(grouper_ != nullptr);
-  return grouper_->GetUniques();
+  ANTB1_CHECK(key_table_ != nullptr);
+  return key_table_->Uniques();
 }
 
 arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uint64_t> heavy) {
@@ -495,7 +487,7 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
     return arrow::Status::OK();
   }
   partition_groups_.resize(partitions_);
-  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, grouper_->GetUniques());
+  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, key_table_->Uniques());
   arrow::compute::ExecBatch prefix_keys = uniques;
   prefix_keys.values.resize(prefix);
   ARROW_ASSIGN_OR_RAISE(std::vector<std::uint64_t> hashes, KeyHashes(prefix_keys));
@@ -554,7 +546,7 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
   // The partition's groups of part (`groups`) and this table's groups they become (`to`): the
   // work is proportional to the partition, not to the part.
   std::vector<std::uint32_t> single;
-  std::shared_ptr<arrow::UInt32Array> ids;
+  KeyIds ids;
   std::span<const std::uint32_t> to;
   if (keys_.empty()) {
     if (num_groups_ == 0) {
@@ -563,13 +555,10 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
     single.assign(1, 0);
     to = single;
   } else {
-    // The partition's groups of part, by their normalized keys, through this table's grouper.
-    ARROW_ASSIGN_OR_RAISE(
-        const arrow::Datum id_datum,
-        grouper_->Consume(arrow::compute::ExecSpan(part.partition_uniques_[partition])));
-    ids = std::static_pointer_cast<arrow::UInt32Array>(id_datum.make_array());
-    to = IdsOf(*ids);
-    const std::uint32_t after = grouper_->num_groups();
+    // The partition's groups of part, by their normalized keys, through this table's key table.
+    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(part.partition_uniques_[partition]));
+    to = ids.ids;
+    const std::uint32_t after = ids.after;
     if (after > num_groups_ && !keep_first_keys_) {
       ARROW_RETURN_NOT_OK(AddGroups(after, {}));
     } else if (after > num_groups_ && !part.keep_first_keys_) {

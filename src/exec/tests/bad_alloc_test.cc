@@ -1,5 +1,5 @@
-// std::bad_alloc in ForEach, the partition lanes, the part scheduler, the join hash table and the
-// join build
+// std::bad_alloc in ForEach, the partition lanes, the part scheduler, the join hash table, the
+// join build and a GROUP BY's key table
 // (docs/adr/0022-joins-and-query-blocks.md): an allocation of the C++ heap that fails anywhere in a
 // call gives OutOfMemory, never an exception (ForEach lets one out only when not even its
 // OutOfMemory can be made, and only once its tasks ended); it stops the lanes as the serial order
@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/exec.h>
 #include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
@@ -39,6 +40,7 @@
 #include "antb1/plan/logical_plan.h"
 
 #include "../hash_join.h"
+#include "../key_table.h"
 #include "../part_scheduler.h"
 #include "../partition_lanes.h"
 #include "exec_test_util.h"
@@ -1150,6 +1152,74 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
     }
     return fired;
   });
+}
+
+// ---- a GROUP BY's key table ----
+
+class KeyTableBadAllocTest : public testing::ExecTest {};
+
+// Making a key table and consuming keys (also a column of NULLs with no values buffer, which the
+// table mends first) give OutOfMemory for any heap allocation that fails in them, never an
+// exception, and leave nothing in the budget once the table is gone. Not Uniques: a heap failure
+// inside arrow's Grouper::GetUniques unwinds into a noexcept frame of Arrow's own and ends the
+// process before any caller can catch it, with or without the key table.
+TEST_F(KeyTableBadAllocTest, MakingAndConsumingRunOutOfMemoryCleanly) {
+  const std::vector<arrow::TypeHolder> types = {arrow::int64()};
+  const arrow::compute::ExecBatch keys({Int64s({1, 2, std::nullopt, 1})}, 4);
+  auto bitmap = arrow::AllocateBitmap(4).ValueOrDie();
+  std::fill_n(bitmap->mutable_data(), bitmap->size(), 0);
+  const arrow::compute::ExecBatch nulls(
+      {arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), 4, {bitmap, nullptr}, 4))}, 4);
+
+  Sweep([&](std::int64_t skip) {
+    MemoryBudget budget(std::nullopt);
+    bool fired = false;
+    {
+      arrow::compute::ExecContext ctx(&budget);
+      std::optional<arrow::Result<std::unique_ptr<KeyTable>>> table;
+      {
+        const FailAllocations fail(skip);
+        table.emplace(MakeKeyTable(types, &ctx));
+        fired = fail.failed() > 0;
+      }
+      if (!table->ok()) {
+        EXPECT_TRUE(fired) << table->status().ToString();
+        EXPECT_TRUE(table->status().IsOutOfMemory()) << table->status().ToString();
+      }
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+    return fired;
+  });
+
+  for (const arrow::compute::ExecBatch* batch : {&keys, &nulls}) {
+    SCOPED_TRACE(batch == &keys ? "keys" : "NULLs without values");
+    Sweep([&](std::int64_t skip) {
+      MemoryBudget budget(std::nullopt);
+      bool fired = false;
+      {
+        arrow::compute::ExecContext ctx(&budget);
+        auto table = MakeKeyTable(types, &ctx);
+        EXPECT_TRUE(table.ok()) << table.status().ToString();
+        if (!table.ok()) {
+          return false;
+        }
+        std::optional<arrow::Result<KeyIds>> ids;
+        {
+          const FailAllocations fail(skip);
+          ids.emplace((*table)->Consume(*batch));
+          fired = fail.failed() > 0;
+        }
+        if (!ids->ok()) {
+          EXPECT_TRUE(fired) << ids->status().ToString();
+          EXPECT_TRUE(ids->status().IsOutOfMemory()) << ids->status().ToString();
+        } else {
+          EXPECT_EQ((*ids)->ids.size(), 4U);
+        }
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      return fired;
+    });
+  }
 }
 
 }  // namespace
