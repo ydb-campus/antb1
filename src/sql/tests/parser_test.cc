@@ -3253,7 +3253,6 @@ INSTANTIATE_TEST_SUITE_P(
         // A set operation after a subquery starts a compound (whose parenthesized first block is
         // unsupported) only where the subquery stands bare and first in the parentheses: after an
         // IN list's comma or inside a larger operand it stays a syntax error, as in DuckDB.
-        // VERIFY: DuckDB 1.5.5 gives a Parser Error for both statements below.
         RejectCase{"UnionAllAfterALaterInListValue",
                    "SELECT a FROM t WHERE a IN (1, (SELECT b FROM u) ^UNION ALL SELECT c FROM v)",
                    kSyntax, 5, "expected , or ) in IN (...), found keyword UNION"},

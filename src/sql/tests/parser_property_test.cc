@@ -603,9 +603,6 @@ void CheckParse(const std::string& sql) {
 
 // ---- random token soup ------------------------------------------------------------------------
 
-// VERIFY: with "UNION ALL" here and INTERSECT and EXCEPT in kOther (the seeds draw new queries),
-// RandomTokenSoupNeverBreaksTheParser still parses more than 500 queries, and it and
-// MutatedQueriesNeverBreakTheParser still pass.
 constexpr auto kStructure = std::to_array<std::string_view>({
     "SELECT", "select", "FROM",   "WHERE", "LIMIT", "AND",  "AS",       "*",         ",",
     "(",      ")",      ";",      "COUNT", "SUM",   "AVG",  "MIN",      "MAX",       "=",

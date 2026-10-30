@@ -105,13 +105,12 @@ TEST(QueryGenOracle, DuckDbReadsEveryGeneratedJoinAndItsCanonicalFormAlike) {
     EXPECT_EQ(*original, *again) << "canonical form: " << canonical;
   }
   EXPECT_EQ(joins, 1500);
-  EXPECT_GT(unions, 0) << "compounds";  // VERIFY: about 2% of all queries, about 50 expected
+  EXPECT_GT(unions, 0) << "compounds";
 }
 
 // Compounds over the tables of join_tables.h that the generator never writes: the WITH list and
 // the tail (ORDER BY, LIMIT, OFFSET) are the top-level compound's, a derived table's compound has a
 // tail of its own, and a compound is the query of each subquery form.
-// VERIFY: each text parses in sql::Parse and in DuckDB 1.5.5's json_serialize_sql (not yet run).
 constexpr auto kCompounds = std::to_array<std::string_view>({
     "WITH c AS (SELECT d_id FROM dims) SELECT d_id FROM c UNION ALL SELECT f_dim FROM facts "
     "ORDER BY 1 LIMIT 2 OFFSET 1",

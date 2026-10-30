@@ -806,7 +806,7 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
     }
   }
   EXPECT_GE(checked, 100) << "checked " << checked << " nested queries";
-  EXPECT_GT(compounds, 10) << "compounds: " << compounds;  // VERIFY: about 45 of 150 expected
+  EXPECT_GT(compounds, 10) << "compounds: " << compounds;
 }
 
 // A join that fails fails before the first draw from the first stream, so its query falls back
@@ -1727,9 +1727,9 @@ TEST(QueryGenerator, UnionAllRowBoundGuardsSelectStar) {
       ++unlimited_two_copy_stars;
     }
   }
-  EXPECT_GT(compounds, 100) << "compounds: " << compounds;  // VERIFY: about 300 expected
-  EXPECT_GT(three_copy_stars, 0);  // VERIFY: about 20 expected (6% compounds, 1/2 three, 15% *)
-  EXPECT_GT(unlimited_two_copy_stars, 0) << "40 rows need no LIMIT";  // VERIFY: about 18 expected
+  EXPECT_GT(compounds, 100) << "compounds: " << compounds;
+  EXPECT_GT(three_copy_stars, 0);
+  EXPECT_GT(unlimited_two_copy_stars, 0) << "40 rows need no LIMIT";
 }
 
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
