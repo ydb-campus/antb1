@@ -28,9 +28,11 @@ namespace antb1::plan {
 // rather than expanding the rest.
 
 // What carries the count past the limit, if any: an index into the outermost block's FROM list, so
-// the binder reports at an item the query text actually holds -- or, when it is one of that block's
-// subquery expressions, that subquery's operator span, since a subquery in WHERE or HAVING has no
-// FROM item of its own to report at.
+// the binder reports at an item the query text actually holds -- or a span, where there is no such
+// item: one of that block's subquery expressions reports at its operator, since a subquery in WHERE
+// or HAVING has no FROM item of its own, and so does the outermost query when it is a compound,
+// which has no FROM list of its own: at a block's FROM item (its connector, or the item when it is
+// its block's first) or subquery, or at a subquery of the compound's ORDER BY.
 struct RelationOverflow {
   std::size_t item = 0;
   std::optional<SourceSpan> span;
@@ -44,7 +46,8 @@ std::optional<RelationOverflow> RelationsExceedLimit(const sql::SelectStatement&
 // kMaxRelations + 1, so a result of kMaxRelations + 1 means "at least that many".
 std::size_t CountRelations(const sql::SelectStatement& block);
 
-// Every block `block` reaches, outermost first: itself, each derived table's query, the query of
+// Every block `block` reaches, outermost first (but for a compound, which follows its blocks):
+// itself, each derived table's query, the query of
 // each subquery expression, and the body of each CTE that a reached block references -- once per
 // CTE however often it is referenced, and not at all when nothing references it, since DuckDB never
 // binds an unreferenced one. Within a block, its FROM list's blocks come before its expressions',

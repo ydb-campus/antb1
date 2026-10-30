@@ -378,6 +378,10 @@ constexpr std::string_view kTypedLiterals =
     "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings (E'...') are not "
     "supported";
 
+// The kUnsupported message of a query in parentheses where a block starts (NotAQuery), also of the
+// first block of a compound in an expression's parentheses (ParenthesizedFirstBlock).
+constexpr std::string_view kParenthesizedQuery = "parenthesized queries are not supported";
+
 constexpr std::size_t kMaxQuotedText = 32;
 
 std::optional<std::string_view> Find(std::span<const Construct> table, std::string_view keyword) {
@@ -613,7 +617,7 @@ ParseError NotAQuery(const Token& token, bool statement_start) {
                             keyword + " is not supported; only SELECT queries are supported");
   }
   if (token.kind == TokenKind::kLeftParen) {
-    return UnsupportedError(token.span, "parenthesized queries are not supported");
+    return UnsupportedError(token.span, kParenthesizedQuery);
   }
   if (token.kind == TokenKind::kEnd && statement_start) {
     return SyntaxError(token.span, "empty query; expected SELECT");
@@ -1299,6 +1303,13 @@ class Parser {
       if (!value) {
         return value;
       }
+      // Only the first value can be the first block of a compound: after a comma, a set operation
+      // stays a syntax error, as in DuckDB.
+      if (in.list.empty()) {
+        if (auto error = ParenthesizedFirstBlock(*value); error.has_value()) {
+          return std::unexpected(std::move(*error));
+        }
+      }
       in.list.push_back(*std::move(value));
       if (Peek().kind == TokenKind::kRightParen) {
         break;
@@ -1451,6 +1462,9 @@ class Parser {
         auto inner = ParseExpr(context);
         if (!inner) {
           return inner;
+        }
+        if (auto error = ParenthesizedFirstBlock(*inner); error.has_value()) {
+          return std::unexpected(std::move(*error));
         }
         if (Peek().kind == TokenKind::kComma) {
           return Unsupported(Peek().span, "row values ((a, b)) are not supported");
@@ -2393,6 +2407,25 @@ class Parser {
                         .span = nested->span};
   }
 
+  // After `expr`, the first value of an IN list or an operand in parentheses: when `expr` is a bare
+  // scalar subquery and a set operation (UNION, INTERSECT, EXCEPT) or a query's tail (ORDER, LIMIT,
+  // OFFSET) is the next token, DuckDB reads the parentheses as a query whose first block is that
+  // subquery (`a IN ((SELECT ...) UNION ALL SELECT ...)`, `a = ((SELECT ...) LIMIT 1)`). A block in
+  // parentheses is kUnsupported at its '(', as where a query starts (NotAQuery); std::nullopt for
+  // any other expression or next token, where only ')' or ',' is valid.
+  std::optional<ParseError> ParenthesizedFirstBlock(const Expr& expr) {
+    const auto* sub = std::get_if<SubqueryExpr>(&expr);
+    if (sub == nullptr || sub->kind != SubqueryExpr::Kind::kScalar) {
+      return std::nullopt;
+    }
+    const std::string keyword = KeywordOf(Peek());
+    if (keyword != "UNION" && keyword != "INTERSECT" && keyword != "EXCEPT" && keyword != "ORDER" &&
+        keyword != "LIMIT" && keyword != "OFFSET") {
+      return std::nullopt;
+    }
+    return UnsupportedError(sub->op_span, kParenthesizedQuery);
+  }
+
   Expected<FromSource> ParseFromSource() {
     const Token& token = Peek();
     switch (token.kind) {
@@ -2844,9 +2877,10 @@ class Parser {
   // The end of a query: the end of the statement, after an optional ';' (kStatement), or the ')'
   // of a nested query, which is left for the caller (kParenthesis). A clause of
   // kUnsupportedClauses there is unsupported; anything else is a syntax error that names what may
-  // still come -- after `block`, the query's last block, and in `query`'s ORDER BY, LIMIT and
-  // OFFSET.
+  // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
+  // `query`'s ORDER BY, LIMIT and OFFSET.
   Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
+    static_assert(kSelectStatementFields == 19, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};
@@ -2872,7 +2906,8 @@ class Parser {
                     "unexpected UNION after ORDER BY, LIMIT or OFFSET; those come after the last "
                     "query of a UNION ALL and apply to all of it");
     }
-    // The clauses that could still follow, in grammar order.
+    // The clauses that could still follow, in grammar order: a UNION ALL follows any block before
+    // the query's ORDER BY, LIMIT and OFFSET.
     const bool ordered_or_later =
         !query.order_by.empty() || query.limit.has_value() || query.offset.has_value();
     const bool grouped_or_later =
@@ -2884,6 +2919,7 @@ class Parser {
     }
     if (!ordered_or_later) {
       next.emplace_back(block.having.empty() ? "HAVING" : "AND");
+      next.emplace_back("UNION ALL");
       next.emplace_back("ORDER BY");
     }
     if (!query.limit.has_value()) {

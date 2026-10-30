@@ -175,10 +175,14 @@ statement, a derived table's query, a CTE's query or the query of a subquery
 Each block is one level below the compound for the depth limit: a later block is parsed a level down, so its depth
 error is where it passes the limit, and the first block moves down at the first `UNION ALL`, which is where it is
 reported when that makes it too deep. A compound of any number of blocks parses. Unsupported (exit code
-4), each at its first token: `UNION` without `ALL` (`UNION DISTINCT` too), `BY NAME` after `UNION` or `UNION ALL`,
-`INTERSECT` and `EXCEPT`, which DuckDB answers, and a block that is not a `SELECT` block, such as one in parentheses
-(`UNION ALL (SELECT ...)`), a `VALUES` list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT
-DISTINCT` and a `SELECT` without `FROM`. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
+4), each at its first token: `UNION` without `ALL` (`UNION DISTINCT` too), `UNION BY NAME` (at `UNION`) and `BY NAME`
+after `UNION ALL` (at `BY`), `INTERSECT` and `EXCEPT`, which DuckDB answers, and a block that is not a `SELECT`
+block, such as one in parentheses (`UNION ALL (SELECT ...)`, and a first block too, also as the first value of an
+`IN` list or inside a parenthesized expression, before a set operation or an `ORDER BY`, `LIMIT` or `OFFSET`:
+`x IN ((SELECT ...) UNION ALL SELECT ...)`, `x = ((SELECT ...) LIMIT 1)`, at its `(`), a `VALUES`
+list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT DISTINCT` and a `SELECT` without `FROM`. After a
+later value of an `IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a
+syntax error, as in DuckDB. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
 `OFFSET` before a `UNION ALL`, and a `UNION ALL` that no block follows (at the end, or before `)`, `ALL`, `DISTINCT`
 or `WITH`). The binder does not answer a compound yet: each is unsupported at its first `UNION ALL` (exit code 4),
 after any construct in its blocks that is unsupported anyway, until ADR 0036's X3 binds it. A compound in a CTE that
