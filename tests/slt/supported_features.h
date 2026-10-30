@@ -64,7 +64,7 @@ enum class Feature : std::uint8_t {
   kWhere,            // WHERE column <op> literal (=, <>, !=, <, <=, >, >=); also in an inner ON
   kWhereAnd,         // several comparisons joined by AND
   kLike,             // VARCHAR column [NOT] LIKE 'pattern' in WHERE or an inner ON
-  kIn,               // column [NOT] IN (literal, ...) in WHERE or an inner ON
+  kIn,               // column [NOT] IN (literal or constant integer expression, ...) in WHERE or ON
   kBetween,          // column [NOT] BETWEEN literal AND literal in WHERE or an inner ON
   kCompareColumns,   // column <op> column in WHERE or an inner ON (a DECIMAL against numbers)
   kLiteralFirst,     // literal <op> column

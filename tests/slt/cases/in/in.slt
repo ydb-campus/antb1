@@ -143,3 +143,93 @@ query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (1)
 ----
 9215
+
+# A constant integer expression in a list is the literal of its value, as on a side of a comparison: typed and
+# folded like that literal (an out-of-range value is dropped), in IN and NOT IN, in WHERE and HAVING.
+
+query I rowsort
+SELECT id FROM edge WHERE i16 IN (0, 3 + 4, 50 * 2, 32766 + 1)
+----
+1
+11
+2
+6
+
+query I rowsort
+SELECT id FROM edge WHERE i16 NOT IN (0, 3 + 4, 50 * 2, -(1))
+----
+0
+1
+10
+4
+7
+9
+
+query I rowsort
+SELECT id FROM edge WHERE i16 IN (1, 32767 + 1)
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (2 - 1)
+----
+9215
+
+query I rowsort
+SELECT id FROM edge WHERE i64 IN (9223372036854775806 + 1, 40 + 2)
+----
+1
+9
+
+query I rowsort
+SELECT id FROM edge WHERE i64 IN (40 + 2, 4.2e1, 1)
+----
+4
+9
+
+query II nosort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 IN (3 + 4, 50 * 2, -(100)) ORDER BY i16
+----
+-100	1
+7	1
+100	1
+
+query II nosort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) IN (1 + 1) ORDER BY i16
+----
+NULL	2
+
+# An overflowing constant expression is the comparison's bind error in both engines.
+
+statement error Overflow
+SELECT id FROM edge WHERE i32 IN (1, 2147483647 + 1)
+
+# DuckDB raises the overflow only when a row computes it, so it answers over an empty table: divergence D17.
+onlyif antb1
+statement error ^bind: Overflow in addition of INTEGER
+SELECT COUNT(*) FROM empty WHERE RegionID IN (1, 2147483647 + 1)
+
+# An IN list with a constant expression under an OR keeps every row the OR keeps, whatever the order of its values
+# (OR factoring derives no IN list from it).
+
+query I nosort
+SELECT id FROM edge WHERE i16 IN (1, 1 + 6) OR i16 = 100 ORDER BY id
+----
+4
+6
+11
+
+query I nosort
+SELECT id FROM edge WHERE i16 IN (1 + 6, 1) OR i16 IN (100, 0 + 0) ORDER BY id
+----
+2
+4
+6
+11
+
+query I nosort
+SELECT id FROM edge WHERE (i16 IN (1, 1 + 6) AND id > 0) OR (i16 = 100 AND id > 0) ORDER BY id
+----
+4
+6
+11
