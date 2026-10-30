@@ -200,7 +200,7 @@ class Searcher {
   };
 
   // Whether a plan was found for every relation at once. It is not when the relations are not
-  // connected, which the binder rejects before this runs.
+  // connected, which the binder never passes.
   bool Solve() {
     for (std::size_t r = 0; r < n_; ++r) {
       memo_[Mask{1} << r].cost = 0;
@@ -426,8 +426,8 @@ class Orderer {
         searcher.Emit(searcher.All(), ratio_, steps);
         return steps;
       }
-      // No plan for every relation at once: they are not connected, which the binder rejects
-      // before this runs. Falling through lets the greedy walk's own check say so.
+      // No plan for every relation at once: they are not connected, which the binder never
+      // passes. Falling through lets the greedy walk's own check say so.
     }
     return Greedy();
   }

@@ -50,7 +50,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
   relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON` —
   or the relation is a derived table or a CTE reference of exactly one row (an aggregate without `GROUP BY`,
-  `HAVING`, `LIMIT` or `OFFSET`) that no condition reads, which then joins the others as one row.
+  `HAVING`, `LIMIT` or `OFFSET`) that no condition but a subquery conjunct reads; such a relation joins the others
+  as one row.
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
   an expression, `x [NOT] IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order are answered as a
   top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
@@ -657,9 +658,10 @@ cast to that type on its own branch, an exact widening, and an equality spelled 
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
 cross product: exit code 4, naming the item nothing connects -- but for a relation of exactly one row, a derived table
 or a CTE reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no
-residual and no condition reads (one could leave it with no row). The keys connect the others to the first relation
-that is not one of those, or to the first relation when all are, and the one-row relations then each join above them,
-in FROM order, as a `ONE-ROW` join that appends its row to every row.
+residual and no conjunct of its own branch reads (one could leave it with no row). The keys connect the others to the
+first relation that is not one of those, or to the first relation when all are, and the one-row relations then each
+join above them, in FROM order, as a `ONE-ROW` join that appends its row to every row. A subquery conjunct that reads
+one joins above that join, as above every join of its block.
 The relations then join left-deep, greedily, from footer metadata only (row counts, and each key's domain from the
 parts' integer ranges capped at their non-NULL rows, else their distinct-count hints): the relation with
 the most rows (an unknown count counts as the most) is probed first, then the connected relation with the smallest

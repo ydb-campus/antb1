@@ -135,11 +135,13 @@ steps (only step 7 uses more than one thread):
    relations becomes a join's residual. An accepted `IN` subquery conjunct takes neither route: its query is a
    sub-plan of its own and the conjunct becomes a semi or null-aware anti join above the block's inner joins, in the
    order the conjuncts are written -- or, for a `WHERE` semi join whose key reads one relation, on that relation's
-   own branch below them (ADR 0029's D0). A join graph no key connects is a cross product, `kUnsupported`; otherwise
-   the relations join left-deep in the order the footer row counts, integer ranges and distinct-count hints choose
-   (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way against the
-   aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above the
-   aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
+   own branch below them (ADR 0029's D0). A join graph no key connects is a cross product, `kUnsupported`, unless
+   every relation the keys leave out is a sub-plan of exactly one row (an aggregate without groups) that no key, no
+   residual and no conjunct of its own branch reads: each of those then joins above the others as a one-row join. The
+   relations the keys connect join left-deep in the order the footer row counts, integer ranges and distinct-count
+   hints choose (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way
+   against the aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above
+   the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
    `RowCount`, `Join`, `DependentJoin`, `UnionAll`) plus the output columns. A correlated subquery binds to a
    `DependentJoin`, whose right input reads columns of its left input as free variables (`plan::FreeVariables`). A

@@ -737,6 +737,9 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT t.i16 FROM t, (SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
                   kUnsupported, "(SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
                   "a cross product is not supported: no join key connects 'b' to 't'"},
+        // A one-row relation first in FROM: the others must connect to the first that is not.
+        ErrorCase{"SELECT t.i16 FROM (SELECT MAX(i32) AS m FROM u) AS b, t, ok", kUnsupported, "ok",
+                  "a cross product is not supported: no join key connects 'ok' to 't'"},
         ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM "
                   "u) AS b",
                   kUnsupported,
@@ -1307,6 +1310,28 @@ TEST(BinderTest, OneRowRelationsJoinAsOneRow) {
   const std::string semi = explain(
       "SELECT ok.i16 FROM ok, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m IN (SELECT i32 FROM t)");
   EXPECT_LT(semi.find("Join SEMI"), semi.find("Join ONE-ROW")) << "the semi join above: " << semi;
+  // The core alone is ordered, renumbered, and its joins come back in FROM's numbering: with the
+  // one-row relation first, a core of three keeps its residual on the join that has both its sides,
+  // and with it in the middle, the core still joins the relations around it.
+  const std::string core = explain(
+      "SELECT COUNT(*) FROM (SELECT MAX(i32) AS m FROM u) AS b, t, ok, dec WHERE t.i16 = ok.i16 "
+      "AND ok.i16 = dec.s16 AND t.i32 < dec.i");
+  const std::size_t upper = core.find("Join INNER");
+  ASSERT_EQ(count(core, "Join INNER"), 2U) << core;
+  EXPECT_LT(core.find("Join ONE-ROW"), upper) << "above the core: " << core;
+  EXPECT_EQ(count(core, "residual="), 1U) << core;
+  EXPECT_GT(core.find("residual="), upper) << "on the upper join: " << core;
+  EXPECT_LT(core.find("residual="), core.find('\n', upper)) << "on the upper join: " << core;
+  for (const std::string_view scan : {"Scan table=t", "Scan table=ok", "Scan table=dec"}) {
+    EXPECT_EQ(count(core, scan), 1U) << scan << ": " << core;
+    EXPECT_LT(core.find(scan), core.find("Scan table=u")) << scan << ": " << core;
+  }
+  const std::string middle = explain(
+      "SELECT COUNT(*) FROM t, (SELECT MAX(i32) AS m FROM u) AS b, ok WHERE t.i16 = ok.i16");
+  EXPECT_EQ(count(middle, "Join INNER"), 1U) << middle;
+  EXPECT_LT(middle.find("Join ONE-ROW"), middle.find("Join INNER")) << middle;
+  EXPECT_LT(middle.find("Scan table=t"), middle.find("Scan table=u")) << middle;
+  EXPECT_LT(middle.find("Scan table=ok"), middle.find("Scan table=u")) << middle;
 }
 
 // A UNION ALL in a CTE that nothing references is never checked or bound, as no such CTE is (DuckDB

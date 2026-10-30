@@ -1,6 +1,6 @@
 # Cross products of one-row inputs (ADR 0022's connectivity rule, relaxed): a derived table or a CTE reference of
-# exactly one row -- an aggregate without GROUP BY, HAVING, LIMIT or OFFSET -- that no key and no condition reads
-# joins the other inputs as one row, appending its row to each of theirs, over the star schema.
+# exactly one row -- an aggregate without GROUP BY, HAVING, LIMIT or OFFSET -- that no key and no condition but a
+# subquery conjunct reads joins the other inputs as one row, appending its row to each of theirs, over the star schema.
 
 # ---- the inputs ----
 
@@ -48,6 +48,20 @@ SELECT z.zn_id, a.m FROM (SELECT MAX(ct_pop) AS m FROM cities) AS a, zones AS z 
 1	120000
 2	120000
 
+# In the middle of FROM: the tables around it are the core.
+query III rowsort
+SELECT z.zn_id, a.m, c.ct_pop FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS a, cities AS c WHERE z.zn_city = c.ct_id AND z.zn_id <= 3
+----
+1	120000	120000
+2	120000	45000
+3	120000	30000
+
+# First in FROM, before a core of three with a condition over two of them that is no key.
+query II nosort
+SELECT COUNT(*), MAX(a.total) FROM (SELECT COUNT(*) AS total FROM trips) AS a, zones AS z, cities AS c, trips AS t WHERE z.zn_city = c.ct_id AND t.tr_pickup = z.zn_id AND t.tr_driver > c.ct_pop / 100
+----
+2057	3000
+
 # Next to a join, with GROUP BY and ORDER BY above.
 query TII nosort
 SELECT c.label, COUNT(*), MAX(a.total) FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id, (SELECT COUNT(*) AS total FROM trips) AS a GROUP BY c.label ORDER BY c.label
@@ -63,6 +77,33 @@ query II nosort
 WITH n AS (SELECT COUNT(*) AS c FROM trips) SELECT COUNT(*), MAX(n.c) FROM zones, n
 ----
 40	3000
+
+# Inside the left input of a LEFT JOIN, and next to one.
+query III nosort
+SELECT COUNT(*), COUNT(c.ct_id), MAX(a.n) FROM zones AS z CROSS JOIN (SELECT COUNT(*) AS n FROM trips) AS a LEFT JOIN cities AS c ON z.zn_city = c.ct_id
+----
+40	38	3000
+
+query III nosort
+SELECT COUNT(*), COUNT(c.ct_id), MAX(a.n) FROM (SELECT COUNT(*) AS n FROM trips) AS a, zones AS z LEFT JOIN cities AS c ON z.zn_city = c.ct_id
+----
+40	38	3000
+
+# A subquery conjunct may read it: its join stands above the one-row join and filters the joined rows.
+query I nosort
+SELECT COUNT(*) FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS b WHERE b.m > (SELECT AVG(ct_pop) FROM cities)
+----
+40
+
+query I nosort
+SELECT COUNT(*) FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS b WHERE b.m IN (SELECT ct_pop FROM cities)
+----
+40
+
+query I nosort
+SELECT COUNT(*) FROM zones AS z, (SELECT MAX(zn_id) AS m FROM zones) AS b WHERE b.m NOT IN (SELECT ct_id FROM cities)
+----
+40
 
 # In the blocks of a UNION ALL, and over one: the aggregate of a union is one row.
 query II rowsort
