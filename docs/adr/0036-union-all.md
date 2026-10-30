@@ -135,7 +135,7 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
 
 - The eight queries derived from TPC-DS that lacked only UNION ALL pass (X3), which takes the ratchet from 38 to 46.
   Three of them (4, 11 and 74) recompute a union CTE per reference, which nearly doubles the run at scale factor 1:
-  under AddressSanitizer one run of the 99 would outlast its timeout, so it runs in three shards of every third
+  under AddressSanitizer one run of the 99 would outlast its timeout, so it runs in four shards of every fourth
   query (tests/tpcds/CMakeLists.txt). X7's filter pushdown into the branches is what would cut that time.
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
