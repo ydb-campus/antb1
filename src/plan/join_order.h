@@ -211,7 +211,8 @@ std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
 // are not reachable from a plan node (unknown where nothing estimated it). A DependentJoin reads
 // through to its left input, which bounds it for every kind the unnesting pass admits: the outer of
 // two nested dependent joins is rewritten while its left input still holds the inner one, so
-// without that it could not choose a build side at all (ADR 0026).
+// without that it could not choose a build side at all (ADR 0026). A UnionAll's is the sum of its
+// inputs', saturated at INT64_MAX, and unknown where any input's is.
 std::optional<int64_t> EstimateRows(const LogicalNode& node);
 
 }  // namespace antb1::plan

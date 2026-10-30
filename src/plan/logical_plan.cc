@@ -85,6 +85,7 @@ struct NodeNameOf {
   std::string_view operator()(const RowCountNode& /*node*/) const { return "RowCount"; }
   std::string_view operator()(const JoinNode& /*node*/) const { return "Join"; }
   std::string_view operator()(const DependentJoinNode& /*node*/) const { return "DependentJoin"; }
+  std::string_view operator()(const UnionAllNode& /*node*/) const { return "UnionAll"; }
 };
 
 struct InputsOfNode {
@@ -105,6 +106,7 @@ struct InputsOfNode {
   std::vector<LogicalNodePtr> operator()(const DependentJoinNode& node) const {
     return {node.left, node.right};
   }
+  std::vector<LogicalNodePtr> operator()(const UnionAllNode& node) const { return node.inputs; }
 };
 
 // A copy of a node over `inputs` (as many as InputsOfNode returns).
@@ -140,6 +142,11 @@ struct WithInputsOfNode {
     DependentJoinNode out = node;
     out.left = std::move(inputs[0]);
     out.right = std::move(inputs[1]);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  LogicalNodePtr operator()(const UnionAllNode& node) const {
+    UnionAllNode out = node;
+    out.inputs = std::move(inputs);
     return std::make_shared<const LogicalNode>(std::move(out));
   }
 };
@@ -583,6 +590,7 @@ struct OutputIdsOf {
   std::vector<ColumnId> operator()(const DependentJoinNode& node) const {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
   }
+  std::vector<ColumnId> operator()(const UnionAllNode& node) const { return node.ids; }
 };
 
 // The ids a plan reads and the ids it defines, gathered over the whole tree. One overload per node
@@ -682,6 +690,16 @@ struct IdsOfNode {
     }
   }
   void operator()(const DependentJoinNode& node) const { Define(node.mark); }
+  void operator()(const UnionAllNode& node) const {
+    for (const std::vector<BoundColumn>& input : node.columns) {
+      for (const BoundColumn& column : input) {
+        Read(column);
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
 };
 
 void CollectIds(const LogicalNode& node, std::set<ColumnId>& reads, std::set<ColumnId>& defines) {
@@ -1029,6 +1047,44 @@ class Resolver {
             .ids = JoinIds(join.kind, std::move(left.ids), right.ids, join.mark)};
   }
 
+  // Each input's columns resolve against that input's ids alone, and column i has one type in every
+  // input. The union's ids are defined after its inputs are walked, so an input's id reused as one
+  // is defined twice: a union passes no column through (ADR 0036).
+  Resolved Visit(const LogicalNodePtr& self, const UnionAllNode& node) {
+    if (node.inputs.size() < 2) {
+      Fail(std::format("UnionAll: {} inputs", node.inputs.size()));
+    }
+    if (node.columns.size() != node.inputs.size()) {
+      Fail(std::format("UnionAll: {} column lists for {} inputs", node.columns.size(),
+                       node.inputs.size()));
+    }
+    UnionAllNode out = node;
+    bool changed = false;
+    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
+      Resolved input = Walk(node.inputs[k]);
+      changed = changed || input.node != node.inputs[k];
+      out.inputs[k] = input.node;
+      if (k >= out.columns.size()) {
+        continue;
+      }
+      CheckSize("UnionAll", "columns", node.ids.size(), out.columns[k].size());
+      for (std::size_t i = 0; i < out.columns[k].size(); ++i) {
+        BoundColumn& column = out.columns[k][i];
+        if (Resolve("UnionAll", column, input.ids)) {
+          changed = true;
+        }
+        if (i < out.columns[0].size() && column.type != out.columns[0][i].type) {
+          Fail(std::format("UnionAll: column {} is {} in input 0 and {} in input {}", i,
+                           ToString(out.columns[0][i].type), ToString(column.type), k));
+        }
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define("UnionAll", id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = node.ids};
+  }
+
   std::set<ColumnId> defined_;
   // One frame per dependent join on the path to the node being walked: the ids its left input
   // outputs, which its right input may read as free variables. Empty outside a right input, so a
@@ -1192,6 +1248,17 @@ struct FreshIds {
   }
   LogicalNode operator()(DependentJoinNode node) const {
     node.mark = Mint(node.mark);
+    return node;
+  }
+  LogicalNode operator()(UnionAllNode node) const {
+    for (std::vector<BoundColumn>& input : node.columns) {
+      for (BoundColumn& column : input) {
+        Rename(column);
+      }
+    }
+    for (ColumnId& id : node.ids) {
+      id = Mint(id);  // never passed through, as ResolvePositions Defines every one
+    }
     return node;
   }
 };

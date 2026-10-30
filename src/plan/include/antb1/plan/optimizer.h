@@ -21,7 +21,9 @@ namespace antb1::plan {
 //     (docs/adr/0018-dependent-group-keys.md): the same groups, fewer keys to hash.
 //  3. Limit below Project and Compute, so that it sits right above a Sort (top-N).
 //  4. Projection pruning: every Scan reads only the fields that the nodes above it reference
-//     (possibly none), and Computes keep only the expressions used.
+//     (possibly none), and Computes keep only the expressions used. A Project and a UnionAll keep
+//     every output, so a derived table's or a union's branch computes its columns whether or not
+//     anything above reads them.
 // Rules 1 to 4 find columns by their ids and ignore the input's indices; last,
 // plan::ResolvePositions sets every index from the ids (ADR 0022). A plan it returns has the same
 // output columns (and column ids) and the same answer as the input plan, and holds no dependent

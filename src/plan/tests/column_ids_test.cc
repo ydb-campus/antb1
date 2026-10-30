@@ -690,6 +690,84 @@ TEST(ColumnIdsTest, ACloneCoversEveryNodeThatDefinesAColumn) {
   EXPECT_EQ(CloneWithFreshIds(nullptr, last), nullptr);
 }
 
+// ---- UnionAll (ADR 0036) ----
+
+// Two scans of their own columns (#1-#3 and #4-#6) under a union of their third and first columns,
+// as #7 and #8, every reference at a wrong index.
+UnionAllNode Union() {
+  return UnionAllNode{.inputs = {Scan(), Scan({kD, kE, kF})},
+                      .columns = {{Column(kC, 0), Column(kA, 0)}, {Column(kF, 0), Column(kD, 0)}},
+                      .ids = {ColumnId{7}, ColumnId{8}},
+                      .span = {}};
+}
+
+TEST(ColumnIdsTest, AUnionOutputsItsOwnIds) {
+  EXPECT_EQ(OutputIds(Union()), (std::vector<ColumnId>{ColumnId{7}, ColumnId{8}}));
+  EXPECT_EQ(FreeVariables(Union()), std::vector<ColumnId>{}) << "it reads only its inputs";
+  EXPECT_EQ(MaxColumnId(Union()), ColumnId{8});
+}
+
+// Each input's columns resolve against that input's ids alone, so the same position in two inputs
+// is resolved twice, once in each.
+TEST(ColumnIdsTest, ResolvePositionsResolvesEachInputsColumnsAgainstThatInput) {
+  const LogicalPlan plan = Plan(Node(Union()));
+  EXPECT_EQ(PositionMismatch(plan), "UnionAll: column #3 is at 2, not 0");
+  const LogicalPlan resolved = ResolvePositions(plan);
+  const auto& node = std::get<UnionAllNode>(*resolved.root);
+  for (const std::vector<BoundColumn>& input : node.columns) {
+    ASSERT_EQ(input.size(), 2U);
+    EXPECT_EQ(input[0].index, 2);
+    EXPECT_EQ(input[1].index, 0);
+  }
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt);
+  EXPECT_EQ(ResolvePositions(resolved).root, resolved.root) << "a resolved plan is kept as it is";
+}
+
+TEST(ColumnIdsTest, PositionMismatchNamesBrokenUnions) {
+  UnionAllNode one = Union();
+  one.inputs.pop_back();
+  one.columns.pop_back();
+  EXPECT_EQ(PositionMismatch(Plan(Node(one))), "UnionAll: 1 inputs");
+
+  UnionAllNode lists = Union();
+  lists.columns.pop_back();
+  EXPECT_EQ(PositionMismatch(Plan(Node(lists))), "UnionAll: 1 column lists for 2 inputs");
+
+  UnionAllNode narrow = Union();
+  narrow.columns[1].pop_back();
+  EXPECT_EQ(PositionMismatch(Plan(Node(narrow))), "UnionAll: 2 ids for 1 columns");
+
+  UnionAllNode typed = Union();
+  typed.columns[1][0].type = LogicalType::kInteger;
+  EXPECT_EQ(PositionMismatch(Plan(Node(typed))),
+            "UnionAll: column 0 is BIGINT in input 0 and INTEGER in input 1");
+
+  // A column of another input is not one this input has.
+  UnionAllNode crossed = Union();
+  crossed.columns[1][1] = Column(kA, 0);
+  EXPECT_EQ(PositionMismatch(Plan(Node(crossed))), "UnionAll: column #1 is not in its input");
+
+  // A union passes nothing through: its id is a new column, so an input's id is defined twice.
+  UnionAllNode passes = Union();
+  passes.ids[1] = kA;
+  EXPECT_EQ(PositionMismatch(Plan(Node(passes))), "UnionAll: column #1 is defined twice");
+}
+
+// The clone mints the union's columns as new ones and its reads follow its inputs' fresh ids.
+TEST(ColumnIdsTest, ACloneOfAUnionMintsItsColumnsAndFollowsItsReads) {
+  const LogicalPlan plan = ResolvePositions(Plan(Node(Union())));
+  ColumnId last = MaxColumnId(*plan.root);
+  const LogicalNodePtr clone = CloneWithFreshIds(plan.root, last);
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), 2U);
+  for (const ColumnId id : cloned) {
+    EXPECT_GT(std::to_underlying(id), 8U) << "not a fresh id";
+  }
+  EXPECT_EQ(MaxColumnId(*clone), last);
+  EXPECT_EQ(PositionMismatch(Plan(clone)), std::nullopt);
+  EXPECT_EQ(Explain(Plan(clone)), Explain(plan)) << "the same plan, read by other names";
+}
+
 TEST(ColumnIdsDeathTest, BrokenPlansAbort) {
   EXPECT_DEATH(ResolvePositions(FilterPlan(Column(ColumnId{99}, 0))),
                "Filter: column #99 is not in its input");

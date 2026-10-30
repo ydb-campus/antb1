@@ -64,6 +64,12 @@ struct SharedSubPlan {
 // and row limits are not properties a shared result can hand to two consumers without deciding
 // whose order wins, a metadata row count is not worth sharing, and a dependent join cannot reach
 // here (plan::Optimize removes every one). Refusing is always safe: it reports less.
+//
+// A UnionAll is compared like any node, its inputs in order, since its rows come in that order: a
+// union repeated whole -- a CTE referenced twice -- is one group when it has a key, which exec
+// declines to materialise (WorthSharing). **Nothing under a union is ever a member** (ADR 0036),
+// whatever its copies hold and in whatever order, so a union's branches are never shared one by one
+// either. A group above a union -- an aggregation of it, repeated -- is found as any other.
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

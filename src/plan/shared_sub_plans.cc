@@ -106,6 +106,17 @@ class Origins {
     Set(node.id, std::format("rowcount({})", node.table_name));
   }
   void Define(const DependentJoinNode& node) { Set(node.mark, "mark"); }
+  // A union's column comes from the columns it reads at its position, one per input, in order.
+  void Define(const UnionAllNode& node) {
+    for (std::size_t i = 0; i < node.ids.size(); ++i) {
+      std::string origin = "u(";
+      for (const std::vector<BoundColumn>& input : node.columns) {
+        origin += i < input.size() ? Key(input[i]) : std::string("-");
+        origin += ',';
+      }
+      Set(node.ids[i], origin + ')');
+    }
+  }
   void Define(const FilterNode& /*node*/) {}
   void Define(const SortNode& /*node*/) {}
   void Define(const LimitNode& /*node*/) {}
@@ -269,6 +280,21 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
             key += ';';
           }
           return key + ')';
+        } else if constexpr (std::is_same_v<T, UnionAllNode>) {
+          // Keyed by its inputs in order, which SubtreeKey appends: a union's rows come in its
+          // inputs' order, so two unions of the same inputs in two orders are not one sub-plan.
+          // Keyed so that a union repeated whole -- a CTE referenced twice -- is reported as one
+          // group, which exec declines to hold (WorthSharing); nothing below a union is collected
+          // at all (SharedSubPlans, ADR 0036).
+          std::string key = "union(";
+          for (const std::vector<BoundColumn>& input : n.columns) {
+            for (const BoundColumn& column : input) {
+              key += origins.Key(column);
+              key += ',';
+            }
+            key += ';';
+          }
+          return key + ')';
         } else if constexpr (std::is_same_v<T, SortNode> || std::is_same_v<T, LimitNode> ||
                              std::is_same_v<T, RowCountNode> ||
                              std::is_same_v<T, DependentJoinNode>) {
@@ -412,6 +438,15 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
         members.push_back(node);
       }
     }
+    // **Nothing under a union is a candidate** (ADR 0036). The union itself is: repeated whole and
+    // with a key, it is one group, which exec declines to hold (WorthSharing). Below it nothing is
+    // collected, so a branch is never held on its own either -- whatever the copies hold that has
+    // no key (a Sort, a RowCount), and in whatever order they list their branches. An
+    // aggregate-topped branch held alone can outgrow MaterializedTable::kMaxBytes, and a result
+    // past the cap fails the query.
+    if (std::holds_alternative<UnionAllNode>(*node)) {
+      return;
+    }
     for (const LogicalNodePtr& input : InputsOf(*node)) {
       collect(input);
     }
@@ -436,6 +471,12 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
         }
       }
       return;  // no descending into a member: its children repeat too, and only this is maximal
+    }
+    // Nor below a union, where no member is: a copy of a sub-plan under a union would otherwise
+    // report a group whose members another group already holds, which exec would then compute and
+    // hold for no consumer.
+    if (std::holds_alternative<UnionAllNode>(*node)) {
+      return;
     }
     for (const LogicalNodePtr& input : InputsOf(*node)) {
       emit(input);

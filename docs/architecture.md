@@ -40,8 +40,8 @@ Responsibilities:
   binder with exact literal folding (`binder.h`, `literal.h`) and its private name scopes (`src/plan/scope.h`: the
   bindings of a query block and the name rules of [ADR 0022](adr/0022-joins-and-query-blocks.md)) and join order
   (`src/plan/join_order.h`: greedy and left-deep, estimated from footer row counts, ranges and distinct-count
-  hints), the logical plan (`logical_plan.h`; a `Join` has two inputs,
-  every other node at most one), the rule
+  hints), the logical plan (`logical_plan.h`; a `Join` and a `DependentJoin` have two inputs, a `UnionAll` two or
+  more ([ADR 0036](adr/0036-union-all.md)), every other node at most one), the rule
   optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
@@ -62,7 +62,7 @@ Responsibilities:
   readers, applies the filter to the filter's columns as it decodes them (strings as views into the decoded pages,
   piece by piece) and copies only the rows that pass, for every column.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`, `ScalarAggregate`,
-  `GroupAggregate`, `Sort`, `Limit`, `RowCount`; see [Execution](#execution)), the exact aggregate states (scalar
+  `GroupAggregate`, `Sort`, `Limit`, `RowCount`, `UnionAll`; see [Execution](#execution)), the exact aggregate states (scalar
   and grouped), the row comparator and sort buffer, the join hash table (`JoinTableBuilder`, `JoinTable`) and the
   hash joins' operators (`JoinBuild`, `BuildsFirstOperator`, `HashJoinOperator`, which the physical planner plans
   every join with; see [Execution](#execution)), the physical planner and `Drain`. It scans only through
@@ -135,8 +135,10 @@ steps (only step 7 uses more than one thread):
    aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above the
    aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`, `Join`, `DependentJoin`) plus the output columns. A correlated subquery binds to a `DependentJoin`,
-   whose right input reads columns of its left input as free variables (`plan::FreeVariables`).
+   `RowCount`, `Join`, `DependentJoin`, `UnionAll`) plus the output columns. A correlated subquery binds to a
+   `DependentJoin`, whose right input reads columns of its left input as free variables (`plan::FreeVariables`). A
+   `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new columns of one type each
+   ([ADR 0036](adr/0036-union-all.md)); no query binds to one until its binder item.
     Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
@@ -146,20 +148,22 @@ steps (only step 7 uses more than one thread):
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
    `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
-   inputs for what is used above it plus its keys and residuals). Every rule visits every input of a node
+   inputs for what is used above it plus its keys and residuals; a `Project` and a `UnionAll` keep every output, a
+   union asking each input for the columns it maps). Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
    `Bind` and `Optimize`, `plan::ResolvePositions`, sets every position from the ids; the executor reads positions
    only.
 6. Physical plan (`exec::BuildPhysicalPlan`): an exhaustive `std::visit` turns each logical node into an operator
-   over the operator of its input; a `Limit` over a `Sort` becomes one top-N `SortOperator` (over a partitioned
+   over the operators of its inputs; a `Limit` over a `Sort` becomes one top-N `SortOperator` (over a partitioned
    `GROUP BY`, each partition first keeps its own top rows, ADR 0011). A global aggregation
    whose calls are all `COUNT(DISTINCT x)` of one column over a part pipeline becomes a `GroupAggregate` by `x`
    (merged in parallel, partitioned) with `COUNT(x)` over its groups. Other aggregations with `COUNT(DISTINCT)`
    over a part pipeline run in two levels when their calls allow it (`exec::TwoLevelAggregation`,
    [ADR 0014](adr/0014-two-level-aggregation.md)). The chain of `Filter`,
    `Compute` and `Project` nodes and joins' probes over a `Scan` is a part pipeline, built once per table part
-   (see [Execution](#execution)). A `Join` of any kind is a hash join
+   (see [Execution](#execution)); a `UnionAll` ends one, each of its inputs planned on its own. A `Join` of any kind
+   is a hash join
    ([ADR 0022](adr/0022-joins-and-query-blocks.md)): a build of one input (keyless for a one-row join), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
@@ -324,6 +328,7 @@ builds, outermost first and each after the builds its input probes, then the pro
 | `HashJoinOperator` | a `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys; an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a left join the same, with a row without a match padded with NULLs of the build's types, and the probe's selection kept on the 1:1 path; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; the residuals of a semi, anti or left join on the candidate pairs, every pair evaluated, a left join padding a row none of whose candidates passed after its last candidate; a one-row join, windows of the probe batch with its build's values sliced; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input |
 | `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that empties its join, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
+| `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
 
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs
@@ -343,7 +348,7 @@ state's groups through a group map, so partial results of separate parts of the 
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/scope.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
-| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds` and the position resolver, the physical planner, the optimizer, EXPLAIN) | tests in `src/plan/tests/` and `src/exec/tests/` |
+| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds`, the ids a node reads and defines (`MaxColumnId`, `FreeVariables`), the position resolver, `CloneWithFreshIds`, pruning, `EstimateRows`, the shared sub-plans' origins and keys, EXPLAIN, the physical planner); then check the walks that compile for any node but assume a shape, such as the semi-join reduction's gate in `src/plan/optimizer.cc` | tests in `src/plan/tests/` and `src/exec/tests/` |
 | An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |
 | A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md); when `pixi run test-data` reports a new ClickBench pass, the ratchet `tests/data/clickbench_status.json` and the status table; when a query derived from TPC-H or TPC-DS starts to pass, `tests/data/tpch_status.json` or `tests/data/tpcds_status.json` and its table |

@@ -40,6 +40,7 @@
 #include "part_pruning.h"
 #include "profiled_operator.h"
 #include "shared_builds.h"
+#include "union_all.h"
 
 namespace antb1::exec {
 namespace {
@@ -1037,14 +1038,14 @@ struct Builder {
   // remapped, and every other node drops it.
   const AggregateFilter* above = nullptr;
 
-  // The profile node of the operator's input (per part as the operator is). A node's name, detail
-  // and per-part flag are written by the first build of its plan (at planning time, before the
-  // query runs); the builds of the other parts, on worker threads, only read them.
-  [[nodiscard]] ProfileNode* Input() const {
+  // The profile node of the operator's input `k` (per part as the operator is). A node's name,
+  // detail and per-part flag are written by the first build of its plan (at planning time, before
+  // the query runs); the builds of the other parts, on worker threads, only read them.
+  [[nodiscard]] ProfileNode* Input(std::size_t k = 0) const {
     if (slot == nullptr) {
       return nullptr;
     }
-    ProfileNode* input = slot->Child(0);
+    ProfileNode* input = slot->Child(k);
     if (input->per_part() != slot->per_part()) {
       input->set_per_part(slot->per_part());
     }
@@ -1514,6 +1515,51 @@ struct Builder {
     // rejects the query, so only a plan a test builds by hand reaches here. kUnsupported, never
     // NotImplemented, so that such a plan exits 4 as the same query does (ADR 0023, ADR 0005).
     return plan::UnsupportedError("a correlated subquery is not supported", node.span);
+  }
+  OperatorResult operator()(const plan::UnionAllNode& node) const {
+    // No part pipeline goes through a union (PipelineInput), so each input is planned on its own --
+    // its part pipelines and builds its own -- and run one after another on the consumer's thread
+    // (ADR 0036). Nothing above travels into a branch: a filter a join offered (`above`) is
+    // dropped, as every node that does not keep its one input's rows drops it, and so are the
+    // pipeline-only hints.
+    if (part.has_value()) {
+      return arrow::Status::Invalid("a UNION ALL inside a part pipeline");
+    }
+    Name("UnionAll");
+    std::vector<std::unique_ptr<Operator>> inputs;
+    std::vector<std::vector<int>> columns;
+    inputs.reserve(node.inputs.size());
+    columns.reserve(node.columns.size());
+    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
+      ARROW_ASSIGN_OR_RAISE(auto input, Build(node.inputs[k], std::nullopt, Input(k)));
+      inputs.push_back(std::move(input));
+    }
+    for (const std::vector<plan::BoundColumn>& input : node.columns) {
+      std::vector<int>& picked = columns.emplace_back();
+      for (const plan::BoundColumn& column : input) {
+        picked.push_back(column.index);
+      }
+    }
+    // Column i has one type in every input, as it has in the plan (the binder casts below the
+    // union); the operator then checks each input's arrays against it.
+    std::vector<plan::LogicalType> types;
+    if (!node.columns.empty()) {
+      for (const plan::BoundColumn& column : node.columns.front()) {
+        types.push_back(column.type);
+      }
+    }
+    for (std::size_t k = 1; k < node.columns.size(); ++k) {
+      for (std::size_t i = 0; i < node.columns[k].size() && i < types.size(); ++i) {
+        if (node.columns[k][i].type != types[i]) {
+          return arrow::Status::Invalid("UNION ALL: column ", i, " is ", plan::ToString(types[i]),
+                                        " in input 0 and ", plan::ToString(node.columns[k][i].type),
+                                        " in input ", k);
+        }
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<UnionAllOperator> union_all,
+                          UnionAllOperator::Make(std::move(inputs), std::move(columns), types));
+    return union_all;
   }
 };
 

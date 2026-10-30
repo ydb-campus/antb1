@@ -201,6 +201,12 @@ struct NodeLine {
     }
     return line;
   }
+  // The columns as the first input names them, which are the union's names (ADR 0036).
+  std::string operator()(const UnionAllNode& node) const {
+    return std::format(
+        "UnionAll inputs={} columns=[{}]", node.inputs.size(),
+        node.columns.empty() ? std::string() : Join(node.columns.front(), ColumnName, ", "));
+  }
 };
 
 // Per node that heads a group of equivalent sub-plans, the suffix its line carries.
@@ -258,7 +264,8 @@ void Render(const LogicalNode& node, std::size_t depth, const SharedNotes& notes
     out += note->second;
   }
   out += '\n';
-  for (const LogicalNodePtr& input : InputsOf(node)) {  // a Join's left input, then its right one
+  // A Join's left input, then its right one; a UnionAll's inputs in the order written.
+  for (const LogicalNodePtr& input : InputsOf(node)) {
     if (input != nullptr) {
       Render(*input, depth + 1, notes, out);
     }

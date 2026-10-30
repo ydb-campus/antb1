@@ -116,6 +116,17 @@ int64_t DroppedIn(const ProfileNode& node) {
   return dropped;
 }
 
+arrow::Result<Run> ExecutePlan(const plan::LogicalPlan& plan) {
+  ProfileNode profile;
+  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, &profile));
+  MemoryBudget budget(int64_t{1024} * 1024 * 1024);
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> rows, Drain(*op, ctx));
+  std::vector<std::string> scans;
+  ScansIn(profile, scans);
+  return Run{.rows = std::move(rows), .dropped = DroppedIn(profile), .scans = std::move(scans)};
+}
+
 arrow::Result<Run> Execute(std::string_view sql, const std::shared_ptr<MemoryTable>& facts,
                            const std::shared_ptr<MemoryTable>& dimension) {
   plan::Catalog catalog;
@@ -128,14 +139,7 @@ arrow::Result<Run> Execute(std::string_view sql, const std::shared_ptr<MemoryTab
   ARROW_ASSIGN_OR_RAISE(const plan::LogicalPlan bound,
                         plan::Bind(*parsed, catalog, plan::BindOptions{}));
   ARROW_ASSIGN_OR_RAISE(const plan::LogicalPlan plan, plan::Optimize(bound));
-  ProfileNode profile;
-  ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, &profile));
-  MemoryBudget budget(int64_t{1024} * 1024 * 1024);
-  ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
-  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Table> rows, Drain(*op, ctx));
-  std::vector<std::string> scans;
-  ScansIn(profile, scans);
-  return Run{.rows = std::move(rows), .dropped = DroppedIn(profile), .scans = std::move(scans)};
+  return ExecutePlan(plan);
 }
 
 // The shape: a grouped aggregate joined to a filtered dimension on the key it groups by. Two of
@@ -258,6 +262,83 @@ TEST_F(AggregateFilterTest, TheOfferDoesNotSurviveAJoinBelowTheAggregate) {
   ASSERT_NE(run->rows, nullptr);
   ASSERT_NE(control->rows, nullptr);
   EXPECT_TRUE(run->rows->Equals(*control->rows));
+}
+
+// **Nor does it survive a union** (ADR 0036): a grouped aggregate over a union has no part pipeline
+// for the offer to travel, and the union's own arm forwards nothing into its inputs, which are
+// pipelines of their own. Pinned for the join's reason: ADR 0023's semi-join reduction restricts a
+// one-column correlation over a union on the grounds that D5 cannot reach it.
+//
+// Hand-built, since no query reaches a union before its binder does -- so the ids are set here, and
+// the control shows that they are what an offer follows: over one scan, the same plan's offer
+// reaches it. Without the control this would be the test the header warns of, passing while
+// testing nothing.
+TEST_F(AggregateFilterTest, TheOfferDoesNotSurviveAUnionBelowTheAggregate) {
+  const auto column = [](std::uint32_t id, std::string name) {
+    return plan::BoundColumn{
+        .id = plan::ColumnId{id}, .name = std::move(name), .type = plan::LogicalType::kBigInt};
+  };
+  const auto node = [](plan::LogicalNode n) {
+    return std::make_shared<const plan::LogicalNode>(std::move(n));
+  };
+  const auto facts = Facts();
+  facts->set_claimed_rows(20'000'000);  // the share gate would admit it
+  const auto scan = [&](std::uint32_t first) {
+    return node(plan::ScanNode{.table = facts,
+                               .table_name = "f",
+                               .fields = {0, 1},
+                               .ids = {plan::ColumnId{first}, plan::ColumnId{first + 1}}});
+  };
+  // kAggregateUnderJoin's shape over `input`, whose key is column `key`: grouped by it, joined to
+  // the dimension's rows of flag 1 on it, and counted.
+  const auto query = [&](plan::LogicalNodePtr input, std::uint32_t key) {
+    const auto group = node(plan::GroupAggregateNode{
+        .input = std::move(input),
+        .keys = {column(key, "k")},
+        .key_ids = {plan::ColumnId{20}},
+        .aggregates = {
+            plan::AggregateCall{.kind = plan::AggKind::kCountStar, .id = plan::ColumnId{21}}}});
+    const auto dimension = node(plan::FilterNode{
+        .input = node(plan::ScanNode{.table = Dimension(),
+                                     .table_name = "d",
+                                     .fields = {0, 1},
+                                     .ids = {plan::ColumnId{30}, plan::ColumnId{31}}}),
+        .predicates = {
+            testing::Compare(column(31, "flag"), plan::CompareOp::kEq, testing::BigInt(1))}});
+    const auto join = node(
+        plan::JoinNode{.kind = plan::JoinKind::kInner,
+                       .left = group,
+                       .right = dimension,
+                       .keys = {plan::JoinKey{.left = column(20, "k"), .right = column(30, "dk")}},
+                       .build = plan::BuildSide::kRight});
+    const auto count = node(
+        plan::AggregateNode{.input = join,
+                            .aggregates = {plan::AggregateCall{.kind = plan::AggKind::kCountStar,
+                                                               .id = plan::ColumnId{40}}}});
+    return ExecutePlan(plan::ResolvePositions(plan::LogicalPlan{
+        .root = count,
+        .output = {plan::OutputColumn{
+            .name = "count", .type = plan::LogicalType::kBigInt, .id = plan::ColumnId{40}}}}));
+  };
+  auto control = query(scan(1), 1);
+  ASSERT_TRUE(control.ok()) << control.status().ToString();
+  EXPECT_GT(control->dropped, 0) << "over one scan, the hand-built ids carry the offer";
+
+  auto run = query(node(plan::UnionAllNode{.inputs = {scan(1), scan(3)},
+                                           .columns = {{column(1, "k"), column(2, "v")},
+                                                       {column(3, "k"), column(4, "v")}},
+                                           .ids = {plan::ColumnId{5}, plan::ColumnId{6}}}),
+                   5);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->dropped, 0);
+  for (const std::string& scan_detail : run->scans) {
+    EXPECT_EQ(scan_detail.find("candidate on"), std::string::npos)
+        << "nothing should reach this scan: " << scan_detail;
+  }
+  ASSERT_NE(run->rows, nullptr);
+  ASSERT_NE(control->rows, nullptr);
+  EXPECT_EQ(testing::SingleInt64(*run->rows), 2) << "the groups of k = 0 and 1 pass the flag";
+  EXPECT_EQ(testing::SingleInt64(*control->rows), 2);
 }
 
 // The condition the whole rewrite rests on: the filter may only be applied to a column the

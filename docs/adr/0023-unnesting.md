@@ -366,6 +366,10 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
         exactly two multi-input alternatives, so a subtree with no join *is* the chain an offer could travel — and
         `src/exec/tests/aggregate_filter_test.cc` pins it, because threading the offer through a join is a natural
         change to make and would silently make this rewrite pay for a reduction D5 had already made.
+        - Update (2026-10-30, [ADR 0036](0036-union-all.md)'s X1): a `UnionAll` is a third multi-input node, and the
+          offer does not cross it either (its inputs are pipelines of their own), so the gate reads a join or a union
+          below the aggregation (`ReadsAJoinOrUnion`, formerly `ReadsAJoin`); the same test file pins the union's
+          case.
       - The pair of structural facts — more than one key, or a join below the aggregation — is what the gate reads,
         because a plan may not read off the filter itself: ADR 0029 attaches it in the physical planner, long after
         this pass. ADR 0030 states the hazard they guard against, "before costing a shared sub-plan, check whether a
@@ -377,7 +381,7 @@ hand reach it without Optimize, as ADR 0022's join kinds do before E2.
         Neither is reached by any of the 22; declining the restriction for an aggregate-topped outer side would
         remove the second, and is not done without a measurement behind it.
     - **What is left:** the one-column case over a **bare scan** whose aggregation's scan has already spent its one
-      filter slot on pushed predicates (ADR 0020). `ReadsAJoin` is false there and D5 is off, so neither mechanism
+      filter slot on pushed predicates (ADR 0020). `ReadsAJoinOrUnion` is false there and D5 is off, so neither mechanism
       restricts it; `src/exec/tests/aggregate_filter_test.cc`'s `YieldsToPredicatesPushedIntoTheScan` pins the
       behaviour. It needs the conjunction of two scan filters, which is ADR 0029's own deferred item.
   - a semi or anti join with a residual keeps every build row (Q21), until profiles of Q21 at SF 10 or above ask for a
