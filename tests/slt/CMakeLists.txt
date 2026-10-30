@@ -601,6 +601,43 @@ if(ANTB1_HAVE_DUCKDB)
     # Their output must not depend on a developer's ANTB1_TPCH_TIMES (ctest passes the environment through).
     set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCH_TIMES=unset:")
   endforeach()
+  # `antb1-slt tpcds` runs the same ratchet with the workload of the queries derived from TPC-DS (tests/tpcds): its
+  # own summary and clean-failure rule, over the pass and parse_error cases above.
+  foreach(case IN ITEMS pass parse_error)
+    set(_name harness.tpcds.status.${case})
+    set(_dir "${_tpch_selftest}/${case}")
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_dir}/queries"
+      --status
+      "${_dir}/status.json"
+      --memory-limit
+      1GiB
+    )
+    if(case STREQUAL "pass")
+      set(_exit 0)
+      set(_require "TPCDS: PASS queries=2 pass=\\[\\] unsupported=2 rejected=0 failed=0 ratchet=\\[\\]\n")
+    else()
+      set(_exit 1)
+      set(
+        _require
+        "FAIL Q1: antb1 fails with a parse error; a query derived from TPC-DS that antb1 does not answer must fail "
+        "TPCDS: FAIL queries=2 "
+      )
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> tpcds ${_args}
+    )
+    set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCDS_TIMES=unset:")
+  endforeach()
 
   # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every
   # report is redacted without --redact and its repro adds --show-values; an explicit --redact wins over

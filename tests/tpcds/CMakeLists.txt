@@ -123,3 +123,79 @@ antb1_add_expect_test(
   REQUIRE "-DWORKLOAD=tpch or -DWORKLOAD=tpcds is required"
   COMMAND ${CMAKE_COMMAND} "-DWORKLOAD=tpcx" -P "${_generate}"
 )
+
+# The tests that read the generated data run through tests/tpch/run_redacted.cmake, as the TPC-H ones do: their tables
+# files mark every table `redact`, so antb1-slt prints no value and no query text; sanitizer reports go to files; and
+# output that looks unredacted (or matches a FORBID regex) is withheld before it reaches the log.
+#   _tpcds_test(<name> LABEL <label> [TIMEOUT <seconds>] [REQUIRE <regex>...] COMMAND <command>...)
+function(_tpcds_test name)
+  cmake_parse_arguments(ARG "" "LABEL;TIMEOUT" "REQUIRE;COMMAND" ${ARGN})
+  if(NOT DEFINED ARG_TIMEOUT)
+    set(ARG_TIMEOUT 300)
+  endif()
+  math(EXPR _inner_timeout "${ARG_TIMEOUT} - 30")
+  set(_defs "-DWORK_DIR=${CMAKE_BINARY_DIR}/slt-tmp/${name}" "-DTIMEOUT=${_inner_timeout}")
+  set(_i 0)
+  foreach(regex IN LISTS ARG_REQUIRE)
+    list(APPEND _defs "-DREQUIRE_${_i}=${regex}")
+    math(EXPR _i "${_i} + 1")
+  endforeach()
+  list(APPEND _defs "-DREQUIRE_COUNT=${_i}" "-DFORBID_COUNT=0")
+  add_test(
+    NAME ${name}
+    COMMAND ${CMAKE_COMMAND} ${_defs} -P "${PROJECT_SOURCE_DIR}/tests/tpch/run_redacted.cmake" -- ${ARG_COMMAND}
+  )
+  set_tests_properties(
+    ${name}
+    PROPERTIES LABELS ${ARG_LABEL} TIMEOUT ${ARG_TIMEOUT} FIXTURES_REQUIRED antb1_tpcds
+  )
+endfunction()
+
+# The ratchet (antb1-slt tpcds, tests/slt/runner/ratchet.h): the 99 queries on antb1, and DuckDB for those antb1
+# answers, against tests/data/tpcds_status.json, by the rules of the TPC-H ratchet (tests/tpch/CMakeLists.txt): a
+# query passes only with DuckDB's answer; every other query must be Unsupported (exit code 4). Both scale factors read
+# the same ratchet, and the parallel run (4 threads, batches of 1000 rows) must equal the 1-thread run byte for byte.
+# The parallel run reads scale factor 0.1, as TPC-H's does: at scale factor 1, its 4-thread run plus the 1-thread run
+# it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
+# 489 seconds. ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
+set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
+foreach(kind IN ITEMS sf0_1 sf1 parallel)
+  if(kind STREQUAL "parallel")
+    set(_name parallel.tpcds.status.sf0_1)
+    set(_sf 0_1)
+    set(_label parallel)
+    set(
+      _options
+      --threads
+      4
+      --same-as-threads
+      1
+      --batch-size
+      1000
+    )
+  else()
+    set(_name tpcds.status.${kind})
+    string(REPLACE "sf" "" _sf "${kind}")
+    set(_label oracle)
+    set(_options "")
+  endif()
+  antb1_slt_args(
+    _args
+    ${_name}
+    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf${_sf}.txt"
+    --queries
+    "${_tpcds_dir}/queries"
+    --status
+    "${_status}"
+    --memory-limit
+    2GiB
+    ${_options}
+  )
+  _tpcds_test(
+    ${_name}
+    LABEL ${_label}
+    TIMEOUT 900
+    REQUIRE "TPCDS: PASS queries=99 "
+    COMMAND $<TARGET_FILE:antb1-slt> tpcds ${_args}
+  )
+endforeach()

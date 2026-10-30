@@ -267,6 +267,11 @@ runs, flushed, so the log of a run that times out names the query. `--memory-lim
 the passing queries. Its self-tests `harness.tpch.status.*` write our own numbered queries over the canary table
 (marked `redact`) into the build tree.
 
+`antb1-slt tpcds`, with the same options, is this ratchet for the 99 queries derived from TPC-DS (`tests/tpcds`)
+against `tests/data/tpcds_status.json`: its summary line starts with `TPCDS:`, its messages name TPC-DS, and
+`ANTB1_TPCDS_TIMES=1` adds the times. `harness.tpcds.status.pass` and `.parse_error` run it on the same numbered
+queries.
+
 ## Stored answers: `answers`
 
 `antb1-slt answers --queries DIR --answers DIR` checks answers that DuckDB stored next to their queries, for data,
@@ -304,7 +309,8 @@ because lint R009 keeps files named like `q01.sql` out of the repository.
 - `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`,
   `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
 
-`--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers` and `tpch` take `--mutate`
-(`tpch` is always redacted, whatever its tables file says), and `--show-values` works for all six. The `pixi run diff-random`
+`--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers`, `tpch` and `tpcds` take
+`--mutate` (`tpch` and `tpcds` are always redacted, whatever their tables file says), and `--show-values` works for
+all seven. The `pixi run diff-random`
 repro of a `diff` failure is printed only for the tables of that task (`tables.txt`); every failure also prints its
 exact command line with `--only`.
