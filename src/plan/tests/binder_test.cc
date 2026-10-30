@@ -720,7 +720,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "a cross product is not supported: no join key connects 'u' to 'a'"},
         // A relation of exactly one row joins as one row only where nothing else reads it: a
         // condition could leave it with no row, and a residual has no join to stand on; and one
-        // that may have no row or many (HAVING, LIMIT, GROUP BY) is no one-row relation.
+        // that may have no row or many (HAVING, LIMIT, GROUP BY, a UNION ALL of aggregates) is no
+        // one-row relation.
         ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m > 5",
                   kUnsupported, "(SELECT MAX(i32) AS m FROM u) AS b",
                   "a cross product is not supported: no join key connects 'b' to 't'"},
@@ -735,6 +736,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "a cross product is not supported: no join key connects 'b' to 't'"},
         ErrorCase{"SELECT t.i16 FROM t, (SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
                   kUnsupported, "(SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM "
+                  "u) AS b",
+                  kUnsupported,
+                  "(SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM u) AS b",
                   "a cross product is not supported: no join key connects 'b' to 't'"},
         // A column both relations have is ambiguous in the select list, which binds before the
         // connectivity check (rule 3, and the documented error order).
