@@ -22,7 +22,8 @@ Closes #
 <!--
 Paste the exact commands you ran and the relevant tail of their output (for example the final
 `ANTB1-TESTS: PASS|FAIL ...` line of `pixi run test`). Never paste values from ClickBench data or anything derived
-from TPC-H (query text, data, answers). Timings of the TPC-H-derived queries are fine, never as TPC-H Benchmark results.
+from TPC-H or TPC-DS (query text, data, answers). Timings of the TPC-derived queries are fine, never as TPC Benchmark
+results.
 -->
 
 ```text
@@ -36,7 +37,8 @@ $ pixi run check
 - [ ] Tests cover the change (unit tests under `src/<module>/tests/`, or why none are needed)
 - [ ] Docs updated where behavior, commands or architecture changed (AGENTS.md, `docs/`, an ADR), or not needed
 - [ ] No ClickBench-derived data is committed: no Parquet files, query answers or values from `hits` (ADR-0006)
-- [ ] Nothing derived from TPC-H is committed: no query text or fragments, data, answers or TPC tools (ADR-0006)
+- [ ] Nothing derived from TPC-H or TPC-DS is committed: no query text or fragments, data, answers or TPC tools
+      (ADR-0006)
 - [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed with a maintainer
 
 ## AI assistance

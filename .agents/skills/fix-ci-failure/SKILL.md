@@ -17,8 +17,9 @@ Step-by-step details per job: [docs/recipes/fix-ci-failure.md](../../../docs/rec
   the job, the failing step) and never re-run it, not even after an infrastructure failure
   ([docs/ci.md](../../../docs/ci.md#releases)).
 - Every job name contains the command that reproduces it, for example `clang-asan (pixi run asan)`.
-- Never paste ClickBench data, anything derived from TPC-H (query text, data, answers) or unredacted data-test output
-  into a PR, an issue or a prompt. Timings of the TPC-H-derived queries are fine, never as TPC-H Benchmark results.
+- Never paste ClickBench data, anything derived from TPC-H or TPC-DS (query text, data, answers) or unredacted
+  data-test output into a PR, an issue or a prompt. Timings of the TPC-derived queries are fine, never as TPC
+  Benchmark results.
 - If the fix needs an "Ask a human first" path (AGENTS.md), for example a workflow in `.github/`, `pixi.toml`,
   `CMakePresets.json`, `cmake/`, `.clang-tidy` or `tools/lint/`: stop and hand off with the exact change (file,
   diff, reason) for a maintainer.

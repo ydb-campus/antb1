@@ -17,13 +17,14 @@ Usage: python tools/lint/check_repo.py [--root DIR] [--only R001,R007]
   R007  docs/architecture.md module table == cmake/Antb1Modules.cmake; `#include` scan of src/ (a module may include
         itself, its allowed deps and what they re-export through PUBLIC_DEPS; tests: every module it can reach).
   R008  ctest labels comment in cmake/Antb1Testing.cmake == docs/testing.md labels table.
-  R009  no data files (Parquet, ClickBench queries, dbgen tables and its distribution file, query and answer files
-        named like DuckDB's or the TPC kit's, files carrying the TPC legend) and no file over 1 MiB except pixi.lock.
+  R009  no data files (Parquet, ClickBench queries, dbgen's and dsdgen's tables, distribution files and templates,
+        query and answer files named like DuckDB's or the TPC kit's, files carrying the TPC legend) and no file over
+        1 MiB except pixi.lock.
   R010  workflow hardening (permissions, timeouts, SHA pins, persist-credentials, triggers, setup-pixi cache key,
         no `${{ github.event.* }}`/`${{ github.head_ref }}` in `run:`); `data` tests use `--redact`.
   R011  ClickBench ratchet `pass` list == docs/sql-subset.md status table; its `clickbench_commit` is the commit
-        of the queries.sql pin in tools/data/clickbench.lock. The ratchet of the queries derived from TPC-H ==
-        the status table of the "Queries derived from TPC-H" section.
+        of the queries.sql pin in tools/data/clickbench.lock. The ratchet of the queries derived from TPC-H (and
+        TPC-DS) == the status table of the "Queries derived from TPC-H" (TPC-DS) section.
   R012  CODEOWNERS, AGENTS.md "Ask a human first" and .claude/settings.json cover the governance path set G; the
         settings allow list approves named pixi tasks only (never `pixi run *`, `pixi run -x`, `pixi exec`).
   R013  docs/adr/README.md lists every ADR.
@@ -81,6 +82,7 @@ GOVERNANCE_PATHS: tuple[str, ...] = (
     "/scripts/agent-setup.sh",
     "/tests/data/clickbench_status.json",
     "/tests/data/tpch_status.json",
+    "/tests/data/tpcds_status.json",
     "/scripts/lint.sh",
     "/scripts/fmt.sh",
     "/tools/sanitizers/",
@@ -110,16 +112,32 @@ SETUP_PIXI_CACHE_KEY = "pixi-${{ hashFiles('pixi.lock') }}-"
 LOCK_FIRST_LINE = "version: 7"
 MAX_FILE_BYTES = 1024 * 1024
 LARGE_FILES_ALLOWED = frozenset({"pixi.lock"})
-# Data files, plus dbgen's tables (*.tbl) and distribution file, and query and answer files named like DuckDB's
-# (q01.sql, q01.csv) or the TPC kit's (q1.out): ADR 0006 keeps everything derived from ClickBench or TPC-H out of the
-# repository. Query templates and dbgen sources under other names are left to authors and reviewers.
-DATA_FILE_GLOBS = ("*.parquet", "*.arrow", "*.feather", "*.csv.gz", "queries.sql", "*.tbl", "*.tbl.*", "dists.dss")
-DATA_FILE_RE = re.compile(r"q\d\d\.(?:csv|sql)|q\d{1,2}\.(?:out|ans)")
+# Data files, plus dbgen's tables (*.tbl) and distribution file, dsdgen's tables (*.dat), distribution file and query
+# templates (*.tpl), and query and answer files named like DuckDB's (q01.sql, q01.csv; 01.sql, 01.csv for TPC-DS) or
+# the TPC kit's (q1.out): ADR 0006 keeps everything derived from ClickBench, TPC-H or TPC-DS out of the repository.
+# Generator sources under other names are left to authors and reviewers.
+DATA_FILE_GLOBS = (
+    "*.parquet",
+    "*.arrow",
+    "*.feather",
+    "*.csv.gz",
+    "queries.sql",
+    "*.tbl",
+    "*.tbl.*",
+    "dists.dss",
+    "*.dat",
+    "tpcds.idx",
+    "*.tpl",
+)
+DATA_FILE_RE = re.compile(r"q?\d\d\.(?:csv|sql)|q\d{1,2}\.(?:out|ans)")
 # The legend that the TPC EULA requires on redistributed TPC software (the kit carries it in its EULA file). Assembled
 # at run time, so this file does not match itself.
 TPC_LEGEND_RE = re.compile(r"\s+".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE", "WITHOUT", "CHARGE")))
-TPCH_STATUS_PATH = "tests/data/tpch_status.json"
-TPCH_STATUS_HEADING = "Queries derived from TPC-H"
+# The ratchets of the TPC-derived workloads: status file and the docs/sql-subset.md section of its status table.
+TPC_RATCHETS = (
+    ("tests/data/tpch_status.json", "Queries derived from TPC-H"),
+    ("tests/data/tpcds_status.json", "Queries derived from TPC-DS"),
+)
 AGENTS_MAX_LINES = 150
 AGENTS_MAX_BYTES = 32 * 1024
 COPILOT_MAX_LINES = 40
@@ -1332,7 +1350,7 @@ def check_r009(ctx: Ctx) -> None:
                 "R009",
                 path,
                 1,
-                "data file in the repository (data derived from ClickBench or TPC-H is never committed)",
+                "data file in the repository (data derived from ClickBench, TPC-H or TPC-DS is never committed)",
                 "remove it; tests generate data, `pixi run fetch-data` downloads ClickBench (ADR 0006)",
             )
         elif path not in LARGE_FILES_ALLOWED and (repo.root / path).stat().st_size > MAX_FILE_BYTES:
@@ -1343,7 +1361,7 @@ def check_r009(ctx: Ctx) -> None:
                 path,
                 text.count("\n", 0, m.start()) + 1,
                 "TPC software or text in the repository (it carries the TPC legend)",
-                "remove it; data derived from TPC-H is generated at test time (ADR 0006)",
+                "remove it; data derived from TPC-H or TPC-DS is generated at test time (ADR 0006)",
             )
 
 
@@ -1450,7 +1468,8 @@ def query_number(text: str) -> int | None:
 
 
 def check_r011(ctx: Ctx) -> None:
-    check_tpch_ratchet(ctx)
+    for path, heading in TPC_RATCHETS:
+        check_tpc_ratchet(ctx, path, heading)
     repo = ctx.repo
     status_text = repo.text("tests/data/clickbench_status.json")
     if status_text is None:
@@ -1514,25 +1533,25 @@ def passing_queries(table: MdTable) -> set[int]:
     return passing
 
 
-def check_tpch_ratchet(ctx: Ctx) -> None:
-    """The ratchet of the queries derived from TPC-H == the status table of its own docs/sql-subset.md section."""
+def check_tpc_ratchet(ctx: Ctx, path: str, heading: str) -> None:
+    """The ratchet of a TPC-derived workload == the status table of its own docs/sql-subset.md section."""
     repo = ctx.repo
-    status_text = repo.text(TPCH_STATUS_PATH)
+    status_text = repo.text(path)
     if status_text is None:
         return
     _, ratchet = ratchet_of(status_text)
     if ratchet is None:
-        repo.add("R011", TPCH_STATUS_PATH, 1, "not a JSON object with a `pass` list", "fix the JSON")
+        repo.add("R011", path, 1, "not a JSON object with a `pass` list", "fix the JSON")
         return
-    section = md_section(repo.text("docs/sql-subset.md") or "", TPCH_STATUS_HEADING)
+    section = md_section(repo.text("docs/sql-subset.md") or "", heading)
     table = status_table(section[1]) if section is not None else None
     if section is None or table is None:
         repo.add(
             "R011",
             "docs/sql-subset.md",
             section[0] if section is not None else 1,
-            f"no `{TPCH_STATUS_HEADING}` section with a status table (| Query | Status |)",
-            f"add it next to {TPCH_STATUS_PATH}",
+            f"no `{heading}` section with a status table (| Query | Status |)",
+            f"add it next to {path}",
         )
         return
     passing = passing_queries(table)
@@ -1541,8 +1560,7 @@ def check_tpch_ratchet(ctx: Ctx) -> None:
             "R011",
             "docs/sql-subset.md",
             section[0] + table.line,
-            f"`{TPCH_STATUS_HEADING}` table passes {sorted(passing)}, the ratchet ({TPCH_STATUS_PATH}) "
-            f"{sorted(ratchet)}",
+            f"`{heading}` table passes {sorted(passing)}, the ratchet ({path}) {sorted(ratchet)}",
             "update both in the same PR",
         )
 
