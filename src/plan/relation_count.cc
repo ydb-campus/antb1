@@ -114,9 +114,12 @@ void EachSubqueryOf(const sql::Expr& expr, Fn& fn) {
 
 // Every subquery expression of `block`'s own expressions, in query order: the select items, each
 // FROM item's ON, WHERE, GROUP BY, HAVING, ORDER BY -- the order plan::CheckBlock reports in. Not
-// the WITH list's bodies: a CTE is reached through the references to it, or not at all.
+// the WITH list's bodies: a CTE is reached through the references to it, or not at all. Nor a
+// compound's branches, which are blocks of their own: a compound's own expressions are its ORDER
+// BY.
 template <class Fn>
 void EachSubqueryIn(const sql::SelectStatement& block, Fn fn) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   for (const sql::SelectItem& item : block.items) {
     EachSubqueryOf(item.expr, fn);
   }
@@ -137,10 +140,18 @@ void EachSubqueryIn(const sql::SelectStatement& block, Fn fn) {
 
 class Counter {
  public:
-  // The relations `block` expands to, saturated; `outer` is the frame around it.
+  // The relations `block` expands to, saturated; `outer` is the frame around it. A compound's are
+  // its branches', each a block in the compound's frame (ADR 0036).
   std::size_t Count(const sql::SelectStatement& block, const CteFrame* outer) {
+    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, outer);
     std::size_t total = 0;
+    for (const sql::SetBranch& branch : block.set_operation) {
+      total = AddSaturating(total, Count(*branch.query, &frame));
+      if (total >= kSaturated) {
+        return kSaturated;
+      }
+    }
     for (const sql::FromItem& item : block.from) {
       total = AddSaturating(total, Item(item, frame));
       if (total >= kSaturated) {
@@ -156,9 +167,39 @@ class Counter {
   // The outermost block: the first FROM item whose expansion carries the running total past the
   // limit, so a flat FROM list reports at its 257th item exactly as it did before sub-plans, then
   // its own subqueries, which have no FROM item to report at and carry a span instead.
+  //
+  // A compound's FROM items are its branches', so a running total runs across them in order and
+  // reports at the item (its connector, or the item itself when it is first in its branch) or the
+  // subquery that carries it past the limit -- by span, the outermost block having no item of its
+  // own to index.
   std::optional<RelationOverflow> Top(const sql::SelectStatement& block) {
+    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, nullptr);
     std::size_t total = 0;
+    for (const sql::SetBranch& branch : block.set_operation) {
+      const sql::SelectStatement& query = *branch.query;
+      const CteFrame& inner = MakeFrame(query, &frame);
+      for (const sql::FromItem& item : query.from) {
+        total = AddSaturating(total, Item(item, inner));
+        if (total > kMaxRelations) {
+          return RelationOverflow{
+              .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span};
+        }
+      }
+      std::optional<RelationOverflow> over;
+      EachSubqueryIn(query, [&](const sql::SubqueryExpr& s) {
+        if (over.has_value()) {
+          return;
+        }
+        total = AddSaturating(total, Subquery(s, inner));
+        if (total > kMaxRelations) {
+          over = RelationOverflow{.span = s.op_span};
+        }
+      });
+      if (over.has_value()) {
+        return over;
+      }
+    }
     for (std::size_t i = 0; i < block.from.size(); ++i) {
       total = AddSaturating(total, Item(block.from[i], frame));
       if (total > kMaxRelations) {
@@ -253,8 +294,19 @@ namespace {
 class Reach {
  public:
   void Walk(const sql::SelectStatement& block, const CteFrame* outer) {
-    blocks_.push_back(&block);
+    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, outer);
+    if (!block.set_operation.empty()) {
+      // A compound's branches are blocks of their own, in its frame, and they come before it: its
+      // own clauses (ORDER BY, LIMIT, OFFSET) follow them in the query (ADR 0036).
+      for (const sql::SetBranch& branch : block.set_operation) {
+        Walk(*branch.query, &frame);
+      }
+      blocks_.push_back(&block);
+      EachSubqueryIn(block, [&](const sql::SubqueryExpr& s) { Walk(*s.query, &frame); });
+      return;
+    }
+    blocks_.push_back(&block);
     for (const sql::FromItem& item : block.from) {
       if (const auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
         Walk(*derived->query, &frame);

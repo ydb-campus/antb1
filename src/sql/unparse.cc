@@ -262,8 +262,40 @@ std::string FromList(const std::vector<FromItem>& from) {
   return out;
 }
 
-// A query: its WITH list, each name quoted (WITH "c"("x") AS (...), "d" AS (...)), then its block.
+// A block: SELECT through HAVING.
+std::string BlockSql(const SelectStatement& block) {
+  std::string sql = "SELECT ";
+  if (block.star) {
+    sql += '*';
+  } else {
+    for (std::size_t i = 0; i < block.items.size(); ++i) {
+      if (i > 0) {
+        sql += ", ";
+      }
+      sql += Sql(block.items[i].expr, kOr);
+      if (const auto& alias = block.items[i].alias; alias.has_value()) {
+        sql += " AS " + Quote(*alias, '"');
+      }
+    }
+  }
+  sql += " FROM " + FromList(block.from);
+  if (!block.where.empty()) {
+    sql += " WHERE " + Conjuncts(block.where);
+  }
+  if (!block.group_by.empty()) {
+    sql += " GROUP BY " + List(block.group_by);
+  }
+  if (!block.having.empty()) {
+    sql += " HAVING " + Conjuncts(block.having);
+  }
+  return sql;
+}
+
+// A query: its WITH list, each name quoted (WITH "c"("x") AS (...), "d" AS (...)), then its block,
+// or a compound's blocks joined by UNION ALL, then ORDER BY, LIMIT and OFFSET, which are the
+// compound's.
 std::string StatementSql(const SelectStatement& stmt) {
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
   std::string sql;
   for (std::size_t i = 0; i < stmt.with.size(); ++i) {
     const CommonTableExpr& cte = stmt.with[i];
@@ -273,29 +305,14 @@ std::string StatementSql(const SelectStatement& stmt) {
     }
     sql += " AS (" + StatementSql(*cte.query) + ")";
   }
-  sql += stmt.with.empty() ? "SELECT " : " SELECT ";
-  if (stmt.star) {
-    sql += '*';
-  } else {
-    for (std::size_t i = 0; i < stmt.items.size(); ++i) {
-      if (i > 0) {
-        sql += ", ";
-      }
-      sql += Sql(stmt.items[i].expr, kOr);
-      if (const auto& alias = stmt.items[i].alias; alias.has_value()) {
-        sql += " AS " + Quote(*alias, '"');
-      }
-    }
+  if (!stmt.with.empty()) {
+    sql += ' ';
   }
-  sql += " FROM " + FromList(stmt.from);
-  if (!stmt.where.empty()) {
-    sql += " WHERE " + Conjuncts(stmt.where);
+  if (stmt.set_operation.empty()) {
+    sql += BlockSql(stmt);
   }
-  if (!stmt.group_by.empty()) {
-    sql += " GROUP BY " + List(stmt.group_by);
-  }
-  if (!stmt.having.empty()) {
-    sql += " HAVING " + Conjuncts(stmt.having);
+  for (std::size_t i = 0; i < stmt.set_operation.size(); ++i) {
+    sql += (i == 0 ? "" : " UNION ALL ") + BlockSql(*stmt.set_operation[i].query);
   }
   for (std::size_t i = 0; i < stmt.order_by.size(); ++i) {
     const OrderItem& item = stmt.order_by[i];

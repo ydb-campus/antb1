@@ -861,6 +861,59 @@ INSTANTIATE_TEST_SUITE_P(
 // of HAVING, so what is left here is the scalar form (J5b), EXISTS (ADR 0023's U-series), and what
 // an answered IN still refuses: a key no type holds, a column count other than one, and a
 // correlation.
+// UNION ALL parses (ADR 0036), and every placement of a compound is refused at its first UNION ALL
+// until its binder item -- statically, so over tables that do not exist too, and before any check
+// that reads a block's clauses: a scalar subquery over a compound is not called a non-aggregate.
+// A construct before the UNION ALL in the query is still reported first.
+INSTANTIATE_TEST_SUITE_P(
+    UnionAll, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i32 FROM u", kUnsupported, "UNION ALL",
+                  "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
+                  "ORDER BY 1",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u) AS d",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u) SELECT i16 FROM c",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u UNION ALL SELECT "
+                  "MAX(i16) FROM t)",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada", kUnsupported, "UNION ALL",
+                  "UNION ALL is not supported"},
+        ErrorCase{"SELECT lower(s) FROM t UNION ALL SELECT s FROM t", kUnsupported, "lower",
+                  "function lower() is not supported"}));
+
+// The walks reach a compound's last block (ADR 0036's matrix): each construct stands only in the
+// last of three, where a walk that skipped the blocks would miss it. A date cast there is folded
+// into a literal, so the compound is what is refused, not the cast; a refused call there, also in a
+// derived table, a CTE body or a subquery that only the last block reads, comes first.
+INSTANTIATE_TEST_SUITE_P(
+    UnionAllLastBlock, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
+                  "WHERE dt > CAST('2020-01-01' AS DATE)",
+                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT lower(s) FROM t",
+                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
+                  "lower(s) AS x FROM t) AS d",
+                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"WITH c AS (SELECT lower(s) AS x FROM t) SELECT i16 FROM t UNION ALL SELECT i16 "
+                  "FROM u UNION ALL SELECT x FROM c",
+                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
+                  "WHERE i16 IN (SELECT lower(s) FROM u)",
+                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
+                  "i16 AS x FROM t UNION ALL SELECT lower(s) FROM t) AS d",
+                  kUnsupported, "lower", "function lower() is not supported"}));
+
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(

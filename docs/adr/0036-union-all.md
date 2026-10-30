@@ -4,7 +4,8 @@ Date: 2026-10-30
 
 ## Status
 
-Proposed (X1 built: the plan node and its operator, which no query reaches until X3).
+Proposed (X1 and X2 built: the plan node and its operator, and the grammar, whose compounds the binder refuses
+until X3).
 
 ## Context
 
@@ -132,7 +133,7 @@ Proposed (X1 built: the plan node and its operator, which no query reaches until
 | Id | Item | Status |
 | --- | --- | --- |
 | X1 | The plan node and `UnionAllOperator`; every visitor; the reduction's gate. No SQL. | Built |
-| X2 | `UNION ALL` in the grammar, the AST, the unparser and the walkers, refused by the binder with exit code 4; the random generator writes it (a pending feature) | Planned |
+| X2 | `UNION ALL` in the grammar, the AST, the unparser and the walkers, refused by the binder with exit code 4; the random generator writes it (a pending feature) | Built |
 | X3 | The binder answers it in derived tables, CTE bodies and statements; `.slt` from DuckDB; the TPC-DS ratchet; D26 | Planned |
 | X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87 |
 | X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it |

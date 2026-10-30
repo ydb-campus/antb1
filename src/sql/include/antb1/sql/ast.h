@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -338,8 +339,15 @@ struct CommonTableExpr {
   SourceSpan span;          // the name through the query's ')'
 };
 
-// A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET). A derived table and
-// a common table expression hold a query of their own.
+// One query of a compound (docs/adr/0036-union-all.md): a block -- SELECT through HAVING, with no
+// WITH list, ORDER BY, LIMIT or OFFSET of its own -- and the UNION ALL written before it.
+struct SetBranch {
+  Box<SelectStatement> query;
+  SourceSpan op_span;  // UNION ALL (empty for the first branch)
+};
+
+// A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET), or a compound of
+// blocks. A derived table and a common table expression hold a query of their own.
 struct SelectStatement {
   std::vector<CommonTableExpr> with;  // the WITH list, in order (empty: none)
   SourceSpan with_span;               // the WITH keyword (when with is not empty)
@@ -359,7 +367,17 @@ struct SelectStatement {
   std::optional<std::int64_t> offset;  // non-negative
   SourceSpan offset_span;              // OFFSET and its value (when offset)
   SourceSpan span;                     // WITH or SELECT .. last token of the query (without ';')
+  // A compound: two or more blocks joined by UNION ALL, in the order written, or none. When set,
+  // the block's own fields (star through having_span) are empty, and the WITH list, ORDER BY, LIMIT
+  // and OFFSET belong to the compound. A walk of a statement that reads those fields must also walk
+  // the branches (kSelectStatementFields).
+  std::vector<SetBranch> set_operation;
 };
+
+// The number of fields of SelectStatement. ast.cc checks it against the struct, and every walk of a
+// statement asserts the number it was written for: a new field fails the build at each of them,
+// which is the only way a walk that forgets it can be found, the compiler checking nothing else.
+inline constexpr std::size_t kSelectStatementFields = 19;
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);
@@ -375,7 +393,8 @@ bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
 std::size_t Depth(const Expr& expr);
 // The deepest expression tree of a statement (its select items, ON, WHERE and HAVING conjuncts and
 // GROUP BY and ORDER BY items), or of a query nested in it: a derived table's or a common table
-// expression's query is one level deeper than the statement. 0 when it has none.
+// expression's query, and each branch of a compound, is one level deeper than the statement. 0
+// when it has none.
 std::size_t Depth(const SelectStatement& stmt);
 
 }  // namespace antb1::sql

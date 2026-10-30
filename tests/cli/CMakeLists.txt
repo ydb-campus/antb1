@@ -568,6 +568,13 @@ antb1_add_cli_golden(
   STDERR
   ARGS query --threads 1 -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS NULL" --table "${_t}"
 )
+# UNION ALL parses, and the binder refuses it at its first UNION ALL until ADR 0036's X3 answers it.
+antb1_add_cli_golden(
+  unsupported_union_all
+  EXIT_CODE 4
+  STDERR
+  ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT WatchID FROM t" --table "${_t}"
+)
 antb1_add_cli_golden(
   error_bind_column
   EXIT_CODE 1

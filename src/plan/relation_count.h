@@ -48,7 +48,8 @@ std::size_t CountRelations(const sql::SelectStatement& block);
 // each subquery expression, and the body of each CTE that a reached block references -- once per
 // CTE however often it is referenced, and not at all when nothing references it, since DuckDB never
 // binds an unreferenced one. Within a block, its FROM list's blocks come before its expressions',
-// so a check over the result reports at the first unsupported construct in query order. Pure name
+// and a compound's branches come before the compound (ADR 0036), whose own clauses follow them, so
+// a check over the result reports at the first unsupported construct in query order. Pure name
 // matching, like the count, so a check over the result runs before anything resolves.
 std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatement& block);
 

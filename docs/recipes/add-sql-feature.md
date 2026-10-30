@@ -36,6 +36,12 @@ at one layer.
 - AST: `src/sql/include/antb1/sql/ast.h`. Every node carries its `SourceSpan`. Extend `EqualIgnoringSpans` in
   `src/sql/ast.cc` for every new field, and `Depth` for every new child: a nested query (a `SelectStatement` in a
   `Box`, such as a derived table's) is one level below its statement, and the parser must count the same levels.
+- A new field of `sql::SelectStatement` fails the build at `kSelectStatementFields` (`ast.h`; a structured binding in
+  `ast.cc` names every field): raise the count, and every walk over a statement that asserts it (`EqualIgnoringSpans`,
+  `Depth`, the unparser, the parser's compound loop, the relation count, the binder's static checks and date-cast
+  fold, the parser property test) fails to compile until you have revisited it. A compound keeps its blocks in
+  `set_operation` and has no block clauses of its own ([ADR 0036](../adr/0036-union-all.md)), so a walk over a
+  block's clauses must visit its blocks too.
 - Parser: `src/sql/parser.cc` (recursive descent). Valid-looking SQL outside the subset returns
   `ParseError::Kind::kUnsupported` with the span of the first offending token; malformed SQL returns `kSyntax`.
 - Unparser: `src/sql/unparse.cc`. `ToSql` prints the canonical form, and `Parse(ToSql(ast))` must be equal to `ast`

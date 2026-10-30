@@ -730,6 +730,11 @@ constexpr unsigned kCorrelatedResidualPercent = 35;
 // Salt of the seventh random stream, which every draw that only a correlated subquery needs takes,
 // so that a query without one is the query this seed generated before the correlated PR.
 constexpr uint64_t kCorrelatedStreamSalt = 0x636F72722D726E67ULL;
+// Share of the nested blocks written as copies of the block joined by UNION ALL (ADR 0036's X2).
+constexpr unsigned kUnionPercent = 30;
+// Salt of the eighth random stream, which every draw that only a compound needs takes, so that a
+// query without one is the query this seed generated before the compound PR.
+constexpr uint64_t kUnionStreamSalt = 0x756E696F6E2D726EULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -867,6 +872,9 @@ struct Binding {
   // of one), and the inner block is a projection, so the row bound is the table's.
   std::vector<std::string> inner;  // per column: the name it reads from the table
   bool as_cte = false;             // the block goes in a WITH list, not in FROM
+  // The block's copies, joined by UNION ALL (ADR 0036): the same columns of the same table in each,
+  // so their types agree, and as many times the table's rows (FromList::rows counts them).
+  std::size_t copies = 1;
 };
 
 // One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
@@ -910,7 +918,8 @@ class Builder {
  public:
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
-          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, FeatureSet allowed)
+          Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -919,6 +928,7 @@ class Builder {
         sub_rng_(sub_rng),
         substring_rng_(substring_rng),
         corr_rng_(corr_rng),
+        union_rng_(union_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1439,6 +1449,12 @@ class Builder {
     // table's own skipped columns are out of reach.
     from.other_columns = false;
     from.any_path = false;
+    // Now and then two or three copies of the block joined by UNION ALL (ADR 0036), and as many
+    // times the rows, which every row guard of the query reads. Drawn from union_rng_ alone.
+    if (allowed_.Has(Feature::kUnionAll) && union_rng_.Percent(kUnionPercent)) {
+      b.copies = 2 + union_rng_.Below(2);
+      from.rows *= static_cast<int64_t>(b.copies);
+    }
   }
 
   std::optional<GeneratedQuery> TryFrom(const FromList& from) {
@@ -2417,22 +2433,30 @@ class Builder {
     }
   }
 
-  // `( SELECT <inner> AS <column> , ... FROM <table> )`: the block a nested binding reads. In FROM
-  // its alias follows, written by EmitFrom like any other; in a WITH list its name precedes it.
+  // `( SELECT <inner> AS <column> , ... FROM <table> )`: the block a nested binding reads, or its
+  // copies joined by UNION ALL. In FROM its alias follows, written by EmitFrom like any other; in a
+  // WITH list its name precedes it.
   void EmitNestedBlock(const Binding& b) {
     Symbol("(");
-    Keyword("SELECT");
-    for (std::size_t i = 0; i < b.inner.size(); ++i) {
-      if (i > 0) {
-        Symbol(",");
+    for (std::size_t copy = 0; copy < b.copies; ++copy) {
+      if (copy > 0) {
+        used_.Add(Feature::kUnionAll);
+        Keyword("UNION");
+        Keyword("ALL");
       }
-      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.inner[i]});
-      used_.Add(TypeFeature(b.columns[i].kind));
+      Keyword("SELECT");
+      for (std::size_t i = 0; i < b.inner.size(); ++i) {
+        if (i > 0) {
+          Symbol(",");
+        }
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.inner[i]});
+        used_.Add(TypeFeature(b.columns[i].kind));
+      }
+      // Nest() never nests a table read by path, so the block always names one.
+      Keyword("FROM");
+      used_.Add(Feature::kTableName);
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
     }
-    // Nest() never nests a table read by path, so the block always names one.
-    Keyword("FROM");
-    used_.Add(Feature::kTableName);
-    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
     Symbol(")");
   }
 
@@ -3666,6 +3690,7 @@ class Builder {
   Rng& sub_rng_;        // the draws that only an uncorrelated subquery needs
   Rng& substring_rng_;  // the draws that only substring needs
   Rng& corr_rng_;       // the draws that only a correlated subquery needs
+  Rng& union_rng_;      // the draws that only a compound needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3866,8 +3891,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng sub_rng(Mix(seed ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(seed ^ kSubstringStreamSalt));
   Rng corr_rng(Mix(seed ^ kCorrelatedStreamSalt));
+  Rng union_rng(Mix(seed ^ kUnionStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               options.supported)
+               union_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -3886,11 +3912,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng sub_rng(Mix(state ^ kSubqueryStreamSalt));
   Rng substring_rng(Mix(state ^ kSubstringStreamSalt));
   Rng corr_rng(Mix(state ^ kCorrelatedStreamSalt));
+  Rng union_rng(Mix(state ^ kUnionStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, allowed)
+                             corr_rng, union_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;
