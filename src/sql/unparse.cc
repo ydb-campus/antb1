@@ -264,6 +264,7 @@ std::string FromList(const std::vector<FromItem>& from) {
 
 // A block: SELECT through HAVING.
 std::string BlockSql(const SelectStatement& block) {
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
   std::string sql = "SELECT ";
   if (block.star) {
     sql += '*';
