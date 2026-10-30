@@ -718,6 +718,24 @@ INSTANTIATE_TEST_SUITE_P(
                   "a cross product is not supported"},  // a residual is no key
         ErrorCase{"SELECT COUNT(*) FROM t AS a CROSS JOIN u", kUnsupported, "u",
                   "a cross product is not supported: no join key connects 'u' to 'a'"},
+        // A relation of exactly one row joins as one row only where nothing else reads it: a
+        // condition could leave it with no row, and a residual has no join to stand on; and one
+        // that may have no row or many (HAVING, LIMIT, GROUP BY) is no one-row relation.
+        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m > 5",
+                  kUnsupported, "(SELECT MAX(i32) AS m FROM u) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE t.i32 < b.m",
+                  kUnsupported, "(SELECT MAX(i32) AS m FROM u) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u HAVING MAX(i32) > 0) AS b",
+                  kUnsupported, "(SELECT MAX(i32) AS m FROM u HAVING MAX(i32) > 0) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
+        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u LIMIT 1) AS b", kUnsupported,
+                  "(SELECT MAX(i32) AS m FROM u LIMIT 1) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
+        ErrorCase{"SELECT t.i16 FROM t, (SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
+                  kUnsupported, "(SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
+                  "a cross product is not supported: no join key connects 'b' to 't'"},
         // A column both relations have is ambiguous in the select list, which binds before the
         // connectivity check (rule 3, and the documented error order).
         ErrorCase{"SELECT i16 FROM t, u", kBind, "i16",
@@ -1165,6 +1183,50 @@ TEST(BinderTest, TheRelationLimitCountsAChainBehindASubquery) {
 
 // A compound in a CTE that nothing references is never checked or bound, as no such CTE is (DuckDB
 // binds none either), so the query is answered without it while compounds are refused (ADR 0036).
+// A relation no join key connects joins as one row when it is a derived table or a CTE reference
+// of exactly one row (an aggregate without GROUP BY, HAVING, LIMIT or OFFSET) that nothing else
+// reads: a ONE-ROW join appends its row to every row of the others, above them, in FROM order --
+// also when it comes first in FROM. A key makes it an ordinary inner join, and a semi join over its
+// column stays above the one-row join, where it filters the rows rather than the relation's row.
+TEST(BinderTest, OneRowRelationsJoinAsOneRow) {
+  const Catalog catalog = MakeCatalog();
+  const auto explain = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  const auto count = [](const std::string& text, std::string_view what) {
+    std::size_t n = 0;
+    for (std::size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) {
+      ++n;
+    }
+    return n;
+  };
+  const std::string two = explain(
+      "SELECT a.n, b.m FROM (SELECT COUNT(*) AS n FROM t) AS a, (SELECT MAX(i32) AS m FROM "
+      "u) AS b");
+  EXPECT_EQ(count(two, "Join ONE-ROW build=right keys=[]"), 1U) << two;
+  EXPECT_LT(two.find("Scan table=t"), two.find("Scan table=u")) << "a, then b's row: " << two;
+  const std::string three = explain(
+      "SELECT a.n FROM (SELECT COUNT(*) AS n FROM t) AS a CROSS JOIN (SELECT MIN(i16) AS m FROM "
+      "u) AS b CROSS JOIN (SELECT SUM(i32) AS s FROM t) AS c");
+  EXPECT_EQ(count(three, "Join ONE-ROW"), 2U) << three;
+  const std::string first =
+      explain("SELECT ok.i16, b.m FROM (SELECT MAX(i32) AS m FROM u) AS b, ok WHERE ok.i16 = 1");
+  EXPECT_EQ(count(first, "Join ONE-ROW"), 1U) << first;
+  EXPECT_LT(first.find("Scan table=ok"), first.find("Scan table=u")) << "the core first: " << first;
+  const std::string cte =
+      explain("WITH c AS (SELECT COUNT(*) AS n FROM u) SELECT ok.i16, c.n FROM ok, c");
+  EXPECT_EQ(count(cte, "Join ONE-ROW"), 1U) << cte;
+  const std::string keyed =
+      explain("SELECT t.i16 FROM t, (SELECT MAX(i16) AS m FROM u) AS b WHERE t.i16 = b.m");
+  EXPECT_EQ(count(keyed, "Join ONE-ROW"), 0U) << keyed;
+  EXPECT_EQ(count(keyed, "Join INNER"), 1U) << keyed;
+  const std::string semi = explain(
+      "SELECT ok.i16 FROM ok, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m IN (SELECT i32 FROM t)");
+  EXPECT_LT(semi.find("Join SEMI"), semi.find("Join ONE-ROW")) << "the semi join above: " << semi;
+}
+
 TEST(BinderTest, AnUnreferencedCompoundCteIsNeverBound) {
   const Catalog catalog = MakeCatalog();
   auto plan = BindSql(

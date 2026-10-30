@@ -308,6 +308,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     with `CROSS JOIN`. Cross products have no design yet, and one planned by accident grows with the product of its
     inputs.
   - The keyless one-row joins of scalar subqueries are exempt: their right input has exactly one row.
+  - Update (2026-10-31): so is a FROM item of exactly one row -- a derived table or a CTE reference whose query is
+    an aggregate without GROUP BY, HAVING, LIMIT or OFFSET -- that no key, residual or condition reads. It joins
+    the key-connected others as a one-row join, after them in FROM order; a condition on it stays refused, as it
+    could leave the join's right input with no row.
 - **Join order (J2b, decision C9): greedy and left-deep, from footer statistics only.**
   1. The probe is the relation with the largest footer row count (for a sub-plan or a fixed unit, its estimate).
   2. Then, of the relations connected to those already joined, the one that gives the smallest estimated result

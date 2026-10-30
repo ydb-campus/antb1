@@ -48,7 +48,9 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
   `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
-  relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON`.
+  relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON` —
+  or the relation is a derived table or a CTE reference of exactly one row (an aggregate without `GROUP BY`,
+  `HAVING`, `LIMIT` or `OFFSET`) that no condition reads, which then joins the others as one row.
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
   an expression, `x [NOT] IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order are answered as a
   top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
@@ -62,7 +64,7 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level `WHERE`
   conjunct and nowhere else; `TRY_CAST`, a lateral reference, more than 256
   relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
-  product): exit code 4 as well. A query in parentheses that starts with neither
+  product, but of one-row inputs as above): exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
   `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
@@ -622,7 +624,11 @@ below) and sends every conjunct that leaves it to the relations it reads, so one
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
 cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
-cross product: exit code 4, naming the item nothing connects.
+cross product: exit code 4, naming the item nothing connects -- but for a relation of exactly one row, a derived table
+or a CTE reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no
+residual and no condition reads (one could leave it with no row). The keys connect the others to the first relation
+that is not one of those, or to the first relation when all are, and the one-row relations then each join above them,
+in FROM order, as a `ONE-ROW` join that appends its row to every row.
 The relations then join left-deep, greedily, from footer metadata only (row counts, and each key's domain from the
 parts' integer ranges capped at their non-NULL rows, else their distinct-count hints): the relation with
 the most rows (an unknown count counts as the most) is probed first, then the connected relation with the smallest
@@ -1313,7 +1319,7 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
 | Q27 | unsupported | needs NULL literals, UNION ALL |
-| Q28 | unsupported | needs cross products of one-row inputs |
+| Q28 | pass | cross products of one-row inputs |
 | Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |
 | Q31 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
@@ -1346,7 +1352,7 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q58 | unsupported | needs scalar subqueries that are not aggregates |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | unsupported | needs UNION ALL |
-| Q61 | unsupported | needs general CAST, cross products of one-row inputs |
+| Q61 | unsupported | needs general CAST |
 | Q62 | unsupported | needs `*` next to other select items |
 | Q63 | unsupported | needs abs, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
@@ -1373,9 +1379,9 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
 | Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
-| Q88 | unsupported | needs cross products of one-row inputs |
+| Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates |
-| Q90 | unsupported | needs general CAST, NULL literals, cross products of one-row inputs |
+| Q90 | unsupported | needs general CAST, NULL literals |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
 | Q93 | unsupported | needs IS [NOT] NULL |

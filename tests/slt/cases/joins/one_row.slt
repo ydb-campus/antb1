@@ -1,0 +1,110 @@
+# Cross products of one-row inputs (ADR 0022's connectivity rule, relaxed): a derived table or a CTE reference of
+# exactly one row -- an aggregate without GROUP BY, HAVING, LIMIT or OFFSET -- that no key and no condition reads
+# joins the other inputs as one row, appending its row to each of theirs, over the star schema.
+
+# ---- the inputs ----
+
+query II nosort
+SELECT COUNT(*), MAX(ct_pop) FROM cities
+----
+6	120000
+
+query I nosort
+SELECT COUNT(*) FROM zones
+----
+40
+
+# ---- one-row inputs only ----
+
+query II nosort
+SELECT a.n, b.m FROM (SELECT COUNT(*) AS n FROM trips) AS a, (SELECT MAX(ct_pop) AS m FROM cities) AS b
+----
+3000	120000
+
+query IIID nosort
+SELECT a.n, b.z, c.p, d.f FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 100) AS a CROSS JOIN (SELECT COUNT(*) AS z FROM zones) AS b CROSS JOIN (SELECT SUM(ct_pop) AS p FROM cities) AS c CROSS JOIN (SELECT SUM(tr_fare) AS f FROM trips) AS d
+----
+100	40	205500	44992.50
+
+# Arithmetic over two one-row inputs: a share of the trips, in percent.
+query I nosort
+SELECT a.n * 100 // b.n FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 1350) AS a, (SELECT COUNT(*) AS n FROM trips) AS b
+----
+45
+
+# ---- one-row inputs next to tables ----
+
+query IIII rowsort
+SELECT z.zn_id, z.zn_city, a.n, a.m FROM zones AS z, (SELECT COUNT(*) AS n, MAX(ct_pop) AS m FROM cities) AS a WHERE z.zn_id <= 3
+----
+1	1	6	120000
+2	2	6	120000
+3	3	6	120000
+
+# First in FROM: the tables are the core, and the one-row input joins above them.
+query II rowsort
+SELECT z.zn_id, a.m FROM (SELECT MAX(ct_pop) AS m FROM cities) AS a, zones AS z WHERE z.zn_id <= 2
+----
+1	120000
+2	120000
+
+# Next to a join, with GROUP BY and ORDER BY above.
+query TII nosort
+SELECT c.label, COUNT(*), MAX(a.total) FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id, (SELECT COUNT(*) AS total FROM trips) AS a GROUP BY c.label ORDER BY c.label
+----
+airport	7	3000
+center	8	3000
+harbor	8	3000
+hills	7	3000
+old town	8	3000
+
+# A CTE reference.
+query II nosort
+WITH n AS (SELECT COUNT(*) AS c FROM trips) SELECT COUNT(*), MAX(n.c) FROM zones, n
+----
+40	3000
+
+# ---- no rows ----
+
+# An aggregate over no row still has its one row; a core of no row keeps none.
+query I nosort
+SELECT COUNT(*) FROM zones AS z, (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 0) AS a
+----
+40
+
+query II nosort
+SELECT a.n, b.m FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 0) AS a, (SELECT MAX(ct_pop) AS m FROM cities WHERE ct_id > 100) AS b
+----
+0	NULL
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT * FROM zones WHERE zn_id < 0) AS z, (SELECT COUNT(*) AS n FROM trips) AS a
+----
+0
+
+# ---- DuckDB only until general cross products get a PR (ADR 0022) ----
+# A one-row input that a condition reads, or that may have no row, and a cross product of tables.
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities) AS a WHERE a.m > 5
+----
+40
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM zones AS z, (SELECT MAX(zn_id) AS m FROM zones) AS a WHERE z.zn_id < a.m
+----
+39
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities HAVING MAX(ct_pop) > 0) AS a
+----
+40
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM zones, cities
+----
+240

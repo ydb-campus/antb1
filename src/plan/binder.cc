@@ -2865,10 +2865,13 @@ class Binder {
   void PushSemiJoinsDown();
   // The relation `join` can run on the branch of, or none: the conditions are in the definition.
   [[nodiscard]] std::optional<std::size_t> PushableSemiJoin(const SubqueryJoin& join) const;
-  // The join order of every block, innermost first: a block's relations must be connected, and
-  // OrderJoins then picks the left-deep order of them.
+  // The join order of every block, innermost first: a block's relations must be connected, but for
+  // the ones that join as one row, and OrderJoins then picks the order of the others.
   arrow::Status OrderRelations();
   arrow::Status OrderBlock(std::size_t b);
+  // Whether the relation at index `i` of block `b` can stand in a cross product: one no key, no
+  // residual and no condition reads, of exactly one row, which a one-row join then appends.
+  [[nodiscard]] bool JoinsAsOneRow(std::size_t b, std::size_t i) const;
   [[nodiscard]] std::optional<int64_t> RelationEstimate(std::size_t r) const;
   [[nodiscard]] std::optional<int64_t> FilteredRelationRows(std::size_t r) const;
   [[nodiscard]] std::optional<int64_t> UnitEstimate(std::size_t u) const;
@@ -2880,6 +2883,7 @@ class Binder {
   LogicalNodePtr RelationNode(std::size_t r);
   // The relations of block `block` joined in the order OrderRelations chose, left-deep.
   LogicalNodePtr JoinTree(std::size_t block);
+  LogicalNodePtr CoreTree(std::size_t block);
   // The join of LEFT JOIN unit `u`'s two inputs, built on its right input.
   LogicalNodePtr UnitNode(std::size_t u);
   // The qualifier of the column `id` belongs to (BoundColumn::qualifier, which EXPLAIN shows), or
@@ -3110,7 +3114,12 @@ class Binder {
     std::vector<JoinEdge> edges;         // its sides index `relations`
     std::vector<std::pair<EdgeKey, EdgeKey>> edge_keys;  // parallel to `edges`
     std::vector<Residual> residuals;
-    std::vector<JoinStep> steps;  // one per relation, after OrderRelations
+    // After OrderRelations: one per relation of the key-connected core but its first, which `root`
+    // is when there are none; the relations no key connects to the core, each of one row, then join
+    // above it in FROM order (`one_row`, indices into `relations`).
+    std::vector<JoinStep> steps;
+    std::size_t root = 0;
+    std::vector<std::size_t> one_row;
   };
   // A LEFT JOIN unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
   // reordered and always built on its right input, whose two inputs are inner blocks of their own.
@@ -4760,11 +4769,49 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
   return arrow::Status::OK();
 }
 
+// Whether a sub-plan returns exactly one row however the data falls: an aggregate without groups,
+// under the Projects and Computes over it -- not a HAVING (a Filter), a LIMIT or an OFFSET, each of
+// which can leave none, and not a Scan.
+bool ExactlyOneRow(const LogicalNode& node) {
+  if (std::holds_alternative<AggregateNode>(node)) {
+    return true;
+  }
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    return ExactlyOneRow(*project->input);
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(&node)) {
+    return ExactlyOneRow(*compute->input);
+  }
+  return false;
+}
+
 // The order the relations of every block join in: each block's relations must be connected to its
 // first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the left-deep order
 // from footer statistics. A unit's inputs are ordered before the block that holds the unit, since
 // its estimate stands in for the unit's rows there.
 arrow::Status Binder::OrderRelations() { return OrderBlock(0); }
+
+// A relation a one-row join can append (JoinNode kOneRow: no key, no residual, exactly one row on
+// its right): a derived table or a CTE reference whose sub-plan has exactly one row, that no key,
+// no residual and no condition of this block reads. A condition routed to it could leave it with
+// no row, which the join would report as a planner bug.
+bool Binder::JoinsAsOneRow(std::size_t b, std::size_t i) const {
+  const JoinBlock& block = blocks_[b];
+  const std::size_t r = block.relations[i];
+  const Relation& relation = relations_[r];
+  if (relation.unit.has_value() || !relation.scan_filter.empty() || !relation.where_exprs.empty() ||
+      !relation.input_filter.empty() || !relation.join_key_exprs.empty() ||
+      !relation.semi_joins.empty()) {
+    return false;
+  }
+  if (std::ranges::any_of(block.edges, [i](const JoinEdge& e) { return e.a == i || e.b == i; }) ||
+      std::ranges::any_of(block.residuals, [i](const Residual& residual) {
+        return std::ranges::contains(residual.relations, i);
+      })) {
+    return false;
+  }
+  return ExactlyOneRow(*scope_.bindings()[r].Node());
+}
 
 arrow::Status Binder::OrderBlock(std::size_t b) {
   // Every unit's own inputs first: its estimate stands in for the unit's rows in this block.
@@ -4780,17 +4827,80 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
   for (const std::size_t r : block.relations) {
     block.stats.push_back(JoinRelation{.rows = RelationEstimate(r)});
   }
-  if (const auto unconnected = FirstUnconnected(block.stats.size(), block.edges)) {
-    // The message names the binding, so a sub-plan needs no table reference here.
-    const std::size_t missing = FirstBindingOf(block.relations[*unconnected]);
-    const std::size_t first = FirstBindingOf(block.relations.front());
-    return UnsupportedError(
-        std::format("a cross product is not supported: no join key connects '{}' to '{}'",
-                    scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
-        stmt_.from[missing].span);
+  block.root = 0;
+  block.one_row.clear();
+  if (!FirstUnconnected(block.stats.size(), block.edges).has_value()) {
+    block.steps =
+        OrderJoins(block.stats, block.edges, options_.build_side_ratio, options_.join_order);
+    return arrow::Status::OK();
   }
-  block.steps =
-      OrderJoins(block.stats, block.edges, options_.build_side_ratio, options_.join_order);
+  // A cross product, answered only where every relation no key connects joins as one row
+  // (JoinsAsOneRow). The core is what the keys connect to the first relation that does not, or to
+  // the first relation when they all do; the others join above the core, in FROM order.
+  const std::size_t n = block.relations.size();
+  std::vector<bool> one_row(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    one_row[i] = JoinsAsOneRow(b, i);
+  }
+  const auto seed_at = std::ranges::find(one_row, false);
+  const std::size_t seed =
+      seed_at == one_row.end() ? 0 : Narrow<std::size_t>(seed_at - one_row.begin());
+  std::vector<bool> reached(n, false);
+  reached[seed] = true;
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (const JoinEdge& edge : block.edges) {
+      if (reached[edge.a] != reached[edge.b]) {
+        reached[edge.a] = true;
+        reached[edge.b] = true;
+        grew = true;
+      }
+    }
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    if (reached[i]) {
+      continue;
+    }
+    if (!one_row[i]) {
+      // The message names the binding, so a sub-plan needs no table reference here.
+      const std::size_t missing = FirstBindingOf(block.relations[i]);
+      const std::size_t first = FirstBindingOf(block.relations[seed]);
+      return UnsupportedError(
+          std::format("a cross product is not supported: no join key connects '{}' to '{}'",
+                      scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
+          stmt_.from[missing].span);
+    }
+    block.one_row.push_back(i);
+  }
+  // The core alone goes to OrderJoins, renumbered, and its steps come back in the block's numbers.
+  // Every edge is the core's: a relation outside it joins as one row, which no edge touches.
+  std::vector<std::size_t> core;
+  std::vector<std::size_t> index_in_core(n, 0);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (reached[i]) {
+      index_in_core[i] = core.size();
+      core.push_back(i);
+    }
+  }
+  std::vector<JoinRelation> stats;
+  stats.reserve(core.size());
+  for (const std::size_t i : core) {
+    stats.push_back(block.stats[i]);
+  }
+  std::vector<JoinEdge> edges = block.edges;
+  for (JoinEdge& edge : edges) {
+    edge.a = index_in_core[edge.a];
+    edge.b = index_in_core[edge.b];
+  }
+  block.steps = OrderJoins(stats, edges, options_.build_side_ratio, options_.join_order);
+  for (JoinStep& step : block.steps) {
+    for (JoinOperand* operand : {&step.left, &step.right}) {
+      if (!operand->step) {
+        operand->index = core[operand->index];
+      }
+    }
+  }
+  block.root = seed;
   return arrow::Status::OK();
 }
 
@@ -5221,11 +5331,32 @@ LogicalNodePtr Binder::UnitNode(std::size_t u) {
 
 LogicalNodePtr Binder::JoinTree(std::size_t b) {
   JoinBlock& block = blocks_[b];
-  // One step per join, so one fewer than the relations; a block of one relation is its own tree.
-  ANTB1_CHECK(block.steps.size() + 1 == block.relations.size());
-  if (block.steps.empty()) {
-    return RelationNode(block.relations.front());
+  // One step per join of the core, so one fewer than its relations; a core of one relation is its
+  // own tree. The relations that join as one row then each append their row, in FROM order.
+  ANTB1_CHECK(block.steps.size() + 1 + block.one_row.size() == block.relations.size());
+  LogicalNodePtr tree =
+      block.steps.empty() ? RelationNode(block.relations[block.root]) : CoreTree(b);
+  const std::optional<int64_t> rows = block.steps.empty()
+                                          ? RelationEstimate(block.relations[block.root])
+                                          : std::optional<int64_t>(block.steps.back().estimate);
+  for (const std::size_t i : block.one_row) {
+    const sql::FromItem& item = stmt_.from[FirstBindingOf(block.relations[i])];
+    tree = Make(JoinNode{
+        .kind = JoinKind::kOneRow,
+        .left = std::move(tree),
+        .right = RelationNode(block.relations[i]),
+        .keys = {},
+        .residual = {},
+        .build = BuildSide::kRight,
+        .estimate = rows,  // one row each: the core's rows, unchanged
+        .span = item.connector == sql::Connector::kFirst ? item.span : item.connector_span});
   }
+  return tree;
+}
+
+// The join tree of block `b`'s key-connected core, from its steps (OrderBlock), which are not none.
+LogicalNodePtr Binder::CoreTree(std::size_t b) {
+  JoinBlock& block = blocks_[b];
   // Per step, the node it produces, the relations below it as a set, and the lowest of them. An
   // operand names either a relation of the block or an earlier step, so all three are indexed by
   // the step that made them. A set rather than a sorted list: every use here is a membership test,
@@ -5329,6 +5460,10 @@ std::optional<std::size_t> Binder::PushableSemiJoin(const SubqueryJoin& join) co
     // A LEFT JOIN unit: its branch is a join of its own and its rows pad. Standing above that join
     // would answer the same, since a padded row's NULL key matches nothing either way, but a unit
     // is the one relation this pass has no measurement for, so it keeps its place.
+    return std::nullopt;
+  }
+  if (block.steps.empty() || std::ranges::contains(block.one_row, locals.front())) {
+    // No join to stand below; or a relation that joins as one row, which must keep its row.
     return std::nullopt;
   }
   // Only where it cannot cost more than it saves. The semi join probes the rows of whatever it
