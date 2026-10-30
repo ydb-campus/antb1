@@ -572,6 +572,19 @@ struct RowsOf {
   std::optional<int64_t> operator()(const DependentJoinNode& node) const {
     return EstimateRows(*node.left);
   }
+  // Its inputs' rows added up, saturated; unknown where any input's is, since an unknown must never
+  // read as small.
+  std::optional<int64_t> operator()(const UnionAllNode& node) const {
+    Int128 rows = 0;
+    for (const LogicalNodePtr& input : node.inputs) {
+      const std::optional<int64_t> input_rows = EstimateRows(*input);
+      if (!input_rows.has_value()) {
+        return std::nullopt;
+      }
+      rows += std::max<int64_t>(*input_rows, 0);
+    }
+    return Saturated(rows);
+  }
 
   template <class Node>
   static std::optional<int64_t> Input(const Node& node) {

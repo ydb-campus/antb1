@@ -415,6 +415,17 @@ struct MapReferences {
     node.right = Map(node.right);
     return std::make_shared<const LogicalNode>(std::move(node));
   }
+  LogicalNodePtr operator()(UnionAllNode node) const {
+    for (std::vector<BoundColumn>& input : node.columns) {
+      for (BoundColumn& column : input) {
+        Column(column);
+      }
+    }
+    for (LogicalNodePtr& input : node.inputs) {
+      input = Map(input);
+    }
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
 };
 
 // The id and the position of every column reference that has an id, from the root down.
@@ -1422,6 +1433,75 @@ TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverAJoin) {
   ASSERT_EQ(restriction->keys.size(), 1U) << Explain(plan);
   EXPECT_EQ(restriction->keys[0].left.id, FieldOf(11, 1).id);
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// A union of FourFieldsRows(11, rows) and FourFieldsRows(31, rows) whose four columns are #71 to
+// #74, named and typed as FieldOf(71, field) says (ADR 0036).
+LogicalNodePtr FourFieldsUnion(int64_t rows) {
+  UnionAllNode node{.inputs = {FourFieldsRows(11, rows), FourFieldsRows(31, rows)},
+                    .columns = {{}, {}},
+                    .ids = {},
+                    .span = {}};
+  for (int field = 0; field < 4; ++field) {
+    node.columns[0].push_back(FieldOf(11, field));
+    node.columns[1].push_back(FieldOf(31, field));
+    node.ids.push_back(FieldOf(71, field).id);
+  }
+  return Node(std::move(node));
+}
+
+// **A union below the aggregation stops the offer too**: its inputs are pipelines of their own and
+// its arm forwards nothing into them (ADR 0036), so a single correlated key over a union has
+// nowhere to attach either, and this rewrite is what restricts it -- as over a join, and unlike
+// over a scan.
+TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverAUnion) {
+  const std::vector<ExprPtr> one = {Compare(FieldOf(71, 1), FieldOf(1, 1), CompareOp::kEq)};
+  const LogicalPlan plan = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = FourFieldsRows(1, 10),
+          .right = Node(AggregateNode{.input = CorrelatedBlockOver(FourFieldsUnion(1000), one, 50),
+                                      .aggregates = {AggregateCall{.kind = AggKind::kMin,
+                                                                   .arg = FieldOf(71, 2),
+                                                                   .type = LogicalType::kBigInt,
+                                                                   .id = ColumnId{140}}}}),
+          .span = {}}),
+      1));
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi) << Explain(plan);
+  EXPECT_EQ(restriction->build, BuildSide::kRight) << Explain(plan);
+  EXPECT_TRUE(std::holds_alternative<UnionAllNode>(*restriction->left))
+      << "its probe is the union: " << Explain(plan);
+  ASSERT_EQ(restriction->keys.size(), 1U) << Explain(plan);
+  EXPECT_EQ(restriction->keys[0].left.id, FieldOf(71, 1).id);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// A union keeps every column, as a Project does, and asks each input for the columns it reads of
+// it and nothing more: a scan below it reads only the fields some position of the union maps.
+TEST(OptimizerTest, PruningKeepsAUnionsColumnsAndNarrowsItsInputs) {
+  const LogicalNodePtr union_all = Node(
+      UnionAllNode{.inputs = {FourFieldsRows(11, 10), FourFieldsRows(31, 10)},
+                   .columns = {{FieldOf(11, 2), FieldOf(11, 0)}, {FieldOf(31, 2), FieldOf(31, 0)}},
+                   .ids = {ColumnId{71}, ColumnId{72}},
+                   .span = {}});
+  const LogicalPlan plan = Optimized(PlanOver(Node(ProjectNode{
+      .input = union_all,
+      .columns = {BoundColumn{.id = ColumnId{72}, .name = "i16", .type = LogicalType::kSmallInt}},
+      .constants = {},
+      .ids = {ColumnId{80}},
+      .span = {}})));
+  const auto& project = std::get<ProjectNode>(*plan.root);
+  const auto& pruned = std::get<UnionAllNode>(*project.input);
+  EXPECT_EQ(pruned.ids, (std::vector<ColumnId>{ColumnId{71}, ColumnId{72}}))
+      << "a column nothing above reads is kept: " << Explain(plan);
+  ASSERT_EQ(pruned.inputs.size(), 2U);
+  for (const LogicalNodePtr& input : pruned.inputs) {
+    EXPECT_EQ(std::get<ScanNode>(*input).fields, (std::vector<int>{0, 2})) << Explain(plan);
+  }
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  EXPECT_EQ(Explain(Optimized(plan)), Explain(plan)) << "Optimize is idempotent";
 }
 
 // The gate: an outer side the aggregation's input does not dwarf buys a build and a probe for

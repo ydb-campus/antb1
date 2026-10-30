@@ -302,6 +302,25 @@ TEST(ExplainTest, DependentJoinShowsBothInputs) {
             "  Scan table=b source=fake columns=[i16]\n");
 }
 
+// A union names its columns as its first input does, which are the union's names, and renders its
+// inputs one level deeper in the order written (ADR 0036).
+TEST(ExplainTest, UnionAllShowsEveryInputInOrder) {
+  EXPECT_EQ(Explain(LogicalPlan{
+                .root = Node(UnionAllNode{
+                    .inputs = {ScanOf("a", {0, 1}), ScanOf("b", {1, 0}), ScanOf("c", {0, 1})},
+                    .columns = {{Qualified("a", "i16"), Qualified("", "i32")},
+                                {Qualified("b", "i32"), Qualified("b", "i16")},
+                                {Qualified("c", "i16"), Qualified("c", "i32")}},
+                    .ids = {},
+                    .span = {}}),
+                .output = {}}),
+            "Output:\n"
+            "UnionAll inputs=3 columns=[a.i16, i32]\n"
+            "  Scan table=a source=fake columns=[i16, i32]\n"
+            "  Scan table=b source=fake columns=[i32, i16]\n"
+            "  Scan table=c source=fake columns=[i16, i32]\n");
+}
+
 // A qualifier is printed wherever a column is (J2b's binder sets it); quoted like a name.
 TEST(ExplainTest, QualifiedColumnNames) {
   const LogicalNodePtr scan = ScanOf("t", {0});

@@ -537,6 +537,58 @@ TEST_F(PartOperatorsTest, LimitStopsSchedulingParts) {
   }
 }
 
+// A union runs its inputs one after another, each over its own parts (ADR 0036): every row of input
+// 0 in part order, then input 1's, on any number of threads. A LIMIT met in input 0 never scans a
+// part of input 1, and the first failing input decides the error.
+TEST_F(PartOperatorsTest, UnionsKeepInputThenPartOrder) {
+  const auto pool = Pool();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto branch = [&x](const std::shared_ptr<MemoryTable>& table) {
+    return Node(
+        plan::ProjectNode{.input = Node(plan::FilterNode{
+                              .input = Scan(table),
+                              .predicates = {testing::Compare(Column(2, "y", LogicalType::kBigInt),
+                                                              plan::CompareOp::kGe, BigInt(0))}}),
+                          .columns = {x}});
+  };
+  const auto union_of = [&](const std::shared_ptr<MemoryTable>& first,
+                            const std::shared_ptr<MemoryTable>& second) {
+    return Node(plan::UnionAllNode{
+        .inputs = {branch(first), branch(second)}, .columns = {{x}, {x}}, .ids = {}, .span = {}});
+  };
+  std::vector<std::optional<int64_t>> expected;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int64_t v = 0; v < kParts * kRows; ++v) {
+      if (v % 5 != 0) {
+        expected.emplace_back(v);
+      }
+    }
+  }
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    SCOPED_TRACE(executor == nullptr ? "one thread" : "the pool");
+    const auto result = Run(PlanOf(union_of(Table(), Table()), 1), executor);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(Int64Column(**result), expected);
+
+    const auto later = Table();
+    const auto limited = Run(
+        PlanOf(Node(plan::LimitNode{.input = union_of(Table(), later), .limit = 4}), 1), executor);
+    ASSERT_TRUE(limited.ok()) << limited.status().ToString();
+    EXPECT_EQ(Int64Column(**limited), (std::vector<std::optional<int64_t>>{1, 2, 3, 4}));
+    EXPECT_TRUE(later->scanned_parts().empty()) << "input 1 is never opened";
+
+    const auto first = Table();
+    const auto second = Table();
+    first->FailPart(15);
+    second->FailPart(2);
+    const auto failed = Run(PlanOf(union_of(first, second), 1), executor);
+    ASSERT_FALSE(failed.ok());
+    EXPECT_EQ(failed.status().message(), "part 15 is broken") << "input 0's error, not input 1's";
+  }
+}
+
 // The first failing part in part order decides the error; a part after the rows a LIMIT needs is
 // never reported.
 TEST_F(PartOperatorsTest, ErrorsFollowPartOrder) {

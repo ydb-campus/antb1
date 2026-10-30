@@ -690,6 +690,27 @@ TEST(JoinOrderTest, EstimateRowsReadsAJoinsOwnEstimate) {
             std::optional<int64_t>(250));
 }
 
+// A union's rows are its inputs' added up (ADR 0036): saturated, since a sum of two large estimates
+// must not wrap into a small one, and unknown where any input's is, since unknown must never read
+// as small.
+TEST(JoinOrderTest, EstimateRowsAddsAUnionsInputs) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto scan = [&schema](std::optional<int64_t> rows) {
+    return std::make_shared<const LogicalNode>(
+        ScanNode{.table = std::make_shared<FakeTable>(schema, rows),
+                 .table_name = "t",
+                 .fields = {0},
+                 .ids = {ColumnId{1}},
+                 .span = {}});
+  };
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  EXPECT_EQ(EstimateRows(UnionAllNode{.inputs = {scan(1000), scan(10), scan(0)}}),
+            std::optional<int64_t>(1010));
+  EXPECT_EQ(EstimateRows(UnionAllNode{.inputs = {scan(kMax), scan(kMax)}}),
+            std::optional<int64_t>(kMax));
+  EXPECT_EQ(EstimateRows(UnionAllNode{.inputs = {scan(1000), scan(std::nullopt)}}), std::nullopt);
+}
+
 // The footer statistics one column's estimates read (ADR 0026): exact only when every part has
 // them, since a part without them could hold any value.
 TEST(JoinOrderTest, ColumnRanges) {

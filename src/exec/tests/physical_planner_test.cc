@@ -1345,6 +1345,122 @@ TEST_F(PhysicalPlannerTest, ADependentJoinIsUnsupportedAndNotABug) {
   EXPECT_EQ(plan::GetSqlError(status)->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
 }
 
+// A union runs each input on its own -- its part pipelines and builds its own -- one after another,
+// and every consumer takes it as the serial input it is (ADR 0036): an aggregate, a grouping, a
+// sort, a limit, and a hash join on either side.
+TEST_F(PhysicalPlannerTest, AUnionAllFeedsEveryConsumer) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto y = Column(1, "y", LogicalType::kBigInt);
+  // Table()'s x = 0..9, then Repeated()'s x where x >= 2: 2, 2, 2, 4.
+  const auto union_all = [&](const std::shared_ptr<MemoryTable>& first,
+                             const std::shared_ptr<MemoryTable>& second) {
+    return Node(plan::UnionAllNode{
+        .inputs = {Node(plan::ScanNode{.table = first, .table_name = "t", .fields = {0, 1}}),
+                   Node(plan::FilterNode{
+                       .input = Node(
+                           plan::ScanNode{.table = second, .table_name = "r", .fields = {0, 1}}),
+                       .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(2))}})},
+        .columns = {{x, y}, {x, y}},
+        .ids = {},
+        .span = {}});
+  };
+  using Values = std::vector<std::optional<int64_t>>;
+  const auto rows = Run(PlanOf(union_all(Table(true), Repeated()), 2));
+  ASSERT_NE(rows, nullptr);
+  EXPECT_EQ(Int64Column(*rows, 0), (Values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 2, 2, 2, 4}));
+  EXPECT_EQ(Int64Column(*rows, 1).back(), -4) << "input 1's own y";
+
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  const auto counted = Run(PlanOf(Node(
+      plan::AggregateNode{.input = union_all(Table(true), Repeated()), .aggregates = {count}})));
+  ASSERT_NE(counted, nullptr);
+  EXPECT_EQ(testing::SingleInt64(*counted), 14);
+
+  const auto grouped = Run(PlanOf(
+      Node(plan::SortNode{
+          .input = Node(plan::GroupAggregateNode{
+              .input = union_all(Table(true), Repeated()), .keys = {x}, .aggregates = {count}}),
+          .keys = {plan::SortKey{.column = x}}}),
+      2));
+  ASSERT_NE(grouped, nullptr);
+  EXPECT_EQ(Int64Column(*grouped, 0), (Values{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  EXPECT_EQ(Int64Column(*grouped, 1), (Values{1, 1, 4, 1, 2, 1, 1, 1, 1, 1}));
+
+  const auto sorted =
+      Run(PlanOf(Node(plan::SortNode{.input = union_all(Table(true), Repeated()),
+                                     .keys = {plan::SortKey{.column = x, .descending = true}}}),
+                 2));
+  ASSERT_NE(sorted, nullptr);
+  EXPECT_EQ(Int64Column(*sorted, 0), (Values{9, 8, 7, 6, 5, 4, 4, 3, 2, 2, 2, 2, 1, 0}));
+
+  // A LIMIT met in input 0 never opens input 1.
+  const auto later = Repeated();
+  const auto limited =
+      Run(PlanOf(Node(plan::LimitNode{.input = union_all(Table(true), later), .limit = 3}), 2));
+  ASSERT_NE(limited, nullptr);
+  EXPECT_EQ(Int64Column(*limited, 0), (Values{0, 1, 2}));
+  EXPECT_EQ(later->scans(), 0);
+
+  // A hash join that builds on the union, and one that probes with it: x = 2 matches four union
+  // rows and x = 4 two, every other x one.
+  for (const bool union_builds : {true, false}) {
+    SCOPED_TRACE(union_builds ? "the union is the build" : "the union is the probe");
+    const auto scan =
+        Node(plan::ScanNode{.table = Table(true), .table_name = "t", .fields = {0, 1}});
+    const auto u = union_all(Table(true), Repeated());
+    const auto joined =
+        Run(PlanOf(Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                       .left = union_builds ? scan : u,
+                                       .right = union_builds ? u : scan,
+                                       .keys = {plan::JoinKey{.left = x, .right = x}},
+                                       .residual = {},
+                                       .build = plan::BuildSide::kRight,
+                                       .span = {}}),
+                   4));
+    ASSERT_NE(joined, nullptr);
+    EXPECT_EQ(joined->num_rows(), 14);
+    EXPECT_EQ(Int64Column(*joined, 0), Int64Column(*joined, 2));
+  }
+
+  // Profiled: the union's line, its inputs as its children in order.
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(PlanOf(union_all(Table(true), Repeated()), 2), &profile);
+  ASSERT_TRUE(op.ok()) << op.status().ToString();
+  EXPECT_EQ(profile.name(), "UnionAll");
+  ASSERT_EQ(profile.children().size(), 2U);
+  for (const ProfileNode* child : profile.children()) {
+    EXPECT_FALSE(child->name().empty());
+  }
+  ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+  auto profiled = Drain(**op, ctx);
+  ASSERT_TRUE(profiled.ok()) << profiled.status().ToString();
+  EXPECT_EQ((*profiled)->num_rows(), 14);
+}
+
+// What a correct plan never holds is Invalid, never unsupported: a union of one input, a column
+// list missing, a column outside its input or of another type than the union's.
+TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
+  const auto scan = [] {
+    return Node(plan::ScanNode{.table = Table(), .table_name = "t", .fields = {0, 1}});
+  };
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const std::vector<plan::UnionAllNode> broken = {
+      plan::UnionAllNode{.inputs = {scan()}, .columns = {{x}}},
+      plan::UnionAllNode{.inputs = {scan(), scan()}, .columns = {{x}}},
+      plan::UnionAllNode{.inputs = {scan(), scan()},
+                         .columns = {{x}, {Column(5, "x", LogicalType::kBigInt)}}},
+      plan::UnionAllNode{.inputs = {scan(), scan()},
+                         .columns = {{x}, {Column(0, "x", LogicalType::kInteger)}}},
+      plan::UnionAllNode{.inputs = {scan(), nullptr}, .columns = {{x}, {x}}},
+  };
+  for (const plan::UnionAllNode& node : broken) {
+    const auto status = BuildPhysicalPlan(PlanOf(Node(node))).status();
+    EXPECT_TRUE(status.IsInvalid()) << status.ToString();
+    EXPECT_EQ(plan::GetSqlError(status), nullptr) << "a malformed plan is a bug, not unsupported";
+  }
+}
+
 // The first Scan of a profile tree, depth first.
 const ProfileNode* FindScan(const ProfileNode& node) {
   if (node.name() == "Scan") {

@@ -446,6 +446,8 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
       std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(1)});
   const LogicalNodePtr other =
       std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(0)});
+  const LogicalNodePtr third =
+      std::make_shared<const LogicalNode>(ScanNode{.table = table, .span = span(2)});
   const std::vector<std::pair<LogicalNode, std::string_view>> nodes = {
       {ScanNode{.table = table, .span = span(1)}, "Scan"},
       {FilterNode{.input = scan, .span = span(2)}, "Filter"},
@@ -458,6 +460,7 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
       {RowCountNode{.table = table, .span = span(9)}, "RowCount"},
       {JoinNode{.left = scan, .right = other, .span = span(10)}, "Join"},
       {DependentJoinNode{.left = scan, .right = other, .span = span(11)}, "DependentJoin"},
+      {UnionAllNode{.inputs = {scan, other, third}, .span = span(12)}, "UnionAll"},
   };
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& [node, name] = nodes[i];
@@ -468,6 +471,8 @@ TEST(LogicalPlanTest, NodeNamesSpansAndInputs) {
       EXPECT_TRUE(inputs.empty()) << name;
     } else if (name == "Join" || name == "DependentJoin") {
       EXPECT_EQ(inputs, (std::vector<LogicalNodePtr>{scan, other})) << "left, then right";
+    } else if (name == "UnionAll") {
+      EXPECT_EQ(inputs, (std::vector<LogicalNodePtr>{scan, other, third})) << "as written";
     } else {
       EXPECT_EQ(inputs, std::vector<LogicalNodePtr>{scan}) << name;
     }
@@ -492,6 +497,7 @@ TEST(LogicalPlanDeathTest, WithInputsNeedsOneInputPerChild) {
   const LogicalNodePtr scan = std::make_shared<const LogicalNode>(ScanNode{.table = table});
   EXPECT_DEATH(WithInputs(JoinNode{.left = scan, .right = scan}, {scan}), "inputs.size");
   EXPECT_DEATH(WithInputs(DependentJoinNode{.left = scan, .right = scan}, {scan}), "inputs.size");
+  EXPECT_DEATH(WithInputs(UnionAllNode{.inputs = {scan, scan, scan}}, {scan, scan}), "inputs.size");
   EXPECT_DEATH(WithInputs(LimitNode{.input = scan}, {}), "inputs.size");
   EXPECT_DEATH(WithInputs(ScanNode{.table = table}, {scan}), "inputs.size");
 }

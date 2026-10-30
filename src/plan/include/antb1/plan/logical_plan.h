@@ -27,8 +27,10 @@
 //
 //   [Compute (key casts)] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
-// or, for several, those branches under left-deep inner Joins (ADR 0022). A Join has two inputs,
-// and every walk of a plan visits every input of a node (InputsOf). plan::Optimize rewrites it
+// or, for several, those branches under left-deep inner Joins (ADR 0022). A relation may also be a
+// sub-plan: a derived table's or a CTE's block, or a UnionAll of blocks (ADR 0036). A Join and a
+// DependentJoin have two inputs and a UnionAll two or more, and every walk of a plan visits every
+// input of a node, in order (InputsOf). plan::Optimize rewrites it
 // (COUNT(*) -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project,
 // projection pruning).
 //
@@ -291,10 +293,11 @@ struct LimitNode;
 struct RowCountNode;
 struct JoinNode;
 struct DependentJoinNode;
+struct UnionAllNode;
 
 using LogicalNode =
     std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode, GroupAggregateNode,
-                 SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode>;
+                 SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode, UnionAllNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -497,6 +500,18 @@ struct DependentJoinNode {
   SourceSpan span;  // the subquery in the query
 };
 
+// UNION ALL of two or more inputs (ADR 0036): every row of inputs[0], in its order, then every row
+// of inputs[1], and so on; duplicates are kept. Output: one column per id; in the rows of input k,
+// column i holds that input's column columns[k][i]. Column i has one type in every input -- the
+// binder casts a branch's column below the union where its type differs -- and the ids are new
+// columns, none of them an input's: no one input defines a union's rows, so none passes through.
+struct UnionAllNode {
+  std::vector<LogicalNodePtr> inputs;             // two or more, in the order written
+  std::vector<std::vector<BoundColumn>> columns;  // per input: one per output column, of that input
+  std::vector<ColumnId> ids;                      // per output column
+  SourceSpan span;                                // the first UNION ALL
+};
+
 struct LogicalPlan {
   LogicalNodePtr root;
   // Result columns of root: names (aliases applied), types and ids (OutputIds(*root)).
@@ -504,14 +519,14 @@ struct LogicalPlan {
 };
 
 // "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit",
-// "RowCount", "Join" or "DependentJoin".
+// "RowCount", "Join", "DependentJoin" or "UnionAll".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.
 SourceSpan SpanOf(const LogicalNode& node);
 
 // The inputs of a node, in order: none for leaves (Scan, RowCount), left then right for a Join and
-// a DependentJoin, and one for the others.
+// a DependentJoin, the branches in the order written for a UnionAll, and one for the others.
 std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node);
 
 // A copy of the node over other inputs, in the order of InputsOf. A count that differs from the
@@ -522,9 +537,10 @@ LogicalNodePtr WithInputs(const LogicalNode& node, std::vector<LogicalNodePtr> i
 // with two inputs may take both. It defines new columns where it creates them: Scan (`ids`),
 // Compute (its input's ids, then `ids`), Project (`ids`), Aggregate (each call's id),
 // GroupAggregate
-// (`key_ids`, then each call's id), RowCount (`id`) and a DependentJoin (`mark`, where it is set);
-// and it passes ids through from its inputs: Filter, Sort and Limit their input's, a Join its
-// inputs' (see JoinNode) and a DependentJoin its inputs' by the same rule.
+// (`key_ids`, then each call's id), RowCount (`id`), a DependentJoin (`mark`, where it is set) and
+// a UnionAll (`ids`, none of them an input's); and it passes ids through from its inputs: Filter,
+// Sort and Limit their input's, a Join its inputs' (see JoinNode) and a DependentJoin its inputs'
+// by the same rule.
 std::vector<ColumnId> OutputIds(const LogicalNode& node);
 
 // The free variables of a plan (ADR 0023, the formalization's F(R)): the ids its expressions read
@@ -570,8 +586,9 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan,
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not
 // the root's; a join key of two types, a join without keys or a one-row join with keys, a residual
-// that is not BOOLEAN, a build side the join's kind does not allow), else the first index that
-// differs from its resolved position, e.g. "Filter: column #12 is at 3, not 4".
+// that is not BOOLEAN, a build side the join's kind does not allow; a UnionAll of fewer than two
+// inputs, without one column per output in each input, or whose column has two types), else the
+// first index that differs from its resolved position, e.g. "Filter: column #12 is at 3, not 4".
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
 
 }  // namespace antb1::plan

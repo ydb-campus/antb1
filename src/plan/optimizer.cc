@@ -227,8 +227,9 @@ LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed);
 // Rewrites a node so that its output keeps at least the columns in `needed`. Only a Scan drops
 // columns (fields) and only a Compute drops expressions, keeping their order; Filter, Sort and
 // Limit pass the request through (with the columns they read), Project, Aggregate and
-// GroupAggregate ask their input for exactly what they read, and a Join asks both inputs for the
-// request plus its keys and residual columns (each input keeps the ones it outputs).
+// GroupAggregate ask their input for exactly what they read, a Join asks both inputs for the
+// request plus its keys and residual columns (each input keeps the ones it outputs), and a UnionAll
+// asks each input for the columns it reads of it.
 struct Pruner {
   const LogicalNodePtr& node;
   Needed& needed;
@@ -381,6 +382,20 @@ struct Pruner {
     // the unnesting pass runs first and replaces every dependent join or rejects the query; a plan
     // test that prunes a hand-built one gets this rule.
     return node;
+  }
+  // Keeps every output, as a Project does: a column nothing above reads is still computed in every
+  // branch, as a derived table's is (narrowing both is a later item of ADR 0036).
+  LogicalNodePtr operator()(const UnionAllNode& union_all) const {
+    std::vector<LogicalNodePtr> inputs;
+    inputs.reserve(union_all.inputs.size());
+    for (std::size_t k = 0; k < union_all.inputs.size(); ++k) {
+      Needed below;
+      for (const BoundColumn& column : union_all.columns.at(k)) {
+        Need(below, column);
+      }
+      inputs.push_back(Prune(union_all.inputs[k], std::move(below)));
+    }
+    return WithInputs(*node, std::move(inputs));
   }
 };
 
@@ -834,18 +849,20 @@ bool RestrictionIsWorth(const std::optional<int64_t>& outer, const std::optional
   return Int128{*inner} >= Int128{kLeastRestriction} * Int128{*outer};
 }
 
-// Whether `node` reads a join: the aggregation's own input holding one is what tells this pass that
-// ADR 0029's filter cannot reach its scan, because the physical planner's offer does not survive a
-// join on the way down. A structural fact about the plan, which is the only kind available here --
-// and a total one, since a subtree with no join is exactly the chain an offer could travel.
-bool ReadsAJoin(const LogicalNodePtr& node) {
+// Whether `node` reads a join or a union: the aggregation's own input holding one is what tells
+// this pass that ADR 0029's filter cannot reach its scan, because the physical planner's offer
+// survives neither on the way down -- a join forwards none to its probe, and a union's inputs are
+// pipelines of their own (ADR 0036). A structural fact about the plan, which is the only kind
+// available here -- and a total one, since a subtree with neither is exactly the chain an offer
+// could travel.
+bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
   if (node == nullptr) {
     return false;
   }
-  if (std::holds_alternative<JoinNode>(*node)) {
+  if (std::holds_alternative<JoinNode>(*node) || std::holds_alternative<UnionAllNode>(*node)) {
     return true;
   }
-  return std::ranges::any_of(InputsOf(*node), ReadsAJoin);
+  return std::ranges::any_of(InputsOf(*node), ReadsAJoinOrUnion);
 }
 
 // ADR 0023's **semi-join reduction**: `input` restricted to the rows whose correlated key the outer
@@ -890,11 +907,13 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // own instead. Past a pipeline breaker there is no offer at all, the aggregate then having no
   // part pipeline for one to travel.
   //
-  // So the test is total rather than incidental: LogicalNode has exactly two multi-input
-  // alternatives, so a subtree with no join *is* the chain an offer could travel, and ReadsAJoin is
-  // false exactly where one could arrive. src/exec/tests/aggregate_filter_test.cc pins that
-  // invariant, because threading the offer through a join is a natural change to make and would
-  // silently leave this gate paying for a reduction D5 had already made.
+  // So the test is total rather than incidental: LogicalNode's multi-input alternatives are the two
+  // joins and the union, and the offer crosses none of them (a union's arm drops it, its inputs
+  // being pipelines of their own), so a subtree with no join and no union *is* the chain an offer
+  // could travel, and ReadsAJoinOrUnion is false exactly where one could arrive.
+  // src/exec/tests/aggregate_filter_test.cc pins that invariant, because threading the offer
+  // through a join or a union is a natural change to make and would silently leave this gate paying
+  // for a reduction D5 had already made.
   //
   // Measured on the query of the 22 shaped this way: **0.931x** and a peak of 483 MiB against
   // 1,011, its aggregation building 47,107 groups over 64,000 rows where it built 11,829,402 over
@@ -905,7 +924,7 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // for it. ADR 0030 states the hazard they guard against -- "before costing a shared sub-plan,
   // check whether a consumer is already pruned by one" -- and a wrong guess here is not a wrong
   // answer but a rewrite that pays twice for one reduction.
-  if (equivalent.size() < 2 && !ReadsAJoin(input)) {
+  if (equivalent.size() < 2 && !ReadsAJoinOrUnion(input)) {
     return input;
   }
   // **An outer side holding a dependent join is not cloned, and that is what bounds the copying.**
