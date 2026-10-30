@@ -19,7 +19,7 @@ functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `t
 `date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not. This
+outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not, and `UNION ALL` of two or more blocks. This
 covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). All 22 queries derived from TPC-H pass
 (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
@@ -184,10 +184,12 @@ list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT DISTINCT` a
 later value of an `IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a
 syntax error, as in DuckDB. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
 `OFFSET` before a `UNION ALL`, and a `UNION ALL` that no block follows (at the end, or before `)`, `ALL`, `DISTINCT`
-or `WITH`). The binder does not answer a compound yet: each is unsupported at its first `UNION ALL` (exit code 4),
-after any construct in its blocks that is unsupported anyway, until ADR 0036's X3 binds it. A compound in a CTE that
-nothing references is the exception: the binder never checks or binds such a CTE, as DuckDB never binds one, so the
-query is answered without it.
+or `WITH`). The binder answers a compound as the whole statement, a derived table's query and a CTE's query
+([Binding](#binding)). Its own `ORDER BY`, `LIMIT` and `OFFSET` are unsupported (exit code 4) at the first of them,
+after any construct in its blocks that is unsupported anyway, until ADR 0036's X5; so is a compound as the query of an
+`IN`, `EXISTS` or scalar subquery, at the subquery's `IN`, `EXISTS` or `(` once the other side of its conjunct is
+checked, until X6 -- a compound in the FROM list of a subquery's query is answered. A compound in a CTE that nothing
+references is never checked or bound, tail included, as no such CTE is.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -264,6 +266,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
   derived table, a CTE reference and a subquery in an expression as one plus the relations of their body, is exit
   code 4 too, before the per-item checks;
+- `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
+  answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
+  ([Binding](#binding));
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -554,6 +559,29 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   takes is unsupported (DuckDB casts it), as is a FLOAT column as a value (divergence D11). `CASE x WHEN v THEN ..` is
   `CASE WHEN x = v THEN ..`. `ELSE NULL` is a `CASE` without `ELSE`, in DuckDB too: the same NULLs, type and name.
   The result name is DuckDB's: `CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END`.
+- `UNION ALL` ([ADR 0036](adr/0036-union-all.md)): each block binds as a query block of its own, in written order,
+  against what the `UNION ALL` sees -- its `WITH` list, which is every block's, and for a derived table the FROM items
+  before it, where a name only they have is a lateral reference (exit code 4) -- and never sees another block's
+  names. As in DuckDB, every block binds before the column counts are compared, and a count that differs is a bind
+  error at the `UNION ALL` before the first block that differs (`Set operations can only apply to expressions with
+  the same number of result columns`); the types come after the counts. The result names are the first block's, made
+  unique for a derived table's or a CTE's binding as any select list's are (rule 7) and kept as they are at the top
+  level. Each column's type is a left fold over the blocks' types in written order, as DuckDB folds it: a literal is
+  typed by itself (`1` next to a SMALLINT column is INTEGER, unlike in `CASE`), equal types stay, two integer types
+  give `CASE`'s type (USMALLINT with SMALLINT: INTEGER), and a DECIMAL with a DECIMAL or an integer gives `CASE`'s
+  DECIMAL: two DECIMALs DECIMAL(e + s, s), with e the most integer digits and s the larger scale, or DECIMAL(38,
+  38 - e) beyond 38 digits; an integer keeps the DECIMAL's scale and widens it to its own digits (SMALLINT and
+  USMALLINT 5, INTEGER 10, BIGINT 19, HUGEINT 38), DECIMAL(min(38, digits + s), s). So the order of the blocks can
+  change the type: USMALLINT, SMALLINT and DECIMAL(9,2) make DECIMAL(12,2), but SMALLINT, DECIMAL(9,2) and USMALLINT
+  DECIMAL(9,2); and BIGINT with DECIMAL(38,30) is DECIMAL(38,30), to which the BIGINT does not widen exactly.
+  FLOAT with FLOAT is FLOAT and FLOAT with DOUBLE is DOUBLE: a column of FLOAT values alone keeps comparing with
+  literals at FLOAT precision, one with a DOUBLE block does not (divergence D11). Every block's values must widen
+  exactly to the column's type, which a block of another type is cast to once, below the union; values that do not,
+  such as a DECIMAL past 38 digits (which DuckDB rounds) or a HUGEINT next to a DECIMAL with a scale, are unsupported
+  (exit code 4), and so is every other mix -- VARCHAR, DATE or TIMESTAMP with another type, a DOUBLE with an integer
+  or a DECIMAL, a FLOAT with an integer or a DECIMAL (D11) -- which DuckDB answers by casting, failing per row where a
+  cast fails. Such a refusal points at the first select item in the query whose type does not fold or widen, or at
+  its block's `*` (`UNION ALL of INTEGER and VARCHAR values is not supported`).
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
@@ -617,8 +645,11 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. A query produces inner `Join`s: the binder factors each element of `WHERE` and of an inner `ON` (below,
-below) and sends every conjunct that leaves it to the relations it reads, so one relation's conjuncts filter that
+builds on. A `UnionAll` has two or more ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of
+the next, and so on; its columns are new, of the types the binder folded, and each input gives them its own columns,
+a block of another type cast below the union by a `Compute`. A query produces inner `Join`s: the binder factors
+each element of `WHERE` and of an inner `ON` (below, below) and sends every conjunct that leaves it to the relations
+it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
 cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
@@ -673,7 +704,8 @@ would be a bind error on a query that binds). A single value for every branch is
 Because a derived conjunct can reach a scan, it takes rows away from the conditions above it, which **narrows**
 divergence D16: `i16 * 2 > 1 AND (id = 6 OR id = 11)` used to overflow and now answers, agreeing with DuckDB.
 
-A rule optimizer then rewrites the plan, through both inputs of every `Join`:
+A rule optimizer then rewrites the plan, through both inputs of every `Join` and every input of a `UnionAll` (no rule
+moves anything through a `UnionAll` yet: a filter, a limit or a join's key filter above it stays above it):
 
 - `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
   up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
@@ -683,7 +715,8 @@ A rule optimizer then rewrites the plan, through both inputs of every `Join`:
   `ORDER BY`, which reads only some groups: every group's keys are computed, so an overflow in any of them still
   fails the query;
 - projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`); each
-  input of a `Join` keeps the columns used above it and the join's key and residual columns;
+  input of a `Join` keeps the columns used above it and the join's key and residual columns; a `UnionAll` keeps every
+  column, read above it or not, and each of its inputs the columns it gives the union;
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.
 - (execution, not a plan rule) an `ORDER BY ... LIMIT` over a table reads first only the columns its `WHERE` and its
@@ -726,6 +759,24 @@ Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)] carries 2 of 4 un
   Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
 
+A `UnionAll` line shows the number of its inputs and its columns, named as the first block names them; its inputs
+follow in written order, indented. A CTE whose query is a `UNION ALL`, referenced twice, prints `[shared #1 of 2, ...]`
+on both `UnionAll` lines, since [ADR 0030](adr/0030-shared-sub-plans.md) finds the repeat, but the executor never
+holds a `UNION ALL`'s rows: each reference computes its own (`--physical` shows no shared source).
+
+```text
+Output: x:INTEGER n:BIGINT
+Project x, n
+  GroupAggregate keys=[x] COUNT(*)
+    UnionAll inputs=2 columns=[x]
+      Compute CAST(x AS INTEGER)
+        Project i16
+          Filter id < 10
+            Scan table=e source=parquet(files=1, rows=12) columns=[id, i16]
+      Project i32
+        Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+```
+
 ### `explain --physical`
 
 `antb1 explain --physical` prints the physical plan the query would run, without running it: the operator tree
@@ -737,7 +788,8 @@ It shows what no logical plan holds, because the physical planner is what decide
 
 - part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,
   `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` under the operator that
-  prepares it, laid out exactly as `--analyze` lays them out;
+  prepares it, laid out exactly as `--analyze` lays them out; no part pipeline goes through a `UnionAll`, so each of
+  its inputs runs its own parts and what reads the union runs on one thread (ADR 0036);
 - a `Scan` that applies predicates of the `Filter` above it while it reads: `, N pushed predicates`
   ([ADR 0020](adr/0020-filter-pushdown.md));
 - a `Scan` a dynamic join filter could be applied to ([ADR 0029](adr/0029-dynamic-join-filters.md)):
@@ -1011,6 +1063,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   is out. `LIMIT 0` returns no row, also for an aggregate. Without `ORDER BY` a projection returns its rows in file
   order too, but SQL does not promise an order, and the tests compare such results without regard to order (with
   `LIMIT` or `OFFSET`, any rows of the full answer are right).
+- UNION ALL: every row of the first block, then of the next block, and so on, duplicates and NULLs kept, each
+  block's rows in its own order; the same on any number of threads. A block runs only once the one before it has
+  ended, and a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run -- so their
+  errors are never reported (divergence D26). A cast below the union is an exact widening and never fails.
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
 - DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s ([ADR
@@ -1117,10 +1173,10 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; for now every `UNION ALL` but one in a CTE that nothing references ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -1155,7 +1211,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no column is HUGEINT (a DECIMAL(38, 0) column is DECIMAL); `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
 | D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
-| D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4) | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT) | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE |
+| D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4); in a `UNION ALL`, FLOAT with FLOAT values stays FLOAT and FLOAT with DOUBLE values is DOUBLE, while FLOAT with integer or DECIMAL values is unsupported | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT); a `UNION ALL` of FLOAT and integer or DECIMAL values is FLOAT | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE; `tests/slt/cases/setops/union_all.slt` counts the rows of FLOAT unions under `x = 0.1` |
 | D12 | HUGEINT literals against DOUBLE | an integer literal beyond BIGINT compared with a DOUBLE column is the correctly rounded nearest double (a decimal literal converts as DuckDB converts a DECIMAL, [ADR 0021](adr/0021-decimal-semantics.md) rule 8: `9007199254740993.5` is 2^53 in both engines) | converts a HUGEINT literal through its 128-bit formula (lower + upper × 2^64), which can be one ulp off | the generator writes DOUBLE columns only their own sample values and short decimals (`DoubleText` and `ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`); `plan.BinderTest` pins the decimal conversion and `tests/slt/cases/types/decimal_literals.slt` compares it with DuckDB |
 | D13 | Decimals with many digits against integer and DECIMAL values | compared exactly, and a literal beyond the operand's type folds to a constant | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits). Two operands that are no literals fail the same way, in comparisons, `IN` lists and `BETWEEN`: a DECIMAL against a DECIMAL of another scale or an integer, once a value of the side with the smaller scale has more integer digits than 38 minus the larger scale (`d9_2 < d38_0` over d38_0's extremes, a DECIMAL(38,2) against a DECIMAL(38,12) past 26 integer digits). An integer literal of more than 38 - s digits against a DECIMAL(p,s) (`p < 1000000000000000000000000000000000000` on DECIMAL(15,2)), and one of 2^127 to 2^128 - 1 (UHUGEINT) against a SMALLINT, INTEGER or BIGINT operand, fails to cast on any input that reaches it | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`) and compare two columns only while their common type stays within 38 digits (`ColumnComparison`, columns of two FROM items of a join included), and join two DECIMAL keys only then (`UsableEdges`); `tests/slt/cases/types/decimal.slt` and `decimal_comparisons.slt` pin both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding, `exec.DecimalTest.CompareExactIsExactAcrossScalesAndIntegers` the exact comparison |
 | D14 | Overflows DuckDB's optimizer does not avoid | a comparison that is a whole `WHERE` or `HAVING` conjunct and folds to never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`, or a DECIMAL result's, as in `price * qty > 100000000000000000000` on DECIMAL(15,2) columns) computes nothing, so it cannot overflow; one that folds to always-true keeps `IS NOT NULL` over its operand, which is computed, and under `OR` or `NOT` or in a `CASE WHEN` condition a folded comparison keeps NULL for a NULL operand, so its operand is computed and overflows as in DuckDB (`p * q > 100000000000000000000 OR id = 1` fails in both engines) | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
@@ -1170,6 +1226,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D23 | A correlated `EXISTS`'s conjuncts over different rows | unnests it into a semi or anti join (ADR 0023's Path 1), so a conjunct that reads both blocks is a residual, computed only over the candidate pairs a key matches, and a conjunct that reads only the outer block is a residual too, computed over those same pairs rather than over every outer row | plans a delim join and computes the subquery's conjuncts for the bindings of the outer side, so an overflow in such a conjunct can fail in one engine and not the other | the random generator writes no arithmetic that can overflow (as for divergences D14 and D16), and `tests/slt/cases/subqueries/exists.slt` compares every shape Path 1 answers with DuckDB's own answer |
 | D24 | A correlated scalar aggregate over keys no outer row binds | unnests it by equivalence substitution (ADR 0023's Path 2). Where the correlation is on more than one column the aggregation's input is restricted to the keys the outer side binds (the semi-join reduction), and the divergence is narrowed to the keys that restriction's own estimate cannot rule out; on a single column it is not, so the aggregation groups by the correlated key and computes the aggregate's argument, the aggregate and its combination for EVERY key of the subquery's own rows, including keys no outer row binds | computes the subquery only for the bindings of the outer side, joining the domain below the aggregation | the answers agree: an outer row with no group is dropped by the inner join and rejected by the comparison alike. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23), and `tests/slt/cases/subqueries/scalar.slt` compares every shape Path 2 answers with DuckDB's own answer |
 | D25 | A moved Compute over rows a join above discards | computes a grouped aggregate on one input of a join below it (ADR 0032), and where the aggregate's argument is an expression a `Compute` above the join defines, that `Compute` travels DOWN with the partial -- a partial cannot aggregate a column that does not exist below it. The expression is then computed for every row of the aggregated side, including the rows the joins above discard | computes it above the join, so only for the rows that survive | the answers agree: a discarded row contributes to no group in either plan. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23 and D24), and `tests/slt/cases/aggregates/placement.slt` pins the overflow against DuckDB's own answer, with a control whose call refuses the placement and so answers in both engines |
+| D26 | Errors of the blocks of a `UNION ALL` that a `LIMIT` does not need | a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run, so their errors -- an overflow, say -- are never reported ([ADR 0036](adr/0036-union-all.md)) | runs at least the first vector of every block, so an error in a later block fails the query | the answers agree where no block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23, D24 and D25), and `tests/slt/cases/setops/errors.slt` pins it: antb1's answer under `onlyif antb1`, DuckDB's error under `onlyif duckdb`, and with `ORDER BY` a control that fails in both |
 
 ## ClickBench status
 
@@ -1280,26 +1337,27 @@ The third workload is the 99 queries derived from TPC-DS, in DuckDB's dialect, a
 `tests/data/tpcds_status.json` lists the queries verified to pass against DuckDB, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data at scale factors 0.1 and 1
-([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, `tpcds.status.sf1` and
-`parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not pass, the last column lists the features
-it is expected to need, from a survey of the corpus; the first of them that antb1 refuses is not always the last.
+([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, the four shards
+`tpcds.status.sf1.1of4` to `4of4` and `parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not
+pass, the last column lists the features it is expected to need, from a survey of the corpus; the first of them that
+antb1 refuses is not always the last.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
 | Q1 | pass | answered when the ratchet was added |
-| Q2 | unsupported | needs round, UNION ALL |
+| Q2 | unsupported | needs round |
 | Q3 | pass | answered when the ratchet was added |
-| Q4 | unsupported | needs UNION ALL |
-| Q5 | unsupported | needs general CAST, concat, ROLLUP and GROUPING(), UNION ALL |
+| Q4 | pass | `UNION ALL` (ADR 0036) |
+| Q5 | unsupported | needs general CAST, concat, ROLLUP and GROUPING() |
 | Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates |
 | Q7 | pass | answered when the ratchet was added |
-| Q8 | unsupported | needs INTERSECT or EXCEPT, UNION ALL |
+| Q8 | unsupported | needs INTERSECT or EXCEPT |
 | Q9 | unsupported | needs scalar subqueries in expressions |
 | Q10 | unsupported | needs EXISTS or IN subqueries under OR |
-| Q11 | unsupported | needs UNION ALL |
+| Q11 | pass | `UNION ALL` (ADR 0036) |
 | Q12 | unsupported | needs window aggregates |
 | Q13 | pass | answered when the ratchet was added |
-| Q14 | unsupported | needs INTERSECT or EXCEPT, ROLLUP and GROUPING(), scalar subqueries that are not aggregates, UNION ALL |
+| Q14 | unsupported | needs INTERSECT or EXCEPT, ROLLUP and GROUPING(), scalar subqueries that are not aggregates |
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
 | Q17 | unsupported | needs stddev_samp |
@@ -1308,22 +1366,22 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q20 | unsupported | needs window aggregates |
 | Q21 | unsupported | needs general CAST |
 | Q22 | unsupported | needs ROLLUP and GROUPING() |
-| Q23 | unsupported | needs `*` next to other select items, UNION ALL |
+| Q23 | unsupported | needs `*` next to other select items |
 | Q24 | unsupported | needs upper and lower |
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
-| Q27 | unsupported | needs NULL literals, UNION ALL |
+| Q27 | unsupported | needs NULL literals |
 | Q28 | unsupported | needs cross products of one-row inputs |
 | Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |
 | Q31 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q32 | pass | answered when the ratchet was added |
-| Q33 | unsupported | needs UNION ALL |
+| Q33 | pass | `UNION ALL` (ADR 0036) |
 | Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q35 | unsupported | needs EXISTS or IN subqueries under OR |
-| Q36 | unsupported | needs NULL literals, UNION, UNION ALL, rank() windows |
+| Q36 | unsupported | needs NULL literals, UNION, rank() windows |
 | Q37 | pass | answered when the ratchet was added |
-| Q38 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
+| Q38 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT |
 | Q39 | unsupported | needs NULL literals, stddev_samp |
 | Q40 | unsupported | needs general CAST, COALESCE |
 | Q41 | unsupported | needs a correlated COUNT subquery, SELECT DISTINCT |
@@ -1334,45 +1392,45 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates, rank() windows |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL, rank() windows |
+| Q49 | unsupported | needs general CAST, COALESCE, UNION, rank() windows |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, IS [NOT] NULL, window aggregates, window frames |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates |
-| Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates, UNION ALL |
+| Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates |
 | Q55 | pass | answered when the ratchet was added |
-| Q56 | unsupported | needs UNION ALL |
+| Q56 | pass | `UNION ALL` (ADR 0036) |
 | Q57 | unsupported | needs abs, window aggregates, rank() windows |
 | Q58 | unsupported | needs scalar subqueries that are not aggregates |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q60 | unsupported | needs UNION ALL |
+| Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | unsupported | needs general CAST, cross products of one-row inputs |
 | Q62 | unsupported | needs `*` next to other select items |
 | Q63 | unsupported | needs abs, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
-| Q66 | unsupported | needs UNION ALL |
+| Q66 | pass | `UNION ALL` (ADR 0036) |
 | Q67 | unsupported | needs COALESCE, ROLLUP and GROUPING(), rank() windows |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
-| Q71 | unsupported | needs UNION ALL |
+| Q71 | pass | `UNION ALL` (ADR 0036) |
 | Q72 | unsupported | needs DATE + INTEGER, IS [NOT] NULL |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q74 | unsupported | needs UNION ALL |
-| Q75 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL |
-| Q76 | unsupported | needs IS [NOT] NULL, UNION ALL |
-| Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING(), UNION ALL |
+| Q74 | pass | `UNION ALL` (ADR 0036) |
+| Q75 | unsupported | needs general CAST, COALESCE, UNION |
+| Q76 | unsupported | needs IS [NOT] NULL |
+| Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING() |
 | Q78 | unsupported | needs COALESCE, IS [NOT] NULL, round |
 | Q79 | pass | constant integer expressions in IN lists |
-| Q80 | unsupported | needs COALESCE, concat, ROLLUP and GROUPING(), UNION ALL |
+| Q80 | unsupported | needs COALESCE, concat, ROLLUP and GROUPING() |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
 | Q84 | unsupported | needs COALESCE, concat |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
-| Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
+| Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT |
 | Q88 | unsupported | needs cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates |
 | Q90 | unsupported | needs general CAST, NULL literals, cross products of one-row inputs |

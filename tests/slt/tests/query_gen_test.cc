@@ -709,8 +709,16 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
       // One form or the other, never both: a WITH list is no derived table.
       EXPECT_NE(q.features.Has(Feature::kDerivedTable), q.features.Has(Feature::kCommonTableExpr))
           << q.sql;
-      // The block is a projection of the table, so the bound is still the table's.
-      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+      // The block is a projection of the table, so the bound is still the table's -- times the
+      // copies of the block when it is written as a UNION ALL of them (ADR 0036).
+      const auto ast = sql::Parse(q.sql);
+      ASSERT_TRUE(ast.has_value()) << ast.error().message;
+      const auto* derived_table = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
+      const sql::SelectStatement& block =
+          derived_table != nullptr ? *derived_table->query : *ast->with.at(0).query;
+      const auto copies =
+          static_cast<int64_t>(std::max<std::size_t>(1, block.set_operation.size()));
+      EXPECT_EQ(q.row_bound, plain.row_bound * copies) << q.sql;
       continue;
     }
     ++same;

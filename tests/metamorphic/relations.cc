@@ -1490,15 +1490,7 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
-  // ---- the canary: a relation that stays pending for good ----
-  // RelationList.PendingRelationsHoldInDuckDb validates a pending relation's SQL on DuckDB before
-  // the PR that declares its features activates it, and asserts there is one to validate -- so once
-  // ADR 0022's ids have all shipped it would have nothing left and fail. kWindowFunctions is the
-  // one out-of-scope marker (kNeverGenerated, tests/slt/supported_features.h), so a relation
-  // carrying it is pending for good and keeps that test honest. Window functions are the canary of
-  // tests/slt/canary/canary_queries.sql too, for the same reason: antb1 refuses them at the OVER
-  // before it resolves a name, so Evaluate reads this as pending rather than broken.
-  // ---- pending until a compound is answered (ADR 0036's X3) ----
+  // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.
   {
@@ -1531,6 +1523,14 @@ std::vector<Relation> AllRelations() {
          .check = FirstEqualsSumOfRest()});
   }
 
+  // ---- the canary: a relation that stays pending for good ----
+  // RelationList.PendingRelationsHoldInDuckDb validates a pending relation's SQL on DuckDB before
+  // the PR that declares its features activates it, and asserts there is one to validate -- so once
+  // ADR 0022's ids have all shipped it would have nothing left and fail. kWindowFunctions is the
+  // one out-of-scope marker (kNeverGenerated, tests/slt/supported_features.h), so a relation
+  // carrying it is pending for good and keeps that test honest. Window functions are the canary of
+  // tests/slt/canary/canary_queries.sql too, for the same reason: antb1 refuses them at the OVER
+  // before it resolves a name, so Evaluate reads this as pending rather than broken.
   r.push_back(
       {.name = "window_function_canary_stays_pending",
        .features = {kCountStar, kColumns, kIntegerColumns, kTableName, kDerivedTable, kOrderBy,
