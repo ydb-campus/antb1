@@ -1907,11 +1907,18 @@ class Parser {
     }
     if (Peek().IsKeyword("ELSE")) {
       Take();
-      auto otherwise = ParseExpr(context);
-      if (!otherwise) {
-        return otherwise;
+      // ELSE NULL is a CASE without ELSE, in DuckDB too: the same NULL for every row no branch
+      // takes, the same type and the same name (`... ELSE NULL END`). NULL anywhere else, also as
+      // an operand of the ELSE value, is still an unsupported NULL literal.
+      if (Peek().IsKeyword("NULL") && PeekAt(1).IsKeyword("END")) {
+        Take();
+      } else {
+        auto otherwise = ParseExpr(context);
+        if (!otherwise) {
+          return otherwise;
+        }
+        out.otherwise.emplace(*std::move(otherwise));
       }
-      out.otherwise.emplace(*std::move(otherwise));
     }
     if (!Peek().IsKeyword("END")) {
       return Syntax(Peek().span, "expected WHEN, ELSE or END in CASE, found " + Describe(Peek()));
