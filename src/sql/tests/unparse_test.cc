@@ -201,6 +201,14 @@ TEST(UnparseTest, RoundTripsCorpus) {
            "SELECT * FROM t JOIN (SELECT k FROM u) AS v(k) ON t.k = v.k LEFT JOIN (SELECT 1 FROM "
            "w) ON TRUE_ish"sv,
            "SELECT * FROM (WITH c(x) AS (SELECT a FROM t) SELECT x FROM c) AS 'q' ORDER BY 1"sv,
+           "SELECT a FROM t UNION ALL SELECT b FROM u"sv,
+           "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1 union all /* c */ SELECT b, 1 "
+           "FROM u WHERE b > 0;"sv,
+           "WITH c AS (SELECT a FROM t UNION ALL SELECT a FROM u) SELECT a FROM c UNION ALL SELECT "
+           "b FROM (SELECT b FROM v UNION ALL SELECT b FROM w) AS s ORDER BY 1 DESC LIMIT 2 OFFSET "
+           "1"sv,
+           "SELECT a FROM t WHERE a IN (SELECT b FROM u UNION ALL SELECT c FROM v) AND EXISTS "
+           "(SELECT 1 FROM w UNION ALL SELECT 1 FROM w)"sv,
        }) {
     ExpectRoundTrip(sql);
   }
@@ -490,6 +498,48 @@ TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInNestedBlocks) {
   auto y = Parse(
       "with \"c\"( \"x\" ) as ( select a from t where (a = 1) ) select * from ( /* q */ select b "
       "from u ) s(\"y\"), c ;");
+  ASSERT_TRUE(x.has_value() && y.has_value());
+  EXPECT_TRUE(EqualIgnoringSpans(*x, *y)) << ToSql(*x) << "\n" << ToSql(*y);
+}
+
+// A compound's blocks are compared in order, and its WITH list and tail are its own (ADR 0036).
+TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInCompounds) {
+  const std::string_view base =
+      "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 UNION ALL "
+      "SELECT c FROM v ORDER BY 1 LIMIT 2";
+  for (const std::string_view other : {
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "ORDER BY 1 LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "UNION ALL SELECT c FROM v UNION ALL SELECT c FROM v ORDER BY 1 LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT b FROM u WHERE b > 1 UNION ALL SELECT a FROM c "
+           "UNION ALL SELECT c FROM v ORDER BY 1 LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 2 "
+           "UNION ALL SELECT c FROM v ORDER BY 1 LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "UNION ALL SELECT d FROM v ORDER BY 1 LIMIT 2"sv,
+           "SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 UNION ALL SELECT c FROM v ORDER "
+           "BY 1 LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "UNION ALL SELECT c FROM v ORDER BY 1 DESC LIMIT 2"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "UNION ALL SELECT c FROM v ORDER BY 1 LIMIT 3"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c UNION ALL SELECT b FROM u WHERE b > 1 "
+           "UNION ALL SELECT c FROM v"sv,
+           "WITH c AS (SELECT a FROM t) SELECT a FROM c ORDER BY 1 LIMIT 2"sv,
+       }) {
+    auto x = Parse(base);
+    auto y = Parse(other);
+    ASSERT_TRUE(x.has_value()) << x.error().message;
+    ASSERT_TRUE(y.has_value()) << other << ": " << y.error().message;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*y, *x)) << other;
+  }
+  // The spelling: the case of keywords, comments, parentheses and a trailing semicolon.
+  auto x = Parse(base);
+  auto y = Parse(
+      "with c as (select a from t) select a from c union /* x */ all select b from u where (b > "
+      "1) UNION ALL select c from v order by 1 limit 2;");
   ASSERT_TRUE(x.has_value() && y.has_value());
   EXPECT_TRUE(EqualIgnoringSpans(*x, *y)) << ToSql(*x) << "\n" << ToSql(*y);
 }

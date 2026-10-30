@@ -211,6 +211,10 @@ void Count(const Expr& expr, const std::string& sql, Counts& c) {
 // nested query and of a column alias list, the commas between CTEs and between column aliases, and
 // a string alias (its last byte a quote).
 void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  for (const SetBranch& branch : stmt.set_operation) {
+    CountStatement(*branch.query, sql, want);
+  }
   want.stars += stmt.star ? 1U : 0U;
   want.numbers += (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
   want.commas += Separators(stmt.items.size()) + Separators(stmt.order_by.size()) +
@@ -481,7 +485,32 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
     ASSERT_TRUE(Within(cte.query->span, cte.span)) << context;
     ASSERT_NO_FATAL_FAILURE(CheckStatement(*cte.query, sql));
   }
-  ASSERT_FALSE(stmt.from.empty());
+  // A compound (ADR 0036) holds its blocks, two or more, each a block of its own in the compound's
+  // span after the UNION ALL that joins it; its own block fields are empty.
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  ASSERT_NE(stmt.set_operation.size(), 1U) << context;
+  ASSERT_EQ(stmt.from.empty(), !stmt.set_operation.empty()) << context;
+  for (const SetBranch& branch : stmt.set_operation) {
+    const bool first = &branch == &stmt.set_operation.front();
+    const SelectStatement& block = *branch.query;
+    ASSERT_TRUE(Within(block.span, stmt.span)) << context;
+    ASSERT_EQ(branch.op_span.length == 0, first) << context;
+    if (!first) {
+      ASSERT_TRUE(Within(branch.op_span, stmt.span)) << context;
+      ASSERT_EQ(UpperText(sql, SourceSpan{.offset = branch.op_span.offset, .length = 5}), "UNION")
+          << context;
+      ASSERT_LT(branch.op_span.offset, block.span.offset) << context;
+    }
+    ASSERT_TRUE(block.with.empty() && block.order_by.empty() && !block.limit.has_value() &&
+                !block.offset.has_value() && block.set_operation.empty())
+        << context;
+    ASSERT_NO_FATAL_FAILURE(CheckStatement(block, sql));
+  }
+  if (!stmt.set_operation.empty()) {
+    ASSERT_TRUE(!stmt.star && stmt.items.empty() && stmt.where.empty() && stmt.group_by.empty() &&
+                stmt.having.empty())
+        << context;
+  }
   for (const FromItem& item : stmt.from) {
     const bool first = &item == &stmt.from.front();
     ASSERT_EQ(item.connector == Connector::kFirst, first) << context;
@@ -788,6 +817,17 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
       }
     }
   }
+  // A compound (ADR 0036): one or two more blocks after UNION ALL, before the compound's LIMIT.
+  if (rng.Percent(15)) {
+    for (std::size_t i = 1 + rng.Below(2); i > 0; --i) {
+      tokens.insert(tokens.end(),
+                    {"UNION", rng.Percent(50) ? "ALL" : "all", "SELECT",
+                     rng.Percent(20) ? "*" : rng.Pick(kNames), "FROM", rng.Pick(kNames)});
+      if (rng.Percent(30)) {
+        tokens.insert(tokens.end(), {"WHERE", rng.Pick(kNames), rng.Pick(kOps), "1"});
+      }
+    }
+  }
   if (rng.Percent(40)) {
     tokens.emplace_back("LIMIT");
     tokens.emplace_back(rng.Percent(90) ? "10" : "9223372036854775808");
@@ -893,6 +933,13 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     "SELECT 1 FROM t WHERE (a IN (SELECT b FROM u)) = c AND (a NOT IN (SELECT b FROM u)) LIKE 'x'",
     "select * from (with w as (select 1 from t) select * from w) q, (select * from (select b from "
     "u) r) z",
+    // Compounds (ADR 0036): at the top with the compound's own tail, in a derived table and a CTE,
+    // and with a WITH list the blocks share.
+    "SELECT a FROM t UNION ALL SELECT b FROM u WHERE b > 1 UNION ALL SELECT c FROM v ORDER BY 1 "
+    "LIMIT 2",
+    "WITH c AS (SELECT a FROM t UNION ALL SELECT a FROM u) SELECT x FROM (SELECT a AS x FROM c "
+    "UNION ALL SELECT a FROM c GROUP BY a) s WHERE x IN (SELECT b FROM w UNION ALL SELECT b FROM "
+    "v)",
 });
 
 std::string Mutate(Rng& rng, std::string sql) {

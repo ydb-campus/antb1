@@ -108,7 +108,9 @@ bool SameAnswer(const ResultSet& a, const ResultSet& b, std::string_view letters
 
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
   auto stmt = sql::Parse(sql);
-  if (!stmt.has_value() || stmt->order_by.empty()) {
+  // A compound's ORDER BY reads its output, which no select list of its own spells out to add keys
+  // to (ADR 0036): declined, as an unnamed key under SELECT * is.
+  if (!stmt.has_value() || stmt->order_by.empty() || !stmt->set_operation.empty()) {
     return std::nullopt;
   }
   std::vector<sql::SelectItem> extra;

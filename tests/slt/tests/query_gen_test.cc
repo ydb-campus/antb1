@@ -781,13 +781,23 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
     const sql::FromItem& item = ast->from.front();
     const auto* derived_source = std::get_if<sql::DerivedTable>(&item.source);
     ASSERT_EQ(derived_source == nullptr, cte) << "the FROM item matches the form recorded";
-    const sql::SelectStatement& block = cte ? *ast->with.front().query : *derived_source->query;
-    EXPECT_FALSE(block.items.empty());
-    for (const sql::SelectItem& select_item : block.items) {
-      EXPECT_FALSE(select_item.alias.has_value()) << "the column's own name is its output name";
+    const sql::SelectStatement& nested = cte ? *ast->with.front().query : *derived_source->query;
+    // The block, or each of its copies when it is a compound (ADR 0036).
+    std::vector<const sql::SelectStatement*> blocks = {&nested};
+    if (!nested.set_operation.empty()) {
+      blocks.clear();
+      for (const sql::SetBranch& branch : nested.set_operation) {
+        blocks.push_back(&*branch.query);
+      }
     }
-    EXPECT_EQ(block.from.size(), 1U);
-    EXPECT_NE(block.from.front().table(), nullptr) << "the block reads the table, never a path";
+    for (const sql::SelectStatement* block : blocks) {
+      EXPECT_FALSE(block->items.empty());
+      for (const sql::SelectItem& select_item : block->items) {
+        EXPECT_FALSE(select_item.alias.has_value()) << "the column's own name is its output name";
+      }
+      ASSERT_EQ(block->from.size(), 1U);
+      EXPECT_NE(block->from.front().table(), nullptr) << "the block reads the table, never a path";
+    }
   }
   EXPECT_GE(checked, 100) << "checked " << checked << " nested queries";
 }
@@ -1615,6 +1625,56 @@ TEST(QueryGenerator, SubstringChangesOnlySubstringQueries) {
   }
   EXPECT_GT(took, 40) << "took: " << took;
   EXPECT_GT(same, 7000);
+}
+
+// A compound comes from the eighth stream (ADR 0036's X2), so every seed that declines one
+// generates the query it did before, SQL and features alike. One that takes one nests a block
+// written as two or three copies of itself joined by UNION ALL, and counts their rows.
+TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
+  const FeatureSet with_union = Union(kSupportedFeatures, {Feature::kUnionAll});
+  const auto with = MakeOver(Tables(), 73, {.supported = with_union, .target_percent = 0});
+  const auto without = MakeOver(
+      Tables(), 73, {.supported = with_union.Minus({Feature::kUnionAll}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kUnionAll)) << plain.sql;
+    if (!q.features.Has(Feature::kUnionAll)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_TRUE(Nests(q)) << "a compound is a nested block's";
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    const sql::FromItem& item = ast->from.at(0);
+    const auto* derived = std::get_if<sql::DerivedTable>(&item.source);
+    const sql::SelectStatement& nested =
+        derived != nullptr ? *derived->query : *ast->with.at(0).query;
+    ASSERT_GE(nested.set_operation.size(), 2U);
+    ASSERT_LE(nested.set_operation.size(), 3U);
+    // The copies are one block, each spelled as the generator spells any name (case, quotes).
+    const auto reads = [](const sql::SelectStatement& block) {
+      std::vector<std::string> names;
+      for (const sql::SelectItem& select_item : block.items) {
+        const auto* column = std::get_if<sql::ColumnRef>(&select_item.expr);
+        names.push_back(column == nullptr ? "?" : Lower(column->name));
+      }
+      const sql::TableRef* table = block.from.at(0).table();
+      names.push_back(table == nullptr ? "?" : Lower(table->name));
+      return names;
+    };
+    for (const sql::SetBranch& branch : nested.set_operation) {
+      EXPECT_EQ(reads(*branch.query), reads(*nested.set_operation.front().query));
+    }
+  }
+  EXPECT_GT(took, 100) << "took: " << took;
+  EXPECT_GT(same, 6000);
 }
 
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates

@@ -28,11 +28,12 @@
 // Hand-written recursive-descent parser for the grammar in docs/sql-subset.md:
 //
 //   statement   := query [';'] EOF
-//   query       := [WITH cte (',' cte)*] block
+//   query       := [WITH cte (',' cte)*] block (UNION ALL block)*
+//                  [ORDER BY order_item (',' order_item)*]
+//                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
 //   cte         := name [columns] AS '(' query ')'
 //   block       := SELECT select_list FROM from_list [WHERE expr] [GROUP BY expr (',' expr)*]
-//                  [HAVING expr] [ORDER BY order_item (',' order_item)*]
-//                  [LIMIT integer] [OFFSET integer]      (LIMIT and OFFSET in either order)
+//                  [HAVING expr]
 //   select_list := '*' | expr [[AS] identifier] (',' expr [[AS] identifier])*
 //   order_item  := expr [ASC | DESC] [NULLS (FIRST | LAST)]
 //   from_list   := from_item (',' from_item | CROSS JOIN from_item | [INNER] JOIN from_item ON expr
@@ -57,19 +58,20 @@
 //
 // The parser keeps expressions as written; what the engine answers is the binder's decision. The
 // FROM list is flat (ADR 0022): each item records its connector to the items before it, and the
-// list is collected in a loop. The ON, WHERE and HAVING predicates are split at their top-level
-// AND chain, collected in a loop too. A query in parentheses (a derived table, or the query of a
-// common table expression) is a block of its own, with fresh aggregate-placement contexts, built
-// on the heap; it ends at its ')'.
-// Recursion is bounded: every level of an expression tree (but that chain) counts against
-// kMaxDepth, and so do the levels that the canonical form of a cast, a unary minus or a NOT
-// operand adds (ToSql writes x::T as CAST(x AS T), -x as -(x) and a = NOT b as a = (NOT b)), and
-// every nested query, one level below the clauses around it; a predicate with a top-level OR is
-// written bare, so it reads back as it was parsed. Tokens are pulled lazily from the lexer (at
-// most three tokens of lookahead), so work and memory stop at the first error whatever the input.
-// Recognized SQL outside the grammar yields kUnsupported at its first offending token and names the
-// construct; anything else yields kSyntax. A lexer error among the tokens the parser looked at wins
-// over the parser's own verdict, which may have been reached on the placeholder end-of-input token.
+// list is collected in a loop, and so are a compound's blocks (ADR 0036), whose ORDER BY, LIMIT and
+// OFFSET follow the last block and are the compound's own. The ON, WHERE and HAVING predicates are
+// split at their top-level AND chain, collected in a loop too. A query in parentheses (a derived
+// table, or the query of a common table expression) is a block of its own, with fresh
+// aggregate-placement contexts, built on the heap; it ends at its ')'. Recursion is bounded: every
+// level of an expression tree (but that chain) counts against kMaxDepth, and so do the levels that
+// the canonical form of a cast, a unary minus or a NOT operand adds (ToSql writes x::T as CAST(x AS
+// T), -x as -(x) and a = NOT b as a = (NOT b)), and every nested query, one level below the clauses
+// around it; a predicate with a top-level OR is written bare, so it reads back as it was parsed.
+// Tokens are pulled lazily from the lexer (at most three tokens of lookahead), so work and memory
+// stop at the first error whatever the input. Recognized SQL outside the grammar yields
+// kUnsupported at its first offending token and names the construct; anything else yields kSyntax.
+// A lexer error among the tokens the parser looked at wins over the parser's own verdict, which may
+// have been reached on the placeholder end-of-input token.
 
 namespace antb1::sql {
 namespace {
@@ -134,14 +136,14 @@ constexpr auto kOtherStatements = std::to_array<std::string_view>({
 
 // Clauses that can follow the select list, the FROM list, the predicate or LIMIT. The join keywords
 // are not among them: the FROM list parses them, and elsewhere they are syntax errors, as in
-// DuckDB.
+// DuckDB. Nor is UNION, which joins blocks (ParseCompound): only its forms without ALL are
+// unsupported.
 constexpr auto kUnsupportedClauses = std::to_array<Construct>({
     {.keyword = "EXCEPT", .message = "EXCEPT is not supported"},
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
     {.keyword = "INTERSECT", .message = "INTERSECT is not supported"},
     {.keyword = "QUALIFY", .message = "QUALIFY is not supported"},
-    {.keyword = "UNION", .message = "UNION is not supported"},
     {.keyword = "USING", .message = "USING SAMPLE is not supported"},
     {.keyword = "WINDOW", .message = "WINDOW is not supported"},
 });
@@ -592,7 +594,7 @@ std::unexpected<ParseError> ReservedQualifier(SourceSpan span, std::string_view 
 bool IsClauseKeyword(std::string_view keyword) {
   return keyword == "FROM" || keyword == "WHERE" || keyword == "GROUP" || keyword == "HAVING" ||
          keyword == "ORDER" || keyword == "LIMIT" || keyword == "OFFSET" || keyword == "INTO" ||
-         Find(kUnsupportedClauses, keyword).has_value();
+         keyword == "UNION" || Find(kUnsupportedClauses, keyword).has_value();
 }
 
 std::string_view Expectation(Context context) {
@@ -666,20 +668,112 @@ class Parser {
     return stmt;
   }
 
-  // query := [WITH cte (',' cte)*] block, the block ending at `end`. Its span starts at the WITH.
+  // query := [WITH cte (',' cte)*] block (UNION ALL block)* [ORDER BY ...] [LIMIT/OFFSET], ending
+  // at `end`. ORDER BY, LIMIT and OFFSET after a compound's last block are the compound's (ADR
+  // 0036), so the tail is parsed after every block. Its span starts at the WITH.
   Status ParseQuery(SelectStatement& stmt, BlockEnd end) {
     if (Peek().IsKeyword("WITH")) {
       if (auto status = ParseWith(stmt); !status) {
         return status;
       }
     }
-    if (auto status = ParseBlock(stmt, end); !status) {
+    const BlockScope scope(*this, end);
+    if (!Peek().IsKeyword("SELECT")) {
+      return std::unexpected(NotAQuery(Peek(), end == BlockEnd::kStatement && stmt.with.empty()));
+    }
+    const std::size_t begin = Peek().span.offset;
+    // The first block's own deepest level, apart from the WITH list's: a compound lifts it.
+    const std::size_t outer_peak = peak_;
+    peak_ = depth_;
+    if (auto status = ParseBlockCore(stmt); !status) {
       return status;
     }
+    if (Peek().IsKeyword("UNION")) {
+      if (auto status = ParseCompound(stmt); !status) {
+        return status;
+      }
+    }
+    peak_ = std::max(outer_peak, peak_);
+    if (auto status = ParseTail(stmt); !status) {
+      return status;
+    }
+    stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     if (!stmt.with.empty()) {
       stmt.span = Cover(stmt.with_span, stmt.span);
     }
+    return ParseBlockEnd(stmt.set_operation.empty() ? stmt : *stmt.set_operation.back().query, stmt,
+                         end);
+  }
+
+  // (UNION ALL block)+, positioned at the UNION after the first block, which `stmt` holds and which
+  // becomes the compound's first branch. Each block of a compound is one level below the query, so
+  // the first one moves down a level once it is known to be a branch -- the depth error at the
+  // first UNION ALL when that is too deep -- and each later one is parsed a level down.
+  Status ParseCompound(SelectStatement& stmt) {
+    const std::size_t depth = depth_;
+    const std::size_t first_peak = peak_;
+    stmt.set_operation.push_back(
+        SetBranch{.query = Box<SelectStatement>(TakeBlock(stmt)), .op_span = {}});
+    while (Peek().IsKeyword("UNION")) {
+      auto op = ParseUnionAll();
+      if (!op) {
+        return std::unexpected(std::move(op.error()));
+      }
+      if (stmt.set_operation.size() == 1) {
+        if (auto error = Lifted(first_peak, *op); error.has_value()) {
+          return std::unexpected(std::move(*error));
+        }
+      }
+      // A level that always fits: the first block's peak, at least this query's level, moved down
+      // it above. So a later block's depth error is where that block passes the limit.
+      ++depth_;
+      peak_ = std::max(peak_, depth_);
+      if (!Peek().IsKeyword("SELECT")) {
+        return std::unexpected(NotAQuery(Peek(), /*statement_start=*/false));
+      }
+      SelectStatement block;
+      if (auto status = ParseBlockCore(block); !status) {
+        return status;
+      }
+      depth_ = depth;
+      stmt.set_operation.push_back(
+          SetBranch{.query = Box<SelectStatement>(std::move(block)), .op_span = *op});
+    }
     return {};
+  }
+
+  // UNION ALL, positioned at the UNION: its span. UNION without ALL (DISTINCT included) and BY NAME
+  // are unsupported (ADR 0036's X4).
+  Expected<SourceSpan> ParseUnionAll() {
+    const Token keyword = Take();
+    if (Peek().IsKeyword("BY")) {
+      return Unsupported(keyword.span, "UNION BY NAME is not supported");
+    }
+    if (!Peek().IsKeyword("ALL")) {
+      return Unsupported(keyword.span, "UNION without ALL is not supported");
+    }
+    const SourceSpan op = Cover(keyword.span, Take().span);
+    if (Peek().IsKeyword("BY")) {
+      return Unsupported(Peek().span, "UNION BY NAME is not supported");
+    }
+    return op;
+  }
+
+  // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
+  static SelectStatement TakeBlock(SelectStatement& stmt) {
+    static_assert(kSelectStatementFields == 19, "revisit this walk");
+    SelectStatement block;
+    block.star = std::exchange(stmt.star, false);
+    block.star_span = std::exchange(stmt.star_span, {});
+    block.items = std::exchange(stmt.items, {});
+    block.from = std::exchange(stmt.from, {});
+    block.where = std::exchange(stmt.where, {});
+    block.group_by = std::exchange(stmt.group_by, {});
+    block.group_by_span = std::exchange(stmt.group_by_span, {});
+    block.having = std::exchange(stmt.having, {});
+    block.having_span = std::exchange(stmt.having_span, {});
+    block.span = std::exchange(stmt.span, {});
+    return block;
   }
 
   // WITH cte (',' cte)*, positioned at WITH. RECURSIVE right after WITH is unsupported, unless it
@@ -829,12 +923,8 @@ class Parser {
     return out;
   }
 
-  // block := SELECT ... [LIMIT/OFFSET], then the block's end (ParseBlockEnd).
-  Status ParseBlock(SelectStatement& stmt, BlockEnd end) {
-    const BlockScope scope(*this, end);
-    if (!Peek().IsKeyword("SELECT")) {
-      return std::unexpected(NotAQuery(Peek(), end == BlockEnd::kStatement && stmt.with.empty()));
-    }
+  // block := SELECT ... [HAVING ...], positioned at SELECT. Its span covers them.
+  Status ParseBlockCore(SelectStatement& stmt) {
     const std::size_t begin = Take().span.offset;
     if (auto status = ParseSelectList(stmt); !status) {
       return status;
@@ -863,6 +953,12 @@ class Parser {
       }
       stmt.having_span = SourceSpan{.offset = having_begin, .length = last_end_ - having_begin};
     }
+    stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
+    return {};
+  }
+
+  // [ORDER BY ...] [LIMIT n] [OFFSET m] after a query's last block: the query's own.
+  Status ParseTail(SelectStatement& stmt) {
     if (Peek().IsKeyword("ORDER")) {
       if (auto status = ParseOrderBy(stmt); !status) {
         return status;
@@ -889,8 +985,7 @@ class Parser {
         stmt.offset_span = span;
       }
     }
-    stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
-    return ParseBlockEnd(stmt, end);
+    return {};
   }
 
   Status ParseSelectList(SelectStatement& stmt) {
@@ -2746,11 +2841,12 @@ class Parser {
     return Syntax(first, "expected a non-negative integer after " + name + ", found " + found);
   }
 
-  // The end of a block: the end of the statement, after an optional ';' (kStatement), or the ')'
+  // The end of a query: the end of the statement, after an optional ';' (kStatement), or the ')'
   // of a nested query, which is left for the caller (kParenthesis). A clause of
   // kUnsupportedClauses there is unsupported; anything else is a syntax error that names what may
-  // still come.
-  Status ParseBlockEnd(const SelectStatement& stmt, BlockEnd end) {
+  // still come -- after `block`, the query's last block, and in `query`'s ORDER BY, LIMIT and
+  // OFFSET.
+  Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};
@@ -2769,24 +2865,31 @@ class Parser {
     if (auto construct = Find(kUnsupportedClauses, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
     }
+    // A block's UNION is taken before its ORDER BY (ParseQuery), so one here follows the tail: a
+    // syntax error, as in DuckDB.
+    if (keyword == "UNION") {
+      return Syntax(token.span,
+                    "unexpected UNION after ORDER BY, LIMIT or OFFSET; those come after the last "
+                    "query of a UNION ALL and apply to all of it");
+    }
     // The clauses that could still follow, in grammar order.
     const bool ordered_or_later =
-        !stmt.order_by.empty() || stmt.limit.has_value() || stmt.offset.has_value();
+        !query.order_by.empty() || query.limit.has_value() || query.offset.has_value();
     const bool grouped_or_later =
-        !stmt.group_by.empty() || !stmt.having.empty() || ordered_or_later;
+        !block.group_by.empty() || !block.having.empty() || ordered_or_later;
     std::vector<std::string_view> next;
     if (!grouped_or_later) {
-      next.emplace_back(stmt.where.empty() ? "WHERE" : "AND");
+      next.emplace_back(block.where.empty() ? "WHERE" : "AND");
       next.emplace_back("GROUP BY");
     }
     if (!ordered_or_later) {
-      next.emplace_back(stmt.having.empty() ? "HAVING" : "AND");
+      next.emplace_back(block.having.empty() ? "HAVING" : "AND");
       next.emplace_back("ORDER BY");
     }
-    if (!stmt.limit.has_value()) {
+    if (!query.limit.has_value()) {
       next.emplace_back("LIMIT");
     }
-    if (!stmt.offset.has_value()) {
+    if (!query.offset.has_value()) {
       next.emplace_back("OFFSET");
     }
     std::string expected = "expected ";

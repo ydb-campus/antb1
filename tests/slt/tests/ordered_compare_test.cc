@@ -82,6 +82,15 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
                 .augmented_sql,
             "SELECT *, x AS \"__antb1_key0\" FROM (SELECT a FROM t LIMIT 3) AS \"s\"(\"x\") "
             "ORDER BY x DESC");
+  // A compound's ORDER BY reads its output, which has no select list of its own to add keys to
+  // (ADR 0036); one nested in a FROM item is the block's business, not the keys'.
+  EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1"), std::nullopt);
+  EXPECT_EQ(MakeOrderedQuery("SELECT x FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM u) s "
+                             "ORDER BY x")
+                .value_or(OrderedQuery{})
+                .augmented_sql,
+            "SELECT x, x AS \"__antb1_key0\" FROM (SELECT a AS \"x\" FROM t UNION ALL SELECT b "
+            "FROM u) AS \"s\" ORDER BY x");
 }
 
 // The oracle side of `SELECT v FROM t ORDER BY k [LIMIT/OFFSET]` for (v, k) rows in DuckDB's order.

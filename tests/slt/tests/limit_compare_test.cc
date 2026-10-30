@@ -120,6 +120,9 @@ TEST(UnlimitedSql, DropsLimitAndOffsetOfUnorderedQueries) {
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t ORDER BY a LIMIT 5"), std::nullopt) << "ordered";
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t WHERE a ILIKE 'x' LIMIT 5"), std::nullopt)
       << "not in antb1's grammar";
+  // A compound's LIMIT is its own (ADR 0036), so dropping it gives the compound's every row.
+  EXPECT_EQ(UnlimitedSql("SELECT a FROM t UNION ALL SELECT b FROM u LIMIT 5"),
+            "SELECT a FROM t UNION ALL SELECT b FROM u");
 }
 
 }  // namespace

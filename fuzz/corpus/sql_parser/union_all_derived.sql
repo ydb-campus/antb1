@@ -1,0 +1,1 @@
+SELECT x, COUNT(*) FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM u JOIN w ON u.k = w.k) AS s(x) GROUP BY x

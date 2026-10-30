@@ -1153,6 +1153,16 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
       .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
 }
 
+// A compound: UNION ALL parses (ADR 0036), and is refused until its binder item binds each branch
+// as a block of its own -- at its first UNION ALL, before any check that reads a block's clauses,
+// which a compound keeps in its branches.
+std::optional<Rejection> RejectCompound(const sql::SelectStatement& query) {
+  if (query.set_operation.size() < 2) {
+    return std::nullopt;
+  }
+  return Rejection{.span = query.set_operation[1].op_span, .message = "UNION ALL is not supported"};
+}
+
 // Why an accepted shape is still not answered, or std::nullopt when it is.
 //
 // The IN form's probe is checked exactly as the left-hand side of an IN list is -- a construct that
@@ -1164,8 +1174,11 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
 // time, and HAVING, LIMIT and OFFSET -- each of which can leave no row -- are out).
 //
 // What needs the catalog, the subquery's column count and the IN key's type, is checked where the
-// sub-block is bound.
+// sub-block is bound. A compound is refused first (RejectCompound).
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
+  if (auto r = RejectCompound(*form.subquery->query)) {
+    return r;
+  }
   if (form.exists()) {
     // The conjunct is the subquery itself: there is no other side to check. ADR 0023's Path 1 takes
     // a plain block, so every clause that would have to act per binding is refused here, where the
@@ -2310,6 +2323,10 @@ class Binder {
         options_(options),
         bind_block_(bind_block),
         relations_(scope_.bindings().size()) {
+    // One block: a compound never reaches here, since CheckSupported refuses it (ADR 0036, until
+    // its binder item binds each branch as a block of its own). Bound here, it would read as a
+    // block with no select list.
+    ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
     // them, and gathers the relations of each block.
@@ -5579,8 +5596,12 @@ void FoldDateCasts(sql::Expr& expr) {
 // nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
 // the folded statement, so folding per level would fold a copy nothing reads).
 void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   for (sql::CommonTableExpr& cte : stmt.with) {
     FoldDateCastsInBlock(*cte.query);
+  }
+  for (sql::SetBranch& branch : stmt.set_operation) {
+    FoldDateCastsInBlock(*branch.query);
   }
   for (sql::SelectItem& item : stmt.items) {
     FoldDateCasts(item.expr);
@@ -5635,7 +5656,9 @@ arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool havin
 }
 
 arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
-  ANTB1_CHECK(!from.empty());  // the parser makes no statement without a FROM item
+  // The parser makes no block without a FROM item; a compound has none of its own, and CheckBlock
+  // never passes one here.
+  ANTB1_CHECK(!from.empty());
   for (const sql::FromItem& item : from) {
     // A subquery conjunct of an inner join's ON counts as a WHERE conjunct (ADR 0022). A LEFT
     // JOIN's ON keeps its own rules, where rule 11 filters the null-supplying input rather than
@@ -5683,6 +5706,10 @@ arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
 }
 
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  if (auto r = RejectCompound(stmt)) {
+    return Reject(*r);
+  }
   for (const sql::SelectItem& item : stmt.items) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
   }

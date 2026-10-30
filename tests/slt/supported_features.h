@@ -106,6 +106,9 @@ enum class Feature : std::uint8_t {
   // and absent from kSupportedFeatures.
   kCorrelatedExists,     // [NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND ...])
   kCorrelatedAggregate,  // <lit> <op> (SELECT <aggregate> FROM inner WHERE inner.k = outer.k)
+  // A compound (ADR 0036): blocks joined by UNION ALL, as a derived table's or a CTE's query. X2
+  // parses it and generates it, and the binder refuses it with exit code 4 until X3 declares it.
+  kUnionAll,  // (SELECT ... UNION ALL SELECT ...) as a nested query
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -240,6 +243,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_exists";
     case Feature::kCorrelatedAggregate:
       return "correlated_aggregate";
+    case Feature::kUnionAll:
+      return "union_all";
     case Feature::kWindowFunctions:
       return "window_functions";
   }

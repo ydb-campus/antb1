@@ -42,6 +42,10 @@ std::vector<std::string> ReachedTables(const std::string& sql) {
   }
   std::vector<std::string> names;
   for (const sql::SelectStatement* block : ReachableBlocks(*stmt)) {
+    if (!block->set_operation.empty()) {
+      names.emplace_back("<compound>");  // its blocks hold its FROM items (ADR 0036)
+      continue;
+    }
     const sql::TableRef* ref = block->from.front().table();
     names.emplace_back(ref == nullptr ? "<derived>" : ref->name);
   }
@@ -238,6 +242,61 @@ TEST(RelationCountTest, ReportsTheFirstItemThatCrossesTheLimit) {
   ASSERT_TRUE(over_nested.has_value());
   EXPECT_EQ(over_nested.value_or(RelationOverflow{}).item, 1U)
       << "the derived table, not the table before it";
+}
+
+// A compound's blocks count as blocks do (ADR 0036), each in the compound's frame: a derived one
+// counts one plus the sum of its blocks, and a CTE the blocks share counts once per reference.
+TEST(RelationCountTest, CountsACompoundsBlocks) {
+  EXPECT_EQ(Count("SELECT a FROM t UNION ALL SELECT b FROM u, v"), 3U);
+  EXPECT_EQ(Count("SELECT 1 FROM (SELECT a FROM t UNION ALL SELECT b FROM u) s"), 3U);
+  EXPECT_EQ(Count("WITH c AS (SELECT a FROM t, u) SELECT a FROM c UNION ALL SELECT a FROM c"), 6U);
+  EXPECT_EQ(Count("SELECT a FROM t WHERE a IN (SELECT b FROM u UNION ALL SELECT c FROM v)"), 4U);
+}
+
+// A compound's blocks come before it, since its own clauses follow them in the query; a CTE the
+// blocks share is reached once, through its first reference.
+TEST(RelationCountTest, ReachesEveryBlockOfACompoundBeforeIt) {
+  EXPECT_EQ(ReachedTables("SELECT a FROM t UNION ALL SELECT b FROM (SELECT c FROM u) s UNION ALL "
+                          "SELECT d FROM v"),
+            (std::vector<std::string>{"t", "<derived>", "u", "v", "<compound>"}));
+  EXPECT_EQ(
+      ReachedTables("WITH c AS (SELECT a FROM w) SELECT a FROM c UNION ALL SELECT a FROM c, x"),
+      (std::vector<std::string>{"c", "w", "c", "<compound>"}));
+  EXPECT_EQ(ReachedTables("SELECT a FROM t WHERE a IN (SELECT b FROM u UNION ALL SELECT c FROM v)"),
+            (std::vector<std::string>{"t", "u", "v", "<compound>"}));
+}
+
+// The outermost compound has no FROM item of its own to index: the item of a block that carries the
+// count past the limit is reported by span -- its connector, or the item when it is its block's
+// first.
+TEST(RelationCountTest, ReportsTheItemOfACompoundsBlockThatCrossesTheLimit) {
+  std::string sql = "SELECT 1 FROM t1";
+  for (std::size_t i = 2; i <= 200; ++i) {
+    sql += std::format(", t{}", i);
+  }
+  sql += " UNION ALL SELECT 1 FROM u1";
+  for (std::size_t i = 2; i <= 60; ++i) {
+    sql += std::format(", u{}", i);
+  }
+  auto stmt = sql::Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  const auto over = RelationsExceedLimit(*stmt);
+  ASSERT_TRUE(over.has_value());
+  const SourceSpan span = over.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
+  EXPECT_EQ(sql.substr(span.offset, span.length), ",") << "the 257th item: u57's comma";
+  EXPECT_EQ(sql.substr(span.offset, 5), ", u57");
+  // The item that crosses the limit is its block's first.
+  std::string first = sql.substr(0, sql.find(" UNION ALL")) + std::format(", t{}", 201);
+  for (std::size_t i = 202; i <= 256; ++i) {
+    first += std::format(", t{}", i);
+  }
+  first += " UNION ALL SELECT 1 FROM 'p.parquet'";
+  auto at_first = sql::Parse(first);
+  ASSERT_TRUE(at_first.has_value()) << at_first.error().message;
+  const auto over_first = RelationsExceedLimit(*at_first);
+  ASSERT_TRUE(over_first.has_value());
+  const SourceSpan item = over_first.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
+  EXPECT_EQ(first.substr(item.offset, item.length), "'p.parquet'");
 }
 
 // An unreferenced CTE of more relations than the limit costs nothing, because it is never walked.

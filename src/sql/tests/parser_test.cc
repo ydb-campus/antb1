@@ -567,6 +567,76 @@ TEST(ParserTest, WithLists) {
   EXPECT_EQ(plain->with_span, SourceSpan{});
 }
 
+// A compound (ADR 0036): blocks joined by UNION ALL, in a flat list. The WITH list before the first
+// block and the ORDER BY, LIMIT and OFFSET after the last one are the compound's, never a block's;
+// each block is one level below the compound.
+TEST(ParserTest, UnionAllCompounds) {
+  constexpr std::string_view kSql =
+      "WITH w AS (SELECT a FROM t) SELECT a FROM w UNION ALL SELECT b FROM u WHERE b > 1 GROUP BY "
+      "b UNION all /* c */ SELECT c AS x FROM v ORDER BY 1 LIMIT 2";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_EQ(At(kSql, stmt->span), kSql);
+  ASSERT_EQ(stmt->with.size(), 1U);
+  ASSERT_EQ(stmt->set_operation.size(), 3U);
+  EXPECT_TRUE(stmt->items.empty()) << "the blocks hold the select lists";
+  EXPECT_TRUE(stmt->from.empty());
+  ASSERT_EQ(stmt->order_by.size(), 1U) << "the compound's own";
+  EXPECT_EQ(stmt->limit, std::optional<std::int64_t>(2));
+  EXPECT_EQ(At(kSql, stmt->limit_span), "LIMIT 2");
+  const std::vector<std::string_view> blocks = {
+      "SELECT a FROM w", "SELECT b FROM u WHERE b > 1 GROUP BY b", "SELECT c AS x FROM v"};
+  const std::vector<std::string_view> ops = {"", "UNION ALL", "UNION all"};
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const SelectStatement& block = *stmt->set_operation[i].query;
+    EXPECT_EQ(At(kSql, block.span), blocks[i]) << i;
+    EXPECT_EQ(At(kSql, stmt->set_operation[i].op_span), ops[i]) << i;
+    EXPECT_TRUE(block.with.empty()) << i;
+    EXPECT_TRUE(block.order_by.empty()) << i;
+    EXPECT_FALSE(block.limit.has_value()) << i;
+    EXPECT_TRUE(block.set_operation.empty()) << i;
+  }
+  EXPECT_EQ(stmt->set_operation[1].query->group_by.size(), 1U);
+  EXPECT_EQ(stmt->set_operation[2].query->items.at(0).alias, std::optional<std::string>("x"));
+  EXPECT_EQ(Depth(*stmt), 3U) << "the second block's b > 1, one level below the compound";
+  EXPECT_EQ(ToSql(*stmt),
+            "WITH \"w\" AS (SELECT a FROM t) SELECT a FROM w UNION ALL SELECT b FROM u WHERE b > 1 "
+            "GROUP BY b UNION ALL SELECT c AS \"x\" FROM v ORDER BY 1 LIMIT 2");
+
+  // In a derived table, a CTE's query and a subquery; the canonical form reads back as the same
+  // tree, and is its own canonical form.
+  constexpr std::string_view kNested =
+      "SELECT x FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM u) AS s, (WITH c AS (SELECT a "
+      "FROM t UNION ALL SELECT a FROM t) SELECT a FROM c UNION ALL SELECT a FROM c) d WHERE x IN "
+      "(SELECT y FROM v UNION ALL SELECT z FROM w)";
+  auto nested = Parse(kNested);
+  ASSERT_TRUE(nested.has_value()) << nested.error().message;
+  EXPECT_EQ(QueryOf(nested->from.at(0)).set_operation.size(), 2U);
+  const SelectStatement& d = QueryOf(nested->from.at(1));
+  EXPECT_EQ(d.set_operation.size(), 2U);
+  ASSERT_EQ(d.with.size(), 1U);
+  EXPECT_EQ(d.with[0].query->set_operation.size(), 2U);
+  const std::string canonical = ToSql(*nested);
+  auto again = Parse(canonical);
+  ASSERT_TRUE(again.has_value()) << canonical << ": " << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*nested, *again)) << canonical;
+  EXPECT_EQ(ToSql(*again), canonical);
+
+  // Equality reads every block, in order.
+  const auto parsed = [](std::string_view sql) {
+    auto s = Parse(sql);
+    EXPECT_TRUE(s.has_value()) << sql;
+    return s.value_or(SelectStatement{});
+  };
+  const SelectStatement two = parsed("SELECT a FROM t UNION ALL SELECT b FROM u");
+  EXPECT_TRUE(EqualIgnoringSpans(two, parsed("select a from t union all select b from u")));
+  EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT b FROM u UNION ALL SELECT a FROM t")));
+  EXPECT_FALSE(EqualIgnoringSpans(
+      two, parsed("SELECT a FROM t UNION ALL SELECT b FROM u UNION ALL SELECT b FROM u")));
+  EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT a FROM t UNION ALL SELECT b FROM v")));
+  EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT a FROM t")));
+}
+
 // The names of a column alias list follow the rules of an implicit table alias (as in DuckDB):
 // names, quoted identifiers and BETWEEN, EXISTS, INTERVAL and OVER, as written. A CTE's list may
 // be of any length.
@@ -1844,6 +1914,54 @@ TEST(ParserTest, NestedQueriesCountTowardTheDepthLimit) {
             257U);
 }
 
+// Each block of a compound is one level below it (ADR 0036), the first one too: it moves down a
+// level once its UNION ALL shows it is a branch, and the depth error is then at that UNION ALL. The
+// compound's own ORDER BY stays at the compound's level.
+TEST(ParserTest, CompoundBlocksAreOneLevelDown) {
+  const auto calls = [](std::size_t k) { return Repeat("f(", k) + "a" + std::string(k, ')'); };
+  const auto plain = [&](std::size_t k) { return "SELECT " + calls(k) + " FROM t"; };
+  const auto first = [&](std::size_t k) { return plain(k) + " UNION ALL SELECT a FROM t"; };
+  const auto last = [&](std::size_t k) { return "SELECT a FROM t UNION ALL " + plain(k); };
+  const auto ordered = [&](std::size_t k) {
+    return "SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY " + calls(k);
+  };
+  const std::size_t at_top = FirstTooDeep(plain);
+  EXPECT_EQ(FirstTooDeep(first), at_top - 1);
+  EXPECT_EQ(FirstTooDeep(last), at_top - 1);
+  EXPECT_EQ(FirstTooDeep(ordered), at_top);
+  for (const auto& sql : {std::function<std::string(std::size_t)>(first),
+                          std::function<std::string(std::size_t)>(last)}) {
+    auto deepest = Parse(sql(at_top - 2));
+    ASSERT_TRUE(deepest.has_value()) << deepest.error().message;
+    EXPECT_EQ(Depth(*deepest), kMaxExpressionDepth);
+  }
+  const std::string lifted = first(at_top - 1);
+  auto too_deep = Parse(lifted);
+  ASSERT_FALSE(too_deep.has_value());
+  EXPECT_EQ(too_deep.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_EQ(At(lifted, too_deep.error().span), "UNION ALL");
+  // A later block is parsed a level down, so its error is where it passes the limit, inside it.
+  const std::string later = last(at_top - 1);
+  auto later_too_deep = Parse(later);
+  ASSERT_FALSE(later_too_deep.has_value());
+  EXPECT_EQ(later_too_deep.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_GT(later_too_deep.error().span.offset, later.find("SELECT f("))
+      << "inside the block, not at its UNION ALL";
+  // Compounds in derived tables, one inside the other: two levels each.
+  const auto nested = [](std::size_t n) {
+    std::string sql = "SELECT a FROM t";
+    for (std::size_t i = 0; i < n; ++i) {
+      sql = std::format("SELECT a FROM ({} UNION ALL SELECT a FROM t) AS d", sql);
+    }
+    return sql;
+  };
+  const std::size_t compounds = FirstTooDeep(nested);
+  auto deepest = Parse(nested(compounds - 1));
+  ASSERT_TRUE(deepest.has_value()) << deepest.error().message;
+  EXPECT_LE(Depth(*deepest), kMaxExpressionDepth);
+  EXPECT_GT(Depth(*deepest) + 2, kMaxExpressionDepth) << "no room for one more compound";
+}
+
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
 // binder tells them apart.
 TEST(ParserTest, ConstantsAndPositions) {
@@ -2412,11 +2530,11 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"SubqueryTrailingCommaInOrderBy", "SELECT a FROM (SELECT a FROM t ORDER BY a^,)",
                    kUnsupported, 1, "a trailing comma in ORDER BY is not supported"},
         RejectCase{"SubqueryUnion", "SELECT a FROM (SELECT a FROM t ^UNION SELECT a FROM u)",
-                   kUnsupported, 5, "UNION is not supported"},
+                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"SubqueryFetch", "SELECT a FROM (SELECT a FROM t ^FETCH FIRST 1 ROWS ONLY) s",
                    kUnsupported, 5, "FETCH is not supported"},
         RejectCase{"UnionAfterSubquery", "SELECT a FROM (SELECT a FROM t) s ^UNION SELECT a FROM u",
-                   kUnsupported, 5, "UNION is not supported"},
+                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"SubqueryInSubquery", "SELECT a FROM (SELECT a FROM (^VALUES (1)) v) w",
                    kUnsupported, 6, "VALUES is not supported"},
         // After a derived table, what DuckDB gives a meaning there (not AT: time travel reads a
@@ -2508,7 +2626,7 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"CteParenthesizedQuery", "WITH c AS (^(SELECT a FROM t)) SELECT a FROM c",
                    kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"CteUnion", "WITH c AS (SELECT a FROM t ^UNION SELECT a FROM u) SELECT a FROM c",
-                   kUnsupported, 5, "UNION is not supported"},
+                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"FromFirstAfterWith", "WITH c AS (SELECT a FROM t) ^FROM c", kUnsupported, 4,
                    "FROM-first queries are not supported"},
         RejectCase{"ValuesAfterWith", "WITH c AS (SELECT a FROM t) ^VALUES (1)", kUnsupported, 6,
@@ -2523,7 +2641,7 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"ParenthesizedQueryAfterWith", "WITH c AS (SELECT a FROM t) ^(SELECT a FROM c)",
                    kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"UnionAfterWith", "WITH c AS (SELECT a FROM t) SELECT a FROM c ^UNION SELECT 1",
-                   kUnsupported, 5, "UNION is not supported"},
+                   kUnsupported, 5, "UNION without ALL is not supported"},
         // Reported at their first token, where DuckDB gives a syntax error (docs/sql-subset.md).
         RejectCase{"SubqueryCutShort", "SELECT a FROM (SELECT 1^", kUnsupported, 0,
                    "SELECT without FROM is not supported"},
@@ -2613,9 +2731,43 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"AtTimeZoneInWhere", "SELECT a FROM events WHERE ts ^at time zone 'UTC' = 1",
                    kUnsupported, 2, "AT TIME ZONE is not supported"},
         RejectCase{"Union", "SELECT a FROM events ^UNION SELECT a FROM users", kUnsupported, 5,
-                   "UNION is not supported"},
-        RejectCase{"UnionAfterWhere", "SELECT a FROM events WHERE a = 1 ^UNION ALL SELECT 1",
-                   kUnsupported, 5, "UNION is not supported"},
+                   "UNION without ALL is not supported"},
+        // UNION ALL parses (ADR 0036): its second block is what lacks a FROM.
+        RejectCase{"UnionAllAfterWhere", "SELECT a FROM events WHERE a = 1 UNION ALL SELECT 1^",
+                   kUnsupported, 0, "SELECT without FROM is not supported"},
+        RejectCase{"FirstBlockWithoutFrom", "SELECT 1 ^UNION ALL SELECT a FROM t", kUnsupported, 5,
+                   "SELECT without FROM is not supported"},
+        RejectCase{"LastBlockWithoutFromInADerivedTable",
+                   "SELECT a FROM (SELECT a FROM t UNION ALL SELECT 1^)", kUnsupported, 1,
+                   "SELECT without FROM is not supported"},
+        // The forms of a set operation other than UNION ALL (ADR 0036's X4).
+        RejectCase{"UnionDistinct", "SELECT a FROM t ^UNION DISTINCT SELECT a FROM u", kUnsupported,
+                   5, "UNION without ALL is not supported"},
+        RejectCase{"UnionByName", "SELECT a FROM t ^UNION BY NAME SELECT a FROM u", kUnsupported, 5,
+                   "UNION BY NAME is not supported"},
+        RejectCase{"UnionAllByName", "SELECT a FROM t UNION ALL ^BY NAME SELECT a FROM u",
+                   kUnsupported, 2, "UNION BY NAME is not supported"},
+        RejectCase{"UnionAfterUnionAll",
+                   "SELECT a FROM t UNION ALL SELECT a FROM u ^UNION SELECT a FROM v", kUnsupported,
+                   5, "UNION without ALL is not supported"},
+        RejectCase{"IntersectAfterUnionAll",
+                   "SELECT a FROM t UNION ALL SELECT a FROM u ^INTERSECT SELECT a FROM v",
+                   kUnsupported, 9, "INTERSECT is not supported"},
+        RejectCase{"ExceptInACompoundCte",
+                   "WITH c AS (SELECT a FROM t UNION ALL SELECT a FROM u ^EXCEPT SELECT a FROM v) "
+                   "SELECT a FROM c",
+                   kUnsupported, 6, "EXCEPT is not supported"},
+        // A block of a compound is a SELECT block: no parentheses, VALUES, FROM-first query or
+        // DISTINCT (ADR 0036).
+        RejectCase{"ParenthesizedBlockAfterUnionAll",
+                   "SELECT a FROM t UNION ALL ^(SELECT a FROM u)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ValuesAfterUnionAll", "SELECT a FROM t UNION ALL ^VALUES (1)", kUnsupported, 6,
+                   "VALUES is not supported; only SELECT queries are supported"},
+        RejectCase{"FromFirstAfterUnionAll", "SELECT a FROM t UNION ALL ^FROM u SELECT a",
+                   kUnsupported, 4, "FROM-first queries are not supported"},
+        RejectCase{"DistinctAfterUnionAll", "SELECT a FROM t UNION ALL SELECT ^DISTINCT a FROM u",
+                   kUnsupported, 8, "DISTINCT is not supported"},
         RejectCase{"Intersect", "SELECT a FROM events ^INTERSECT SELECT a FROM users", kUnsupported,
                    9, "INTERSECT is not supported"},
         RejectCase{"Except", "SELECT a FROM events ^EXCEPT SELECT a FROM users", kUnsupported, 6,
@@ -2973,6 +3125,26 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"InUnclosed", "SELECT a FROM t WHERE b IN (1, 2^", kSyntax, 0,
                    "expected , or ) in IN (...), found end of input"},
         RejectCase{"OnlySemicolon", "^;", kSyntax, 1, "expected SELECT, found ';'"},
+        // ORDER BY, LIMIT and OFFSET come after a compound's last block (ADR 0036), and a UNION ALL
+        // is followed by a SELECT block: anything else is a syntax error, as in DuckDB.
+        RejectCase{"UnionAllAfterOrderBy", "SELECT a FROM t ORDER BY a ^UNION ALL SELECT a FROM u",
+                   kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
+        RejectCase{"UnionAllAfterLimit", "SELECT a FROM t LIMIT 1 ^UNION ALL SELECT a FROM u",
+                   kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
+        RejectCase{"UnionAllAfterTheOffsetOfABlock",
+                   "SELECT a FROM t UNION ALL SELECT a FROM u OFFSET 2 ^UNION ALL SELECT a FROM v",
+                   kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
+        RejectCase{"UnionAllAtTheEnd", "SELECT a FROM t UNION ALL^", kSyntax, 0,
+                   "expected SELECT, found end of input"},
+        RejectCase{"UnionAllAll", "SELECT a FROM t UNION ALL ^ALL SELECT a FROM u", kSyntax, 3,
+                   "expected SELECT, found keyword ALL"},
+        RejectCase{"UnionAllDistinct", "SELECT a FROM t UNION ALL ^DISTINCT SELECT a FROM u",
+                   kSyntax, 8, "expected SELECT, found keyword DISTINCT"},
+        RejectCase{"UnionAllWith",
+                   "SELECT a FROM t UNION ALL ^WITH c AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 4, "expected SELECT, found keyword WITH"},
+        RejectCase{"UnionAllBeforeAParen", "SELECT a FROM (SELECT a FROM t UNION ALL ^)", kSyntax,
+                   1, "expected SELECT, found ')'"},
         RejectCase{"Misspelled", "^SELEC a FROM events", kSyntax, 5,
                    "expected SELECT, found identifier SELEC"},
         RejectCase{"Number", "^42", kSyntax, 2, "expected SELECT, found integer literal 42"},
@@ -4018,6 +4190,28 @@ TEST(ParserRobustnessTest, LongWithListsAndColumnLists) {
   auto listed = Parse(columns);
   ASSERT_TRUE(listed.has_value());
   EXPECT_EQ(listed->from.at(0).columns.size(), 50000U);
+}
+
+// A compound's blocks are a flat list (ADR 0036): 10,000 of them parse, compare, unparse and read
+// back without one level of recursion per block, at a depth of two.
+TEST(ParserRobustnessTest, LongCompounds) {
+  std::string sql = "SELECT a FROM t";
+  for (int i = 1; i < 10000; ++i) {
+    sql += " UNION ALL SELECT a FROM t" + std::to_string(i);
+  }
+  auto stmt = Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_EQ(stmt->set_operation.size(), 10000U);
+  EXPECT_EQ(Depth(*stmt), 2U);
+  SelectStatement copy = *stmt;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, copy));
+  copy.set_operation.back().query->from.at(0).alias = "s";
+  EXPECT_FALSE(EqualIgnoringSpans(*stmt, copy));
+  const std::string canonical = ToSql(*stmt);
+  auto again = Parse(canonical);
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+  EXPECT_EQ(ToSql(*again), canonical);
 }
 
 TEST(ParserRobustnessTest, MegabyteInputs) {

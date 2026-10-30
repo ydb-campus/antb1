@@ -104,15 +104,18 @@ steps (only step 7 uses more than one thread):
 3. Parse (`sql::Parse`): tokens, then a `SelectStatement` AST with spans; expressions are trees (`sql::Expr`), parsed
    by precedence climbing with a depth limit, and the FROM clause is a flat list of items (tables, paths or derived
    tables, with their aliases and joins). A derived table and each query of a `WITH` list are `SelectStatement`s of
-   their own, held in heap boxes, and every such nested query counts against the same depth limit. Syntax outside the
+   their own, held in heap boxes, and every such nested query counts against the same depth limit. A compound
+   (blocks joined by `UNION ALL`) keeps its blocks in a flat list of boxes, each one level below it, and owns the
+   `WITH` list before them and the `ORDER BY`, `LIMIT` and `OFFSET` after them
+   ([ADR 0036](adr/0036-union-all.md)). Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an
    `IN` subquery anywhere but as a top-level conjunct of `WHERE`, of an inner `ON` or of `HAVING`, a lateral
-   reference, more than 256 relations counting every sub-plan and every subquery, many expressions) is
-   `kUnsupported` before any name resolves, over every block
-   the statement reaches — its own, each derived table's, each subquery's, and the body of each CTE something
-   references; then each
+   reference, more than 256 relations counting every sub-plan and every subquery, a compound until ADR 0036's X3,
+   many expressions) is `kUnsupported` before any name resolves, over every block
+   the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
+   each CTE something references; then each
    FROM item resolves, in FROM order, one binding per item in the block's scope (`src/plan/scope.h`: its rule-1
    name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else
    `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT flags). A derived

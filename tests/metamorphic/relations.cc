@@ -1498,6 +1498,39 @@ std::vector<Relation> AllRelations() {
   // carrying it is pending for good and keeps that test honest. Window functions are the canary of
   // tests/slt/canary/canary_queries.sql too, for the same reason: antb1 refuses them at the OVER
   // before it resolves a name, so Evaluate reads this as pending rather than broken.
+  // ---- pending until a compound is answered (ADR 0036's X3) ----
+  // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
+  // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.
+  {
+    const slt::FeatureSet unioned = {kColumns, kMultipleItems,  kIntegerColumns, kTableName,
+                                     kWhere,   kIntegerLiteral, kDerivedTable,   kUnionAll};
+    constexpr std::string_view kLow = "SELECT tr_row, tr_rider FROM trips WHERE tr_row < 100";
+    constexpr std::string_view kHigh = "SELECT tr_row, tr_rider FROM trips WHERE tr_row >= 2900";
+    const std::string both =
+        std::format("SELECT tr_row, tr_rider FROM ({} UNION ALL {}) AS u", kLow, kHigh);
+    r.push_back({.name = "union_all_has_its_blocks_rows",
+                 .features = unioned,
+                 .probes = {Q(both), Q(std::string(kLow)), Q(std::string(kHigh))},
+                 .check = FirstIsUnionOfRest()});
+    r.push_back(
+        {.name = "union_all_forms_and_orders_equal",
+         .features = SetWith(unioned, kCommonTableExpr),
+         .probes = {Q(both),
+                    Q(std::format("WITH u AS ({} UNION ALL {}) SELECT tr_row, tr_rider FROM u",
+                                  kLow, kHigh)),
+                    Q(std::format("SELECT tr_row, tr_rider FROM ({} UNION ALL {}) AS u", kHigh,
+                                  kLow)),
+                    Q(both, 1), Q(both, 7)},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "union_all_count_sums_its_blocks",
+         .features = SetWith(unioned, kCountStar),
+         .probes = {Q(std::format("SELECT COUNT(*) FROM ({} UNION ALL {}) AS u", kLow, kHigh)),
+                    Q("SELECT COUNT(*) FROM trips WHERE tr_row < 100"),
+                    Q("SELECT COUNT(*) FROM trips WHERE tr_row >= 2900")},
+         .check = FirstEqualsSumOfRest()});
+  }
+
   r.push_back(
       {.name = "window_function_canary_stays_pending",
        .features = {kCountStar, kColumns, kIntegerColumns, kTableName, kDerivedTable, kOrderBy,
