@@ -403,7 +403,7 @@ by hand with the CLI, never committed.
 
 ## Data derived from TPC-DS
 
-`tests/tpcds/` will test the engine on data derived from TPC-DS, under the same rules as the data derived from TPC-H
+`tests/tpcds/` tests the engine on data derived from TPC-DS, under the same rules as the data derived from TPC-H
 below, with the differences of ADR 0006's TPC-DS amendment: no stored answers (the live DuckDB oracle is the only
 judge). Linux only, as for TPC-H. So far it holds:
 
@@ -422,6 +422,14 @@ judge). Linux only, as for TPC-H. So far it holds:
   `harness.tpcds.generate.unknown_workload`: the generator refuses an unknown `-DWORKLOAD`. `fixtures.tpch` and
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
 - `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
+- `tpcds.status.sf0_1`, `tpcds.status.sf1` (label `oracle`) and `parallel.tpcds.status.sf1` (label `parallel`: 4
+  threads, 1000-row batches, equal to the 1-thread results byte for byte): the ratchet. `antb1-slt tpcds` runs the 99
+  queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
+  ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with a 2 GiB
+  memory limit and a 900-second timeout; its status table is "Queries derived from TPC-DS" in
+  [sql-subset.md](sql-subset.md#queries-derived-from-tpc-ds). `ANTB1_TPCDS_TIMES=1` adds each query's seconds in a
+  local run. `harness.tpcds.status.pass` and `.parse_error` run `antb1-slt tpcds` on our own numbered queries
+  (`harness.tpch.status.*` covers the rest of the shared ratchet).
 
 ## Data derived from TPC-H
 

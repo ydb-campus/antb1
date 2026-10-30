@@ -13,6 +13,7 @@
 //                     [--mutate KIND]
 //   antb1-slt tpch --fixtures DIR --tables FILE --queries DIR --status FILE [--memory-limit SIZE]
 //                  [--only N] [--mutate KIND]
+//   antb1-slt tpcds ... (the options of tpch)
 //   antb1-slt version
 //
 // `pending` is the pending check: antb1 must still answer every `pending <roadmap id>` record of
@@ -20,7 +21,8 @@
 // (tests/data): see query_file.h and clickbench.h. `answers` checks stored answers against the
 // DuckDB oracle (answers.h). `tpch` is the ratchet of the queries derived from TPC-H (ratchet.h,
 // tests/tpch): q01.sql, q02.sql, ... of DIR as Q1, Q2, ...; ANTB1_TPCH_TIMES=1 adds each query's
-// seconds and their geometric mean.
+// seconds and their geometric mean. `tpcds` is the same for the queries derived from TPC-DS
+// (tests/tpcds; ANTB1_TPCDS_TIMES=1).
 //
 // Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
 // and no SQL. --show-values lifts the last two for a local repro; it is refused when
@@ -105,12 +107,12 @@ struct Args {
   // queries, clickbench
   std::string query_file;
   std::string status;
-  // answers, tpch
+  // answers, tpch, tpcds
   std::string queries_dir;
   std::string answers_dir;
-  // tpch: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
+  // tpch, tpcds: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
   std::string memory_limit;
-  bool times = false;  // ANTB1_TPCH_TIMES=1
+  bool times = false;  // ANTB1_TPCH_TIMES=1, ANTB1_TPCDS_TIMES=1
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -149,6 +151,7 @@ std::string CommandLine(std::span<char*> argv, bool show_values) {
 struct Environment {
   bool github_actions = false;  // GITHUB_ACTIONS=true
   bool tpch_times = false;      // ANTB1_TPCH_TIMES=1
+  bool tpcds_times = false;     // ANTB1_TPCDS_TIMES=1
 };
 
 Environment ReadEnvironment(char* const* envp) {
@@ -157,6 +160,7 @@ Environment ReadEnvironment(char* const* envp) {
     const std::string_view variable(*entry);
     env.github_actions = env.github_actions || variable == "GITHUB_ACTIONS=true";
     env.tpch_times = env.tpch_times || variable == "ANTB1_TPCH_TIMES=1";
+    env.tpcds_times = env.tpcds_times || variable == "ANTB1_TPCDS_TIMES=1";
   }
   return env;
 }
@@ -614,7 +618,22 @@ constexpr Workload kTpch{
     .running_lines = true,
 };
 
-int Tpch(const Args& args, const std::vector<TableDef>& tables, const std::string& command) {
+// The workload of the queries derived from TPC-DS: Q1 to Q99, with the same rule.
+constexpr Workload kTpcds{
+    .summary = "TPCDS",
+    .commit_key = "",
+    .first = 1,
+    .rejections_clean = false,
+    .unclean_rule =
+        "a query derived from TPC-DS that antb1 does not answer must fail with "
+        "Unsupported (exit code 4)",
+    .table = "the table of the queries derived from TPC-DS",
+    .running_lines = true,
+};
+
+// The ratchet of a numbered workload (tpch, tpcds): q01.sql, ... of --queries against --status.
+int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
+                     const std::string& command, const Workload& workload) {
   auto queries = LoadNumberedQueries(args.queries_dir, args.redact);
   if (!queries) {
     std::println(stderr, "antb1-slt: {}", queries.error());
@@ -625,7 +644,7 @@ int Tpch(const Args& args, const std::vector<TableDef>& tables, const std::strin
     std::println(stderr, "{}", status_text.error());
     return kExitSetup;
   }
-  auto status = ParseRatchetStatus(*status_text, kTpch);
+  auto status = ParseRatchetStatus(*status_text, workload);
   if (!status) {
     std::println(stderr, "antb1-slt: {}: {}", args.status, status.error());
     return kExitUsage;
@@ -648,8 +667,8 @@ int Tpch(const Args& args, const std::vector<TableDef>& tables, const std::strin
     };
   }
   // Each line as it comes, so the log of a run that times out ends with the query it was running.
-  const RatchetStats stats = RunRatchet(*queries, *status, kTpch, antb1->get(), **oracle, options,
-                                        [](std::string_view text) {
+  const RatchetStats stats = RunRatchet(*queries, *status, workload, antb1->get(), **oracle,
+                                        options, [](std::string_view text) {
                                           std::print("{}", text);
                                           std::fflush(stdout);
                                         });
@@ -750,21 +769,28 @@ int Main(std::span<char*> argv, const Environment& env) {
       ->required();
   answers->add_option("--only", args.only, "Run only Q<n> (repro)");
   answers->add_option("--mutate", args.mutate, "Corrupt DuckDB's results (harness self-tests)");
-  auto* tpch = app.add_subcommand(
-      "tpch", "Ratchet of the queries derived from TPC-H: q01.sql, ... on antb1 vs DuckDB");
-  AddSetup(tpch, args);
-  tpch->add_option("--queries", args.queries_dir, "Directory of q01.sql, q02.sql, ...")->required();
-  tpch->add_option("--status", args.status, "The ratchet (tests/data/tpch_status.json)")
-      ->required();
-  tpch->add_option("--memory-limit", args.memory_limit,
-                   "antb1: memory a query may use, e.g. 2GiB (bytes, KiB, MiB or GiB)")
-      ->check([](const std::string& value) -> std::string {
-        return ParseByteSize(value).has_value()
-                   ? std::string()
-                   : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
-      });
-  tpch->add_option("--only", args.only, "Run only Q<n> (repro)");
-  tpch->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
+  // tpch and tpcds: the ratchets of the numbered workloads, with the same options.
+  const auto add_numbered = [&app, &args](const std::string& name, const std::string& workload,
+                                          const std::string& status_file) {
+    auto* cmd = app.add_subcommand(name, "Ratchet of the queries derived from " + workload +
+                                             ": q01.sql, ... on antb1 vs DuckDB");
+    AddSetup(cmd, args);
+    cmd->add_option("--queries", args.queries_dir, "Directory of q01.sql, q02.sql, ...")
+        ->required();
+    cmd->add_option("--status", args.status, "The ratchet (" + status_file + ")")->required();
+    cmd->add_option("--memory-limit", args.memory_limit,
+                    "antb1: memory a query may use, e.g. 2GiB (bytes, KiB, MiB or GiB)")
+        ->check([](const std::string& value) -> std::string {
+          return ParseByteSize(value).has_value()
+                     ? std::string()
+                     : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
+        });
+    cmd->add_option("--only", args.only, "Run only Q<n> (repro)");
+    cmd->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
+    return cmd;
+  };
+  const auto* tpch = add_numbered("tpch", "TPC-H", "tests/data/tpch_status.json");
+  const auto* tpcds = add_numbered("tpcds", "TPC-DS", "tests/data/tpcds_status.json");
   const auto* version = app.add_subcommand("version", "Print the DuckDB version the oracle uses");
   try {
     app.parse(static_cast<int>(argv.size()), argv.data());
@@ -798,10 +824,11 @@ int Main(std::span<char*> argv, const Environment& env) {
     std::println(stderr, "antb1-slt: {}", tables.error());
     return kExitSetup;
   }
-  // Redacted unless --show-values: tables marked `redact`, `answers` and `tpch`.
-  // `tpch` too: its queries are derived from TPC-H, whatever the tables file says.
-  const bool redacted_data =
-      answers->parsed() || tpch->parsed() || std::ranges::any_of(*tables, &TableDef::redact);
+  // Redacted unless --show-values: tables marked `redact`, `answers`, `tpch` and `tpcds`.
+  // `tpch` and `tpcds` too: their queries are derived from TPC-H and TPC-DS, whatever the tables
+  // file says.
+  const bool redacted_data = answers->parsed() || tpch->parsed() || tpcds->parsed() ||
+                             std::ranges::any_of(*tables, &TableDef::redact);
   if (redacted_data && complete->parsed()) {
     std::println(stderr,
                  "antb1-slt: complete writes values into .slt files; it is refused for tables "
@@ -835,7 +862,11 @@ int Main(std::span<char*> argv, const Environment& env) {
   }
   if (tpch->parsed()) {
     args.times = env.tpch_times;
-    return Tpch(args, *tables, command);
+    return NumberedWorkload(args, *tables, command, kTpch);
+  }
+  if (tpcds->parsed()) {
+    args.times = env.tpcds_times;
+    return NumberedWorkload(args, *tables, command, kTpcds);
   }
   return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, command);
 }
