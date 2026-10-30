@@ -1047,9 +1047,11 @@ struct RejectConditionOf {
       return r;
     }
     for (const sql::Expr& value : in.list) {
-      if (!std::holds_alternative<sql::Literal>(value)) {
-        return Rejection{.span = value.span(),
-                         .message = "only literals are supported in an IN list"};
+      if (!std::holds_alternative<sql::Literal>(value) && !IsConstantInteger(value)) {
+        return Rejection{
+            .span = value.span(),
+            .message =
+                "only literals and constant integer expressions are supported in an IN list"};
       }
     }
     return std::nullopt;
@@ -3384,10 +3386,18 @@ struct Binder::BindConditionOf {
                        std::get<sql::Literal>(*like.pattern), {}, like.span);
   }
   arrow::Result<Predicate> operator()(const sql::InExpr& in) const {
+    // A constant integer expression (10 + 1) as the literal of its value, as on a side of a
+    // comparison: then typed and folded as any value of the list; one that overflows its type is a
+    // bind error.
     std::vector<sql::Literal> list;
     list.reserve(in.list.size());
     for (const sql::Expr& value : in.list) {
-      list.push_back(std::get<sql::Literal>(value));
+      if (const auto* literal = std::get_if<sql::Literal>(&value)) {
+        list.push_back(*literal);
+      } else {
+        ARROW_ASSIGN_OR_RAISE(sql::Literal folded, FoldConstant(value));
+        list.push_back(std::move(folded));
+      }
     }
     return WithLiteral(*in.operand, in.negated ? sql::CompareOp::kNotIn : sql::CompareOp::kIn,
                        sql::Literal{}, list, in.span);

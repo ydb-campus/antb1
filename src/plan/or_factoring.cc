@@ -80,10 +80,15 @@ bool ValuesOf(const sql::Expr& conjunct, const sql::Expr& column,
     if (in->negated || !sql::EqualIgnoringSpans(*in->operand, column)) {
       return false;
     }
+    // All or nothing: a list with a value that is no literal (a constant integer expression) bounds
+    // the column with values this derivation does not read, so it contributes none of them; one
+    // literal taken from it alone would derive a list that drops the rows of the others.
+    if (!std::ranges::all_of(in->list, [](const sql::Expr& value) {
+          return std::holds_alternative<sql::Literal>(value);
+        })) {
+      return false;
+    }
     for (const sql::Expr& value : in->list) {
-      if (!std::holds_alternative<sql::Literal>(value)) {
-        return false;
-      }
       out.push_back(&value);
     }
     return !in->list.empty();

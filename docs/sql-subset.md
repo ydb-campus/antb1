@@ -12,8 +12,9 @@ All of this runs (the [grammar](#grammar) below accepts more than the binder ans
 (`GROUP BY`) aggregates, `COUNT(DISTINCT ...)` included, projections (`*`, columns or constants), `WHERE`
 conditions (comparisons between columns, expressions and literals, `[NOT] LIKE 'pattern'`,
 `[NOT] IN (literal, ...)` and `[NOT] BETWEEN low AND high`, combined with `AND`, `OR` and `NOT`, with constant
-integer arithmetic folded on a side), `GROUP BY` and `ORDER BY` (also by position), `HAVING` (the same conditions
-on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers, DOUBLE and DECIMAL, the string
+integer arithmetic folded on a side and in an `IN` list), `GROUP BY` and `ORDER BY` (also by position), `HAVING`
+(the same conditions on aggregates and keys), arithmetic (`+ - * / // %` and unary `-`) over integers, DOUBLE and
+DECIMAL, the string
 functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `toDateTime`, `EXTRACT` and
 `date_trunc`, and
 `CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
@@ -253,8 +254,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `operand [NOT] LIKE 'pattern'`, `operand [NOT] IN (literal, ...)` and `operand [NOT] BETWEEN low AND high`
   (`low <= operand AND operand <= high`, each bound a literal or an operand), where an operand is a value
   expression that reads a column (in `HAVING`, and in a `CASE` of an aggregate query, also one over aggregates),
-  combined with `AND`, `OR` and `NOT`. Instead of a literal, a comparison or a bound may be a constant integer
-  expression: integer literals under unary `-`, `+`, `-` and `*` (`a > 2 * 1000`), folded to its value in DuckDB's
+  combined with `AND`, `OR` and `NOT`. Instead of a literal, a comparison, a bound or an `IN` list's value may be
+  a constant integer expression: integer literals under unary `-`, `+`, `-` and `*` (`a > 2 * 1000`), folded to its
+  value in DuckDB's
   types (each literal `INTEGER` when its magnitude fits, else `BIGINT` or `HUGEINT` by its value, so `-2147483648`
   is a `BIGINT`; each operation in the wider type of its operands); one that overflows `INTEGER` or `BIGINT` is a
   bind error (exit code 1, divergence D17), and a `HUGEINT` value of more than 38 digits is unsupported. Other
@@ -881,7 +883,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   never computes `x * x` where `x > 100`), as DuckDB does for the same order (divergence D16).
   VARCHAR compares byte-wise and DATE chronologically. A predicate folded to never-true reads no data at all.
 - IN: `c IN (v1, v2, ...)` is `c = v1 OR c = v2 OR ...` with Kleene logic, and `c NOT IN (...)` its negation, so a NULL
-  value rejects the row for both. Each value is typed and folded exactly like `c = v` ([Binding](#binding)); a value
+  value rejects the row for both. Each value is typed and folded exactly like `c = v` ([Binding](#binding)), a
+  constant integer expression (`c IN (10, 10 + 1)`) as the literal of its value; a value
   that no column value can equal (out of the column type's range, or not an integer for an integer column) is dropped,
   and without values `IN` is `FALSE` and `NOT IN` is `IS NOT NULL`. DuckDB gives the list one type: when a number in it
   types as DOUBLE (an exponent, or a decimal of more than 38 digits), every number is read as a double, so an integer
@@ -1135,7 +1138,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D14 | Overflows DuckDB's optimizer does not avoid | a comparison that is a whole `WHERE` or `HAVING` conjunct and folds to never-true at bind time (a literal outside the operand's type, as in `smallint_col + 1 > 40000`, or a DECIMAL result's, as in `price * qty > 100000000000000000000` on DECIMAL(15,2) columns) computes nothing, so it cannot overflow; one that folds to always-true keeps `IS NOT NULL` over its operand, which is computed, and under `OR` or `NOT` or in a `CASE WHEN` condition a folded comparison keeps NULL for a NULL operand, so its operand is computed and overflows as in DuckDB (`p * q > 100000000000000000000 OR id = 1` fails in both engines) | computes the operand and fails on an overflow ("Overflow in addition of INT16") | the random generator never writes arithmetic that can overflow; `plan.BinderTest.WhereMovesConstantsLikeDuckDb` pins which comparisons move their constants |
 | D15 | VARCHAR bytes that are not UTF-8 | answers: `strlen` counts every byte, and `regexp_replace` runs RE2 over the bytes as UTF-8, where an invalid byte never matches (not even `.` or `[^a]`) and stays in the result | cannot read such a value as VARCHAR: reading an unannotated BYTE_ARRAY column (`binary_as_string`) with it fails the query ("Invalid string encoding") | every fixture string is valid UTF-8, so the oracle tests never meet it; `exec.ComputeTest.StringFunctions` pins antb1's behavior |
 | D16 | Evaluation order in conditions | computes the arguments of `AND` and `OR` in the order written, each only for the rows still undecided, and a WHERE conjunct's operands for every row; so an overflow, or a failed cast of a DECIMAL `CASE` value, inside a condition fails exactly when a row reaches it in that order. OR factoring makes a conjunct every branch of an `OR` shares a WHERE conjunct of its own, so its operands are then computed for every row: `id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1` overflows where the `OR`'s own argument order would have computed `i16 * 2` for one row only (the factoring's result written by hand, `i16 * 2 > 1 AND (id = 6 OR id = 11)`, has always failed the same way) | may reorder conjunctions by its cost model, and computes the argument of a `NOT` for every row, so an overflow or a failed cast can fail in one engine and not the other (`NOT (x < 100 AND x * x > 0)` fails in DuckDB; both factored forms above answer) | the random generator never writes arithmetic that can overflow nor a `CASE` value whose cast can fail; `exec.ComputeTest.ConditionsAreThreeValued` pins antb1's order, and `tests/slt/cases/joins/or_factoring.slt` both forms of the overflow against DuckDB's answer. Narrowed by the implied-`IN` derivation (ADR 0026): a derived conjunct reaches the scan and takes rows away from the arithmetic above it, so all three of that file's overflow cases now answer, and agree with DuckDB |
-| D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison or a `BETWEEN` bound that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table |
+| D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison, a `BETWEEN` bound or a value of an `IN` list that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table, and `tests/slt/cases/in/in.slt` the same for an `IN` list |
 | D18 | DECIMAL SUM beyond 38 digits | a `SUM` of a DECIMAL(p,s) whose result has more than 38 digits is an execution error (`SUM overflow: the result is outside the range of DECIMAL(38,s) (38 decimal digits)`), as for HUGEINT (D9) | returns up to 39 digits until its 128-bit sum overflows | `tests/slt/cases/types/decimal_arithmetic.slt` pins both answers; the generator sums only DECIMAL columns whose sum over every row fits 38 digits |
 | D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic, and the cast errors of DECIMAL `CASE` values, print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order; a failed cast names the column it casts (`when casting from source column b`) only for a column reference, an aggregate's output and a key included | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; it also names the column of an expression its optimizer reduces to one (`b + 0`); the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order, `exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` the named columns |
 | D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
@@ -1282,18 +1285,18 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q20 | unsupported | needs window aggregates |
 | Q21 | unsupported | needs general CAST, NULL literals |
 | Q22 | unsupported | needs ROLLUP and GROUPING() |
-| Q23 | unsupported | needs constant expressions in IN lists, `*` next to other select items, UNION ALL |
+| Q23 | unsupported | needs `*` next to other select items, UNION ALL |
 | Q24 | unsupported | needs upper and lower |
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
 | Q27 | unsupported | needs NULL literals, UNION ALL |
 | Q28 | unsupported | needs cross products of one-row inputs |
-| Q29 | unsupported | needs constant expressions in IN lists |
+| Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |
 | Q31 | unsupported | needs NULL literals |
 | Q32 | pass | answered when the ratchet was added |
 | Q33 | unsupported | needs UNION ALL |
-| Q34 | unsupported | needs constant expressions in IN lists, NULL literals |
+| Q34 | unsupported | needs NULL literals |
 | Q35 | unsupported | needs EXISTS or IN subqueries under OR |
 | Q36 | unsupported | needs NULL literals, UNION, UNION ALL, rank() windows |
 | Q37 | pass | answered when the ratchet was added |
@@ -1305,14 +1308,14 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q43 | unsupported | needs NULL literals |
 | Q44 | unsupported | needs IS [NOT] NULL, rank() windows |
 | Q45 | unsupported | needs EXISTS or IN subqueries under OR |
-| Q46 | unsupported | needs constant expressions in IN lists |
+| Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, NULL literals, window aggregates, rank() windows |
 | Q48 | pass | answered when the ratchet was added |
 | Q49 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL, rank() windows |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, IS [NOT] NULL, window aggregates, window frames |
 | Q52 | pass | answered when the ratchet was added |
-| Q53 | unsupported | needs abs, constant expressions in IN lists, NULL literals, window aggregates |
+| Q53 | unsupported | needs abs, NULL literals, window aggregates |
 | Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates, UNION ALL |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | unsupported | needs UNION ALL |
@@ -1322,23 +1325,23 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q60 | unsupported | needs UNION ALL |
 | Q61 | unsupported | needs general CAST, cross products of one-row inputs |
 | Q62 | unsupported | needs `*` next to other select items |
-| Q63 | unsupported | needs abs, constant expressions in IN lists, NULL literals, window aggregates |
+| Q63 | unsupported | needs abs, NULL literals, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | unsupported | needs UNION ALL |
 | Q67 | unsupported | needs COALESCE, ROLLUP and GROUPING(), rank() windows |
-| Q68 | unsupported | needs constant expressions in IN lists |
+| Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
 | Q71 | unsupported | needs UNION ALL |
 | Q72 | unsupported | needs DATE + INTEGER, IS [NOT] NULL |
-| Q73 | unsupported | needs constant expressions in IN lists, NULL literals |
-| Q74 | unsupported | needs constant expressions in IN lists, NULL literals, UNION ALL |
+| Q73 | unsupported | needs NULL literals |
+| Q74 | unsupported | needs NULL literals, UNION ALL |
 | Q75 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL |
 | Q76 | unsupported | needs IS [NOT] NULL, UNION ALL |
 | Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING(), UNION ALL |
 | Q78 | unsupported | needs COALESCE, IS [NOT] NULL, round |
-| Q79 | unsupported | needs constant expressions in IN lists |
+| Q79 | pass | constant integer expressions in IN lists |
 | Q80 | unsupported | needs COALESCE, concat, ROLLUP and GROUPING(), UNION ALL |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |

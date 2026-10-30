@@ -269,7 +269,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING a IN (1, COUNT(*))", kUnsupported, "COUNT(*)",
-                  "only literals are supported in an IN list"},
+                  "only literals and constant integer expressions are supported in an IN list"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 'x' LIKE 'y'", kUnsupported, "'x'",
                   "LIKE needs a column or an aggregate on the left"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 IN (1)", kUnsupported, "1",
@@ -281,13 +281,11 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
                   "LIKE is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
-                  "only literals are supported in an IN list"},
+                  "only literals and constant integer expressions are supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
                   "IN is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
-        ErrorCase{"SELECT a FROM t WHERE region IN (1 + 2)", kUnsupported, "1 + 2",
-                  "only literals are supported in an IN list"},
         ErrorCase{"SELECT toDateTime(d) FROM t", kBind, "d",
                   "toDateTime() needs an integer (seconds), but 'd' is DOUBLE"},
         ErrorCase{"SELECT toDateTime(h) FROM t", kBind, "h", "toDateTime() needs an integer"},
@@ -371,6 +369,17 @@ INSTANTIATE_TEST_SUITE_P(
                   "integer constants outside HUGEINT's range (38 digits) are not supported"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 > 100000000000000000000000000000000000000 - 1",
                   kUnsupported, "100000000000000000000000000000000000000",
+                  "integer constants outside HUGEINT's range (38 digits) are not supported"},
+        // The same in an IN list: a constant that does not fold stays unsupported, an overflow
+        // is the comparison's bind error (D17) and a HUGEINT past 38 digits is unsupported.
+        ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 1 // 1)", kUnsupported, "1 // 1",
+                  "only literals and constant integer expressions are supported in an IN list"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 NOT IN (2 * 1.5, 1)", kUnsupported, "2 * 1.5",
+                  "only literals and constant integer expressions are supported in an IN list"},
+        ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 2147483647 + 1)", kBind, "2147483647 + 1",
+                  "Overflow in addition of INTEGER"},
+        ErrorCase{"SELECT i32 FROM t WHERE h IN (99999999999999999999999999999999999999 + 1)",
+                  kUnsupported, "99999999999999999999999999999999999999 + 1",
                   "integer constants outside HUGEINT's range (38 digits) are not supported"},
         // DuckDB compares a DOUBLE and a BIGINT BETWEEN all in DOUBLE, antb1 pairwise.
         ErrorCase{"SELECT i32 FROM t WHERE i64 BETWEEN 1e0 AND 9223372036854775806", kUnsupported,
@@ -765,7 +774,7 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
-                  "only literals are supported in an IN list"},
+                  "only literals and constant integer expressions are supported in an IN list"},
         // A call with the wrong number of arguments stays a bind error whatever its arguments
         // (CheckSupported does not look into them, and the binder reports the arity before it
         // binds one).
@@ -2779,6 +2788,51 @@ std::vector<Predicate> FilterPredicates(const LogicalPlan& plan) {
     node = inputs.empty() ? nullptr : inputs[0].get();
   }
   return out;
+}
+
+// A constant integer expression in an IN list is the literal of its value, as on a side of a
+// comparison: the list binds exactly as the one written with those literals, in WHERE and HAVING,
+// also where a DOUBLE-typed number makes the list DOUBLE, and an overflow is the comparison's
+// error.
+TEST(BinderTest, InListFoldsConstantIntegerExpressions) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view folded;
+    std::string_view literal;
+  };
+  for (const Case& c : {
+           Case{.folded = "SELECT COUNT(*) FROM t WHERE i16 IN (10, 10 + 1, 2 * 3, -(4))",
+                .literal = "SELECT COUNT(*) FROM t WHERE i16 IN (10, 11, 6, -4)"},
+           Case{.folded = "SELECT COUNT(*) FROM t WHERE i32 NOT IN (300 + 5, 7 - 8)",
+                .literal = "SELECT COUNT(*) FROM t WHERE i32 NOT IN (305, -1)"},
+           Case{.folded = "SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740992 + 1, 1e0)",
+                .literal = "SELECT COUNT(*) FROM t WHERE i64 IN (9007199254740993, 1e0)"},
+           Case{.folded = "SELECT COUNT(*) FROM t WHERE i16 IN (40000 - 1)",
+                .literal = "SELECT COUNT(*) FROM t WHERE i16 IN (39999)"},
+           Case{.folded = "SELECT i16 FROM t GROUP BY i16 HAVING MAX(i32) IN (1 + 1, 3)",
+                .literal = "SELECT i16 FROM t GROUP BY i16 HAVING MAX(i32) IN (2, 3)"},
+       }) {
+    auto folded = BindSql(c.folded, catalog);
+    auto literal = BindSql(c.literal, catalog);
+    ASSERT_TRUE(folded.ok()) << c.folded << ": " << folded.status().ToString();
+    ASSERT_TRUE(literal.ok()) << c.literal << ": " << literal.status().ToString();
+    const std::vector<Predicate> a = FilterPredicates(*folded);
+    const std::vector<Predicate> b = FilterPredicates(*literal);
+    ASSERT_EQ(a.size(), b.size()) << c.folded;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      EXPECT_EQ(a[i].kind, b[i].kind) << c.folded;
+      ASSERT_EQ(a[i].values.size(), b[i].values.size()) << c.folded;
+      for (std::size_t j = 0; j < a[i].values.size(); ++j) {
+        EXPECT_EQ(a[i].values[j].type, b[i].values[j].type) << c.folded;
+        EXPECT_EQ(a[i].values[j].value, b[i].values[j].value) << c.folded;
+      }
+    }
+  }
+  auto in = BindSql("SELECT COUNT(*) FROM t WHERE i32 IN (1, 2147483647 + 1)", catalog);
+  auto eq = BindSql("SELECT COUNT(*) FROM t WHERE i32 = 2147483647 + 1", catalog);
+  ASSERT_FALSE(in.ok());
+  ASSERT_FALSE(eq.ok());
+  EXPECT_EQ(in.status().message(), eq.status().message());
 }
 
 // A DECIMAL compares with a DECIMAL of another precision or scale, with an integer and with a

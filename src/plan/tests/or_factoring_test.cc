@@ -221,6 +221,13 @@ TEST(OrFactoringTest, DerivesNothingWhereABranchLeavesTheColumnFree) {
   EXPECT_EQ(conjuncts("(a = b AND c = 2) OR (a = 1 AND c = 3)"), 2U);
   // Mixing literal kinds would make the derived IN a bind error on a query that binds today.
   EXPECT_EQ(conjuncts("(a = 1 AND c = 2) OR (a = 'x' AND c = 3)"), 2U);
+  // An IN list with a constant integer expression contributes none of its values, whatever their
+  // order: its literals alone would derive `a IN (1, 3)` and drop the rows where `a` is 7.
+  EXPECT_EQ(conjuncts("a IN (1, 1 + 6) OR a = 3"), 1U);
+  EXPECT_EQ(conjuncts("a IN (1 + 6, 1) OR a = 3"), 1U);
+  EXPECT_EQ(conjuncts("(a IN (1, 1 + 6) AND b = 2) OR (a = 3 AND b = 4)"), 2U);
+  EXPECT_EQ(Factor("(a IN (1, 1 + 6) AND b = 2) OR (a = 3 AND b = 4)").conjuncts.back(),
+            "b IN (2, 4)");
   // One value for every branch is the shared-conjunct path's, not this one's: no IN is added.
   EXPECT_EQ(Factor("(a = 1 AND b = 2) OR (a = 1 AND b = 3)").conjuncts,
             (Texts{"a = 1", "b = 2 OR b = 3", "b IN (2, 3)"}));
