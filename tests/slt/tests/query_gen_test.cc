@@ -761,10 +761,13 @@ TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
 
 // What a nested query's text holds: the block names the table and projects its columns under their
 // own names, which is why the outer block can read them and why the property tests above, whose
-// guards are regexes over column names, still see them.
+// guards are regexes over column names, still see them. With kUnionAll each copy of a compound is
+// such a block, and the compound itself holds none of a block's fields (ADR 0036).
 TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
-  const auto gen = Make(37, {.supported = kSupportedFeatures, .target_percent = 0});
+  const FeatureSet with_union = Union(kSupportedFeatures, {Feature::kUnionAll});
+  const auto gen = Make(37, {.supported = with_union, .target_percent = 0});
   int checked = 0;
+  int compounds = 0;
   for (uint64_t i = 0; i < 2000 && checked < 150; ++i) {
     const auto q = gen.Generate(i);
     if (!Nests(q)) {
@@ -785,6 +788,9 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
     // The block, or each of its copies when it is a compound (ADR 0036).
     std::vector<const sql::SelectStatement*> blocks = {&nested};
     if (!nested.set_operation.empty()) {
+      ++compounds;
+      EXPECT_TRUE(nested.items.empty()) << "a compound's select lists are its blocks'";
+      EXPECT_TRUE(nested.from.empty()) << "a compound's FROM lists are its blocks'";
       blocks.clear();
       for (const sql::SetBranch& branch : nested.set_operation) {
         blocks.push_back(&*branch.query);
@@ -800,6 +806,7 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
     }
   }
   EXPECT_GE(checked, 100) << "checked " << checked << " nested queries";
+  EXPECT_GT(compounds, 10) << "compounds: " << compounds;  // VERIFY: about 45 of 150 expected
 }
 
 // A join that fails fails before the first draw from the first stream, so its query falls back
@@ -1402,6 +1409,7 @@ void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& o
 }
 
 void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   for (const sql::CommonTableExpr& cte : stmt.with) {
     DeepSubqueries(*cte.query, out);
   }
@@ -1427,6 +1435,10 @@ void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::Sub
   }
   for (const sql::OrderItem& item : stmt.order_by) {
     DeepSubqueries(item.expr, out);
+  }
+  // A compound's blocks (ADR 0036): its own block fields above are empty.
+  for (const sql::SetBranch& branch : stmt.set_operation) {
+    DeepSubqueries(*branch.query, out);
   }
 }
 
@@ -1658,6 +1670,9 @@ TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
         derived != nullptr ? *derived->query : *ast->with.at(0).query;
     ASSERT_GE(nested.set_operation.size(), 2U);
     ASSERT_LE(nested.set_operation.size(), 3U);
+    // The first and third streams pick the table and nest it, so the plain query nests the same
+    // table in one block, bounded by the table's rows, which the compound reads once per copy.
+    EXPECT_EQ(q.row_bound, static_cast<int64_t>(nested.set_operation.size()) * plain.row_bound);
     // The copies are one block, each spelled as the generator spells any name (case, quotes).
     const auto reads = [](const sql::SelectStatement& block) {
       std::vector<std::string> names;
@@ -1675,6 +1690,46 @@ TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
   }
   EXPECT_GT(took, 100) << "took: " << took;
   EXPECT_GT(same, 6000);
+}
+
+// The copies multiply the rows that every row guard of the query reads (Nest): over a table of 20
+// rows a compound has 40 or 60, so SELECT * over three copies takes the LIMIT that more than
+// kStarMaxRows (50) rows require, and over two copies it need not.
+TEST(QueryGenerator, UnionAllRowBoundGuardsSelectStar) {
+  GenTable table = Tables().front();
+  table.rows = 20;
+  const FeatureSet with_union = Union(kSupportedFeatures, {Feature::kUnionAll});
+  const auto gen = MakeOver({table}, 79, {.supported = with_union, .target_percent = 0});
+  int compounds = 0;
+  int three_copy_stars = 0;          // SELECT * over three copies: always with a LIMIT
+  int unlimited_two_copy_stars = 0;  // SELECT * over two copies without one
+  for (uint64_t i = 0; i < 5000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kUnionAll)) {
+      continue;
+    }
+    ++compounds;
+    SCOPED_TRACE(q.sql);
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    const auto* derived = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
+    const sql::SelectStatement& nested =
+        derived != nullptr ? *derived->query : *ast->with.at(0).query;
+    const auto copies = static_cast<int64_t>(nested.set_operation.size());
+    EXPECT_EQ(q.row_bound, copies * table.rows);
+    if (!q.features.Has(Feature::kStar)) {
+      continue;
+    }
+    if (copies == 3) {
+      ++three_copy_stars;
+      EXPECT_TRUE(q.features.Has(Feature::kLimit)) << "60 rows are more than kStarMaxRows";
+    } else if (!q.features.Has(Feature::kLimit)) {
+      ++unlimited_two_copy_stars;
+    }
+  }
+  EXPECT_GT(compounds, 100) << "compounds: " << compounds;  // VERIFY: about 300 expected
+  EXPECT_GT(three_copy_stars, 0);  // VERIFY: about 20 expected (6% compounds, 1/2 three, 15% *)
+  EXPECT_GT(unlimited_two_copy_stars, 0) << "40 rows need no LIMIT";  // VERIFY: about 18 expected
 }
 
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
