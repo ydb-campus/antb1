@@ -151,7 +151,7 @@ BASELINE: dict[str, str] = {
         `.pre-commit-config.yaml`, `.clang-format`, `.clang-tidy`, `tests/.clang-tidy`, `scripts/ctest.sh`,
         `scripts/agent-setup.sh`, `tests/data/clickbench_status.json`, `scripts/lint.sh`, `scripts/fmt.sh`,
         `tools/sanitizers/`, `.markdownlint-cli2.yaml`, `_typos.toml`, `ruff.toml`, `.gersemirc`, `tombi.toml`,
-        `tests/data/tpch_status.json`, `/LICENSE`, `/NOTICE`.
+        `tests/data/tpch_status.json`, `tests/data/tpcds_status.json`, `/LICENSE`, `/NOTICE`.
 
         ## Code Review Rules
 
@@ -673,6 +673,29 @@ def test_r009_tpch_material(repo: Path) -> None:
     assert [f.line for f in out if f.path == "third_party/EULA.txt"] == [3]
 
 
+def test_r009_tpcds_material(repo: Path) -> None:
+    # dsdgen's tables, distribution file and query templates, and DuckDB's TPC-DS query and answer files.
+    write(repo, {"t/store_sales.dat": "1|2|", "t/tpcds.idx": "x", "t/query14.tpl": "define", "q/14.sql": "SELECT 1;"})
+    write(repo, {"a/sf1/14.csv": "1", "a/sf1/q14.csv": "1"})
+    # The kit's distribution sources, dsqgen's query streams and its answer sets.
+    write(repo, {"k/tpcds.dst": "x", "k/query_0.sql": "SELECT 1;", "k/1.ans": "1", "k/14_NULLS_FIRST.ans": "1"})
+    write(repo, {"t/notes.md": "ok", "q/114.sql": "SELECT 1;", "q/x14.sql": "SELECT 1;", "t/tpcds.md": "ok"})
+    write(repo, {"k/query_template.sql": "SELECT 1;", "k/123.ans": "1"})
+    paths = {f.path for f in findings(repo, "R009")}
+    assert paths == {
+        "t/store_sales.dat",
+        "t/tpcds.idx",
+        "t/query14.tpl",
+        "q/14.sql",
+        "a/sf1/14.csv",
+        "a/sf1/q14.csv",
+        "k/tpcds.dst",
+        "k/query_0.sql",
+        "k/1.ans",
+        "k/14_NULLS_FIRST.ans",
+    }
+
+
 # --- R010 ------------------------------------------------------------------------------------------------------------
 
 
@@ -816,6 +839,39 @@ def test_r011_tpch_ratchet_needs_its_section(repo: Path) -> None:
     assert [(f.line, f.message[:41]) for f in out] == [(7, "no `Queries derived from TPC-H` section w")]
     write(repo, {"tests/data/tpch_status.json": "[1]"})
     assert "tests/data/tpch_status.json:1: R011 not a JSON object with a `pass` list" in messages(repo, "R011")
+
+
+TPCDS_SECTION = """
+    ## Queries derived from TPC-DS
+
+    | Query | Status |
+    |---|---|
+    | Q1 | unsupported |
+    | Q3 | pass |
+"""
+
+
+def test_r011_tpcds_ratchet(repo: Path) -> None:
+    doc = "# SQL subset\n" + textwrap.dedent(TPCH_SECTION) + textwrap.dedent(TPCDS_SECTION)
+    status = {"tests/data/tpch_status.json": '{"pass": [1]}', "tests/data/tpcds_status.json": '{"pass": [3]}'}
+    write(repo, {"docs/sql-subset.md": doc, **status})
+    assert findings(repo, "R011") == []
+    # Each workload reads the table under its own heading: TPC-H's Q1 pass does not satisfy TPC-DS's ratchet.
+    write(repo, {"tests/data/tpcds_status.json": '{"pass": [1, 3]}'})
+    out = findings(repo, "R011")
+    assert [(f.line, f.message) for f in out] == [
+        (
+            19,  # the TPC-DS table's header row
+            "`Queries derived from TPC-DS` table passes [3], the ratchet (tests/data/tpcds_status.json) [1, 3]",
+        )
+    ]
+
+
+def test_r011_tpcds_ratchet_needs_its_section(repo: Path) -> None:
+    write(repo, {"tests/data/tpcds_status.json": '{"pass": []}'})
+    assert "no `Queries derived from TPC-DS` section with a status table" in messages(repo, "R011")
+    write(repo, {"tests/data/tpcds_status.json": "[1]"})
+    assert "tests/data/tpcds_status.json:1: R011 not a JSON object with a `pass` list" in messages(repo, "R011")
 
 
 @pytest.mark.parametrize("path", ["tests/data/tpch_status.json", "tests/data/clickbench_status.json"])

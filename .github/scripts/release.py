@@ -836,7 +836,7 @@ def check_antb1_source(data: bytes, rel: Release, root: Path, where: str) -> Non
 
 def render_notes(rel: Release, files: dict[str, tuple[str, int]], tag: Tag | None) -> str:
     """The release body: the annotation, the assets, how to install and verify, the platforms and the licences.
-    Nothing measured goes here (no benchmark figures, nothing derived from ClickBench or TPC-H)."""
+    Nothing measured goes here (no benchmark figures, nothing derived from ClickBench, TPC-H or TPC-DS)."""
     base = f"https://github.com/{rel.repo}/releases"
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     run = f"{server}/{rel.repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '?')}"

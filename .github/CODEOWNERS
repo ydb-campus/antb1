@@ -26,6 +26,7 @@
 /scripts/agent-setup.sh @Hor911 @lll-phill-lll
 /tests/data/clickbench_status.json @Hor911 @lll-phill-lll
 /tests/data/tpch_status.json @Hor911 @lll-phill-lll
+/tests/data/tpcds_status.json @Hor911 @lll-phill-lll
 /scripts/lint.sh @Hor911 @lll-phill-lll
 /scripts/fmt.sh @Hor911 @lll-phill-lll
 /tools/sanitizers/ @Hor911 @lll-phill-lll
