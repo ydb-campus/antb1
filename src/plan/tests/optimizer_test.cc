@@ -181,7 +181,10 @@ TEST(OptimizerTest, IsIdempotentAndKeepsTheOutput) {
         "SELECT AVG(i32), MAX(dt) FROM t WHERE dt >= DATE '2013-07-01' AND d < 0.5",
         "SELECT i64, dt FROM u WHERE i64 > 9223372036854775807",
         "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
-        "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1"}) {
+        "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1",
+        "SELECT x, COUNT(*) FROM (SELECT i16 AS x FROM t WHERE i32 > 1 UNION ALL SELECT i32 FROM "
+        "u) "
+        "AS v GROUP BY x"}) {
     const LogicalPlan once = Optimized(sql);
     const LogicalPlan twice = Optimized(once);
     EXPECT_EQ(Explain(twice), Explain(once)) << sql;
@@ -242,7 +245,11 @@ TEST(OptimizerTest, KeepsTheColumnIds) {
        {"SELECT i16 + 1 FROM t WHERE i32 // 2 > 0", "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
         "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
         "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
-        "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3", "SELECT * FROM ok WHERE s = 'x' LIMIT 2"}) {
+        "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3", "SELECT * FROM ok WHERE s = 'x' LIMIT 2",
+        "SELECT i16, s FROM t UNION ALL SELECT i32, s FROM u WHERE i64 > 3",
+        "SELECT a.x FROM (SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u) AS a JOIN ok ON a.x "
+        "= "
+        "ok.i16"}) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql;
     const LogicalPlan optimized = Optimized(*bound);
@@ -462,6 +469,9 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
            "SELECT CASE WHEN i16 > 0 THEN s ELSE 'neg' END AS c FROM t ORDER BY c LIMIT 5",
            "SELECT SUM(i32) + 1, COUNT(*) FROM t HAVING SUM(i32) > 5 OR COUNT(*) < 2",
            kHavingAlias,
+           "SELECT x, COUNT(*) FROM (SELECT i16 AS x, s FROM t UNION ALL SELECT i32, s FROM u) AS "
+           "v "
+           "WHERE s = 'a' GROUP BY x",
        }) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();

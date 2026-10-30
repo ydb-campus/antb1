@@ -106,8 +106,8 @@ enum class Feature : std::uint8_t {
   // and absent from kSupportedFeatures.
   kCorrelatedExists,     // [NOT] EXISTS (SELECT * FROM inner WHERE inner.k = outer.k [AND ...])
   kCorrelatedAggregate,  // <lit> <op> (SELECT <aggregate> FROM inner WHERE inner.k = outer.k)
-  // A compound (ADR 0036): blocks joined by UNION ALL, as a derived table's or a CTE's query. X2
-  // parses it and generates it, and the binder refuses it with exit code 4 until X3 declares it.
+  // A compound (ADR 0036): blocks joined by UNION ALL, as a derived table's or a CTE's query; X2
+  // parses and generates it, and X3 answers and declares it.
   kUnionAll,  // (SELECT ... UNION ALL SELECT ...) as a nested query
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
@@ -391,6 +391,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kScalarSubquery,
     Feature::kCorrelatedExists,
     Feature::kCorrelatedAggregate,
+    Feature::kUnionAll,
 };
 static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
               "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");

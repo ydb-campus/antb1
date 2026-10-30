@@ -1,0 +1,204 @@
+# UNION ALL's errors and what is not answered yet (ADR 0036): column counts that differ are a bind error in both
+# engines; the other set operations (X4), a UNION ALL's own ORDER BY, LIMIT and OFFSET (X5) and a subquery over a
+# UNION ALL (X6) wait on their roadmap items; values with no exact common type stay DuckDB's; and divergence D26.
+
+# ---- the input ----
+
+query II nosort
+SELECT COUNT(*), MAX(ct_id) FROM cities
+----
+6	6
+
+# ---- bind errors in both engines: column counts ----
+
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities UNION ALL SELECT ct_id, label FROM cities
+
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id FROM cities UNION ALL SELECT ct_id, ct_pop FROM cities) AS u
+
+# Every block binds before the counts are compared.
+statement error nope
+SELECT ct_id FROM cities UNION ALL SELECT ct_id, label FROM cities UNION ALL SELECT nope FROM cities
+
+# A block does not see another block's names.
+statement error zn_id
+SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM cities
+
+# ---- the other set operations (ADR 0036's X4) ----
+
+pending X4
+query I rowsort
+SELECT ct_id FROM cities UNION SELECT zn_city FROM zones
+----
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+pending X4
+query I rowsort
+SELECT ct_id FROM cities UNION DISTINCT SELECT zn_city FROM zones
+----
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+pending X4
+query I rowsort
+SELECT ct_id FROM cities INTERSECT SELECT zn_city FROM zones
+----
+1
+2
+3
+4
+5
+
+pending X4
+query I rowsort
+SELECT ct_id FROM cities EXCEPT SELECT zn_city FROM zones
+----
+6
+
+pending X4
+query I rowsort
+SELECT ct_id AS x FROM cities UNION ALL BY NAME SELECT zn_city AS x FROM zones WHERE zn_id < 3
+----
+1
+1
+2
+2
+3
+4
+5
+6
+
+pending X4
+query I rowsort
+SELECT ct_id FROM cities UNION ALL (SELECT zn_city FROM zones WHERE zn_id < 3)
+----
+1
+1
+2
+2
+3
+4
+5
+6
+
+# ---- a UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5) ----
+
+pending X5
+query I nosort
+SELECT ct_id FROM cities UNION ALL SELECT zn_city FROM zones ORDER BY 1 DESC LIMIT 3
+----
+9
+6
+5
+
+pending X5
+query I nosort
+SELECT COUNT(*) FROM (SELECT ct_id FROM cities UNION ALL SELECT zn_city FROM zones LIMIT 10) AS u
+----
+10
+
+pending X5
+query I nosort
+SELECT COUNT(*) FROM (SELECT ct_id FROM cities UNION ALL SELECT zn_city FROM zones OFFSET 40) AS u
+----
+6
+
+# ---- a subquery over a UNION ALL (ADR 0036's X6) ----
+
+pending X6
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id < 3 UNION ALL SELECT ct_id FROM cities)
+----
+420
+
+pending X6
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM zones AS z WHERE z.zn_city = c.ct_id UNION ALL SELECT * FROM zones AS z WHERE z.zn_id = c.ct_id)
+----
+6
+
+pending X6
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(ct_pop) FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_id < 0)
+----
+0
+
+# ---- DuckDB only, for good: values with no exact common type (ADR 0036) ----
+# DuckDB casts every type mix, a cast that fails failing per row; antb1 casts only exact widenings and exits 4.
+
+onlyif duckdb
+query T rowsort
+SELECT ct_id FROM cities WHERE ct_id < 3 UNION ALL SELECT label FROM cities WHERE ct_id < 3
+----
+1
+2
+center
+harbor
+
+onlyif duckdb
+query T rowsort
+SELECT tr_day FROM trips WHERE tr_row < 2 UNION ALL SELECT '2020-01-01' FROM cities WHERE ct_id = 1
+----
+2020-01-01
+2026-03-01
+2026-03-02
+
+onlyif duckdb
+query R rowsort
+SELECT i64 FROM edge UNION ALL SELECT d FROM edge
+----
+-0.3333333333333333
+-0.5
+-1
+-1e+15
+-42
+-9007199254740992
+-9223372036854775808
+0
+0
+0.1
+0.3333333333333333
+0.6666666666666666
+1
+123456789.125
+1e+15
+42
+7
+9.99999993e-10
+9223372036854775808
+922337203685477632
+NULL
+NULL
+NULL
+NULL
+
+# ---- divergence D26: errors under a LIMIT without ORDER BY ----
+# antb1 never opens a block that a met LIMIT does not need, so the overflow of the second block never surfaces; DuckDB
+# runs a vector of every block and fails. With ORDER BY every row is needed, and both engines fail.
+
+onlyif antb1
+query I nosort
+SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id + 9223372036854775807 FROM cities) AS u LIMIT 1
+----
+1
+
+onlyif duckdb
+statement error Overflow
+SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id + 9223372036854775807 FROM cities) AS u LIMIT 1
+
+statement error Overflow
+SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id + 9223372036854775807 FROM cities) AS u ORDER BY x LIMIT 1

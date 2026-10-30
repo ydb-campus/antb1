@@ -1,0 +1,4 @@
+antb1: bind error: Set operations can only apply to expressions with the same number of result columns
+  at line 2, column 1
+  UNION ALL SELECT WatchID, Title FROM t
+  ^^^^^^^^^
