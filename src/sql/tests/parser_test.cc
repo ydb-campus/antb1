@@ -1376,6 +1376,28 @@ TEST(ParserTest, Casts) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
 }
 
+// ELSE NULL is a CASE without ELSE (DuckDB's NULL for the rows no branch takes, its type and its
+// name), in every clause; NULL anywhere else stays an unsupported literal.
+TEST(ParserTest, ElseNullIsACaseWithoutElse) {
+  for (const auto& [with_null, without] : {
+           std::pair{"SELECT CASE WHEN a > 1 THEN b ELSE NULL END FROM t",
+                     "SELECT CASE WHEN a > 1 THEN b END FROM t"},
+           std::pair{"SELECT CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE null END FROM t",
+                     "SELECT CASE a WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t"},
+           std::pair{"SELECT SUM(CASE WHEN a = 1 THEN b ELSE NULL END) FROM t",
+                     "SELECT SUM(CASE WHEN a = 1 THEN b END) FROM t"},
+           std::pair{"SELECT a FROM t WHERE CASE WHEN b > 0 THEN a / b ELSE NULL END > 1",
+                     "SELECT a FROM t WHERE CASE WHEN b > 0 THEN a / b END > 1"},
+       }) {
+    auto stmt = Parse(with_null);
+    auto expected = Parse(without);
+    ASSERT_TRUE(stmt.has_value()) << with_null << ": " << stmt.error().message;
+    ASSERT_TRUE(expected.has_value()) << without << ": " << expected.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *expected)) << with_null;
+    EXPECT_EQ(ToSql(*stmt), ToSql(*expected)) << with_null;
+  }
+}
+
 // A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
 // in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
 TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
@@ -2623,6 +2645,16 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"NullInSelect", "SELECT ^NULL FROM events", kUnsupported, 4,
                    "NULL literals are not supported"},
         RejectCase{"LimitNull", "SELECT a FROM events LIMIT ^NULL", kUnsupported, 4,
+                   "NULL literals are not supported"},
+        // ELSE NULL END alone is a CASE without ELSE; NULL as a THEN value, as an operand of the
+        // ELSE value or in parentheses is still a NULL literal.
+        RejectCase{"ThenNull", "SELECT CASE WHEN a > 1 THEN ^NULL ELSE 1 END FROM events",
+                   kUnsupported, 4, "NULL literals are not supported"},
+        RejectCase{"ElseNullOperand",
+                   "SELECT CASE WHEN a > 1 THEN 1 ELSE ^NULL + 1 END FROM events", kUnsupported, 4,
+                   "NULL literals are not supported"},
+        RejectCase{"ElseParenthesizedNull",
+                   "SELECT CASE WHEN a > 1 THEN 1 ELSE (^NULL) END FROM events", kUnsupported, 4,
                    "NULL literals are not supported"},
         RejectCase{"UnaryPlus", "SELECT a FROM events WHERE a = ^+1", kUnsupported, 1,
                    "unary '+' is not supported"},

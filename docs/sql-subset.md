@@ -123,7 +123,7 @@ postfix     = primary , { "::" , type } ;
 primary     = column_ref | literal | "(" , expr , ")" | "(" , query , ")" | agg_call
             | identifier , "(" , [ expr , { "," , expr } ] , ")"
             | "CASE" , [ expr ] , "WHEN" , expr , "THEN" , expr , { "WHEN" , expr , "THEN" , expr } ,
-              [ "ELSE" , expr ] , "END"
+              [ "ELSE" , ( "NULL" | expr ) ] , "END"
             | "EXTRACT" , "(" , identifier , "FROM" , expr , ")"
             | ( "CAST" | "TRY_CAST" ) , "(" , expr , "AS" , type , ")" ;
 type        = identifier , [ "(" , integer , { "," , integer } , ")" ] ;
@@ -317,7 +317,7 @@ the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the pars
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-`SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals, `IS [NOT] NULL`,
+`SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals (but `ELSE NULL END`), `IS [NOT] NULL`,
 `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
@@ -530,7 +530,8 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   (`cannot mix values of type VARCHAR and DECIMAL(15,2) in CASE`), as is a DATE, TIMESTAMP or VARCHAR value with a
   DECIMAL; otherwise (an `ELSE` literal too) it takes the type folded next, and a string literal that a DECIMAL type
   takes is unsupported (DuckDB casts it), as is a FLOAT column as a value (divergence D11). `CASE x WHEN v THEN ..` is
-  `CASE WHEN x = v THEN ..`. The result name is DuckDB's: `CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END`.
+  `CASE WHEN x = v THEN ..`. `ELSE NULL` is a `CASE` without `ELSE`, in DuckDB too: the same NULLs, type and name.
+  The result name is DuckDB's: `CASE  WHEN ((a = 1)) THEN (b) ELSE NULL END`.
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
@@ -1264,9 +1265,9 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
 | Q1 | pass | answered when the ratchet was added |
-| Q2 | unsupported | needs NULL literals, round, UNION ALL |
+| Q2 | unsupported | needs round, UNION ALL |
 | Q3 | pass | answered when the ratchet was added |
-| Q4 | unsupported | needs NULL literals, UNION ALL |
+| Q4 | unsupported | needs UNION ALL |
 | Q5 | unsupported | needs general CAST, concat, ROLLUP and GROUPING(), UNION ALL |
 | Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates |
 | Q7 | pass | answered when the ratchet was added |
@@ -1283,7 +1284,7 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q18 | unsupported | needs general CAST, ROLLUP and GROUPING() |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates |
-| Q21 | unsupported | needs general CAST, NULL literals |
+| Q21 | unsupported | needs general CAST |
 | Q22 | unsupported | needs ROLLUP and GROUPING() |
 | Q23 | unsupported | needs `*` next to other select items, UNION ALL |
 | Q24 | unsupported | needs upper and lower |
@@ -1293,10 +1294,10 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q28 | unsupported | needs cross products of one-row inputs |
 | Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |
-| Q31 | unsupported | needs NULL literals |
+| Q31 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q32 | pass | answered when the ratchet was added |
 | Q33 | unsupported | needs UNION ALL |
-| Q34 | unsupported | needs NULL literals |
+| Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q35 | unsupported | needs EXISTS or IN subqueries under OR |
 | Q36 | unsupported | needs NULL literals, UNION, UNION ALL, rank() windows |
 | Q37 | pass | answered when the ratchet was added |
@@ -1305,27 +1306,27 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q40 | unsupported | needs general CAST, COALESCE |
 | Q41 | unsupported | needs a correlated COUNT subquery, SELECT DISTINCT |
 | Q42 | pass | answered when the ratchet was added |
-| Q43 | unsupported | needs NULL literals |
+| Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q44 | unsupported | needs IS [NOT] NULL, rank() windows |
 | Q45 | unsupported | needs EXISTS or IN subqueries under OR |
 | Q46 | pass | constant integer expressions in IN lists |
-| Q47 | unsupported | needs abs, NULL literals, window aggregates, rank() windows |
+| Q47 | unsupported | needs abs, window aggregates, rank() windows |
 | Q48 | pass | answered when the ratchet was added |
 | Q49 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL, rank() windows |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, IS [NOT] NULL, window aggregates, window frames |
 | Q52 | pass | answered when the ratchet was added |
-| Q53 | unsupported | needs abs, NULL literals, window aggregates |
+| Q53 | unsupported | needs abs, window aggregates |
 | Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates, UNION ALL |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | unsupported | needs UNION ALL |
-| Q57 | unsupported | needs abs, NULL literals, window aggregates, rank() windows |
+| Q57 | unsupported | needs abs, window aggregates, rank() windows |
 | Q58 | unsupported | needs scalar subqueries that are not aggregates |
-| Q59 | unsupported | needs NULL literals |
+| Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | unsupported | needs UNION ALL |
 | Q61 | unsupported | needs general CAST, cross products of one-row inputs |
 | Q62 | unsupported | needs `*` next to other select items |
-| Q63 | unsupported | needs abs, NULL literals, window aggregates |
+| Q63 | unsupported | needs abs, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | unsupported | needs UNION ALL |
@@ -1335,8 +1336,8 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q70 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
 | Q71 | unsupported | needs UNION ALL |
 | Q72 | unsupported | needs DATE + INTEGER, IS [NOT] NULL |
-| Q73 | unsupported | needs NULL literals |
-| Q74 | unsupported | needs NULL literals, UNION ALL |
+| Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
+| Q74 | unsupported | needs UNION ALL |
 | Q75 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL |
 | Q76 | unsupported | needs IS [NOT] NULL, UNION ALL |
 | Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING(), UNION ALL |
@@ -1351,7 +1352,7 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q86 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
 | Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
 | Q88 | unsupported | needs cross products of one-row inputs |
-| Q89 | unsupported | needs abs, NULL literals, window aggregates |
+| Q89 | unsupported | needs abs, window aggregates |
 | Q90 | unsupported | needs general CAST, NULL literals, cross products of one-row inputs |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
