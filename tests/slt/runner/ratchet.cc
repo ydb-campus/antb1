@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -213,6 +215,27 @@ std::string List(const std::vector<int64_t>& values) {
 std::expected<RatchetStatus, std::string> ParseRatchetStatus(std::string_view json,
                                                              const Workload& workload) {
   return StatusReader(json, workload.commit_key).Read();
+}
+
+std::optional<RatchetShard> ParseRatchetShard(std::string_view text) {
+  const std::size_t slash = text.find('/');
+  if (slash == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto number = [](std::string_view digits) -> std::optional<int64_t> {
+    int64_t value = 0;
+    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (error != std::errc{} || end != digits.data() + digits.size()) {
+      return std::nullopt;
+    }
+    return value;
+  };
+  const std::optional<int64_t> k = number(text.substr(0, slash));
+  const std::optional<int64_t> n = number(text.substr(slash + 1));
+  if (!k.has_value() || !n.has_value() || *n < 1 || *n > 99 || *k < 1 || *k > *n) {
+    return std::nullopt;
+  }
+  return RatchetShard{.index = *k - 1, .count = *n};
 }
 
 RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStatus& status,

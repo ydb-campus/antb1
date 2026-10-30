@@ -116,28 +116,6 @@ struct Args {
   std::string shard;   // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
 };
 
-// "K/N", 1 <= K <= N <= 99, as the slice of RatchetShard (K counts from 1 on the command line).
-std::optional<RatchetShard> ParseShard(std::string_view text) {
-  const std::size_t slash = text.find('/');
-  if (slash == std::string_view::npos) {
-    return std::nullopt;
-  }
-  const auto number = [](std::string_view digits) -> std::optional<int64_t> {
-    int64_t value = 0;
-    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
-    if (error != std::errc{} || end != digits.data() + digits.size()) {
-      return std::nullopt;
-    }
-    return value;
-  };
-  const std::optional<int64_t> k = number(text.substr(0, slash));
-  const std::optional<int64_t> n = number(text.substr(slash + 1));
-  if (!k.has_value() || !n.has_value() || *n < 1 || *n > 99 || *k < 1 || *k > *n) {
-    return std::nullopt;
-  }
-  return RatchetShard{.index = *k - 1, .count = *n};
-}
-
 std::string ShellQuote(std::string_view arg) {
   const bool plain = !arg.empty() && arg.find_first_not_of(
                                          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -685,7 +663,7 @@ int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
                          .command = command,
                          .clock = {}};
   if (!args.shard.empty()) {
-    const std::optional<RatchetShard> shard = ParseShard(args.shard);
+    const std::optional<RatchetShard> shard = ParseRatchetShard(args.shard);
     if (!shard.has_value()) {
       std::println(stderr, "antb1-slt: --shard expects K/N with 1 <= K <= N <= 99, got '{}'",
                    args.shard);

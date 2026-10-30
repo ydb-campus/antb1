@@ -5970,7 +5970,9 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
   static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
-  ANTB1_CHECK(stmt.order_by.empty() && !stmt.limit.has_value() && !stmt.offset.has_value());
+  ANTB1_CHECK(stmt.order_by.empty());
+  ANTB1_CHECK(!stmt.limit.has_value());
+  ANTB1_CHECK(!stmt.offset.has_value());
   std::vector<LogicalPlan> blocks;
   blocks.reserve(stmt.set_operation.size());
   for (const sql::SetBranch& branch : stmt.set_operation) {
@@ -6134,7 +6136,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   if (!stmt.set_operation.empty()) {
     // No subquery's query is a UNION ALL (RejectSubqueryConjunct refuses it, ADR 0036's X6), so it
     // is never an EXISTS block, and only its blocks' own subqueries read enclosing blocks.
-    ANTB1_CHECK(!outer_encloses && !inside_exists);
+    ANTB1_CHECK(!(outer_encloses || inside_exists));
     ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, BindUnionAll(stmt, catalog, options, ids, own, outer));
     return BoundBlockOf(std::move(plan));
   }

@@ -180,6 +180,25 @@ TEST(RunRatchet, OnlyTakesAQueryNumber) {
   }
 }
 
+// --shard takes K/N with K from 1 (the slice at index K - 1); anything else is refused, which
+// antb1-slt reports as a usage error.
+TEST(ParseRatchetShard, TakesKOfNFromOne) {
+  // A refused text reads as this impossible slice, so a field check fails too.
+  const auto parse = [](std::string_view text) {
+    return ParseRatchetShard(text).value_or(RatchetShard{.index = -1, .count = -1});
+  };
+  EXPECT_EQ(parse("2/4").index, 1);
+  EXPECT_EQ(parse("2/4").count, 4);
+  EXPECT_EQ(parse("1/1").index, 0);
+  EXPECT_EQ(parse("1/1").count, 1);
+  EXPECT_EQ(parse("99/99").index, 98);
+  EXPECT_EQ(parse("99/99").count, 99);
+  for (const char* bad : {"", "4", "/4", "1/", "0/4", "5/4", "-1/4", "1/0", "1/100", "a/4", "1/4/2",
+                          " 1/4", "1 /4", "+1/4"}) {
+    EXPECT_FALSE(ParseRatchetShard(bad).has_value()) << "'" << bad << "'";
+  }
+}
+
 // A shard runs every count-th query from its index and checks only those against the ratchet: a
 // listed query of another shard is no unexpected fail, a query of its own still is.
 TEST(RunRatchet, AShardRunsAndChecksItsSliceAlone) {

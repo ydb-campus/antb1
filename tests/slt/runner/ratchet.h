@@ -55,6 +55,10 @@ struct RatchetShard {
   int64_t count = 1;
 };
 
+// "K/N", 1 <= K <= N <= 99, as the slice of RatchetShard (K counts from 1 on the command line,
+// where --shard takes it); std::nullopt for anything else.
+std::optional<RatchetShard> ParseRatchetShard(std::string_view text);
+
 struct RatchetOptions {
   bool redact = false;
   std::optional<uint64_t> only;  // run only Q<only>

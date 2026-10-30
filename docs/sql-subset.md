@@ -569,8 +569,11 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   level. Each column's type is a left fold over the blocks' types in written order, as DuckDB folds it: a literal is
   typed by itself (`1` next to a SMALLINT column is INTEGER, unlike in `CASE`), equal types stay, two integer types
   give `CASE`'s type (USMALLINT with SMALLINT: INTEGER), and a DECIMAL with a DECIMAL or an integer gives `CASE`'s
-  DECIMAL, DECIMAL(e + s, s) or DECIMAL(38, 38 - e) beyond 38 digits -- so the order of the blocks can change it:
-  USMALLINT, SMALLINT and DECIMAL(9,2) make DECIMAL(12,2), but SMALLINT, DECIMAL(9,2) and USMALLINT DECIMAL(9,2).
+  DECIMAL: two DECIMALs DECIMAL(e + s, s), with e the most integer digits and s the larger scale, or DECIMAL(38,
+  38 - e) beyond 38 digits; an integer keeps the DECIMAL's scale and widens it to its own digits (SMALLINT and
+  USMALLINT 5, INTEGER 10, BIGINT 19, HUGEINT 38), DECIMAL(min(38, digits + s), s). So the order of the blocks can
+  change the type: USMALLINT, SMALLINT and DECIMAL(9,2) make DECIMAL(12,2), but SMALLINT, DECIMAL(9,2) and USMALLINT
+  DECIMAL(9,2); and BIGINT with DECIMAL(38,30) is DECIMAL(38,30), to which the BIGINT does not widen exactly.
   FLOAT with FLOAT is FLOAT and FLOAT with DOUBLE is DOUBLE: a column of FLOAT values alone keeps comparing with
   literals at FLOAT precision, one with a DOUBLE block does not (divergence D11). Every block's values must widen
   exactly to the column's type, which a block of another type is cast to once, below the union; values that do not,
@@ -644,8 +647,9 @@ its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
 builds on. A `UnionAll` has two or more ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of
 the next, and so on; its columns are new, of the types the binder folded, and each input gives them its own columns,
-a block of another type cast below the union by a `Compute`. A query produces inner `Join`s: the binder factors each element of `WHERE` and of an inner `ON` (below,
-below) and sends every conjunct that leaves it to the relations it reads, so one relation's conjuncts filter that
+a block of another type cast below the union by a `Compute`. A query produces inner `Join`s: the binder factors
+each element of `WHERE` and of an inner `ON` (below, below) and sends every conjunct that leaves it to the relations
+it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
 cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
@@ -1334,8 +1338,9 @@ The third workload is the 99 queries derived from TPC-DS, in DuckDB's dialect, a
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data at scale factors 0.1 and 1
 ([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, the four shards
-`tpcds.status.sf1.1of4` to `4of4` and `parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not pass, the last column lists the features
-it is expected to need, from a survey of the corpus; the first of them that antb1 refuses is not always the last.
+`tpcds.status.sf1.1of4` to `4of4` and `parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not
+pass, the last column lists the features it is expected to need, from a survey of the corpus; the first of them that
+antb1 refuses is not always the last.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
