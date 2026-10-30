@@ -126,10 +126,12 @@ DATA_FILE_GLOBS = (
     "*.tbl.*",
     "dists.dss",
     "*.dat",
+    "*.dst",
     "tpcds.idx",
     "*.tpl",
 )
-DATA_FILE_RE = re.compile(r"q?\d\d\.(?:csv|sql)|q\d{1,2}\.(?:out|ans)")
+# DuckDB's (q01.sql, 01.csv), dsqgen's query streams (query_0.sql) and the kits' answers (q1.out, 14_NULLS_FIRST.ans).
+DATA_FILE_RE = re.compile(r"q?\d\d\.(?:csv|sql)|query_\d+\.sql|q\d{1,2}\.(?:out|ans)|\d{1,2}(?:_\w+)?\.ans")
 # The legend that the TPC EULA requires on redistributed TPC software (the kit carries it in its EULA file). Assembled
 # at run time, so this file does not match itself.
 TPC_LEGEND_RE = re.compile(r"\s+".join(("THE", "TPC", "SOFTWARE", "IS", "AVAILABLE", "WITHOUT", "CHARGE")))

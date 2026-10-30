@@ -677,9 +677,23 @@ def test_r009_tpcds_material(repo: Path) -> None:
     # dsdgen's tables, distribution file and query templates, and DuckDB's TPC-DS query and answer files.
     write(repo, {"t/store_sales.dat": "1|2|", "t/tpcds.idx": "x", "t/query14.tpl": "define", "q/14.sql": "SELECT 1;"})
     write(repo, {"a/sf1/14.csv": "1", "a/sf1/q14.csv": "1"})
+    # The kit's distribution sources, dsqgen's query streams and its answer sets.
+    write(repo, {"k/tpcds.dst": "x", "k/query_0.sql": "SELECT 1;", "k/1.ans": "1", "k/14_NULLS_FIRST.ans": "1"})
     write(repo, {"t/notes.md": "ok", "q/114.sql": "SELECT 1;", "q/x14.sql": "SELECT 1;", "t/tpcds.md": "ok"})
+    write(repo, {"k/query_template.sql": "SELECT 1;", "k/123.ans": "1"})
     paths = {f.path for f in findings(repo, "R009")}
-    assert paths == {"t/store_sales.dat", "t/tpcds.idx", "t/query14.tpl", "q/14.sql", "a/sf1/14.csv", "a/sf1/q14.csv"}
+    assert paths == {
+        "t/store_sales.dat",
+        "t/tpcds.idx",
+        "t/query14.tpl",
+        "q/14.sql",
+        "a/sf1/14.csv",
+        "a/sf1/q14.csv",
+        "k/tpcds.dst",
+        "k/query_0.sql",
+        "k/1.ans",
+        "k/14_NULLS_FIRST.ans",
+    }
 
 
 # --- R010 ------------------------------------------------------------------------------------------------------------
