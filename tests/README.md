@@ -17,7 +17,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
 | `tpch/` | `tpch.status.*`, `parallel.tpch.status.sf0_1`, `harness.tpch.*`, `diff.tpch`, `parallel.diff.tpch` | `oracle`, `harness`, `diff`, `parallel` | the data derived from TPC-H (Linux only, redacted): the ratchet of the 22 queries on antb1 against DuckDB, DuckDB's answers on the generated files, antb1 against DuckDB on generated queries over them |
-| `tpcds/` | `tpcds.status.*`, `parallel.tpcds.status.sf1`, `fixtures.tpcds`, `harness.tpcds.*` | `oracle`, `parallel`, `setup`, `harness` | the data derived from TPC-DS (Linux only, redacted), generated at test time at scale factors 0.1 and 1: the ratchet of the 99 queries on antb1 against DuckDB |
+| `tpcds/` | `tpcds.status.*`, `parallel.tpcds.status.sf0_1`, `fixtures.tpcds`, `harness.tpcds.*` | `oracle`, `parallel`, `setup`, `harness` | the data derived from TPC-DS (Linux only, redacted), generated at test time at scale factors 0.1 and 1: the ratchet of the 99 queries on antb1 against DuckDB |
 
 ```bash
 pixi run test -L diff          # one label

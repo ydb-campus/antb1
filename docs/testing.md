@@ -422,9 +422,10 @@ judge). Linux only, as for TPC-H. So far it holds:
   `harness.tpcds.generate.unknown_workload`: the generator refuses an unknown `-DWORKLOAD`. `fixtures.tpch` and
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
 - `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
-- `tpcds.status.sf0_1`, `tpcds.status.sf1` (label `oracle`) and `parallel.tpcds.status.sf1` (label `parallel`: 4
-  threads, 1000-row batches, equal to the 1-thread results byte for byte): the ratchet. `antb1-slt tpcds` runs the 99
-  queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
+- `tpcds.status.sf0_1`, `tpcds.status.sf1` (label `oracle`) and `parallel.tpcds.status.sf0_1` (label `parallel`: 4
+  threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for TPC-H, because at
+  scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet. `antb1-slt tpcds`
+  runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
   ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with a 2 GiB
   memory limit and a 900-second timeout; its status table is "Queries derived from TPC-DS" in
   [sql-subset.md](sql-subset.md#queries-derived-from-tpc-ds). `ANTB1_TPCDS_TIMES=1` adds each query's seconds in a

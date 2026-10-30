@@ -1255,7 +1255,7 @@ The third workload is the 99 queries derived from TPC-DS, in DuckDB's dialect, a
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data at scale factors 0.1 and 1
 ([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, `tpcds.status.sf1` and
-`parallel.tpcds.status.sf1` enforce the ratchet. For a query that does not pass, the last column lists the features
+`parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not pass, the last column lists the features
 it is expected to need, from a survey of the corpus; the first of them that antb1 refuses is not always the last.
 
 | Query | Status | Completed by / needs |

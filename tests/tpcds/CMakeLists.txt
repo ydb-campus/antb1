@@ -155,12 +155,14 @@ endfunction()
 # answers, against tests/data/tpcds_status.json, by the rules of the TPC-H ratchet (tests/tpch/CMakeLists.txt): a
 # query passes only with DuckDB's answer; every other query must be Unsupported (exit code 4). Both scale factors read
 # the same ratchet, and the parallel run (4 threads, batches of 1000 rows) must equal the 1-thread run byte for byte.
-# ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
+# The parallel run reads scale factor 0.1, as TPC-H's does: at scale factor 1, its 4-thread run plus the 1-thread run
+# it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
+# 489 seconds. ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
 foreach(kind IN ITEMS sf0_1 sf1 parallel)
   if(kind STREQUAL "parallel")
-    set(_name parallel.tpcds.status.sf1)
-    set(_sf 1)
+    set(_name parallel.tpcds.status.sf0_1)
+    set(_sf 0_1)
     set(_label parallel)
     set(
       _options
