@@ -105,6 +105,13 @@ are what was built.
     canonical form of a sub-tree therefore expresses each column reference as its qualifier and name, and a scan as
     its table and the set of fields it reads. Positions are what the sharing has to *rewrite*; names are what it
     matches on.
+    - Update (2026-10-30, a wrong answer): as built, a reference was its column's origin (`table#field` for a
+      scanned one), which cannot tell the two sides of a self-join apart, nor the COUNT(*)s of two aggregations.
+      Two sub-plans grouping one self-join by `a.k` and by `b.k` were one group, and E2 answered the second from
+      the first's result (`src/exec/tests/shared_builds_test.cc` measured SUM 72 where the answer is 48). Each
+      reference now also carries its **path** -- the inputs from the node that reads it down to the node that
+      defines it -- in node keys, in derived origins and when members' outputs are matched. Equivalent sub-plans
+      share their shape and so their paths, which keeps every sharing this ADR measured.
 - **The consumers' column indices are rewritten, and that is the real cost of subsumption.** A consumer reading the
   shared result sees the union's width and ordering, not its own, so every column reference above the shared node
   shifts. This is the one rewrite this ADR needs, it is mechanical, and it is confined to the consumers of a shared
