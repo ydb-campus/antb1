@@ -97,13 +97,14 @@ struct Fixture {
   };
 
   Result Run(std::vector<int64_t> pass, bool redact = false,
-             std::optional<uint64_t> only = std::nullopt) {
+             std::optional<uint64_t> only = std::nullopt, RatchetShard shard = {}) {
     ScriptedEngine a("antb1", [this](const std::string& sql) { return antb1_answers.at(sql); });
     ScriptedEngine o("duckdb", [this](const std::string& sql) { return oracle_answers.at(sql); });
     Result r;
     r.stats = RunRatchet(queries, {.commit = {}, .pass = std::move(pass)}, kNumberedFromOne, a, o,
                          {.redact = redact,
                           .only = only,
+                          .shard = shard,
                           .status_path = "status.json",
                           .command = "cmd",
                           .clock = clock},
@@ -177,6 +178,26 @@ TEST(RunRatchet, OnlyTakesAQueryNumber) {
     EXPECT_EQ(none.stats.queries, 0);
     EXPECT_TRUE(none.out.contains(std::format("FAIL Q{}: no such query", bad))) << none.out;
   }
+}
+
+// A shard runs every count-th query from its index and checks only those against the ratchet: a
+// listed query of another shard is no unexpected fail, a query of its own still is.
+TEST(RunRatchet, AShardRunsAndChecksItsSliceAlone) {
+  Fixture f;
+  const auto odd = f.Run({1, 2}, false, std::nullopt, {.index = 0, .count = 2});
+  EXPECT_EQ(odd.stats.queries, 2);
+  EXPECT_EQ(odd.stats.passed, (std::vector<int64_t>{1}));
+  EXPECT_EQ(odd.stats.failed, 0) << odd.out;
+  EXPECT_TRUE(odd.out.starts_with("Q1: running\nQ1: pass\nQ3: running\n")) << odd.out;
+  EXPECT_TRUE(odd.out.contains("TPCH: PASS queries=2 pass=[1] unsupported=1")) << odd.out;
+  const auto even = f.Run({1, 2}, false, std::nullopt, {.index = 1, .count = 2});
+  EXPECT_EQ(even.stats.queries, 1);
+  EXPECT_EQ(even.stats.failed, 1) << even.out;
+  EXPECT_TRUE(even.out.contains("FAIL Q2: unexpected fail")) << even.out;
+  EXPECT_FALSE(even.out.contains("Q1:")) << even.out;
+  const auto unlisted = f.Run({}, false, std::nullopt, {.index = 0, .count = 3});
+  EXPECT_EQ(unlisted.stats.queries, 1);
+  EXPECT_TRUE(unlisted.out.contains("FAIL Q1: unexpected pass")) << unlisted.out;
 }
 
 TEST(RunRatchet, RedactedWrongAnswersShowNoQueryTextOrValues) {

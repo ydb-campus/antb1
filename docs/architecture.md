@@ -112,15 +112,18 @@ steps (only step 7 uses more than one thread):
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an
    `IN` subquery anywhere but as a top-level conjunct of `WHERE`, of an inner `ON` or of `HAVING`, a lateral
-   reference, more than 256 relations counting every sub-plan and every subquery, a compound until ADR 0036's X3,
-   many expressions) is `kUnsupported` before any name resolves, over every block
+   reference, more than 256 relations counting every sub-plan and every subquery, a `UNION ALL`'s own `ORDER BY`,
+   `LIMIT` or `OFFSET` and a subquery over one (ADR 0036's X5 and X6), many expressions) is `kUnsupported` before
+   any name resolves, over every block
    the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
    each CTE something references; then each
    FROM item resolves, in FROM order, one binding per item in the block's scope (`src/plan/scope.h`: its rule-1
    name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else
    `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT flags). A derived
    table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
-   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9). Columns resolve there,
+   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9). A `UNION ALL` binds
+   each of its blocks so, in its own CTE frame and scope, then folds their types into one `UnionAll` node, casting
+   below it the blocks of another type ([ADR 0036](adr/0036-union-all.md)). Columns resolve there,
    an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
    are checked, and every `WHERE` literal is folded exactly into its column's type

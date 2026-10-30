@@ -46,9 +46,19 @@ struct RatchetStatus {
 std::expected<RatchetStatus, std::string> ParseRatchetStatus(std::string_view json,
                                                              const Workload& workload);
 
+// One of `count` disjoint slices of the queries (antb1-slt --shard): the query at index i of the
+// file, from 0, is in slice i % count, so every slice holds every count-th query and the slices
+// stay even in size and in how far apart their queries are. A run reports and checks its slice
+// alone.
+struct RatchetShard {
+  int64_t index = 0;  // from 0
+  int64_t count = 1;
+};
+
 struct RatchetOptions {
   bool redact = false;
   std::optional<uint64_t> only;  // run only Q<only>
+  RatchetShard shard;            // run only the queries of this slice
   std::string status_path;       // for messages
   std::string command;           // the antb1-slt command line without --redact and --only (repro)
   // Seconds since any fixed point (ANTB1_TPCH_TIMES): each outcome line gets the query's time and

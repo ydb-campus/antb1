@@ -157,10 +157,24 @@ endfunction()
 # the same ratchet, and the parallel run (4 threads, batches of 1000 rows) must equal the 1-thread run byte for byte.
 # The parallel run reads scale factor 0.1, as TPC-H's does: at scale factor 1, its 4-thread run plus the 1-thread run
 # it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
-# 489 seconds. ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
+# 489 seconds. Scale factor 1 itself runs in three shards (antb1-slt --shard), which together are the whole ratchet:
+# once queries 4, 11 and 74 recompute their UNION ALL CTEs per reference (ADR 0036), one run of all 99 would outlast
+# that timeout too. Each shard runs every third query, so the shards stay even as queries join the ratchet.
+# ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
-foreach(kind IN ITEMS sf0_1 sf1 parallel)
-  if(kind STREQUAL "parallel")
+foreach(
+  kind
+  IN
+  ITEMS sf0_1 sf1_1of3 sf1_2of3 sf1_3of3 parallel
+)
+  set(_queries 99)
+  if(kind MATCHES "^sf1_([1-3])of3$")
+    set(_name tpcds.status.sf1.${CMAKE_MATCH_1}of3)
+    set(_sf 1)
+    set(_label oracle)
+    set(_options --shard ${CMAKE_MATCH_1}/3)
+    set(_queries 33)
+  elseif(kind STREQUAL "parallel")
     set(_name parallel.tpcds.status.sf0_1)
     set(_sf 0_1)
     set(_label parallel)
@@ -195,7 +209,7 @@ foreach(kind IN ITEMS sf0_1 sf1 parallel)
     ${_name}
     LABEL ${_label}
     TIMEOUT 900
-    REQUIRE "TPCDS: PASS queries=99 "
+    REQUIRE "TPCDS: PASS queries=${_queries} "
     COMMAND $<TARGET_FILE:antb1-slt> tpcds ${_args}
   )
 endforeach()

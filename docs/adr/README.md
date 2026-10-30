@@ -44,4 +44,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0033](0033-standalone-static-binary.md) | A standalone static binary for releases and performance work | Proposed |
 | [0034](0034-licence-and-static-sources.md) | The project licence and the sources of the static binary | Proposed |
 | [0035](0035-github-releases.md) | Tagged GitHub releases of the standalone binary | Proposed |
-| [0036](0036-union-all.md) | UNION ALL: compound queries and an n-ary plan node | Proposed |
+| [0036](0036-union-all.md) | UNION ALL: compound queries and an n-ary plan node | Accepted |

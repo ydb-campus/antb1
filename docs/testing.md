@@ -422,7 +422,9 @@ judge). Linux only, as for TPC-H. So far it holds:
   `harness.tpcds.generate.unknown_workload`: the generator refuses an unknown `-DWORKLOAD`. `fixtures.tpch` and
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
 - `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
-- `tpcds.status.sf0_1`, `tpcds.status.sf1` (label `oracle`) and `parallel.tpcds.status.sf0_1` (label `parallel`: 4
+- `tpcds.status.sf0_1`, `tpcds.status.sf1.1of3` to `tpcds.status.sf1.3of3` (label `oracle`; scale factor 1 in
+  three shards of every third query, `antb1-slt tpcds --shard K/3`, since one run of all 99 outlasts the timeout under
+  AddressSanitizer once the queries with UNION ALL CTEs pass) and `parallel.tpcds.status.sf0_1` (label `parallel`: 4
   threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for TPC-H, because at
   scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet. `antb1-slt tpcds`
   runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet

@@ -1329,26 +1329,26 @@ The third workload is the 99 queries derived from TPC-DS, in DuckDB's dialect, a
 `tests/data/tpcds_status.json` lists the queries verified to pass against DuckDB, and `pass` below means exactly the
 ratchet (`pixi run lint` compares them); the PR that makes a query pass updates both. A query that does not pass must
 fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data at scale factors 0.1 and 1
-([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, `tpcds.status.sf1` and
-`parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not pass, the last column lists the features
+([testing.md](testing.md#data-derived-from-tpc-ds)), and `tpcds.status.sf0_1`, the three shards
+`tpcds.status.sf1.1of3` to `3of3` and `parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not pass, the last column lists the features
 it is expected to need, from a survey of the corpus; the first of them that antb1 refuses is not always the last.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
 | Q1 | pass | answered when the ratchet was added |
-| Q2 | unsupported | needs round, UNION ALL |
+| Q2 | unsupported | needs round |
 | Q3 | pass | answered when the ratchet was added |
-| Q4 | unsupported | needs UNION ALL |
-| Q5 | unsupported | needs general CAST, concat, ROLLUP and GROUPING(), UNION ALL |
+| Q4 | pass | `UNION ALL` (ADR 0036) |
+| Q5 | unsupported | needs general CAST, concat, ROLLUP and GROUPING() |
 | Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates |
 | Q7 | pass | answered when the ratchet was added |
-| Q8 | unsupported | needs INTERSECT or EXCEPT, UNION ALL |
+| Q8 | unsupported | needs INTERSECT or EXCEPT |
 | Q9 | unsupported | needs scalar subqueries in expressions |
 | Q10 | unsupported | needs EXISTS or IN subqueries under OR |
-| Q11 | unsupported | needs UNION ALL |
+| Q11 | pass | `UNION ALL` (ADR 0036) |
 | Q12 | unsupported | needs window aggregates |
 | Q13 | pass | answered when the ratchet was added |
-| Q14 | unsupported | needs INTERSECT or EXCEPT, ROLLUP and GROUPING(), scalar subqueries that are not aggregates, UNION ALL |
+| Q14 | unsupported | needs INTERSECT or EXCEPT, ROLLUP and GROUPING(), scalar subqueries that are not aggregates |
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
 | Q17 | unsupported | needs stddev_samp |
@@ -1357,22 +1357,22 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q20 | unsupported | needs window aggregates |
 | Q21 | unsupported | needs general CAST |
 | Q22 | unsupported | needs ROLLUP and GROUPING() |
-| Q23 | unsupported | needs `*` next to other select items, UNION ALL |
+| Q23 | unsupported | needs `*` next to other select items |
 | Q24 | unsupported | needs upper and lower |
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
-| Q27 | unsupported | needs NULL literals, UNION ALL |
+| Q27 | unsupported | needs NULL literals |
 | Q28 | unsupported | needs cross products of one-row inputs |
 | Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |
 | Q31 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q32 | pass | answered when the ratchet was added |
-| Q33 | unsupported | needs UNION ALL |
+| Q33 | pass | `UNION ALL` (ADR 0036) |
 | Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q35 | unsupported | needs EXISTS or IN subqueries under OR |
-| Q36 | unsupported | needs NULL literals, UNION, UNION ALL, rank() windows |
+| Q36 | unsupported | needs NULL literals, UNION, rank() windows |
 | Q37 | pass | answered when the ratchet was added |
-| Q38 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
+| Q38 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT |
 | Q39 | unsupported | needs NULL literals, stddev_samp |
 | Q40 | unsupported | needs general CAST, COALESCE |
 | Q41 | unsupported | needs a correlated COUNT subquery, SELECT DISTINCT |
@@ -1383,45 +1383,45 @@ it is expected to need, from a survey of the corpus; the first of them that antb
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates, rank() windows |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL, rank() windows |
+| Q49 | unsupported | needs general CAST, COALESCE, UNION, rank() windows |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, IS [NOT] NULL, window aggregates, window frames |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates |
-| Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates, UNION ALL |
+| Q54 | unsupported | needs general CAST, SELECT DISTINCT, round, scalar subqueries that are not aggregates |
 | Q55 | pass | answered when the ratchet was added |
-| Q56 | unsupported | needs UNION ALL |
+| Q56 | pass | `UNION ALL` (ADR 0036) |
 | Q57 | unsupported | needs abs, window aggregates, rank() windows |
 | Q58 | unsupported | needs scalar subqueries that are not aggregates |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q60 | unsupported | needs UNION ALL |
+| Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | unsupported | needs general CAST, cross products of one-row inputs |
 | Q62 | unsupported | needs `*` next to other select items |
 | Q63 | unsupported | needs abs, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
-| Q66 | unsupported | needs UNION ALL |
+| Q66 | pass | `UNION ALL` (ADR 0036) |
 | Q67 | unsupported | needs COALESCE, ROLLUP and GROUPING(), rank() windows |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
-| Q71 | unsupported | needs UNION ALL |
+| Q71 | pass | `UNION ALL` (ADR 0036) |
 | Q72 | unsupported | needs DATE + INTEGER, IS [NOT] NULL |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q74 | unsupported | needs UNION ALL |
-| Q75 | unsupported | needs general CAST, COALESCE, UNION, UNION ALL |
-| Q76 | unsupported | needs IS [NOT] NULL, UNION ALL |
-| Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING(), UNION ALL |
+| Q74 | pass | `UNION ALL` (ADR 0036) |
+| Q75 | unsupported | needs general CAST, COALESCE, UNION |
+| Q76 | unsupported | needs IS [NOT] NULL |
+| Q77 | unsupported | needs COALESCE, ROLLUP and GROUPING() |
 | Q78 | unsupported | needs COALESCE, IS [NOT] NULL, round |
 | Q79 | pass | constant integer expressions in IN lists |
-| Q80 | unsupported | needs COALESCE, concat, ROLLUP and GROUPING(), UNION ALL |
+| Q80 | unsupported | needs COALESCE, concat, ROLLUP and GROUPING() |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
 | Q84 | unsupported | needs COALESCE, concat |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP and GROUPING(), rank() windows |
-| Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT, UNION ALL |
+| Q87 | unsupported | needs SELECT DISTINCT, INTERSECT or EXCEPT |
 | Q88 | unsupported | needs cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates |
 | Q90 | unsupported | needs general CAST, NULL literals, cross products of one-row inputs |

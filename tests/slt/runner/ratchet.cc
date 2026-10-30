@@ -248,6 +248,9 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
     if (options.only.has_value() && std::cmp_not_equal(*options.only, n)) {
       continue;
     }
+    if (i % options.shard.count != options.shard.index) {
+      continue;  // another slice's (RatchetShard)
+    }
     ++stats.queries;
     if (workload.running_lines) {
       write(std::format("Q{}: running\n", n));
