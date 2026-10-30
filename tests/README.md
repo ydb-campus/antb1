@@ -17,7 +17,7 @@ time: the ctest `fixtures.tpch` (label `setup`) writes it to `build/<preset>/fix
 | `slt/`, `harness/`, `cli/` | `harness.*` | `harness` | the harness itself: mutations, redaction, digest |
 | `data/` | `data.*` | `data` | ClickBench data tests on downloaded data, redacted (`pixi run test-data` only) |
 | `tpch/` | `tpch.status.*`, `parallel.tpch.status.sf0_1`, `harness.tpch.*`, `diff.tpch`, `parallel.diff.tpch` | `oracle`, `harness`, `diff`, `parallel` | the data derived from TPC-H (Linux only, redacted): the ratchet of the 22 queries on antb1 against DuckDB, DuckDB's answers on the generated files, antb1 against DuckDB on generated queries over them |
-| `tpcds/` | `harness.tpcds.extension` | `harness` | the data derived from TPC-DS (Linux only): so far the smoke test of the pinned dsdgen extension |
+| `tpcds/` | `fixtures.tpcds`, `harness.tpcds.*` | `setup`, `harness` | the data derived from TPC-DS (Linux only): generated at test time at scale factors 0.1 and 1, checked against committed digests; the ratchet is next |
 
 ```bash
 pixi run test -L diff          # one label
@@ -98,8 +98,8 @@ together with `ANTB1_UPDATE_GOLDENS`).
   `harness.slt.pending.mutate.<kind>`: corrupting antb1's answers to `slt/selftest/pending.slt` must fail the check.
 - `harness.fixtures.digest`: the fixtures this build generated match `fixtures/fixtures.digest`, a logical
   digest (schema, row groups, values; not compression or page layout), so Linux and macOS generate the same
-  data. The top-level `tpch/` directory of the data derived from TPC-H is skipped. After an intended generator
-  change:
+  data. The top-level `tpch/` and `tpcds/` directories of the data derived from TPC-H and TPC-DS are skipped. After
+  an intended generator change:
 
   ```bash
   build/dev/bin/antb1-fixture-digest --write tests/fixtures/fixtures.digest build/dev/fixtures

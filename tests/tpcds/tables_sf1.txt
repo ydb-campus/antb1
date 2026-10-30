@@ -1,0 +1,26 @@
+# The tables derived from TPC-DS at scale factor 1, written at test time by tests/tpch/generate.cmake (fixtures.tpcds)
+# and never committed (ADR 0006). `redact`: no value of them is ever printed (tests/slt/runner/tables.h).
+call_center  tpcds/sf1/call_center.parquet  redact
+catalog_page  tpcds/sf1/catalog_page.parquet  redact
+catalog_returns  tpcds/sf1/catalog_returns.parquet  redact
+catalog_sales  tpcds/sf1/catalog_sales.parquet  redact
+customer  tpcds/sf1/customer.parquet  redact
+customer_address  tpcds/sf1/customer_address.parquet  redact
+customer_demographics  tpcds/sf1/customer_demographics.parquet  redact
+date_dim  tpcds/sf1/date_dim.parquet  redact
+household_demographics  tpcds/sf1/household_demographics.parquet  redact
+income_band  tpcds/sf1/income_band.parquet  redact
+inventory  tpcds/sf1/inventory.parquet  redact
+item  tpcds/sf1/item.parquet  redact
+promotion  tpcds/sf1/promotion.parquet  redact
+reason  tpcds/sf1/reason.parquet  redact
+ship_mode  tpcds/sf1/ship_mode.parquet  redact
+store  tpcds/sf1/store.parquet  redact
+store_returns  tpcds/sf1/store_returns.parquet  redact
+store_sales  tpcds/sf1/store_sales.parquet  redact
+time_dim  tpcds/sf1/time_dim.parquet  redact
+warehouse  tpcds/sf1/warehouse.parquet  redact
+web_page  tpcds/sf1/web_page.parquet  redact
+web_returns  tpcds/sf1/web_returns.parquet  redact
+web_sales  tpcds/sf1/web_sales.parquet  redact
+web_site  tpcds/sf1/web_site.parquet  redact

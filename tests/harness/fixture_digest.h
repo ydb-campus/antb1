@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -35,12 +36,14 @@ struct FileDigest {
 
 arrow::Result<FileDigest> DigestFile(const std::filesystem::path& file, std::string relative_path);
 
-// The top-level directory of the fixtures that DigestDirectory skips: the data derived from TPC-H,
-// which the fixtures.tpch test writes there with TPC's dbgen (tests/tpch). It is not ours to pin,
-// and that test may write it while this one reads.
-inline constexpr std::string_view kSkippedDirectory = "tpch";
+// The top-level directories of the fixtures that DigestDirectory skips: the data derived from TPC-H
+// and TPC-DS, which the fixtures.tpch and fixtures.tpcds tests write there with TPC's dbgen and
+// dsdgen (tests/tpch, tests/tpcds). It is not ours to pin, and those tests may write it while this
+// one reads.
+inline constexpr std::array<std::string_view, 2> kSkippedDirectories = {"tpch", "tpcds"};
 
-// Every *.parquet file under dir (recursively, but not under dir/tpch), sorted by relative path.
+// Every *.parquet file under dir (recursively, but not under dir/tpch or dir/tpcds), sorted by
+// relative path.
 arrow::Result<std::vector<FileDigest>> DigestDirectory(const std::filesystem::path& dir);
 
 // The digest file text: a comment header, then one line per file.

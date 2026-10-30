@@ -41,12 +41,12 @@ set(_digests "${CMAKE_CURRENT_SOURCE_DIR}/queries.sha256")
 add_test(
   NAME fixtures.tpch
   COMMAND
-    ${CMAKE_COMMAND} "-DDUCKDB=${ANTB1_DUCKDB_CLI}" "-DEXTENSION=${ANTB1_TPCH_EXTENSION}" "-DTPCH_DIR=${_tpch_dir}"
-    "-DBINARY_DIR=${CMAKE_BINARY_DIR}" "-DDIGESTS=${_digests}" -P "${_generate}"
+    ${CMAKE_COMMAND} "-DDUCKDB=${ANTB1_DUCKDB_CLI}" "-DEXTENSION=${ANTB1_TPCH_EXTENSION}" "-DWORKLOAD=tpch"
+    "-DDIR=${_tpch_dir}" "-DBINARY_DIR=${CMAKE_BINARY_DIR}" "-DDIGESTS=${_digests}" -P "${_generate}"
 )
 set_tests_properties(
   fixtures.tpch
-  PROPERTIES LABELS setup FIXTURES_SETUP antb1_tpch TIMEOUT 300
+  PROPERTIES LABELS setup FIXTURES_SETUP antb1_tpch TIMEOUT 300 RESOURCE_LOCK antb1_tpc_generate
 )
 
 # The tests that read the generated data run through run_redacted.cmake: their tables files mark every table
@@ -234,7 +234,7 @@ _tpch_test(
   EXIT_CODE 1
   REQUIRE "q01\\.sql: sha256 [0-9a-f]+, committed 0+\n" "q22\\.sql: sha256 [0-9a-f]+, committed 0+\n"
   COMMAND
-    ${CMAKE_COMMAND} "-DTPCH_DIR=${_tpch_dir}" "-DBINARY_DIR=${CMAKE_BINARY_DIR}" "-DDIGESTS=${_wrong}" -DCHECK_ONLY=ON
+    ${CMAKE_COMMAND} "-DWORKLOAD=tpch" "-DDIR=${_tpch_dir}" "-DBINARY_DIR=${CMAKE_BINARY_DIR}" "-DDIGESTS=${_wrong}" -DCHECK_ONLY=ON
     -P "${_generate}"
 )
 
@@ -261,7 +261,8 @@ foreach(case IN ITEMS on_ci local)
       ${CMAKE_COMMAND}
       "-DDUCKDB=${CMAKE_COMMAND}"
       "-DEXTENSION=${ANTB1_TPCH_EXTENSION}"
-      "-DTPCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/${_name}"
+      "-DWORKLOAD=tpch"
+      "-DDIR=${CMAKE_CURRENT_BINARY_DIR}/${_name}"
       "-DBINARY_DIR=${CMAKE_BINARY_DIR}"
       "-DDIGESTS=${_wrong}"
       -P
