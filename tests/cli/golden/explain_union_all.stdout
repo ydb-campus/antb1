@@ -1,0 +1,10 @@
+Output: x:INTEGER n:BIGINT
+Project x, n
+  GroupAggregate keys=[x] COUNT(*)
+    UnionAll inputs=2 columns=[x]
+      Compute CAST(x AS INTEGER)
+        Project i16
+          Filter id < 10
+            Scan table=e source=parquet(files=1, rows=12) columns=[id, i16]
+      Project i32
+        Scan table=e source=parquet(files=1, rows=12) columns=[i32]

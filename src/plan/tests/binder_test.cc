@@ -874,48 +874,127 @@ INSTANTIATE_TEST_SUITE_P(
                   "WHERE g.i16 = u.i16",
                   kBind, "unnamed_subquery2.s", "no FROM item is named 'unnamed_subquery2'"}));
 
-// UNION ALL parses (ADR 0036), and every placement of a compound is refused at its first UNION ALL
-// until its binder item -- statically, so over tables that do not exist too, and before any check
-// that reads a block's clauses: a scalar subquery over a compound is not called a non-aggregate.
-// A construct before the UNION ALL in the query is still reported first. A compound in a CTE that
-// nothing references is never checked or bound, as no such CTE is, so the outer error is the one.
+// What stays unsupported of UNION ALL (ADR 0036): its own ORDER BY, LIMIT and OFFSET (X5), and a
+// subquery whose query it is (X6) -- statically, so over tables that do not exist too. Its tail is
+// refused at its first clause, after any construct of its blocks, which come before it in the
+// query; a subquery at its operator, once the conjunct's other side is checked, and before the
+// checks that read a block's clauses, so a scalar subquery over it is not called a non-aggregate. A
+// CTE that nothing references is never checked or bound, a UNION ALL in it, tail and all, too.
 INSTANTIATE_TEST_SUITE_P(
-    UnionAll, BindErrorTest,
+    UnionAllRefusals, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i32 FROM u", kUnsupported, "UNION ALL",
-                  "UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
                   "ORDER BY 1",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
-        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u) AS d",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
-        ErrorCase{"WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u) SELECT i16 FROM c",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+                  kUnsupported, "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u LIMIT 1", kUnsupported, "LIMIT 1",
+                  "LIMIT on a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u OFFSET 2 LIMIT 1", kUnsupported,
+                  "OFFSET 2", "OFFSET on a UNION ALL is not supported"},
+        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u LIMIT 3) AS d",
+                  kUnsupported, "LIMIT 3", "LIMIT on a UNION ALL is not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY 1) SELECT i16 "
+                  "FROM c",
+                  kUnsupported, "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
+        ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1", kUnsupported,
+                  "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT lower(s) FROM t ORDER BY 1", kUnsupported,
+                  "lower", "function lower() is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM u UNION ALL SELECT i16 "
+                  "FROM t)",
+                  kUnsupported, "NOT IN", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u UNION ALL SELECT "
                   "MAX(i16) FROM t)",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+                  kUnsupported, "(", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
-        ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada", kUnsupported, "UNION ALL",
-                  "UNION ALL is not supported"},
-        ErrorCase{"SELECT lower(s) FROM t UNION ALL SELECT s FROM t", kUnsupported, "lower",
-                  "function lower() is not supported"},
-        ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada) SELECT x FROM "
-                  "missing",
+                  kUnsupported, "EXISTS", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 "
+                  "FROM t)",
+                  kUnsupported, "EXISTS", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MAX(i16) FROM u UNION "
+                  "ALL SELECT MAX(i16) FROM t)",
+                  kUnsupported, "(", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT i32 FROM u "
+                  "UNION ALL SELECT i32 FROM t)",
+                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE lower(s) IN (SELECT s FROM u UNION ALL SELECT s FROM t)",
+                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT lower(s) FROM u UNION ALL SELECT s FROM "
+                  "t)",
+                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1) SELECT x "
+                  "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
-// The walks reach a compound's last block (ADR 0036's matrix): each construct stands only in the
-// last of three, where a walk that skipped the blocks would miss it. A date cast there is folded
-// into a literal, so the compound is what is refused, not the cast; a refused call there, also in a
-// derived table, a CTE body or a subquery that only the last block reads, comes first.
+// A UNION ALL's binding (ADR 0036), as in DuckDB: every block binds before the column counts are
+// compared, and those before the types; a count that differs is a bind error at the UNION ALL
+// before the block. A block binds against the scope the UNION ALL has -- a name that only an
+// enclosing FROM item has is a lateral reference -- and never sees another block's names.
+INSTANTIATE_TEST_SUITE_P(
+    UnionAllBinding, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada", kBind, "nope",
+                  "table 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16, i32 FROM u", kBind, "UNION ALL",
+                  "Set operations can only apply to expressions with the same number of result "
+                  "columns"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16, i32 FROM u UNION ALL SELECT nope FROM t",
+                  kBind, "nope", "nope"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT s, i32 FROM u", kBind, "UNION ALL",
+                  "Set operations can only apply to expressions with the same number of result "
+                  "columns"},
+        ErrorCase{"SELECT i32 FROM t UNION ALL SELECT i32 FROM ok", kBind, "i32", "i32"},
+        ErrorCase{"SELECT d.i16 FROM t AS a, (SELECT i16 FROM u WHERE u.i32 = a.i32 UNION ALL "
+                  "SELECT i16 FROM u) AS d",
+                  kUnsupported, "a.i32",
+                  "a lateral qualified column of an enclosing query block is not supported"}));
+
+// A UNION ALL's types (ADR 0036): a left fold in written order over each block's own type, which
+// has to widen exactly to the column's type; where it cannot, exit code 4 at the first select item
+// in the query that fails -- a later block's at the fold, any block's at the widening -- or at the
+// `*` it was expanded from.
+INSTANTIATE_TEST_SUITE_P(
+    UnionAllTypes, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i32 FROM t UNION ALL SELECT s FROM t", kUnsupported, "s",
+                  "UNION ALL of INTEGER and VARCHAR values is not supported"},
+        ErrorCase{"SELECT i64 FROM t UNION ALL SELECT d FROM t", kUnsupported, "d",
+                  "UNION ALL of BIGINT and DOUBLE values is not supported"},
+        ErrorCase{"SELECT dt FROM t UNION ALL SELECT toDateTime(i64) FROM t", kUnsupported,
+                  "toDateTime(i64)", "UNION ALL of DATE and TIMESTAMP values is not supported"},
+        ErrorCase{"SELECT 1 FROM t UNION ALL SELECT '7' FROM t", kUnsupported, "'7'",
+                  "UNION ALL of INTEGER and VARCHAR values is not supported"},
+        ErrorCase{"SELECT dt FROM t UNION ALL SELECT '2020-01-01' FROM t", kUnsupported,
+                  "'2020-01-01'", "UNION ALL of DATE and VARCHAR values is not supported"},
+        ErrorCase{"SELECT SUM(i32) FROM t UNION ALL SELECT p FROM dec", kUnsupported, "SUM(i32)",
+                  "UNION ALL of DECIMAL(38,2) and HUGEINT values is not supported (HUGEINT does "
+                  "not widen exactly to DECIMAL(38,2))"},
+        ErrorCase{"SELECT h FROM t UNION ALL SELECT p FROM dec", kUnsupported, "p",
+                  "UNION ALL of DECIMAL(38,0) and DECIMAL(15,2) values is not supported "
+                  "(DECIMAL(15,2) does not widen exactly to DECIMAL(38,0))"},
+        ErrorCase{"SELECT i32, i16 FROM t UNION ALL SELECT * FROM ok", kUnsupported, "*",
+                  "UNION ALL of SMALLINT and VARCHAR values is not supported"},
+        ErrorCase{"SELECT i32, i16 FROM t UNION ALL SELECT s, dt FROM t", kUnsupported, "s",
+                  "UNION ALL of INTEGER and VARCHAR values is not supported"},
+        ErrorCase{"SELECT SUM(i32), MIN(i32) FROM t UNION ALL SELECT p, 'x' FROM dec", kUnsupported,
+                  "SUM(i32)", "HUGEINT does not widen exactly to DECIMAL(38,2)"}));
+
+// The walks reach a UNION ALL's last block (ADR 0036's matrix): each construct stands only in the
+// last of three, where a walk that skipped the blocks would miss it -- a refused call, also in a
+// derived table, a CTE body or a subquery that only the last block reads, a name that does not
+// resolve, a type that does not fold and a column count that differs.
 INSTANTIATE_TEST_SUITE_P(
     UnionAllLastBlock, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
-                  "WHERE dt > CAST('2020-01-01' AS DATE)",
-                  kUnsupported, "UNION ALL", "UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT nope FROM t",
+                  kBind, "nope", "nope"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT s FROM t",
+                  kUnsupported, "s", "UNION ALL of SMALLINT and VARCHAR values is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16, i32 FROM t",
+                  kBind, "UNION ALL",
+                  "Set operations can only apply to expressions with the same number of result "
+                  "columns"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT lower(s) FROM t",
                   kUnsupported, "lower", "function lower() is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
@@ -936,7 +1015,6 @@ INSTANTIATE_TEST_SUITE_P(
 // of HAVING, so what is left here is the scalar form (J5b), EXISTS (ADR 0023's U-series), and what
 // an answered IN still refuses: a key no type holds, a column count other than one, and a
 // correlation.
-
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(
@@ -1181,8 +1259,6 @@ TEST(BinderTest, TheRelationLimitCountsAChainBehindASubquery) {
       << plan.status().message();
 }
 
-// A compound in a CTE that nothing references is never checked or bound, as no such CTE is (DuckDB
-// binds none either), so the query is answered without it while compounds are refused (ADR 0036).
 // A relation no join key connects joins as one row when it is a derived table or a CTE reference
 // of exactly one row (an aggregate without GROUP BY, HAVING, LIMIT or OFFSET) that nothing else
 // reads: a ONE-ROW join appends its row to every row of the others, above them, in FROM order --
@@ -1227,13 +1303,145 @@ TEST(BinderTest, OneRowRelationsJoinAsOneRow) {
   EXPECT_LT(semi.find("Join SEMI"), semi.find("Join ONE-ROW")) << "the semi join above: " << semi;
 }
 
-TEST(BinderTest, AnUnreferencedCompoundCteIsNeverBound) {
+// A UNION ALL in a CTE that nothing references is never checked or bound, as no such CTE is (DuckDB
+// binds none either): neither its tail (X5) nor its column counts stop the query.
+TEST(BinderTest, AnUnreferencedUnionAllCteIsNeverBound) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY 1) SELECT COUNT(*) "
+           "FROM t",
+           "WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16, i32 FROM u) SELECT COUNT(*) FROM t",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    ASSERT_EQ(plan->output.size(), 1U);
+    EXPECT_EQ(plan->output[0].name, "count_star()");
+  }
+}
+
+// The types DuckDB gives a UNION ALL's columns (ADR 0036): a left fold in written order over each
+// block's own type -- a literal typed by itself, unlike in CASE -- by CASE's rules for integers and
+// DECIMALs, so the order of the blocks can change the type; equal types of any kind stay.
+TEST(BinderTest, UnionAllTypes) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT i16 FROM t UNION ALL SELECT i32 FROM t", LogicalType::kInteger},
+           {"SELECT i16 FROM t UNION ALL SELECT u16 FROM t", LogicalType::kInteger},
+           {"SELECT u16 FROM t UNION ALL SELECT i16 FROM t", LogicalType::kInteger},
+           {"SELECT u16 FROM t UNION ALL SELECT i64 FROM t", LogicalType::kBigInt},
+           {"SELECT 1 FROM t UNION ALL SELECT i16 FROM t", LogicalType::kInteger},
+           {"SELECT 3000000000 FROM t UNION ALL SELECT i32 FROM t", LogicalType::kBigInt},
+           {"SELECT i32 FROM t UNION ALL SELECT SUM(i16) FROM t", LogicalType::kHugeInt},
+           {"SELECT p FROM dec UNION ALL SELECT r FROM dec", LogicalType::Decimal(17, 4)},
+           {"SELECT p FROM dec UNION ALL SELECT b FROM dec", LogicalType::Decimal(21, 2)},
+           {"SELECT b FROM dec UNION ALL SELECT p FROM dec", LogicalType::Decimal(21, 2)},
+           {"SELECT u16 FROM dec UNION ALL SELECT s16 FROM dec UNION ALL SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT s16 FROM dec UNION ALL SELECT r FROM dec UNION ALL SELECT u16 FROM dec",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT e FROM dec UNION ALL SELECT g FROM dec", LogicalType::Decimal(20, 10)},
+           {"SELECT z FROM dec UNION ALL SELECT b FROM dec", LogicalType::Decimal(38, 10)},
+           {"SELECT h FROM t UNION ALL SELECT SUM(i32) FROM t", LogicalType::Decimal(38, 0)},
+           {"SELECT d FROM t UNION ALL SELECT d FROM u", LogicalType::kDouble},
+           {"SELECT s FROM t UNION ALL SELECT 'x' FROM t", LogicalType::kVarchar},
+           {"SELECT dt FROM t UNION ALL SELECT DATE '2020-01-01' FROM t", LogicalType::kDate},
+           {"SELECT dt FROM t UNION ALL SELECT dt FROM u UNION ALL SELECT CAST('2020-01-02' AS "
+            "DATE) "
+            "FROM t",
+            LogicalType::kDate},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+}
+
+// A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first
+// block's and its ids new; a block whose column is of another type is cast below it, once, to the
+// union's type -- and only such a block.
+TEST(BinderTest, UnionAllPlan) {
   const Catalog catalog = MakeCatalog();
   auto plan = BindSql(
-      "WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u) SELECT COUNT(*) FROM t", catalog);
+      "SELECT i16 AS x, s FROM t UNION ALL SELECT i32, s FROM u UNION ALL SELECT i16, s FROM t",
+      catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
-  ASSERT_EQ(plan->output.size(), 1U);
-  EXPECT_EQ(plan->output[0].name, "count_star()");
+  ASSERT_EQ(plan->output.size(), 2U);
+  EXPECT_EQ(plan->output[0].name, "x");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kInteger);
+  EXPECT_EQ(plan->output[1].name, "s");
+  EXPECT_EQ(plan->output[1].type, LogicalType::kVarchar);
+  const auto* node = std::get_if<UnionAllNode>(plan->root.get());
+  ASSERT_NE(node, nullptr) << Explain(*plan);
+  ASSERT_EQ(node->inputs.size(), 3U);
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(*node->inputs[0])) << Explain(*plan);
+  EXPECT_FALSE(std::holds_alternative<ComputeNode>(*node->inputs[1])) << Explain(*plan);
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(*node->inputs[2])) << Explain(*plan);
+  EXPECT_EQ(std::get<ComputeNode>(*node->inputs[0]).exprs.size(), 1U) << "only the SMALLINT column";
+  for (const LogicalNodePtr& input : node->inputs) {
+    for (const ColumnId id : OutputIds(*input)) {
+      EXPECT_FALSE(std::ranges::contains(node->ids, id)) << "the union's ids are new";
+    }
+  }
+  EXPECT_EQ(node->columns[1][0].name, "i32") << "each block reads under its own names";
+  EXPECT_TRUE(Explain(*plan).contains("UnionAll inputs=3 columns=[x, s]")) << Explain(*plan);
+}
+
+// The names of a UNION ALL are its first block's: kept as they are at the top level, as any select
+// list's, and made unique for a derived table's or a CTE's binding (ADR 0022's rule 7).
+TEST(BinderTest, UnionAllNames) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::vector<std::string> names;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16, i16 FROM t UNION ALL SELECT i32, i64 FROM u",
+                .names = {"i16", "i16"}},
+           Case{.sql =
+                    "SELECT * FROM (SELECT i16, i16 FROM t UNION ALL SELECT i32, i64 FROM u) AS d",
+                .names = {"i16", "i16_1"}},
+           Case{.sql = "WITH c(a) AS (SELECT i16, i32 FROM t UNION ALL SELECT i32, i16 FROM u) "
+                       "SELECT * FROM c",
+                .names = {"a", "i32"}},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    std::vector<std::string> names;
+    for (const OutputColumn& out : plan->output) {
+      names.push_back(out.name);
+    }
+    EXPECT_EQ(names, c.names) << c.sql;
+  }
+}
+
+// A count that differs is a bind error at the UNION ALL before the first block that differs, not
+// at the first UNION ALL (ADR 0036).
+TEST(BinderTest, UnionAllCountErrorIsAtTheBlocksUnionAll) {
+  const Catalog catalog = MakeCatalog();
+  const std::string sql =
+      "SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16, i32 FROM t";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_FALSE(plan.ok());
+  const auto detail = GetSqlError(plan.status());
+  ASSERT_NE(detail, nullptr) << plan.status().ToString();
+  EXPECT_EQ(detail->kind(), kBind);
+  EXPECT_EQ(detail->span().offset, sql.rfind("UNION ALL"));
+}
+
+// A CTE that only a UNION ALL's last block reads is found in the UNION ALL's frame, and a WITH list
+// before the first block is every block's (ADR 0036).
+TEST(BinderTest, UnionAllBlocksSeeItsWithList) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "WITH c AS (SELECT i32 AS x FROM t) SELECT i32 FROM t UNION ALL SELECT i32 FROM u "
+           "UNION ALL SELECT x FROM c",
+           "WITH c AS (SELECT i32 AS x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c",
+           "SELECT y FROM (WITH c AS (SELECT i32 AS x FROM t) SELECT x AS y FROM c UNION ALL "
+           "SELECT i32 FROM u) AS d",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
 }
 
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name
@@ -3675,6 +3883,46 @@ TEST(BinderTest, FloatColumnsByColumnId) {
     ASSERT_NE(detail, nullptr) << sql;
     EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
   }
+}
+
+// A UNION ALL's FLOAT flag is the AND over its blocks (ADR 0036): FLOAT and FLOAT values stay
+// FLOAT, whose literals fold at FLOAT precision (divergence D11), while FLOAT and DOUBLE values
+// make a DOUBLE in DuckDB, whose literals do not; a FLOAT next to an integer or a DECIMAL is
+// refused, as DuckDB would make a FLOAT of them.
+TEST(BinderTest, UnionAllFloatFlagIsTheAndOverItsBlocks) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32()),
+                                                     arrow::field("d", arrow::float64()),
+                                                     arrow::field("k", arrow::int32())}),
+                                      10, std::vector<int>{0}))
+                  .ok());
+  const auto as_float = static_cast<double>(0.1F);
+  for (const auto& [sql, constant] : {
+           std::pair{"SELECT COUNT(*) FROM (SELECT f AS x FROM tf UNION ALL SELECT f FROM tf) AS u "
+                     "WHERE x = 0.1",
+                     as_float},
+           std::pair{"SELECT COUNT(*) FROM (SELECT f AS x FROM tf UNION ALL SELECT d FROM tf) AS u "
+                     "WHERE x = 0.1",
+                     0.1},
+           std::pair{"SELECT COUNT(*) FROM (SELECT d AS x FROM tf UNION ALL SELECT f FROM tf) AS u "
+                     "WHERE x = 0.1",
+                     0.1},
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(FilterConstants(*plan), std::vector<double>{constant}) << sql;
+  }
+  const std::string sql = "SELECT f FROM tf UNION ALL SELECT k FROM tf";
+  auto refused = BindSql(sql, catalog);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_TRUE(refused.status().IsNotImplemented()) << refused.status().ToString();
+  EXPECT_TRUE(refused.status().message().contains(
+      "UNION ALL of FLOAT and INTEGER values is not supported (antb1 reads FLOAT as DOUBLE, "
+      "divergence D11)"))
+      << refused.status().message();
+  EXPECT_EQ(SpanText(sql, refused.status()), "k");
 }
 
 // ORDER BY a select item by name, alias or position: a column already ordered by is no key again,

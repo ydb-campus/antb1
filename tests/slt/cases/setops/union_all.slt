@@ -1,0 +1,885 @@
+# UNION ALL (ADR 0036): two or more blocks as the whole statement, a derived table's query or a CTE's query, over the
+# star schema and the type tables. Every row of each block in written order, duplicates and NULLs kept; the names are
+# the first block's; each column's type is a left fold over the blocks' types in written order.
+
+# ---- the inputs, one table at a time ----
+
+query II nosort
+SELECT COUNT(*), MAX(ct_id) FROM cities
+----
+6	6
+
+query III nosort
+SELECT COUNT(*), COUNT(zn_parent), MAX(zn_id) FROM zones
+----
+40	35	40
+
+# ---- placements: the whole statement, a derived table, a CTE ----
+
+query I rowsort
+SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id > 4
+----
+1
+2
+3
+4
+5
+5
+6
+6
+
+query IT rowsort
+SELECT ct_id, label FROM cities WHERE ct_id <= 2 UNION ALL SELECT zn_city, label FROM zones WHERE zn_id <= 2 UNION ALL SELECT ct_id, label FROM cities WHERE ct_id = 6
+----
+1	center
+1	center
+2	harbor
+2	north
+6	outskirts
+
+query II rowsort
+SELECT x, COUNT(*) FROM (SELECT tr_pickup AS x FROM trips WHERE tr_row < 100 UNION ALL SELECT zn_id FROM zones) AS u GROUP BY x
+----
+1	4
+10	4
+11	4
+12	4
+13	4
+14	4
+15	3
+16	3
+17	3
+18	3
+19	3
+2	4
+20	3
+21	3
+22	3
+23	3
+24	3
+25	3
+26	3
+27	3
+28	3
+29	3
+3	4
+30	3
+31	3
+32	3
+33	3
+34	3
+35	3
+36	3
+37	3
+38	3
+39	3
+4	4
+40	3
+41	2
+42	2
+43	2
+5	4
+6	4
+7	4
+8	4
+9	4
+
+query II nosort union_cte
+WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) SELECT COUNT(*), SUM(x) FROM u
+----
+46	143
+
+query II nosort union_cte
+SELECT COUNT(*), SUM(x) FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) AS u
+----
+46	143
+
+# A WITH list before the first block is every block's.
+query I rowsort
+WITH c AS (SELECT ct_id AS x FROM cities WHERE ct_id <= 2) SELECT x FROM c UNION ALL SELECT x + 10 FROM c
+----
+1
+11
+12
+2
+
+# A CTE whose query is a UNION ALL, referenced twice and three times.
+query II nosort
+WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) SELECT COUNT(*), SUM(a.x) FROM u AS a JOIN u AS b ON a.x = b.x
+----
+373	1111
+
+query I nosort
+WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id < 3) SELECT COUNT(*) FROM u AS a, u AS b, u AS c WHERE a.x = b.x AND b.x = c.x
+----
+20
+
+# ---- blocks: aggregates, GROUP BY and HAVING, joins, subqueries, nested unions ----
+
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING COUNT(*) > 74 UNION ALL SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city
+----
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query ID rowsort
+SELECT COUNT(*), SUM(tr_fare) FROM trips UNION ALL SELECT COUNT(*), SUM(tr_rate) FROM trips WHERE tr_row < 1000
+----
+1000	1518.80
+3000	44992.50
+
+query IT rowsort
+SELECT z.zn_id, c.label FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 3 UNION ALL SELECT ct_id, label FROM cities WHERE ct_id = 1
+----
+1	center
+1	center
+2	harbor
+3	hills
+
+query I rowsort
+SELECT ct_id FROM cities AS c WHERE EXISTS (SELECT * FROM zones AS z WHERE z.zn_city = c.ct_id AND z.zn_id < 5) UNION ALL SELECT ct_id FROM cities WHERE ct_id = 6
+----
+1
+2
+3
+4
+6
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id < 9) UNION ALL SELECT dv_city FROM drivers WHERE dv_row < 3
+----
+1
+1
+2
+2
+3
+3
+4
+5
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT y FROM (SELECT zn_id AS y FROM zones UNION ALL SELECT dv_city FROM drivers) AS v) AS u
+----
+143
+
+# Each block counts its own derived tables without an alias.
+query I rowsort
+SELECT unnamed_subquery.c FROM (SELECT ct_id AS c FROM cities) UNION ALL SELECT unnamed_subquery.z FROM (SELECT zn_id AS z FROM zones WHERE zn_id < 3)
+----
+1
+1
+2
+2
+3
+4
+5
+6
+
+# ---- what reads a UNION ALL: SELECT *, alias lists, ORDER BY with LIMIT, COUNT(DISTINCT), joins ----
+
+query IT rowsort
+SELECT * FROM (SELECT ct_id, label FROM cities UNION ALL SELECT zn_city, label FROM zones WHERE zn_id = 1) AS u
+----
+1	center
+1	center
+2	harbor
+3	hills
+4	airport
+5	old town
+6	outskirts
+
+query II rowsort
+SELECT a, b FROM (SELECT ct_id, ct_pop FROM cities UNION ALL SELECT zn_city, zn_id FROM zones WHERE zn_id < 3) AS u(a, b)
+----
+1	1
+1	120000
+2	2
+2	45000
+3	30000
+4	NULL
+5	8000
+6	2500
+
+query II nosort
+SELECT x, y FROM (SELECT ct_id AS x, ct_pop AS y FROM cities UNION ALL SELECT zn_city, zn_id FROM zones) AS u ORDER BY y DESC, x LIMIT 5 OFFSET 1
+----
+2	45000
+3	30000
+5	8000
+6	2500
+5	40
+
+query II nosort
+SELECT COUNT(DISTINCT x), COUNT(*) FROM (SELECT tr_pickup AS x FROM trips UNION ALL SELECT zn_id FROM zones) AS u
+----
+43	3040
+
+# A UNION ALL as a join's build side and as its probe side.
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips AS t JOIN (SELECT zn_id AS z FROM zones WHERE zn_id <= 5 UNION ALL SELECT zn_id FROM zones WHERE zn_id = 7) AS u ON t.tr_pickup = u.z
+----
+420	624190
+
+query II nosort
+SELECT COUNT(*), SUM(u.r) FROM (SELECT tr_row AS r, tr_pickup AS p FROM trips WHERE tr_row < 500 UNION ALL SELECT tr_row, tr_dropoff FROM trips WHERE tr_row >= 2500) AS u JOIN zones AS z ON u.p = z.zn_id WHERE z.zn_city = 2
+----
+188	281980
+
+query II nosort
+SELECT COUNT(*), COUNT(u.z) FROM zones AS z LEFT JOIN (SELECT zn_id AS z FROM zones WHERE zn_id <= 3 UNION ALL SELECT zn_id FROM zones WHERE zn_id = 3) AS u ON z.zn_id = u.z
+----
+41	4
+
+# A UNION ALL in the FROM list of a subquery: answered, as any derived table there.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT z FROM (SELECT zn_id AS z FROM zones WHERE zn_id <= 3 UNION ALL SELECT ct_id FROM cities) AS u)
+----
+420
+
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM (SELECT zn_city AS k FROM zones UNION ALL SELECT dv_city FROM drivers) AS u WHERE u.k = c.ct_id)
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(x) FROM (SELECT ct_id * 400 AS x FROM cities UNION ALL SELECT zn_id * 70 FROM zones) AS u)
+----
+199
+
+
+# ---- NULLs, empty blocks, several row groups ----
+
+query II nosort
+SELECT COUNT(*), COUNT(x) FROM (SELECT tr_promo AS x FROM trips UNION ALL SELECT zn_parent FROM zones) AS u
+----
+3040	95
+
+query II nosort
+SELECT COUNT(*), SUM(x) FROM (SELECT tr_row AS x FROM trips WHERE tr_row < 0 UNION ALL SELECT ct_pop FROM cities) AS u
+----
+6	205500
+
+query II nosort
+SELECT COUNT(*), SUM(x) FROM (SELECT RegionID AS x FROM hits_like_split WHERE IsMobile = 1 UNION ALL SELECT RegionID FROM hits_like WHERE IsMobile = 0) AS u
+----
+10000	97210255
+
+# ---- types: each column's is a left fold over the blocks' types in written order ----
+
+query I rowsort
+SELECT i16 FROM edge UNION ALL SELECT i32 FROM edge
+----
+-1
+-1
+-100
+-100000
+-12345
+-2147483648
+-32768
+-7
+0
+0
+1
+1
+100
+100000
+12345
+2147483647
+32767
+54321
+7
+7
+NULL
+NULL
+NULL
+NULL
+
+query I rowsort
+SELECT u16 FROM edge UNION ALL SELECT i16 FROM edge
+----
+-1
+-100
+-12345
+-32768
+0
+0
+1
+1
+100
+12
+12345
+15887
+15917
+2
+32767
+32768
+40000
+65535
+7
+7
+NULL
+NULL
+NULL
+NULL
+
+query I rowsort
+SELECT i64 FROM edge UNION ALL SELECT u16 FROM edge
+----
+-1
+-1000000000000000
+-42
+-9223372036854775808
+0
+0
+1
+1
+1000000000000000
+12
+15887
+15917
+2
+32768
+40000
+42
+65535
+7
+7
+9223372036854775807
+NULL
+NULL
+NULL
+NULL
+
+query I rowsort
+SELECT i32 FROM edge UNION ALL SELECT SUM(i64) FROM edge
+----
+-1
+-100000
+-2147483648
+-7
+0
+1
+100000
+2147483647
+54321
+6
+7
+NULL
+NULL
+
+query D rowsort
+SELECT d9_2 FROM decimals UNION ALL SELECT d18_4 FROM decimals
+----
+-1.0001
+-1.0001
+-1.0001
+-1.2500
+-1.2500
+-1.2500
+-2.0002
+-2.0002
+-2.0002
+-2.5000
+-2.5000
+-3.0003
+-3.0003
+-3.0003
+-3.0003
+-3.7500
+-3.7500
+-3.7500
+-4.0004
+-4.0004
+-4.0004
+-4.0004
+-5.0000
+-5.0000
+-5.0000
+-5.0005
+-5.0005
+-5.0005
+-6.2500
+-6.2500
+-6.2500
+-6.2500
+-9999999.9900
+0.0000
+0.0000
+0.0000
+0.0000
+0.0000
+0.0000
+1.0001
+1.0001
+1.0001
+1.2500
+1.2500
+1.2500
+12345678901234.5678
+2.0002
+2.0002
+2.0002
+2.5000
+2.5000
+3.0003
+3.0003
+3.0003
+3.7500
+3.7500
+4.0004
+4.0004
+4.0004
+5.0000
+5.0000
+5.0000
+5.0005
+5.0005
+6.2500
+6.2500
+6.2500
+9999999.9900
+99999999999999.9999
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT p FROM decimals UNION ALL SELECT b FROM decimals
+----
+-12000000076.00
+-12000000076.00
+-12000000076.00
+-15000000095.00
+-15000000095.00
+-15000000095.00
+-19.99
+-19.99
+-19.99
+-3000000019.00
+-3000000019.00
+-39.98
+-39.98
+-59.97
+-59.97
+-59.97
+-6000000038.00
+-6000000038.00
+-6000000038.00
+-79.96
+-79.96
+-79.96
+-9000000057.00
+-9000000057.00
+-9000000057.00
+-9223372036854775808.00
+-99.95
+-99.95
+-99.95
+-9999999999999.99
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+12000000076.00
+12000000076.00
+12000000076.00
+15000000095.00
+15000000095.00
+15000000095.00
+19.99
+19.99
+3000000019.00
+3000000019.00
+39.98
+39.98
+59.97
+59.97
+59.97
+6000000038.00
+6000000038.00
+6000000038.00
+79.96
+79.96
+79.96
+79.96
+9000000057.00
+9000000057.00
+9007199254740993.00
+9223372036854775807.00
+99.95
+99.95
+9999999999999.99
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT b FROM decimals UNION ALL SELECT d9_2 FROM decimals
+----
+-1.25
+-1.25
+-1.25
+-12000000076.00
+-12000000076.00
+-12000000076.00
+-15000000095.00
+-15000000095.00
+-15000000095.00
+-2.50
+-2.50
+-3.75
+-3.75
+-3.75
+-3000000019.00
+-3000000019.00
+-5.00
+-5.00
+-5.00
+-6.25
+-6.25
+-6.25
+-6.25
+-6000000038.00
+-6000000038.00
+-6000000038.00
+-9000000057.00
+-9000000057.00
+-9000000057.00
+-9223372036854775808.00
+-9999999.99
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+1.25
+1.25
+1.25
+12000000076.00
+12000000076.00
+12000000076.00
+15000000095.00
+15000000095.00
+15000000095.00
+2.50
+2.50
+3.75
+3.75
+3000000019.00
+3000000019.00
+5.00
+5.00
+5.00
+6.25
+6.25
+6.25
+6000000038.00
+6000000038.00
+6000000038.00
+9000000057.00
+9000000057.00
+9007199254740993.00
+9223372036854775807.00
+9999999.99
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT d38_0 FROM decimals UNION ALL SELECT SUM(b) FROM decimals
+----
+-100000000000000000000
+-100000000000000000000
+-100000000000000000000
+-200000000000000000000
+-200000000000000000000
+-300000000000000000000
+-300000000000000000000
+-300000000000000000000
+-400000000000000000000
+-400000000000000000000
+-400000000000000000000
+-500000000000000000000
+-500000000000000000000
+-500000000000000000000
+-99999999999999999999999999999999999999
+0
+0
+0
+0
+100000000000000000000
+100000000000000000000
+200000000000000000000
+200000000000000000000
+200000000000000000000
+300000000000000000000
+300000000000000000000
+300000000000000000000
+400000000000000000000
+400000000000000000000
+400000000000000000000
+400000000000000000000
+500000000000000000000
+9007190254740935
+99999999999999999999999999999999999999
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# The fold depends on the order: USMALLINT and SMALLINT make an INTEGER, which DECIMAL(9,2) widens to DECIMAL(12,2);
+# SMALLINT with DECIMAL(9,2) stays DECIMAL(9,2), which holds USMALLINT too.
+query D rowsort
+SELECT u16 FROM edge UNION ALL SELECT i16 FROM edge UNION ALL SELECT d9_2 FROM decimals
+----
+-1.00
+-1.25
+-1.25
+-1.25
+-100.00
+-12345.00
+-2.50
+-2.50
+-3.75
+-3.75
+-3.75
+-32768.00
+-5.00
+-5.00
+-5.00
+-6.25
+-6.25
+-6.25
+-6.25
+-9999999.99
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+1.00
+1.00
+1.25
+1.25
+1.25
+100.00
+12.00
+12345.00
+15887.00
+15917.00
+2.00
+2.50
+2.50
+3.75
+3.75
+32767.00
+32768.00
+40000.00
+5.00
+5.00
+5.00
+6.25
+6.25
+6.25
+65535.00
+7.00
+7.00
+9999999.99
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT i16 FROM edge UNION ALL SELECT d9_2 FROM decimals UNION ALL SELECT u16 FROM edge
+----
+-1.00
+-1.25
+-1.25
+-1.25
+-100.00
+-12345.00
+-2.50
+-2.50
+-3.75
+-3.75
+-3.75
+-32768.00
+-5.00
+-5.00
+-5.00
+-6.25
+-6.25
+-6.25
+-6.25
+-9999999.99
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+1.00
+1.00
+1.25
+1.25
+1.25
+100.00
+12.00
+12345.00
+15887.00
+15917.00
+2.00
+2.50
+2.50
+3.75
+3.75
+32767.00
+32768.00
+40000.00
+5.00
+5.00
+5.00
+6.25
+6.25
+6.25
+65535.00
+7.00
+7.00
+9999999.99
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# A literal is typed by itself: 1 is an INTEGER, 3000000000 a BIGINT, whatever the other blocks hold.
+query I rowsort
+SELECT 1 FROM cities WHERE ct_id < 3 UNION ALL SELECT i16 FROM edge
+----
+-1
+-100
+-12345
+-32768
+0
+1
+1
+1
+100
+12345
+32767
+7
+NULL
+NULL
+
+query I rowsort
+SELECT 3000000000 FROM cities WHERE ct_id < 3 UNION ALL SELECT i32 FROM edge
+----
+-1
+-100000
+-2147483648
+-7
+0
+1
+100000
+2147483647
+3000000000
+3000000000
+54321
+7
+NULL
+NULL
+
+query TT rowsort
+SELECT label, 'city' FROM cities WHERE ct_id < 3 UNION ALL SELECT label, 'zone' FROM zones WHERE zn_id < 3
+----
+center	city
+center	zone
+harbor	city
+north	zone
+
+query T rowsort
+SELECT tr_day FROM trips WHERE tr_row < 3 UNION ALL SELECT dv_since FROM drivers WHERE dv_row < 3
+----
+2025-01-01
+2025-01-12
+2025-01-23
+2026-03-01
+2026-03-02
+2026-03-03
+
+# An outer WHERE compares in the union's type: 54321 is no SMALLINT, but an INTEGER.
+query I nosort
+SELECT COUNT(*) FROM (SELECT i16 AS x FROM edge UNION ALL SELECT i32 FROM edge) AS u WHERE x = 54321 OR x = -32768
+----
+2
+
+# FLOAT and FLOAT make a FLOAT, whose literal folds at FLOAT precision (D11); FLOAT and DOUBLE make a DOUBLE.
+query I nosort
+SELECT COUNT(*) FROM (SELECT f AS x FROM floats UNION ALL SELECT f FROM floats) AS u WHERE x = 0.1
+----
+2
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT f AS x FROM floats UNION ALL SELECT d FROM decimals) AS u WHERE x = 0.1
+----
+0
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT d AS x FROM decimals UNION ALL SELECT f FROM floats) AS u WHERE x = 0.1
+----
+0

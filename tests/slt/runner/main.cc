@@ -113,6 +113,7 @@ struct Args {
   // tpch, tpcds: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
   std::string memory_limit;
   bool times = false;  // ANTB1_TPCH_TIMES=1, ANTB1_TPCDS_TIMES=1
+  std::string shard;   // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -657,9 +658,19 @@ int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
   }
   RatchetOptions options{.redact = args.redact,
                          .only = args.only,
+                         .shard = {},
                          .status_path = args.status,
                          .command = command,
                          .clock = {}};
+  if (!args.shard.empty()) {
+    const std::optional<RatchetShard> shard = ParseRatchetShard(args.shard);
+    if (!shard.has_value()) {
+      std::println(stderr, "antb1-slt: --shard expects K/N with 1 <= K <= N <= 99, got '{}'",
+                   args.shard);
+      return kExitUsage;
+    }
+    options.shard = *shard;
+  }
   if (args.times) {
     options.clock = [] {
       return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
@@ -786,6 +797,10 @@ int Main(std::span<char*> argv, const Environment& env) {
                      : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
         });
     cmd->add_option("--only", args.only, "Run only Q<n> (repro)");
+    cmd->add_option(
+        "--shard", args.shard,
+        "Run only slice K of N (K/N): the queries at index K - 1, K - 1 + N, ... of the "
+        "file, from 0, checked against the ratchet alone");
     cmd->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
     return cmd;
   };

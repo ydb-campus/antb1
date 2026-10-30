@@ -1153,14 +1153,15 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
       .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
 }
 
-// A compound: UNION ALL parses (ADR 0036), and is refused until its binder item binds each branch
-// as a block of its own -- at its first UNION ALL, before any check that reads a block's clauses,
-// which a compound keeps in its branches.
-std::optional<Rejection> RejectCompound(const sql::SelectStatement& query) {
-  if (query.set_operation.size() < 2) {
+// A UNION ALL as the query of a subquery conjunct, which ADR 0036's X6 answers: at the subquery's
+// operator, as every shape of a subquery is refused, and before any check that reads a block's
+// clauses, which a UNION ALL keeps in its blocks (it is no aggregate query, for one).
+std::optional<Rejection> RejectUnionAllSubquery(const SubqueryConjunct& form) {
+  if (form.subquery->query->set_operation.empty()) {
     return std::nullopt;
   }
-  return Rejection{.span = query.set_operation[1].op_span, .message = "UNION ALL is not supported"};
+  return Rejection{.span = form.subquery->op_span,
+                   .message = "a subquery over a UNION ALL is not supported"};
 }
 
 // Why an accepted shape is still not answered, or std::nullopt when it is.
@@ -1174,12 +1175,13 @@ std::optional<Rejection> RejectCompound(const sql::SelectStatement& query) {
 // time, and HAVING, LIMIT and OFFSET -- each of which can leave no row -- are out).
 //
 // What needs the catalog, the subquery's column count and the IN key's type, is checked where the
-// sub-block is bound. A compound is refused first (RejectCompound).
+// sub-block is bound. A UNION ALL as the query is refused once the other side is checked
+// (RejectUnionAllSubquery).
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
-  if (auto r = RejectCompound(*form.subquery->query)) {
-    return r;
-  }
   if (form.exists()) {
+    if (auto r = RejectUnionAllSubquery(form)) {
+      return r;
+    }
     // The conjunct is the subquery itself: there is no other side to check. ADR 0023's Path 1 takes
     // a plain block, so every clause that would have to act per binding is refused here, where the
     // shape is visible before a name resolves; an uncorrelated EXISTS stays deferred and is refused
@@ -1217,7 +1219,7 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
                        .message = std::format("IN needs {} on the left",
                                               having ? "a column or an aggregate" : "a column")};
     }
-    return std::nullopt;
+    return RejectUnionAllSubquery(form);
   }
   if (!ReadsColumn(*form.other, having) && !std::holds_alternative<sql::Literal>(*form.other) &&
       !IsConstantInteger(*form.other)) {
@@ -1225,6 +1227,9 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
                      .message = std::format("a comparison with a subquery needs {} or a literal "
                                             "on the other side",
                                             having ? "a column or an aggregate" : "a column")};
+  }
+  if (auto r = RejectUnionAllSubquery(form)) {
+    return r;
   }
   const sql::SelectStatement& query = *form.subquery->query;
   if (!query.group_by.empty() || !query.having.empty() || query.limit.has_value() ||
@@ -2323,9 +2328,9 @@ class Binder {
         options_(options),
         bind_block_(bind_block),
         relations_(scope_.bindings().size()) {
-    // One block: a compound never reaches here, since CheckSupported refuses it (ADR 0036, until
-    // its binder item binds each branch as a block of its own). Bound here, it would read as a
-    // block with no select list.
+    // One block: BindBlock binds a UNION ALL by its blocks (BindUnionAll), each of which comes
+    // here. Bound here, a UNION ALL would read as a block with no select list.
+    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -3728,6 +3733,35 @@ LogicalType CaseDecimal(LogicalType decimal, LogicalType other) {
   return LogicalType::Decimal(Narrow<std::uint8_t>(kMax), Narrow<std::uint8_t>(kMax - integers));
 }
 
+// The type DuckDB gives two values of integer types in a CASE or a UNION ALL: unlike arithmetic,
+// USMALLINT with SMALLINT is INTEGER.
+LogicalType CommonInteger(LogicalType a, LogicalType b) {
+  const bool mixed = (a == LogicalType::kUSmallInt && b == LogicalType::kSmallInt) ||
+                     (a == LogicalType::kSmallInt && b == LogicalType::kUSmallInt);
+  return mixed ? LogicalType::kInteger : CombineIntegers(a, b);
+}
+
+// The type DuckDB gives a UNION ALL column's values so far, `so_far`, and the next block's, `next`
+// (ADR 0036): a left fold in written order over each block's own type, so a literal is typed by
+// itself, unlike in CASE. Numbers combine by CASE's rules for integers and DECIMALs, and FLOAT is
+// DOUBLE here, its flag aside. Every other mix -- VARCHAR, DATE or TIMESTAMP with another type, a
+// DOUBLE with an integer or a DECIMAL -- has no exact widening, so no type.
+std::optional<LogicalType> UnionAllType(LogicalType so_far, LogicalType next) {
+  if (so_far == next) {
+    return so_far;
+  }
+  if (IsInteger(so_far) && IsInteger(next)) {
+    return CommonInteger(so_far, next);
+  }
+  const bool decimal_so_far = so_far == LogicalType::kDecimal;
+  const bool decimal_next = next == LogicalType::kDecimal;
+  if ((decimal_so_far || decimal_next) && (decimal_so_far || IsInteger(so_far)) &&
+      (decimal_next || IsInteger(next))) {
+    return decimal_so_far ? CaseDecimal(so_far, next) : CaseDecimal(next, so_far);
+  }
+  return std::nullopt;
+}
+
 // The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere).
 arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
   if (a == b) {
@@ -3744,10 +3778,7 @@ arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan s
     }
   }
   if (IsInteger(a) && IsInteger(b)) {
-    // Unlike arithmetic, USMALLINT with SMALLINT is INTEGER here.
-    const bool mixed = (a == LogicalType::kUSmallInt && b == LogicalType::kSmallInt) ||
-                       (a == LogicalType::kSmallInt && b == LogicalType::kUSmallInt);
-    return mixed ? LogicalType::kInteger : CombineIntegers(a, b);
+    return CommonInteger(a, b);
   }
   if (IsNumeric(a) && IsNumeric(b)) {
     return LogicalType::kDouble;
@@ -5827,7 +5858,8 @@ arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
     return arrow::Status::OK();
   }
   // A FROM item of the outermost block reports at its connector, or at the item itself when it is
-  // the first; one of that block's subqueries has no item of its own and carries its span.
+  // the first; one of that block's subqueries has no item of its own and carries its span, and so
+  // does an item of a UNION ALL's block, since the UNION ALL has no FROM list of its own.
   const SourceSpan span = [&] {
     if (over->span.has_value()) {
       return *over->span;
@@ -5840,10 +5872,34 @@ arrow::Status CheckRelationLimit(const sql::SelectStatement& stmt) {
       .message = std::format("a query of more than {} relations is not supported", kMaxRelations)});
 }
 
+// A UNION ALL's own clauses: the ORDER BY, LIMIT and OFFSET after its last block, which ADR 0036's
+// X5 answers (its WITH list is answered), at the first of them in the query.
+std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
+  if (!stmt.order_by.empty()) {
+    return Rejection{.span = stmt.order_by_span,
+                     .message = "ORDER BY on a UNION ALL is not supported"};
+  }
+  const bool limit_first =
+      stmt.limit.has_value() &&
+      (!stmt.offset.has_value() || stmt.limit_span.offset < stmt.offset_span.offset);
+  if (limit_first) {
+    return Rejection{.span = stmt.limit_span, .message = "LIMIT on a UNION ALL is not supported"};
+  }
+  if (stmt.offset.has_value()) {
+    return Rejection{.span = stmt.offset_span, .message = "OFFSET on a UNION ALL is not supported"};
+  }
+  return std::nullopt;
+}
+
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
-  if (auto r = RejectCompound(stmt)) {
-    return Reject(*r);
+  if (!stmt.set_operation.empty()) {
+    // A UNION ALL keeps its clauses in its blocks, which ReachableBlocks lists before it, so what
+    // is left is its tail; its FROM list is empty, which CheckFromList must never see.
+    if (auto r = RejectUnionAllTail(stmt)) {
+      return Reject(*r);
+    }
+    return arrow::Status::OK();
   }
   for (const sql::SelectItem& item : stmt.items) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
@@ -5861,9 +5917,10 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
 }
 
 // What antb1 answers, over the whole statement: the relation limit first, like the parser's depth
-// limit, then every block the statement reaches -- its own, each derived table's, and the body of
-// each CTE something references. A static walk over names, so every kUnsupported is reported before
-// any name resolves, and an unreferenced CTE is not checked at all, as DuckDB never binds one.
+// limit, then every block the statement reaches -- its own, each derived table's, each subquery's,
+// a UNION ALL's blocks before the UNION ALL itself, and the body of each CTE a reached block
+// references. A static walk over names, so every kUnsupported is reported before any name resolves,
+// and an unreferenced CTE is not checked at all, as DuckDB never binds one.
 arrow::Status CheckSupported(const sql::SelectStatement& stmt) {
   ARROW_RETURN_NOT_OK(CheckRelationLimit(stmt));
   for (const sql::SelectStatement* block : ReachableBlocks(stmt)) {
@@ -6020,10 +6077,174 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
                          cte == nullptr ? std::string{} : cte->name);
 }
 
+// The span a type refusal of a UNION ALL block's column points at: its select item's expression,
+// or the `*` the column was expanded from.
+SourceSpan UnionAllItemSpan(const sql::SelectStatement& block, std::size_t column) {
+  return block.star ? block.star_span : block.items.at(column).expr.span();
+}
+
+// A type as a UNION ALL refusal names it: FLOAT for a DOUBLE that holds FLOAT values (D11).
+std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
+  return stored_as_float ? std::string("FLOAT") : ToString(type);
+}
+
+// A UNION ALL (ADR 0036): each block bound as a block of its own, in written order, from the one id
+// source, in the UNION ALL's CTE frame and against its scope -- so its WITH list is every block's,
+// and a name that only an enclosing FROM item has is a lateral reference, as in a derived table's
+// block. Then, as in DuckDB, the column counts (a bind error at the UNION ALL before the first
+// block that differs), then the types: each column's is a left fold over the blocks in written
+// order (UnionAllType), and every block's values must widen to it exactly, the one cast the
+// executor runs (CastExpr); a type refusal points at the first select item in the query that fails
+// either. A block whose column is of another type is cast below the union, once, straight to the
+// column's type, and the union's ids are new, since no block defines its rows. Its names are the
+// first block's, and its FLOAT flag the AND over the blocks: FLOAT and DOUBLE values make a DOUBLE
+// in DuckDB, whose literals do not fold at FLOAT precision.
+arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                        const BindOptions& options, ColumnIdSource& ids,
+                                        const CteFrame& own, const Scope* outer) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  ANTB1_CHECK(stmt.set_operation.size() >= 2);
+  // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
+  ANTB1_CHECK(stmt.order_by.empty());
+  ANTB1_CHECK(!stmt.limit.has_value());
+  ANTB1_CHECK(!stmt.offset.has_value());
+  std::vector<LogicalPlan> blocks;
+  blocks.reserve(stmt.set_operation.size());
+  for (const sql::SetBranch& branch : stmt.set_operation) {
+    ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
+                          BindBlock(*branch.query, catalog, options, ids, &own, outer));
+    blocks.push_back(std::move(bound.plan));
+  }
+  const std::size_t width = blocks.front().output.size();
+  for (std::size_t k = 1; k < blocks.size(); ++k) {
+    if (blocks[k].output.size() != width) {
+      return BindError(
+          "Set operations can only apply to expressions with the same number of result columns",
+          stmt.set_operation[k].op_span);
+    }
+  }
+
+  struct Column {
+    LogicalType type;
+    bool stored_as_float = false;
+  };
+  struct Refusal {
+    std::size_t block = 0;
+    std::size_t column = 0;
+    std::string message;
+  };
+  std::vector<Column> columns;
+  columns.reserve(width);
+  std::optional<Refusal> first;  // the first item in the query whose type fails
+  const auto refuse = [&first](std::size_t block, std::size_t column, std::string message) {
+    if (!first.has_value() || std::pair(block, column) < std::pair(first->block, first->column)) {
+      first = Refusal{.block = block, .column = column, .message = std::move(message)};
+    }
+  };
+  for (std::size_t i = 0; i < width; ++i) {
+    Column column{.type = blocks[0].output[i].type,
+                  .stored_as_float = blocks[0].output[i].stored_as_float};
+    bool folded = true;
+    for (std::size_t k = 1; k < blocks.size(); ++k) {
+      const OutputColumn& next = blocks[k].output[i];
+      const std::optional<LogicalType> type = UnionAllType(column.type, next.type);
+      if (!type.has_value()) {
+        // DuckDB makes a FLOAT of FLOAT and integer or DECIMAL values, which antb1 reads as DOUBLE.
+        const auto exact_number = [](LogicalType t) {
+          return IsInteger(t) || t == LogicalType::kDecimal;
+        };
+        const bool d11 = (column.stored_as_float && exact_number(next.type)) ||
+                         (next.stored_as_float && exact_number(column.type));
+        refuse(k, i,
+               std::format("UNION ALL of {} and {} values is not supported{}",
+                           UnionAllTypeName(column.type, column.stored_as_float),
+                           UnionAllTypeName(next.type, next.stored_as_float),
+                           d11 ? " (antb1 reads FLOAT as DOUBLE, divergence D11)" : ""));
+        folded = false;
+        break;
+      }
+      column.type = *type;
+      column.stored_as_float = column.stored_as_float && next.stored_as_float;
+    }
+    for (std::size_t k = 0; folded && k < blocks.size(); ++k) {
+      const LogicalType from = blocks[k].output[i].type;
+      if (!IsExactWidening(from, column.type)) {
+        refuse(k, i,
+               std::format("UNION ALL of {} and {} values is not supported ({} does not widen "
+                           "exactly to {})",
+                           ToString(column.type), ToString(from), ToString(from),
+                           ToString(column.type)));
+        break;
+      }
+    }
+    columns.push_back(column);
+  }
+  if (first.has_value()) {
+    return Reject(
+        Rejection{.span = UnionAllItemSpan(*stmt.set_operation[first->block].query, first->column),
+                  .message = std::move(first->message)});
+  }
+
+  UnionAllNode node{.span = stmt.set_operation[1].op_span};
+  for (std::size_t k = 0; k < blocks.size(); ++k) {
+    std::vector<BoundColumn> reads;
+    std::vector<ExprPtr> casts;
+    std::vector<ColumnId> cast_ids;
+    for (std::size_t i = 0; i < width; ++i) {
+      const OutputColumn& out = blocks[k].output[i];
+      ColumnId id = out.id;
+      if (out.type != columns[i].type) {
+        casts.push_back(
+            WidenTo(std::make_shared<const Expr>(
+                        Expr{.node = ColumnExpr{.id = out.id}, .type = out.type, .name = out.name}),
+                    columns[i].type));
+        id = ids.Next();
+        cast_ids.push_back(id);
+      }
+      // The block's own name: the first block's are the union's, which EXPLAIN shows.
+      reads.push_back(BoundColumn{.id = id, .name = out.name, .type = columns[i].type});
+    }
+    LogicalNodePtr input = std::move(blocks[k].root);
+    if (!casts.empty()) {
+      input = Make(ComputeNode{.input = std::move(input),
+                               .exprs = std::move(casts),
+                               .ids = std::move(cast_ids),
+                               .span = stmt.set_operation[k].query->span});
+    }
+    node.inputs.push_back(std::move(input));
+    node.columns.push_back(std::move(reads));
+  }
+  std::vector<OutputColumn> output;
+  output.reserve(width);
+  for (std::size_t i = 0; i < width; ++i) {
+    node.ids.push_back(ids.Next());
+    output.push_back(OutputColumn{.name = blocks[0].output[i].name,
+                                  .type = columns[i].type,
+                                  .id = node.ids.back(),
+                                  .stored_as_float = columns[i].stored_as_float});
+  }
+  return LogicalPlan{.root = Make(std::move(node)), .output = std::move(output)};
+}
+
+// A bound block's columns: its root's, each with its FLOAT flag.
+BoundBlock BoundBlockOf(LogicalPlan plan) {
+  std::vector<BindingColumn> columns;
+  columns.reserve(plan.output.size());
+  for (const OutputColumn& out : plan.output) {
+    columns.push_back(BindingColumn{.name = out.name,
+                                    .id = out.id,
+                                    .type = out.type,
+                                    .unsupported_type = {},
+                                    .stored_as_float = out.stored_as_float});
+  }
+  return BoundBlock{.plan = std::move(plan), .columns = std::move(columns)};
+}
+
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
                                     bool inside_exists) {
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -6047,6 +6268,13 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
     frame.declared = declared;
   }
   const CteFrame& own = frames.back();
+  if (!stmt.set_operation.empty()) {
+    // No subquery's query is a UNION ALL (RejectSubqueryConjunct refuses it, ADR 0036's X6), so it
+    // is never an EXISTS block, and only its blocks' own subqueries read enclosing blocks.
+    ANTB1_CHECK(!(outer_encloses || inside_exists));
+    ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, BindUnionAll(stmt, catalog, options, ids, own, outer));
+    return BoundBlockOf(std::move(plan));
+  }
 
   // One binding per FROM item, in FROM order and from one id source, so that a relation's index is
   // its binding's and its FROM item's: the invariant OnVisibility, OrderJoins and Scope::Find
@@ -6074,16 +6302,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   Binder binder(stmt, std::move(bindings), ids, options, outer, &bind_sub, outer_encloses,
                 inside_exists);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
-  std::vector<BindingColumn> columns;
-  columns.reserve(plan.output.size());
-  for (const OutputColumn& out : plan.output) {
-    columns.push_back(BindingColumn{.name = out.name,
-                                    .id = out.id,
-                                    .type = out.type,
-                                    .unsupported_type = {},
-                                    .stored_as_float = out.stored_as_float});
-  }
-  return BoundBlock{.plan = std::move(plan), .columns = std::move(columns)};
+  return BoundBlockOf(std::move(plan));
 }
 
 }  // namespace

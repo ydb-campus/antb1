@@ -4,8 +4,8 @@ Date: 2026-10-30
 
 ## Status
 
-Proposed (X1 and X2 built: the plan node and its operator, and the grammar, whose compounds the binder refuses
-until X3).
+Accepted (2026-10-30, with X3). X1, X2 and X3 are built: the plan node and its operator, the grammar, and the
+binding, which answers UNION ALL in derived tables, CTE bodies and statements. X4 to X7 stay on the Plan below.
 
 ## Context
 
@@ -98,6 +98,8 @@ until X3).
    - Until X3, the binder refuses every compound it checks with exit code 4; like DuckDB, it checks no CTE that
      nothing references. It does so before any check that assumes a FROM list; otherwise a compound would reach
      `CheckFromList`'s assertion and abort with exit code 70.
+   - Update (2026-10-30, X3): the static check of a compound is now its tail alone (X5), and it still returns
+     before `CheckFromList`; a compound as a subquery's query is refused where the subquery conjunct is checked (X6).
    - These stay exit 4 until X4: `UNION` without `ALL`, `BY NAME`, `INTERSECT`, `EXCEPT`, and a parenthesized or
      non-SELECT branch.
    - ORDER BY, LIMIT or OFFSET before a `UNION ALL` is a syntax error, as in DuckDB.
@@ -105,22 +107,36 @@ until X3).
    - **Scope.** A compound's WITH list is visible to every branch. Each branch binds as a block of its own with
      `BindBlock`, from the query's one id source, in the compound's CTE frame and scope. A derived table's branches
      bind against the FROM items before it, so a lateral reference is refused by ADR 0022's rule 9.
-   - **Column counts.** A mismatch is a bind error, exit code 1, with DuckDB's message.
-   - **The type fold** runs left to right in written order over each branch's own types:
-     - numeric types combine by CASE's numeric rules (`CaseCommon`, `CaseDecimal`);
+   - **Column counts.** A mismatch is a bind error, exit code 1, with DuckDB's message, at the UNION ALL before the
+     first branch that differs. Every branch binds first, as in DuckDB (checked: a bind error in a third branch wins
+     over a count mismatch at the second).
+   - **The type fold** runs left to right in written order over each branch's own types (`UnionAllType`):
+     - equal types stay, whatever their kind;
+     - integers combine by CASE's integer rule (USMALLINT ∪ SMALLINT is INTEGER), and an integer or DECIMAL with a
+       DECIMAL by `CaseDecimal` -- never by the rest of `CaseCommon`, whose DOUBLE results and exit-1 errors are
+       CASE's;
      - FLOAT ∪ FLOAT is FLOAT (D11), and FLOAT ∪ DOUBLE is DOUBLE;
-     - every other mix exits 4.
+     - every other mix exits 4, naming FLOAT as FLOAT, and D11 where a FLOAT meets an integer or a DECIMAL.
    - **Exactness.** Each branch must widen exactly to the result, else exit 4 (for example, a DECIMAL that DuckDB
      would round past 38 digits).
+   - **The type refusal** is "UNION ALL of T1 and T2 values is not supported", T2 being the refused item's type, at
+     the first select item in the query (the branch, then the column) that fails either check, or at its branch's
+     `*`.
    - **Casts.** A branch whose type differs gets one `Compute` of `WidenTo` casts, straight to the final type.
    - **Names and flags.** Names come from branch 0. `stored_as_float` is the AND over the branches.
    - **Answered:** a compound as a derived table's query, as a CTE's query, or as the whole statement.
-   - **Refused with exit code 4:** ORDER BY, LIMIT or OFFSET on a compound (X5), and a compound as the query of IN,
-     EXISTS or a scalar subquery (X6).
+   - **Refused with exit code 4:** ORDER BY, LIMIT or OFFSET on a compound (X5), at the first of them; and a compound
+     as the query of IN, EXISTS or a scalar subquery (X6), at the subquery's operator once the conjunct's other
+     side is checked.
+   - **D26** is recorded in docs/sql-subset.md: a LIMIT met without ORDER BY never runs the branches it does not
+     need, so their errors are never reported, where DuckDB fails (checked with an overflow in a second branch).
 
 ## Consequences
 
-- The eight queries derived from TPC-DS that lack only UNION ALL can pass (X3).
+- The eight queries derived from TPC-DS that lacked only UNION ALL pass (X3), which takes the ratchet from 38 to 46.
+  Three of them (4, 11 and 74) recompute a union CTE per reference, which nearly doubles the run at scale factor 1:
+  under AddressSanitizer one run of the 99 would outlast its timeout, so it runs in four shards of every fourth
+  query (tests/tpcds/CMakeLists.txt). X7's filter pushdown into the branches is what would cut that time.
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
 - A union's consumer is serial. A large union under a GROUP BY, a join or a sort runs at the consumer's
@@ -135,7 +151,7 @@ until X3).
 | --- | --- | --- |
 | X1 | The plan node and `UnionAllOperator`; every visitor; the reduction's gate. No SQL. | Built |
 | X2 | `UNION ALL` in the grammar, the AST, the unparser and the walkers, refused by the binder with exit code 4; the random generator writes it (a pending feature) | Built |
-| X3 | The binder answers it in derived tables, CTE bodies and statements; `.slt` from DuckDB; the TPC-DS ratchet; D26 | Planned |
+| X3 | The binder answers it in derived tables, CTE bodies and statements; `.slt` from DuckDB; the TPC-DS ratchet; D26 | Built |
 | X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87 |
 | X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it |
 | X6 | A compound as the query of IN, EXISTS or a scalar subquery | Trigger: a query that needs it |

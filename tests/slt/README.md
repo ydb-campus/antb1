@@ -239,8 +239,13 @@ the same type and not merely the same `ValueKind` (a widening pair feeds no equi
 table is never named like the outer binding (the fixtures' self-reference edges would shadow it and make the
 subquery silently uncorrelated), and the outer binding is never read by a path (its name in SQL is the path's).
 `AVG` is written only over a `DECIMAL` argument, where ADR 0021 rule 13 makes the engines agree bit for bit.
-Both forms are answered `Unsupported` and counted as such until U2 and U3 declare their feature, so a diff run
-reports a non-zero `unsupported=` count until then.
+U2 and U3 declare both forms, so they are compared like any other.
+
+Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
+itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
+before. The copies read the same columns of the same table, so their types agree, and the query's row guards count
+every copy's rows. With `union_all` declared (ADR 0036's X3), every feature the generator writes is supported, and a
+diff run reports `unsupported=0`.
 
 ## Data tests: `queries` and `clickbench`
 

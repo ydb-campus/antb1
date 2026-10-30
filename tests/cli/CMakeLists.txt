@@ -568,12 +568,26 @@ antb1_add_cli_golden(
   STDERR
   ARGS query --threads 1 -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS NULL" --table "${_t}"
 )
-# UNION ALL parses, and the binder refuses it at its first UNION ALL until ADR 0036's X3 answers it.
+# A UNION ALL's own ORDER BY, LIMIT and OFFSET exit 4 at their first clause until ADR 0036's X5;
+# values with no exact common type exit 4 at the first item that does not widen; a column count
+# that differs is DuckDB's bind error, at the UNION ALL before the block.
 antb1_add_cli_golden(
-  unsupported_union_all
+  unsupported_union_all_order_by
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT WatchID FROM t" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT WatchID FROM t\nORDER BY 1" --table "${_t}"
+)
+antb1_add_cli_golden(
+  unsupported_union_all_types
+  EXIT_CODE 4
+  STDERR
+  ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT Title FROM t" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_bind_union_all_columns
+  EXIT_CODE 1
+  STDERR
+  ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT WatchID, Title FROM t" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_column
@@ -696,6 +710,30 @@ antb1_add_cli_golden(schema_decimals ARGS schema --table "d=${_f}/decimals.parqu
 antb1_add_cli_golden(
   explain
   ARGS explain -c "${_count}" --table "t=${_f}/hits_like_split/part-*.parquet"
+)
+# A UNION ALL (ADR 0036): one node over its blocks in written order, named as the first block is;
+# the block of another type is cast below it, and only that one. Physically each block ends its own
+# part pipelines, and the union's consumer is serial.
+antb1_add_cli_golden(
+  explain_union_all
+  ARGS
+    explain
+    -c
+    "SELECT x, COUNT(*) AS n FROM (SELECT i16 AS x FROM e WHERE id < 10 UNION ALL SELECT i32 FROM e) AS u GROUP BY x"
+    --table
+    "e=${_f}/edge.parquet"
+)
+antb1_add_cli_golden(
+  explain_physical_union_all
+  ARGS
+    explain
+    --physical
+    --threads
+    4
+    -c
+    "SELECT x, COUNT(*) AS n FROM (SELECT i16 AS x FROM e WHERE id < 10 UNION ALL SELECT i32 FROM e) AS u GROUP BY x"
+    --table
+    "e=${_f}/edge.parquet"
 )
 antb1_add_cli_golden(
   explain_aggregate

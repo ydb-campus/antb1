@@ -1,0 +1,4 @@
+antb1: unsupported error: UNION ALL of BIGINT and VARCHAR values is not supported; see docs/sql-subset.md
+  at line 2, column 18
+  UNION ALL SELECT Title FROM t
+                   ^^^^^
