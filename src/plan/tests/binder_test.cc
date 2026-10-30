@@ -856,15 +856,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "WHERE g.i16 = u.i16",
                   kBind, "unnamed_subquery2.s", "no FROM item is named 'unnamed_subquery2'"}));
 
-// Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on.
-// Roadmap PR J5a answers IN and NOT IN as a top-level conjunct of WHERE, of an inner join's ON or
-// of HAVING, so what is left here is the scalar form (J5b), EXISTS (ADR 0023's U-series), and what
-// an answered IN still refuses: a key no type holds, a column count other than one, and a
-// correlation.
 // UNION ALL parses (ADR 0036), and every placement of a compound is refused at its first UNION ALL
 // until its binder item -- statically, so over tables that do not exist too, and before any check
 // that reads a block's clauses: a scalar subquery over a compound is not called a non-aggregate.
-// A construct before the UNION ALL in the query is still reported first.
+// A construct before the UNION ALL in the query is still reported first. A compound in a CTE that
+// nothing references is never checked or bound, as no such CTE is, so the outer error is the one.
 INSTANTIATE_TEST_SUITE_P(
     UnionAll, BindErrorTest,
     ::testing::Values(
@@ -887,7 +883,10 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada", kUnsupported, "UNION ALL",
                   "UNION ALL is not supported"},
         ErrorCase{"SELECT lower(s) FROM t UNION ALL SELECT s FROM t", kUnsupported, "lower",
-                  "function lower() is not supported"}));
+                  "function lower() is not supported"},
+        ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada) SELECT x FROM "
+                  "missing",
+                  kBind, "missing", "table 'missing' does not exist"}));
 
 // The walks reach a compound's last block (ADR 0036's matrix): each construct stands only in the
 // last of three, where a walk that skipped the blocks would miss it. A date cast there is folded
@@ -913,6 +912,12 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
                   "i16 AS x FROM t UNION ALL SELECT lower(s) FROM t) AS d",
                   kUnsupported, "lower", "function lower() is not supported"}));
+
+// Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on.
+// Roadmap PR J5a answers IN and NOT IN as a top-level conjunct of WHERE, of an inner join's ON or
+// of HAVING, so what is left here is the scalar form (J5b), EXISTS (ADR 0023's U-series), and what
+// an answered IN still refuses: a key no type holds, a column count other than one, and a
+// correlation.
 
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
@@ -1156,6 +1161,17 @@ TEST(BinderTest, TheRelationLimitCountsAChainBehindASubquery) {
   EXPECT_EQ(SpanText(sql, plan.status()), "IN") << plan.status().ToString();
   EXPECT_NE(plan.status().message().find("relations is not supported"), std::string::npos)
       << plan.status().message();
+}
+
+// A compound in a CTE that nothing references is never checked or bound, as no such CTE is (DuckDB
+// binds none either), so the query is answered without it while compounds are refused (ADR 0036).
+TEST(BinderTest, AnUnreferencedCompoundCteIsNeverBound) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "WITH c AS (SELECT i16 FROM t UNION ALL SELECT i16 FROM u) SELECT COUNT(*) FROM t", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 1U);
+  EXPECT_EQ(plan->output[0].name, "count_star()");
 }
 
 // Rules 1, 2 and 6 of ADR 0022 over one FROM item: an alias names the binding, a qualified name

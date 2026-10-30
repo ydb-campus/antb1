@@ -95,8 +95,9 @@ until X3).
      - a test matrix whose constructs sit only in a last branch.
 4. **The grammar and its refusals (X2).**
    - `UNION ALL` joins blocks. A tail of ORDER BY, LIMIT or OFFSET after the last branch belongs to the compound.
-   - Until X3, the binder refuses every compound with exit code 4. It does so before any check that assumes a FROM
-     list; otherwise a compound would reach `CheckFromList`'s assertion and abort with exit code 70.
+   - Until X3, the binder refuses every compound it checks with exit code 4; like DuckDB, it checks no CTE that
+     nothing references. It does so before any check that assumes a FROM list; otherwise a compound would reach
+     `CheckFromList`'s assertion and abort with exit code 70.
    - These stay exit 4 until X4: `UNION` without `ALL`, `BY NAME`, `INTERSECT`, `EXCEPT`, and a parenthesized or
      non-SELECT branch.
    - ORDER BY, LIMIT or OFFSET before a `UNION ALL` is a syntax error, as in DuckDB.

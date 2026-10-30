@@ -172,15 +172,18 @@ Compounds: `UNION ALL` joins two or more blocks into one query, which stands whe
 statement, a derived table's query, a CTE's query or the query of a subquery
 ([ADR 0036](adr/0036-union-all.md)). A `WITH` list before the first block belongs to the compound, and so do an
 `ORDER BY`, `LIMIT` and `OFFSET` after the last block: they apply to all of its rows, never to the last block alone.
-Each block is one level below the compound for the depth limit, so a block too deep is reported at its own
-`UNION ALL` (the first block at the first one), and a compound of any number of blocks parses. Unsupported (exit code
+Each block is one level below the compound for the depth limit: a later block is parsed a level down, so its depth
+error is where it passes the limit, and the first block moves down at the first `UNION ALL`, which is where it is
+reported when that makes it too deep. A compound of any number of blocks parses. Unsupported (exit code
 4), each at its first token: `UNION` without `ALL` (`UNION DISTINCT` too), `BY NAME` after `UNION` or `UNION ALL`,
 `INTERSECT` and `EXCEPT`, which DuckDB answers, and a block that is not a `SELECT` block, such as one in parentheses
 (`UNION ALL (SELECT ...)`), a `VALUES` list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT
 DISTINCT` and a `SELECT` without `FROM`. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
 `OFFSET` before a `UNION ALL`, and a `UNION ALL` that no block follows (at the end, or before `)`, `ALL`, `DISTINCT`
 or `WITH`). The binder does not answer a compound yet: each is unsupported at its first `UNION ALL` (exit code 4),
-after any construct in its blocks that is unsupported anyway, until ADR 0036's X3 binds it.
+after any construct in its blocks that is unsupported anyway, until ADR 0036's X3 binds it. A compound in a CTE that
+nothing references is the exception: the binder never checks or binds such a CTE, as DuckDB never binds one, so the
+query is answered without it.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -1113,7 +1116,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; for now every `UNION ALL` ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; for now every `UNION ALL` but one in a CTE that nothing references ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

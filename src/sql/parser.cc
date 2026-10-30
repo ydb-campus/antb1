@@ -724,9 +724,9 @@ class Parser {
           return std::unexpected(std::move(*error));
         }
       }
-      if (++depth_ > kMaxDepth) {
-        return std::unexpected(DepthError(*op));
-      }
+      // A level that always fits: the first block's peak, at least this query's level, moved down
+      // it above. So a later block's depth error is where that block passes the limit.
+      ++depth_;
       peak_ = std::max(peak_, depth_);
       if (!Peek().IsKeyword("SELECT")) {
         return std::unexpected(NotAQuery(Peek(), /*statement_start=*/false));

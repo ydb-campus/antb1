@@ -1940,6 +1940,13 @@ TEST(ParserTest, CompoundBlocksAreOneLevelDown) {
   ASSERT_FALSE(too_deep.has_value());
   EXPECT_EQ(too_deep.error().kind, ParseError::Kind::kUnsupported);
   EXPECT_EQ(At(lifted, too_deep.error().span), "UNION ALL");
+  // A later block is parsed a level down, so its error is where it passes the limit, inside it.
+  const std::string later = last(at_top - 1);
+  auto later_too_deep = Parse(later);
+  ASSERT_FALSE(later_too_deep.has_value());
+  EXPECT_EQ(later_too_deep.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_GT(later_too_deep.error().span.offset, later.find("SELECT f("))
+      << "inside the block, not at its UNION ALL";
   // Compounds in derived tables, one inside the other: two levels each.
   const auto nested = [](std::size_t n) {
     std::string sql = "SELECT a FROM t";
@@ -3124,7 +3131,7 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
         RejectCase{"UnionAllAfterLimit", "SELECT a FROM t LIMIT 1 ^UNION ALL SELECT a FROM u",
                    kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
-        RejectCase{"UnionAllAfterABranchsOffset",
+        RejectCase{"UnionAllAfterTheOffsetOfABlock",
                    "SELECT a FROM t UNION ALL SELECT a FROM u OFFSET 2 ^UNION ALL SELECT a FROM v",
                    kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
         RejectCase{"UnionAllAtTheEnd", "SELECT a FROM t UNION ALL^", kSyntax, 0,
