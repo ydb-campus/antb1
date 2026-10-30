@@ -178,7 +178,8 @@ reported when that makes it too deep. A compound of any number of blocks parses.
 4), each at its first token: `UNION` without `ALL` (`UNION DISTINCT` too), `UNION BY NAME` (at `UNION`) and `BY NAME`
 after `UNION ALL` (at `BY`), `INTERSECT` and `EXCEPT`, which DuckDB answers, and a block that is not a `SELECT`
 block, such as one in parentheses (`UNION ALL (SELECT ...)`, and a first block too, also as the first value of an
-`IN` list or inside a parenthesized expression: `x IN ((SELECT ...) UNION ALL SELECT ...)`, at its `(`), a `VALUES`
+`IN` list or inside a parenthesized expression, before a set operation or an `ORDER BY`, `LIMIT` or `OFFSET`:
+`x IN ((SELECT ...) UNION ALL SELECT ...)`, `x = ((SELECT ...) LIMIT 1)`, at its `(`), a `VALUES`
 list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT DISTINCT` and a `SELECT` without `FROM`. After a
 later value of an `IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a
 syntax error, as in DuckDB. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or

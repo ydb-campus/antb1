@@ -2860,7 +2860,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DistinctAfterUnionAll", "SELECT a FROM t UNION ALL SELECT ^DISTINCT a FROM u",
                    kUnsupported, 8, "DISTINCT is not supported"},
         // A first block in parentheses too, which DuckDB reads in an IN list's or an operand's
-        // parentheses when a set operation follows a subquery there: refused at the block's '('.
+        // parentheses when a set operation or a query's tail follows a subquery there: refused at
+        // the block's '('.
         RejectCase{"ParenthesizedFirstBlockOfAnInSubquery",
                    "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) UNION ALL SELECT c FROM v)",
                    kUnsupported, 1, "parenthesized queries are not supported"},
@@ -2872,6 +2873,18 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "parenthesized queries are not supported"},
         RejectCase{"ParenthesizedFirstBlockOfAScalarSubqueryBeforeIntersect",
                    "SELECT (^(SELECT b FROM u) INTERSECT SELECT c FROM v) FROM t", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedFirstBlockOfAnInSubqueryBeforeExcept",
+                   "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) EXCEPT SELECT c FROM v)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfAnInSubqueryBeforeLimit",
+                   "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) LIMIT 1)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfAScalarSubqueryBeforeOrderBy",
+                   "SELECT a FROM t WHERE a = (^(SELECT b FROM u) ORDER BY 1)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfANotInSubqueryBeforeOffset",
+                   "SELECT a FROM t WHERE a NOT IN (^(SELECT b FROM u) OFFSET 1)", kUnsupported, 1,
                    "parenthesized queries are not supported"},
         RejectCase{"Intersect", "SELECT a FROM events ^INTERSECT SELECT a FROM users", kUnsupported,
                    9, "INTERSECT is not supported"},

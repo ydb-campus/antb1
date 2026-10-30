@@ -2408,17 +2408,19 @@ class Parser {
   }
 
   // After `expr`, the first value of an IN list or an operand in parentheses: when `expr` is a bare
-  // scalar subquery and UNION, INTERSECT or EXCEPT is the next token, DuckDB reads the parentheses
-  // as a query whose first block is that subquery (`a IN ((SELECT ...) UNION ALL SELECT ...)`). A
-  // block in parentheses is kUnsupported at its '(', as where a query starts (NotAQuery);
-  // std::nullopt for any other expression or next token.
+  // scalar subquery and a set operation (UNION, INTERSECT, EXCEPT) or a query's tail (ORDER, LIMIT,
+  // OFFSET) is the next token, DuckDB reads the parentheses as a query whose first block is that
+  // subquery (`a IN ((SELECT ...) UNION ALL SELECT ...)`, `a = ((SELECT ...) LIMIT 1)`). A block in
+  // parentheses is kUnsupported at its '(', as where a query starts (NotAQuery); std::nullopt for
+  // any other expression or next token, where only ')' or ',' is valid.
   std::optional<ParseError> ParenthesizedFirstBlock(const Expr& expr) {
     const auto* sub = std::get_if<SubqueryExpr>(&expr);
     if (sub == nullptr || sub->kind != SubqueryExpr::Kind::kScalar) {
       return std::nullopt;
     }
     const std::string keyword = KeywordOf(Peek());
-    if (keyword != "UNION" && keyword != "INTERSECT" && keyword != "EXCEPT") {
+    if (keyword != "UNION" && keyword != "INTERSECT" && keyword != "EXCEPT" && keyword != "ORDER" &&
+        keyword != "LIMIT" && keyword != "OFFSET") {
       return std::nullopt;
     }
     return UnsupportedError(sub->op_span, kParenthesizedQuery);

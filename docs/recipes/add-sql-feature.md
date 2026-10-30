@@ -39,10 +39,10 @@ at one layer.
 - A new field of `sql::SelectStatement` fails the build at `kSelectStatementFields` (`ast.h`; a structured binding in
   `ast.cc` names every field): raise the count, and every walk over a statement that asserts it (`EqualIgnoringSpans`,
   `Depth`, the unparser and its `BlockSql`, the parser's compound loop and `ParseBlockEnd`, the relation count, the
-  binder's static checks and date-cast fold, the parser property test) fails to compile until you have revisited it.
-  Revisit the test harness's walks and rewrites of a statement too: `DeepSubqueries` in
-  `tests/slt/tests/query_gen_test.cc`, `MakeOrderedQuery` in `tests/slt/runner/ordered_compare.cc` and
-  `UnlimitedSql` in `tests/slt/runner/unordered_limit.cc`. A compound keeps its blocks in `set_operation` and has no
+  binder's static checks and date-cast fold, the parser property test, the generator test's `DeepSubqueries`) fails
+  to compile until you have revisited it. Revisit the test harness's rewrites of a statement too, which read a few
+  fields and assert nothing: `MakeOrderedQuery` in `tests/slt/runner/ordered_compare.cc` and `UnlimitedSql` in
+  `tests/slt/runner/unordered_limit.cc`. A compound keeps its blocks in `set_operation` and has no
   block clauses of its own ([ADR 0036](../adr/0036-union-all.md)), so a walk over a block's clauses must visit its
   blocks too.
 - Parser: `src/sql/parser.cc` (recursive descent). Valid-looking SQL outside the subset returns
