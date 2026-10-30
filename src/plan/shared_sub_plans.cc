@@ -26,11 +26,21 @@ std::string ConstantKey(const Constant& constant);
 // to one CTE never share one, and BoundColumn::index is a position, which a scan reading one field
 // fewer shifts in every node above it -- so neither can match the two sides. Where a column *comes
 // from* is the same on both sides, and that is what this interns.
+//
+// **"The same place" includes the way there.** A table's field is one origin wherever it is read,
+// so the two sides of a self-join read columns of one origin, and so do the COUNT(*)s of two
+// aggregations: an origin alone cannot tell `a.k` from `b.k`, and two sub-plans grouping one by
+// `a.k` and the other by `b.k` once keyed as one and were answered from one result. So every
+// reference -- in a node's key, and inside the origin of a column defined from it -- carries its
+// path: the inputs it is read through, from the node that reads it down to the node that defines
+// it. Equivalent sub-plans have one shape, so their references take the same paths; the two sides
+// of a join take different ones.
 class Origins {
  public:
   static constexpr int kUnknown = -1;
 
-  // Defines an ordinal for every column the plan's nodes mint, inputs first.
+  // Defines an ordinal for every column the plan's nodes mint, and the path of every column each
+  // node outputs, inputs first.
   void Walk(const LogicalNodePtr& node) {
     if (node == nullptr) {
       return;
@@ -38,7 +48,8 @@ class Origins {
     for (const LogicalNodePtr& input : InputsOf(*node)) {
       Walk(input);
     }
-    std::visit([this](const auto& n) { Define(n); }, *node);
+    Trace(*node);
+    std::visit([this, &node](const auto& n) { Define(n, *node); }, *node);
   }
 
   [[nodiscard]] int Of(ColumnId id) const {
@@ -46,19 +57,69 @@ class Origins {
     return it == of_.end() ? kUnknown : it->second;
   }
 
-  // A column reference as a key: its ordinal, or its position when it has no id (the executor's
-  // positional plans, which never reach here from the binder).
-  [[nodiscard]] std::string Key(const BoundColumn& column) const {
+  // A column reference that `at` reads, as a key: its ordinal and its path, or its position when it
+  // has no id (the executor's positional plans, which never reach here from the binder).
+  [[nodiscard]] std::string Key(const BoundColumn& column, const LogicalNode& at) const {
     if (column.id == kNoColumnId) {
       return std::format("@{}", column.index);
     }
-    return std::format("c{}", Of(column.id));
+    return std::format("c{}{}", Of(column.id), PathOf(column.id, at));
   }
-  [[nodiscard]] std::string Key(const std::optional<BoundColumn>& column) const {
-    return column.has_value() ? Key(*column) : "-";
+  [[nodiscard]] std::string Key(const std::optional<BoundColumn>& column,
+                                const LogicalNode& at) const {
+    return column.has_value() ? Key(*column, at) : "-";
+  }
+
+  // The path from `at` to the node that defines `id`, which `at` reads from one of its inputs: that
+  // input's index, then the input's own path to it. "/?" for a column read from outside `at`'s
+  // inputs, a free variable, which no plan the physical planner gets holds.
+  [[nodiscard]] std::string PathOf(ColumnId id, const LogicalNode& at) const {
+    const std::vector<LogicalNodePtr> inputs = InputsOf(at);
+    for (std::size_t k = 0; k < inputs.size(); ++k) {
+      if (const std::string* path = Within(inputs[k].get(), id); path != nullptr) {
+        return std::format("/{}{}", k, *path);
+      }
+    }
+    return "/?";
+  }
+
+  // The path of `id` inside `node`, which outputs it: empty where `node` defines it. Null where
+  // `node` does not output it.
+  [[nodiscard]] const std::string* Within(const LogicalNode* node, ColumnId id) const {
+    const auto paths = paths_.find(node);
+    if (paths == paths_.end()) {
+      return nullptr;
+    }
+    const auto path = paths->second.find(static_cast<std::uint32_t>(id));
+    return path == paths->second.end() ? nullptr : &path->second;
   }
 
  private:
+  // The paths of `node`'s output columns: a column one of its inputs outputs passes through it --
+  // that input's index, then its path there -- and any other is the node's own. None for a node
+  // with an input missing, or with one missing anywhere below it: a malformed plan, which the
+  // physical planner rejects after this pass, and whose output a walk could not even list. A read
+  // through such a node has no path.
+  void Trace(const LogicalNode& node) {
+    const std::vector<LogicalNodePtr> inputs = InputsOf(node);
+    for (const LogicalNodePtr& input : inputs) {
+      if (input == nullptr || !paths_.contains(input.get())) {
+        return;
+      }
+    }
+    std::unordered_map<std::uint32_t, std::string>& own = paths_[&node];
+    for (const ColumnId id : OutputIds(node)) {
+      std::string path;
+      for (std::size_t k = 0; k < inputs.size(); ++k) {
+        if (const std::string* below = Within(inputs[k].get(), id); below != nullptr) {
+          path = std::format("/{}{}", k, *below);
+          break;
+        }
+      }
+      own.emplace(static_cast<std::uint32_t>(id), std::move(path));
+    }
+  }
+
   int Intern(const std::string& origin) {
     const auto [it, added] = interned_.try_emplace(origin, static_cast<int>(interned_.size()));
     return it->second;
@@ -71,64 +132,71 @@ class Origins {
 
   // One overload per node type, so a new node type fails to compile. Only the nodes that *mint*
   // columns define anything: a Filter, a Sort, a Limit and a Join pass their inputs' columns
-  // through, and ids survive a change of position (logical_plan.h).
-  void Define(const ScanNode& node) {
+  // through, and ids survive a change of position (logical_plan.h). `at` is the node itself, from
+  // which the paths of what it reads start.
+  void Define(const ScanNode& node, const LogicalNode& /*at*/) {
     for (std::size_t i = 0; i < node.ids.size() && i < node.fields.size(); ++i) {
       Set(node.ids[i], std::format("{}#{}", node.table_name, node.fields[i]));
     }
   }
-  void Define(const ComputeNode& node);
-  void Define(const ProjectNode& node) {
+  void Define(const ComputeNode& node, const LogicalNode& at);
+  void Define(const ProjectNode& node, const LogicalNode& at) {
     for (std::size_t i = 0; i < node.ids.size(); ++i) {
       const std::optional<Constant>* constant =
           i < node.constants.size() ? &node.constants[i] : nullptr;
       if (constant != nullptr && constant->has_value()) {
         Set(node.ids[i], std::format("k{}", ConstantKey(**constant)));
       } else if (i < node.columns.size()) {
-        Set(node.ids[i], std::format("={}", Key(node.columns[i])));
+        Set(node.ids[i], std::format("={}", Key(node.columns[i], at)));
       }
     }
   }
-  void Define(const AggregateNode& node) {
+  void Define(const AggregateNode& node, const LogicalNode& at) {
     for (const AggregateCall& call : node.aggregates) {
-      Set(call.id, CallOrigin(call));
+      Set(call.id, CallOrigin(call, at));
     }
   }
-  void Define(const GroupAggregateNode& node) {
+  void Define(const GroupAggregateNode& node, const LogicalNode& at) {
     for (std::size_t i = 0; i < node.key_ids.size() && i < node.keys.size(); ++i) {
-      Set(node.key_ids[i], std::format("key({})", Key(node.keys[i])));
+      Set(node.key_ids[i], std::format("key({})", Key(node.keys[i], at)));
     }
     for (const AggregateCall& call : node.aggregates) {
-      Set(call.id, CallOrigin(call));
+      Set(call.id, CallOrigin(call, at));
     }
   }
-  void Define(const RowCountNode& node) {
+  void Define(const RowCountNode& node, const LogicalNode& /*at*/) {
     Set(node.id, std::format("rowcount({})", node.table_name));
   }
-  void Define(const DependentJoinNode& node) { Set(node.mark, "mark"); }
-  // A union's column comes from the columns it reads at its position, one per input, in order.
-  void Define(const UnionAllNode& node) {
+  void Define(const DependentJoinNode& node, const LogicalNode& /*at*/) { Set(node.mark, "mark"); }
+  // A union's column comes from the columns it reads at its position, one per input, in order, each
+  // by its path through its own input.
+  void Define(const UnionAllNode& node, const LogicalNode& at) {
     for (std::size_t i = 0; i < node.ids.size(); ++i) {
       std::string origin = "u(";
       for (const std::vector<BoundColumn>& input : node.columns) {
-        origin += i < input.size() ? Key(input[i]) : std::string("-");
+        origin += i < input.size() ? Key(input[i], at) : std::string("-");
         origin += ',';
       }
       Set(node.ids[i], origin + ')');
     }
   }
-  void Define(const FilterNode& /*node*/) {}
-  void Define(const SortNode& /*node*/) {}
-  void Define(const LimitNode& /*node*/) {}
-  void Define(const JoinNode& /*node*/) {}
+  void Define(const FilterNode& /*node*/, const LogicalNode& /*at*/) {}
+  void Define(const SortNode& /*node*/, const LogicalNode& /*at*/) {}
+  void Define(const LimitNode& /*node*/, const LogicalNode& /*at*/) {}
+  void Define(const JoinNode& /*node*/, const LogicalNode& /*at*/) {}
 
-  [[nodiscard]] std::string CallOrigin(const AggregateCall& call) const {
-    return std::format("agg({},{},{})", static_cast<int>(call.kind), Key(call.arg),
+  // A call's origin: what it computes over which argument. COUNT(*) has none, so every COUNT(*) of
+  // the plan has one origin whatever it counts -- and a read of one is told from a read of another
+  // by its path, as two sides' columns of one table are.
+  [[nodiscard]] std::string CallOrigin(const AggregateCall& call, const LogicalNode& at) const {
+    return std::format("agg({},{},{})", static_cast<int>(call.kind), Key(call.arg, at),
                        static_cast<int>(call.type.id()));
   }
 
   std::unordered_map<std::uint32_t, int> of_;
   std::unordered_map<std::string, int> interned_;
+  // Per node, the path of each column it outputs (Trace).
+  std::unordered_map<const LogicalNode*, std::unordered_map<std::uint32_t, std::string>> paths_;
 };
 
 // A constant as a key: **its type and its text**, never the text alone. ToString is a display
@@ -143,14 +211,16 @@ std::string ConstantKey(const Constant& constant) {
   return std::format("{}:{}", static_cast<int>(constant.type.id()), ToString(constant));
 }
 
-// `p` as a key. With `local`, its columns are the operand-local ones of a PredicateExpr (index 0
-// and 1 into the operands) rather than columns of a node's input, so they are keyed by position.
-std::string PredicateKey(const Predicate& p, const Origins& origins, bool local) {
+// `p`, read by `at`, as a key. With `local`, its columns are the operand-local ones of a
+// PredicateExpr (index 0 and 1 into the operands) rather than columns of a node's input, so they
+// are keyed by position.
+std::string PredicateKey(const Predicate& p, const Origins& origins, bool local,
+                         const LogicalNode& at) {
   const auto column = [&](const std::optional<BoundColumn>& c) {
     if (!c.has_value()) {
       return std::string("-");
     }
-    return local ? std::format("@{}", c->index) : origins.Key(*c);
+    return local ? std::format("@{}", c->index) : origins.Key(*c, at);
   };
   std::string key = std::format("P{},{},{},{},{}", static_cast<int>(p.kind), column(p.column),
                                 column(p.other), static_cast<int>(p.op), ConstantKey(p.constant));
@@ -161,16 +231,16 @@ std::string PredicateKey(const Predicate& p, const Origins& origins, bool local)
   return key;
 }
 
-// An expression as a key: its structure and type with every column reference by origin, and
-// without its display name (which SameExpr ignores too, for the same reason).
-std::string ExprKey(const ExprPtr& expr, const Origins& origins) {
+// An expression that `at` computes, as a key: its structure and type with every column reference by
+// origin and path, and without its display name (which SameExpr ignores too, for the same reason).
+std::string ExprKey(const ExprPtr& expr, const Origins& origins, const LogicalNode& at) {
   if (expr == nullptr) {
     return "_";
   }
-  const auto args = [&origins](const std::vector<ExprPtr>& list) {
+  const auto args = [&origins, &at](const std::vector<ExprPtr>& list) {
     std::string out;
     for (const ExprPtr& arg : list) {
-      out += ExprKey(arg, origins);
+      out += ExprKey(arg, origins, at);
       out += ',';
     }
     return out;
@@ -179,27 +249,28 @@ std::string ExprKey(const ExprPtr& expr, const Origins& origins) {
       [&](const auto& e) -> std::string {
         using T = std::decay_t<decltype(e)>;
         if constexpr (std::is_same_v<T, ColumnExpr>) {
-          return e.id == kNoColumnId ? std::format("@{}", e.index)
-                                     : std::format("c{}", origins.Of(e.id));
+          return e.id == kNoColumnId
+                     ? std::format("@{}", e.index)
+                     : std::format("c{}{}", origins.Of(e.id), origins.PathOf(e.id, at));
         } else if constexpr (std::is_same_v<T, ConstantExpr>) {
           return std::format("k{}", ConstantKey(e.value));
         } else if constexpr (std::is_same_v<T, ArithExpr>) {
-          return std::format("A{}({},{})", static_cast<int>(e.op), ExprKey(e.left, origins),
-                             ExprKey(e.right, origins));
+          return std::format("A{}({},{})", static_cast<int>(e.op), ExprKey(e.left, origins, at),
+                             ExprKey(e.right, origins, at));
         } else if constexpr (std::is_same_v<T, NegateExpr>) {
-          return std::format("N({})", ExprKey(e.operand, origins));
+          return std::format("N({})", ExprKey(e.operand, origins, at));
         } else if constexpr (std::is_same_v<T, FunctionExpr>) {
           return std::format("F{}({})", static_cast<int>(e.function), args(e.args));
         } else if constexpr (std::is_same_v<T, PredicateExpr>) {
-          return std::format("E{}({})", PredicateKey(e.predicate, origins, /*local=*/true),
+          return std::format("E{}({})", PredicateKey(e.predicate, origins, /*local=*/true, at),
                              args(e.operands));
         } else if constexpr (std::is_same_v<T, BoolExpr>) {
           return std::format("B{}({})", static_cast<int>(e.op), args(e.args));
         } else if constexpr (std::is_same_v<T, CaseExpr>) {
           return std::format("W({}|{}|{})", args(e.whens), args(e.thens),
-                             ExprKey(e.otherwise, origins));
+                             ExprKey(e.otherwise, origins, at));
         } else if constexpr (std::is_same_v<T, CastExpr>) {
-          return std::format("X({})", ExprKey(e.operand, origins));
+          return std::format("X({})", ExprKey(e.operand, origins, at));
         } else {
           static_assert(false, "an expression type without a key");
         }
@@ -208,9 +279,9 @@ std::string ExprKey(const ExprPtr& expr, const Origins& origins) {
   return std::format("{}:{}", node, static_cast<int>(expr->type.id()));
 }
 
-void Origins::Define(const ComputeNode& node) {
+void Origins::Define(const ComputeNode& node, const LogicalNode& at) {
   for (std::size_t i = 0; i < node.ids.size() && i < node.exprs.size(); ++i) {
-    Set(node.ids[i], std::format("e{}", ExprKey(node.exprs[i], *this)));
+    Set(node.ids[i], std::format("e{}", ExprKey(node.exprs[i], *this, at)));
   }
 }
 
@@ -222,21 +293,21 @@ void Origins::Define(const ComputeNode& node) {
 // about *how* to run it, and neither changes the rows or their order.
 std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origins) {
   return std::visit(
-      [&origins](const auto& n) -> std::optional<std::string> {
+      [&origins, &node](const auto& n) -> std::optional<std::string> {
         using T = std::decay_t<decltype(n)>;
         if constexpr (std::is_same_v<T, ScanNode>) {
           return std::format("scan({})", n.table_name);
         } else if constexpr (std::is_same_v<T, FilterNode>) {
           std::string key = "filter(";
           for (const Predicate& p : n.predicates) {
-            key += PredicateKey(p, origins, /*local=*/false);
+            key += PredicateKey(p, origins, /*local=*/false, node);
             key += ';';
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, ComputeNode>) {
           std::string key = "compute(";
           for (const ExprPtr& expr : n.exprs) {
-            key += ExprKey(expr, origins);
+            key += ExprKey(expr, origins, node);
             key += ';';
           }
           return key + ')';
@@ -246,37 +317,37 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
             if (i < n.constants.size() && n.constants[i].has_value()) {
               key += std::format("k{};", ConstantKey(*n.constants[i]));
             } else {
-              key += std::format("{};", origins.Key(n.columns[i]));
+              key += std::format("{};", origins.Key(n.columns[i], node));
             }
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, AggregateNode>) {
           std::string key = "aggregate(";
           for (const AggregateCall& call : n.aggregates) {
-            key += std::format("{},{},{};", static_cast<int>(call.kind), origins.Key(call.arg),
-                               static_cast<int>(call.type.id()));
+            key += std::format("{},{},{};", static_cast<int>(call.kind),
+                               origins.Key(call.arg, node), static_cast<int>(call.type.id()));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, GroupAggregateNode>) {
           std::string key = "group(";
           for (const BoundColumn& k : n.keys) {
-            key += origins.Key(k);
+            key += origins.Key(k, node);
             key += ',';
           }
           key += ';';
           for (const AggregateCall& call : n.aggregates) {
-            key += std::format("{},{},{};", static_cast<int>(call.kind), origins.Key(call.arg),
-                               static_cast<int>(call.type.id()));
+            key += std::format("{},{},{};", static_cast<int>(call.kind),
+                               origins.Key(call.arg, node), static_cast<int>(call.type.id()));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, JoinNode>) {
           std::string key = std::format("join({},", static_cast<int>(n.kind));
           for (const JoinKey& k : n.keys) {
-            key += std::format("{}={},", origins.Key(k.left), origins.Key(k.right));
+            key += std::format("{}={},", origins.Key(k.left, node), origins.Key(k.right, node));
           }
           key += ';';
           for (const ExprPtr& expr : n.residual) {
-            key += ExprKey(expr, origins);
+            key += ExprKey(expr, origins, node);
             key += ';';
           }
           return key + ')';
@@ -289,7 +360,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
           std::string key = "union(";
           for (const std::vector<BoundColumn>& input : n.columns) {
             for (const BoundColumn& column : input) {
-              key += origins.Key(column);
+              key += origins.Key(column, node);
               key += ',';
             }
             key += ';';
@@ -374,17 +445,23 @@ int64_t FieldUnion(const std::vector<LogicalNodePtr>& members) {
 // outputs are possible in principle (two scans reading {0,1} and {1,2}) and are reported as nothing
 // rather than as a group a consumer could not read.
 std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const Origins& origins) {
-  // Each member's output columns as origin ordinals: two columns match when they come from the
-  // same place, which is the only sense in which the members' outputs can be compared -- their
-  // ColumnIds are minted per reference and never equal.
-  std::vector<std::vector<int>> outputs;
+  // Each member's output columns as origin ordinals and paths inside the member: two columns match
+  // when they come from the same place by the same way, which is the only sense in which the
+  // members' outputs can be compared -- their ColumnIds are minted per reference and never equal,
+  // and an ordinal alone would match a join's two sides' columns of one table to each other.
+  std::vector<std::vector<std::string>> outputs;
   outputs.reserve(members.size());
   for (const LogicalNodePtr& member : members) {
-    std::vector<int> ordinals;
+    std::vector<std::string> columns;
     for (const ColumnId id : OutputIds(*member)) {
-      ordinals.push_back(origins.Of(id));
+      const int ordinal = origins.Of(id);
+      const std::string* path = origins.Within(member.get(), id);
+      if (ordinal == Origins::kUnknown || path == nullptr) {
+        return std::nullopt;  // a column of no known origin matches nothing
+      }
+      columns.push_back(std::format("{}{}", ordinal, *path));
     }
-    outputs.push_back(std::move(ordinals));
+    outputs.push_back(std::move(columns));
   }
   // The widest is the candidate container; every other output must be found inside it.
   std::size_t widest = 0;
@@ -395,12 +472,12 @@ std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const 
   }
   std::vector<std::vector<int>> columns;
   columns.reserve(members.size());
-  for (const std::vector<int>& output : outputs) {
+  for (const std::vector<std::string>& output : outputs) {
     std::vector<int> positions;
     positions.reserve(output.size());
-    for (const int ordinal : output) {
-      const auto at = std::ranges::find(outputs[widest], ordinal);
-      if (ordinal == Origins::kUnknown || at == outputs[widest].end()) {
+    for (const std::string& column : output) {
+      const auto at = std::ranges::find(outputs[widest], column);
+      if (at == outputs[widest].end()) {
         return std::nullopt;  // not nested, so not one result's to serve
       }
       positions.push_back(static_cast<int>(at - outputs[widest].begin()));

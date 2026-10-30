@@ -53,6 +53,13 @@ struct SharedSubPlan {
 // per reference, so two references to one CTE never share one. Only the source of a column is the
 // same on both sides.
 //
+// **And by the path it is read through, not by origin alone.** A table's field is one origin
+// wherever it is read, so the two sides of a self-join -- and the COUNT(*)s of two aggregations --
+// read columns of one origin. Every reference therefore also carries its path: the inputs it
+// passes, from the node that reads it down to the node that defines it. Equivalent sub-plans have
+// one shape and so the same paths; without them, two sub-plans grouping one join by `a.k` and by
+// `b.k` were one group, and the second was answered from the first's result.
+//
 // Groups are **outermost-first and never wholly nested**: where a subtree repeats so does every
 // subtree inside it, and a group all of whose members lie inside another group's members is not
 // reported -- the outer one is what a later item would materialise. A group with even one member

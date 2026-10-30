@@ -150,6 +150,34 @@ TEST_F(SharedBuildsTest, RefusesARepeatedSubPlanThatDoesNotReduce) {
   EXPECT_EQ(run->parts_scanned, 6) << "a scan is not a sub-plan worth holding the output of";
 }
 
+// **The wrong answer this pass once gave.** Two sub-plans over one self-join, one grouping by
+// `a.k` and the other by `b.k`, compute different groups -- but a table's field was one origin
+// wherever it was read, so they keyed as one, and the second was answered from the first's result:
+// SUM(s2.n) came out 72 where it is 48. Each reference's path now tells the two sides apart; what
+// the two sub-plans really repeat is the join under them, which reduces nothing and is not held.
+TEST_F(SharedBuildsTest, AnswersTwoSidesOfASelfJoinEachFromItsOwnRows) {
+  constexpr std::string_view kQuery =
+      "SELECT COUNT(*), SUM(s1.n), SUM(s2.n) FROM "
+      "(SELECT a.k AS g, COUNT(*) AS n FROM t AS a, t AS b WHERE a.k = b.v AND b.v > 3 "
+      "GROUP BY a.k) AS s1, "
+      "(SELECT b.k AS g, COUNT(*) AS n FROM t AS a, t AS b WHERE a.k = b.v AND b.v > 3 "
+      "GROUP BY b.k) AS s2 "
+      "WHERE s1.g = s2.g";
+  const auto shared = KeyedTable();
+  shared->set_claimed_rows(20'000'000);  // past the gate, while holding 60 rows
+  auto with = Execute(kQuery, shared);
+  ASSERT_TRUE(with.ok()) << with.status().ToString();
+  auto without = Execute(kQuery, KeyedTable());
+  ASSERT_TRUE(without.ok()) << without.status().ToString();
+  ASSERT_NE(with->rows, nullptr);
+  ASSERT_NE(without->rows, nullptr);
+  EXPECT_EQ(with->shared_rows, std::nullopt) << "the two sub-plans differ; their join is a join";
+  EXPECT_TRUE(with->rows->Equals(*without->rows)) << with->rows->ToString() << "\nagainst\n"
+                                                  << without->rows->ToString();
+  const auto& sums = static_cast<const arrow::Decimal128Array&>(*with->rows->column(2)->chunk(0));
+  EXPECT_EQ(sums.FormatValue(0), "48") << "SUM(s2.n): each b row with v in 4..6 meets 8 a rows";
+}
+
 // Nothing shared, nothing changed: the plan of a query with no repetition is the plan it was.
 TEST_F(SharedBuildsTest, LeavesAPlanWithNoRepetitionAlone) {
   const auto table = KeyedTable();

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -288,6 +289,40 @@ TEST(SharedSubPlansTest, AGroupAboveAUnionIsFound) {
   const LogicalNodePtr root = JoinedOnFirst(GroupedOn(UnionOfGroups(100, false, false), 400),
                                             GroupedOn(UnionOfGroups(200, false, false), 500));
   EXPECT_EQ(GroupsOf(PlanOf(root)), (std::vector<std::string>{"GroupAggregate 2x2"}));
+}
+
+// **The two sides of a self-join are not one place.** A table's field is one origin wherever it
+// is read, so these two sub-plans -- one join, grouped by `a.i64` in one and by `b.i64` in the
+// other, which give different groups -- once keyed as one, and exec answered one from the other's
+// result. Each reference now carries its path, which tells the two sides apart.
+TEST(SharedSubPlansTest, TheSidesOfASelfJoinAreNotOnePlace) {
+  const std::vector<std::string> groups = Groups(
+      "SELECT COUNT(*) FROM "
+      "(SELECT a.i64 AS g, COUNT(*) AS n FROM t AS a, t AS b WHERE a.i32 = b.i32 AND b.i16 > 3 "
+      "GROUP BY a.i64) AS s1, "
+      "(SELECT b.i64 AS g, COUNT(*) AS n FROM t AS a, t AS b WHERE a.i32 = b.i32 AND b.i16 > 3 "
+      "GROUP BY b.i64) AS s2 "
+      "WHERE s1.g = s2.g");
+  // Not even the joins under them: one outputs `a.i64` and the other `b.i64`, so neither's output
+  // holds the other's, and one result could not serve both. Matched by origin alone, `b.i64`
+  // would have been read from `a.i64`'s place.
+  EXPECT_TRUE(groups.empty()) << groups.front();
+}
+
+// **Nor are two aggregations' counts one column.** COUNT(*) has no argument, so every COUNT(*)
+// has one origin whatever it counts: a sum of one side's count and a sum of the other's once
+// keyed as one. The path of each read tells them apart, and the join they share is what is
+// reported.
+TEST(SharedSubPlansTest, TwoAggregationsCountsAreNotOneColumn) {
+  constexpr std::string_view kCounts =
+      "(SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) AS x, "
+      "(SELECT i64 AS k, COUNT(*) AS n FROM u GROUP BY i64) AS y WHERE x.k = y.k GROUP BY x.k";
+  const std::vector<std::string> groups =
+      Groups(std::format("SELECT COUNT(*) FROM (SELECT x.k, SUM(x.n) AS s FROM {}) AS p, "
+                         "(SELECT x.k, SUM(y.n) AS s FROM {}) AS q WHERE p.k = q.k",
+                         kCounts, kCounts));
+  ASSERT_EQ(groups.size(), 1U);
+  EXPECT_EQ(groups[0].substr(0, groups[0].find(' ')), "Join") << groups[0];
 }
 
 // The same plan gives the same groups in the same order, which EXPLAIN's goldens depend on.
