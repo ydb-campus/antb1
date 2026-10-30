@@ -163,22 +163,31 @@ TEST_F(FixtureDigest, DirectoryIsSortedAndRecursive) {
   EXPECT_FALSE(DigestDirectory(dir_ / "sub" / "none").ok());
 }
 
-// The top-level tpch/ belongs to fixtures.tpch: it is skipped before it is opened (an unreadable
-// one is no error), while a tpch/ deeper down is digested like any other directory.
-TEST_F(FixtureDigest, SkipsTheTopLevelTpchDirectoryOnly) {
+// The top-level tpch/ and tpcds/ belong to fixtures.tpch and fixtures.tpcds: they are skipped
+// before they are opened (an unreadable one is no error), while a tpch/ or tpcds/ deeper down is
+// digested like any other directory.
+TEST_F(FixtureDigest, SkipsTheTopLevelTpcDirectoriesOnly) {
   fs::create_directories(dir_ / "tpch" / "deep");
+  fs::create_directories(dir_ / "tpcds" / "deep");
   fs::create_directories(dir_ / "sub" / "tpch");
+  fs::create_directories(dir_ / "sub" / "tpcds");
   Write("a.parquet", *MakeTable(), 100, Snappy());
   Write("tpch/b.parquet", *MakeTable(), 100, Snappy());
   Write("tpch/deep/c.parquet", *MakeTable(), 100, Snappy());
+  Write("tpcds/b.parquet", *MakeTable(), 100, Snappy());
+  Write("tpcds/deep/c.parquet", *MakeTable(), 100, Snappy());
   Write("sub/tpch/d.parquet", *MakeTable(), 100, Snappy());
+  Write("sub/tpcds/e.parquet", *MakeTable(), 100, Snappy());
   fs::permissions(dir_ / "tpch", fs::perms::none);
+  fs::permissions(dir_ / "tpcds", fs::perms::none);
   auto digests = DigestDirectory(dir_);
   fs::permissions(dir_ / "tpch", fs::perms::owner_all);
+  fs::permissions(dir_ / "tpcds", fs::perms::owner_all);
   ASSERT_TRUE(digests.ok()) << digests.status().ToString();
-  ASSERT_EQ(digests->size(), 2U);
+  ASSERT_EQ(digests->size(), 3U);
   EXPECT_EQ((*digests)[0].path, "a.parquet");
-  EXPECT_EQ((*digests)[1].path, "sub/tpch/d.parquet");
+  EXPECT_EQ((*digests)[1].path, "sub/tpcds/e.parquet");
+  EXPECT_EQ((*digests)[2].path, "sub/tpch/d.parquet");
 }
 
 }  // namespace

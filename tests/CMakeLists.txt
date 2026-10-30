@@ -7,7 +7,8 @@
 #   data                        tests/data: ClickBench data tests (network data, redacted; not hermetic)
 #   setup, harness, diff,       tests/tpch: data derived from TPC-H, generated at test time by the pinned dbgen
 #   parallel                    (fixtures.tpch), its answers and differential tests, redacted
-#   harness                     tests/tpcds: data derived from TPC-DS from the pinned dsdgen (the extension smoke test)
+#   setup, harness              tests/tpcds: data derived from TPC-DS, generated at test time by the pinned dsdgen
+#                               (fixtures.tpcds), and its self-tests
 add_subdirectory(slt)
 add_subdirectory(metamorphic)
 add_subdirectory(integration)
