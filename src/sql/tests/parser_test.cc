@@ -578,10 +578,12 @@ TEST(ParserTest, UnionAllCompounds) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   EXPECT_EQ(At(kSql, stmt->span), kSql);
   ASSERT_EQ(stmt->with.size(), 1U);
+  EXPECT_EQ(At(kSql, stmt->with_span), "WITH") << "the compound's own";
   ASSERT_EQ(stmt->set_operation.size(), 3U);
   EXPECT_TRUE(stmt->items.empty()) << "the blocks hold the select lists";
   EXPECT_TRUE(stmt->from.empty());
   ASSERT_EQ(stmt->order_by.size(), 1U) << "the compound's own";
+  EXPECT_EQ(At(kSql, stmt->order_by_span), "ORDER BY 1");
   EXPECT_EQ(stmt->limit, std::optional<std::int64_t>(2));
   EXPECT_EQ(At(kSql, stmt->limit_span), "LIMIT 2");
   const std::vector<std::string_view> blocks = {
@@ -635,6 +637,82 @@ TEST(ParserTest, UnionAllCompounds) {
       two, parsed("SELECT a FROM t UNION ALL SELECT b FROM u UNION ALL SELECT b FROM u")));
   EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT a FROM t UNION ALL SELECT b FROM v")));
   EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT a FROM t")));
+}
+
+// A compound wherever a nested query stands (ADR 0036): a CTE's query, a scalar subquery, a derived
+// table, IN and EXISTS. Each holder's span runs through its ')', its query's through the compound's
+// tail, and each block's through its own last clause: the tail is the compound's, no block's.
+TEST(ParserTest, UnionAllCompoundsInNestedQueries) {
+  constexpr std::string_view kSql =
+      "WITH c AS (SELECT a FROM t UNION ALL SELECT b FROM u) SELECT (SELECT d FROM v UNION ALL "
+      "SELECT e FROM w) FROM (SELECT f FROM x UNION ALL SELECT g FROM y ORDER BY 1 LIMIT 1 OFFSET "
+      "2) AS s WHERE h IN (SELECT i FROM z UNION ALL SELECT j FROM c) AND EXISTS (SELECT k FROM t "
+      "UNION ALL SELECT l FROM u)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_TRUE(stmt->set_operation.empty()) << "the statement itself is one block";
+  // A nested compound of two blocks: its span, and each block's span and UNION ALL.
+  const auto expect_compound = [&](const SelectStatement& query, std::string_view span,
+                                   std::string_view first, std::string_view second) {
+    EXPECT_EQ(At(kSql, query.span), span);
+    ASSERT_EQ(query.set_operation.size(), 2U) << span;
+    EXPECT_EQ(At(kSql, query.set_operation[0].query->span), first) << span;
+    EXPECT_EQ(At(kSql, query.set_operation[0].op_span), "") << span;
+    EXPECT_EQ(At(kSql, query.set_operation[1].query->span), second) << span;
+    EXPECT_EQ(At(kSql, query.set_operation[1].op_span), "UNION ALL") << span;
+  };
+
+  // The CTE: from its name through its ')'.
+  ASSERT_EQ(stmt->with.size(), 1U);
+  const CommonTableExpr& cte = stmt->with[0];
+  EXPECT_EQ(At(kSql, cte.span), "c AS (SELECT a FROM t UNION ALL SELECT b FROM u)");
+  expect_compound(*cte.query, "SELECT a FROM t UNION ALL SELECT b FROM u", "SELECT a FROM t",
+                  "SELECT b FROM u");
+
+  // The scalar subquery: its parentheses, the '(' its op_span.
+  ASSERT_EQ(stmt->items.size(), 1U);
+  const auto& scalar = std::get<SubqueryExpr>(stmt->items[0].expr);
+  EXPECT_EQ(scalar.kind, SubqueryExpr::Kind::kScalar);
+  EXPECT_EQ(At(kSql, scalar.span), "(SELECT d FROM v UNION ALL SELECT e FROM w)");
+  EXPECT_EQ(At(kSql, scalar.op_span), "(");
+  expect_compound(*scalar.query, "SELECT d FROM v UNION ALL SELECT e FROM w", "SELECT d FROM v",
+                  "SELECT e FROM w");
+
+  // The derived table: its compound's ORDER BY, LIMIT and OFFSET are the compound's, after its last
+  // block, which ends before them.
+  ASSERT_EQ(stmt->from.size(), 1U);
+  const auto& derived = std::get<DerivedTable>(stmt->from[0].source);
+  EXPECT_EQ(At(kSql, derived.span),
+            "(SELECT f FROM x UNION ALL SELECT g FROM y ORDER BY 1 LIMIT 1 OFFSET 2)");
+  const SelectStatement& ordered = *derived.query;
+  expect_compound(ordered, "SELECT f FROM x UNION ALL SELECT g FROM y ORDER BY 1 LIMIT 1 OFFSET 2",
+                  "SELECT f FROM x", "SELECT g FROM y");
+  EXPECT_EQ(ordered.order_by.size(), 1U);
+  EXPECT_EQ(At(kSql, ordered.order_by_span), "ORDER BY 1");
+  EXPECT_EQ(ordered.limit, std::optional<std::int64_t>(1));
+  EXPECT_EQ(At(kSql, ordered.limit_span), "LIMIT 1");
+  EXPECT_EQ(ordered.offset, std::optional<std::int64_t>(2));
+  EXPECT_EQ(At(kSql, ordered.offset_span), "OFFSET 2");
+  for (const SetBranch& branch : ordered.set_operation) {
+    EXPECT_TRUE(branch.query->order_by.empty());
+    EXPECT_FALSE(branch.query->limit.has_value());
+    EXPECT_FALSE(branch.query->offset.has_value());
+  }
+
+  // IN and EXISTS: from the operand or the keyword through the ')'.
+  ASSERT_EQ(stmt->where.size(), 2U);
+  const auto& in = std::get<SubqueryExpr>(stmt->where[0]);
+  EXPECT_EQ(in.kind, SubqueryExpr::Kind::kIn);
+  EXPECT_EQ(At(kSql, in.span), "h IN (SELECT i FROM z UNION ALL SELECT j FROM c)");
+  EXPECT_EQ(At(kSql, in.op_span), "IN");
+  expect_compound(*in.query, "SELECT i FROM z UNION ALL SELECT j FROM c", "SELECT i FROM z",
+                  "SELECT j FROM c");
+  const auto& exists = std::get<SubqueryExpr>(stmt->where[1]);
+  EXPECT_EQ(exists.kind, SubqueryExpr::Kind::kExists);
+  EXPECT_EQ(At(kSql, exists.span), "EXISTS (SELECT k FROM t UNION ALL SELECT l FROM u)");
+  EXPECT_EQ(At(kSql, exists.op_span), "EXISTS");
+  expect_compound(*exists.query, "SELECT k FROM t UNION ALL SELECT l FROM u", "SELECT k FROM t",
+                  "SELECT l FROM u");
 }
 
 // The names of a column alias list follow the rules of an implicit table alias (as in DuckDB):
@@ -1915,22 +1993,28 @@ TEST(ParserTest, NestedQueriesCountTowardTheDepthLimit) {
 }
 
 // Each block of a compound is one level below it (ADR 0036), the first one too: it moves down a
-// level once its UNION ALL shows it is a branch, and the depth error is then at that UNION ALL. The
-// compound's own ORDER BY stays at the compound's level.
+// level once its UNION ALL shows it is a branch, and the depth error is then at that UNION ALL.
+// Every later block is one level down, the third as the second. The compound's own ORDER BY stays
+// at the compound's level.
 TEST(ParserTest, CompoundBlocksAreOneLevelDown) {
   const auto calls = [](std::size_t k) { return Repeat("f(", k) + "a" + std::string(k, ')'); };
   const auto plain = [&](std::size_t k) { return "SELECT " + calls(k) + " FROM t"; };
   const auto first = [&](std::size_t k) { return plain(k) + " UNION ALL SELECT a FROM t"; };
   const auto last = [&](std::size_t k) { return "SELECT a FROM t UNION ALL " + plain(k); };
+  const auto last3 = [&](std::size_t k) {
+    return "SELECT a FROM t UNION ALL SELECT a FROM t UNION ALL " + plain(k);
+  };
   const auto ordered = [&](std::size_t k) {
     return "SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY " + calls(k);
   };
   const std::size_t at_top = FirstTooDeep(plain);
   EXPECT_EQ(FirstTooDeep(first), at_top - 1);
   EXPECT_EQ(FirstTooDeep(last), at_top - 1);
+  EXPECT_EQ(FirstTooDeep(last3), at_top - 1);
   EXPECT_EQ(FirstTooDeep(ordered), at_top);
   for (const auto& sql : {std::function<std::string(std::size_t)>(first),
-                          std::function<std::string(std::size_t)>(last)}) {
+                          std::function<std::string(std::size_t)>(last),
+                          std::function<std::string(std::size_t)>(last3)}) {
     auto deepest = Parse(sql(at_top - 2));
     ASSERT_TRUE(deepest.has_value()) << deepest.error().message;
     EXPECT_EQ(Depth(*deepest), kMaxExpressionDepth);
@@ -1947,6 +2031,13 @@ TEST(ParserTest, CompoundBlocksAreOneLevelDown) {
   EXPECT_EQ(later_too_deep.error().kind, ParseError::Kind::kUnsupported);
   EXPECT_GT(later_too_deep.error().span.offset, later.find("SELECT f("))
       << "inside the block, not at its UNION ALL";
+  // So is a third block's, after the second UNION ALL.
+  const std::string third = last3(at_top - 1);
+  auto third_too_deep = Parse(third);
+  ASSERT_FALSE(third_too_deep.has_value());
+  EXPECT_EQ(third_too_deep.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_GT(third_too_deep.error().span.offset, third.find("SELECT f("))
+      << "inside the third block, not at a UNION ALL";
   // Compounds in derived tables, one inside the other: two levels each.
   const auto nested = [](std::size_t n) {
     std::string sql = "SELECT a FROM t";
@@ -2768,6 +2859,33 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 4, "FROM-first queries are not supported"},
         RejectCase{"DistinctAfterUnionAll", "SELECT a FROM t UNION ALL SELECT ^DISTINCT a FROM u",
                    kUnsupported, 8, "DISTINCT is not supported"},
+        // A first block in parentheses too, which DuckDB reads in an IN list's or an operand's
+        // parentheses when a set operation or a query's tail follows a subquery there: refused at
+        // the block's '('.
+        RejectCase{"ParenthesizedFirstBlockOfAnInSubquery",
+                   "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) UNION ALL SELECT c FROM v)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedFirstBlockOfANotInSubqueryBeforeIntersect",
+                   "SELECT a FROM t WHERE a NOT IN (^(SELECT b FROM u) INTERSECT SELECT c FROM v)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedFirstBlockOfAScalarSubquery",
+                   "SELECT a FROM t WHERE a = (^(SELECT b FROM u) UNION ALL SELECT c FROM v)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedFirstBlockOfAScalarSubqueryBeforeIntersect",
+                   "SELECT (^(SELECT b FROM u) INTERSECT SELECT c FROM v) FROM t", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedFirstBlockOfAnInSubqueryBeforeExcept",
+                   "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) EXCEPT SELECT c FROM v)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfAnInSubqueryBeforeLimit",
+                   "SELECT a FROM t WHERE a IN (^(SELECT b FROM u) LIMIT 1)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfAScalarSubqueryBeforeOrderBy",
+                   "SELECT a FROM t WHERE a = (^(SELECT b FROM u) ORDER BY 1)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
+        RejectCase{"ParenthesizedBlockOfANotInSubqueryBeforeOffset",
+                   "SELECT a FROM t WHERE a NOT IN (^(SELECT b FROM u) OFFSET 1)", kUnsupported, 1,
+                   "parenthesized queries are not supported"},
         RejectCase{"Intersect", "SELECT a FROM events ^INTERSECT SELECT a FROM users", kUnsupported,
                    9, "INTERSECT is not supported"},
         RejectCase{"Except", "SELECT a FROM events ^EXCEPT SELECT a FROM users", kUnsupported, 6,
@@ -3145,6 +3263,15 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 4, "expected SELECT, found keyword WITH"},
         RejectCase{"UnionAllBeforeAParen", "SELECT a FROM (SELECT a FROM t UNION ALL ^)", kSyntax,
                    1, "expected SELECT, found ')'"},
+        // A set operation after a subquery starts a compound (whose parenthesized first block is
+        // unsupported) only where the subquery stands bare and first in the parentheses: after an
+        // IN list's comma or inside a larger operand it stays a syntax error, as in DuckDB.
+        RejectCase{"UnionAllAfterALaterInListValue",
+                   "SELECT a FROM t WHERE a IN (1, (SELECT b FROM u) ^UNION ALL SELECT c FROM v)",
+                   kSyntax, 5, "expected , or ) in IN (...), found keyword UNION"},
+        RejectCase{"UnionAllAfterASubqueryInArithmetic",
+                   "SELECT a FROM t WHERE a = ((SELECT b FROM u) + 1 ^UNION ALL SELECT c FROM v)",
+                   kSyntax, 5, "expected ) to close the ( at offset 26, found keyword UNION"},
         RejectCase{"Misspelled", "^SELEC a FROM events", kSyntax, 5,
                    "expected SELECT, found identifier SELEC"},
         RejectCase{"Number", "^42", kSyntax, 2, "expected SELECT, found integer literal 42"},
@@ -3210,8 +3337,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"ReservedInWhere", "SELECT a FROM events WHERE ^LIMIT 5", kSyntax, 5,
                    "expected an expression, found keyword LIMIT"},
         RejectCase{"MissingOperator", "SELECT a FROM events WHERE a ^b", kSyntax, 1,
-                   "unexpected identifier b; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
-                   "OFFSET or the end of the query"},
+                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "LIMIT, OFFSET or the end of the query"},
         RejectCase{"DoubleEquals", "SELECT a FROM events WHERE a = ^= 1", kSyntax, 1,
                    "expected an expression, found '='"},
         RejectCase{"MissingRightOperand", "SELECT a FROM events WHERE a =^", kSyntax, 0,
@@ -3258,13 +3385,13 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"QuotedRowsAfterOffset", "SELECT a FROM events OFFSET 5 ^\"ROWS\"", kSyntax, 6,
                    "unexpected quoted identifier; expected LIMIT or the end of the query"},
         RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
-                   "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
-                   "OFFSET or the end of the query"},
+                   "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, UNION ALL, "
+                   "ORDER BY, LIMIT, OFFSET or the end of the query"},
         RejectCase{"DuplicateLimit", "SELECT a FROM events LIMIT 1 ^LIMIT 2", kSyntax, 5,
                    "unexpected keyword LIMIT; expected OFFSET or the end of the query"},
         RejectCase{"StrayParen", "SELECT a FROM events^)", kSyntax, 1,
-                   "unexpected ')'; expected WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET or "
-                   "the end of the query"},
+                   "unexpected ')'; expected WHERE, GROUP BY, HAVING, UNION ALL, ORDER BY, LIMIT, "
+                   "OFFSET or the end of the query"},
         RejectCase{"GroupWithoutBy", "SELECT a FROM events GROUP ^a", kSyntax, 1,
                    "expected BY after GROUP, found identifier a"},
         RejectCase{"OrderWithoutBy", "SELECT a FROM events ORDER ^a", kSyntax, 1,
@@ -3284,12 +3411,12 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"GroupByAfterOrderBy", "SELECT a FROM events ORDER BY a ^GROUP BY a", kSyntax, 5,
                    "unexpected keyword GROUP; expected LIMIT, OFFSET or the end of the query"},
         RejectCase{"WhereAfterGroupBy", "SELECT a FROM events GROUP BY a ^WHERE a = 1", kSyntax, 5,
-                   "unexpected keyword WHERE; expected HAVING, ORDER BY, LIMIT, OFFSET or the end "
-                   "of the query"},
+                   "unexpected keyword WHERE; expected HAVING, UNION ALL, ORDER BY, LIMIT, OFFSET "
+                   "or the end of the query"},
         RejectCase{"GroupByAfterHaving", "SELECT a FROM events HAVING COUNT(*) > 1 ^GROUP BY a",
                    kSyntax, 5,
-                   "unexpected keyword GROUP; expected AND, ORDER BY, LIMIT, OFFSET or the end of "
-                   "the query"},
+                   "unexpected keyword GROUP; expected AND, UNION ALL, ORDER BY, LIMIT, OFFSET or "
+                   "the end of the query"},
         RejectCase{"HavingAfterOrderBy", "SELECT a FROM events ORDER BY a ^HAVING COUNT(*) > 1",
                    kSyntax, 6, "unexpected keyword HAVING; expected LIMIT, OFFSET or the end"},
         RejectCase{"EmptyHaving", "SELECT a FROM events GROUP BY a HAVING^", kSyntax, 0,
@@ -3455,8 +3582,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected ',' or FROM, found keyword JOIN"},
         RejectCase{"JoinAfterWhere", "SELECT a FROM events WHERE a = 1 ^JOIN users ON a = b",
                    kSyntax, 4,
-                   "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, ORDER BY, LIMIT, "
-                   "OFFSET or the end of the query"},
+                   "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "LIMIT, OFFSET or the end of the query"},
         // A join keyword after a list comma is no clause, so the comma is no trailing comma.
         RejectCase{"JoinAfterSelectComma", "SELECT a, ^JOIN FROM events", kSyntax, 4,
                    "expected an expression or '*', found keyword JOIN"},
@@ -3573,8 +3700,14 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected a column name after '.', found end of input"},
         // Derived tables and WITH lists where DuckDB gives a syntax error too.
         RejectCase{"SubqueryUnclosed", "SELECT a FROM (SELECT a FROM t^", kSyntax, 0,
-                   "unexpected end of input; expected WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, "
-                   "OFFSET or ')'"},
+                   "unexpected end of input; expected WHERE, GROUP BY, HAVING, UNION ALL, "
+                   "ORDER BY, LIMIT, OFFSET or ')'"},
+        // A UNION ALL may follow any block before the compound's tail, in a nested query too.
+        RejectCase{"MissingOperatorInACompoundInADerivedTable",
+                   "SELECT a FROM (SELECT a FROM t UNION ALL SELECT a FROM u WHERE a = 1 ^b)",
+                   kSyntax, 1,
+                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "LIMIT, OFFSET or ')'"},
         RejectCase{"SubquerySemicolon", "SELECT a FROM (SELECT a FROM t ORDER BY a^;)", kSyntax, 1,
                    "unexpected ';'; expected LIMIT, OFFSET or ')'"},
         RejectCase{"SubqueryEmptyWith", "SELECT a FROM (WITH c AS (SELECT a FROM t)^)", kSyntax, 1,

@@ -354,7 +354,8 @@ struct SelectStatement {
   bool star = false;                  // SELECT *
   SourceSpan star_span;               // the '*' (when star)
   std::vector<SelectItem> items;
-  std::vector<FromItem> from;          // at least one: a flat list, never a tree (ADR 0022)
+  std::vector<FromItem> from;          // at least one in a block, empty in a compound: a flat
+                                       // list, never a tree (ADR 0022)
   std::vector<Expr> where;             // conjuncts: the top-level AND chain, split
   std::vector<GroupExpr> group_by;     // GROUP BY items (aliases and positions: see the binder)
   SourceSpan group_by_span;            // GROUP BY and its list (when group_by is not empty)

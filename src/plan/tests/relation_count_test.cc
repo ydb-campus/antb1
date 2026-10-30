@@ -251,6 +251,12 @@ TEST(RelationCountTest, CountsACompoundsBlocks) {
   EXPECT_EQ(Count("SELECT 1 FROM (SELECT a FROM t UNION ALL SELECT b FROM u) s"), 3U);
   EXPECT_EQ(Count("WITH c AS (SELECT a FROM t, u) SELECT a FROM c UNION ALL SELECT a FROM c"), 6U);
   EXPECT_EQ(Count("SELECT a FROM t WHERE a IN (SELECT b FROM u UNION ALL SELECT c FROM v)"), 4U);
+  // Three blocks: each one counts, not only the first two.
+  EXPECT_EQ(Count("SELECT a FROM t UNION ALL SELECT b FROM u UNION ALL SELECT c FROM v, w, x"), 5U);
+  // A CTE whose query is a compound: one for the reference, plus its blocks'.
+  EXPECT_EQ(Count("WITH c AS (SELECT a FROM t UNION ALL SELECT b FROM u) SELECT 1 FROM c"), 3U);
+  // The compound's own ORDER BY: its subquery counts one plus its body, after the blocks.
+  EXPECT_EQ(Count("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY (SELECT MAX(c) FROM v)"), 4U);
 }
 
 // A compound's blocks come before it, since its own clauses follow them in the query; a CTE the
@@ -264,6 +270,10 @@ TEST(RelationCountTest, ReachesEveryBlockOfACompoundBeforeIt) {
       (std::vector<std::string>{"c", "w", "c", "<compound>"}));
   EXPECT_EQ(ReachedTables("SELECT a FROM t WHERE a IN (SELECT b FROM u UNION ALL SELECT c FROM v)"),
             (std::vector<std::string>{"t", "u", "v", "<compound>"}));
+  // A subquery of the compound's own ORDER BY comes after the compound, as a block's subqueries do.
+  EXPECT_EQ(
+      ReachedTables("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY (SELECT MAX(c) FROM v)"),
+      (std::vector<std::string>{"t", "u", "<compound>", "v"}));
 }
 
 // The outermost compound has no FROM item of its own to index: the item of a block that carries the
@@ -297,6 +307,49 @@ TEST(RelationCountTest, ReportsTheItemOfACompoundsBlockThatCrossesTheLimit) {
   ASSERT_TRUE(over_first.has_value());
   const SourceSpan item = over_first.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
   EXPECT_EQ(first.substr(item.offset, item.length), "'p.parquet'");
+  // Three blocks: the total runs on across all of them, so after t and u the 257th relation is the
+  // third block's v255, reported at its comma.
+  std::string third = "SELECT 1 FROM t UNION ALL SELECT 1 FROM u UNION ALL SELECT 1 FROM v1";
+  for (std::size_t i = 2; i <= 255; ++i) {
+    third += std::format(", v{}", i);
+  }
+  auto at_third = sql::Parse(third);
+  ASSERT_TRUE(at_third.has_value()) << at_third.error().message;
+  const auto over_third = RelationsExceedLimit(*at_third);
+  ASSERT_TRUE(over_third.has_value());
+  const SourceSpan comma = over_third.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
+  EXPECT_EQ(third.substr(comma.offset, comma.length), ",");
+  EXPECT_EQ(third.substr(comma.offset, 6), ", v255");
+}
+
+// A subquery that carries a compound's count past the limit is reported at its operator, by span,
+// whether a block holds it or the compound's own ORDER BY does, which counts after every block.
+TEST(RelationCountTest, ReportsTheSubqueryOfACompoundThatCrossesTheLimit) {
+  std::string first_block = "SELECT 1 FROM t1";
+  for (std::size_t i = 2; i <= 254; ++i) {
+    first_block += std::format(", t{}", i);
+  }
+  // 254 relations in the first block and u the 255th: the subquery in the second block's WHERE
+  // counts 2 more, so its IN carries the total to 257.
+  const std::string in_block =
+      first_block + " UNION ALL SELECT 1 FROM u WHERE a IN (SELECT b FROM v)";
+  auto stmt = sql::Parse(in_block);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  const auto over = RelationsExceedLimit(*stmt);
+  ASSERT_TRUE(over.has_value());
+  const SourceSpan span = over.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
+  EXPECT_EQ(in_block.substr(span.offset, span.length), "IN");
+  EXPECT_EQ(span.offset, in_block.find("IN (SELECT b FROM v)"));
+  // The blocks hold 255 and the compound's ORDER BY subquery 2 more: reported at its '('.
+  const std::string ordered =
+      first_block + " UNION ALL SELECT 1 FROM u ORDER BY (SELECT MAX(a) FROM v)";
+  auto in_order_by = sql::Parse(ordered);
+  ASSERT_TRUE(in_order_by.has_value()) << in_order_by.error().message;
+  const auto over_ordered = RelationsExceedLimit(*in_order_by);
+  ASSERT_TRUE(over_ordered.has_value());
+  const SourceSpan open = over_ordered.value_or(RelationOverflow{}).span.value_or(SourceSpan{});
+  EXPECT_EQ(ordered.substr(open.offset, open.length), "(");
+  EXPECT_EQ(open.offset, ordered.find("(SELECT MAX(a) FROM v)")) << "the subquery's, not MAX's";
 }
 
 // An unreferenced CTE of more relations than the limit costs nothing, because it is never walked.
