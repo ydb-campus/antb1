@@ -7,6 +7,8 @@
 //   2. Every random valid AST (random expression trees, WITH lists and derived tables included)
 //      round-trips: Parse(ToSql(ast)) == ast and ToSql is idempotent; a comparison written
 //      literal-first normalizes like the column-first one.
+//   3. Every walk of a statement (the checks of 1., Depth, equality and the unparser) reaches a
+//      construct that stands only in the last of three blocks of a compound.
 
 #include <algorithm>
 #include <array>
@@ -15,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -600,11 +603,14 @@ void CheckParse(const std::string& sql) {
 
 // ---- random token soup ------------------------------------------------------------------------
 
+// VERIFY: with "UNION ALL" here and INTERSECT and EXCEPT in kOther (the seeds draw new queries),
+// RandomTokenSoupNeverBreaksTheParser still parses more than 500 queries, and it and
+// MutatedQueriesNeverBreakTheParser still pass.
 constexpr auto kStructure = std::to_array<std::string_view>({
-    "SELECT", "select", "FROM",   "WHERE", "LIMIT", "AND",  "AS",       "*",   ",",
-    "(",      ")",      ";",      "COUNT", "SUM",   "AVG",  "MIN",      "MAX", "=",
-    "<>",     "!=",     "<",      "<=",    ">",     ">=",   "GROUP",    "BY",  "ORDER",
-    "ASC",    "desc",   "OFFSET", "NULLS", "FIRST", "last", "DISTINCT",
+    "SELECT", "select", "FROM",   "WHERE", "LIMIT", "AND",  "AS",       "*",         ",",
+    "(",      ")",      ";",      "COUNT", "SUM",   "AVG",  "MIN",      "MAX",       "=",
+    "<>",     "!=",     "<",      "<=",    ">",     ">=",   "GROUP",    "BY",        "ORDER",
+    "ASC",    "desc",   "OFFSET", "NULLS", "FIRST", "last", "DISTINCT", "UNION ALL",
 });
 constexpr auto kOperands = std::to_array<std::string_view>({
     "events",
@@ -657,7 +663,8 @@ constexpr auto kOther = std::to_array<std::string_view>({
     "NATURAL",   "RIGHT",       "LATERAL",   "only",
     "PIVOT",     "TABLESAMPLE", "at",        "GLOB",
     "FULL",      "POSITIONAL",  "RECURSIVE", "MATERIALIZED",
-    "VALUES",    "KEY",         "TABLE",
+    "VALUES",    "KEY",         "TABLE",     "INTERSECT",
+    "EXCEPT",
 });
 constexpr auto kSeparators = std::to_array<std::string_view>(
     {" ", " ", " ", "", "\n", "\t", "/**/", "--\n", "\r", "--\r", "/*/**/*/"});
@@ -1417,6 +1424,91 @@ TEST(ParserPropertyTest, LiteralFirstComparisonsNormalize) {
     }
   }
 }
+
+// ---- the last block of a compound -------------------------------------------------------------
+
+// One construct that stands only in the last of three blocks of a compound (ADR 0036), where a walk
+// that skipped the blocks, or stopped before the last, would miss it. Wherever it can be (not '*'),
+// the construct is the deepest part of its block, so the exact depth shows that Depth reached it.
+struct LastBlockCase {
+  std::string_view name;
+  std::string_view block;    // the third block
+  std::string_view changed;  // the third block with only the construct changed
+  std::size_t depth;         // Depth of the compound
+
+  friend void PrintTo(const LastBlockCase& c, std::ostream* os) { *os << c.block; }
+};
+
+// The compound of two plain blocks and `last`.
+std::string ThreeBlocks(std::string_view last) {
+  return "SELECT a FROM t UNION ALL SELECT a FROM t UNION ALL " + std::string(last);
+}
+
+class CompoundWalkTest : public ::testing::TestWithParam<LastBlockCase> {};
+
+TEST_P(CompoundWalkTest, WalksReachTheLastOfThreeBlocks) {
+  const LastBlockCase& c = GetParam();
+  const std::string sql = ThreeBlocks(c.block);
+  auto stmt = Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+  ASSERT_EQ(stmt->set_operation.size(), 3U) << sql;
+  const SourceSpan last = stmt->set_operation[2].query->span;
+  EXPECT_EQ(sql.substr(last.offset, last.length), c.block);
+  // The invariants and the token count of the compound and of every block, the depth limit, and
+  // the round trip: Parse(ToSql) is the same statement, and ToSql is idempotent.
+  ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
+  EXPECT_EQ(Depth(*stmt), c.depth) << sql;
+  // Equality reads the last block: the construct changed there makes another statement, and a
+  // respelling (keywords in lower case, a newline for each space) is the same one, with the same
+  // canonical form.
+  auto changed = Parse(ThreeBlocks(c.changed));
+  ASSERT_TRUE(changed.has_value()) << c.changed << ": " << changed.error().message;
+  EXPECT_FALSE(EqualIgnoringSpans(*stmt, *changed)) << c.changed;
+  std::string respelled = sql;
+  std::ranges::transform(respelled, respelled.begin(), [](unsigned char ch) {
+    return ch == ' ' ? '\n' : static_cast<char>(std::tolower(ch));
+  });
+  auto again = Parse(respelled);
+  ASSERT_TRUE(again.has_value()) << testing::PrintToString(respelled) << ": "
+                                 << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << testing::PrintToString(respelled);
+  EXPECT_EQ(ToSql(*again), ToSql(*stmt));
+}
+
+// A compound is one level over its deepest block (SELECT a: 1, so 2 at least), and a nested query
+// one level below the FROM item or the subquery that holds it: a < (SELECT MAX(b) FROM u) is 4.
+INSTANTIATE_TEST_SUITE_P(
+    UnionAllLastBlock, CompoundWalkTest,
+    ::testing::Values(
+        LastBlockCase{"DeepSelectExpression", "SELECT f(f(f(f(f(a))))) FROM t",
+                      "SELECT f(f(f(f(f(b))))) FROM t", 7},
+        LastBlockCase{"Star", "SELECT * FROM t", "SELECT a FROM t", 2},
+        LastBlockCase{"DerivedTableWithColumnAliases", "SELECT x FROM (SELECT a FROM t) AS s(x)",
+                      "SELECT x FROM (SELECT a FROM t) AS s(y)", 3},
+        LastBlockCase{"JoinOn", "SELECT a FROM t JOIN u ON t.k = u.k",
+                      "SELECT a FROM t JOIN u ON t.k = u.j", 3},
+        LastBlockCase{"Where", "SELECT a FROM t WHERE a > 1", "SELECT a FROM t WHERE a > 2", 3},
+        LastBlockCase{"GroupBy", "SELECT a FROM t GROUP BY a, b + 1",
+                      "SELECT a FROM t GROUP BY a, b + 2", 3},
+        LastBlockCase{"Having", "SELECT a FROM t GROUP BY a HAVING SUM(b) > 1",
+                      "SELECT a FROM t GROUP BY a HAVING SUM(b) > 2", 4},
+        LastBlockCase{"InSubquery", "SELECT a FROM t WHERE a IN (SELECT b FROM u WHERE b > 1)",
+                      "SELECT a FROM t WHERE a IN (SELECT b FROM u WHERE b > 2)", 4},
+        LastBlockCase{"ExistsSubquery",
+                      "SELECT a FROM t WHERE EXISTS (SELECT b FROM u WHERE b > 1)",
+                      "SELECT a FROM t WHERE EXISTS (SELECT b FROM u WHERE b > 2)", 4},
+        LastBlockCase{"ScalarSubquery", "SELECT a FROM t WHERE a < (SELECT MAX(b) FROM u)",
+                      "SELECT a FROM t WHERE a < (SELECT MIN(b) FROM u)", 5},
+        // The inner compound is 3 (its second block's b > 1 is 2), and its FROM item 4.
+        LastBlockCase{"CompoundInADerivedTable",
+                      "SELECT x FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM u WHERE b > 1) "
+                      "AS s",
+                      "SELECT x FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM u WHERE b > 2) "
+                      "AS s",
+                      5}),
+    [](const ::testing::TestParamInfo<LastBlockCase>& param_info) {
+      return std::string(param_info.param.name);
+    });
 
 }  // namespace
 }  // namespace antb1::sql
