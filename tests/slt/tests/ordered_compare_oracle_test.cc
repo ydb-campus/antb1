@@ -2,6 +2,7 @@
 // the rows it fetches in order: the rows antb1 returns there are checked with one query that writes
 // their cells as SQL literals (ordered_compare.h).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,12 +14,16 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/writer.h>
 
 #include "duckdb_engine.h"
 #include "engine.h"
 #include "ordered_compare.h"
 #include "result_diff.h"
+#include "tables.h"
 
 namespace antb1::slt {
 namespace {
@@ -172,6 +177,53 @@ TEST_F(OrderedCompareOracleTest, LongRunMembersMatchDecimalsAsText) {
     EXPECT_EQ(queries_, 2) << m;
     EXPECT_EQ(last_rows_, 1U) << m << ": only row 3";
   }
+}
+
+// An ORDER BY whose bare name two items spell apart, as the random generator spells names (case,
+// quotes), still keys the comparison: both items are one column, so antb1's own order of the ties
+// is right too. The harness used to decline such an ORDER BY and compare the ties in exact order,
+// a false failure (`antb1-slt diff`, seed 61701, case 1530).
+TEST_F(OrderedCompareOracleTest, AKeySpelledApartStillOrdersTies) {
+  // kTable's ids and keys as a Parquet table t: the harness parses the query with antb1's parser,
+  // which reads a table by name and no VALUES list.
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "ordered_compare_oracle_spelled_apart";
+  std::filesystem::create_directories(dir);
+  const std::string file = (dir / "t.parquet").string();
+  arrow::Int32Builder ids;
+  arrow::Int32Builder keys;
+  for (int32_t id = 1; id <= 12; ++id) {
+    ASSERT_TRUE(ids.Append(id).ok());
+    ASSERT_TRUE(keys.Append(id <= 2 ? 1 : 0).ok());
+  }
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("id", arrow::int32()), arrow::field("k", arrow::int32())}),
+      {ids.Finish().ValueOrDie(), keys.Finish().ValueOrDie()});
+  const auto out = arrow::io::FileOutputStream::Open(file).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 12).ok());
+  ASSERT_TRUE(out->Close().ok());
+  auto engine =
+      DuckDbEngine::Make({TableDef{.name = "t", .files = {file}, .patterns = {file}}}, dir, dir);
+  ASSERT_TRUE(engine.has_value()) << engine.error();
+  DuckDbEngine& duckdb = **engine;
+
+  const std::string sql = R"(SELECT k, "K", id FROM t ORDER BY 1, 2 DESC, K)";
+  const auto oracle = duckdb.Execute(sql);
+  ASSERT_TRUE(oracle.has_value()) << oracle.error().message;
+  // The ties in another order: every run of one key backwards.
+  ResultSet antb1 = *oracle;
+  std::ranges::reverse(antb1.rows);
+  std::ranges::stable_sort(antb1.rows, {}, [](const Row& row) { return row.at(0).value_or(""); });
+  ASSERT_NE(antb1.rows, oracle->rows);
+  const auto right =
+      CompareQueryAnswers(sql, *oracle, antb1, duckdb, /*rows=*/false, SortMode::kNoSort);
+  EXPECT_FALSE(right.has_value()) << right.value_or(Discrepancy{}).what;
+  // The same rows across the keys' order still fail: a row of k = 1 first, one of k = 0 last.
+  std::swap(antb1.rows.front(), antb1.rows.back());
+  const auto d =
+      CompareQueryAnswers(sql, *oracle, antb1, duckdb, /*rows=*/false, SortMode::kNoSort);
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
 }
 
 }  // namespace

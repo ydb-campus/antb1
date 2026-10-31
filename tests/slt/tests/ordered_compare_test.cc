@@ -95,8 +95,8 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
 
 // DuckDB takes a plain column written otherwise than its column is declared for an alias of the
 // declared name, the last alias winning, which the harness cannot tell from one written as
-// declared: a plain column item of the name is the key where every reading agrees, and any other
-// mix declines.
+// declared: a plain column item of the name is the key where every reading agrees -- several with
+// at most one qualifier among them name one column, however spelled -- and any other mix declines.
 TEST(MakeOrderedQuery, KeysThroughImplicitAliases) {
   EXPECT_EQ(MakeOrderedQuery("SELECT 1 AS k, K, x FROM t ORDER BY k DESC"), std::nullopt)
       << "K after the written alias may be the last alias";
@@ -110,10 +110,30 @@ TEST(MakeOrderedQuery, KeysThroughImplicitAliases) {
       "SELECT t2.K, v, t2.K AS \"__antb1_key0\" FROM t2 INNER JOIN u2 ON t2.k = u2.k ORDER BY "
       "k");
   EXPECT_EQ(MakeOrderedQuery("SELECT t.k, u.K FROM t JOIN u ON t.k = u.k ORDER BY k"), std::nullopt)
-      << "two columns spelled apart";
+      << "the columns of two items";
+  EXPECT_EQ(MakeOrderedQuery("SELECT k, t.k, u.K FROM t JOIN u ON t.v = u.v ORDER BY k"),
+            std::nullopt)
+      << "a bare column next to the columns of two items";
+  // A bare name binds only where one FROM item has the column, so next to t.k it is t.k.
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT t.k, k, x FROM t JOIN u ON t.v = u.v ORDER BY k")
+          .value_or(OrderedQuery{})
+          .augmented_sql,
+      "SELECT t.k, k, x, t.k AS \"__antb1_key0\" FROM t INNER JOIN u ON t.v = u.v ORDER BY k");
   EXPECT_EQ(
       MakeOrderedQuery("SELECT c0, c0 FROM t ORDER BY c0").value_or(OrderedQuery{}).augmented_sql,
       "SELECT c0, c0, c0 AS \"__antb1_key0\" FROM t ORDER BY c0");
+  // One column spelled apart by case and quotes, as the random generator writes names: the first
+  // item is the key, whichever DuckDB takes (they are the same column).
+  EXPECT_EQ(
+      MakeOrderedQuery(R"(SELECT k, "K", tR_x FROM t ORDER BY 1, 2 DESC, K)")
+          .value_or(OrderedQuery{})
+          .augmented_sql,
+      R"(SELECT k, "K", tR_x, k AS "__antb1_key0", "K" AS "__antb1_key1", k AS "__antb1_key2" )"
+      "FROM t ORDER BY 1, 2 DESC, K");
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT t.k, T.K FROM t ORDER BY k").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT t.k, T.K, t.k AS \"__antb1_key0\" FROM t ORDER BY k");
 }
 
 // Stars among the select items: a position names an item only before the first star, whose width
