@@ -60,7 +60,7 @@ struct JoinStep {
   JoinOperand left;
   JoinOperand right;
   // The edges between the two inputs, ascending: the keys of this join. Never empty -- a step
-  // joins two inputs that an edge connects, and the binder rejects a cross product.
+  // joins two inputs that an edge connects, and the binder passes only relations the edges connect.
   std::vector<std::size_t> edges;
   // The side this join builds on: its right input, unless that input's estimate exceeds its left
   // input's by more than `build_side_ratio` (ADR 0026). An unknown estimate on either side keeps
@@ -70,7 +70,8 @@ struct JoinStep {
 };
 
 // The first relation, in FROM order, that the edges do not connect to relation 0, or std::nullopt
-// when they connect every relation (the binder rejects a disconnected graph: a cross product).
+// when they connect every relation. A disconnected graph is a cross product: the binder refuses it
+// unless every relation left out joins as one row, and then orders only the connected rest.
 // Every edge must join two relations below `relations`.
 std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<const JoinEdge> edges);
 
