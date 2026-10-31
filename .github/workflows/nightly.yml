@@ -1,8 +1,9 @@
 # Nightly deep checks on main (advisory, never a merge gate): long fuzzing, ThreadSanitizer, the ClickBench data
-# tests under ASan and on ARM64, a long random differential run, shuffled test order, and the standalone static
-# build from scratch on its three targets plus every hermetic test against its static Arrow. A failure opens one issue
-# labelled nightly-failure (or comments on the open one) with the failing jobs and the commands that reproduce them.
-# Every job name contains its local command (docs/ci.md). The jobs only read caches (CI on main writes them).
+# tests under ASan and on ARM64, the ratchet of the queries derived from TPC-DS at scale factor 1 under ASan, a long
+# random differential run, shuffled test order, and the standalone static build from scratch on its three targets plus
+# every hermetic test against its static Arrow. A failure opens one issue labelled nightly-failure (or comments on the
+# open one) with the failing jobs and the commands that reproduce them. Every job name contains its local command
+# (docs/ci.md). The jobs only read caches (CI on main writes them).
 name: Nightly
 
 on:
@@ -144,6 +145,57 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+
+  # The ratchet of the queries derived from TPC-DS at scale factor 1 (label tpc-sf1) on the ASan build, which the PR
+  # leg clang-asan and the tsan job leave out: under the sanitizers its shards come close to their timeout
+  # (tests/tpcds/CMakeLists.txt). Its output is redacted.
+  asan-tpc-sf1:
+    name: asan-tpc-sf1 (pixi run asan-tpc-sf1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+    env:
+      CCACHE_MAXSIZE: 250M
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.81.0
+          environments: default
+          locked: true
+          cache: true
+          cache-key: pixi-${{ hashFiles('pixi.lock') }}-
+          cache-write: false
+      - name: Restore ccache (the ci-asan preset of clang-asan)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/ccache
+          key: ccache-clang-asan-${{ github.run_id }}
+          restore-keys: ccache-clang-asan-
+      - name: Scale factor 1 under ASan and UBSan (pixi run asan-tpc-sf1)
+        run: pixi run --frozen -e default asan-tpc-sf1
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@6ef3fdcfcd5f0b5d14df3e659ef19b8c6820f93d # v6.6.1
+        with:
+          report_paths: build/ci-asan/junit-tpc-sf1.xml
+          annotate_only: true
+          job_summary: true
+          detailed_summary: true
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-asan-tpc-sf1
+          path: |
+            build/ci-asan/Testing/Temporary/LastTest*.log
+            build/ci-asan/junit-tpc-sf1.xml
+          retention-days: 7
+          if-no-files-found: ignore
 
   # Linux ARM64 (not a PR leg): the release build with the hermetic tests, then the data tests. Its pixi environments
   # are not cached (the cache budget covers the x86-64 and macOS legs); the data cache is platform-independent.
@@ -363,7 +415,7 @@ jobs:
   # job cancelled on its own (a timeout) counts as failed; a cancelled workflow run reports nothing.
   report:
     name: report
-    needs: [fuzz-long, tsan, asan-data, arm64, diff-extended, ci-shuffle, static-cold, static-urls, static-test]
+    needs: [fuzz-long, tsan, asan-data, asan-tpc-sf1, arm64, diff-extended, ci-shuffle, static-cold, static-urls, static-test]
     if: >-
       ${{ !cancelled() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-slim
@@ -385,6 +437,7 @@ jobs:
             [fuzz-long]='ANTB1_FUZZ_SECONDS=1200 pixi run fuzz (crash inputs: the fuzz-long-artifacts artifact)'
             [tsan]='pixi run tsan'
             [asan-data]='pixi run asan-data'
+            [asan-tpc-sf1]='pixi run asan-tpc-sf1'
             [arm64]='pixi run release && pixi run test-data (on linux-aarch64)'
             [diff-extended]="ANTB1_DIFF_SEED=$RUN_ID ANTB1_DIFF_COUNT=20000 pixi run diff-random"
             [ci-shuffle]='pixi run ci-shuffle'

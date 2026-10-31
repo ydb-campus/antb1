@@ -38,7 +38,7 @@ agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subse
 | All Linux PR gates: `check` + `asan` + `tidy` + `coverage` + `fuzz-smoke` + `ci-gcc` | `pixi run check-full` |
 | Single legs (coverage floors: `tools/ci/coverage_thresholds.json`); CodeQL traced build (GCC, no tests) | `pixi run ci` · `pixi run asan` · `pixi run ci-gcc` · `pixi run release` · `pixi run tidy` · `pixi run coverage` · `pixi run fuzz-smoke` · `pixi run codeql-build` |
 | Rewrite `.slt` expectations from DuckDB (then review the diff); random differential test vs DuckDB, and its repro | `pixi run slt-complete` · `pixi run diff-random` · `ANTB1_DIFF_SEED=<s> ANTB1_DIFF_ONLY=<case> pixi run diff-random` |
-| Not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order; micro benchmarks and ClickBench runs of `antb1 bench` on the static build (NETWORK once, via `static-arrow`; `build/static/bench-results`, docs/benchmarks.md); the standalone static binary (`static-arrow`: NETWORK once; `build/static/package`, docs/ci.md), its checks, its full test run and the sources that go with a Linux package (NETWORK once; `build/static/sources`) | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` · `pixi run bench` · `pixi run bench-clickbench` · `pixi run static-arrow` · `pixi run static` · `pixi run static-check` · `pixi run static-test` · `pixi run static-sources` |
+| Not PR gates: long fuzzing (`ANTB1_FUZZ_SECONDS`), ThreadSanitizer, random test order, the ratchet derived from TPC-DS at scale factor 1 under ASan (label `tpc-sf1`, which `asan` and `tsan` skip); micro benchmarks and ClickBench runs of `antb1 bench` on the static build (NETWORK once, via `static-arrow`; `build/static/bench-results`, docs/benchmarks.md); the standalone static binary (`static-arrow`: NETWORK once; `build/static/package`, docs/ci.md), its checks, its full test run and the sources that go with a Linux package (NETWORK once; `build/static/sources`) | `pixi run fuzz` · `pixi run tsan` · `pixi run ci-shuffle` · `pixi run asan-tpc-sf1` · `pixi run bench` · `pixi run bench-clickbench` · `pixi run static-arrow` · `pixi run static` · `pixi run static-check` · `pixi run static-test` · `pixi run static-sources` |
 | ClickBench (NETWORK; files in `~/.cache/antb1`, never committed): pinned download (`--full`: 14.7 GB, host only); redacted data tests (CI `clickbench-hits0`); their nightly ASan run | `pixi run fetch-data` · `pixi run test-data` · `pixi run asan-data` |
 | Environment status; delete build trees; optional git hook (lint on staged files) | `pixi run doctor` · `pixi run doctor --json` · `pixi run clean` · `pixi run install-git-hooks` |
 
@@ -80,9 +80,9 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
 ## Testing
 
 - Unit tests live in `src/<module>/tests/*_test.cc` (`antb1_add_module_tests`, named `<module>.<Suite>.<Case>`, label
-  `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels:
-  `unit` `integration` `slt` `oracle` `diff` `parallel` `metamorphic` `cli` `harness` `fuzz-replay` `setup` (hermetic),
-  `fuzz` (`pixi run fuzz-smoke`), `bench-smoke` (`pixi run release`), `data` (`pixi run test-data`); docs/testing.md.
+  `unit`); cross-module suites and the harness live in `tests/` ([tests/README.md](tests/README.md)). Labels: `unit`
+  `integration` `slt` `oracle` `diff` `parallel` `metamorphic` `cli` `harness` `fuzz-replay` `setup` `tpc-sf1`
+  (hermetic), `fuzz` (`pixi run fuzz-smoke`), `bench-smoke` (`pixi run release`), `data` (`pixi run test-data`).
 - SQL behavior goes into `tests/slt/cases/<area>/*.slt`: write the SQL, let `pixi run slt-complete` write the expected
   blocks from DuckDB, review the diff. Declare a newly answered feature in `tests/slt/supported_features.h`; when a
   pass set changes, update its ratchet (`tests/data/*_status.json`) and its docs/sql-subset.md table together.

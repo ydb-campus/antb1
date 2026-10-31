@@ -140,7 +140,9 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   query (tests/tpcds/CMakeLists.txt). X7's filter pushdown into the branches is what would cut that time.
   Update (2026-10-31): eight shards of every eighth query. On CI runners about half as fast as before, the shards
   holding queries 4, 28 and 88 and queries 11 and 23 took 87% and 89% of the timeout once 28, 88 and 23 joined the
-  ratchet.
+  ratchet. In eight, the one holding query 4 still took 79%. So the same day the shards left the PR's ASan leg and the
+  nightly ThreadSanitizer run, where one of four had outlasted the timeout; a nightly job runs them under ASan
+  ([ADR 0006](0006-test-strategy-and-data-policy.md)).
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
 - A union's consumer is serial. A large union under a GROUP BY, a join or a sort runs at the consumer's
