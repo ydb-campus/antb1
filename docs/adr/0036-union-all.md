@@ -15,7 +15,9 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   - Every compound is the query of a derived table (19 queries) or of a CTE (4). None is the whole statement, and
     none has ORDER BY or LIMIT on the compound.
   - Every compound has two or three branches, and a branch may GROUP BY (7 queries).
-  - Only queries with INTERSECT, EXCEPT or UNION parenthesize a branch (8, 14, 49 and 87).
+  - Only queries with INTERSECT, EXCEPT or UNION parenthesize a branch (8, 14, 49 and 87). Correction
+    (2026-10-31, [ADR 0037](0037-tpcds-roadmap.md)'s survey): only 87 does, all three of its branches. In 8, 14 and 49
+    the parenthesis before an operator closes something inside the branch (a condition, a list or a subquery).
   - UNION ALL is the only feature queries 4, 11, 33, 56, 60, 66, 71 and 74 still lack.
 - **[ADR 0022](0022-joins-and-query-blocks.md) recorded that the queries derived from TPC-H never need set
   operations, and the engine has none.**
@@ -158,10 +160,10 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
 | X1 | The plan node and `UnionAllOperator`; every visitor; the reduction's gate. No SQL. | Built |
 | X2 | `UNION ALL` in the grammar, the AST, the unparser and the walkers, refused by the binder with exit code 4; the random generator writes it (a pending feature) | Built |
 | X3 | The binder answers it in derived tables, CTE bodies and statements; `.slt` from DuckDB; the TPC-DS ratchet; D26 | Built |
-| X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87 |
+| X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules these as X4a-X4d in its phase 6; `BY NAME` and non-SELECT branches stay on X4, unscheduled, and keep their `pending X4` guards |
 | X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it |
 | X6 | A compound as the query of IN, EXISTS or a scalar subquery | Trigger: a query that needs it |
-| X7 | Performance: filters into branches with constant-branch pruning; one part pipeline over every branch; dropping a union's unread columns (and a derived table's); sharing union-topped sub-plans once the cap falls back to recomputation | Trigger: a profile at a large scale factor |
+| X7 | Performance: filters into branches with constant-branch pruning; one part pipeline over every branch; dropping a union's unread columns (and a derived table's); sharing union-topped sub-plans once the cap falls back to recomputation | Trigger: a profile at a large scale factor. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules the filters and pruning as X7a and the sharing as its guard PF5 |
 
 ## Alternatives considered
 
