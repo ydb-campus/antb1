@@ -30,8 +30,9 @@ Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), cla
 coverage floors (`pixi run coverage`), a libFuzzer smoke run (`pixi run fuzz-smoke`), the GCC 15 compatibility
 build (`pixi run ci-gcc`) and the data tests on `hits_0` (`pixi run test-data`). ThreadSanitizer (`pixi run tsan`),
 shuffled test order (`pixi run ci-shuffle`), long fuzzing (`pixi run fuzz`), the data tests under ASan
-(`pixi run asan-data`) and on ARM64, and a 20,000-query differential run are deep checks outside the PR gates: the
-nightly workflow runs them ([ci.md](ci.md#nightly)).
+(`pixi run asan-data`) and on ARM64, the ratchet of the queries derived from TPC-DS at scale factor 1 under ASan
+(`pixi run asan-tpc-sf1`; `gcc-compat` and `clang-coverage-fuzz` run it on every PR), and a 20,000-query differential
+run are deep checks outside the PR gates: the nightly workflow runs them ([ci.md](ci.md#nightly)).
 
 ## Labels
 
@@ -54,9 +55,14 @@ table must match it (`pixi run lint` compares them).
 | `setup` | in use | `fixtures.generate`, `fixtures.tpch` and `fixtures.tpcds`: write the Parquet fixtures (and the data derived from TPC-H and TPC-DS) before any test that needs them |
 | `data` | in use | ClickBench data tests (`data.*`, [below](#clickbench-data-tests)): downloaded data, always redacted; only the `data` and `asan-data` test presets run them |
 | `bench-smoke` | in use | `bench.micro.smoke`: every micro benchmark once (presets with benchmarks: `ci-release`, `static`); numbers never gate |
+| `tpc-sf1` | in use | the ratchet of the queries derived from TPC-DS at scale factor 1, `tpcds.status.sf1.1of8` to `8of8` ([below](#data-derived-from-tpc-ds)): hermetic, but the `ci-asan` and `tsan` test presets leave it out; the `asan-tpc-sf1` preset runs only it, nightly |
 
 The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `coverage`, `tsan`, `ci-shuffle`,
-`static`) exclude the `data` and `fuzz` labels. The `fuzz` test preset runs only `fuzz` and `fuzz-replay`.
+`static`) exclude the `data` and `fuzz` labels, and `ci-asan` and `tsan` also `tpc-sf1`. Under the sanitizers its
+shards come close to their timeout ([ADR 0036](adr/0036-union-all.md)), while `gcc-compat` and `clang-coverage-fuzz`
+check the same answers on every PR without them. So ASan runs the shards nightly (`asan-tpc-sf1`) and scale factor
+0.1 on every PR; ThreadSanitizer keeps the 4-thread run at 0.1, since the shards run one engine thread. The `fuzz`
+test preset runs only `fuzz` and `fuzz-replay`.
 
 ## Running tests
 
@@ -70,11 +76,13 @@ The hermetic test presets (`dev`, `ci`, `ci-asan`, `ci-release`, `ci-gcc`, `cove
 - A filtered run still generates the fixtures first: every test that reads them requires the ctest fixture that
   `fixtures.generate` sets up.
 - `pixi run ci`, `pixi run asan`, `pixi run ci-gcc` and `pixi run release` run the same tests in the CI
-  configurations (`release` also builds the micro benchmarks and runs `bench.micro.smoke`). Each writes JUnit XML to
-  `build/<preset>/junit.xml`. Benchmarks themselves are not tests: [benchmarks.md](benchmarks.md).
-- `pixi run tsan` runs the hermetic tests under ThreadSanitizer (`build/tsan`); `pixi run ci-shuffle` runs the tests
-  of the `ci` build in random order, each repeated until it fails (at most twice), and writes
-  `build/ci/junit-shuffle.xml`.
+  configurations (`asan` all but `tpc-sf1`; `release` also builds the micro benchmarks and runs `bench.micro.smoke`).
+  Each writes JUnit XML to `build/<preset>/junit.xml`. Benchmarks themselves are not tests:
+  [benchmarks.md](benchmarks.md).
+- `pixi run tsan` runs the hermetic tests but `tpc-sf1` under ThreadSanitizer (`build/tsan`); `pixi run ci-shuffle`
+  runs the tests of the `ci` build in random order, each repeated until it fails (at most twice), and writes
+  `build/ci/junit-shuffle.xml`; `pixi run asan-tpc-sf1` runs the `tpc-sf1` tests on the `ci-asan` build, four at a
+  time, and writes `build/ci-asan/junit-tpc-sf1.xml`.
 
 ## Hermetic rules
 
@@ -96,10 +104,10 @@ Every test except those labeled `data` must be hermetic:
 - the test presets set `OMP_NUM_THREADS=1`, `ARROW_IO_THREADS=2`, `LC_ALL=C`, `TZ=UTC` and `GTEST_COLOR=no`, and each
   gtest case has a 120-second timeout.
 
-The sanitizer presets (`pixi run asan`, `pixi run fuzz-smoke`) additionally use `ARROW_DEFAULT_MEMORY_POOL=system`,
-abort on the first ASan error and run UBSan in recoverable mode with `halt_on_error=1`, so every finding still fails
-the test while the suppression files in `tools/sanitizers/` can work. The suppression files start empty; every entry
-needs a comment that justifies it and a maintainer's agreement.
+The sanitizer presets (`pixi run asan`, `asan-data`, `asan-tpc-sf1` and `fuzz-smoke`) additionally use
+`ARROW_DEFAULT_MEMORY_POOL=system`, abort on the first ASan error and run UBSan in recoverable mode with
+`halt_on_error=1`, so every finding still fails the test while the suppression files in `tools/sanitizers/` can work.
+The suppression files start empty; every entry needs a comment that justifies it and a maintainer's agreement.
 
 ## Fixtures
 
@@ -422,17 +430,21 @@ judge). Linux only, as for TPC-H. So far it holds:
   `harness.tpcds.generate.unknown_workload`: the generator refuses an unknown `-DWORKLOAD`. `fixtures.tpch` and
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
 - `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
-- `tpcds.status.sf0_1`, `tpcds.status.sf1.1of8` to `tpcds.status.sf1.8of8` (label `oracle`; scale factor 1 in
-  eight shards of every eighth query, `antb1-slt tpcds --shard K/8`, since one run of all 99 outlasts the timeout under
-  AddressSanitizer once the queries with UNION ALL CTEs pass) and `parallel.tpcds.status.sf0_1` (label `parallel`: 4
-  threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for TPC-H, because at
-  scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet. `antb1-slt tpcds`
-  runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
+- `tpcds.status.sf0_1` (label `oracle`), `tpcds.status.sf1.1of8` to `tpcds.status.sf1.8of8` (label `tpc-sf1`:
+  scale factor 1 in eight shards of every eighth query, `antb1-slt tpcds --shard K/8`, since one run of all 99 outlasts
+  the timeout under AddressSanitizer once the queries with UNION ALL CTEs pass; under ASan they run nightly,
+  `pixi run asan-tpc-sf1`, not in `pixi run asan`, and not under ThreadSanitizer) and `parallel.tpcds.status.sf0_1`
+  (label `parallel`: 4 threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for
+  TPC-H, because at scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet.
+  `antb1-slt tpcds` runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
   ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with a 2 GiB
   memory limit and a 900-second timeout; its status table is "Queries derived from TPC-DS" in
   [sql-subset.md](sql-subset.md#queries-derived-from-tpc-ds). `ANTB1_TPCDS_TIMES=1` adds each query's seconds in a
   local run. `harness.tpcds.status.pass` and `.parse_error` run `antb1-slt tpcds` on our own numbered queries
   (`harness.tpch.status.*` covers the rest of the shared ratchet).
+
+This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
+this implementation does not comply with all requirements of the TPC-DS Benchmark.
 
 ## Data derived from TPC-H
 

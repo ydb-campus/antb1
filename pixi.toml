@@ -118,7 +118,7 @@ description = "clang Debug -Werror + hermetic tests -> build/ci/junit.xml"
 cmd = "cmake --workflow --preset ci"
 
 [feature.clang.tasks.asan]
-description = "CI leg clang-asan: ASan+UBSan -Werror + hermetic tests -> build/ci-asan"
+description = "CI leg clang-asan: ASan+UBSan -Werror + hermetic tests except label tpc-sf1 (asan-tpc-sf1) -> build/ci-asan"
 cmd = "cmake --workflow --preset ci-asan"
 
 [feature.clang.tasks.release]
@@ -142,12 +142,16 @@ description = "Long libFuzzer run of the SQL parser: ANTB1_FUZZ_SECONDS (default
 cmd = "bash scripts/fuzz.sh"
 
 [feature.clang.tasks.tsan]
-description = "Nightly tsan (advisory): ThreadSanitizer RelWithDebInfo + hermetic tests -> build/tsan"
+description = "Nightly tsan (advisory): ThreadSanitizer RelWithDebInfo + hermetic tests except label tpc-sf1 -> build/tsan"
 cmd = "cmake --workflow --preset tsan"
 
 [feature.clang.tasks.ci-shuffle]
 description = "Nightly ci-shuffle: the `ci` build, hermetic tests in random order, each repeated until it fails (max 2) -> build/ci/junit-shuffle.xml"
 cmd = "cmake --workflow --preset ci-shuffle"
+
+[feature.clang.tasks.asan-tpc-sf1]
+description = "Nightly asan-tpc-sf1: the ratchet of the queries derived from TPC-DS at scale factor 1 (label tpc-sf1) on the ci-asan build (ASan+UBSan) -> build/ci-asan/junit-tpc-sf1.xml"
+cmd = "cmake --workflow --preset asan-tpc-sf1"
 
 [feature.clang.tasks.fetch-data]
 description = "NETWORK: download the pinned ClickBench files (tools/data/clickbench.lock: hits_0.parquet 122 MB, queries.sql) into $ANTB1_DATA_DIR (default ~/.cache/antb1/clickbench), sha256-verified, kept when they match; --full: all 100 partitions (14.7 GB, host only)"

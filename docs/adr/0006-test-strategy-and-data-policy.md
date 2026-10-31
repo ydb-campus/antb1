@@ -41,7 +41,10 @@ Test strategy:
   engine threads and check their answers against 1 thread, [ADR 0013](0013-parallel-execution.md); every other test
   still pins 1.)
 - Sanitizers (ASan and UBSan), clang-tidy and a GCC compatibility build run on every PR; coverage floors per module
-  only go up.
+  only go up. (Since 2026-10-31 one test set runs under the sanitizers only in a nightly ASan job: the ratchet of the
+  queries derived from TPC-DS at scale factor 1, label `tpc-sf1`, whose shards come close to their timeout under them
+  ([ADR 0036](0036-union-all.md)). The other Linux PR legs run it without them, and scale factor 0.1 runs under ASan
+  on every PR and under ThreadSanitizer nightly; [ci.md](../ci.md#nightly).)
 - Unsupported answers are counted, never silently skipped.
 
 Data policy:

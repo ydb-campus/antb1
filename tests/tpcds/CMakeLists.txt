@@ -162,9 +162,16 @@ endfunction()
 # that timeout too. Each shard runs every eighth query, so each holds the same number of queries; their times differ
 # with the heavy queries they hold. With three shards, the one holding query 4 came within a third of the timeout;
 # with four, on CI runners about half as fast as before, the shards holding queries 4, 28 and 88 and queries 11 and
-# 23 took 87% and 89% of it once 28, 88 and 23 joined the ratchet. Query 4 alone takes most of its shard's time: more
-# shards no longer help there, while X7's filter pushdown into the branches would.
+# 23 took 87% and 89% of it once 28, 88 and 23 joined the ratchet; with eight, the one holding query 4 still took 79%.
+# Query 4 alone takes most of its shard's time: more shards no longer help there, while X7's filter pushdown into the
+# branches would. So the sanitizers run scale factor 1 only in its own nightly job: its label, tpc-sf1, is left out by
+# the ci-asan test preset (pixi run asan, the PR leg clang-asan) and by the tsan one (ThreadSanitizer, nightly, where
+# a shard of four outlasted the timeout; the shards run one engine thread), and it is all that the asan-tpc-sf1 preset
+# runs (the nightly job of that name). On every PR, gcc-compat and clang-coverage-fuzz still run the shards and
+# clang-asan scale factor 0.1; tsan still runs the 4-thread run at scale factor 0.1.
 # ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
+# This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
+# this implementation does not comply with all requirements of the TPC-DS Benchmark.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
 set(_shards 8)
 set(_kinds sf0_1)
@@ -178,7 +185,7 @@ foreach(kind IN LISTS _kinds)
     set(_shard ${CMAKE_MATCH_1})
     set(_name tpcds.status.sf1.${_shard}of${_shards})
     set(_sf 1)
-    set(_label oracle)
+    set(_label tpc-sf1)
     set(_options --shard ${_shard}/${_shards})
     # Queries K, K + 8, ... of the 99: 13 for shards 1 to 3, 12 for shards 4 to 8.
     math(EXPR _queries "(99 - ${_shard} + ${_shards}) / ${_shards}")

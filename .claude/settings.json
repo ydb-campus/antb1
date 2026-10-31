@@ -26,6 +26,7 @@
       "Bash(pixi run fuzz)",
       "Bash(pixi run tsan)",
       "Bash(pixi run ci-shuffle)",
+      "Bash(pixi run asan-tpc-sf1)",
       "Bash(pixi run slt-complete)",
       "Bash(pixi run diff-random)",
       "Bash(pixi run fetch-data)",

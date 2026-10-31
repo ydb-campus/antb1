@@ -142,7 +142,13 @@
     },
     { "name": "dev", "configurePreset": "dev", "inherits": ["hermetic"] },
     { "name": "ci", "configurePreset": "ci", "inherits": ["hermetic"] },
-    { "name": "ci-asan", "configurePreset": "ci-asan", "inherits": ["sanitizer-env", "hermetic"] },
+    {
+      "name": "ci-asan",
+      "displayName": "CI clang-asan: the hermetic tests except label tpc-sf1, which the nightly asan-tpc-sf1 runs",
+      "configurePreset": "ci-asan",
+      "inherits": ["sanitizer-env", "hermetic"],
+      "filter": { "exclude": { "label": "^(data|fuzz|tpc-sf1)$" } }
+    },
     { "name": "ci-release", "configurePreset": "ci-release", "inherits": ["hermetic"] },
     { "name": "ci-gcc", "configurePreset": "ci-gcc", "inherits": ["hermetic"] },
     { "name": "static", "configurePreset": "static", "inherits": ["hermetic"] },
@@ -154,8 +160,10 @@
     },
     {
       "name": "tsan",
+      "displayName": "Nightly tsan: the hermetic tests except label tpc-sf1 under ThreadSanitizer",
       "configurePreset": "tsan",
       "inherits": ["hermetic"],
+      "filter": { "exclude": { "label": "^(data|fuzz|tpc-sf1)$" } },
       "environment": {
         "ARROW_DEFAULT_MEMORY_POOL": "system",
         "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:suppressions=${sourceDir}/tools/sanitizers/tsan.supp"
@@ -184,6 +192,15 @@
       "filter": { "include": { "label": "^data$" } },
       "output": { "outputJUnitFile": "junit-data.xml" },
       "execution": { "jobs": 2 }
+    },
+    {
+      "name": "asan-tpc-sf1",
+      "displayName": "Nightly asan-tpc-sf1: the ratchet derived from TPC-DS at scale factor 1 (label tpc-sf1) on the ci-asan build",
+      "configurePreset": "ci-asan",
+      "inherits": ["sanitizer-env", "test-common"],
+      "filter": { "include": { "label": "^tpc-sf1$" } },
+      "output": { "outputJUnitFile": "junit-tpc-sf1.xml" },
+      "execution": { "jobs": 4 }
     },
     {
       "name": "ci-shuffle",
@@ -279,6 +296,14 @@
         { "type": "configure", "name": "ci-asan" },
         { "type": "build", "name": "ci-asan" },
         { "type": "test", "name": "asan-data" }
+      ]
+    },
+    {
+      "name": "asan-tpc-sf1",
+      "steps": [
+        { "type": "configure", "name": "ci-asan" },
+        { "type": "build", "name": "ci-asan" },
+        { "type": "test", "name": "asan-tpc-sf1" }
       ]
     },
     {

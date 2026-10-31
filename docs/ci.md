@@ -90,7 +90,10 @@ Advisory jobs (not required):
   tests. On pull requests it also runs GitHub's dependency review. `pixi run fmt` fixes what can be fixed
   automatically. Locally it checks tracked and untracked (non-ignored) files, the same set CI sees after commit.
 - `clang-asan` is a Clang Debug build with AddressSanitizer and UndefinedBehaviorSanitizer and `-Werror`, followed by
-  the hermetic tests.
+  the hermetic tests except the label `tpc-sf1`: the ratchet of the queries derived from TPC-DS at scale factor 1,
+  whose shards come close to their timeout under ASan ([ADR 0036](adr/0036-union-all.md)). `gcc-compat` and
+  `clang-coverage-fuzz` run it on every PR, and the nightly `asan-tpc-sf1` runs it under ASan
+  ([testing.md](testing.md#labels)).
 - `gcc-compat` builds with GCC 15 and GCC-only warnings, with `-Werror`, and runs the hermetic tests.
 - `macos-release` is a RelWithDebInfo build with `-Werror` against libc++ on Apple silicon, followed by the hermetic
   tests; it also builds the micro benchmarks and runs each once (`bench.micro.smoke`).
@@ -368,8 +371,9 @@ but every failure is tracked in an issue.
 | Job | Runner | Reproduce locally | What it adds |
 | --- | --- | --- | --- |
 | `fuzz-long` | ubuntu-24.04 | `ANTB1_FUZZ_SECONDS=1200 pixi run fuzz` | 20 minutes of libFuzzer with a random seed; crash inputs are uploaded as `fuzz-long-artifacts` for 14 days |
-| `tsan` | ubuntu-24.04 | `pixi run tsan` | the hermetic tests under ThreadSanitizer |
+| `tsan` | ubuntu-24.04 | `pixi run tsan` | the hermetic tests except the label `tpc-sf1` under ThreadSanitizer |
 | `asan-data` | ubuntu-24.04 | `pixi run asan-data` | the data tests under ASan and UBSan (redacted, no uploads) |
+| `asan-tpc-sf1` | ubuntu-24.04 | `pixi run asan-tpc-sf1` | the ratchet of the queries derived from TPC-DS at scale factor 1 (label `tpc-sf1`) under ASan and UBSan, four shards at a time, which `clang-asan` and `tsan` leave out; redacted output |
 | `arm64` | ubuntu-24.04-arm | `pixi run release` then `pixi run test-data` | Linux ARM64: the release build, the hermetic tests and the data tests |
 | `diff-extended` | ubuntu-24.04 | `ANTB1_DIFF_SEED=<run id> ANTB1_DIFF_COUNT=20000 pixi run diff-random` | 20,000 random differential queries with the run id as the seed |
 | `ci-shuffle` | ubuntu-24.04 | `pixi run ci-shuffle` | the hermetic tests in random order, each repeated until it fails (at most twice) |
@@ -378,11 +382,11 @@ but every failure is tracked in an issue.
 | `static-test` | ubuntu-24.04 | `pixi run static-test` | every hermetic test in `build/static`, against the static Arrow (the prefix `main` saved); each of its 20 executables is a ThinLTO link over that Arrow, about 4 CPU-hours in all |
 | `report` | ubuntu-slim | nothing to run | on any failed or timed-out job: opens an issue labelled `nightly-failure` and `agent-task`, or comments on the open one, with the failing jobs, the run URL and the commands above |
 
-The nightly jobs only read caches: pixi environments and ccache come from the runs on `main` (`asan-data` reuses
-the ccache of `clang-asan`, `fuzz-long` that of `clang-coverage-fuzz`), and the data comes from the cache that
-`clickbench-hits0` saved. The ARM64 environments are not cached, to stay within the cache budget. To work on a
-nightly failure, take the issue, run its command locally, fix the cause with a regression test and close the issue
-from the PR.
+The nightly jobs only read caches: pixi environments and ccache come from the runs on `main` (`asan-data` and
+`asan-tpc-sf1` reuse the ccache of `clang-asan`, `fuzz-long` that of `clang-coverage-fuzz`), and the data comes from
+the cache that `clickbench-hits0` saved. The ARM64 environments are not cached, to stay within the cache budget. To
+work on a nightly failure, take the issue, run its command locally, fix the cause with a regression test and close
+the issue from the PR.
 
 ## CodeQL
 
@@ -424,14 +428,14 @@ dismiss the alert with a reason. Until then the ruleset blocks the merge (after 
 
 Test jobs write JUnit XML to `build/<preset>/junit.xml` (`clang-coverage-fuzz`: `build/coverage/junit.xml` and
 `build/fuzz/junit.xml`; the data tests: `build/ci-release/junit-data.xml` and, nightly, `build/ci-asan/junit-data.xml`;
-`ci-shuffle`: `build/ci/junit-shuffle.xml`). The results appear as annotations on the PR and in the job summary. When
-a hermetic test job fails, the ctest logs and the JUnit files are uploaded as the `logs-<job>` artifact and kept for
-7 days. The build jobs and `clang-tidy` also write their disk usage to the job summary. Timing and cache
-measurements are recorded here once enough runs exist.
+`ci-shuffle`: `build/ci/junit-shuffle.xml`; `asan-tpc-sf1`: `build/ci-asan/junit-tpc-sf1.xml`). The results appear as
+annotations on the PR and in the job summary. When a hermetic test job fails, the ctest logs and the JUnit files are
+uploaded as the `logs-<job>` artifact and kept for 7 days. The build jobs and `clang-tidy` also write their disk
+usage to the job summary. Timing and cache measurements are recorded here once enough runs exist.
 
 | Artifact | Job | When | Kept |
 | --- | --- | --- | --- |
-| `logs-<job>` | every hermetic test job (CI legs, nightly `tsan` and `ci-shuffle`) | on failure | 7 days |
+| `logs-<job>` | every hermetic test job (CI legs, nightly `tsan`, `ci-shuffle` and `asan-tpc-sf1`) | on failure | 7 days |
 | `coverage-summary` | `clang-coverage-fuzz` | always (when the report exists) | 7 days |
 | `fuzz-artifacts` | `clang-coverage-fuzz` | when the fuzz smoke run fails | 14 days |
 | `fuzz-long-artifacts` | nightly `fuzz-long` | when long fuzzing fails | 14 days |
@@ -452,8 +456,9 @@ sources of a package only source code (never an environment directory), a smoke 
 DuckDB writes from `range()` and `kit.json` with their digests and DuckDB's answers (never a release asset),
 `release-meta` only `SHA256SUMS` and the release notes, `release-provenance` only the Sigstore bundle, and the
 data jobs (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the
-output of the tests over the data derived from TPC-H, which is redacted like the data tests' (query numbers,
-counts and hashes; [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build tree.
+output of the tests over the data derived from TPC-H and TPC-DS, which is redacted like the data tests' (query
+numbers, counts and hashes; [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build
+tree.
 
 ## Caches
 
@@ -481,7 +486,8 @@ counts and hashes; [testing.md](testing.md#data-derived-from-tpc-h)); the genera
 1. Find the command in the job name, for example `gcc-compat (pixi run ci-gcc)`.
 2. Run it locally: `pixi run ci-gcc`. Use the same platform for the macOS leg.
 3. To iterate on one test, use the dev build: `pixi run test -R '^<name>$' -V`.
-4. For a sanitizer finding, run `pixi run asan`, fix the code and add a regression test; do not add a suppression
+4. For a sanitizer finding, run the job's command (`pixi run asan` for `clang-asan`; nightly, `pixi run asan-data`,
+   `pixi run asan-tpc-sf1` or `pixi run tsan`), fix the code and add a regression test; do not add a suppression
    without a maintainer's agreement.
 5. For a lint failure, run `pixi run fmt`, then `pixi run lint`; the drift checks print the file, line and fix.
 6. For a coverage failure, run `pixi run coverage` and read `build/coverage/summary.md` (module and metric) and
