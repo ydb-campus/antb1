@@ -4,6 +4,7 @@
 query I rowsort
 SELECT id FROM edge WHERE i16 IN (0, 7, 100, 32767)
 ----
+INTEGER
 1
 11
 2
@@ -12,6 +13,7 @@ SELECT id FROM edge WHERE i16 IN (0, 7, 100, 32767)
 query I rowsort
 SELECT id FROM edge WHERE i16 NOT IN (0, 7, 100, 32767)
 ----
+INTEGER
 0
 10
 3
@@ -22,6 +24,7 @@ SELECT id FROM edge WHERE i16 NOT IN (0, 7, 100, 32767)
 query I rowsort
 SELECT id FROM edge WHERE i64 IN (9223372036854775807, -9223372036854775808, 42)
 ----
+INTEGER
 0
 1
 9
@@ -31,21 +34,25 @@ SELECT id FROM edge WHERE i64 IN (9223372036854775807, -9223372036854775808, 42)
 query I rowsort
 SELECT id FROM edge WHERE i16 IN (1.5, 40000, 1)
 ----
+INTEGER
 4
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 IN (1.5, 40000)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 NOT IN (1.5, 40000)
 ----
+BIGINT
 10
 
 query I rowsort
 SELECT id FROM edge WHERE u16 NOT IN (-1, 0, 65535, 2)
 ----
+INTEGER
 10
 11
 2
@@ -57,6 +64,7 @@ SELECT id FROM edge WHERE u16 NOT IN (-1, 0, 65535, 2)
 query I rowsort
 SELECT id FROM edge WHERE d IN (0.1, -0.5, 0, 123456789.125)
 ----
+INTEGER
 0
 2
 4
@@ -65,6 +73,7 @@ SELECT id FROM edge WHERE d IN (0.1, -0.5, 0, 123456789.125)
 query I rowsort
 SELECT id FROM edge WHERE u IN ('a', 'tab	here', '', 'nope')
 ----
+INTEGER
 0
 1
 2
@@ -72,6 +81,7 @@ SELECT id FROM edge WHERE u IN ('a', 'tab	here', '', 'nope')
 query I rowsort
 SELECT id FROM edge WHERE s NOT IN ('a', '')
 ----
+INTEGER
 11
 2
 3
@@ -87,15 +97,18 @@ SELECT id FROM edge WHERE s NOT IN ('a', '')
 query I rowsort
 SELECT id FROM floats WHERE f IN (0.1, 2)
 ----
+INTEGER
 0
 
 query I rowsort
 SELECT id FROM floats WHERE f IN (0.1, 1e0)
 ----
+INTEGER
 
 query I rowsort
 SELECT id FROM floats WHERE f NOT IN (0.1, 1e0, 19.99)
 ----
+INTEGER
 0
 1
 10
@@ -117,6 +130,7 @@ SELECT id FROM floats WHERE f NOT IN (0.1, 1e0, 19.99)
 query I rowsort
 SELECT id FROM edge WHERE i64 IN (42, 4.2e1, 1)
 ----
+INTEGER
 4
 9
 
@@ -124,6 +138,7 @@ SELECT id FROM edge WHERE i64 IN (42, 4.2e1, 1)
 query I rowsort
 SELECT id FROM floats WHERE f IN (0, 19.99)
 ----
+INTEGER
 15
 16
 4
@@ -131,17 +146,20 @@ SELECT id FROM floats WHERE f IN (0, 19.99)
 query TI nosort
 SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate IN (DATE '2013-07-02', '2013-07-15', DATE '2013-08-01') GROUP BY EventDate ORDER BY EventDate
 ----
+DATE	BIGINT
 2013-07-02	362
 2013-07-15	335
 
 query II nosort
 SELECT COUNT(*), COUNT(DISTINCT UserID) FROM hits_like_split WHERE OS IN (1, 2, 3, 4, 5) AND RegionID NOT IN (1, 2)
 ----
+BIGINT	BIGINT
 411	411
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (1)
 ----
+BIGINT
 9215
 
 # A constant integer expression in a list is the literal of its value, as on a side of a comparison: typed and
@@ -150,6 +168,7 @@ SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (1)
 query I rowsort
 SELECT id FROM edge WHERE i16 IN (0, 3 + 4, 50 * 2, 32766 + 1)
 ----
+INTEGER
 1
 11
 2
@@ -158,6 +177,7 @@ SELECT id FROM edge WHERE i16 IN (0, 3 + 4, 50 * 2, 32766 + 1)
 query I rowsort
 SELECT id FROM edge WHERE i16 NOT IN (0, 3 + 4, 50 * 2, -(1))
 ----
+INTEGER
 0
 1
 10
@@ -168,28 +188,33 @@ SELECT id FROM edge WHERE i16 NOT IN (0, 3 + 4, 50 * 2, -(1))
 query I rowsort
 SELECT id FROM edge WHERE i16 IN (1, 32767 + 1)
 ----
+INTEGER
 4
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT IN (2 - 1)
 ----
+BIGINT
 9215
 
 query I rowsort
 SELECT id FROM edge WHERE i64 IN (9223372036854775806 + 1, 40 + 2)
 ----
+INTEGER
 1
 9
 
 query I rowsort
 SELECT id FROM edge WHERE i64 IN (40 + 2, 4.2e1, 1)
 ----
+INTEGER
 4
 9
 
 query II nosort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 IN (3 + 4, 50 * 2, -(100)) ORDER BY i16
 ----
+SMALLINT	BIGINT
 -100	1
 7	1
 100	1
@@ -197,6 +222,7 @@ SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 IN (3 + 4, 50 * 2, -(100)
 query II nosort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) IN (1 + 1) ORDER BY i16
 ----
+SMALLINT	BIGINT
 NULL	2
 
 # An overflowing constant expression is the comparison's bind error in both engines.
@@ -215,6 +241,7 @@ SELECT COUNT(*) FROM empty WHERE RegionID IN (1, 2147483647 + 1)
 query I nosort
 SELECT id FROM edge WHERE i16 IN (1, 1 + 6) OR i16 = 100 ORDER BY id
 ----
+INTEGER
 4
 6
 11
@@ -222,6 +249,7 @@ SELECT id FROM edge WHERE i16 IN (1, 1 + 6) OR i16 = 100 ORDER BY id
 query I nosort
 SELECT id FROM edge WHERE i16 IN (1 + 6, 1) OR i16 IN (100, 0 + 0) ORDER BY id
 ----
+INTEGER
 2
 4
 6
@@ -230,6 +258,7 @@ SELECT id FROM edge WHERE i16 IN (1 + 6, 1) OR i16 IN (100, 0 + 0) ORDER BY id
 query I nosort
 SELECT id FROM edge WHERE (i16 IN (1, 1 + 6) AND id > 0) OR (i16 = 100 AND id > 0) ORDER BY id
 ----
+INTEGER
 4
 6
 11

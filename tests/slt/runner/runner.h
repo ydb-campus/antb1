@@ -21,7 +21,8 @@ enum class Mutation : std::uint8_t {
   kDropRow,      // drop the last row
   kExtraRow,     // duplicate the first row (or add a row of NULLs)
   kExtraColumn,  // append an integer column
-  kError,        // every statement fails with an execution error
+  kTypeName,  // rename the first column's type (BIGINT to HUGEINT, else to BIGINT), not its class
+  kError,     // every statement fails with an execution error
   kUnsupported,  // every statement fails as Unsupported
   kSucceed,      // failing statements succeed with an empty result
   kCanary,       // replace the first value of the first row with kCanaryValue (redaction canaries)
@@ -32,7 +33,8 @@ inline constexpr std::string_view kCanaryValue = "ANTB1_CANARY_VALUE";
 
 std::optional<Mutation> ParseMutation(std::string_view name);
 inline constexpr std::string_view kMutationNames =
-    "value, null, drop-row, extra-row, extra-column, error, unsupported, succeed, canary";
+    "value, null, drop-row, extra-row, extra-column, type-name, error, unsupported, succeed, "
+    "canary";
 
 // Wraps `inner` (which must outlive the result) and corrupts its results.
 std::unique_ptr<Engine> MakeMutatingEngine(Engine& inner, Mutation mutation);

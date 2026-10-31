@@ -4,16 +4,19 @@
 query I nosort
 SELECT COUNT(*) FROM edge WHERE s = ''
 ----
+BIGINT
 1
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE s <> ''
 ----
+BIGINT
 9
 
 query I rowsort
 SELECT id FROM edge WHERE s > 'a'
 ----
+INTEGER
 11
 2
 3
@@ -24,56 +27,67 @@ SELECT id FROM edge WHERE s > 'a'
 query I rowsort
 SELECT id FROM edge WHERE u >= 'Привет'
 ----
+INTEGER
 10
 8
 
 query I rowsort
 SELECT id FROM edge WHERE u < 'a'
 ----
+INTEGER
 0
 9
 
 query I rowsort
 SELECT id FROM edge WHERE s = 'NULL'
 ----
+INTEGER
 9
 
 query I rowsort
 SELECT id FROM edge WHERE u = '(empty)'
 ----
+INTEGER
 9
 
 query I rowsort
 SELECT id FROM edge WHERE s = 'naïve café'
 ----
+INTEGER
 11
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE SearchPhrase = ''
 ----
+BIGINT
 7995
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE Title >= 'погода'
 ----
+BIGINT
 267
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_required WHERE Title < 'beta' AND Title > 'alpha'
 ----
+BIGINT
 247
 
 query II nosort
 SELECT COUNT(*), COUNT(URL) FROM hits_like WHERE URL <> 'https://www.example.org/'
 ----
+BIGINT	BIGINT
 10000	10000
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE s = 'O''Brien'
 ----
+BIGINT
 0
 
 query TT nosort
 SELECT MIN(SearchPhrase), MAX(SearchPhrase) FROM hits_like WHERE SearchPhrase <> ''
 ----
+VARCHAR	VARCHAR
 alpha	погода погода погода

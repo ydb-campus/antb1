@@ -5,6 +5,7 @@
 query IIII rowsort
 SELECT id, id + 1, id - 100, id * 3 FROM edge
 ----
+INTEGER	INTEGER	INTEGER	INTEGER
 0	1	-100	0
 1	2	-99	3
 10	11	-90	30
@@ -21,6 +22,7 @@ SELECT id, id + 1, id - 100, id * 3 FROM edge
 query IIIR rowsort
 SELECT id, id // 3, id % 3, id / 4 FROM edge
 ----
+INTEGER	INTEGER	INTEGER	DOUBLE
 0	0	0	0
 1	0	1	0.25
 10	3	1	2.5
@@ -37,6 +39,7 @@ SELECT id, id // 3, id % 3, id / 4 FROM edge
 query III rowsort
 SELECT id, -id, -(id + 1) * 2 FROM edge WHERE id < 5
 ----
+INTEGER	INTEGER	INTEGER
 0	0	-2
 1	-1	-4
 2	-2	-6
@@ -46,6 +49,7 @@ SELECT id, -id, -(id + 1) * 2 FROM edge WHERE id < 5
 query II rowsort
 SELECT i32 // 0, i32 % 0 FROM edge WHERE id < 3
 ----
+INTEGER	INTEGER
 NULL	NULL
 NULL	NULL
 NULL	NULL
@@ -53,6 +57,7 @@ NULL	NULL
 query RRR rowsort
 SELECT d + 1.5, d * 2, d / 4 FROM edge WHERE d > -1000 AND d < 1000
 ----
+DOUBLE	DOUBLE	DOUBLE
 1	-1	-0.125
 1.1666666666666667	-0.6666666666666666	-0.08333333333333333
 1.5	0	0
@@ -64,6 +69,7 @@ SELECT d + 1.5, d * 2, d / 4 FROM edge WHERE d > -1000 AND d < 1000
 query III rowsort
 SELECT i16, i16 // -7, i16 % -7 FROM edge
 ----
+SMALLINT	SMALLINT	SMALLINT
 -1	0	-1
 -100	14	-2
 -12345	1763	-4
@@ -80,6 +86,7 @@ NULL	NULL	NULL
 query II rowsort
 SELECT u16 + 1, u16 * 2 FROM edge WHERE u16 < 1000
 ----
+USMALLINT	USMALLINT
 1	0
 13	24
 2	2
@@ -90,6 +97,7 @@ SELECT u16 + 1, u16 * 2 FROM edge WHERE u16 < 1000
 query II rowsort
 SELECT i16 + i32, u16 + i16 FROM edge WHERE id IN (1, 2, 3) AND i32 < 100000 AND i32 > -100000
 ----
+INTEGER	BIGINT
 -2	32767
 0	1
 
@@ -107,17 +115,20 @@ SELECT -i32 FROM edge
 query IIII nosort
 SELECT SUM(i16 + 1), SUM(1 + (i16 + 1)), SUM(i64 + 1), COUNT(i16) FROM edge
 ----
+HUGEINT	HUGEINT	HUGEINT	BIGINT
 16	26	16	10
 
 query I nosort
 SELECT SUM(i32 + 2147483647) FROM edge
 ----
+HUGEINT
 21474890790
 
 # Expressions in WHERE, GROUP BY, HAVING and ORDER BY.
 query II rowsort
 SELECT id, i16 FROM edge WHERE i16 + 1 > 5 AND i16 < 32767
 ----
+INTEGER	SMALLINT
 11	7
 6	100
 9	12345
@@ -125,6 +136,7 @@ SELECT id, i16 FROM edge WHERE i16 + 1 > 5 AND i16 < 32767
 query II rowsort
 SELECT id, i32 FROM edge WHERE i32 < id * 1000
 ----
+INTEGER	INTEGER
 0	-2147483648
 11	-7
 2	0
@@ -136,6 +148,7 @@ SELECT id, i32 FROM edge WHERE i32 < id * 1000
 query III nosort
 SELECT AdvEngineID // 2 AS k, AdvEngineID // 2 * 10, COUNT(*) AS c FROM hits_like GROUP BY AdvEngineID // 2 ORDER BY c DESC, k
 ----
+SMALLINT	SMALLINT	BIGINT
 0	0	8988
 15	150	45
 16	160	45
@@ -171,11 +184,13 @@ SELECT AdvEngineID // 2 AS k, AdvEngineID // 2 * 10, COUNT(*) AS c FROM hits_lik
 query II nosort
 SELECT RegionID, SUM(ResolutionWidth) * 2 - 1 AS s FROM hits_like GROUP BY RegionID HAVING SUM(ResolutionWidth) + 1 > 30000 AND COUNT(*) > 1 ORDER BY s DESC, RegionID LIMIT 5
 ----
+INTEGER	HUGEINT
 0	833075
 
 query IR nosort
 SELECT ClientIP, ClientIP / 2 FROM hits_like WHERE ClientIP > 0 ORDER BY ClientIP % 1000, ClientIP LIMIT 5
 ----
+INTEGER	DOUBLE
 854256000	427128000
 865206000	432603000
 921149000	460574500
@@ -185,6 +200,7 @@ SELECT ClientIP, ClientIP / 2 FROM hits_like WHERE ClientIP > 0 ORDER BY ClientI
 query IIII nosort
 SELECT ClientIP, ClientIP - 1, ClientIP - 2, COUNT(*) AS c FROM hits_like WHERE ClientIP > 0 GROUP BY ClientIP, ClientIP - 1, ClientIP - 2 ORDER BY c DESC, ClientIP LIMIT 5
 ----
+INTEGER	INTEGER	INTEGER	BIGINT
 132847	132846	132845	1
 331107	331106	331105	1
 676070	676069	676068	1
@@ -194,6 +210,7 @@ SELECT ClientIP, ClientIP - 1, ClientIP - 2, COUNT(*) AS c FROM hits_like WHERE 
 query I nosort
 SELECT id + 1 AS k FROM edge ORDER BY -k LIMIT 3
 ----
+INTEGER
 12
 11
 10
@@ -201,6 +218,7 @@ SELECT id + 1 AS k FROM edge ORDER BY -k LIMIT 3
 query II nosort
 SELECT COUNT(*), SUM(ResolutionWidth + 7) - SUM(ResolutionWidth) FROM hits_like
 ----
+BIGINT	HUGEINT
 10000	70000
 
 # DuckDB's optimizer moves the constant of x + c <op> k (and x - c, c - x, x * c when c divides k)
@@ -208,16 +226,19 @@ SELECT COUNT(*), SUM(ResolutionWidth + 7) - SUM(ResolutionWidth) FROM hits_like
 query II nosort
 SELECT COUNT(*), SUM(i32 // 1000) FROM edge WHERE i16 + 1 > 0
 ----
+BIGINT	HUGEINT
 6	2147583
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE 1 - i16 < 0 AND (i16 + 1) * 2 > 0 AND i16 * -2 < 0
 ----
+BIGINT
 4
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 * 2 = 3
 ----
+BIGINT
 0
 
 statement error
@@ -230,6 +251,7 @@ SELECT COUNT(*) FROM edge WHERE u16 + 1 > 0
 query I nosort
 SELECT SUM(i16 + (i16 - i16) + 1) FROM edge
 ----
+HUGEINT
 16
 
 statement error
@@ -239,16 +261,19 @@ SELECT SUM(i16 + 1) FROM edge GROUP BY i32
 query I nosort
 SELECT COUNT(*) FROM edge HAVING COUNT(*) + 1 > 1
 ----
+BIGINT
 12
 
 query I nosort
 SELECT SUM(i16) FROM edge HAVING SUM(i16) * 2 > SUM(i16)
 ----
+HUGEINT
 6
 
 query I rowsort
 SELECT id FROM edge WHERE i64 < d
 ----
+INTEGER
 0
 10
 3
@@ -258,6 +283,7 @@ SELECT id FROM edge WHERE i64 < d
 query II rowsort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 + 30000 > 5
 ----
+SMALLINT	BIGINT
 -1	1
 -100	1
 -12345	1
@@ -271,6 +297,7 @@ SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 + 30000 > 5
 query II rowsort
 SELECT i16, MIN(i32) FROM edge GROUP BY i16 HAVING MIN(i16) + 30000 > 5 OR i16 < 0
 ----
+SMALLINT	INTEGER
 -1	-1
 -100	-100000
 -12345	54321
@@ -285,6 +312,7 @@ SELECT i16, MIN(i32) FROM edge GROUP BY i16 HAVING MIN(i16) + 30000 > 5 OR i16 <
 query II rowsort
 SELECT i16, CASE WHEN i16 + 30000 > 5 THEN 1 END FROM edge GROUP BY i16
 ----
+SMALLINT	INTEGER
 -1	1
 -100	1
 -12345	1

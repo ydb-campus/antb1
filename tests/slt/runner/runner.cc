@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -50,6 +51,7 @@ class MutatingEngine final : public Engine {
       case Mutation::kDropRow:
       case Mutation::kExtraRow:
       case Mutation::kExtraColumn:
+      case Mutation::kTypeName:
       case Mutation::kCanary:
         if (result.has_value()) {
           Corrupt(*result);
@@ -91,6 +93,11 @@ class MutatingEngine final : public Engine {
         r.type_names.emplace_back("MUTATED");
         for (auto& row : rows) {
           row.emplace_back("0");
+        }
+        break;
+      case Mutation::kTypeName:
+        if (!r.type_names.empty()) {
+          r.type_names[0] = r.type_names[0] == "BIGINT" ? "HUGEINT" : "BIGINT";
         }
         break;
       case Mutation::kCanary:
@@ -150,6 +157,29 @@ std::string Letters(const ResultSet& r) {
   return letters;
 }
 
+std::string CommaList(const std::vector<std::string>& names) {
+  std::string list;
+  for (const auto& n : names) {
+    list += (list.empty() ? "" : ", ") + n;
+  }
+  return list;
+}
+
+// Why the type names of `rs` cannot open a block, or std::nullopt: the type line needs one name
+// per column, none blank or holding a tab or a line break.
+std::optional<std::string> TypeLineProblem(const ResultSet& rs) {
+  if (rs.type_names.size() != rs.classes.size()) {
+    return std::format("{} type names for {} columns", rs.type_names.size(), rs.classes.size());
+  }
+  for (const auto& name : rs.type_names) {
+    if (name.find_first_not_of(' ') == std::string::npos ||
+        name.find_first_of("\t\r\n") != std::string::npos) {
+      return std::format("the type name '{}' cannot be written on a type line", name);
+    }
+  }
+  return std::nullopt;
+}
+
 std::string Join(const std::vector<std::string>& lines) {
   std::string text;
   for (const auto& line : lines) {
@@ -197,16 +227,24 @@ std::optional<Failure> CheckQuery(const Record& r, const ResultSet& rs, int64_t 
                                   Labels& labels) {
   const std::string letters = Letters(rs);
   if (letters != r.types) {
-    Failure f;
-    std::string names;
-    for (const auto& n : rs.type_names) {
-      names += (names.empty() ? "" : ", ") + n;
-    }
-    f.what = std::format("column types differ: expected {}, got {} ({})", r.types, letters, names);
-    return f;
+    return Failure{.what = std::format("column types differ: expected {}, got {} ({})", r.types,
+                                       letters, CommaList(rs.type_names))};
   }
   if (!r.has_separator) {
     return Failure{.what = "no expected results ('----'): write them with `pixi run slt-complete`"};
+  }
+  if (r.type_names != rs.type_names) {
+    // The type line is part of the expected block, which a redacted report never prints: in a
+    // block written without one, the first line is a row of values.
+    Failure f;
+    f.what =
+        std::format("{}: got {}", r.type_names.empty() ? "no type line" : "the type line differs",
+                    CommaList(rs.type_names));
+    f.detail = std::format(
+        "type line: {}\n  The first line after '----' holds the result's type names, separated by "
+        "tabs; `pixi run slt-complete` writes it from DuckDB.",
+        r.type_names.empty() ? "(none)" : CommaList(r.type_names));
+    return f;
   }
   auto block = RenderBlock(rs, r.sort, hash_threshold);
   const double tolerance = r.tolerance.value_or(kDefaultRelTolerance);
@@ -310,7 +348,8 @@ void Report(const SltFile& file, const Record& r, std::string_view engine, const
     AppendLines(out, "expected", f.expected);
     AppendLines(out, "actual", f.actual);
     if (f.first_row.has_value()) {
-      out += std::format("  first difference at line {} of the block\n", *f.first_row);
+      out += std::format("  first differing row: {} (counted from 0 below the type line)\n",
+                         *f.first_row);
     }
   }
   out += "  repro:\n" + options.repro;
@@ -343,13 +382,14 @@ Failure PendingFailure(const Record& r, const ExecResult& result, std::string_vi
 }  // namespace
 
 std::optional<Mutation> ParseMutation(std::string_view name) {
-  static constexpr std::array<std::pair<std::string_view, Mutation>, 10> kNames = {{
+  static constexpr std::array<std::pair<std::string_view, Mutation>, 11> kNames = {{
       {"none", Mutation::kNone},
       {"value", Mutation::kValue},
       {"null", Mutation::kNull},
       {"drop-row", Mutation::kDropRow},
       {"extra-row", Mutation::kExtraRow},
       {"extra-column", Mutation::kExtraColumn},
+      {"type-name", Mutation::kTypeName},
       {"error", Mutation::kError},
       {"unsupported", Mutation::kUnsupported},
       {"succeed", Mutation::kSucceed},
@@ -510,8 +550,13 @@ CompleteStats CompleteFile(const SltFile& file, Engine& oracle, Engine& antb1,
       problem(r, engine.name(), *why);  // rewritten, the record would no longer parse
       continue;
     }
-    BlockUpdate update{.lines = RenderBlock(*result, r.sort, flow->hash_threshold),
-                       .new_types = std::nullopt};
+    if (const auto why = TypeLineProblem(*result)) {
+      problem(r, engine.name(), *why);
+      continue;
+    }
+    BlockUpdate update{.lines = {TypeLine(result->type_names)}, .new_types = std::nullopt};
+    std::ranges::move(RenderBlock(*result, r.sort, flow->hash_threshold),
+                      std::back_inserter(update.lines));
     if (letters != r.types) {
       out +=
           std::format("NOTE {}:{}: column types {} -> {}\n", file.path, r.line, r.types, letters);

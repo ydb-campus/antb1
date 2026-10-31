@@ -7,11 +7,13 @@
 query II nosort
 SELECT COUNT(*), MAX(ct_id) FROM cities
 ----
+BIGINT	SMALLINT
 6	6
 
 query III nosort
 SELECT COUNT(*), COUNT(zn_parent), MAX(zn_id) FROM zones
 ----
+BIGINT	BIGINT	INTEGER
 40	35	40
 
 # ---- placements: the whole statement, a derived table, a CTE ----
@@ -19,6 +21,7 @@ SELECT COUNT(*), COUNT(zn_parent), MAX(zn_id) FROM zones
 query I rowsort
 SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id > 4
 ----
+SMALLINT
 1
 2
 3
@@ -31,6 +34,7 @@ SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id > 4
 query IT rowsort
 SELECT ct_id, label FROM cities WHERE ct_id <= 2 UNION ALL SELECT zn_city, label FROM zones WHERE zn_id <= 2 UNION ALL SELECT ct_id, label FROM cities WHERE ct_id = 6
 ----
+SMALLINT	VARCHAR
 1	center
 1	center
 2	harbor
@@ -40,6 +44,7 @@ SELECT ct_id, label FROM cities WHERE ct_id <= 2 UNION ALL SELECT zn_city, label
 query II rowsort
 SELECT x, COUNT(*) FROM (SELECT tr_pickup AS x FROM trips WHERE tr_row < 100 UNION ALL SELECT zn_id FROM zones) AS u GROUP BY x
 ----
+INTEGER	BIGINT
 1	4
 10	4
 11	4
@@ -87,17 +92,20 @@ SELECT x, COUNT(*) FROM (SELECT tr_pickup AS x FROM trips WHERE tr_row < 100 UNI
 query II nosort union_cte
 WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) SELECT COUNT(*), SUM(x) FROM u
 ----
+BIGINT	HUGEINT
 46	143
 
 query II nosort union_cte
 SELECT COUNT(*), SUM(x) FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) AS u
 ----
+BIGINT	HUGEINT
 46	143
 
 # A WITH list before the first block is every block's.
 query I rowsort
 WITH c AS (SELECT ct_id AS x FROM cities WHERE ct_id <= 2) SELECT x FROM c UNION ALL SELECT x + 10 FROM c
 ----
+SMALLINT
 1
 11
 12
@@ -107,11 +115,13 @@ WITH c AS (SELECT ct_id AS x FROM cities WHERE ct_id <= 2) SELECT x FROM c UNION
 query II nosort
 WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT zn_city FROM zones) SELECT COUNT(*), SUM(a.x) FROM u AS a JOIN u AS b ON a.x = b.x
 ----
+BIGINT	HUGEINT
 373	1111
 
 query I nosort
 WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id < 3) SELECT COUNT(*) FROM u AS a, u AS b, u AS c WHERE a.x = b.x AND b.x = c.x
 ----
+BIGINT
 20
 
 # ---- blocks: aggregates, GROUP BY and HAVING, joins, subqueries, nested unions ----
@@ -119,6 +129,7 @@ WITH u AS (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id FROM cities WHER
 query II rowsort
 SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING COUNT(*) > 74 UNION ALL SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city
 ----
+INTEGER	BIGINT
 1	8
 2	8
 3	7
@@ -130,12 +141,14 @@ NULL	1
 query ID rowsort
 SELECT COUNT(*), SUM(tr_fare) FROM trips UNION ALL SELECT COUNT(*), SUM(tr_rate) FROM trips WHERE tr_row < 1000
 ----
+BIGINT	DECIMAL(38,2)
 1000	1518.80
 3000	44992.50
 
 query IT rowsort
 SELECT z.zn_id, c.label FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 3 UNION ALL SELECT ct_id, label FROM cities WHERE ct_id = 1
 ----
+INTEGER	VARCHAR
 1	center
 1	center
 2	harbor
@@ -144,6 +157,7 @@ SELECT z.zn_id, c.label FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id 
 query I rowsort
 SELECT ct_id FROM cities AS c WHERE EXISTS (SELECT * FROM zones AS z WHERE z.zn_city = c.ct_id AND z.zn_id < 5) UNION ALL SELECT ct_id FROM cities WHERE ct_id = 6
 ----
+SMALLINT
 1
 2
 3
@@ -153,6 +167,7 @@ SELECT ct_id FROM cities AS c WHERE EXISTS (SELECT * FROM zones AS z WHERE z.zn_
 query I rowsort
 SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id < 9) UNION ALL SELECT dv_city FROM drivers WHERE dv_row < 3
 ----
+SMALLINT
 1
 1
 2
@@ -165,12 +180,14 @@ SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id <
 query I nosort
 SELECT COUNT(*) FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT y FROM (SELECT zn_id AS y FROM zones UNION ALL SELECT dv_city FROM drivers) AS v) AS u
 ----
+BIGINT
 143
 
 # Each block counts its own derived tables without an alias.
 query I rowsort
 SELECT unnamed_subquery.c FROM (SELECT ct_id AS c FROM cities) UNION ALL SELECT unnamed_subquery.z FROM (SELECT zn_id AS z FROM zones WHERE zn_id < 3)
 ----
+INTEGER
 1
 1
 2
@@ -185,6 +202,7 @@ SELECT unnamed_subquery.c FROM (SELECT ct_id AS c FROM cities) UNION ALL SELECT 
 query IT rowsort
 SELECT * FROM (SELECT ct_id, label FROM cities UNION ALL SELECT zn_city, label FROM zones WHERE zn_id = 1) AS u
 ----
+SMALLINT	VARCHAR
 1	center
 1	center
 2	harbor
@@ -196,6 +214,7 @@ SELECT * FROM (SELECT ct_id, label FROM cities UNION ALL SELECT zn_city, label F
 query II rowsort
 SELECT a, b FROM (SELECT ct_id, ct_pop FROM cities UNION ALL SELECT zn_city, zn_id FROM zones WHERE zn_id < 3) AS u(a, b)
 ----
+SMALLINT	INTEGER
 1	1
 1	120000
 2	2
@@ -208,6 +227,7 @@ SELECT a, b FROM (SELECT ct_id, ct_pop FROM cities UNION ALL SELECT zn_city, zn_
 query II nosort
 SELECT x, y FROM (SELECT ct_id AS x, ct_pop AS y FROM cities UNION ALL SELECT zn_city, zn_id FROM zones) AS u ORDER BY y DESC, x LIMIT 5 OFFSET 1
 ----
+SMALLINT	INTEGER
 2	45000
 3	30000
 5	8000
@@ -217,38 +237,45 @@ SELECT x, y FROM (SELECT ct_id AS x, ct_pop AS y FROM cities UNION ALL SELECT zn
 query II nosort
 SELECT COUNT(DISTINCT x), COUNT(*) FROM (SELECT tr_pickup AS x FROM trips UNION ALL SELECT zn_id FROM zones) AS u
 ----
+BIGINT	BIGINT
 43	3040
 
 # A UNION ALL as a join's build side and as its probe side.
 query II nosort
 SELECT COUNT(*), SUM(t.tr_row) FROM trips AS t JOIN (SELECT zn_id AS z FROM zones WHERE zn_id <= 5 UNION ALL SELECT zn_id FROM zones WHERE zn_id = 7) AS u ON t.tr_pickup = u.z
 ----
+BIGINT	HUGEINT
 420	624190
 
 query II nosort
 SELECT COUNT(*), SUM(u.r) FROM (SELECT tr_row AS r, tr_pickup AS p FROM trips WHERE tr_row < 500 UNION ALL SELECT tr_row, tr_dropoff FROM trips WHERE tr_row >= 2500) AS u JOIN zones AS z ON u.p = z.zn_id WHERE z.zn_city = 2
 ----
+BIGINT	HUGEINT
 188	281980
 
 query II nosort
 SELECT COUNT(*), COUNT(u.z) FROM zones AS z LEFT JOIN (SELECT zn_id AS z FROM zones WHERE zn_id <= 3 UNION ALL SELECT zn_id FROM zones WHERE zn_id = 3) AS u ON z.zn_id = u.z
 ----
+BIGINT	BIGINT
 41	4
 
 # A UNION ALL in the FROM list of a subquery: answered, as any derived table there.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT z FROM (SELECT zn_id AS z FROM zones WHERE zn_id <= 3 UNION ALL SELECT ct_id FROM cities) AS u)
 ----
+BIGINT
 420
 
 query I nosort
 SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM (SELECT zn_city AS k FROM zones UNION ALL SELECT dv_city FROM drivers) AS u WHERE u.k = c.ct_id)
 ----
+BIGINT
 5
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(x) FROM (SELECT ct_id * 400 AS x FROM cities UNION ALL SELECT zn_id * 70 FROM zones) AS u)
 ----
+BIGINT
 199
 
 
@@ -257,16 +284,19 @@ SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(x) FROM (SELECT ct_id * 40
 query II nosort
 SELECT COUNT(*), COUNT(x) FROM (SELECT tr_promo AS x FROM trips UNION ALL SELECT zn_parent FROM zones) AS u
 ----
+BIGINT	BIGINT
 3040	95
 
 query II nosort
 SELECT COUNT(*), SUM(x) FROM (SELECT tr_row AS x FROM trips WHERE tr_row < 0 UNION ALL SELECT ct_pop FROM cities) AS u
 ----
+BIGINT	HUGEINT
 6	205500
 
 query II nosort
 SELECT COUNT(*), SUM(x) FROM (SELECT RegionID AS x FROM hits_like_split WHERE IsMobile = 1 UNION ALL SELECT RegionID FROM hits_like WHERE IsMobile = 0) AS u
 ----
+BIGINT	HUGEINT
 10000	97210255
 
 # ---- types: each column's is a left fold over the blocks' types in written order ----
@@ -274,6 +304,7 @@ SELECT COUNT(*), SUM(x) FROM (SELECT RegionID AS x FROM hits_like_split WHERE Is
 query I rowsort
 SELECT i16 FROM edge UNION ALL SELECT i32 FROM edge
 ----
+INTEGER
 -1
 -1
 -100
@@ -302,6 +333,7 @@ NULL
 query I rowsort
 SELECT u16 FROM edge UNION ALL SELECT i16 FROM edge
 ----
+INTEGER
 -1
 -100
 -12345
@@ -330,6 +362,7 @@ NULL
 query I rowsort
 SELECT i64 FROM edge UNION ALL SELECT u16 FROM edge
 ----
+BIGINT
 -1
 -1000000000000000
 -42
@@ -358,6 +391,7 @@ NULL
 query I rowsort
 SELECT i32 FROM edge UNION ALL SELECT SUM(i64) FROM edge
 ----
+HUGEINT
 -1
 -100000
 -2147483648
@@ -375,6 +409,7 @@ NULL
 query D rowsort
 SELECT d9_2 FROM decimals UNION ALL SELECT d18_4 FROM decimals
 ----
+DECIMAL(18,4)
 -1.0001
 -1.0001
 -1.0001
@@ -459,6 +494,7 @@ NULL
 query D rowsort
 SELECT p FROM decimals UNION ALL SELECT b FROM decimals
 ----
+DECIMAL(21,2)
 -12000000076.00
 -12000000076.00
 -12000000076.00
@@ -543,6 +579,7 @@ NULL
 query D rowsort
 SELECT b FROM decimals UNION ALL SELECT d9_2 FROM decimals
 ----
+DECIMAL(21,2)
 -1.25
 -1.25
 -1.25
@@ -627,6 +664,7 @@ NULL
 query D rowsort
 SELECT d38_0 FROM decimals UNION ALL SELECT SUM(b) FROM decimals
 ----
+DECIMAL(38,0)
 -100000000000000000000
 -100000000000000000000
 -100000000000000000000
@@ -674,6 +712,7 @@ NULL
 query D rowsort
 SELECT u16 FROM edge UNION ALL SELECT i16 FROM edge UNION ALL SELECT d9_2 FROM decimals
 ----
+DECIMAL(12,2)
 -1.00
 -1.25
 -1.25
@@ -742,6 +781,7 @@ NULL
 query D rowsort
 SELECT i16 FROM edge UNION ALL SELECT d9_2 FROM decimals UNION ALL SELECT u16 FROM edge
 ----
+DECIMAL(9,2)
 -1.00
 -1.25
 -1.25
@@ -811,6 +851,7 @@ NULL
 query I rowsort
 SELECT 1 FROM cities WHERE ct_id < 3 UNION ALL SELECT i16 FROM edge
 ----
+INTEGER
 -1
 -100
 -12345
@@ -829,6 +870,7 @@ NULL
 query I rowsort
 SELECT 3000000000 FROM cities WHERE ct_id < 3 UNION ALL SELECT i32 FROM edge
 ----
+BIGINT
 -1
 -100000
 -2147483648
@@ -847,6 +889,7 @@ NULL
 query TT rowsort
 SELECT label, 'city' FROM cities WHERE ct_id < 3 UNION ALL SELECT label, 'zone' FROM zones WHERE zn_id < 3
 ----
+VARCHAR	VARCHAR
 center	city
 center	zone
 harbor	city
@@ -855,6 +898,7 @@ north	zone
 query T rowsort
 SELECT tr_day FROM trips WHERE tr_row < 3 UNION ALL SELECT dv_since FROM drivers WHERE dv_row < 3
 ----
+DATE
 2025-01-01
 2025-01-12
 2025-01-23
@@ -866,20 +910,24 @@ SELECT tr_day FROM trips WHERE tr_row < 3 UNION ALL SELECT dv_since FROM drivers
 query I nosort
 SELECT COUNT(*) FROM (SELECT i16 AS x FROM edge UNION ALL SELECT i32 FROM edge) AS u WHERE x = 54321 OR x = -32768
 ----
+BIGINT
 2
 
 # FLOAT and FLOAT make a FLOAT, whose literal folds at FLOAT precision (D11); FLOAT and DOUBLE make a DOUBLE.
 query I nosort
 SELECT COUNT(*) FROM (SELECT f AS x FROM floats UNION ALL SELECT f FROM floats) AS u WHERE x = 0.1
 ----
+BIGINT
 2
 
 query I nosort
 SELECT COUNT(*) FROM (SELECT f AS x FROM floats UNION ALL SELECT d FROM decimals) AS u WHERE x = 0.1
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM (SELECT d AS x FROM decimals UNION ALL SELECT f FROM floats) AS u WHERE x = 0.1
 ----
+BIGINT
 0

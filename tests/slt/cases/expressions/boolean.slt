@@ -5,31 +5,37 @@
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 > 0 OR u = 'a'
 ----
+BIGINT
 5
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE NOT (i16 > 0)
 ----
+BIGINT
 5
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE NOT (i16 = 1.5)
 ----
+BIGINT
 10
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE NOT (i16 <> 1.5)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE NOT (i16 > 40000) OR NOT (u LIKE '%')
 ----
+BIGINT
 10
 
 query II rowsort
 SELECT id, i16 FROM edge WHERE i16 < 0 OR i16 IN (7, 100) AND NOT (u LIKE 'a%' OR u = '') OR id = 1
 ----
+INTEGER	SMALLINT
 0	-32768
 1	32767
 10	-12345
@@ -40,6 +46,7 @@ SELECT id, i16 FROM edge WHERE i16 < 0 OR i16 IN (7, 100) AND NOT (u LIKE 'a%' O
 query II rowsort
 SELECT id, i16 FROM edge WHERE (i16 < 0 OR i32 > 0) AND (NOT (id > 8) OR d = 0.1)
 ----
+INTEGER	SMALLINT
 0	-32768
 1	32767
 3	-1
@@ -51,6 +58,7 @@ SELECT id, i16 FROM edge WHERE (i16 < 0 OR i32 > 0) AND (NOT (id > 8) OR d = 0.1
 query II rowsort
 SELECT id, i16 FROM edge WHERE NOT (i16 IN (1, 7) OR NOT (i32 >= 0)) AND id < 20
 ----
+INTEGER	SMALLINT
 1	32767
 10	-12345
 2	0
@@ -59,11 +67,13 @@ SELECT id, i16 FROM edge WHERE NOT (i16 IN (1, 7) OR NOT (i32 >= 0)) AND id < 20
 query II rowsort
 SELECT id, i16 FROM edge WHERE NOT (u NOT IN ('a', 'tab	there') OR u NOT LIKE '%a%')
 ----
+INTEGER	SMALLINT
 1	32767
 
 query II rowsort
 SELECT id, i16 FROM edge WHERE i16 + 1 > 100 OR i16 - 1 < -100 OR i32 = i16
 ----
+INTEGER	SMALLINT
 0	-32768
 1	32767
 10	-12345
@@ -78,6 +88,7 @@ SELECT id, i16 FROM edge WHERE i16 + 1 > 100 OR i16 - 1 < -100 OR i32 = i16
 query I rowsort
 SELECT i16 FROM edge WHERE i16 > 100 OR i16 < -100 OR i16 * i16 >= 0
 ----
+SMALLINT
 -1
 -100
 -12345
@@ -92,15 +103,18 @@ SELECT i16 FROM edge WHERE i16 > 100 OR i16 < -100 OR i16 * i16 >= 0
 query I rowsort
 SELECT i16 FROM edge WHERE i16 < 100 AND i16 > -100 AND i16 * i16 > 5
 ----
+SMALLINT
 7
 
 # HAVING: over keys, aggregates and select aliases.
 query II rowsort
 SELECT OS, COUNT(*) AS n FROM hits_like GROUP BY OS HAVING n > 350 OR MIN(URL) LIKE 'x%' OR NOT (OS < 120)
 ----
+SMALLINT	BIGINT
 120	74
 
 query I nosort
 SELECT COUNT(*) FROM hits_like HAVING COUNT(*) < 0 OR NOT (SUM(RegionID) < 0)
 ----
+BIGINT
 10000

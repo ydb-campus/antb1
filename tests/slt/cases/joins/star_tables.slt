@@ -10,32 +10,38 @@ SELECT COUNT(*), COUNT(tr_rider), COUNT(tr_driver), COUNT(tr_pickup), COUNT(tr_d
   COUNT(tr_tariff), COUNT(tr_rate), COUNT(tr_promo), COUNT(tr_fare), COUNT(tr_distance)
 FROM trips
 ----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
 3000	2869	2896	3000	2824	2919	2842	2769	60	2903	2927
 
 query IIIII nosort
 SELECT COUNT(*), COUNT(rd_id), COUNT(rd_city), COUNT(rd_tier), COUNT(rd_joined) FROM riders
 ----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
 240	240	232	240	240
 
 query IIII nosort
 SELECT COUNT(*), COUNT(dv_id), COUNT(dv_city), COUNT(dv_since) FROM drivers
 ----
+BIGINT	BIGINT	BIGINT	BIGINT
 97	96	89	97
 
 query IIIIII nosort
 SELECT COUNT(*), COUNT(zn_id), COUNT(zn_city), COUNT(zn_parent), COUNT(label), COUNT(zn_radius) FROM zones
 ----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
 40	40	39	35	35	37
 
 query IIII nosort
 SELECT COUNT(*), COUNT(sh_driver), COUNT(sh_day), COUNT(sh_hours) FROM shifts
 ----
+BIGINT	BIGINT	BIGINT	BIGINT
 500	494	495	478
 
 # The empty dimension: no row, so SUM and MAX are NULL.
 query IIDI nosort
 SELECT COUNT(*), COUNT(pm_code), SUM(pm_discount), MAX(pm_id) FROM promos
 ----
+BIGINT	BIGINT	DECIMAL(38,2)	INTEGER
 0	0	NULL	NULL
 
 # ---- repeated keys ----
@@ -44,6 +50,7 @@ SELECT COUNT(*), COUNT(pm_code), SUM(pm_discount), MAX(pm_id) FROM promos
 query II rowsort
 SELECT rd_id, COUNT(*) FROM riders GROUP BY rd_id HAVING COUNT(*) > 1
 ----
+BIGINT	BIGINT
 127	2
 167	2
 192	2
@@ -56,12 +63,14 @@ SELECT rd_id, COUNT(*) FROM riders GROUP BY rd_id HAVING COUNT(*) > 1
 query III nosort
 SELECT COUNT(DISTINCT rd_id), MIN(rd_id), MAX(rd_id) FROM riders
 ----
+BIGINT	BIGINT	BIGINT
 232	1	240
 
 # shifts repeats 2 of its (sh_driver, sh_day) keys; a key with a NULL part never repeats.
 query ITI rowsort
 SELECT sh_driver, sh_day, COUNT(*) FROM shifts GROUP BY sh_driver, sh_day HAVING COUNT(*) > 1
 ----
+INTEGER	DATE	BIGINT
 1111	2026-03-22	2
 1148	2026-03-29	2
 
@@ -69,11 +78,13 @@ SELECT sh_driver, sh_day, COUNT(*) FROM shifts GROUP BY sh_driver, sh_day HAVING
 query IIII nosort
 SELECT COUNT(DISTINCT dv_id), COUNT(dv_id), MIN(dv_id), MAX(dv_id) FROM drivers
 ----
+BIGINT	BIGINT	BIGINT	BIGINT
 96	96	1000	4294968296
 
 query IIII nosort
 SELECT COUNT(DISTINCT zn_id), COUNT(zn_id), MIN(zn_id), MAX(zn_id) FROM zones
 ----
+BIGINT	BIGINT	INTEGER	INTEGER
 40	40	1	40
 
 # ---- keys without a match ----
@@ -82,11 +93,13 @@ SELECT COUNT(DISTINCT zn_id), COUNT(zn_id), MIN(zn_id), MAX(zn_id) FROM zones
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_rider > 240
 ----
+BIGINT
 28
 
 query II rowsort
 SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (8, 48, 65, 88, 128, 168, 193, 208) GROUP BY tr_rider
 ----
+BIGINT	BIGINT
 128	12
 168	13
 193	12
@@ -99,6 +112,7 @@ SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (8, 48, 65, 88, 128, 168,
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_rider BETWEEN 237 AND 240
 ----
+BIGINT
 0
 
 # No driver has key 2850 (driver 50's key is NULL) or a key from 4552 to 4885; drivers 90 to 95 (4330 to 4515)
@@ -106,6 +120,7 @@ SELECT COUNT(*) FROM trips WHERE tr_rider BETWEEN 237 AND 240
 query II rowsort
 SELECT tr_driver, COUNT(*) FROM trips WHERE tr_driver = 2850 OR tr_driver > 4515 GROUP BY tr_driver
 ----
+INTEGER	BIGINT
 2850	29
 4552	29
 4589	29
@@ -121,12 +136,14 @@ SELECT tr_driver, COUNT(*) FROM trips WHERE tr_driver = 2850 OR tr_driver > 4515
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver BETWEEN 4330 AND 4515
 ----
+BIGINT
 0
 
 # Zones 41 to 43 do not exist; 9 is no city, and 77 no zone.
 query II rowsort
 SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup > 40 GROUP BY tr_pickup
 ----
+INTEGER	BIGINT
 41	69
 42	69
 43	69
@@ -134,6 +151,7 @@ SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup > 40 GROUP BY tr_pickup
 query II rowsort
 SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city
 ----
+SMALLINT	BIGINT
 1	8
 2	8
 3	7
@@ -145,6 +163,7 @@ NULL	1
 query II rowsort
 SELECT zn_parent, COUNT(*) FROM zones GROUP BY zn_parent
 ----
+INTEGER	BIGINT
 1	7
 2	7
 3	7
@@ -156,6 +175,7 @@ NULL	5
 query II rowsort
 SELECT rd_city, COUNT(*) FROM riders GROUP BY rd_city
 ----
+SMALLINT	BIGINT
 1	77
 2	77
 3	78
@@ -164,6 +184,7 @@ NULL	8
 query II rowsort
 SELECT dv_city, COUNT(*) FROM drivers GROUP BY dv_city
 ----
+SMALLINT	BIGINT
 1	23
 2	22
 3	22
@@ -174,6 +195,7 @@ NULL	8
 query TI rowsort
 SELECT tr_tariff, COUNT(*) FROM trips GROUP BY tr_tariff
 ----
+VARCHAR	BIGINT
 (empty)	284
 AIRPORT	285
 NIGHT	284
@@ -190,6 +212,7 @@ std	284
 query DI rowsort
 SELECT tr_rate, COUNT(*) FROM trips GROUP BY tr_rate
 ----
+DECIMAL(4,2)	BIGINT
 0.88	343
 1.00	348
 1.25	350
@@ -204,6 +227,7 @@ NULL	231
 query II rowsort
 SELECT tr_promo, COUNT(*) FROM trips GROUP BY tr_promo
 ----
+INTEGER	BIGINT
 1	15
 2	15
 3	15
@@ -214,11 +238,13 @@ NULL	2940
 query TT nosort
 SELECT MIN(sh_day), MAX(sh_day) FROM shifts
 ----
+DATE	DATE
 2026-03-01	2026-03-30
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_day = DATE '2026-03-31'
 ----
+BIGINT
 93
 
 # ---- values ----
@@ -227,37 +253,44 @@ SELECT COUNT(*) FROM trips WHERE tr_day = DATE '2026-03-31'
 query TTRRDD nosort
 SELECT MIN(tr_day), MAX(tr_day), MIN(tr_distance), MAX(tr_distance), MIN(tr_fare), MAX(tr_fare) FROM trips
 ----
+DATE	DATE	DOUBLE	DOUBLE	DECIMAL(9,2)	DECIMAL(9,2)
 2026-03-01	2026-03-31	0.125	19.5	3.50	27.50
 
 query RD nosort
 SELECT SUM(tr_distance), SUM(tr_fare) FROM trips
 ----
+DOUBLE	DECIMAL(38,2)
 28657.125	44992.50
 
 query TT nosort
 SELECT MIN(rd_joined), MAX(rd_joined) FROM riders
 ----
+DATE	DATE
 2025-01-01	2026-03-26
 
 query TT nosort
 SELECT MIN(dv_since), MAX(dv_since) FROM drivers
 ----
+DATE	DATE
 2025-01-01	2025-12-30
 
 query DD nosort
 SELECT MIN(sh_hours), MAX(sh_hours) FROM shifts
 ----
+DECIMAL(4,1)	DECIMAL(4,1)
 4.0	12.0
 
 # zn_radius holds some of the tr_distance values.
 query RR nosort
 SELECT MIN(zn_radius), MAX(zn_radius) FROM zones
 ----
+DOUBLE	DOUBLE
 0.5	3.25
 
 query RI rowsort
 SELECT tr_distance, COUNT(*) FROM trips WHERE tr_distance IN (0.75, 2, 3.25) GROUP BY tr_distance
 ----
+DOUBLE	BIGINT
 0.75	92
 2	92
 3.25	92
@@ -268,6 +301,7 @@ SELECT tr_distance, COUNT(*) FROM trips WHERE tr_distance IN (0.75, 2, 3.25) GRO
 query IITI nosort
 SELECT * FROM cities ORDER BY ct_row
 ----
+INTEGER	SMALLINT	VARCHAR	INTEGER
 0	1	center	120000
 1	2	harbor	45000
 2	3	hills	30000
@@ -278,6 +312,7 @@ SELECT * FROM cities ORDER BY ct_row
 query ITDT nosort
 SELECT * FROM tariffs ORDER BY tf_row
 ----
+INTEGER	VARCHAR	DECIMAL(5,3)	VARCHAR
 0	STD	1.000	standard
 1	NIGHT	1.500	night
 2	AIRPORT	2.000	airport
@@ -293,4 +328,5 @@ SELECT * FROM tariffs ORDER BY tf_row
 query III nosort
 SELECT COUNT(*), COUNT(label), COUNT(zn_radius) FROM '${FIXTURES}/star/zones.parquet'
 ----
+BIGINT	BIGINT	BIGINT
 40	35	37

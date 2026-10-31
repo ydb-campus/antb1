@@ -5,6 +5,7 @@
 query DDDDD nosort
 SELECT 2.5, 007.50, .125, -0.5, 5. FROM decimals WHERE id = 0
 ----
+DECIMAL(2,1)	DECIMAL(5,2)	DECIMAL(3,3)	DECIMAL(2,1)	DECIMAL(1,0)
 2.5	7.50	.125	-0.5	5
 
 # Integers with decimal literals compute in DECIMAL.
@@ -12,6 +13,7 @@ SELECT 2.5, 007.50, .125, -0.5, 5. FROM decimals WHERE id = 0
 query IDDDDD nosort
 SELECT id, i16 + 1.5, i32 * 0.5, i64 - 0.25, i64 % 2.5, u16 * 1.5 FROM edge ORDER BY id
 ----
+INTEGER	DECIMAL(7,1)	DECIMAL(12,1)	DECIMAL(22,2)	DECIMAL(20,1)	DECIMAL(7,1)
 0	-32766.5	-1073741824.0	-9223372036854775808.25	-0.5	0.0
 1	32768.5	1073741823.5	9223372036854775806.75	2.0	98302.5
 2	1.5	0.0	-0.25	0.0	1.5
@@ -28,11 +30,13 @@ SELECT id, i16 + 1.5, i32 * 0.5, i64 - 0.25, i64 % 2.5, u16 * 1.5 FROM edge ORDE
 query DDDD nosort
 SELECT 1.5 + 2, 1.5 * 2.25, 7 % 2.5, -7.25 % 2 FROM decimals WHERE id = 0
 ----
+DECIMAL(12,1)	DECIMAL(5,3)	DECIMAL(11,1)	DECIMAL(12,2)
 3.5	3.375	2.0	-1.25
 
 query IDDDD nosort
 SELECT id, p + 0.5, p * 1.5, d9_2 - 007.50, d18_4 * 0.5 FROM decimals WHERE id >= 14 ORDER BY id
 ----
+INTEGER	DECIMAL(16,2)	DECIMAL(17,3)	DECIMAL(10,2)	DECIMAL(18,5)
 14	NULL	NULL	-12.50	-2.00020
 15	0.50	0.000	-7.50	0.00000
 16	80.46	119.940	-2.50	2.00020
@@ -65,6 +69,7 @@ SELECT id, p + 0.5, p * 1.5, d9_2 - 007.50, d18_4 * 0.5 FROM decimals WHERE id >
 query IRRRRRR nosort
 SELECT id, p / 3, p // 3, d38_10 / 7, d18_4 / p, p / 0, p // 0 FROM decimals WHERE id >= 14 ORDER BY id
 ----
+INTEGER	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE
 14	NULL	NULL	-0.5714285714857142	NULL	NULL	NULL
 15	0	0	0	nan	nan	NULL
 16	26.653333333333332	26.653333333333332	0.5714285714857142	0.05003001500750376	inf	NULL
@@ -95,6 +100,7 @@ SELECT id, p / 3, p // 3, d38_10 / 7, d18_4 / p, p / 0, p // 0 FROM decimals WHE
 query IRRR nosort
 SELECT id, d38_0 / 3, d9_2 // 0.5, id / 1.5 FROM decimals WHERE id >= 30 ORDER BY id
 ----
+INTEGER	DOUBLE	DOUBLE	DOUBLE
 30	NULL	12.5	20
 31	-66666666666666663936	NULL	20.666666666666668
 32	66666666666666663936	5	21.333333333333332
@@ -111,6 +117,7 @@ SELECT id, d38_0 / 3, d9_2 // 0.5, id / 1.5 FROM decimals WHERE id >= 30 ORDER B
 query IDDDDDD nosort
 SELECT id, p % 7, p % q, d18_4 % p, d38_0 % 7, p % 0, -p % 3 FROM decimals WHERE id >= 14 ORDER BY id
 ----
+INTEGER	DECIMAL(15,2)	DECIMAL(15,2)	DECIMAL(18,4)	DECIMAL(38,0)	DECIMAL(15,2)	DECIMAL(15,2)
 14	NULL	NULL	NULL	-1	NULL	NULL
 15	0.00	NULL	NULL	0	NULL	0.00
 16	2.96	79.96	4.0004	1	NULL	-1.96
@@ -143,6 +150,7 @@ SELECT id, p % 7, p % q, d18_4 % p, d38_0 % 7, p % 0, -p % 3 FROM decimals WHERE
 query IRRR nosort
 SELECT id, d + 1.5, d * 0.25, CASE WHEN id > 5 THEN 0.5 ELSE d END FROM edge ORDER BY id
 ----
+INTEGER	DOUBLE	DOUBLE	DOUBLE
 0	1	-0.125	-0.5
 1	1.8333333333333333	0.08333333333333333	0.3333333333333333
 2	1.5	0	0
@@ -159,6 +167,7 @@ SELECT id, d + 1.5, d * 0.25, CASE WHEN id > 5 THEN 0.5 ELSE d END FROM edge ORD
 query IRR nosort
 SELECT id, p * 1e0, p + 2.5e0 FROM decimals WHERE id >= 30 ORDER BY id
 ----
+INTEGER	DOUBLE	DOUBLE
 30	99.95	102.45
 31	-39.98	-37.48
 32	39.98	42.48
@@ -175,6 +184,7 @@ SELECT id, p * 1e0, p + 2.5e0 FROM decimals WHERE id >= 30 ORDER BY id
 query IRRRR nosort
 SELECT id, CASE WHEN id > 35 THEN 1.5 ELSE 2.5e0 END, CASE WHEN id > 35 THEN -(1.5) ELSE p * 1e0 END, CASE WHEN id > 35 THEN p ELSE 1e1 END, CASE WHEN id = 30 THEN d18_4 WHEN id = 31 THEN 7 ELSE id / 4 END FROM decimals WHERE id >= 30 ORDER BY id
 ----
+INTEGER	DOUBLE	DOUBLE	DOUBLE	DOUBLE
 30	2.5	99.95	10	5.0005
 31	2.5	-39.98	10	7
 32	2.5	39.98	10	8
@@ -190,6 +200,7 @@ onlyif duckdb
 query TTT nosort
 SELECT typeof(CASE WHEN id > 35 THEN 1.5 ELSE 2.5e0 END), typeof(CASE WHEN id > 35 THEN -(1.5) ELSE p * 1e0 END), typeof(CASE WHEN id > 35 THEN p ELSE 1e1 END) FROM decimals WHERE id = 30
 ----
+VARCHAR	VARCHAR	VARCHAR
 DOUBLE	DOUBLE	DOUBLE
 
 # In conditions and aggregates.
@@ -197,6 +208,7 @@ DOUBLE	DOUBLE	DOUBLE
 query I rowsort
 SELECT id FROM decimals WHERE p % 7 = 0 AND id >= 14
 ----
+INTEGER
 15
 26
 37
@@ -204,6 +216,7 @@ SELECT id FROM decimals WHERE p % 7 = 0 AND id >= 14
 query I rowsort
 SELECT id FROM decimals WHERE id * 0.5 > 17.25
 ----
+INTEGER
 35
 36
 37
@@ -213,16 +226,19 @@ SELECT id FROM decimals WHERE id * 0.5 > 17.25
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p / 3 > 10
 ----
+BIGINT
 12
 
 query DRDR nosort
 SELECT SUM(p % 7), AVG(p / 3), SUM(id * 0.5), MAX(p // 2) FROM decimals WHERE id >= 14
 ----
+DECIMAL(38,2)	DOUBLE	DECIMAL(38,1)	DOUBLE
 -2.96	-1.3326666666666669	344.5	49.975
 
 query IDD nosort
 SELECT id % 3 AS g, SUM(q % 10), MIN(d9_2 * 1.5) FROM decimals GROUP BY g ORDER BY g
 ----
+INTEGER	DECIMAL(38,2)	DECIMAL(11,3)
 0	10.03	-9.375
 1	19.90	-9.375
 2	69.66	-14999999.985
@@ -235,16 +251,19 @@ SELECT id % 3 AS g, SUM(q % 10), MIN(d9_2 * 1.5) FROM decimals GROUP BY g ORDER 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE d * 0 + 9007199254740994 = 9007199254740993.5
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE d * 0 + 9007199254740992 = 9007199254740993.5
 ----
+BIGINT
 10
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE d * 0 + 9007199254740992 IN (1.5, 9007199254740992.5)
 ----
+BIGINT
 10
 
 # Overflows past a capped width fail with DuckDB's messages, literals included.
@@ -261,6 +280,7 @@ SELECT d18_4 + 0.00005 FROM decimals
 query R rowsort
 SELECT d38_0 % 0.5 FROM decimals WHERE id >= 30
 ----
+DOUBLE
 -0
 -0
 -0
@@ -275,6 +295,7 @@ NULL
 query D rowsort
 SELECT CASE WHEN id > 35 THEN p ELSE 0.5 END FROM decimals WHERE id >= 30
 ----
+DECIMAL(15,2)
 -79.96
 0.00
 0.50

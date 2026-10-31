@@ -91,6 +91,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p = '59.97'
 ----
+BIGINT
 3
 
 onlyif antb1

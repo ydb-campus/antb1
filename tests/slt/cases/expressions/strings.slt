@@ -5,6 +5,7 @@
 query TII rowsort
 SELECT u, strlen(u), STRLEN(u) * 2 FROM edge
 ----
+VARCHAR	BIGINT	BIGINT
 (empty)	0	0
 NULL	NULL	NULL
 NULL	NULL	NULL
@@ -21,6 +22,7 @@ x\x7fy	3	6
 query TT rowsort
 SELECT u, regexp_replace(u, 'a|e', 'X') FROM edge
 ----
+VARCHAR	VARCHAR
 (empty)	(empty)
 NULL	NULL
 NULL	NULL
@@ -37,6 +39,7 @@ x\x7fy	x\x7fy
 query TT rowsort
 SELECT u, regexp_replace(u, '^(.)(.*)$', '\2\1') FROM edge
 ----
+VARCHAR	VARCHAR
 (empty)	(empty)
 NULL	NULL
 NULL	NULL
@@ -53,6 +56,7 @@ x\x7fy	\x7fyx
 query TT rowsort
 SELECT u, regexp_replace(u, '...', '<\0>') FROM edge
 ----
+VARCHAR	VARCHAR
 (empty)	(empty)
 NULL	NULL
 NULL	NULL
@@ -69,17 +73,20 @@ x\x7fy	<x\x7fy>
 query I nosort
 SELECT COUNT(*) FROM edge WHERE strlen(u) > 5 AND regexp_replace(u, ' ', '') LIKE '%a%'
 ----
+BIGINT
 4
 
 query IR nosort
 SELECT COUNT(*), AVG(strlen(URL)) FROM hits_like WHERE URL <> ''
 ----
+BIGINT	DOUBLE
 9805	39.106068332483424
 
 # Grouping by string function results, with aggregates of them and HAVING, over the fixture data.
 query III nosort
 SELECT OS, MAX(strlen(Title)) AS m, SUM(strlen(URL)) AS total FROM hits_like WHERE strlen(URL) > 30 GROUP BY OS ORDER BY total DESC, OS LIMIT 4
 ----
+SMALLINT	BIGINT	HUGEINT
 10	49	4113
 116	48	3983
 118	51	3924
@@ -88,12 +95,14 @@ SELECT OS, MAX(strlen(Title)) AS m, SUM(strlen(URL)) AS total FROM hits_like WHE
 query TII nosort
 SELECT regexp_replace(URL, '^([a-z]+)://.*$', '\1') AS scheme, COUNT(*), MIN(strlen(URL)) FROM hits_like GROUP BY scheme HAVING COUNT(*) > 5 ORDER BY scheme
 ----
+VARCHAR	BIGINT	BIGINT
 (empty)	195	0
 https	9805	31
 
 query TIT nosort
 SELECT regexp_replace(Referer, '^[^/]*//[^/]*/([^/?]*).*$', 'seg:\1') AS seg, COUNT(*) AS n, MAX(Referer) FROM hits_like WHERE Referer LIKE 'http%' GROUP BY 1 ORDER BY n DESC, seg LIMIT 5
 ----
+VARCHAR	BIGINT	VARCHAR
 seg:дорога	269	https://ref.example.org/дорога/99884?q=orbit
 seg:cloud	268	https://ref.example.org/cloud/99935
 seg:stone	265	https://ref.example.org/stone/99758
@@ -104,6 +113,7 @@ seg:pixel	260	https://ref.example.org/pixel/99525
 query TTTTTT rowsort
 SELECT u, regexp_replace(u, 'a\B', 'Z'), regexp_replace(u, '(a)$|(a)', '[\1]'), regexp_replace(u, '\B(e)|(e)', '[\1]'), regexp_replace(u, '\b', '|'), regexp_replace(u, '(?m)^t|k$', '#') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	(empty)	(empty)	(empty)
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -122,6 +132,7 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy	|x\x7fy	x\x7fy
 query TTTTT rowsort
 SELECT u, regexp_replace(u, 'a', '\1'), regexp_replace(u, '(a)', '\2'), regexp_replace(u, 'a', 'x\'), regexp_replace(u, 'a', '[\\]') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	(empty)	(empty)
 NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL
@@ -145,6 +156,7 @@ SELECT regexp_replace(u, '(', 'x') FROM edge
 query TTTTT rowsort
 SELECT u, regexp_replace(u, '^a|e', 'X'), regexp_replace(u, '^a$|e', 'X'), regexp_replace(u, '^*a', 'X'), regexp_replace(u, '^?a', 'X') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	(empty)	(empty)
 NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL
@@ -163,6 +175,7 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy	x\x7fy
 query TTTT rowsort
 SELECT u, regexp_replace(u, '^a|^e', 'X'), regexp_replace(u, '^(a|b)', 'X'), regexp_replace(u, '^[a|b]', 'X') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	(empty)
 NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL
@@ -184,6 +197,7 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy
 query TTTT rowsort
 SELECT u, regexp_replace(u, '^(.).*$', '[\1]'), regexp_replace(u, 'a.*$', 'X'), regexp_replace(u, '.*$', 'X') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	X
 NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL
@@ -205,6 +219,7 @@ x\x7fy	[x]	x\x7fy	X
 query TTTTT rowsort
 SELECT u, regexp_replace(u, '(?m)^.*$', 'X'), regexp_replace(u, '^[a-z]+\.*$', 'X'), regexp_replace(u, '^.\C.*$', 'X'), regexp_replace(u, '\B.*$', 'X') FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	X	(empty)	(empty)	X
 NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL
@@ -226,6 +241,7 @@ x\x7fy	X	x\x7fy	X	x\x7fy
 query TIIIII rowsort
 SELECT u, strlen(u), strlen(substring(u, 2, 3)), strlen(substring(u FROM 2 FOR 3)), strlen(substring(u FROM 2)), strlen(substr(u, 2, 3)) FROM edge
 ----
+VARCHAR	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
 (empty)	0	0	0	0	0
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -246,6 +262,7 @@ x\x7fy	3	2	2	2	2
 query TTTTTTTT nosort
 SELECT substring('aдb日x', 2, 3), substring('aдb日x' FROM 1 FOR 2), substring('aдb日x', -2, 2), substring('aдb日x', 2, -1), substring('aдb日x', 0, 3), substring('aдb日x', 99, 2), substring('aдb日x', 3), substring('aдb日x', -4294967296, 2) FROM edge LIMIT 1
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
 дb日	aд	日x	a	aд	(empty)	b日x	(empty)
 
 
@@ -254,6 +271,7 @@ SELECT substring('aдb日x', 2, 3), substring('aдb日x' FROM 1 FOR 2), substrin
 query TTTT nosort
 SELECT substring('aдb日x', 2, -99), substring('aдb日x', 3, -4294967296), substring('', 1, 2), substring('aдb日x', 4294967295, 2) FROM edge LIMIT 1
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR
 a	aд	(empty)	(empty)
 
 # The positions are expressions, evaluated per row, and a NULL in either gives NULL: CASE leaves one
@@ -261,6 +279,7 @@ a	aд	(empty)	(empty)
 query TII rowsort
 SELECT u, strlen(substring(u, strlen(u) - 1, 2)), strlen(substring(u, CASE WHEN strlen(u) > 3 THEN 2 END, 2)) FROM edge
 ----
+VARCHAR	BIGINT	BIGINT
 (empty)	0	NULL
 NULL	NULL	NULL
 NULL	NULL	NULL
@@ -280,6 +299,7 @@ x\x7fy	2	NULL
 query TTTT rowsort
 SELECT u, substring(u, -4294967296), substring(u, -4294967295), substring(u, -4294967296, 4294967295) FROM edge
 ----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR
 (empty)	(empty)	(empty)	(empty)
 NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL

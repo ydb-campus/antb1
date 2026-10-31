@@ -11,6 +11,7 @@
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
 ----
+BIGINT
 2165
 
 # Three branches, and the shared equality written last in one of them.
@@ -18,12 +19,14 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND zn_city = 1 OR tr_pickup = zn_id AND zn_city = 2 OR zn_city = 3 AND tr_pickup = zn_id
 ----
+BIGINT
 1608
 
 # A remainder that reads both relations is a residual of the join, evaluated per candidate pair.
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND tr_row < 100 OR tr_pickup = zn_id AND zn_radius > 3
 ----
+BIGINT
 296
 
 # A branch of only shared conjuncts makes the OR true wherever they hold, so the equality is the whole condition:
@@ -31,17 +34,20 @@ SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND tr_row < 100 OR tr
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id OR tr_pickup = zn_id AND zn_radius > 1
 ----
+BIGINT
 2793
 
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id
 ----
+BIGINT
 2793
 
 # An inner ON is factored exactly as a WHERE is.
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
 ----
+BIGINT
 2165
 
 # ---- what else the branches share ----
@@ -52,12 +58,14 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND tr_row > 100 AND zn_radius > 1 OR tr_pickup = zn_id AND tr_row > 100 AND zn_city = 2
 ----
+BIGINT
 2093
 
 # A LIKE only one branch writes stays in the remainder, computed on zones' branch with the rest of it.
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND label LIKE 'a%' OR tr_pickup = zn_id AND zn_city = 2
 ----
+BIGINT
 838
 
 # A LIKE both branches write is shared like any other conjunct.
@@ -65,6 +73,7 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND label LIKE 'a%' AND zn_city = 2 OR tr_pickup = zn_id AND label LIKE 'a%' AND zn_city = 3
 ----
+BIGINT
 140
 
 # A DECIMAL comparison, shared: it reads trips alone, so it reaches trips' branch and not the join.
@@ -72,6 +81,7 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND tr_fare > 20.50 AND zn_radius > 1 OR tr_pickup = zn_id AND tr_fare > 20.50 AND zn_city = 2
 ----
+BIGINT
 603
 
 # A BETWEEN is one conjunct, shared when both branches write the same bounds.
@@ -80,6 +90,7 @@ SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND tr_row BETWEEN 10 AND 90 AND zn_city = 2
    OR tr_pickup = zn_id AND tr_row BETWEEN 10 AND 90 AND zn_city = 3
 ----
+BIGINT
 28
 
 # ---- NULL keys and three-valued logic ----
@@ -89,11 +100,13 @@ WHERE tr_pickup = zn_id AND tr_row BETWEEN 10 AND 90 AND zn_city = 2
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_dropoff = zn_id AND zn_radius > 1 OR tr_dropoff = zn_id AND zn_city = 2
 ----
+BIGINT
 2189
 
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_dropoff = zn_id AND (zn_radius > 1 OR zn_city = 2)
 ----
+BIGINT
 2189
 
 # A remainder over a column that is almost always NULL: tr_promo is set for 60 trips, so `tr_promo > 2` is NULL
@@ -103,6 +116,7 @@ query II nosort
 SELECT COUNT(*), COUNT(tr_promo) FROM trips, zones
 WHERE tr_pickup = zn_id AND tr_promo > 2 OR tr_pickup = zn_id AND zn_city = 2
 ----
+BIGINT	BIGINT
 580	32
 
 # ---- several relations, and grouping over the result ----
@@ -112,6 +126,7 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones, cities
 WHERE tr_pickup = zn_id AND zn_city = ct_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = ct_id AND ct_id = 2
 ----
+BIGINT
 2165
 
 query IID rowsort
@@ -119,6 +134,7 @@ SELECT zn_city, COUNT(*), SUM(tr_fare) FROM trips, zones
 WHERE tr_pickup = zn_id AND zn_radius > 1 OR tr_pickup = zn_id AND zn_city = 2
 GROUP BY zn_city
 ----
+SMALLINT	BIGINT	DECIMAL(38,2)
 1	419	6279.25
 2	559	8432.75
 3	350	5211.50
@@ -132,17 +148,20 @@ GROUP BY zn_city
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_row > 100 AND tr_rate = 1.50 OR tr_row > 100 AND tr_rate = 2.25
 ----
+BIGINT
 666
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_row > 100 AND (tr_rate = 1.50 OR tr_rate = 2.25)
 ----
+BIGINT
 666
 
 # A NOT is one opaque conjunct: nothing is shared with the bare equality, and the answer is unchanged.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE NOT (tr_row > 100 AND tr_rate = 1.50) OR tr_row > 100 AND tr_rate = 2.25
 ----
+BIGINT
 2441
 
 # ---- what hoisting a conjunct changes about when it is computed: divergence D16 ----
@@ -159,12 +178,14 @@ SELECT COUNT(*) FROM trips WHERE NOT (tr_row > 100 AND tr_rate = 1.50) OR tr_row
 query I nosort
 SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 * 2 > 1
 ----
+BIGINT
 2
 
 # The result of the factoring written by hand answers for the same reason, and the same as DuckDB.
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1 AND (id = 6 OR id = 11)
 ----
+BIGINT
 2
 
 # Nothing shared, so nothing is hoisted and both engines answer: the OR's arguments are computed in the order
@@ -172,6 +193,7 @@ SELECT COUNT(*) FROM edge WHERE i16 * 2 > 1 AND (id = 6 OR id = 11)
 query I nosort
 SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 + i16 > 1
 ----
+BIGINT
 2
 
 # Hoisting can also take an overflow away. A comparison that folds to never-true computes nothing once it is a
@@ -183,11 +205,13 @@ SELECT COUNT(*) FROM edge WHERE id = 6 AND i16 * 2 > 1 OR id = 11 AND i16 + i16 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + i16 + 1 > 40000 AND id = 11
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AND id = 11
 ----
+BIGINT
 0
 
 # ---- DuckDB only: what the factoring does not reach ----
@@ -198,6 +222,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND zn_radius > 1 OR zn_id = tr_pickup AND zn_city = 2
 ----
+BIGINT
 2165
 
 # Every branch must share it: two of these three write the equality and the third does not, so nothing is hoisted
@@ -207,4 +232,5 @@ query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND zn_city = 2 OR tr_pickup = zn_id AND zn_city = 3 OR zn_radius > 99
 ----
+BIGINT
 1049

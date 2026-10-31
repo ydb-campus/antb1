@@ -4,56 +4,67 @@
 query ITT nosort
 SELECT COUNT(EventDate), MAX(EventDate), MIN(EventDate) FROM hits_like
 ----
+BIGINT	DATE	DATE
 10000	2013-07-31	2013-07-01
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate = DATE '2013-07-15'
 ----
+BIGINT
 335
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate = '2013-07-15'
 ----
+BIGINT
 335
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate >= '2013-07-10' AND EventDate < DATE '2013-07-20'
 ----
+BIGINT
 3227
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate > DATE '2013-07-31'
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate <> '2013-07-01'
 ----
+BIGINT
 9647
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate <= '9999-12-31'
 ----
+BIGINT
 9238
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate < DATE '1970-01-02'
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE DATE '2013-07-04' >= EventDate
 ----
+BIGINT
 1376
 
 query TT nosort
 SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_split WHERE AdvEngineID <> 0 AND EventDate > '2013-07-05'
 ----
+DATE	DATE
 2013-07-31	2013-07-06
 
 query IT rowsort
 SELECT WatchID, EventDate FROM hits_like WHERE EventDate = '2013-07-31' AND RegionID > 19000
 ----
+BIGINT	DATE
 -118000787521951111	2013-07-31
 1789877250658587283	2013-07-31
 2331564732249556418	2013-07-31

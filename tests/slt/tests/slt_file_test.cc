@@ -30,6 +30,7 @@ constexpr std::string_view kFile =
     "SELECT a,\n"
     "  b FROM t\n"
     "----\n"
+    "BIGINT\tDOUBLE\n"
     "1\t2.5\n"
     "3\t4.5\n"
     "\n"
@@ -62,12 +63,14 @@ TEST(ParseSlt, ReadsEveryDirective) {
   EXPECT_EQ(query.label, "lbl");
   EXPECT_EQ(query.tolerance, 1e-6);
   EXPECT_EQ(query.sql, "SELECT a,\n  b FROM t");
+  EXPECT_EQ(query.type_names, (std::vector<std::string>{"BIGINT", "DOUBLE"}));
   EXPECT_EQ(query.expected, (std::vector<std::string>{"1\t2.5", "3\t4.5"}));
   EXPECT_TRUE(query.has_separator);
   EXPECT_FALSE(query.RunsOn("antb1"));
   const auto& bare = file->records[4];
   EXPECT_EQ(bare.sort, SortMode::kNoSort);
   EXPECT_FALSE(bare.has_separator);
+  EXPECT_TRUE(bare.type_names.empty());
   EXPECT_TRUE(bare.expected.empty());
 }
 
@@ -126,7 +129,7 @@ TEST(ParseSlt, RejectsMalformedFiles) {
 TEST(ParseSlt, ReadsPendingGuards) {
   auto file = ParseSlt("f.slt",
                        "pending J2b\n# a comment between the guard and its record\n"
-                       "query I rowsort\nSELECT 1\n----\n1\n\n"
+                       "query I rowsort\nSELECT 1\n----\nINTEGER\n1\n\n"
                        "pending S3\nstatement error\nSELECT 2\n\n"
                        "statement ok\nSELECT 3\n");
   ASSERT_TRUE(file.has_value()) << file.error();
@@ -153,10 +156,11 @@ TEST(IsRoadmapId, TakesALetterDigitsAndOneOptionalLowerCaseLetter) {
 }
 
 TEST(ParseSlt, ReadsDecimalColumns) {
-  auto file = ParseSlt("f.slt",
-                       "query ID\nSELECT 1, 1.50\n----\n1\t1.50\n\n"
-                       "query DT valuesort\nSELECT 1.5, 'a'\n----\n1.5\na\n\n"
-                       "query RD rowsort\nSELECT 0.5::DOUBLE, 1.5\n");
+  auto file =
+      ParseSlt("f.slt",
+               "query ID\nSELECT 1, 1.50\n----\nINTEGER\tDECIMAL(3,2)\n1\t1.50\n\n"
+               "query DT valuesort\nSELECT 1.5, 'a'\n----\nDECIMAL(2,1)\tVARCHAR\n1.5\na\n\n"
+               "query RD rowsort\nSELECT 0.5::DOUBLE, 1.5\n");
   ASSERT_TRUE(file.has_value()) << file.error();
   ASSERT_EQ(file->records.size(), 3U);
   EXPECT_EQ(file->records[0].types, "ID");
@@ -167,16 +171,53 @@ TEST(ParseSlt, ReadsDecimalColumns) {
   EXPECT_EQ(file->records[2].sort, SortMode::kRowSort);
 }
 
+TEST(ParseSlt, ReadsTheTypeLineAsTheBlocksFirstLine) {
+  auto file = ParseSlt("f.slt",
+                       "query I nosort\nSELECT 1 WHERE false\n----\nINTEGER\n\n"
+                       "query I nosort\nSELECT 2\n----\n\n"
+                       "query TD nosort\nSELECT t, d FROM u\n----\nTIMESTAMP WITH TIME ZONE\t"
+                       "DECIMAL(15,2)\n\n"
+                       "hash-threshold 1\n\n"
+                       "query I rowsort\nSELECT a FROM t\n----\nBIGINT\n3 values hashing to 0\n\n"
+                       "query T nosort\nSELECT 'BIGINT'\n----\nVARCHAR\nBIGINT\n");
+  ASSERT_TRUE(file.has_value()) << file.error();
+  ASSERT_EQ(file->records.size(), 6U);
+  const auto& empty = file->records[0];  // an empty result still names its types
+  EXPECT_TRUE(empty.has_separator);
+  EXPECT_EQ(empty.type_names, (std::vector<std::string>{"INTEGER"}));
+  EXPECT_TRUE(empty.expected.empty());
+  const auto& missing = file->records[1];  // no type line: the runner reports it
+  EXPECT_TRUE(missing.has_separator);
+  EXPECT_TRUE(missing.type_names.empty());
+  EXPECT_TRUE(missing.expected.empty());
+  EXPECT_EQ(file->records[2].type_names,
+            (std::vector<std::string>{"TIMESTAMP WITH TIME ZONE", "DECIMAL(15,2)"}));
+  EXPECT_EQ(file->records[4].type_names, (std::vector<std::string>{"BIGINT"}));
+  EXPECT_EQ(file->records[4].expected, (std::vector<std::string>{"3 values hashing to 0"}));
+  // The first line is the type line by its position, whatever the values look like.
+  EXPECT_EQ(file->records[5].type_names, (std::vector<std::string>{"VARCHAR"}));
+  EXPECT_EQ(file->records[5].expected, (std::vector<std::string>{"BIGINT"}));
+}
+
+TEST(TypeLine, SeparatesTheNamesWithTabs) {
+  EXPECT_EQ(TypeLine({"BIGINT"}), "BIGINT");
+  EXPECT_EQ(TypeLine({"TIMESTAMP WITH TIME ZONE", "DECIMAL(15,2)"}),
+            "TIMESTAMP WITH TIME ZONE\tDECIMAL(15,2)");
+  EXPECT_EQ(TypeLine({"", "VARCHAR"}), "\tVARCHAR");
+  EXPECT_EQ(TypeLine({}), "");
+}
+
 TEST(RewriteSlt, ReplacesBlocksAndKeepsEverythingElse) {
   auto file = ParseSlt("f.slt", kFile);
   ASSERT_TRUE(file.has_value());
   EXPECT_EQ(RewriteSlt(*file, {}), kFile);
 
   std::map<std::size_t, BlockUpdate> updates;
-  updates[3] = BlockUpdate{.lines = {"7\t8.5"}, .new_types = std::nullopt};
-  updates[4] = BlockUpdate{.lines = {"x", "y"}, .new_types = "TT"};
+  updates[3] = BlockUpdate{.lines = {"BIGINT\tDOUBLE", "7\t8.5"}, .new_types = std::nullopt};
+  updates[4] = BlockUpdate{.lines = {"VARCHAR\tVARCHAR", "x", "y"}, .new_types = "TT"};
   const std::string text = RewriteSlt(*file, updates);
-  EXPECT_NE(text.find("----\n7\t8.5\n\nquery TT\nSELECT s FROM t\n----\nx\ny\n\nhalt\n"),
+  EXPECT_NE(text.find("----\nBIGINT\tDOUBLE\n7\t8.5\n\nquery TT\nSELECT s FROM t\n----\n"
+                      "VARCHAR\tVARCHAR\nx\ny\n\nhalt\n"),
             std::string::npos)
       << text;
   EXPECT_EQ(text.find("3\t4.5"), std::string::npos);
@@ -184,6 +225,7 @@ TEST(RewriteSlt, ReplacesBlocksAndKeepsEverythingElse) {
   auto again = ParseSlt("f.slt", text);
   ASSERT_TRUE(again.has_value()) << again.error();
   EXPECT_EQ(again->records[4].types, "TT");
+  EXPECT_EQ(again->records[4].type_names, (std::vector<std::string>{"VARCHAR", "VARCHAR"}));
   EXPECT_EQ(again->records[4].expected, (std::vector<std::string>{"x", "y"}));
   EXPECT_EQ(RewriteSlt(*again, updates), text);  // idempotent
 }

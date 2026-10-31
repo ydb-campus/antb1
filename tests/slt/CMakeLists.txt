@@ -127,6 +127,7 @@ set(
   drop-row
   extra-row
   extra-column
+  type-name
   error
   unsupported
   succeed
@@ -306,7 +307,7 @@ if(ANTB1_HAVE_DUCKDB)
   foreach(
     kind
     IN
-    ITEMS value null drop-row extra-row extra-column error unsupported canary
+    ITEMS value null drop-row extra-row extra-column type-name error unsupported canary
   )
     set(_name harness.diff.mutate.${kind})
     antb1_slt_args(

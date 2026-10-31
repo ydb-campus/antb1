@@ -5,4 +5,5 @@
 query I nosort
 SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM antb1_canary_table
 ----
+BIGINT
 12

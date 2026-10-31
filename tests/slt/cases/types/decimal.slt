@@ -6,6 +6,7 @@
 query IDDDDDD nosort
 SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
 ----
+INTEGER	DECIMAL(9,2)	DECIMAL(18,4)	DECIMAL(38,10)	DECIMAL(38,0)	DECIMAL(15,2)	DECIMAL(15,2)
 0	-6.25	-5.0005	-5.0000000005	NULL	-99.95	-99.95
 1	9999999.99	-1.0001	-1.0000000001	-100000000000000000000	-19.99	NULL
 2	-9999999.99	3.0003	NULL	300000000000000000000	59.97	99.95
@@ -24,21 +25,25 @@ SELECT id, d9_2, d18_4, d38_10, d38_0, p, q FROM decimals ORDER BY id LIMIT 14
 query IIIIII nosort
 SELECT COUNT(d9_2), COUNT(d18_4), COUNT(d38_10), COUNT(d38_0), COUNT(p), COUNT(q) FROM decimals
 ----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
 34	35	35	33	32	35
 
 query DDDDDD nosort
 SELECT MIN(d9_2), MAX(d9_2), MIN(d18_4), MAX(d18_4), MIN(d38_10), MAX(d38_10) FROM decimals
 ----
+DECIMAL(9,2)	DECIMAL(9,2)	DECIMAL(18,4)	DECIMAL(18,4)	DECIMAL(38,10)	DECIMAL(38,10)
 -9999999.99	9999999.99	-5.0005	99999999999999.9999	-9999999999999999999999999999.9999999999	9999999999999999999999999999.9999999999
 
 query DDDD nosort
 SELECT MIN(d38_0), MAX(d38_0), MIN(p), MAX(q) FROM decimals WHERE id > 13
 ----
+DECIMAL(38,0)	DECIMAL(38,0)	DECIMAL(15,2)	DECIMAL(15,2)
 -500000000000000000000	500000000000000000000	-99.95	119.94
 
 query IIII nosort
 SELECT COUNT(DISTINCT d9_2), COUNT(DISTINCT d18_4), COUNT(DISTINCT d38_0), COUNT(DISTINCT p) FROM decimals
 ----
+BIGINT	BIGINT	BIGINT	BIGINT
 13	13	13	13
 
 # Literal folding: integers, the column's scale, more digits than the scale (rounded by direction), out of range.
@@ -46,6 +51,7 @@ SELECT COUNT(DISTINCT d9_2), COUNT(DISTINCT d18_4), COUNT(DISTINCT d38_0), COUNT
 query I rowsort
 SELECT id FROM decimals WHERE d9_2 = 1.25
 ----
+INTEGER
 18
 29
 7
@@ -53,6 +59,7 @@ SELECT id FROM decimals WHERE d9_2 = 1.25
 query I rowsort
 SELECT id FROM decimals WHERE d9_2 = 1.250000
 ----
+INTEGER
 18
 29
 7
@@ -60,11 +67,13 @@ SELECT id FROM decimals WHERE d9_2 = 1.250000
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 = 1.251
 ----
+BIGINT
 0
 
 query I rowsort
 SELECT id FROM decimals WHERE d9_2 = 5
 ----
+INTEGER
 16
 27
 5
@@ -72,61 +81,73 @@ SELECT id FROM decimals WHERE d9_2 = 5
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 < 1.251
 ----
+BIGINT
 23
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 <= 1.251
 ----
+BIGINT
 23
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 > 1.249
 ----
+BIGINT
 14
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 >= -1.249
 ----
+BIGINT
 18
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 <> -3.75
 ----
+BIGINT
 31
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE -3.75 < d9_2
 ----
+BIGINT
 23
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 <= 9999999.99
 ----
+BIGINT
 34
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 < 10000000
 ----
+BIGINT
 34
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 > -10000000
 ----
+BIGINT
 34
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 = 10000000
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d9_2 <> 123456789012
 ----
+BIGINT
 34
 
 query I rowsort
 SELECT id FROM decimals WHERE d18_4 = -5.0005
 ----
+INTEGER
 0
 11
 22
@@ -134,16 +155,19 @@ SELECT id FROM decimals WHERE d18_4 = -5.0005
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d18_4 >= 99999999999999.9999
 ----
+BIGINT
 1
 
 query I rowsort
 SELECT id FROM decimals WHERE d38_10 = 9999999999999999999999999999.9999999999
 ----
+INTEGER
 6
 
 query I rowsort
 SELECT id FROM decimals WHERE d38_10 < -9999999999999999999999999999.999999999
 ----
+INTEGER
 7
 
 # Divergence D13: DuckDB compares in DECIMAL(38, 11), which cannot hold the column's largest value, and fails.
@@ -152,6 +176,7 @@ onlyif antb1
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d38_10 > 0.00000000001
 ----
+BIGINT
 15
 
 onlyif duckdb
@@ -162,17 +187,20 @@ SELECT COUNT(*) FROM decimals WHERE d38_10 > 0.00000000001
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE d38_10 > 0
 ----
+BIGINT
 15
 
 query I rowsort
 SELECT id FROM decimals WHERE d38_0 = 99999999999999999999999999999999999999
 ----
+INTEGER
 8
 
 onlyif antb1
 query I rowsort
 SELECT id FROM decimals WHERE d38_0 >= 300000000000000000000.4
 ----
+INTEGER
 16
 19
 27
@@ -187,6 +215,7 @@ SELECT id FROM decimals WHERE d38_0 >= 300000000000000000000.4
 query I rowsort
 SELECT id FROM decimals WHERE d38_0 = -400000000000000000000
 ----
+INTEGER
 14
 25
 3
@@ -194,6 +223,7 @@ SELECT id FROM decimals WHERE d38_0 = -400000000000000000000
 query I rowsort
 SELECT id FROM decimals WHERE p IN (59.97, -19.99, 1.001)
 ----
+INTEGER
 1
 12
 13
@@ -204,11 +234,13 @@ SELECT id FROM decimals WHERE p IN (59.97, -19.99, 1.001)
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p NOT IN (59.97, -19.99)
 ----
+BIGINT
 26
 
 query I rowsort
 SELECT id FROM decimals WHERE p BETWEEN 19.99 AND 80 AND d9_2 >= 0
 ----
+INTEGER
 13
 16
 18
@@ -222,16 +254,19 @@ SELECT id FROM decimals WHERE p BETWEEN 19.99 AND 80 AND d9_2 >= 0
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p NOT BETWEEN -20 AND 20
 ----
+BIGINT
 24
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p < -50 OR d38_10 > 3
 ----
+BIGINT
 20
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p > 0 OR q < 0
 ----
+BIGINT
 24
 
 # Folded literals under OR and NOT keep three-valued logic: a NULL p stays NULL.
@@ -239,16 +274,19 @@ SELECT COUNT(*) FROM decimals WHERE p > 0 OR q < 0
 query I rowsort
 SELECT id FROM decimals WHERE p = 59.975 OR id = 1
 ----
+INTEGER
 1
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE NOT (p <> 59.975)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE NOT (p = 59.975)
 ----
+BIGINT
 32
 
 # HAVING folds into the aggregate's own scale.
@@ -256,6 +294,7 @@ SELECT COUNT(*) FROM decimals WHERE NOT (p = 59.975)
 query DI rowsort
 SELECT d9_2, COUNT(*) FROM decimals GROUP BY d9_2 HAVING MAX(p) < 59.975
 ----
+DECIMAL(9,2)	BIGINT
 -1.25	3
 -2.50	2
 -3.75	3
@@ -271,6 +310,7 @@ SELECT d9_2, COUNT(*) FROM decimals GROUP BY d9_2 HAVING MAX(p) < 59.975
 query DD rowsort
 SELECT d18_4, MIN(q) FROM decimals GROUP BY d18_4 HAVING MIN(q) >= -59.975 AND MAX(d38_10) > 0.0000000001
 ----
+DECIMAL(18,4)	DECIMAL(15,2)
 -3.0003	-59.97
 1.0001	19.99
 2.0002	39.98
@@ -284,6 +324,7 @@ NULL	39.98
 query I rowsort
 SELECT id FROM decimals WHERE p = q
 ----
+INTEGER
 0
 15
 18
@@ -297,6 +338,7 @@ SELECT id FROM decimals WHERE p = q
 query I nosort
 SELECT COUNT(*) FROM decimals WHERE p < q
 ----
+BIGINT
 17
 
 # Keys: ORDER BY, top-N and GROUP BY order and group by value.
@@ -304,6 +346,7 @@ SELECT COUNT(*) FROM decimals WHERE p < q
 query ID nosort
 SELECT id, d38_10 FROM decimals ORDER BY d38_10 DESC NULLS LAST, id LIMIT 6
 ----
+INTEGER	DECIMAL(38,10)
 6	9999999999999999999999999999.9999999999
 12	9007199254740992.5000000000
 13	12345678901234.5678000001
@@ -314,6 +357,7 @@ SELECT id, d38_10 FROM decimals ORDER BY d38_10 DESC NULLS LAST, id LIMIT 6
 query ID nosort
 SELECT id, d9_2 FROM decimals ORDER BY d9_2 NULLS FIRST, id LIMIT 8 OFFSET 3
 ----
+INTEGER	DECIMAL(9,2)
 24	NULL
 31	NULL
 38	NULL
@@ -326,6 +370,7 @@ SELECT id, d9_2 FROM decimals ORDER BY d9_2 NULLS FIRST, id LIMIT 8 OFFSET 3
 query DI nosort
 SELECT p, COUNT(*) FROM decimals GROUP BY p ORDER BY p
 ----
+DECIMAL(15,2)	BIGINT
 -9999999999999.99	1
 -99.95	3
 -79.96	3
@@ -344,6 +389,7 @@ NULL	8
 query DII rowsort
 SELECT d38_0, COUNT(*), MIN(id) FROM decimals GROUP BY d38_0
 ----
+DECIMAL(38,0)	BIGINT	INTEGER
 -100000000000000000000	3	1
 -200000000000000000000	2	20
 -300000000000000000000	3	17
@@ -362,6 +408,7 @@ NULL	7	0
 query DDI rowsort
 SELECT d9_2, MAX(d18_4), COUNT(q) FROM decimals WHERE id < 30 GROUP BY d9_2 HAVING COUNT(*) > 2
 ----
+DECIMAL(9,2)	DECIMAL(18,4)	BIGINT
 -6.25	-5.0005	3
 0.00	99999999999999.9999	3
 1.25	1.0001	3
@@ -371,6 +418,7 @@ NULL	3.0003	3
 query D rowsort
 SELECT q FROM decimals WHERE q > -60 GROUP BY q
 ----
+DECIMAL(15,2)
 -19.99
 -39.98
 -59.97
@@ -387,6 +435,7 @@ SELECT q FROM decimals WHERE q > -60 GROUP BY q
 query DD nosort
 SELECT p, q FROM decimals WHERE p <> q ORDER BY q DESC, p
 ----
+DECIMAL(15,2)	DECIMAL(15,2)
 -19.99	9999999999999.99
 99.95	139.93
 79.96	119.94

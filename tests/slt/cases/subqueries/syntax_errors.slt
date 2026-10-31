@@ -8,6 +8,7 @@
 query II nosort
 SELECT COUNT(*), MAX(tr_row) FROM trips
 ----
+BIGINT	INTEGER
 3000	2999
 
 # ---- WITH lists: the list without a query, a CTE without AS or its parentheses, a trailing comma ----
@@ -325,5 +326,6 @@ onlyif duckdb
 query II nosort
 SELECT COUNT(*), MAX(x) FROM (SELECT tr_row, tr_fare FROM trips) AS s(x,)
 ----
+BIGINT	INTEGER
 3000	2999
 

@@ -69,6 +69,20 @@ std::vector<std::string> SplitLines(std::string_view text) {
   return lines;
 }
 
+// The names of a type line, split at every tab (a name may hold spaces).
+std::vector<std::string> SplitTypeLine(std::string_view line) {
+  std::vector<std::string> names;
+  std::size_t pos = 0;
+  while (true) {
+    const std::size_t tab = line.find('\t', pos);
+    names.emplace_back(line.substr(pos, tab == std::string_view::npos ? tab : tab - pos));
+    if (tab == std::string_view::npos) {
+      return names;
+    }
+    pos = tab + 1;
+  }
+}
+
 std::optional<SortMode> ParseSortMode(std::string_view word) {
   if (word == "nosort") {
     return SortMode::kNoSort;
@@ -225,6 +239,9 @@ class Parser {
       if (next < lines.size() && lines[next] == "----") {
         record.has_separator = true;
         ++next;
+        if (next < lines.size() && !IsBlank(lines[next])) {
+          record.type_names = SplitTypeLine(lines[next++]);
+        }
         while (next < lines.size() && !IsBlank(lines[next])) {
           record.expected.push_back(lines[next++]);
         }
@@ -332,6 +349,17 @@ std::optional<std::string> SortModeProblem(std::string_view types, SortMode sort
 
 std::expected<SltFile, std::string> ParseSlt(const std::string& path, std::string_view text) {
   return Parser(path, text).Parse();
+}
+
+std::string TypeLine(const std::vector<std::string>& type_names) {
+  std::string line;
+  for (std::size_t i = 0; i < type_names.size(); ++i) {
+    if (i > 0) {
+      line += '\t';
+    }
+    line += type_names[i];
+  }
+  return line;
 }
 
 std::string RewriteSlt(const SltFile& file, const std::map<std::size_t, BlockUpdate>& updates) {

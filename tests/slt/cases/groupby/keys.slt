@@ -4,6 +4,7 @@
 query II rowsort
 SELECT AdvEngineID, COUNT(*) FROM hits_like GROUP BY AdvEngineID
 ----
+SMALLINT	BIGINT
 0	8968
 1	20
 10	14
@@ -70,6 +71,7 @@ SELECT AdvEngineID, COUNT(*) FROM hits_like GROUP BY AdvEngineID
 query I valuesort
 SELECT COUNT(*) FROM hits_like GROUP BY AdvEngineID
 ----
+BIGINT
 11
 12
 12
@@ -135,6 +137,7 @@ SELECT COUNT(*) FROM hits_like GROUP BY AdvEngineID
 query III rowsort
 SELECT COUNT(*), IsMobile, OS FROM hits_like WHERE OS < 20 GROUP BY OS, IsMobile
 ----
+BIGINT	SMALLINT	SMALLINT
 27	0	5
 28	1	4
 30	0	16
@@ -180,6 +183,7 @@ SELECT COUNT(*), IsMobile, OS FROM hits_like WHERE OS < 20 GROUP BY OS, IsMobile
 query II rowsort
 SELECT IsMobile, COUNT(*) FROM hits_like_nulls GROUP BY IsMobile
 ----
+SMALLINT	BIGINT
 0	4557
 1	4679
 NULL	764
@@ -187,6 +191,7 @@ NULL	764
 query III rowsort
 SELECT OS, IsMobile, COUNT(*) FROM hits_like_nulls WHERE OS < 10 GROUP BY OS, IsMobile
 ----
+SMALLINT	SMALLINT	BIGINT
 0	0	41
 0	1	30
 0	NULL	7
@@ -222,6 +227,7 @@ SELECT OS, IsMobile, COUNT(*) FROM hits_like_nulls WHERE OS < 10 GROUP BY OS, Is
 query II rowsort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16
 ----
+SMALLINT	BIGINT
 -1	1
 -100	1
 -12345	1
@@ -237,6 +243,7 @@ NULL	2
 query II rowsort
 SELECT i32, COUNT(*) FROM edge GROUP BY i32
 ----
+INTEGER	BIGINT
 -1	1
 -100000	1
 -2147483648	1
@@ -252,6 +259,7 @@ NULL	2
 query II rowsort
 SELECT i64, COUNT(*) FROM edge GROUP BY i64
 ----
+BIGINT	BIGINT
 -1	1
 -1000000000000000	1
 -42	1
@@ -267,6 +275,7 @@ NULL	2
 query II rowsort
 SELECT u16, COUNT(*) FROM edge GROUP BY u16
 ----
+USMALLINT	BIGINT
 0	1
 1	1
 12	1
@@ -282,6 +291,7 @@ NULL	2
 query TI rowsort
 SELECT s, COUNT(*) FROM edge GROUP BY s
 ----
+VARCHAR	BIGINT
 (empty)	1
 NULL	2
 \x20leading space	1
@@ -297,6 +307,7 @@ x\x01y	1
 query TI rowsort
 SELECT u, COUNT(*) FROM edge GROUP BY u
 ----
+VARCHAR	BIGINT
 (empty)	1
 NULL	2
 \x28empty)	1
@@ -312,6 +323,7 @@ x\x7fy	1
 query RI rowsort
 SELECT d, COUNT(*) FROM edge GROUP BY d
 ----
+DOUBLE	BIGINT
 -0.3333333333333333	1
 -0.5	1
 -9007199254740992	1
@@ -328,6 +340,7 @@ NULL	2
 query TI rowsort
 SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-07-05' GROUP BY EventDate
 ----
+DATE	BIGINT
 2013-07-01	353
 2013-07-02	362
 2013-07-03	350
@@ -337,6 +350,7 @@ SELECT EventDate, COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-07-05' GR
 query I valuesort
 SELECT COUNT(*) FROM floats GROUP BY f
 ----
+BIGINT
 1
 1
 1
@@ -359,6 +373,7 @@ SELECT COUNT(*) FROM floats GROUP BY f
 query II rowsort
 SELECT TraficSourceID AS source, COUNT(*) FROM hits_like_split GROUP BY source
 ----
+SMALLINT	BIGINT
 -1	951
 0	900
 1	854
@@ -374,6 +389,7 @@ SELECT TraficSourceID AS source, COUNT(*) FROM hits_like_split GROUP BY source
 query TI rowsort
 SELECT SearchPhrase, COUNT(*) FROM hits_like WHERE SearchPhrase <> '' AND OS = 1 GROUP BY SearchPhrase
 ----
+VARCHAR	BIGINT
 alpha	1
 alpha cloud музыка	1
 delta	1
@@ -394,6 +410,7 @@ tundra	1
 query II rowsort
 SELECT OS, COUNT(*) FROM hits_like WHERE OS < 5 GROUP BY OS, os, "OS"
 ----
+SMALLINT	BIGINT
 0	82
 1	82
 2	97
@@ -404,8 +421,10 @@ SELECT OS, COUNT(*) FROM hits_like WHERE OS < 5 GROUP BY OS, os, "OS"
 query II rowsort
 SELECT AdvEngineID, COUNT(*) FROM hits_like WHERE AdvEngineID > 1000 GROUP BY AdvEngineID
 ----
+SMALLINT	BIGINT
 
 query II rowsort
 SELECT AdvEngineID, COUNT(*) FROM empty GROUP BY AdvEngineID
 ----
+SMALLINT	BIGINT
 

@@ -7,6 +7,7 @@
 query ITI rowsort
 SELECT zn_id, label, zn_city FROM zones WHERE zn_id <= 6
 ----
+INTEGER	VARCHAR	SMALLINT
 1	center	1
 2	north	2
 3	south	3
@@ -17,6 +18,7 @@ SELECT zn_id, label, zn_city FROM zones WHERE zn_id <= 6
 query IT rowsort
 SELECT ct_id, label FROM cities WHERE ct_id <= 3
 ----
+SMALLINT	VARCHAR
 1	center
 2	harbor
 3	hills
@@ -27,6 +29,7 @@ SELECT ct_id, label FROM cities WHERE ct_id <= 3
 query TT rowsort labels
 SELECT zones.label, cities.label FROM zones, cities WHERE zn_city = ct_id AND zn_id <= 6
 ----
+VARCHAR	VARCHAR
 airport	airport
 center	center
 docks	old town
@@ -37,6 +40,7 @@ south	hills
 query TT rowsort labels
 SELECT z.label, c.label FROM zones AS z, cities AS c WHERE z.zn_city = c.ct_id AND z.zn_id <= 6
 ----
+VARCHAR	VARCHAR
 airport	airport
 center	center
 docks	old town
@@ -47,6 +51,7 @@ south	hills
 query TT rowsort labels
 SELECT z.label, c.label FROM zones z JOIN cities c ON z.zn_city = c.ct_id WHERE z.zn_id <= 6
 ----
+VARCHAR	VARCHAR
 airport	airport
 center	center
 docks	old town
@@ -58,6 +63,7 @@ south	hills
 query IITIIIIITR rowsort
 SELECT * FROM cities, zones WHERE zn_city = ct_id AND zn_id <= 3
 ----
+INTEGER	SMALLINT	VARCHAR	INTEGER	INTEGER	INTEGER	SMALLINT	INTEGER	VARCHAR	DOUBLE
 0	1	center	120000	0	1	1	NULL	center	0.5
 1	2	harbor	45000	1	2	2	NULL	north	0.75
 2	3	hills	30000	2	3	3	NULL	south	1
@@ -66,6 +72,7 @@ SELECT * FROM cities, zones WHERE zn_city = ct_id AND zn_id <= 3
 query III rowsort
 SELECT t.zn_id, t.ct_id, t.ct_pop FROM zones AS t, cities AS t WHERE t.zn_city = t.ct_id AND t.zn_id <= 3
 ----
+INTEGER	SMALLINT	INTEGER
 1	1	120000
 2	2	45000
 3	3	30000
@@ -75,6 +82,7 @@ query ITT rowsort
 SELECT cities.zn_id, zones.label, cities.label FROM zones AS cities, cities AS zones
 WHERE cities.zn_city = zones.ct_id AND cities.zn_id <= 3
 ----
+INTEGER	VARCHAR	VARCHAR
 1	center	center
 2	harbor	north
 3	hills	south
@@ -83,12 +91,14 @@ WHERE cities.zn_city = zones.ct_id AND cities.zn_id <= 3
 query ID nosort
 SELECT COUNT(*), SUM(trips.tr_fare) FROM '${FIXTURES}/star/trips.parquet', zones WHERE trips.tr_pickup = zones.zn_id
 ----
+BIGINT	DECIMAL(38,2)
 2793	41889.25
 
 # Bindings and columns match in any case, quoted or not.
 query I nosort
 SELECT COUNT(*) FROM Zones, CITIES WHERE ZONES.zn_city = "Cities".CT_ID
 ----
+BIGINT
 38
 
 # ---- name errors (ADR 0022) ----

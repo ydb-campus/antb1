@@ -23,7 +23,8 @@
 //               first byte escaped, so every cell is unambiguous.
 //   block       one row per line with cells separated by a tab; rowsort sorts the rows, valuesort
 //               sorts the single values (one per line); results with more than hash-threshold
-//               values (and no R column) become "<n> values hashing to <sha256>".
+//               values (and no R column) become "<n> values hashing to <sha256>". In an .slt
+//               file the line of type names comes first (TypeLine in slt_file.h).
 
 namespace antb1::slt {
 

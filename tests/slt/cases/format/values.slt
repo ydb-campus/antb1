@@ -4,6 +4,7 @@
 query IIII nosort
 SELECT id, i16, i32, i64 FROM edge
 ----
+INTEGER	SMALLINT	INTEGER	BIGINT
 0	-32768	-2147483648	-9223372036854775808
 1	32767	2147483647	9223372036854775807
 2	0	0	0
@@ -20,6 +21,7 @@ SELECT id, i16, i32, i64 FROM edge
 query IIR nosort
 SELECT id, u16, d FROM edge
 ----
+INTEGER	USMALLINT	DOUBLE
 0	0	-0.5
 1	65535	0.3333333333333333
 2	1	0
@@ -36,6 +38,7 @@ SELECT id, u16, d FROM edge
 query ITT nosort
 SELECT id, s, u FROM edge
 ----
+INTEGER	VARCHAR	VARCHAR
 0	(empty)	(empty)
 1	a	a
 2	tab\there	tab\there
@@ -52,6 +55,7 @@ SELECT id, s, u FROM edge
 query T valuesort
 SELECT s FROM edge
 ----
+VARCHAR
 (empty)
 NULL
 NULL
@@ -71,6 +75,7 @@ hash-threshold 10
 query IT rowsort
 SELECT id, u FROM edge
 ----
+INTEGER	VARCHAR
 24 values hashing to 51f6f4f855babfbcea9d8ea850ac2635f40140596ef60745cd42e60ea371cdb4
 
 hash-threshold 0
@@ -79,35 +84,42 @@ hash-threshold 0
 query I nosort
 SELECT SUM(UserID) FROM hits_like
 ----
+HUGEINT
 23021353196360218899981
 
 query IR nosort
 SELECT SUM(WatchID), AVG(WatchID) FROM hits_like_nulls
 ----
+HUGEINT	DOUBLE
 110231108887945010512	11963437040150316
 
 # tol 1e-6
 query R nosort
 SELECT AVG(ResolutionWidth) FROM hits_like_split
 ----
+DOUBLE
 1397.6722
 
 query TT nosort
 SELECT MAX(EventDate), MIN(EventDate) FROM hits_like_required
 ----
+DATE	DATE
 2013-07-31	2013-07-01
 
 query III nosort
 SELECT COUNT(*), COUNT(SocialAction), COUNT(HistoryLength) FROM hits_like_nulls
 ----
+BIGINT	BIGINT	BIGINT
 10000	0	0
 
 query TT nosort
 SELECT MIN(Title), MAX(SearchPhrase) FROM hits_like
 ----
+VARCHAR	VARCHAR
 (empty)	погода погода погода
 
 query IIII nosort
 SELECT MIN(Interests), MAX(Interests), MIN(ClientIP), MAX(ClientIP) FROM hits_like
 ----
+SMALLINT	SMALLINT	INTEGER	INTEGER
 -32768	32767	-2147483648	2147483647

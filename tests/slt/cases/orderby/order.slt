@@ -5,6 +5,7 @@
 query II nosort
 SELECT id, i16 FROM edge ORDER BY i16, id
 ----
+INTEGER	SMALLINT
 0	-32768
 10	-12345
 7	-100
@@ -21,6 +22,7 @@ SELECT id, i16 FROM edge ORDER BY i16, id
 query II nosort
 SELECT id, i16 FROM edge ORDER BY i16 DESC, id
 ----
+INTEGER	SMALLINT
 1	32767
 9	12345
 6	100
@@ -37,6 +39,7 @@ SELECT id, i16 FROM edge ORDER BY i16 DESC, id
 query II nosort
 SELECT id, i16 FROM edge ORDER BY i16 NULLS FIRST, id DESC
 ----
+INTEGER	SMALLINT
 8	NULL
 5	NULL
 0	-32768
@@ -53,6 +56,7 @@ SELECT id, i16 FROM edge ORDER BY i16 NULLS FIRST, id DESC
 query II nosort
 SELECT id, i32 FROM edge ORDER BY i32 DESC NULLS FIRST, id
 ----
+INTEGER	INTEGER
 5	NULL
 9	NULL
 1	2147483647
@@ -69,6 +73,7 @@ SELECT id, i32 FROM edge ORDER BY i32 DESC NULLS FIRST, id
 query II nosort
 SELECT id, i64 FROM edge ORDER BY i64 ASC NULLS LAST, id
 ----
+INTEGER	BIGINT
 0	-9223372036854775808
 7	-1000000000000000
 10	-42
@@ -85,6 +90,7 @@ SELECT id, i64 FROM edge ORDER BY i64 ASC NULLS LAST, id
 query II nosort
 SELECT id, u16 FROM edge ORDER BY u16 DESC, id
 ----
+INTEGER	USMALLINT
 1	65535
 7	40000
 3	32768
@@ -101,6 +107,7 @@ SELECT id, u16 FROM edge ORDER BY u16 DESC, id
 query IR nosort
 SELECT id, d FROM edge ORDER BY d, id
 ----
+INTEGER	DOUBLE
 7	-9007199254740992
 0	-0.5
 11	-0.3333333333333333
@@ -117,6 +124,7 @@ SELECT id, d FROM edge ORDER BY d, id
 query IT nosort
 SELECT id, s FROM edge ORDER BY s, id
 ----
+INTEGER	VARCHAR
 0	(empty)
 6	\x20leading space
 9	\x4eULL
@@ -133,6 +141,7 @@ SELECT id, s FROM edge ORDER BY s, id
 query IT nosort
 SELECT id, u FROM edge ORDER BY u DESC, id
 ----
+INTEGER	VARCHAR
 10	日本語
 8	Привет, мир
 7	x\x7fy
@@ -151,6 +160,7 @@ SELECT id, u FROM edge ORDER BY u DESC, id
 query I nosort
 SELECT id FROM edge ORDER BY d DESC, id
 ----
+INTEGER
 10
 6
 3
@@ -167,6 +177,7 @@ SELECT id FROM edge ORDER BY d DESC, id
 query T nosort
 SELECT u FROM edge ORDER BY i32 NULLS FIRST, id
 ----
+VARCHAR
 NULL
 \x28empty)
 (empty)
@@ -185,6 +196,7 @@ a
 query II nosort
 SELECT id AS i16, i16 AS id FROM edge ORDER BY i16 DESC
 ----
+INTEGER	SMALLINT
 11	7
 10	-12345
 9	12345
@@ -201,6 +213,7 @@ SELECT id AS i16, i16 AS id FROM edge ORDER BY i16 DESC
 query II nosort
 SELECT i16 AS x, id AS x FROM edge ORDER BY x
 ----
+SMALLINT	INTEGER
 -32768	0
 32767	1
 0	2
@@ -220,6 +233,7 @@ NULL	8
 query II nosort
 SELECT i16 AS id, ID FROM edge ORDER BY id DESC
 ----
+SMALLINT	INTEGER
 7	11
 -12345	10
 12345	9
@@ -236,6 +250,7 @@ NULL	5
 query II nosort
 SELECT ID, i16 AS id FROM edge ORDER BY id, edge.id
 ----
+INTEGER	SMALLINT
 0	-32768
 10	-12345
 7	-100
@@ -252,6 +267,7 @@ SELECT ID, i16 AS id FROM edge ORDER BY id, edge.id
 query II nosort
 SELECT id, i16 FROM edge ORDER By I16 DESC, "ID"
 ----
+INTEGER	SMALLINT
 1	32767
 9	12345
 6	100
@@ -270,6 +286,7 @@ SELECT id, i16 FROM edge ORDER By I16 DESC, "ID"
 query IIIIIRTT nosort
 SELECT * FROM edge WHERE id > 2 ORDER BY i64 DESC, id
 ----
+INTEGER	SMALLINT	INTEGER	BIGINT	USMALLINT	DOUBLE	VARCHAR	VARCHAR
 6	100	100000	1000000000000000	15917	123456789.125	\x20leading space	trailing space\x20
 9	12345	NULL	42	NULL	NULL	\x4eULL	\x28empty)
 11	7	-7	7	7	-0.3333333333333333	naïve café	NULL
@@ -283,6 +300,7 @@ SELECT * FROM edge WHERE id > 2 ORDER BY i64 DESC, id
 query II nosort
 SELECT WatchID, RegionID FROM hits_like_split WHERE RegionID < 100 ORDER BY RegionID DESC, WatchID LIMIT 12
 ----
+BIGINT	INTEGER
 -1766967153472275909	99
 -4116633239524032126	98
 8035179356301960050	98
@@ -299,6 +317,7 @@ SELECT WatchID, RegionID FROM hits_like_split WHERE RegionID < 100 ORDER BY Regi
 query TI nosort
 SELECT EventDate, WatchID FROM hits_like ORDER BY EventDate DESC, WatchID LIMIT 5
 ----
+DATE	BIGINT
 2013-07-31	-9168464353029678484
 2013-07-31	-9104910405192239326
 2013-07-31	-9000425214964352462
@@ -311,6 +330,7 @@ SELECT EventDate, WatchID FROM hits_like ORDER BY EventDate DESC, WatchID LIMIT 
 query II nosort
 SELECT RegionID, COUNT(*) AS c FROM hits_like GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 10
 ----
+INTEGER	BIGINT
 0	304
 8830	6
 7430	5
@@ -325,6 +345,7 @@ SELECT RegionID, COUNT(*) AS c FROM hits_like GROUP BY RegionID ORDER BY c DESC,
 query I nosort
 SELECT RegionID FROM hits_like GROUP BY RegionID ORDER BY COUNT(*) DESC, RegionID DESC LIMIT 5
 ----
+INTEGER
 0
 8830
 7430
@@ -334,6 +355,7 @@ SELECT RegionID FROM hits_like GROUP BY RegionID ORDER BY COUNT(*) DESC, RegionI
 query ITI nosort
 SELECT OS, MIN(SearchPhrase), SUM(ResolutionWidth) FROM hits_like GROUP BY OS ORDER BY sum(ResolutionWidth) DESC, OS
 ----
+SMALLINT	VARCHAR	HUGEINT
 116	(empty)	156860
 26	(empty)	152896
 89	(empty)	148276
@@ -459,6 +481,7 @@ SELECT OS, MIN(SearchPhrase), SUM(ResolutionWidth) FROM hits_like GROUP BY OS OR
 query TI nosort
 SELECT EventDate, MAX(RegionID) AS m FROM hits_like WHERE IsMobile = 1 GROUP BY EventDate ORDER BY MIN(WatchID), EventDate LIMIT 7
 ----
+DATE	INTEGER
 2013-07-17	19939
 2013-07-02	19852
 2013-07-19	19610
@@ -470,6 +493,7 @@ SELECT EventDate, MAX(RegionID) AS m FROM hits_like WHERE IsMobile = 1 GROUP BY 
 query II nosort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16 ORDER BY i16 NULLS FIRST
 ----
+SMALLINT	BIGINT
 NULL	2
 -32768	1
 -12345	1
@@ -487,9 +511,11 @@ NULL	2
 query II nosort
 SELECT COUNT(*) AS c, MAX(id) FROM edge ORDER BY c DESC, MIN(i16)
 ----
+BIGINT	INTEGER
 12	11
 
 query I nosort
 SELECT COUNT(*) FROM empty ORDER BY COUNT(*)
 ----
+BIGINT
 0

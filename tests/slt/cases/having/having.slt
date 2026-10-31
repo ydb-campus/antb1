@@ -6,21 +6,25 @@
 query II rowsort
 SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) > 1
 ----
+SMALLINT	BIGINT
 NULL	2
 
 query II rowsort
 SELECT AdvEngineID, COUNT(*) AS c FROM hits_like GROUP BY AdvEngineID HAVING c >= 500
 ----
+SMALLINT	BIGINT
 0	8968
 
 query I rowsort
 SELECT AdvEngineID FROM hits_like GROUP BY AdvEngineID HAVING 500 <= COUNT(*) AND SUM(ResolutionWidth) > 0
 ----
+SMALLINT
 0
 
 query II rowsort
 SELECT CounterID, COUNT(*) FROM hits_like GROUP BY CounterID HAVING COUNT(*) >= 3
 ----
+INTEGER	BIGINT
 10062	247
 1062	253
 11062	265
@@ -65,6 +69,7 @@ SELECT CounterID, COUNT(*) FROM hits_like GROUP BY CounterID HAVING COUNT(*) >= 
 query IT rowsort
 SELECT id, u FROM edge GROUP BY id, u HAVING u LIKE '%a%' AND id IN (0, 1, 2, 3, 4, 5)
 ----
+INTEGER	VARCHAR
 1	a
 2	tab\there
 3	line\nbreak
@@ -73,6 +78,7 @@ SELECT id, u FROM edge GROUP BY id, u HAVING u LIKE '%a%' AND id IN (0, 1, 2, 3,
 query I rowsort
 SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (1, 7) AND MIN(u) NOT LIKE 'x%'
 ----
+SMALLINT
 -1
 -12345
 -32768
@@ -84,6 +90,7 @@ SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (1, 7) AND MIN(u) NOT LIKE '
 query IR rowsort
 SELECT i16, AVG(d) FROM edge GROUP BY i16 HAVING AVG(d) > 0.5
 ----
+SMALLINT	DOUBLE
 -1	0.6666666666666666
 -12345	922337203685477632
 100	123456789.125
@@ -91,19 +98,23 @@ SELECT i16, AVG(d) FROM edge GROUP BY i16 HAVING AVG(d) > 0.5
 query II rowsort
 SELECT i32, SUM(i64) FROM edge GROUP BY i32 HAVING SUM(i64) > 9223372036854775807
 ----
+INTEGER	HUGEINT
 
 query I rowsort
 SELECT id FROM edge GROUP BY id HAVING SUM(i64) <= -9223372036854775808
 ----
+INTEGER
 0
 
 query I rowsort
 SELECT id FROM edge GROUP BY id HAVING MAX(d) >= 1e308
 ----
+INTEGER
 
 query TI rowsort
 SELECT MIN(u) AS m, COUNT(DISTINCT i16) FROM edge GROUP BY i32 HAVING COUNT(DISTINCT i16) = 1 AND m <> ''
 ----
+VARCHAR	BIGINT
 \x28empty)	1
 a	1
 back\\slash	1
@@ -117,6 +128,7 @@ x\x7fy	1
 query II rowsort
 SELECT i16, SUM(i32) FROM edge GROUP BY i16 HAVING SUM(i32) <> 0
 ----
+SMALLINT	HUGEINT
 -1	-1
 -100	-100000
 -12345	54321
@@ -130,6 +142,7 @@ NULL	7
 query I rowsort
 SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (0)
 ----
+SMALLINT
 -1
 -100
 -12345
@@ -145,6 +158,7 @@ SELECT i16 FROM edge GROUP BY i16 HAVING i16 NOT IN (0)
 query I rowsort
 SELECT COUNT(*) AS i16 FROM edge GROUP BY i16 HAVING i16 > 1
 ----
+BIGINT
 1
 1
 1
@@ -153,6 +167,7 @@ SELECT COUNT(*) AS i16 FROM edge GROUP BY i16 HAVING i16 > 1
 query II rowsort
 SELECT i16 AS id, COUNT(*) AS n FROM edge GROUP BY i16 HAVING id < 100 AND n = 1
 ----
+SMALLINT	BIGINT
 -1	1
 -100	1
 -12345	1
@@ -165,30 +180,36 @@ SELECT i16 AS id, COUNT(*) AS n FROM edge GROUP BY i16 HAVING id < 100 AND n = 1
 query I nosort
 SELECT COUNT(*) FROM edge HAVING COUNT(*) > 100
 ----
+BIGINT
 
 query I nosort
 SELECT COUNT(*) FROM edge HAVING 100 > COUNT(*)
 ----
+BIGINT
 12
 
 query IT nosort
 SELECT 7 AS k, 'x' FROM hits_like HAVING SUM(AdvEngineID) >= 0 AND MAX(EventDate) > DATE '2000-01-01'
 ----
+INTEGER	VARCHAR
 7	x
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE id > 100 HAVING MIN(id) = 5
 ----
+BIGINT
 
 query I nosort
 SELECT COUNT(*) FROM empty HAVING COUNT(*) = 0
 ----
+BIGINT
 0
 
 # With ORDER BY, LIMIT and OFFSET: the filter comes before the sort.
 query II nosort
 SELECT CounterID, COUNT(*) AS c FROM hits_like WHERE AdvEngineID = 0 GROUP BY CounterID HAVING c > 10 ORDER BY c DESC, CounterID LIMIT 5 OFFSET 1
 ----
+INTEGER	BIGINT
 9062	252
 7062	250
 17062	247
@@ -198,6 +219,7 @@ SELECT CounterID, COUNT(*) AS c FROM hits_like WHERE AdvEngineID = 0 GROUP BY Co
 query I nosort
 SELECT UserID FROM hits_like GROUP BY UserID HAVING COUNT(*) >= 2 ORDER BY SUM(ResolutionWidth) DESC, UserID LIMIT 3
 ----
+BIGINT
 9223372036854775807
 
 # FLOAT (floats): DuckDB's MIN and MAX of a FLOAT column are FLOAT, compared in FLOAT like the column in
@@ -205,20 +227,63 @@ SELECT UserID FROM hits_like GROUP BY UserID HAVING COUNT(*) >= 2 ORDER BY SUM(R
 query I rowsort
 SELECT id FROM floats GROUP BY id HAVING MAX(f) = 0.1
 ----
+INTEGER
 0
 
 query I rowsort
 SELECT id FROM floats GROUP BY id HAVING SUM(f) = 0.1
 ----
+INTEGER
 
 query I rowsort
 SELECT id FROM floats GROUP BY id HAVING AVG(f) > 0.1 AND MIN(f) IN (0.1, 0.5, 2)
 ----
+INTEGER
 0
 
-query R rowsort
+# antb1 reads a FLOAT column as DOUBLE, so its result is DOUBLE where DuckDB's is FLOAT (divergence D11): one
+# record per engine. Their label ties both to a record that both engines run, DOUBLE in both through an empty
+# DOUBLE branch, so that antb1's values are still DuckDB's.
+query R rowsort float_keys
+SELECT f FROM floats GROUP BY f HAVING f >= 0.1 UNION ALL SELECT d FROM edge WHERE id < 0
+----
+DOUBLE
+0.10000000149011612
+0.20000000298023224
+0.30000001192092896
+1.2676506002282294e+30
+1.2676507513439569e+30
+1234.5
+16777216
+16777218
+19.989999771118164
+3.299999952316284
+3.4028234663852886e+38
+inf
+
+onlyif duckdb
+query R rowsort float_keys
 SELECT f FROM floats GROUP BY f HAVING f >= 0.1
 ----
+FLOAT
+0.10000000149011612
+0.20000000298023224
+0.30000001192092896
+1.2676506002282294e+30
+1.2676507513439569e+30
+1234.5
+16777216
+16777218
+19.989999771118164
+3.299999952316284
+3.4028234663852886e+38
+inf
+
+onlyif antb1
+query R rowsort float_keys
+SELECT f FROM floats GROUP BY f HAVING f >= 0.1
+----
+DOUBLE
 0.10000000149011612
 0.20000000298023224
 0.30000001192092896

@@ -171,9 +171,10 @@ Workflow for new or changed SQL:
 1. Add `statement ok`, `statement error` or `query <types> [nosort|rowsort|valuesort]` records to a file under
    `tests/slt/cases/`. Write only the SQL and leave out the expected block. A new file is picked up by the next build.
 2. Run `pixi run slt-complete`. It regenerates the fixtures, runs every record on DuckDB and rewrites the expected
-   blocks (and wrong column-type letters, printed as `NOTE`) of every registered `.slt` file. `ERROR` lines are
-   records that could not be completed; `REVIEW` lines are `onlyif antb1` records, completed from antb1, which you
-   must check by hand.
+   blocks (and wrong column-type letters, printed as `NOTE`) of every registered `.slt` file. A block opens with the
+   result's type names (`BIGINT`, `DECIMAL(15,2)`), which both engines must match exactly. `ERROR` lines are records
+   that could not be completed; `REVIEW` lines are `onlyif antb1` records, completed from antb1, which you must check
+   by hand.
 3. Review `git diff tests/slt`: only the records you meant to change may differ. Never edit an expected block by
    hand.
 4. Run `pixi run test -L '^(slt|oracle)$'`, and for `pending` records (below) also the pending check, which has the
