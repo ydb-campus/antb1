@@ -106,6 +106,26 @@ TEST_F(OrderedCompareOracleTest, RowsOfALongRunAreCheckedByQuery) {
                         {"4", "d", "2013-07-04", "3.5"}}));
 }
 
+// Duplicate output names next to a star, as generated stars give them: `id, *` holds id twice and
+// the key k among the star's columns. The query of the run's rows renames the columns by position
+// (ordered_compare.h), so it still checks every cell of a row.
+TEST_F(OrderedCompareOracleTest, RowsWithDuplicateNamesNextToAStar) {
+  EXPECT_FALSE(Compare({{"2", "2", "b", "2013-07-02", "1.5", "1"},
+                        {"12", "12", "l", "2013-07-12", "11.5", "0"},
+                        {"3", "3", "c", std::nullopt, "2.5", "0"}},
+                       kTable, "id, *"));
+  EXPECT_EQ(queries_, 2) << "the first 5 ranked rows, then the rows of the run of k = 0";
+  queries_ = 0;
+  // The two id cells of the second row disagree: no row of the run is that row.
+  const auto d = Compare({{"2", "2", "b", "2013-07-02", "1.5", "1"},
+                          {"12", "11", "l", "2013-07-12", "11.5", "0"},
+                          {"3", "3", "c", std::nullopt, "2.5", "0"}},
+                         kTable, "id, *");
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
+  EXPECT_EQ(queries_, 2);
+}
+
 TEST_F(OrderedCompareOracleTest, WrongRowsOfALongRunFail) {
   // Not in the run (k = 1), a value that no row has, the same row twice, a wrong R value.
   for (const std::vector<Row>& rows :

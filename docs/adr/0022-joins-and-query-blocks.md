@@ -676,6 +676,8 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     integration and `.slt` tests.
   - The random generator learns joins (T1), then derived tables, CTEs, LEFT JOINs and uncorrelated subqueries (T2),
     before the PR that declares each feature supported, so the differential tests compare them from that PR on.
+    Update (2026-10-31): stars among the select items went the other way round. The binder answered them first
+    (rule 5), and the next PR taught the generator, from a ninth random stream, and declared them.
   - Nothing derived from TPC-H is committed: no query text, data, answers or EXPLAIN output of the 22 queries.
 - **Module edges stay as they are:** joins live in plan and exec, statistics reach the planner through `plan::Table`,
   and no library is added.

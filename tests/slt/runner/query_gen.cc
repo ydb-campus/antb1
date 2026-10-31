@@ -735,6 +735,15 @@ constexpr unsigned kUnionPercent = 30;
 // Salt of the eighth random stream, which every draw that only a compound needs takes, so that a
 // query without one is the query this seed generated before the compound PR.
 constexpr uint64_t kUnionStreamSalt = 0x756E696F6E2D726EULL;
+// Share of the projections where a star may stand that take one among their items (`a, *`), of the
+// lone stars that take a second one (`*, t.*`), and of the stars written qualified (`t.*`) where
+// a FROM item can be named.
+constexpr unsigned kStarItemPercent = 30;
+constexpr unsigned kSecondStarPercent = 25;
+constexpr unsigned kQualifiedStarPercent = 40;
+// Salt of the ninth random stream, which every draw that only a star item or a qualified star needs
+// takes, so that a query with neither is the query this seed generated before the stars PR.
+constexpr uint64_t kStarStreamSalt = 0x737461722D726E67ULL;
 
 std::optional<std::size_t> ColumnIndex(const GenTable& t, std::string_view name) {
   const auto it = std::ranges::find_if(
@@ -919,7 +928,7 @@ class Builder {
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
-          FeatureSet allowed)
+          Rng& star_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -929,6 +938,7 @@ class Builder {
         substring_rng_(substring_rng),
         corr_rng_(corr_rng),
         union_rng_(union_rng),
+        star_rng_(star_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1505,7 +1515,8 @@ class Builder {
       }
     }
     // SELECT * reads every column of every binding (a column of several bindings needs no
-    // qualifier there).
+    // qualifier there). A star among other items, or a qualified one, stands only where a lone one
+    // could (SelectList), so it reads no column the lone one could not.
     const bool star_ok = allowed_.Has(Feature::kStar) && columns > 0 && !from.other_columns &&
                          usable == columns &&
                          (from.rows <= kStarMaxRows || allowed_.Has(Feature::kLimit));
@@ -1570,9 +1581,10 @@ class Builder {
     key_positions_.clear();
     constant_positions_.clear();
     aggregate_emitted_ = false;
+    starred_ = false;
     EmitWith(from);
     Keyword("SELECT");
-    SelectList(shape, from, cols, numeric, aggs, selected_keys);
+    SelectList(shape, star_ok, from, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
     EmitFrom(from);
     Where(from.where_keys);
@@ -1605,7 +1617,9 @@ class Builder {
     }
     const bool having = Having(shape, from.rows, cols, numeric, aggs, keys);
     const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
-    const bool limited = Limit(shape == Shape::kStar && from.rows > kStarMaxRows);
+    // Any star of the select list over more than kStarMaxRows rows takes a LIMIT, as a lone one
+    // does: the guard is FROM's bound, even for a qualified star of a smaller binding.
+    const bool limited = Limit(starred_ && from.rows > kStarMaxRows);
     const bool offset = Offset(limited);
     if (allowed_.Has(Feature::kSemicolon) && rng_.Percent(15)) {
       used_.Add(Feature::kSemicolon);
@@ -1625,18 +1639,24 @@ class Builder {
     return q;
   }
 
-  // `keys`: GROUP BY keys to select too, before or after the aggregates.
-  void SelectList(Shape shape, const FromList& from, const std::vector<const GenColumn*>& cols,
+  // `keys`: GROUP BY keys to select too, before or after the aggregates. `star_ok`: a star may
+  // stand in the list (QueryFrom). Shape::kStar writes the lone one; now and then, drawn from
+  // star_rng_ alone, a second star follows it, or a projection takes one among its items.
+  void SelectList(Shape shape, bool star_ok, const FromList& from,
+                  const std::vector<const GenColumn*>& cols,
                   const std::vector<const GenColumn*>& numeric, const std::vector<Agg>& aggs,
                   const std::vector<const GenColumn*>& keys) {
+    // A star next to another item makes a list of several items, which needs both features.
+    const bool star_items =
+        star_ok && allowed_.Has(Feature::kStarItems) && allowed_.Has(Feature::kMultipleItems);
     if (shape == Shape::kStar) {
-      used_.Add(Feature::kStar);
-      for (const Binding& b : from.bindings) {
-        for (const auto& c : b.columns) {
-          used_.Add(TypeFeature(c.kind));
-        }
+      Star(from);
+      if (star_items && star_rng_.Percent(kSecondStarPercent)) {
+        used_.Add(Feature::kStarItems);
+        used_.Add(Feature::kMultipleItems);
+        Symbol(",");
+        Star(from);
       }
-      Symbol("*");
       return;
     }
     std::size_t items = 1;
@@ -1644,7 +1664,23 @@ class Builder {
       used_.Add(Feature::kMultipleItems);
       items = 2 + rng_.Below(2);
     }
+    // A star before item `star_at`, or after the last one (`star_at == items`). A projection only:
+    // in an aggregate query every column a star reads would have to be a GROUP BY key.
+    std::optional<std::size_t> star_at;
+    if (shape == Shape::kColumns && star_items && star_rng_.Percent(kStarItemPercent)) {
+      star_at = star_rng_.Below(items + 1);
+    }
     std::size_t emitted = 0;
+    const auto star_item = [&] {
+      if (emitted++ > 0) {
+        Symbol(",");
+      }
+      used_.Add(Feature::kStarItems);
+      used_.Add(Feature::kMultipleItems);
+      Star(from);
+    };
+    // No position after a star: a position counts the star's columns, and MakeOrderedQuery
+    // declines one at or after a star (it would compare an ORDER BY's ties in exact order).
     const auto emit_keys = [&] {
       for (const auto* key : keys) {
         if (emitted++ > 0) {
@@ -1652,8 +1688,10 @@ class Builder {
         }
         used_.Add(Feature::kColumns);
         Column(*key);
-        key_positions_.emplace_back(key, emitted);
-        order_positions_.push_back(emitted);
+        if (!starred_) {
+          key_positions_.emplace_back(key, emitted);
+          order_positions_.push_back(emitted);
+        }
       }
     };
     const bool keys_first = rng_.Percent(60);
@@ -1661,6 +1699,9 @@ class Builder {
       emit_keys();
     }
     for (std::size_t i = 0; i < items; ++i) {
+      if (star_at == i) {
+        star_item();
+      }
       if (emitted++ > 0) {
         Symbol(",");
       }
@@ -1692,7 +1733,9 @@ class Builder {
         } else {
           tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::string(constant)});
         }
-        constant_positions_.push_back(emitted);
+        if (!starred_) {
+          constant_positions_.push_back(emitted);
+        }
       } else if (shape == Shape::kColumns) {
         const GenColumn& c = *rng_.Pick(cols);
         std::optional<bool> exact;
@@ -1743,13 +1786,57 @@ class Builder {
         }
         tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::move(alias)});
       }
-      if (orderable) {
+      if (orderable && !starred_) {
         order_positions_.push_back(emitted);
       }
+    }
+    if (star_at == items) {
+      star_item();
     }
     if (!keys_first) {
       emit_keys();
     }
+  }
+
+  // One star of the select list: `*`, which reads every FROM item, or now and then `<name>.*`,
+  // which reads one (ADR 0022 rule 5). The qualifier is rule 1's name of an item whose name the
+  // generator holds (KnowsRuleOneName), written as an identifier token like any other name, and
+  // never through Column(), which would record kQualifiedName and draw from join_rng_. Records
+  // kStar and the type of every column the star reads, and kQualifiedStar for a qualifier.
+  void Star(const FromList& from) {
+    std::vector<const Binding*> nameable;
+    if (allowed_.Has(Feature::kQualifiedStar)) {
+      for (const Binding& b : from.bindings) {
+        if (KnowsRuleOneName(b)) {
+          nameable.push_back(&b);
+        }
+      }
+    }
+    const Binding* named = !nameable.empty() && star_rng_.Percent(kQualifiedStarPercent)
+                               ? nameable[star_rng_.Below(nameable.size())]
+                               : nullptr;
+    used_.Add(Feature::kStar);
+    for (const Binding& b : from.bindings) {
+      if (named == nullptr || &b == named) {
+        for (const auto& c : b.columns) {
+          used_.Add(TypeFeature(c.kind));
+        }
+      }
+    }
+    if (named != nullptr) {
+      used_.Add(Feature::kQualifiedStar);
+      tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = named->name});
+      Symbol(".");
+    }
+    Symbol("*");
+    starred_ = true;
+  }
+
+  // Whether Binding::name is rule 1's name of `b`: an alias, a table's name, a nested block's name,
+  // or the file name of a path that names its table. A table read by path under another name (a
+  // glob, say) is named by its path's text, which TryTableAs does not keep.
+  static bool KnowsRuleOneName(const Binding& b) {
+    return !b.by_path || b.aliased || PathNamesTable(*b.table);
   }
 
   // A select item's aggregate argument: a number for SUM and AVG, now and then a DATE for AVG
@@ -3691,6 +3778,7 @@ class Builder {
   Rng& substring_rng_;  // the draws that only substring needs
   Rng& corr_rng_;       // the draws that only a correlated subquery needs
   Rng& union_rng_;      // the draws that only a compound needs
+  Rng& star_rng_;       // the draws that only a star item or a qualified star needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3710,6 +3798,7 @@ class Builder {
   std::vector<std::pair<const GenColumn*, std::size_t>> key_positions_;  // selected GROUP BY keys
   std::vector<std::size_t> constant_positions_;  // positions of constant items
   bool aggregate_emitted_ = false;  // the select list has an aggregate (constants alone: rows)
+  bool starred_ = false;            // the select list has a star: positions stop there
 };
 
 }  // namespace
@@ -3892,8 +3981,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng substring_rng(Mix(seed ^ kSubstringStreamSalt));
   Rng corr_rng(Mix(seed ^ kCorrelatedStreamSalt));
   Rng union_rng(Mix(seed ^ kUnionStreamSalt));
+  Rng star_rng(Mix(seed ^ kStarStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, options.supported)
+               union_rng, star_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -3913,11 +4003,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng substring_rng(Mix(state ^ kSubstringStreamSalt));
   Rng corr_rng(Mix(state ^ kCorrelatedStreamSalt));
   Rng union_rng(Mix(state ^ kUnionStreamSalt));
+  Rng star_rng(Mix(state ^ kStarStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, allowed)
+                             corr_rng, union_rng, star_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

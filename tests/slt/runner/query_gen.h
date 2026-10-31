@@ -24,15 +24,17 @@
 // type (no implicit casts), doubles only get literals that both engines convert to the same double,
 // FLOAT columns (results are DOUBLE on antb1 only, divergence D11) are never referenced, columns
 // read as DATE through the clickbench option are never used with FROM '<path>' (DuckDB reads the
-// raw file there), SELECT * on a large table always has a LIMIT, and a DECIMAL column is only
-// compared with literals of its own digits and with columns of numbers whose common type with it
-// has at most 38 digits, which keep DuckDB's common DECIMAL type within 38 digits (divergence D13),
-// or with numbers DuckDB types as DOUBLE (an exponent: compared in DOUBLE, never next to an integer
-// column, divergence D7); its CASE values never fail to cast to DuckDB's CASE type, and under an
-// aggregate keep its scale. DECIMAL SUM, AVG and arithmetic (an integer or decimal literal,
-// DuckDB's capped types; / // % too, % beyond 38 digits only as a select item) stay within their
-// types over the data, since an overflow fails both engines, and SUM and AVG never add inexact
-// doubles a division made, whose sum's rounding follows the order of the additions.
+// raw file there), a select list with a star (`*`, `t.*`, among other items or alone) on a large
+// table always has a LIMIT, a star's qualifier is its FROM item's rule-1 name (ADR 0022), and a
+// DECIMAL column is only compared with literals of its own digits and with columns of numbers
+// whose common type with it has at most 38 digits, which keep DuckDB's common DECIMAL type within
+// 38 digits (divergence D13), or with numbers DuckDB types as DOUBLE (an exponent: compared in
+// DOUBLE, never next to an integer column, divergence D7); its CASE values never fail to cast to
+// DuckDB's CASE type, and under an aggregate keep its scale. DECIMAL SUM, AVG and arithmetic (an
+// integer or decimal literal, DuckDB's capped types; / // % too, % beyond 38 digits only as a
+// select item) stay within their types over the data, since an overflow fails both engines, and SUM
+// and AVG never add inexact doubles a division made, whose sum's rounding follows the order of the
+// additions.
 //
 // Over tables with refs (GenTable::refs), a query that may use a join feature (kCommaJoin,
 // kJoinOn) now and then joins 2 or 3 tables along them (ADR 0022), written as commas, CROSS JOIN
@@ -126,7 +128,7 @@ struct GenTable {
   std::string path;  // the FROM '<path>' form (a file or a glob); empty: by name only
   int64_t rows = 0;
   std::vector<GenColumn> columns;
-  bool other_columns = false;  // columns of types the generator skips: no SELECT *
+  bool other_columns = false;  // columns of types the generator skips: no star
   std::vector<GenRef> refs;    // the refs joins may follow (the generator checks their columns)
 };
 
