@@ -1144,7 +1144,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     return found;
   };
   for (const sql::SelectItem& item : stmt.items) {
-    check_columns(item.expr, kNone);
+    if (const sql::SelectExpr* expr = item.expr()) {
+      check_columns(*expr, kNone);
+    }
   }
   bool condition = false;  // a WHERE or ON conjunct that is no key
   for (std::size_t k = 0; k < stmt.from.size(); ++k) {
@@ -1278,7 +1280,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     });
   };
   for (const sql::SelectItem& item : stmt.items) {
-    comparisons(item.expr);
+    if (const sql::SelectExpr* expr = item.expr()) {
+      comparisons(*expr);
+    }
   }
   for (const sql::FromItem& item : stmt.from) {
     for (const sql::Expr& conjunct : item.on) {
@@ -1288,7 +1292,7 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   for (const sql::Expr& conjunct : stmt.where) {
     comparisons(conjunct);
   }
-  if (stmt.star) {
+  if (std::ranges::any_of(stmt.items, [](const sql::SelectItem& item) { return item.star(); })) {
     EXPECT_TRUE(stmt.limit.has_value() || q.row_bound <= 50) << "bound " << q.row_bound;
     cov.star_without_limit += stmt.limit.has_value() ? 0 : 1;
     EXPECT_FALSE(any_path && std::ranges::any_of(items,
@@ -1417,12 +1421,15 @@ void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& o
 }
 
 void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (const sql::CommonTableExpr& cte : stmt.with) {
     DeepSubqueries(*cte.query, out);
   }
   for (const sql::SelectItem& item : stmt.items) {
-    DeepSubqueries(item.expr, out);
+    if (const sql::SelectExpr* expr = item.expr()) {
+      DeepSubqueries(*expr, out);
+    }
   }
   for (const sql::FromItem& item : stmt.from) {
     if (const auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
@@ -1501,8 +1508,8 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
   // The block: one named table, one output column, and nothing else.
   const sql::SelectStatement& block = *sub.query;
   EXPECT_TRUE(block.with.empty());
-  EXPECT_FALSE(block.star);
   EXPECT_EQ(block.items.size(), 1U);
+  EXPECT_EQ(block.items.at(0).star(), nullptr);
   EXPECT_TRUE(block.where.empty());
   EXPECT_TRUE(block.group_by.empty());
   EXPECT_TRUE(block.having.empty());
@@ -1520,7 +1527,7 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
 
   // Uncorrelated: every reference inside the block is unqualified and a column of the block's own
   // table. A qualifier, or a name that table does not have, would reach the outer query.
-  ForEachNode(block.items.front().expr, [&](const sql::Expr& node) {
+  ForEachNode(*block.items.front().expr(), [&](const sql::Expr& node) {
     if (const sql::ColumnRef* c = AsColumn(node)) {
       EXPECT_TRUE(c->qualifier.empty()) << c->qualifier << "." << c->name << ": correlated";
       EXPECT_TRUE(HasColumn(*inner, c->name)) << c->name << ": not a column of " << inner->name;
@@ -1555,7 +1562,7 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
         }))
         << probe->name << ": no FROM item has the probe";
     // An IN block selects a plain column, so it records no aggregate feature of its own.
-    EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(block.items.front().expr));
+    EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(*block.items.front().expr()));
     EXPECT_TRUE(q.features.Has(Feature::kInSubquery));
     return;
   }
@@ -1565,7 +1572,7 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
   EXPECT_FALSE(sub.operand.has_value());
   EXPECT_TRUE(q.features.Has(Feature::kScalarSubquery));
   // A scalar subquery's block aggregates, so it yields exactly one row whatever the data.
-  const auto* call = std::get_if<sql::AggregateCall>(&block.items.front().expr);
+  const auto* call = std::get_if<sql::AggregateCall>(&*block.items.front().expr());
   ASSERT_NE(call, nullptr) << "a scalar subquery's block aggregates";
   EXPECT_FALSE(call->distinct);
   cov.count_star += call->kind == sql::AggKind::kCountStar ? 1 : 0;
@@ -1685,7 +1692,7 @@ TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
     const auto reads = [](const sql::SelectStatement& block) {
       std::vector<std::string> names;
       for (const sql::SelectItem& select_item : block.items) {
-        const auto* column = std::get_if<sql::ColumnRef>(&select_item.expr);
+        const auto* column = std::get_if<sql::ColumnRef>(select_item.expr());
         names.push_back(column == nullptr ? "?" : Lower(column->name));
       }
       const sql::TableRef* table = block.from.at(0).table();

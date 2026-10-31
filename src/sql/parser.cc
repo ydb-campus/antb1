@@ -34,7 +34,8 @@
 //   cte         := name [columns] AS '(' query ')'
 //   block       := SELECT select_list FROM from_list [WHERE expr] [GROUP BY expr (',' expr)*]
 //                  [HAVING expr]
-//   select_list := '*' | expr [[AS] identifier] (',' expr [[AS] identifier])*
+//   select_list := select_item (',' select_item)*
+//   select_item := '*' | name '.' '*' | expr [[AS] identifier]
 //   order_item  := expr [ASC | DESC] [NULLS (FIRST | LAST)]
 //   from_list   := from_item (',' from_item | CROSS JOIN from_item | [INNER] JOIN from_item ON expr
 //                  | LEFT [OUTER] JOIN from_item ON expr)*
@@ -177,7 +178,7 @@ constexpr auto kUnsupportedOperatorKeywords = std::to_array<Construct>({
 constexpr auto kNegatableOperators =
     std::to_array<std::string_view>({"BETWEEN", "ILIKE", "IN", "LIKE", "SIMILAR"});
 
-// Modifiers of SELECT * (DuckDB).
+// Modifiers of a star select item (DuckDB), `*` or `t.*`.
 constexpr auto kStarModifiers = std::to_array<Construct>({
     {.keyword = "EXCLUDE", .message = "SELECT * EXCLUDE is not supported"},
     {.keyword = "GLOB", .message = "SELECT * GLOB is not supported"},
@@ -765,10 +766,8 @@ class Parser {
 
   // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
   static SelectStatement TakeBlock(SelectStatement& stmt) {
-    static_assert(kSelectStatementFields == 19, "revisit this walk");
+    static_assert(kSelectStatementFields == 17, "revisit this walk");
     SelectStatement block;
-    block.star = std::exchange(stmt.star, false);
-    block.star_span = std::exchange(stmt.star_span, {});
     block.items = std::exchange(stmt.items, {});
     block.from = std::exchange(stmt.from, {});
     block.where = std::exchange(stmt.where, {});
@@ -933,7 +932,10 @@ class Parser {
     if (auto status = ParseSelectList(stmt); !status) {
       return status;
     }
-    if (auto status = ExpectFrom(stmt.star); !status) {
+    static_assert(kSelectItemKinds == 2, "revisit this walk");
+    const bool has_star =
+        std::ranges::any_of(stmt.items, [](const SelectItem& item) { return item.star(); });
+    if (auto status = ExpectFrom(has_star); !status) {
       return status;
     }
     if (auto status = ParseFromList(stmt); !status) {
@@ -1000,18 +1002,6 @@ class Parser {
     if (first.IsKeyword("ALL")) {
       return Unsupported(first.span, "SELECT ALL is not supported");
     }
-    if (first.kind == TokenKind::kStar) {
-      stmt.star_span = Take().span;
-      stmt.star = true;
-      const Token& next = Peek();
-      if (next.kind == TokenKind::kComma) {
-        return Unsupported(next.span, "combining '*' with other select items is not supported");
-      }
-      if (auto construct = Find(kStarModifiers, KeywordOf(next)); construct.has_value()) {
-        return Unsupported(next.span, *construct);
-      }
-      return {};
-    }
     while (true) {
       auto item = ParseSelectItem();
       if (!item) {
@@ -1029,16 +1019,15 @@ class Parser {
   }
 
   Expected<SelectItem> ParseSelectItem() {
-    const Token& first = Peek();
-    if (first.kind == TokenKind::kStar) {
-      return Unsupported(first.span, "combining '*' with other select items is not supported");
+    if (StartsStar()) {
+      return ParseStar();
     }
     auto expr = ParseExpr(Context::kSelect);
     if (!expr) {
       return std::unexpected(std::move(expr.error()));
     }
-    SelectItem item{.expr = std::move(*expr), .alias = {}, .span = {}};
-    item.span = item.expr.span();
+    const SourceSpan expr_span = expr->span();
+    SelectItem item{.value = std::move(*expr), .alias = {}, .span = expr_span};
     const Token& next = Peek();
     if (next.IsKeyword("AS")) {
       Take();
@@ -1063,6 +1052,134 @@ class Parser {
     item.alias = std::move(alias.text);
     item.span = Cover(item.span, alias.span);
     return item;
+  }
+
+  // Whether the select item at the current token is a star: `*`, or a qualifier, '.' and `*`. The
+  // qualifier is a word that ParseIdentifierPrimary takes for a column's qualifier, so a keyword
+  // before `.*` is refused or rejected there exactly as before `.x` (DuckDB parses `kw.*` wherever
+  // it parses `kw.x`).
+  bool StartsStar() {
+    const Token& first = Peek();
+    if (first.kind == TokenKind::kStar) {
+      return true;
+    }
+    if (!IsName(first) || Contains(kAliasKeywords, KeywordOf(first))) {
+      return false;
+    }
+    return PeekAt(1).kind == TokenKind::kDot && PeekAt(2).kind == TokenKind::kStar;
+  }
+
+  // A star select item (StartsStar), which the binder expands. DuckDB's modifiers and an alias
+  // after it are unsupported; anything else after it is left to ExpectFrom, a syntax error, as
+  // DuckDB rejects a star as an operand (`* + 1`, `t.* = 1`, `* ISNULL`).
+  Expected<SelectItem> ParseStar() {
+    SelectStar star;
+    if (Peek().kind != TokenKind::kStar) {
+      Token qualifier = Take();  // by value: Take() invalidates what Peek() returned
+      Take();                    // '.'
+      star.qualifier = std::move(qualifier.text);
+      star.qualifier_quoted = qualifier.kind == TokenKind::kQuotedIdentifier;
+      star.span = qualifier.span;
+    }
+    const SourceSpan asterisk = Take().span;
+    star.span = star.qualifier.empty() ? asterisk : Cover(star.span, asterisk);
+    if (auto status = RejectStarModifier(); !status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    if (auto status = RejectStarAlias(); !status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    const SourceSpan span = star.span;
+    return SelectItem{.value = std::move(star), .alias = {}, .span = span};
+  }
+
+  // DuckDB's modifiers after a star (kStarModifiers): unsupported. A pattern -- LIKE, ILIKE, GLOB
+  // or SIMILAR TO, and LIKE, ILIKE or SIMILAR TO after NOT -- is one only before a constant, which
+  // DuckDB requires ("Pattern applied to a star expression must be a constant"): a string of any
+  // kind, or one in parentheses, whose insides are not looked at. Anything else is the syntax
+  // error ExpectFrom gives at the modifier's first word, as `* NOT IN (1)` and `* LIKE b` are
+  // errors in DuckDB too.
+  Status RejectStarModifier() {
+    const Token& first = Peek();
+    const std::string word = KeywordOf(first);
+    const auto construct = Find(kStarModifiers, word);
+    if (!construct.has_value()) {
+      return {};
+    }
+    const SourceSpan span = first.span;
+    if (word == "EXCLUDE" || word == "REPLACE" || word == "RENAME") {
+      return Unsupported(span, *construct);
+    }
+    std::string op = word;  // the pattern's operator, and its tokens
+    std::size_t words = 1;
+    if (word == "NOT") {
+      op = KeywordOf(PeekAt(1));
+      if (op != "LIKE" && op != "ILIKE" && op != "SIMILAR") {
+        return {};
+      }
+      words = 2;
+    }
+    if (op == "SIMILAR") {
+      if (!PeekAt(words).IsKeyword("TO")) {
+        return {};
+      }
+      ++words;
+    }
+    // The pattern lies past the lookahead after the longest operator, so the operator's words but
+    // its last are taken: after a star's operator only an error can follow anyway.
+    const std::string found = Describe(first);
+    for (std::size_t i = 1; i < words; ++i) {
+      Take();
+    }
+    if (PeekAt(1).kind == TokenKind::kString || PeekAt(1).kind == TokenKind::kLeftParen ||
+        PrefixedStringAt(1) != PrefixedString::kNone || IsStringPrefix(PeekAt(1), PeekAt(2))) {
+      return Unsupported(span, "SELECT * " + std::string(word == "NOT" ? "NOT " : "") + op +
+                                   (op == "SIMILAR" ? " TO" : "") + " is not supported");
+    }
+    if (words > 1) {
+      return Syntax(span, "expected ',' or FROM, found " + found);
+    }
+    return {};
+  }
+
+  // An alias after a star (`* AS x`, `* x`, `t.* AS ''`), which DuckDB gives every column the star
+  // expands to: unsupported -- but only a complete one, before ',' or FROM, so that a missing comma
+  // (`t.* u.*`) or a stray word (`* a b`) stays the syntax error DuckDB gives. After AS an alias is
+  // a name, any keyword or any string (an escape or a dollar-quoted one too); without AS, a name
+  // but ISNULL, NOTNULL and AT, which are operators in DuckDB, and a letter before a string (E'x'),
+  // which makes one string.
+  Status RejectStarAlias() {
+    if (Peek().IsKeyword("AS")) {
+      const Token as = Take();  // after a star's AS only an alias or an error can follow
+      if (PrefixedStringAt() != PrefixedString::kNone) {
+        // An escape or a dollar-quoted string spans tokens of its own, past the lookahead: an alias
+        // whatever follows it, as a FROM item's is.
+        return Unsupported(Cover(as.span, PeekAt(1).span), "an alias after '*' is not supported");
+      }
+      std::size_t tokens = 0;  // the alias's
+      if (const Token& alias = Peek(); alias.kind == TokenKind::kIdentifier ||
+                                       alias.kind == TokenKind::kQuotedIdentifier ||
+                                       alias.kind == TokenKind::kString) {
+        tokens = 1;
+      }
+      const Token& after = PeekAt(tokens);
+      if (tokens == 0 || (after.kind != TokenKind::kComma && !after.IsKeyword("FROM"))) {
+        return Syntax(as.span, "expected ',' or FROM, found " + Describe(as));
+      }
+      return Unsupported(Cover(as.span, PeekAt(tokens - 1).span),
+                         "an alias after '*' is not supported");
+    }
+    const Token& word = Peek();
+    const std::string keyword = KeywordOf(word);
+    if (!IsName(word) || keyword == "ISNULL" || keyword == "NOTNULL" || keyword == "AT" ||
+        PrefixedStringAt() != PrefixedString::kNone || IsStringPrefix(word, PeekAt(1))) {
+      return {};
+    }
+    const Token& after = PeekAt(1);
+    if (after.kind != TokenKind::kComma && !after.IsKeyword("FROM")) {
+      return {};
+    }
+    return Unsupported(Peek().span, "an alias after '*' is not supported");
   }
 
   // Tokens that may follow a complete list (select list, FROM list, GROUP BY, ORDER BY); a comma
@@ -1607,8 +1724,8 @@ class Parser {
     Token qualifier = Take();
     Take();  // '.'
     const Token& name = Peek();
-    if (name.kind == TokenKind::kStar) {
-      return Unsupported(name.span, "qualified * (t.*) is not supported");
+    if (name.kind == TokenKind::kStar) {  // a select item's own `t.*` is ParseStar's
+      return Unsupported(name.span, "qualified * (t.*) is only supported as a select item");
     }
     if (name.kind == TokenKind::kIdentifier && !IsName(name)) {
       return Unsupported(name.span, "the reserved word " + KeywordOf(name) +
@@ -2179,11 +2296,16 @@ class Parser {
     return tree;
   }
 
-  Status ExpectFrom(bool star) {
+  Status ExpectFrom(bool has_star) {
     const Token& token = Peek();
     if (token.IsKeyword("FROM")) {
       Take();
       return {};
+    }
+    // A star with nothing to expand: DuckDB's bind error "* expression without FROM clause", ahead
+    // of the refusals of a block without FROM below.
+    if (has_star && EndsList(token)) {
+      return Syntax(token.span, "'*' needs a FROM clause, found " + Describe(token));
     }
     if (block_end_ == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return Unsupported(token.span, "SELECT without FROM is not supported");  // DuckDB: (SELECT 1)
@@ -2199,8 +2321,7 @@ class Parser {
         IsClauseKeyword(keyword)) {
       return Unsupported(token.span, "SELECT without FROM is not supported");
     }
-    return Syntax(token.span, std::string(star ? "expected FROM" : "expected ',' or FROM") +
-                                  ", found " + Describe(token));
+    return Syntax(token.span, "expected ',' or FROM, found " + Describe(token));
   }
 
   // ---- the FROM list ----
@@ -2880,7 +3001,7 @@ class Parser {
   // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
   // `query`'s ORDER BY, LIMIT and OFFSET.
   Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
-    static_assert(kSelectStatementFields == 19, "revisit this walk");
+    static_assert(kSelectStatementFields == 17, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};

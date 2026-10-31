@@ -100,6 +100,14 @@ bool AliasHides(const Binding& binding, std::string_view qualifier) {
   return !binding.Named(unaliased) && AsciiLower(qualifier) == AsciiLower(unaliased);
 }
 
+// The hint that an alias of one of `visible` hides `qualifier` (rule 2), or nothing.
+std::string AliasHint(std::span<const Binding> visible, std::string_view qualifier) {
+  const auto hiding = std::ranges::find_if(
+      visible, [qualifier](const Binding& b) { return AliasHides(b, qualifier); });
+  return hiding != visible.end() ? std::format(" (the alias '{}' hides it)", hiding->name())
+                                 : std::string();
+}
+
 // Why `ref` resolves nowhere in the bindings before `end`, for its bind error: the name it lacks,
 // and the hints that a later FROM item, which an ON does not see, has it, or that an alias hides a
 // table's name.
@@ -131,12 +139,7 @@ std::string MissingMessage(const std::vector<Binding>& bindings, const sql::Colu
           later, [&](const Binding& b) { return named(b) || AliasHides(b, ref.qualifier); })) {
     message += kLaterHint;
   }
-  const auto hiding = std::ranges::find_if(
-      visible, [&ref](const Binding& b) { return AliasHides(b, ref.qualifier); });
-  if (hiding != visible.end()) {
-    message += std::format(" (the alias '{}' hides it)", hiding->name());
-  }
-  return message;
+  return message + AliasHint(visible, ref.qualifier);
 }
 
 // The bind error of an ambiguous `ref` (Lookup::Outcome::kAmbiguous).
@@ -211,6 +214,7 @@ Binding Binding::OfTable(std::string name, TableSource source, ColumnIdSource& i
       column.type = *type;
     } else {
       column.unsupported_type = field.type()->ToString();
+      column.is_struct = field.type()->id() == arrow::Type::STRUCT;
     }
     columns.push_back(std::move(column));
   }
@@ -375,6 +379,42 @@ std::optional<Scope::StarConflict> Scope::FindStarConflict() const {
     }
   }
   return std::nullopt;
+}
+
+arrow::Result<std::size_t> Scope::StarBinding(std::string_view qualifier, SourceSpan span) const {
+  std::optional<std::size_t> named;
+  for (std::size_t b = 0; b < bindings_.size(); ++b) {
+    if (!bindings_[b].Named(qualifier)) {
+      continue;
+    }
+    if (named.has_value()) {
+      return BindError(
+          std::format("'{}.*' is ambiguous: two FROM items are named '{}'", qualifier, qualifier),
+          span);
+    }
+    named = b;
+  }
+  if (named.has_value()) {
+    return *named;
+  }
+  // No FROM item: DuckDB then reads the qualifier as a column, which it expands only as a STRUCT.
+  std::size_t columns = 0;
+  bool is_struct = false;
+  for (const Binding& binding : bindings_) {
+    const NameMatches matches = binding.Match(qualifier);
+    for (const std::optional<std::size_t> match : {matches.first, matches.second}) {
+      if (match.has_value()) {
+        ++columns;
+        is_struct = binding.columns()[*match].is_struct;
+      }
+    }
+  }
+  if (columns == 1 && is_struct) {
+    return UnsupportedError(std::format("'{}.*' over a STRUCT column is not supported", qualifier),
+                            span);
+  }
+  return BindError(
+      std::format("no FROM item is named '{}'", qualifier) + AliasHint(bindings_, qualifier), span);
 }
 
 std::optional<ColumnLocation> Scope::Find(ColumnId id) const {

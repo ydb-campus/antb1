@@ -12,8 +12,9 @@ namespace antb1::sql {
 // a column alias list (WITH "c"("x") AS (...), FROM (...) AS "s"("x")), JOIN as INNER JOIN and
 // LEFT OUTER JOIN as LEFT JOIN, numbers as written, expressions in the order written with only the
 // parentheses that the operator precedence needs (a unary minus always takes them), casts as
-// CAST(x AS T) (also x::T), a compound's blocks joined by UNION ALL with its ORDER BY, LIMIT and
-// OFFSET after the last one. For every statement Parse() returns, Parse(ToSql(s)) is
+// CAST(x AS T) (also x::T), a star where it stands among the select items (`*`, or `t.*` with its
+// qualifier quoted only when it was), a compound's blocks joined by UNION ALL with its ORDER BY,
+// LIMIT and OFFSET after the last one. For every statement Parse() returns, Parse(ToSql(s)) is
 // EqualIgnoringSpans to s and ToSql is idempotent.
 std::string ToSql(const SelectStatement& stmt);
 

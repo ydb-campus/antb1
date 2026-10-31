@@ -1,0 +1,1 @@
+SELECT a, * EXCLUDE (b), t.* REPLACE (a + 1 AS a) FROM t

@@ -109,6 +109,10 @@ enum class Feature : std::uint8_t {
   // A compound (ADR 0036): blocks joined by UNION ALL, as a derived table's or a CTE's query; X2
   // parses and generates it, and X3 answers and declares it.
   kUnionAll,  // (SELECT ... UNION ALL SELECT ...) as a nested query
+  // Stars among the select items: the binder answers them, and the generator does not write them
+  // yet (kGeneratorPending).
+  kStarItems,      // a star next to another select item, or a second star: SELECT a, *
+  kQualifiedStar,  // SELECT t.*
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -245,6 +249,10 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_aggregate";
     case Feature::kUnionAll:
       return "union_all";
+    case Feature::kStarItems:
+      return "star_items";
+    case Feature::kQualifiedStar:
+      return "qualified_star";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -321,8 +329,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // ADR 0022's T2 took derived tables and WITH lists out of it, T2c LEFT JOIN and T2b the two
 // uncorrelated subquery forms, and ADR 0023's S5 substring. A Feature added for grammar the
 // generator cannot write yet goes in, and the PR that teaches it takes it out again -- in the same
-// commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly.
-inline constexpr FeatureSet kGeneratorPending = {};
+// commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly. Stars among
+// the select items wait here for the PR after the one that answers them.
+inline constexpr FeatureSet kGeneratorPending = {Feature::kStarItems, Feature::kQualifiedStar};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

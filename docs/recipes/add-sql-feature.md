@@ -44,7 +44,8 @@ at one layer.
   fields and assert nothing: `MakeOrderedQuery` in `tests/slt/runner/ordered_compare.cc` and `UnlimitedSql` in
   `tests/slt/runner/unordered_limit.cc`. A compound keeps its blocks in `set_operation` and has no
   block clauses of its own ([ADR 0036](../adr/0036-union-all.md)), so a walk over a block's clauses must visit its
-  blocks too.
+  blocks too. A new kind of select item (`sql::SelectItem::value`, an expression or a star today) fails the build the
+  same way at `kSelectItemKinds`, which every walk that tells the kinds apart asserts.
 - Parser: `src/sql/parser.cc` (recursive descent). Valid-looking SQL outside the subset returns
   `ParseError::Kind::kUnsupported` with the span of the first offending token; malformed SQL returns `kSyntax`.
 - Unparser: `src/sql/unparse.cc`. `ToSql` prints the canonical form, and `Parse(ToSql(ast))` must be equal to `ast`

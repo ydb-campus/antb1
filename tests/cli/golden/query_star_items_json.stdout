@@ -1,0 +1,4 @@
+[
+ {"x": 1, "zn_row": 0, "zn_id": 1, "zn_city": 1, "zn_parent": null, "label": "center", "zn_radius": 0.5, "ct_row": 0, "ct_id": 1, "label": "center", "ct_pop": 120000, "ct_row": 0, "ct_id": 1, "label": "center", "ct_pop": 120000},
+ {"x": 2, "zn_row": 1, "zn_id": 2, "zn_city": 2, "zn_parent": null, "label": "north", "zn_radius": 0.75, "ct_row": 1, "ct_id": 2, "label": "harbor", "ct_pop": 45000, "ct_row": 1, "ct_id": 2, "label": "harbor", "ct_pop": 45000}
+]

@@ -121,7 +121,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
      would round past 38 digits).
    - **The type refusal** is "UNION ALL of T1 and T2 values is not supported", T2 being the refused item's type, at
      the first select item in the query (the branch, then the column) that fails either check, or at its branch's
-     `*`.
+     `*`. Update (2026-10-31): at the `*` or `t.*` the column expands from, wherever the star stands among the
+     items.
    - **Casts.** A branch whose type differs gets one `Compute` of `WidenTo` casts, straight to the final type.
    - **Names and flags.** Names come from branch 0. `stored_as_float` is the AND over the branches.
    - **Answered:** a compound as a derived table's query, as a CTE's query, or as the whole statement.

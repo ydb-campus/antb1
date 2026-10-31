@@ -1,0 +1,4 @@
+antb1: bind error: no FROM item is named 'x'
+  at line 1, column 17
+  SELECT WatchID, x.* FROM t
+                  ^^^

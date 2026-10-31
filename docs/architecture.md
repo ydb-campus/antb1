@@ -121,7 +121,9 @@ steps (only step 7 uses more than one thread):
    name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else
    `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT flags). A derived
    table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
-   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9). A `UNION ALL` binds
+   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*` names a
+   FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT column
+   instead, whose fields DuckDB expands). A `UNION ALL` binds
    each of its blocks so, in its own CTE frame and scope, then folds their types into one `UnionAll` node, casting
    below it the blocks of another type ([ADR 0036](adr/0036-union-all.md)). Columns resolve there,
    an `ON` seeing only its

@@ -74,6 +74,7 @@ struct BindingColumn {
   std::optional<LogicalType> type;
   std::string unsupported_type;
   bool stored_as_float = false;  // a DOUBLE stored as FLOAT (Table::StoredAsFloat, divergence D11)
+  bool is_struct = false;  // a STRUCT, whose fields DuckDB's `name.*` expands (Scope::StarBinding)
 };
 
 // The columns of a binding that a name matches: the first two, in column order.
@@ -240,6 +241,14 @@ class Scope {
     std::string column;  // as the first binding declares it
   };
   [[nodiscard]] std::optional<StarConflict> FindStarConflict() const;
+
+  // The binding `qualifier.*` expands, as in DuckDB: the one binding of this block that
+  // `qualifier` names, never an enclosing one. A bind error at `span` when none is named so (with
+  // the hint that an alias hides the name) or when two or more are, whatever their columns; but
+  // kUnsupported when none is and exactly one column of this block has the name and is a STRUCT,
+  // whose fields DuckDB expands.
+  [[nodiscard]] arrow::Result<std::size_t> StarBinding(std::string_view qualifier,
+                                                       SourceSpan span) const;
 
   // Where column `id` is, if it is a binding's column (and not a computed one).
   [[nodiscard]] std::optional<ColumnLocation> Find(ColumnId id) const;

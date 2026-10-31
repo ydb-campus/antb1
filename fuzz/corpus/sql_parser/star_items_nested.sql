@@ -1,0 +1,1 @@
+WITH c AS (SELECT *, a FROM t) SELECT c.*, x.* FROM c, (SELECT u.* FROM u WHERE EXISTS (SELECT *, 1 FROM v WHERE v.k = u.k)) AS x UNION ALL SELECT *, 1 FROM w

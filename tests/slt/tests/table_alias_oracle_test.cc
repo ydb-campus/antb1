@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -142,6 +143,31 @@ TEST(TableAliasOracle, DuckDbReadsAKeywordAsATableAliasExactlyWhenAntb1Does) {
   EXPECT_GT(words, kPlaces.size() * 400);
   // The words that are aliases in neither engine are 105 of 489 in DuckDB 1.5.5.
   EXPECT_GT(aliases, 9U * 300U);
+}
+
+// A star's qualifier is read as a column's: for every DuckDB keyword, antb1 reads `kw.*` as a
+// select item, first or not, exactly as it reads `kw.x` -- parsed, unsupported or a syntax error
+// alike -- since DuckDB parses the one exactly where it parses the other.
+TEST(TableAliasOracle, AStarsQualifierIsReadAsAColumnsIs) {
+  const std::filesystem::path dir = std::filesystem::path(::testing::TempDir()) / "star_oracle";
+  std::filesystem::create_directories(dir);
+  auto duckdb = DuckDbEngine::Make({}, dir, dir);
+  ASSERT_TRUE(duckdb.has_value()) << duckdb.error();
+  auto result = (*duckdb)->Execute("SELECT keyword_name FROM duckdb_keywords() ORDER BY 1");
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  ASSERT_GT(result->rows.size(), 400U);
+  const auto reading = [](const std::string& sql) {
+    auto stmt = sql::Parse(sql);
+    return stmt.has_value() ? std::string("parsed")
+                            : "error kind " + std::to_string(std::to_underlying(stmt.error().kind));
+  };
+  for (const auto& row : result->rows) {
+    const std::string word = row.at(0).value_or("");
+    for (const std::string_view before : {"SELECT ", "SELECT 1, "}) {
+      const std::string star = std::string(before) + word + ".* FROM t";
+      EXPECT_EQ(reading(star), reading(std::string(before) + word + ".x FROM t")) << star;
+    }
+  }
 }
 
 }  // namespace

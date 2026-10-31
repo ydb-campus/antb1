@@ -1,0 +1,1 @@
+SELECT a, *, t.*, "T".*, u . /* c */ * FROM t AS "T", t, u WHERE a = 1 ORDER BY 1

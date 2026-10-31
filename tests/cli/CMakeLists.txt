@@ -98,6 +98,22 @@ antb1_add_cli_golden(
     --format
     json
 )
+# Stars among the select items: each expands where it stands, its columns under their declared names,
+# so a name repeats (a repeated key in json, as in DuckDB's CLI).
+set(_stars "SELECT z.zn_id AS x, *, c.* FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 2")
+set(_star_tables --table "zones=${_f}/star/zones.parquet" --table "cities=${_f}/star/cities.parquet")
+antb1_add_cli_golden(
+  query_star_items
+  ARGS query --threads 1 -c "${_stars}" ${_star_tables}
+)
+antb1_add_cli_golden(
+  query_star_items_csv
+  ARGS query --threads 1 -c "${_stars}" ${_star_tables} --format csv
+)
+antb1_add_cli_golden(
+  query_star_items_json
+  ARGS query --threads 1 -c "${_stars}" ${_star_tables} --format json
+)
 antb1_add_cli_golden(
   query_decimals_json
   ARGS
@@ -588,6 +604,20 @@ antb1_add_cli_golden(
   EXIT_CODE 1
   STDERR
   ARGS query --threads 1 -c "SELECT WatchID FROM t\nUNION ALL SELECT WatchID, Title FROM t" --table "${_t}"
+)
+# An alias after a star exits 4 (DuckDB gives it to every column the star expands to); a qualified
+# star names one FROM item of its own block, else DuckDB's bind error.
+antb1_add_cli_golden(
+  unsupported_star_alias
+  EXIT_CODE 4
+  STDERR
+  ARGS query --threads 1 -c "SELECT *, WatchID AS w, * AS x FROM t" --table "${_t}"
+)
+antb1_add_cli_golden(
+  error_bind_qualified_star
+  EXIT_CODE 1
+  STDERR
+  ARGS query --threads 1 -c "SELECT WatchID, x.* FROM t" --table "${_t}"
 )
 antb1_add_cli_golden(
   error_bind_column

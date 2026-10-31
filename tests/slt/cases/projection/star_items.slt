@@ -1,0 +1,411 @@
+# Stars among the select items, as in DuckDB: `*` expands every FROM item's columns in FROM order and `t.*` the
+# columns of the one FROM item named t, each where it stands, any number of times, next to any other items. Over the
+# star schema (tools/fixturegen/star.h).
+
+# ---- the inputs ----
+
+query IITI rowsort
+SELECT * FROM cities
+----
+0	1	center	120000
+1	2	harbor	45000
+2	3	hills	30000
+3	4	airport	NULL
+4	5	old town	8000
+5	6	outskirts	2500
+
+# ---- one table ----
+
+query IIITII rowsort
+SELECT ct_pop AS p, *, ct_id FROM cities
+----
+120000	0	1	center	120000	1
+2500	5	6	outskirts	2500	6
+30000	2	3	hills	30000	3
+45000	1	2	harbor	45000	2
+8000	4	5	old town	8000	5
+NULL	3	4	airport	NULL	4
+
+query IITIIITI rowsort
+SELECT *, * FROM cities WHERE ct_id <= 3
+----
+0	1	center	120000	0	1	center	120000
+1	2	harbor	45000	1	2	harbor	45000
+2	3	hills	30000	2	3	hills	30000
+
+query IITII rowsort
+SELECT cities.*, 1 FROM cities WHERE ct_id <= 3
+----
+0	1	center	120000	1
+1	2	harbor	45000	1
+2	3	hills	30000	1
+
+# A quoted qualifier names the FROM item in any case, and comments may stand around the dot.
+query IITI rowsort
+SELECT "CITIES".* FROM cities WHERE ct_id <= 2
+----
+0	1	center	120000
+1	2	harbor	45000
+
+query IITI rowsort
+SELECT cities . /* all */ * FROM cities WHERE ct_id <= 2
+----
+0	1	center	120000
+1	2	harbor	45000
+
+# ---- several FROM items ----
+
+# `*` gives every FROM item's columns in FROM order, `t.*` its own FROM item's wherever it stands.
+query IIIITRIITI rowsort
+SELECT * FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 3
+----
+0	1	1	NULL	center	0.5	0	1	center	120000
+1	2	2	NULL	north	0.75	1	2	harbor	45000
+2	3	3	NULL	south	1	2	3	hills	30000
+
+query IITIIIIITR rowsort
+SELECT c.*, z.* FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 3
+----
+0	1	center	120000	0	1	1	NULL	center	0.5
+1	2	harbor	45000	1	2	2	NULL	north	0.75
+2	3	hills	30000	2	3	3	NULL	south	1
+
+query ITIITIT rowsort
+SELECT z.zn_id, z.label, c.*, c.label FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 3
+----
+1	center	0	1	center	120000	center
+2	north	1	2	harbor	45000	harbor
+3	south	2	3	hills	30000	hills
+
+# A self-join's two sides, each by its alias.
+query IIIITRIIIITR rowsort
+SELECT a.*, b.* FROM zones AS a JOIN zones AS b ON a.zn_parent = b.zn_id WHERE a.zn_id <= 8
+----
+5	6	1	1	park	1.75	0	1	1	NULL	center	0.5
+6	7	2	2	market	2	1	2	2	NULL	north	0.75
+7	8	3	3	NULL	2.25	2	3	3	NULL	south	1
+
+# A path's FROM item is named by its file name, and a derived table without an alias unnamed_subquery.
+query IITI rowsort
+SELECT cities.* FROM '${FIXTURES}/star/cities.parquet' WHERE ct_id <= 2
+----
+0	1	center	120000
+1	2	harbor	45000
+
+query II rowsort
+SELECT unnamed_subquery.* FROM (SELECT ct_id, ct_pop FROM cities WHERE ct_id <= 2)
+----
+1	120000
+2	45000
+
+# ---- LEFT JOIN ----
+
+# The right side of a LEFT JOIN pads its star's columns with NULLs: a NULL key, a key no city has, and an empty
+# right side.
+query IIIITI rowsort
+SELECT z.zn_id, z.zn_city, c.* FROM zones AS z LEFT JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id >= 36
+----
+36	1	0	1	center	120000
+37	2	1	2	harbor	45000
+38	NULL	NULL	NULL	NULL	NULL
+39	9	NULL	NULL	NULL	NULL
+40	5	4	5	old town	8000
+
+query IIIITD rowsort
+SELECT t.tr_row, t.tr_promo, p.* FROM trips AS t LEFT JOIN promos AS p ON t.tr_promo = p.pm_id WHERE t.tr_row < 4
+----
+0	1	NULL	NULL	NULL	NULL
+1	NULL	NULL	NULL	NULL	NULL
+2	NULL	NULL	NULL	NULL	NULL
+3	NULL	NULL	NULL	NULL	NULL
+
+# ---- names read back ----
+
+# A derived table's or a CTE's names are made unique (x, x_1) after its alias list, so a star's duplicates read
+# back by those names.
+query IT rowsort
+SELECT zn_id, label_1 FROM (SELECT z.*, c.label FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id) AS s WHERE zn_id <= 3
+----
+1	center
+2	harbor
+3	hills
+
+query II rowsort
+SELECT x, ct_id_1 FROM (SELECT *, ct_id FROM cities) AS s(x) WHERE x <= 2
+----
+0	1
+1	2
+2	3
+
+query II rowsort
+WITH c AS (SELECT *, ct_id FROM cities) SELECT ct_id, ct_id_1 FROM c WHERE ct_id <= 2
+----
+1	1
+2	2
+
+# ---- positions, GROUP BY, UNION ALL, IN, EXISTS ----
+
+# Positions count every column a star expands to.
+query IIITI nosort
+SELECT ct_pop AS p, * FROM cities ORDER BY 3 DESC
+----
+2500	5	6	outskirts	2500
+8000	4	5	old town	8000
+NULL	3	4	airport	NULL
+30000	2	3	hills	30000
+45000	1	2	harbor	45000
+120000	0	1	center	120000
+
+query IITII nosort
+SELECT *, ct_id AS k FROM cities ORDER BY 5
+----
+0	1	center	120000	1
+1	2	harbor	45000	2
+2	3	hills	30000	3
+3	4	airport	NULL	4
+4	5	old town	8000	5
+5	6	outskirts	2500	6
+
+# In a grouped query every column of a star is a key.
+query IITII rowsort
+SELECT *, COUNT(*) FROM cities GROUP BY ct_row, ct_id, label, ct_pop
+----
+0	1	center	120000	1
+1	2	harbor	45000	1
+2	3	hills	30000	1
+3	4	airport	NULL	1
+4	5	old town	8000	1
+5	6	outskirts	2500	1
+
+query IITII rowsort
+SELECT *, COUNT(*) FROM cities GROUP BY 1, 2, 3, 4
+----
+0	1	center	120000	1
+1	2	harbor	45000	1
+2	3	hills	30000	1
+3	4	airport	NULL	1
+4	5	old town	8000	1
+5	6	outskirts	2500	1
+
+# UNION ALL counts a star's columns and folds their types.
+query IITI rowsort
+SELECT * FROM cities WHERE ct_id <= 2 UNION ALL SELECT ct_row, ct_id, label, ct_pop FROM cities WHERE ct_id = 6
+----
+0	1	center	120000
+1	2	harbor	45000
+5	6	outskirts	2500
+
+query IIITI rowsort
+SELECT 1 AS k, * FROM cities WHERE ct_id = 1 UNION ALL SELECT 2, * FROM cities WHERE ct_id = 2
+----
+1	0	1	center	120000
+2	1	2	harbor	45000
+
+# A star of one column is an IN subquery's column; an EXISTS block reads no star's columns.
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT q.* FROM (SELECT zn_city FROM zones) AS q)
+----
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT zones.*, 1 FROM zones WHERE zones.zn_city = cities.ct_id)
+----
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1, * FROM zones WHERE zones.zn_city = cities.ct_id ORDER BY 1)
+----
+1
+2
+3
+4
+5
+
+# ORDER BY a name a star's column and a column written otherwise both carry: the latter is an alias of its declared
+# name in DuckDB, which decides before FROM's ambiguity.
+query IIIITRT nosort
+SELECT z.*, c.LABEL FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 6 ORDER BY label, zn_id
+----
+3	4	4	NULL	airport	1.25	airport
+0	1	1	NULL	center	0.5	center
+5	6	1	1	park	1.75	center
+1	2	2	NULL	north	0.75	harbor
+2	3	3	NULL	south	1	hills
+4	5	5	NULL	docks	1.5	old town
+
+# ---- errors in both engines ----
+
+# A qualified star names one FROM item of its own block: never an enclosing block's, never a hidden name, never one
+# of two items of the name (cities and drivers share no column).
+statement error
+SELECT x.* FROM cities
+
+statement error
+SELECT cities.* FROM cities AS c
+
+statement error
+SELECT t.* FROM cities AS t JOIN drivers AS t ON t.ct_id = t.dv_city
+
+statement error
+SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.* FROM zones WHERE zones.zn_city = cities.ct_id)
+
+statement error
+SELECT * FROM cities JOIN (SELECT cities.* FROM zones) AS d ON cities.ct_id = d.zn_id
+
+# A star next to an aggregate needs every column as a key; positions and counts are the expanded ones.
+statement error
+SELECT cities.*, COUNT(*) FROM cities
+
+statement error
+SELECT *, COUNT(*) FROM cities GROUP BY ct_id
+
+statement error
+SELECT *, ct_id FROM cities ORDER BY 6
+
+statement error
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT *, 1 FROM zones)
+
+statement error
+SELECT * FROM cities WHERE ct_id <= 2 UNION ALL SELECT *, 1 FROM cities
+
+# A star is no operand, and an alias after it ends at ',' or FROM.
+statement error
+SELECT * + 1 FROM cities
+
+statement error
+SELECT cities.* cities.* FROM cities
+
+statement error
+SELECT * * FROM cities
+
+statement error
+SELECT * ISNULL FROM cities
+
+# ---- antb1's error texts ----
+
+onlyif antb1
+statement error ^bind: no FROM item is named 'x'
+SELECT x.* FROM cities
+
+onlyif antb1
+statement error ^bind: no FROM item is named 'cities' \(the alias 'c' hides it\)
+SELECT cities.* FROM cities AS c
+
+onlyif antb1
+statement error ^bind: 't\.\*' is ambiguous: two FROM items are named 't'
+SELECT t.* FROM cities AS t JOIN drivers AS t ON t.ct_id = t.dv_city
+
+onlyif antb1
+statement error ^bind: column 'ct_row' must be inside an aggregate function
+SELECT cities.*, COUNT(*) FROM cities
+
+onlyif antb1
+statement error ^parse: expected ',' or FROM, found '\+'
+SELECT * + 1 FROM cities
+
+# ---- DuckDB only, for good: DuckDB's error texts ----
+
+onlyif duckdb
+statement error Referenced table "x" not found
+SELECT x.* FROM cities
+
+onlyif duckdb
+statement error Ambiguous reference to table "t"
+SELECT t.* FROM cities AS t JOIN drivers AS t ON t.ct_id = t.dv_city
+
+onlyif duckdb
+statement error Referenced table "cities" not found
+SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.* FROM zones WHERE zones.zn_city = cities.ct_id)
+
+# ---- DuckDB only: the star forms antb1 refuses with exit code 4 ----
+# A star's modifiers, an alias after a star (DuckDB gives it to every column), a qualified star inside an
+# expression, and an ORDER BY position over a star of an EXISTS block, which antb1 does not expand.
+
+onlyif duckdb
+query ITI rowsort
+SELECT * EXCLUDE (ct_row) FROM cities WHERE ct_id <= 2
+----
+1	center	120000
+2	harbor	45000
+
+onlyif duckdb
+query IITI rowsort
+SELECT * REPLACE (ct_pop // 1000 AS ct_pop) FROM cities WHERE ct_id <= 2
+----
+0	1	center	120
+1	2	harbor	45
+
+onlyif duckdb
+query IITI rowsort
+SELECT * AS x FROM cities WHERE ct_id <= 2
+----
+0	1	center	120000
+1	2	harbor	45000
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(cities.*) FROM cities
+----
+6
+
+onlyif duckdb
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT *, 1 FROM zones WHERE zones.zn_city = cities.ct_id ORDER BY 1)
+----
+1
+2
+3
+4
+5
+
+# ---- DuckDB only: forms antb1's parser rejects (docs/sql-subset.md's Known gaps) ----
+
+onlyif duckdb
+query IITI rowsort
+SELECT (*) FROM cities WHERE ct_id <= 2
+----
+0	1	center	120000
+1	2	harbor	45000
+
+onlyif duckdb
+query IITI nosort
+SELECT * FROM cities ORDER BY *
+----
+0	1	center	120000
+1	2	harbor	45000
+2	3	hills	30000
+3	4	airport	NULL
+4	5	old town	8000
+5	6	outskirts	2500
+
+# ---- DuckDB only until ORDER BY names of the select list get a PR ----
+# DuckDB orders by the one select item of a name FROM has twice (here z.label through z.*); antb1 exits 4.
+
+onlyif duckdb
+query IIIITRI nosort
+SELECT z.*, c.ct_pop FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 6 ORDER BY label, zn_id
+----
+3	4	4	NULL	airport	1.25	NULL
+0	1	1	NULL	center	0.5	120000
+4	5	5	NULL	docks	1.5	8000
+1	2	2	NULL	north	0.75	45000
+5	6	1	1	park	1.75	120000
+2	3	3	NULL	south	1	30000
+
+onlyif duckdb
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT z.*, c2.ct_pop FROM zones AS z JOIN cities AS c2 ON z.zn_city = c2.ct_id WHERE z.zn_city = cities.ct_id ORDER BY label)
+----
+1
+2
+3
+4
+5

@@ -1,0 +1,5 @@
+x | zn_row | zn_id | zn_city | zn_parent | label  | zn_radius | ct_row | ct_id | label  | ct_pop | ct_row | ct_id | label  | ct_pop
+- | ------ | ----- | ------- | --------- | ------ | --------- | ------ | ----- | ------ | ------ | ------ | ----- | ------ | ------
+1 | 0      | 1     | 1       | NULL      | center | 0.5       | 0      | 1     | center | 120000 | 0      | 1     | center | 120000
+2 | 1      | 2     | 2       | NULL      | north  | 0.75      | 1      | 2     | harbor | 45000  | 1      | 2     | harbor | 45000
+(2 rows)

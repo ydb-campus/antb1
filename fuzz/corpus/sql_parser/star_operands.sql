@@ -1,0 +1,1 @@
+SELECT t.* + 1, (*), COUNT(t.*) FROM t GROUP BY * ORDER BY *

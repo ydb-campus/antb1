@@ -179,9 +179,10 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
 generator needs more than the parser; such a feature cannot be declared
 supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, T2c `LEFT JOIN`,
-T2b the two uncorrelated subquery forms and ADR 0023's T3 the two correlated ones, so the set is empty
-today: a `Feature` added for grammar the generator cannot write goes in, and the PR that teaches it takes
-it out again -- in the same commit, since the grammar-coverage test asserts the generated set exactly.
+T2b the two uncorrelated subquery forms and ADR 0023's T3 the two correlated ones. Today it holds `star_items` and
+`qualified_star` (stars among the select items), which the binder answers and the generator does not write yet: a
+`Feature` added for grammar the generator cannot write goes in, and the PR that teaches it takes it out again -- in
+the same commit, since the grammar-coverage test asserts the generated set exactly.
 
 Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
 ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,

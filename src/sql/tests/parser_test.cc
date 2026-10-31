@@ -33,9 +33,14 @@ std::string_view At(std::string_view sql, SourceSpan span) {
   return sql.substr(span.offset, span.length);
 }
 
-const ColumnRef* ColumnOf(const SelectItem& item) { return std::get_if<ColumnRef>(&item.expr); }
+const ColumnRef* ColumnOf(const SelectItem& item) { return std::get_if<ColumnRef>(item.expr()); }
 const AggregateCall* AggregateOf(const SelectItem& item) {
-  return std::get_if<AggregateCall>(&item.expr);
+  return std::get_if<AggregateCall>(item.expr());
+}
+// Whether a block's select list is `*` alone.
+bool IsLoneStar(const SelectStatement& block) {
+  return block.items.size() == 1 && block.items[0].star() != nullptr &&
+         block.items[0].star()->qualifier.empty();
 }
 std::string ArgName(const AggregateCall& agg) {
   const ColumnRef* column = agg.arg_column();
@@ -67,8 +72,7 @@ HavingComparison HavingCmp(const Expr& expr) {
 TEST(ParserTest, SelectStar) {
   auto stmt = Parse("SELECT * FROM events");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
-  EXPECT_TRUE(stmt->star);
-  EXPECT_TRUE(stmt->items.empty());
+  EXPECT_TRUE(IsLoneStar(*stmt));
   EXPECT_EQ(TableOf(stmt->from.at(0)).kind, TableRef::Kind::kName);
   EXPECT_EQ(TableOf(stmt->from.at(0)).name, "events");
   EXPECT_FALSE(TableOf(stmt->from.at(0)).quoted);
@@ -80,7 +84,7 @@ TEST(ParserTest, ColumnsKeepTheirSpelling) {
   constexpr std::string_view kSql = R"(SELECT CustomerId, "Region", "a""b", _x1 FROM Events)";
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
-  EXPECT_FALSE(stmt->star);
+  EXPECT_FALSE(IsLoneStar(*stmt));
   ASSERT_EQ(stmt->items.size(), 4U);
   struct Expected {
     std::string_view name;
@@ -398,14 +402,14 @@ TEST(ParserTest, QualifiedColumnsInEveryClause) {
             "t.e END, lower(t.f), EXTRACT(year FROM t.g), CAST(t.h AS INT) FROM t WHERE t.i "
             "BETWEEN t.j AND 2 AND t.k LIKE 'x' GROUP BY t.a HAVING MAX(t.l) > 1 ORDER BY t.a "
             "DESC, \"x y\".m");
-  const auto* sum = std::get_if<AggregateCall>(&stmt->items.at(1).expr);
+  const auto* sum = std::get_if<AggregateCall>(&*stmt->items.at(1).expr());
   ASSERT_NE(sum, nullptr);
   ASSERT_NE(sum->arg_column(), nullptr);
   EXPECT_EQ(sum->arg_column()->qualifier, "T");
   EXPECT_TRUE(sum->arg_column()->qualifier_quoted);
   EXPECT_FALSE(sum->arg_column()->quoted);
   EXPECT_EQ(At(kSql, sum->arg_column()->span), R"("T".b)");
-  const auto* distinct = std::get_if<AggregateCall>(&stmt->items.at(2).expr);
+  const auto* distinct = std::get_if<AggregateCall>(&*stmt->items.at(2).expr());
   ASSERT_NE(distinct, nullptr);
   ASSERT_NE(distinct->arg_column(), nullptr);
   EXPECT_EQ(distinct->arg_column()->name, "B c");
@@ -498,7 +502,7 @@ TEST(ParserTest, DerivedTables) {
   EXPECT_FALSE(unnamed.alias.has_value());
   EXPECT_EQ(At(kSql, unnamed.span), "( SELECT * FROM (SELECT e FROM v) n )");
   const SelectStatement& outer = QueryOf(unnamed);
-  EXPECT_TRUE(outer.star);
+  EXPECT_TRUE(IsLoneStar(outer));
   ASSERT_EQ(outer.from.size(), 1U);
   EXPECT_EQ(outer.from[0].alias, std::optional<std::string>("n"));
   EXPECT_EQ(TableOf(QueryOf(outer.from[0]).from.at(0)).name, "v");
@@ -546,7 +550,7 @@ TEST(ParserTest, WithLists) {
   EXPECT_EQ(b.query->with[0].name, "d");
   EXPECT_EQ(At(kSql, b.query->span), "WITH d AS (SELECT 1 FROM u) SELECT y FROM d");
   EXPECT_EQ(stmt->with[2].name, "over");
-  EXPECT_TRUE(stmt->with[2].query->star);
+  EXPECT_TRUE(IsLoneStar(*stmt->with[2].query));
   // Unquoted, a reserved word is no table name (divergence D21), so a CTE named by one of
   // kAliasKeywords is read quoted only.
   auto quoted_over = Parse(R"(WITH over AS (SELECT a FROM t) SELECT a FROM "over")");
@@ -671,7 +675,7 @@ TEST(ParserTest, UnionAllCompoundsInNestedQueries) {
 
   // The scalar subquery: its parentheses, the '(' its op_span.
   ASSERT_EQ(stmt->items.size(), 1U);
-  const auto& scalar = std::get<SubqueryExpr>(stmt->items[0].expr);
+  const auto& scalar = std::get<SubqueryExpr>(*stmt->items[0].expr());
   EXPECT_EQ(scalar.kind, SubqueryExpr::Kind::kScalar);
   EXPECT_EQ(At(kSql, scalar.span), "(SELECT d FROM v UNION ALL SELECT e FROM w)");
   EXPECT_EQ(At(kSql, scalar.op_span), "(");
@@ -731,7 +735,7 @@ TEST(ParserTest, SubqueriesInExpressions) {
 
   // A scalar subquery as a select item: its span is the parentheses, which is also its op_span.
   ASSERT_EQ(stmt->items.size(), 1U);
-  const auto& item = std::get<SubqueryExpr>(stmt->items[0].expr);
+  const auto& item = std::get<SubqueryExpr>(*stmt->items[0].expr());
   EXPECT_EQ(item.kind, SubqueryExpr::Kind::kScalar);
   EXPECT_FALSE(item.operand.has_value());
   EXPECT_EQ(At(kSql, item.span), "(SELECT COUNT(*) FROM u)");
@@ -1381,7 +1385,7 @@ TEST(ParserTest, ExpressionPrecedenceAndAssociativity) {
   const auto canonical = [](std::string_view expr) {
     auto stmt = Parse("SELECT " + std::string(expr) + " FROM t");
     EXPECT_TRUE(stmt.has_value()) << expr << ": " << stmt.error().message;
-    return stmt.has_value() ? ToSql(stmt->items[0].expr) : std::string();
+    return stmt.has_value() ? ToSql(*stmt->items[0].expr()) : std::string();
   };
   EXPECT_EQ(canonical("a + b * c"), "a + b * c");
   EXPECT_EQ(canonical("(a + b) * c"), "(a + b) * c");
@@ -1405,7 +1409,7 @@ TEST(ParserTest, ExpressionPrecedenceAndAssociativity) {
   EXPECT_FALSE(Parse("SELECT x LIKE 'a' || 'b' FROM t").has_value()) << "|| stays unsupported";
   auto tree = Parse("SELECT a + b * c FROM t");
   ASSERT_TRUE(tree.has_value());
-  const auto& add = std::get<BinaryExpr>(tree->items[0].expr);
+  const auto& add = std::get<BinaryExpr>(*tree->items[0].expr());
   EXPECT_EQ(add.op, BinaryOp::kAdd);
   EXPECT_EQ(std::get<BinaryExpr>(*add.right).op, BinaryOp::kMultiply);
   EXPECT_EQ(At("SELECT a + b * c FROM t", add.op_span), "+");
@@ -1421,29 +1425,29 @@ TEST(ParserTest, FunctionsCaseExtractAndExpressionOperands) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->items.size(), 8U);
-  const auto& replace = std::get<FunctionCall>(stmt->items[0].expr);
+  const auto& replace = std::get<FunctionCall>(*stmt->items[0].expr());
   EXPECT_EQ(replace.name, "regexp_replace");
   EXPECT_EQ(replace.args.size(), 3U);
   EXPECT_EQ(At(kSql, replace.name_span), "regexp_replace");
-  EXPECT_TRUE(std::get<FunctionCall>(stmt->items[1].expr).args.empty());
-  EXPECT_TRUE(std::get<FunctionCall>(stmt->items[2].expr).quoted);
-  const auto& searched = std::get<CaseExpr>(stmt->items[3].expr);
+  EXPECT_TRUE(std::get<FunctionCall>(*stmt->items[1].expr()).args.empty());
+  EXPECT_TRUE(std::get<FunctionCall>(*stmt->items[2].expr()).quoted);
+  const auto& searched = std::get<CaseExpr>(*stmt->items[3].expr());
   EXPECT_FALSE(searched.operand.has_value());
   ASSERT_EQ(searched.branches.size(), 1U);
   EXPECT_EQ(std::get<BinaryExpr>(*searched.branches[0].when).op, BinaryOp::kAnd);
   EXPECT_TRUE(searched.otherwise.has_value());
-  const auto& simple = std::get<CaseExpr>(stmt->items[4].expr);
+  const auto& simple = std::get<CaseExpr>(*stmt->items[4].expr());
   EXPECT_TRUE(simple.operand.has_value());
   EXPECT_FALSE(simple.otherwise.has_value());
-  const auto& extract = std::get<ExtractExpr>(stmt->items[5].expr);
+  const auto& extract = std::get<ExtractExpr>(*stmt->items[5].expr());
   EXPECT_EQ(extract.field, "minute");
   EXPECT_EQ(At(kSql, extract.span), "extract(minute FROM ts)");
-  const auto& sum = std::get<AggregateCall>(stmt->items[6].expr);
+  const auto& sum = std::get<AggregateCall>(*stmt->items[6].expr());
   EXPECT_EQ(sum.arg_column(), nullptr);
   const Expr* sum_arg = sum.arg.has_value() ? &**sum.arg : nullptr;
   ASSERT_NE(sum_arg, nullptr);
   EXPECT_EQ(std::get<BinaryExpr>(*sum_arg).op, BinaryOp::kAdd);
-  EXPECT_TRUE(std::get<AggregateCall>(stmt->items[7].expr).distinct);
+  EXPECT_TRUE(std::get<AggregateCall>(*stmt->items[7].expr()).distinct);
   ASSERT_EQ(stmt->where.size(), 2U);
   EXPECT_FALSE(AsComparison(stmt->where[0]).has_value()) << "not column <op> literal";
   EXPECT_EQ(std::get<InExpr>(stmt->where[0]).list.size(), 2U);
@@ -1462,7 +1466,7 @@ TEST(ParserTest, LeftAndRightCallsAfterListCommas) {
       Parse("SELECT a, left(s, 1) FROM events GROUP BY a, right(s, 1) ORDER BY a, LEFT(s, 2)");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->items.size(), 2U);
-  EXPECT_EQ(std::get<FunctionCall>(stmt->items[1].expr).name, "left");
+  EXPECT_EQ(std::get<FunctionCall>(*stmt->items[1].expr()).name, "left");
   ASSERT_EQ(stmt->group_by.size(), 2U);
   EXPECT_EQ(std::get<FunctionCall>(stmt->group_by[1]).name, "right");
   ASSERT_EQ(stmt->order_by.size(), 2U);
@@ -1482,7 +1486,7 @@ TEST(ParserTest, Casts) {
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->items.size(), 10U);
   const auto cast_of = [&](const Expr& e) -> const CastExpr& { return std::get<CastExpr>(e); };
-  const CastExpr& decimal = cast_of(stmt->items[0].expr);
+  const CastExpr& decimal = cast_of(*stmt->items[0].expr());
   EXPECT_EQ(decimal.type, "DECIMAL");
   EXPECT_EQ(decimal.type_params, (std::vector<std::string>{"15", "2"}));
   EXPECT_FALSE(decimal.try_cast);
@@ -1490,30 +1494,30 @@ TEST(ParserTest, Casts) {
   EXPECT_EQ(At(kSql, decimal.type_span), "decimal( 15 ,2 )");
   EXPECT_EQ(At(kSql, decimal.span), "CAST(a AS decimal( 15 ,2 ))");
   EXPECT_EQ(stmt->items[0].alias, std::optional<std::string>("x"));
-  const CastExpr& try_date = cast_of(stmt->items[1].expr);
+  const CastExpr& try_date = cast_of(*stmt->items[1].expr());
   EXPECT_TRUE(try_date.try_cast);
   EXPECT_EQ(try_date.type, "DATE");
   EXPECT_EQ(At(kSql, try_date.op_span), "try_cast");
-  const CastExpr& operator_int = cast_of(stmt->items[2].expr);
+  const CastExpr& operator_int = cast_of(*stmt->items[2].expr());
   EXPECT_EQ(operator_int.type, "INT");
   EXPECT_EQ(At(kSql, operator_int.op_span), "::");
   EXPECT_EQ(At(kSql, operator_int.span), "c::int");
-  const CastExpr& chain = cast_of(stmt->items[3].expr);
+  const CastExpr& chain = cast_of(*stmt->items[3].expr());
   EXPECT_EQ(chain.type, "VARCHAR");
   const CastExpr& inner = cast_of(*chain.operand);
   EXPECT_EQ(inner.type, "BIGINT");
   EXPECT_TRUE(std::holds_alternative<BinaryExpr>(*inner.operand));
   EXPECT_EQ(At(kSql, inner.span), "(a + 1)::BIGINT");
   EXPECT_EQ(At(kSql, chain.span), "(a + 1)::BIGINT::Varchar");
-  EXPECT_TRUE(std::holds_alternative<AggregateCall>(*cast_of(stmt->items[4].expr).operand));
-  EXPECT_TRUE(std::holds_alternative<CaseExpr>(*cast_of(stmt->items[5].expr).operand));
-  EXPECT_EQ(std::get<Literal>(*cast_of(stmt->items[6].expr).operand).kind, Literal::Kind::kDate);
-  const auto& sum = std::get<AggregateCall>(stmt->items[7].expr);
+  EXPECT_TRUE(std::holds_alternative<AggregateCall>(*cast_of(*stmt->items[4].expr()).operand));
+  EXPECT_TRUE(std::holds_alternative<CaseExpr>(*cast_of(*stmt->items[5].expr()).operand));
+  EXPECT_EQ(std::get<Literal>(*cast_of(*stmt->items[6].expr()).operand).kind, Literal::Kind::kDate);
+  const auto& sum = std::get<AggregateCall>(*stmt->items[7].expr());
   const Expr* sum_arg = sum.arg.has_value() ? &**sum.arg : nullptr;
   ASSERT_NE(sum_arg, nullptr);
   EXPECT_TRUE(std::holds_alternative<CastExpr>(*sum_arg));
-  EXPECT_EQ(std::get<ColumnRef>(stmt->items[8].expr).name, "try_cast");
-  EXPECT_EQ(cast_of(stmt->items[9].expr).type, "DATE");
+  EXPECT_EQ(std::get<ColumnRef>(*stmt->items[8].expr()).name, "try_cast");
+  EXPECT_EQ(cast_of(*stmt->items[9].expr()).type, "DATE");
   EXPECT_EQ(stmt->items[9].alias, std::optional<std::string>("d"));
   ASSERT_EQ(stmt->where.size(), 2U);
   const auto& ge = std::get<BinaryExpr>(stmt->where[0]);
@@ -1552,7 +1556,7 @@ TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
   const auto item = [](std::string_view expr) {
     auto stmt = Parse("SELECT " + std::string(expr) + " FROM t");
     EXPECT_TRUE(stmt.has_value()) << expr << ": " << stmt.error().message;
-    return stmt.has_value() ? stmt->items.at(0).expr : Expr(ColumnRef{});
+    return stmt.has_value() ? *stmt->items.at(0).expr() : Expr(ColumnRef{});
   };
   const Expr minus = item("-1::INTEGER");
   const auto& unary = std::get<UnaryExpr>(minus);
@@ -2061,12 +2065,12 @@ TEST(ParserTest, ConstantsAndPositions) {
   auto stmt = Parse(sql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
   ASSERT_EQ(stmt->items.size(), 5U);
-  EXPECT_EQ(std::get<Literal>(stmt->items[0].expr).text, "1");
-  EXPECT_TRUE(std::get<Literal>(stmt->items[1].expr).negative);
+  EXPECT_EQ(std::get<Literal>(*stmt->items[0].expr()).text, "1");
+  EXPECT_TRUE(std::get<Literal>(*stmt->items[1].expr()).negative);
   EXPECT_EQ(stmt->items[1].alias, "m");
   EXPECT_EQ(At(sql, stmt->items[1].span), "-2 AS m");
-  EXPECT_EQ(std::get<Literal>(stmt->items[2].expr).kind, Literal::Kind::kString);
-  EXPECT_EQ(std::get<Literal>(stmt->items[3].expr).kind, Literal::Kind::kDate);
+  EXPECT_EQ(std::get<Literal>(*stmt->items[2].expr()).kind, Literal::Kind::kString);
+  EXPECT_EQ(std::get<Literal>(*stmt->items[3].expr()).kind, Literal::Kind::kDate);
   ASSERT_EQ(stmt->group_by.size(), 3U);
   EXPECT_EQ(std::get<Literal>(stmt->group_by[0]).text, "1");
   EXPECT_EQ(std::get<ColumnRef>(stmt->group_by[1]).name, "a");
@@ -2080,11 +2084,11 @@ TEST(ParserTest, ConstantsAndPositions) {
 TEST(ParserTest, CountDistinct) {
   auto stmt = Parse("SELECT count( distinct user_id ), COUNT(user_id) FROM events");
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
-  const auto& distinct = std::get<AggregateCall>(stmt->items[0].expr);
+  const auto& distinct = std::get<AggregateCall>(*stmt->items[0].expr());
   EXPECT_EQ(distinct.kind, AggKind::kCount);
   EXPECT_TRUE(distinct.distinct);
   EXPECT_EQ(ArgName(distinct), "user_id");
-  EXPECT_FALSE(std::get<AggregateCall>(stmt->items[1].expr).distinct);
+  EXPECT_FALSE(std::get<AggregateCall>(*stmt->items[1].expr()).distinct);
 }
 
 // NULLS, FIRST and LAST are not reserved: they stay usable as names.
@@ -2131,12 +2135,82 @@ TEST(ParserTest, StarAndLimitSpans) {
   constexpr std::string_view kSql = "SELECT /* all */ * FROM events LIMIT -- n\n 10 ;";
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
-  EXPECT_EQ(At(kSql, stmt->star_span), "*");
+  ASSERT_TRUE(IsLoneStar(*stmt));
+  EXPECT_EQ(At(kSql, stmt->items[0].span), "*");
+  EXPECT_EQ(At(kSql, stmt->items[0].star()->span), "*");
   EXPECT_EQ(At(kSql, stmt->limit_span), "LIMIT -- n\n 10");
   auto no_limit = Parse("SELECT a FROM t");
   ASSERT_TRUE(no_limit.has_value());
-  EXPECT_EQ(no_limit->star_span, SourceSpan{});
+  EXPECT_EQ(no_limit->items.at(0).star(), nullptr);
   EXPECT_EQ(no_limit->limit_span, SourceSpan{});
+}
+
+// A star is a select item of its own, anywhere among the others: `*`, or `t.*` with its qualifier
+// as written (quoted or not, comments around the dot), from the qualifier through the '*'.
+TEST(ParserTest, StarsStandAmongTheItems) {
+  struct Star {
+    std::size_t item;
+    std::string qualifier;
+    bool quoted;
+    std::string text;
+  };
+  const auto stars = [](std::string_view sql) {
+    auto stmt = Parse(sql);
+    EXPECT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    std::vector<Star> out;
+    if (!stmt.has_value()) {
+      return out;
+    }
+    for (std::size_t i = 0; i < stmt->items.size(); ++i) {
+      const SelectItem& item = stmt->items[i];
+      if (const SelectStar* star = item.star()) {
+        EXPECT_EQ(item.span, star->span) << sql;
+        EXPECT_FALSE(item.alias.has_value()) << sql;
+        out.push_back(Star{.item = i,
+                           .qualifier = star->qualifier,
+                           .quoted = star->qualifier_quoted,
+                           .text = std::string(At(sql, star->span))});
+      } else {
+        EXPECT_NE(item.expr(), nullptr) << sql;
+      }
+    }
+    return out;
+  };
+  const auto expect = [&stars](std::string_view sql, std::vector<Star> want) {
+    const std::vector<Star> got = stars(sql);
+    ASSERT_EQ(got.size(), want.size()) << sql;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      EXPECT_EQ(got[i].item, want[i].item) << sql;
+      EXPECT_EQ(got[i].qualifier, want[i].qualifier) << sql;
+      EXPECT_EQ(got[i].quoted, want[i].quoted) << sql;
+      EXPECT_EQ(got[i].text, want[i].text) << sql;
+    }
+  };
+  // The star at select item `item`: its qualifier, whether that is quoted, and its text.
+  const auto at = [](std::size_t item, std::string_view qualifier, bool quoted,
+                     std::string_view text) {
+    return Star{.item = item,
+                .qualifier = std::string(qualifier),
+                .quoted = quoted,
+                .text = std::string(text)};
+  };
+  expect("SELECT *, a FROM t", {at(0, "", false, "*")});
+  expect("SELECT a, * FROM t", {at(1, "", false, "*")});
+  expect("SELECT *, * FROM t", {at(0, "", false, "*"), at(1, "", false, "*")});
+  expect("SELECT e.* FROM events e", {at(0, "e", false, "e.*")});
+  expect(R"(SELECT "E".* FROM events AS "E")", {at(0, "E", true, R"("E".*)")});
+  expect("SELECT e . /*c*/ * FROM events e", {at(0, "e", false, "e . /*c*/ *")});
+  expect("SELECT e.*, u.y, u.* FROM events e, u",
+         {at(0, "e", false, "e.*"), at(2, "u", false, "u.*")});
+  expect(R"(SELECT "over".* FROM t AS "over")", {at(0, "over", true, R"("over".*)")});
+  // A quoted * after a dot is a column named *, no star.
+  expect(R"(SELECT t."*" FROM t)", {});
+  auto quoted = Parse(R"(SELECT t."*" FROM t)");
+  ASSERT_TRUE(quoted.has_value());
+  const auto* column = std::get_if<ColumnRef>(quoted->items.at(0).expr());
+  ASSERT_NE(column, nullptr);
+  EXPECT_EQ(column->name, "*");
+  EXPECT_TRUE(column->quoted);
 }
 
 TEST(ParserTest, IsReservedWord) {
@@ -2788,10 +2862,14 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"TrailingCommaAfterJoin", "SELECT a FROM events JOIN users ON a = b^, LIMIT 1",
                    kUnsupported, 1, "a trailing comma in FROM is not supported"},
         // Qualified names: one qualifier, and a column name that needs no quoting.
-        RejectCase{"QualifiedStar", "SELECT e.^* FROM events e", kUnsupported, 1,
-                   "qualified * (t.*) is not supported"},
+        // A select item's own `t.*` is answered; one inside an expression is not (DuckDB answers
+        // `(t.*)` and COUNT(t.*), and rejects the rest).
+        RejectCase{"QualifiedStarInAnExpression", "SELECT 1 + e.^* FROM events e", kUnsupported, 1,
+                   "qualified * (t.*) is only supported as a select item"},
+        RejectCase{"ParenthesizedQualifiedStar", "SELECT (e.^*) FROM events e", kUnsupported, 1,
+                   "qualified * (t.*) is only supported as a select item"},
         RejectCase{"CountQualifiedStar", "SELECT COUNT(e.^*) FROM events e", kUnsupported, 1,
-                   "qualified * (t.*) is not supported"},
+                   "qualified * (t.*) is only supported as a select item"},
         RejectCase{"ThreePartName", "SELECT main.e^.a FROM events e", kUnsupported, 1,
                    "names of more than two parts (a.b.c) are not supported"},
         RejectCase{"MethodCall", "SELECT e.^lower(a) FROM events e", kUnsupported, 5,
@@ -3001,7 +3079,7 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"SelectWithoutFromWhere", "SELECT a ^WHERE a = 1", kUnsupported, 5,
                    "SELECT without FROM is not supported"},
-        RejectCase{"SelectWithoutFromLimit", "SELECT * ^LIMIT 1", kUnsupported, 5,
+        RejectCase{"SelectWithoutFromLimit", "SELECT a ^LIMIT 1", kUnsupported, 5,
                    "SELECT without FROM is not supported"},
         RejectCase{"SelectInto", "SELECT a ^INTO copy FROM events", kUnsupported, 4,
                    "SELECT INTO is not supported"},
@@ -3031,10 +3109,57 @@ INSTANTIATE_TEST_SUITE_P(
                    4, "window functions (OVER) are not supported"},
         RejectCase{"Filter", "SELECT COUNT(*) ^FILTER (WHERE a = 1) FROM events", kUnsupported, 6,
                    "aggregate FILTER clauses are not supported"},
-        RejectCase{"StarWithItems", "SELECT *^, a FROM events", kUnsupported, 1,
-                   "combining '*' with other select items is not supported"},
-        RejectCase{"ItemsWithStar", "SELECT a, ^* FROM events", kUnsupported, 1,
-                   "combining '*' with other select items is not supported"},
+        // A star stands anywhere among the items, but its modifiers and an alias after it, which
+        // DuckDB gives every column it expands to, are unsupported.
+        RejectCase{"ExcludeAfterALaterStar", "SELECT a, * ^EXCLUDE (b) FROM events", kUnsupported,
+                   7, "SELECT * EXCLUDE is not supported"},
+        RejectCase{"ReplaceAfterAQualifiedStar", "SELECT e.* ^REPLACE (a + 1 AS a) FROM events e",
+                   kUnsupported, 7, "SELECT * REPLACE is not supported"},
+        RejectCase{"LikeAfterAQualifiedStar", "SELECT e.* ^LIKE 'a%' FROM events e", kUnsupported,
+                   4, "SELECT * LIKE is not supported"},
+        RejectCase{"NotLikeAfterAStar", "SELECT * ^NOT LIKE 'a%' FROM events", kUnsupported, 3,
+                   "SELECT * NOT LIKE is not supported"},
+        RejectCase{"StarAlias", "SELECT * ^AS x FROM events", kUnsupported, 4,
+                   "an alias after '*' is not supported"},
+        RejectCase{"StarImplicitAlias", "SELECT *, * ^x FROM events", kUnsupported, 1,
+                   "an alias after '*' is not supported"},
+        RejectCase{"StarStringAlias", "SELECT * ^AS 'x' FROM events", kUnsupported, 6,
+                   "an alias after '*' is not supported"},
+        RejectCase{"QualifiedStarAlias", "SELECT e.* ^AS x, a FROM events e", kUnsupported, 4,
+                   "an alias after '*' is not supported"},
+        RejectCase{"ReservedStarQualifier", "SELECT ^over.* FROM events AS over", kUnsupported, 4,
+                   "the reserved word OVER as a qualifier is not supported"},
+        RejectCase{"StarTrailingComma", "SELECT *^, FROM events", kUnsupported, 1,
+                   "a trailing comma in the select list is not supported"},
+        RejectCase{"KeywordAliasAfterAStar", "SELECT * ^default FROM events", kUnsupported, 7,
+                   "an alias after '*' is not supported"},
+        RejectCase{"EmptyStringAliasAfterAStar", "SELECT * ^AS '' FROM events", kUnsupported, 5,
+                   "an alias after '*' is not supported"},
+        RejectCase{"EscapeStringAliasAfterAStar", "SELECT e.* ^AS E'x' FROM events e", kUnsupported,
+                   7, "an alias after '*' is not supported"},
+        RejectCase{"RenameAfterAStar", "SELECT * ^RENAME (a AS b) FROM events", kUnsupported, 6,
+                   "SELECT * RENAME is not supported"},
+        RejectCase{"GlobAfterAStar", "SELECT * ^GLOB 'a*' FROM events", kUnsupported, 4,
+                   "SELECT * GLOB is not supported"},
+        RejectCase{"IlikeAfterAStar", "SELECT * ^ILIKE 'A%' FROM events", kUnsupported, 5,
+                   "SELECT * ILIKE is not supported"},
+        RejectCase{"LikeAnEscapeStringAfterAStar", "SELECT * ^LIKE E'a%' FROM events", kUnsupported,
+                   4, "SELECT * LIKE is not supported"},
+        RejectCase{"LikeAParenthesizedStringAfterAStar", "SELECT * ^LIKE ('a%') FROM events",
+                   kUnsupported, 4, "SELECT * LIKE is not supported"},
+        RejectCase{"LikeABitStringAfterAStar", "SELECT * ^LIKE B'01' FROM events", kUnsupported, 4,
+                   "SELECT * LIKE is not supported"},
+        RejectCase{"NotSimilarToAParenthesizedStringAfterAStar",
+                   "SELECT * ^NOT SIMILAR TO ('a.*') FROM events", kUnsupported, 3,
+                   "SELECT * NOT SIMILAR TO is not supported"},
+        RejectCase{"DollarStringAliasAfterAStar", "SELECT * ^AS $$x y$$, a FROM events",
+                   kUnsupported, 6, "an alias after '*' is not supported"},
+        RejectCase{"SimilarToAfterAStar", "SELECT * ^SIMILAR TO 'a.*' FROM events", kUnsupported, 7,
+                   "SELECT * SIMILAR TO is not supported"},
+        RejectCase{"NotIlikeAfterAStar", "SELECT * ^NOT ILIKE 'A%' FROM events", kUnsupported, 3,
+                   "SELECT * NOT ILIKE is not supported"},
+        RejectCase{"NotSimilarToAfterAStar", "SELECT e.* ^NOT SIMILAR TO 'a.*' FROM events e",
+                   kUnsupported, 3, "SELECT * NOT SIMILAR TO is not supported"},
         RejectCase{"Collate", "SELECT a FROM events WHERE a = 'x' ^COLLATE nocase", kUnsupported, 7,
                    "COLLATE is not supported"},
         RejectCase{"Qualify", "SELECT a FROM events ^QUALIFY a = 1", kUnsupported, 7,
@@ -3287,7 +3412,49 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected a table name or a quoted file path, found integer literal 5"},
         RejectCase{"MissingComma", "SELECT a b ^c FROM events", kSyntax, 1,
                    "expected ',' or FROM, found identifier c"},
-        RejectCase{"StarStar", "SELECT * ^* FROM events", kSyntax, 1, "expected FROM, found '*'"},
+        RejectCase{"StarStar", "SELECT * ^* FROM events", kSyntax, 1,
+                   "expected ',' or FROM, found '*'"},
+        // DuckDB rejects a star as an operand, and its alias only before ',' or FROM: what follows
+        // a star otherwise is no alias but a syntax error.
+        RejectCase{"OperatorAfterAQualifiedStar", "SELECT e.* ^+ 1 FROM events e", kSyntax, 1,
+                   "expected ',' or FROM, found '+'"},
+        RejectCase{"MissingCommaBetweenStars", "SELECT e.* ^e.* FROM events e", kSyntax, 1,
+                   "expected ',' or FROM"},
+        RejectCase{"TwoWordsAfterAStar", "SELECT * ^a b FROM events", kSyntax, 1,
+                   "expected ',' or FROM"},
+        RejectCase{"NumberAfterStarAs", "SELECT * ^AS 1 FROM events", kSyntax, 2,
+                   "expected ',' or FROM"},
+        RejectCase{"EscapeStringAfterAStar", "SELECT * ^E'x' FROM events", kSyntax, 1,
+                   "expected ',' or FROM"},
+        RejectCase{"IsnullAfterAStar", "SELECT * ^ISNULL FROM events", kSyntax, 6,
+                   "expected ',' or FROM"},
+        RejectCase{"NotnullAfterAQualifiedStar", "SELECT e.* ^NOTNULL FROM events e", kSyntax, 7,
+                   "expected ',' or FROM"},
+        RejectCase{"AtTimeZoneAfterAStar", "SELECT * ^AT TIME ZONE 'UTC' FROM events", kSyntax, 2,
+                   "expected ',' or FROM"},
+        RejectCase{"NotInAfterAStar", "SELECT * ^NOT IN (1) FROM events", kSyntax, 3,
+                   "expected ',' or FROM"},
+        RejectCase{"LikeAColumnAfterAStar", "SELECT * ^LIKE b FROM events", kSyntax, 4,
+                   "expected ',' or FROM"},
+        RejectCase{"LikeAColumnNamedEAfterAStar", "SELECT * ^LIKE e FROM events", kSyntax, 4,
+                   "expected ',' or FROM"},
+        RejectCase{"GlobAColumnAfterAStar", "SELECT * ^GLOB b FROM events", kSyntax, 4,
+                   "expected ',' or FROM"},
+        RejectCase{"SimilarWithoutToAfterAStar", "SELECT * ^SIMILAR 'a' FROM events", kSyntax, 7,
+                   "expected ',' or FROM"},
+        RejectCase{"NotSimilarToAColumnAfterAStar", "SELECT * ^NOT SIMILAR TO b FROM events",
+                   kSyntax, 3, "expected ',' or FROM, found keyword NOT"},
+        RejectCase{"NotSimilarWithoutToAfterAStar", "SELECT * ^NOT SIMILAR 'a' FROM events",
+                   kSyntax, 3, "expected ',' or FROM"},
+        RejectCase{"AtAfterAStar", "SELECT * ^at FROM events", kSyntax, 2, "expected ',' or FROM"},
+        RejectCase{"AsFromAfterAStar", "SELECT * ^AS FROM events", kSyntax, 2,
+                   "expected ',' or FROM, found keyword AS"},
+        RejectCase{"ReservedWordStarQualifier", "SELECT ^from.* FROM events", kSyntax, 4,
+                   "expected an expression"},
+        // A star with nothing to expand: DuckDB's "* expression without FROM clause".
+        RejectCase{"StarWithoutFrom", "SELECT * ^LIMIT 1", kSyntax, 5, "'*' needs a FROM clause"},
+        RejectCase{"QualifiedStarWithoutFrom", "SELECT 1, e.*^", kSyntax, 0,
+                   "'*' needs a FROM clause"},
         RejectCase{"ReservedColumn", "SELECT ^order FROM events", kSyntax, 5,
                    "expected an expression or '*', found keyword ORDER"},
         RejectCase{"MissingAlias", "SELECT a AS^", kSyntax, 0,
@@ -4135,7 +4302,7 @@ TEST(ParserTest, WordsThatCannotBeImplicitAliases) {
     ASSERT_TRUE(stmt.has_value()) << names << ": " << stmt.error().message;
     EXPECT_EQ(TableOf(stmt->from.at(0)).name, w);
     EXPECT_FALSE(stmt->from.at(0).alias.has_value());
-    EXPECT_EQ(std::get<ColumnRef>(stmt->items.at(1).expr).qualifier, w);
+    EXPECT_EQ(std::get<ColumnRef>(*stmt->items.at(1).expr()).qualifier, w);
     EXPECT_FALSE(IsReservedWord(w));
   }
 }

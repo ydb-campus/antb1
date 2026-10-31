@@ -1546,7 +1546,7 @@ TEST(BinderTest, TablesMatchCaseInsensitively) {
 TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
   const Catalog catalog = MakeCatalog();
   sql::SelectStatement stmt;
-  stmt.star = true;
+  stmt.items.push_back(sql::SelectItem{.value = sql::SelectStar{}, .alias = {}, .span = {}});
   EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
@@ -3507,6 +3507,225 @@ TEST(BinderTest, DateCastsAreDateLiterals) {
   ASSERT_EQ(project.constants.size(), 2U);
   EXPECT_EQ(std::get<Int128>(project.constants[0].value_or(Constant{}).value), Int128{18263});
   EXPECT_EQ(std::get<Int128>(project.constants[1].value_or(Constant{}).value), Int128{19753});
+}
+
+// Stars among the select items (DuckDB's rules): `*` expands every FROM item, `t.*` the one FROM
+// item of its own block named t -- which neither an enclosing block's item nor a second item of the
+// name stands in for -- and every star's name binds before any item does.
+INSTANTIATE_TEST_SUITE_P(
+    StarItems, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT x.* FROM t", kBind, "x.*", "no FROM item is named 'x'"},
+        ErrorCase{"SELECT t.* FROM t AS a", kBind, "t.*",
+                  "no FROM item is named 't' (the alias 'a' hides it)"},
+        // Never an enclosing block's FROM item, where a column would correlate (DuckDB:
+        // "Referenced table not found").
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT ok.* FROM u WHERE u.i16 = ok.i16)",
+                  kBind, "ok.*", "no FROM item is named 'ok'"},
+        ErrorCase{"SELECT ok.i16 FROM ok JOIN (SELECT ok.* FROM u) AS d ON ok.i16 = d.i16", kBind,
+                  "ok.*", "no FROM item is named 'ok'"},
+        ErrorCase{"SELECT i16 FROM ok WHERE i16 = (SELECT MAX(i16), ok.* FROM u)", kBind, "ok.*",
+                  "no FROM item is named 'ok'"},
+        // Two FROM items of the name, which share no column here (rule 5 would let `*` pass).
+        ErrorCase{"SELECT x.* FROM ok AS x JOIN dec AS x ON x.i16 = x.s16", kBind, "x.*",
+                  "'x.*' is ambiguous: two FROM items are named 'x'"},
+        // No FROM item, but a column of the name: DuckDB expands a STRUCT's fields and rejects any
+        // other type.
+        ErrorCase{"SELECT rec.* FROM st", kUnsupported, "rec.*",
+                  "'rec.*' over a STRUCT column is not supported"},
+        ErrorCase{"SELECT bad.* FROM t", kBind, "bad.*", "no FROM item is named 'bad'"},
+        ErrorCase{"SELECT i16.* FROM t", kBind, "i16.*", "no FROM item is named 'i16'"},
+        ErrorCase{"SELECT rec.* FROM st AS a JOIN st AS b ON a.i16 = b.i16", kBind, "rec.*",
+                  "no FROM item is named 'rec'"},
+        // A star's name binds first, before an earlier item's name or unsupported type.
+        ErrorCase{"SELECT nope, x.* FROM t", kBind, "x.*", "no FROM item is named 'x'"},
+        ErrorCase{"SELECT bad, x.* FROM t", kBind, "x.*", "no FROM item is named 'x'"},
+        ErrorCase{"SELECT i32, * FROM ok AS t, t", kBind, "*",
+                  "'*' is ambiguous: two FROM items named 't' have a column 'i16'"},
+        // A star reads its own FROM items' columns only: t's unsupported one, not ok's.
+        ErrorCase{"SELECT ok.i16, t.* FROM ok JOIN t ON ok.i16 = t.i16", kUnsupported, "t.*",
+                  "unsupported type"},
+        // Aggregates without GROUP BY: the first plain column in select order, a star's
+        // included, named as DuckDB names it (unqualified).
+        ErrorCase{"SELECT i16, *, COUNT(*) FROM ok", kBind, "i16",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT COUNT(*), *, s FROM ok", kBind, "*",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT COUNT(*), ok.* FROM ok", kBind, "ok.*",
+                  "column 'i16' must be inside an aggregate function"},
+        ErrorCase{"SELECT t.i16, COUNT(*) FROM t", kBind, "t.i16",
+                  "column 'i16' must be inside an aggregate function"},
+        // GROUP BY: every column of a star must be a key.
+        ErrorCase{"SELECT *, COUNT(*) FROM ok GROUP BY i16", kBind, "*",
+                  "column 's' must appear in the GROUP BY clause"},
+        // Positions count every column a star expands to.
+        ErrorCase{"SELECT *, i16 FROM ok ORDER BY 4", kBind, "4",
+                  "ORDER BY position 4 is not between 1 and 3"},
+        // An EXISTS block checks its stars without expanding them: positions still count their
+        // columns (u has 11), one inside a star is unsupported, and the other items bind.
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT *, i32 FROM u WHERE u.i16 = ok.i16 "
+                  "ORDER BY 1)",
+                  kUnsupported, "1",
+                  "ORDER BY position 1 over a '*' of an EXISTS subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT *, i32 FROM u WHERE u.i16 = ok.i16 "
+                  "ORDER BY 99)",
+                  kBind, "99", "ORDER BY position 99 is not between 1 and 12"},
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT x.* FROM u WHERE u.i16 = ok.i16)", kBind,
+                  "x.*", "no FROM item is named 'x'"},
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT *, nope FROM u WHERE u.i16 = ok.i16)",
+                  kBind, "nope", "column 'nope' does not exist"},
+        // ORDER BY a name FROM has twice but one un-aliased column item carries as declared: DuckDB
+        // orders by that item (its select-list step), which a later PR answers. A star's column and
+        // a reference written as declared match in that case only.
+        ErrorCase{"SELECT ok.*, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", kUnsupported,
+                  "i16", "which only the select list makes unambiguous"},
+        ErrorCase{"SELECT ok.*, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY I16", kBind, "I16",
+                  "is ambiguous"},
+        ErrorCase{"SELECT a.*, b.* FROM ok AS a JOIN ok AS b ON a.i16 = b.i16 ORDER BY i16", kBind,
+                  "i16", "is ambiguous"},
+        // An aliased item carries only its alias, and a reference written as declared matches in
+        // that case only: FROM's ambiguity stands, as in DuckDB.
+        ErrorCase{"SELECT ok.i16 AS x, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", kBind,
+                  "i16", "is ambiguous"},
+        ErrorCase{"SELECT ok.i16, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY I16", kBind,
+                  "I16", "is ambiguous"},
+        // An EXISTS block's star carries its columns' names too, unexpanded.
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT u.*, t.d FROM u JOIN t ON u.i16 = t.i16 "
+                  "WHERE u.i16 = ok.i16 ORDER BY i32)",
+                  kUnsupported, "i32", "which only the select list makes unambiguous"},
+        ErrorCase{
+            "SELECT i16 FROM ok WHERE EXISTS (SELECT t.i32, u.* FROM u JOIN t ON u.i16 = t.i16 "
+            "WHERE u.i16 = ok.i16 ORDER BY i32)",
+            kBind, "i32", "is ambiguous"},
+        // Positions in an EXISTS block over a star of two FROM items: u's 11 columns, then ok's 2.
+        ErrorCase{
+            "SELECT i16 FROM t WHERE EXISTS (SELECT *, u.i32 FROM u JOIN ok ON u.i16 = ok.i16 "
+            "WHERE u.i16 = t.i16 ORDER BY 13)",
+            kUnsupported, "13", "over a '*' of an EXISTS subquery"},
+        ErrorCase{
+            "SELECT i16 FROM t WHERE EXISTS (SELECT *, u.i32 FROM u JOIN ok ON u.i16 = ok.i16 "
+            "WHERE u.i16 = t.i16 ORDER BY 15)",
+            kBind, "15", "ORDER BY position 15 is not between 1 and 14"},
+        // The aggregate-mixing error names a reference as written.
+        ErrorCase{"SELECT I16, COUNT(*) FROM ok", kBind, "I16",
+                  "column 'I16' must be inside an aggregate function"}));
+
+// DuckDB's implicit ORDER BY alias: a plain column written otherwise than its column is declared is
+// an alias of the declared name, found in any case, the last alias -- implicit or explicit --
+// winning, where a FROM column would be ambiguous too.
+TEST(BinderTest, OrderByFindsAColumnWrittenOtherwiseAsAnAlias) {
+  const Catalog catalog = MakeCatalog();
+  const auto key = [&catalog](std::string_view sql, int sort_at) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return std::string();
+    }
+    const auto& sort = std::get<SortNode>(Nth(*plan, sort_at));
+    EXPECT_EQ(sort.keys.size(), 1U) << sql;
+    return sort.keys.empty() ? std::string() : sort.keys[0].column.name;
+  };
+  EXPECT_EQ(key("SELECT i32 AS i16, I16 FROM t ORDER BY i16", 1), "i16");
+  EXPECT_EQ(key("SELECT I16, i32 AS i16 FROM t ORDER BY i16", 1), "i32");
+  EXPECT_EQ(key("SELECT i32 AS i16, t.I16 FROM t ORDER BY I16", 1), "i16");
+  // The alias decides before FROM's ambiguity, also next to a star's column of the name.
+  EXPECT_EQ(key("SELECT ok.*, t.I16 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", 1), "i16");
+  auto plan = BindSql("SELECT ok.*, t.I16 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  ASSERT_EQ(project.columns.size(), 3U);
+  ASSERT_EQ(sort.keys.size(), 1U);
+  EXPECT_EQ(sort.keys[0].column.id, project.columns[2].id) << "t.i16, not ok.i16";
+  EXPECT_NE(sort.keys[0].column.id, project.columns[0].id);
+}
+
+// A star expands where it stands among the other items -- `*` every FROM item's columns in FROM
+// order, `t.*` its one FROM item's -- each under its declared name and read by its own id, so a
+// column two stars read is the one column twice. A derived table's names are made unique after
+// its alias list, as in DuckDB.
+TEST(BinderTest, StarsExpandWhereTheyStand) {
+  const Catalog catalog = MakeCatalog();
+  using Names = std::vector<std::string>;
+  const auto names = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    Names out;
+    if (plan.ok()) {
+      for (const OutputColumn& column : plan->output) {
+        out.push_back(column.name);
+      }
+    }
+    return out;
+  };
+  EXPECT_EQ(names("SELECT i16 AS x, *, s FROM ok"), (Names{"x", "i16", "s", "s"}));
+  EXPECT_EQ(names("SELECT *, * FROM ok"), (Names{"i16", "s", "i16", "s"}));
+  EXPECT_EQ(names("SELECT a.*, 1, b.i16 FROM ok AS a JOIN ok AS b ON a.i16 = b.i16"),
+            (Names{"i16", "s", "1", "i16"}));
+  EXPECT_EQ(names("SELECT dec.p, ok.* FROM ok JOIN dec ON ok.i16 = dec.s16"),
+            (Names{"p", "i16", "s"}));
+  EXPECT_EQ(names(R"(SELECT "OK".*, T.i32 FROM ok JOIN t ON ok.i16 = t.i16)"),
+            (Names{"i16", "s", "i32"}));
+  EXPECT_EQ(names(R"(SELECT "over".* FROM ok AS "over")"), (Names{"i16", "s"}));
+  EXPECT_EQ(names("SELECT bad.* FROM ok AS bad"), (Names{"i16", "s"}));  // an item, not a column
+  EXPECT_EQ(names("SELECT * FROM (SELECT *, i16, * FROM ok) AS d"),
+            (Names{"i16", "s", "i16_1", "i16_2", "s_1"}));
+  EXPECT_EQ(names("SELECT * FROM (SELECT *, i16 FROM ok) AS d(x)"), (Names{"x", "s", "i16"}));
+  EXPECT_EQ(names("SELECT i16_1 FROM (SELECT *, i16 FROM ok) AS d"), (Names{"i16_1"}));
+  // In a grouped query a star's columns are keys like any other column's.
+  EXPECT_EQ(names("SELECT *, COUNT(*) FROM ok GROUP BY i16, s"),
+            (Names{"i16", "s", "count_star()"}));
+  EXPECT_EQ(names("SELECT i16 AS x, *, COUNT(*) FROM ok GROUP BY 2, 3 ORDER BY 3 DESC"),
+            (Names{"x", "i16", "s", "count_star()"}));
+
+  constexpr std::string_view kSql = "SELECT *, i16, ok.* FROM ok";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  ASSERT_EQ(project.columns.size(), 5U);
+  EXPECT_EQ(project.columns[0].id, project.columns[2].id);
+  EXPECT_EQ(project.columns[0].id, project.columns[3].id);
+  EXPECT_EQ(project.columns[1].id, project.columns[4].id);
+  EXPECT_NE(project.columns[0].id, project.columns[1].id);
+  EXPECT_EQ(kSql.substr(project.span.offset, project.span.length), "*, i16, ok.*");
+}
+
+// A UNION ALL refusal points at the select item a column comes from, found by its place in the
+// query: the star it expands from, or an item after a star.
+TEST(BinderTest, UnionAllRefusalsPointAtTheItemAColumnComesFrom) {
+  const Catalog catalog = MakeCatalog();
+  const auto refused_at = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    EXPECT_NE(detail, nullptr) << sql;
+    if (detail == nullptr) {
+      return std::string_view::npos;
+    }
+    EXPECT_EQ(detail->kind(), kUnsupported) << plan.status().ToString();
+    return static_cast<std::size_t>(detail->span().offset);
+  };
+  constexpr std::string_view kStar =
+      "SELECT i16, i16, i16 FROM ok UNION ALL SELECT i16, ok.* FROM ok";
+  EXPECT_EQ(refused_at(kStar), kStar.rfind("ok.*"));
+  constexpr std::string_view kAfter = "SELECT i16, s, s FROM ok UNION ALL SELECT *, i16 FROM ok";
+  EXPECT_EQ(refused_at(kAfter), kAfter.rfind("i16"));
+}
+
+// In an EXISTS block a star is checked, not expanded (ADR 0023): its FROM item's unsupported
+// columns are not read, the other items bind, and a position after it skips its columns.
+TEST(BinderTest, StarsOfAnExistsBlockAreCheckedNotExpanded) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view sql : {
+           "SELECT i16 FROM ok WHERE EXISTS (SELECT u.*, u.i32 FROM u WHERE u.i16 = ok.i16)",
+           "SELECT i16 FROM ok WHERE EXISTS (SELECT i32, * FROM u WHERE u.i16 = ok.i16 ORDER BY "
+           "1)",
+           "SELECT i16 FROM ok WHERE EXISTS (SELECT *, i32 FROM u WHERE u.i16 = ok.i16 ORDER BY "
+           "12)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  }
 }
 
 TEST(BinderTest, SelectStarProjectsEveryColumn) {

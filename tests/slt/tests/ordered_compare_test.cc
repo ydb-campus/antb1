@@ -93,6 +93,50 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
             "FROM u) AS \"s\" ORDER BY x");
 }
 
+// DuckDB takes a plain column written otherwise than its column is declared for an alias of the
+// declared name, the last alias winning, which the harness cannot tell from one written as
+// declared: a plain column item of the name is the key where every reading agrees, and any other
+// mix declines.
+TEST(MakeOrderedQuery, KeysThroughImplicitAliases) {
+  EXPECT_EQ(MakeOrderedQuery("SELECT 1 AS k, K, x FROM t ORDER BY k DESC"), std::nullopt)
+      << "K after the written alias may be the last alias";
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT K, 1 AS k FROM t ORDER BY k").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT K, 1 AS \"k\", 1 AS \"__antb1_key0\" FROM t ORDER BY k");
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT t2.K, v FROM t2 JOIN u2 ON t2.k = u2.k ORDER BY k")
+          .value_or(OrderedQuery{})
+          .augmented_sql,
+      "SELECT t2.K, v, t2.K AS \"__antb1_key0\" FROM t2 INNER JOIN u2 ON t2.k = u2.k ORDER BY "
+      "k");
+  EXPECT_EQ(MakeOrderedQuery("SELECT t.k, u.K FROM t JOIN u ON t.k = u.k ORDER BY k"), std::nullopt)
+      << "two columns spelled apart";
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT c0, c0 FROM t ORDER BY c0").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT c0, c0, c0 AS \"__antb1_key0\" FROM t ORDER BY c0");
+}
+
+// Stars among the select items: a position names an item only before the first star, whose width
+// only the catalog knows, so one at or after a star is declined; a star takes no alias, and a name
+// that is no alias stays a column (DuckDB orders by the alias before a star's column).
+TEST(MakeOrderedQuery, KeysNextToStars) {
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT a AS z, * FROM t ORDER BY 1").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT a AS \"z\", *, a AS \"__antb1_key0\" FROM t ORDER BY 1");
+  EXPECT_EQ(MakeOrderedQuery("SELECT *, a AS z FROM t ORDER BY 2"), std::nullopt);
+  EXPECT_EQ(MakeOrderedQuery("SELECT a, * FROM t ORDER BY 2"), std::nullopt);
+  EXPECT_EQ(MakeOrderedQuery("SELECT t.*, a FROM t ORDER BY 1"), std::nullopt);
+  EXPECT_EQ(
+      MakeOrderedQuery("SELECT *, b AS a FROM t ORDER BY a").value_or(OrderedQuery{}).augmented_sql,
+      "SELECT *, b AS \"a\", b AS \"__antb1_key0\" FROM t ORDER BY a");
+  EXPECT_EQ(
+      MakeOrderedQuery(R"(SELECT "T".*, u.y FROM t AS "T" JOIN u ON "T".a = u.a ORDER BY u.y)")
+          .value_or(OrderedQuery{})
+          .augmented_sql,
+      "SELECT \"T\".*, u.y, u.y AS \"__antb1_key0\" FROM t AS \"T\" INNER JOIN u ON \"T\".a "
+      "= u.a ORDER BY u.y");
+}
+
 // The oracle side of `SELECT v FROM t ORDER BY k [LIMIT/OFFSET]` for (v, k) rows in DuckDB's order.
 class Oracle {
  public:

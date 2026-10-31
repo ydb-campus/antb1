@@ -123,6 +123,9 @@ TEST(UnlimitedSql, DropsLimitAndOffsetOfUnorderedQueries) {
   // A compound's LIMIT is its own (ADR 0036), so dropping it gives the compound's every row.
   EXPECT_EQ(UnlimitedSql("SELECT a FROM t UNION ALL SELECT b FROM u LIMIT 5"),
             "SELECT a FROM t UNION ALL SELECT b FROM u");
+  // Stars stay where they stand, a quoted qualifier quoted.
+  EXPECT_EQ(UnlimitedSql(R"(SELECT "T".*, * FROM t AS "T" LIMIT 3 OFFSET 1)"),
+            R"(SELECT "T".*, * FROM t AS "T")");
 }
 
 }  // namespace

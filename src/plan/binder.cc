@@ -1566,18 +1566,41 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
 // What a select item is: a plain column, an aggregate call, a constant or any other expression.
 enum class ItemKind : std::uint8_t { kColumn, kAggregate, kConstant, kExpression };
 
+// How DuckDB's ORDER BY finds an un-aliased column item by name, before any FROM column. DuckDB
+// aliases a reference spelled otherwise than its column is declared (`t.K` for `k`) by the declared
+// name, which its alias step then finds in any case, the last alias winning (FindOrderAlias). A
+// star's column and a reference spelled as declared it finds by the declared name in that case
+// only, and only when one item carries it (its select-list step, OnlyTheSelectListResolves).
+struct ImplicitName {
+  std::string name;    // the declared name
+  bool alias = false;  // a reference spelled otherwise: an alias
+};
+
+// Where a star of an EXISTS block stands, which ADR 0023 checks but does not expand: its first
+// column's position as DuckDB counts them (0-based, every such star at its full width), and its
+// width, which ORDER BY positions still count (PositionOf).
+struct UnexpandedStar {
+  std::size_t position = 0;
+  std::size_t width = 0;
+};
+
 struct SelectList {
-  std::vector<BoundColumn> columns;       // SELECT * or plain columns, in select order
+  std::vector<BoundColumn> columns;       // plain columns and stars' columns, in select order
   std::vector<AggregateCall> aggregates;  // aggregates, in select order (hidden ones appended)
   std::vector<Constant> constants;        // constants, in select order
   std::vector<const sql::Expr*> exprs;    // other expressions, in select order
   std::vector<BoundColumn> expr_columns;  // per entry of `exprs`: its column (once bound)
   std::vector<OutputColumn> output;
   // Per output column: its kind and an index into `columns`, `aggregates`, `constants` or `exprs`.
+  // A star gives one per column it expands to.
   std::vector<std::pair<ItemKind, std::size_t>> items;
   std::vector<SourceSpan> column_spans;     // per entry of `columns`: what the error points at
   std::vector<std::string> column_written;  // per entry of `columns`: the name as written
   std::vector<std::optional<std::string>> aliases;  // per output column
+  std::vector<SourceSpan> spans;  // per output column: its expression, or the star it comes from
+  std::vector<std::optional<ImplicitName>> implicit_names;  // per output column
+  std::vector<UnexpandedStar> unexpanded;                   // an EXISTS block's stars, in order
+  std::vector<std::string> unexpanded_names;  // their columns' declared names (ImplicitName)
   SourceSpan span;
 };
 
@@ -2200,6 +2223,38 @@ std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view 
   return std::nullopt;
 }
 
+// The select item an ORDER BY name is the alias of, as DuckDB finds it: the last item whose alias,
+// or whose implicit alias (ImplicitName), the name is, in any case.
+std::optional<std::size_t> FindOrderAlias(const SelectList& select, std::string_view name) {
+  ANTB1_CHECK(select.implicit_names.size() == select.aliases.size());
+  const std::string wanted = AsciiLower(name);
+  for (std::size_t n = select.aliases.size(); n > 0; --n) {
+    const auto& alias = select.aliases[n - 1];
+    const auto& implicit = select.implicit_names[n - 1];
+    if ((alias.has_value() && AsciiLower(*alias) == wanted) ||
+        (implicit.has_value() && implicit->alias && AsciiLower(implicit->name) == wanted)) {
+      return n - 1;
+    }
+  }
+  return std::nullopt;
+}
+
+// Whether DuckDB's ORDER BY finds `ref`, a bare name that no alias has (FindOrderAlias), only by
+// its select-list step: FROM has two or more columns of the name, and exactly one un-aliased column
+// item carries it as declared, an EXISTS block's unexpanded stars included (ImplicitName).
+// Unsupported until a later PR answers it.
+bool OnlyTheSelectListResolves(const Scope& scope, const SelectList& select,
+                               const sql::ColumnRef& ref) {
+  if (scope.LookUp(ref).outcome != Lookup::Outcome::kAmbiguous) {
+    return false;
+  }
+  const auto items =
+      std::ranges::count_if(select.implicit_names, [&ref](const std::optional<ImplicitName>& n) {
+        return n.has_value() && !n->alias && n->name == ref.name;
+      });
+  return items + std::ranges::count(select.unexpanded_names, ref.name) == 1;
+}
+
 bool SameCall(const AggregateCall& a, const AggregateCall& b) {
   if (a.kind != b.kind || a.arg.has_value() != b.arg.has_value()) {
     return false;
@@ -2222,14 +2277,33 @@ arrow::Result<std::optional<std::size_t>> PositionOf(const sql::Literal& lit,
     return std::nullopt;
   }
   const auto exact = ParseExactNumber(lit.text, lit.negative);
-  const auto count = static_cast<Int128>(select.items.size());
+  // An EXISTS block's unexpanded stars count at their full width, as in DuckDB.
+  std::size_t count = select.items.size();
+  for (const UnexpandedStar& star : select.unexpanded) {
+    count += star.width;
+  }
+  const auto last = static_cast<Int128>(count);
   if (!exact.has_value() || exact->huge || exact->negative || exact->magnitude < 1 ||
-      exact->magnitude > count) {
+      exact->magnitude > last) {
     return BindError(std::format("{} position {}{} is not between 1 and {}", clause,
-                                 lit.negative ? "-" : "", Clip(lit.text), select.items.size()),
+                                 lit.negative ? "-" : "", Clip(lit.text), count),
                      lit.span);
   }
-  return static_cast<std::size_t>(exact->magnitude) - 1;
+  const auto position = static_cast<std::size_t>(exact->magnitude) - 1;
+  std::size_t before = 0;  // the widths of the unexpanded stars before the position
+  for (const UnexpandedStar& star : select.unexpanded) {
+    if (position < star.position) {
+      break;
+    }
+    if (position < star.position + star.width) {
+      return UnsupportedError(std::format("{} position {} over a '*' of an EXISTS subquery is not "
+                                          "supported",
+                                          clause, Clip(lit.text)),
+                              lit.span);
+    }
+    before += star.width;
+  }
+  return position - before;
 }
 
 // How the rows of a query are shaped, which decides what ORDER BY may refer to.
@@ -2242,8 +2316,10 @@ enum class Shape : std::uint8_t {
 // An aggregate anywhere in the select list, HAVING or ORDER BY makes the query aggregate, and so
 // does HAVING itself (DuckDB).
 bool IsAggregateQuery(const sql::SelectStatement& stmt) {
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   return !stmt.having.empty() || std::ranges::any_of(stmt.items, [](const sql::SelectItem& i) {
-    return ContainsAggregate(i.expr);
+    const sql::SelectExpr* expr = i.expr();  // a star holds no aggregate
+    return expr != nullptr && ContainsAggregate(*expr);
   }) || std::ranges::any_of(stmt.order_by, [](const sql::OrderItem& i) {
     return ContainsAggregate(i.expr);
   });
@@ -2255,6 +2331,9 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 struct BoundBlock {
   LogicalPlan plan;
   std::vector<BindingColumn> columns;
+  // Per column of a block (none of a compound's): the select item it comes from, its expression or
+  // the star that expands to it, which a UNION ALL's refusal points at.
+  std::vector<SourceSpan> spans;
 };
 
 // The clause whose expressions are binding. ADR 0023 answers an outer reference only in a WHERE
@@ -2330,7 +2409,7 @@ class Binder {
         relations_(scope_.bindings().size()) {
     // One block: BindBlock binds a UNION ALL by its blocks (BindUnionAll), each of which comes
     // here. Bound here, a UNION ALL would read as a block with no select list.
-    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -2342,6 +2421,8 @@ class Binder {
   }
 
   arrow::Result<LogicalPlan> Bind();
+  // After Bind: per output column, the select item it comes from (BoundBlock::spans).
+  [[nodiscard]] const std::vector<SourceSpan>& OutputSpans() const { return select_.spans; }
 
  private:
   // ---- the input scope: the bindings' columns, and computed columns over them ----
@@ -3057,9 +3138,10 @@ class Binder {
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
-  // The block of an EXISTS conjunct. ADR 0023's Path 1 drops its select list, so a `*` here is
-  // checked for ADR 0022's rule 5 and then neither expanded into columns nor type-checked: a table
-  // with a column antb1 cannot read still works inside EXISTS, as it does in DuckDB.
+  // The block of an EXISTS conjunct. ADR 0023's Path 1 drops its select list, so a star here, `*`
+  // or `t.*`, is checked by name (ADR 0022's rule 5, or its one FROM item) and then neither
+  // expanded into columns nor type-checked: a table with a column antb1 cannot read still works
+  // inside EXISTS, as it does in DuckDB. The other select items bind as usual.
   bool inside_exists_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
   ColumnIdSource& ids_;
@@ -3161,55 +3243,90 @@ class Binder {
 };
 
 arrow::Status Binder::BindSelectList() {
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   clause_ = Clause::kSelect;
   SelectList& list = select_;
-  if (stmt_.star) {
-    list.span = stmt_.star_span;
-    // Rule 5 of ADR 0022, before the expansion, so it beats an unsupported column type.
-    if (const auto conflict = scope_.FindStarConflict()) {
-      return BindError(std::format("'*' is ambiguous: two FROM items named '{}' have a column '{}'",
-                                   scope_.bindings()[conflict->first].name(), conflict->column),
-                       stmt_.star_span);
-    }
-    if (inside_exists_) {
-      // Checked, not expanded (ADR 0023): the semi or anti join reads none of these columns, and
-      // the expansion below is the only place a column's engine type is checked.
-      return arrow::Status::OK();
-    }
-    for (std::size_t b = 0; b < scope_.bindings().size(); ++b) {
-      for (std::size_t c = 0; c < scope_.bindings()[b].columns().size(); ++c) {
-        ARROW_ASSIGN_OR_RAISE(
-            BoundColumn column,
-            scope_.Reference(ColumnLocation{.binding = b, .column = c}, stmt_.star_span));
-        list.output.push_back(
-            plan::OutputColumn{.name = column.name,
-                               .type = column.type,
-                               .id = kNoColumnId,
-                               .stored_as_float = scope_.StoredAsFloat(column.id)});
-        list.items.emplace_back(ItemKind::kColumn, list.columns.size());
-        list.column_spans.push_back(stmt_.star_span);
-        list.column_written.push_back(column.name);
-        list.aliases.emplace_back();
-        list.columns.push_back(std::move(column));
-      }
-    }
-    if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && !list.columns.empty()) {
-      return BindError(std::format("column '{}' must be inside an aggregate function: a query "
-                                   "with aggregates cannot also select plain columns (there is "
-                                   "no GROUP BY)",
-                                   list.columns.front().name),
-                       stmt_.star_span);
-    }
-    return arrow::Status::OK();
-  }
   if (stmt_.items.empty()) {
     return BindError("the select list is empty", stmt_.span);
   }
   list.span = Cover(stmt_.items.front().span, stmt_.items.back().span);
-  const sql::ColumnRef* first_column = nullptr;
-  for (const sql::SelectItem& item : stmt_.items) {
+  // Per star: the bindings it expands, [first, last) -- every one for `*`, the one a `t.*` names.
+  // Found for every star before any item binds, as DuckDB expands its stars first, so a star's
+  // error wins over an earlier item's and over an unsupported column type: rule 5 of ADR 0022 for
+  // `*`, and for `t.*` its one FROM item of this block (Scope::StarBinding).
+  std::vector<std::pair<std::size_t, std::size_t>> expands(stmt_.items.size());
+  for (std::size_t i = 0; i < stmt_.items.size(); ++i) {
+    const sql::SelectStar* star = stmt_.items[i].star();
+    if (star == nullptr) {
+      continue;
+    }
+    ANTB1_CHECK(!stmt_.items[i].alias.has_value());  // the parser refuses one (DuckDB renames)
+    if (!star->qualifier.empty()) {
+      ARROW_ASSIGN_OR_RAISE(const std::size_t b, scope_.StarBinding(star->qualifier, star->span));
+      expands[i] = {b, b + 1};
+      continue;
+    }
+    if (const auto conflict = scope_.FindStarConflict()) {
+      return BindError(std::format("'*' is ambiguous: two FROM items named '{}' have a column '{}'",
+                                   scope_.bindings()[conflict->first].name(), conflict->column),
+                       star->span);
+    }
+    expands[i] = {0, scope_.bindings().size()};
+  }
+  // The first plain column, a star's included: the column a query with aggregates and no GROUP BY
+  // must not select, named as DuckDB names it.
+  std::optional<std::pair<SourceSpan, std::string>> first_column;
+  std::size_t unexpanded = 0;  // the columns of the unexpanded stars so far (inside EXISTS)
+  for (std::size_t i = 0; i < stmt_.items.size(); ++i) {
+    const sql::SelectItem& item = stmt_.items[i];
+    if (const sql::SelectStar* star = item.star()) {
+      const auto [first, last] = expands[i];
+      if (inside_exists_) {
+        // Checked, not expanded (ADR 0023): the semi or anti join reads none of these columns, and
+        // the expansion below is where a column's engine type is checked. ORDER BY positions still
+        // count its columns (PositionOf).
+        std::size_t width = 0;
+        for (std::size_t b = first; b < last; ++b) {
+          width += scope_.bindings()[b].columns().size();
+        }
+        list.unexpanded.push_back(
+            UnexpandedStar{.position = list.items.size() + unexpanded, .width = width});
+        unexpanded += width;
+        for (std::size_t b = first; b < last; ++b) {
+          for (const BindingColumn& column : scope_.bindings()[b].columns()) {
+            list.unexpanded_names.push_back(column.name);
+          }
+        }
+        continue;
+      }
+      for (std::size_t b = first; b < last; ++b) {
+        for (std::size_t c = 0; c < scope_.bindings()[b].columns().size(); ++c) {
+          ARROW_ASSIGN_OR_RAISE(
+              BoundColumn column,
+              scope_.Reference(ColumnLocation{.binding = b, .column = c}, star->span));
+          if (!first_column.has_value()) {
+            first_column.emplace(star->span, column.name);
+          }
+          list.output.push_back(
+              plan::OutputColumn{.name = column.name,
+                                 .type = column.type,
+                                 .id = kNoColumnId,
+                                 .stored_as_float = scope_.StoredAsFloat(column.id)});
+          list.items.emplace_back(ItemKind::kColumn, list.columns.size());
+          list.column_spans.push_back(star->span);
+          list.column_written.push_back(column.name);
+          list.aliases.emplace_back();
+          list.spans.push_back(star->span);
+          list.implicit_names.emplace_back(ImplicitName{.name = column.name, .alias = false});
+          list.columns.push_back(std::move(column));
+        }
+      }
+      continue;
+    }
+    const sql::SelectExpr& expr = *item.expr();
     list.aliases.push_back(item.alias);
-    const auto* call = std::get_if<sql::AggregateCall>(&item.expr);
+    list.spans.push_back(expr.span());
+    const auto* call = std::get_if<sql::AggregateCall>(&expr);
     bool rewritten = false;
     if (call != nullptr) {
       ARROW_ASSIGN_OR_RAISE(const auto rewrite, RewritableSum(*call));
@@ -3222,19 +3339,21 @@ arrow::Status Binder::BindSelectList() {
                                                .id = kNoColumnId,
                                                .stored_as_float = FloatResult(bound)});
       list.items.emplace_back(ItemKind::kAggregate, list.aggregates.size());
+      list.implicit_names.emplace_back();
       bound.id = ids_.Next();
       list.aggregates.push_back(std::move(bound));
       continue;
     }
-    if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
+    if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
       ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(*lit));
       list.output.push_back(plan::OutputColumn{
           .name = item.alias.value_or(std::move(constant.second)), .type = constant.first.type});
       list.items.emplace_back(ItemKind::kConstant, list.constants.size());
+      list.implicit_names.emplace_back();
       list.constants.push_back(std::move(constant.first));
       continue;
     }
-    if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr)) {
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
       ARROW_ASSIGN_OR_RAISE(BoundColumn column, Resolve(*ref));
       // DuckDB names a plain column by its declared name, not as written.
       list.output.push_back(plan::OutputColumn{.name = item.alias.value_or(column.name),
@@ -3244,23 +3363,30 @@ arrow::Status Binder::BindSelectList() {
       list.items.emplace_back(ItemKind::kColumn, list.columns.size());
       list.column_spans.push_back(ref->span);
       list.column_written.push_back(WrittenName(*ref));
-      list.columns.push_back(std::move(column));
-      if (first_column == nullptr) {
-        first_column = ref;
+      if (item.alias.has_value()) {
+        list.implicit_names.emplace_back();
+      } else {
+        list.implicit_names.emplace_back(
+            ImplicitName{.name = column.name, .alias = ref->name != column.name});
       }
+      if (!first_column.has_value()) {
+        first_column.emplace(ref->span, ref->name);
+      }
+      list.columns.push_back(std::move(column));
       continue;
     }
     // Bound once the query's shape and keys are known (BindSelectExpressions).
     list.output.push_back(plan::OutputColumn{.name = item.alias.value_or(""), .type = {}});
     list.items.emplace_back(ItemKind::kExpression, list.exprs.size());
-    list.exprs.push_back(&item.expr);
+    list.implicit_names.emplace_back();
+    list.exprs.push_back(&expr);
   }
-  if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && first_column != nullptr) {
+  if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && first_column.has_value()) {
     return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
                                  "aggregates cannot also select plain columns (there is no "
                                  "GROUP BY)",
-                                 first_column->name),
-                     first_column->span);
+                                 first_column->second),
+                     first_column->first);
   }
   return arrow::Status::OK();
 }
@@ -5248,9 +5374,17 @@ arrow::Status Binder::BindOrderBy() {
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
-               FindAlias(select_, ref->name).has_value()) {  // t.x never names an alias
-      const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
+               FindOrderAlias(select_, ref->name).has_value()) {  // t.x never names an alias
+      const std::size_t alias = FindOrderAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
+    } else if (const auto* name = std::get_if<sql::ColumnRef>(&item.expr);
+               name != nullptr && name->qualifier.empty() &&
+               OnlyTheSelectListResolves(scope_, select_, *name)) {
+      // DuckDB orders by that select item; FROM alone finds the name ambiguous.
+      return UnsupportedError(std::format("ORDER BY {}, which only the select list makes "
+                                          "unambiguous, is not supported",
+                                          name->name),
+                              name->span);
     } else {
       // A global aggregate's only row needs no sort: its ORDER BY items are checked, and computed
       // or hidden aggregates for them dropped again.
@@ -5762,7 +5896,8 @@ void FoldDateCasts(sql::Expr& expr) {
 // nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
 // the folded statement, so folding per level would fold a copy nothing reads).
 void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (sql::CommonTableExpr& cte : stmt.with) {
     FoldDateCastsInBlock(*cte.query);
   }
@@ -5770,7 +5905,9 @@ void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
     FoldDateCastsInBlock(*branch.query);
   }
   for (sql::SelectItem& item : stmt.items) {
-    FoldDateCasts(item.expr);
+    if (sql::SelectExpr* expr = item.expr()) {  // a star has nothing to fold
+      FoldDateCasts(*expr);
+    }
   }
   for (std::vector<sql::Expr>* clause : {&stmt.where, &stmt.group_by, &stmt.having}) {
     for (sql::Expr& expr : *clause) {
@@ -5892,7 +6029,8 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
 }
 
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
     // A UNION ALL keeps its clauses in its blocks, which ReachableBlocks lists before it, so what
     // is left is its tail; its FROM list is empty, which CheckFromList must never see.
@@ -5902,7 +6040,9 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
     return arrow::Status::OK();
   }
   for (const sql::SelectItem& item : stmt.items) {
-    ARROW_RETURN_NOT_OK(CheckValue(item.expr));
+    if (const sql::SelectExpr* expr = item.expr()) {  // a star's names bind later (BindSelectList)
+      ARROW_RETURN_NOT_OK(CheckValue(*expr));
+    }
   }
   ARROW_RETURN_NOT_OK(CheckFromList(stmt.from));
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false));
@@ -6077,12 +6217,6 @@ arrow::Result<Binding> BindFromItem(const sql::FromItem& item, const Catalog& ca
                          cte == nullptr ? std::string{} : cte->name);
 }
 
-// The span a type refusal of a UNION ALL block's column points at: its select item's expression,
-// or the `*` the column was expanded from.
-SourceSpan UnionAllItemSpan(const sql::SelectStatement& block, std::size_t column) {
-  return block.star ? block.star_span : block.items.at(column).expr.span();
-}
-
 // A type as a UNION ALL refusal names it: FLOAT for a DOUBLE that holds FLOAT values (D11).
 std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
   return stored_as_float ? std::string("FLOAT") : ToString(type);
@@ -6102,18 +6236,22 @@ std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
 arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
                                         const BindOptions& options, ColumnIdSource& ids,
                                         const CteFrame& own, const Scope* outer) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
   ANTB1_CHECK(stmt.order_by.empty());
   ANTB1_CHECK(!stmt.limit.has_value());
   ANTB1_CHECK(!stmt.offset.has_value());
   std::vector<LogicalPlan> blocks;
+  std::vector<std::vector<SourceSpan>> spans;  // per block: per column, what a refusal points at
   blocks.reserve(stmt.set_operation.size());
+  spans.reserve(stmt.set_operation.size());
   for (const sql::SetBranch& branch : stmt.set_operation) {
     ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
                           BindBlock(*branch.query, catalog, options, ids, &own, outer));
+    ANTB1_CHECK(bound.spans.size() == bound.plan.output.size());  // a block, never a compound
     blocks.push_back(std::move(bound.plan));
+    spans.push_back(std::move(bound.spans));
   }
   const std::size_t width = blocks.front().output.size();
   for (std::size_t k = 1; k < blocks.size(); ++k) {
@@ -6180,9 +6318,8 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
     columns.push_back(column);
   }
   if (first.has_value()) {
-    return Reject(
-        Rejection{.span = UnionAllItemSpan(*stmt.set_operation[first->block].query, first->column),
-                  .message = std::move(first->message)});
+    return Reject(Rejection{.span = spans[first->block][first->column],
+                            .message = std::move(first->message)});
   }
 
   UnionAllNode node{.span = stmt.set_operation[1].op_span};
@@ -6244,7 +6381,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
                                     bool inside_exists) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -6302,7 +6439,9 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   Binder binder(stmt, std::move(bindings), ids, options, outer, &bind_sub, outer_encloses,
                 inside_exists);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
-  return BoundBlockOf(std::move(plan));
+  BoundBlock bound = BoundBlockOf(std::move(plan));
+  bound.spans = binder.OutputSpans();
+  return bound;
 }
 
 }  // namespace

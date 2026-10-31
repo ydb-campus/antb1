@@ -266,11 +266,30 @@ std::optional<HavingComparison> AsHavingComparison(const Expr& expr);
 Expr ToExpr(const Comparison& cmp);
 Expr ToExpr(const HavingComparison& cmp);
 
-struct SelectItem {
-  SelectExpr expr;
-  std::optional<std::string> alias;  // as written (quoted aliases unescaped)
-  SourceSpan span;                   // expression and alias
+// `*` or `t.*` as a select item, never inside an expression: every column of every FROM item, in
+// FROM order, or every column of the FROM item named t, expanded where the star stands.
+struct SelectStar {
+  std::string qualifier;          // t.*: "t", as written (a quoted one unescaped); empty: `*`
+  bool qualifier_quoted = false;  // (the lexer makes no empty quoted identifier)
+  SourceSpan span;                // the qualifier (when there is one) through the '*'
 };
+
+// A select item: an expression with an optional alias, or a star, which has no alias.
+struct SelectItem {
+  std::variant<SelectExpr, SelectStar> value;
+  std::optional<std::string> alias;  // as written (quoted aliases unescaped); never on a star
+  SourceSpan span;                   // the expression and its alias, or the star
+
+  // The expression, or nullptr for a star; the star, or nullptr for an expression.
+  [[nodiscard]] const SelectExpr* expr() const;
+  [[nodiscard]] SelectExpr* expr();
+  [[nodiscard]] const SelectStar* star() const;
+};
+
+// The number of kinds of select item (SelectItem::value's alternatives). ast.cc checks it, and
+// every walk that tells the kinds apart asserts the number it was written for, as with
+// kSelectStatementFields: a new kind fails the build at each of them.
+inline constexpr std::size_t kSelectItemKinds = 2;
 
 // NULLS FIRST / NULLS LAST as written; kDefault when omitted.
 enum class NullsOrder : std::uint8_t { kDefault, kFirst, kLast };
@@ -349,11 +368,9 @@ struct SetBranch {
 // A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET), or a compound of
 // blocks. A derived table and a common table expression hold a query of their own.
 struct SelectStatement {
-  std::vector<CommonTableExpr> with;  // the WITH list, in order (empty: none)
-  SourceSpan with_span;               // the WITH keyword (when with is not empty)
-  bool star = false;                  // SELECT *
-  SourceSpan star_span;               // the '*' (when star)
-  std::vector<SelectItem> items;
+  std::vector<CommonTableExpr> with;   // the WITH list, in order (empty: none)
+  SourceSpan with_span;                // the WITH keyword (when with is not empty)
+  std::vector<SelectItem> items;       // in a block, at least one; stars among them
   std::vector<FromItem> from;          // at least one in a block, empty in a compound: a flat
                                        // list, never a tree (ADR 0022)
   std::vector<Expr> where;             // conjuncts: the top-level AND chain, split
@@ -369,16 +386,16 @@ struct SelectStatement {
   SourceSpan offset_span;              // OFFSET and its value (when offset)
   SourceSpan span;                     // WITH or SELECT .. last token of the query (without ';')
   // A compound: two or more blocks joined by UNION ALL, in the order written, or none. When set,
-  // the block's own fields (star through having_span) are empty, and the WITH list, ORDER BY, LIMIT
-  // and OFFSET belong to the compound. A walk of a statement that reads those fields must also walk
-  // the branches (kSelectStatementFields).
+  // the block's own fields (items through having_span) are empty, and the WITH list, ORDER BY,
+  // LIMIT and OFFSET belong to the compound. A walk of a statement that reads those fields must
+  // also walk the branches (kSelectStatementFields).
   std::vector<SetBranch> set_operation;
 };
 
 // The number of fields of SelectStatement. ast.cc checks it against the struct, and every walk of a
 // statement asserts the number it was written for: a new field fails the build at each of them,
 // which is the only way a walk that forgets it can be found, the compiler checking nothing else.
-inline constexpr std::size_t kSelectStatementFields = 19;
+inline constexpr std::size_t kSelectStatementFields = 17;
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);
