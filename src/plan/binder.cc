@@ -1566,12 +1566,14 @@ arrow::Result<Predicate> BindEquality(const sql::Comparison& cmp, const BoundCol
 // What a select item is: a plain column, an aggregate call, a constant or any other expression.
 enum class ItemKind : std::uint8_t { kColumn, kAggregate, kConstant, kExpression };
 
-// The name DuckDB's ORDER BY finds an un-aliased column item by, before any FROM column (its
-// select-list step): a star's column and a reference spelled as declared by the declared name, in
-// that case only; a reference spelled otherwise by its spelling, in any case.
+// How DuckDB's ORDER BY finds an un-aliased column item by name, before any FROM column. DuckDB
+// aliases a reference spelled otherwise than its column is declared (`t.K` for `k`) by the declared
+// name, which its alias step then finds in any case, the last alias winning (FindOrderAlias). A
+// star's column and a reference spelled as declared it finds by the declared name in that case
+// only, and only when one item carries it (its select-list step, OnlyTheSelectListResolves).
 struct ImplicitName {
-  std::string name;
-  bool exact = true;  // whether the case must match
+  std::string name;    // the declared name
+  bool alias = false;  // a reference spelled otherwise: an alias
 };
 
 // Where a star of an EXISTS block stands, which ADR 0023 checks but does not expand: its first
@@ -1598,6 +1600,7 @@ struct SelectList {
   std::vector<SourceSpan> spans;  // per output column: its expression, or the star it comes from
   std::vector<std::optional<ImplicitName>> implicit_names;  // per output column
   std::vector<UnexpandedStar> unexpanded;                   // an EXISTS block's stars, in order
+  std::vector<std::string> unexpanded_names;  // their columns' declared names (ImplicitName)
   SourceSpan span;
 };
 
@@ -2220,18 +2223,36 @@ std::optional<std::size_t> FindAlias(const SelectList& select, std::string_view 
   return std::nullopt;
 }
 
-// Whether DuckDB's ORDER BY finds `ref`, a bare name that no alias has, only by its select-list
-// step: FROM has two or more columns of the name, and exactly one un-aliased column item carries it
-// (ImplicitName). Unsupported until a later PR answers it.
+// The select item an ORDER BY name is the alias of, as DuckDB finds it: the last item whose alias,
+// or whose implicit alias (ImplicitName), the name is, in any case.
+std::optional<std::size_t> FindOrderAlias(const SelectList& select, std::string_view name) {
+  ANTB1_CHECK(select.implicit_names.size() == select.aliases.size());
+  const std::string wanted = AsciiLower(name);
+  for (std::size_t n = select.aliases.size(); n > 0; --n) {
+    const auto& alias = select.aliases[n - 1];
+    const auto& implicit = select.implicit_names[n - 1];
+    if ((alias.has_value() && AsciiLower(*alias) == wanted) ||
+        (implicit.has_value() && implicit->alias && AsciiLower(implicit->name) == wanted)) {
+      return n - 1;
+    }
+  }
+  return std::nullopt;
+}
+
+// Whether DuckDB's ORDER BY finds `ref`, a bare name that no alias has (FindOrderAlias), only by
+// its select-list step: FROM has two or more columns of the name, and exactly one un-aliased column
+// item carries it as declared, an EXISTS block's unexpanded stars included (ImplicitName).
+// Unsupported until a later PR answers it.
 bool OnlyTheSelectListResolves(const Scope& scope, const SelectList& select,
                                const sql::ColumnRef& ref) {
   if (scope.LookUp(ref).outcome != Lookup::Outcome::kAmbiguous) {
     return false;
   }
-  const std::string lower = AsciiLower(ref.name);
-  return std::ranges::count_if(select.implicit_names, [&](const std::optional<ImplicitName>& n) {
-           return n.has_value() && (n->exact ? n->name == ref.name : AsciiLower(n->name) == lower);
-         }) == 1;
+  const auto items =
+      std::ranges::count_if(select.implicit_names, [&ref](const std::optional<ImplicitName>& n) {
+        return n.has_value() && !n->alias && n->name == ref.name;
+      });
+  return items + std::ranges::count(select.unexpanded_names, ref.name) == 1;
 }
 
 bool SameCall(const AggregateCall& a, const AggregateCall& b) {
@@ -2261,8 +2282,9 @@ arrow::Result<std::optional<std::size_t>> PositionOf(const sql::Literal& lit,
   for (const UnexpandedStar& star : select.unexpanded) {
     count += star.width;
   }
+  const auto last = static_cast<Int128>(count);
   if (!exact.has_value() || exact->huge || exact->negative || exact->magnitude < 1 ||
-      exact->magnitude > static_cast<Int128>(count)) {
+      exact->magnitude > last) {
     return BindError(std::format("{} position {}{} is not between 1 and {}", clause,
                                  lit.negative ? "-" : "", Clip(lit.text), count),
                      lit.span);
@@ -3270,6 +3292,11 @@ arrow::Status Binder::BindSelectList() {
         list.unexpanded.push_back(
             UnexpandedStar{.position = list.items.size() + unexpanded, .width = width});
         unexpanded += width;
+        for (std::size_t b = first; b < last; ++b) {
+          for (const BindingColumn& column : scope_.bindings()[b].columns()) {
+            list.unexpanded_names.push_back(column.name);
+          }
+        }
         continue;
       }
       for (std::size_t b = first; b < last; ++b) {
@@ -3290,7 +3317,7 @@ arrow::Status Binder::BindSelectList() {
           list.column_written.push_back(column.name);
           list.aliases.emplace_back();
           list.spans.push_back(star->span);
-          list.implicit_names.emplace_back(ImplicitName{.name = column.name, .exact = true});
+          list.implicit_names.emplace_back(ImplicitName{.name = column.name, .alias = false});
           list.columns.push_back(std::move(column));
         }
       }
@@ -3338,10 +3365,9 @@ arrow::Status Binder::BindSelectList() {
       list.column_written.push_back(WrittenName(*ref));
       if (item.alias.has_value()) {
         list.implicit_names.emplace_back();
-      } else if (ref->name == column.name) {
-        list.implicit_names.emplace_back(ImplicitName{.name = column.name, .exact = true});
       } else {
-        list.implicit_names.emplace_back(ImplicitName{.name = ref->name, .exact = false});
+        list.implicit_names.emplace_back(
+            ImplicitName{.name = column.name, .alias = ref->name != column.name});
       }
       if (!first_column.has_value()) {
         first_column.emplace(ref->span, ref->name);
@@ -5348,8 +5374,8 @@ arrow::Status Binder::BindOrderBy() {
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
-               FindAlias(select_, ref->name).has_value()) {  // t.x never names an alias
-      const std::size_t alias = FindAlias(select_, ref->name).value_or(0);
+               FindOrderAlias(select_, ref->name).has_value()) {  // t.x never names an alias
+      const std::size_t alias = FindOrderAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
     } else if (const auto* name = std::get_if<sql::ColumnRef>(&item.expr);
                name != nullptr && name->qualifier.empty() &&

@@ -3574,17 +3574,71 @@ INSTANTIATE_TEST_SUITE_P(
                   "x.*", "no FROM item is named 'x'"},
         ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT *, nope FROM u WHERE u.i16 = ok.i16)",
                   kBind, "nope", "column 'nope' does not exist"},
-        // ORDER BY a name FROM has twice but one un-aliased column item carries: DuckDB orders by
-        // that item (its select-list step), which a later PR answers. A star's column matches its
-        // declared name in that case only, a reference spelled otherwise its spelling in any case.
+        // ORDER BY a name FROM has twice but one un-aliased column item carries as declared: DuckDB
+        // orders by that item (its select-list step), which a later PR answers. A star's column and
+        // a reference written as declared match in that case only.
         ErrorCase{"SELECT ok.*, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", kUnsupported,
                   "i16", "which only the select list makes unambiguous"},
-        ErrorCase{"SELECT OK.I16, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16",
-                  kUnsupported, "i16", "which only the select list makes unambiguous"},
         ErrorCase{"SELECT ok.*, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY I16", kBind, "I16",
                   "is ambiguous"},
         ErrorCase{"SELECT a.*, b.* FROM ok AS a JOIN ok AS b ON a.i16 = b.i16 ORDER BY i16", kBind,
-                  "i16", "is ambiguous"}));
+                  "i16", "is ambiguous"},
+        // An aliased item carries only its alias, and a reference written as declared matches in
+        // that case only: FROM's ambiguity stands, as in DuckDB.
+        ErrorCase{"SELECT ok.i16 AS x, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", kBind,
+                  "i16", "is ambiguous"},
+        ErrorCase{"SELECT ok.i16, t.i32 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY I16", kBind,
+                  "I16", "is ambiguous"},
+        // An EXISTS block's star carries its columns' names too, unexpanded.
+        ErrorCase{"SELECT i16 FROM ok WHERE EXISTS (SELECT u.*, t.d FROM u JOIN t ON u.i16 = t.i16 "
+                  "WHERE u.i16 = ok.i16 ORDER BY i32)",
+                  kUnsupported, "i32", "which only the select list makes unambiguous"},
+        ErrorCase{
+            "SELECT i16 FROM ok WHERE EXISTS (SELECT t.i32, u.* FROM u JOIN t ON u.i16 = t.i16 "
+            "WHERE u.i16 = ok.i16 ORDER BY i32)",
+            kBind, "i32", "is ambiguous"},
+        // Positions in an EXISTS block over a star of two FROM items: u's 11 columns, then ok's 2.
+        ErrorCase{
+            "SELECT i16 FROM t WHERE EXISTS (SELECT *, u.i32 FROM u JOIN ok ON u.i16 = ok.i16 "
+            "WHERE u.i16 = t.i16 ORDER BY 13)",
+            kUnsupported, "13", "over a '*' of an EXISTS subquery"},
+        ErrorCase{
+            "SELECT i16 FROM t WHERE EXISTS (SELECT *, u.i32 FROM u JOIN ok ON u.i16 = ok.i16 "
+            "WHERE u.i16 = t.i16 ORDER BY 15)",
+            kBind, "15", "ORDER BY position 15 is not between 1 and 14"},
+        // The aggregate-mixing error names a reference as written.
+        ErrorCase{"SELECT I16, COUNT(*) FROM ok", kBind, "I16",
+                  "column 'I16' must be inside an aggregate function"}));
+
+// DuckDB's implicit ORDER BY alias: a plain column written otherwise than its column is declared is
+// an alias of the declared name, found in any case, the last alias -- implicit or explicit --
+// winning, where a FROM column would be ambiguous too.
+TEST(BinderTest, OrderByFindsAColumnWrittenOtherwiseAsAnAlias) {
+  const Catalog catalog = MakeCatalog();
+  const auto key = [&catalog](std::string_view sql, int sort_at) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return std::string();
+    }
+    const auto& sort = std::get<SortNode>(Nth(*plan, sort_at));
+    EXPECT_EQ(sort.keys.size(), 1U) << sql;
+    return sort.keys.empty() ? std::string() : sort.keys[0].column.name;
+  };
+  EXPECT_EQ(key("SELECT i32 AS i16, I16 FROM t ORDER BY i16", 1), "i16");
+  EXPECT_EQ(key("SELECT I16, i32 AS i16 FROM t ORDER BY i16", 1), "i32");
+  EXPECT_EQ(key("SELECT i32 AS i16, t.I16 FROM t ORDER BY I16", 1), "i16");
+  // The alias decides before FROM's ambiguity, also next to a star's column of the name.
+  EXPECT_EQ(key("SELECT ok.*, t.I16 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", 1), "i16");
+  auto plan = BindSql("SELECT ok.*, t.I16 FROM ok JOIN t ON ok.i16 = t.i16 ORDER BY i16", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& project = std::get<ProjectNode>(Nth(*plan, 0));
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  ASSERT_EQ(project.columns.size(), 3U);
+  ASSERT_EQ(sort.keys.size(), 1U);
+  EXPECT_EQ(sort.keys[0].column.id, project.columns[2].id) << "t.i16, not ok.i16";
+  EXPECT_NE(sort.keys[0].column.id, project.columns[0].id);
+}
 
 // A star expands where it stands among the other items -- `*` every FROM item's columns in FROM
 // order, `t.*` its one FROM item's -- each under its declared name and read by its own id, so a

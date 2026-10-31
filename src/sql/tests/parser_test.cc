@@ -2186,14 +2186,23 @@ TEST(ParserTest, StarsStandAmongTheItems) {
       EXPECT_EQ(got[i].text, want[i].text) << sql;
     }
   };
-  expect("SELECT *, a FROM t", {{0, "", false, "*"}});
-  expect("SELECT a, * FROM t", {{1, "", false, "*"}});
-  expect("SELECT *, * FROM t", {{0, "", false, "*"}, {1, "", false, "*"}});
-  expect("SELECT e.* FROM events e", {{0, "e", false, "e.*"}});
-  expect(R"(SELECT "E".* FROM events AS "E")", {{0, "E", true, R"("E".*)"}});
-  expect("SELECT e . /*c*/ * FROM events e", {{0, "e", false, "e . /*c*/ *"}});
-  expect("SELECT e.*, u.y, u.* FROM events e, u", {{0, "e", false, "e.*"}, {2, "u", false, "u.*"}});
-  expect(R"(SELECT "over".* FROM t AS "over")", {{0, "over", true, R"("over".*)"}});
+  // The star at select item `item`: its qualifier, whether that is quoted, and its text.
+  const auto at = [](std::size_t item, std::string_view qualifier, bool quoted,
+                     std::string_view text) {
+    return Star{.item = item,
+                .qualifier = std::string(qualifier),
+                .quoted = quoted,
+                .text = std::string(text)};
+  };
+  expect("SELECT *, a FROM t", {at(0, "", false, "*")});
+  expect("SELECT a, * FROM t", {at(1, "", false, "*")});
+  expect("SELECT *, * FROM t", {at(0, "", false, "*"), at(1, "", false, "*")});
+  expect("SELECT e.* FROM events e", {at(0, "e", false, "e.*")});
+  expect(R"(SELECT "E".* FROM events AS "E")", {at(0, "E", true, R"("E".*)")});
+  expect("SELECT e . /*c*/ * FROM events e", {at(0, "e", false, "e . /*c*/ *")});
+  expect("SELECT e.*, u.y, u.* FROM events e, u",
+         {at(0, "e", false, "e.*"), at(2, "u", false, "u.*")});
+  expect(R"(SELECT "over".* FROM t AS "over")", {at(0, "over", true, R"("over".*)")});
   // A quoted * after a dot is a column named *, no star.
   expect(R"(SELECT t."*" FROM t)", {});
   auto quoted = Parse(R"(SELECT t."*" FROM t)");
@@ -3122,6 +3131,26 @@ INSTANTIATE_TEST_SUITE_P(
                    "the reserved word OVER as a qualifier is not supported"},
         RejectCase{"StarTrailingComma", "SELECT *^, FROM events", kUnsupported, 1,
                    "a trailing comma in the select list is not supported"},
+        RejectCase{"KeywordAliasAfterAStar", "SELECT * ^default FROM events", kUnsupported, 7,
+                   "an alias after '*' is not supported"},
+        RejectCase{"EmptyStringAliasAfterAStar", "SELECT * ^AS '' FROM events", kUnsupported, 5,
+                   "an alias after '*' is not supported"},
+        RejectCase{"EscapeStringAliasAfterAStar", "SELECT e.* ^AS E'x' FROM events e", kUnsupported,
+                   7, "an alias after '*' is not supported"},
+        RejectCase{"RenameAfterAStar", "SELECT * ^RENAME (a AS b) FROM events", kUnsupported, 6,
+                   "SELECT * RENAME is not supported"},
+        RejectCase{"GlobAfterAStar", "SELECT * ^GLOB 'a*' FROM events", kUnsupported, 4,
+                   "SELECT * GLOB is not supported"},
+        RejectCase{"IlikeAfterAStar", "SELECT * ^ILIKE 'A%' FROM events", kUnsupported, 5,
+                   "SELECT * ILIKE is not supported"},
+        RejectCase{"LikeAnEscapeStringAfterAStar", "SELECT * ^LIKE E'a%' FROM events", kUnsupported,
+                   4, "SELECT * LIKE is not supported"},
+        RejectCase{"SimilarToAfterAStar", "SELECT * ^SIMILAR TO 'a.*' FROM events", kUnsupported, 7,
+                   "SELECT * SIMILAR TO is not supported"},
+        RejectCase{"NotIlikeAfterAStar", "SELECT * ^NOT ILIKE 'A%' FROM events", kUnsupported, 3,
+                   "SELECT * NOT ILIKE is not supported"},
+        RejectCase{"NotSimilarToAfterAStar", "SELECT e.* ^NOT SIMILAR TO 'a.*' FROM events e",
+                   kUnsupported, 3, "SELECT * NOT SIMILAR TO is not supported"},
         RejectCase{"Collate", "SELECT a FROM events WHERE a = 'x' ^COLLATE nocase", kUnsupported, 7,
                    "COLLATE is not supported"},
         RejectCase{"Qualify", "SELECT a FROM events ^QUALIFY a = 1", kUnsupported, 7,
@@ -3398,6 +3427,19 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected ',' or FROM"},
         RejectCase{"LikeAColumnAfterAStar", "SELECT * ^LIKE b FROM events", kSyntax, 4,
                    "expected ',' or FROM"},
+        RejectCase{"LikeAColumnNamedEAfterAStar", "SELECT * ^LIKE e FROM events", kSyntax, 4,
+                   "expected ',' or FROM"},
+        RejectCase{"GlobAColumnAfterAStar", "SELECT * ^GLOB b FROM events", kSyntax, 4,
+                   "expected ',' or FROM"},
+        RejectCase{"SimilarWithoutToAfterAStar", "SELECT * ^SIMILAR 'a' FROM events", kSyntax, 7,
+                   "expected ',' or FROM"},
+        RejectCase{"NotSimilarToAColumnAfterAStar", "SELECT * ^NOT SIMILAR TO b FROM events",
+                   kSyntax, 3, "expected ',' or FROM, found keyword NOT"},
+        RejectCase{"NotSimilarWithoutToAfterAStar", "SELECT * ^NOT SIMILAR 'a' FROM events",
+                   kSyntax, 3, "expected ',' or FROM"},
+        RejectCase{"AtAfterAStar", "SELECT * ^at FROM events", kSyntax, 2, "expected ',' or FROM"},
+        RejectCase{"AsFromAfterAStar", "SELECT * ^AS FROM events", kSyntax, 2,
+                   "expected ',' or FROM, found keyword AS"},
         RejectCase{"ReservedWordStarQualifier", "SELECT ^from.* FROM events", kSyntax, 4,
                    "expected an expression"},
         // A star with nothing to expand: DuckDB's "* expression without FROM clause".

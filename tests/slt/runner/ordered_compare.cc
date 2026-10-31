@@ -107,6 +107,7 @@ bool SameAnswer(const ResultSet& a, const ResultSet& b, std::string_view letters
 }  // namespace
 
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
+  static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   auto stmt = sql::Parse(sql);
   // A compound's ORDER BY reads its output, which no select list of its own spells out to add keys
   // to (ADR 0036): declined, as a position at or after a star is.

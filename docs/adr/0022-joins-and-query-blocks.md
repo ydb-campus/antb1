@@ -643,7 +643,8 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   column name, a table name that its alias hides, a name in an ON that only a later FROM item has, a column alias
   list longer than the select list, a scalar subquery with two columns.
   Update (2026-10-31): `t.*` as a select item is answered and stays exit 4 inside an expression; a `t.*` that names
-  no FROM item of its own block, or two, is a bind error (exit code 1), as in DuckDB.
+  no FROM item of its own block, or two, is a bind error (exit code 1), as in DuckDB; one that names a STRUCT column
+  instead exits 4, since DuckDB expands its fields.
 - **Correct plans that are not the fastest,** each deferred until its trigger:
   - DOUBLE join keys, until a user or generated query joins on DOUBLE columns;
   - cost-based join order (dynamic programming, selectivity estimates, equivalence edges, key ranges carried across

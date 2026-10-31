@@ -229,6 +229,18 @@ SELECT ct_id FROM cities WHERE EXISTS (SELECT 1, * FROM zones WHERE zones.zn_cit
 4
 5
 
+# ORDER BY a name a star's column and a column written otherwise both carry: the latter is an alias of its declared
+# name in DuckDB, which decides before FROM's ambiguity.
+query IIIITRT nosort
+SELECT z.*, c.LABEL FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHERE z.zn_id <= 6 ORDER BY label, zn_id
+----
+3	4	4	NULL	airport	1.25	airport
+0	1	1	NULL	center	0.5	center
+5	6	1	1	park	1.75	center
+1	2	2	NULL	north	0.75	harbor
+2	3	3	NULL	south	1	hills
+4	5	5	NULL	docks	1.5	old town
+
 # ---- errors in both engines ----
 
 # A qualified star names one FROM item of its own block: never an enclosing block's, never a hidden name, never one
@@ -387,3 +399,13 @@ SELECT z.*, c.ct_pop FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHE
 1	2	2	NULL	north	0.75	45000
 5	6	1	1	park	1.75	120000
 2	3	3	NULL	south	1	30000
+
+onlyif duckdb
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT z.*, c2.ct_pop FROM zones AS z JOIN cities AS c2 ON z.zn_city = c2.ct_id WHERE z.zn_city = cities.ct_id ORDER BY label)
+----
+1
+2
+3
+4
+5

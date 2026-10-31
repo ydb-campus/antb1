@@ -932,6 +932,7 @@ class Parser {
     if (auto status = ParseSelectList(stmt); !status) {
       return status;
     }
+    static_assert(kSelectItemKinds == 2, "revisit this walk");
     const bool has_star =
         std::ranges::any_of(stmt.items, [](const SelectItem& item) { return item.star(); });
     if (auto status = ExpectFrom(has_star); !status) {
@@ -1092,73 +1093,88 @@ class Parser {
     return SelectItem{.value = std::move(star), .alias = {}, .span = span};
   }
 
-  // DuckDB's modifiers after a star (kStarModifiers): unsupported. A pattern -- LIKE, ILIKE, GLOB,
-  // SIMILAR TO, or NOT before LIKE, ILIKE or SIMILAR -- is one only before a string, which DuckDB
-  // requires ("Pattern applied to a star expression must be a constant"). Anything else is left to
-  // ExpectFrom: `* NOT IN (1)` and `* LIKE b` are errors in DuckDB too.
+  // DuckDB's modifiers after a star (kStarModifiers): unsupported. A pattern -- LIKE, ILIKE, GLOB
+  // or SIMILAR TO, and LIKE, ILIKE or SIMILAR TO after NOT -- is one only before a string, which
+  // DuckDB requires ("Pattern applied to a star expression must be a constant"); anything else is
+  // the syntax error ExpectFrom gives at the modifier's first word, as `* NOT IN (1)` and `* LIKE
+  // b` are errors in DuckDB too.
   Status RejectStarModifier() {
-    const std::string word = KeywordOf(Peek());
+    const Token& first = Peek();
+    const std::string word = KeywordOf(first);
     const auto construct = Find(kStarModifiers, word);
     if (!construct.has_value()) {
       return {};
     }
-    const SourceSpan span = Peek().span;
-    std::size_t pattern = 0;  // where the pattern starts, for a pattern; 0: none to check
-    if (word == "LIKE" || word == "ILIKE" || word == "GLOB") {
-      pattern = 1;
-    } else if (word == "SIMILAR") {
-      if (!PeekAt(1).IsKeyword("TO")) {
-        return {};
-      }
-      pattern = 2;
-    } else if (word == "NOT") {
-      const std::string negated = KeywordOf(PeekAt(1));
-      if (negated != "LIKE" && negated != "ILIKE" && negated != "SIMILAR") {
-        return {};
-      }
-      // NOT SIMILAR TO's pattern is past the three tokens of lookahead: unchecked.
-      pattern = negated == "SIMILAR" ? 0 : 2;
+    const SourceSpan span = first.span;
+    if (word == "EXCLUDE" || word == "REPLACE" || word == "RENAME") {
+      return Unsupported(span, *construct);
     }
-    if (pattern != 0 && !StartsString(PeekAt(pattern))) {
+    std::string op = word;  // the pattern's operator, and its tokens
+    std::size_t words = 1;
+    if (word == "NOT") {
+      op = KeywordOf(PeekAt(1));
+      if (op != "LIKE" && op != "ILIKE" && op != "SIMILAR") {
+        return {};
+      }
+      words = 2;
+    }
+    if (op == "SIMILAR") {
+      if (!PeekAt(words).IsKeyword("TO")) {
+        return {};
+      }
+      ++words;
+    }
+    // The pattern lies past the lookahead after the longest operator, so the operator's words but
+    // its last are taken: after a star's operator only an error can follow anyway.
+    const std::string found = Describe(first);
+    for (std::size_t i = 1; i < words; ++i) {
+      Take();
+    }
+    if (PeekAt(1).kind == TokenKind::kString || PrefixedStringAt(1) != PrefixedString::kNone) {
+      return Unsupported(span, "SELECT * " + std::string(word == "NOT" ? "NOT " : "") + op +
+                                   (op == "SIMILAR" ? " TO" : "") + " is not supported");
+    }
+    if (words > 1) {
+      return Syntax(span, "expected ',' or FROM, found " + found);
+    }
+    return {};
+  }
+
+  // An alias after a star (`* AS x`, `* x`, `t.* AS ''`), which DuckDB gives every column the star
+  // expands to: unsupported -- but only a complete one, before ',' or FROM, so that a missing comma
+  // (`t.* u.*`) or a stray word (`* a b`) stays the syntax error DuckDB gives. After AS an alias is
+  // a name, any keyword or any string (an escape or a dollar-quoted one too); without AS, a name
+  // but ISNULL, NOTNULL and AT, which are operators in DuckDB, and a letter before a string (E'x'),
+  // which makes one string.
+  Status RejectStarAlias() {
+    if (Peek().IsKeyword("AS")) {
+      const Token as = Take();  // after a star's AS only an alias or an error can follow
+      std::size_t tokens = 0;   // the alias's
+      if (PrefixedStringAt() != PrefixedString::kNone) {
+        tokens = 2;
+      } else if (const Token& alias = Peek(); alias.kind == TokenKind::kIdentifier ||
+                                              alias.kind == TokenKind::kQuotedIdentifier ||
+                                              alias.kind == TokenKind::kString) {
+        tokens = 1;
+      }
+      const Token& after = PeekAt(tokens);
+      if (tokens == 0 || (after.kind != TokenKind::kComma && !after.IsKeyword("FROM"))) {
+        return Syntax(as.span, "expected ',' or FROM, found " + Describe(as));
+      }
+      return Unsupported(Cover(as.span, PeekAt(tokens - 1).span),
+                         "an alias after '*' is not supported");
+    }
+    const Token& word = Peek();
+    const std::string keyword = KeywordOf(word);
+    if (!IsName(word) || keyword == "ISNULL" || keyword == "NOTNULL" || keyword == "AT" ||
+        PrefixedStringAt() != PrefixedString::kNone || IsStringPrefix(word, PeekAt(1))) {
       return {};
     }
-    return Unsupported(span, *construct);
-  }
-
-  // Whether a string constant starts at `token`: a string, or what an escape or a dollar-quoted
-  // one starts with (PrefixedStringAt, without its look at the token after).
-  static bool StartsString(const Token& token) {
-    return token.kind == TokenKind::kString || KeywordOf(token) == "E" ||
-           token.kind == TokenKind::kParameter;
-  }
-
-  // An alias after a star (`* AS x`, `* x`, `t.* AS x`), which DuckDB gives every column the star
-  // expands to: unsupported. Only a complete one, before ',' or FROM, so that a missing comma
-  // (`t.* u.*`) or a stray word (`* a b`) stays the syntax error DuckDB gives. ISNULL, NOTNULL and
-  // AT are operators in DuckDB, and a letter before a string (E'x') makes one string: no alias.
-  Status RejectStarAlias() {
-    std::size_t name = 0;  // the alias's token
-    if (Peek().IsKeyword("AS")) {
-      name = 1;
-      const Token& alias = PeekAt(1);
-      if (alias.kind != TokenKind::kIdentifier && alias.kind != TokenKind::kQuotedIdentifier &&
-          (alias.kind != TokenKind::kString || alias.text.empty())) {
-        return {};  // `* AS 1`
-      }
-    } else {
-      const Token& word = Peek();
-      const std::string keyword = KeywordOf(word);
-      if (!IsName(word) || keyword == "ISNULL" || keyword == "NOTNULL" || keyword == "AT" ||
-          IsStringPrefix(word, PeekAt(1)) || PrefixedStringAt() != PrefixedString::kNone) {
-        return {};
-      }
-    }
-    const Token& after = PeekAt(name + 1);
+    const Token& after = PeekAt(1);
     if (after.kind != TokenKind::kComma && !after.IsKeyword("FROM")) {
       return {};
     }
-    return Unsupported(Cover(Peek().span, PeekAt(name).span),
-                       "an alias after '*' is not supported");
+    return Unsupported(Peek().span, "an alias after '*' is not supported");
   }
 
   // Tokens that may follow a complete list (select list, FROM list, GROUP BY, ORDER BY); a comma
