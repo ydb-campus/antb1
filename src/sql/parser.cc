@@ -1094,10 +1094,11 @@ class Parser {
   }
 
   // DuckDB's modifiers after a star (kStarModifiers): unsupported. A pattern -- LIKE, ILIKE, GLOB
-  // or SIMILAR TO, and LIKE, ILIKE or SIMILAR TO after NOT -- is one only before a string, which
-  // DuckDB requires ("Pattern applied to a star expression must be a constant"); anything else is
-  // the syntax error ExpectFrom gives at the modifier's first word, as `* NOT IN (1)` and `* LIKE
-  // b` are errors in DuckDB too.
+  // or SIMILAR TO, and LIKE, ILIKE or SIMILAR TO after NOT -- is one only before a constant, which
+  // DuckDB requires ("Pattern applied to a star expression must be a constant"): a string of any
+  // kind, or one in parentheses, whose insides are not looked at. Anything else is the syntax
+  // error ExpectFrom gives at the modifier's first word, as `* NOT IN (1)` and `* LIKE b` are
+  // errors in DuckDB too.
   Status RejectStarModifier() {
     const Token& first = Peek();
     const std::string word = KeywordOf(first);
@@ -1130,7 +1131,8 @@ class Parser {
     for (std::size_t i = 1; i < words; ++i) {
       Take();
     }
-    if (PeekAt(1).kind == TokenKind::kString || PrefixedStringAt(1) != PrefixedString::kNone) {
+    if (PeekAt(1).kind == TokenKind::kString || PeekAt(1).kind == TokenKind::kLeftParen ||
+        PrefixedStringAt(1) != PrefixedString::kNone || IsStringPrefix(PeekAt(1), PeekAt(2))) {
       return Unsupported(span, "SELECT * " + std::string(word == "NOT" ? "NOT " : "") + op +
                                    (op == "SIMILAR" ? " TO" : "") + " is not supported");
     }
@@ -1149,12 +1151,15 @@ class Parser {
   Status RejectStarAlias() {
     if (Peek().IsKeyword("AS")) {
       const Token as = Take();  // after a star's AS only an alias or an error can follow
-      std::size_t tokens = 0;   // the alias's
       if (PrefixedStringAt() != PrefixedString::kNone) {
-        tokens = 2;
-      } else if (const Token& alias = Peek(); alias.kind == TokenKind::kIdentifier ||
-                                              alias.kind == TokenKind::kQuotedIdentifier ||
-                                              alias.kind == TokenKind::kString) {
+        // An escape or a dollar-quoted string spans tokens of its own, past the lookahead: an alias
+        // whatever follows it, as a FROM item's is.
+        return Unsupported(Cover(as.span, PeekAt(1).span), "an alias after '*' is not supported");
+      }
+      std::size_t tokens = 0;  // the alias's
+      if (const Token& alias = Peek(); alias.kind == TokenKind::kIdentifier ||
+                                       alias.kind == TokenKind::kQuotedIdentifier ||
+                                       alias.kind == TokenKind::kString) {
         tokens = 1;
       }
       const Token& after = PeekAt(tokens);

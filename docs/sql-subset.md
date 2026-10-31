@@ -353,7 +353,8 @@ the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the pars
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two
-and `SIMILAR TO` also after `NOT`, before a string, after any `*` or `t.*`), an alias after a star (`* AS x`, `t.* x`,
+and `SIMILAR TO` also after `NOT`, before a string, also one in parentheses, after any `*` or `t.*`), an alias after a
+star (`* AS x`, `t.* x`,
 `* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax error as in DuckDB),
 `t.*` inside an expression,
 `SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals (but `ELSE NULL END`), `IS [NOT] NULL`,
