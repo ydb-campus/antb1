@@ -241,6 +241,72 @@ SELECT z.*, c.LABEL FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id WHER
 2	3	3	NULL	south	1	hills
 4	5	5	NULL	docks	1.5	old town
 
+# ---- what the random generator writes (runner/query_gen.cc) ----
+
+# A bare ORDER BY name that a plain item and a star's column both carry, or two stars, names one column: the generator
+# writes it in any case next to its stars.
+query IIITI nosort
+SELECT CT_ID, * FROM cities WHERE ct_id <= 3 ORDER BY ct_id DESC
+----
+3	2	3	hills	30000
+2	1	2	harbor	45000
+1	0	1	center	120000
+
+query IITIIITI nosort
+SELECT *, * FROM cities WHERE ct_id <= 3 ORDER BY CT_ID DESC
+----
+2	3	hills	30000	2	3	hills	30000
+1	2	harbor	45000	1	2	harbor	45000
+0	1	center	120000	0	1	center	120000
+
+query IITIIITI nosort
+SELECT "CITIES".*, * FROM cities WHERE ct_id <= 3 ORDER BY ct_id
+----
+0	1	center	120000	0	1	center	120000
+1	2	harbor	45000	1	2	harbor	45000
+2	3	hills	30000	2	3	hills	30000
+
+# A qualifier in any case and quoting, as the generator renders names, of a derived table (a UNION ALL too) and of a
+# WITH query, around a dot that a layout may space out.
+query II nosort
+SELECT UNNAMED_SUBQUERY.* FROM (SELECT ct_id, ct_pop FROM cities WHERE ct_id <= 2) ORDER BY ct_id
+----
+1	120000
+2	45000
+
+query III nosort
+SELECT "Unnamed_Subquery".*, ct_id FROM (SELECT ct_id, ct_pop FROM cities WHERE ct_id <= 2) ORDER BY ct_id
+----
+1	120000	1
+2	45000	2
+
+query I nosort
+SELECT unnamed_subquery.* FROM (SELECT ct_id FROM cities WHERE ct_id <= 2 UNION ALL SELECT ct_id FROM cities WHERE ct_id = 1) ORDER BY ct_id
+----
+1
+1
+2
+
+query ITIT nosort
+WITH t1 AS (SELECT ct_id, label FROM cities WHERE ct_id <= 2) SELECT "T1".*, * FROM t1 ORDER BY ct_id
+----
+1	center	1	center
+2	harbor	2	harbor
+
+query IITI nosort
+SELECT t1
+.
+* FROM cities AS t1 WHERE ct_id <= 2 ORDER BY ct_id
+----
+0	1	center	120000
+1	2	harbor	45000
+
+query IIITI nosort
+SELECT ct_id,cities.*FROM cities WHERE ct_id <= 2 ORDER BY ct_id
+----
+1	0	1	center	120000
+2	1	2	harbor	45000
+
 # ---- errors in both engines ----
 
 # A qualified star names one FROM item of its own block: never an enclosing block's, never a hidden name, never one

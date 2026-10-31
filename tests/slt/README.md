@@ -161,7 +161,8 @@ and the supported features, so one case reproduces alone.
   (typed literals, doubles that both engines parse alike, no FLOAT column because its results are DOUBLE on antb1
   only (divergence D11 in `docs/sql-subset.md`), no clickbench-typed column with `FROM '<path>'`, a DECIMAL compared
   only where DuckDB's common type keeps 38 digits (divergence D13), a DECIMAL `CASE` value only where its cast to the
-  `CASE` type cannot fail), so a DuckDB error is a generator bug and fails.
+  `CASE` type cannot fail, a star's qualifier only where rule 1 of ADR 0022 names the FROM item so), so a DuckDB
+  error is a generator bug and fails.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the repro.
 
 ```bash
@@ -179,10 +180,10 @@ feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the
 generator needs more than the parser; such a feature cannot be declared
 supported until it leaves that set. ADR 0022's T2 took derived tables and `WITH` lists out of it, T2c `LEFT JOIN`,
-T2b the two uncorrelated subquery forms and ADR 0023's T3 the two correlated ones. Today it holds `star_items` and
-`qualified_star` (stars among the select items), which the binder answers and the generator does not write yet: a
-`Feature` added for grammar the generator cannot write goes in, and the PR that teaches it takes it out again -- in
-the same commit, since the grammar-coverage test asserts the generated set exactly.
+T2b the two uncorrelated subquery forms, ADR 0023's T3 the two correlated ones and the ninth stream (below) the stars
+among the select items; it is empty today. A `Feature` added for grammar the generator cannot write goes in, and the
+PR that teaches it takes it out again -- in the same commit, since the grammar-coverage test asserts the generated set
+exactly.
 
 Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
 ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
@@ -201,14 +202,13 @@ every key that touches it reaches back no further than its own join group, since
 inputs alone and DuckDB refuses one that reads an earlier comma sibling ("Non-inner join on correlated columns not
 supported"). Its bound is `LeftJoinRowBound`, which adds the left rows a padded row stands for; a query has one such
 item at most, and its draws come from a fourth random stream, so a query that joins inner is the query the seed gave
-before the feature. The bound stands in for the table's rows wherever the
-generator needs a row count (`SELECT *` above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT`
-literals in `HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query
-index, so a query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal`
-and `diff.tpch` keep their queries, and only the join queries of `diff.star` are new. The join features are
-declared supported, so every generated join is compared against DuckDB like any other query. The
-generated joins never use single-table aliases, and never meet a bind error or an exit code 4 of the join rules:
-`.slt` files cover those.
+before the feature. The bound stands in for the table's rows wherever the generator needs a row count (a select list
+with a star above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT` literals in `HAVING`). Every
+draw that only a join needs comes from a second random stream of the seed and the query index, so a query that joins
+nothing is the query the same tables give without refs: `diff.random`, `diff.decimal` and `diff.tpch` keep their
+queries, and only the join queries of `diff.star` are new. The join features are declared supported, so every
+generated join is compared against DuckDB like any other query. The generated joins never use single-table aliases,
+and never meet a bind error or an exit code 4 of the join rules: `.slt` files cover those.
 
 The refs also carry the uncorrelated subqueries (ADR 0022's T2b, feature `in_subquery` or `scalar_subquery`): a
 query with a usable probe takes one as a further top-level `AND` conjunct of `WHERE` 25% of the time, which may be
@@ -247,6 +247,21 @@ itself joined by `UNION ALL`, from an eighth random stream, so that a query with
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count
 every copy's rows. With `union_all` declared (ADR 0036's X3), every feature the generator writes is supported, and a
 diff run reports `unsupported=0`.
+
+Stars among the select items (ADR 0022 rule 5, features `star_items` and `qualified_star`) come from a ninth random
+stream, so a query without one is the query its seed gave before. They stand only where a lone `SELECT *` could:
+every column of every FROM item usable (no clickbench-typed column next to a path, D2), none of a type the generator
+skips, and a `LIMIT` allowed above 50 rows. A projection then takes a star among its items 30% of the time (`a, *`,
+`t.*, a`), a lone star a second one 25% of the time (`*, t.*`), and each star is qualified 40% of the time where the
+generator knows the FROM item's rule-1 name: an alias, a table's or a `WITH` query's name, `unnamed_subquery`, or the
+file name of a path that names its table (a glob's name is its whole text, which it does not keep). These stars stand
+in the query's own select list only, never in an aggregate query (every column they read would have to be a `GROUP BY`
+key), a nested block or a subquery (the correlated `EXISTS` block keeps its lone `SELECT *`, which records no feature),
+and never take an alias. Each records `star` and the type of every column it reads, so the row-shape rules read the
+list as a projection, and an `ORDER BY` position names an item before the first star only: a position counts a star's
+columns, which the comparator cannot (`MakeOrderedQuery` declines one), so the metamorphic relations answer those.
+Every committed seed (`diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and their parallel runs) has new star
+queries, and every other query keeps its text.
 
 ## Data tests: `queries` and `clickbench`
 

@@ -109,6 +109,41 @@ TEST(QueryGenOracle, DuckDbReadsEveryGeneratedJoinAndItsCanonicalFormAlike) {
   EXPECT_GT(unions, 0) << "compounds";
 }
 
+// The same for the generated stars among items and the qualified ones, which the test above sees
+// only in joins and nested blocks: a qualifier spelled in any case, quoted or not, around a dot
+// that a layout may space out, and a star next to items with aliases.
+TEST(QueryGenOracle, DuckDbReadsEveryGeneratedStarAndItsCanonicalFormAlike) {
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "query_gen_oracle_generated_stars";
+  std::filesystem::create_directories(dir);
+  auto duckdb = DuckDbEngine::Make({}, dir, dir);
+  ASSERT_TRUE(duckdb.has_value()) << duckdb.error();
+  const auto gen = QueryGenerator::Make(JoinTables(), 43,
+                                        {.supported = kSupportedFeatures, .target_percent = 100});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  int stars = 0;
+  int single = 0;  // of them over one FROM item
+  for (uint64_t i = 0; stars < 500 && i < 20'000; ++i) {
+    const GeneratedQuery q = gen->Generate(i);
+    if (!q.features.Has(Feature::kStarItems) && !q.features.Has(Feature::kQualifiedStar)) {
+      continue;
+    }
+    ++stars;
+    SCOPED_TRACE(q.sql);
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    single += ast->from.size() == 1 ? 1 : 0;
+    const std::string canonical = sql::ToSql(*ast);
+    const auto original = DuckDbReading(**duckdb, q.sql);
+    const auto again = DuckDbReading(**duckdb, canonical);
+    ASSERT_TRUE(original.has_value()) << original.error();
+    ASSERT_TRUE(again.has_value()) << canonical << "\n  " << again.error();
+    EXPECT_EQ(*original, *again) << "canonical form: " << canonical;
+  }
+  EXPECT_EQ(stars, 500);
+  EXPECT_GT(single, 100) << "over one FROM item: " << single;
+}
+
 // Compounds over the tables of join_tables.h that the generator never writes: the WITH list and
 // the tail (ORDER BY, LIMIT, OFFSET) are the top-level compound's, a derived table's compound has a
 // tail of its own, and a compound is the query of each subquery form.
@@ -127,9 +162,9 @@ constexpr auto kCompounds = std::to_array<std::string_view>({
     "FROM facts ORDER BY 1 DESC LIMIT 1)",
 });
 
-// Stars among the select items, which the generator does not write: quoted, spaced and repeated
-// stars, a qualified star over a derived table and over a CTE, and stars in an EXISTS block, an IN
-// block and UNION ALL branches.
+// Stars among the select items beyond the generator's: a comment inside a qualified star, a
+// qualified star over an aliased derived table, and stars in an EXISTS block, an IN block and
+// UNION ALL branches; and, written out, quoted and repeated stars and one over a WITH query.
 constexpr auto kStars = std::to_array<std::string_view>({
     R"(SELECT "D".*, *, f_id FROM dims AS "D" JOIN facts ON "D".d_id = facts.f_dim)",
     "SELECT dims . /* all */ *, d_id FROM dims",

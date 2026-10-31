@@ -109,8 +109,8 @@ enum class Feature : std::uint8_t {
   // A compound (ADR 0036): blocks joined by UNION ALL, as a derived table's or a CTE's query; X2
   // parses and generates it, and X3 answers and declares it.
   kUnionAll,  // (SELECT ... UNION ALL SELECT ...) as a nested query
-  // Stars among the select items: the binder answers them, and the generator does not write them
-  // yet (kGeneratorPending).
+  // Stars among the select items (ADR 0022 rule 5); a star item also records kStar and
+  // kMultipleItems, a qualified star kStar.
   kStarItems,      // a star next to another select item, or a second star: SELECT a, *
   kQualifiedStar,  // SELECT t.*
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
@@ -330,8 +330,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // uncorrelated subquery forms, and ADR 0023's S5 substring. A Feature added for grammar the
 // generator cannot write yet goes in, and the PR that teaches it takes it out again -- in the same
 // commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly. Stars among
-// the select items wait here for the PR after the one that answers them.
-inline constexpr FeatureSet kGeneratorPending = {Feature::kStarItems, Feature::kQualifiedStar};
+// the select items and qualified stars waited here from the PR that answered them to the one that
+// taught the generator (its ninth stream).
+inline constexpr FeatureSet kGeneratorPending = {};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
@@ -401,6 +402,8 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedExists,
     Feature::kCorrelatedAggregate,
     Feature::kUnionAll,
+    Feature::kStarItems,
+    Feature::kQualifiedStar,
 };
 static_assert(kSupportedFeatures.Minus(kNeverGenerated) == kSupportedFeatures,
               "kSupportedFeatures must not declare an out-of-scope marker (kNeverGenerated)");

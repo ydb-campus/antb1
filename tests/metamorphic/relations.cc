@@ -1523,6 +1523,69 @@ std::vector<Relation> AllRelations() {
          .check = FirstEqualsSumOfRest()});
   }
 
+  // ---- stars among the select items (ADR 0022 rule 5) ----
+  // A star is the columns it reads, where it stands: `*` every FROM item's in FROM order, `t.*` the
+  // item's, whichever name rule 1 gives it (the table's, an alias, a path's file name) and however
+  // the name is spelled. A position after a star counts its columns, which the random differential
+  // test never writes (MakeOrderedQuery declines one), so these relations answer it. Every ORDER BY
+  // ends in a unique column (ct_row, zn_row), for an order the answers must share.
+  {
+    const slt::FeatureSet stars = {kColumns,        kStar,           kStarItems, kMultipleItems,
+                                   kIntegerColumns, kVarcharColumns, kTableName};
+    const slt::FeatureSet ordered = SetWith(stars, kOrderBy);
+    // cities: ct_row, ct_id, label, ct_pop (tools/fixturegen/star.h).
+    constexpr std::string_view kSpelled = "SELECT ct_pop, *, ct_id FROM cities ORDER BY ct_row";
+    r.push_back(
+        {.name = "star_items_are_their_columns_where_they_stand",
+         .features = SetWith(ordered, kQualifiedStar, kTableAlias, kQualifiedName, kTablePath,
+                             kQuotedIdentifier, kIdentifierCase, kLayout),
+         .probes = {Q(std::string(kSpelled)),
+                    Q("SELECT ct_pop, cities.*, ct_id FROM cities ORDER BY ct_row"),
+                    Q(R"(SELECT ct_pop, "C".*, ct_id FROM cities AS c ORDER BY c.ct_row)"),
+                    Q("SELECT ct_pop, CITIES . *, ct_id FROM '${FIXTURES}/star/cities.parquet' "
+                      "ORDER BY ct_row"),
+                    Q("SELECT ct_pop, ct_row, ct_id, label, ct_pop, ct_id FROM cities "
+                      "ORDER BY ct_row"),
+                    Q(std::string(kSpelled), 1)},
+         .check = AllEqualInOrder()});
+    // zones: zn_row, zn_id, zn_city, zn_parent, label, zn_radius, so label is column 7 after `*`.
+    r.push_back({.name = "order_by_positions_after_a_star_count_its_columns",
+                 .features = SetWith(ordered, kPosition, kDoubleColumns),
+                 .probes = {Q("SELECT *, label FROM zones ORDER BY 7, 1"),
+                            Q("SELECT *, label FROM zones ORDER BY label, zn_row"),
+                            Q("SELECT *, label FROM zones ORDER BY 7, 1", 1),
+                            Q("SELECT *, label FROM zones ORDER BY 7, 1", 7)},
+                 .check = AllEqualInOrder()});
+    r.push_back(
+        {.name = "group_by_positions_after_a_star_count_its_columns",
+         .features = SetWith(stars, kQualifiedStar, kGroupBy, kCountStar, kPosition),
+         .probes = {Q("SELECT cities.*, COUNT(*) FROM cities GROUP BY 1, 2, 3, 4"),
+                    Q("SELECT cities.*, COUNT(*) FROM cities GROUP BY ct_row, ct_id, label, "
+                      "ct_pop")},
+         .check = AllEqual()});
+    // Over a join `*` is the items' stars in FROM order, label of each item included.
+    constexpr std::string_view kJoined =
+        "FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id ORDER BY z.zn_row";
+    r.push_back(
+        {.name = "star_of_a_join_is_its_items_stars",
+         .features =
+             SetWith(ordered, kQualifiedStar, kJoinOn, kTableAlias, kQualifiedName, kDoubleColumns),
+         .probes = {Q(std::format("SELECT * {}", kJoined)),
+                    Q(std::format("SELECT z.*, c.* {}", kJoined)),
+                    Q(std::format("SELECT z.*, ct_row, ct_id, c.label, ct_pop {}", kJoined))},
+         .check = AllEqualInOrder()});
+    // promos is empty, so a LEFT JOIN pads every column of its star with NULL.
+    r.push_back(
+        {.name = "left_join_pads_a_star_of_the_right_item",
+         .features = SetWith(stars, kQualifiedStar, kLeftJoin, kTableAlias, kQualifiedName,
+                             kDecimalColumns),
+         .probes = {Q("SELECT t.tr_row, p.* FROM trips AS t LEFT JOIN promos AS p "
+                      "ON t.tr_promo = p.pm_id"),
+                    Q("SELECT t.tr_row, p.pm_row, p.pm_id, p.pm_code, p.pm_discount FROM trips "
+                      "AS t LEFT JOIN promos AS p ON t.tr_promo = p.pm_id")},
+         .check = AllEqual()});
+  }
+
   // ---- the canary: a relation that stays pending for good ----
   // RelationList.PendingRelationsHoldInDuckDb validates a pending relation's SQL on DuckDB before
   // the PR that declares its features activates it, and asserts there is one to validate -- so once

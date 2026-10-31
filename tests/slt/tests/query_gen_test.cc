@@ -1747,6 +1747,221 @@ TEST(QueryGenerator, UnionAllRowBoundGuardsSelectStar) {
   EXPECT_GT(unlimited_two_copy_stars, 0) << "40 rows need no LIMIT";
 }
 
+bool WritesStars(const GeneratedQuery& q) {
+  return q.features.Has(Feature::kStarItems) || q.features.Has(Feature::kQualifiedStar);
+}
+
+// A star among a projection's items, a second star after a lone one and a qualifier on a star come
+// from the ninth stream, so allowing kStarItems and kQualifiedStar changes the queries that take
+// one and no others: a query that writes neither is the one its seed generated before, SQL and
+// features alike. One that takes one keeps its FROM list, its table and its row bound.
+TEST(QueryGenerator, StarsChangeOnlyStarQueries) {
+  const FeatureSet without_stars =
+      kSupportedFeatures.Minus({Feature::kStarItems, Feature::kQualifiedStar});
+  for (const auto& tables : {Tables(), JoinTables()}) {
+    // target_percent 0: every query draws from `supported`, not from the whole grammar.
+    const auto with = MakeOver(tables, 83, {.supported = kSupportedFeatures, .target_percent = 0});
+    const auto without = MakeOver(tables, 83, {.supported = without_stars, .target_percent = 0});
+    int took = 0;
+    int same = 0;
+    for (uint64_t i = 0; i < 4000; ++i) {
+      const auto q = with.Generate(i);
+      const auto plain = without.Generate(i);
+      EXPECT_FALSE(WritesStars(plain)) << plain.sql;
+      if (!WritesStars(q)) {
+        ++same;
+        EXPECT_EQ(q.sql, plain.sql) << i;
+        EXPECT_EQ(q.features, plain.features) << i;
+        continue;
+      }
+      ++took;
+      EXPECT_EQ(q.table, plain.table) << q.sql;
+      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+    }
+    // Measured: 536 of the 4000 take one over Tables(), 333 over JoinTables() (whose slots, of
+    // skipped column types, take no star).
+    EXPECT_GT(took, 250) << "took: " << took;
+    EXPECT_GT(same, 3000) << "same: " << same;
+  }
+}
+
+Feature ColumnsOf(ValueKind kind) {
+  switch (kind) {
+    case ValueKind::kInteger:
+      return Feature::kIntegerColumns;
+    case ValueKind::kDouble:
+      return Feature::kDoubleColumns;
+    case ValueKind::kVarchar:
+      return Feature::kVarcharColumns;
+    case ValueKind::kDate:
+      return Feature::kDateColumns;
+    case ValueKind::kDecimal:
+      return Feature::kDecimalColumns;
+  }
+  return Feature::kIntegerColumns;
+}
+
+// What the stars of a run's select lists covered (CheckStars).
+struct StarCoverage {
+  int queries = 0;           // a star in the select list
+  int lone_qualified = 0;    // SELECT t.* alone
+  int second = 0;            // two stars
+  int with_items = 0;        // a star next to an expression item
+  int first = 0;             // a star first of several items
+  int last = 0;              // a star last of several items
+  int middle = 0;            // a star between two items
+  int join_qualified = 0;    // t.* of one item of a join
+  int path_qualified = 0;    // t.* of a table read by path, named by its file
+  int nested_qualified = 0;  // t.* of a derived table (unnamed_subquery) or a WITH query
+  int limited = 0;           // a LIMIT that a bound above 50 rows requires
+  int positions = 0;         // an ORDER BY position, which names an item before the stars
+};
+
+// Checks the stars of a generated query's select list on its AST: a star stands in a projection
+// only (no GROUP BY, which would need every column it reads as a key); every ORDER BY position
+// names an item before the first star, since a position counts a star's columns; a bound above
+// kStarMaxRows (50) rows takes a LIMIT; a qualifier names exactly one FROM item by rule 1 of ADR
+// 0022; no column typed through clickbench next to a path (D2); and the features say what the list
+// holds: kStar exactly with a star, kQualifiedStar with a qualifier, kStarItems and kMultipleItems
+// with a second item, and the type of every column a star reads of a table.
+void CheckStars(const GeneratedQuery& q, const std::vector<GenTable>& tables, StarCoverage& cov) {
+  SCOPED_TRACE(q.sql);
+  const auto parsed = sql::Parse(q.sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  const sql::SelectStatement& stmt = *parsed;
+  std::vector<std::size_t> stars;
+  for (std::size_t n = 0; n < stmt.items.size(); ++n) {
+    if (stmt.items[n].star() != nullptr) {
+      stars.push_back(n);
+    }
+  }
+  EXPECT_EQ(q.features.Has(Feature::kStar), !stars.empty());
+  if (stars.empty()) {
+    return;
+  }
+  ++cov.queries;
+  EXPECT_TRUE(stmt.group_by.empty()) << "a star stands in a projection only";
+  for (const sql::SelectItem& item : stmt.items) {
+    if (const sql::SelectExpr* expr = item.expr()) {
+      ForEachNode(*expr, [](const sql::Expr& node) {
+        EXPECT_EQ(std::get_if<sql::AggregateCall>(&static_cast<const sql::ExprNode&>(node)),
+                  nullptr)
+            << "an aggregate next to a star";
+      });
+    }
+  }
+  for (const sql::OrderItem& item : stmt.order_by) {
+    const auto* lit = std::get_if<sql::Literal>(&static_cast<const sql::ExprNode&>(item.expr));
+    if (lit != nullptr && lit->kind == sql::Literal::Kind::kInteger) {
+      ++cov.positions;
+      EXPECT_LE(std::stoull(lit->text), stars.front()) << "a position at or after a star";
+    }
+  }
+  EXPECT_TRUE(q.row_bound <= 50 || stmt.limit.has_value()) << "bound " << q.row_bound;
+  cov.limited += q.row_bound > 50 ? 1 : 0;
+  // The FROM items by rule 1's names: an alias, a table's or a WITH query's name, a path's file
+  // name (a glob's whole text), or unnamed_subquery for a derived table.
+  struct Named {
+    std::string name;
+    const GenTable* table = nullptr;  // nullptr: a derived table or a WITH query
+    bool path = false;
+  };
+  std::vector<Named> from;
+  for (const sql::FromItem& item : stmt.from) {
+    const sql::TableRef* ref = item.table();
+    if (ref == nullptr) {
+      from.push_back(Named{.name = item.alias.value_or("unnamed_subquery")});
+      continue;
+    }
+    const bool path = ref->kind == sql::TableRef::Kind::kPath;
+    const auto table = std::ranges::find_if(tables, [&](const GenTable& t) {
+      return path ? t.path == ref->name : SameName(t.name, ref->name);
+    });
+    from.push_back(Named{.name = item.alias.value_or(path ? PathBindingName(ref->name) : ref->name),
+                         .table = table == tables.end() ? nullptr : &*table,
+                         .path = path});
+    if (table == tables.end()) {
+      EXPECT_TRUE(std::ranges::any_of(
+          stmt.with, [&](const sql::CommonTableExpr& c) { return SameName(c.name, ref->name); }))
+          << ref->name << ": no table and no WITH query";
+    }
+  }
+  const bool any_path = std::ranges::any_of(from, [](const Named& f) { return f.path; });
+  bool qualified = false;
+  for (const std::size_t n : stars) {
+    const sql::SelectStar& star = *stmt.items[n].star();
+    std::vector<const Named*> read;
+    if (star.qualifier.empty()) {
+      for (const Named& f : from) {
+        read.push_back(&f);
+      }
+    } else {
+      qualified = true;
+      for (const Named& f : from) {
+        if (SameName(f.name, star.qualifier)) {
+          read.push_back(&f);
+        }
+      }
+      ASSERT_EQ(read.size(), 1U) << star.qualifier << ".*: not exactly one FROM item of the name";
+      cov.join_qualified += from.size() > 1 ? 1 : 0;
+      cov.path_qualified += read.front()->path ? 1 : 0;
+      cov.nested_qualified += read.front()->table == nullptr ? 1 : 0;
+    }
+    for (const Named* f : read) {
+      if (f->table == nullptr) {
+        continue;  // a nested block reads columns of its table that its own items name
+      }
+      for (const GenColumn& c : f->table->columns) {
+        EXPECT_TRUE(q.features.Has(ColumnsOf(c.kind))) << c.name << " read by a star";
+        EXPECT_FALSE(any_path && c.via_override) << c.name << ": clickbench typing (D2)";
+      }
+    }
+  }
+  EXPECT_EQ(q.features.Has(Feature::kQualifiedStar), qualified);
+  const bool several = stmt.items.size() > 1;
+  EXPECT_EQ(q.features.Has(Feature::kStarItems), several);
+  EXPECT_TRUE(!several || q.features.Has(Feature::kMultipleItems));
+  cov.lone_qualified += !several && qualified ? 1 : 0;
+  cov.second += stars.size() > 1 ? 1 : 0;
+  cov.with_items += stars.size() < stmt.items.size() ? 1 : 0;
+  if (several) {
+    cov.first += stars.front() == 0 ? 1 : 0;
+    cov.last += stars.back() + 1 == stmt.items.size() ? 1 : 0;
+    cov.middle += std::ranges::any_of(
+                      stars, [&](std::size_t n) { return n > 0 && n + 1 < stmt.items.size(); })
+                      ? 1
+                      : 0;
+  }
+}
+
+// Every star the generator writes keeps the rules CheckStars checks, over tables with and without
+// refs and in both grammars, and each form of them is written.
+TEST(QueryGenerator, StarsFollowTheirRules) {
+  StarCoverage cov;
+  for (const auto& tables : {Tables(), JoinTables()}) {
+    for (const unsigned target : {0U, 100U}) {
+      const auto gen =
+          MakeOver(tables, 89, {.supported = kSupportedFeatures, .target_percent = target});
+      for (uint64_t i = 0; i < 3000; ++i) {
+        const auto q = gen.Generate(i);
+        ASSERT_NO_FATAL_FAILURE(CheckStars(q, tables, cov)) << i;
+      }
+    }
+  }
+  EXPECT_GT(cov.queries, 1000) << "queries: " << cov.queries;
+  EXPECT_GT(cov.lone_qualified, 50) << "SELECT t.* alone";
+  EXPECT_GT(cov.second, 50) << "two stars";
+  EXPECT_GT(cov.with_items, 200) << "a star next to an expression item";
+  EXPECT_GT(cov.first, 50) << "a star first";
+  EXPECT_GT(cov.last, 50) << "a star last";
+  EXPECT_GT(cov.middle, 20) << "a star between two items";
+  EXPECT_GT(cov.join_qualified, 50) << "t.* of one item of a join";
+  EXPECT_GT(cov.path_qualified, 10) << "t.* of a table read by path";
+  EXPECT_GT(cov.nested_qualified, 20) << "t.* of a derived table or a WITH query";
+  EXPECT_GT(cov.limited, 50) << "a LIMIT for a bound above 50 rows";
+  EXPECT_GT(cov.positions, 20) << "ORDER BY positions before a star";
+}
+
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
 // the query it did before ADR 0023's T3, SQL and features alike.
 TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
