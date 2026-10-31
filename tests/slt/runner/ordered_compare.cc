@@ -137,8 +137,9 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
       // qualified name (t.x) is always a column. DuckDB also takes a plain column written otherwise
       // than its column is declared for an alias of the declared name, which the harness cannot
       // tell from one written as declared without the catalog. So a plain column item of the name
-      // is the key where every reading agrees -- one such item, or several spelled alike, all
-      // before the last written alias or with none -- and any other mix is declined.
+      // is the key where every reading agrees -- one such item, or several of at most one qualifier
+      // (they then name the same column, however their case and quotes are written), all before
+      // the last written alias or with none -- and any other mix is declined.
       const std::string wanted = Lower(ref->name);
       std::optional<std::size_t> alias;  // the last item with a written alias of the name
       std::vector<std::size_t> columns;  // the plain column items of the name
@@ -161,12 +162,21 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
         }
         expr = *stmt->items[*alias].expr();  // a star has no alias
       } else if (!columns.empty()) {
-        const std::string first = sql::ToSql(*stmt->items[columns.front()].expr());
-        if (std::ranges::any_of(columns, [&](std::size_t n) {
-              return sql::ToSql(*stmt->items[n].expr()) != first;
-            })) {
-          return std::nullopt;  // columns spelled apart: which one DuckDB orders by is the
-                                // catalog's
+        // A bare name binds only where one FROM item has the column, and a qualified one only to
+        // the item it names, both ASCII case-insensitively whatever the quotes. So items of the
+        // name with at most one qualifier among them (t.x next to x or T.X) are one column, and
+        // whichever DuckDB orders by gives the same keys.
+        std::optional<std::string> qualifier;
+        for (const std::size_t n : columns) {
+          const std::string& written = std::get<sql::ColumnRef>(*stmt->items[n].expr()).qualifier;
+          if (written.empty()) {
+            continue;
+          }
+          if (qualifier.has_value() && *qualifier != Lower(written)) {
+            return std::nullopt;  // columns of two items (t.x, u.x): which one DuckDB orders by
+                                  // is the catalog's
+          }
+          qualifier = Lower(written);
         }
         expr = *stmt->items[columns.front()].expr();
       }
