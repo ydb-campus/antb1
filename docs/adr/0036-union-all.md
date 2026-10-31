@@ -138,6 +138,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   Three of them (4, 11 and 74) recompute a union CTE per reference, which nearly doubles the run at scale factor 1:
   under AddressSanitizer one run of the 99 would outlast its timeout, so it runs in four shards of every fourth
   query (tests/tpcds/CMakeLists.txt). X7's filter pushdown into the branches is what would cut that time.
+  Update (2026-10-31): eight shards of every eighth query, after a CI runner half as fast took two of the four to
+  87% and 89% of the timeout.
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
 - A union's consumer is serial. A large union under a GROUP BY, a join or a sort runs at the consumer's

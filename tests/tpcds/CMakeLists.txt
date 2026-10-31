@@ -157,25 +157,30 @@ endfunction()
 # the same ratchet, and the parallel run (4 threads, batches of 1000 rows) must equal the 1-thread run byte for byte.
 # The parallel run reads scale factor 0.1, as TPC-H's does: at scale factor 1, its 4-thread run plus the 1-thread run
 # it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
-# 489 seconds. Scale factor 1 itself runs in four shards (antb1-slt --shard), which together are the whole ratchet:
+# 489 seconds. Scale factor 1 itself runs in eight shards (antb1-slt --shard), which together are the whole ratchet:
 # once queries 4, 11 and 74 recompute their UNION ALL CTEs per reference (ADR 0036), one run of all 99 would outlast
-# that timeout too. Each shard runs every fourth query, so the shards stay even as queries join the ratchet; with
-# three, the shard holding query 4 came within a third of the timeout.
+# that timeout too. Each shard runs every eighth query, so the shards stay even as queries join the ratchet; with
+# three, the shard holding query 4 came within a third of the timeout, and with four, two shards took 87% and 89% of
+# it on a runner half as fast as before. Query 4 alone takes most of its shard's time: more shards no longer help
+# there, while X7's filter pushdown into the branches would.
 # ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
-foreach(
-  kind
-  IN
-  ITEMS sf0_1 sf1_1of4 sf1_2of4 sf1_3of4 sf1_4of4 parallel
-)
+set(_shards 8)
+set(_kinds sf0_1)
+foreach(shard RANGE 1 ${_shards})
+  list(APPEND _kinds sf1_${shard})
+endforeach()
+list(APPEND _kinds parallel)
+foreach(kind IN LISTS _kinds)
   set(_queries 99)
-  if(kind MATCHES "^sf1_([1-4])of4$")
-    set(_name tpcds.status.sf1.${CMAKE_MATCH_1}of4)
+  if(kind MATCHES "^sf1_([0-9]+)$")
+    set(_shard ${CMAKE_MATCH_1})
+    set(_name tpcds.status.sf1.${_shard}of${_shards})
     set(_sf 1)
     set(_label oracle)
-    set(_options --shard ${CMAKE_MATCH_1}/4)
-    # Queries K, K + 4, ... of the 99: 25 for shards 1 to 3, 24 for shard 4.
-    math(EXPR _queries "(99 - ${CMAKE_MATCH_1} + 4) / 4")
+    set(_options --shard ${_shard}/${_shards})
+    # Queries K, K + 8, ... of the 99: 13 for shards 1 to 3, 12 for shards 4 to 8.
+    math(EXPR _queries "(99 - ${_shard} + ${_shards}) / ${_shards}")
   elseif(kind STREQUAL "parallel")
     set(_name parallel.tpcds.status.sf0_1)
     set(_sf 0_1)
