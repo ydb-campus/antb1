@@ -159,10 +159,11 @@ endfunction()
 # it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
 # 489 seconds. Scale factor 1 itself runs in eight shards (antb1-slt --shard), which together are the whole ratchet:
 # once queries 4, 11 and 74 recompute their UNION ALL CTEs per reference (ADR 0036), one run of all 99 would outlast
-# that timeout too. Each shard runs every eighth query, so the shards stay even as queries join the ratchet; with
-# three, the shard holding query 4 came within a third of the timeout, and with four, two shards took 87% and 89% of
-# it on a runner half as fast as before. Query 4 alone takes most of its shard's time: more shards no longer help
-# there, while X7's filter pushdown into the branches would.
+# that timeout too. Each shard runs every eighth query, so each holds the same number of queries; their times differ
+# with the heavy queries they hold. With three shards, the one holding query 4 came within a third of the timeout;
+# with four, on CI runners about half as fast as before, the shards holding queries 4, 28 and 88 and queries 11 and
+# 23 took 87% and 89% of it once 28, 88 and 23 joined the ratchet. Query 4 alone takes most of its shard's time: more
+# shards no longer help there, while X7's filter pushdown into the branches would.
 # ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
 set(_shards 8)
