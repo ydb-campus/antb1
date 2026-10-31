@@ -214,11 +214,11 @@ void Count(const Expr& expr, const std::string& sql, Counts& c) {
 // nested query and of a column alias list, the commas between CTEs and between column aliases, and
 // a string alias (its last byte a quote).
 void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectItemKinds == 2, "revisit this walk");
   for (const SetBranch& branch : stmt.set_operation) {
     CountStatement(*branch.query, sql, want);
   }
-  want.stars += stmt.star ? 1U : 0U;
   want.numbers += (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
   want.commas += Separators(stmt.items.size()) + Separators(stmt.order_by.size()) +
                  Separators(stmt.with.size());
@@ -229,7 +229,12 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
     CountStatement(*cte.query, sql, want);
   }
   for (const SelectItem& item : stmt.items) {
-    Count(item.expr, sql, want);
+    if (const SelectStar* star = item.star()) {  // `*`, or a qualifier, '.' and `*`
+      ++want.stars;
+      want.dots += star->qualifier.empty() ? 0U : 1U;
+      continue;
+    }
+    Count(*item.expr(), sql, want);
   }
   for (const FromItem& item : stmt.from) {
     if (const TableRef* table = item.table()) {
@@ -490,7 +495,8 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
   }
   // A compound (ADR 0036) holds its blocks, two or more, each a block of its own in the compound's
   // span after the UNION ALL that joins it; its own block fields are empty.
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectItemKinds == 2, "revisit this walk");
   ASSERT_NE(stmt.set_operation.size(), 1U) << context;
   ASSERT_EQ(stmt.from.empty(), !stmt.set_operation.empty()) << context;
   for (const SetBranch& branch : stmt.set_operation) {
@@ -510,7 +516,7 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
     ASSERT_NO_FATAL_FAILURE(CheckStatement(block, sql));
   }
   if (!stmt.set_operation.empty()) {
-    ASSERT_TRUE(!stmt.star && stmt.items.empty() && stmt.where.empty() && stmt.group_by.empty() &&
+    ASSERT_TRUE(stmt.items.empty() && stmt.where.empty() && stmt.group_by.empty() &&
                 stmt.having.empty())
         << context;
   }
@@ -558,7 +564,20 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
   }
   for (const SelectItem& item : stmt.items) {
     ASSERT_TRUE(SpanInside(item.span, sql));
-    ASSERT_NO_FATAL_FAILURE(CheckSpans(item.expr, sql));
+    if (const SelectStar* star = item.star()) {
+      // The item is its star: from the qualifier (when there is one) to the '*', and no alias.
+      ASSERT_EQ(item.span, star->span);
+      ASSERT_FALSE(item.alias.has_value());
+      const std::string text = sql.substr(star->span.offset, star->span.length);
+      ASSERT_TRUE(text.ends_with('*')) << text;
+      if (star->qualifier.empty()) {
+        ASSERT_EQ(text, "*");
+      } else if (!star->qualifier_quoted) {
+        ASSERT_TRUE(text.starts_with(star->qualifier)) << text;
+      }
+      continue;
+    }
+    ASSERT_NO_FATAL_FAILURE(CheckSpans(*item.expr(), sql));
   }
   for (const auto* clause : {&stmt.where, &stmt.group_by, &stmt.having}) {
     for (const Expr& e : *clause) {
@@ -1272,11 +1291,20 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
       stmt.with.push_back(std::move(cte));
     }
   }
-  stmt.star = rng.Percent(15);
-  if (!stmt.star) {
+  if (rng.Percent(15)) {
+    stmt.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
+  } else {
     const std::size_t items = 1 + rng.Below(5);
     for (std::size_t i = 0; i < items; ++i) {
-      SelectItem item{.expr = RandomExpr(rng, 3, true), .alias = {}, .span = {}};
+      if (rng.Percent(10)) {  // a star among the items, qualified half the time
+        SelectStar star;
+        if (rng.Percent(50)) {
+          std::tie(star.qualifier, star.qualifier_quoted) = RandomNameOrQuoted(rng);
+        }
+        stmt.items.push_back(SelectItem{.value = std::move(star), .alias = {}, .span = {}});
+        continue;
+      }
+      SelectItem item{.value = RandomExpr(rng, 3, true), .alias = {}, .span = {}};
       if (rng.Percent(35)) {
         item.alias = RandomBytes(rng, 10, true);
       }

@@ -33,8 +33,8 @@ struct OrderedQuery {
 };
 
 // The augmented form of a query with ORDER BY (a position is the select item it names);
-// std::nullopt without ORDER BY, for text antb1's parser does not accept, or for a position under
-// SELECT *.
+// std::nullopt without ORDER BY, for text antb1's parser does not accept, for a compound, or for a
+// position at or after a star, whose width only the catalog knows.
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql);
 
 // `augmented_sql` with LIMIT `rows` (none: as is).

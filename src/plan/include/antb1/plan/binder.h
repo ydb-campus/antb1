@@ -19,10 +19,12 @@ namespace antb1::plan {
 // position at the end (ADR 0022). The plan is not optimized yet (see plan::Optimize). Errors carry
 // a SqlErrorDetail with the span of the offending AST node: kBind for SQL that is wrong for the
 // tables (unknown or ambiguous column, a qualifier no FROM item is named by, `*` over two items of
-// one name sharing a column name, aggregates mixed with columns, SUM/AVG of a non-number, a literal
-// of the wrong type), kUnsupported for a column of an unsupported type, FROM 'path' without a path
-// opener, a LEFT JOIN, a derived table, a WITH list, more than 256 relations, and a join graph no
-// key connects (a cross product).
+// one name sharing a column name, a `t.*` that names no FROM item of its own block or two of them,
+// aggregates mixed with columns, SUM/AVG of a non-number, a literal of the wrong type),
+// kUnsupported for a column of an unsupported type, FROM 'path' without a path opener, more than
+// 256 relations, a join graph no key connects (a cross product, but of one-row inputs), a `t.*`
+// over a STRUCT column, an ORDER BY position over an EXISTS block's star, and an ORDER BY name
+// only the select list makes unambiguous.
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog,
                                 const BindOptions& options = {});
 

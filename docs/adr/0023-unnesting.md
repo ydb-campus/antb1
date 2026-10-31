@@ -187,6 +187,9 @@ work: mark and single dependent-join kinds, and lifting those rejections.
   into columns nor checks their types: a table with a column of a type that antb1 cannot read still works there.
   Every other select item is bound as usual: a bind error stays a bind error, as in DuckDB, and an aggregate makes the
   block an aggregate query, which exits 4.
+  Update (2026-10-31): so is every star there, `*` or `t.*`, next to other items; a `t.*` naming only the enclosing
+  block's FROM item is a bind error, as in DuckDB. An ORDER BY position counts a star's columns: one out of range is a
+  bind error, one that names a column of a star exits 4, since the star is not expanded.
 - **The pull-up** (Lemma 4.8, then Lemma 3.1): the block's select list is dropped, since the semi or anti join reads
   none of its columns, and the conjuncts of the block's top filter move into the join, which becomes a semi join
   (EXISTS) or a plain anti join (NOT EXISTS, which has no NULL case, unlike NOT IN). Its build side is the subquery

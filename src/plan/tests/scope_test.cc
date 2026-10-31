@@ -705,6 +705,41 @@ TEST(ScopeTest, StarConflicts) {
   EXPECT_EQ(conflict(later).column, "c");
 }
 
+// A qualified star's FROM item (StarBinding, as in DuckDB): the one of this block its qualifier
+// names, ASCII case-insensitively, an alias hiding a table's name. Two of the name make it
+// ambiguous whatever their columns, unlike `*` (rule 5). With none, a column of the name is a
+// STRUCT's, whose fields DuckDB expands (unsupported), or nothing the star can expand.
+TEST(ScopeTest, StarBindingIsTheOneFromItemOfItsName) {
+  ColumnIdSource ids;
+  const SourceSpan span{.offset = 7, .length = 3};
+  const Scope scope({TableBinding("t", T(), ids), Aliased("x", "u", U(), ids)});
+  EXPECT_EQ(scope.StarBinding("t", span).ValueOr(9), 0U);
+  EXPECT_EQ(scope.StarBinding("X", span).ValueOr(9), 1U);
+  ExpectSqlError(scope.StarBinding("u", span).status(), kBind,
+                 "no FROM item is named 'u' (the alias 'x' hides it)", span);
+  ExpectSqlError(scope.StarBinding("a", span).status(), kBind, "no FROM item is named 'a'", span);
+  const Scope disjoint({Aliased("x", "t", T(), ids), Aliased("x", "v", V(), ids)});
+  ExpectSqlError(disjoint.StarBinding("x", span).status(), kBind,
+                 "'x.*' is ambiguous: two FROM items are named 'x'", span);
+  const auto with_struct = [] {
+    return arrow::schema({arrow::field("i", arrow::int32()),
+                          arrow::field("rec", arrow::struct_({arrow::field("x", arrow::int32())})),
+                          arrow::field("list", arrow::list(arrow::int32()))});
+  };
+  const Scope structs({TableBinding("s", with_struct(), ids)});
+  ExpectSqlError(structs.StarBinding("REC", span).status(), kUnsupported,
+                 "'REC.*' over a STRUCT column is not supported", span);
+  ExpectSqlError(structs.StarBinding("list", span).status(), kBind, "no FROM item is named 'list'",
+                 span);
+  ExpectSqlError(structs.StarBinding("i", span).status(), kBind, "no FROM item is named 'i'", span);
+  // A FROM item of the name comes first; two columns of it are no one STRUCT.
+  const Scope named({TableBinding("s", with_struct(), ids), Aliased("rec", "t", T(), ids)});
+  EXPECT_EQ(named.StarBinding("rec", span).ValueOr(9), 1U);
+  const Scope twice({TableBinding("s", with_struct(), ids), Aliased("q", "s", with_struct(), ids)});
+  ExpectSqlError(twice.StarBinding("rec", span).status(), kBind, "no FROM item is named 'rec'",
+                 span);
+}
+
 // Ambiguity across bindings comes before an unsupported type, which a qualified name reaches like
 // an unqualified one.
 TEST(ScopeTest, UnsupportedTypesAcrossBindings) {

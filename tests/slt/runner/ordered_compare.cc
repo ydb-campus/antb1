@@ -109,7 +109,7 @@ bool SameAnswer(const ResultSet& a, const ResultSet& b, std::string_view letters
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
   auto stmt = sql::Parse(sql);
   // A compound's ORDER BY reads its output, which no select list of its own spells out to add keys
-  // to (ADR 0036): declined, as an unnamed key under SELECT * is.
+  // to (ADR 0036): declined, as a position at or after a star is.
   if (!stmt.has_value() || stmt->order_by.empty() || !stmt->set_operation.empty()) {
     return std::nullopt;
   }
@@ -118,30 +118,33 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
     sql::SelectExpr expr = stmt->order_by[i].expr;
     if (const auto* lit = std::get_if<sql::Literal>(&expr);
         lit != nullptr && lit->kind == sql::Literal::Kind::kInteger && !lit->negative) {
-      // A position in the select list (1-based); under SELECT * the harness cannot name it.
+      // A position in the select list (1-based). At or after a star the harness cannot name it:
+      // the star's width is the catalog's.
       std::size_t position = 0;
       const auto [end, error] =
           std::from_chars(lit->text.data(), lit->text.data() + lit->text.size(), position);
-      if (stmt->star || error != std::errc{} || end != lit->text.data() + lit->text.size() ||
-          position == 0 || position > stmt->items.size()) {
+      const auto star = std::ranges::find_if(
+          stmt->items, [](const sql::SelectItem& item) { return item.star() != nullptr; });
+      if (error != std::errc{} || end != lit->text.data() + lit->text.size() || position == 0 ||
+          position > stmt->items.size() || std::cmp_less(star - stmt->items.begin(), position)) {
         return std::nullopt;
       }
-      expr = stmt->items[position - 1].expr;
+      expr = *stmt->items[position - 1].expr();
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&expr);
                ref != nullptr && ref->qualifier.empty()) {
       // A select alias comes first (the last item with it), as in the binder and DuckDB; a
       // qualified name (t.x) is always a column.
       const std::string wanted = Lower(ref->name);
       for (std::size_t n = stmt->items.size(); n > 0; --n) {
-        const auto& alias = stmt->items[n - 1].alias;
-        if (alias.has_value() && Lower(*alias) == wanted) {
-          expr = stmt->items[n - 1].expr;
+        const sql::SelectItem& item = stmt->items[n - 1];
+        if (item.alias.has_value() && Lower(*item.alias) == wanted) {
+          expr = *item.expr();  // a star has no alias
           break;
         }
       }
     }
-    extra.push_back(
-        sql::SelectItem{.expr = std::move(expr), .alias = std::format("__antb1_key{}", i)});
+    extra.push_back(sql::SelectItem{
+        .value = std::move(expr), .alias = std::format("__antb1_key{}", i), .span = {}});
   }
   OrderedQuery q{.augmented_sql = {},
                  .keys = extra.size(),
@@ -149,20 +152,8 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
                  .offset = stmt->offset.value_or(0)};
   stmt->limit.reset();
   stmt->offset.reset();
-  if (stmt->star) {
-    // SELECT *, <keys>: the keys printed as the select list, then the star put before them, after
-    // the WITH list (if any).
-    stmt->star = false;
-    stmt->items = std::move(extra);
-    const std::string text = sql::ToSql(*stmt);  // [WITH ...] SELECT <keys> FROM ...
-    stmt->with.clear();
-    const std::string block = sql::ToSql(*stmt);  // SELECT <keys> FROM ...
-    q.augmented_sql = text.substr(0, text.size() - block.size()) + "SELECT *, " +
-                      block.substr(std::string_view("SELECT ").size());
-  } else {
-    stmt->items.insert(stmt->items.end(), extra.begin(), extra.end());
-    q.augmented_sql = sql::ToSql(*stmt);
-  }
+  stmt->items.insert(stmt->items.end(), extra.begin(), extra.end());
+  q.augmented_sql = sql::ToSql(*stmt);
   return q;
 }
 

@@ -5,6 +5,7 @@
 #include <variant>
 #include <vector>
 
+#include "antb1/common/check.h"
 #include "antb1/sql/ast.h"
 
 namespace antb1::sql {
@@ -264,19 +265,23 @@ std::string FromList(const std::vector<FromItem>& from) {
 
 // A block: SELECT through HAVING.
 std::string BlockSql(const SelectStatement& block) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectItemKinds == 2, "revisit this walk");
   std::string sql = "SELECT ";
-  if (block.star) {
-    sql += '*';
-  } else {
-    for (std::size_t i = 0; i < block.items.size(); ++i) {
-      if (i > 0) {
-        sql += ", ";
-      }
-      sql += Sql(block.items[i].expr, kOr);
-      if (const auto& alias = block.items[i].alias; alias.has_value()) {
-        sql += " AS " + Quote(*alias, '"');
-      }
+  for (std::size_t i = 0; i < block.items.size(); ++i) {
+    const SelectItem& item = block.items[i];
+    if (i > 0) {
+      sql += ", ";
+    }
+    if (const SelectStar* star = item.star()) {
+      // A star takes no alias: DuckDB would give it to every column the star expands to.
+      ANTB1_CHECK(!item.alias.has_value());
+      sql += star->qualifier.empty() ? "*" : Name(star->qualifier, star->qualifier_quoted) + ".*";
+      continue;
+    }
+    sql += Sql(*item.expr(), kOr);
+    if (item.alias.has_value()) {
+      sql += " AS " + Quote(*item.alias, '"');
     }
   }
   sql += " FROM " + FromList(block.from);
@@ -296,7 +301,7 @@ std::string BlockSql(const SelectStatement& block) {
 // or a compound's blocks joined by UNION ALL, then ORDER BY, LIMIT and OFFSET, which are the
 // compound's.
 std::string StatementSql(const SelectStatement& stmt) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 17, "revisit this walk");
   std::string sql;
   for (std::size_t i = 0; i < stmt.with.size(); ++i) {
     const CommonTableExpr& cte = stmt.with[i];

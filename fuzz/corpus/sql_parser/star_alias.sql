@@ -1,0 +1,1 @@
+SELECT *, a, t.* AS x FROM t

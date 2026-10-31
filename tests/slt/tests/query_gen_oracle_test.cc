@@ -14,6 +14,7 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -126,13 +127,29 @@ constexpr auto kCompounds = std::to_array<std::string_view>({
     "FROM facts ORDER BY 1 DESC LIMIT 1)",
 });
 
-TEST(QueryGenOracle, DuckDbReadsEveryFixedCompoundAndItsCanonicalFormAlike) {
-  const std::filesystem::path dir =
-      std::filesystem::path(::testing::TempDir()) / "query_gen_oracle_compounds";
+// Stars among the select items, which the generator does not write: quoted, spaced and repeated
+// stars, a qualified star over a derived table and over a CTE, and stars in an EXISTS block, an IN
+// block and UNION ALL branches.
+constexpr auto kStars = std::to_array<std::string_view>({
+    R"(SELECT "D".*, *, f_id FROM dims AS "D" JOIN facts ON "D".d_id = facts.f_dim)",
+    "SELECT dims . /* all */ *, d_id FROM dims",
+    "SELECT *, *, d_id AS x FROM dims",
+    "SELECT s.*, 1 FROM (SELECT d_id, d_parent FROM dims) AS s",
+    "WITH c AS (SELECT d_id FROM dims) SELECT c.*, * FROM c",
+    "SELECT f_id FROM facts WHERE EXISTS (SELECT dims.*, 1 FROM dims WHERE dims.d_id = "
+    "facts.f_dim)",
+    "SELECT f_id FROM facts WHERE f_dim IN (SELECT q.* FROM (SELECT d_id FROM dims) AS q)",
+    "SELECT d_id, * FROM dims UNION ALL SELECT *, d_id FROM dims",
+});
+
+// DuckDB reads every query of `queries` and antb1's canonical form of it alike.
+void ExpectDuckDbReadsTheCanonicalFormsAlike(std::string_view name,
+                                             std::span<const std::string_view> queries) {
+  const std::filesystem::path dir = std::filesystem::path(::testing::TempDir()) / name;
   std::filesystem::create_directories(dir);
   auto duckdb = DuckDbEngine::Make({}, dir, dir);
   ASSERT_TRUE(duckdb.has_value()) << duckdb.error();
-  for (const std::string_view text : kCompounds) {
+  for (const std::string_view text : queries) {
     const std::string sql(text);
     SCOPED_TRACE(sql);
     const auto ast = sql::Parse(sql);
@@ -144,6 +161,14 @@ TEST(QueryGenOracle, DuckDbReadsEveryFixedCompoundAndItsCanonicalFormAlike) {
     ASSERT_TRUE(again.has_value()) << canonical << "\n  " << again.error();
     EXPECT_EQ(*original, *again) << "canonical form: " << canonical;
   }
+}
+
+TEST(QueryGenOracle, DuckDbReadsEveryFixedCompoundAndItsCanonicalFormAlike) {
+  ExpectDuckDbReadsTheCanonicalFormsAlike("query_gen_oracle_compounds", kCompounds);
+}
+
+TEST(QueryGenOracle, DuckDbReadsEveryFixedStarFormAndItsCanonicalFormAlike) {
+  ExpectDuckDbReadsTheCanonicalFormsAlike("query_gen_oracle_stars", kStars);
 }
 
 }  // namespace

@@ -54,6 +54,9 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = R"(SELECT COUNT(user_id), SUM(amount) AS "total" FROM Events)"},
            Case{.input = R"(SELECT a AS x, "B" "y" FROM t)",
                 .canonical = R"(SELECT a AS "x", "B" AS "y" FROM t)"},
+           // A star prints where it stands, its qualifier quoted only when it was.
+           Case{.input = R"(select "T" . /* all */ * , a , t.*,* from t as "T", t)",
+                .canonical = R"(SELECT "T".*, a, t.*, * FROM t AS "T", t)"},
            Case{.input =
                     "select a from t where a in ( 1,-2 , 'x' ) and b not in (date '2024-01-02')",
                 .canonical =
@@ -218,7 +221,7 @@ TEST(UnparseTest, RoundTripsCorpus) {
 // which parses back to it.
 TEST(UnparseTest, RendersNestedQueries) {
   SelectStatement inner;
-  inner.star = true;
+  inner.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
   inner.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kPath, .name = "p.parquet"}}};
   SelectStatement stmt;
   stmt.with.push_back(CommonTableExpr{.name = "c\"1",
@@ -227,7 +230,7 @@ TEST(UnparseTest, RendersNestedQueries) {
                                       .name_span = {},
                                       .columns_span = {},
                                       .span = {}});
-  stmt.star = true;
+  stmt.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
   stmt.from.push_back(FromItem{.source = DerivedTable{.query = Box<SelectStatement>(inner)}});
   stmt.from.push_back(FromItem{.connector = Connector::kCross,
                                .source = DerivedTable{.query = Box<SelectStatement>(stmt)},
@@ -245,7 +248,7 @@ TEST(UnparseTest, RendersNestedQueries) {
 
 TEST(UnparseTest, RendersFromLists) {
   SelectStatement stmt;
-  stmt.star = true;
+  stmt.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
   stmt.from.push_back(
       FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}, .alias = "a\"b"});
   stmt.from.push_back(FromItem{.connector = Connector::kComma,
@@ -290,7 +293,7 @@ TEST(UnparseTest, RendersFullAst) {
   SelectStatement stmt;
   AggregateCall sum{.kind = AggKind::kSum};
   sum.arg.emplace(Expr(ColumnRef{.name = "a"}));
-  stmt.items.push_back(SelectItem{.expr = Expr(std::move(sum)), .alias = "s"});
+  stmt.items.push_back(SelectItem{.value = Expr(std::move(sum)), .alias = "s", .span = {}});
   stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.where.push_back(ToExpr(Comparison{
       .column = ColumnRef{.name = "b"},
@@ -302,7 +305,7 @@ TEST(UnparseTest, RendersFullAst) {
 
 TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
   SelectStatement stmt;
-  stmt.star = true;
+  stmt.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
   stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kPath, .name = "x'y.parquet"}}};
   const std::array<Literal, 6> literals{{
       Literal{.kind = Literal::Kind::kInteger, .negative = false, .text = "1"},
@@ -330,7 +333,7 @@ TEST(UnparseTest, RendersEveryLiteralKindAndOperator) {
 
 TEST(UnparseTest, LimitExtremes) {
   SelectStatement stmt;
-  stmt.star = true;
+  stmt.items.push_back(SelectItem{.value = SelectStar{}, .alias = {}, .span = {}});
   stmt.from = {FromItem{.source = TableRef{.kind = TableRef::Kind::kName, .name = "t"}}};
   stmt.limit = 0;
   EXPECT_EQ(ToSql(stmt), "SELECT * FROM t LIMIT 0");
@@ -392,6 +395,21 @@ TEST(EqualIgnoringSpansTest, DetectsEveryStructuralDifference) {
   ASSERT_TRUE(star && count && count_col);
   EXPECT_FALSE(EqualIgnoringSpans(*star, *count));
   EXPECT_FALSE(EqualIgnoringSpans(*count, *count_col));
+  // Stars among the items: their kind, qualifier, quoting, place and number.
+  for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT * FROM t", "SELECT t.* FROM t"},
+           {"SELECT t.* FROM t", "SELECT u.* FROM t"},
+           {R"(SELECT "t".* FROM t)", "SELECT t.* FROM t"},
+           {"SELECT *, a FROM t", "SELECT a, * FROM t"},
+           {"SELECT * FROM t", "SELECT *, * FROM t"},
+           {"SELECT *, a FROM t", "SELECT a, a FROM t"},
+       })) {
+    auto x = Parse(a);
+    auto y = Parse(b);
+    ASSERT_TRUE(x.has_value() && y.has_value()) << a << " / " << b;
+    EXPECT_FALSE(EqualIgnoringSpans(*x, *y)) << a << " / " << b;
+    EXPECT_TRUE(EqualIgnoringSpans(*x, *x)) << a;
+  }
 }
 
 TEST(EqualIgnoringSpansTest, DetectsEveryDifferenceInFromLists) {
@@ -684,7 +702,7 @@ TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
     auto x = Parse("SELECT " + std::string(base) + " FROM t");
     auto y = Parse("SELECT " + std::string(other) + " FROM t");
     ASSERT_TRUE(x.has_value() && y.has_value()) << other;
-    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << other;
+    EXPECT_FALSE(EqualIgnoringSpans(*x->items[0].expr(), *y->items[0].expr())) << other;
   }
   for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
            {"-a", "NOT a"},
@@ -714,14 +732,14 @@ TEST(EqualIgnoringSpansTest, DetectsDifferencesInExpressions) {
     auto x = Parse("SELECT " + std::string(a) + " FROM t");
     auto y = Parse("SELECT " + std::string(b) + " FROM t");
     ASSERT_TRUE(x.has_value() && y.has_value()) << a << " / " << b;
-    EXPECT_FALSE(EqualIgnoringSpans(x->items[0].expr, y->items[0].expr)) << a << " / " << b;
-    EXPECT_TRUE(EqualIgnoringSpans(x->items[0].expr, x->items[0].expr));
+    EXPECT_FALSE(EqualIgnoringSpans(*x->items[0].expr(), *y->items[0].expr())) << a << " / " << b;
+    EXPECT_TRUE(EqualIgnoringSpans(*x->items[0].expr(), *x->items[0].expr()));
   }
   // The spelling of a cast is not recorded, and type names are upper-cased.
   auto cast = Parse("SELECT CAST(a AS DECIMAL(15, 2)) FROM t");
   auto colons = Parse("SELECT a::decimal(15,2) FROM t");
   ASSERT_TRUE(cast.has_value() && colons.has_value());
-  EXPECT_TRUE(EqualIgnoringSpans(cast->items[0].expr, colons->items[0].expr));
+  EXPECT_TRUE(EqualIgnoringSpans(*cast->items[0].expr(), *colons->items[0].expr()));
 }
 
 }  // namespace

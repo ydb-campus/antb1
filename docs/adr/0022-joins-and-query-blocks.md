@@ -152,6 +152,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   5. `SELECT *` returns every binding's columns in FROM order, duplicates included. When two bindings of the same name
      share a column name, `*` is a bind error (`SELECT * FROM t, t`), like the qualified reference to that column
      (rule 3).
+     Update (2026-10-31): stars stand anywhere among the select items, any number of times, each expanded where it
+     stands. `t.*` expands the one binding of its own block named `t`: two of that name make it a bind error whatever
+     their columns (unlike rule 3), and a `t` that only an enclosing block has is a bind error too, never rule 9's
+     correlation, both as in DuckDB.
   6. A plain column item `a.x` is named `x`; inside an expression the qualifier stays as written: `sum(a.x)`,
      `(a.x + 1)`.
   7. A derived table's output names are de-duplicated (`x`, `x_1`). A column alias list may be shorter than the
@@ -196,6 +200,7 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   the FROM items, ON conditions, CTEs and subqueries before any table resolves, so such a join exits 4 even over a
   table that is not registered. Each grammar PR lands ahead of the engine, as the expressions did (ADR 0008's
   update): the binder rejects every form it does not answer yet with exit code 4.
+  Update (2026-10-31): `t.*` as a select item is answered (rule 5); inside an expression it still exits 4.
 
 ### Logical plan
 
@@ -637,6 +642,8 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   bind errors stay bind errors (exit code 1): an ambiguous name, `*` over two bindings of the same name that share a
   column name, a table name that its alias hides, a name in an ON that only a later FROM item has, a column alias
   list longer than the select list, a scalar subquery with two columns.
+  Update (2026-10-31): `t.*` as a select item is answered and stays exit 4 inside an expression; a `t.*` that names
+  no FROM item of its own block, or two, is a bind error (exit code 1), as in DuckDB.
 - **Correct plans that are not the fastest,** each deferred until its trigger:
   - DOUBLE join keys, until a user or generated query joins on DOUBLE columns;
   - cost-based join order (dynamic programming, selectivity estimates, equivalence edges, key ranges carried across

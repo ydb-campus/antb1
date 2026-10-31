@@ -9,7 +9,8 @@ This page is the contract: a PR that changes SQL behavior updates it in the same
 ## What works today
 
 All of this runs (the [grammar](#grammar) below accepts more than the binder answers): global and grouped
-(`GROUP BY`) aggregates, `COUNT(DISTINCT ...)` included, projections (`*`, columns or constants), `WHERE`
+(`GROUP BY`) aggregates, `COUNT(DISTINCT ...)` included, projections (columns, constants, and `*` and `t.*`
+anywhere among the select items), `WHERE`
 conditions (comparisons between columns, expressions and literals, `[NOT] LIKE 'pattern'`,
 `[NOT] IN (literal, ...)` and `[NOT] BETWEEN low AND high`, combined with `AND`, `OR` and `NOT`, with constant
 integer arithmetic folded on a side and in an `IN` list), `GROUP BY` and `ORDER BY` (also by position), `HAVING`
@@ -101,8 +102,8 @@ cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
 block       = "SELECT" , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
               [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
-select_list = "*" | select_item , { "," , select_item } ;
-select_item = expr , [ [ "AS" ] , identifier ] ;
+select_list = select_item , { "," , select_item } ;
+select_item = "*" | identifier , "." , "*" | expr , [ [ "AS" ] , identifier ] ;
 order_item  = expr , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 from_list   = from_item , { "," , from_item
                           | "CROSS" , "JOIN" , from_item
@@ -215,8 +216,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   word before the dot is an error, as in DuckDB, unless the parser takes the word there for the start of a construct
   that it does not support and reports that (exit code 4, where DuckDB gives a syntax error): `ALL`, `ANY`, `ARRAY`,
   `DISTINCT`, `FALSE`, `NULL`, `SOME` and `TRUE` (`null.a`: NULL literals are not supported; `SELECT DISTINCT.a`).
-  `t.*`, `a.b.c`, `t.f()` and a qualified name before a string (`main.integer '5'`, which DuckDB reads as a typed
-  literal of a qualified type) are unsupported.
+  `t.*` is a select item of its own (below), with its qualifier written as a column's; inside an expression
+  (`1 + t.*`, `(t.*)`, `COUNT(t.*)`) it is unsupported, and so are `a.b.c`, `t.f()` and a qualified name before a
+  string (`main.integer '5'`, which DuckDB reads as a typed literal of a qualified type).
 - Typed literals: as in DuckDB, a string after a type name makes a typed literal, whether the string is plain, an escape
   or a dollar-quoted one, and the name plain, quoted or qualified (`integer '5'`, `integer E'5'`, `DATE $$2020-01-01$$`,
   `"integer" '5'`, `main.integer '5'`). Only `DATE` and `TIMESTAMP` before a plain string are in the grammar: every
@@ -253,8 +255,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `WITH over AS (...) SELECT a FROM over` is a syntax error, which DuckDB answers.
 - The canonical form (`sql::ToSql`, [ADR 0008](adr/0008-parser-and-unparser.md)) writes every alias quoted after `AS`
   (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, a qualifier as written, a nested query
-  in parentheses, CTE names and column aliases quoted (`WITH "c"("x") AS (...)`, `FROM (...) AS "s"("x")`), and a
-  compound's blocks joined by `UNION ALL` in upper case.
+  in parentheses, CTE names and column aliases quoted (`WITH "c"("x") AS (...)`, `FROM (...) AS "s"("x")`), a star
+  where it stands among the select items (`*`, or `t.*` with its qualifier as written), and a compound's blocks
+  joined by `UNION ALL` in upper case.
 
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
@@ -335,7 +338,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   reference is read only in a `WHERE`
   conjunct of the subquery's own block, an inner join's `ON` included, and only one block out; in a select list,
   `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral
-  reference) it is exit code 4 at the reference, each with its own message;
+  reference) it is exit code 4 at the reference, each with its own message. A star in an `EXISTS` block is checked
+  by name but not expanded: an `ORDER BY` position there counts its columns, and one that names a column of it is
+  exit code 4 (one out of range is a bind error, as in DuckDB);
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -347,6 +352,9 @@ the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the pars
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
+a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO` and their `NOT`
+forms before a string, after any `*` or `t.*`), an alias after a star (`* AS x`, `t.* x`, which DuckDB gives every
+column of the star; only before `,` or `FROM`, else a syntax error as in DuckDB), `t.*` inside an expression,
 `SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals (but `ELSE NULL END`), `IS [NOT] NULL`,
 `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
@@ -355,7 +363,9 @@ typed literals, also of quoted and qualified names of at most three parts (`LIMI
 `LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
 (`OFFSET 5 ROWS`, also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a
 column there (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax
-errors, and DuckDB refuses them too. Known gaps, among others:
+errors, and DuckDB refuses them too, and so are an operator after a star (`* + 1`, `t.* = 1`, `* ISNULL`) and a star
+with no FROM (`SELECT 1, *`). Known gaps, among others: a star in parentheses (`(*)`), `ORDER BY *` and `GROUP BY *`
+are syntax errors, which DuckDB answers;
 `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
 (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
 comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN ASYMMETRIC`
@@ -414,13 +424,16 @@ in parentheses).
 ## Binding
 
 The binder (`plan::Bind`) resolves the statement against the table and builds the logical plan. A bind error has exit
-code 1 and points at the offending name, call or literal; the first error in query order wins (the tables, then the
-select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping rule below, `LIMIT`, `OFFSET`,
-`HAVING` and the `ORDER BY` items).
+code 1 and points at the offending name, call or literal; the first error in query order wins (the tables, then every
+star's name, as DuckDB expands its stars first, then the select list, the `ON` conditions and `WHERE`, the `GROUP BY`
+names, the grouping rule below, `LIMIT`, `OFFSET`, `HAVING` and the `ORDER BY` items). A column of an unsupported
+type exits 4 where it is referenced, so it can come before a later bind error, which DuckDB, which reads every type,
+reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
 
 - Names: table and column names match ASCII case-insensitively, quoted identifiers included (as in DuckDB). An
   unknown table or column is a bind error, and so is a name that matches two columns differing only in case. A
-  column of an unsupported type fails with exit code 4 wherever it is referenced (by `SELECT *` too).
+  column of an unsupported type fails with exit code 4 wherever it is referenced (by a `*` or `t.*` that expands
+  to it too).
   Each FROM item is one binding, named by its alias, else a table's name as written, else the file name of its path
   up to the first dot (a path with a glob character is named by its whole text). An alias hides that name, and the
   error for a qualifier nothing is named by says so. Two bindings may share a name: a qualified name then resolves
@@ -430,11 +443,16 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   later item, whose name its error points out; `WHERE` and every other clause see every binding in one level. A
   qualified name never names a select item's alias, as in DuckDB, so `ORDER BY t.x` over `SELECT i16 AS x` is a bind
   error.
-- Select list: `*` alone, or plain columns, aggregates and constants. `*` expands to every binding's columns, in
-  FROM order then column order, and is a bind error when two bindings of one name share a column name. Without
-  `GROUP BY`, aggregates (in the select list, in `HAVING` or in `ORDER BY`) and `HAVING` itself cannot be mixed with
-  plain columns: a bind error at the first plain column (or at `*`). Constants mix with anything; with an aggregate
-  (also one only in `HAVING` or `ORDER BY`) or `HAVING` the query has one row.
+- Select list: plain columns, aggregates, constants and other expressions, and stars anywhere among them, any number
+  of times. A star expands where it stands: `*` to every binding's columns, in FROM order then column order (a bind
+  error when two bindings of one name share a column name), and `t.*` to the columns of the one binding of its own
+  block that `t` names, matched as a qualifier is. A `t.*` is a bind error when no binding of its block is named `t`
+  (also when only an enclosing block's is: a star never correlates, as in DuckDB), or when two are, whatever their
+  columns; a `t` that names no binding but a STRUCT column, whose fields DuckDB expands, is unsupported. A star takes
+  no alias. Without `GROUP BY`, aggregates (in the select list, in `HAVING` or in `ORDER BY`) and `HAVING` itself
+  cannot be mixed with plain columns: a bind error at the first plain column in select order, a star's columns
+  included (at the star, naming its first column). Constants mix with anything; with an aggregate (also one only in
+  `HAVING` or `ORDER BY`) or `HAVING` the query has one row.
 - Constants (as DuckDB types and names them): an integer is INTEGER when its magnitude fits (so `-2147483648` is
   BIGINT), else BIGINT or HUGEINT, and is named by its value (`007` is `7`); a string is VARCHAR named with its
   quotes (`'it''s'`); `DATE '2020-01-02'` is DATE named `CAST('2020-01-02' AS "DATE")` (so are
@@ -444,15 +462,16 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   DECIMAL(2,1), `.125` DECIMAL(3,3), `007.50` DECIMAL(5,2) named `7.50`; [ADR 0021](adr/0021-decimal-semantics.md)
   rule 3). A number DuckDB types as DOUBLE (an exponent, or more than 38 digits) and an integer beyond HUGEINT's 38
   digits are unsupported (exit code 4).
-- Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; `*`
-  counts every column); one out of range, a negative one too, is a bind error. `GROUP BY` of an aggregate item is a
-  bind error. Any other literal is a constant: in `GROUP BY` it is no key but still makes the query grouped (one group
-  when there are rows, none otherwise), in `ORDER BY` a number or string is a bind error (it would order nothing,
-  as in DuckDB) and a DATE literal orders nothing. A position naming a constant item groups or orders nothing.
+- Positions: in `GROUP BY` and `ORDER BY` an integer literal names the select item at that position (1-based; a star
+  counts every column it expands to, wherever it stands); one out of range, a negative one too, is a bind error.
+  `GROUP BY` of an aggregate item is a bind error. Any other literal is a constant: in `GROUP BY` it is no key but
+  still makes the query grouped (one group when there are rows, none otherwise), in `ORDER BY` a number or string is
+  a bind error (it would order nothing, as in DuckDB) and a DATE literal orders nothing. A position naming a constant
+  item groups or orders nothing.
 - `GROUP BY`: each name is a table column, or else the alias of a plain column of the select list (as in DuckDB; an
   alias of an aggregate is a bind error, an alias of a constant is no key); a key repeated, also in another spelling,
-  is one key, and a key need not be selected. Every plain column of the select list, and every column of `SELECT *`,
-  must be a key: otherwise a bind error at that column
+  is one key, and a key need not be selected. Every plain column of the select list, and every column a star expands
+  to, must be a key: otherwise a bind error at that column (at its star)
   (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`).
 - Result types: `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)` are BIGINT; `SUM` of an integer column is
   HUGEINT and of a DOUBLE column DOUBLE; `AVG` of a number is DOUBLE and of a DATE or TIMESTAMP TIMESTAMP, as in
@@ -464,9 +483,15 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   reserved word (`sum("from")`). A qualifier inside an expression's name stays as written, each part quoted by that
   same rule (`sum(t.i16)`, `sum(t."Mixed Case")`), while a plain column select item keeps its declared name alone
   (`SELECT t.i16` is `i16`); a message that echoes a reference back prints it as written and unquoted, so a grouping
-  error over `t.label` names `t.label`. Constants: see above. An alias replaces the name.
+  error over `t.label` names `t.label`. A star's columns keep their declared names, so a name can repeat at the top
+  level (`SELECT *, *`); a derived table's or a CTE's names are made unique (`a`, `a_1`) after its column alias
+  list, as in DuckDB. Constants: see above. An alias replaces the name.
 - `ORDER BY`: a name is the alias of a select item first (the last item with that alias, as in DuckDB; also when a
-  table column has the same name), else a table column; an aggregate call is computed like a select-list aggregate.
+  table column has the same name; a star's columns have no alias), else a table column; an aggregate call is
+  computed like a select-list aggregate. DuckDB has a step between the two: a name that only one un-aliased column
+  item of the select list carries, a star's column included, orders by that item. Where the table columns alone make
+  the name ambiguous (`SELECT t.*, u.y FROM t JOIN u ON t.k = u.k ORDER BY k`), antb1 refuses it (exit code 4) until
+  a later PR answers it; a name both lists find ambiguous stays a bind error.
   A projection may order by any column of the table, selected or not. A grouped query orders by its keys and
   aggregates (an aggregate the select list lacks is computed and not returned); any other column is a bind error
   (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`). An aggregate query without
@@ -584,7 +609,8 @@ select list, the `ON` conditions and `WHERE`, the `GROUP BY` names, the grouping
   (exit code 4), and so is every other mix -- VARCHAR, DATE or TIMESTAMP with another type, a DOUBLE with an integer
   or a DECIMAL, a FLOAT with an integer or a DECIMAL (D11) -- which DuckDB answers by casting, failing per row where a
   cast fails. Such a refusal points at the first select item in the query whose type does not fold or widen, or at
-  its block's `*` (`UNION ALL of INTEGER and VARCHAR values is not supported`).
+  the `*` or `t.*` it expands from (`UNION ALL of INTEGER and VARCHAR values is not supported`); a star's columns
+  count in the column counts.
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
@@ -643,7 +669,8 @@ A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `F
 above the aggregation the `HAVING` one), `Compute` (appends one computed column per expression: over the table for
 `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and over the aggregation for select, `HAVING` and
 `ORDER BY` expressions),
-`Project` (`*` or the plain columns), `Aggregate` (the aggregates, one output row) or `GroupAggregate` (`GROUP BY`:
+`Project` (the select list's columns, every star expanded where it stands), `Aggregate` (the aggregates, one output
+row) or `GroupAggregate` (`GROUP BY`:
 the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
@@ -1169,7 +1196,8 @@ formatter:
   `YYYY-MM-DD (BC)` before year 1, more year digits after 9999, `infinity` and `-infinity` for DuckDB's sentinel
   day numbers; VARCHAR as its raw bytes;
 - NULL as `NULL` in `table`, an empty field in `csv` and `null` in `json`;
-- `csv` has a header row and RFC 4180 quoting, with LF line endings; `json` is an array of objects, where numbers are
+- `csv` has a header row and RFC 4180 quoting, with LF line endings; `json` is an array of objects (a name that
+  repeats, as two stars can make it, repeats as a key, as in DuckDB's CLI), where numbers are
   JSON numbers except HUGEINT, DECIMAL and non-finite doubles, which are strings (exactness), and every byte of ill-formed
   UTF-8 in strings (RFC 3629, so also overlong forms, surrogates and code points above U+10FFFF) is written as the
   text `\xHH` with lowercase hex digits, so the output is always valid UTF-8; `table` and `csv` write the raw bytes.
@@ -1229,7 +1257,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D18 | DECIMAL SUM beyond 38 digits | a `SUM` of a DECIMAL(p,s) whose result has more than 38 digits is an execution error (`SUM overflow: the result is outside the range of DECIMAL(38,s) (38 decimal digits)`), as for HUGEINT (D9) | returns up to 39 digits until its 128-bit sum overflows | `tests/slt/cases/types/decimal_arithmetic.slt` pins both answers; the generator sums only DECIMAL columns whose sum over every row fits 38 digits |
 | D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic, and the cast errors of DECIMAL `CASE` values, print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order; a failed cast names the column it casts (`when casting from source column b`) only for a column reference, an aggregate's output and a key included | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; it also names the column of an expression its optimizer reduces to one (`b + 0`); the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order, `exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` the named columns |
 | D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
-| D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
+| D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers; a name right after a star and before `,` or `FROM` is an alias there (unsupported), also a word DuckDB keeps as a keyword (a syntax error in DuckDB) | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
 | D22 | `IN` over a doubly parenthesized query | reads `x [NOT] IN ((query))` as an `IN` list holding one scalar subquery, because a `(` opens a nested query only before a reserved query word (divergence D21), and a list of one subquery is unsupported: exit code 4 at the inner `(` | reads an `IN` subquery and answers it exactly as the single-paren form | `plan.SubqueryPlacements/BindErrorTest` pins the refusal and its span, and `tests/slt/cases/subqueries/in.slt` compares the form with DuckDB's own answer under `onlyif duckdb` |
 | D23 | A correlated `EXISTS`'s conjuncts over different rows | unnests it into a semi or anti join (ADR 0023's Path 1), so a conjunct that reads both blocks is a residual, computed only over the candidate pairs a key matches, and a conjunct that reads only the outer block is a residual too, computed over those same pairs rather than over every outer row | plans a delim join and computes the subquery's conjuncts for the bindings of the outer side, so an overflow in such a conjunct can fail in one engine and not the other | the random generator writes no arithmetic that can overflow (as for divergences D14 and D16), and `tests/slt/cases/subqueries/exists.slt` compares every shape Path 1 answers with DuckDB's own answer |
 | D24 | A correlated scalar aggregate over keys no outer row binds | unnests it by equivalence substitution (ADR 0023's Path 2). Where the correlation is on more than one column the aggregation's input is restricted to the keys the outer side binds (the semi-join reduction), and the divergence is narrowed to the keys that restriction's own estimate cannot rule out; on a single column it is not, so the aggregation groups by the correlated key and computes the aggregate's argument, the aggregate and its combination for EVERY key of the subquery's own rows, including keys no outer row binds | computes the subquery only for the bindings of the outer side, joining the domain below the aggregation | the answers agree: an outer row with no group is dropped by the inner join and rejected by the comparison alike. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23), and `tests/slt/cases/subqueries/scalar.slt` compares every shape Path 2 answers with DuckDB's own answer |
@@ -1374,7 +1402,7 @@ antb1 refuses is not always the last.
 | Q20 | unsupported | needs window aggregates |
 | Q21 | unsupported | needs general CAST |
 | Q22 | unsupported | needs ROLLUP and GROUPING() |
-| Q23 | unsupported | needs `*` next to other select items |
+| Q23 | pass | `*` next to other select items |
 | Q24 | unsupported | needs upper and lower |
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
@@ -1413,7 +1441,7 @@ antb1 refuses is not always the last.
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | unsupported | needs general CAST |
-| Q62 | unsupported | needs `*` next to other select items |
+| Q62 | pass | `*` next to other select items |
 | Q63 | unsupported | needs abs, window aggregates |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
@@ -1450,7 +1478,7 @@ antb1 refuses is not always the last.
 | Q96 | pass | answered when the ratchet was added |
 | Q97 | unsupported | needs FULL OUTER JOIN, IS [NOT] NULL |
 | Q98 | unsupported | needs window aggregates |
-| Q99 | unsupported | needs `*` next to other select items, upper and lower |
+| Q99 | unsupported | needs upper and lower |
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 this implementation does not comply with all requirements of the TPC-DS Benchmark.

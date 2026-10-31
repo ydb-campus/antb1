@@ -133,9 +133,10 @@ inline std::shared_ptr<arrow::Schema> AllTypesSchema() {
 }
 
 // A catalog with "t" (AllTypesSchema, 100 rows), "u" (the same schema, unknown row count),
-// "dup" (columns "a" and "A"), "ok" (i16 and s only) and "dec" (DECIMALs: p DECIMAL(15,2),
+// "dup" (columns "a" and "A"), "ok" (i16 and s only), "dec" (DECIMALs: p DECIMAL(15,2),
 // q DECIMAL(15,2), r DECIMAL(9,4), z DECIMAL(38,10), i INTEGER, s16 SMALLINT, u16 USMALLINT,
-// b BIGINT, e DECIMAL(18,8), g DECIMAL(18,10), f DOUBLE).
+// b BIGINT, e DECIMAL(18,8), g DECIMAL(18,10), f DOUBLE) and "st" (i16, and rec STRUCT<x INTEGER>,
+// which no engine type reads).
 inline Catalog MakeCatalog() {
   Catalog catalog;
   const auto must = [](const arrow::Status& status) {
@@ -171,6 +172,12 @@ inline Catalog MakeCatalog() {
                arrow::field("b", arrow::int64()), arrow::field("e", arrow::decimal128(18, 8)),
                arrow::field("g", arrow::decimal128(18, 10)), arrow::field("f", arrow::float64())}),
           10)));
+  must(catalog.Register(
+      "st",
+      std::make_shared<FakeTable>(
+          arrow::schema({arrow::field("i16", arrow::int16()),
+                         arrow::field("rec", arrow::struct_({arrow::field("x", arrow::int32())}))}),
+          5)));
   return catalog;
 }
 
