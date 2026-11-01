@@ -165,6 +165,8 @@ struct QueryOutcome {
   Outcome outcome = Outcome::kPass;
   std::string label;  // safe to print redacted: pass, unsupported, parse error, ...
   Discrepancy failure;
+  std::optional<int64_t> peak_memory;   // antb1's, when it answered (ResultSet)
+  std::optional<double> antb1_seconds;  // antb1's own, when it answered
 };
 
 QueryOutcome Check(const Statement& q, const Workload& workload, Engine& antb1, Engine& oracle) {
@@ -188,18 +190,26 @@ QueryOutcome Check(const Statement& q, const Workload& workload, Engine& antb1, 
                 e.kind, workload.unclean_rule),
             e)};
   }
+  QueryOutcome r{.outcome = Outcome::kPass,
+                 .label = "pass",
+                 .failure = {},
+                 .peak_memory = a->peak_memory,
+                 .antb1_seconds = a->engine_seconds};
   const auto o = oracle.Execute(q.sql);
   if (!o.has_value()) {
-    return {.outcome = Outcome::kWrong,
-            .label = "DuckDB error",
-            .failure = ErrorDiscrepancy("antb1 answers, but DuckDB fails", o.error())};
+    r.outcome = Outcome::kWrong;
+    r.label = "DuckDB error";
+    r.failure = ErrorDiscrepancy("antb1 answers, but DuckDB fails", o.error());
+    return r;
   }
   // ORDER BY: in order, ties in any order; LIMIT without ORDER BY: any rows of the unlimited
   // answer; otherwise any row order.
   if (auto d = CompareQueryAnswers(q.sql, *o, *a, oracle, /*rows=*/true, SortMode::kRowSort)) {
-    return {.outcome = Outcome::kWrong, .label = "wrong answer", .failure = *std::move(d)};
+    r.outcome = Outcome::kWrong;
+    r.label = "wrong answer";
+    r.failure = *std::move(d);
   }
-  return {.outcome = Outcome::kPass, .label = "pass", .failure = {}};
+  return r;
 }
 
 std::string List(const std::vector<int64_t>& values) {
@@ -209,6 +219,54 @@ std::string List(const std::vector<int64_t>& values) {
   }
   return "[" + out + "]";
 }
+
+// A JSON string: `text` quoted, with quotes, backslashes and control characters escaped.
+std::string JsonString(std::string_view text) {
+  std::string out = "\"";
+  for (const char c : text) {
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+    } else {
+      out += c;
+    }
+  }
+  return out + "\"";
+}
+
+std::string JsonOrNull(const std::optional<int64_t>& value) {
+  return value.has_value() ? std::format("{}", *value) : "null";
+}
+
+std::string JsonOrNull(const std::optional<double>& seconds) {
+  return seconds.has_value() ? std::format("{:.6f}", *seconds) : "null";
+}
+
+std::string Lowercase(std::string_view text) {
+  std::string out(text);
+  std::ranges::transform(out, out.begin(),
+                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
+// How a query's outcome stands against the ratchet (RatchetCosts' "ratchet").
+std::string_view Verdict(Outcome outcome, bool expected_pass) {
+  switch (outcome) {
+    case Outcome::kPass:
+      return expected_pass ? "ok" : "unexpected pass";
+    case Outcome::kUnsupported:
+    case Outcome::kRejected:
+      return expected_pass ? "unexpected fail" : "ok";
+    case Outcome::kWrong:
+    case Outcome::kUnclean:
+      return "fail";
+  }
+  return "fail";
+}
+
+constexpr double kMebibyte = 1024.0 * 1024.0;
 
 }  // namespace
 
@@ -245,6 +303,26 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
   RatchetStats stats;
   const auto count = static_cast<int64_t>(queries.size());
   const int64_t first = workload.first;
+  const auto record = [&](const std::string& json) {
+    if (options.costs.has_value()) {
+      options.costs->write(json + "\n");
+    }
+  };
+  if (options.costs.has_value()) {
+    const RatchetCosts& costs = *options.costs;
+    record(std::format(
+        R"({{"record": "run", "workload": {}, "test": {}, "shard": "{}/{}", "threads": {}, )"
+        R"("same_as_threads": {}, "memory_limit_bytes": {}}})",
+        JsonString(Lowercase(workload.summary)), JsonString(costs.test), options.shard.index + 1,
+        options.shard.count, costs.threads,
+        costs.same_as_threads.has_value() ? std::format("{}", *costs.same_as_threads) : "null",
+        JsonOrNull(costs.memory_limit)));
+    // First as well as after the summary: a log cut short (a timeout, a crash, the head of a
+    // passing test's output that JUnit keeps) still carries it next to the numbers.
+    if (!workload.disclaimer.empty()) {
+      write(std::string(workload.disclaimer) + "\n");
+    }
+  }
   const auto repro = [&](int64_t n) {
     write(options.redact ? "  repro (unredacted, prints values and query text; run it locally):\n"
                          : "  repro:\n");
@@ -278,19 +356,33 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
     if (workload.running_lines) {
       write(std::format("Q{}: running\n", n));
     }
+    record(std::format(R"({{"record": "running", "query": {}}})", n));
     const double start = options.clock ? options.clock() : 0;
     const Statement& query = queries[static_cast<std::size_t>(i)];
     const QueryOutcome r = Check(query, workload, antb1, oracle);
+    const bool expected_pass = std::ranges::binary_search(status.pass, n);
     if (options.clock) {
       const double seconds = std::max(options.clock() - start, 1e-6);
-      write(std::format("Q{}: {} ({:.3f} s)\n", n, r.label, seconds));
+      std::string antb1_costs;
+      if (options.costs.has_value() && r.antb1_seconds.has_value()) {
+        antb1_costs += std::format(", antb1 {:.3f} s", *r.antb1_seconds);
+      }
+      if (options.costs.has_value() && r.peak_memory.has_value()) {
+        antb1_costs +=
+            std::format(", peak {:.1f} MiB", static_cast<double>(*r.peak_memory) / kMebibyte);
+      }
+      write(std::format("Q{}: {} ({:.3f} s{})\n", n, r.label, seconds, antb1_costs));
       if (r.outcome == Outcome::kPass) {
         log_sum += std::log(seconds);
       }
+      record(std::format(
+          R"({{"record": "query", "query": {}, "outcome": {}, "ratchet": {}, "seconds": {:.6f}, )"
+          R"("antb1_seconds": {}, "peak_memory_bytes": {}}})",
+          n, JsonString(r.label), JsonString(Verdict(r.outcome, expected_pass)), seconds,
+          JsonOrNull(r.antb1_seconds), JsonOrNull(r.peak_memory)));
     } else {
       write(std::format("Q{}: {}\n", n, r.label));
     }
-    const bool expected_pass = std::ranges::binary_search(status.pass, n);
     switch (r.outcome) {
       case Outcome::kPass:
         stats.passed.push_back(n);
@@ -337,6 +429,15 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
                                  std::exp(log_sum / static_cast<double>(stats.passed.size())));
   }
   write(summary + "\n");
+  if (options.costs.has_value()) {
+    if (!workload.disclaimer.empty()) {
+      write(std::string(workload.disclaimer) + "\n");
+    }
+    const double wall = options.clock ? options.clock() - options.costs->started : 0;
+    record(std::format(
+        R"({{"record": "end", "queries": {}, "passed": {}, "failed": {}, "wall_seconds": {:.6f}}})",
+        stats.queries, stats.passed.size(), stats.failed, wall));
+  }
   return stats;
 }
 

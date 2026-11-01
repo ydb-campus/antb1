@@ -86,7 +86,8 @@ Data policy for the data derived from TPC-H (amendment, 2026-10-02):
   first), then locked down (allowed directories, no external access, configuration locked) before writing. The
   smoke test `harness.tpch.extension` checks that the extension loads.
 - **Output:** TPC-H-derived tests run redacted like the data tests (query number, hashes and a local repro command):
-  never query text, data or answers, because CI logs and artifacts are public. They may print timings (see Naming).
+  never query text, data or answers, because CI logs and artifacts are public. They may print timings and memory peaks
+  (see Naming).
 - **Naming:** every public mention says "derived from TPC-H". Material that describes the workload or presents its
   numbers also carries this disclaimer verbatim: "This workload is
   derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this implementation
@@ -117,6 +118,21 @@ differences.
   comparable to published TPC-DS Benchmark results, as this implementation does not comply with all requirements of
   the TPC-DS Benchmark." No TPC metrics (QphDS, $/QphDS) and no comparison with official TPC results. On 2026-10-30
   the maintainers allowed its timings in the same public places as those of the queries derived from TPC-H.
+
+Update (2026-11-01, ADR 0037's HC3; a decision of the maintainers), for the queries derived from TPC-H and TPC-DS
+alike:
+
+- **Peaks.** Each query's seconds and antb1's peak memory may appear in every public place that timings may. That
+  covers CI logs, job summaries and annotations, artifacts, pull requests and benchmark reports. The peak is the most
+  bytes antb1's memory budget held while the query ran.
+- **Naming.** Both follow the Naming rules: "derived from TPC-H" or "derived from TPC-DS", the disclaimer verbatim, no
+  TPC metric, and no comparison with official results.
+- **Test builds.** Numbers from a test build name the build and the runner, and are diagnostics, not performance
+  numbers.
+- **Profiles.** Per-operator profiles of these queries are EXPLAIN output and are never published.
+- **Refusal messages.** antb1's Unsupported messages can quote the query, so they count as query text. A report of
+  them stays local: never committed, pasted or uploaded. A refusal is cited by query number and construct, in our own
+  words.
 
 ## Consequences
 

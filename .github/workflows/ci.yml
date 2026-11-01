@@ -120,6 +120,12 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      # Each query's seconds and antb1's peak memory (ADR 0037's HC3; macOS registers no TPC tests and says so).
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/${{ matrix.preset }})
+        if: ${{ !cancelled() }}
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: python3 -I tools/ci/tpc_costs.py "build/$PRESET"
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -216,6 +222,9 @@ jobs:
           else
             echo '### Coverage: no summary (the build or the tests failed before the report)' >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/coverage)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/coverage
       - name: Upload coverage summary
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

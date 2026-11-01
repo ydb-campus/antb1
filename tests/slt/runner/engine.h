@@ -26,10 +26,15 @@ struct ResultSet {
   std::vector<std::string> type_names;
   // Canonical text of every value (canonical.h); std::nullopt is SQL NULL.
   std::vector<std::vector<std::optional<std::string>>> rows;
+  // antb1 only, for the costs of the ratchets (--costs): the query's peak memory
+  // (engine::QueryResult::peak_memory) and its own seconds (parsing, binding and execution).
+  std::optional<int64_t> peak_memory;
+  std::optional<double> engine_seconds;
 };
 
 struct EngineError {
-  std::string kind;  // antb1: parse|bind|unsupported|io|execution|internal; DuckDB: its error type
+  // antb1: parse|bind|unsupported|io|execution|memory|internal; DuckDB: its error type
+  std::string kind;
   std::string message;       // "<kind>: <message>"; `statement error <regex>` searches it
   bool unsupported = false;  // antb1 SqlErrorDetail{kUnsupported}: never an acceptable outcome
   bool internal = false;     // an engine or harness bug, never an acceptable `statement error`

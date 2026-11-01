@@ -291,14 +291,21 @@ with `clickbench`) for the numbered queries of a directory (`q01.sql`, ... as Q1
 against `tests/data/tpch_status.json` (`{"pass": [...]}`). Two differences: only Unsupported is a clean failure (a
 parse or bind error fails, since the queries are valid SQL), and each query is logged as `Q<n>: running` before it
 runs, flushed, so the log of a run that times out names the query. `--memory-limit` takes an absolute size (`2GiB`,
-`512MiB`, bytes) for the antb1 sessions. `ANTB1_TPCH_TIMES=1` adds each query's seconds and the geometric mean of
-the passing queries. Its self-tests `harness.tpch.status.*` write our own numbered queries over the canary table
-(marked `redact`) into the build tree.
+`512MiB`, bytes) for the antb1 sessions. `--costs FILE` adds each query's seconds (antb1, DuckDB and the comparison)
+and, where antb1 answered, antb1's own seconds and its peak memory (`engine::QueryResult::peak_memory`), then the
+geometric mean of the passing queries; the workload's disclaimer comes first and after the summary; FILE gets the
+same as JSON lines (`RatchetCosts`), truncated first and flushed record by record, and the repro line leaves
+`--costs` out. Every
+TPC ratchet test passes `--costs build/<preset>/tpc-costs/<test>.jsonl`, which `tools/ci/tpc_costs.py` reports in each
+CI leg ([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). Its self-tests `harness.tpch.status.*` write our own
+numbered queries over the canary table (marked `redact`) into the build tree; `harness.tpch.status.costs`,
+`.costs_repro`, `.costs_memory` and `.costs_unwritable` check the costs lines, the file (through
+`print_file_after.cmake`), the repro line, a query over the memory limit (a memory error) and a file that cannot be
+written (exit code 3).
 
 `antb1-slt tpcds`, with the same options, is this ratchet for the 99 queries derived from TPC-DS (`tests/tpcds`)
-against `tests/data/tpcds_status.json`: its summary line starts with `TPCDS:`, its messages name TPC-DS, and
-`ANTB1_TPCDS_TIMES=1` adds the times. `harness.tpcds.status.pass` and `.parse_error` run it on the same numbered
-queries.
+against `tests/data/tpcds_status.json`: its summary line starts with `TPCDS:`, its messages and disclaimer name
+TPC-DS. `harness.tpcds.status.pass`, `.parse_error` and `.costs` run it on the same numbered queries.
 
 ## Stored answers: `answers`
 

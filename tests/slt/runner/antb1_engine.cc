@@ -1,5 +1,6 @@
 #include "antb1_engine.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -44,6 +45,8 @@ EngineError FromStatus(const arrow::Status& status) {
     error.kind = "io";
   } else if (status.IsExecutionError() || status.IsInvalid()) {
     error.kind = "execution";
+  } else if (status.IsOutOfMemory()) {
+    error.kind = "memory";
   } else {
     error.kind = "internal";
     error.internal = true;
@@ -152,6 +155,10 @@ ExecResult Antb1Engine::Execute(const std::string& sql) {
                                        .unsupported = false,
                                        .internal = true});
   }
+  const engine::QueryTimings& timings = result->timings;
+  rows->peak_memory = result->peak_memory;
+  rows->engine_seconds =
+      std::chrono::duration<double>(timings.parse + timings.bind + timings.execute).count();
   return std::move(*rows);
 }
 

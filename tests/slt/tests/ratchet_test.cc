@@ -89,6 +89,8 @@ struct Fixture {
       {"SELECT SECRET_Q3", Error("unsupported", /*unsupported=*/true)}};
   std::map<std::string, ExecResult> oracle_answers = {{"SELECT SECRET_Q1", Int("1")}};
   std::function<double()> clock;
+  std::optional<RatchetCosts> costs;
+  Workload workload = kNumberedFromOne;
 
   struct Result {
     RatchetStats stats;
@@ -101,13 +103,14 @@ struct Fixture {
     ScriptedEngine a("antb1", [this](const std::string& sql) { return antb1_answers.at(sql); });
     ScriptedEngine o("duckdb", [this](const std::string& sql) { return oracle_answers.at(sql); });
     Result r;
-    r.stats = RunRatchet(queries, {.commit = {}, .pass = std::move(pass)}, kNumberedFromOne, a, o,
+    r.stats = RunRatchet(queries, {.commit = {}, .pass = std::move(pass)}, workload, a, o,
                          {.redact = redact,
                           .only = only,
                           .shard = shard,
                           .status_path = "status.json",
                           .command = "cmd",
-                          .clock = clock},
+                          .clock = clock,
+                          .costs = costs},
                          [&r](std::string_view text) {
                            r.out += text;
                            r.writes.emplace_back(text);
@@ -232,8 +235,8 @@ TEST(RunRatchet, RedactedWrongAnswersShowNoQueryTextOrValues) {
   EXPECT_FALSE(r.out.contains("SECRET")) << r.out;
 }
 
-// With a clock (ANTB1_TPCH_TIMES=1): each outcome line has the query's seconds, and the summary
-// the geometric mean of the passing queries'.
+// With a clock: each outcome line has the query's seconds, and the summary the geometric mean of
+// the passing queries'.
 TEST(RunRatchet, TimesFromTheClock) {
   Fixture f;
   f.antb1_answers["SELECT SECRET_Q2"] = Int("2");
@@ -253,6 +256,63 @@ TEST(RunRatchet, TimesFromTheClock) {
   none.clock = [] { return 0.0; };
   const auto r2 = none.Run({}, false, 2);
   EXPECT_TRUE(r2.out.contains(" geomean=n/a\n")) << r2.out;
+}
+
+// With costs (antb1-slt --costs): antb1's own seconds and peak memory join the line of each query
+// antb1 answered, the workload's disclaimer comes first and after the summary, and the costs file
+// gets the records, each a line of JSON: the run first, then each query's running and outcome
+// records with its verdict against the ratchet, then the end with the wall time since the run
+// began. Neither the file nor the log holds a query's text.
+TEST(RunRatchet, CostsLinesAndRecords) {
+  Fixture f;
+  ResultSet answer = Int("1");
+  answer.peak_memory = int64_t{1536} * 1024;  // 1.5 MiB
+  answer.engine_seconds = 0.25;
+  f.antb1_answers["SELECT SECRET_Q1"] = answer;
+  f.antb1_answers["SELECT SECRET_Q3"] = answer;
+  f.oracle_answers["SELECT SECRET_Q3"] = Int("1");
+  f.workload.disclaimer = "DISCLAIMER";
+  int calls = 0;
+  // The run begins at 0; Q1 takes 2 s, Q2 0.5 s, Q3 2 s; the run ends at 10.
+  const std::vector<double> steps = {1, 3, 3, 3.5, 4, 6, 10};
+  f.clock = [&] { return steps.at(static_cast<std::size_t>(calls++)); };
+  std::string file;
+  f.costs = RatchetCosts{.write = [&file](std::string_view line) { file += line; },
+                         .test = "t\"x",
+                         .threads = 4,
+                         .same_as_threads = 1,
+                         .memory_limit = int64_t{2} * 1024 * 1024 * 1024,
+                         .started = 0};
+  const auto r = f.Run({1, 2});  // Q2 no longer passes, Q3 newly does
+  EXPECT_EQ(r.stats.failed, 2) << r.out;
+  EXPECT_TRUE(r.out.contains("Q1: pass (2.000 s, antb1 0.250 s, peak 1.5 MiB)\n")) << r.out;
+  EXPECT_TRUE(r.out.contains("Q2: unsupported (0.500 s)\n")) << r.out;
+  EXPECT_TRUE(r.out.contains("Q3: pass (2.000 s, antb1 0.250 s, peak 1.5 MiB)\n")) << r.out;
+  EXPECT_TRUE(r.out.starts_with("DISCLAIMER\nQ1: running\n")) << r.out;  // also before any number
+  EXPECT_TRUE(r.out.ends_with(" ratchet=[1, 2] geomean=2.000s\nDISCLAIMER\n")) << r.out;
+  EXPECT_EQ(
+      file,
+      R"({"record": "run", "workload": "tpch", "test": "t\"x", "shard": "1/1", "threads": 4, )"
+      R"("same_as_threads": 1, "memory_limit_bytes": 2147483648})"
+      "\n"
+      R"({"record": "running", "query": 1})"
+      "\n"
+      R"({"record": "query", "query": 1, "outcome": "pass", "ratchet": "ok", "seconds": )"
+      R"(2.000000, "antb1_seconds": 0.250000, "peak_memory_bytes": 1572864})"
+      "\n"
+      R"({"record": "running", "query": 2})"
+      "\n"
+      R"({"record": "query", "query": 2, "outcome": "unsupported", "ratchet": "unexpected )"
+      R"(fail", "seconds": 0.500000, "antb1_seconds": null, "peak_memory_bytes": null})"
+      "\n"
+      R"({"record": "running", "query": 3})"
+      "\n"
+      R"({"record": "query", "query": 3, "outcome": "pass", "ratchet": "unexpected pass", )"
+      R"("seconds": 2.000000, "antb1_seconds": 0.250000, "peak_memory_bytes": 1572864})"
+      "\n"
+      R"({"record": "end", "queries": 3, "passed": 2, "failed": 2, "wall_seconds": 10.000000})"
+      "\n");
+  EXPECT_FALSE(file.contains("SECRET")) << file;
 }
 
 }  // namespace

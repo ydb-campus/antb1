@@ -109,6 +109,9 @@ at one layer.
   from TPC-H" table in sql-subset.md (TPC-DS: `tests/data/tpcds_status.json`, "Queries derived from TPC-DS") change
   together, in the PR that makes a query pass, with a maintainer. Never write their query text, or fragments of it,
   into a test, a doc or a PR; refer to them by number.
+- A PR that completes a query derived from TPC-DS lists its seconds and antb1's peak memory at scale factor 1
+  ([ADR 0037](../adr/0037-tpcds-roadmap.md), Decisions 5 and 6). Take them from the "Costs of the queries derived from
+  TPC-H and TPC-DS" job summary of the PR's `gcc-compat` run, name that leg, and add the disclaimer verbatim.
 
 ## 8. Verify and open the PR
 
