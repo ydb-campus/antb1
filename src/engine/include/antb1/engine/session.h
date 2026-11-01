@@ -64,6 +64,12 @@ struct QueryResult {
   std::vector<std::string> names;
   std::vector<plan::LogicalType> types;
   QueryTimings timings;
+  // The most bytes the session's memory held from the start of the query until its result was
+  // built, the result included: the count the memory limit checks. It also holds what was still
+  // held when the query started: the results of earlier queries the caller keeps and, with more
+  // than one thread, buffers the previous query's workers had not yet released. With one thread and
+  // no earlier result alive, it is the query's own peak, the same on every run.
+  int64_t peak_memory = 0;
 };
 
 // One profiled run of a query (`antb1 explain --analyze`, docs/adr/0015-query-profiles.md).

@@ -631,6 +631,43 @@ TEST_F(SessionTest, MemoryLimit) {
   EXPECT_NE(tiny.status().message().find("memory limit of 64 bytes"), std::string::npos);
 }
 
+// QueryResult::peak_memory: each Execute starts its peak from the bytes held at the time. With one
+// thread and no earlier result alive, that is the query's own peak, the same on every run and
+// within the limit; a result the caller still holds adds its bytes to the next query's peak.
+TEST_F(SessionTest, ExecuteReportsThePeakMemoryOfTheQuery) {
+  SessionOptions options;
+  options.memory_limit = int64_t{1024} * 1024 * 1024;
+  auto session = Session::Make(options).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  const std::string sorted = "SELECT AdvEngineID, EventDate FROM t ORDER BY AdvEngineID DESC";
+  const std::string count = "SELECT COUNT(*) FROM t";  // the row count of the file's metadata
+  const auto peak = [&](const std::string& sql) {      // the result is dropped on return
+    const auto result = session->Execute(sql);
+    EXPECT_TRUE(result.ok()) << result.status().ToString();
+    return result.ok() ? result->peak_memory : -1;
+  };
+  const int64_t sorted_peak = peak(sorted);
+  EXPECT_GT(sorted_peak, 0);
+  EXPECT_LE(sorted_peak, *options.memory_limit);
+  EXPECT_EQ(peak(sorted), sorted_peak);
+  const auto profile = session->ExplainAnalyze(sorted);  // the same count, no pool allocations
+  ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+  EXPECT_EQ(profile->peak_memory, sorted_peak);
+  const int64_t count_peak = peak(count);
+  EXPECT_GT(count_peak, 0);  // its builder's capacity
+  EXPECT_LT(count_peak, sorted_peak);
+
+  const auto held = session->Execute(sorted);
+  ASSERT_TRUE(held.ok()) << held.status().ToString();
+  const int64_t held_bytes = held->memory->bytes_allocated();
+  EXPECT_GT(held_bytes, 0);
+  // The peak, not the bytes still held at the end: the sort's input and buffers came first.
+  EXPECT_GT(sorted_peak, held_bytes);
+  const auto next = session->Execute(count);
+  ASSERT_TRUE(next.ok()) << next.status().ToString();
+  EXPECT_EQ(next->peak_memory, held_bytes + count_peak);
+}
+
 // A query that fails in its first row group while later ones hold buffers of the session's
 // memory on the pool's threads: destroying the session right away must wait for those threads
 // before the memory goes (ASan checks the frees).

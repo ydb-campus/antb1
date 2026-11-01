@@ -69,6 +69,8 @@ Proposed
   - `PartAggregate` and `PartTopN`: `merge`.
   - `TopN` and `Sort`: `sort`.
   - The query: its time, result rows, threads and peak memory (`MemoryBudget::ResetPeak` before the run).
+  - Update (2026-11-01, ADR 0037's HC3): `Session::Execute` restarts the peak the same way and returns it as
+    `QueryResult::peak_memory`, so a query run without a profile reports its peak too.
   - Update (2026-10-09, J1b): a hash join shows its probe, `HashJoin` (per part in a part pipeline), with `find`,
     `gather`, `residual` and, on the 1:1 path, `window_rows` (the probe rows it gathered the build's columns for,
     against the rows it returns); and its build, `HashBuild`, under the operator that prepares it, with the rows its
