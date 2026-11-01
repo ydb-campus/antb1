@@ -60,7 +60,9 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
 4. **Window functions come last** (phase 9). Their scope and design are decided then, in an ADR of their own, which
    also replaces `kWindowFunctions` as the permanent canary. Until then they stay out of scope.
 5. **Every PR of the Plan** builds one feature, with:
-   - `.slt` records completed from DuckDB, with result type names where a type is decided (HC2);
+   - `.slt` records completed from DuckDB, with result type names where a type is decided (HC2). Update
+     (2026-11-01, HC2): every query record carries the type names of its result, so any change of a result type
+     shows in the diff of `slt-complete`;
    - a `Feature` the random generator writes from a random stream of its own, or a place in `kGeneratorPending` with
      the PR that will write it named;
    - metamorphic relations where a relation holds;
@@ -100,8 +102,8 @@ Queries are those a PR completes when the PRs merge in this order.
 | Id | Item | Completes | Status |
 | --- | --- | --- | --- |
 | **Phase 0** | **The harness** | | |
-| HC1 | This ADR; the TPC-DS table of docs/sql-subset.md rewritten from the survey; ADR 0036's context corrected | | This PR |
-| HC2 | Result type names in `.slt` records: a line `slt-complete` writes from DuckDB's types, matched exactly by both engines | | Planned |
+| HC1 | This ADR; the TPC-DS table of docs/sql-subset.md rewritten from the survey; ADR 0036's context corrected | | Built |
+| HC2 | Result type names in `.slt` records: a line `slt-complete` writes from DuckDB's types, matched exactly by both engines | | Built |
 | HC3 | Each SF 1 query's seconds and peak memory in the shard logs of every leg, and a local report of each refusal | | Planned |
 | HC4 | SF 1 shards by measured cost: a committed map of queries to shards instead of every eighth query | | Planned |
 | HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Planned |

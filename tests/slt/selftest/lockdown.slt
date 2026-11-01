@@ -6,6 +6,7 @@ onlyif duckdb
 query IT nosort
 SELECT current_setting('threads'), current_setting('autoload_known_extensions')
 ----
+BIGINT	BOOLEAN
 1	false
 
 # The late_materialization optimizer is off, for a DuckDB bug (where/pushdown.slt).
@@ -14,6 +15,7 @@ onlyif duckdb
 query T nosort
 SELECT current_setting('disabled_optimizers')
 ----
+VARCHAR
 late_materialization
 
 onlyif duckdb
@@ -80,4 +82,5 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM glob('${FIXTURES}/lockdown-canary*')
 ----
+BIGINT
 0

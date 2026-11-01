@@ -7,12 +7,14 @@
 query I nosort
 SELECT COUNT(*) FROM edge
 ----
+BIGINT
 12
 
 pending Z9
 query I nosort
 SELECT COUNT(*) OVER () FROM edge LIMIT 1
 ----
+BIGINT
 12
 
 pending Z9

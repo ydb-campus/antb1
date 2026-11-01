@@ -7,22 +7,26 @@
 query II nosort
 SELECT COUNT(*), COUNT(tr_tariff) FROM trips
 ----
+BIGINT	BIGINT
 3000	2842
 
 # tariffs and drivers each hold one NULL key, and promos is empty.
 query II nosort
 SELECT COUNT(*), COUNT(tf_code) FROM tariffs
 ----
+BIGINT	BIGINT
 9	8
 
 query II nosort
 SELECT COUNT(*), COUNT(dv_id) FROM drivers
 ----
+BIGINT	BIGINT
 97	96
 
 query I nosort
 SELECT COUNT(*) FROM promos
 ----
+BIGINT
 0
 
 # ---- pending: IN and NOT IN subqueries (ADR 0022; roadmap PR J5 removes these guards) ----
@@ -31,28 +35,33 @@ SELECT COUNT(*) FROM promos
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs)
 ----
+BIGINT
 2274
 
 # With a NULL in the set, NOT IN keeps no row, in either spelling.
 query I nosort null_in_set
 SELECT COUNT(*) FROM trips WHERE tr_tariff NOT IN (SELECT tf_code FROM tariffs)
 ----
+BIGINT
 0
 
 query I nosort null_in_set
 SELECT COUNT(*) FROM trips WHERE NOT (tr_tariff IN (SELECT tf_code FROM tariffs))
 ----
+BIGINT
 0
 
 query I nosort null_in_set
 SELECT COUNT(*) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers)
 ----
+BIGINT
 0
 
 # Without the NULL code: std and XL, never a NULL probe value.
 query TI rowsort
 SELECT tr_tariff, COUNT(*) FROM trips WHERE tr_tariff NOT IN (SELECT tf_code FROM tariffs WHERE tf_row <> 7) GROUP BY tr_tariff
 ----
+VARCHAR	BIGINT
 XL	284
 std	284
 
@@ -60,38 +69,45 @@ std	284
 query II nosort null_probe
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 0)
 ----
+BIGINT	BIGINT
 319	319
 
 query II nosort null_probe
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT (tr_driver IN (SELECT dv_id FROM drivers WHERE dv_id > 0))
 ----
+BIGINT	BIGINT
 319	319
 
 # An empty set keeps every row, NULL probe values included.
 query I nosort empty_set
 SELECT COUNT(*) FROM trips WHERE tr_promo NOT IN (SELECT pm_id FROM promos)
 ----
+BIGINT
 3000
 
 query I nosort empty_set
 SELECT COUNT(*) FROM trips WHERE NOT (tr_promo IN (SELECT pm_id FROM promos))
 ----
+BIGINT
 3000
 
 query I nosort empty_set
 SELECT COUNT(*) FROM trips WHERE tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 9000000000)
 ----
+BIGINT
 3000
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_promo IN (SELECT pm_id FROM promos)
 ----
+BIGINT
 0
 
 # No NULL on either side: the pickups without a zone.
 query II rowsort
 SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones) GROUP BY tr_pickup
 ----
+INTEGER	BIGINT
 41	69
 42	69
 43	69
@@ -100,23 +116,27 @@ SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM 
 query ID nosort
 SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)
 ----
+BIGINT	DECIMAL(38,2)
 2745	41289.25
 
 # GROUP BY and HAVING inside the subquery: the trips of the 8 repeated riders.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders GROUP BY rd_id HAVING COUNT(*) > 1)
 ----
+BIGINT
 96
 
 # Keys of two types: INTEGER against BIGINT (driver 2^32 + 1000 matches no trip), DECIMAL(4,2) against DECIMAL(5,3).
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers)
 ----
+BIGINT
 2577
 
 query DI rowsort
 SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate IN (SELECT tf_rate FROM tariffs) GROUP BY tr_rate
 ----
+DECIMAL(4,2)	BIGINT
 1.00	348
 1.25	350
 1.50	348
@@ -127,6 +147,7 @@ SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate IN (SELECT tf_rate FROM tariff
 query DI rowsort
 SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate NOT IN (SELECT tf_rate FROM tariffs WHERE tf_rate > 1) GROUP BY tr_rate
 ----
+DECIMAL(4,2)	BIGINT
 0.88	343
 1.00	348
 2.25	343
@@ -135,12 +156,14 @@ SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate NOT IN (SELECT tf_rate FROM ta
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_day IN (SELECT sh_day FROM shifts WHERE sh_driver = 1000)
 ----
+BIGINT
 473
 
 # A table against itself: zone 40's parent 77 is in no set, NULL parents drop out, and parents 2 to 5 are in the set.
 query II rowsort
 SELECT zn_id, zn_parent FROM zones WHERE zn_parent NOT IN (SELECT zn_id FROM zones WHERE zn_city <> 1)
 ----
+INTEGER	INTEGER
 11	1
 16	1
 21	1
@@ -154,6 +177,7 @@ SELECT zn_id, zn_parent FROM zones WHERE zn_parent NOT IN (SELECT zn_id FROM zon
 query II rowsort
 SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup NOT IN (SELECT zn_id FROM zones)
 ----
+INTEGER	BIGINT
 41	69
 42	69
 43	69
@@ -162,6 +186,7 @@ SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup NOT IN
 query TI rowsort
 SELECT label, COUNT(*) FROM zones WHERE label IN (SELECT label FROM cities) GROUP BY label
 ----
+VARCHAR	BIGINT
 airport	5
 center	5
 
@@ -169,6 +194,7 @@ center	5
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers JOIN cities ON dv_city = ct_id WHERE ct_pop > 40000)
 ----
+BIGINT
 1216
 
 # A CTE referenced inside the subquery (roadmap PR J4): the rider rows of the riders with 13 trips or
@@ -177,6 +203,7 @@ query II nosort
 WITH busy AS (SELECT tr_rider AS rider FROM trips GROUP BY tr_rider HAVING COUNT(*) >= 13)
 SELECT COUNT(*), COUNT(DISTINCT rd_id) FROM riders WHERE rd_id IN (SELECT rider FROM busy)
 ----
+BIGINT	BIGINT
 62	59
 
 # ---- the shapes the generator does not write (roadmap PR J5a) ----
@@ -185,6 +212,7 @@ SELECT COUNT(*), COUNT(DISTINCT rd_id) FROM riders WHERE rd_id IN (SELECT rider 
 query I nosort
 SELECT COUNT(*) FROM drivers WHERE dv_id IN (SELECT tr_driver FROM trips)
 ----
+BIGINT
 89
 
 # A LEFT JOIN's padded right column as the probe of a NOT IN over an empty set: every row of the join
@@ -193,6 +221,7 @@ query II nosort
 SELECT COUNT(*), COUNT(sh_hours) FROM trips LEFT JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
 WHERE sh_hours NOT IN (SELECT pm_discount FROM promos)
 ----
+BIGINT	BIGINT
 3002	426
 
 # A NULL grouping key under a HAVING NOT IN, against the same groups without it: promos is empty, so
@@ -200,11 +229,13 @@ WHERE sh_hours NOT IN (SELECT pm_discount FROM promos)
 query II nosort all_groups
 SELECT COUNT(*), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider HAVING tr_rider NOT IN (SELECT pm_id FROM promos)) AS s
 ----
+BIGINT	HUGEINT
 244	3000
 
 query II nosort all_groups
 SELECT COUNT(*), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider) AS s
 ----
+BIGINT	HUGEINT
 244	3000
 
 # The same conjunct in an inner join's ON and in WHERE: an ON conjunct of an inner join counts as a
@@ -212,23 +243,27 @@ SELECT COUNT(*), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY
 query I nosort inner_on
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_rider IN (SELECT rd_id FROM riders)
 ----
+BIGINT
 2558
 
 query I nosort inner_on
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_rider IN (SELECT rd_id FROM riders)
 ----
+BIGINT
 2558
 
 # Two subquery conjuncts of one WHERE, stacked in the order they are written.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders) AND tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 0)
 ----
+BIGINT
 294
 
 # A subquery as a top-level WHERE conjunct of a derived table's block: the rule is per block.
 query I nosort
 SELECT COUNT(*) FROM (SELECT tr_row FROM trips WHERE tr_driver IN (SELECT dv_id FROM drivers)) AS s
 ----
+BIGINT
 2577
 
 # An aggregate as the probe in HAVING, which is an operand there: the riders whose trip count is one
@@ -236,6 +271,7 @@ SELECT COUNT(*) FROM (SELECT tr_row FROM trips WHERE tr_driver IN (SELECT dv_id 
 query II nosort
 SELECT COUNT(*), SUM(n) FROM (SELECT COUNT(*) AS n FROM trips GROUP BY tr_rider HAVING COUNT(*) IN (SELECT zn_id FROM zones)) AS s
 ----
+BIGINT	HUGEINT
 243	2869
 
 # A global aggregate whose select list is exactly its aggregates, with a HAVING IN whose probe needs
@@ -244,16 +280,19 @@ SELECT COUNT(*), SUM(n) FROM (SELECT COUNT(*) AS n FROM trips GROUP BY tr_rider 
 query I nosort
 SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) IN (SELECT dv_id FROM drivers)
 ----
+INTEGER
 1000
 
 query I nosort
 SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) NOT IN (SELECT dv_id FROM drivers)
 ----
+INTEGER
 
 # The same block as a sub-plan, where its columns are a binding's.
 query II nosort
 SELECT COUNT(*), SUM(m) FROM (SELECT MIN(tr_driver) AS m FROM trips HAVING MIN(tr_driver) IN (SELECT dv_id FROM drivers)) AS s
 ----
+BIGINT	HUGEINT
 1	1000
 
 # ---- DuckDB only, for good: an IN list of one subquery, which antb1 reads as a list (divergence D22) ----
@@ -264,6 +303,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_pickup IN ((SELECT zn_id FROM zones))
 ----
+BIGINT
 2793
 
 # ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: an IN subquery of type DOUBLE exits 4) ----
@@ -272,6 +312,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_distance IN (SELECT zn_radius FROM zones)
 ----
+BIGINT
 276
 
 # ---- DuckDB only until correlated IN and NOT IN get a PR (ADR 0023) ----
@@ -280,6 +321,7 @@ onlyif duckdb
 query II nosort
 SELECT COUNT(*), COUNT(tr_tariff) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs WHERE tf_rate = tr_rate)
 ----
+BIGINT	BIGINT
 199	199
 
 # ---- IN over a FROM of more than one relation: the semi join runs on one relation's branch ----
@@ -292,24 +334,28 @@ SELECT COUNT(*), COUNT(tr_tariff) FROM trips WHERE tr_tariff IN (SELECT tf_code 
 query II rowsort
 SELECT COUNT(*), COUNT(tr_fare) FROM trips, cities WHERE tr_pickup = ct_id AND ct_id IN (SELECT ct_id FROM cities WHERE ct_pop > 10000)
 ----
+BIGINT	BIGINT
 210	204
 
 # The same join with NOT IN, which reads its whole set to answer one row and so keeps its place.
 query II rowsort
 SELECT COUNT(*), COUNT(tr_fare) FROM trips, cities WHERE tr_pickup = ct_id AND ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_pop > 10000)
 ----
+BIGINT	BIGINT
 210	202
 
 # The key is a VARCHAR whose set repeats values, holds a NULL and the empty string.
 query II rowsort
 SELECT COUNT(*), COUNT(tr_rate) FROM trips, tariffs WHERE tr_tariff = tf_code AND tf_code IN (SELECT tr_tariff FROM trips)
 ----
+BIGINT	BIGINT
 2274	2098
 
 # An empty set drops every row, wherever the semi join stands.
 query I rowsort
 SELECT COUNT(*) FROM trips, drivers WHERE tr_driver = dv_id AND dv_id IN (SELECT pm_id FROM promos)
 ----
+BIGINT
 0
 
 # Three relations, so the join that moves sits under two of them, and a grouped answer rather than a
@@ -317,6 +363,7 @@ SELECT COUNT(*) FROM trips, drivers WHERE tr_driver = dv_id AND dv_id IN (SELECT
 query TII rowsort
 SELECT cities.label, COUNT(*), COUNT(DISTINCT tr_driver) FROM trips, zones, cities WHERE tr_pickup = zn_id AND zn_city = ct_id AND ct_id IN (SELECT rd_city FROM riders) GROUP BY cities.label
 ----
+VARCHAR	BIGINT	BIGINT
 center	559	100
 harbor	559	100
 hills	490	100
@@ -326,6 +373,7 @@ hills	490	100
 query II rowsort
 SELECT COUNT(*), COUNT(tr_promo) FROM trips, zones WHERE tr_pickup = zn_id AND tr_tariff IN (SELECT tf_code FROM tariffs)
 ----
+BIGINT	BIGINT
 2118	52
 
 # ---- DuckDB only, for good: IN over a VALUES table, which is postponed (ADR 0025) ----
@@ -338,4 +386,5 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_pickup IN (VALUES (1), (2))
 ----
+BIGINT
 140

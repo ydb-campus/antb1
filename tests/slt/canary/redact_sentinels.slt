@@ -6,6 +6,7 @@
 query I nosort
 SELECT COUNT(*) /* ANTB1_CANARY_SQL */ FROM edge
 ----
+BIGINT
 ANTB1_CANARY_EXPECTED
 
 statement ok

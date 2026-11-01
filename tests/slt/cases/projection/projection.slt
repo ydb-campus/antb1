@@ -4,6 +4,7 @@
 query IIIIIRTT rowsort
 SELECT * FROM edge
 ----
+INTEGER	SMALLINT	INTEGER	BIGINT	USMALLINT	DOUBLE	VARCHAR	VARCHAR
 0	-32768	-2147483648	-9223372036854775808	0	-0.5	(empty)	(empty)
 1	32767	2147483647	9223372036854775807	65535	0.3333333333333333	a	a
 10	-12345	54321	-42	12	922337203685477632	NULL	日本語
@@ -20,6 +21,7 @@ SELECT * FROM edge
 query TIT rowsort
 SELECT u, id, s FROM edge WHERE id < 4
 ----
+VARCHAR	INTEGER	VARCHAR
 (empty)	0	(empty)
 a	1	a
 line\nbreak	3	line\nbreak
@@ -28,6 +30,7 @@ tab\there	2	tab\there
 query III rowsort
 SELECT id, id AS again, i16 FROM edge WHERE i16 > 0
 ----
+INTEGER	INTEGER	SMALLINT
 1	1	32767
 11	11	7
 4	4	1
@@ -37,6 +40,7 @@ SELECT id, id AS again, i16 FROM edge WHERE i16 > 0
 query IT rowsort
 SELECT "ID", "U" FROM "EDGE" WHERE Id >= 9
 ----
+INTEGER	VARCHAR
 10	日本語
 11	NULL
 9	\x28empty)
@@ -44,6 +48,7 @@ SELECT "ID", "U" FROM "EDGE" WHERE Id >= 9
 query ITIT rowsort
 select watchid, eventdate, regionid AS r, title AS "The Title" from HITS_LIKE where regionid > 19990
 ----
+BIGINT	DATE	INTEGER	VARCHAR
 -7309109776868671579	2013-07-27	19998	(empty)
 -7707613778036793793	2013-07-03	19997	(empty)
 5152808038682550417	2013-07-18	19994	(empty)
@@ -54,6 +59,7 @@ select watchid, eventdate, regionid AS r, title AS "The Title" from HITS_LIKE wh
 query ITT rowsort
 SELECT WatchID, EventDate, SearchPhrase FROM hits_like_nulls WHERE RegionID > 19980 AND SearchPhrase <> ''
 ----
+BIGINT	DATE	VARCHAR
 -8773633443468164452	2013-07-30	beta книга
 1562737956605608062	2013-07-14	quick maple
 
@@ -61,6 +67,7 @@ SELECT WatchID, EventDate, SearchPhrase FROM hits_like_nulls WHERE RegionID > 19
 query TII rowsort
 SELECT s, i32, i64 FROM edge WHERE id >= 5
 ----
+VARCHAR	INTEGER	BIGINT
 NULL	54321	-42
 NULL	NULL	NULL
 \x20leading space	100000	1000000000000000
@@ -73,6 +80,7 @@ x\x01y	-100000	-1000000000000000
 query RTI rowsort
 SELECT d, u, u16 FROM edge WHERE u16 >= 15000
 ----
+DOUBLE	VARCHAR	USMALLINT
 -9007199254740992	x\x7fy	40000
 0.1	back\\slash	15887
 0.3333333333333333	a	65535
@@ -82,6 +90,7 @@ SELECT d, u, u16 FROM edge WHERE u16 >= 15000
 query ITIIIIIIII rowsort
 SELECT RegionID, SocialAction, HistoryLength, CounterID, IsMobile, AdvEngineID, OS, UserAgent, Age, Sex FROM hits_like_nulls WHERE CounterID = 62 AND RegionID < 2000
 ----
+INTEGER	VARCHAR	SMALLINT	INTEGER	SMALLINT	SMALLINT	SMALLINT	SMALLINT	SMALLINT	SMALLINT
 0	NULL	NULL	62	0	0	13	45	0	1
 0	NULL	NULL	62	0	0	63	32	NULL	2
 0	NULL	NULL	62	0	0	73	9	5	2

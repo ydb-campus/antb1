@@ -32,8 +32,9 @@ The sqllogictest runner (`tests/slt/runner`, binary `antb1-slt`), its fixture ta
 2. Write records in standard sqllogictest form: `statement ok` or `statement error <regex>`, and
    `query <types> <sort mode>` followed by the SQL. Use `nosort` with an `ORDER BY` whose keys end with a unique
    column (rows with equal keys may come in any order), otherwise `rowsort` for multi-row results.
-3. Leave the expected block empty and run the completion task (it runs the SQL on DuckDB and writes the results
-   below `----`); records that only antb1 runs are flagged for review instead of completed.
+3. Leave the expected block empty and run the completion task (it runs the SQL on DuckDB and writes below `----`
+   the line of the result's type names, which both engines must match exactly, then the rows); records that only
+   antb1 runs are completed from antb1 and flagged `REVIEW` for a check by hand.
 4. Review the generated results: do they match docs/sql-subset.md? A surprising value is a bug in the test or a
    semantic difference to register, never something to edit away.
 5. Run the SQL logic tests against antb1 and against DuckDB (ctest labels `slt` and `oracle`), for example

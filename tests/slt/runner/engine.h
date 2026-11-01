@@ -21,8 +21,8 @@ char ClassLetter(ColumnClass c);
 
 struct ResultSet {
   std::vector<ColumnClass> classes;
-  // Engine type names (e.g. BIGINT, HUGEINT, DECIMAL(15,2)), for messages; the diff, query-file and
-  // ClickBench comparisons require them to match.
+  // Engine type names (e.g. BIGINT, HUGEINT, DECIMAL(15,2)): the type line of an .slt record and
+  // the diff, query-file and ClickBench comparisons require them to match.
   std::vector<std::string> type_names;
   // Canonical text of every value (canonical.h); std::nullopt is SQL NULL.
   std::vector<std::vector<std::optional<std::string>>> rows;

@@ -5,6 +5,7 @@
 query II nosort
 SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DESC, UserID LIMIT 5
 ----
+BIGINT	BIGINT
 9223372036854775807	2
 -9223372036854775808	1
 386056098584291	1
@@ -14,6 +15,7 @@ SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DES
 query II nosort
 SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DESC, UserID LIMIT 4 OFFSET 3000
 ----
+BIGINT	BIGINT
 1352933567315323775	1
 1353141830839239171	1
 1353323344675940665	1
@@ -22,6 +24,7 @@ SELECT UserID, COUNT(*) AS c FROM hits_like_split GROUP BY UserID ORDER BY c DES
 query ITI nosort
 SELECT RegionID, MIN(URL), COUNT(*) AS c FROM hits_like_nulls GROUP BY RegionID ORDER BY c DESC, RegionID NULLS FIRST LIMIT 6
 ----
+INTEGER	VARCHAR	BIGINT
 NULL	(empty)	785
 0	(empty)	276
 8830	(empty)	6
@@ -32,6 +35,7 @@ NULL	(empty)	785
 query III nosort
 SELECT CounterID, RegionID, SUM(ResolutionWidth) AS w FROM hits_like_split GROUP BY CounterID, RegionID ORDER BY w DESC, CounterID, RegionID LIMIT 5 OFFSET 2
 ----
+INTEGER	INTEGER	HUGEINT
 15062	0	17932
 4062	0	16248
 28062	0	15350
@@ -41,6 +45,7 @@ SELECT CounterID, RegionID, SUM(ResolutionWidth) AS w FROM hits_like_split GROUP
 query TI nosort
 SELECT SearchPhrase, COUNT(*) AS c FROM hits_like_split WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c, SearchPhrase DESC LIMIT 3
 ----
+VARCHAR	BIGINT
 погода погода погода	1
 погода погода новости	1
 погода погода	1
@@ -49,6 +54,7 @@ SELECT SearchPhrase, COUNT(*) AS c FROM hits_like_split WHERE SearchPhrase <> ''
 query II nosort
 SELECT OS, COUNT(*) AS c FROM hits_like GROUP BY OS ORDER BY c DESC, OS LIMIT 1000 OFFSET 2
 ----
+SMALLINT	BIGINT
 118	103
 73	102
 26	100

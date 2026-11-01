@@ -7,11 +7,13 @@
 query II nosort
 SELECT COUNT(*), MAX(ct_pop) FROM cities
 ----
+BIGINT	INTEGER
 6	120000
 
 query I nosort
 SELECT COUNT(*) FROM zones
 ----
+BIGINT
 40
 
 # ---- one-row inputs only ----
@@ -19,17 +21,20 @@ SELECT COUNT(*) FROM zones
 query II nosort
 SELECT a.n, b.m FROM (SELECT COUNT(*) AS n FROM trips) AS a, (SELECT MAX(ct_pop) AS m FROM cities) AS b
 ----
+BIGINT	INTEGER
 3000	120000
 
 query IIID nosort
 SELECT a.n, b.z, c.p, d.f FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 100) AS a CROSS JOIN (SELECT COUNT(*) AS z FROM zones) AS b CROSS JOIN (SELECT SUM(ct_pop) AS p FROM cities) AS c CROSS JOIN (SELECT SUM(tr_fare) AS f FROM trips) AS d
 ----
+BIGINT	BIGINT	HUGEINT	DECIMAL(38,2)
 100	40	205500	44992.50
 
 # Arithmetic over two one-row inputs: a share of the trips, in percent.
 query I nosort
 SELECT a.n * 100 // b.n FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 1350) AS a, (SELECT COUNT(*) AS n FROM trips) AS b
 ----
+BIGINT
 45
 
 # ---- one-row inputs next to tables ----
@@ -37,6 +42,7 @@ SELECT a.n * 100 // b.n FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 135
 query IIII rowsort
 SELECT z.zn_id, z.zn_city, a.n, a.m FROM zones AS z, (SELECT COUNT(*) AS n, MAX(ct_pop) AS m FROM cities) AS a WHERE z.zn_id <= 3
 ----
+INTEGER	SMALLINT	BIGINT	INTEGER
 1	1	6	120000
 2	2	6	120000
 3	3	6	120000
@@ -45,6 +51,7 @@ SELECT z.zn_id, z.zn_city, a.n, a.m FROM zones AS z, (SELECT COUNT(*) AS n, MAX(
 query II rowsort
 SELECT z.zn_id, a.m FROM (SELECT MAX(ct_pop) AS m FROM cities) AS a, zones AS z WHERE z.zn_id <= 2
 ----
+INTEGER	INTEGER
 1	120000
 2	120000
 
@@ -52,6 +59,7 @@ SELECT z.zn_id, a.m FROM (SELECT MAX(ct_pop) AS m FROM cities) AS a, zones AS z 
 query III rowsort
 SELECT z.zn_id, a.m, c.ct_pop FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS a, cities AS c WHERE z.zn_city = c.ct_id AND z.zn_id <= 3
 ----
+INTEGER	INTEGER	INTEGER
 1	120000	120000
 2	120000	45000
 3	120000	30000
@@ -60,12 +68,14 @@ SELECT z.zn_id, a.m, c.ct_pop FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cit
 query II nosort
 SELECT COUNT(*), MAX(a.total) FROM (SELECT COUNT(*) AS total FROM trips) AS a, zones AS z, cities AS c, trips AS t WHERE z.zn_city = c.ct_id AND t.tr_pickup = z.zn_id AND t.tr_driver > c.ct_pop / 100
 ----
+BIGINT	BIGINT
 2057	3000
 
 # Next to a join, with GROUP BY and ORDER BY above.
 query TII nosort
 SELECT c.label, COUNT(*), MAX(a.total) FROM zones AS z JOIN cities AS c ON z.zn_city = c.ct_id, (SELECT COUNT(*) AS total FROM trips) AS a GROUP BY c.label ORDER BY c.label
 ----
+VARCHAR	BIGINT	BIGINT
 airport	7	3000
 center	8	3000
 harbor	8	3000
@@ -76,39 +86,46 @@ old town	8	3000
 query II nosort
 WITH n AS (SELECT COUNT(*) AS c FROM trips) SELECT COUNT(*), MAX(n.c) FROM zones, n
 ----
+BIGINT	BIGINT
 40	3000
 
 # Inside the left input of a LEFT JOIN, and next to one.
 query III nosort
 SELECT COUNT(*), COUNT(c.ct_id), MAX(a.n) FROM zones AS z CROSS JOIN (SELECT COUNT(*) AS n FROM trips) AS a LEFT JOIN cities AS c ON z.zn_city = c.ct_id
 ----
+BIGINT	BIGINT	BIGINT
 40	38	3000
 
 query III nosort
 SELECT COUNT(*), COUNT(c.ct_id), MAX(a.n) FROM (SELECT COUNT(*) AS n FROM trips) AS a, zones AS z LEFT JOIN cities AS c ON z.zn_city = c.ct_id
 ----
+BIGINT	BIGINT	BIGINT
 40	38	3000
 
 # A subquery conjunct may read it: its join stands above the one-row join and filters the joined rows.
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS b WHERE b.m > (SELECT AVG(ct_pop) FROM cities)
 ----
+BIGINT
 40
 
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT MAX(ct_pop) AS m FROM cities) AS b WHERE b.m IN (SELECT ct_pop FROM cities)
 ----
+BIGINT
 40
 
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT MAX(zn_id) AS m FROM zones) AS b WHERE b.m NOT IN (SELECT ct_id FROM cities)
 ----
+BIGINT
 40
 
 # In the blocks of a UNION ALL, and over one: the aggregate of a union is one row.
 query II rowsort
 SELECT z.zn_id, a.n FROM zones AS z, (SELECT COUNT(*) AS n FROM cities) AS a WHERE z.zn_id <= 2 UNION ALL SELECT a.n, b.n FROM (SELECT COUNT(*) AS n FROM zones) AS a, (SELECT COUNT(*) AS n FROM (SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM zones) AS u) AS b
 ----
+BIGINT	BIGINT
 1	6
 2	6
 40	46
@@ -119,16 +136,19 @@ SELECT z.zn_id, a.n FROM zones AS z, (SELECT COUNT(*) AS n FROM cities) AS a WHE
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 0) AS a
 ----
+BIGINT
 40
 
 query II nosort
 SELECT a.n, b.m FROM (SELECT COUNT(*) AS n FROM trips WHERE tr_row < 0) AS a, (SELECT MAX(ct_pop) AS m FROM cities WHERE ct_id > 100) AS b
 ----
+BIGINT	INTEGER
 0	NULL
 
 query I nosort
 SELECT COUNT(*) FROM (SELECT * FROM zones WHERE zn_id < 0) AS z, (SELECT COUNT(*) AS n FROM trips) AS a
 ----
+BIGINT
 0
 
 # ---- DuckDB only until general cross products get a PR (ADR 0022) ----
@@ -139,28 +159,33 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities) AS a WHERE a.m > 5
 ----
+BIGINT
 40
 
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT MAX(zn_id) AS m FROM zones) AS a WHERE z.zn_id < a.m
 ----
+BIGINT
 39
 
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities HAVING MAX(ct_pop) > 0) AS a
 ----
+BIGINT
 40
 
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities UNION ALL SELECT MIN(ct_pop) FROM cities) AS a
 ----
+BIGINT
 80
 
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, cities
 ----
+BIGINT
 240

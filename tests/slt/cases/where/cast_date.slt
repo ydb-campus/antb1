@@ -5,36 +5,43 @@
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate = CAST('2013-07-15' AS DATE)
 ----
+BIGINT
 335
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate >= '2013-07-10'::DATE AND EventDate < cast('2013-07-20' as date)
 ----
+BIGINT
 3227
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE '2013-07-04'::date >= EventDate
 ----
+BIGINT
 1376
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE CAST('2013-07-30' AS DATE) < EventDate OR EventDate <= ('2013-07-01')::Date
 ----
+BIGINT
 676
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate IN ('2013-07-01'::DATE, CAST('2013-07-31' AS DATE), DATE '2013-07-15')
 ----
+BIGINT
 941
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE EventDate NOT IN ('2013-07-01'::DATE, CAST('2013-07-31' AS DATE))
 ----
+BIGINT
 8604
 
 query TI rowsort
 SELECT EventDate, COUNT(*) FROM hits_like_split WHERE EventDate > '2013-07-27'::DATE GROUP BY EventDate
 ----
+DATE	BIGINT
 2013-07-28	335
 2013-07-29	336
 2013-07-30	327
@@ -43,6 +50,7 @@ SELECT EventDate, COUNT(*) FROM hits_like_split WHERE EventDate > '2013-07-27'::
 query ITT rowsort
 SELECT AdvEngineID, MIN(EventDate), MAX(EventDate) FROM hits_like GROUP BY AdvEngineID HAVING MIN(EventDate) <= CAST('2013-07-01' AS DATE) AND MAX(EventDate) >= '2013-07-31'::DATE
 ----
+SMALLINT	DATE	DATE
 0	2013-07-01	2013-07-31
 12	2013-07-01	2013-07-31
 20	2013-07-01	2013-07-31
@@ -60,6 +68,7 @@ SELECT AdvEngineID, MIN(EventDate), MAX(EventDate) FROM hits_like GROUP BY AdvEn
 query IT nosort
 SELECT AdvEngineID, MAX(EventDate) FROM hits_like WHERE EventDate < '2013-07-02'::DATE GROUP BY AdvEngineID ORDER BY '2013-07-15'::DATE, AdvEngineID
 ----
+SMALLINT	DATE
 0	2013-07-01
 3	2013-07-01
 5	2013-07-01
@@ -92,22 +101,26 @@ SELECT AdvEngineID, MAX(EventDate) FROM hits_like WHERE EventDate < '2013-07-02'
 query TTT nosort
 SELECT CAST('2020-01-02' AS DATE), '2024-01-31'::date AS d, DATE '2013-07-15' FROM hits_like LIMIT 2
 ----
+DATE	DATE	DATE
 2020-01-02	2024-01-31	2013-07-15
 2020-01-02	2024-01-31	2013-07-15
 
 query TI nosort
 SELECT '2020-01-02'::DATE, COUNT(*) FROM hits_like GROUP BY '2020-01-02'::DATE
 ----
+DATE	BIGINT
 2020-01-02	10000
 
 query TI nosort
 SELECT CAST('2020-01-02' AS DATE) AS k, COUNT(*) FROM hits_like_split GROUP BY 1
 ----
+DATE	BIGINT
 2020-01-02	10000
 
 query TI rowsort
 SELECT CASE WHEN EventDate < '2013-07-03'::DATE THEN CAST('2013-07-01' AS DATE) ELSE EventDate END AS d, COUNT(*) FROM hits_like WHERE EventDate < DATE '2013-07-06' GROUP BY d
 ----
+DATE	BIGINT
 2013-07-01	715
 2013-07-03	350
 2013-07-04	311
@@ -116,6 +129,7 @@ SELECT CASE WHEN EventDate < '2013-07-03'::DATE THEN CAST('2013-07-01' AS DATE) 
 query I nosort
 SELECT COUNT(CASE EventDate WHEN '2013-07-15'::DATE THEN 1 END) FROM hits_like
 ----
+BIGINT
 335
 
 # Timestamps: a date cast compared with a timestamp is its midnight.
@@ -123,11 +137,13 @@ SELECT COUNT(CASE EventDate WHEN '2013-07-15'::DATE THEN 1 END) FROM hits_like
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE toDateTime(EventTime) >= CAST('2013-07-15' AS DATE) AND toDateTime(EventTime) < '2013-07-16'::DATE
 ----
+BIGINT
 335
 
 query TII nosort
 SELECT date_trunc('month', '2013-07-15'::DATE), EXTRACT(year FROM '2013-07-15'::DATE), EXTRACT(day FROM CAST('2013-07-15' AS DATE)) FROM hits_like LIMIT 1
 ----
+TIMESTAMP	BIGINT	BIGINT
 2013-07-01 00:00:00	2013	15
 
 # The empty table and a table of several files.
@@ -135,11 +151,13 @@ SELECT date_trunc('month', '2013-07-15'::DATE), EXTRACT(year FROM '2013-07-15'::
 query IT nosort
 SELECT COUNT(*), MAX(EventDate) FROM empty WHERE EventDate >= '2013-07-01'::DATE
 ----
+BIGINT	DATE
 0	NULL
 
 query TT nosort
 SELECT MIN(EventDate), MAX(EventDate) FROM hits_like_split WHERE AdvEngineID <> 0 AND EventDate > CAST('2013-07-05' AS DATE)
 ----
+DATE	DATE
 2013-07-06	2013-07-31
 
 # An invalid date fails in both engines.

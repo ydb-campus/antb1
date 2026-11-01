@@ -3,42 +3,50 @@
 query I nosort
 SELECT COUNT(*) FROM hits_like
 ----
+BIGINT
 10000
 
 # Keywords and table names are case-insensitive; quoted names too (DuckDB semantics).
 query I nosort
 select count(*) from HITS_LIKE
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM "Hits_Like";
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_split
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_required
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM edge
 ----
+BIGINT
 12
 
 query I nosort
 SELECT COUNT(*) FROM empty
 ----
+BIGINT
 0
 
 # SQL may span lines and carry comments.
@@ -47,17 +55,20 @@ SELECT
   COUNT(*) -- all rows
 FROM /* four files */ hits_like_split
 ----
+BIGINT
 10000
 
 # The same label means the same result.
 query I nosort same_rows
 SELECT COUNT(*) FROM hits_like_split
 ----
+BIGINT
 10000
 
 query I nosort same_rows
 SELECT COUNT(*) FROM hits_like_required
 ----
+BIGINT
 10000
 
 statement ok
@@ -67,9 +78,11 @@ SELECT COUNT(*) FROM hits_like
 query I nosort
 SELECT count(*) AS "Rows" FROM hits_like_split
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) n FROM edge;
 ----
+BIGINT
 12

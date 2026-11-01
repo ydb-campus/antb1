@@ -6,126 +6,151 @@
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200
 ----
+BIGINT
 54
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID between 200 and 100
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 150 AND 150
 ----
+BIGINT
 1
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID NOT BETWEEN 100 AND 200
 ----
+BIGINT
 9946
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE NOT RegionID BETWEEN 100 AND 200
 ----
+BIGINT
 9946
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE NOT (RegionID NOT BETWEEN 100 AND 200)
 ----
+BIGINT
 54
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200 AND UserAgent = 2
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE (RegionID BETWEEN 100 AND 200 AND UserAgent BETWEEN 1 AND 3)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID BETWEEN 100 AND 200 OR RegionID BETWEEN 1000 AND 2000
 ----
+BIGINT
 551
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID + 1 BETWEEN 2 * 50 AND 4 * 50 - 1
 ----
+BIGINT
 55
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE 100 + 5 <= RegionID AND RegionID < -(-300)
 ----
+BIGINT
 93
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate BETWEEN DATE '2013-07-10' AND CAST('2013-07-12' AS DATE)
 ----
+BIGINT
 1007
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE EventDate NOT BETWEEN '2013-07-02'::DATE AND '2013-07-30'::DATE
 ----
+BIGINT
 676
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE URL BETWEEN 'http://a' AND 'http://m'
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE Title NOT BETWEEN 'A' AND 'Z'
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID BETWEEN 100 AND 200
 ----
+BIGINT
 48
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE RegionID NOT BETWEEN 100 AND 200
 ----
+BIGINT
 9167
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_nulls WHERE NOT (RegionID BETWEEN 100 AND 200) OR RegionID = 150
 ----
+BIGINT
 9168
 
 query I nosort
 SELECT COUNT(*) FROM hits_like_split WHERE RegionID BETWEEN 100 AND 200
 ----
+BIGINT
 54
 
 query I nosort
 SELECT COUNT(*) FROM empty WHERE RegionID BETWEEN 1 AND 2
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i64 BETWEEN -9223372036854775808 AND 9223372036854775807
 ----
+BIGINT
 10
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i16 BETWEEN -40000 AND 40000
 ----
+BIGINT
 10
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i32 BETWEEN i16 AND i64
 ----
+BIGINT
 5
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE d BETWEEN -1.5 AND 1e3
 ----
+BIGINT
 7
 
 query II rowsort
 SELECT UserAgent, COUNT(*) FROM hits_like GROUP BY UserAgent HAVING COUNT(*) BETWEEN 100 AND 2000
 ----
+SMALLINT	BIGINT
 0	191
 1	167
 10	169
@@ -191,10 +216,12 @@ SELECT UserAgent, COUNT(*) FROM hits_like GROUP BY UserAgent HAVING COUNT(*) BET
 query II rowsort
 SELECT UserAgent, COUNT(*) FROM hits_like GROUP BY UserAgent HAVING COUNT(*) NOT BETWEEN 100 AND 2000
 ----
+SMALLINT	BIGINT
 
 query II rowsort
 SELECT UserAgent, CASE WHEN COUNT(*) BETWEEN 100 AND 2000 THEN 1 ELSE 0 END FROM hits_like GROUP BY UserAgent
 ----
+SMALLINT	INTEGER
 0	1
 1	1
 10	1
@@ -260,6 +287,7 @@ SELECT UserAgent, CASE WHEN COUNT(*) BETWEEN 100 AND 2000 THEN 1 ELSE 0 END FROM
 query T rowsort
 SELECT CASE WHEN RegionID BETWEEN 100 AND 200 THEN 'in' WHEN RegionID NOT BETWEEN 0 AND 1000 THEN 'far' END FROM hits_like_nulls GROUP BY 1
 ----
+VARCHAR
 NULL
 far
 in
@@ -284,11 +312,13 @@ SELECT COUNT(*) FROM hits_like WHERE '2013-07-10' BETWEEN URL AND EventDate
 query I nosort
 SELECT COUNT(*) FROM hits_like WHERE RegionID < -(-9223372036854775808)
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM edge WHERE i64 BETWEEN -(-(-9223372036854775808)) AND -(-(9223372036854775807))
 ----
+BIGINT
 10
 
 # A DOUBLE operand compares with both bounds in DOUBLE, DuckDB's common type of the three values, whatever the bounds'
@@ -296,11 +326,13 @@ SELECT COUNT(*) FROM edge WHERE i64 BETWEEN -(-(-9223372036854775808)) AND -(-(9
 query I nosort
 SELECT COUNT(*) FROM edge WHERE d BETWEEN i64 AND 3000000000
 ----
+BIGINT
 3
 
 query I rowsort
 SELECT id FROM edge WHERE d NOT BETWEEN -9007199254740993 AND i64
 ----
+INTEGER
 0
 10
 3
@@ -308,6 +340,7 @@ SELECT id FROM edge WHERE d NOT BETWEEN -9007199254740993 AND i64
 query IT rowsort
 SELECT id, CASE WHEN d BETWEEN i16 AND 9223372036854775807 THEN 'in' ELSE 'out' END FROM edge
 ----
+INTEGER	VARCHAR
 0	in
 1	out
 10	in
@@ -324,6 +357,7 @@ SELECT id, CASE WHEN d BETWEEN i16 AND 9223372036854775807 THEN 'in' ELSE 'out' 
 query I rowsort
 SELECT id FROM edge WHERE d BETWEEN -1.5 AND i32 OR d BETWEEN 1e300 AND i64
 ----
+INTEGER
 1
 2
 4

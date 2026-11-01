@@ -5,11 +5,13 @@
 query I nosort
 SELECT COUNT(*) FROM hits_like
 ----
+BIGINT
 10000
 
 query I nosort
 SELECT COUNT(*) FROM edge
 ----
+BIGINT
 12
 
 statement ok

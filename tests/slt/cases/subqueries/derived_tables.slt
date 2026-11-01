@@ -7,6 +7,7 @@
 query II rowsort
 SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup > 38 GROUP BY tr_pickup
 ----
+INTEGER	BIGINT
 39	69
 40	69
 41	69
@@ -16,6 +17,7 @@ SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup > 38 GROUP BY tr_pickup
 query II nosort
 SELECT COUNT(*), MAX(ct_id) FROM cities
 ----
+BIGINT	SMALLINT
 6	6
 
 # ---- pending: derived tables and CTEs (ADR 0022; roadmap PR J4 removes these guards) ----
@@ -24,6 +26,7 @@ SELECT COUNT(*), MAX(ct_id) FROM cities
 query II rowsort
 SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS g(d) WHERE d > 38
 ----
+INTEGER	BIGINT
 39	69
 40	69
 41	69
@@ -34,17 +37,20 @@ SELECT d, n FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 query I nosort unnamed
 SELECT unnamed_subquery.n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
+BIGINT
 3000
 
 query I nosort unnamed
 SELECT n FROM (SELECT COUNT(*) AS n FROM trips)
 ----
+BIGINT
 3000
 
 query II rowsort
 SELECT unnamed_subquery.z, unnamed_subquery2.c FROM (SELECT zn_id AS z, zn_city AS zc FROM zones), (SELECT ct_id AS c FROM cities)
 WHERE zc = c AND z <= 3
 ----
+INTEGER	SMALLINT
 1	1
 2	2
 3	3
@@ -53,35 +59,41 @@ WHERE zc = c AND z <= 3
 query III nosort
 SELECT COUNT(*), MIN(tr_driver_1), MAX(tr_driver_1) FROM (SELECT tr_driver, tr_driver + 1 AS tr_driver FROM trips)
 ----
+BIGINT	INTEGER	INTEGER
 3000	1001	4886
 
 # ORDER BY with LIMIT inside a derived table picks the rows.
 query IDI nosort
 SELECT COUNT(*), SUM(tr_fare), MIN(tr_row) FROM (SELECT tr_row, tr_fare FROM trips ORDER BY tr_fare DESC NULLS LAST, tr_row LIMIT 10)
 ----
+BIGINT	DECIMAL(38,2)	INTEGER
 10	275.00	10
 
 # Aggregates over aggregates, and a filter on the grouped rows.
 query III nosort
 SELECT MAX(n), MIN(n), SUM(n) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider)
 ----
+BIGINT	BIGINT	HUGEINT
 131	3	3000
 
 query I nosort
 SELECT COUNT(*) FROM (SELECT tr_rider, COUNT(*) AS n FROM trips GROUP BY tr_rider) WHERE n >= 13
 ----
+BIGINT
 63
 
 # A CTE hides the table of the same name.
 query II nosort
 WITH zones AS (SELECT ct_id AS zn_id FROM cities) SELECT COUNT(*), MAX(zn_id) FROM zones
 ----
+BIGINT	SMALLINT
 6	6
 
 # An unused CTE is never bound.
 query I nosort
 WITH unused AS (SELECT nope FROM no_such_table) SELECT COUNT(*) FROM trips
 ----
+BIGINT
 3000
 
 # A CTE that reads the CTE before it.
@@ -90,6 +102,7 @@ WITH per_rider AS (SELECT tr_rider AS rider, COUNT(*) AS n FROM trips GROUP BY t
   busy AS (SELECT rider FROM per_rider WHERE n >= 13)
 SELECT COUNT(*) FROM busy
 ----
+BIGINT
 63
 
 # A derived table joined with a table.
@@ -97,6 +110,7 @@ query II rowsort
 SELECT zn_city, SUM(n) FROM (SELECT tr_pickup, COUNT(*) AS n FROM trips GROUP BY tr_pickup) AS p JOIN zones ON p.tr_pickup = zn_id
 GROUP BY zn_city
 ----
+SMALLINT	HUGEINT
 1	559
 2	559
 3	490
@@ -110,6 +124,7 @@ query III nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup)
 SELECT COUNT(*), SUM(a.n), SUM(b.n) FROM per_zone AS a, per_zone AS b WHERE a.zone + 1 = b.zone
 ----
+BIGINT	HUGEINT	HUGEINT
 42	2931	2930
 
 # A CTE referenced inside a scalar subquery (roadmap PR J5).
@@ -117,6 +132,7 @@ query ID nosort
 WITH per_zone AS (SELECT tr_pickup AS zone, SUM(tr_fare) AS fares FROM trips GROUP BY tr_pickup)
 SELECT zone, fares FROM per_zone WHERE fares = (SELECT MAX(fares) FROM per_zone)
 ----
+INTEGER	DECIMAL(38,2)
 33	1093.25
 
 # A column alias list longer than the select list is a bind error for a derived table, while a CTE's
@@ -127,6 +143,7 @@ SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips) AS g(a, b)
 query II nosort
 WITH c(x, y, z) AS (SELECT tr_row FROM trips) SELECT COUNT(*), MAX(x) FROM c
 ----
+BIGINT	INTEGER
 3000	2999
 
 # The suffix is the first free `base_N`, so a name the block already declares as `x_1` pushes the
@@ -135,6 +152,7 @@ query III nosort
 SELECT x, x_1, x_1_1 FROM (SELECT tr_row AS x, tr_pickup AS x, tr_dropoff AS x_1 FROM trips)
 ORDER BY x LIMIT 1
 ----
+INTEGER	INTEGER	INTEGER
 0	1	1
 
 # Rule 7's de-duplication runs over the alias list too, after it is applied: the second `a` is
@@ -142,6 +160,7 @@ ORDER BY x LIMIT 1
 query II nosort
 SELECT a, a_1 FROM (SELECT tr_row, tr_pickup FROM trips) AS g(a, a) ORDER BY a LIMIT 1
 ----
+INTEGER	INTEGER
 0	1
 
 # A FLOAT column keeps divergence D11 through a sub-plan: the comparison folds at FLOAT precision
@@ -149,11 +168,13 @@ SELECT a, a_1 FROM (SELECT tr_row, tr_pickup FROM trips) AS g(a, a) ORDER BY a L
 query I nosort
 SELECT COUNT(*) FROM (SELECT id, f FROM floats) AS s WHERE f = 0.1
 ----
+BIGINT
 1
 
 query I nosort
 SELECT COUNT(*) FROM floats WHERE f = 0.1
 ----
+BIGINT
 1
 
 # Rule 8: a CTE is visible from a derived table of the same block, and names a string FROM item
@@ -161,11 +182,13 @@ SELECT COUNT(*) FROM floats WHERE f = 0.1
 query I nosort
 WITH c AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM (SELECT tr_row FROM c) AS s
 ----
+BIGINT
 3000
 
 query I nosort
 WITH "trips" AS (SELECT ct_id AS tr_row FROM cities) SELECT COUNT(*) FROM 'trips'
 ----
+BIGINT
 6
 
 # A chain of three CTEs: the middle one's body must see the first, which only works if the frame a
@@ -177,6 +200,7 @@ WITH per_zone AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr
      busiest AS (SELECT zone FROM busy WHERE zone > 20)
 SELECT COUNT(*) FROM busiest
 ----
+BIGINT
 13
 
 # The same three levels through a nested WITH list, whose CTEs are the inner block's own.
@@ -186,6 +210,7 @@ WITH outer_c AS (WITH i1 AS (SELECT tr_pickup AS z FROM trips), i2 AS (SELECT z 
                  SELECT COUNT(*) AS n FROM i3)
 SELECT n FROM outer_c
 ----
+BIGINT
 3000
 
 # A CTE whose name is also a table's, referenced from inside another CTE's body: the CTE wins there
@@ -194,6 +219,7 @@ query I nosort
 WITH zones AS (SELECT ct_id AS zn_id FROM cities), nested AS (SELECT zn_id FROM zones)
 SELECT COUNT(*) FROM nested
 ----
+BIGINT
 6
 
 # An inner block's GROUP BY alias that happens to name a column of the enclosing block is the
@@ -203,23 +229,27 @@ query I nosort
 SELECT SUM(s.n) FROM zones, (SELECT tr_pickup AS zn_id, COUNT(*) AS n FROM trips GROUP BY zn_id) s
 WHERE s.zn_id = zones.zn_id
 ----
+HUGEINT
 2793
 
 query I nosort
 SELECT SUM(s.n) FROM (SELECT tr_pickup AS zn_id, COUNT(*) AS n FROM trips GROUP BY zn_id) s, zones
 WHERE s.zn_id = zones.zn_id
 ----
+HUGEINT
 2793
 
 # A date cast inside a sub-plan is folded like one in the outer block, in both spellings.
 query IT nosort
 SELECT COUNT(*), MIN(d) FROM (SELECT tr_day AS d FROM trips WHERE tr_day > CAST('2026-03-01' AS DATE)) AS s
 ----
+BIGINT	DATE
 2825	2026-03-02
 
 query I nosort
 WITH c AS (SELECT tr_day AS d FROM trips WHERE tr_day > '2026-03-01'::DATE) SELECT COUNT(*) FROM c
 ----
+BIGINT
 2825
 
 # A WITH list inside a derived table may reuse a name of the statement's: the inner one wins.
@@ -227,6 +257,7 @@ query I nosort
 WITH c AS (SELECT MIN(tr_row) AS x FROM trips)
 SELECT x FROM (WITH c AS (SELECT MAX(tr_row) AS x FROM trips) SELECT x FROM c)
 ----
+INTEGER
 2999
 
 # ---- DuckDB only until lateral references get a PR (ADR 0022: a lateral reference exits 4) ----
@@ -236,6 +267,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT COUNT(*) AS n FROM trips WHERE tr_pickup = zn_id) AS t WHERE n > 69
 ----
+BIGINT
 33
 
 # ---- DuckDB only until column alias lists after a table get a PR (ADR 0022, rule 7) ----
@@ -244,6 +276,7 @@ onlyif duckdb
 query II rowsort
 SELECT a, b FROM cities AS c(a, b) WHERE a <= 2
 ----
+INTEGER	SMALLINT
 0	1
 1	2
 2	3

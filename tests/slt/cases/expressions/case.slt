@@ -5,6 +5,7 @@
 query IT rowsort
 SELECT i16, CASE WHEN i16 > 0 THEN 'pos' WHEN i16 < 0 THEN 'neg' END FROM edge
 ----
+SMALLINT	VARCHAR
 -1	neg
 -100	neg
 -12345	neg
@@ -21,6 +22,7 @@ NULL	NULL
 query II rowsort
 SELECT i16, CASE WHEN i16 < 100 THEN i16 * 300 ELSE 0 END FROM edge WHERE i16 > -100
 ----
+SMALLINT	SMALLINT
 -1	-300
 0	0
 1	300
@@ -32,6 +34,7 @@ SELECT i16, CASE WHEN i16 < 100 THEN i16 * 300 ELSE 0 END FROM edge WHERE i16 > 
 query II rowsort
 SELECT i16, CASE WHEN i16 >= -100 AND i16 <= 100 THEN 1 END FROM edge
 ----
+SMALLINT	INTEGER
 -1	1
 -100	1
 -12345	NULL
@@ -48,6 +51,7 @@ NULL	NULL
 query III rowsort
 SELECT id, CASE i32 WHEN 1 THEN u16 WHEN -1 THEN i16 ELSE 0 END, CASE id WHEN 1 THEN 10 WHEN 2 THEN 3000000000 END FROM edge
 ----
+INTEGER	INTEGER	BIGINT
 0	0	NULL
 1	0	10
 10	0	NULL
@@ -64,6 +68,7 @@ SELECT id, CASE i32 WHEN 1 THEN u16 WHEN -1 THEN i16 ELSE 0 END, CASE id WHEN 1 
 query IR rowsort
 SELECT id, CASE WHEN id > 2 THEN d ELSE i64 END FROM edge
 ----
+INTEGER	DOUBLE
 0	-9223372036854775808
 1	9223372036854775808
 10	922337203685477632
@@ -80,6 +85,7 @@ SELECT id, CASE WHEN id > 2 THEN d ELSE i64 END FROM edge
 query IT rowsort
 SELECT id, CASE WHEN u LIKE '%a%' OR NOT (id > 3) THEN s ELSE 'none' END FROM edge
 ----
+INTEGER	VARCHAR
 0	(empty)
 1	a
 10	none
@@ -96,12 +102,14 @@ SELECT id, CASE WHEN u LIKE '%a%' OR NOT (id > 3) THEN s ELSE 'none' END FROM ed
 query TI rowsort
 SELECT CASE WHEN i16 = 0 AND i32 = 0 THEN u ELSE '' END AS k, COUNT(*) FROM edge GROUP BY k
 ----
+VARCHAR	BIGINT
 (empty)	11
 tab\there	1
 
 query IT rowsort
 SELECT CounterID, CASE WHEN SUM(RegionID) > 40000 THEN 'big' WHEN COUNT(*) > 10 THEN 'many' END AS size FROM hits_like WHERE CounterID < 10000 GROUP BY CounterID HAVING size = 'many' OR size = 'big'
 ----
+INTEGER	VARCHAR
 1062	big
 2062	big
 3062	big
@@ -116,6 +124,7 @@ SELECT CounterID, CASE WHEN SUM(RegionID) > 40000 THEN 'big' WHEN COUNT(*) > 10 
 query TIR nosort
 SELECT CASE WHEN IsMobile = 1 AND OS > 100 THEN 'mobile' WHEN OS IN (1, 2, 3) THEN 'low' ELSE 'other' END AS kind, COUNT(*) AS n, AVG(ResolutionWidth) FROM hits_like GROUP BY kind ORDER BY n DESC, kind
 ----
+VARCHAR	BIGINT	DOUBLE
 other	8896	1392.6285971223022
 mobile	832	1445.7908653846155
 low	272	1415.4411764705883
@@ -123,6 +132,7 @@ low	272	1415.4411764705883
 query TII nosort
 SELECT MIN(URL), CASE WHEN IsMobile = 0 THEN OS END AS o, COUNT(*) AS n FROM hits_like GROUP BY o ORDER BY n DESC, o NULLS FIRST LIMIT 5 OFFSET 2
 ----
+VARCHAR	SMALLINT	BIGINT
 (empty)	77	54
 https://www.example.org/alpha/46696?q=beta	50	53
 https://www.example.org/alpha/37936?q=дорога	69	53
@@ -132,6 +142,7 @@ https://www.example.org/beta/12561	110	52
 query TTI nosort
 SELECT MIN(CASE WHEN CounterID < 100 THEN EventDate ELSE '2013-07-20' END), MAX(CASE WHEN CounterID < 100 THEN EventDate ELSE '2013-07-20' END), COUNT(DISTINCT CASE WHEN RegionID > 200 THEN EventDate END) FROM hits_like
 ----
+DATE	DATE	BIGINT
 2013-07-01	2013-07-31	31
 
 statement error
@@ -143,6 +154,7 @@ SELECT CASE WHEN i16 = 1 THEN u ELSE 1 END FROM edge
 query IT rowsort
 SELECT i16, CASE WHEN i16 > 0 THEN 'pos' WHEN i16 < 0 THEN 'neg' ELSE NULL END FROM edge
 ----
+SMALLINT	VARCHAR
 -1	neg
 -100	neg
 -12345	neg
@@ -159,11 +171,13 @@ NULL	NULL
 query II nosort
 SELECT SUM(CASE WHEN i16 > 0 THEN i16 ELSE NULL END), COUNT(CASE WHEN i16 < 0 THEN 1 ELSE NULL END) FROM edge
 ----
+HUGEINT	BIGINT
 45220	4
 
 query I rowsort
 SELECT id FROM edge WHERE CASE WHEN i16 <> 0 THEN i32 / i16 ELSE NULL END > 0
 ----
+INTEGER
 0
 1
 3
@@ -174,6 +188,7 @@ SELECT id FROM edge WHERE CASE WHEN i16 <> 0 THEN i32 / i16 ELSE NULL END > 0
 query ID nosort
 SELECT id % 3 AS k, SUM(CASE WHEN id % 2 = 0 THEN d9_2 ELSE NULL END) AS even FROM decimals GROUP BY k ORDER BY k
 ----
+INTEGER	DECIMAL(38,2)
 0	-8.75
 1	-6.25
 2	-9999998.74

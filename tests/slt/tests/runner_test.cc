@@ -1,5 +1,6 @@
 #include "runner.h"
 
+#include <format>
 #include <map>
 #include <optional>
 #include <string>
@@ -81,6 +82,7 @@ constexpr std::string_view kCount =
     "query I nosort\n"
     "SELECT COUNT(*) FROM t\n"
     "----\n"
+    "BIGINT\n"
     "31337\n";
 
 TEST(RunFile, PassingQueryAndStatements) {
@@ -110,6 +112,12 @@ TEST(RunFile, MismatchPrintsSqlValuesAndRepro) {
   EXPECT_NE(o.out.find("31337"), std::string::npos);
   EXPECT_NE(o.out.find("31338"), std::string::npos);
   EXPECT_NE(o.out.find("repro-command"), std::string::npos);
+  // The rows are counted below the type line: the third row differs.
+  engine.Answer("SELECT a FROM t", Ints({{"1"}, {"2"}, {"4"}}));
+  const auto rows = RunText("query I nosort\nSELECT a FROM t\n----\nBIGINT\n1\n2\n3\n", engine);
+  EXPECT_NE(rows.out.find("  first differing row: 2 (counted from 0 below the type line)\n"),
+            std::string::npos)
+      << rows.out;
 }
 
 TEST(RunFile, RedactedMismatchPrintsNoValuesAndNoSql) {
@@ -184,6 +192,59 @@ TEST(RunFile, ConditionsHaltAndTypeChecks) {
   EXPECT_EQ(engine.calls(), 2);
 }
 
+TEST(RunFile, TypeNamesMustMatchExactly) {
+  FakeEngine engine("antb1");
+  engine.Answer("SELECT COUNT(*) FROM t", Ints({{"31337"}}));
+  engine.Answer("SELECT COUNT(*) FROM t WHERE false", Ints({}));
+  // Same class I, another type name.
+  auto o = RunText("query I nosort\nSELECT COUNT(*) FROM t\n----\nHUGEINT\n31337\n", engine);
+  EXPECT_EQ(o.stats.failed, 1);
+  EXPECT_NE(o.out.find("FAIL t.slt:1: query I nosort [antb1]: the type line differs: got BIGINT\n"
+                       "  type line: HUGEINT\n  The first line after '----' holds the result's "
+                       "type names"),
+            std::string::npos)
+      << o.out;
+  // No type line: the block is empty.
+  o = RunText("query I nosort\nSELECT COUNT(*) FROM t\n----\n", engine);
+  EXPECT_NE(o.out.find("no type line: got BIGINT\n  type line: (none)\n"), std::string::npos)
+      << o.out;
+  // A block written without a type line: its first row is read as the type line.
+  o = RunText("query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n", engine);
+  EXPECT_NE(o.out.find("the type line differs: got BIGINT\n  type line: 31337\n"),
+            std::string::npos)
+      << o.out;
+  // Redacted, the report names antb1's types but prints neither the record's type line, which can
+  // be such a row of values, nor the SQL.
+  o = RunText("query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n", engine, /*redact=*/true);
+  EXPECT_NE(o.out.find("query I nosort [antb1]: the type line differs: got BIGINT\n"),
+            std::string::npos)
+      << o.out;
+  EXPECT_EQ(o.out.find("3133"), std::string::npos) << o.out;
+  EXPECT_EQ(o.out.find("SELECT"), std::string::npos) << o.out;
+  // An empty result checks its types too.
+  o = RunText("query I nosort\nSELECT COUNT(*) FROM t WHERE false\n----\nBIGINT\n", engine);
+  EXPECT_EQ(o.stats.failed, 0) << o.out;
+  o = RunText("query I nosort\nSELECT COUNT(*) FROM t WHERE false\n----\nINTEGER\n", engine);
+  EXPECT_EQ(o.stats.failed, 1) << o.out;
+  // Every column counts, and the line names each one, no fewer and no more.
+  engine.Answer("SELECT a, d FROM t",
+                ResultSet{.classes = {ColumnClass::kInteger, ColumnClass::kDecimal},
+                          .type_names = {"INTEGER", "DECIMAL(18,2)"},
+                          .rows = {{"1", "1.50"}}});
+  const auto two = [&](std::string_view line) {
+    return RunText(std::format("query ID nosort\nSELECT a, d FROM t\n----\n{}\n1\t1.50\n", line),
+                   engine);
+  };
+  EXPECT_EQ(two("INTEGER\tDECIMAL(18,2)").stats.failed, 0);
+  o = two("INTEGER\tDECIMAL(15,2)");
+  EXPECT_NE(o.out.find("the type line differs: got INTEGER, DECIMAL(18,2)\n  type line: INTEGER, "
+                       "DECIMAL(15,2)\n"),
+            std::string::npos)
+      << o.out;
+  EXPECT_EQ(two("INTEGER").stats.failed, 1);
+  EXPECT_EQ(two("INTEGER\tDECIMAL(18,2)\tBIGINT").stats.failed, 1);
+}
+
 TEST(RunFile, HashThresholdAndLabels) {
   FakeEngine engine("antb1");
   engine.Answer("SELECT a FROM t", Ints({{"1"}, {"2"}, {"3"}}));
@@ -193,11 +254,11 @@ TEST(RunFile, HashThresholdAndLabels) {
   std::string out;
   auto file = Parse(
       "hash-threshold 2\n\n"
-      "query I rowsort L\nSELECT a FROM t\n----\n3 values hashing to "
+      "query I rowsort L\nSELECT a FROM t\n----\nBIGINT\n3 values hashing to "
       "0000000000000000000000000000000000000000000000000000000000000000\n\n"
-      "query I rowsort L\nSELECT b FROM t\n----\n1\n2\n3\n\n"
+      "query I rowsort L\nSELECT b FROM t\n----\nBIGINT\n1\n2\n3\n\n"
       "hash-threshold 0\n\n"
-      "query I rowsort L\nSELECT c FROM t\n----\n1\n2\n4\n");
+      "query I rowsort L\nSELECT c FROM t\n----\nBIGINT\n1\n2\n4\n");
   // Fill in the real hash of "1\n2\n3\n" so only the label check of the third query fails.
   file.records[1].expected = RenderBlock(Ints({{"1"}, {"2"}, {"3"}}), SortMode::kRowSort, 2);
   file.records[2].expected = file.records[1].expected;
@@ -210,8 +271,8 @@ TEST(RunFile, HashThresholdAndLabels) {
 
 // A pending record between two records that antb1 answers.
 constexpr std::string_view kPendingFile =
-    "query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n\n"
-    "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\n7\n\n"
+    "query I nosort\nSELECT COUNT(*) FROM t\n----\nBIGINT\n31337\n\n"
+    "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\nBIGINT\n7\n\n"
     "statement ok\nSELECT COUNT(*) FROM t\n";
 
 TEST(RunFile, Antb1SkipsPendingRecordsAndDuckDbRunsThem) {
@@ -258,7 +319,7 @@ TEST(CheckPendingFile, PassesWhileEveryPendingRecordIsUnsupported) {
 TEST(CheckPendingFile, AnyOtherAnswerSaysRemoveTheGuard) {
   const std::string file = std::string(kPendingFile) +
                            "\npending J5\nstatement error\nSELECT nope\n\n"
-                           "pending U2\nquery I nosort\nSELECT 1\n----\n1\n";
+                           "pending U2\nquery I nosort\nSELECT 1\n----\nINTEGER\n1\n";
   FakeEngine antb1("antb1");
   antb1.Answer("SELECT COUNT(*) FROM t, u WHERE t.k = u.k", Ints({{"7"}, {"8"}}));
   antb1.Answer("SELECT 1", std::unexpected(EngineError{.kind = "internal",
@@ -270,12 +331,12 @@ TEST(CheckPendingFile, AnyOtherAnswerSaysRemoveTheGuard) {
   EXPECT_EQ(stats.records, 3);
   EXPECT_EQ(stats.unsupported, 0);
   EXPECT_EQ(stats.failed, 3);
-  EXPECT_NE(out.find("FAIL t.slt:7: query I nosort [antb1]: remove the guard (J2b): antb1 answers "
+  EXPECT_NE(out.find("FAIL t.slt:8: query I nosort [antb1]: remove the guard (J2b): antb1 answers "
                      "it now\n  antb1 answers with 2 rows."),
             std::string::npos)
       << out;
   EXPECT_NE(
-      out.find("FAIL t.slt:16: statement error [antb1]: remove the guard (J5): antb1 fails "
+      out.find("FAIL t.slt:18: statement error [antb1]: remove the guard (J5): antb1 fails "
                "with a bind error now, not Unsupported\n  bind: unknown statement SELECT nope"),
       std::string::npos)
       << out;
@@ -337,21 +398,22 @@ TEST(CompleteFile, WritesPendingRecordsFromTheOracle) {
   EXPECT_EQ(stats.from_antb1, 0);
   EXPECT_EQ(antb1.calls(), 0);
   EXPECT_EQ(text,
-            "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\n9\n");
+            "pending J2b\nquery I nosort\nSELECT COUNT(*) FROM t, u WHERE t.k = u.k\n----\nBIGINT\n"
+            "9\n");
 }
 
 TEST(RunFile, EveryMutationIsCaught) {
   // On an integer record and on a DECIMAL one, where a value mutation (an appended digit) only
   // changes the scale.
   const std::vector<std::pair<std::string, ResultSet>> queries = {
-      {"query I nosort\nSELECT COUNT(*) FROM t\n----\n31337\n\n", Ints({{"31337"}})},
-      {"query D nosort\nSELECT COUNT(*) FROM t\n----\n1234567890.12\n\n",
+      {"query I nosort\nSELECT COUNT(*) FROM t\n----\nBIGINT\n31337\n\n", Ints({{"31337"}})},
+      {"query D nosort\nSELECT COUNT(*) FROM t\n----\nDECIMAL(12,2)\n1234567890.12\n\n",
        Decimals({{"1234567890.12"}})}};
   for (const auto& [query, answer] : queries) {
     const std::string file =
         query + "statement ok\nSELECT COUNT(*) FROM t\n\nstatement error\nSELECT nope\n";
-    for (const auto* name : {"value", "null", "drop-row", "extra-row", "extra-column", "error",
-                             "unsupported", "succeed", "canary"}) {
+    for (const auto* name : {"value", "null", "drop-row", "extra-row", "extra-column", "type-name",
+                             "error", "unsupported", "succeed", "canary"}) {
       FakeEngine engine("antb1");
       engine.Answer("SELECT COUNT(*) FROM t", answer);
       EXPECT_EQ(RunText(file, engine).stats.failed, 0);
@@ -370,6 +432,7 @@ constexpr std::string_view kTotal =
     "query D nosort\n"
     "SELECT total FROM t\n"
     "----\n"
+    "DECIMAL(12,2)\n"
     "1234567890.12\n";
 
 TEST(RunFile, DecimalValuesCompareExactly) {
@@ -383,12 +446,15 @@ TEST(RunFile, DecimalValuesCompareExactly) {
   }
   FakeEngine zero("antb1");
   zero.Answer("SELECT total FROM t", Decimals({{"-.25"}}, ColumnClass::kDecimal, "DECIMAL(3,2)"));
-  EXPECT_EQ(RunText("query D nosort\nSELECT total FROM t\n----\n-0.25\n", zero).stats.failed, 1);
+  EXPECT_EQ(RunText("query D nosort\nSELECT total FROM t\n----\nDECIMAL(3,2)\n-0.25\n", zero)
+                .stats.failed,
+            1);
   // The same wrong cent passes in an R record: the hole that D closes.
   FakeEngine real("antb1");
   real.Answer("SELECT total FROM t", Decimals({{"1234567890.13"}}, ColumnClass::kReal, "DOUBLE"));
-  EXPECT_EQ(
-      RunText("query R nosort\nSELECT total FROM t\n----\n1234567890.12\n", real).stats.failed, 0);
+  EXPECT_EQ(RunText("query R nosort\nSELECT total FROM t\n----\nDOUBLE\n1234567890.12\n", real)
+                .stats.failed,
+            0);
   // A DOUBLE answer to a D record fails on its column type.
   const auto o = RunText(kTotal, real);
   EXPECT_NE(o.out.find("column types differ: expected D, got R (DOUBLE)"), std::string::npos)
@@ -401,7 +467,8 @@ TEST(RunFile, DecimalResultsAreHashedAboveTheThreshold) {
   const auto block = RenderBlock(right, SortMode::kRowSort, 1);
   ASSERT_EQ(block.size(), 1U);
   EXPECT_TRUE(block[0].starts_with("2 values hashing to ")) << block[0];
-  auto file = Parse("hash-threshold 1\n\nquery D rowsort\nSELECT total FROM t\n----\n1\n");
+  auto file =
+      Parse("hash-threshold 1\n\nquery D rowsort\nSELECT total FROM t\n----\nDECIMAL(12,2)\n1\n");
   file.records[1].expected = block;
   FakeEngine engine("antb1");
   engine.Answer("SELECT total FROM t", right);
@@ -413,6 +480,52 @@ TEST(RunFile, DecimalResultsAreHashedAboveTheThreshold) {
   EXPECT_NE(out.find("hashed results differ"), std::string::npos) << out;
 }
 
+TEST(CompleteFile, WritesTheTypeLineAndRefusesNamesItCannotHold) {
+  FakeEngine oracle("duckdb");
+  FakeEngine antb1("antb1");
+  oracle.Answer("SELECT COUNT(*) FROM t WHERE false", Ints({}));
+  oracle.Answer("SELECT t, d FROM u",
+                ResultSet{.classes = {ColumnClass::kText, ColumnClass::kDecimal},
+                          .type_names = {"TIMESTAMP WITH TIME ZONE", "DECIMAL(15,2)"},
+                          .rows = {{"2026-11-01 00:00:00+00", "1.50"}}});
+  oracle.Answer("SELECT a FROM t", Decimals({{"1"}}, ColumnClass::kText, "A\tB"));
+  oracle.Answer("SELECT b FROM t",
+                ResultSet{.classes = {ColumnClass::kInteger}, .type_names = {}, .rows = {{"1"}}});
+  oracle.Answer("SELECT c FROM t", Decimals({{"1"}}, ColumnClass::kText, " "));
+  const std::string text =
+      "query I nosort\nSELECT COUNT(*) FROM t WHERE false\n\n"
+      "query TD nosort\nSELECT t, d FROM u\n\n"
+      "query T nosort\nSELECT a FROM t\n\n"
+      "query I nosort\nSELECT b FROM t\n\n"
+      "query T nosort\nSELECT c FROM t\n";
+  std::string new_text;
+  std::string out;
+  const auto stats = CompleteFile(Parse(text), oracle, antb1, new_text, out);
+  EXPECT_EQ(stats.queries, 2);
+  EXPECT_EQ(stats.errors, 3);
+  EXPECT_EQ(new_text,
+            "query I nosort\nSELECT COUNT(*) FROM t WHERE false\n----\nBIGINT\n\n"
+            "query TD nosort\nSELECT t, d FROM u\n----\nTIMESTAMP WITH TIME ZONE\tDECIMAL(15,2)\n"
+            "2026-11-01 00:00:00+00\t1.50\n\n"
+            "query T nosort\nSELECT a FROM t\n\n"
+            "query I nosort\nSELECT b FROM t\n\n"
+            "query T nosort\nSELECT c FROM t\n");
+  EXPECT_NE(out.find("ERROR t.slt:7: query T nosort [duckdb]: the type name 'A\tB' cannot be "
+                     "written on a type line"),
+            std::string::npos)
+      << out;
+  EXPECT_NE(out.find("ERROR t.slt:10: query I nosort [duckdb]: 0 type names for 1 columns"),
+            std::string::npos)
+      << out;
+  EXPECT_NE(out.find("ERROR t.slt:13: query T nosort [duckdb]: the type name ' ' cannot be"),
+            std::string::npos)
+      << out;
+  // The two blocks it wrote read back, and the oracle passes them.
+  const auto o = RunText(new_text.substr(0, new_text.find("query T nosort\nSELECT a")), oracle);
+  EXPECT_EQ(o.stats.failed, 0) << o.out;
+  EXPECT_EQ(o.stats.passed, 2) << o.out;
+}
+
 TEST(CompleteFile, WritesDecimalRecordsWithTheirLetterAndText) {
   FakeEngine oracle("duckdb");
   FakeEngine antb1("antb1");
@@ -421,7 +534,7 @@ TEST(CompleteFile, WritesDecimalRecordsWithTheirLetterAndText) {
   std::string text;
   std::string out;
   CompleteFile(file, oracle, antb1, text, out);
-  EXPECT_EQ(text, "query D rowsort\nSELECT total FROM t\n----\n-0.25\n17.00\n");
+  EXPECT_EQ(text, "query D rowsort\nSELECT total FROM t\n----\nDECIMAL(12,2)\n-0.25\n17.00\n");
   EXPECT_NE(out.find("NOTE t.slt:1: column types R -> D"), std::string::npos) << out;
 }
 
@@ -467,9 +580,9 @@ TEST(CompleteFile, WritesBlocksFromTheOracleAndFlagsAntb1OnlyRecords) {
   EXPECT_EQ(stats.from_antb1, 1);
   EXPECT_EQ(stats.errors, 1);
   EXPECT_EQ(text,
-            "query I nosort\nSELECT COUNT(*) FROM t\n----\n7\n\n"
-            "query T rowsort\nSELECT x FROM t\n----\n(empty)\na\\tb\n\n"
-            "onlyif antb1\nquery I nosort\nSELECT COUNT(*) FROM u\n----\n8\n\n"
+            "query I nosort\nSELECT COUNT(*) FROM t\n----\nBIGINT\n7\n\n"
+            "query T rowsort\nSELECT x FROM t\n----\nVARCHAR\n(empty)\na\\tb\n\n"
+            "onlyif antb1\nquery I nosort\nSELECT COUNT(*) FROM u\n----\nBIGINT\n8\n\n"
             "statement error\nSELECT COUNT(*) FROM t\n");
   EXPECT_NE(out.find("NOTE t.slt:6: column types I -> T"), std::string::npos) << out;
   EXPECT_NE(out.find("REVIEW t.slt:10: onlyif antb1"), std::string::npos) << out;

@@ -57,22 +57,29 @@ onlyif duckdb
 query T valuesort
 SELECT s FROM edge
 ----
+VARCHAR
 (empty)
 NULL
 a
 ```
 
-In an expected block each row is one line; the cells of a row are separated by a tab.
+A query's block opens with the line of the result's type names, one per column and separated by a tab (`BIGINT`,
+`DECIMAL(15,2)`, `VARCHAR`), even when the result has no rows. It is the type line by its position, whatever the
+values below it look like. Each row of the result is one line after it; the cells of a row are separated by a tab.
 
 - `statement ok` / `statement error [regex]`: the statement must succeed / fail. The regex (ECMAScript) is
   searched in the error text: antb1 reports `<kind>: <message>` with kind `parse`, `bind`, `io` or
   `execution`; DuckDB reports its own text (`Catalog Error: ...`). A regex usually needs `onlyif`.
 - `query <types> [nosort|rowsort|valuesort] [label]`: one letter per column, `I` integer, `R` real, `D` decimal (a
-  `DECIMAL(p,s)` of any scale), `T` text (dates too). The engine's column classes must match. A record does not check
-  type names: a DECIMAL's text shows its scale, but `DECIMAL(15,2)` and `DECIMAL(18,2)` print alike (the diff,
-  query-file and ClickBench runs compare type names). `valuesort` refuses a record with both `R` and `D` columns: it
-  loses the columns, so every value would compare within the R tolerance. Queries with the same label must return the
-  same result.
+  `DECIMAL(p,s)` of any scale), `T` text (dates too). The engine's column classes must match, and so must its type
+  names, exactly: `DECIMAL(15,2)` against `DECIMAL(18,2)` and `HUGEINT` against `BIGINT` fail, although their values
+  print alike. The checks run in that order: the letters, the type line (a block without one fails), the values.
+  `valuesort` refuses a record with both `R` and `D` columns: it loses the columns, so every value would compare within
+  the R tolerance. Queries with the same label must return the same values (their type lines are not compared).
+- A FLOAT result is DOUBLE in antb1 (divergence D11 of docs/sql-subset.md): such a record is written twice, `onlyif
+  duckdb` and `onlyif antb1`. `slt-complete` writes the antb1 copy from antb1 itself, so both copies share a label
+  with a record that both engines run and that is DOUBLE in both (a `UNION ALL` with an empty DOUBLE branch): antb1's
+  values must still be DuckDB's (`float_keys` in `cases/having/having.slt`).
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
 - `pending <roadmap id>` (`pending J4`) guards the next statement or query until that roadmap PR answers it: DuckDB
   runs it, antb1 only in the pending check (below). It takes no `skipif` or `onlyif`.
@@ -327,8 +334,10 @@ because lint R009 keeps files named like `q01.sql` out of the repository.
   (`harness.answers.show_values`): the repro command of a redacted failure carries it. It is refused when
   `GITHUB_ACTIONS=true` (`harness.answers.show_values_on_ci`), because CI logs are public. An explicit `--redact`
   always wins (`harness.queries.redact_wins`).
-- `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`,
-  `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught.
+- `--mutate <kind>` corrupts antb1 results (`value`, `null`, `drop-row`, `extra-row`, `extra-column`, `type-name`,
+  `error`, `unsupported`, `succeed`, `canary`); the self-tests prove that each one is caught. `type-name` changes the
+  first column's type name but not its class (`BIGINT` to `HUGEINT`, any other to `BIGINT`), which only the type line
+  catches in an `.slt` file.
 
 `--redact` and `--mutate` work for `run`, `diff`, `queries` and `clickbench`; `answers`, `tpch` and `tpcds` take
 `--mutate` (`tpch` and `tpcds` are always redacted, whatever their tables file says), and `--show-values` works for

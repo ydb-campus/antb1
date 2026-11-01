@@ -6,6 +6,7 @@
 query IIIII nosort
 SELECT RegionID, RegionID - 1, RegionID * 2, RegionID % 7, COUNT(*) AS c FROM hits_like_nulls GROUP BY RegionID, RegionID - 1, RegionID * 2, RegionID % 7 ORDER BY c DESC, RegionID NULLS FIRST LIMIT 6
 ----
+INTEGER	INTEGER	INTEGER	INTEGER	BIGINT
 NULL	NULL	NULL	NULL	785
 0	-1	0	0	276
 8830	8829	17660	3	6
@@ -17,6 +18,7 @@ NULL	NULL	NULL	NULL	785
 query TII nosort
 SELECT URL, strlen(URL), COUNT(*) AS c FROM hits_like_nulls GROUP BY URL, strlen(URL) ORDER BY c DESC, URL NULLS FIRST LIMIT 5
 ----
+VARCHAR	BIGINT	BIGINT
 NULL	NULL	775
 (empty)	0	186
 https://www.example.org/beta/23449	34	2
@@ -27,6 +29,7 @@ https://www.example.org/beta/31881	34	2
 query IIII nosort
 SELECT CounterID, RegionID + 10, RegionID, SUM(ResolutionWidth) AS w FROM hits_like GROUP BY CounterID, RegionID, RegionID + 10 ORDER BY RegionID + 10 DESC, CounterID LIMIT 5
 ----
+INTEGER	INTEGER	INTEGER	HUGEINT
 18062	20008	19998	1920
 5062	20007	19997	1440
 39062	20007	19997	0
@@ -37,6 +40,7 @@ SELECT CounterID, RegionID + 10, RegionID, SUM(ResolutionWidth) AS w FROM hits_l
 query III nosort
 SELECT RegionID, RegionID % 5, COUNT(*) AS c FROM hits_like GROUP BY RegionID, RegionID % 5 HAVING RegionID % 5 = 3 ORDER BY c DESC, RegionID LIMIT 5
 ----
+INTEGER	INTEGER	BIGINT
 2493	3	4
 19043	3	4
 728	3	3
@@ -47,6 +51,7 @@ SELECT RegionID, RegionID % 5, COUNT(*) AS c FROM hits_like GROUP BY RegionID, R
 query II nosort
 SELECT UserID // 1000, COUNT(*) AS c FROM hits_like GROUP BY UserID, UserID // 1000 ORDER BY c DESC, UserID // 1000 LIMIT 5
 ----
+BIGINT	BIGINT
 9223372036854775	2
 -9223372036854775	1
 386056098584	1
@@ -57,6 +62,7 @@ SELECT UserID // 1000, COUNT(*) AS c FROM hits_like GROUP BY UserID, UserID // 1
 query IIII nosort
 SELECT OS, OS * 3, COUNT(DISTINCT UserID) AS u, COUNT(*) FROM hits_like GROUP BY OS, OS * 3 ORDER BY u DESC, OS LIMIT 5
 ----
+SMALLINT	SMALLINT	BIGINT	BIGINT
 10	30	107	107
 116	348	104	104
 118	354	103	103
@@ -67,6 +73,7 @@ SELECT OS, OS * 3, COUNT(DISTINCT UserID) AS u, COUNT(*) FROM hits_like GROUP BY
 query IIII nosort
 SELECT RegionID, RegionID * 3, RegionID + 7, COUNT(*) AS c FROM hits_like_split GROUP BY RegionID, RegionID * 3, RegionID + 7 ORDER BY c DESC, RegionID LIMIT 5
 ----
+INTEGER	INTEGER	INTEGER	BIGINT
 0	0	7	304
 8830	26490	8837	6
 7430	22290	7437	5
@@ -78,6 +85,7 @@ SELECT RegionID, RegionID * 3, RegionID + 7, COUNT(*) AS c FROM hits_like_split 
 query RRI rowsort
 SELECT d, 1 / d, COUNT(*) FROM edge GROUP BY d, 1 / d
 ----
+DOUBLE	DOUBLE	BIGINT
 -0.3333333333333333	-3	1
 -0.5	-2	1
 -9007199254740992	-1.1102230246251565e-16	1

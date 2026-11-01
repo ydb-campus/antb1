@@ -8,11 +8,13 @@
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE sh_hours > 10
 ----
+BIGINT
 115
 
 query II nosort
 SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE tr_fare > 20
 ----
+BIGINT	BIGINT
 897	897
 
 # ---- correlated EXISTS and NOT EXISTS (ADR 0023, roadmap PR U2) ----
@@ -21,85 +23,100 @@ SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE tr_fare > 20
 query ID nosort
 SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE EXISTS (SELECT * FROM riders WHERE rd_id = tr_rider)
 ----
+BIGINT	DECIMAL(38,2)
 2745	41289.25
 
 # NOT EXISTS keeps the NULL and the dangling keys: with EXISTS, every trip once.
 query II nosort
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
 ----
+BIGINT	BIGINT
 2577	2577
 
 query II nosort
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
 ----
+BIGINT	BIGINT
 423	319
 
 # A residual that reads both blocks.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day < tr_day)
 ----
+BIGINT
 2206
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day < tr_day)
 ----
+BIGINT
 794
 
 # A conjunct on the outer block only: where it is false or NULL, NOT EXISTS keeps the trip.
 query II nosort
 SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver AND tr_fare > 20)
 ----
+BIGINT	BIGINT
 771	771
 
 query II nosort
 SELECT COUNT(*), COUNT(tr_fare) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver AND tr_fare > 20)
 ----
+BIGINT	BIGINT
 2229	2132
 
 # A conjunct on the inner block only.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_hours > 10)
 ----
+BIGINT
 2143
 
 # Two columns: 445 trips have a shift that day, where the inner join has 447 rows.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day = tr_day)
 ----
+BIGINT
 445
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day = tr_day)
 ----
+BIGINT
 2555
 
 # An empty inner side.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM promos WHERE pm_id = tr_promo)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM promos WHERE pm_id = tr_promo)
 ----
+BIGINT
 3000
 
 # VARCHAR keys: NULL, std and XL.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM tariffs WHERE tf_code = tr_tariff)
 ----
+BIGINT
 726
 
 # A select list other than *.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT rd_city FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')
 ----
+BIGINT
 911
 
 # The drivers without a trip: the NULL key, drivers 90 to 95 and the key beyond INTEGER.
 query I rowsort
 SELECT dv_row FROM drivers WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_driver = dv_id)
 ----
+INTEGER
 50
 90
 91
@@ -115,6 +132,7 @@ query I rowsort
 SELECT ct_id FROM cities
 WHERE EXISTS (SELECT * FROM trips JOIN tariffs ON tf_code = tr_tariff AND tf_label = label JOIN zones ON zn_id = tr_pickup)
 ----
+SMALLINT
 1
 4
 
@@ -129,6 +147,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT COUNT(*) FROM promos WHERE pm_id = tr_promo)
 ----
+BIGINT
 3000
 
 # ---- the outer side far smaller than the subquery's (ADR 0026's C2b) ----
@@ -140,6 +159,7 @@ SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT COUNT(*) FROM promos WHERE pm_id
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id)
 ----
+BIGINT
 40
 
 # A residual reads both blocks, so its columns are the outer side's and then the subquery's while
@@ -147,6 +167,7 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = z
 query I nosort
 SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
 ----
+INTEGER
 1
 2
 3
@@ -189,12 +210,14 @@ SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_i
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare < -1)
 ----
+BIGINT
 0
 
 # The subquery's NULL keys match nothing, and a zone with no trip is not marked.
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
 ----
+BIGINT
 40
 
 # NOT EXISTS of the same shape still builds on the subquery (C2c is not in). With the EXISTS above
@@ -203,11 +226,13 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_dropoff = 
 query I nosort
 SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius)
 ----
+BIGINT
 3
 
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius)
 ----
+BIGINT
 37
 
 # ---- NOT EXISTS over a much larger subquery (ADR 0026's C2c) ----
@@ -217,6 +242,7 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = z
 query I nosort
 SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
 ----
+INTEGER
 13
 26
 39
@@ -227,11 +253,13 @@ SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = 
 query I nosort
 SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent)
 ----
+BIGINT
 6
 
 query I nosort
 SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare > zn_radius) ORDER BY zn_id
 ----
+INTEGER
 1
 2
 3
@@ -247,6 +275,7 @@ SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = 
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent)
 ----
+BIGINT
 34
 
 # A NOT EXISTS whose subquery keeps nothing, so no row is marked and every zone comes out -- both
@@ -254,6 +283,7 @@ SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = z
 query I nosort
 SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare < -1)
 ----
+BIGINT
 40
 
 # ---- two correlated subqueries at one level (ADR 0026) ----
@@ -264,12 +294,14 @@ SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup
 query I nosort
 SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
 ----
+BIGINT
 40
 
 # With a residual on each level, so both marks come from the pair path rather than the key range.
 query I nosort
 SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > zn_radius) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id AND tr_fare > zn_radius) ORDER BY zn_id
 ----
+INTEGER
 1
 2
 3
@@ -314,6 +346,7 @@ SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_i
 query I nosort
 SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_id AND tr_fare > 60) AND EXISTS (SELECT * FROM trips WHERE tr_dropoff = zn_id)
 ----
+BIGINT
 40
 
 # ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
@@ -322,6 +355,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM promos)
 ----
+BIGINT
 0
 
 # ---- DuckDB only until mark joins get a PR (ADR 0023: EXISTS under OR exits 4) ----
@@ -330,6 +364,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > 25 OR EXISTS (SELECT * FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')
 ----
+BIGINT
 1114
 
 # ---- DuckDB only, for good: DuckDB's error texts ----

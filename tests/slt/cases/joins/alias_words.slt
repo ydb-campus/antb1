@@ -8,11 +8,13 @@
 query III nosort
 SELECT COUNT(*), MIN(tr_pickup), MAX(tr_pickup) FROM trips
 ----
+BIGINT	INTEGER	INTEGER
 3000	1	43
 
 query IIII nosort
 SELECT COUNT(*), COUNT(DISTINCT zn_id), MIN(zn_id), MAX(zn_id) FROM zones
 ----
+BIGINT	BIGINT	INTEGER	INTEGER
 40	40	1	40
 
 # ---- the words as aliases are syntax errors in both engines (roadmap PR S3) ----
@@ -40,16 +42,19 @@ SELECT COUNT(*) FROM trips asof
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips AS "semi" JOIN drivers AS "anti" ON "semi".tr_driver = "anti".dv_id
 ----
+BIGINT	DECIMAL(38,2)
 2577	38689.00
 
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips "asof" JOIN drivers ON "asof".tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)
 2577	38689.00
 
 query ID nosort quoted_words
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)
 2577	38689.00
 
 # ---- DuckDB only until SEMI and ANTI joins get a PR (ADR 0022) ----
@@ -59,18 +64,21 @@ onlyif duckdb
 query ID nosort semi
 SELECT COUNT(*), SUM(tr_fare) FROM trips semi JOIN riders ON tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 2745	41289.25
 
 onlyif duckdb
 query ID nosort semi
 SELECT COUNT(*), SUM(tr_fare) FROM trips SEMI JOIN riders ON tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 2745	41289.25
 
 # The pending twin of the label semi, an IN subquery (roadmap PR J5): labels hold within a file.
 query ID nosort semi
 SELECT COUNT(*), SUM(tr_fare) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders)
 ----
+BIGINT	DECIMAL(38,2)
 2745	41289.25
 
 # An anti join keeps the trips without a driver, NULL keys included, as NOT EXISTS does.
@@ -78,12 +86,14 @@ onlyif duckdb
 query II nosort anti
 SELECT COUNT(*), COUNT(tr_driver) FROM trips anti JOIN drivers ON tr_driver = dv_id
 ----
+BIGINT	BIGINT
 423	319
 
 # The twin of the label anti, a NOT EXISTS (ADR 0023, roadmap PR U2).
 query II nosort anti
 SELECT COUNT(*), COUNT(tr_driver) FROM trips WHERE NOT EXISTS (SELECT * FROM drivers WHERE dv_id = tr_driver)
 ----
+BIGINT	BIGINT
 423	319
 
 # ---- DuckDB only until ASOF joins get a PR (ADR 0022) ----
@@ -95,12 +105,14 @@ onlyif duckdb
 query III nosort
 SELECT COUNT(*), MIN(zn_id), MAX(zn_id) FROM trips asof JOIN zones ON tr_pickup >= zn_id
 ----
+BIGINT	INTEGER	INTEGER
 3000	1	40
 
 onlyif duckdb
 query II rowsort
 SELECT zn_id, COUNT(*) FROM trips asof JOIN zones ON tr_pickup >= zn_id WHERE tr_pickup > 38 GROUP BY zn_id
 ----
+INTEGER	BIGINT
 39	69
 40	276
 
@@ -109,6 +121,7 @@ onlyif duckdb
 query III nosort
 SELECT COUNT(*), COUNT(zn_id), MIN(zn_id) FROM trips asof LEFT JOIN zones ON tr_pickup > zn_id
 ----
+BIGINT	BIGINT	INTEGER
 3000	2930	1
 
 # ---- DuckDB only, for good: DuckDB's error texts ----

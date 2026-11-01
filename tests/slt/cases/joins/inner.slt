@@ -9,17 +9,20 @@
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver = 1000
 ----
+BIGINT
 29
 
 query I nosort
 SELECT dv_id FROM drivers WHERE dv_id > 2147483647
 ----
+BIGINT
 4294968296
 
 # Riders 7, 47, 64 and 192 repeat their key; rider 8 does not exist, and rider 237 has no trip.
 query II rowsort
 SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (7, 8, 47, 64, 192, 236, 237) GROUP BY tr_rider
 ----
+BIGINT	BIGINT
 192	12
 236	12
 47	12
@@ -31,11 +34,13 @@ SELECT tr_rider, COUNT(*) FROM trips WHERE tr_rider IN (7, 8, 47, 64, 192, 236, 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver = 1111 AND tr_day = DATE '2026-03-22'
 ----
+BIGINT
 1
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_driver = 1148 AND tr_day = DATE '2026-03-29'
 ----
+BIGINT
 1
 
 # ---- inner joins (ADR 0022) ----
@@ -45,47 +50,56 @@ SELECT COUNT(*) FROM trips WHERE tr_driver = 1148 AND tr_day = DATE '2026-03-29'
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips, drivers WHERE tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)	DATE
 2577	38689.00	2025-01-01
 
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM drivers, trips WHERE dv_id = tr_driver
 ----
+BIGINT	DECIMAL(38,2)	DATE
 2577	38689.00	2025-01-01
 
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips JOIN drivers ON tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)	DATE
 2577	38689.00	2025-01-01
 
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips INNER JOIN drivers ON dv_id = tr_driver
 ----
+BIGINT	DECIMAL(38,2)	DATE
 2577	38689.00	2025-01-01
 
 query IDT nosort trips_drivers
 SELECT COUNT(*), SUM(tr_fare), MIN(dv_since) FROM trips CROSS JOIN drivers WHERE tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)	DATE
 2577	38689.00	2025-01-01
 
 query II rowsort
 SELECT dv_id, COUNT(*) FROM trips JOIN drivers ON tr_driver = dv_id WHERE dv_id IN (1000, 4294968296) GROUP BY dv_id
 ----
+BIGINT	BIGINT
 1000	29
 
 # A repeated rider key matches twice: 2841 rows hold 2745 trips.
 query II nosort trips_riders
 SELECT COUNT(*), COUNT(DISTINCT tr_row) FROM trips JOIN riders ON tr_rider = rd_id
 ----
+BIGINT	BIGINT
 2841	2745
 
 query II nosort trips_riders
 SELECT COUNT(*), COUNT(DISTINCT tr_row) FROM riders, trips WHERE rd_id = tr_rider
 ----
+BIGINT	BIGINT
 2841	2745
 
 query II rowsort
 SELECT rd_id, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_id IN (7, 8, 47, 64, 192, 236, 237) GROUP BY rd_id
 ----
+BIGINT	BIGINT
 192	24
 236	12
 47	24
@@ -96,12 +110,14 @@ SELECT rd_id, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_id IN
 query ID nosort
 SELECT COUNT(*), SUM(pm_discount) FROM trips JOIN promos ON tr_promo = pm_id
 ----
+BIGINT	DECIMAL(38,2)
 0	NULL
 
 # VARCHAR keys: std and XL match no code (case, a trailing space), and the NULL code matches nothing.
 query TI rowsort
 SELECT tf_code, COUNT(*) FROM trips JOIN tariffs ON tr_tariff = tf_code GROUP BY tf_code
 ----
+VARCHAR	BIGINT
 (empty)	284
 AIRPORT	285
 NIGHT	284
@@ -115,6 +131,7 @@ XL\x20	285
 query DDI rowsort
 SELECT tr_rate, tf_rate, COUNT(*) FROM trips JOIN tariffs ON tr_rate = tf_rate GROUP BY tr_rate, tf_rate
 ----
+DECIMAL(4,2)	DECIMAL(5,3)	BIGINT
 1.00	1.000	348
 1.25	1.250	350
 1.50	1.500	348
@@ -127,16 +144,19 @@ SELECT tr_rate, tf_rate, COUNT(*) FROM trips JOIN tariffs ON tr_rate = tf_rate G
 query IDD nosort trips_shifts
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
 ----
+BIGINT	DECIMAL(4,1)	DECIMAL(4,1)
 447	4.0	12.0
 
 query IDD nosort trips_shifts
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM shifts, trips WHERE sh_day = tr_day AND sh_driver = tr_driver
 ----
+BIGINT	DECIMAL(4,1)	DECIMAL(4,1)
 447	4.0	12.0
 
 query TI rowsort
 SELECT sh_day, COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day WHERE sh_driver = 1111 GROUP BY sh_day
 ----
+DATE	BIGINT
 2026-03-03	1
 2026-03-06	1
 2026-03-17	1
@@ -147,6 +167,7 @@ SELECT sh_day, COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_d
 query I nosort
 SELECT COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day WHERE tr_day = DATE '2026-03-31'
 ----
+BIGINT
 0
 
 # A FROM list that starts with two tables sharing no predicate, the join chain, and an ON that names an earlier comma
@@ -154,16 +175,19 @@ SELECT COUNT(*) FROM trips JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM zones, riders, trips WHERE tr_pickup = zn_id AND tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 2650	39900.50
 
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id JOIN riders ON tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 2650	39900.50
 
 query ID nosort unconnected_first
 SELECT COUNT(*), SUM(tr_fare) FROM zones, trips JOIN riders ON tr_rider = rd_id AND tr_pickup = zn_id
 ----
+BIGINT	DECIMAL(38,2)
 2650	39900.50
 
 # A cycle: trips -> zones -> cities <- riders <- trips, in two FROM orders.
@@ -171,68 +195,80 @@ query ID nosort cycle
 SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, cities, riders
 WHERE tr_pickup = zn_id AND zn_city = ct_id AND rd_city = ct_id AND tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 492	7333.75
 
 query ID nosort cycle
 SELECT COUNT(*), SUM(tr_fare) FROM riders, cities, zones, trips
 WHERE tr_rider = rd_id AND rd_city = ct_id AND zn_city = ct_id AND tr_pickup = zn_id
 ----
+BIGINT	DECIMAL(38,2)
 492	7333.75
 
 # A cycle whose shortcut zn_city = dv_city is many-to-many, next to the keys tr_pickup = zn_id and tr_driver = dv_id.
 query ID nosort shortcut
 SELECT COUNT(*), SUM(tr_fare) FROM trips, zones, drivers WHERE tr_pickup = zn_id AND tr_driver = dv_id AND zn_city = dv_city
 ----
+BIGINT	DECIMAL(38,2)
 416	6174.25
 
 query ID nosort shortcut
 SELECT COUNT(*), SUM(tr_fare) FROM drivers JOIN zones ON zn_city = dv_city JOIN trips ON tr_pickup = zn_id AND tr_driver = dv_id
 ----
+BIGINT	DECIMAL(38,2)
 416	6174.25
 
 # The many-to-many edge as the only way to zones: every trip meets each zone of its driver's city.
 query ID nosort many_to_many
 SELECT COUNT(*), SUM(tr_fare) FROM trips, drivers, riders, zones WHERE tr_driver = dv_id AND tr_rider = rd_id AND zn_city = dv_city
 ----
+BIGINT	DECIMAL(38,2)
 16652	250781.75
 
 query ID nosort many_to_many
 SELECT COUNT(*), SUM(tr_fare) FROM zones JOIN drivers ON zn_city = dv_city JOIN trips ON tr_driver = dv_id JOIN riders ON tr_rider = rd_id
 ----
+BIGINT	DECIMAL(38,2)
 16652	250781.75
 
 # Residuals across two tables, in WHERE and in ON.
 query I nosort
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_joined > tr_day
 ----
+BIGINT
 59
 
 query I nosort residual_or
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id WHERE rd_joined > tr_day OR rd_city = 1
 ----
+BIGINT
 949
 
 query I nosort residual_or
 SELECT COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND (rd_joined > tr_day OR rd_city = 1)
 ----
+BIGINT
 949
 
 # A DOUBLE equality next to a key is a residual.
 query ID nosort
 SELECT COUNT(*), SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_distance = zn_radius
 ----
+BIGINT	DECIMAL(38,2)
 19	274.25
 
 # An expression key.
 query III nosort
 SELECT COUNT(*), MIN(zn_id), MAX(zn_id) FROM trips JOIN zones ON tr_pickup + 1 = zn_id
 ----
+BIGINT	INTEGER	INTEGER
 2724	2	40
 
 # Self-joins: a zone and its parent (zone 40's parent 77 does not exist), and zones in two roles.
 query ITI rowsort
 SELECT z.zn_id, p.label, p.zn_id FROM zones AS z JOIN zones AS p ON z.zn_parent = p.zn_id WHERE z.zn_id > 30
 ----
+INTEGER	VARCHAR	INTEGER
 31	center	1
 32	north	2
 33	south	3
@@ -246,12 +282,14 @@ SELECT z.zn_id, p.label, p.zn_id FROM zones AS z JOIN zones AS p ON z.zn_parent 
 query III nosort
 SELECT COUNT(*), MIN(pu.zn_id), MAX(dr.zn_id) FROM trips, zones AS pu, zones AS dr WHERE tr_pickup = pu.zn_id AND tr_dropoff = dr.zn_id
 ----
+BIGINT	INTEGER	INTEGER
 2629	1	40
 
 query TTI rowsort
 SELECT pu.label, dr.label, COUNT(*) FROM trips, zones AS pu, zones AS dr
 WHERE tr_pickup = pu.zn_id AND tr_dropoff = dr.zn_id AND pu.zn_id <= 2 GROUP BY pu.label, dr.label
 ----
+VARCHAR	VARCHAR	BIGINT
 center	NULL	9
 center	airport	8
 center	center	8
@@ -274,11 +312,13 @@ north	south	8
 query IDI nosort
 SELECT COUNT(*), SUM(a.tr_fare), MIN(b.tr_row - a.tr_row) FROM trips AS a JOIN trips AS b ON a.tr_rider = b.tr_rider AND a.tr_row < b.tr_row
 ----
+BIGINT	DECIMAL(38,2)	INTEGER
 15785	236682.00	236
 
 query I nosort
 SELECT COUNT(*) FROM trips AS a JOIN trips AS b ON a.tr_driver = b.tr_driver AND a.tr_row < b.tr_row
 ----
+BIGINT
 40488
 
 # The row counts that integration.JoinTest (tests/integration/join_test.cc) pins for its hand-built plans of these
@@ -287,21 +327,25 @@ SELECT COUNT(*) FROM trips AS a JOIN trips AS b ON a.tr_driver = b.tr_driver AND
 query I nosort
 SELECT COUNT(*) FROM trips JOIN tariffs ON tr_tariff = tf_code
 ----
+BIGINT
 2274
 
 query I nosort
 SELECT COUNT(*) FROM zones AS z JOIN zones AS p ON z.zn_parent = p.zn_id
 ----
+BIGINT
 34
 
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_city = ct_id
 ----
+BIGINT
 2655
 
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_row >= 2400 AND zn_id <= 10
 ----
+BIGINT
 140
 
 # ---- a build holds only what is read above the join (ADR 0026's C8a) ----
@@ -327,6 +371,7 @@ query II rowsort
 SELECT ct_id, COUNT(*) FROM trips, zones, cities WHERE tr_pickup = zn_id AND zn_city = ct_id
 GROUP BY ct_id
 ----
+SMALLINT	BIGINT
 1	559
 2	559
 3	490
@@ -340,6 +385,7 @@ query TI rowsort
 SELECT rd_tier, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND rd_joined > DATE '2025-01-01'
 GROUP BY rd_tier
 ----
+VARCHAR	BIGINT
 basic	953
 gold	934
 plus	941
@@ -350,6 +396,7 @@ query IR rowsort
 SELECT zn_city, SUM(tr_distance) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius < 2
 GROUP BY zn_city
 ----
+SMALLINT	DOUBLE
 1	2026.25
 2	2681
 3	1978
@@ -366,6 +413,7 @@ query TI rowsort
 SELECT rd_tier, COUNT(*) FROM trips JOIN riders ON tr_rider = rd_id AND tr_fare > rd_city
 GROUP BY rd_tier
 ----
+VARCHAR	BIGINT
 basic	885
 gold	882
 plus	889
@@ -376,10 +424,12 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_distance = zn_radius
 ----
+BIGINT
 828
 
 onlyif duckdb
 query RI rowsort
 SELECT zn_radius, COUNT(*) FROM trips JOIN zones ON tr_distance = zn_radius WHERE zn_radius > 3 GROUP BY zn_radius
 ----
+DOUBLE	BIGINT
 3.25	276

@@ -20,7 +20,8 @@ The rest of this recipe describes that workflow.
 - Tables come from the committed fixture generator: deterministic, synthetic, hits-shaped data plus edge-case tables
   (NULLs, several files, empty tables). They are identical on Linux and macOS. Nothing comes from ClickBench.
 - Expected results are written by DuckDB through a completion task. Nobody types or edits them.
-- Integers, decimals and text compare exactly; floating-point values compare with a tight relative tolerance.
+- Type names, integers, decimals and text compare exactly; floating-point values compare with a tight relative
+  tolerance.
 - A failure prints the file and line, the SQL, the expected and actual rows and a command that reproduces it.
 
 ## Record format
@@ -30,7 +31,7 @@ The rest of this recipe describes that workflow.
 query I nosort
 SELECT SUM(a) FROM t_nulls WHERE b >= 2
 ----
-(written by DuckDB)
+(written by DuckDB: the line of type names, here HUGEINT, then the rows)
 
 # A grouped query selects only its keys and aggregates: a bind error in both engines
 statement error must appear in the GROUP BY clause
@@ -39,7 +40,8 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
 
 - `query <types> <sort mode>`: one type letter per result column (`I` integer, `R` floating point, `D` decimal, `T`
   text and dates), then `nosort` for a single row or an `ORDER BY` whose keys end with a unique column (rows with equal
-  keys may come in any order), `rowsort` for several rows otherwise.
+  keys may come in any order), `rowsort` for several rows otherwise. The block opens with the result's type names,
+  one per column and separated by a tab, which both engines must match exactly.
 - `statement ok` for SQL that must succeed, `statement error <regex>` for SQL that must fail with a matching error.
 - `onlyif antb1` or `skipif duckdb` before a record limits it to one engine. Use them only for a divergence
   registered in [sql-subset.md](../sql-subset.md#divergences-from-duckdb), and put its ID in a comment.
@@ -52,8 +54,8 @@ SELECT a, b, COUNT(*) FROM t GROUP BY a
 1. Pick the area file for the feature, or add one for a new area. Prefer several small records, each with a comment
    that says what it checks, to one big query.
 2. Write the records without expected results.
-3. Run the completion task. It executes each query on DuckDB and writes the results below `----`; records limited to
-   antb1 are flagged for review instead of completed.
+3. Run the completion task. It executes each query on DuckDB and writes below `----` the line of the result's type
+   names, then the rows; records limited to antb1 are completed from antb1 and flagged `REVIEW`: check them by hand.
 4. Review `git diff` of the generated results line by line against [sql-subset.md](../sql-subset.md). A surprising
    value means a wrong test, an engine bug or a semantic difference to register; it is never edited away.
 5. Run the SQL logic tests on both engines, for example `pixi run test -L slt` and `pixi run test -L oracle`, and for

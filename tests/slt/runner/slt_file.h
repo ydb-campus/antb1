@@ -15,8 +15,9 @@
 
 // The sqllogictest subset of antb1-slt (tests/slt/README.md):
 // - statement ok | statement error [regex]: SQL lines up to a blank line.
-// - query <I|R|D|T...> [nosort|rowsort|valuesort] [label]: SQL lines, "----", then the expected
-//   lines up to a blank line.
+// - query <I|R|D|T...> [nosort|rowsort|valuesort] [label]: SQL lines, "----", the line of the
+//   result's type names (BIGINT, DECIMAL(15,2), ...: one per column, separated by tabs), then the
+//   expected lines up to a blank line.
 // - skipif <engine> | onlyif <engine> (antb1 or duckdb): conditions of the next record.
 // - pending <roadmap id> (e.g. pending J4): the next statement or query waits on that roadmap PR.
 //   DuckDB runs it as usual; antb1 runs it only in the pending check (CheckPendingFile in
@@ -49,7 +50,9 @@ struct Record {
   std::string label;
   std::optional<double> tolerance;  // "# tol <rel>" before the record
   int64_t hash_threshold = 0;       // hash-threshold
-  std::vector<std::string> expected;
+  // query: the type names on the first line of the block, or empty when the block has no line.
+  std::vector<std::string> type_names;
+  std::vector<std::string> expected;  // query: the lines of the block after the type names
   // 0-based line indexes for rewriting: [header, sql_end) holds the header and the SQL; a query's
   // block is "----" at sql_end (if has_separator) followed by the lines up to block_end.
   std::size_t header = 0;
@@ -82,8 +85,11 @@ std::optional<std::string> SortModeProblem(std::string_view types, SortMode sort
 // Parses the text of an .slt file; the error names path:line.
 std::expected<SltFile, std::string> ParseSlt(const std::string& path, std::string_view text);
 
+// The first line of a query's block: `type_names` separated by tabs.
+std::string TypeLine(const std::vector<std::string>& type_names);
+
 struct BlockUpdate {
-  std::vector<std::string> lines;        // new expected lines
+  std::vector<std::string> lines;        // the new block: the type line, then the expected lines
   std::optional<std::string> new_types;  // replaces the types in the query header
 };
 

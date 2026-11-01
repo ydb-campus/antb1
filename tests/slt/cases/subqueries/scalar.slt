@@ -7,16 +7,19 @@
 query DD nosort
 SELECT MIN(tr_fare), MAX(tr_fare) FROM trips
 ----
+DECIMAL(9,2)	DECIMAL(9,2)
 3.50	27.50
 
 query IDD nosort
 SELECT COUNT(*), MIN(sh_hours), MAX(sh_hours) FROM shifts
 ----
+BIGINT	DECIMAL(4,1)	DECIMAL(4,1)
 500	4.0	12.0
 
 query II nosort
 SELECT COUNT(*), COUNT(pm_discount) FROM promos
 ----
+BIGINT	BIGINT
 0	0
 
 # ---- pending: uncorrelated scalar subqueries (ADR 0022; roadmap PR J5 removes these guards) ----
@@ -25,34 +28,40 @@ SELECT COUNT(*), COUNT(pm_discount) FROM promos
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MAX(pm_discount) FROM promos)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE 0 = (SELECT COUNT(*) FROM promos)
 ----
+BIGINT
 3000
 
 # The subquery first, and AVG.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE (SELECT AVG(tr_fare) FROM trips) < tr_fare
 ----
+BIGINT
 1466
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_distance > (SELECT AVG(zn_radius) FROM zones)
 ----
+BIGINT
 2652
 
 # SUM over the zero rows a filter leaves.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare < (SELECT SUM(sh_hours) FROM shifts WHERE sh_hours > 100)
 ----
+BIGINT
 0
 
 # An aggregate subquery in a block without aggregates, and two of them.
 query ID rowsort
 SELECT tr_row, tr_fare FROM trips WHERE tr_fare = (SELECT MAX(tr_fare) FROM trips) AND tr_row < 300
 ----
+INTEGER	DECIMAL(9,2)
 10	27.50
 107	27.50
 204	27.50
@@ -60,12 +69,14 @@ SELECT tr_row, tr_fare FROM trips WHERE tr_fare = (SELECT MAX(tr_fare) FROM trip
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(sh_hours) FROM shifts) AND tr_fare < (SELECT MAX(sh_hours) FROM shifts)
 ----
+BIGINT
 928
 
 # In HAVING.
 query ID rowsort
 SELECT tr_pickup, SUM(tr_fare) FROM trips GROUP BY tr_pickup HAVING SUM(tr_fare) > (SELECT MAX(tr_fare) * 39 FROM trips)
 ----
+INTEGER	DECIMAL(38,2)
 1	1075.00
 12	1077.25
 14	1079.75
@@ -77,6 +88,7 @@ SELECT tr_pickup, SUM(tr_fare) FROM trips GROUP BY tr_pickup HAVING SUM(tr_fare)
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips JOIN drivers ON tr_driver = dv_id WHERE dv_city = 1)
 ----
+BIGINT
 1436
 
 # Two columns.
@@ -90,23 +102,27 @@ SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MIN(pm_discount), MAX(pm_disc
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_tariff < (SELECT MAX(tf_code) FROM tariffs)
 ----
+BIGINT
 2558
 
 # <> and != are the same operator, and NULL on either side keeps no row.
 query I nosort not_equal
 SELECT COUNT(*) FROM trips WHERE tr_tariff <> (SELECT MAX(tf_code) FROM tariffs)
 ----
+BIGINT
 2558
 
 query I nosort not_equal
 SELECT COUNT(*) FROM trips WHERE tr_tariff != (SELECT MAX(tf_code) FROM tariffs)
 ----
+BIGINT
 2558
 
 # An expression on the outer side, computed in a layer of its own below the join.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare * 2 > (SELECT MAX(sh_hours) FROM shifts)
 ----
+BIGINT
 2574
 
 # A global aggregate whose select list is exactly its aggregates: the one row the join appends is a
@@ -114,34 +130,40 @@ SELECT COUNT(*) FROM trips WHERE tr_fare * 2 > (SELECT MAX(sh_hours) FROM shifts
 query I nosort
 SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) = (SELECT MIN(dv_id) FROM drivers)
 ----
+INTEGER
 1000
 
 query I nosort
 SELECT MIN(tr_driver) FROM trips HAVING MIN(tr_driver) = (SELECT MAX(dv_id) FROM drivers)
 ----
+INTEGER
 
 # In an inner join's ON, which counts as a WHERE conjunct (ADR 0022), against the same conjunct in
 # WHERE.
 query I nosort scalar_inner_on
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_fare > (SELECT AVG(tr_fare) FROM trips)
 ----
+BIGINT
 1365
 
 query I nosort scalar_inner_on
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips)
 ----
+BIGINT
 1365
 
 # Both forms in one WHERE, stacked in the order they are written.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders) AND tr_fare > (SELECT AVG(tr_fare) FROM trips)
 ----
+BIGINT
 1349
 
 # A DATE value from the one row.
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_day > (SELECT MIN(sh_day) FROM shifts)
 ----
+BIGINT
 2825
 
 # A constant integer expression on the other side, in either order: folding it copies the whole
@@ -150,32 +172,38 @@ SELECT COUNT(*) FROM trips WHERE tr_day > (SELECT MIN(sh_day) FROM shifts)
 query I nosort
 SELECT COUNT(*) FROM trips WHERE 1 + 2 = (SELECT COUNT(*) FROM promos)
 ----
+BIGINT
 0
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE 0 + 0 = (SELECT COUNT(*) FROM promos)
 ----
+BIGINT
 3000
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE (SELECT COUNT(*) FROM zones) = 20 + 20
 ----
+BIGINT
 3000
 
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT AVG(tr_fare) FROM trips) AND 1 + 1 > (SELECT COUNT(*) FROM promos)
 ----
+BIGINT
 1466
 
 # The same fold in HAVING and in an inner join's ON.
 query I nosort
 SELECT COUNT(*) FROM trips HAVING 2 + 3 > (SELECT COUNT(*) FROM promos)
 ----
+BIGINT
 3000
 
 query I nosort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND 2 * 1000 > (SELECT COUNT(*) FROM trips)
 ----
+BIGINT
 0
 
 # A constant expression that overflows its type is a bind error, as it is without a subquery
@@ -189,28 +217,33 @@ SELECT COUNT(*) FROM trips WHERE 2147483647 + 1 = (SELECT COUNT(*) FROM promos)
 query I nosort
 SELECT COUNT(*) FROM riders WHERE rd_id > 225 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id)
 ----
+BIGINT
 11
 
 # SUM, MIN of a DATE and AVG.
 query I nosort
 SELECT COUNT(*) FROM riders WHERE (SELECT SUM(tr_fare) FROM trips WHERE tr_rider = rd_id) > 200
 ----
+BIGINT
 34
 
 query I nosort
 SELECT COUNT(*) FROM riders WHERE rd_joined > (SELECT MIN(tr_day) FROM trips WHERE tr_rider = rd_id)
 ----
+BIGINT
 12
 
 query I nosort
 SELECT COUNT(*) FROM riders WHERE (SELECT AVG(tr_fare) FROM trips WHERE tr_rider = rd_id) > 17
 ----
+BIGINT
 27
 
 # An aggregate combined with literals.
 query I rowsort
 SELECT rd_id FROM riders WHERE rd_id < 20 AND 400 < (SELECT SUM(tr_fare) * 2 - 10 FROM trips WHERE tr_rider = rd_id)
 ----
+BIGINT
 12
 14
 17
@@ -219,6 +252,7 @@ SELECT rd_id FROM riders WHERE rd_id < 20 AND 400 < (SELECT SUM(tr_fare) * 2 - 1
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE sh_hours * 4 > (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
+BIGINT
 380
 
 # A correlation into a middle block: the subquery reads the zones of the IN subquery, not the outer cities (roadmap
@@ -227,6 +261,7 @@ query I rowsort
 SELECT ct_id FROM cities
 WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_radius * 3 > (SELECT AVG(tr_distance) FROM trips WHERE tr_pickup = zn_id))
 ----
+SMALLINT
 2
 4
 
@@ -237,6 +272,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 0 = (SELECT COUNT(*) FROM trips WHERE tr_rider = rd_id)
 ----
+BIGINT
 4
 
 # ---- DuckDB only until CASE over correlated aggregates gets a PR (ADR 0023) ----
@@ -245,6 +281,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 0 = (SELECT CASE WHEN SUM(tr_fare) > 0 THEN 1 ELSE 0 END FROM trips WHERE tr_rider = rd_id)
 ----
+BIGINT
 4
 
 # ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
@@ -255,6 +292,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM drivers WHERE 450 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = dv_id)
 ----
+BIGINT
 13
 
 # ---- DuckDB only until single joins get a PR (ADR 0023: a scalar subquery that is no aggregate exits 4) ----
@@ -264,6 +302,7 @@ onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_promo = (SELECT pm_id FROM promos)
 ----
+BIGINT
 0
 
 onlyif duckdb
@@ -286,6 +325,7 @@ SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)
 query I nosort
 SELECT COUNT(*) FROM zones WHERE 2 < (SELECT MIN(tr_fare) FROM trips WHERE trips.tr_pickup = zones.zn_id AND trips.tr_pickup = zones.zn_parent)
 ----
+BIGINT
 0
 
 # ---- the semi-join reduction (ADR 0023): two correlated keys, where the restriction fires ----
@@ -299,12 +339,14 @@ SELECT COUNT(*) FROM zones WHERE 2 < (SELECT MIN(tr_fare) FROM trips WHERE trips
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE sh_hours > 0 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
+BIGINT
 412
 
 # The same shape with AVG, whose value moves if the restriction changed which rows are aggregated.
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE sh_hours * 2 < (SELECT AVG(tr_distance) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
+BIGINT
 93
 
 # Repeated outer keys, listed rather than counted: a restriction that multiplied the aggregation's
@@ -312,6 +354,7 @@ SELECT COUNT(*) FROM shifts WHERE sh_hours * 2 < (SELECT AVG(tr_distance) FROM t
 query IT rowsort
 SELECT sh_driver, sh_day FROM shifts WHERE sh_driver < 1010 AND sh_hours < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
+INTEGER	DATE
 1000	2026-03-12
 1000	2026-03-15
 1000	2026-03-23
@@ -323,6 +366,7 @@ SELECT sh_driver, sh_day FROM shifts WHERE sh_driver < 1010 AND sh_hours < (SELE
 query I nosort
 SELECT COUNT(*) FROM shifts WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = sh_driver) AND sh_hours > 0 AND 0 < (SELECT SUM(tr_fare) FROM trips WHERE tr_driver = sh_driver AND tr_day = sh_day)
 ----
+BIGINT
 408
 
 # ---- the semi-join reduction over a join (ADR 0023): one correlated key, restricted anyway ----
@@ -333,6 +377,7 @@ SELECT COUNT(*) FROM shifts WHERE EXISTS (SELECT * FROM drivers WHERE dv_id = sh
 query II rowsort
 SELECT rd_id, rd_city FROM riders WHERE 0 < (SELECT SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id WHERE tr_rider = rd_id)
 ----
+BIGINT	SMALLINT
 1	1
 10	1
 100	1
@@ -574,10 +619,12 @@ SELECT rd_id, rd_city FROM riders WHERE 0 < (SELECT SUM(tr_fare) FROM trips JOIN
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 15 < (SELECT AVG(tr_fare) FROM trips LEFT JOIN zones ON tr_pickup = zn_id WHERE tr_rider = rd_id)
 ----
+BIGINT
 152
 
 # A residual on the inner join, which the restriction sits above: its candidate pairs are unchanged.
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 0 < (SELECT SUM(tr_fare) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_distance > zn_radius WHERE tr_rider = rd_id)
 ----
+BIGINT
 236
