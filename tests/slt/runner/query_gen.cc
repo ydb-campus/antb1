@@ -1679,8 +1679,7 @@ class Builder {
       used_.Add(Feature::kMultipleItems);
       Star(from);
     };
-    // No position after a star: a position counts the star's columns, and MakeOrderedQuery
-    // declines one at or after a star (it would compare an ORDER BY's ties in exact order).
+    // No position after a star: a position counts the star's columns, which `emitted` does not.
     const auto emit_keys = [&] {
       for (const auto* key : keys) {
         if (emitted++ > 0) {

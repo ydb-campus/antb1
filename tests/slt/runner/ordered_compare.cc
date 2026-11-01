@@ -74,6 +74,17 @@ bool SameCells(const Cells& a, const Cells& b, std::size_t begin, std::string_vi
   return true;
 }
 
+// The cells `columns` of two rows, of the classes `letters` (one per column).
+bool SameKeys(const Cells& a, const Cells& b, const std::vector<std::size_t>& columns,
+              std::string_view letters) {
+  for (std::size_t k = 0; k < columns.size(); ++k) {
+    if (!SameCell(a[columns[k]], b[columns[k]], letters[k])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The first `letters.size()` cells of a row that are not R, as one string: rows with the same
 // cells within the R tolerance have the same text.
 std::string ExactText(const Cells& row, std::string_view letters) {
@@ -110,29 +121,30 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   auto stmt = sql::Parse(sql);
   // A compound's ORDER BY reads its output, which no select list of its own spells out to add keys
-  // to (ADR 0036): declined, as a position at or after a star is.
+  // to (ADR 0036): declined.
   if (!stmt.has_value() || stmt->order_by.empty() || !stmt->set_operation.empty()) {
     return std::nullopt;
   }
   std::vector<sql::SelectItem> extra;
-  for (std::size_t i = 0; i < stmt->order_by.size(); ++i) {
-    sql::SelectExpr expr = stmt->order_by[i].expr;
+  std::vector<std::size_t> positions;
+  for (const sql::OrderItem& key : stmt->order_by) {
+    sql::SelectExpr expr = key.expr;
     if (const auto* lit = std::get_if<sql::Literal>(&expr);
         lit != nullptr && lit->kind == sql::Literal::Kind::kInteger && !lit->negative) {
-      // A position in the select list (1-based). At or after a star the harness cannot name it:
-      // the star's width is the catalog's.
+      // A position names a column of the answer (1-based), counting every column of a star before
+      // it: the comparison reads the key there, so the key needs no column of its own. One beyond
+      // the answer's columns fails the query in DuckDB.
       std::size_t position = 0;
       const auto [end, error] =
           std::from_chars(lit->text.data(), lit->text.data() + lit->text.size(), position);
-      const auto star = std::ranges::find_if(
-          stmt->items, [](const sql::SelectItem& item) { return item.star() != nullptr; });
-      if (error != std::errc{} || end != lit->text.data() + lit->text.size() || position == 0 ||
-          position > stmt->items.size() || std::cmp_less(star - stmt->items.begin(), position)) {
+      if (error != std::errc{} || end != lit->text.data() + lit->text.size() || position == 0) {
         return std::nullopt;
       }
-      expr = *stmt->items[position - 1].expr();
-    } else if (const auto* ref = std::get_if<sql::ColumnRef>(&expr);
-               ref != nullptr && ref->qualifier.empty()) {
+      positions.push_back(position - 1);
+      continue;
+    }
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&expr);
+        ref != nullptr && ref->qualifier.empty()) {
       // A select alias comes first (the last item with it), as in the binder and DuckDB; a
       // qualified name (t.x) is always a column. DuckDB also takes a plain column written otherwise
       // than its column is declared for an alias of the declared name, which the harness cannot
@@ -182,9 +194,10 @@ std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql) {
       }
     }
     extra.push_back(sql::SelectItem{
-        .value = std::move(expr), .alias = std::format("__antb1_key{}", i), .span = {}});
+        .value = std::move(expr), .alias = std::format("__antb1_key{}", extra.size()), .span = {}});
   }
   OrderedQuery q{.augmented_sql = {},
+                 .positions = std::move(positions),
                  .keys = extra.size(),
                  .limit = stmt->limit,
                  .offset = stmt->offset.value_or(0)};
@@ -242,11 +255,12 @@ std::string Operand(std::string_view column, char letter) {
                                         : std::string(column);
 }
 
-// The rows of DuckDB's augmented query whose ORDER BY keys equal `key` (a row of it) and whose I,
-// D and T cells equal those of one of `wanted` (antb1 rows): everything needed to match those rows
-// against a run of ties that is too long to fetch whole. std::nullopt if a value cannot be written
-// as SQL.
+// The rows of DuckDB's augmented query whose ORDER BY keys (its columns `key_columns`, of the
+// classes `key_letters`) equal those of `key` (a row of it) and whose I, D and T cells equal those
+// of one of `wanted` (antb1 rows): everything needed to match those rows against a run of ties that
+// is too long to fetch whole. std::nullopt if a value cannot be written as SQL.
 std::optional<std::string> RunMembersSql(const OrderedQuery& q, std::string_view letters,
+                                         const std::vector<std::size_t>& key_columns,
                                          std::string_view key_letters, const Cells& key,
                                          std::size_t width,
                                          const std::vector<const Cells*>& wanted) {
@@ -254,18 +268,20 @@ std::optional<std::string> RunMembersSql(const OrderedQuery& q, std::string_view
   for (std::size_t c = 0; c < width; ++c) {
     columns += std::format("{}c{}", c == 0 ? "" : ", ", c);
   }
-  for (std::size_t k = 0; k < key_letters.size(); ++k) {
+  for (std::size_t k = 0; k < q.keys; ++k) {
     columns += std::format("{}k{}", columns.empty() ? "" : ", ", k);
   }
   std::string where;
-  for (std::size_t k = 0; k < key_letters.size(); ++k) {
-    const std::string column = std::format("__antb1_a.k{}", k);
-    const auto literal = CellSql(key[width + k], key_letters[k]);
+  for (std::size_t k = 0; k < key_columns.size(); ++k) {
+    const std::size_t c = key_columns[k];
+    const std::string column =
+        c < width ? std::format("__antb1_a.c{}", c) : std::format("__antb1_a.k{}", c - width);
+    const auto literal = CellSql(key[c], key_letters[k]);
     if (!literal.has_value()) {
       return std::nullopt;
     }
     std::string condition;
-    if (!key[width + k].has_value()) {
+    if (!key[c].has_value()) {
       condition = column + " IS NULL";
     } else if (key_letters[k] == 'R') {
       condition = std::format(
@@ -453,6 +469,17 @@ std::optional<Discrepancy> CompareOrdered(
     return std::nullopt;
   }
   const std::size_t width = letters.size();
+  // The columns of the augmented query that hold the ORDER BY keys: those of the answer that
+  // positions name, then the appended ones.
+  std::vector<std::size_t> key_columns = q.positions;
+  if (std::ranges::any_of(key_columns, [&](std::size_t c) { return c >= width; })) {
+    return Discrepancy{
+        .what = std::format(
+            "an ORDER BY position is beyond the answer's {} columns (a harness bug)", width)};
+  }
+  for (std::size_t k = 0; k < q.keys; ++k) {
+    key_columns.push_back(width + k);
+  }
   const int64_t window_end =
       q.limit.has_value() ? SaturatingAdd(q.offset, *q.limit) : std::numeric_limits<int64_t>::max();
   const auto check_shape = [&](const ResultSet& result) -> std::optional<Discrepancy> {
@@ -485,11 +512,15 @@ std::optional<Discrepancy> CompareOrdered(
     if (auto d = check_shape(*ranked)) {
       return d;
     }
-    key_letters = Letters(*ranked).substr(width);
+    const std::string all_letters = Letters(*ranked);
+    key_letters.clear();
+    for (const std::size_t c : key_columns) {
+      key_letters += all_letters[c];
+    }
     const std::vector<Cells>& rows = ranked->rows;
     if (!limit.has_value() || std::cmp_less(rows.size(), *limit) || window_end == 0 ||
-        !SameCells(rows[static_cast<std::size_t>(*limit - 1)],
-                   rows[static_cast<std::size_t>(window_end - 1)], width, key_letters)) {
+        !SameKeys(rows[static_cast<std::size_t>(*limit - 1)],
+                  rows[static_cast<std::size_t>(window_end - 1)], key_columns, key_letters)) {
       break;
     }
     if (*limit >= q.max_rows) {
@@ -504,7 +535,8 @@ std::optional<Discrepancy> CompareOrdered(
   Buckets buckets(rows, letters);
   for (std::size_t j = 0; j < rows.size(); ++j) {
     if (j > 0) {
-      run_of[j] = run_of[j - 1] + (SameCells(rows[j - 1], rows[j], width, key_letters) ? 0U : 1U);
+      run_of[j] =
+          run_of[j - 1] + (SameKeys(rows[j - 1], rows[j], key_columns, key_letters) ? 0U : 1U);
     }
     buckets.Add(run_of[j], j);
   }
@@ -548,7 +580,7 @@ std::optional<Discrepancy> CompareOrdered(
   for (const std::size_t i : in_open_run) {
     wanted.push_back(&antb1.rows[i]);
   }
-  const auto sql = RunMembersSql(q, letters, key_letters, rows.back(), width, wanted);
+  const auto sql = RunMembersSql(q, letters, key_columns, key_letters, rows.back(), width, wanted);
   if (!sql.has_value()) {
     return Discrepancy{
         .what = std::format("cannot check the rows at ranks tied beyond the first {} rows: a value "

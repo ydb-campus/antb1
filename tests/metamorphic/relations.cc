@@ -1527,8 +1527,9 @@ std::vector<Relation> AllRelations() {
   // A star is the columns it reads, where it stands: `*` every FROM item's in FROM order, `t.*` the
   // item's, whichever name rule 1 gives it (the table's, an alias, a path's file name) and however
   // the name is spelled. A position after a star counts its columns, which the random differential
-  // test never writes (MakeOrderedQuery declines one), so these relations answer it. Every ORDER BY
-  // ends in a unique column (ct_row, zn_row), for an order the answers must share.
+  // test never writes (its generator counts select items, not a star's columns), so these relations
+  // answer it. Every ORDER BY ends in a unique column (ct_row, zn_row), for an order the answers
+  // must share.
   {
     const slt::FeatureSet stars = {kColumns,        kStar,           kStarItems, kMultipleItems,
                                    kIntegerColumns, kVarcharColumns, kTableName};
