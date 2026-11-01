@@ -29,6 +29,7 @@ namespace {
 EngineError FromStatus(const arrow::Status& status) {
   EngineError error;
   if (const auto detail = plan::GetSqlError(status)) {
+    error.span = detail->span();
     switch (detail->kind()) {
       case plan::SqlErrorDetail::Kind::kParse:
         error.kind = "parse";

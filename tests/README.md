@@ -121,3 +121,8 @@ together with `ANTB1_UPDATE_GOLDENS`).
   `harness.tpch.status.costs`, `.costs_repro`, `.costs_memory` and `.costs_unwritable` check `--costs`: its lines,
   its file (never a query's text), a repro line without it, a memory error and a file it cannot write.
   `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds` on the same queries.
+  `harness.tpch.status.refusals_*`: the local report of the refused queries holds a canary's message at its place and
+  keeps it out of a redacted log (`_local`); `--show-values` prints it (`_shown`); no report is written on GitHub
+  Actions (`_actions`) or for `--only` (`_only`), an earlier one goes even when the setup fails (`_setup`), and one
+  that cannot be written is a setup error (`_unwritable`). `harness.tpch.run_redacted.refusal`: a message that
+  reaches the log anyway is withheld.

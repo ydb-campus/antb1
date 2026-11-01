@@ -771,6 +771,111 @@ if(ANTB1_HAVE_DUCKDB)
     COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
   )
 
+  # The local report of the refused queries (RatchetOptions::refusals): antb1's messages quote the query, so the
+  # reasons go only to <temp dir>/refusals.txt, never to the log, and not at all on GitHub Actions, where an earlier
+  # run's file is removed too. The canary query is refused with a message that quotes a sentinel, from line 3 of its
+  # file, which is where the report places it; check_refusals.cmake checks the file without printing it. Unredacted
+  # (--show-values, a local repro), the log shows the message and its place.
+  set(_refusals_dir "${_tpch_selftest}/refusals")
+  set(_sentinel antb1_canary_unit)
+  file(
+    WRITE "${_refusals_dir}/queries/q01.sql"
+    "\n-- the statement starts on line 3\nSELECT date_trunc('${_sentinel}', id) FROM antb1_canary_table;\n"
+  )
+  file(WRITE "${_refusals_dir}/status.json" "{\"pass\": []}\n")
+  file(WRITE "${_refusals_dir}/status_unsorted.json" "{\"pass\": [2, 1]}\n")
+  foreach(
+    case
+    IN
+    ITEMS local actions shown only setup unwritable
+  )
+    set(_name harness.tpch.status.refusals_${case})
+    set(_status "${_refusals_dir}/status.json")
+    set(_costs "${CMAKE_BINARY_DIR}/slt-tmp/${_name}/costs.jsonl")
+    set(_extra "")
+    if(case STREQUAL "local")
+      set(_extra --costs "${_costs}")
+    elseif(case STREQUAL "only")
+      set(_extra --only 1)
+    elseif(case STREQUAL "setup")
+      set(_status "${_refusals_dir}/status_unsorted.json")
+    endif()
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_refusals_dir}/queries"
+      --status
+      "${_status}"
+      --memory-limit
+      1GiB
+      ${_extra}
+    )
+    if(case STREQUAL "shown")
+      antb1_add_expect_test(
+        ${_name}
+        LABELS harness
+        FIXTURES_REQUIRED antb1_fixtures
+        EXIT_CODE 0
+        REQUIRE
+          "Q1: unsupported\n  date_trunc\\(\\) with the unit '${_sentinel}' is not supported [^\n]*\\(line 3, column 19\\)\n"
+          "refusals: [^\n]*/refusals\\.txt\n"
+        COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args} --show-values
+      )
+      set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "GITHUB_ACTIONS=unset:")
+      continue()
+    endif()
+    set(_check "-DFILE=${CMAKE_BINARY_DIR}/slt-tmp/${_name}/refusals.txt" "-DSENTINEL=${_sentinel}")
+    set(_exit 0)
+    set(_require "TPCH: PASS queries=1 ")
+    if(case STREQUAL "local")
+      list(APPEND _check -DEXPECT=present "-DLINE=\nQ1\t3:19\t[^\n]*'${_sentinel}'" "-DCOSTS=${_costs}")
+      list(
+        APPEND _require
+        "refusals: [^\n]*/refusals\\.txt\n"
+        "refusals file: holds the sentinel at its place; costs file: no sentinel"
+      )
+    elseif(case STREQUAL "actions")
+      list(APPEND _check -DEXPECT=absent -DPLANT=1)
+      list(APPEND _require "refusals: not written on GitHub Actions\n" "refusals file: none")
+    elseif(case STREQUAL "only")
+      list(APPEND _check -DEXPECT=absent -DPLANT=1)
+      list(APPEND _require "refusals: not written for --only\n" "refusals file: none")
+    elseif(case STREQUAL "setup")
+      # A run that fails in its setup (an unsorted ratchet, exit code 2) leaves no earlier run's report.
+      list(APPEND _check -DEXPECT=absent -DPLANT=1)
+      set(_require "refusals file: none")
+      set(_exit 2)
+    else()
+      # A report the run can neither remove nor write (a directory in its place) is a setup error.
+      list(APPEND _check -DEXPECT=unchecked -DPLANT_DIR=1)
+      set(_require "antb1-slt: cannot write the refusals file ")
+      set(_exit 3)
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid}
+      COMMAND
+        ${CMAKE_COMMAND}
+        ${_check}
+        -P
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_refusals.cmake"
+        --
+        $<TARGET_FILE:antb1-slt>
+        tpch
+        ${_args}
+    )
+    if(case STREQUAL "actions")
+      set_tests_properties(${_name} PROPERTIES ENVIRONMENT "GITHUB_ACTIONS=true")
+    else()
+      set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "GITHUB_ACTIONS=unset:")
+    endif()
+  endforeach()
+
   # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every
   # report is redacted without --redact and its repro adds --show-values; an explicit --redact wins over
   # --show-values; `diff --list` (also with --redact over any tables) and `complete` are refused.

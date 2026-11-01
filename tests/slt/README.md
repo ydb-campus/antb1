@@ -301,7 +301,14 @@ CI leg ([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). Its self-tests `h
 numbered queries over the canary table (marked `redact`) into the build tree; `harness.tpch.status.costs`,
 `.costs_repro`, `.costs_memory` and `.costs_unwritable` check the costs lines, the file (through
 `print_file_after.cmake`), the repro line, a query over the memory limit (a memory error) and a file that cannot be
-written (exit code 3).
+written (exit code 3). A run also writes why antb1 refuses each query to `<temp dir>/refusals.txt` (`Q<n>`,
+`line:column` in the query's file, antb1's message; a `--shard` run, its slice's) and names only the file in the log.
+The messages quote the queries, so the report is local only (`PlanRefusalReport` in `runner/ratchet.h`): it is not
+written on GitHub Actions, for the repro of one query (`--only`) or with a temp dir outside the build tree (the parent
+of `--fixtures`), and an earlier run's file is removed before anything else. `--show-values` also prints each message,
+and `run_redacted.cmake` withholds one that reaches the log of a TPC test. `harness.tpch.status.refusals_local`,
+`_actions`, `_shown`, `_only`, `_setup` and `_unwritable` check it on a canary query (`check_refusals.cmake` reads the
+file without printing it), and `harness.tpch.run_redacted.refusal` the withholding.
 
 `antb1-slt tpcds`, with the same options, is this ratchet for the 99 queries derived from TPC-DS (`tests/tpcds`)
 against `tests/data/tpcds_status.json`: its summary line starts with `TPCDS:`, its messages and disclaimer name

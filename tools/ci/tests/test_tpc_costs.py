@@ -221,7 +221,7 @@ def test_a_report_that_looks_unredacted_is_withheld(tmp_path, monkeypatch, capsy
 
 def test_the_withheld_patterns_are_run_redacted_cmakes() -> None:
     text = (ROOT / "tests/tpch/run_redacted.cmake").read_text(encoding="utf-8")
-    match = re.search(r'^set\(_unredacted((?: "[^"]*")+)\)$', text, re.MULTILINE)
+    match = re.search(r'^set\(\s*_unredacted((?:\s+"[^"]*")+)\s*\)$', text, re.MULTILINE)
     assert match, "set(_unredacted ...) in tests/tpch/run_redacted.cmake"
     cmake = [s.encode().decode("unicode_escape") for s in re.findall(r'"([^"]*)"', match.group(1))]
     assert [p.pattern for p in tpc_costs.FORBIDDEN] == [s.replace("\n", r"\n").replace("\t", r"\t") for s in cmake]

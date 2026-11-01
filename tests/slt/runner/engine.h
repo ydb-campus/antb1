@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "antb1/common/source_span.h"
+
 // The engines antb1-slt runs records on (antb1 through engine::Session, DuckDB through its C API).
 // Both return values as canonical text (canonical.h), so one formatter and one comparator serve
 // both.
@@ -38,6 +40,9 @@ struct EngineError {
   std::string message;       // "<kind>: <message>"; `statement error <regex>` searches it
   bool unsupported = false;  // antb1 SqlErrorDetail{kUnsupported}: never an acceptable outcome
   bool internal = false;     // an engine or harness bug, never an acceptable `statement error`
+  // antb1's parse, bind and Unsupported errors: their byte range in the SQL (the local refusal
+  // report of the ratchets, RatchetOptions::refusals).
+  std::optional<SourceSpan> span;
 };
 
 using ExecResult = std::expected<ResultSet, EngineError>;

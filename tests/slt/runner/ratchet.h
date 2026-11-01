@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -97,6 +98,14 @@ struct RatchetOptions {
   // geometric mean of the passing queries. Empty: no times. Set whenever `costs` is.
   std::function<double()> clock;
   std::optional<RatchetCosts> costs;
+  // The reasons of the refused queries (antb1-slt tpch and tpcds, ADR 0037's HC3): `refusals` gets
+  // a line per query antb1 answers Unsupported, "Q<n>\t<line>:<column>\t<message>", the place
+  // counted in the query's file ("-" without one) and the message's tabs, line breaks and
+  // backslashes escaped. antb1's messages quote the query, so the caller sends them to a local file
+  // only (NumberedWorkload in main.cc). With `show_refusals`, an unredacted run also prints the
+  // message under the query's outcome line.
+  std::function<void(std::string_view)> refusals;
+  bool show_refusals = false;
 };
 
 struct RatchetStats {
@@ -106,6 +115,21 @@ struct RatchetStats {
   int rejected = 0;     // clean failures: parse or bind errors (where the workload allows them)
   int failed = 0;       // wrong answers, unclean failures and ratchet differences
 };
+
+// The local report of the refused queries (RatchetOptions::refusals) of a run whose temp dir and
+// fixtures directory are `temp_dir` and `fixtures` (absolute): its file, <temp_dir>/refusals.txt,
+// which a run removes before anything else, and why it is not written ("": it is). antb1's messages
+// quote the queries (ADR 0006), so the report is written only off GitHub Actions, never for the
+// repro of one query (`only`), and only inside the build tree, the parent of the fixtures
+// directory, which already holds the generated query texts.
+struct RefusalReport {
+  std::filesystem::path file;
+  std::string skipped;
+};
+
+RefusalReport PlanRefusalReport(bool github_actions, bool only,
+                                const std::filesystem::path& temp_dir,
+                                const std::filesystem::path& fixtures);
 
 // Runs queries[i] as Q<workload.first + i> and writes the report through `write` as it goes (one
 // call per line or block, so a caller can flush each).

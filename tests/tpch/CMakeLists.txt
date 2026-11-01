@@ -283,11 +283,16 @@ foreach(case IN ITEMS on_ci local)
 endforeach()
 
 # run_redacted.cmake withholds output that matches a FORBID regex or looks like an unredacted report, prints only the
-# SUMMARY lines of a sanitizer report (fake_sanitizer_report.cmake writes one with a sentinel), and fails a command
+# SUMMARY lines of a sanitizer report (fake_sanitizer_report.cmake writes one with a sentinel), withholds an
+# unredacted refusal's message (fake_refusal.cmake), and fails a command
 # that does not exit normally with exit code 125 after printing its output so far (fake_slow_query.cmake logs a
 # query as running, then outlasts TIMEOUT). The outer expect test checks what reached the log; these outputs are our
 # own sentinels, never data.
-foreach(case IN ITEMS forbid unredacted sanitizer timeout)
+foreach(
+  case
+  IN
+  ITEMS forbid unredacted refusal sanitizer timeout
+)
   set(_name harness.tpch.run_redacted.${case})
   set(_inner "-DWORK_DIR=${CMAKE_BINARY_DIR}/slt-tmp/${_name}")
   set(_exit 1)
@@ -307,6 +312,10 @@ foreach(case IN ITEMS forbid unredacted sanitizer timeout)
     )
     set(_require "the output is withheld")
     set(_forbid "SELECT 42")
+  elseif(case STREQUAL "refusal")
+    set(_command ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/fake_refusal.cmake")
+    set(_require "the output is withheld")
+    set(_forbid "antb1_canary_refusal")
   elseif(case STREQUAL "timeout")
     list(APPEND _inner -DTIMEOUT=2)
     set(_command ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/fake_slow_query.cmake")

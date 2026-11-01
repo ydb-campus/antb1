@@ -8,7 +8,8 @@
 # - Sanitizer reports go to files in WORK_DIR/sanitizers, because an ASan or UBSan report prints values. Only their
 #   SUMMARY lines (the kind of error and its source location) join the output, as in cmake/scripts/RunDataTest.cmake.
 # - The output (stdout and stderr) is checked before it is printed. Output that matches a FORBID regex, or a pattern
-#   of an unredacted antb1-slt report (an SQL keyword, the `SQL:` block, differing rows), is withheld: the log names
+#   of an unredacted antb1-slt report (an SQL keyword, the `SQL:` block, differing rows, a refusal's message under its
+#   query's outcome line), is withheld: the log names
 #   only the pattern, so a broken redaction fails the test without publishing what it should have hidden. Unlike
 #   cmake/scripts/expect_output.cmake, which prints first and checks after.
 # - The test fails unless the command exits with EXIT_CODE (default 0) and every REQUIRE regex matches. A command
@@ -73,9 +74,10 @@ if(_reports)
   string(APPEND _out "\n")
 endif()
 
-# What an unredacted antb1-slt report prints (tests/slt/runner/result_diff.cc): the SQL block, differing rows, and
-# the SQL itself.
-set(_unredacted "\n  SQL:\n" "\n    row [0-9]+: " "[sS][eE][lL][eE][cC][tT][ \t\n]")
+# What an unredacted antb1-slt report prints (tests/slt/runner/result_diff.cc): the SQL block, differing rows, the
+# SQL itself, and antb1's message under the outcome line of a query it refuses (ratchet.cc, --show-values), which
+# can quote the query; a redacted run never indents the line after an outcome line.
+set(_unredacted "\n  SQL:\n" "\n    row [0-9]+: " "[sS][eE][lL][eE][cC][tT][ \t\n]" "\nQ[0-9]+: unsupported[^\n]*\n  ")
 set(_forbid "${_unredacted}")
 if(DEFINED FORBID_COUNT AND FORBID_COUNT GREATER 0)
   math(EXPR _n "${FORBID_COUNT} - 1")

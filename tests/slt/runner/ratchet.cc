@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <optional>
@@ -15,6 +16,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include "antb1/common/source_span.h"
 
 #include "engine.h"
 #include "ordered_compare.h"
@@ -167,6 +170,8 @@ struct QueryOutcome {
   Discrepancy failure;
   std::optional<int64_t> peak_memory;   // antb1's, when it answered (ResultSet)
   std::optional<double> antb1_seconds;  // antb1's own, when it answered
+  std::string refusal;                  // Unsupported: antb1's message, never printed redacted
+  std::optional<SourceSpan> refusal_span;
 };
 
 QueryOutcome Check(const Statement& q, const Workload& workload, Engine& antb1, Engine& oracle) {
@@ -174,7 +179,11 @@ QueryOutcome Check(const Statement& q, const Workload& workload, Engine& antb1, 
   if (!a.has_value()) {
     const EngineError& e = a.error();
     if (e.unsupported) {
-      return {.outcome = Outcome::kUnsupported, .label = "unsupported", .failure = {}};
+      return {.outcome = Outcome::kUnsupported,
+              .label = "unsupported",
+              .failure = {},
+              .refusal = e.message,
+              .refusal_span = e.span};
     }
     const bool rejection = !e.internal && (e.kind == "parse" || e.kind == "bind");
     if (rejection && workload.rejections_clean) {
@@ -268,11 +277,65 @@ std::string_view Verdict(Outcome outcome, bool expected_pass) {
 
 constexpr double kMebibyte = 1024.0 * 1024.0;
 
+// `text` on one line: backslashes, tabs and line breaks escaped.
+std::string OneLine(std::string_view text) {
+  std::string out;
+  for (const char c : text) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+// Where a refusal points in the query's file: the statement's first line plus the span's.
+std::optional<LineColumn> RefusalPlace(const Statement& q, const std::optional<SourceSpan>& span) {
+  if (!span.has_value()) {
+    return std::nullopt;
+  }
+  const LineColumn in_statement = ToLineColumn(q.sql, *span);
+  return LineColumn{.line = static_cast<std::size_t>(q.line) + in_statement.line - 1,
+                    .column = in_statement.column};
+}
+
 }  // namespace
 
 std::expected<RatchetStatus, std::string> ParseRatchetStatus(std::string_view json,
                                                              const Workload& workload) {
   return StatusReader(json, workload.commit_key).Read();
+}
+
+RefusalReport PlanRefusalReport(bool github_actions, bool only,
+                                const std::filesystem::path& temp_dir,
+                                const std::filesystem::path& fixtures) {
+  RefusalReport report{.file = temp_dir.lexically_normal() / "refusals.txt", .skipped = {}};
+  std::filesystem::path build = fixtures.lexically_normal();
+  if (!build.has_filename()) {  // a trailing separator
+    build = build.parent_path();
+  }
+  build = build.parent_path();
+  const auto [b, f] = std::ranges::mismatch(build, report.file);
+  if (github_actions) {
+    report.skipped = "not written on GitHub Actions";
+  } else if (only) {
+    report.skipped = "not written for --only";
+  } else if (build.empty() || b != build.end() || f == report.file.end()) {
+    report.skipped = "not written outside the build tree";
+  }
+  return report;
 }
 
 std::optional<RatchetShard> ParseRatchetShard(std::string_view text) {
@@ -382,6 +445,25 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
           JsonOrNull(r.antb1_seconds), JsonOrNull(r.peak_memory)));
     } else {
       write(std::format("Q{}: {}\n", n, r.label));
+    }
+    if (r.outcome == Outcome::kUnsupported && (options.refusals || options.show_refusals)) {
+      std::string_view message = r.refusal;
+      if (message.starts_with("unsupported: ")) {
+        message.remove_prefix(std::string_view("unsupported: ").size());
+      }
+      const std::optional<LineColumn> place = RefusalPlace(query, r.refusal_span);
+      if (options.refusals) {
+        options.refusals(
+            std::format("Q{}\t{}\t{}\n", n,
+                        place.has_value() ? std::format("{}:{}", place->line, place->column) : "-",
+                        OneLine(message)));
+      }
+      if (options.show_refusals && !options.redact) {  // local only: it quotes the query
+        write(std::format("  {}{}\n", OneLine(message),
+                          place.has_value()
+                              ? std::format(" (line {}, column {})", place->line, place->column)
+                              : ""));
+      }
     }
     switch (r.outcome) {
       case Outcome::kPass:
