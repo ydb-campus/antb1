@@ -73,8 +73,9 @@ struct SltFile {
 
 inline constexpr std::array<std::string_view, 2> kEngineNames{"antb1", "duckdb"};
 
-// Whether `id` names a roadmap PR as a `pending` line writes it: an upper-case letter, digits and
-// at most one lower-case letter (S3, J2b, H6b).
+// Whether `id` names a roadmap PR as a `pending` line writes it: one or two upper-case letters,
+// digits and at most one lower-case letter (S3, J2b, X4a, and the two-letter ids of ADR 0037's Plan
+// such as NL2 and PF5).
 bool IsRoadmapId(std::string_view id);
 
 // Why `sort` cannot check a record whose columns have the classes `types`, or std::nullopt.

@@ -84,7 +84,7 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    X4a-X4d, ADR 0036's X4 but for `BY NAME` and non-SELECT branches, which no query of the 99 needs and which stay on
    X4 with their `pending X4` guards; X7a and PF5, ADR 0036's X7 in two parts; and W1 onward, which the window ADR
    numbers. None collides with an earlier ADR's ids. A `pending` line takes one upper-case letter today; HC8 makes it
-   take two before any PR writes such a guard.
+   take two before any PR writes such a guard. Update (2026-11-01, HC8): it does, so `pending NL2` and the like parse.
 
 ## Consequences
 
@@ -117,7 +117,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Planned |
 | HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Planned |
 | HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch` | | Planned |
-| HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Planned |
+| HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
 | X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned | | Planned |
 | PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures | | Planned |

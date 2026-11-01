@@ -328,12 +328,17 @@ bool Record::RunsOn(std::string_view engine) const {
 }
 
 bool IsRoadmapId(std::string_view id) {
+  const auto is_upper = [](char c) { return c >= 'A' && c <= 'Z'; };
   const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
-  if (id.size() < 2 || id[0] < 'A' || id[0] > 'Z') {
+  std::size_t letters = 0;
+  while (letters < 2 && letters < id.size() && is_upper(id[letters])) {
+    ++letters;
+  }
+  if (letters == 0) {
     return false;
   }
-  id.remove_prefix(1);
-  if (id.back() >= 'a' && id.back() <= 'z') {
+  id.remove_prefix(letters);
+  if (!id.empty() && id.back() >= 'a' && id.back() <= 'z') {
     id.remove_suffix(1);
   }
   return !id.empty() && std::ranges::all_of(id, is_digit);
