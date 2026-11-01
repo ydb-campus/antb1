@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "canonical.h"
 #include "engine.h"
@@ -15,16 +16,21 @@
 // any order, and with LIMIT/OFFSET any of the rows tied at the window's edges are right.
 //
 // The oracle side is an "augmented" query: the original select list followed by one column per
-// ORDER BY key (an alias resolved to its select item's expression, as the binder does), the same
-// ORDER BY, and no LIMIT or OFFSET. Its answer, in DuckDB's order, defines the rank of every row
-// and the runs of rows with equal keys (R keys equal within the tolerance of CompareBlocks).
-// antb1's row i must then be a distinct row of the run that holds rank offset + i.
+// ORDER BY key that is not a position (an alias resolved to its select item's expression, as the
+// binder does), the same ORDER BY, and no LIMIT or OFFSET. A position names a column of the answer
+// itself, which holds its key, whatever stars come before it. The augmented answer, in DuckDB's
+// order, defines the rank of every row and the runs of rows with equal keys (R keys equal within
+// the tolerance of CompareBlocks). antb1's row i must then be a distinct row of the run that holds
+// rank offset + i.
 
 namespace antb1::slt {
 
 struct OrderedQuery {
   std::string augmented_sql;  // without LIMIT and OFFSET
-  std::size_t keys = 0;       // ORDER BY keys, the last columns of the augmented query
+  // The ORDER BY keys: the columns of the answer that positions name (0-based), and `keys` more,
+  // the last columns of the augmented query.
+  std::vector<std::size_t> positions;
+  std::size_t keys = 0;
   std::optional<int64_t> limit;
   int64_t offset = 0;
   // The most rows fetched in order: a run of ties at the window's end that goes on beyond them is
@@ -32,9 +38,10 @@ struct OrderedQuery {
   int64_t max_rows = int64_t{1024} * 1024;
 };
 
-// The augmented form of a query with ORDER BY (a position is the select item it names);
-// std::nullopt without ORDER BY, for text antb1's parser does not accept, for a compound, or for a
-// position at or after a star, whose width only the catalog knows.
+// The augmented form of a query with ORDER BY; std::nullopt without ORDER BY, for text antb1's
+// parser does not accept, for a compound, for position 0, or for a bare name whose column only the
+// catalog can tell (an alias before a later column item of the name, or columns of two
+// qualifiers).
 std::optional<OrderedQuery> MakeOrderedQuery(std::string_view sql);
 
 // `augmented_sql` with LIMIT `rows` (none: as is).

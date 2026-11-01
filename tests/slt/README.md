@@ -152,15 +152,16 @@ compares the results with the same comparator (rowsort for projections and `GROU
 `OFFSET` and no `ORDER BY`, any rows of the unlimited answer are right: antb1 must return as many rows as DuckDB,
 each one a distinct row of DuckDB's answer to the same query without the `LIMIT` (`CompareSubset`). With `ORDER BY`,
 rows with equal keys may come in any order: DuckDB runs the query with its `ORDER BY` keys appended to the select
-list and without `LIMIT`/`OFFSET` (its limit grows until the run of ties at the window's end is complete), and
-antb1's row `i` must be a distinct row of the run of equal keys at rank `offset + i` (`CompareOrdered`,
-`runner/ordered_compare.h`). At most 2^20 rows are fetched in order: when the run at the window's end goes on
-beyond them (millions of groups tied at a count, say), one more query fetches only the rows of that run whose
-cells equal antb1's rows there, written as SQL literals (`D` and `T` cells compare with the column's text as DuckDB
-prints it, so a DECIMAL literal is never rounded or respelled). The query files of the data tests and the ClickBench
-runner check the same way (`CompareQueryAnswers`). The column types must match exactly (`BIGINT`, `HUGEINT`,
-`DECIMAL(15,2)`, ...), not only their `I`/`R`/`D`/`T` class. Query `i` of seed `s` depends only on `s`, `i`, the tables
-and the supported features, so one case reproduces alone.
+list, except those written as positions, which name the answer's own columns, a star's columns included (the
+appended keys follow the answer's columns), and without `LIMIT`/`OFFSET` (its limit grows until the run of ties at the
+window's end is complete), and antb1's row `i` must be a distinct row of the run of equal keys at rank `offset + i`
+(`CompareOrdered`, `runner/ordered_compare.h`). At most 2^20 rows are fetched in order: when the run at the window's
+end goes on beyond them (millions of groups tied at a count, say), one more query fetches only the rows of that run
+whose cells equal antb1's rows there, written as SQL literals (`D` and `T` cells compare with the column's text as
+DuckDB prints it, so a DECIMAL literal is never rounded or respelled). The query files of the data tests and the
+ClickBench runner check the same way (`CompareQueryAnswers`). The column types must match exactly (`BIGINT`,
+`HUGEINT`, `DECIMAL(15,2)`, ...), not only their `I`/`R`/`D`/`T` class. Query `i` of seed `s` depends only on `s`,
+`i`, the tables and the supported features, so one case reproduces alone.
 
 - 75% of the queries use only the features in `supported_features.h` (`kSupportedFeatures`); the rest
   sample the full target grammar of `docs/sql-subset.md` (`--target-percent`).
@@ -269,7 +270,8 @@ in the query's own select list only, never in an aggregate query (every column t
 key), a nested block or a subquery (the correlated `EXISTS` block keeps its lone `SELECT *`, which records no feature),
 and never take an alias. Each records `star` and the type of every column it reads, so the row-shape rules read the
 list as a projection, and an `ORDER BY` position names an item before the first star only: a position counts a star's
-columns, which the comparator cannot (`MakeOrderedQuery` declines one), so the metamorphic relations answer those.
+columns, which the generator does not count (the comparator needs no count: it reads the answer's column at the
+position), so the metamorphic relations answer those.
 Every committed seed (`diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and their parallel runs) has new star
 queries, and every other query keeps its text.
 

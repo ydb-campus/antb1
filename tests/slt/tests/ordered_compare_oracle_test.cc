@@ -86,6 +86,20 @@ class OrderedCompareOracleTest : public ::testing::Test {
     });
   }
 
+  // `<ordered> LIMIT 3 OFFSET 1` compared with `antb1` through `q`, whose augmented query is
+  // `ordered` with the keys it appends.
+  std::optional<Discrepancy> CompareWith(const std::string& ordered, const OrderedQuery& q,
+                                         std::vector<Row> antb1_rows) {
+    auto oracle = duckdb_->Execute(ordered + " LIMIT 3 OFFSET 1");
+    EXPECT_TRUE(oracle.has_value()) << oracle.error().message;
+    ResultSet antb1 = oracle.value_or(ResultSet{});
+    antb1.rows = std::move(antb1_rows);
+    return CompareOrdered(oracle.value_or(ResultSet{}), antb1, q, [&](const std::string& query) {
+      ++queries_;
+      return duckdb_->Execute(query);
+    });
+  }
+
   std::unique_ptr<DuckDbEngine> duckdb_;
   int queries_ = 0;
   std::size_t last_rows_ = 0;  // rows of the last oracle query that CompareOrdered ran
@@ -124,6 +138,69 @@ TEST_F(OrderedCompareOracleTest, RowsWithDuplicateNamesNextToAStar) {
   ASSERT_TRUE(d.has_value());
   EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
   EXPECT_EQ(queries_, 2);
+}
+
+// A position among a star's columns keys that column of the answer: `SELECT * ... ORDER BY 5`
+// orders by k, the star's last column, and appends nothing. The query of a long run's rows reads
+// the key by position too.
+TEST_F(OrderedCompareOracleTest, APositionInAStarKeysItsColumn) {
+  const std::string ordered = std::format("SELECT * FROM {} ORDER BY 5 DESC", kTable);
+  const OrderedQuery q{.augmented_sql = ordered,
+                       .positions = {4},
+                       .keys = 0,
+                       .limit = 3,
+                       .offset = 1,
+                       .max_rows = 4};
+  // Rank 1 is (2, k = 1); ranks 2 and 3 are any two distinct rows with k = 0.
+  EXPECT_FALSE(CompareWith(ordered, q,
+                           {{"2", "b", "2013-07-02", "1.5", "1"},
+                            {"12", "l", "2013-07-12", "11.5", "0"},
+                            {"3", "c", std::nullopt, "2.5", "0"}}));
+  EXPECT_EQ(queries_, 2) << "the first 5 ranked rows, then the rows of the run of k = 0";
+  // The other row of k = 1 at rank 2, in the run of k = 0: only the run's query, which keeps the
+  // rows whose fifth column is 0, can tell.
+  const auto in_run = CompareWith(ordered, q,
+                                  {{"2", "b", "2013-07-02", "1.5", "1"},
+                                   {"1", "it's", "2013-07-01", "0.5", "1"},
+                                   {"3", "c", std::nullopt, "2.5", "0"}});
+  ASSERT_TRUE(in_run.has_value());
+  EXPECT_TRUE(in_run.value_or(Discrepancy{}).mismatch);
+  EXPECT_EQ(queries_, 4) << "the run's query ran";
+  // A row of the run of k = 0 at rank 1.
+  const auto d = CompareWith(ordered, q,
+                             {{"12", "l", "2013-07-12", "11.5", "0"},
+                              {"2", "b", "2013-07-02", "1.5", "1"},
+                              {"3", "c", std::nullopt, "2.5", "0"}});
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
+}
+
+// A position next to an appended key: `ORDER BY 5 DESC, id // 11` ranks the rows of k = 1, then
+// those of k = 0 in two runs, ids 3 to 10 and ids 11 and 12. The query of a long run's rows keeps
+// the rows equal in both keys, the position's column c4 and the appended k0.
+TEST_F(OrderedCompareOracleTest, APositionNextToAnAppendedKey) {
+  const std::string ordered = std::format("SELECT * FROM {} ORDER BY 5 DESC, id // 11", kTable);
+  const OrderedQuery q{
+      .augmented_sql = std::format(
+          "SELECT *, id // 11 AS __antb1_key0 FROM {} ORDER BY 5 DESC, id // 11", kTable),
+      .positions = {4},
+      .keys = 1,
+      .limit = 3,
+      .offset = 1,
+      .max_rows = 4};
+  EXPECT_FALSE(CompareWith(ordered, q,
+                           {{"2", "b", "2013-07-02", "1.5", "1"},
+                            {"10", "j", "2013-07-10", "9.5", "0"},
+                            {"3", "c", std::nullopt, "2.5", "0"}}));
+  EXPECT_EQ(queries_, 2) << "the first 5 ranked rows, then the rows of the run of ids 3 to 10";
+  // Id 12 has k = 0 too, but the other value of the appended key.
+  const auto d = CompareWith(ordered, q,
+                             {{"2", "b", "2013-07-02", "1.5", "1"},
+                              {"12", "l", "2013-07-12", "11.5", "0"},
+                              {"3", "c", std::nullopt, "2.5", "0"}});
+  ASSERT_TRUE(d.has_value());
+  EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
+  EXPECT_EQ(queries_, 4) << "the run's query ran";
 }
 
 TEST_F(OrderedCompareOracleTest, WrongRowsOfALongRunFail) {

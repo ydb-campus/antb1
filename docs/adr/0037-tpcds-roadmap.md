@@ -120,7 +120,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC3 | Each SF 1 query's seconds and peak memory in the shard logs of every leg, and a local report of each refusal | | Built |
 | HC4 | SF 1 shards by measured cost: a committed map of queries to shards instead of every eighth query | | Planned |
 | HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Built |
-| HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Planned |
+| HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Built |
 | HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch` | | Planned |
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
@@ -185,6 +185,10 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Closing** | | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
+
+Update (2026-11-01, HC6): the ORDER BY positions of Q47, Q57 and Q89 name columns inside a lone star, not after one. So
+the comparison reads a position's key from the answer's own column, wherever stars stand, and the answer's width is
+the only width it needs.
 
 ## Alternatives considered
 

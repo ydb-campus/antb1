@@ -72,11 +72,15 @@ TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
                 .augmented_sql,
             "WITH \"c\" AS (SELECT a FROM t ORDER BY a) SELECT *, a AS \"__antb1_key0\" FROM c "
             "ORDER BY a");
-  EXPECT_EQ(MakeOrderedQuery("WITH c(x) AS (SELECT a FROM t) SELECT x FROM c ORDER BY 1 LIMIT 2")
-                .value_or(OrderedQuery{})
-                .augmented_sql,
-            "WITH \"c\"(\"x\") AS (SELECT a FROM t) SELECT x, x AS \"__antb1_key0\" FROM c ORDER "
-            "BY 1");
+  // A position names a column of the answer, which holds its key: nothing is appended for it.
+  const auto by_position =
+      MakeOrderedQuery("WITH c(x) AS (SELECT a FROM t) SELECT x FROM c ORDER BY 1 LIMIT 2")
+          .value_or(OrderedQuery{});
+  EXPECT_EQ(by_position.augmented_sql,
+            "WITH \"c\"(\"x\") AS (SELECT a FROM t) SELECT x FROM c ORDER BY 1");
+  EXPECT_EQ(by_position.positions, (std::vector<std::size_t>{0}));
+  EXPECT_EQ(by_position.keys, 0U);
+  EXPECT_EQ(MakeOrderedQuery("SELECT a FROM t ORDER BY 0"), std::nullopt) << "no column 0";
   EXPECT_EQ(MakeOrderedQuery("SELECT * FROM (SELECT a FROM t LIMIT 3) s(x) ORDER BY x DESC")
                 .value_or(OrderedQuery{})
                 .augmented_sql,
@@ -124,28 +128,56 @@ TEST(MakeOrderedQuery, KeysThroughImplicitAliases) {
       MakeOrderedQuery("SELECT c0, c0 FROM t ORDER BY c0").value_or(OrderedQuery{}).augmented_sql,
       "SELECT c0, c0, c0 AS \"__antb1_key0\" FROM t ORDER BY c0");
   // One column spelled apart by case and quotes, as the random generator writes names: the first
-  // item is the key, whichever DuckDB takes (they are the same column).
-  EXPECT_EQ(
-      MakeOrderedQuery(R"(SELECT k, "K", tR_x FROM t ORDER BY 1, 2 DESC, K)")
-          .value_or(OrderedQuery{})
-          .augmented_sql,
-      R"(SELECT k, "K", tR_x, k AS "__antb1_key0", "K" AS "__antb1_key1", k AS "__antb1_key2" )"
-      "FROM t ORDER BY 1, 2 DESC, K");
+  // item is the key, whichever DuckDB takes (they are the same column). The positions are keys of
+  // their own columns.
+  const auto spelled_apart = MakeOrderedQuery(R"(SELECT k, "K", tR_x FROM t ORDER BY 1, 2 DESC, K)")
+                                 .value_or(OrderedQuery{});
+  EXPECT_EQ(spelled_apart.augmented_sql,
+            R"(SELECT k, "K", tR_x, k AS "__antb1_key0" FROM t ORDER BY 1, 2 DESC, K)");
+  EXPECT_EQ(spelled_apart.positions, (std::vector<std::size_t>{0, 1}));
+  EXPECT_EQ(spelled_apart.keys, 1U);
   EXPECT_EQ(
       MakeOrderedQuery("SELECT t.k, T.K FROM t ORDER BY k").value_or(OrderedQuery{}).augmented_sql,
       "SELECT t.k, T.K, t.k AS \"__antb1_key0\" FROM t ORDER BY k");
 }
 
-// Stars among the select items: a position names an item only before the first star, whose width
-// only the catalog knows, so one at or after a star is declined; a star takes no alias, and a name
-// that is no alias stays a column (DuckDB orders by the alias before a star's column).
+// Stars among the select items: a position names a column of the answer, counting each of a star's
+// columns, so one at, in or after a star keys that column of the answer, and nothing is appended
+// for it; a star takes no alias, and a name that is no alias stays a column (DuckDB orders by the
+// alias before a star's column).
 TEST(MakeOrderedQuery, KeysNextToStars) {
-  EXPECT_EQ(
-      MakeOrderedQuery("SELECT a AS z, * FROM t ORDER BY 1").value_or(OrderedQuery{}).augmented_sql,
-      "SELECT a AS \"z\", *, a AS \"__antb1_key0\" FROM t ORDER BY 1");
-  EXPECT_EQ(MakeOrderedQuery("SELECT *, a AS z FROM t ORDER BY 2"), std::nullopt);
-  EXPECT_EQ(MakeOrderedQuery("SELECT a, * FROM t ORDER BY 2"), std::nullopt);
-  EXPECT_EQ(MakeOrderedQuery("SELECT t.*, a FROM t ORDER BY 1"), std::nullopt);
+  struct Case {
+    std::string_view sql;
+    std::string_view augmented;  // nothing appended
+    std::size_t position = 0;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT a AS z, * FROM t ORDER BY 1",
+                .augmented = "SELECT a AS \"z\", * FROM t ORDER BY 1",
+                .position = 0},
+           Case{.sql = "SELECT *, a AS z FROM t ORDER BY 2",
+                .augmented = "SELECT *, a AS \"z\" FROM t ORDER BY 2",
+                .position = 1},
+           Case{.sql = "SELECT a, * FROM t ORDER BY 2",
+                .augmented = "SELECT a, * FROM t ORDER BY 2",
+                .position = 1},
+           Case{.sql = "SELECT t.*, a FROM t ORDER BY 1",
+                .augmented = "SELECT t.*, a FROM t ORDER BY 1",
+                .position = 0},
+       }) {
+    const OrderedQuery q = MakeOrderedQuery(c.sql).value_or(OrderedQuery{});
+    EXPECT_EQ(q.augmented_sql, c.augmented) << c.sql;
+    EXPECT_EQ(q.positions, (std::vector<std::size_t>{c.position})) << c.sql;
+    EXPECT_EQ(q.keys, 0U) << c.sql;
+  }
+  const auto positions =
+      MakeOrderedQuery("SELECT * FROM (SELECT a, b, c FROM t) s ORDER BY 3, 1 DESC, b LIMIT 4")
+          .value_or(OrderedQuery{});
+  EXPECT_EQ(positions.positions, (std::vector<std::size_t>{2, 0}));
+  EXPECT_EQ(positions.keys, 1U);
+  EXPECT_EQ(positions.augmented_sql,
+            "SELECT *, b AS \"__antb1_key0\" FROM (SELECT a, b, c FROM t) AS \"s\" ORDER BY 3, 1 "
+            "DESC, b");
   EXPECT_EQ(
       MakeOrderedQuery("SELECT *, b AS a FROM t ORDER BY a").value_or(OrderedQuery{}).augmented_sql,
       "SELECT *, b AS \"a\", b AS \"__antb1_key0\" FROM t ORDER BY a");
@@ -227,6 +259,45 @@ TEST(CompareOrdered, TiesComeInAnyOrder) {
     ASSERT_TRUE(d.has_value());
     EXPECT_TRUE(d.value_or(Discrepancy{}).mismatch);
   }
+}
+
+// A position's key is a column of the answer itself, so its query appends nothing: ranked (value,
+// key) rows ordered by position 2 come in any order within their runs, and with a key appended too,
+// the runs are the rows equal in both.
+TEST(CompareOrdered, APositionKeysTheAnswersOwnColumn) {
+  Oracle oracle = Ranked();
+  const OrderedQuery query{.augmented_sql = "q", .positions = {1}, .keys = 0};
+  const ResultSet answer = oracle.Answer(2, 0, std::nullopt);
+  EXPECT_FALSE(CompareOrdered(
+      answer, Result({kT, kI}, {{"a", "1"}, {"d", "2"}, {"b", "2"}, {"c", "2"}, {"e", "3"}}), query,
+      std::ref(oracle)));
+  const auto across = CompareOrdered(
+      answer, Result({kT, kI}, {{"b", "2"}, {"a", "1"}, {"c", "2"}, {"d", "2"}, {"e", "3"}}), query,
+      std::ref(oracle));
+  ASSERT_TRUE(across.has_value());
+  EXPECT_TRUE(across.value_or(Discrepancy{}).mismatch);
+
+  // ORDER BY 2, <expression>: runs {a}, {b, c}, {d, e}.
+  Oracle both(
+      {kT, kI, kI},
+      {{"a", "1", "1"}, {"b", "1", "2"}, {"c", "1", "2"}, {"d", "2", "1"}, {"e", "2", "1"}});
+  const OrderedQuery mixed{.augmented_sql = "q", .positions = {1}, .keys = 1};
+  const ResultSet mixed_answer = both.Answer(2, 0, std::nullopt);
+  EXPECT_FALSE(CompareOrdered(
+      mixed_answer, Result({kT, kI}, {{"a", "1"}, {"c", "1"}, {"b", "1"}, {"e", "2"}, {"d", "2"}}),
+      mixed, std::ref(both)));
+  const auto first = CompareOrdered(
+      mixed_answer, Result({kT, kI}, {{"b", "1"}, {"a", "1"}, {"c", "1"}, {"d", "2"}, {"e", "2"}}),
+      mixed, std::ref(both));
+  ASSERT_TRUE(first.has_value()) << "a and b have equal positions but not equal appended keys";
+  EXPECT_TRUE(first.value_or(Discrepancy{}).mismatch);
+
+  // A position beyond the answer's columns: DuckDB fails such a query, so it is a harness bug.
+  const auto beyond = CompareOrdered(
+      answer, Result({kT, kI}, {{"b", "2"}, {"a", "1"}, {"c", "2"}, {"d", "2"}, {"e", "3"}}),
+      OrderedQuery{.augmented_sql = "q", .positions = {2}, .keys = 0}, std::ref(oracle));
+  ASSERT_TRUE(beyond.has_value());
+  EXPECT_NE(beyond.value_or(Discrepancy{}).what.find("harness bug"), std::string::npos);
 }
 
 // Tied rows whose R values differ by less than the tolerance but are not equal: every antb1 row
