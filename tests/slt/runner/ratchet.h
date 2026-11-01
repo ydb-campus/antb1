@@ -50,18 +50,28 @@ struct RatchetStatus {
 std::expected<RatchetStatus, std::string> ParseRatchetStatus(std::string_view json,
                                                              const Workload& workload);
 
-// One of `count` disjoint slices of the queries (antb1-slt --shard): the query at index i of the
-// file, from 0, is in slice i % count, so every slice holds every count-th query and the slices
-// stay even in size and in how far apart their queries are. A run reports and checks its slice
+// One of `count` disjoint slices of the queries (antb1-slt --shard). Without a shard map, the query
+// at index i of the file, from 0, is in slice i % count, so every slice holds every count-th query
+// and the slices stay even in size and in how far apart their queries are. With one (--shard-map,
+// ParseShardMap), `queries` holds the slice's query numbers. A run reports and checks its slice
 // alone.
 struct RatchetShard {
   int64_t index = 0;  // from 0
   int64_t count = 1;
+  std::optional<std::vector<int64_t>> queries;  // sorted
 };
 
 // "K/N", 1 <= K <= N <= 99, as the slice of RatchetShard (K counts from 1 on the command line,
 // where --shard takes it); std::nullopt for anything else.
 std::optional<RatchetShard> ParseRatchetShard(std::string_view text);
+
+// The slices of a shard map, the JSON `{"shards": [[<query number>, ...], ...]}` (antb1-slt
+// --shard-map, for the slices of --shard): 1 to 99 slices, each a sorted list of query numbers
+// without duplicates and never empty, and every query of the file, `first` to `first + count - 1`,
+// in exactly one slice, so that the slices together are the whole ratchet.
+std::expected<std::vector<std::vector<int64_t>>, std::string> ParseShardMap(std::string_view json,
+                                                                            int64_t first,
+                                                                            int64_t count);
 
 // The costs of a run (antb1-slt tpch and tpcds --costs, for ADR 0037's SF 1 budget): with them,
 // each outcome line gets the query's seconds (antb1, DuckDB and the comparison), antb1's own

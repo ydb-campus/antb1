@@ -436,11 +436,15 @@ judge). Linux only, as for TPC-H. So far it holds:
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
 - `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
 - `tpcds.status.sf0_1` (label `oracle`), `tpcds.status.sf1.1of8` to `tpcds.status.sf1.8of8` (label `tpc-sf1`:
-  scale factor 1 in eight shards of every eighth query, `antb1-slt tpcds --shard K/8`, since one run of all 99 outlasts
-  the timeout under AddressSanitizer once the queries with UNION ALL CTEs pass; under ASan they run nightly,
-  `pixi run asan-tpc-sf1`, not in `pixi run asan`, and not under ThreadSanitizer) and `parallel.tpcds.status.sf0_1`
-  (label `parallel`: 4 threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for
-  TPC-H, because at scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet.
+  scale factor 1 in eight shards, since one run of all 99 outlasts the timeout under AddressSanitizer once the queries
+  with UNION ALL CTEs pass; under ASan they run nightly, `pixi run asan-tpc-sf1`, not in `pixi run asan`, and not
+  under ThreadSanitizer) and `parallel.tpcds.status.sf0_1` (label `parallel`: 4 threads, 1000-row batches, equal to
+  the 1-thread results byte for byte; scale factor 0.1, as for TPC-H, because at scale factor 1 it outlasted the
+  timeout under AddressSanitizer on a CI runner): the ratchet. Each shard runs the queries that
+  `tests/tpcds/sf1_shards.json` lists for it (`antb1-slt tpcds --shard K/8 --shard-map`), split by measured cost:
+  `python3 -I tools/ci/tpc_costs.py --shard-map 8 build/<preset>` proposes the map from the costs of every shard of one
+  split, each finished, the longest query first, each to the shard with the fewest seconds so far, and a query that
+  does not pass yet counted as the median passing one. Propose it again when a shard misses ADR 0037's budget.
   `antb1-slt tpcds` runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
   ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with memory
   limits of 2 GiB for antb1 and 1 GiB for DuckDB, and a 900-second timeout; its status table is "Queries derived

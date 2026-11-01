@@ -12,8 +12,8 @@
 //   antb1-slt answers --fixtures DIR --tables FILE --queries DIR --answers DIR [--only N]
 //                     [--mutate KIND]
 //   antb1-slt tpch --fixtures DIR --tables FILE --queries DIR --status FILE [--memory-limit SIZE]
-//                  [--oracle-memory-limit SIZE] [--only N] [--shard K/N] [--costs FILE]
-//                  [--mutate KIND]
+//                  [--oracle-memory-limit SIZE] [--only N] [--shard K/N [--shard-map FILE]]
+//                  [--costs FILE] [--mutate KIND]
 //   antb1-slt tpcds ... (the options of tpch)
 //   antb1-slt version
 //
@@ -116,8 +116,9 @@ struct Args {
   // DuckDB oracle's (DuckDbEngine::Make)
   std::string memory_limit;
   std::string oracle_memory_limit;
-  std::string shard;  // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
-  std::string costs;  // tpch, tpcds: the costs file (RatchetCosts), or empty
+  std::string shard;      // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
+  std::string shard_map;  // tpch, tpcds: the slices of --shard as a file (ParseShardMap), or empty
+  std::string costs;      // tpch, tpcds: the costs file (RatchetCosts), or empty
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -691,6 +692,28 @@ int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
     }
     options.shard = *shard;
   }
+  if (!args.shard_map.empty()) {
+    if (args.shard.empty()) {
+      std::println(stderr, "antb1-slt: --shard-map needs --shard K/N");
+      return kExitUsage;
+    }
+    auto text = ReadFile(args.shard_map);
+    if (!text) {
+      std::println(stderr, "{}", text.error());
+      return kExitSetup;
+    }
+    auto map = ParseShardMap(*text, workload.first, static_cast<int64_t>(queries->size()));
+    if (!map) {
+      std::println(stderr, "antb1-slt: {}: {}", args.shard_map, map.error());
+      return kExitUsage;
+    }
+    if (std::cmp_not_equal(map->size(), options.shard.count)) {
+      std::println(stderr, "antb1-slt: {}: slice count {}, but --shard {} needs {}", args.shard_map,
+                   map->size(), args.shard, options.shard.count);
+      return kExitUsage;
+    }
+    options.shard.queries = std::move((*map)[static_cast<std::size_t>(options.shard.index)]);
+  }
   // The costs file is truncated first and every record flushed, so a run that times out keeps the
   // queries it finished and names the one it was running.
   std::ofstream costs_file;
@@ -872,7 +895,10 @@ int Main(std::span<char*> argv, const Environment& env) {
     cmd->add_option(
         "--shard", args.shard,
         "Run only slice K of N (K/N): the queries at index K - 1, K - 1 + N, ... of the "
-        "file, from 0, checked against the ratchet alone");
+        "file, from 0, or those --shard-map lists, checked against the ratchet alone");
+    cmd->add_option("--shard-map", args.shard_map,
+                    "The queries of each slice of --shard: {\"shards\": [[<query>, ...], ...]}, "
+                    "every query in one slice (tests/tpcds/sf1_shards.json)");
     cmd->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
     cmd->add_option("--costs", args.costs,
                     "Print each query's seconds and antb1's peak memory, and write them to this "

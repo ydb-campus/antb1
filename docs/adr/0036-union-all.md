@@ -145,6 +145,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   ratchet. In eight, the one holding query 4 still took 79%. So the same day the shards left the PR's ASan leg and the
   nightly ThreadSanitizer run, where one of four had outlasted the timeout; a nightly job runs them under ASan
   ([ADR 0006](0006-test-strategy-and-data-policy.md)).
+  Update (2026-11-01, ADR 0037's HC4): the eight shards run the queries of a committed map split by measured cost
+  (`tests/tpcds/sf1_shards.json`), where query 4 has a shard to itself.
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
 - A union's consumer is serial. A large union under a GROUP BY, a join or a sort runs at the consumer's

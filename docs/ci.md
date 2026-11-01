@@ -453,6 +453,9 @@ These jobs are the build-test legs, `clang-coverage-fuzz`, nightly `tsan`, `asan
   branch runs every nightly job (the static builds included), and a job that fails there opens the nightly-failure
   issue or comments on the open one.
 - Locally, run it after `pixi run test`: `python3 -I tools/ci/tpc_costs.py build/dev`.
+- When a shard misses the budget, `python3 -I tools/ci/tpc_costs.py --shard-map 8 build/<preset>` proposes a new
+  `tests/tpcds/sf1_shards.json` from the costs of the eight shards (ADR 0037's HC4,
+  [testing.md](testing.md#data-derived-from-tpc-ds)); the costs of a run under AddressSanitizer split them best.
 
 | Artifact | Job | When | Kept |
 | --- | --- | --- | --- |

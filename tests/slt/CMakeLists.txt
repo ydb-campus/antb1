@@ -812,6 +812,61 @@ if(ANTB1_HAVE_DUCKDB)
       COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
     )
   endforeach()
+  # --shard-map (RatchetShard, ParseShardMap): the slices of --shard as a file. A slice runs the queries the map lists
+  # for it; a map that does not split the queries into --shard's slices, each query in one, and --shard-map without
+  # --shard are usage errors, and a map that cannot be read is a setup error.
+  set(_map_dir "${_tpch_selftest}/shard_map")
+  file(WRITE "${_map_dir}/map.json" "{\"shards\": [[2], [1]]}\n")
+  file(WRITE "${_map_dir}/partial.json" "{\"shards\": [[1]]}\n")
+  foreach(
+    case
+    IN
+    ITEMS slice missing_query slices slices_more alone unreadable
+  )
+    set(_name harness.tpch.status.shard_map_${case})
+    set(_exit 2)
+    if(case STREQUAL "slice")
+      set(_exit 0)
+      set(_options --shard 1/2 --shard-map "${_map_dir}/map.json")
+      set(_require "^Q2: running\nQ2: unsupported\nTPCH: PASS queries=1 pass=\\[\\] unsupported=1 ")
+    elseif(case STREQUAL "missing_query")
+      set(_options --shard 1/1 --shard-map "${_map_dir}/partial.json")
+      set(_require "partial\\.json: Q2 is in no shard")
+    elseif(case STREQUAL "slices")
+      set(_options --shard 1/3 --shard-map "${_map_dir}/map.json")
+      set(_require "map\\.json: slice count 2, but --shard 1/3 needs 3")
+    elseif(case STREQUAL "slices_more")
+      set(_options --shard 1/1 --shard-map "${_map_dir}/map.json")
+      set(_require "map\\.json: slice count 2, but --shard 1/1 needs 1")
+    elseif(case STREQUAL "alone")
+      set(_options --shard-map "${_map_dir}/map.json")
+      set(_require "--shard-map needs --shard K/N")
+    else()
+      set(_exit 3)
+      set(_options --shard 1/2 --shard-map "${_map_dir}/no_such_map.json")
+      set(_require "cannot read '[^\n]*no_such_map\\.json'")
+    endif()
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_costs_dir}/queries"
+      --status
+      "${_costs_dir}/status.json"
+      --memory-limit
+      1GiB
+      ${_options}
+    )
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
+    )
+  endforeach()
 
   # The local report of the refused queries (RatchetOptions::refusals): antb1's messages quote the query, so the
   # reasons go only to <temp dir>/refusals.txt, never to the log, and not at all on GitHub Actions, where an earlier
