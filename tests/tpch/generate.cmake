@@ -11,7 +11,7 @@
 #   generate.sql                  our own SQL that the duckdb CLI runs (no TPC text)
 #   queries/q01.sql ..            the query texts, in DuckDB's dialect (22 for TPC-H, 99 for TPC-DS)
 #   sf<sf>/<table>.parquet        the tables at each scale factor (snappy, row groups of 2048 rows): TPC-H's 8 at 0.01
-#                                 and 0.1, TPC-DS's 24 at 0.1 and 1
+#                                 and 0.1, TPC-DS's 24 at 0.01, 0.1 and 1
 #   sf<sf>/answers/q01.csv ..     TPC-H only: DuckDB's stored answers (`antb1-slt answers` reads them). The TPC-DS
 #                                 extension has none to read: tpcds_answers() fails on every scan (ADR 0006).
 #
@@ -81,7 +81,7 @@ elseif(WORKLOAD STREQUAL "tpcds")
     web_site
   )
   set(_query_count 99)
-  set(_scale_factors 0.1 1)
+  set(_scale_factors 0.01 0.1 1)
   set(_answers OFF)
 else()
   message(FATAL_ERROR "generate.cmake: -DWORKLOAD=tpch or -DWORKLOAD=tpcds is required")

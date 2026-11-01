@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -175,6 +176,11 @@ class QueryGenerator {
 
   [[nodiscard]] uint64_t seed() const { return seed_; }
   [[nodiscard]] const GeneratorOptions& options() const { return options_; }
+  // How many of the tables' refs the generator can follow (UsableEdges): those whose table and
+  // columns resolve and whose column pairs are of one kind, never DOUBLE, never a column read
+  // through a type override, DECIMALs within 38 common digits. A ref it cannot follow is dropped
+  // without an error; a query may still pass over a counted one, for its key types or row bound.
+  [[nodiscard]] std::size_t joinable_refs() const;
 
  private:
   QueryGenerator(std::vector<GenTable> tables, uint64_t seed, GeneratorOptions options)

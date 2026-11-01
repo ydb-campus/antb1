@@ -23,7 +23,7 @@ internals are described next to the code in [tests/README.md](../tests/README.md
 | Coverage floors | `tools/ci/` | line and branch coverage of each module never drops below its floor | in use |
 | ClickBench data tests | `tests/data/` | antb1 against DuckDB on the pinned `hits_0` partition, metamorphic relations on it and the ClickBench ratchet, with redacted output | in use |
 | Data derived from TPC-H | `tests/tpch/` | data, query texts and answers generated at test time; DuckDB's answers on the generated files, and antb1 against DuckDB on generated queries over them, with redacted output (Linux only) | in use |
-| Data derived from TPC-DS | `tests/tpcds/` | data and query texts generated at test time from the pinned dsdgen extension, checked byte for byte and against committed digests; the ratchet is next (Linux only) | started |
+| Data derived from TPC-DS | `tests/tpcds/` | data and query texts generated at test time from the pinned dsdgen extension, checked byte for byte and against committed digests; the ratchet of the 99 queries, and antb1 against DuckDB on generated queries joined along the schema's foreign keys, with redacted output (Linux only) | in use |
 | Benchmark smoke tests | `bench/` | every micro benchmark runs once (`pixi run release`), so they keep building and running | in use |
 
 Build-level gates run on every PR as well: ASan and UBSan (`pixi run asan`), clang-tidy (`pixi run tidy`), the
@@ -45,8 +45,8 @@ table must match it (`pixi run lint` compares them).
 | `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs and hand-built hash-join plans over the star fixtures |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
-| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star` and `diff.tpch`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema, `diff.tpch` over the data derived from TPC-H) |
-| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and 300 random differential queries (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
+| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
+| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`, `parallel.diff.tpcds`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
 | `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the pending check of the `.slt` files, the data derived from TPC-H against DuckDB's answers |
@@ -215,11 +215,11 @@ only on `s`, `i`, the tables and the supported features, so a single case reprod
 - Most queries use only the features declared in `tests/slt/supported_features.h`; for them an antb1 `Unsupported`
   answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#grammar):
   there an `Unsupported` answer is counted per missing feature and reported, not a failure.
-- Over tables with `ref=` options (the star schema) a query that may use a join feature often joins 2 or 3 tables
-  along the refs, as commas, `CROSS JOIN` or `[INNER] JOIN ... ON`, with aliases and qualified names, within a row
-  bound computed from the keys' statistics ([tests/slt/README.md](../tests/slt/README.md#random-differential-test)).
-  Until the join features are declared supported, those queries are target-grammar samples that antb1 answers with
-  `Unsupported`.
+- Over tables with `ref=` options (the star schema, and the tables derived from TPC-DS of `diff.tpcds`) a query that
+  may use a join feature often joins 2 or 3 tables along the refs, as commas, `CROSS JOIN` or `[INNER] JOIN ... ON`,
+  with aliases and qualified names, within a row bound computed from the keys' statistics
+  ([tests/slt/README.md](../tests/slt/README.md#random-differential-test)). The join features are declared
+  supported, so every generated join is compared against DuckDB like any other query.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the command that
   reproduces the case:
 
@@ -424,7 +424,7 @@ judge). Linux only, as for TPC-H. So far it holds:
   (one thread, no extension auto-install or auto-load) and provides the 99 query texts, of which only the count is
   printed.
 - `fixtures.tpcds` (label `setup`): `tests/tpch/generate.cmake` with `-DWORKLOAD=tpcds`, the generator of the
-  data derived from TPC-H below. It writes the 24 tables at scale factors 0.1 and 1 and the 99 query texts to
+  data derived from TPC-H below. It writes the 24 tables at scale factors 0.01, 0.1 and 1 and the 99 query texts to
   `build/<preset>/fixtures/tpcds`, checks every text byte for byte and against `tests/tpcds/queries.sha256`, and
   prints numbers and digests only. Scale factor 1 because at 0.1 DuckDB returns no rows for 18 of the 99 queries
   (for 1 at scale factor 1), and an empty answer that equals an empty answer shows little. After an intended update
@@ -434,7 +434,9 @@ judge). Linux only, as for TPC-H. So far it holds:
   `harness.tpcds.generate.duckdb_fails.on_ci` and `.local`: as for TPC-H, with `ANTB1_TPCDS_SHOW`;
   `harness.tpcds.generate.unknown_workload`: the generator refuses an unknown `-DWORKLOAD`. `fixtures.tpch` and
   `fixtures.tpcds` share a ctest resource lock, so the two generators never run at once.
-- `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet.
+- `tests/tpcds/tables_sf0_1.txt` and `tables_sf1.txt`: the tables, each marked `redact`, for the ratchet;
+  `tables_sf0_01.txt` for the differential test, which also declares the schema's 107 foreign keys (`ref=`, table and
+  column names only).
 - `tpcds.status.sf0_1` (label `oracle`), `tpcds.status.sf1.1of8` to `tpcds.status.sf1.8of8` (label `tpc-sf1`:
   scale factor 1 in eight shards, since one run of all 99 outlasts the timeout under AddressSanitizer once the queries
   with UNION ALL CTEs pass; under ASan they run nightly, `pixi run asan-tpc-sf1`, not in `pixi run asan`, and not
@@ -452,6 +454,13 @@ judge). Linux only, as for TPC-H. So far it holds:
   seconds and antb1's peak memory (`--costs`, [below](#the-ratchet-of-the-queries-derived-from-tpc-h)): the numbers
   of ADR 0037's scale factor 1 budget. `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds`
   on our own numbered queries (`harness.tpch.status.*` covers the rest of the shared ratchet).
+- `diff.tpcds` (label `diff`) and `parallel.diff.tpcds` (label `parallel`: 4 threads, 1000-row batches, equal to the
+  1-thread results byte for byte): 200 generated queries over the tables at scale factor 0.01, joined along their
+  foreign keys, antb1 against DuckDB (`antb1-slt diff`, a fixed seed; ADR 0037's HC7). The run must print that the
+  generator can follow all 107 foreign keys, since it drops one it cannot follow without an error. Scale factor 0.01
+  and 200 queries, where `diff.tpch` runs 300, keep both runs within the default timeout under AddressSanitizer on a
+  CI runner: at 0.1 the same 200 queries took 5.8 times as long in a Debug build on a developer's Apple silicon Mac
+  (test-build diagnostics).
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 this implementation does not comply with all requirements of the TPC-DS Benchmark.
@@ -551,11 +560,11 @@ groups without `ORDER BY`, so a new seed is checked with `pixi run asan` first, 
 is replaced. The queries of a seed also depend on the query generator and on the supported features
 (`tests/slt/supported_features.h`), so a PR that changes either runs `pixi run asan` too. A failure in antb1 is fixed,
 never avoided with another seed. The DECIMAL queries of the generator change only the seeds of tables with DECIMAL
-columns (`diff.decimal`, `diff.star`, `diff.tpch`): every draw for them is taken where a DECIMAL column is used. The
-joins draw from a second random stream of the seed and the query index, so a query that joins nothing is the same
-with or without refs, and the join generation changes only the join queries of the seeds of tables with refs
-(`diff.star`). Stars among the select items and qualified stars draw from a ninth stream: they changed the star
-queries of every seed and no other query ([tests/slt/README.md](../tests/slt/README.md)).
+columns (`diff.decimal`, `diff.star`, `diff.tpch`, `diff.tpcds`): every draw for them is taken where a DECIMAL column
+is used. The joins draw from a second random stream of the seed and the query index, so a query that joins nothing is
+the same with or without refs, and the join generation changes only the join queries of the seeds of tables with refs
+(`diff.star`, `diff.tpcds`). Stars among the select items and qualified stars draw from a ninth stream: they changed
+the star queries of every seed and no other query ([tests/slt/README.md](../tests/slt/README.md)).
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

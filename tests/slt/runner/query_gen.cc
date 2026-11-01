@@ -3992,6 +3992,8 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   return QueryGenerator(std::move(tables), seed, options);
 }
 
+std::size_t QueryGenerator::joinable_refs() const { return UsableEdges(tables_).size(); }
+
 GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   const uint64_t state = Mix(seed_ + Mix(index + kGamma));
   Rng rng(state);
