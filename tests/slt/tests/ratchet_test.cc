@@ -109,7 +109,7 @@ struct Fixture {
     r.stats = RunRatchet(queries, {.commit = {}, .pass = std::move(pass)}, workload, a, o,
                          {.redact = redact,
                           .only = only,
-                          .shard = shard,
+                          .shard = std::move(shard),
                           .status_path = "status.json",
                           .command = "cmd",
                           .clock = clock,
@@ -205,6 +205,62 @@ TEST(ParseRatchetShard, TakesKOfNFromOne) {
                           " 1/4", "1 /4", "+1/4"}) {
     EXPECT_FALSE(ParseRatchetShard(bad).has_value()) << "'" << bad << "'";
   }
+}
+
+// A shard map lists the queries of every slice: each query of the file in exactly one slice.
+TEST(ParseShardMap, TakesEveryQueryInExactlyOneSlice) {
+  EXPECT_EQ(ParseShardMap(R"({"shards": [[2, 3], [1]]})", 1, 3),
+            (std::vector<std::vector<int64_t>>{{2, 3}, {1}}));
+  EXPECT_EQ(ParseShardMap("{\n  \"shards\": [\n    [1, 2, 3]\n  ]\n}\n", 1, 3),
+            (std::vector<std::vector<int64_t>>{{1, 2, 3}}));
+  const auto error = [](std::string_view json) {
+    const auto map = ParseShardMap(json, 1, 3);
+    return map.has_value() ? std::string("accepted") : map.error();
+  };
+  EXPECT_EQ(error(R"({"shards": []})"), "0 shards, not 1 to 99");
+  EXPECT_EQ(error(R"({"shards": [[1, 2, 3], []]})"), "shard 2 is empty");
+  EXPECT_EQ(error(R"({"shards": [[2, 1], [3]]})"), "shard 1 must be sorted and without duplicates");
+  EXPECT_EQ(error(R"({"shards": [[1, 1], [2, 3]]})"),
+            "shard 1 must be sorted and without duplicates");
+  EXPECT_EQ(error(R"({"shards": [[1, 4], [2, 3]]})"),
+            "shard 1 lists Q4, but the query file has 3 queries");
+  EXPECT_EQ(error(R"({"shards": [[0, 1], [2, 3]]})"),
+            "shard 1 lists Q0, but the query file has 3 queries");
+  EXPECT_EQ(error(R"({"shards": [[1, 2], [2, 3]]})"), "Q2 is in shards 1 and 2");
+  EXPECT_EQ(error(R"({"shards": [[1], [3]]})"), "Q2 is in no shard");
+  EXPECT_TRUE(
+      error(R"({"slices": [[1, 2, 3]]})").ends_with(R"(unexpected key "slices", not "shards")"));
+  for (const std::string_view json :
+       {R"({"shards": [[1, 2, 3]], "x": 1})", R"({"shards": [[1, 2, 3],]})",
+        R"({"shards": [[1, 2, 3] [4]]})", R"({"shards": [[1, 2, 3]]} x)",
+        R"({"shards": [1, 2, 3]})", R"({"shards": [[1, 2, -3]]})", ""}) {
+    EXPECT_TRUE(error(json).starts_with("offset ")) << json << ": " << error(json);
+  }
+  // At most 99 slices, as --shard takes.
+  std::string hundred = R"({"shards": [)";
+  for (int n = 1; n <= 100; ++n) {
+    hundred += std::format("{}[{}]", n == 1 ? "" : ", ", n);
+  }
+  hundred += "]}";
+  EXPECT_EQ(ParseShardMap(hundred, 1, 100).error_or(""), "100 shards, not 1 to 99");
+}
+
+// A slice of a shard map runs the queries it lists, whichever their index, and checks only those.
+TEST(RunRatchet, AShardMapSliceRunsTheQueriesItLists) {
+  Fixture f;
+  const auto listed = f.Run({1, 2}, false, std::nullopt,
+                            {.index = 0, .count = 2, .queries = std::vector<int64_t>{2, 3}});
+  EXPECT_EQ(listed.stats.queries, 2);
+  EXPECT_EQ(listed.stats.failed, 1) << listed.out;
+  EXPECT_TRUE(listed.out.starts_with("Q2: running\n")) << listed.out;
+  EXPECT_TRUE(listed.out.contains("Q3: running\n")) << listed.out;
+  EXPECT_TRUE(listed.out.contains("FAIL Q2: unexpected fail")) << listed.out;
+  EXPECT_FALSE(listed.out.contains("Q1:")) << listed.out;
+  const auto first = f.Run({1, 2}, false, std::nullopt,
+                           {.index = 1, .count = 2, .queries = std::vector<int64_t>{1}});
+  EXPECT_EQ(first.stats.queries, 1);
+  EXPECT_EQ(first.stats.passed, (std::vector<int64_t>{1}));
+  EXPECT_EQ(first.stats.failed, 0) << first.out;
 }
 
 // A shard runs every count-th query from its index and checks only those against the ratchet: a

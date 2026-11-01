@@ -1,6 +1,8 @@
 """Tests for tools/ci/tpc_costs.py (run by `pixi run lint`): the report of each query's seconds and antb1's peak memory
 in the ratchets of the queries derived from TPC-H and TPC-DS (ADR 0037's HC3), its budget warnings, that it fails
-closed without printing what it refuses, and that every CI leg that runs those ratchets reports them.
+closed without printing what it refuses, that every CI leg that runs those ratchets reports them, the --shard-map
+proposal of tests/tpcds/sf1_shards.json (ADR 0037's HC4), and the committed map against the query files and the tool's
+format.
 """
 
 from __future__ import annotations
@@ -320,3 +322,108 @@ def test_every_leg_that_runs_the_ratchets_reports_their_costs() -> None:
                     assert target == f"build/{build_dir}", f"{where}: {task}"
                 checked.add(task)
     assert checked >= CI_LEGS, sorted(CI_LEGS - checked)  # found every leg, so the guard cannot pass on nothing
+
+
+def propose(build: Path, slices: int, capsys) -> tuple[int, str, str]:
+    """The exit code, stdout and stderr of `--shard-map slices`."""
+    code = tpc_costs.main(["--shard-map", str(slices), str(build)])
+    out, err = capsys.readouterr()
+    return code, out, err
+
+
+def sf1_run(build: Path, test: str, queries: list[tuple[int, str, float]], shard: str = "1/1") -> None:
+    records = [{**header(test), "shard": shard}]
+    for n, outcome, seconds in queries:
+        records += query(n, outcome, seconds=seconds)
+    passed = sum(outcome == "pass" for _, outcome, _ in queries)
+    write(build, test, [*records, end(len(queries), passed)])
+
+
+def test_shard_map_puts_the_longest_query_first_into_the_lightest_slice(tmp_path, capsys) -> None:
+    # Q3 10 s into slice 1, Q5 7 s into 2, Q4 5 s into 2 (7 < 10), Q2 4 s into 1 (10 < 12), Q1 3 s into 2 (12 < 14):
+    # neither in the order of the numbers nor in that of the files.
+    sf1_run(tmp_path, "tpcds.status.sf1.1of2", [(1, "pass", 3.0), (3, "pass", 10.0), (5, "pass", 7.0)], "1/2")
+    sf1_run(tmp_path, "tpcds.status.sf1.2of2", [(2, "pass", 4.0), (4, "pass", 5.0)], "2/2")
+    write(tmp_path, "tpcds.status.sf0_1", [header("tpcds.status.sf0_1"), *query(6, seconds=99.0), end(1, 1)])
+    code, out, err = propose(tmp_path, 2, capsys)
+    assert code == 0, err
+    assert out == '{\n  "shards": [\n    [2, 3],\n    [1, 4, 5]\n  ]\n}\n'
+    assert "tpc_costs: slice 1: 2 queries, 14.0 s measured\n" in err
+    assert "tpc_costs: slice 2: 3 queries, 15.0 s measured\n" in err
+
+
+def test_shard_map_spreads_the_queries_that_do_not_pass_yet(tmp_path, capsys) -> None:
+    # Each refused query counts as the median passing one, 3 s: never next to the 30 s query, and two in each of the
+    # other slices, where at their own 0.001 s all four would go to the lightest, slice 3.
+    sf1_run(
+        tmp_path,
+        "tpcds.status.sf1.all",
+        [(1, "pass", 30.0), (2, "pass", 3.0), (3, "pass", 2.0)] + [(n, "unsupported", 0.001) for n in range(4, 8)],
+    )
+    code, out, err = propose(tmp_path, 3, capsys)
+    assert code == 0, err
+    assert json.loads(out) == {"shards": [[1], [2, 5, 7], [3, 4, 6]]}
+
+
+@pytest.mark.parametrize(
+    ("runs", "slices", "message"),
+    [
+        pytest.param({"tpcds.status.sf1.all": ("1/1", [1, 3], "pass")}, 1, "no costs of Q2", id="a missing query"),
+        pytest.param(
+            {"tpcds.status.sf1.1of2": ("1/2", [1, 2], "pass"), "tpcds.status.sf1.2of2": ("2/2", [2], "pass")},
+            1,
+            "Q2 is in two runs",
+            id="twice",
+        ),
+        pytest.param(
+            {"tpcds.status.sf1.1of2": ("1/2", [1, 2], "pass")},
+            1,
+            "the runs are not every shard of one split: 1/2",
+            id="a missing shard",
+        ),
+        pytest.param(
+            {
+                "tpcds.status.sf1.all": ("1/1", [1, 2], "pass"),
+                "tpcds.status.sf1.1of2": ("1/2", [1], "pass"),
+                "tpcds.status.sf1.2of2": ("2/2", [2], "pass"),
+            },
+            1,
+            "the runs are not every shard of one split: 1/1, 1/2, 2/2",
+            id="two splits",
+        ),
+        pytest.param({"tpcds.status.sf1.all": ("1/1", [1, 2], "pass")}, 3, "3 slices for 2 queries", id="slices"),
+        pytest.param({"tpcds.status.sf1.all": ("1/1", [1, 2], "unsupported")}, 2, "no query passes", id="none passes"),
+        pytest.param(
+            {"tpcds.status.sf0_1": ("1/1", [1, 2], "pass")}, 1, "no costs of the scale-factor-1 runs", id="no sf1 run"
+        ),
+    ],
+)
+def test_shard_map_needs_every_query_once(tmp_path, capsys, runs, slices, message) -> None:
+    for test, (shard, numbers, outcome) in runs.items():
+        sf1_run(tmp_path, test, [(n, outcome, 1.0) for n in numbers], shard)
+    code, out, err = propose(tmp_path, slices, capsys)
+    assert code == 1
+    assert out == ""
+    assert f"tpc_costs: {message}" in err and "no shard map" in err
+
+
+def test_shard_map_needs_runs_that_finished_and_files(tmp_path, capsys) -> None:
+    write(tmp_path, "tpcds.status.sf1.1of1", [header("tpcds.status.sf1.1of1"), *query(1)])
+    code, out, err = propose(tmp_path, 1, capsys)
+    assert (code, out) == (1, "")
+    assert "tpcds.status.sf1.1of1 did not finish" in err
+    code, out, err = propose(tmp_path / "empty", 1, capsys)
+    assert (code, out) == (1, ""), "stdout is the map's"
+    assert "tpc_costs: no costs of the queries derived from TPC-H or TPC-DS" in err
+    with pytest.raises(SystemExit) as usage:
+        propose(tmp_path, 0, capsys)
+    assert usage.value.code == 2
+
+
+def test_the_committed_shard_map_holds_every_query_once_as_the_tool_writes_it() -> None:
+    text = (ROOT / "tests" / "tpcds" / "sf1_shards.json").read_text(encoding="utf-8")
+    shards = json.loads(text)["shards"]
+    queries = len(re.findall(r"\bq[0-9]+\.sql\b", (ROOT / "tests" / "tpcds" / "queries.sha256").read_text()))
+    assert sorted(n for shard in shards for n in shard) == list(range(1, queries + 1))
+    assert all(shard == sorted(shard) for shard in shards)
+    assert text == tpc_costs.map_json(shards), "the format of tools/ci/tpc_costs.py --shard-map"

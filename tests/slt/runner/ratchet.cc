@@ -27,14 +27,14 @@
 namespace antb1::slt {
 namespace {
 
-// A strict reader for the small JSON object of a status file: string keys, and values that are
-// strings (without escapes) or arrays of non-negative integers.
-class StatusReader {
+// A strict reader for the small JSON objects of a status file and a shard map: string keys, and
+// values that are strings (without escapes), arrays of non-negative integers or arrays of those.
+class JsonReader {
  public:
-  StatusReader(std::string_view text, std::string_view commit_key)
-      : text_(text), commit_key_(commit_key) {}
+  explicit JsonReader(std::string_view text) : text_(text) {}
 
-  std::expected<RatchetStatus, std::string> Read() {
+  // A status file, with the key `commit_key` too unless it is empty.
+  std::expected<RatchetStatus, std::string> ReadStatus(std::string_view commit_key) {
     RatchetStatus status;
     bool have_commit = false;
     bool have_pass = false;
@@ -49,7 +49,7 @@ class StatusReader {
       if (!Consume(':')) {
         return Error("expected ':'");
       }
-      if (!commit_key_.empty() && *key == commit_key_ && !have_commit) {
+      if (!commit_key.empty() && *key == commit_key && !have_commit) {
         auto commit = String();
         if (!commit) {
           return std::unexpected(commit.error());
@@ -77,16 +77,55 @@ class StatusReader {
     if (pos_ != text_.size()) {
       return Error("text after the object");
     }
-    if (!have_pass || (!commit_key_.empty() && !have_commit)) {
-      return Error(commit_key_.empty()
+    if (!have_pass || (!commit_key.empty() && !have_commit)) {
+      return Error(commit_key.empty()
                        ? std::string(R"(needs the key "pass")")
-                       : std::format(R"(needs the keys "{}" and "pass")", commit_key_));
+                       : std::format(R"(needs the keys "{}" and "pass")", commit_key));
     }
     if (!std::ranges::is_sorted(status.pass) ||
         std::ranges::adjacent_find(status.pass) != status.pass.end()) {
       return Error("\"pass\" must be sorted and without duplicates");
     }
     return status;
+  }
+
+  // A shard map: the one key "shards", whose value is an array of arrays of query numbers.
+  std::expected<std::vector<std::vector<int64_t>>, std::string> ReadShardMap() {
+    if (!Consume('{')) {
+      return Error("expected '{'");
+    }
+    auto key = String();
+    if (!key) {
+      return std::unexpected(key.error());
+    }
+    if (*key != "shards") {
+      return Error(std::format(R"(unexpected key "{}", not "shards")", *key));
+    }
+    if (!Consume(':')) {
+      return Error("expected ':'");
+    }
+    if (!Consume('[')) {
+      return Error("expected an array of shards");
+    }
+    std::vector<std::vector<int64_t>> shards;
+    while (!Consume(']')) {
+      if (!shards.empty() && !Consume(',')) {
+        return Error("expected ',' or ']'");
+      }
+      auto shard = IntegerArray();
+      if (!shard) {
+        return std::unexpected(shard.error());
+      }
+      shards.push_back(*std::move(shard));
+    }
+    if (!Consume('}')) {
+      return Error("expected '}'");
+    }
+    SkipSpace();
+    if (pos_ != text_.size()) {
+      return Error("text after the object");
+    }
+    return shards;
   }
 
  private:
@@ -158,7 +197,6 @@ class StatusReader {
   }
 
   std::string_view text_;
-  std::string_view commit_key_;
   std::size_t pos_ = 0;
 };
 
@@ -315,7 +353,7 @@ std::optional<LineColumn> RefusalPlace(const Statement& q, const std::optional<S
 
 std::expected<RatchetStatus, std::string> ParseRatchetStatus(std::string_view json,
                                                              const Workload& workload) {
-  return StatusReader(json, workload.commit_key).Read();
+  return JsonReader(json).ReadStatus(workload.commit_key);
 }
 
 RefusalReport PlanRefusalReport(bool github_actions, bool only,
@@ -357,6 +395,43 @@ std::optional<RatchetShard> ParseRatchetShard(std::string_view text) {
     return std::nullopt;
   }
   return RatchetShard{.index = *k - 1, .count = *n};
+}
+
+std::expected<std::vector<std::vector<int64_t>>, std::string> ParseShardMap(std::string_view json,
+                                                                            int64_t first,
+                                                                            int64_t count) {
+  auto shards = JsonReader(json).ReadShardMap();
+  if (!shards) {
+    return std::unexpected(shards.error());
+  }
+  if (shards->empty() || shards->size() > 99) {
+    return std::unexpected(std::format("{} shards, not 1 to 99", shards->size()));
+  }
+  std::vector<std::size_t> shard_of(static_cast<std::size_t>(count), 0);  // from 1; 0: none yet
+  for (std::size_t s = 0; s < shards->size(); ++s) {
+    const std::vector<int64_t>& queries = (*shards)[s];
+    if (queries.empty()) {
+      return std::unexpected(std::format("shard {} is empty", s + 1));
+    }
+    if (!std::ranges::is_sorted(queries) || std::ranges::adjacent_find(queries) != queries.end()) {
+      return std::unexpected(std::format("shard {} must be sorted and without duplicates", s + 1));
+    }
+    for (const int64_t n : queries) {
+      if (n < first || n - first >= count) {
+        return std::unexpected(
+            std::format("shard {} lists Q{}, but the query file has {} queries", s + 1, n, count));
+      }
+      std::size_t& owner = shard_of[static_cast<std::size_t>(n - first)];
+      if (owner != 0) {
+        return std::unexpected(std::format("Q{} is in shards {} and {}", n, owner, s + 1));
+      }
+      owner = s + 1;
+    }
+  }
+  if (const auto none = std::ranges::find(shard_of, std::size_t{0}); none != shard_of.end()) {
+    return std::unexpected(std::format("Q{} is in no shard", first + (none - shard_of.begin())));
+  }
+  return *std::move(shards);
 }
 
 RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStatus& status,
@@ -412,7 +487,8 @@ RatchetStats RunRatchet(const std::vector<Statement>& queries, const RatchetStat
     if (options.only.has_value() && std::cmp_not_equal(*options.only, n)) {
       continue;
     }
-    if (i % options.shard.count != options.shard.index) {
+    if (options.shard.queries.has_value() ? !std::ranges::binary_search(*options.shard.queries, n)
+                                          : i % options.shard.count != options.shard.index) {
       continue;  // another slice's (RatchetShard)
     }
     ++stats.queries;

@@ -13,8 +13,15 @@ It fails closed on anything else: a file name or a record outside the schema is 
 without its content, and the exit code is 1, so that even a broken redaction cannot publish text through it. Every line
 it prints is also checked against the patterns tests/tpch/run_redacted.cmake withholds.
 
-Usage: python3 -I tools/ci/tpc_costs.py build/<preset>
-Exit codes: 0, also when there are no files (the macOS leg registers no TPC tests); 1 input outside the schema; 2 usage.
+With --shard-map SLICES it reports nothing and proposes instead the map of the scale-factor-1 shards of TPC-DS,
+tests/tpcds/sf1_shards.json (ADR 0037's HC4), from the costs of every shard of one split, each finished (or of one run
+of all the queries): the longest query first, each to the slice with the fewest seconds so far. A query that does not
+pass yet counts as the median passing query, so that the queries still to come spread over the slices. The map goes to
+stdout, each slice's measured seconds and every error to stderr.
+
+Usage: python3 -I tools/ci/tpc_costs.py [--shard-map SLICES] build/<preset>
+Exit codes: 0, also when there are no files and no --shard-map (the macOS leg registers no TPC tests); 1 input outside
+the schema, or costs that cannot make a map; 2 usage.
 Standard library only: it runs on a bare GitHub runner.
 """
 
@@ -363,20 +370,99 @@ def withheld(text: str) -> bool:
     return any(p.search(text) for p in FORBIDDEN)
 
 
+class MapError(Exception):
+    """Costs that cannot make a shard map."""
+
+
+def propose_shards(runs: list[Run], slices: int) -> tuple[list[list[int]], list[float]]:
+    """The queries of the scale-factor-1 runs of TPC-DS at one thread in `slices` slices (see --shard-map), each
+    sorted, and each slice's measured seconds. The runs must be every shard of one split, K/N for each K of N (one run
+    of all the queries is 1/1), each finished, so that they hold every query once."""
+    chosen = [run for run in runs if run.workload == "tpcds" and SF1_SHARD.match(run.test) and run.one_thread]
+    if not chosen:
+        raise MapError("no costs of the scale-factor-1 runs of TPC-DS at one thread")
+    split = sorted(tuple(int(part) for part in run.shard.split("/")) for run in chosen)
+    if split != [(k, split[0][1]) for k in range(1, split[0][1] + 1)]:
+        raise MapError("the runs are not every shard of one split: " + ", ".join(f"{k}/{n}" for k, n in split))
+    measured: dict[int, float] = {}
+    passing: set[int] = set()
+    for run in chosen:
+        if not run.complete:
+            raise MapError(f"{run.test} did not finish")
+        for q in run.queries:
+            if q.number in measured:
+                raise MapError(f"Q{q.number} is in two runs")
+            measured[q.number] = q.seconds
+            if q.outcome == "pass":
+                passing.add(q.number)
+    if not measured:
+        raise MapError("the runs hold no queries")
+    missing = [n for n in range(1, max(measured) + 1) if n not in measured]
+    if missing:
+        raise MapError(f"no costs of Q{missing[0]}")
+    if not passing:
+        raise MapError("no query passes, so none has a cost to weigh the others by")
+    if slices > len(measured):
+        raise MapError(f"{slices} slices for {len(measured)} queries")
+    nominal = sorted(measured[n] for n in passing)
+    median = (nominal[(len(nominal) - 1) // 2] + nominal[len(nominal) // 2]) / 2
+    weight = {n: measured[n] if n in passing else median for n in measured}
+    weights = [0.0] * slices
+    seconds = [0.0] * slices
+    members: list[list[int]] = [[] for _ in range(slices)]
+    for n in sorted(weight, key=lambda n: (-weight[n], n)):
+        k = min(range(slices), key=lambda i: (weights[i], i))
+        weights[k] += weight[n]
+        seconds[k] += measured[n]
+        members[k].append(n)
+    if not all(members):  # every weight is positive, so each slice takes a query before any takes two
+        raise MapError("a slice is empty")
+    return [sorted(m) for m in members], seconds
+
+
+def map_json(shards: list[list[int]]) -> str:
+    """tests/tpcds/sf1_shards.json: one slice per line."""
+    lines = ",\n".join("    [" + ", ".join(str(n) for n in shard) + "]" for shard in shards)
+    return '{\n  "shards": [\n' + lines + "\n  ]\n}\n"
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("build_dir", help="the build tree, e.g. build/ci-gcc")
+    parser.add_argument(
+        "--shard-map",
+        type=int,
+        metavar="SLICES",
+        help="propose tests/tpcds/sf1_shards.json in SLICES slices instead of reporting",
+    )
     args = parser.parse_args(argv)
+    if args.shard_map is not None and not 1 <= args.shard_map <= 99:
+        parser.error("--shard-map takes 1 to 99 slices")
     costs_dir = Path(args.build_dir) / "tpc-costs"
     paths = sorted(costs_dir.glob("*.jsonl")) if costs_dir.is_dir() else []
     if not paths:
-        print(f"tpc_costs: no costs of the queries derived from TPC-H or TPC-DS in {args.build_dir}", flush=True)
-        return 0
+        # With --shard-map, stdout is the map's.
+        print(
+            f"tpc_costs: no costs of the queries derived from TPC-H or TPC-DS in {args.build_dir}",
+            file=sys.stdout if args.shard_map is None else sys.stderr,
+            flush=True,
+        )
+        return 0 if args.shard_map is None else 1
     try:
         runs = sorted((read_run(path) for path in paths), key=sort_key)
     except SchemaError as e:
         print(f"tpc_costs: {e}: nothing is reported", file=sys.stderr, flush=True)
         return 1
+    if args.shard_map is not None:
+        try:
+            shards, seconds = propose_shards(runs, args.shard_map)
+        except MapError as e:
+            print(f"tpc_costs: {e}: no shard map", file=sys.stderr, flush=True)
+            return 1
+        sys.stdout.write(map_json(shards))
+        for k, members in enumerate(shards, start=1):
+            print(f"tpc_costs: slice {k}: {len(members)} queries, {seconds[k - 1]:.1f} s measured", file=sys.stderr)
+        return 0
     runner = " ".join(filter(None, [os.environ.get("RUNNER_OS"), os.environ.get("RUNNER_ARCH")])) or "a local run"
     log = log_lines(runs, args.build_dir, runner)
     markdown = summary_markdown(runs, args.build_dir, runner)

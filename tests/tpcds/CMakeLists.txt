@@ -157,14 +157,20 @@ endfunction()
 # the same ratchet, and the parallel run (4 threads, batches of 1000 rows) must equal the 1-thread run byte for byte.
 # The parallel run reads scale factor 0.1, as TPC-H's does: at scale factor 1, its 4-thread run plus the 1-thread run
 # it compares against outlasted the timeout under AddressSanitizer on a CI runner, where the 1-thread run alone took
-# 489 seconds. Scale factor 1 itself runs in eight shards (antb1-slt --shard), which together are the whole ratchet:
-# once queries 4, 11 and 74 recompute their UNION ALL CTEs per reference (ADR 0036), one run of all 99 would outlast
-# that timeout too. Each shard runs every eighth query, so each holds the same number of queries; their times differ
-# with the heavy queries they hold. With three shards, the one holding query 4 came within a third of the timeout;
-# with four, on CI runners about half as fast as before, the shards holding queries 4, 28 and 88 and queries 11 and
-# 23 took 87% and 89% of it once 28, 88 and 23 joined the ratchet; with eight, the one holding query 4 still took 79%.
-# Query 4 alone takes most of its shard's time: more shards no longer help there, while X7's filter pushdown into the
-# branches would. So the sanitizers run scale factor 1 only in its own nightly job: its label, tpc-sf1, is left out by
+# 489 seconds. Scale factor 1 itself runs in eight shards (antb1-slt --shard K/8), which together are the whole
+# ratchet: once queries 4, 11 and 74 recompute their UNION ALL CTEs per reference (ADR 0036), one run of all 99 would
+# outlast that timeout too. Each shard used to run every eighth query, so their times differed with the heavy queries
+# they held: with eight, the one holding query 4 took 79% of the timeout under AddressSanitizer on a GitHub runner (the
+# PR leg clang-asan, 2026-10-31). Now each runs the queries that sf1_shards.json lists for it (--shard-map, ADR 0037's
+# HC4), split by measured cost: tools/ci/tpc_costs.py --shard-map 8 proposes the map from the costs of every shard of
+# one split (or of one run of all 99), the longest query first, each to the shard with the fewest seconds so far; a
+# query that does not pass yet counts as the median passing query, so that the queries still to come spread over the
+# shards. The map comes from one run of all 99 in the ASan build (build/ci-asan) on a developer's Apple silicon Mac
+# (2026-11-01; test-build diagnostics, not performance numbers): query 4 alone in the first shard, which it fills by
+# itself, and the other seven within 2% of each other in seconds. Propose it again when a shard misses ADR 0037's budget
+# (tools/ci/tpc_costs.py warns in every leg that runs the shards). Query 4 alone takes most of a shard's
+# time: more shards no longer help there, while X7's filter pushdown into the branches would. So the sanitizers run
+# scale factor 1 only in its own nightly job: its label, tpc-sf1, is left out by
 # the ci-asan test preset (pixi run asan, the PR leg clang-asan) and by the tsan one (ThreadSanitizer, nightly, where
 # a shard of four outlasted the timeout; the shards run one engine thread), and it is all that the asan-tpc-sf1 preset
 # runs (the nightly job of that name). On every PR, gcc-compat and clang-coverage-fuzz still run the shards and
@@ -186,7 +192,10 @@ string(
   "Benchmark results, as this implementation does not comply with all requirements of the TPC-DS Benchmark\\.\n"
 )
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
-set(_shards 8)
+set(_shard_map "${CMAKE_CURRENT_SOURCE_DIR}/sf1_shards.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_shard_map}")
+file(READ "${_shard_map}" _shard_json)
+string(JSON _shards LENGTH "${_shard_json}" shards)
 set(_kinds sf0_1)
 foreach(shard RANGE 1 ${_shards})
   list(APPEND _kinds sf1_${shard})
@@ -199,9 +208,10 @@ foreach(kind IN LISTS _kinds)
     set(_name tpcds.status.sf1.${_shard}of${_shards})
     set(_sf 1)
     set(_label tpc-sf1)
-    set(_options --shard ${_shard}/${_shards})
-    # Queries K, K + 8, ... of the 99: 13 for shards 1 to 3, 12 for shards 4 to 8.
-    math(EXPR _queries "(99 - ${_shard} + ${_shards}) / ${_shards}")
+    set(_options --shard ${_shard}/${_shards} --shard-map "${_shard_map}")
+    # The queries the map lists for the shard.
+    math(EXPR _at "${_shard} - 1")
+    string(JSON _queries LENGTH "${_shard_json}" shards ${_at})
   elseif(kind STREQUAL "parallel")
     set(_name parallel.tpcds.status.sf0_1)
     set(_sf 0_1)

@@ -302,14 +302,20 @@ passing queries; the workload's disclaimer comes first and after the summary; FI
 (`RatchetCosts`), truncated first and flushed record by record, and the repro line leaves `--costs` out. Every TPC
 ratchet test passes `--memory-limit 2GiB --oracle-memory-limit 1GiB` and
 `--costs build/<preset>/tpc-costs/<test>.jsonl`, the file that `tools/ci/tpc_costs.py` reports in each CI leg
-([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). Its self-tests `harness.tpch.status.*` write our own
+([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). `--shard K/N` runs slice K of N, every Nth query from the
+Kth, or with `--shard-map FILE` the queries that the map, `{"shards": [[<query>, ...], ...]}`, lists for slice K: N
+slices, every query of the file in exactly one (`tests/tpcds/sf1_shards.json`). Either way the run checks its slice
+against the ratchet alone. Its self-tests `harness.tpch.status.*` write our own
 numbered queries over the canary table (marked `redact`) into the build tree; `harness.tpch.status.costs`,
 `.costs_repro`, `.costs_memory` and `.costs_unwritable` check the costs lines, the file (through
 `print_file_after.cmake`), the repro line, a query over the memory limit (a memory error) and a file that cannot be
 written (exit code 3); `.oracle_memory` and `.oracle_memory_invalid` check that DuckDB gets its limit (under 1 KiB
 it fails the query that antb1 answers, and the repro line keeps the limit) and that a size the option does not take
-is a usage error. A run also writes why antb1 refuses each query to `<temp dir>/refusals.txt` (`Q<n>`,
-`line:column` in the query's file, antb1's message; a `--shard` run, its slice's) and names only the file in the log.
+is a usage error; `.shard_map_slice`, `_missing_query`, `_slices`, `_slices_more`, `_alone` and `_unreadable` check
+that a slice runs the queries its map lists, and that a map missing a query, one with fewer or more slices than
+`--shard`, a map without `--shard` (usage errors) and a map that cannot be read (exit code 3) are refused. A run also
+writes why antb1 refuses each query to `<temp dir>/refusals.txt` (`Q<n>`, `line:column` in the query's file, antb1's
+message; a `--shard` run, its slice's) and names only the file in the log.
 The messages quote the queries, so the report is local only (`PlanRefusalReport` in `runner/ratchet.h`): it is not
 written on GitHub Actions, for the repro of one query (`--only`) or with a temp dir outside the build tree (the parent
 of `--fixtures`), and an earlier run's file is removed before anything else. `--show-values` also prints each message,
