@@ -81,7 +81,8 @@ values below it look like. Each row of the result is one line after it; the cell
   with a record that both engines run and that is DOUBLE in both (a `UNION ALL` with an empty DOUBLE branch): antb1's
   values must still be DuckDB's (`float_keys` in `cases/having/having.slt`).
 - `skipif <engine>` / `onlyif <engine>` (engine `antb1` or `duckdb`) guard the next record.
-- `pending <roadmap id>` (`pending J4`) guards the next statement or query until that roadmap PR answers it: DuckDB
+- `pending <roadmap id>` (`pending J4`, `pending NL2`: one or two capital letters, digits and at most one small
+  letter) guards the next statement or query until that roadmap PR answers it: DuckDB
   runs it, antb1 only in the pending check (below). It takes no `skipif` or `onlyif`.
 - `halt` stops the file (for one engine when guarded); `hash-threshold <n>` hashes results with more than
   `n` values (0: never), except results with an R column.

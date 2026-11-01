@@ -130,7 +130,7 @@ TEST(ParseSlt, ReadsPendingGuards) {
   auto file = ParseSlt("f.slt",
                        "pending J2b\n# a comment between the guard and its record\n"
                        "query I rowsort\nSELECT 1\n----\nINTEGER\n1\n\n"
-                       "pending S3\nstatement error\nSELECT 2\n\n"
+                       "pending NL2\nstatement error\nSELECT 2\n\n"
                        "statement ok\nSELECT 3\n");
   ASSERT_TRUE(file.has_value()) << file.error();
   ASSERT_EQ(file->records.size(), 3U);
@@ -140,17 +140,19 @@ TEST(ParseSlt, ReadsPendingGuards) {
   EXPECT_EQ(query.expected, (std::vector<std::string>{"1"}));
   EXPECT_FALSE(query.RunsOn("antb1"));
   EXPECT_TRUE(query.RunsOn("duckdb"));
-  EXPECT_EQ(file->records[1].pending, "S3");
+  EXPECT_EQ(file->records[1].pending, "NL2");  // a two-letter id of ADR 0037's Plan
   EXPECT_EQ(file->records[1].kind, RecordKind::kStatementError);
   EXPECT_TRUE(file->records[2].pending.empty());
   EXPECT_TRUE(file->records[2].RunsOn("antb1"));
 }
 
-TEST(IsRoadmapId, TakesALetterDigitsAndOneOptionalLowerCaseLetter) {
-  for (const std::string_view id : {"S3", "J2b", "H6b", "T1", "U23", "Z9"}) {
+TEST(IsRoadmapId, TakesOneOrTwoLettersDigitsAndOneOptionalLowerCaseLetter) {
+  for (const std::string_view id : {"S3", "J2b", "H6b", "T1", "U23", "Z9", "X4a", "X7a", "W1",
+                                    "NL2", "HC8", "PF5", "SQ8", "JJ2b", "W10"}) {
     EXPECT_TRUE(IsRoadmapId(id)) << id;
   }
-  for (const std::string_view id : {"", "J", "2b", "j2b", "J2B", "J2bc", "JJ2", "J-2", "J2 "}) {
+  for (const std::string_view id : {"", "J", "NL", "2b", "j2b", "nL2", "Nl2", "J2B", "J2bc", "JJJ2",
+                                    "NL2B", "N-2", "NL 2", "J2 ", "NL2b3", "Jb", "NLb"}) {
     EXPECT_FALSE(IsRoadmapId(id)) << id;
   }
 }
