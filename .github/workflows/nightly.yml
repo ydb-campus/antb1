@@ -90,6 +90,9 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/tsan)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/tsan
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -186,6 +189,9 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/ci-asan)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/ci-asan
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -236,6 +242,9 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/ci-release)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/ci-release
 
   diff-extended:
     name: diff-extended (ANTB1_DIFF_COUNT=20000 pixi run diff-random)
@@ -292,6 +301,9 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/ci)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/ci
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -409,6 +421,9 @@ jobs:
           annotate_only: true
           job_summary: true
           detailed_summary: true
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/static)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/static
 
   # Opens an issue (labels nightly-failure, agent-task) for a failed night, or comments on the open one, with the
   # failing jobs, the run URL and the local commands. Every value reaches the script through env:, never inline. A

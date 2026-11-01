@@ -18,7 +18,7 @@
 // comparator). The other queries must fail cleanly: antb1 answers Unsupported (exit code 4) or a
 // parse or bind error. The run fails on
 //   - a wrong answer (antb1 answers, DuckDB disagrees or cannot run the query),
-//   - an unclean failure (an io, execution or internal error),
+//   - an unclean failure (an io, execution, memory or internal error),
 //   - any difference between the passing queries and the ratchet, the committed "pass" list of
 //     tests/data/clickbench_status.json: an unexpected pass or an unexpected fail. The PR that
 //     changes the pass set updates the ratchet and the status table in docs/sql-subset.md.

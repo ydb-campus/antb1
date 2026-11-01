@@ -599,8 +599,6 @@ if(ANTB1_HAVE_DUCKDB)
       REQUIRE ${_require} ${_redacted_forbid}
       COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
     )
-    # Their output must not depend on a developer's ANTB1_TPCH_TIMES (ctest passes the environment through).
-    set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCH_TIMES=unset:")
   endforeach()
   # `antb1-slt tpcds` runs the same ratchet with the workload of the queries derived from TPC-DS (tests/tpcds): its
   # own summary and clean-failure rule, over the pass and parse_error cases above.
@@ -637,8 +635,141 @@ if(ANTB1_HAVE_DUCKDB)
       REQUIRE ${_require} ${_redacted_forbid}
       COMMAND $<TARGET_FILE:antb1-slt> tpcds ${_args}
     )
-    set_tests_properties(${_name} PROPERTIES ENVIRONMENT_MODIFICATION "ANTB1_TPCDS_TIMES=unset:")
   endforeach()
+  # --costs (runner/ratchet.h, RatchetCosts): each outcome line gets the query's seconds, and antb1's own seconds and
+  # peak memory where antb1 answered; the workload's disclaimer comes first and after the summary; the file holds one
+  # JSON record per line and never a query's text; a repro line leaves --costs out, so that it cannot overwrite the
+  # run's file; a query over the memory limit is a memory error, an unclean failure with the outcome "memory error"
+  # that tools/ci/tpc_costs.py knows; and a costs file that cannot be written is a setup error.
+  # print_file_after.cmake prints the file after the run, for the REQUIRE and FORBID regexes.
+  set(_costs_dir "${_tpch_selftest}/costs")
+  file(WRITE "${_costs_dir}/queries/q01.sql" "${_answered}")
+  file(WRITE "${_costs_dir}/queries/q02.sql" "${_unsupported}")
+  file(WRITE "${_costs_dir}/status.json" "{\"pass\": [1]}\n")
+  set(_seconds "[0-9]+\\.[0-9][0-9][0-9] s")
+  set(_number "[0-9]+\\.[0-9]+")
+  foreach(case IN ITEMS tpch tpch_repro tpch_memory tpcds)
+    set(_name harness.${case}.status.costs)
+    set(_workload ${case})
+    set(_dir "${_costs_dir}")
+    set(_exit 0)
+    set(_limit 1GiB)
+    set(_limit_bytes 1073741824)
+    set(_summary "PASS queries=2 pass=\\[1\\] unsupported=1 rejected=0 failed=0 ratchet=\\[1\\] geomean=${_number}s\n")
+    if(case STREQUAL "tpch_repro")
+      set(_name harness.tpch.status.costs_repro)
+      set(_workload tpch)
+      set(_dir "${_tpch_selftest}/unexpected_fail")
+      set(_exit 1)
+      set(_summary "FAIL queries=2 pass=\\[\\] unsupported=2 rejected=0 failed=1 ratchet=\\[1\\] geomean=n/a\n")
+    elseif(case STREQUAL "tpch_memory")
+      set(_name harness.tpch.status.costs_memory)
+      set(_workload tpch)
+      set(_exit 1)
+      set(_limit 64)
+      set(_limit_bytes 64)
+      set(_summary "FAIL queries=2 pass=\\[\\] unsupported=1 rejected=0 failed=1 ratchet=\\[1\\] geomean=n/a\n")
+    endif()
+    set(_file "${_tpch_selftest}/${case}.costs.jsonl")
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_dir}/queries"
+      --status
+      "${_dir}/status.json"
+      --memory-limit
+      ${_limit}
+      --costs
+      "${_file}"
+    )
+    if(_workload STREQUAL "tpch")
+      set(_bench TPC-H)
+    else()
+      set(_bench TPC-DS)
+    endif()
+    string(
+      CONCAT _disclaimer
+      "This workload is derived from the ${_bench} Benchmark and is not comparable to published ${_bench} Benchmark "
+      "results, as this implementation does not comply with all requirements of the ${_bench} Benchmark\\.\n"
+    )
+    set(
+      _require
+      "^${_disclaimer}Q1: running\n"
+      "${_summary}${_disclaimer}"
+      "{\"record\": \"run\", \"workload\": \"${_workload}\", \"test\": \"${_name}\", \"shard\": \"1/1\", "
+      "\"threads\": 1, \"same_as_threads\": null, \"memory_limit_bytes\": ${_limit_bytes}}\n"
+      "{\"record\": \"running\", \"query\": 2}\n{\"record\": \"query\", \"query\": 2, \"outcome\": "
+      "\"unsupported\", \"ratchet\": \"ok\", \"seconds\": ${_number}, \"antb1_seconds\": null, "
+      "\"peak_memory_bytes\": null}\n"
+    )
+    if(case STREQUAL "tpch_repro")
+      list(
+        APPEND _require
+        "Q1: unsupported \\(${_seconds}\\)\n"
+        "\"query\": 1, \"outcome\": \"unsupported\", \"ratchet\": \"unexpected fail\""
+        "--show-values --only 1\n"
+        "{\"record\": \"end\", \"queries\": 2, \"passed\": 0, \"failed\": 1, \"wall_seconds\": ${_number}}\n"
+      )
+    elseif(case STREQUAL "tpch_memory")
+      list(
+        APPEND _require
+        "Q1: memory error \\(${_seconds}\\)\n"
+        "FAIL Q1: antb1 fails with a memory error; a query derived from TPC-H"
+        "{\"record\": \"query\", \"query\": 1, \"outcome\": \"memory error\", \"ratchet\": \"fail\", \"seconds\": "
+        "${_number}, \"antb1_seconds\": null, \"peak_memory_bytes\": null}\n"
+        "{\"record\": \"end\", \"queries\": 2, \"passed\": 0, \"failed\": 1, \"wall_seconds\": ${_number}}\n"
+      )
+    else()
+      list(
+        APPEND _require
+        "Q1: pass \\(${_seconds}, antb1 ${_seconds}, peak [0-9]+\\.[0-9] MiB\\)\nQ2: running\nQ2: unsupported "
+        "\\(${_seconds}\\)\n"
+        "{\"record\": \"query\", \"query\": 1, \"outcome\": \"pass\", \"ratchet\": \"ok\", \"seconds\": "
+        "${_number}, \"antb1_seconds\": ${_number}, \"peak_memory_bytes\": [1-9][0-9]*}\n"
+        "{\"record\": \"end\", \"queries\": 2, \"passed\": 1, \"failed\": 0, \"wall_seconds\": ${_number}}\n"
+      )
+    endif()
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid} "--costs"
+      COMMAND
+        ${CMAKE_COMMAND}
+        "-DFILE=${_file}"
+        -P
+        "${CMAKE_CURRENT_SOURCE_DIR}/print_file_after.cmake"
+        --
+        $<TARGET_FILE:antb1-slt>
+        ${_workload}
+        ${_args}
+    )
+  endforeach()
+  set(_name harness.tpch.status.costs_unwritable)
+  antb1_slt_args(
+    _args
+    ${_name}
+    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+    --queries
+    "${_costs_dir}/queries"
+    --status
+    "${_costs_dir}/status.json"
+    --memory-limit
+    1GiB
+    --costs
+    "${_costs_dir}/status.json/costs.jsonl"
+  )
+  antb1_add_expect_test(
+    ${_name}
+    LABELS harness
+    FIXTURES_REQUIRED antb1_fixtures
+    EXIT_CODE 3
+    REQUIRE "antb1-slt: cannot write the costs file " ${_redacted_forbid}
+    COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
+  )
 
   # The `redact` option of a tables file (runner/tables.h): canary/tables_redact.txt marks the canary table, so every
   # report is redacted without --redact and its repro adds --show-values; an explicit --redact wins over

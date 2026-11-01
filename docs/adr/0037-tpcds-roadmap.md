@@ -68,10 +68,18 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    - metamorphic relations where a relation holds;
    - docs/sql-subset.md (grammar, semantics, exit-code examples) and the ADR the feature updates;
    - the ratchet and its table, where it completes queries, with each completed query's SF 1 seconds and peak memory
-     (HC3) in the PR description.
+     (HC3) in the PR description. Update (2026-11-01, HC3): the numbers come from the "Costs of the queries derived
+     from TPC-H and TPC-DS" job summary of the PR's `gcc-compat` run; the description names that leg and carries the
+     disclaimer.
 6. **An SF 1 budget gate.** A completed query must peak below about 1.5 GiB, and every shard must stay below about
    60% of its inner timeout in each leg that runs it. A PR that misses either waits for the performance guard (PF)
-   that fixes its cause, pulled in front of it.
+   that fixes its cause, pulled in front of it. Update (2026-11-01, HC3):
+   - `tools/ci/tpc_costs.py` warns once for a shard that misses either, or that did not finish, in every leg that
+     runs it, and never fails the job.
+   - On every PR, `gcc-compat` and `clang-coverage-fuzz` run scale factor 1. The numbers under AddressSanitizer
+     come from the nightly `asan-tpc-sf1`. Before merging a PR that completes a heavy query, run
+     `pixi run asan-tpc-sf1` on a Linux host. Dispatching the nightly workflow on the branch also works, but it runs
+     every nightly job.
 7. **The Plan's ids** name the roadmap's PRs in `pending` guards and docs: HC, PF, NL, CT, FN, AG, RU, OJ, SQ and CL;
    X4a-X4d, ADR 0036's X4 but for `BY NAME` and non-SELECT branches, which no query of the 99 needs and which stay on
    X4 with their `pending X4` guards; X7a and PF5, ADR 0036's X7 in two parts; and W1 onward, which the window ADR

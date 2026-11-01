@@ -22,8 +22,8 @@ Closes #
 <!--
 Paste the exact commands you ran and the relevant tail of their output (for example the final
 `ANTB1-TESTS: PASS|FAIL ...` line of `pixi run test`). Never paste values from ClickBench data or anything derived
-from TPC-H or TPC-DS (query text, data, answers). Timings of the TPC-derived queries are fine, never as TPC Benchmark
-results.
+from TPC-H or TPC-DS (query text, data, answers). Timings and memory peaks of the TPC-derived queries are fine, with
+the leg they come from and the disclaimer; never as TPC Benchmark results.
 -->
 
 ```text

@@ -118,4 +118,6 @@ together with `ANTB1_UPDATE_GOLDENS`).
   `SUMMARY:` lines when something fails.
 - `harness.tpch.status.*`: `antb1-slt tpch`, the ratchet of the queries derived from TPC-H, on our own numbered
   queries over the canary table: every way the ratchet can fail is caught, and the report stays redacted.
-  `harness.tpcds.status.pass` and `.parse_error` run `antb1-slt tpcds` on the same queries.
+  `harness.tpch.status.costs`, `.costs_repro`, `.costs_memory` and `.costs_unwritable` check `--costs`: its lines,
+  its file (never a query's text), a repro line without it, a memory error and a file it cannot write.
+  `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds` on the same queries.

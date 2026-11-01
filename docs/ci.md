@@ -433,6 +433,27 @@ annotations on the PR and in the job summary. When a hermetic test job fails, th
 uploaded as the `logs-<job>` artifact and kept for 7 days. The build jobs and `clang-tidy` also write their disk
 usage to the job summary. Timing and cache measurements are recorded here once enough runs exist.
 
+Every job whose tests include the ratchets of the queries derived from TPC-H and TPC-DS then reports their costs.
+These jobs are the build-test legs, `clang-coverage-fuzz`, nightly `tsan`, `asan-tpc-sf1`, `arm64`, `ci-shuffle` and
+`static-test`, and `Agent bootstrap`.
+
+- The step runs `python3 -I tools/ci/tpc_costs.py build/<preset>`, a standard-library script on the runner's Python.
+- It reads each test's `build/<preset>/tpc-costs/<test>.jsonl` (`--costs`,
+  [testing.md](testing.md#the-ratchet-of-the-queries-derived-from-tpc-h)), and prints each query's seconds and antb1's
+  peak memory, with the disclaimers, to the step log and the job summary.
+- On the scale-factor-1 shards of TPC-DS it warns once per shard that misses ADR 0037's budget: more than 60% of the
+  870-second inner timeout, or a passing query above 1.5 GiB at one thread. It never fails on the budget.
+- A run without its end record (stopped by its timeout, or crashed) is reported from the records it has: its seconds
+  as a lower bound, its share as `-`, and the query that was running. A scale-factor-1 shard of TPC-DS that did not
+  finish is warned about too.
+- It fails closed, with exit code 1 and nothing reported, on a file or record outside its schema.
+- On every PR, `gcc-compat` and `clang-coverage-fuzz` run scale factor 1, and so does `Agent bootstrap` on a PR that
+  touches its paths. Its numbers under AddressSanitizer come from the nightly `asan-tpc-sf1`.
+- For those numbers before a merge, run `pixi run asan-tpc-sf1` on a Linux host. Dispatching `nightly.yml` on a
+  branch runs every nightly job (the static builds included), and a job that fails there opens the nightly-failure
+  issue or comments on the open one.
+- Locally, run it after `pixi run test`: `python3 -I tools/ci/tpc_costs.py build/dev`.
+
 | Artifact | Job | When | Kept |
 | --- | --- | --- | --- |
 | `logs-<job>` | every hermetic test job (CI legs, nightly `tsan`, `ci-shuffle` and `asan-tpc-sf1`) | on failure | 7 days |
@@ -457,8 +478,8 @@ DuckDB writes from `range()` and `kit.json` with their digests and DuckDB's answ
 `release-meta` only `SHA256SUMS` and the release notes, `release-provenance` only the Sigstore bundle, and the
 data jobs (`clickbench-hits0`, nightly `asan-data` and `arm64`) upload nothing. The `logs-<job>` files hold the
 output of the tests over the data derived from TPC-H and TPC-DS, which is redacted like the data tests' (query
-numbers, counts and hashes; [testing.md](testing.md#data-derived-from-tpc-h)); the generated data stays in the build
-tree.
+numbers, counts, hashes, and each query's seconds and antb1's peak memory; [testing.md](testing.md#data-derived-from-tpc-h));
+the generated data stays in the build tree.
 
 ## Caches
 

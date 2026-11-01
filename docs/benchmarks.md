@@ -11,8 +11,10 @@ the micro benchmarks, ClickBench runs, timings of the queries derived from TPC-H
 - Both tasks below build in `build/static`, against the static Arrow, at `-O3` with ThinLTO.
 - `bench-clickbench` also runs a given package (`ANTB1_BENCH_BIN`). On a host without the repository, run the
   package directly ([below](#on-a-host-without-the-repository-or-pixi)).
-- Profiles (`explain --analyze`) and the dev build's times of the queries derived from TPC-H (`ANTB1_TPCH_TIMES`)
-  are diagnostics, for orientation only.
+- Profiles (`explain --analyze`) and the costs the ratchets of the queries derived from TPC-H and TPC-DS print in the
+  test builds (each query's seconds and antb1's peak memory, `--costs`, in every CI leg's job summary) are
+  diagnostics: they measure the ratchets against their timeouts and memory limit (ADR 0037's SF 1 budget), not
+  performance.
 - The dynamic builds (`dev`, `ci-release`) are for tests.
 
 ## Micro benchmarks

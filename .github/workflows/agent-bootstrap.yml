@@ -45,5 +45,8 @@ jobs:
         run: bash scripts/agent-setup.sh --envs "default lint"
       - name: Tests (pixi run --as-is test)
         run: pixi run --as-is test
+      - name: Costs of the queries derived from TPC-H and TPC-DS (python3 -I tools/ci/tpc_costs.py build/dev)
+        if: ${{ !cancelled() }}
+        run: python3 -I tools/ci/tpc_costs.py build/dev
       - name: Doctor (pixi run --as-is doctor --json)
         run: pixi run --as-is doctor --json

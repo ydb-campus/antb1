@@ -12,7 +12,7 @@
 //   antb1-slt answers --fixtures DIR --tables FILE --queries DIR --answers DIR [--only N]
 //                     [--mutate KIND]
 //   antb1-slt tpch --fixtures DIR --tables FILE --queries DIR --status FILE [--memory-limit SIZE]
-//                  [--only N] [--mutate KIND]
+//                  [--only N] [--shard K/N] [--costs FILE] [--mutate KIND]
 //   antb1-slt tpcds ... (the options of tpch)
 //   antb1-slt version
 //
@@ -20,9 +20,9 @@
 // FILEs with Unsupported (runner.h). `queries` and `clickbench` run the ClickBench data tests
 // (tests/data): see query_file.h and clickbench.h. `answers` checks stored answers against the
 // DuckDB oracle (answers.h). `tpch` is the ratchet of the queries derived from TPC-H (ratchet.h,
-// tests/tpch): q01.sql, q02.sql, ... of DIR as Q1, Q2, ...; ANTB1_TPCH_TIMES=1 adds each query's
-// seconds and their geometric mean. `tpcds` is the same for the queries derived from TPC-DS
-// (tests/tpcds; ANTB1_TPCDS_TIMES=1).
+// tests/tpch): q01.sql, q02.sql, ... of DIR as Q1, Q2, ...; --costs adds each query's seconds and
+// antb1's peak memory, and writes them to FILE (RatchetCosts). `tpcds` is the same for the queries
+// derived from TPC-DS (tests/tpcds).
 //
 // Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
 // and no SQL. --show-values lifts the last two for a local repro; it is refused when
@@ -112,8 +112,8 @@ struct Args {
   std::string answers_dir;
   // tpch, tpcds: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
   std::string memory_limit;
-  bool times = false;  // ANTB1_TPCH_TIMES=1, ANTB1_TPCDS_TIMES=1
-  std::string shard;   // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
+  std::string shard;  // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
+  std::string costs;  // tpch, tpcds: the costs file (RatchetCosts), or empty
 };
 
 std::string ShellQuote(std::string_view arg) {
@@ -130,16 +130,18 @@ std::string ShellQuote(std::string_view arg) {
   return out + "'";
 }
 
-// The command line of this run without --redact, --show-values and --only (repro lines add their
-// own --only), with --show-values when the run is redacted without --redact (`show_values`).
+// The command line of this run without --redact, --show-values, --only (repro lines add their
+// own --only) and --costs (a repro must not overwrite the run's costs file), with --show-values
+// when the run is redacted without --redact (`show_values`).
 std::string CommandLine(std::span<char*> argv, bool show_values) {
   std::string command;
   for (std::size_t i = 0; i < argv.size(); ++i) {
     const std::string_view arg = argv[i];
-    if (arg == "--redact" || arg == "--show-values" || arg.starts_with("--only=")) {
+    if (arg == "--redact" || arg == "--show-values" || arg.starts_with("--only=") ||
+        arg.starts_with("--costs=")) {
       continue;
     }
-    if (arg == "--only") {
+    if (arg == "--only" || arg == "--costs") {
       ++i;
       continue;
     }
@@ -151,8 +153,6 @@ std::string CommandLine(std::span<char*> argv, bool show_values) {
 // What antb1-slt reads from main's environment `envp` (std::getenv is not thread-safe).
 struct Environment {
   bool github_actions = false;  // GITHUB_ACTIONS=true
-  bool tpch_times = false;      // ANTB1_TPCH_TIMES=1
-  bool tpcds_times = false;     // ANTB1_TPCDS_TIMES=1
 };
 
 Environment ReadEnvironment(char* const* envp) {
@@ -160,8 +160,6 @@ Environment ReadEnvironment(char* const* envp) {
   for (char* const* entry = envp; entry != nullptr && *entry != nullptr; ++entry) {
     const std::string_view variable(*entry);
     env.github_actions = env.github_actions || variable == "GITHUB_ACTIONS=true";
-    env.tpch_times = env.tpch_times || variable == "ANTB1_TPCH_TIMES=1";
-    env.tpcds_times = env.tpcds_times || variable == "ANTB1_TPCDS_TIMES=1";
   }
   return env;
 }
@@ -617,6 +615,11 @@ constexpr Workload kTpch{
         "Unsupported (exit code 4)",
     .table = "the table of the queries derived from TPC-H",
     .running_lines = true,
+    .disclaimer =
+        "This workload is derived from the TPC-H Benchmark and is not comparable to published "
+        "TPC-H "
+        "Benchmark results, as this implementation does not comply with all requirements of the "
+        "TPC-H Benchmark.",
 };
 
 // The workload of the queries derived from TPC-DS: Q1 to Q99, with the same rule.
@@ -630,11 +633,25 @@ constexpr Workload kTpcds{
         "Unsupported (exit code 4)",
     .table = "the table of the queries derived from TPC-DS",
     .running_lines = true,
+    .disclaimer =
+        "This workload is derived from the TPC-DS Benchmark and is not comparable to published "
+        "TPC-DS Benchmark results, as this implementation does not comply with all requirements of "
+        "the TPC-DS Benchmark.",
 };
 
 // The ratchet of a numbered workload (tpch, tpcds): q01.sql, ... of --queries against --status.
+// Seconds of the steady clock since any fixed point.
+double SteadySeconds() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
                      const std::string& command, const Workload& workload) {
+  const double started = SteadySeconds();  // the costs' wall_seconds include the setup
+  if (!args.costs.empty()) {
+    std::error_code ec;
+    fs::remove(args.costs, ec);  // a run that fails in its setup leaves no earlier run's costs
+  }
   auto queries = LoadNumberedQueries(args.queries_dir, args.redact);
   if (!queries) {
     std::println(stderr, "antb1-slt: {}", queries.error());
@@ -671,11 +688,32 @@ int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
     }
     options.shard = *shard;
   }
-  if (args.times) {
-    options.clock = [] {
-      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-          .count();
-    };
+  // The costs file is truncated first and every record flushed, so a run that times out keeps the
+  // queries it finished and names the one it was running.
+  std::ofstream costs_file;
+  if (!args.costs.empty()) {
+    const fs::path path(args.costs);
+    std::error_code ec;
+    if (path.has_parent_path()) {
+      fs::create_directories(path.parent_path(), ec);
+    }
+    costs_file.open(path, std::ios::out | std::ios::trunc);
+    if (!costs_file) {
+      std::println(stderr, "antb1-slt: cannot write the costs file {}", args.costs);
+      return kExitSetup;
+    }
+    options.clock = SteadySeconds;
+    options.costs = RatchetCosts{
+        .write =
+            [&costs_file](std::string_view line) {
+              costs_file << line;
+              costs_file.flush();
+            },
+        .test = args.test_name,
+        .threads = args.threads,
+        .same_as_threads = args.same_as_threads,
+        .memory_limit = args.memory_limit.empty() ? std::nullopt : ParseByteSize(args.memory_limit),
+        .started = started};
   }
   // Each line as it comes, so the log of a run that times out ends with the query it was running.
   const RatchetStats stats = RunRatchet(*queries, *status, workload, antb1->get(), **oracle,
@@ -802,6 +840,9 @@ int Main(std::span<char*> argv, const Environment& env) {
         "Run only slice K of N (K/N): the queries at index K - 1, K - 1 + N, ... of the "
         "file, from 0, checked against the ratchet alone");
     cmd->add_option("--mutate", args.mutate, "Corrupt antb1 results (harness self-tests)");
+    cmd->add_option("--costs", args.costs,
+                    "Print each query's seconds and antb1's peak memory, and write them to this "
+                    "file as JSON lines (truncated first)");
     return cmd;
   };
   const auto* tpch = add_numbered("tpch", "TPC-H", "tests/data/tpch_status.json");
@@ -876,11 +917,9 @@ int Main(std::span<char*> argv, const Environment& env) {
     return Answers(args, *tables, command);
   }
   if (tpch->parsed()) {
-    args.times = env.tpch_times;
     return NumberedWorkload(args, *tables, command, kTpch);
   }
   if (tpcds->parsed()) {
-    args.times = env.tpcds_times;
     return NumberedWorkload(args, *tables, command, kTpcds);
   }
   return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, command);

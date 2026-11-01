@@ -169,9 +169,17 @@ endfunction()
 # a shard of four outlasted the timeout; the shards run one engine thread), and it is all that the asan-tpc-sf1 preset
 # runs (the nightly job of that name). On every PR, gcc-compat and clang-coverage-fuzz still run the shards and
 # clang-asan scale factor 0.1; tsan still runs the 4-thread run at scale factor 0.1.
-# ANTB1_TPCDS_TIMES=1 in the environment of a local run adds each query's seconds.
+# --costs adds each query's seconds and antb1's peak memory, with the disclaimer first and last, and writes them to
+# build/<preset>/tpc-costs/<test>.jsonl, which tools/ci/tpc_costs.py reports in every CI leg (docs/ci.md): the
+# seconds of the eight shards against the 870-second inner timeout and the peaks against ADR 0037's SF 1 budget.
 # This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 # this implementation does not comply with all requirements of the TPC-DS Benchmark.
+# The line --costs prints first and after the summary: ADR 0006's disclaimer, verbatim.
+string(
+  CONCAT _disclaimer
+  "This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS "
+  "Benchmark results, as this implementation does not comply with all requirements of the TPC-DS Benchmark\\.\n"
+)
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpcds_status.json")
 set(_shards 8)
 set(_kinds sf0_1)
@@ -218,13 +226,17 @@ foreach(kind IN LISTS _kinds)
     "${_status}"
     --memory-limit
     2GiB
+    --costs
+    "${CMAKE_BINARY_DIR}/tpc-costs/${_name}.jsonl"
     ${_options}
   )
   _tpcds_test(
     ${_name}
     LABEL ${_label}
     TIMEOUT 900
-    REQUIRE "TPCDS: PASS queries=${_queries} "
+    REQUIRE
+      "^${_disclaimer}"
+      "TPCDS: PASS queries=${_queries} [^\n]*\n${_disclaimer}"
     COMMAND $<TARGET_FILE:antb1-slt> tpcds ${_args}
   )
 endforeach()

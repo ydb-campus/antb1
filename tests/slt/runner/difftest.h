@@ -17,7 +17,8 @@
 // Per query:
 //   - antb1 Unsupported: a failure if the query uses only supported features; otherwise counted
 //     (per feature outside the supported set) and not a failure;
-//   - another antb1 query error (parse, bind, io, execution) for a query outside the supported
+//   - another antb1 query error (parse, bind, io, execution, memory) for a query outside the
+//   supported
 //     set: counted as "rejected" and listed, not a failure (the target grammar promises
 //     Unsupported there; the sql unit tests own that contract);
 //   - any other antb1 error (internal errors always), a DuckDB error, different column types

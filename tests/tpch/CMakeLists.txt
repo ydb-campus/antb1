@@ -149,7 +149,14 @@ endforeach()
 # I/O or execution error fails the test, as do an unexpected pass and an unexpected fail. Both scale factors read
 # the same ratchet, so a query passes at both or the test fails at one, and the parallel run (4 threads, batches of
 # 1000 rows) must equal the 1-thread run byte for byte. Each query logs "Q<n>: running" first, so a timeout names
-# it. ANTB1_TPCH_TIMES=1 in the environment of a local run adds each query's seconds; no preset or CI job sets it.
+# it. --costs adds each query's seconds and antb1's peak memory, with the disclaimer first and last, and writes them to
+# build/<preset>/tpc-costs/<test>.jsonl, which tools/ci/tpc_costs.py reports in every CI leg (docs/ci.md).
+# The line --costs prints first and after the summary: ADR 0006's disclaimer, verbatim.
+string(
+  CONCAT _disclaimer
+  "This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H "
+  "Benchmark results, as this implementation does not comply with all requirements of the TPC-H Benchmark\\.\n"
+)
 set(_status "${PROJECT_SOURCE_DIR}/tests/data/tpch_status.json")
 foreach(kind IN ITEMS sf0_01 sf0_1 parallel)
   if(kind STREQUAL "parallel")
@@ -181,13 +188,17 @@ foreach(kind IN ITEMS sf0_01 sf0_1 parallel)
     "${_status}"
     --memory-limit
     2GiB
+    --costs
+    "${CMAKE_BINARY_DIR}/tpc-costs/${_name}.jsonl"
     ${_options}
   )
   _tpch_test(
     ${_name}
     LABEL ${_label}
     TIMEOUT 900
-    REQUIRE "TPCH: PASS queries=22 "
+    REQUIRE
+      "^${_disclaimer}"
+      "TPCH: PASS queries=22 [^\n]*\n${_disclaimer}"
     COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
   )
 endforeach()
