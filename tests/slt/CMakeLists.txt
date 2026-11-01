@@ -63,8 +63,8 @@ antb1_add_gtest(
 target_include_directories(antb1_slt_tests PRIVATE "${PROJECT_SOURCE_DIR}/fuzz")
 if(ANTB1_HAVE_DUCKDB)
   # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
-  # adapter's DECIMAL columns, the keywords DuckDB reads as table aliases, DuckDB's reading of
-  # generated joins and the distinct counts DuckDB writes into Parquet footers.
+  # adapter's DECIMAL columns and memory limit, the keywords DuckDB reads as table aliases, DuckDB's
+  # reading of generated joins and the distinct counts DuckDB writes into Parquet footers.
   target_sources(
     antb1_slt_tests
     PRIVATE
@@ -770,6 +770,48 @@ if(ANTB1_HAVE_DUCKDB)
     REQUIRE "antb1-slt: cannot write the costs file " ${_redacted_forbid}
     COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
   )
+  # --oracle-memory-limit caps the DuckDB oracle's memory (DuckDbEngine::Make), and every TPC ratchet registration
+  # passes 1GiB: beyond it DuckDB spills to the temp dir, and a query that still does not fit fails with an
+  # out-of-memory error, whose kind is all that a redacted log shows. Under 1 KiB, DuckDB cannot run the canary query
+  # that antb1 answers, and the repro line keeps the cap; a size the option does not take is a usage error.
+  foreach(case IN ITEMS oracle_memory oracle_memory_invalid)
+    set(_name harness.tpch.status.${case})
+    if(case STREQUAL "oracle_memory")
+      set(_limit 1KiB)
+      set(_exit 1)
+      set(
+        _require
+        "Q1: DuckDB error\nFAIL Q1: antb1 answers, but DuckDB fails\n  error kind: Out of Memory Error\n"
+        "--oracle-memory-limit 1KiB [^\n]*--show-values --only 1\n"
+        "TPCH: FAIL queries=2 pass=\\[\\] unsupported=1 rejected=0 failed=1 ratchet=\\[1\\]\n"
+      )
+    else()
+      set(_limit 0)
+      set(_exit 2)
+      set(_require "--oracle-memory-limit: expects a size such as 2GiB or 512MiB, got '0'")
+    endif()
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/canary/tables_redact.txt"
+      --queries
+      "${_costs_dir}/queries"
+      --status
+      "${_costs_dir}/status.json"
+      --memory-limit
+      1GiB
+      --oracle-memory-limit
+      ${_limit}
+    )
+    antb1_add_expect_test(
+      ${_name}
+      LABELS harness
+      FIXTURES_REQUIRED antb1_fixtures
+      EXIT_CODE ${_exit}
+      REQUIRE ${_require} ${_redacted_forbid}
+      COMMAND $<TARGET_FILE:antb1-slt> tpch ${_args}
+    )
+  endforeach()
 
   # The local report of the refused queries (RatchetOptions::refusals): antb1's messages quote the query, so the
   # reasons go only to <temp dir>/refusals.txt, never to the log, and not at all on GitHub Actions, where an earlier

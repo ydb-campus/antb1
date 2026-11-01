@@ -1,7 +1,6 @@
 #include "duckdb_engine.h"
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -463,7 +462,12 @@ DuckDbEngine::~DuckDbEngine() = default;
 std::string DuckDbEngine::Version() { return duckdb_library_version(); }
 
 std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
-    const std::vector<TableDef>& tables, const fs::path& fixtures_dir, const fs::path& temp_dir) {
+    const std::vector<TableDef>& tables, const fs::path& fixtures_dir, const fs::path& temp_dir,
+    std::optional<int64_t> memory_limit) {
+  if (memory_limit.has_value() && *memory_limit < 1) {
+    return std::unexpected(
+        std::format("duckdb: the memory limit must be at least 1 byte, not {}", *memory_limit));
+  }
   std::error_code ec;
   fs::create_directories(temp_dir, ec);
   const std::string fixtures = fs::absolute(fixtures_dir, ec).lexically_normal().string();
@@ -474,12 +478,15 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   if (duckdb_create_config(&config) == DuckDBError) {
     return std::unexpected("duckdb: cannot create a config");
   }
-  const std::array<std::pair<std::string, std::string>, 4> options = {{
+  std::vector<std::pair<std::string, std::string>> options = {
       {"threads", "1"},
       {"autoinstall_known_extensions", "false"},
       {"autoload_known_extensions", "false"},
       {"temp_directory", temp},
-  }};
+  };
+  if (memory_limit.has_value()) {
+    options.emplace_back("memory_limit", std::format("{}B", *memory_limit));  // bytes
+  }
   for (const auto& [key, value] : options) {
     if (duckdb_set_config(config, key.c_str(), value.c_str()) == DuckDBError) {
       duckdb_destroy_config(&config);

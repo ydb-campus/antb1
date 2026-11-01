@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,7 +17,10 @@ namespace antb1::slt {
 // The DuckDB oracle (C API, DUCKDB_API_NO_DEPRECATED, results via duckdb_fetch_chunk), locked down:
 // threads=1, no extension autoinstall/autoload, no file access outside the fixtures directory, the
 // directories of the table files and temp_dir (temp files), the late_materialization optimizer off
-// (a DuckDB bug, duckdb_engine.cc), then lock_configuration=true. Execute()
+// (a DuckDB bug, duckdb_engine.cc), then lock_configuration=true. A memory_limit (bytes, at least
+// 1) is DuckDB's memory_limit: beyond it DuckDB spills to temp_dir, and a query that still does not
+// fit fails with an "Out of Memory Error"; without one, DuckDB's default applies (80% of the host's
+// memory). Execute()
 // runs one statement per call, and only SELECT, EXPLAIN, SET and LOAD: anything else (COPY, ATTACH,
 // EXPORT, DDL, DML) is refused with a "Permission Error: ..." before it runs, so no record can
 // write next to the shared fixtures or change the oracle's state. Every table is a view
@@ -26,7 +31,7 @@ class DuckDbEngine final : public Engine {
  public:
   static std::expected<std::unique_ptr<DuckDbEngine>, std::string> Make(
       const std::vector<TableDef>& tables, const std::filesystem::path& fixtures_dir,
-      const std::filesystem::path& temp_dir);
+      const std::filesystem::path& temp_dir, std::optional<int64_t> memory_limit = std::nullopt);
 
   DuckDbEngine(const DuckDbEngine&) = delete;
   DuckDbEngine& operator=(const DuckDbEngine&) = delete;

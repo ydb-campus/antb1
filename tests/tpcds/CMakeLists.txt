@@ -169,6 +169,11 @@ endfunction()
 # a shard of four outlasted the timeout; the shards run one engine thread), and it is all that the asan-tpc-sf1 preset
 # runs (the nightly job of that name). On every PR, gcc-compat and clang-coverage-fuzz still run the shards and
 # clang-asan scale factor 0.1; tsan still runs the 4-thread run at scale factor 0.1.
+# antb1 may use 2 GiB per query. DuckDB, the oracle, may use 1 GiB (--oracle-memory-limit), beyond which it spills to
+# the test's temp dir: ctest runs up to eight shards at once, and uncapped, each DuckDB could take 80% of the host's
+# memory. The cap leaves room: measured locally (the numbers stay local, ADR 0006), DuckDB answers every one of the 99
+# queries at scale factor 1 well within it. A query that outgrows it fails its test with the error kind "Out of Memory
+# Error", which is when to revisit the cap.
 # --costs adds each query's seconds and antb1's peak memory, with the disclaimer first and last, and writes them to
 # build/<preset>/tpc-costs/<test>.jsonl, which tools/ci/tpc_costs.py reports in every CI leg (docs/ci.md): the
 # seconds of the eight shards against the 870-second inner timeout and the peaks against ADR 0037's SF 1 budget.
@@ -226,6 +231,8 @@ foreach(kind IN LISTS _kinds)
     "${_status}"
     --memory-limit
     2GiB
+    --oracle-memory-limit
+    1GiB
     --costs
     "${CMAKE_BINARY_DIR}/tpc-costs/${_name}.jsonl"
     ${_options}

@@ -12,7 +12,8 @@
 //   antb1-slt answers --fixtures DIR --tables FILE --queries DIR --answers DIR [--only N]
 //                     [--mutate KIND]
 //   antb1-slt tpch --fixtures DIR --tables FILE --queries DIR --status FILE [--memory-limit SIZE]
-//                  [--only N] [--shard K/N] [--costs FILE] [--mutate KIND]
+//                  [--oracle-memory-limit SIZE] [--only N] [--shard K/N] [--costs FILE]
+//                  [--mutate KIND]
 //   antb1-slt tpcds ... (the options of tpch)
 //   antb1-slt version
 //
@@ -21,8 +22,9 @@
 // (tests/data): see query_file.h and clickbench.h. `answers` checks stored answers against the
 // DuckDB oracle (answers.h). `tpch` is the ratchet of the queries derived from TPC-H (ratchet.h,
 // tests/tpch): q01.sql, q02.sql, ... of DIR as Q1, Q2, ...; --costs adds each query's seconds and
-// antb1's peak memory, and writes them to FILE (RatchetCosts). `tpcds` is the same for the queries
-// derived from TPC-DS (tests/tpcds).
+// antb1's peak memory, and writes them to FILE (RatchetCosts); --oracle-memory-limit caps DuckDB's
+// memory, beyond which it spills to the temp dir. `tpcds` is the same for the queries derived from
+// TPC-DS (tests/tpcds).
 //
 // Redaction: --redact, a table with the `redact` option (tables.h) and `answers` print no values
 // and no SQL. --show-values lifts the last two for a local repro; it is refused when
@@ -110,8 +112,10 @@ struct Args {
   // answers, tpch, tpcds
   std::string queries_dir;
   std::string answers_dir;
-  // tpch, tpcds: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit)
+  // tpch, tpcds: the antb1 sessions' memory limit (engine::SessionOptions::memory_limit) and the
+  // DuckDB oracle's (DuckDbEngine::Make)
   std::string memory_limit;
+  std::string oracle_memory_limit;
   std::string shard;  // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
   std::string costs;  // tpch, tpcds: the costs file (RatchetCosts), or empty
 };
@@ -258,7 +262,9 @@ std::expected<std::unique_ptr<Engine>, std::string> MakeEngine(std::string_view 
                                 std::format("{} thread(s)", *args.same_as_threads));
   }
 #ifdef ANTB1_SLT_HAVE_DUCKDB
-  auto engine = DuckDbEngine::Make(tables, args.fixtures, args.temp_dir);
+  auto engine = DuckDbEngine::Make(
+      tables, args.fixtures, args.temp_dir,
+      args.oracle_memory_limit.empty() ? std::nullopt : ParseByteSize(args.oracle_memory_limit));
   if (!engine) {
     return std::unexpected(engine.error());
   }
@@ -850,13 +856,18 @@ int Main(std::span<char*> argv, const Environment& env) {
     cmd->add_option("--queries", args.queries_dir, "Directory of q01.sql, q02.sql, ...")
         ->required();
     cmd->add_option("--status", args.status, "The ratchet (" + status_file + ")")->required();
+    const auto size = [](const std::string& value) -> std::string {
+      return ParseByteSize(value).has_value()
+                 ? std::string()
+                 : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
+    };
     cmd->add_option("--memory-limit", args.memory_limit,
                     "antb1: memory a query may use, e.g. 2GiB (bytes, KiB, MiB or GiB)")
-        ->check([](const std::string& value) -> std::string {
-          return ParseByteSize(value).has_value()
-                     ? std::string()
-                     : "expects a size such as 2GiB or 512MiB, got '" + value + "'";
-        });
+        ->check(size);
+    cmd->add_option("--oracle-memory-limit", args.oracle_memory_limit,
+                    "DuckDB: memory the oracle may use before it spills to --temp-dir, e.g. 1GiB "
+                    "(bytes, KiB, MiB or GiB; default: DuckDB's, 80% of the host's memory)")
+        ->check(size);
     cmd->add_option("--only", args.only, "Run only Q<n> (repro)");
     cmd->add_option(
         "--shard", args.shard,
