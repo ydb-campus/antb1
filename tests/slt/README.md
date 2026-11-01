@@ -131,6 +131,8 @@ off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 and 1.5.6 f
 queries with an internal error (`where/pushdown.slt`). With it off, DuckDB computes the select list of a
 small `ORDER BY ... LIMIT` for every row the `WHERE` keeps, as antb1 does, so an overflow there fails in both
 engines; only the order of tied rows at the edge of a `LIMIT` can differ, and every comparison accepts that.
+Its memory limit is DuckDB's default (80% of the host's memory) unless a run sets one (`--oracle-memory-limit` of
+`tpch` and `tpcds`); beyond it DuckDB spills to the temp dir.
 A record runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
 (`COPY`, `ATTACH`, `EXPORT`, DDL, DML) with a `Permission Error` before it runs, so no record writes next
 to the shared fixtures or changes state for later records (`selftest/lockdown.slt` checks it). It never
@@ -286,22 +288,26 @@ The ClickBench data tests (`tests/data`, label `data`) use two more subcommands:
 
 ## The ratchet of the queries derived from TPC-H: `tpch`
 
-`antb1-slt tpch --queries DIR --status FILE [--memory-limit SIZE]` is the same ratchet (`runner/ratchet.h`, shared
-with `clickbench`) for the numbered queries of a directory (`q01.sql`, ... as Q1, ...; the loader of `answers`)
-against `tests/data/tpch_status.json` (`{"pass": [...]}`). Two differences: only Unsupported is a clean failure (a
-parse or bind error fails, since the queries are valid SQL), and each query is logged as `Q<n>: running` before it
-runs, flushed, so the log of a run that times out names the query. `--memory-limit` takes an absolute size (`2GiB`,
-`512MiB`, bytes) for the antb1 sessions. `--costs FILE` adds each query's seconds (antb1, DuckDB and the comparison)
-and, where antb1 answered, antb1's own seconds and its peak memory (`engine::QueryResult::peak_memory`), then the
-geometric mean of the passing queries; the workload's disclaimer comes first and after the summary; FILE gets the
-same as JSON lines (`RatchetCosts`), truncated first and flushed record by record, and the repro line leaves
-`--costs` out. Every
-TPC ratchet test passes `--costs build/<preset>/tpc-costs/<test>.jsonl`, which `tools/ci/tpc_costs.py` reports in each
-CI leg ([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). Its self-tests `harness.tpch.status.*` write our own
+`antb1-slt tpch --queries DIR --status FILE [--memory-limit SIZE] [--oracle-memory-limit SIZE]` is the same ratchet
+(`runner/ratchet.h`, shared with `clickbench`) for the numbered queries of a directory (`q01.sql`, ... as Q1, ...; the
+loader of `answers`) against `tests/data/tpch_status.json` (`{"pass": [...]}`). Two differences: only Unsupported is a
+clean failure (a parse or bind error fails, since the queries are valid SQL), and each query is logged as
+`Q<n>: running` before it runs, flushed, so the log of a run that times out names the query. `--memory-limit` takes an
+absolute size (`2GiB`, `512MiB`, bytes) for the antb1 sessions, and `--oracle-memory-limit` one for DuckDB: beyond it
+DuckDB spills to the temp dir, and a query that still does not fit fails, its log showing the error kind
+`Out of Memory Error`. `--costs FILE` adds each query's seconds (antb1, DuckDB and the comparison) and, where antb1
+answered, antb1's own seconds and its peak memory (`engine::QueryResult::peak_memory`), then the geometric mean of the
+passing queries; the workload's disclaimer comes first and after the summary; FILE gets the same as JSON lines
+(`RatchetCosts`), truncated first and flushed record by record, and the repro line leaves `--costs` out. Every TPC
+ratchet test passes `--memory-limit 2GiB --oracle-memory-limit 1GiB` and
+`--costs build/<preset>/tpc-costs/<test>.jsonl`, the file that `tools/ci/tpc_costs.py` reports in each CI leg
+([docs/ci.md](../../docs/ci.md#test-reports-and-logs)). Its self-tests `harness.tpch.status.*` write our own
 numbered queries over the canary table (marked `redact`) into the build tree; `harness.tpch.status.costs`,
 `.costs_repro`, `.costs_memory` and `.costs_unwritable` check the costs lines, the file (through
 `print_file_after.cmake`), the repro line, a query over the memory limit (a memory error) and a file that cannot be
-written (exit code 3). A run also writes why antb1 refuses each query to `<temp dir>/refusals.txt` (`Q<n>`,
+written (exit code 3); `.oracle_memory` and `.oracle_memory_invalid` check that DuckDB gets its limit (under 1 KiB
+it fails the query that antb1 answers, and the repro line keeps the limit) and that a size the option does not take
+is a usage error. A run also writes why antb1 refuses each query to `<temp dir>/refusals.txt` (`Q<n>`,
 `line:column` in the query's file, antb1's message; a `--shard` run, its slice's) and names only the file in the log.
 The messages quote the queries, so the report is local only (`PlanRefusalReport` in `runner/ratchet.h`): it is not
 written on GitHub Actions, for the repro of one query (`--only`) or with a temp dir outside the build tree (the parent

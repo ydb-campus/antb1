@@ -149,8 +149,10 @@ endforeach()
 # I/O or execution error fails the test, as do an unexpected pass and an unexpected fail. Both scale factors read
 # the same ratchet, so a query passes at both or the test fails at one, and the parallel run (4 threads, batches of
 # 1000 rows) must equal the 1-thread run byte for byte. Each query logs "Q<n>: running" first, so a timeout names
-# it. --costs adds each query's seconds and antb1's peak memory, with the disclaimer first and last, and writes them to
-# build/<preset>/tpc-costs/<test>.jsonl, which tools/ci/tpc_costs.py reports in every CI leg (docs/ci.md).
+# it. antb1 may use 2 GiB per query and DuckDB 1 GiB (--oracle-memory-limit), beyond which it spills to the test's temp
+# dir; tests/tpcds/CMakeLists.txt says why. --costs adds each query's seconds and antb1's peak memory, with the
+# disclaimer first and last, and writes them to build/<preset>/tpc-costs/<test>.jsonl, which tools/ci/tpc_costs.py
+# reports in every CI leg (docs/ci.md).
 # The line --costs prints first and after the summary: ADR 0006's disclaimer, verbatim.
 string(
   CONCAT _disclaimer
@@ -188,6 +190,8 @@ foreach(kind IN ITEMS sf0_01 sf0_1 parallel)
     "${_status}"
     --memory-limit
     2GiB
+    --oracle-memory-limit
+    1GiB
     --costs
     "${CMAKE_BINARY_DIR}/tpc-costs/${_name}.jsonl"
     ${_options}

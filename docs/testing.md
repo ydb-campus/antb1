@@ -442,12 +442,12 @@ judge). Linux only, as for TPC-H. So far it holds:
   (label `parallel`: 4 threads, 1000-row batches, equal to the 1-thread results byte for byte; scale factor 0.1, as for
   TPC-H, because at scale factor 1 it outlasted the timeout under AddressSanitizer on a CI runner): the ratchet.
   `antb1-slt tpcds` runs the 99 queries against `tests/data/tpcds_status.json` with the rules of the TPC-H ratchet
-  ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with a 2 GiB
-  memory limit and a 900-second timeout; its status table is "Queries derived from TPC-DS" in
-  [sql-subset.md](sql-subset.md#queries-derived-from-tpc-ds). Each run prints and keeps each query's seconds and
-  antb1's peak memory (`--costs`, [below](#the-ratchet-of-the-queries-derived-from-tpc-h)): the numbers of ADR 0037's
-  scale factor 1 budget. `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds` on our own
-  numbered queries (`harness.tpch.status.*` covers the rest of the shared ratchet).
+  ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)), through `tests/tpch/run_redacted.cmake`, with memory
+  limits of 2 GiB for antb1 and 1 GiB for DuckDB, and a 900-second timeout; its status table is "Queries derived
+  from TPC-DS" in [sql-subset.md](sql-subset.md#queries-derived-from-tpc-ds). Each run prints and keeps each query's
+  seconds and antb1's peak memory (`--costs`, [below](#the-ratchet-of-the-queries-derived-from-tpc-h)): the numbers
+  of ADR 0037's scale factor 1 budget. `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds`
+  on our own numbered queries (`harness.tpch.status.*` covers the rest of the shared ratchet).
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 this implementation does not comply with all requirements of the TPC-DS Benchmark.
@@ -497,21 +497,23 @@ the test is withheld, so a broken redaction fails the test without publishing th
 | `harness.tpch.drift` | `harness` | query texts that differ from the committed digests fail, and the report gives numbers and digests only |
 | `harness.tpch.generate.duckdb_fails.on_ci`, `.local` | `harness` | a failing duckdb CLI: only its exit code and error kind are printed; `ANTB1_TPCH_SHOW=1` shows its messages locally, never on GitHub Actions |
 | `harness.tpch.run_redacted.forbid`, `.unredacted`, `.sanitizer`, `.timeout` | `harness` | `run_redacted.cmake` withholds forbidden and unredacted output, prints only the `SUMMARY:` line of a sanitizer report, and fails a command that outlasts its timeout with exit code 125 after printing how far it got |
-| `harness.tpch.status.*` | `harness` | `antb1-slt tpch` on our own numbered queries over the canary table: all unsupported passes; an unexpected pass, an unexpected fail, a wrong answer and a parse, bind or execution error each fail, redacted; `--costs` prints and writes each query's costs, never a query's text, and stays out of the repro line |
+| `harness.tpch.status.*` | `harness` | `antb1-slt tpch` on our own numbered queries over the canary table: all unsupported passes; an unexpected pass, an unexpected fail, a wrong answer and a parse, bind or execution error each fail, redacted; `--costs` prints and writes each query's costs, never a query's text, and stays out of the repro line; `--oracle-memory-limit` reaches DuckDB, which fails a query it cannot fit with an out-of-memory error |
 | `harness.tpch.extension` | `harness` | the pinned extension loads into the duckdb CLI |
 
 ### The ratchet of the queries derived from TPC-H
 
 `tpch.status.sf0_01`, `tpch.status.sf0_1` and `parallel.tpch.status.sf0_1` run `antb1-slt tpch`
 (`tests/slt/runner/ratchet.h`, which the ClickBench ratchet shares): `q01.sql` to `q22.sql` as Q1 to Q22 on antb1,
-with a memory limit of 2 GiB, and on DuckDB the queries antb1 answers. A query passes when antb1's answer equals
-DuckDB's: the same type names, DOUBLE within 1e-9, ORDER BY order with ties in any order, and any row order
-otherwise. Every other query must be Unsupported (exit code 4): unlike ClickBench, a parse or bind error is not a
-clean failure, because these queries are valid SQL. The tests fail on a wrong answer, on any other error and on any
-difference from the ratchet `tests/data/tpch_status.json` (`{"pass": [<n>, ...]}`). Both scale factors read the same
-ratchet, so a query must pass at both, and the parallel run must equal the 1-thread run byte for byte. The PR that
-makes a query pass adds it to the ratchet and to the table in [sql-subset.md](sql-subset.md#queries-derived-from-tpc-h)
-(`pixi run lint` checks that they agree); both are protected paths, so the maintainer signs off.
+with a memory limit of 2 GiB, and on DuckDB, with 1 GiB, the queries antb1 answers. Beyond its limit DuckDB spills to
+the test's temp dir, `build/<preset>/slt-tmp/<test>`; a query it still cannot fit fails the test, with the error kind
+`Out of Memory Error` in the log. A query passes when antb1's answer equals DuckDB's: the same type names, DOUBLE
+within 1e-9, ORDER BY order with ties in any order, and any row order otherwise. Every other query must be Unsupported
+(exit code 4): unlike ClickBench, a parse or bind error is not a clean failure, because these queries are valid SQL.
+The tests fail on a wrong answer, on any other error and on any difference from the ratchet
+`tests/data/tpch_status.json` (`{"pass": [<n>, ...]}`). Both scale factors read the same ratchet, so a query must pass
+at both, and the parallel run must equal the 1-thread run byte for byte. The PR that makes a query pass adds it to the
+ratchet and to the table in [sql-subset.md](sql-subset.md#queries-derived-from-tpc-h) (`pixi run lint` checks that
+they agree); both are protected paths, so the maintainer signs off.
 
 Each query is logged as `Q<n>: running` before it runs, and `run_redacted.cmake` stops the run 30 seconds before
 the ctest timeout (900 seconds), so the log of a run that hangs names the query. Every registration passes

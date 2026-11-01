@@ -1,16 +1,20 @@
 // The DuckDB adapter (duckdb_engine.h) against the DuckDB library: a DECIMAL is an exact D column
 // named DECIMAL(p,s), and its canonical text is the text DuckDB prints, at every physical width
-// DuckDB stores a DECIMAL in (16, 32, 64 and 128 bits).
+// DuckDB stores a DECIMAL in (16, 32, 64 and 128 bits). A memory limit is DuckDB's memory_limit,
+// locked with the rest of the configuration, beyond which DuckDB spills to the temp dir.
 
 #include "duckdb_engine.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -99,6 +103,62 @@ TEST_F(DuckDbEngineTest, DecimalTextIsDuckDbsVarcharText) {
         EXPECT_EQ(row[0], row[1]) << type;
       }
     }
+  }
+}
+
+// A directory of its own under TempDir() for each test: ctest runs them in parallel.
+std::filesystem::path TestDir(std::string_view name) {
+  const std::filesystem::path dir = std::filesystem::path(::testing::TempDir()) / name;
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+
+constexpr int64_t kMiB = int64_t{1024} * 1024;
+
+TEST(DuckDbEngineMemoryLimitTest, IsDuckDbsMemoryLimitLockedWithTheRest) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_memory_limit");
+  auto engine = DuckDbEngine::Make({}, dir, dir, 64 * kMiB);
+  ASSERT_TRUE(engine.has_value()) << engine.error();
+  const ExecResult setting = (*engine)->Execute("SELECT current_setting('memory_limit')");
+  ASSERT_TRUE(setting.has_value()) << setting.error().message;
+  EXPECT_EQ(setting->rows, (std::vector<Row>{{"64.0 MiB"}}));
+  const ExecResult set = (*engine)->Execute("SET memory_limit = '1GiB'");
+  ASSERT_FALSE(set.has_value());
+  EXPECT_TRUE(set.error().message.contains("the configuration has been locked"))
+      << set.error().message;
+}
+
+// Beyond its memory limit DuckDB spills to the temp dir. With a temp dir DuckDB cannot create (one
+// below a regular file), a DISTINCT of a million keys answers under the limit, and one of ten
+// million, whose hash table outgrows it, fails; with its temp dir, the same limit answers the
+// larger one too.
+TEST(DuckDbEngineMemoryLimitTest, SpillsToTheTempDirBeyondIt) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_spill");
+  std::ofstream(dir / "file") << "not a directory\n";
+  const auto distinct = [](int64_t keys) {
+    return std::format("SELECT COUNT(*) FROM (SELECT DISTINCT i FROM range({}) t(i))", keys);
+  };
+  auto blocked = DuckDbEngine::Make({}, dir, dir / "file" / "tmp", 64 * kMiB);
+  ASSERT_TRUE(blocked.has_value()) << blocked.error();
+  const ExecResult fits = (*blocked)->Execute(distinct(1'000'000));
+  ASSERT_TRUE(fits.has_value()) << fits.error().message;
+  EXPECT_EQ(fits->rows, (std::vector<Row>{{"1000000"}}));
+  EXPECT_FALSE((*blocked)->Execute(distinct(10'000'000)).has_value())
+      << "the query fits the limit, so it shows no spill";
+  auto engine = DuckDbEngine::Make({}, dir, dir / "tmp", 64 * kMiB);
+  ASSERT_TRUE(engine.has_value()) << engine.error();
+  const ExecResult answered = (*engine)->Execute(distinct(10'000'000));
+  ASSERT_TRUE(answered.has_value()) << answered.error().message;
+  EXPECT_EQ(answered->rows, (std::vector<Row>{{"10000000"}}));
+}
+
+TEST(DuckDbEngineMemoryLimitTest, IsAtLeastOneByte) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_bad_memory_limit");
+  for (const int64_t bytes : {int64_t{0}, int64_t{-1}}) {
+    const auto engine = DuckDbEngine::Make({}, dir, dir, bytes);
+    ASSERT_FALSE(engine.has_value()) << bytes;
+    EXPECT_EQ(engine.error(),
+              std::format("duckdb: the memory limit must be at least 1 byte, not {}", bytes));
   }
 }
 

@@ -80,6 +80,11 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
      come from the nightly `asan-tpc-sf1`. Before merging a PR that completes a heavy query, run
      `pixi run asan-tpc-sf1` on a Linux host. Dispatching the nightly workflow on the branch also works, but it runs
      every nightly job.
+
+   Update (2026-11-01, HC5): DuckDB, the oracle, may use 1 GiB in each run, beyond which it spills to the run's temp
+   dir, so the shards that ctest runs at once cannot each take most of a runner's memory for it. The cap leaves DuckDB
+   room on all 99 queries at SF 1, measured locally; a query that outgrows it fails its shard with an
+   `Out of Memory Error`, which is when to revisit it.
 7. **The Plan's ids** name the roadmap's PRs in `pending` guards and docs: HC, PF, NL, CT, FN, AG, RU, OJ, SQ and CL;
    X4a-X4d, ADR 0036's X4 but for `BY NAME` and non-SELECT branches, which no query of the 99 needs and which stay on
    X4 with their `pending X4` guards; X7a and PF5, ADR 0036's X7 in two parts; and W1 onward, which the window ADR
@@ -114,7 +119,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC2 | Result type names in `.slt` records: a line `slt-complete` writes from DuckDB's types, matched exactly by both engines | | Built |
 | HC3 | Each SF 1 query's seconds and peak memory in the shard logs of every leg, and a local report of each refusal | | Built |
 | HC4 | SF 1 shards by measured cost: a committed map of queries to shards instead of every eighth query | | Planned |
-| HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Planned |
+| HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Built |
 | HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Planned |
 | HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch` | | Planned |
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Planned |
