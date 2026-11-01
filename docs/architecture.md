@@ -249,7 +249,9 @@ destroyed). A finished build stays held until the parts of its probe pipeline ar
 pressure below; the builds a build's input probes go once that build is finished. The count is atomic and checked
 before an allocation, so threads never pass the limit together; past it, an allocation fails with
 `Status::OutOfMemory` and nothing is left behind. A result keeps the budget alive (`QueryResult::memory`) as long as
-its buffers exist. The
+its buffers exist. `Execute` restarts the budget's peak from the bytes held when it starts (`MemoryBudget::ResetPeak`,
+as `ExplainAnalyze` does) and reports it as `QueryResult::peak_memory`: with one thread and no earlier result alive,
+the query's own peak, the same on every run. The
 part scheduler's window adapts to the budget: every part taken above half of the limit halves it, every part taken
 below widens it by one, and above half no new part starts while another is in flight. A part that runs out of memory
 next to others does not fail the query: the parts ahead are dropped (and run again when reached) and it runs again

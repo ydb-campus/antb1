@@ -141,6 +141,7 @@ arrow::Status Session::RegisterParquet(const std::string& name,
 
 arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   QueryResult result;
+  memory_->ResetPeak();
   ARROW_ASSIGN_OR_RAISE(auto logical,
                         ParseAndBind(sql, catalog_, BindOptionsOf(options_), &result.timings));
   const auto t0 = Clock::now();
@@ -158,6 +159,7 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   }
   ARROW_ASSIGN_OR_RAISE(result.table, table->RenameColumns(result.names));
   result.timings.execute = Clock::now() - t0;
+  result.peak_memory = memory_->max_memory();
   return result;
 }
 
