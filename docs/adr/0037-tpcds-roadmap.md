@@ -112,7 +112,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 0** | **The harness** | | |
 | HC1 | This ADR; the TPC-DS table of docs/sql-subset.md rewritten from the survey; ADR 0036's context corrected | | Built |
 | HC2 | Result type names in `.slt` records: a line `slt-complete` writes from DuckDB's types, matched exactly by both engines | | Built |
-| HC3 | Each SF 1 query's seconds and peak memory in the shard logs of every leg, and a local report of each refusal | | Planned |
+| HC3 | Each SF 1 query's seconds and peak memory in the shard logs of every leg, and a local report of each refusal | | Built |
 | HC4 | SF 1 shards by measured cost: a committed map of queries to shards instead of every eighth query | | Planned |
 | HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Planned |
 | HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Planned |

@@ -371,7 +371,8 @@ void AddSetup(CLI::App* cmd, Args& args) {
       ->required();
   cmd->add_option("--tables", args.tables, "Table definitions (tests/slt/tables.txt)")->required();
   cmd->add_option("--temp-dir", args.temp_dir,
-                  "DuckDB temp directory (default: <fixtures>/../slt-tmp)");
+                  "DuckDB temp directory, and tpch and tpcds's local refusal report (default: "
+                  "<fixtures>/../slt-tmp)");
   cmd->add_option("--test-name", args.test_name, "ctest name, for the repro line");
   cmd->add_option("--threads", args.threads, "antb1: threads of the engine (default 1)")
       ->check(CLI::Range(1, engine::Session::kMaxThreads));
@@ -646,12 +647,8 @@ double SteadySeconds() {
 }
 
 int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
-                     const std::string& command, const Workload& workload) {
+                     const std::string& command, const Workload& workload, bool github_actions) {
   const double started = SteadySeconds();  // the costs' wall_seconds include the setup
-  if (!args.costs.empty()) {
-    std::error_code ec;
-    fs::remove(args.costs, ec);  // a run that fails in its setup leaves no earlier run's costs
-  }
   auto queries = LoadNumberedQueries(args.queries_dir, args.redact);
   if (!queries) {
     std::println(stderr, "antb1-slt: {}", queries.error());
@@ -715,12 +712,38 @@ int NumberedWorkload(const Args& args, const std::vector<TableDef>& tables,
         .memory_limit = args.memory_limit.empty() ? std::nullopt : ParseByteSize(args.memory_limit),
         .started = started};
   }
+  // Why antb1 refuses each query it refuses, a local report (PlanRefusalReport): the log names the
+  // file, never what it holds.
+  std::error_code ec;
+  const RefusalReport report = PlanRefusalReport(github_actions, args.only.has_value(),
+                                                 fs::absolute(args.temp_dir, ec), args.fixtures);
+  std::ofstream refusals_file;
+  std::string refusals_note = report.skipped;
+  if (report.skipped.empty()) {
+    fs::create_directories(report.file.parent_path(), ec);
+    refusals_file.open(report.file, std::ios::out | std::ios::trunc);
+    if (!refusals_file) {
+      std::println(stderr, "antb1-slt: cannot write the refusals file {}", report.file.string());
+      return kExitSetup;
+    }
+    refusals_file << std::format(
+        "# Why antb1 refuses the queries derived from {}: its messages quote the query text. Local "
+        "only: never commit, paste or upload them (ADR 0006).\n",
+        workload.summary == "TPCDS" ? "TPC-DS" : "TPC-H");
+    options.refusals = [&refusals_file](std::string_view line) {
+      refusals_file << line;
+      refusals_file.flush();
+    };
+    refusals_note = report.file.string();
+  }
+  options.show_refusals = !args.redact;  // --show-values: a local repro
   // Each line as it comes, so the log of a run that times out ends with the query it was running.
   const RatchetStats stats = RunRatchet(*queries, *status, workload, antb1->get(), **oracle,
                                         options, [](std::string_view text) {
                                           std::print("{}", text);
                                           std::fflush(stdout);
                                         });
+  std::println("refusals: {}", refusals_note);
   return stats.failed == 0 ? 0 : kExitFailed;
 }
 
@@ -875,6 +898,15 @@ int Main(std::span<char*> argv, const Environment& env) {
   if (args.temp_dir.empty()) {
     args.temp_dir = (fs::path(args.fixtures).parent_path() / "slt-tmp").string();
   }
+  if (tpch->parsed() || tpcds->parsed()) {
+    // An earlier run's costs and refusal report go before any setup, on GitHub Actions too, so that
+    // a run that fails leaves none behind that would read as its own.
+    if (!args.costs.empty()) {
+      fs::remove(args.costs, ec);
+    }
+    fs::remove(PlanRefusalReport(false, false, fs::absolute(args.temp_dir, ec), args.fixtures).file,
+               ec);
+  }
   const auto tables = LoadTables(args.tables, args.fixtures);
   if (!tables) {
     std::println(stderr, "antb1-slt: {}", tables.error());
@@ -917,10 +949,10 @@ int Main(std::span<char*> argv, const Environment& env) {
     return Answers(args, *tables, command);
   }
   if (tpch->parsed()) {
-    return NumberedWorkload(args, *tables, command, kTpch);
+    return NumberedWorkload(args, *tables, command, kTpch, github_actions);
   }
   if (tpcds->parsed()) {
-    return NumberedWorkload(args, *tables, command, kTpcds);
+    return NumberedWorkload(args, *tables, command, kTpcds, github_actions);
   }
   return complete->parsed() ? Complete(args, *tables) : Run(args, *tables, command);
 }

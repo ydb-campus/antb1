@@ -74,6 +74,7 @@ FORBIDDEN = [
     re.compile(r"\n  SQL:\n"),
     re.compile(r"\n    row [0-9]+: "),
     re.compile(r"[sS][eE][lL][eE][cC][tT][ \t\n]"),
+    re.compile(r"\nQ[0-9]+: unsupported[^\n]*\n  "),
 ]
 
 

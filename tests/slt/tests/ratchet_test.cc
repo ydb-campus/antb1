@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <map>
@@ -90,6 +91,8 @@ struct Fixture {
   std::map<std::string, ExecResult> oracle_answers = {{"SELECT SECRET_Q1", Int("1")}};
   std::function<double()> clock;
   std::optional<RatchetCosts> costs;
+  std::function<void(std::string_view)> refusals;
+  bool show_refusals = false;
   Workload workload = kNumberedFromOne;
 
   struct Result {
@@ -110,7 +113,9 @@ struct Fixture {
                           .status_path = "status.json",
                           .command = "cmd",
                           .clock = clock,
-                          .costs = costs},
+                          .costs = costs,
+                          .refusals = refusals,
+                          .show_refusals = show_refusals},
                          [&r](std::string_view text) {
                            r.out += text;
                            r.writes.emplace_back(text);
@@ -313,6 +318,65 @@ TEST(RunRatchet, CostsLinesAndRecords) {
       R"({"record": "end", "queries": 3, "passed": 2, "failed": 2, "wall_seconds": 10.000000})"
       "\n");
   EXPECT_FALSE(file.contains("SECRET")) << file;
+}
+
+// The reasons of the refused queries (antb1-slt's local report): a line per Unsupported answer, its
+// place counted in the query's file (the statement starts on its line 3 here), "-" without one, and
+// the message on one line; the log shows a message only unredacted (--show-values, local only).
+TEST(RunRatchet, RefusalsGoToTheirSinkWithTheirPlace) {
+  Fixture f;
+  f.queries[0] = {.line = 3, .sql = "SELECT\n  SECRET_Q1 OVER ()", .features = {}};
+  f.antb1_answers["SELECT\n  SECRET_Q1 OVER ()"] =
+      std::unexpected(EngineError{.kind = "unsupported",
+                                  .message = "unsupported: SECRET OVER is not supported",
+                                  .unsupported = true,
+                                  .internal = false,
+                                  .span = SourceSpan{.offset = 19, .length = 4}});
+  f.antb1_answers["SELECT SECRET_Q2"] = std::unexpected(EngineError{
+      .kind = "unsupported", .message = "unsupported: A\tB\nC\\D", .unsupported = true});
+  std::string file;
+  f.refusals = [&file](std::string_view line) { file += line; };
+  f.show_refusals = true;
+  const std::string expected =
+      "Q1\t4:13\tSECRET OVER is not supported\nQ2\t-\tA\\tB\\nC\\\\D\nQ3\t-\tSECRET_MESSAGE\n";
+  auto r = f.Run({}, /*redact=*/true);
+  EXPECT_EQ(r.stats.unsupported, 3) << r.out;
+  EXPECT_EQ(file, expected);
+  EXPECT_FALSE(r.out.contains("SECRET")) << r.out;  // redacted: neither a message nor the SQL
+  file.clear();
+  r = f.Run({}, /*redact=*/false);
+  EXPECT_TRUE(
+      r.out.contains("Q1: unsupported\n  SECRET OVER is not supported (line 4, column 13)\n"))
+      << r.out;
+  EXPECT_TRUE(r.out.contains("Q2: unsupported\n  A\\tB\\nC\\\\D\n")) << r.out;
+  EXPECT_TRUE(r.out.contains("Q3: unsupported\n  SECRET_MESSAGE\n")) << r.out;
+  EXPECT_EQ(file, expected);
+}
+
+// Where the local refusal report goes: always <temp dir>/refusals.txt, written only off GitHub
+// Actions, for a run of more than one query, inside the build tree (the fixtures' parent), compared
+// by path components after normalization.
+TEST(PlanRefusalReport, OnlyOffGitHubActionsForWholeRunsInsideTheBuildTree) {
+  const std::filesystem::path fixtures = "/b/dev/fixtures";
+  const auto skipped = [&](const std::filesystem::path& temp_dir) {
+    return PlanRefusalReport(false, false, temp_dir, fixtures).skipped;
+  };
+  const RefusalReport report = PlanRefusalReport(false, false, "/b/dev/slt-tmp/t", fixtures);
+  EXPECT_EQ(report.file, std::filesystem::path("/b/dev/slt-tmp/t/refusals.txt"));
+  EXPECT_EQ(report.skipped, "");
+  EXPECT_EQ(skipped("/b/dev"), "");               // the build tree itself
+  EXPECT_EQ(skipped("/b/dev/slt-tmp/../t"), "");  // /b/dev/t
+  EXPECT_EQ(PlanRefusalReport(false, false, "/b/dev/t", "/b/dev/fixtures/").skipped, "");
+  for (const char* outside :
+       {"/b", "/b/devx/t", "/b/dev-other/t", "/b/dev/../src", "/tmp/t", "/"}) {
+    EXPECT_EQ(skipped(outside), "not written outside the build tree") << outside;
+  }
+  EXPECT_EQ(PlanRefusalReport(true, false, "/b/dev/slt-tmp/t", fixtures).skipped,
+            "not written on GitHub Actions");
+  EXPECT_EQ(PlanRefusalReport(false, true, "/b/dev/slt-tmp/t", fixtures).skipped,
+            "not written for --only");
+  // The file is the same however the run turns out: an earlier run's is always removed.
+  EXPECT_EQ(PlanRefusalReport(true, true, "/b/dev/slt-tmp/t", fixtures).file, report.file);
 }
 
 }  // namespace
