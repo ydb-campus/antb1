@@ -2802,29 +2802,31 @@ TEST_F(HashJoinTest, ResidualErrorsDoNotDependOnTheBatchSize) {
 
 // Residuals that read no build column but its keys meet one candidate pair per probe row in a semi
 // or anti join, a pair that stands for the row's others (ADR 0022's E2c): every candidate holds the
-// row's key, so each pair gives the residuals the same values. The build has 2 parts: 1,000 rows of
-// key 1, 3 of key 2, 1 of key 3 and a NULL key. The probe rows of keys 1, 2 and 3 and the one of a
-// NULL v have candidates; those of key 4 and a NULL key, and the row the probe does not select,
-// have none. These residuals give the reference's rows with `pairs` 5, at every batch size, on one
-// thread and on the pool:
+// row's key, so each pair gives the residuals the same values. The build has 2 parts: 40 rows of
+// key 1, 20 in each, 3 of key 2, 1 of key 3 and a NULL key. The probe rows of keys 1, 2 and 3 and
+// the one of a NULL v have candidates; those of key 4 and a NULL key, and the row the probe does
+// not select, have none. These residuals give the reference's rows with `pairs` 5, at every batch
+// size, on one thread and on the pool:
 // - all pass (bk >= pk), none pass (bk > pk);
 // - mixed arithmetic with a NULL operand (bk * 10 > v);
 // - the probe's columns alone (v > 2);
 // - two residuals in order (v > 0, then bk < v).
-// w > v reads w, a build column that is no key: the control meets every candidate, 3,004 pairs, as
-// left joins do.
+// w > v reads w, a build column that is no key: the control meets every candidate, 124 pairs, as
+// left joins do; at every batch size but the largest, some row's 40 candidates span two chunks or
+// more. The key stays small because every run of the control and of the left join walks all its
+// pairs: with 1,000 rows of key 1 the test outran its timeout under ASan.
 TEST_F(HashJoinTest, ResidualsOverTheBuildKeysMeetOneCandidatePerRow) {
   const auto pool = MakeThreadPool();
   const std::optional<int64_t> null;
   const auto build_schema = Int64Schema({"bk", "w"});
-  std::vector<std::optional<int64_t>> keys0(500, 1);
-  std::vector<std::optional<int64_t>> w0(500);
+  std::vector<std::optional<int64_t>> keys0(20, 1);
+  std::vector<std::optional<int64_t>> w0(20);
   std::ranges::iota(w0, int64_t{0});
   keys0.insert(keys0.end(), {2, 2, null});
   w0.insert(w0.end(), {7, 8, 0});
-  std::vector<std::optional<int64_t>> keys1(500, 1);
-  std::vector<std::optional<int64_t>> w1(500);
-  std::ranges::iota(w1, int64_t{500});
+  std::vector<std::optional<int64_t>> keys1(20, 1);
+  std::vector<std::optional<int64_t>> w1(20);
+  std::ranges::iota(w1, int64_t{20});
   keys1.insert(keys1.end(), {2, 3});
   w1.insert(w1.end(), {9, 5});
   const auto build_table = std::make_shared<MemoryTable>(
@@ -2925,7 +2927,7 @@ TEST_F(HashJoinTest, ResidualsOverTheBuildKeysMeetOneCandidatePerRow) {
           ASSERT_TRUE(batches.ok()) << batches.status().ToString();
           EXPECT_EQ(RowsOf(join->output_schema(), *batches), expected);
           if (kind != plan::JoinKind::kInner) {  // inner applies its residuals to its output
-            EXPECT_EQ(MetricOf(profile, "pairs"), one_pair ? 5 : 3004);
+            EXPECT_EQ(MetricOf(profile, "pairs"), one_pair ? 5 : 124);
           }
         }
       }

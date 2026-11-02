@@ -688,7 +688,7 @@ TEST_F(JoinTableTest, TheRowsOfAKeyHoldItsProbeKeyBytes) {
   for (const LogicalType type :
        {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt,
         LogicalType::kUSmallInt, LogicalType::kDate, LogicalType::kTimestamp}) {
-    SCOPED_TRACE("dense " + std::string(plan::ToString(type)));
+    SCOPED_TRACE("dense " + plan::ToString(type));
     BuildData data({type});
     data.Add(0, {IntegersOf(type, {1, 1, 2, std::nullopt, 3})})
         .Add(1, {IntegersOf(type, {2, 1, 4})});
