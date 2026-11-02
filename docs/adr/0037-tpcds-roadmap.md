@@ -130,7 +130,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch`; built at SF 0.01 (the HC7 update below) | | Built |
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
-| X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned | | Planned |
+| X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned; the key filters stay on X7, unscheduled (the X7a update below) | | Planned |
 | PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures | | Planned |
 | **Phase 2** | **NULL as a value** | | |
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes | | Planned |
@@ -160,7 +160,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU4 | GROUPING() | | Planned |
 | **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
 | X4a | UNION, INTERSECT and EXCEPT in the grammar, with parenthesized branches | | Planned |
-| X4b | UNION | 75 | Planned |
+| X4b | UNION, after PF5's fallback (the X7a update below) | 75 | Planned |
 | X4c | INTERSECT | 8, 38 | Planned |
 | X4d | EXCEPT | 87 | Planned |
 | **Phase 7** | **Join kinds** | | |
@@ -180,15 +180,16 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ8 | Correlated EXISTS under OR | 10, 35 | Planned |
 | **Phase 9** | **Window functions** | | |
 | W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
-| **Guards** | **Pulled in front of the PR they protect when the budget gate fires** | | |
-| PF2 | Filters into derived tables and CTE references through their GROUP BY keys | | Conditional |
+| **Guards** | **Pulled in front of the PR they protect when the budget gate or their own trigger (the updates below) fires** | | |
+| PF2 | Filters into derived tables and CTE references: through their Projects, GROUP BY keys and inner joins to the scan of the relation that defines the column | | Conditional |
 | PF3 | LEFT JOIN as INNER or anti join where WHERE rejects the padded rows | | Conditional |
 | PF4 | One aggregation for one-row subqueries over the same rows | | Conditional |
-| PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared | | Conditional |
+| PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared; the fallback lands before X4b at the latest (the X7a update below) | | Conditional |
 | PF6 | A partial aggregate below the join under a ROLLUP | | Conditional |
 | PF7 | One-row and single joins on the branch of the relation they read | | Conditional |
 | PF8 | Hash-set membership for long IN lists | | Conditional |
 | PF9 | One candidate per probe row for semi and anti residuals that read no build column but its keys (ADR 0022's E2c) | | Built |
+| PF10 | A derived table's or CTE reference's row estimate after its conditions, without the union branches they rule out, for the join order and the build sides | | Conditional |
 | **Closing** | | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
@@ -213,6 +214,44 @@ The tables file declares the schema's 107 foreign keys (`ref=`, table and column
 generator joins. The run must print that the generator can follow all of them, since it drops one it cannot follow
 without an error. The seed's first 300 queries leave DuckDB clean under LeakSanitizer, against the leak of a string
 MIN or MAX that `tests/tpch/CMakeLists.txt` describes.
+
+Update (2026-11-02, X7a's design, agreed with the maintainer before its PR): four changes to the Plan.
+
+- **X7a defers the dynamic key filters into branches.** No passing query would gain much from them. The CTE
+  references that Q4, Q11 and Q74 join to each other meet on a string key, and a build publishes a key filter for one
+  integer or DATE key only (`exec::CanPublishKeyFilter`, for [ADR 0029](0029-dynamic-join-filters.md)'s filters).
+  Q71, the one passing query that joins a union on such a key, would gain little. The key filters stay on
+  [ADR 0036](0036-union-all.md)'s X7, unscheduled, until a profile, or the SF 1 budget, shows a join above a union
+  whose key filter would cut a measured share of a passing query's time (Q2, Q5 or Q54 may be one once they pass).
+  Until then ADR 0036's planning rule stands, and no filter a join offers travels into a branch.
+
+  X7a keeps the conjuncts into the branches and the pruning of the branches a constant rules out, as an Optimize pass
+  that puts each conjunct on top of each branch. A union that pruning leaves with one branch stays a union of one
+  input, and one it leaves with none keeps one branch under a filter that is never true. Either way nothing under it
+  becomes shareable before PF5's fallback: ADR 0036 keeps branches out of sharing because an aggregate-topped branch
+  held alone can pass the cap, and the two references of each channel in Q4, Q11 and Q74 would otherwise hold the
+  same branch outside any union.
+- **PF2 goes through Projects, GROUP BY keys and inner joins.** Today a condition on a derived table or a CTE
+  reference stops above its Project, so its scan gets no pushed predicate and no part pruning
+  ([ADR 0020](0020-filter-pushdown.md)), as a plain table's scan does. The rule that carries a condition to the scan
+  of the relation that defines its column serves every derived table. In a block that reads more than one relation,
+  the condition has to pass its inner joins as well: each branch of Q4, Q11 and Q74 joins three relations under its
+  GROUP BY, and nothing routes a condition past a join today except the binder's classification of WHERE. The same
+  rule carries X7a's conditions from a branch's top down to its scan. Its PR decides how a condition is folded into a
+  narrower type below the union's widening cast, and records the changed error order below a Project's computations.
+- **PF10 is new.** The binder chooses the join order and the build sides before Optimize runs. Its estimates count
+  every branch of a union and leave out the conditions on a derived table or a CTE reference
+  (`FilteredRelationRows`), so X7a's pruning never reaches those choices. An estimate that is too high costs a larger
+  build than needed, never a build larger than the planner expected. The trigger is a profile, or the SF 1 budget,
+  showing a join order or build side chosen badly from such an estimate. The fix shares X7a's pruning check with the
+  estimate rather than moving the rewrite into the binder.
+- **PF5's first half gets a second trigger.** Its fallback to recomputation past `MaterializedTable`'s cap lands
+  before the first PR that makes a result topped by a union or a set operation shareable, not only when the SF 1
+  budget fires. The cap can fail a query only above SF 1, since sharing needs 10 million scanned rows, and no CI leg
+  runs there. X7a is not such a PR, since its unions of one input stay out of sharing. X4b is the latest: it compiles
+  UNION to a GROUP BY over a UNION ALL, which ADR 0030's sharing collects, so a CTE whose body is a UNION, referenced
+  more than once, would hold the union's distinct rows. None of the 99 has a CTE whose body is a UNION, INTERSECT or
+  EXCEPT referenced more than once, so this trigger guards SQL beyond them.
 
 ## Alternatives considered
 
