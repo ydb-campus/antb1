@@ -12,7 +12,9 @@
 #include <span>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -131,6 +133,77 @@ arrow::Result<std::shared_ptr<const JoinColumns>> MakeJoinColumns(
   columns->arrays = ChunkColumns(table->chunks(), fields);
   columns->table = std::move(table);
   return std::shared_ptr<const JoinColumns>(std::move(columns));
+}
+
+// Whether equal keys of `type` hold equal bytes, so that every build row of a key's range holds the
+// probe key's bytes: KeysEqual compares bytes, the direct layout one integer (join_table.cc). No
+// default: a key type added later -- a DOUBLE, whose -0.0 equals 0.0 -- is decided here first.
+bool KeyEqualityIsBytewise(plan::LogicalType type) {
+  switch (type.id()) {
+    case plan::LogicalType::kSmallInt:
+    case plan::LogicalType::kInteger:
+    case plan::LogicalType::kBigInt:
+    case plan::LogicalType::kUSmallInt:
+    case plan::LogicalType::kHugeInt:
+    case plan::LogicalType::kDecimal:
+    case plan::LogicalType::kVarchar:
+    case plan::LogicalType::kDate:
+    case plan::LogicalType::kTimestamp:
+      return true;
+    case plan::LogicalType::kDouble:  // never a join key (JoinBuildSpec::Make)
+    case plan::LogicalType::kBoolean:
+      return false;
+  }
+  return false;
+}
+
+bool IsDeterministic(plan::Function function) {
+  switch (function) {  // no default: a function added later (random(), now()) is decided here
+    case plan::Function::kStrlen:
+    case plan::Function::kRegexpReplace:
+    case plan::Function::kEpochMs:
+    case plan::Function::kExtract:
+    case plan::Function::kDateTrunc:
+    case plan::Function::kSubstring:
+      return true;
+  }
+  return false;
+}
+
+// Whether `expr` gives the same value, or the same error, on rows that hold the same values in the
+// columns it reads. Every kind is listed, as in shared_sub_plans.cc's ExprKey, so that a new kind
+// does not compile until it is decided.
+bool IsDeterministic(const plan::ExprPtr& expr) {
+  if (expr == nullptr) {
+    return true;  // a CASE without ELSE
+  }
+  const auto all = [](const std::vector<plan::ExprPtr>& list) {
+    return std::ranges::all_of(list, [](const plan::ExprPtr& e) { return IsDeterministic(e); });
+  };
+  return std::visit(
+      [&](const auto& e) -> bool {
+        using T = std::decay_t<decltype(e)>;
+        if constexpr (std::is_same_v<T, plan::ColumnExpr> ||
+                      std::is_same_v<T, plan::ConstantExpr>) {
+          return true;
+        } else if constexpr (std::is_same_v<T, plan::ArithExpr>) {
+          return IsDeterministic(e.left) && IsDeterministic(e.right);
+        } else if constexpr (std::is_same_v<T, plan::NegateExpr> ||
+                             std::is_same_v<T, plan::CastExpr>) {
+          return IsDeterministic(e.operand);
+        } else if constexpr (std::is_same_v<T, plan::FunctionExpr>) {
+          return IsDeterministic(e.function) && all(e.args);
+        } else if constexpr (std::is_same_v<T, plan::PredicateExpr>) {
+          return all(e.operands);
+        } else if constexpr (std::is_same_v<T, plan::BoolExpr>) {
+          return all(e.args);
+        } else if constexpr (std::is_same_v<T, plan::CaseExpr>) {
+          return all(e.whens) && all(e.thens) && IsDeterministic(e.otherwise);
+        } else {
+          static_assert(false, "an expression kind not known to be deterministic");
+        }
+      },
+      expr->node);
 }
 
 }  // namespace
@@ -737,6 +810,18 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       return plan::ColumnExpr{.index = Narrow<int>(at), .id = column.id};
     }));
   }
+  if (kind_ == plan::JoinKind::kSemi || kind_ == plan::JoinKind::kAnti) {
+    const std::vector<plan::BoundColumn>& keys = build_->spec()->keys();
+    const auto is_key = [&keys](int column) {
+      return std::ranges::any_of(
+          keys, [column](const plan::BoundColumn& key) { return key.index == column; });
+    };
+    candidates_alike_ =
+        std::ranges::all_of(pair_build_, is_key) &&
+        std::ranges::all_of(
+            keys, [](const plan::BoundColumn& key) { return KeyEqualityIsBytewise(key.type); }) &&
+        std::ranges::all_of(residual_, [](const plan::ExprPtr& e) { return IsDeterministic(e); });
+  }
 }
 
 HashJoinOperator::~HashJoinOperator() = default;
@@ -1096,7 +1181,9 @@ arrow::Result<int64_t> HashJoinOperator::NextSlots() {
     int64_t count = 0;
     while (row < length && count < limit) {
       const JoinMatches& m = matches_[static_cast<std::size_t>(row)];
-      const std::uint32_t candidates = m.end - m.begin;
+      // An alike row takes one slot, its first candidate, which stands for the others.
+      const std::uint32_t candidates =
+          candidates_alike_ ? std::min(m.end - m.begin, std::uint32_t{1}) : m.end - m.begin;
       if (candidates == 0) {
         if (pads && Selected(row)) {
           emit(row, kPadded, count, true);
@@ -1161,6 +1248,9 @@ arrow::Result<int64_t> HashJoinOperator::PassingSlots(int64_t count) {
       std::ranges::count_if(slots, [](const JoinRowRef& ref) { return ref.chunk != kNoChunk; }));
   if (candidates == 0) {
     return 0;
+  }
+  if (profile() != nullptr) {  // the candidate pairs the residuals meet
+    profile()->Add("pairs", MetricUnit::kCount, Narrow<int64_t>(candidates));
   }
   ARROW_RETURN_NOT_OK(Fit(pair_rows_, candidates, memory_));
   ARROW_RETURN_NOT_OK(Fit(pair_builds_, candidates, memory_));
@@ -1274,7 +1364,15 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::MarkMatches() {
       }
       ARROW_ASSIGN_OR_RAISE(const int64_t passing, PassingSlots(count));
       for (int64_t i = 0; i < passing; ++i) {
-        marks_->Mark(build_positions_[pair_slots_[static_cast<std::size_t>(i)]]);
+        const std::uint32_t slot = pair_slots_[static_cast<std::size_t>(i)];
+        if (candidates_alike_) {  // the row's one pair passed, so every candidate of it does
+          const JoinMatches& m = matches_[static_cast<std::size_t>(probe_rows_[slot])];
+          for (std::uint32_t at = m.begin; at < m.end; ++at) {
+            marks_->Mark(at);
+          }
+        } else {
+          marks_->Mark(build_positions_[slot]);
+        }
       }
     }
   }

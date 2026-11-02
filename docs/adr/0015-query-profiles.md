@@ -86,6 +86,10 @@ Proposed
     build columns it gathers, and the probe rows it takes on its other path than 1:1), and `window_rows` on its 1:1
     path (without residuals). A semi, anti or left join with residuals adds `gather` for the columns of the candidate
     pairs that its residuals read, and `residual`. No metric is new.
+  - Update (2026-11-02, ADR 0037's PF9): a semi, anti or left join with residuals adds `pairs`, the candidate pairs
+    its residuals met. For a semi or anti join whose residuals read no build column but its keys, ADR 0022's E2c
+    brings that down to one pair per probe row with candidates, and `pairs` shows it without a timing. The fixed order
+    does not name it, so it follows the named metrics, by name, as `window_matched` does.
 - **Output.**
   - Text: the `Output:` line, a `Total:` line, then one line per operator indented as EXPLAIN, with the numbers in
     brackets.

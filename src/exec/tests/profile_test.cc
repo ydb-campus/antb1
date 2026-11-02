@@ -395,6 +395,27 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
   const std::string dimension =
       "  HashBuild rows=10 runs=1 parts=2 skipped=0\n"
       "    Scan rows=10 runs=2 per_part\n";
+  // d probes t on d.k = t.g: 28 candidates for each key 0 to 4. Over a pair: d's k and v, then t's
+  // x and g. d.v > 102 reads no build column, so the candidates are alike (ADR 0022's E2c) and one
+  // pair stands for each row's 28; t.x > 100 reads t's x, which is no key, and meets every pair.
+  const auto pair_column = [](int index) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = LogicalType::kBigInt});
+  };
+  const auto above_over = [&pair_column](int index, int64_t value) {
+    return std::vector<plan::ExprPtr>{std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::PredicateExpr{.predicate = testing::Compare(
+                                                   Column(0, "c", LogicalType::kBigInt),
+                                                   plan::CompareOp::kGt, testing::BigInt(value)),
+                                               .operands = {pair_column(index)}},
+                   .type = LogicalType::kBoolean})};
+  };
+  const auto by_g = std::vector<plan::JoinKey>{
+      plan::JoinKey{.left = k, .right = Column(1, "g", LogicalType::kBigInt)}};
+  const std::string probe_of_d = "    Scan rows=5 runs=2 per_part\n";
+  const std::string facts =
+      "  HashBuild rows=140 runs=1 parts=20 skipped=0\n"
+      "    Scan rows=140 runs=20 per_part\n";
   struct Case {
     std::string name;
     plan::LogicalNodePtr join;
@@ -402,6 +423,8 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
     bool find = true;
     bool gather = false;
     bool window_rows = false;
+    std::optional<int64_t> pairs;  // the candidate pairs the residuals meet
+    int parts = 20;                // of the probe: t's 20, d's 2
   };
   const std::vector<Case> cases = {
       {.name = "semi",
@@ -436,11 +459,26 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
       {.name = "left with a residual",
        .join = join_of(plan::JoinKind::kLeft, t, d, on(g), above),
        .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension,
-       .gather = true},
+       .gather = true,
+       .pairs = 140},
       {.name = "semi with a residual",
        .join = join_of(plan::JoinKind::kSemi, t, d, on(g), above),
        .counts = "  HashJoin rows=56 runs=20 per_part\n" + scan_lines + dimension,
-       .gather = true},
+       .gather = true,
+       .pairs = 140},
+      // The build's keys filter d's scan to its 5 rows of k 0 to 4.
+      {.name = "semi with a residual over the probe alone",
+       .join = join_of(plan::JoinKind::kSemi, d, t, by_g, above_over(1, 102)),
+       .counts = "  HashJoin rows=2 runs=2 per_part\n" + probe_of_d + facts,
+       .gather = true,
+       .pairs = 5,
+       .parts = 2},
+      {.name = "semi with a residual over the build's other column",
+       .join = join_of(plan::JoinKind::kSemi, d, t, by_g, above_over(2, 100)),
+       .counts = "  HashJoin rows=5 runs=2 per_part\n" + probe_of_d + facts,
+       .gather = true,
+       .pairs = 140,
+       .parts = 2},
   };
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
@@ -448,7 +486,8 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
     for (const Case& c : cases) {
       SCOPED_TRACE(c.name);
       const auto profile = Profile(count_of(c.join), executor);
-      EXPECT_EQ(Counts(*profile), "PartAggregate rows=1 runs=1 parts=20 skipped=0\n" + c.counts);
+      EXPECT_EQ(Counts(*profile), "PartAggregate rows=1 runs=1 parts=" + std::to_string(c.parts) +
+                                      " skipped=0\n" + c.counts);
       ASSERT_EQ(profile->children().size(), 2U);
       const ProfileNode& probe = *profile->children()[0];
       const ProfileNode& build = *profile->children()[1];
@@ -462,6 +501,7 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
                 c.window_rows ? std::optional<int64_t>(140) : std::nullopt);
       EXPECT_EQ(MetricOf(probe, "residual").has_value(),
                 !std::get<plan::JoinNode>(*c.join).residual.empty());
+      EXPECT_EQ(MetricOf(probe, "pairs"), c.pairs);
       EXPECT_TRUE(MetricOf(build, "finish").has_value());
     }
   }

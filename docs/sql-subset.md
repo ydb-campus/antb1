@@ -711,9 +711,12 @@ input it builds on before it reads the other input, which then streams through i
 - The residual conditions of a semi, anti or left join decide which candidates (the build rows with a row's key) are
   matches. They are evaluated in the order written, each on the candidates the ones before it passed (NULL counts as
   false), on every candidate of every row, without stopping at a row's first match, so whether an overflow fails the
-  query does not depend on the batch size (unless a `LIMIT` above stops the join before it reads every row). A row
-  without candidates never meets them: an anti join keeps it, a left join pads it. A left join pads a row none of
-  whose candidates passes right after its last candidate.
+  query does not depend on the batch size (unless a `LIMIT` above stops the join before it reads every row). The one
+  exception gives the same answers and errors: a semi or anti join whose residuals read no column of the build but
+  its keys meets only a row's first candidate, since every candidate of the row would give them the same values
+  ([ADR 0022](adr/0022-joins-and-query-blocks.md)'s E2c). A row without candidates never meets them: an anti join
+  keeps it, a left join pads it. A left join pads a row none of whose candidates passes right after its last
+  candidate.
 - A one-row join appends the single row of its right input, an aggregate without groups, to every row; any other row
   count is a planner bug, reported as an error (exit code 1).
 - When an inner or a semi join's build holds no row, the other input is never read.
@@ -917,12 +920,14 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     NULL key, and an anti join on its left input over a build with no key at all, whose probe is never opened),
     `gather` (the rows' columns: the build columns an inner or a left join gathers, and the probe rows it
     takes on its other path than 1:1; the columns of the candidates that residuals read; a one-row join's values, which
-    its build makes once), `residual` and, when the build's keys are unique, an inner join's `window_rows`, and a left
-    join's without residuals (the rows of the probe's batches it gathered the build's columns for, next to the `rows` it
-    returned), beside an inner join's `window_matched` (how many of those rows found a match: a window all of whose
-    rows did keeps the probe's columns where they are and gathers the build for the window, and any other window
-    gathers only the rows that matched, which is why a selective join's `gather` is near its output rather than near
-    its probe — [ADR 0026](adr/0026-join-performance.md));
+    its build makes once), `residual`, `pairs` (a semi, anti or left join with residuals: the candidate pairs they
+    met, one per probe row with candidates for a semi or anti join whose residuals read no build column but its
+    keys, [ADR 0022](adr/0022-joins-and-query-blocks.md)'s E2c) and, when the build's keys are unique, an inner
+    join's `window_rows`, and a left join's without residuals (the rows of the probe's batches it gathered the
+    build's columns for, next to the `rows` it returned), beside an inner join's `window_matched` (how many of those
+    rows found a match: a window all of whose rows did keeps the probe's columns where they are and gathers the build
+    for the window, and any other window gathers only the rows that matched, which is why a selective join's `gather`
+    is near its output rather than near its probe — [ADR 0026](adr/0026-join-performance.md));
   - a `HashBuild`'s `finish` (the table built from its parts, the arrays of its columns that its gathers read, and a
     one-row join's values), `null_keys` (rows with a NULL key, which no key's range holds and no lookup returns; a join
     that emits the build rows which did not match keeps their rows apart from the table it indexes, since such a row is

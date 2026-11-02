@@ -685,20 +685,25 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
   // The right input's y > the left input's x. Its columns are the left input's, then the right
   // input's, whichever side the join builds on -- which is the mapping a left-building join has to
   // invert to read them off a batch of candidate pairs.
-  const auto compare = [&](int left_index, int right_index) {
+  const auto compare = [&](int left_index, int right_index,
+                           plan::CompareOp op = plan::CompareOp::kGt) {
     return std::make_shared<const plan::Expr>(plan::Expr{
         .node =
             plan::PredicateExpr{
                 .predicate = plan::Predicate{.kind = plan::Predicate::Kind::kCompareColumns,
                                              .column = Column(0, "a", LogicalType::kBigInt),
                                              .other = Column(1, "b", LogicalType::kBigInt),
-                                             .op = plan::CompareOp::kGt},
+                                             .op = op},
                 .operands = {column(left_index), column(right_index)}},
         .type = LogicalType::kBoolean});
   };
   // The table holds x = 0..9 and y = 10 * x, NULL where x is a multiple of 3.
   const plan::ExprPtr y_over_x = compare(3, 0);  // the right input's y > the left input's x
   const plan::ExprPtr x_over_y = compare(2, 1);  // the right input's x > the left input's y: never
+  // Over the two inputs' x, the join's key alone (alike candidates, ADR 0022's E2c): always and
+  // never.
+  const plan::ExprPtr x_at_least_x = compare(0, 2, plan::CompareOp::kGe);
+  const plan::ExprPtr x_above_x = compare(0, 2, plan::CompareOp::kGt);
   using Values = std::vector<std::optional<int64_t>>;
   struct Case {
     plan::LogicalNodePtr left;
@@ -708,6 +713,28 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     Values xs;  // a semi join's rows, sorted: the directions agree on those, not on the order
     Values preserved;  // every row of the side both kinds preserve, sorted
     std::string_view what;
+    // Built on the left: the candidate pairs the residuals meet (the probe's `pairs`), if pinned.
+    std::optional<int64_t> left_pairs;
+  };
+  // The `pairs` of the join's probe, the HashJoin under the RightJoin sink, summed over its parts.
+  const auto pairs_of = [](const ProfileNode& root) -> std::optional<int64_t> {
+    std::vector<const ProfileNode*> nodes = {&root};
+    while (!nodes.empty()) {
+      const ProfileNode* node = nodes.back();
+      nodes.pop_back();
+      if (node->name() == "HashJoin") {
+        for (const ProfileMetric& metric : node->metrics()) {
+          if (metric.name == "pairs") {
+            return metric.value;
+          }
+        }
+        return std::nullopt;
+      }
+      for (const ProfileNode* child : node->children()) {
+        nodes.push_back(child);
+      }
+    }
+    return std::nullopt;
   };
   // t holds x = 0..9; r holds 1, 1, 2, 2, 2, 4.
   const Values all_t = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -792,7 +819,27 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
              .residual = y_over_x,
              .xs = {},
              .preserved = all_t,
-             .what = "repeated keys on the right, y > x"}}) {
+             .what = "repeated keys on the right, y > x"},
+        // Repeated keys on both sides and residuals over the key alone: one pair stands for a
+        // row's others (ADR 0022's E2c), and building on the left, a row whose pair passes marks
+        // its key's whole range, the rows each other pair would have marked. Each of r's 6 rows
+        // meets one pair, where every pair would be 2 * 2 + 3 * 3 + 1 * 1 = 14.
+        Case{.left = dups,
+             .right = dups,
+             .key = x,
+             .residual = x_at_least_x,
+             .xs = {1, 1, 2, 2, 2, 4},
+             .preserved = all_r,
+             .what = "repeated keys on both sides, x >= x",
+             .left_pairs = 6},
+        Case{.left = dups,
+             .right = dups,
+             .key = x,
+             .residual = x_above_x,
+             .xs = {},
+             .preserved = all_r,
+             .what = "repeated keys on both sides, x > x",
+             .left_pairs = 6}}) {
     SCOPED_TRACE(c.what);
     const auto join_of = [&](plan::JoinKind kind, plan::BuildSide build) {
       return Node(plan::JoinNode{.kind = kind,
@@ -823,8 +870,9 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
       for (const int64_t batch_size : {1, 3, 64}) {
         SCOPED_TRACE(std::string(executor == nullptr ? "serial" : "pooled") +
                      " batch_size=" + std::to_string(batch_size));
-        const auto drain = [&](plan::JoinKind kind, plan::BuildSide build) {
-          auto op = BuildPhysicalPlan(PlanOf(join_of(kind, build), 2));
+        const auto drain = [&](plan::JoinKind kind, plan::BuildSide build,
+                               ProfileNode* profile = nullptr) {
+          auto op = BuildPhysicalPlan(PlanOf(join_of(kind, build), 2), profile);
           EXPECT_TRUE(op.ok()) << op.status().ToString();
           if (!op.ok()) {
             return std::shared_ptr<arrow::Table>{};
@@ -840,10 +888,16 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
         // A semi join emits the rows the marks selected, an anti join those they did not plus the
         // build rows whose keys are NULL, which no mark can reach. Both directions of both kinds
         // must agree, and the two kinds must partition the side they preserve.
+        ProfileNode semi_profile;
+        ProfileNode anti_profile;
         const auto semi_right = drain(plan::JoinKind::kSemi, plan::BuildSide::kRight);
-        const auto semi_left = drain(plan::JoinKind::kSemi, plan::BuildSide::kLeft);
+        const auto semi_left = drain(plan::JoinKind::kSemi, plan::BuildSide::kLeft, &semi_profile);
         const auto anti_right = drain(plan::JoinKind::kAnti, plan::BuildSide::kRight);
-        const auto anti_left = drain(plan::JoinKind::kAnti, plan::BuildSide::kLeft);
+        const auto anti_left = drain(plan::JoinKind::kAnti, plan::BuildSide::kLeft, &anti_profile);
+        if (c.left_pairs.has_value()) {
+          EXPECT_EQ(pairs_of(semi_profile), c.left_pairs);
+          EXPECT_EQ(pairs_of(anti_profile), c.left_pairs);
+        }
         ASSERT_NE(semi_right, nullptr);
         ASSERT_NE(semi_left, nullptr);
         ASSERT_NE(anti_right, nullptr);
@@ -927,6 +981,94 @@ TEST_F(PhysicalPlannerTest, JoinsBuildingOnTheirLeftInputKeepTheSameRows) {
     // operator above it prepares before it opens. Without this the case would pass just as well on
     // a planner that quietly kept building on the right.
     EXPECT_EQ(names, "RightJoin/HashJoin/Scan/HashBuild/Scan/");
+  }
+}
+
+// Alike candidates raise E2b's errors on either side. l holds x 1, 1, 2; r holds (x, big) (1, 3),
+// (2, 2^62) and (2, 1). l.x * r.big > 0 overflows on the pair of l.x 2 and r.big 2^62:
+// - built on the left, the residual reads only the build's key l.x, so its candidates are alike;
+// - built on the right, it reads r.big, a build column that is no key, and meets every pair.
+// Both raise the overflow, at every batch size, serial and pooled. r.big < 2 first leaves the one
+// pair of r.big 1, which passes, and both sides agree: semi keeps l's row of x 2, anti its two rows
+// of x 1.
+TEST_F(PhysicalPlannerTest, AlikeResidualsRaiseTheSameErrorsOnEitherSide) {
+  constexpr int64_t kTwoTo62 = 4611686018427387904;
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("big", arrow::int64())});
+  const auto table = [&schema](const std::vector<std::optional<int64_t>>& x,
+                               const std::vector<std::optional<int64_t>>& big) {
+    const auto rows = static_cast<int64_t>(x.size());
+    return std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{arrow::RecordBatch::Make(
+                                                     schema, rows, {Int64s(x), Int64s(big)})});
+  };
+  const auto l = Node(
+      plan::ScanNode{.table = table({1, 1, 2}, {0, 0, 0}), .table_name = "l", .fields = {0, 1}});
+  const auto r = Node(plan::ScanNode{
+      .table = table({1, 2, 2}, {3, kTwoTo62, 1}), .table_name = "r", .fields = {0, 1}});
+  const auto column = [](int index) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = LogicalType::kBigInt});
+  };
+  // `operand <op> value` over the join's columns: l's x and big, then r's.
+  const auto condition = [](plan::ExprPtr operand, plan::CompareOp op, int64_t value) {
+    return std::make_shared<const plan::Expr>(plan::Expr{
+        .node = plan::PredicateExpr{.predicate = testing::Compare(
+                                        Column(0, "o", LogicalType::kBigInt), op, BigInt(value)),
+                                    .operands = {std::move(operand)}},
+        .type = LogicalType::kBoolean});
+  };
+  const plan::ExprPtr product =
+      condition(std::make_shared<const plan::Expr>(plan::Expr{
+                    .node =
+                        plan::ArithExpr{
+                            .op = plan::ArithOp::kMultiply, .left = column(0), .right = column(3)},
+                    .type = LogicalType::kBigInt}),
+                plan::CompareOp::kGt, 0);
+  const plan::ExprPtr small = condition(column(3), plan::CompareOp::kLt, 2);
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok()) << pool.status().ToString();
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool->get())}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+      for (const plan::BuildSide build : {plan::BuildSide::kLeft, plan::BuildSide::kRight}) {
+        for (const int64_t batch_size : {1, 3, 64}) {
+          SCOPED_TRACE(
+              std::string(plan::ToString(kind)) +
+              (build == plan::BuildSide::kLeft ? ", built on the left" : ", on the right") +
+              (executor == nullptr ? ", serial" : ", pooled") +
+              ", batch_size=" + std::to_string(batch_size));
+          const auto run = [&](std::vector<plan::ExprPtr> residual) {
+            const auto join = Node(plan::JoinNode{.kind = kind,
+                                                  .left = l,
+                                                  .right = r,
+                                                  .keys = {plan::JoinKey{.left = x, .right = x}},
+                                                  .residual = std::move(residual),
+                                                  .build = build,
+                                                  .span = {}});
+            auto op = BuildPhysicalPlan(PlanOf(join, 2));
+            EXPECT_TRUE(op.ok()) << op.status().ToString();
+            ExecContext ctx{.pool = arrow::default_memory_pool(),
+                            .batch_size = batch_size,
+                            .executor = executor,
+                            .threads = executor == nullptr ? 1 : 4};
+            return op.ok() ? Drain(**op, ctx)
+                           : arrow::Result<std::shared_ptr<arrow::Table>>(op.status());
+          };
+          const auto overflow = run({product});
+          EXPECT_TRUE(overflow.status().IsExecutionError()) << overflow.status().ToString();
+          const auto narrowed = run({small, product});
+          ASSERT_TRUE(narrowed.ok()) << narrowed.status().ToString();
+          std::vector<std::optional<int64_t>> xs = Int64Column(**narrowed, 0);
+          std::ranges::sort(xs);
+          const std::vector<std::optional<int64_t>> expected =
+              kind == plan::JoinKind::kSemi ? std::vector<std::optional<int64_t>>{2}
+                                            : std::vector<std::optional<int64_t>>{1, 1};
+          EXPECT_EQ(xs, expected);
+        }
+      }
+    }
   }
 }
 
