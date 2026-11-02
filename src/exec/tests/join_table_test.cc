@@ -655,6 +655,93 @@ TEST_F(JoinTableTest, KeysOfEveryTypeAndSeveralColumns) {
   }
 }
 
+// Every row of a key's range holds the probe row's key in every key column, byte for byte and never
+// NULL. A semi or anti join with alike candidates relies on it (ADR 0022's E2c): one pair stands
+// for the others. Over the direct layout (dense integers), the hashed one (sparse integers) and
+// every key type, several columns too.
+TEST_F(JoinTableTest, TheRowsOfAKeyHoldItsProbeKeyBytes) {
+  const auto pool = MakeThreadPool();
+  const auto check = [&pool](const BuildData& data, const Probe& probe, JoinTable::Layout layout) {
+    for (arrow::internal::Executor* executor : Executors(pool.get())) {
+      auto table = BuildTable(data, executor);
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      EXPECT_EQ((*table)->layout(), layout);
+      const std::vector<JoinMatches> matches = FindAll(**table, probe);
+      int64_t checked = 0;
+      for (std::size_t i = 0; i < matches.size(); ++i) {
+        const auto row = static_cast<int64_t>(i);
+        for (std::uint32_t at = matches[i].begin; at < matches[i].end; ++at) {
+          const JoinRowRef ref = (*table)->rows()[at];
+          const arrow::RecordBatch& chunk = *(*table)->chunks().at(ref.chunk);
+          for (std::size_t k = 0; k < probe.keys.size(); ++k) {
+            const arrow::Array& column = *chunk.column(static_cast<int>(k));
+            EXPECT_TRUE(column.IsValid(ref.row)) << "probe row " << i << ", key " << k;
+            EXPECT_TRUE(probe.keys[k]->RangeEquals(row, row + 1, ref.row, column))
+                << "probe row " << i << ", key " << k;
+          }
+          ++checked;
+        }
+      }
+      EXPECT_GT(checked, 0);
+    }
+  };
+  for (const LogicalType type :
+       {LogicalType::kSmallInt, LogicalType::kInteger, LogicalType::kBigInt,
+        LogicalType::kUSmallInt, LogicalType::kDate, LogicalType::kTimestamp}) {
+    SCOPED_TRACE("dense " + std::string(plan::ToString(type)));
+    BuildData data({type});
+    data.Add(0, {IntegersOf(type, {1, 1, 2, std::nullopt, 3})})
+        .Add(1, {IntegersOf(type, {2, 1, 4})});
+    check(data,
+          Probe{.keys = {IntegersOf(type, {1, 2, 3, 4, 5, std::nullopt})}, .selection = nullptr},
+          JoinTable::Layout::kDirect);
+  }
+  {
+    SCOPED_TRACE("sparse BIGINT");
+    BuildData data({LogicalType::kBigInt});
+    data.Add(0, {Int64s({1, 1'000'000'000'000, 1, std::nullopt})})
+        .Add(1, {Int64s({-7'000'000'000'000, 1'000'000'000'000})});
+    check(data,
+          Probe{.keys = {Int64s({1, 1'000'000'000'000, -7'000'000'000'000, 2})},
+                .selection = nullptr},
+          JoinTable::Layout::kHashed);
+  }
+  for (const LogicalType type : {LogicalType::Decimal(15, 2), LogicalType::Decimal(30, 2),
+                                 LogicalType(LogicalType::kHugeInt)}) {
+    SCOPED_TRACE(plan::ToString(type));
+    BuildData data({type});
+    data.Add(0, {Decimals(type, {"12345", "-1", "12345", std::nullopt})})
+        .Add(1, {Decimals(type, {"0", "-1", "12345"})});
+    check(data, Probe{.keys = {Decimals(type, {"12345", "-1", "0", "1"})}, .selection = nullptr},
+          JoinTable::Layout::kHashed);
+  }
+  {
+    SCOPED_TRACE("VARCHAR");
+    const std::string longer = "a string of more than sixteen bytes";
+    const std::string nul_b("a\0b", 3);
+    BuildData data({LogicalType::kVarchar});
+    data.Add(0, {Strings({"", "a", longer, nul_b, std::nullopt, nul_b})})
+        .Add(1, {Strings({"a", "", longer, std::string("a\0", 2)})});
+    check(data,
+          Probe{.keys = {Strings({"", "a", nul_b, std::string("a\0", 2), longer, "zzz"})},
+                .selection = nullptr},
+          JoinTable::Layout::kHashed);
+  }
+  {
+    SCOPED_TRACE("(BIGINT, VARCHAR) and (INTEGER, DATE)");
+    BuildData text({LogicalType::kBigInt, LogicalType::kVarchar});
+    text.Add(0, {Int64s({1, 1, 2, 1}), Strings({"x", "y", "x", "x"})})
+        .Add(1, {Int64s({2, 1}), Strings({"x", "x"})});
+    check(text, Probe{.keys = {Int64s({1, 1, 2}), Strings({"x", "y", "x"})}, .selection = nullptr},
+          JoinTable::Layout::kHashed);
+    BuildData dated({LogicalType::kInteger, LogicalType::kDate});
+    dated.Add(0, {Int32s({7, 7, 8, 7}), Dates({100, 101, 100, 100})})
+        .Add(1, {Int32s({7, 8}), Dates({100, 100})});
+    check(dated, Probe{.keys = {Int32s({7, 7, 8}), Dates({100, 101, 100})}, .selection = nullptr},
+          JoinTable::Layout::kHashed);
+  }
+}
+
 // Build and probe batches sliced from larger ones: keys, ids and selections at an offset.
 TEST_F(JoinTableTest, SlicedBatches) {
   constexpr int64_t kSlice = 3;

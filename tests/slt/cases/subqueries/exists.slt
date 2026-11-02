@@ -349,6 +349,135 @@ SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup
 BIGINT
 40
 
+# ---- residuals over the keys alone (ADR 0037's PF9) ----
+
+# A residual that reads no column of the build side but its keys gives every candidate of a probe
+# row the same values, so the join meets one candidate per row (ADR 0022's E2c). Over the key pair
+# itself it is true for every match (>=) or for none (>).
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_driver >= tr_driver)
+----
+BIGINT
+2606
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_driver >= tr_driver)
+----
+BIGINT
+394
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_driver > tr_driver)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_driver > tr_driver)
+----
+BIGINT
+3000
+
+# Arithmetic over the key and a column of the outer side, NULL for a trip without a fare.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND tr_fare * 200 > sh_driver)
+----
+BIGINT
+1498
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE NOT EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND tr_fare * 200 > sh_driver)
+----
+BIGINT
+1502
+
+# The same over a two-column key.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM shifts WHERE sh_driver = tr_driver AND sh_day = tr_day AND tr_fare * 200 > sh_driver)
+----
+BIGINT
+256
+
+# The trips' own drivers: about thirty candidates a row, of which the join meets one. Reading a
+# column other than the key, the next two meet every candidate.
+query I nosort
+SELECT COUNT(*) FROM trips AS a WHERE EXISTS (SELECT * FROM trips AS b WHERE b.tr_driver = a.tr_driver AND b.tr_driver >= a.tr_driver)
+----
+BIGINT
+2896
+
+query I nosort
+SELECT COUNT(*) FROM trips AS a WHERE EXISTS (SELECT * FROM trips AS b WHERE b.tr_driver = a.tr_driver AND b.tr_fare > a.tr_fare)
+----
+BIGINT
+2702
+
+query I nosort
+SELECT COUNT(*) FROM trips AS a WHERE NOT EXISTS (SELECT * FROM trips AS b WHERE b.tr_driver = a.tr_driver AND b.tr_fare > a.tr_fare)
+----
+BIGINT
+298
+
+# Building on the outer side (ADR 0026's C2b and C2c) over a key that repeats: zn_parent holds 1 to 5
+# about seven times each. A trip meets the first zone of its key, and when that pair passes, every
+# zone of the key is marked.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_pickup >= zn_parent)
+----
+BIGINT
+34
+
+# No trip has a fare above 30, so here the zones under parent 5 stay unmarked.
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare > zn_parent * 6) ORDER BY zn_id
+----
+INTEGER
+6
+7
+8
+9
+11
+12
+13
+14
+16
+17
+18
+19
+21
+22
+23
+24
+26
+27
+28
+29
+31
+32
+33
+34
+36
+37
+38
+39
+
+query I nosort
+SELECT zn_id FROM zones WHERE NOT EXISTS (SELECT * FROM trips WHERE tr_pickup = zn_parent AND tr_fare > zn_parent * 6) ORDER BY zn_id
+----
+INTEGER
+1
+2
+3
+4
+5
+10
+15
+20
+25
+30
+35
+40
+
 # ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
 
 onlyif duckdb
