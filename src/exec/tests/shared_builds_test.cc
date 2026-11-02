@@ -301,5 +301,49 @@ TEST_F(SharedBuildsTest, HoldsNothingUnderAUnion) {
   }
 }
 
+// The union of `a` alone, its two columns #first and #first + 1: a union whose other branches the
+// conditions on it ruled out (ADR 0036's X7a).
+plan::LogicalNodePtr UnionOfOne(const plan::LogicalNodePtr& a, std::uint32_t first) {
+  plan::UnionAllNode node{.inputs = {a}, .columns = {{}}, .ids = {Id(first), Id(first + 1)}};
+  for (const plan::ColumnId id : plan::OutputIds(*a)) {
+    node.columns[0].push_back(Bigint(id));
+  }
+  return Node(std::move(node));
+}
+
+// A union of one input is still a union: nothing under it is held, whether its branch repeats under
+// another such union or outside any, until ADR 0037's PF5 gives the cap a fallback.
+TEST_F(SharedBuildsTest, HoldsNothingUnderAUnionOfOneInput) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  for (const plan::LogicalPlan& plan :
+       {Joined(UnionOfOne(Grouped(table, 100), 120), UnionOfOne(Grouped(table, 200), 220)),
+        Joined(UnionOfOne(Grouped(table, 100), 120), Grouped(table, 200))}) {
+    auto run = ExecutePlan(plan, table);
+    ASSERT_TRUE(run.ok()) << run.status().ToString();
+    EXPECT_EQ(run->shared_rows, std::nullopt) << "nothing under a union is held";
+    ASSERT_NE(run->rows, nullptr);
+    EXPECT_EQ(testing::SingleInt64(*run->rows), 7) << "each key once on either side";
+  }
+}
+
+// Two references of a CTE whose body is a union of two aggregate-topped blocks, both keeping the
+// block tagged 'a' (ADR 0036's X7a): each reference runs that block alone, and the two copies of it
+// are not held, though they repeat and read past the gate.
+TEST_F(SharedBuildsTest, ThePrunedReferencesOfAUnionCteShareNothing) {
+  const auto table = KeyedTable();
+  table->set_claimed_rows(20'000'000);
+  auto run = Execute(
+      "WITH v AS (SELECT k, 'a' AS tag FROM t GROUP BY k UNION ALL SELECT k, 'b' AS tag FROM t "
+      "GROUP BY k) SELECT COUNT(*) FROM v AS p, v AS q WHERE p.k = q.k AND p.tag = 'a' AND "
+      "q.tag = 'a'",
+      table);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->shared_rows, std::nullopt);
+  EXPECT_EQ(run->parts_scanned, 6) << "one block of three parts per reference, not two";
+  ASSERT_NE(run->rows, nullptr);
+  EXPECT_EQ(testing::SingleInt64(*run->rows), 7);
+}
+
 }  // namespace
 }  // namespace antb1::exec

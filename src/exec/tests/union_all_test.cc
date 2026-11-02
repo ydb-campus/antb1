@@ -98,6 +98,30 @@ TEST_F(UnionAllTest, EmitsEveryInputInOrderUnderItsOwnSchema) {
   EXPECT_EQ(texts, (std::vector<std::optional<std::string>>{"a", "b", "c", "d", std::nullopt}));
 }
 
+// A union of one input -- one whose other branches the optimizer ruled out (ADR 0036's X7a) -- is
+// that input's rows, its columns at the positions the union maps, under fields named as the input
+// names them and all nullable.
+TEST_F(UnionAllTest, AUnionOfOneInputIsThatInput) {
+  std::vector<std::unique_ptr<Operator>> inputs;
+  inputs.push_back(std::make_unique<ScriptedSource>(
+      TextThenKey(),
+      std::vector<Batch>{TextKey({"d", std::nullopt}, {4, 5}), TextKey({"e"}, {6})}));
+  auto op = UnionAllOperator::Make(std::move(inputs), {{1, 0}},
+                                   {LogicalType::kBigInt, LogicalType::kVarchar});
+  ASSERT_TRUE(op.ok()) << op.status().ToString();
+  const std::shared_ptr<arrow::Schema>& schema = (*op)->output_schema();
+  ASSERT_EQ(schema->num_fields(), 2);
+  EXPECT_EQ(schema->field(0)->name(), "n");
+  EXPECT_EQ(schema->field(1)->name(), "t");
+  EXPECT_TRUE(schema->field(0)->nullable());
+  EXPECT_TRUE(schema->field(1)->nullable());
+
+  ExecContext ctx;
+  auto table = Drain(**op, ctx);
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  EXPECT_EQ(Int64Column(**table, 0), (std::vector<std::optional<int64_t>>{4, 5, 6}));
+}
+
 // A batch is rebuilt, not copied: the union's columns are the input's own arrays, and its selection
 // is the input's own.
 TEST_F(UnionAllTest, KeepsTheInputsArraysAndSelection) {
@@ -344,8 +368,8 @@ TEST_F(UnionAllTest, EmptyInputsAddNoRows) {
   EXPECT_EQ(Int64Column(**rows, 0), (std::vector<std::optional<int64_t>>{3}));
 }
 
-// What a correct plan never holds is Invalid: fewer than two inputs, a column list per input that
-// does not match the types, a column outside its input or of another type, a call out of order.
+// What a correct plan never holds is Invalid: no input, a column list per input that does not
+// match the types, a column outside its input or of another type, a call out of order.
 TEST_F(UnionAllTest, RejectsWhatItCannotUnion) {
   const auto source = [] {
     return std::make_unique<ScriptedSource>(KeyThenText(), std::vector<Batch>{});
@@ -359,9 +383,9 @@ TEST_F(UnionAllTest, RejectsWhatItCannotUnion) {
         inputs.push_back(source());
         return UnionAllOperator::Make(std::move(inputs), std::move(columns), as).status();
       };
-  std::vector<std::unique_ptr<Operator>> one;
-  one.push_back(source());
-  EXPECT_TRUE(UnionAllOperator::Make(std::move(one), {{0, 1}}, types).status().IsInvalid());
+  EXPECT_TRUE(UnionAllOperator::Make({}, {}, types).status().IsInvalid()) << "no input";
+  EXPECT_TRUE(UnionAllOperator::Make({}, {{0, 1}}, types).status().IsInvalid())
+      << "a column list without its input";
   std::vector<std::unique_ptr<Operator>> missing;
   missing.push_back(source());
   missing.push_back(nullptr);

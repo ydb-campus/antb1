@@ -40,7 +40,7 @@ Responsibilities:
   binder with exact literal folding (`binder.h`, `literal.h`) and its private name scopes (`src/plan/scope.h`: the
   bindings of a query block and the name rules of [ADR 0022](adr/0022-joins-and-query-blocks.md)) and join order
   (`src/plan/join_order.h`: greedy and left-deep, estimated from footer row counts, ranges and distinct-count
-  hints), the logical plan (`logical_plan.h`; a `Join` and a `DependentJoin` have two inputs, a `UnionAll` two or
+  hints), the logical plan (`logical_plan.h`; a `Join` and a `DependentJoin` have two inputs, a `UnionAll` one or
   more ([ADR 0036](adr/0036-union-all.md)), every other node at most one), the rule
   optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
@@ -148,16 +148,19 @@ steps (only step 7 uses more than one thread):
    `RowCount`, `Join`, `DependentJoin`, `UnionAll`) plus the output columns. A correlated subquery binds to a
    `DependentJoin`, whose right input reads columns of its left input as free variables (`plan::FreeVariables`). A
    `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new columns of one type each
-   ([ADR 0036](adr/0036-union-all.md)); no query binds to one until its binder item.
+   ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one.
     Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
 5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass, which replaces every `DependentJoin` with
    ordinary joins or rejects the query with exit code 4, so no later rule and no operator meets one (ADR 0023); then
-   `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
+   the conditions of a `Filter` over a `UnionAll` go on top of each of its inputs, and an input whose constants make
+   one never true is ruled out (a union of one input stays a union; of none, its first input stays, under a `FALSE`
+   filter: ADR 0036's X7a); `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
-   `Limit` below `Project`; and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
+   `Limit` below `Project`; a grouped aggregate computed as partials on one input of its join, where the gate admits
+   it (ADR 0032's G2b); and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
    inputs for what is used above it plus its keys and residuals; a `Project` and a `UnionAll` keep every output, a
    union asking each input for the columns it maps). Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and

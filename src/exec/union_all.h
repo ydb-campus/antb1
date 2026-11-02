@@ -26,9 +26,10 @@ namespace antb1::exec {
 // part pipeline runs its own parts on the executor, as it would without the union.
 class UnionAllOperator final : public Operator {
  public:
-  // Invalid for fewer than two inputs, for a column list per input that does not hold one column
-  // per type, and for an input's column outside its schema or not of its type's Arrow type
-  // (plan::ToArrow).
+  // Invalid without inputs, for a column list per input that does not hold one column per type, and
+  // for an input's column outside its schema or not of its type's Arrow type (plan::ToArrow). One
+  // input is a union whose other branches the optimizer ruled out (ADR 0036's X7a): its batches
+  // are that input's, rebuilt in the union's schema.
   static arrow::Result<std::unique_ptr<UnionAllOperator>> Make(
       std::vector<std::unique_ptr<Operator>> inputs, std::vector<std::vector<int>> columns,
       const std::vector<plan::LogicalType>& types);

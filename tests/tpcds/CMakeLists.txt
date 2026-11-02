@@ -215,13 +215,15 @@ endforeach()
 # shards. The map comes from one run of all 99 in the ASan build (build/ci-asan) on a developer's Apple silicon Mac
 # (2026-11-01; test-build diagnostics, not performance numbers): query 4 alone in the first shard, which it fills by
 # itself, and the other seven within 2% of each other in seconds. Propose it again when a shard misses ADR 0037's budget
-# (tools/ci/tpc_costs.py warns in every leg that runs the shards). Query 4 alone takes most of a shard's
-# time: more shards no longer help there, while X7's filter pushdown into the branches would. So the sanitizers run
+# (tools/ci/tpc_costs.py warns in every leg that runs the shards). Query 4 alone took most of a shard's
+# time, where more shards no longer helped. So the sanitizers run
 # scale factor 1 only in its own nightly job: its label, tpc-sf1, is left out by
 # the ci-asan test preset (pixi run asan, the PR leg clang-asan) and by the tsan one (ThreadSanitizer, nightly, where
 # a shard of four outlasted the timeout; the shards run one engine thread), and it is all that the asan-tpc-sf1 preset
 # runs (the nightly job of that name). On every PR, gcc-compat and clang-coverage-fuzz still run the shards and
-# clang-asan scale factor 0.1; tsan still runs the 4-thread run at scale factor 0.1.
+# clang-asan scale factor 0.1; tsan still runs the 4-thread run at scale factor 0.1. ADR 0036's X7a, the conditions
+# into a union's branches, later cut query 4 to a third: 24.0 seconds instead of 74.8 at one thread, in the ASan build
+# on that Mac (2026-11-03, test-build diagnostics).
 # antb1 may use 2 GiB per query. DuckDB, the oracle, may use 1 GiB (--oracle-memory-limit), beyond which it spills to
 # the test's temp dir: ctest runs up to eight shards at once, and uncapped, each DuckDB could take 80% of the host's
 # memory. The cap leaves room: measured locally (the numbers stay local, ADR 0006), DuckDB answers every one of the 99

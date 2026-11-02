@@ -23,6 +23,7 @@
 #include "aggregate_placement.h"
 #include "join_order.h"
 #include "key_type.h"
+#include "union_branches.h"
 
 // Every std::visit below uses a visitor with one overload per node type, so a new node type fails
 // to compile until each rule handles it. The rules find columns by their ids and never read or set
@@ -1280,6 +1281,9 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
     return plan;
   }
   ARROW_ASSIGN_OR_RAISE(LogicalNodePtr root, Unnest(plan.root, options.build_side_ratio));
+  // WHERE conditions into the branches of the unions they sit on, and the branches they rule out
+  // pruned (ADR 0036's X7a); before ExchangeAggregates, whose gate reads the unions' estimates.
+  root = FilterIntoUnionBranches(root);
   root = LimitBelowProject(DependentKeys(CountStarToRowCount(root), /*limited=*/false));
   // A grouped aggregate computed on one input of the join it reads, where the gate admits it
   // (docs/adr/0032-aggregate-placement.md's G2b). After the unnesting, so that a correlated

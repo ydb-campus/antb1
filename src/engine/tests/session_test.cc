@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -62,6 +63,27 @@ TEST_F(SessionTest, CountStarFromRegisteredTable) {
   auto col = std::static_pointer_cast<arrow::Int64Array>(result->table->column(0)->chunk(0));
   EXPECT_EQ(col->Value(0), 10);
   EXPECT_EQ(result->names, std::vector<std::string>{"count_star()"});
+}
+
+// A union whose first block the condition on it rules out (ADR 0036's X7a) names and types its
+// columns as that first block does: the block left, which calls its column z, does not rename it.
+TEST_F(SessionTest, AUnionPrunedOfItsFirstBlockKeepsItsNamesAndTypes) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+  constexpr std::string_view kSql =
+      "SELECT * FROM (SELECT 1 AS k FROM events UNION ALL SELECT 3000000000 AS z FROM events) AS v "
+      "WHERE k > 5";
+  const auto plan = session->Explain(kSql);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_NE(plan->find("UnionAll inputs=1 columns=[z]"), std::string::npos)
+      << "the first block is ruled out:\n"
+      << *plan;
+  auto result = session->Execute(kSql);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_EQ(result->names, std::vector<std::string>{"k"});
+  EXPECT_EQ(result->types, std::vector<plan::LogicalType>{plan::LogicalType::kBigInt});
+  EXPECT_EQ(result->table->schema()->field(0)->name(), "k");
+  EXPECT_EQ(result->table->num_rows(), 10) << "the second block's rows, all of them";
 }
 
 TEST_F(SessionTest, CountStarFromPath) {

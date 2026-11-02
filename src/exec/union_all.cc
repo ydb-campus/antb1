@@ -15,8 +15,8 @@ namespace antb1::exec {
 arrow::Result<std::unique_ptr<UnionAllOperator>> UnionAllOperator::Make(
     std::vector<std::unique_ptr<Operator>> inputs, std::vector<std::vector<int>> columns,
     const std::vector<plan::LogicalType>& types) {
-  if (inputs.size() < 2) {
-    return arrow::Status::Invalid("UNION ALL of ", inputs.size(), " inputs");
+  if (inputs.empty()) {
+    return arrow::Status::Invalid("UNION ALL without inputs");
   }
   if (columns.size() != inputs.size()) {
     return arrow::Status::Invalid("UNION ALL: ", columns.size(), " column lists for ",

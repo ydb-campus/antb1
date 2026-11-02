@@ -220,6 +220,55 @@ TEST(SharedSubPlansTest, NothingUnderAUnionWithoutAKeyIsAMember) {
   EXPECT_TRUE(GroupsOf(JoinOfUnions(/*swapped=*/false, /*sorted=*/true)).empty());
 }
 
+// A union of one input, as the optimizer leaves a union whose other branches the conditions on it
+// rule out (ADR 0036's X7a), columns minted from `first`.
+LogicalNodePtr UnionOfOneGroup(std::uint32_t first) {
+  const LogicalNodePtr branch = Grouped("t", first);
+  UnionAllNode node{.inputs = {branch}, .columns = {{}}, .ids = {}, .span = {}};
+  for (const ColumnId id : OutputIds(*branch)) {
+    node.columns[0].push_back(BoundColumn{.id = id, .name = "c", .type = LogicalType::kBigInt});
+  }
+  node.ids = {ColumnId{first + 20}, ColumnId{first + 21}};
+  return Node(std::move(node));
+}
+
+LogicalPlan JoinOf(LogicalNodePtr left, LogicalNodePtr right, ColumnId left_key,
+                   ColumnId right_key) {
+  const LogicalNodePtr join = Node(JoinNode{
+      .kind = JoinKind::kInner,
+      .left = std::move(left),
+      .right = std::move(right),
+      .keys = {JoinKey{.left = BoundColumn{.id = left_key, .type = LogicalType::kBigInt},
+                       .right = BoundColumn{.id = right_key, .type = LogicalType::kBigInt}}},
+      .span = {}});
+  std::vector<OutputColumn> output;
+  for (const ColumnId id : OutputIds(*join)) {
+    output.push_back(OutputColumn{.name = "c", .type = LogicalType::kBigInt, .id = id});
+  }
+  return ResolvePositions(LogicalPlan{.root = join, .output = std::move(output)});
+}
+
+// A union pruned to one branch stays a union, so two references of a CTE that keep the same branch
+// are one group headed by the union, which exec declines to hold, and their aggregate-topped
+// branch is no member: before ADR 0037's PF5 gives the cap a fallback, holding it could fail the
+// query at a large scale factor.
+TEST(SharedSubPlansTest, AUnionOfOneInputIsStillTheGroupsHead) {
+  EXPECT_EQ(
+      GroupsOf(JoinOf(UnionOfOneGroup(100), UnionOfOneGroup(200), ColumnId{120}, ColumnId{220})),
+      (std::vector<std::string>{"UnionAll 2x1"}));
+}
+
+// The same aggregate-topped branch outside any union is a sub-plan of its own, never one group with
+// the branch under a union of one input.
+TEST(SharedSubPlansTest, ABranchUnderAUnionOfOneInputIsNoMember) {
+  EXPECT_TRUE(
+      GroupsOf(JoinOf(UnionOfOneGroup(100), Grouped("t", 200), ColumnId{120}, ColumnId{201}))
+          .empty());
+  // The control: outside any union, the two are one group.
+  EXPECT_FALSE(
+      GroupsOf(JoinOf(Grouped("t", 100), Grouped("t", 200), ColumnId{101}, ColumnId{201})).empty());
+}
+
 LogicalNodePtr ScanOf(const std::string& table, std::uint32_t id) {
   return Node(
       ScanNode{.table = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 100),

@@ -51,6 +51,7 @@ if(ANTB1_BUILD_TESTS)
       tests/operators_test.cc
       tests/compute_test.cc
       tests/decimal_test.cc
+      tests/branch_truth_test.cc
       tests/parallel_compute_test.cc
       tests/row_count_test.cc
       tests/physical_planner_test.cc

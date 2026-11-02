@@ -1,6 +1,7 @@
 # UNION ALL's errors and what is not answered yet (ADR 0036): column counts that differ are a bind error in both
 # engines; the other set operations (X4), a UNION ALL's own ORDER BY, LIMIT and OFFSET (X5) and a subquery over a
-# UNION ALL (X6) wait on their roadmap items; values with no exact common type stay DuckDB's; and divergence D26.
+# UNION ALL (X6) wait on their roadmap items; values with no exact common type stay DuckDB's; the errors of the
+# blocks a condition rules out (X7a); and divergences D26 and D27.
 
 # ---- the input ----
 
@@ -219,3 +220,76 @@ SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id + 9223372036
 
 statement error Overflow
 SELECT x FROM (SELECT ct_id AS x FROM cities UNION ALL SELECT ct_id + 9223372036854775807 FROM cities) AS u ORDER BY x LIMIT 1
+
+# ---- errors of the blocks a condition on the union rules out (ADR 0036's X7a) ----
+# Both engines rule out the blocks whose constants make the condition never true, and never run them: the second
+# block's overflow does not surface when the condition keeps the first block alone, with or without a LIMIT, and does
+# when it keeps the second.
+
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag = 'a'
+----
+BIGINT
+6
+
+query I nosort
+SELECT x FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag = 'a' LIMIT 1
+----
+BIGINT
+1
+
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag = 'b'
+
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag <> 'a'
+
+# ---- divergence D27: errors of a block a condition on the union does not rule out by its constants ----
+# Where antb1's constants do not decide the condition -- a LIKE, a DOUBLE against a DECIMAL constant, a condition the
+# binder computes (a NOT) -- the block runs and fails; DuckDB rules it out. A condition on a column goes on top of each
+# block in antb1, above the block's select list, which computes the overflow first; DuckDB filters below the select
+# list, which then has no row.
+
+onlyif antb1
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag LIKE 'a%'
+
+onlyif duckdb
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag LIKE 'a%'
+----
+BIGINT
+6
+
+onlyif antb1
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 1.5 AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 2.5 FROM cities) AS u WHERE tag = 1.5e0
+
+onlyif duckdb
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS x, 1.5 AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 2.5 FROM cities) AS u WHERE tag = 1.5e0
+----
+BIGINT
+6
+
+onlyif antb1
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE NOT (tag = 'b')
+
+onlyif duckdb
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION ALL SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE NOT (tag = 'b')
+----
+BIGINT
+6
+
+onlyif antb1
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS y, ct_id AS x FROM cities UNION ALL SELECT ct_id, ct_id + 9223372036854775807 FROM cities) AS u WHERE y > 100
+
+onlyif duckdb
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS y, ct_id AS x FROM cities UNION ALL SELECT ct_id, ct_id + 9223372036854775807 FROM cities) AS u WHERE y > 100
+----
+BIGINT
+NULL

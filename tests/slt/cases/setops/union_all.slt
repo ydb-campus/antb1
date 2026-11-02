@@ -931,3 +931,134 @@ SELECT COUNT(*) FROM (SELECT d AS x FROM decimals UNION ALL SELECT f FROM floats
 ----
 BIGINT
 0
+
+# ---- conditions into the blocks (ADR 0036's X7a) ----
+# A condition on a union goes into each block. A block whose constants make it never true is not run, one they make
+# always true drops it, and any other block filters its own rows by it. The answers are those of the condition above
+# the union.
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind = 'city'
+----
+BIGINT	INTEGER
+6	6
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind = 'zone' AND x > 35
+----
+BIGINT	INTEGER
+5	40
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind <> 'trip'
+----
+BIGINT	INTEGER
+46	40
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind NOT IN ('zone')
+----
+BIGINT	INTEGER
+6	6
+
+# No block left: no row, and the aggregates of none.
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind = 'trip'
+----
+BIGINT	INTEGER
+0	NULL
+
+query IT rowsort
+SELECT x, kind FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones UNION ALL SELECT tr_row, 'trip' FROM trips) AS v WHERE kind IN ('trip', 'city') AND x < 3
+----
+INTEGER	VARCHAR
+0	trip
+1	city
+1	trip
+2	city
+2	trip
+
+# A block's constant is compared in the union's type, through the cast below the union: an INTEGER as a BIGINT or a
+# DECIMAL, a DECIMAL at a larger scale.
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT 1 AS x FROM cities UNION ALL SELECT 3000000000 FROM zones) AS v WHERE x = 3000000000
+----
+BIGINT	BIGINT
+40	3000000000
+
+query ID nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT 1 AS x FROM cities UNION ALL SELECT 1.50 FROM zones) AS v WHERE x = 1
+----
+BIGINT	DECIMAL(12,2)
+6	1.00
+
+query ID nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT 1.5 AS x FROM cities UNION ALL SELECT 2.25 FROM zones) AS v WHERE x < 2
+----
+BIGINT	DECIMAL(3,2)
+6	1.50
+
+# Two constant columns of a block, an INTEGER and a DECIMAL, compared by value.
+query I nosort
+SELECT COUNT(*) FROM (SELECT 1 AS a, 1.5 AS b FROM cities UNION ALL SELECT 2, 1.5 FROM zones) AS v WHERE a < b
+----
+BIGINT
+6
+
+query IT nosort
+SELECT COUNT(*), MAX(d) FROM (SELECT tr_row AS x, DATE '2026-03-01' AS d FROM trips UNION ALL SELECT zn_id, DATE '2025-01-01' FROM zones) AS v WHERE d < DATE '2026-01-01'
+----
+BIGINT	DATE
+40	2025-01-01
+
+query IT nosort
+SELECT COUNT(*), MAX(t) FROM (SELECT ct_id AS x, TIMESTAMP '2026-03-01 10:00:00' AS t FROM cities UNION ALL SELECT zn_id, TIMESTAMP '2026-03-01 09:59:59' FROM zones) AS v WHERE t >= TIMESTAMP '2026-03-01 10:00:00'
+----
+BIGINT	TIMESTAMP
+6	2026-03-01 10:00:00
+
+# Text compares by bytes: a Cyrillic letter is above every ASCII one.
+query IT nosort
+SELECT COUNT(*), MAX(k) FROM (SELECT ct_id AS x, 'Ж' AS k FROM cities UNION ALL SELECT zn_id, 'z' FROM zones) AS v WHERE k > 'z'
+----
+BIGINT	VARCHAR
+6	Ж
+
+# What the constants do not decide filters each block's rows: a LIKE, a DOUBLE against a DECIMAL, a column.
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE kind LIKE 'c%'
+----
+BIGINT	INTEGER
+6	6
+
+query ID nosort
+SELECT COUNT(*), MAX(p) FROM (SELECT 1.5 AS p FROM cities UNION ALL SELECT tr_fare FROM trips) AS v WHERE p = 1.5e0
+----
+BIGINT	DECIMAL(9,2)
+6	1.50
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_id, 'zone' FROM zones) AS v WHERE x > 3
+----
+BIGINT	INTEGER
+40	40
+
+# A comparison of two columns, constant in no block or in one block's other side, filters each block's rows.
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, ct_id AS y FROM cities UNION ALL SELECT zn_id, zn_city FROM zones) AS v WHERE x > y
+----
+BIGINT	INTEGER
+34	40
+
+query II nosort
+SELECT COUNT(*), MAX(x) FROM (SELECT ct_id AS x, 3 AS y FROM cities UNION ALL SELECT zn_id, zn_city FROM zones) AS v WHERE x > y
+----
+BIGINT	INTEGER
+37	40
+
+# Each reference of a CTE keeps the block its own conditions leave.
+query I nosort
+WITH v AS (SELECT ct_id AS x, 'city' AS kind FROM cities UNION ALL SELECT zn_city, 'zone' FROM zones) SELECT COUNT(*) FROM v AS a, v AS b WHERE a.x = b.x AND a.kind = 'city' AND b.kind = 'zone'
+----
+BIGINT
+38
