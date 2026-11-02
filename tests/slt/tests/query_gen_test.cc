@@ -637,6 +637,19 @@ TEST(QueryGenerator, GeneratedQueriesParseAndRoundTrip) {
   }
 }
 
+// joinable_refs counts the refs a join can follow, which antb1-slt diff prints next to the declared
+// ones: of JoinTables()' 11, those between DOUBLE columns, to a table or from a column that does
+// not exist, beyond 38 common decimal digits and between an integer and a VARCHAR are dropped.
+TEST(QueryGenerator, CountsTheRefsAJoinCanFollow) {
+  EXPECT_EQ(MakeOver(JoinTables(), 1, {.supported = kSupportedFeatures, .target_percent = 0})
+                .joinable_refs(),
+            6U);
+  EXPECT_EQ(
+      MakeOver(WithoutRefs(JoinTables()), 1, {.supported = kSupportedFeatures, .target_percent = 0})
+          .joinable_refs(),
+      0U);
+}
+
 // Over tables without refs the join features change nothing: no query joins, and every query is
 // the one the other supported features alone give.
 TEST(QueryGenerator, TablesWithoutRefsGiveTheSameQueriesWithJoinFeatures) {

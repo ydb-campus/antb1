@@ -127,7 +127,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC4 | SF 1 shards by measured cost: a committed map of queries to shards instead of every eighth query | | Built |
 | HC5 | A memory limit for the DuckDB oracle of the TPC ratchets, spilling to its temp directory | | Built |
 | HC6 | Ordered comparison with ORDER BY positions after a star (the star's width from the oracle's answer) | | Built |
-| HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch` | | Planned |
+| HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch`; built at SF 0.01 (the HC7 update below) | | Built |
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
 | X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned | | Planned |
@@ -201,6 +201,18 @@ Update (2026-11-02, PF9): pulled in front of HC7. HC7's differential test over t
 generated a correlated `EXISTS` whose residual compares the join's key columns again. The semi join met every row of a
 probe row's key, one pair at a time, and the test under ASan would have outrun its timeout. PF9 lets such a join meet
 one candidate per row, with E2b's answers and errors ([ADR 0022](0022-joins-and-query-blocks.md)'s E2c).
+
+Update (2026-11-02, HC7): built as `diff.tpcds` and `parallel.diff.tpcds` at SF 0.01, not 0.1, with 200 queries
+where `diff.tpch` runs 300. Both choices keep the runs within the default timeout under ASan on a CI runner:
+
+- at SF 0.1, the same 200 queries took 5.8 times as long in a Debug build (test-build diagnostics, on a developer's
+  Mac);
+- 300 queries at SF 0.01 would bring the parallel run near its timeout on a slow runner.
+
+The tables file declares the schema's 107 foreign keys (`ref=`, table and column names only), along which the
+generator joins. The run must print that the generator can follow all of them, since it drops one it cannot follow
+without an error. The seed's first 300 queries leave DuckDB clean under LeakSanitizer, against the leak of a string
+MIN or MAX that `tests/tpch/CMakeLists.txt` describes.
 
 ## Alternatives considered
 

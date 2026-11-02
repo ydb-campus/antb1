@@ -32,11 +32,12 @@ antb1_add_expect_test(
   LABELS harness
 )
 
-# fixtures.tpcds (label setup, fixture antb1_tpcds) generates the data at scale factors 0.1 and 1 and the 99 query
-# texts into ${ANTB1_FIXTURES_DIR}/tpcds with tests/tpch/generate.cmake, checks that every dump is DuckDB's text byte
-# for byte and that the query texts match queries.sha256. It prints numbers and digests only. There are no stored
-# answers to dump: tpcds_answers() fails on every scan in the pinned version (ADR 0006). Scale factor 1 because at 0.1
-# 18 of the 99 queries return no rows in DuckDB (1 at scale factor 1), so a pass there would show little.
+# fixtures.tpcds (label setup, fixture antb1_tpcds) generates the data at scale factors 0.01, 0.1 and 1 and the 99
+# query texts into ${ANTB1_FIXTURES_DIR}/tpcds with tests/tpch/generate.cmake, checks that every dump is DuckDB's text
+# byte for byte and that the query texts match queries.sha256. It prints numbers and digests only. There are no stored
+# answers to dump: tpcds_answers() fails on every scan in the pinned version (ADR 0006). The ratchet runs at scale
+# factor 1 because at 0.1 18 of the 99 queries return no rows in DuckDB (1 at scale factor 1), so a pass there would
+# show little; the random differential test, diff.tpcds, runs at 0.01.
 set(_tpcds_dir "${ANTB1_FIXTURES_DIR}/tpcds")
 set(_generate "${PROJECT_SOURCE_DIR}/tests/tpch/generate.cmake")
 set(_digests "${CMAKE_CURRENT_SOURCE_DIR}/queries.sha256")
@@ -150,6 +151,52 @@ function(_tpcds_test name)
     PROPERTIES LABELS ${ARG_LABEL} TIMEOUT ${ARG_TIMEOUT} FIXTURES_REQUIRED antb1_tpcds
   )
 endfunction()
+
+# Random differential test over the tables at scale factor 0.01 (tests/slt/runner/difftest.h, ADR 0037's HC7), and the
+# same queries on 4 threads with batches of 1000 rows, equal to the 1-thread results byte for byte (ADR 0013), as for
+# TPC-H (tests/tpch/CMakeLists.txt). tables_sf0_01.txt declares the schema's 107 foreign keys (ref=), and the run must
+# say that the generator can follow every one, since it drops a ref it cannot follow without an error. The seed is
+# chosen so that DuckDB itself stays clean under ASan, against the leak of a string MIN or MAX that
+# tests/tpch/CMakeLists.txt describes. A failure in antb1 is fixed, never avoided by another seed.
+# 200 queries, where the test over the data derived from TPC-H runs 300: a query here costs more under
+# AddressSanitizer. Measured in the ASan build on a developer's Mac, these 200 take about as long as that test's 300,
+# whose parallel run already takes most of its inner timeout on a slow runner of CI's clang-asan leg, and 300 here
+# would bring this parallel run near it. A query's index alone decides it, so these 200 are the first 200 of any
+# larger count.
+set(_seed 20261102)
+foreach(kind IN ITEMS diff parallel)
+  if(kind STREQUAL "diff")
+    set(_name diff.tpcds)
+    set(_options "")
+  else()
+    set(_name parallel.diff.tpcds)
+    set(
+      _options
+      --threads
+      4
+      --same-as-threads
+      1
+      --batch-size
+      1000
+    )
+  endif()
+  antb1_slt_args(
+    _args
+    ${_name}
+    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf0_01.txt"
+    --seed
+    ${_seed}
+    --count
+    200
+    ${_options}
+  )
+  _tpcds_test(
+    ${_name}
+    LABEL ${kind}
+    REQUIRE "antb1-slt diff: 107 of the 107 declared refs can be joined\n" "DIFF: PASS "
+    COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
+  )
+endforeach()
 
 # The ratchet (antb1-slt tpcds, tests/slt/runner/ratchet.h): the 99 queries on antb1, and DuckDB for those antb1
 # answers, against tests/data/tpcds_status.json, by the rules of the TPC-H ratchet (tests/tpch/CMakeLists.txt): a

@@ -23,10 +23,12 @@ ClickBench query text.
 
 A table's `ref=<column>[+<column>...]:<table>.<column>[+<column>...]` options (repeatable) declare its foreign keys:
 which of its columns reference, pairwise, which columns of a table of the same file, itself included. The star
-schema of the join tests (`tools/fixturegen/star.h`) declares 13. A ref is a hint for generated joins, not a
+schema of the join tests (`tools/fixturegen/star.h`) declares 13, and `tests/tpcds/tables_sf0_01.txt` the 107 of the
+tables derived from TPC-DS. A ref is a hint for generated joins, not a
 constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table ASCII
-case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks that every column
-exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never DOUBLE). The engines
+case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks, for `tables.txt`,
+that every column exists and that each pair joins one kind of key (integers, DECIMALs, DATE or VARCHAR, never
+DOUBLE), and `diff.tpcds` requires all 107 of `tests/tpcds/tables_sf0_01.txt` to be ones it can join. The engines
 ignore refs; the random differential test joins along them (see "Random differential test").
 
 ## Commands
@@ -185,7 +187,11 @@ pixi run diff-random --list --target-percent 100        # print generated querie
 
 ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over the tables it names, and `diff.decimal`
 (over `decimals`) and `diff.star` (over the star schema of the join tests) with seeds of their own; `parallel.diff.star`
-runs the queries of `diff.star` on 4 threads in 97-row batches. A slice PR that implements a
+runs the queries of `diff.star` on 4 threads in 97-row batches. `diff.tpch` and `diff.tpcds` run over the data derived
+from TPC-H and TPC-DS, redacted ([docs/testing.md](../../docs/testing.md)), and their parallel runs on 4 threads in
+1000-row batches. Every run prints how many of the declared refs a join can follow (`antb1-slt diff: N of the M
+declared refs can be joined`), since the generator drops a ref it cannot follow without an error: `diff.tpcds` requires
+all 107. A slice PR that implements a
 feature adds it to `kSupportedFeatures` (and new grammar to `runner/query_gen.cc`; the unit test
 `harness.QueryGenerator.TargetSamplesCoverTheWholeGrammar` fails until every feature is generated). Grammar the
 generator cannot write yet waits in `kGeneratorPending`, whether because the parser rejects it or because the

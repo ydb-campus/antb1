@@ -434,6 +434,15 @@ int Diff(const Args& args, std::vector<TableDef> tables, const std::string& comm
     std::println(stderr, "antb1-slt: {}", generator.error());
     return kExitSetup;
   }
+  // The generator drops a ref it cannot follow without an error; the count shows it. With
+  // --table, a ref to a table outside the selection counts as one it cannot follow.
+  std::size_t declared = 0;
+  for (const TableDef& t : tables) {
+    declared += t.refs.size();
+  }
+  std::println("antb1-slt diff: {} of the {} declared refs can be joined",
+               generator->joinable_refs(), declared);
+  std::fflush(stdout);
   if (args.list) {
     const uint64_t first = args.only.value_or(0);
     const uint64_t last = args.only.has_value() ? first + 1 : args.count;
