@@ -292,6 +292,8 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
       if (key.index < 0 || key.index >= schema->num_fields()) {
         return arrow::Status::Invalid("join key outside its input");
       }
+      // A key type that came to be allowed with an equality other than KeysEqual's bytes (DOUBLE's
+      // -0.0 = 0.0, say) must also make hash_join.cc's KeyEqualityIsBytewise false for it.
       if (key.type == plan::LogicalType::kDouble || key.type == plan::LogicalType::kBoolean) {
         return arrow::Status::Invalid("a join key of type ", plan::ToString(key.type));
       }
@@ -656,6 +658,10 @@ std::span<const JoinTable::KeyView> JoinTable::ChunkKeys(std::uint32_t chunk) co
   return std::span<const KeyView>(chunk_keys_).subspan(chunk * keys, keys);
 }
 
+// Equal means equal bytes, so every row of a key's range holds its probe rows' key bytes: a semi or
+// anti join whose deterministic residuals read no build column but the keys meets one candidate per
+// probe row (hash_join.h's candidates_alike_). An equality that normalized or collated would end
+// that.
 bool JoinTable::KeysEqual(std::span<const KeyView> keys, int64_t row, JoinRowRef ref) const {
   const std::span<const KeyView> build = ChunkKeys(ref.chunk);
   const int64_t build_row = ref.row;

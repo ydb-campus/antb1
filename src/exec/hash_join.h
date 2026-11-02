@@ -228,13 +228,17 @@ class BuildsFirstOperator final : public Operator {
 //     rows that passed the ones before it, never on others (the selected rows are taken first),
 //     and a row passes when every one is true (NULL is not): a later residual never sees a row an
 //     earlier one dropped, as in a WHERE.
-// - Semi building on its left input, the side it preserves (EmitsBuildRows; ADR 0026's C2b).
-//   Output: the build's own schema object, and no row at all from this operator -- every batch it
-//   returns holds none. It marks the build rows that matched (JoinMarks, the build's, shared by
-//   every part of the probe pipeline) and the join's sink emits the marked rows once no part runs
-//   any more (PartRightJoinOperator). With residuals only the pairs that pass every one mark, the
-//   same pairs a left-sided semi join would have counted as matches, so the two directions keep
-//   the same rows; without residuals every build row of a matching key marks.
+// - Semi and anti building on their left input, the side they preserve (EmitsBuildRows; ADR
+//   0026's C2b and C2c). Output: the build's own schema object (semi) or a copy of it whose key
+//   fields are nullable (anti, whose sink also emits the build rows with a NULL key), and no row at
+//   all from this operator -- every batch it returns holds none. It marks the build rows that
+//   matched (JoinMarks, the build's, shared by every part of the probe pipeline) and the join's
+//   sink emits the marked rows (semi) or the others (anti) once no part runs any more
+//   (PartRightJoinOperator). With residuals only the pairs that pass every one mark, the same
+//   pairs the join building on its right would have counted as matches, so the two directions keep
+//   the same rows; with alike candidates (below) a row's one pair marks its key's whole range when
+//   it passes, the bits its pairs would have marked one by one. Without residuals every build row
+//   of a matching key marks.
 // - Semi, anti and null-aware anti (building on the right). Output: the probe's own schema object;
 //   each window of at most batch_size rows of a probe batch is a slice of it, selected where it
 //   keeps a row, without a selection when it keeps every row, skipped when it keeps none. Semi
@@ -257,12 +261,16 @@ class BuildsFirstOperator final : public Operator {
 //   chunk with only the columns the residuals read: each residual in order, on the pairs the ones
 //   before it passed (NULL is false). Every pair is evaluated, with no early stop once a row has a
 //   match, so whether an error comes does not depend on batch_size (unless a Limit above stops the
-//   probe before it reads every row). A row without candidates never
-//   meets a residual: anti keeps it, left pads it. Semi and anti evaluate a probe batch's pairs
-//   before its first window, and a row matched when one of its pairs passed every residual. Left
-//   evaluates each batch of slots before it emits it: the pairs that pass, and one padded row right
-//   after the last candidate of a row none of whose candidates passed (whether one passed carries
-//   over to the next batch of slots).
+//   probe before it reads every row). One case skips pairs and still keeps that promise: a semi or
+//   anti join with alike candidates (candidates_alike_: residuals that read the probe's columns and
+//   the build's keys alone), whose rows meet only their first candidate. Every candidate of a row
+//   holds its key's bytes, so its other pairs would give the residuals the same values, and the
+//   first pair's outcome, an error included, is theirs (ADR 0022's E2c). A row without candidates
+//   never meets a residual: anti keeps it, left pads it. Semi and anti evaluate a probe batch's
+//   pairs before its first window, and a row matched when one of its pairs passed every residual.
+//   Left evaluates each batch of slots before it emits it: the pairs that pass, and one padded row
+//   right after the last candidate of a row none of whose candidates passed (whether one passed
+//   carries over to the next batch of slots).
 // - One-row (a keyless build of one row, on the right). Output: the probe's columns, then the
 //   build row's values (nullable); each window of a probe batch is a slice of it with its
 //   selection, the values sliced from the build's OneRowValues, so a window has at most their
@@ -280,17 +288,19 @@ class BuildsFirstOperator final : public Operator {
 // ExecContext::pool. Profile: the metrics find (whenever it looks keys up), gather (the rows'
 // columns: the build columns an inner or left join gathers, the probe rows it takes on a path
 // other than 1:1, and the columns of candidate pairs that residuals read; the slices of a one-row
-// join's values), residual and, on the 1:1 path of an inner or left join, window_rows (the rows of
-// the windows its build columns were gathered for, against the rows it emits).
+// join's values), residual, pairs (a semi, anti or left join with residuals: the candidate pairs
+// they met, which alike candidates bring down to a pair per row) and, on the 1:1 path of an inner
+// or left join, window_rows (the rows of the windows its build columns were gathered for, against
+// the rows it emits).
 class HashJoinOperator final : public Operator {
  public:
-  // The kind is the build's. Invalid without a probe or a build; for a kind other than inner or
-  // semi building on the left (ADR 0026's C2c, not implemented); for a one-row join over a build
-  // with keys, or any other kind over a
-  // keyless one; for a null-aware anti join of other than one key; for residuals on a null-aware
-  // anti or a one-row join; for probe keys (columns of the probe's output, one per build key)
-  // outside the probe's output or of another type than their build key; and for a residual that is
-  // not BOOLEAN or reads a column outside the probe's and the build's columns.
+  // The kind is the build's. Invalid without a probe or a build; for a kind other than inner, semi
+  // or anti building on the left (not implemented); for an anti one over a build that did not keep
+  // its NULL keys; for a one-row join over a build with keys, or any other kind over a keyless one;
+  // for a null-aware anti join of other than one key; for residuals on a null-aware anti or a
+  // one-row join; for probe keys (columns of the probe's output, one per build key) outside the
+  // probe's output or of another type than their build key; and for a residual that is not BOOLEAN
+  // or reads a column outside the probe's and the build's columns.
   static arrow::Result<std::unique_ptr<HashJoinOperator>> Make(std::unique_ptr<Operator> probe,
                                                                std::shared_ptr<JoinBuild> build,
                                                                std::vector<int> probe_keys,
@@ -344,8 +354,9 @@ class HashJoinOperator final : public Operator {
   arrow::Result<std::optional<Batch>> NextOneRow();
   // A join that emits its build rows: marks the build rows the current probe batch matched, the
   // whole batch at once, and returns no batch. With residuals it walks the batch's candidate pairs
-  // as EvaluatePairs does and marks the build row of each pair that passes; without them it marks
-  // every candidate of every row, which Find left empty for a row that is not selected.
+  // as EvaluatePairs does and marks the build row of each pair that passes (an alike row's one
+  // pair marks its whole range); without them it marks every candidate of every row, which Find
+  // left empty for a row that is not selected.
   arrow::Result<std::optional<Batch>> MarkMatches();
   arrow::Result<std::optional<Batch>> NextLeftWindow();
   arrow::Result<std::optional<Batch>> NextPadded();
@@ -360,7 +371,8 @@ class HashJoinOperator final : public Operator {
   [[nodiscard]] bool Selected(int64_t row) const;
   // The next slots of the current probe batch, from (row_, taken_) on, at most batch_size_ (and
   // 2^32 - 1) of them, in probe_rows_ and build_rows_: one per candidate pair (a probe row and a
-  // build row of its key) and, for a left join, one for each selected row without a candidate (a
+  // build row of its key; with alike candidates, a row's first only) and, for a left join, one for
+  // each selected row without a candidate (a
   // padded row: its build row's chunk is kNoChunk); for a left join with residuals, last_ marks
   // the slot of each row's last candidate. Their number: 0 at the batch's end.
   arrow::Result<int64_t> NextSlots();
@@ -372,7 +384,8 @@ class HashJoinOperator final : public Operator {
   // The batch (pair_schema_) of the pairs pair_rows_ and pair_builds_ [0, pairs): the probe's
   // columns that the residuals read, taken, then the build's, gathered.
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> PairBatch(int64_t pairs);
-  // A semi or anti join with residuals: passed_ of the current probe batch, from all its pairs.
+  // A semi or anti join with residuals: passed_ of the current probe batch, from all its pairs (a
+  // pair per row with alike candidates).
   arrow::Status EvaluatePairs();
   // A left join with residuals: slots [0, count) without the pairs that failed, but for the last
   // candidate of a row none of whose pairs passed, which becomes a padded row; `passing` passing
@@ -409,6 +422,14 @@ class HashJoinOperator final : public Operator {
   std::vector<int> pair_build_;  // columns of the build's schema
   std::shared_ptr<arrow::Schema> pair_schema_;
   std::vector<plan::ExprPtr> pair_residual_;
+  // A semi or anti join whose residuals read no build column but its keys, over keys that compare
+  // by bytes, with deterministic residuals (ADR 0022's E2c): a probe row's candidates are the rows
+  // of its key, which hold its key bytes in every key column, and each pair carries the row's own
+  // probe columns, so every pair gives the residuals the same values -- and the same true, false,
+  // NULL or error -- as the first. NextSlots gives such a row one slot, its first candidate;
+  // MarkMatches marks the row's whole range when that pair passes. A fact of the plan, the same in
+  // every part's probe.
+  bool candidates_alike_ = false;
 
   ExecContext ctx_;  // a copy: the context of the first Next of a probe that prepares its build
   int64_t batch_size_ = 1;

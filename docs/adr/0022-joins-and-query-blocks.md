@@ -598,6 +598,21 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     probe row's pairs; a left join emits the passing pairs and pads a row none of whose candidates passed once, right
     after its last candidate, whatever chunk that falls in. A row without candidates never meets a residual: an anti
     join keeps it, a left join pads it. No join kind exits 4 in exec any more.
+  - Update (2026-11-02, E2c, [ADR 0037](0037-tpcds-roadmap.md)'s PF9): one exception to "on every pair", which keeps
+    what that rule promises. A semi or anti join has *alike candidates* when three things hold:
+    - its residuals read no column of the build but its keys;
+    - its keys compare by their bytes (`JoinTable::KeysEqual`);
+    - its residuals are deterministic.
+
+    Every key type and every function qualifies today. `KeyEqualityIsBytewise` and `IsDeterministic` in
+    `src/exec/hash_join.cc` decide each by an exhaustive switch, so a new type, expression kind or function cannot
+    compile until it is decided. A probe row's candidates then hold its key's bytes in every key column, and each pair
+    carries the row's own probe columns, so its pairs give the residuals the same values and the same true, false,
+    NULL or error. Such a row meets its first candidate alone. Building on the left (ADR 0026's C2b and C2c), a passing
+    pair marks its key's whole range: the bits its pairs would have marked one by one. The answers, the errors and
+    their independence of the batch size are E2b's, and the probe's `pairs` metric counts the pairs met ([ADR
+    0015](0015-query-profiles.md)). A residual over another build column keeps the full walk. An early stop for those
+    waits for a profile of a query that needs one.
 - **One build feeds one probe pipeline,** until a later ADR. Nothing else is buffered for reuse: a table or sub-plan
   read twice is computed twice (ADR 0013).
 - **Memory.** A build's Arrow buffers come from the budget's pool, and its own containers are charged through

@@ -188,6 +188,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | PF6 | A partial aggregate below the join under a ROLLUP | | Conditional |
 | PF7 | One-row and single joins on the branch of the relation they read | | Conditional |
 | PF8 | Hash-set membership for long IN lists | | Conditional |
+| PF9 | One candidate per probe row for semi and anti residuals that read no build column but its keys (ADR 0022's E2c) | | Built |
 | **Closing** | | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
@@ -195,6 +196,11 @@ Queries are those a PR completes when the PRs merge in this order.
 Update (2026-11-01, HC6): the ORDER BY positions of Q47, Q57 and Q89 name columns inside a lone star, not after one. So
 the comparison reads a position's key from the answer's own column, wherever stars stand, and the answer's width is
 the only width it needs.
+
+Update (2026-11-02, PF9): pulled in front of HC7. HC7's differential test over the tables derived from TPC-DS
+generated a correlated `EXISTS` whose residual compares the join's key columns again. The semi join met every row of a
+probe row's key, one pair at a time, and the test under ASan would have outrun its timeout. PF9 lets such a join meet
+one candidate per row, with E2b's answers and errors ([ADR 0022](0022-joins-and-query-blocks.md)'s E2c).
 
 ## Alternatives considered
 
