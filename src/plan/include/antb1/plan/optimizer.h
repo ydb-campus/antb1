@@ -14,25 +14,36 @@ namespace antb1::plan {
 //     every correlated subquery is rejected here. A dependent join left in the plan afterwards is a
 //     bug in the pass, and fails with no SqlErrorDetail (exit code 70), so that it can never pass
 //     for a refusal (ADR 0005).
-//  1. COUNT(*) as the only aggregate directly over a Scan (no WHERE) of a table with an exact row
+//  1. WHERE conditions into a union's branches (ADR 0036's X7a): the conditions of a Filter
+//     directly over a UnionAll go on top of each branch, in that branch's columns. A condition the
+//     branch's constants (a literal select item, through the binder's widening casts) make never
+//     true rules the branch out, one they make always true is dropped there, and any other filters
+//     the branch's rows. A union left with one branch stays a UnionAll of one input; one left with
+//     none keeps its first branch under a FALSE filter, which reads nothing.
+//  2. COUNT(*) as the only aggregate directly over a Scan (no WHERE) of a table with an exact row
 //     count becomes a RowCount node: answered from metadata, no data is read.
-//  2. A GROUP BY key computed only from other keys (not DOUBLE ones) is dropped from the
+//  3. A GROUP BY key computed only from other keys (not DOUBLE ones) is dropped from the
 //     GroupAggregate and computed from them once per group, above it
 //     (docs/adr/0018-dependent-group-keys.md): the same groups, fewer keys to hash.
-//  3. Limit below Project and Compute, so that it sits right above a Sort (top-N).
-//  4. Projection pruning: every Scan reads only the fields that the nodes above it reference
+//  4. Limit below Project and Compute, so that it sits right above a Sort (top-N).
+//  5. Aggregate placement (docs/adr/0032-aggregate-placement.md's G2b): a grouped aggregate is
+//     computed on one input of the join it reads, as partials, where the gate admits it.
+//  6. Projection pruning: every Scan reads only the fields that the nodes above it reference
 //     (possibly none), and Computes keep only the expressions used. A Project and a UnionAll keep
 //     every output, so a derived table's or a union's branch computes its columns whether or not
 //     anything above reads them.
-// Rules 1 to 4 find columns by their ids and ignore the input's indices; last,
+// Rules 1 to 6 find columns by their ids and ignore the input's indices; last,
 // plan::ResolvePositions sets every index from the ids (ADR 0022). A plan it returns has the same
 // output columns (and column ids) and the same answer as the input plan, and holds no dependent
 // join, so no later pass and no operator meets one.
 //
-// The unnesting pass is the one rule that changes a NODE's output columns: Path 2's inner join
-// exposes the group's key columns that the dependent join did not. The PLAN's output is unchanged
-// all the same, since the binder always puts a Project or an aggregation above a subquery's join;
-// a hand-built plan whose root is the join itself would see the wider output.
+// The unnesting pass and the aggregate placement change NODES' output columns: Path 2's inner join
+// exposes the group's key columns that the dependent join did not, and a join over partials
+// outputs their columns, of new ids, in place of its aggregated input's. The PLAN's output is
+// unchanged all the same, since the binder always puts a Project or an aggregation above a
+// subquery's join and the placed aggregate stays above its partials, as their final step; a
+// hand-built plan whose root is Path 2's join itself would see the wider output. Rule 1 changes
+// the number of a UnionAll's inputs, and no node's output columns.
 arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options = {});
 
 }  // namespace antb1::plan

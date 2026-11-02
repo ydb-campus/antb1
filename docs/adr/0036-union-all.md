@@ -42,14 +42,16 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
 
 1. **The plan node is `UnionAllNode`, and it is N-ary.**
    - **Fields:**
-     - `inputs`: two or more, as written.
+     - `inputs`: two or more, as written. Update (2026-11-03, X7a): one or more. The binder makes two or more; a union
+       whose other inputs the optimizer ruled out keeps one, and stays a union (Consequences).
      - `columns`: per input, one `BoundColumn` per output column.
      - `ids`: per output column. These are new columns: no input defines a union's rows, so none passes through.
      - `span`.
    - **Rows:** every row of input 0 in its order, then input 1's, and so on. Duplicates and NULLs are kept.
    - **Types:** column i has one type in every input. The binder ensures it by casting below the union.
    - **The arity invariant becomes:** a Join and a DependentJoin have two inputs, a UnionAll two or more, every other
-     node at most one. Every walk visits every input in order (`InputsOf`, `WithInputs`).
+     node at most one. Every walk visits every input in order (`InputsOf`, `WithInputs`). Update (2026-11-03, X7a): a
+     UnionAll one or more.
    - **Every exhaustive visitor handles the node:**
      - its name, its inputs and its output ids;
      - the ids it reads and defines (`MaxColumnId`, `FreeVariables`);
@@ -147,13 +149,20 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   ([ADR 0006](0006-test-strategy-and-data-policy.md)).
   Update (2026-11-01, ADR 0037's HC4): the eight shards run the queries of a committed map split by measured cost
   (`tests/tpcds/sf1_shards.json`), where query 4 has a shard to itself.
+  Update (2026-11-03, X7a): "nearly doubles" understated it. Each reference of those CTEs now runs only the branches
+  its conditions leave: 6 of 18 in query 4, 4 of 8 in queries 11 and 74. In the release build on a developer's Apple
+  silicon Mac at scale factor 1, the medians of seven interleaved runs at 14 threads went from 2.800 to 0.970 seconds
+  for query 4, from 1.264 to 0.641 for query 11 and from 0.583 to 0.301 for query 74; of five at one thread, from
+  7.679 to 2.562, from 3.255 to 1.642 and from 1.977 to 0.995. Their peaks stayed within 1.2 MiB of what they were.
 - Every `std::visit` over the plan grows by one alternative. A walk that compiles for any node but assumes a shape
   must be read whenever a node is added ([architecture](../architecture.md), "Where to add things").
 - A union's consumer is serial. A large union under a GROUP BY, a join or a sort runs at the consumer's
   single-thread rate; X7's part pipeline over all branches lifts that.
 - No rule moves anything through a union yet. A filter above a union runs above it, and a CTE whose body is a union
   is computed once per reference. X7's filter pushdown, with constant-branch pruning, is what queries 4, 11 and 74
-  want at large scale.
+  want at large scale. Update (2026-11-03, X7a): a WHERE condition on a union now goes on top of each branch, and a
+  branch whose constants make it never true is pruned, so each reference computes only the branches it keeps. Each
+  reference still computes its own, and a condition stops on top of a branch: ADR 0037's PF2 carries it further down.
 
 ## Plan
 
@@ -165,7 +174,7 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
 | X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules these as X4a-X4d in its phase 6; `BY NAME` and non-SELECT branches stay on X4, unscheduled, and keep their `pending X4` guards |
 | X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it |
 | X6 | A compound as the query of IN, EXISTS or a scalar subquery | Trigger: a query that needs it |
-| X7 | Performance: filters into branches with constant-branch pruning; one part pipeline over every branch; dropping a union's unread columns (and a derived table's); sharing union-topped sub-plans once the cap falls back to recomputation | Trigger: a profile at a large scale factor. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules the filters and pruning as X7a and the sharing as its guard PF5. Update (2026-11-02, ADR 0037's X7a update): X7a defers the dynamic key filters into branches that ADR 0037 had given it; they stay here, unscheduled, with the part pipeline and the dropping of unread columns, until a profile or the SF 1 budget shows a join above a union whose key filter would cut a measured share of a passing query's time |
+| X7 | Performance: filters into branches with constant-branch pruning; one part pipeline over every branch; dropping a union's unread columns (and a derived table's); sharing union-topped sub-plans once the cap falls back to recomputation | Trigger: a profile at a large scale factor. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules the filters and pruning as X7a and the sharing as its guard PF5. Update (2026-11-02, ADR 0037's X7a update): X7a defers the dynamic key filters into branches that ADR 0037 had given it; they stay here, unscheduled, with the part pipeline and the dropping of unread columns, until a profile or the SF 1 budget shows a join above a union whose key filter would cut a measured share of a passing query's time. Update (2026-11-03): X7a is built, the filters into the branches and the pruning |
 
 ## Alternatives considered
 

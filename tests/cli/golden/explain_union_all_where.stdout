@@ -1,0 +1,10 @@
+Output: x:BIGINT tag:VARCHAR
+Project x, tag
+  UnionAll inputs=2 columns=[i32, "'large'"]
+    Filter i32 > 5
+      Compute CAST(i32 AS BIGINT)
+        Project i32, 'large'
+          Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+    Filter i64 > 5
+      Project i64, 'wide'
+        Scan table=e source=parquet(files=1, rows=12) columns=[i64]

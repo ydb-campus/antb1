@@ -679,9 +679,10 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. A `UnionAll` has two or more ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of
-the next, and so on; its columns are new, of the types the binder folded, and each input gives them its own columns,
-a block of another type cast below the union by a `Compute`. A query produces inner `Join`s: the binder factors
+builds on. A `UnionAll` has two or more, or one once the optimizer has ruled the others out
+([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of the next, and so on; its columns are new,
+of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
+union by a `Compute`. A query produces inner `Join`s: the binder factors
 each element of `WHERE` and of an inner `ON` (below, below) and sends every conjunct that leaves it to the relations
 it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
@@ -746,9 +747,21 @@ would be a bind error on a query that binds). A single value for every branch is
 Because a derived conjunct can reach a scan, it takes rows away from the conditions above it, which **narrows**
 divergence D16: `i16 * 2 > 1 AND (id = 6 OR id = 11)` used to overflow and now answers, agreeing with DuckDB.
 
-A rule optimizer then rewrites the plan, through both inputs of every `Join` and every input of a `UnionAll` (no rule
-moves anything through a `UnionAll` yet: a filter, a limit or a join's key filter above it stays above it):
+A rule optimizer then rewrites the plan, through both inputs of every `Join` and every input of a `UnionAll` (a
+`WHERE` condition is the one thing a rule moves through a `UnionAll`: a limit or a join's key filter above it stays
+above it):
 
+- a `WHERE` condition on a `UNION ALL` (a derived table's or a CTE's) goes into each of its blocks, read in the block's
+  own columns ([ADR 0036](adr/0036-union-all.md)'s X7a); a condition the binder computes, a `NOT` or an `OR` say, stays
+  above the union, though the `IN` list an `OR` implies (above) goes into the blocks. Where the block's select item is a
+  constant -- a literal, through the exact widening that casts it to the union's type -- the constant decides the
+  condition for the whole block: a block it makes never true is ruled out and never runs, and a condition it makes
+  always true is dropped from that block. It decides a comparison or an `[NOT] IN` list whose constants have the item's
+  type (numbers by value at any scale, DATE, TIMESTAMP, and VARCHAR by unsigned bytes) and a comparison of two constant
+  items; never a DOUBLE or a `LIKE`. Any other condition filters the block's rows on top of the block, above its select
+  list (divergence D27). A union left with one block stays a `UnionAll` of one input, and one left with none keeps its
+  first block under a `FALSE` filter, which reads nothing. Each reference of a CTE keeps the blocks its own conditions
+  leave;
 - `Limit` moves below `Project`: a `Project` keeps every row, so the `Limit` copies only the rows it keeps and ends
   up right above a `Sort`, which the executor runs as a top-N (it keeps only `limit + offset` rows while it reads);
 - a `GROUP BY` key computed only from other keys, none of them DOUBLE (`GROUP BY x, x + 1`), is dropped from the
@@ -801,10 +814,13 @@ Join INNER build=right keys=[a.k = b.k] residual=[(a.x < b.y)] carries 2 of 4 un
   Scan table=b source=parquet(files=1, rows=10) columns=[k, y]
 ```
 
-A `UnionAll` line shows the number of its inputs and its columns, named as the first block names them; its inputs
-follow in written order, indented. A CTE whose query is a `UNION ALL`, referenced twice, prints `[shared #1 of 2, ...]`
-on both `UnionAll` lines, since [ADR 0030](adr/0030-shared-sub-plans.md) finds the repeat, but the executor never
-holds a `UNION ALL`'s rows: each reference computes its own (`--physical` shows no shared source).
+A `UnionAll` line shows the number of its inputs and its columns, named as the first block names them -- the first
+block left, once a condition has ruled blocks out; its inputs follow in written order, indented. A CTE whose query is
+a `UNION ALL`, referenced twice with the same conditions, prints `[shared #1 of 2, ...]` on the highest node the two
+references repeat, since [ADR 0030](adr/0030-shared-sub-plans.md) finds the repeat: their `UnionAll` lines when every
+condition went into the blocks and a block is left, else the `Filter` above the union (the `FALSE` when no block is
+left, or a condition the binder computes). The executor never holds a `UNION ALL`'s rows all the same: each reference
+computes its own (`--physical` shows no shared source).
 
 ```text
 Output: x:INTEGER n:BIGINT
@@ -817,6 +833,23 @@ Project x, n
             Scan table=e source=parquet(files=1, rows=12) columns=[id, i16]
       Project i32
         Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+```
+
+A condition on the union goes into its blocks (above). Over three blocks tagged `'small'`, `'large'` and `'wide'`,
+`WHERE tag <> 'small' AND x > 5` rules the first block out, drops `tag <> 'small'` from the other two and puts
+`x > 5` on top of each, above the cast:
+
+```text
+Output: x:BIGINT tag:VARCHAR
+Project x, tag
+  UnionAll inputs=2 columns=[i32, "'large'"]
+    Filter i32 > 5
+      Compute CAST(i32 AS BIGINT)
+        Project i32, 'large'
+          Scan table=e source=parquet(files=1, rows=12) columns=[i32]
+    Filter i64 > 5
+      Project i64, 'wide'
+        Scan table=e source=parquet(files=1, rows=12) columns=[i64]
 ```
 
 ### `explain --physical`
@@ -1110,7 +1143,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
 - UNION ALL: every row of the first block, then of the next block, and so on, duplicates and NULLs kept, each
   block's rows in its own order; the same on any number of threads. A block runs only once the one before it has
   ended, and a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run -- so their
-  errors are never reported (divergence D26). A cast below the union is an exact widening and never fails.
+  errors are never reported (divergence D26). Nor are those of a block a `WHERE` condition on the union rules out by
+  its constants, in both engines; a block it does not rule out runs, and fails where DuckDB's plan may not run it
+  (divergence D27). A cast below the union is an exact widening and never fails.
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
 - DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s ([ADR
@@ -1272,6 +1307,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D24 | A correlated scalar aggregate over keys no outer row binds | unnests it by equivalence substitution (ADR 0023's Path 2). Where the correlation is on more than one column the aggregation's input is restricted to the keys the outer side binds (the semi-join reduction), and the divergence is narrowed to the keys that restriction's own estimate cannot rule out; on a single column it is not, so the aggregation groups by the correlated key and computes the aggregate's argument, the aggregate and its combination for EVERY key of the subquery's own rows, including keys no outer row binds | computes the subquery only for the bindings of the outer side, joining the domain below the aggregation | the answers agree: an outer row with no group is dropped by the inner join and rejected by the comparison alike. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23), and `tests/slt/cases/subqueries/scalar.slt` compares every shape Path 2 answers with DuckDB's own answer |
 | D25 | A moved Compute over rows a join above discards | computes a grouped aggregate on one input of a join below it (ADR 0032), and where the aggregate's argument is an expression a `Compute` above the join defines, that `Compute` travels DOWN with the partial -- a partial cannot aggregate a column that does not exist below it. The expression is then computed for every row of the aggregated side, including the rows the joins above discard | computes it above the join, so only for the rows that survive | the answers agree: a discarded row contributes to no group in either plan. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23 and D24), and `tests/slt/cases/aggregates/placement.slt` pins the overflow against DuckDB's own answer, with a control whose call refuses the placement and so answers in both engines |
 | D26 | Errors of the blocks of a `UNION ALL` that a `LIMIT` does not need | a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run, so their errors -- an overflow, say -- are never reported ([ADR 0036](adr/0036-union-all.md)) | runs at least the first vector of every block, so an error in a later block fails the query | the answers agree where no block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23, D24 and D25), and `tests/slt/cases/setops/errors.slt` pins it: antb1's answer under `onlyif antb1`, DuckDB's error under `onlyif duckdb`, and with `ORDER BY` a control that fails in both |
+| D27 | Errors of the blocks of a `UNION ALL` that a condition on it does not rule out by their constants | a `WHERE` condition on a union goes on top of each block, above the block's select list, and rules a block out only where the block's constants decide it ([ADR 0036](adr/0036-union-all.md)'s X7a; never for a `LIKE` or a DOUBLE, and never for a condition the binder computes, such as a `NOT`, which stays above the union). Any other block runs, so an error of its select list -- an overflow, say -- fails the query, even on rows a condition on another column rejects | rules out a block whose constants make a `LIKE`, a DOUBLE comparison or a `NOT` never true too, and filters a column below the select list, so that error is never reported | the answers agree where no block fails; the random generator writes no arithmetic that can overflow and tags no block with a constant, and `tests/slt/cases/setops/errors.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb`, and the conditions both engines decide as records both pass |
 
 ## ClickBench status
 

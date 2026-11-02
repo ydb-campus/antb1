@@ -130,7 +130,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC7 | Optional: seeded differential queries over the tables derived from TPC-DS at SF 0.1, redacted like `diff.tpch`; built at SF 0.01 (the HC7 update below) | | Built |
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
-| X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned; the key filters stay on X7, unscheduled (the X7a update below) | | Planned |
+| X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned; the key filters stay on X7, unscheduled (the X7a updates below) | | Built |
 | PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures | | Planned |
 | **Phase 2** | **NULL as a value** | | |
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes | | Planned |
@@ -252,6 +252,20 @@ Update (2026-11-02, X7a's design, agreed with the maintainer before its PR): fou
   UNION to a GROUP BY over a UNION ALL, which ADR 0030's sharing collects, so a CTE whose body is a UNION, referenced
   more than once, would hold the union's distinct rows. None of the 99 has a CTE whose body is a UNION, INTERSECT or
   EXCEPT referenced more than once, so this trigger guards SQL beyond them.
+
+Update (2026-11-03, X7a): built as the Optimize pass the note above describes (`src/plan/union_branches.h`).
+
+- Queries 4, 11 and 74 run 6 of 18, 4 of 8 and 4 of 8 branches. At scale factor 1, in the release build on a
+  developer's Apple silicon Mac, they take 0.35, 0.51 and 0.52 of their time at 14 threads and 0.33, 0.50 and 0.50 at
+  one thread (ADR 0036's consequences give the seconds). Under AddressSanitizer there, query 4 took 24.0 seconds at
+  one thread instead of 74.8 (test-build diagnostics), so the shard that holds it alone (HC4) has room to spare. The
+  plans of the other 47 passing queries do not change.
+- The pass decides only what exec's filters decide the same way: a comparison or an IN list whose constants have the
+  column's own type (numbers at any scale, DATE, TIMESTAMP, VARCHAR by unsigned bytes), never a DOUBLE or a LIKE.
+  DuckDB rules out more, so divergence D27 records the errors of the blocks antb1 still runs. PF2 narrows it.
+- NL3 must teach the evaluator NULL constants before a NULL item reaches a union, since a NULL makes a comparison
+  neither true nor false. A `static_assert` in `src/plan/branch_truth.cc` stops a new alternative of a constant's
+  value until the evaluator decides it.
 
 ## Alternatives considered
 

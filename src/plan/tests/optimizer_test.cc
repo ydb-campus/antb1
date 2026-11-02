@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +32,24 @@ LogicalPlan Optimized(std::string_view sql) {
   auto plan = BindSql(sql, catalog);
   EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
   return plan.ok() ? Optimized(*plan) : LogicalPlan{};
+}
+
+// Conditions on a union that the optimizer moves into its branches (ADR 0036's X7a): one branch
+// left with a condition, none left, a condition on every branch, a comparison of two columns, a
+// CTE referenced twice.
+std::vector<std::string> UnionConditionQueries() {
+  constexpr std::string_view kTagged =
+      "SELECT x FROM (SELECT i16 AS x, 'a' AS tag FROM t UNION ALL SELECT i32 AS x, 'b' AS tag "
+      "FROM u) AS v WHERE ";
+  constexpr std::string_view kTwoColumns =
+      "SELECT x FROM (SELECT i16 AS x, i32 AS y FROM t UNION ALL SELECT i32 AS x, i16 AS y FROM u) "
+      "AS v WHERE x > y";
+  constexpr std::string_view kTwoReferences =
+      "WITH v AS (SELECT i16 AS x, 'a' AS tag FROM t UNION ALL SELECT i16 AS x, 'b' AS tag FROM "
+      "u) SELECT COUNT(*) FROM v AS p, v AS q WHERE p.x = q.x AND p.tag = 'a' AND q.tag = 'b'";
+  return {std::string(kTagged) + "tag = 'a' AND x > 3", std::string(kTagged) + "tag = 'c'",
+          std::string(kTagged) + "tag LIKE 'a%'", std::string(kTwoColumns),
+          std::string(kTwoReferences)};
 }
 
 TEST(OptimizerTest, CountStarWithoutWhereBecomesRowCount) {
@@ -189,6 +208,10 @@ TEST(OptimizerTest, IsIdempotentAndKeepsTheOutput) {
     const LogicalPlan twice = Optimized(once);
     EXPECT_EQ(Explain(twice), Explain(once)) << sql;
   }
+  for (const std::string& sql : UnionConditionQueries()) {
+    const LogicalPlan once = Optimized(sql);
+    EXPECT_EQ(Explain(Optimized(once)), Explain(once)) << sql;
+  }
 }
 
 // A GROUP BY key computed only from other keys is dropped from the GroupAggregate and computed
@@ -244,12 +267,17 @@ TEST(OptimizerTest, KeepsTheColumnIds) {
   constexpr const char* kUnionJoin =
       "SELECT a.x FROM (SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u) AS a JOIN ok ON a.x = "
       "ok.i16";
-  for (const char* sql :
-       {"SELECT i16 + 1 FROM t WHERE i32 // 2 > 0", "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
-        "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
-        "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
-        "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3", "SELECT * FROM ok WHERE s = 'x' LIMIT 2",
-        "SELECT i16, s FROM t UNION ALL SELECT i32, s FROM u WHERE i64 > 3", kUnionJoin}) {
+  std::vector<std::string> queries = {
+      "SELECT i16 + 1 FROM t WHERE i32 // 2 > 0",
+      "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+      "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
+      "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
+      "SELECT i32 * 2 FROM t ORDER BY i32 LIMIT 3",
+      "SELECT * FROM ok WHERE s = 'x' LIMIT 2",
+      "SELECT i16, s FROM t UNION ALL SELECT i32, s FROM u WHERE i64 > 3",
+      kUnionJoin};
+  std::ranges::copy(UnionConditionQueries(), std::back_inserter(queries));
+  for (const std::string& sql : queries) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql;
     const LogicalPlan optimized = Optimized(*bound);
@@ -456,24 +484,26 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
   constexpr const char* kUnionWhere =
       "SELECT x, COUNT(*) FROM (SELECT i16 AS x, s FROM t UNION ALL SELECT i32, s FROM u) AS v "
       "WHERE s = 'a' GROUP BY x";
-  for (const char* sql : {
-           "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
-           "SELECT s, i16, s AS again FROM t WHERE dt > '2013-07-01' AND i16 < 5 LIMIT 3",
-           "SELECT i16 + 1 FROM t WHERE i32 // 2 > 0",
-           "SELECT i32 * 2 FROM t LIMIT 3",
-           "SELECT i32, i32 - 1, i32 * 2, COUNT(*) FROM t GROUP BY i32, i32 - 1, i32 * 2",
-           "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
-           "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
-           "SELECT i32, i16 + 1, COUNT(*) FROM t GROUP BY i32, i16, i16 + 1",
-           "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
-           "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1",
-           "SELECT MAX(\"from\"), COUNT(*), SUM(d), MIN(d) FROM u",
-           "SELECT i16, 42, 'x' AS c, i16 * 2 FROM t WHERE i16 > 0 OR i32 < 5 ORDER BY 4",
-           "SELECT CASE WHEN i16 > 0 THEN s ELSE 'neg' END AS c FROM t ORDER BY c LIMIT 5",
-           "SELECT SUM(i32) + 1, COUNT(*) FROM t HAVING SUM(i32) > 5 OR COUNT(*) < 2",
-           kHavingAlias,
-           kUnionWhere,
-       }) {
+  std::vector<std::string> queries = {
+      "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+      "SELECT s, i16, s AS again FROM t WHERE dt > '2013-07-01' AND i16 < 5 LIMIT 3",
+      "SELECT i16 + 1 FROM t WHERE i32 // 2 > 0",
+      "SELECT i32 * 2 FROM t LIMIT 3",
+      "SELECT i32, i32 - 1, i32 * 2, COUNT(*) FROM t GROUP BY i32, i32 - 1, i32 * 2",
+      "SELECT i32 - 1, COUNT(*) AS c FROM t GROUP BY i32, i32 - 1 ORDER BY c DESC LIMIT 3",
+      "SELECT s, strlen(s), SUM(i16) FROM t GROUP BY s, strlen(s) HAVING strlen(s) > 1",
+      "SELECT i32, i16 + 1, COUNT(*) FROM t GROUP BY i32, i16, i16 + 1",
+      "SELECT i32, i32 + 1, SUM(i32 + 1) FROM t GROUP BY i32, i32 + 1",
+      "SELECT i32, i32 + 1, COUNT(*) FROM t GROUP BY i32, i32 + 1 LIMIT 1",
+      "SELECT MAX(\"from\"), COUNT(*), SUM(d), MIN(d) FROM u",
+      "SELECT i16, 42, 'x' AS c, i16 * 2 FROM t WHERE i16 > 0 OR i32 < 5 ORDER BY 4",
+      "SELECT CASE WHEN i16 > 0 THEN s ELSE 'neg' END AS c FROM t ORDER BY c LIMIT 5",
+      "SELECT SUM(i32) + 1, COUNT(*) FROM t HAVING SUM(i32) > 5 OR COUNT(*) < 2",
+      kHavingAlias,
+      kUnionWhere,
+  };
+  std::ranges::copy(UnionConditionQueries(), std::back_inserter(queries));
+  for (const std::string& sql : queries) {
     auto bound = BindSql(sql, catalog);
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
     const LogicalPlan expected = Optimized(*bound);
@@ -492,6 +522,209 @@ TEST(OptimizerTest, RulesReadColumnIdsNotPositions) {
       EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql;
     }
   }
+}
+
+// ---- conditions into a union's branches (ADR 0036's X7a) ----
+
+// A union of two blocks over t and u, each tagged with a constant, the first one's x cast to the
+// union's INTEGER; and a condition on it.
+std::string Tagged(std::string_view where) {
+  return "SELECT x FROM (SELECT i16 AS x, 'a' AS tag FROM t UNION ALL SELECT i32 AS x, 'b' AS tag "
+         "FROM u) AS v WHERE " +
+         std::string(where);
+}
+
+// The conditions on a union go into its branches: a branch whose constants make one never true is
+// gone, one they make always true is dropped there, and any other is a Filter on top of the
+// branch, reading the branch's own column of the union's type. A union left one branch is a union
+// of one input.
+TEST(OptimizerTest, AConditionOnAUnionGoesIntoItsBranchesAndDropsTheOnesItRulesOut) {
+  constexpr std::string_view kFirst =
+      "Output: x:INTEGER\n"
+      "Project x\n"
+      "  UnionAll inputs=1 columns=[x, tag]\n"
+      "    Compute CAST(x AS INTEGER)\n"
+      "      Project i16, 'a'\n"
+      "        Scan table=t source=fake columns=[i16]\n";
+  for (const std::string_view where : {"tag = 'a'", "tag IN ('a', 'c')", "tag < 'b'"}) {
+    EXPECT_EQ(Explain(Optimized(Tagged(where))), kFirst) << where;
+  }
+  EXPECT_EQ(Explain(Optimized(Tagged("tag = 'a' AND x > 3"))),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x, tag]\n"
+            "    Filter x > 3\n"
+            "      Compute CAST(x AS INTEGER)\n"
+            "        Project i16, 'a'\n"
+            "          Scan table=t source=fake columns=[i16]\n");
+  EXPECT_EQ(Explain(Optimized(Tagged("tag NOT IN ('a', 'c')"))),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x, tag]\n"
+            "    Project i32, 'b'\n"
+            "      Scan table=u source=fake columns=[i32]\n");
+}
+
+// Conditions the constants make always true are dropped from every branch, and the union keeps
+// them all.
+TEST(OptimizerTest, AConditionTheConstantsOfEveryBranchMeetIsDropped) {
+  for (const std::string_view where : {"tag <> 'c'", "tag IN ('a', 'b')", "tag >= 'a'"}) {
+    EXPECT_EQ(Explain(Optimized(Tagged(where))),
+              "Output: x:INTEGER\n"
+              "Project x\n"
+              "  UnionAll inputs=2 columns=[x, tag]\n"
+              "    Compute CAST(x AS INTEGER)\n"
+              "      Project i16, 'a'\n"
+              "        Scan table=t source=fake columns=[i16]\n"
+              "    Project i32, 'b'\n"
+              "      Scan table=u source=fake columns=[i32]\n")
+        << where;
+  }
+}
+
+// A union none of whose branches is left becomes FALSE over a union of its first branch: above the
+// union, which ends every part pipeline, it reads nothing.
+TEST(OptimizerTest, AUnionWhoseEveryBranchIsRuledOutKeepsItsFirstUnderFalse) {
+  for (const std::string_view where : {"tag = 'c'", "x > 3 AND tag > 'b'"}) {
+    EXPECT_EQ(Explain(Optimized(Tagged(where))),
+              "Output: x:INTEGER\n"
+              "Project x\n"
+              "  Filter FALSE\n"
+              "    UnionAll inputs=1 columns=[x, tag]\n"
+              "      Compute CAST(x AS INTEGER)\n"
+              "        Project i16, 'a'\n"
+              "          Scan table=t source=fake columns=[i16]\n")
+        << where;
+  }
+}
+
+// A condition the binder folded to FALSE already reads nothing above the union: it stays there.
+TEST(OptimizerTest, AFalseConditionAboveAUnionStaysAsItIs) {
+  EXPECT_EQ(Explain(Optimized(Tagged("x = 1.5"))),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  Filter FALSE\n"
+            "    UnionAll inputs=2 columns=[x, tag]\n"
+            "      Compute CAST(x AS INTEGER)\n"
+            "        Project i16, 'a'\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "      Project i32, 'b'\n"
+            "        Scan table=u source=fake columns=[i32]\n");
+}
+
+// A branch's constant is read through the binder's widening cast below the union, and compared in
+// the union's type: an integer as a BIGINT or a DECIMAL, a DECIMAL at a larger scale.
+TEST(OptimizerTest, UnionBranchesDecideThroughTheirWideningCasts) {
+  constexpr std::string_view kWide =
+      "SELECT x FROM (SELECT 1 AS x FROM t UNION ALL SELECT 3000000000 AS x FROM u) AS v WHERE ";
+  EXPECT_EQ(Explain(Optimized(std::string(kWide) + "x = 1")),
+            "Output: x:BIGINT\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x]\n"
+            "    Compute CAST(x AS BIGINT)\n"
+            "      Project 1\n"
+            "        Scan table=t source=fake columns=[]\n");
+  EXPECT_EQ(Explain(Optimized(std::string(kWide) + "x = 3000000000")),
+            "Output: x:BIGINT\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x]\n"
+            "    Project 3000000000\n"
+            "      Scan table=u source=fake columns=[]\n");
+  EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT 1 AS x FROM t UNION ALL SELECT 1.50 AS x "
+                              "FROM u) AS v WHERE x = 1")),
+            "Output: x:DECIMAL(12,2)\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x]\n"
+            "    Compute CAST(x AS DECIMAL(12,2))\n"
+            "      Project 1\n"
+            "        Scan table=t source=fake columns=[]\n");
+  EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT 1.5 AS x FROM t UNION ALL SELECT 2.25 AS x "
+                              "FROM u) AS v WHERE x < 2")),
+            "Output: x:DECIMAL(3,2)\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x]\n"
+            "    Compute CAST(x AS DECIMAL(3,2))\n"
+            "      Project 1.5\n"
+            "        Scan table=t source=fake columns=[]\n");
+}
+
+// A comparison of two columns that are both constants in a branch is decided there, an INTEGER
+// with a DECIMAL by value.
+TEST(OptimizerTest, UnionBranchesCompareTwoConstantColumns) {
+  EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT 1 AS x, 1.5 AS y FROM t UNION ALL SELECT 2 AS "
+                              "x, 1.5 AS y FROM u) AS v WHERE x < y")),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=1 columns=[x, y]\n"
+            "    Project 1, 1.5\n"
+            "      Scan table=t source=fake columns=[]\n");
+}
+
+// What a branch's constants cannot decide exactly goes on top of the branch: a column that is not
+// a constant there, LIKE (exec's matcher decides it), a DOUBLE constant on a DECIMAL column.
+TEST(OptimizerTest, UnionBranchesPushWhatTheirConstantsCannotDecide) {
+  EXPECT_EQ(Explain(Optimized(Tagged("x > 3"))),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=2 columns=[x, tag]\n"
+            "    Filter x > 3\n"
+            "      Compute CAST(x AS INTEGER)\n"
+            "        Project i16, 'a'\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "    Filter x > 3\n"
+            "      Project i32, 'b'\n"
+            "        Scan table=u source=fake columns=[i32]\n");
+  EXPECT_EQ(Explain(Optimized(Tagged("tag LIKE 'a%'"))),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=2 columns=[x, tag]\n"
+            "    Filter tag LIKE 'a%'\n"
+            "      Compute CAST(x AS INTEGER)\n"
+            "        Project i16, 'a'\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "    Filter tag LIKE 'a%'\n"
+            "      Project i32, 'b'\n"
+            "        Scan table=u source=fake columns=[i32]\n");
+  EXPECT_EQ(Explain(Optimized("SELECT x FROM (SELECT i16 AS x, i32 AS y FROM t UNION ALL SELECT "
+                              "i32 AS x, i16 AS y FROM u) AS v WHERE x > y")),
+            "Output: x:INTEGER\n"
+            "Project x\n"
+            "  UnionAll inputs=2 columns=[x, y]\n"
+            "    Filter x > y\n"
+            "      Compute CAST(x AS INTEGER)\n"
+            "        Project i16, i32\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "    Filter x > y\n"
+            "      Compute CAST(y AS INTEGER)\n"
+            "        Project i32, i16\n"
+            "          Scan table=u source=fake columns=[i16, i32]\n");
+  EXPECT_EQ(Explain(Optimized("SELECT p FROM (SELECT 1.5 AS p FROM t UNION ALL SELECT 2.5 AS p "
+                              "FROM u) AS v WHERE p = 1.5e0")),
+            "Output: p:DECIMAL(2,1)\n"
+            "Project p\n"
+            "  UnionAll inputs=2 columns=[p]\n"
+            "    Filter CAST(p AS DOUBLE) = 1.5\n"
+            "      Project 1.5\n"
+            "        Scan table=t source=fake columns=[]\n"
+            "    Filter CAST(p AS DOUBLE) = 1.5\n"
+            "      Project 2.5\n"
+            "        Scan table=u source=fake columns=[]\n");
+}
+
+// Each reference of a CTE is bound on its own, so each keeps the branch its own conditions leave.
+TEST(OptimizerTest, EachReferenceOfAUnionCteKeepsTheBranchItsConditionsLeave) {
+  EXPECT_EQ(Explain(Optimized("WITH v AS (SELECT i16 AS x, 'a' AS tag FROM t UNION ALL SELECT i16 "
+                              "AS x, 'b' AS tag FROM u) SELECT COUNT(*) FROM v AS p, v AS q WHERE "
+                              "p.x = q.x AND p.tag = 'a' AND q.tag = 'b'")),
+            "Output: count_star():BIGINT\n"
+            "Aggregate COUNT(*)\n"
+            "  Join INNER build=right keys=[p.x = q.x]\n"
+            "    UnionAll inputs=1 columns=[x, tag]\n"
+            "      Project i16, 'a'\n"
+            "        Scan table=t source=fake columns=[i16]\n"
+            "    UnionAll inputs=1 columns=[x, tag]\n"
+            "      Project i16, 'b'\n"
+            "        Scan table=u source=fake columns=[i16]\n");
 }
 
 // ---- joins (hand-built plans: kinds and shapes no query makes) ----

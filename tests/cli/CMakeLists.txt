@@ -765,6 +765,18 @@ antb1_add_cli_golden(
     --table
     "e=${_f}/edge.parquet"
 )
+# A condition on a UNION ALL (ADR 0036's X7a) goes into its blocks: the block whose constant makes it
+# never true is gone, a part every block's constant makes true is dropped, and the rest goes on top of
+# each block, above its cast. The union is then named as its first remaining block.
+antb1_add_cli_golden(
+  explain_union_all_where
+  ARGS
+    explain
+    -c
+    "SELECT x, tag FROM (SELECT i16 AS x, 'small' AS tag FROM e UNION ALL SELECT i32, 'large' FROM e UNION ALL SELECT i64, 'wide' FROM e) AS u WHERE tag <> 'small' AND x > 5"
+    --table
+    "e=${_f}/edge.parquet"
+)
 antb1_add_cli_golden(
   explain_aggregate
   ARGS

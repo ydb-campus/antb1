@@ -723,11 +723,28 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesEachInputsColumnsAgainstThatInput) {
   EXPECT_EQ(ResolvePositions(resolved).root, resolved.root) << "a resolved plan is kept as it is";
 }
 
-TEST(ColumnIdsTest, PositionMismatchNamesBrokenUnions) {
+// A union of one input is a union whose other branches the optimizer ruled out (ADR 0036's X7a):
+// it resolves as any union does.
+TEST(ColumnIdsTest, AUnionOfOneInputResolvesAgainstThatInput) {
   UnionAllNode one = Union();
   one.inputs.pop_back();
   one.columns.pop_back();
-  EXPECT_EQ(PositionMismatch(Plan(Node(one))), "UnionAll: 1 inputs");
+  const LogicalPlan plan = Plan(Node(one));
+  EXPECT_EQ(PositionMismatch(plan), "UnionAll: column #3 is at 2, not 0");
+  const LogicalPlan resolved = ResolvePositions(plan);
+  const auto& node = std::get<UnionAllNode>(*resolved.root);
+  ASSERT_EQ(node.columns.size(), 1U);
+  ASSERT_EQ(node.columns[0].size(), 2U);
+  EXPECT_EQ(node.columns[0][0].index, 2);
+  EXPECT_EQ(node.columns[0][1].index, 0);
+  EXPECT_EQ(PositionMismatch(resolved), std::nullopt);
+}
+
+TEST(ColumnIdsTest, PositionMismatchNamesBrokenUnions) {
+  UnionAllNode none = Union();
+  none.inputs.clear();
+  none.columns.clear();
+  EXPECT_EQ(PositionMismatch(Plan(Node(none))), "UnionAll: 0 inputs");
 
   UnionAllNode lists = Union();
   lists.columns.pop_back();

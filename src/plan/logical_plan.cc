@@ -1049,9 +1049,11 @@ class Resolver {
 
   // Each input's columns resolve against that input's ids alone, and column i has one type in every
   // input. The union's ids are defined after its inputs are walked, so an input's id reused as one
-  // is defined twice: a union passes no column through (ADR 0036).
+  // is defined twice: a union passes no column through (ADR 0036). One input is a union whose other
+  // branches the optimizer ruled out (ADR 0036's X7a): it stays a union, so nothing under it is
+  // shared.
   Resolved Visit(const LogicalNodePtr& self, const UnionAllNode& node) {
-    if (node.inputs.size() < 2) {
+    if (node.inputs.empty()) {
       Fail(std::format("UnionAll: {} inputs", node.inputs.size()));
     }
     if (node.columns.size() != node.inputs.size()) {

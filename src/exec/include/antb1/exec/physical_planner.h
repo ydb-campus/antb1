@@ -23,9 +23,9 @@ namespace antb1::exec {
 // another kind than inner that builds on its left input; a one-row join with keys or residuals; a
 // join of another kind without keys; a null-aware anti join of other than one key or with
 // residuals; a key of two types, of DOUBLE or BOOLEAN, or outside its input; a residual that is
-// missing, not BOOLEAN or reads outside the join's two inputs; a union of fewer than two inputs, or
-// whose column is outside its input or has two types; a root whose width differs from
-// plan.output), with a profile or without.
+// missing, not BOOLEAN or reads outside the join's two inputs; a union without inputs, or whose
+// column is outside its input or has two types; a root whose width differs from plan.output),
+// with a profile or without.
 // With a `profile` node, the plan is profiled into it (profile.h): one node per physical operator,
 // each input a child, a part pipeline profiled once per part into the same nodes, a join's build
 // under the operator that prepares it.

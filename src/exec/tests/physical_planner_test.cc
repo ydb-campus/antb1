@@ -1580,7 +1580,7 @@ TEST_F(PhysicalPlannerTest, AUnionAllFeedsEveryConsumer) {
   EXPECT_EQ((*profiled)->num_rows(), 14);
 }
 
-// What a correct plan never holds is Invalid, never unsupported: a union of one input, a column
+// What a correct plan never holds is Invalid, never unsupported: a union without inputs, a column
 // list missing, a column outside its input or of another type than the union's.
 TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
   const auto scan = [] {
@@ -1588,7 +1588,8 @@ TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
   };
   const auto x = Column(0, "x", LogicalType::kBigInt);
   const std::vector<plan::UnionAllNode> broken = {
-      plan::UnionAllNode{.inputs = {scan()}, .columns = {{x}}},
+      plan::UnionAllNode{.inputs = {}, .columns = {}},
+      plan::UnionAllNode{.inputs = {}, .columns = {{x}}},
       plan::UnionAllNode{.inputs = {scan(), scan()}, .columns = {{x}}},
       plan::UnionAllNode{.inputs = {scan(), scan()},
                          .columns = {{x}, {Column(5, "x", LogicalType::kBigInt)}}},
@@ -1601,6 +1602,61 @@ TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
     EXPECT_TRUE(status.IsInvalid()) << status.ToString();
     EXPECT_EQ(plan::GetSqlError(status), nullptr) << "a malformed plan is a bug, not unsupported";
   }
+}
+
+// A union none of whose branches is left is FALSE over a union of its first branch (ADR 0036's
+// X7a): above the union, which ends every part pipeline, it reads nothing -- neither the branch's
+// parts nor its join's build. FALSE on top of the branch instead still prepares the join's build
+// and opens the parts of its probe, which is why the optimizer puts it above the union.
+TEST_F(PhysicalPlannerTest, FalseAboveAUnionOfOneInputReadsNothing) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  // Every part of `table` fails when it is read.
+  const auto broken = [](std::shared_ptr<MemoryTable> table) {
+    for (int64_t part = 0; part < table->num_parts(); ++part) {
+      table->FailPart(part);
+    }
+    return table;
+  };
+  const auto join_of = [&](const std::shared_ptr<MemoryTable>& probe,
+                           const std::shared_ptr<MemoryTable>& build) {
+    return Node(plan::JoinNode{
+        .kind = plan::JoinKind::kInner,
+        .left = Node(plan::ScanNode{.table = probe, .table_name = "t", .fields = {0, 1}}),
+        .right = Node(plan::ScanNode{.table = build, .table_name = "r", .fields = {0, 1}}),
+        .keys = {plan::JoinKey{.left = x, .right = x}},
+        .build = plan::BuildSide::kRight});
+  };
+  const auto never = [](plan::LogicalNodePtr input) {
+    return Node(
+        plan::FilterNode{.input = std::move(input),
+                         .predicates = {plan::Predicate{.kind = plan::Predicate::Kind::kFalse}}});
+  };
+  const auto one_input = [&](plan::LogicalNodePtr input) {
+    return Node(plan::UnionAllNode{.inputs = {std::move(input)}, .columns = {{x}}});
+  };
+
+  const auto probe = broken(Table(/*split=*/true));
+  const auto build = broken(Repeated());
+  const auto rows = Run(PlanOf(never(one_input(join_of(probe, build)))));
+  ASSERT_NE(rows, nullptr);
+  EXPECT_EQ(rows->num_rows(), 0);
+  EXPECT_TRUE(probe->scanned_parts().empty());
+  EXPECT_TRUE(build->scanned_parts().empty());
+
+  // FALSE on top of the branch: whether running it fails.
+  const auto fails_below = [&](const std::shared_ptr<MemoryTable>& probe_table,
+                               const std::shared_ptr<MemoryTable>& build_table) {
+    auto op = BuildPhysicalPlan(PlanOf(one_input(never(join_of(probe_table, build_table)))));
+    EXPECT_TRUE(op.ok()) << op.status().ToString();
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .batch_size = 3};
+    return op.ok() && !Drain(**op, ctx).ok();
+  };
+  const auto broken_build = broken(Repeated());
+  EXPECT_TRUE(fails_below(Table(/*split=*/true), broken_build)) << "the join's build is prepared";
+  EXPECT_FALSE(broken_build->scanned_parts().empty());
+  const auto broken_probe = broken(Table(/*split=*/true));
+  EXPECT_TRUE(fails_below(broken_probe, Repeated())) << "the probe's parts are opened";
+  EXPECT_FALSE(broken_probe->scanned_parts().empty());
 }
 
 // The first Scan of a profile tree, depth first.

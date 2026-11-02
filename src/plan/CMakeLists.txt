@@ -13,6 +13,8 @@ antb1_add_module(
     relation_count.cc
     binder.cc
     logical_plan.cc
+    branch_truth.cc
+    union_branches.cc
     optimizer.cc
     shared_sub_plans.cc
     explain.cc
@@ -34,6 +36,8 @@ if(ANTB1_BUILD_TESTS)
       tests/relation_count_test.cc
       tests/column_ids_test.cc
       tests/folding_test.cc
+      tests/branch_truth_test.cc
+      tests/union_branches_test.cc
       tests/optimizer_test.cc
       tests/shared_sub_plans_test.cc
       tests/explain_test.cc

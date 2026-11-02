@@ -201,7 +201,9 @@ struct NodeLine {
     }
     return line;
   }
-  // The columns as the first input names them, which are the union's names (ADR 0036).
+  // The columns as the first input names them: the union's names (ADR 0036) while that input is
+  // the first block, the first block left once the optimizer has ruled branches out (X7a). Results
+  // are named from the plan's output either way.
   std::string operator()(const UnionAllNode& node) const {
     return std::format(
         "UnionAll inputs={} columns=[{}]", node.inputs.size(),

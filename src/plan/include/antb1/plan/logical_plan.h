@@ -29,10 +29,11 @@
 //
 // or, for several, those branches under left-deep inner Joins (ADR 0022). A relation may also be a
 // sub-plan: a derived table's or a CTE's block, or a UnionAll of blocks (ADR 0036). A Join and a
-// DependentJoin have two inputs and a UnionAll two or more, and every walk of a plan visits every
-// input of a node, in order (InputsOf). plan::Optimize rewrites it
-// (COUNT(*) -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project,
-// projection pruning).
+// DependentJoin have two inputs and a UnionAll one or more (two or more as bound; one once the
+// optimizer has ruled the others out), and every walk of a plan visits every input of a node, in
+// order (InputsOf). plan::Optimize rewrites it (WHERE conditions into a union's branches, COUNT(*)
+// -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project, projection
+// pruning).
 //
 // Every column has a plan-unique ColumnId, defined once by the node that creates it (see
 // OutputIds); a column reference (BoundColumn, ColumnExpr) names the column it reads by its id and
@@ -500,13 +501,15 @@ struct DependentJoinNode {
   SourceSpan span;  // the subquery in the query
 };
 
-// UNION ALL of two or more inputs (ADR 0036): every row of inputs[0], in its order, then every row
+// UNION ALL of one or more inputs (ADR 0036): every row of inputs[0], in its order, then every row
 // of inputs[1], and so on; duplicates are kept. Output: one column per id; in the rows of input k,
 // column i holds that input's column columns[k][i]. Column i has one type in every input -- the
 // binder casts a branch's column below the union where its type differs -- and the ids are new
 // columns, none of them an input's: no one input defines a union's rows, so none passes through.
+// The binder makes two or more; one input is a union whose other branches the optimizer ruled out
+// (ADR 0036's X7a), and it stays a union all the same, so that nothing below it is shared.
 struct UnionAllNode {
-  std::vector<LogicalNodePtr> inputs;             // two or more, in the order written
+  std::vector<LogicalNodePtr> inputs;             // one or more, in the order written
   std::vector<std::vector<BoundColumn>> columns;  // per input: one per output column, of that input
   std::vector<ColumnId> ids;                      // per output column
   SourceSpan span;                                // the first UNION ALL
@@ -586,8 +589,8 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan,
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not
 // the root's; a join key of two types, a join without keys or a one-row join with keys, a residual
-// that is not BOOLEAN, a build side the join's kind does not allow; a UnionAll of fewer than two
-// inputs, without one column per output in each input, or whose column has two types), else the
+// that is not BOOLEAN, a build side the join's kind does not allow; a UnionAll without inputs,
+// without one column per output in each input, or whose column has two types), else the
 // first index that differs from its resolved position, e.g. "Filter: column #12 is at 3, not 4".
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
 

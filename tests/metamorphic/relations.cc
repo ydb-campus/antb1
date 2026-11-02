@@ -1521,6 +1521,30 @@ std::vector<Relation> AllRelations() {
                     Q("SELECT COUNT(*) FROM trips WHERE tr_row < 100"),
                     Q("SELECT COUNT(*) FROM trips WHERE tr_row >= 2900")},
          .check = FirstEqualsSumOfRest()});
+
+    // A condition on a block's constant tag keeps that block alone, however it is spelled, and a
+    // tag no block carries keeps no row: the optimizer rules the other blocks out (ADR 0036's X7a).
+    // The random differential test never tags a block with a constant, so it never rules one out.
+    constexpr std::string_view kTagged =
+        "SELECT tr_row, tr_rider, 'low' AS tag FROM trips WHERE tr_row < 100 UNION ALL "
+        "SELECT tr_row, tr_rider, 'high' FROM trips WHERE tr_row >= 2900";
+    const auto tagged = [&](std::string_view items, std::string_view where) {
+      return std::format("SELECT {} FROM ({}) AS u WHERE {}", items, kTagged, where);
+    };
+    const slt::FeatureSet tags = SetWith(unioned, kConstant, kAlias, kStringLiteral);
+    r.push_back({.name = "union_all_condition_on_a_tag_keeps_its_block",
+                 .features = SetWith(tags, kIn),
+                 .probes = {Q(std::string(kLow)), Q(tagged("tr_row, tr_rider", "tag = 'low'")),
+                            Q(tagged("tr_row, tr_rider", "tag IN ('low', 'none')")),
+                            Q(tagged("tr_row, tr_rider", "tag <> 'high'")),
+                            Q(tagged("tr_row, tr_rider", "tag NOT IN ('high')")),
+                            Q(tagged("tr_row, tr_rider", "tag = 'low'"), 1)},
+                 .check = AllEqual()});
+    r.push_back({.name = "union_all_condition_on_no_tag_keeps_no_row",
+                 .features = SetWith(tags, kCountStar),
+                 .probes = {Q(tagged("COUNT(*)", "tag = 'none'")),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_row < 0")},
+                 .check = AllEqual()});
   }
 
   // ---- stars among the select items (ADR 0022 rule 5) ----
