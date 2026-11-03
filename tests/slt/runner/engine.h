@@ -47,6 +47,13 @@ struct EngineError {
 
 using ExecResult = std::expected<ResultSet, EngineError>;
 
+// An assertion inside DuckDB ("INTERNAL Error"), or a database DuckDB invalidated after one ("FATAL
+// Error"): a DuckDB bug, never the query's. DuckDbEngine's own "harness" errors are internal too,
+// and are not DuckDB's.
+inline bool IsDuckDbInternalError(const EngineError& error) {
+  return error.internal && (error.kind == "INTERNAL Error" || error.kind == "FATAL Error");
+}
+
 class Engine {
  public:
   Engine() = default;

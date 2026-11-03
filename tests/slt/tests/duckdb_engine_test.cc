@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <duckdb.h>
 #include <gtest/gtest.h>
 
 #include "engine.h"
@@ -160,6 +161,131 @@ TEST(DuckDbEngineMemoryLimitTest, IsAtLeastOneByte) {
     EXPECT_EQ(engine.error(),
               std::format("duckdb: the memory limit must be at least 1 byte, not {}", bytes));
   }
+}
+
+// The canonical text of every cell of `result`, one per line; "" with a test failure for an error.
+std::string Cells(const ExecResult& result, std::string_view sql) {
+  EXPECT_TRUE(result.has_value()) << sql << "\n"
+                                  << (result.has_value() ? "" : result.error().message);
+  std::string text;
+  for (const Row& row : result.value_or(ResultSet{}).rows) {
+    for (const auto& cell : row) {
+      text += cell.value_or("NULL") + "\n";
+    }
+  }
+  return text;
+}
+
+// The differential test's retries (difftest.h), in the order it asks them, run fewer optimizers:
+// without join_order a comma join is still a hash join, in the written order, and with
+// filter_pushdown alone too, where without it the join would stay a cross product.
+TEST(DuckDbEngineOptimizersTest, RetriesRunFewerOptimizers) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_optimizers");
+  auto oracle = DuckDbEngine::Make({}, dir, dir);
+  ASSERT_TRUE(oracle.has_value()) << oracle.error();
+  auto retries = DuckDbEngine::MakeRetries({}, dir, dir);
+  ASSERT_TRUE(retries.has_value()) << retries.error();
+  ASSERT_EQ(retries->size(), 2U);
+  const auto run = [](DuckDbEngine& engine, const std::string& sql) {
+    return Cells(engine.Execute(sql), sql);
+  };
+  const std::string disabled = "SELECT current_setting('disabled_optimizers')";
+  EXPECT_EQ(run(**oracle, disabled), "late_materialization\n");
+  EXPECT_EQ(run(*(*retries)[0], disabled), "join_order,late_materialization\n");
+  const std::string filter_pushdown_only = run(*(*retries)[1], disabled);
+  for (const std::string_view off :
+       {"join_order", "late_materialization", "statistics_propagation", "build_side_probe_side"}) {
+    EXPECT_TRUE(filter_pushdown_only.contains(off)) << off << " in " << filter_pushdown_only;
+  }
+  EXPECT_FALSE(("," + filter_pushdown_only.substr(0, filter_pushdown_only.size() - 1) + ",")
+                   .contains(",filter_pushdown,"))
+      << filter_pushdown_only;
+  const std::string plan =
+      "EXPLAIN SELECT COUNT(*) FROM range(5) AS a(i), range(5) AS b(j) WHERE i = j";
+  for (DuckDbEngine* engine : {oracle->get(), (*retries)[0].get(), (*retries)[1].get()}) {
+    const std::string text = run(*engine, plan);
+    EXPECT_TRUE(text.contains("HASH_JOIN")) << text;
+    EXPECT_FALSE(text.contains("CROSS_PRODUCT")) << text;
+  }
+}
+
+// Runs `sql` in an in-memory DuckDB database of its own (the oracle refuses COPY): "" on success,
+// else the error.
+std::string RunInNewDatabase(const std::string& sql) {
+  duckdb_database db = nullptr;
+  if (duckdb_open(nullptr, &db) == DuckDBError) {
+    return "duckdb: cannot open a database";
+  }
+  std::string error;
+  duckdb_connection conn = nullptr;
+  if (duckdb_connect(db, &conn) == DuckDBError) {
+    error = "duckdb: cannot connect";
+  } else {
+    duckdb_result result{};
+    if (duckdb_query(conn, sql.c_str(), &result) == DuckDBError) {
+      const char* text = duckdb_result_error(&result);
+      error = text != nullptr ? text : "unknown error";
+    }
+    duckdb_destroy_result(&result);
+    duckdb_disconnect(&conn);
+  }
+  duckdb_close(&db);
+  return error;
+}
+
+// DuckDB 1.5.6 fails a join of three tables with an OR across two of them under a GROUP BY with an
+// internal error, as in a nightly differential test of 2026-11-02, while its retries answer it.
+// When the oracle answers too, DuckDB has fixed the bug: drop the first expectation.
+TEST(DuckDbEngineOptimizersTest, RetriesAnswerAQueryTheOracleFailsWithAnInternalError) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_retries");
+  std::vector<TableDef> tables;
+  for (const auto& [name, rows] :
+       {std::pair{"r", "SELECT i AS rd_id, (i % 3 + 1)::SMALLINT AS rd_city FROM range(240) t(i)"},
+        std::pair{"z",
+                  "SELECT (i + 1)::INTEGER AS zn_id, (i % 5 + 1)::SMALLINT AS zn_city "
+                  "FROM range(40) t(i)"},
+        std::pair{"c",
+                  "SELECT (i + 1)::SMALLINT AS ct_id, 'l' || i AS label FROM range(6) t(i)"}}) {
+    const std::string path = (dir / (std::string(name) + ".parquet")).string();
+    ASSERT_EQ(RunInNewDatabase(std::format("COPY ({}) TO '{}' (FORMAT parquet)", rows, path)), "");
+    tables.push_back(TableDef{.name = name, .files = {path}});
+  }
+  const std::string sql =
+      "SELECT c.label, COUNT(*) FROM r, z, c WHERE c.ct_id = r.rd_city AND z.zn_city = c.ct_id AND "
+      "(c.label <> 'x' OR z.zn_city > 2) GROUP BY c.label ORDER BY c.label";
+  auto oracle = DuckDbEngine::Make(tables, dir, dir);
+  ASSERT_TRUE(oracle.has_value()) << oracle.error();
+  const ExecResult failed = (*oracle)->Execute(sql);
+  ASSERT_FALSE(failed.has_value()) << "DuckDB answers: drop this expectation";
+  EXPECT_EQ(failed.error().kind, "INTERNAL Error") << failed.error().message;
+  auto retries = DuckDbEngine::MakeRetries(tables, dir, dir);
+  ASSERT_TRUE(retries.has_value()) << retries.error();
+  for (const auto& retry : *retries) {
+    EXPECT_EQ(Cells(retry->Execute(sql), sql), "l0\n640\nl1\n640\nl2\n640\n");
+  }
+}
+
+// A query that fails with an internal error while it runs leaves DuckDB's database invalidated, so
+// the engine opens it again, with its views and settings, and the next query answers. With
+// filter_pushdown alone, DuckDB 1.5.6 fails this IN over an aggregate while it runs; when it
+// answers, DuckDB has fixed that bug: find another.
+TEST(DuckDbEngineOptimizersTest, AnInternalErrorOpensTheDatabaseAgain) {
+  const std::filesystem::path dir = TestDir("duckdb_engine_reopen");
+  auto engine =
+      DuckDbEngine::Make({}, dir, dir, std::nullopt, DuckDbEngine::Optimizers::kFilterPushdownOnly);
+  ASSERT_TRUE(engine.has_value()) << engine.error();
+  const ExecResult failed =
+      (*engine)->Execute("SELECT 0 FROM range(3) t(i) HAVING 0 IN (SELECT 0 FROM range(3) s(j))");
+  ASSERT_FALSE(failed.has_value()) << "DuckDB answers: find another such query";
+  EXPECT_EQ(failed.error().kind, "INTERNAL Error") << failed.error().message;
+  EXPECT_EQ(Cells((*engine)->Execute("SELECT 42"), "SELECT 42"), "42\n");
+  const std::string disabled = "SELECT current_setting('disabled_optimizers')";
+  EXPECT_TRUE(Cells((*engine)->Execute(disabled), disabled).contains("join_order"))
+      << "the same settings";
+  const ExecResult locked = (*engine)->Execute("SET threads = 4");
+  ASSERT_FALSE(locked.has_value());
+  EXPECT_TRUE(locked.error().message.contains("the configuration has been locked"))
+      << locked.error().message;
 }
 
 }  // namespace

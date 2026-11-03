@@ -277,6 +277,28 @@ std::expected<std::unique_ptr<Engine>, std::string> MakeEngine(std::string_view 
 #endif
 }
 
+// The oracle again, for the queries the differential test's oracle fails with an internal error
+// (difftest.h, DuckDbEngine::MakeRetries).
+std::expected<std::vector<std::unique_ptr<Engine>>, std::string> MakeOracleRetries(
+    const std::vector<TableDef>& tables, const Args& args) {
+  std::vector<std::unique_ptr<Engine>> out;
+#ifdef ANTB1_SLT_HAVE_DUCKDB
+  auto retries = DuckDbEngine::MakeRetries(
+      tables, args.fixtures, args.temp_dir,
+      args.oracle_memory_limit.empty() ? std::nullopt : ParseByteSize(args.oracle_memory_limit));
+  if (!retries) {
+    return std::unexpected(retries.error());
+  }
+  for (auto& engine : *retries) {
+    out.push_back(std::move(engine));
+  }
+#else
+  (void)tables;
+  (void)args;
+#endif
+  return out;
+}
+
 struct Loaded {
   std::string text;
   SltFile file;
@@ -458,6 +480,15 @@ int Diff(const Args& args, std::vector<TableDef> tables, const std::string& comm
     std::println(stderr, "antb1-slt: {}", !antb1 ? antb1.error() : oracle.error());
     return kExitSetup;
   }
+  auto retries = MakeOracleRetries(tables, args);
+  if (!retries) {
+    std::println(stderr, "antb1-slt: {}", retries.error());
+    return kExitSetup;
+  }
+  std::vector<Engine*> oracle_retries;
+  for (const auto& engine : *retries) {
+    oracle_retries.push_back(engine.get());
+  }
   std::unique_ptr<Engine> mutating;
   if (*mutation != Mutation::kNone) {
     mutating = MakeMutatingEngine(**antb1, *mutation);
@@ -474,7 +505,7 @@ int Diff(const Args& args, std::vector<TableDef> tables, const std::string& comm
                             .command = command};
   std::string out;
   const DiffStats stats =
-      RunDiff(*generator, mutating ? *mutating : **antb1, **oracle, options, out);
+      RunDiff(*generator, mutating ? *mutating : **antb1, **oracle, options, out, oracle_retries);
   std::print("{}", out);
   return stats.failed == 0 ? 0 : kExitFailed;
 }
