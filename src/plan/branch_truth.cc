@@ -175,8 +175,15 @@ std::string_view ToString(BranchTruth truth) {
 
 BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>& column_value,
                       const std::optional<Constant>& other_value) {
-  // A NULL value makes no predicate true: a comparison, IN and NOT IN, LIKE and IS TRUE are NULL,
-  // and IS NOT NULL false. FALSE reads no column.
+  // A NULL value makes no predicate but IS NULL true: a comparison, IN and NOT IN, LIKE and IS TRUE
+  // are NULL, and IS NOT NULL false. FALSE reads no column.
+  if (predicate.kind == Predicate::Kind::kIsNull) {
+    if (IsNull(column_value)) {
+      return BranchTruth::kAlways;
+    }
+    return OfItsType(predicate.column, column_value) != nullptr ? BranchTruth::kNever
+                                                                : BranchTruth::kUnknown;
+  }
   if (predicate.kind != Predicate::Kind::kFalse &&
       ((predicate.column.has_value() && IsNull(column_value)) ||
        (predicate.other.has_value() && IsNull(other_value)))) {
@@ -214,6 +221,7 @@ BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>&
                                                                   : BranchTruth::kUnknown;
     case Predicate::Kind::kFalse:
       return BranchTruth::kNever;
+    case Predicate::Kind::kIsNull:  // decided above
     case Predicate::Kind::kLike:
     case Predicate::Kind::kNotLike:
     case Predicate::Kind::kIsTrue:

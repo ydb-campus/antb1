@@ -978,6 +978,12 @@ TEST_F(ComputeTest, ConditionsAreThreeValued) {
   EXPECT_EQ(show(Bool(plan::BoolOp::kNot, {never})), "[\n  true,\n  true,\n  null,\n  true\n]");
   const auto always = Condition(Kind::kIsNotNull, plan::CompareOp::kEq, 0, column);
   EXPECT_EQ(show(always), "[\n  true,\n  true,\n  null,\n  true\n]");
+  // IS NULL (ADR 0037's NL4) is two-valued, so NOT over it is IS NOT NULL: false for NULL.
+  const auto is_null = Condition(Kind::kIsNull, plan::CompareOp::kEq, 0, column);
+  EXPECT_EQ(show(is_null), "[\n  false,\n  false,\n  true,\n  false\n]");
+  EXPECT_EQ(show(Bool(plan::BoolOp::kNot, {is_null})), "[\n  true,\n  true,\n  false,\n  true\n]");
+  EXPECT_EQ(show(Bool(plan::BoolOp::kOr, {is_null, gt2})),
+            "[\n  false,\n  true,\n  true,\n  false\n]");
 }
 
 // CASE takes the first branch whose condition is true (NULL is not), else ELSE or NULL; a value is

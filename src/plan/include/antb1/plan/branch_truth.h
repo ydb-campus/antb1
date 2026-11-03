@@ -26,7 +26,8 @@ std::string_view ToString(BranchTruth truth);
 // - numbers (the integer types and DECIMAL, at any scale) exactly by value, DATE and TIMESTAMP by
 //   their integers, VARCHAR by unsigned bytes;
 // - IS NOT NULL is always true of a constant that is not NULL;
-// - a NULL value (ADR 0037's NL3) makes every predicate that reads it never true.
+// - a NULL value (ADR 0037's NL3) makes every predicate that reads it never true but IS NULL,
+//   which it makes always true; IS NULL is never true of a constant that is not NULL.
 // Unknown for DOUBLE, LIKE, a computed condition and anything else: an answer is never kNever or
 // kAlways by default.
 BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>& column_value,

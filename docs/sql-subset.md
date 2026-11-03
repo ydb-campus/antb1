@@ -45,7 +45,7 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS NULL`, other functions, ...) fails
+- SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS TRUE`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
   `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
   as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
@@ -119,7 +119,8 @@ condition   = sum , cmp_op , sum
             | sum , [ "NOT" ] , "IN" , "(" , expr , { "," , expr } , ")"
             | sum , [ "NOT" ] , "IN" , "(" , query , ")"
             | "EXISTS" , "(" , query , ")"
-            | sum , [ "NOT" ] , "BETWEEN" , sum , "AND" , sum ;
+            | sum , [ "NOT" ] , "BETWEEN" , sum , "AND" , sum
+            | sum , "IS" , [ "NOT" ] , "NULL" ;
 sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
 unary       = "-" , unary | postfix ;
@@ -139,8 +140,9 @@ literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , 
             | "TIMESTAMP" , string_literal ;
 ```
 
-Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE`, `IN` and `BETWEEN` (which do
-not chain: `a = b = c` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds of `BETWEEN` bind like the operand of
+Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE`, `IN`, `BETWEEN` and `IS
+[NOT] NULL` (which do not chain: `a = b = c`, `a = b IS NULL` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds
+of `BETWEEN` bind like the operand of
 `+`, so its `AND` is its own and `a BETWEEN 1 AND 2 AND b = 3` is two conjuncts), `+` and `-`, `*`, `/`, `//` and `%`,
 unary `-`, `::`; binary operators are left-associative, and parentheses group. An expression may be at most 256 levels
 deep, counted along its deepest path through operators and parentheses (the top-level `AND` chain of `ON`, `WHERE` and
@@ -284,8 +286,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   as below) of them, in the select list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals
   there are positions or constants, see [Binding](#binding));
 - conditions (`WHERE`, `HAVING` and `CASE WHEN`): `operand <op> literal` in either order, `operand <op> operand`,
-  `operand [NOT] LIKE 'pattern'`, `operand [NOT] IN (literal, ...)` and `operand [NOT] BETWEEN low AND high`
-  (`low <= operand AND operand <= high`, each bound a literal or an operand), where an operand is a value
+  `operand [NOT] LIKE 'pattern'`, `operand [NOT] IN (literal, ...)`, `operand [NOT] BETWEEN low AND high`
+  (`low <= operand AND operand <= high`, each bound a literal or an operand) and `operand IS [NOT] NULL`, where an
+  operand is a value
   expression that reads a column (in `HAVING`, and in a `CASE` of an aggregate query, also one over aggregates),
   combined with `AND`, `OR` and `NOT`. Instead of a literal, a comparison, a bound or an `IN` list's value may be
   a constant integer expression: integer literals under unary `-`, `+`, `-` and `*` (`a > 2 * 1000`), folded to its
@@ -359,8 +362,9 @@ star (`* AS x`, `t.* x`,
 `t.*` inside an expression,
 `SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`,
 `NULL` literals (but a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL`
-block), `IS [NOT] NULL`,
-`AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
+block), `IS` but `IS [NOT] NULL` (`IS DISTINCT FROM`, `IS TRUE`), `ISNULL`, `NOTNULL`, a condition as a select item
+(`SELECT a IS NULL`), `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names,
+type names of several
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
 typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`,
@@ -1043,6 +1047,11 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   only when every comparison is true, so a comparison that is NULL rejects it. `OR` and `NOT` follow SQL's
   three-valued logic too (`NULL OR TRUE` is true, `NOT NULL` is NULL); a comparison folded to always or never true
   is still NULL for a NULL operand there, so `NOT (smallint_col = 1.5)` rejects NULL and keeps every other row.
+  `x IS NULL` and `x IS NOT NULL` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL4) are never NULL: true or false for
+  any value `x`, an expression too (`x + 1 IS NULL`), so `NOT (x IS NOT NULL)` keeps the rows where `x` is NULL. They
+  are named as DuckDB names them (`(x IS NULL)`); EXPLAIN shows `x IS NULL` and, for a `WHERE` conjunct, `x IS NOT
+  NULL`. Above a `LEFT JOIN`, `IS NULL` on a column of the null-supplying side keeps the rows the join pads. A
+  condition as the operand (`(a = 1) IS NULL`, a chained comparison) is unsupported.
 - BETWEEN: `a BETWEEN lo AND hi` is `lo <= a AND a <= hi` in three-valued logic, both bounds inclusive: a range with
   `lo > hi` matches nothing, and a NULL operand (or a NULL bound column) makes it NULL, which rejects the row;
   `a NOT BETWEEN lo AND hi` is its negation, so it rejects that row too.
@@ -1271,7 +1280,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS NULL`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -1485,14 +1494,14 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q41 | unsupported | needs SELECT DISTINCT and a correlated COUNT subquery (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q44 | unsupported | needs IS NULL, scalar subqueries inside a condition, scalar subqueries that are not aggregates and rank() (phase 9) |
+| Q44 | unsupported | needs scalar subqueries inside a condition, scalar subqueries that are not aggregates and rank() (phase 9) |
 | Q45 | unsupported | needs an IN subquery under OR (SQ7) |
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
 | Q48 | pass | answered when the ratchet was added |
 | Q49 | unsupported | needs COALESCE, CAST to DECIMAL(p,s), UNION and rank() (phase 9) |
 | Q50 | pass | answered when the ratchet was added |
-| Q51 | unsupported | needs IS NOT NULL, FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
+| Q51 | unsupported | needs FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q54 | unsupported | needs CAST of a DOUBLE to an integer type, round, SELECT DISTINCT, scalar subqueries inside a condition and scalar subqueries that are not aggregates (SQ4) |
@@ -1513,13 +1522,13 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q71 | pass | `UNION ALL` (ADR 0036) |
-| Q72 | unsupported | needs IS NULL, IS NOT NULL and DATE plus an integer (CT5) |
+| Q72 | unsupported | needs DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q74 | pass | `UNION ALL` (ADR 0036) |
 | Q75 | unsupported | needs COALESCE, CAST to DECIMAL(p,s) and UNION (X4b) |
-| Q76 | unsupported | needs IS NULL (NL4) |
+| Q76 | pass | IS NULL (NL4) |
 | Q77 | unsupported | needs COALESCE, ROLLUP and a cross product of multi-row relations (OJ4) |
-| Q78 | unsupported | needs IS NULL, COALESCE and round (FN2) |
+| Q78 | unsupported | needs COALESCE and round (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
 | Q80 | unsupported | needs COALESCE, concat and ROLLUP (RU3) |
 | Q81 | pass | answered when the ratchet was added |
@@ -1534,11 +1543,11 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q90 | unsupported | needs NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
-| Q93 | unsupported | needs IS NOT NULL (NL4) |
+| Q93 | pass | IS NOT NULL (NL4) |
 | Q94 | pass | answered when the ratchet was added |
 | Q95 | pass | answered when the ratchet was added |
 | Q96 | pass | answered when the ratchet was added |
-| Q97 | unsupported | needs IS NULL, IS NOT NULL and FULL OUTER JOIN (OJ3) |
+| Q97 | unsupported | needs FULL OUTER JOIN (OJ3) |
 | Q98 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q99 | unsupported | needs lower (FN4) |
 

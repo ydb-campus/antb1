@@ -149,7 +149,9 @@ struct Predicate {
     kNotLike,         // column NOT LIKE constant
     kIn,              // column IN (values): column = v1 OR column = v2 ... (Kleene)
     kNotIn,           // column NOT IN (values): NOT (column IN (values))
-    kIsNotNull,       // folded: true for every non-NULL value (NULL still rejects the row)
+    kIsNotNull,       // folded: true for every non-NULL value (NULL still rejects the row), and
+                      // a WHERE conjunct IS NOT NULL, which a filter evaluates alike
+    kIsNull,          // column IS NULL: true for NULL, false otherwise, never NULL (NL4)
     kFalse,           // folded: true for no row (inside an expression: NULL for a NULL column)
     kIsTrue,          // a BOOLEAN column (a computed condition) is true
   };
@@ -217,7 +219,8 @@ struct FunctionExpr {
 // A condition of the binder's WHERE forms (a comparison, [NOT] LIKE, [NOT] IN, folded as in
 // WHERE) inside a boolean expression: its column is operands[0] (index 0) and, for
 // kCompareColumns, its other column operands[1] (index 1). BOOLEAN, with NULL where SQL's
-// three-valued logic has it: a kFalse or kIsNotNull predicate is NULL for a NULL operand.
+// three-valued logic has it: a kFalse or kIsNotNull predicate is NULL for a NULL operand, and a
+// kIsNull predicate is never NULL.
 struct PredicateExpr {
   Predicate predicate;
   std::vector<ExprPtr> operands;

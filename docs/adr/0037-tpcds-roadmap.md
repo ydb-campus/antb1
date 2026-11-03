@@ -136,7 +136,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes (the NL1 update below) | | Built |
 | NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 (the NL2 update below) | | Built |
 | NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union (the NL3 update below) | 27 | Built |
-| NL4 | IS NULL and IS NOT NULL | 76, 93 | Planned |
+| NL4 | IS NULL and IS NOT NULL (the NL4 update below) | 76, 93 | Built |
 | NL5 | COALESCE | | Planned |
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
 | CT1 | A general cast expression: identity casts, exact widenings and constants that fit | 40 | Planned |
@@ -354,6 +354,22 @@ Update (2026-11-03, NL3): built for UNION ALL. NULL items of INTERSECT and EXCEP
   out a branch whose column is NULL, through `ConstantColumn`, which now reads a constant of a `ComputeNode`.
 - **The ratchet.** Query 27 passes: 51 of the 99. The other queries with NULL items need INTERSECT, EXCEPT or UNION,
   or a later item.
+
+Update (2026-11-04, NL4): built. Queries 76 and 93 pass: 53 of the 99.
+
+- **Parsing.** `operand IS [NOT] NULL` is a new AST node, `sql::IsNullExpr`, at the comparisons' level as in DuckDB,
+  and like them it does not chain (`a = b IS NULL` is unsupported). Every other `IS` stays unsupported, `IS DISTINCT
+  FROM` until OJ5.
+- **Binding.** `IS NULL` binds as a new two-valued predicate, `Predicate::Kind::kIsNull`, never NULL. `IS NOT NULL`
+  as a `WHERE` or `HAVING` conjunct binds as the existing folded `kIsNotNull`, which a filter evaluates the same way,
+  so the scan, part pruning and the estimates keep reading it. Inside an expression it is `NOT (IS NULL)`: false for
+  NULL, where the folded kind would be NULL.
+- **Execution.** `kIsNull` never goes into a scan's per-column filter, whose fast paths drop NULL rows: a filter
+  above the scan applies it.
+- **The other passes.** Branch truth decides it for a constant (always for NULL, never for any other value). The
+  join order estimates it from the null count.
+- **Outer joins.** Nothing assumes that a `WHERE` on the null-supplying side of a `LEFT JOIN` rejects the padded
+  rows. Above the join, `IS NULL` keeps them, which is the anti-join shape; PF3 may plan it as an anti join.
 
 ## Alternatives considered
 

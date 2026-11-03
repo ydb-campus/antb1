@@ -201,6 +201,16 @@ TEST(BranchTruthTest, ANullValueMakesNoPredicateTrue) {
       kNever);
 }
 
+// IS NULL (ADR 0037's NL4) is always true of a NULL value and never of another constant.
+TEST(BranchTruthTest, IsNullIsTrueOfANullValueOnly) {
+  const Predicate is_null{.kind = Predicate::Kind::kIsNull, .column = Col(LogicalType::kInteger)};
+  EXPECT_EQ(TruthOver(is_null, Constant{.type = LogicalType::kInteger, .value = std::monostate{}},
+                      std::nullopt),
+            kAlways);
+  EXPECT_EQ(TruthOver(is_null, Number(5), std::nullopt), kNever);
+  EXPECT_EQ(TruthOver(is_null, std::nullopt, std::nullopt), kUnknown);
+}
+
 // What is not decided exactly here stays a condition: LIKE (its matcher is exec's), a computed
 // condition, DOUBLE (NaN, -0.0, DuckDB's conversions) on either side, a constant missing or whose
 // value is not of its type.

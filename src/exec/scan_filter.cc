@@ -630,6 +630,8 @@ bool PushableToScan(const plan::Predicate& predicate) {
     case Kind::kCompareColumns:
     case Kind::kFalse:
     case Kind::kIsTrue:
+    case Kind::kIsNull:  // the scan's per-column filters drop NULL rows; a FilterOperator keeps
+                         // them
       return false;
   }
   return false;

@@ -1621,6 +1621,36 @@ TEST(ParserTest, NullItemsOnlyInUnionAllBranches) {
   }
 }
 
+// IS [NOT] NULL (ADR 0037's NL4) binds at the comparisons' level, as in DuckDB: over an arithmetic
+// operand, under NOT, and written back in the same place.
+TEST(ParserTest, IsNullIsAComparison) {
+  const auto where = [](std::string_view condition) {
+    auto stmt = Parse("SELECT a FROM t WHERE " + std::string(condition));
+    EXPECT_TRUE(stmt.has_value()) << condition << ": " << stmt.error().message;
+    return stmt.has_value() ? stmt->where.at(0) : Expr(ColumnRef{});
+  };
+  const Expr plain = where("a IS NULL");
+  const auto& is_null = std::get<IsNullExpr>(plain);
+  EXPECT_FALSE(is_null.negated);
+  EXPECT_EQ(std::get<ColumnRef>(*is_null.operand).name, "a");
+  EXPECT_TRUE(std::get<IsNullExpr>(where("a is not null")).negated);
+  EXPECT_TRUE(
+      std::holds_alternative<BinaryExpr>(*std::get<IsNullExpr>(where("a + 1 IS NULL")).operand));
+  const Expr negated = where("NOT a IS NULL");
+  EXPECT_TRUE(std::holds_alternative<IsNullExpr>(*std::get<UnaryExpr>(negated).operand));
+  for (const std::string_view sql : {
+           "SELECT a FROM t WHERE a IS NULL AND b IS NOT NULL OR c + 1 IS NULL",
+           "SELECT CASE WHEN a IS NOT NULL THEN 1 END FROM t",
+           "SELECT a FROM t WHERE NOT (a IS NULL)",
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+  }
+}
+
 // A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
 // in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
 TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
@@ -3049,14 +3079,16 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "chained comparisons (a = b = c) are not supported"},
         RejectCase{"BetweenAfterComparison", "SELECT a FROM events WHERE a = b ^BETWEEN 1 AND 2",
                    kUnsupported, 7, "chained comparisons (a = b = c) are not supported"},
-        RejectCase{"IsNull", "SELECT a FROM events WHERE a ^IS NULL", kUnsupported, 2,
-                   "IS NULL is not supported"},
-        RejectCase{"IsNotNull", "SELECT a FROM events WHERE a ^is not null", kUnsupported, 2,
-                   "IS NOT NULL is not supported"},
+        // IS [NOT] NULL is a comparison (ADR 0037's NL4): it does not chain, and every other IS is
+        // unsupported.
+        RejectCase{"IsNullAfterComparison", "SELECT a FROM events WHERE a = b ^IS NULL",
+                   kUnsupported, 2, "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"IsDistinctFrom", "SELECT a FROM events WHERE a ^IS DISTINCT FROM b",
+                   kUnsupported, 2, "IS is not supported"},
         RejectCase{"IsTrue", "SELECT a FROM events WHERE a ^IS TRUE", kUnsupported, 2,
                    "IS is not supported"},
-        RejectCase{"IsNullInSelect", "SELECT a ^IS NULL FROM events", kUnsupported, 2,
-                   "IS NULL is not supported"},
+        RejectCase{"IsNotTrue", "SELECT a ^IS NOT TRUE FROM events", kUnsupported, 2,
+                   "IS is not supported"},
         RejectCase{"NullLiteral", "SELECT a FROM events WHERE a = ^NULL", kUnsupported, 4,
                    "NULL literals are not supported"},
         RejectCase{"NullLiteralFirst", "SELECT a FROM events WHERE ^NULL = a", kUnsupported, 4,

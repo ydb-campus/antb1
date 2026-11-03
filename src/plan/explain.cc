@@ -88,6 +88,8 @@ std::string PredicateText(const Predicate& p) {
     }
     case Predicate::Kind::kIsNotNull:
       return column + " IS NOT NULL";
+    case Predicate::Kind::kIsNull:
+      return column + " IS NULL";
     case Predicate::Kind::kIsTrue:
       return column;
     case Predicate::Kind::kFalse:

@@ -1256,7 +1256,8 @@ class Parser {
     if (keyword == "AND") {
       return kAndPrecedence;
     }
-    if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN") {
+    if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN" ||
+        (keyword == "IS" && StartsIsNull())) {
       return kComparisonPrecedence;
     }
     if (keyword == "NOT") {
@@ -1355,9 +1356,29 @@ class Parser {
     }
   }
 
+  // Whether the next tokens are IS NULL or IS NOT NULL.
+  bool StartsIsNull() {
+    return Peek().IsKeyword("IS") && (PeekAt(1).IsKeyword("NULL") ||
+                                      (PeekAt(1).IsKeyword("NOT") && PeekAt(2).IsKeyword("NULL")));
+  }
+
   // The operator at the next token applied to `lhs`.
   Expected<Expr> ParseInfix(Context context, Expr lhs, int precedence) {
     const std::string keyword = KeywordOf(Peek());
+    if (keyword == "IS") {
+      // operand IS [NOT] NULL (ADR 0037's NL4), at the comparisons' level as in DuckDB.
+      const SourceSpan first = Take().span;
+      const bool negated = Peek().IsKeyword("NOT");
+      if (negated) {
+        Take();
+      }
+      const SourceSpan op_span = Cover(first, Take().span);
+      const SourceSpan span = Cover(lhs.span(), op_span);
+      return Expr(IsNullExpr{.operand = Box<Expr>(std::move(lhs)),
+                             .negated = negated,
+                             .op_span = op_span,
+                             .span = span});
+    }
     if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN" || keyword == "NOT") {
       const bool negated = keyword == "NOT";
       const SourceSpan first = Take().span;
@@ -2224,12 +2245,8 @@ class Parser {
       return UnsupportedError(token.span, "AT TIME ZONE is not supported");
     }
     if (keyword == "IS") {
-      const std::string after = KeywordOf(PeekAt(1));
-      if (after == "NULL") {
-        return UnsupportedError(token.span, "IS NULL is not supported");
-      }
-      if (after == "NOT" && PeekAt(2).IsKeyword("NULL")) {
-        return UnsupportedError(token.span, "IS NOT NULL is not supported");
+      if (StartsIsNull()) {
+        return std::nullopt;  // IS [NOT] NULL, a comparison (ParseInfix)
       }
       return UnsupportedError(token.span, "IS is not supported");
     }

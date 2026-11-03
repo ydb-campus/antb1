@@ -94,7 +94,7 @@ int Precedence(const Expr& expr) {
     return unary->op == UnaryOp::kNot ? kNot : kUnary;
   }
   if (std::holds_alternative<LikeExpr>(expr) || std::holds_alternative<InExpr>(expr) ||
-      std::holds_alternative<BetweenExpr>(expr)) {
+      std::holds_alternative<BetweenExpr>(expr) || std::holds_alternative<IsNullExpr>(expr)) {
     return kComparison;
   }
   // `operand IN (query)` binds like the IN list it spells, so a comparison around it needs its
@@ -154,6 +154,9 @@ struct SqlOf {
   std::string operator()(const InExpr& in) const {
     return Sql(*in.operand, kComparison + 1) + (in.negated ? " NOT IN (" : " IN (") +
            List(in.list) + ")";
+  }
+  std::string operator()(const IsNullExpr& is_null) const {
+    return Sql(*is_null.operand, kComparison + 1) + (is_null.negated ? " IS NOT NULL" : " IS NULL");
   }
   std::string operator()(const BetweenExpr& between) const {
     return Sql(*between.operand, kComparison + 1) +

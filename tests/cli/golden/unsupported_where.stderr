@@ -1,4 +1,4 @@
-antb1: unsupported error: IS NULL is not supported; see docs/sql-subset.md
+antb1: unsupported error: IS is not supported; see docs/sql-subset.md
   at line 2, column 33
-  WHERE IsMobile = 1 OR IsRefresh IS NULL
+  WHERE IsMobile = 1 OR IsRefresh IS DISTINCT FROM 0
                                   ^^

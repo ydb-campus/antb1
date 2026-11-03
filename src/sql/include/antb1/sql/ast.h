@@ -134,6 +134,14 @@ struct InExpr {
   SourceSpan span;     // operand .. ')'
 };
 
+// operand IS [NOT] NULL (ADR 0037's NL4): true or false, never NULL.
+struct IsNullExpr {
+  Box<Expr> operand;
+  bool negated = false;  // IS NOT NULL
+  SourceSpan op_span;    // IS [NOT] NULL
+  SourceSpan span;       // operand .. NULL
+};
+
 // operand [NOT] BETWEEN low AND high
 struct BetweenExpr {
   Box<Expr> operand;
@@ -205,9 +213,9 @@ struct SubqueryExpr {
   SourceSpan span;                   // kIn: the operand .. ')'; else the keyword or '(' .. ')'
 };
 
-using ExprNode =
-    std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr, InExpr,
-                 BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr, SubqueryExpr>;
+using ExprNode = std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr,
+                              InExpr, BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr,
+                              SubqueryExpr, IsNullExpr>;
 
 template <class T>
 concept ExprNodeKind =
@@ -216,7 +224,7 @@ concept ExprNodeKind =
     std::is_same_v<T, BinaryExpr> || std::is_same_v<T, LikeExpr> || std::is_same_v<T, InExpr> ||
     std::is_same_v<T, BetweenExpr> || std::is_same_v<T, FunctionCall> ||
     std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr> ||
-    std::is_same_v<T, SubqueryExpr>;
+    std::is_same_v<T, SubqueryExpr> || std::is_same_v<T, IsNullExpr>;
 
 // An expression: a variant of its node kinds (std::get, std::get_if and std::visit apply). It
 // converts only from its node kinds: variant's catch-all converting constructor would make every
