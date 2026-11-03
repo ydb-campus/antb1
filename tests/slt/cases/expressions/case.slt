@@ -192,3 +192,56 @@ INTEGER	DECIMAL(38,2)
 0	-8.75
 1	-6.25
 2	-9999998.74
+
+# THEN NULL (ADR 0037's NL2): NULL for the rows its branch takes, which no later branch takes; the other values type the
+# CASE. In the select list, in the simple form, in an aggregate's argument and in a WHERE comparison.
+
+query IT rowsort
+SELECT i16, CASE WHEN i16 = 0 THEN NULL WHEN i16 > 0 THEN 'pos' ELSE 'neg' END FROM edge
+----
+SMALLINT	VARCHAR
+-1	neg
+-100	neg
+-12345	neg
+-32768	neg
+0	NULL
+1	pos
+100	pos
+12345	pos
+32767	pos
+7	pos
+NULL	neg
+NULL	neg
+
+query II rowsort
+SELECT i16, CASE i16 WHEN 1 THEN NULL WHEN 7 THEN i32 ELSE i16 END FROM edge
+----
+SMALLINT	INTEGER
+-1	-1
+-100	-100
+-12345	-12345
+-32768	-32768
+0	0
+1	NULL
+100	100
+12345	12345
+32767	32767
+7	-7
+NULL	NULL
+NULL	NULL
+
+query II nosort
+SELECT SUM(CASE WHEN i16 < 0 THEN NULL ELSE i16 END), COUNT(CASE WHEN i16 > 0 THEN NULL ELSE 1 END) FROM edge
+----
+HUGEINT	BIGINT
+45220	7
+
+query I rowsort
+SELECT id FROM edge WHERE CASE WHEN i16 = 0 THEN NULL WHEN i16 = 1 THEN NULL ELSE i32 / i16 END > 0
+----
+INTEGER
+0
+1
+3
+6
+7

@@ -158,6 +158,8 @@ std::string LiteralName(const sql::Literal& lit) {
     case sql::Literal::Kind::kDate:
     case sql::Literal::Kind::kTimestamp:
       return "'" + lit.text + "'";
+    case sql::Literal::Kind::kNull:
+      return "NULL";
   }
   return (lit.negative ? "-" : "") + lit.text;
 }
@@ -1310,6 +1312,8 @@ std::string_view LiteralKind(const sql::Literal& lit) {
       return "a DATE literal";
     case sql::Literal::Kind::kTimestamp:
       return "a TIMESTAMP literal";
+    case sql::Literal::Kind::kNull:
+      return "NULL";
   }
   return "a literal";
 }
@@ -1672,6 +1676,8 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
       return std::pair(Constant{.type = LogicalType::kTimestamp, .value = Int128{*micros}},
                        "CAST('" + lit.text + "' AS TIMESTAMP)");
     }
+    case sql::Literal::Kind::kNull:
+      return UnsupportedError("NULL literals are not supported", lit.span);
   }
   return UnsupportedError("this constant is not supported", lit.span);
 }
@@ -2113,6 +2119,9 @@ arrow::Result<Typed> Negate(const sql::UnaryExpr& unary, Typed operand) {
 // A literal as an expression operand: typed by its value (an integer), DECIMAL (a decimal, ADR 0021
 // rule 3: flagged), DOUBLE (an exponent or more than 38 digits), VARCHAR or DATE.
 arrow::Result<Typed> LiteralOperand(const sql::Literal& lit) {
+  if (lit.kind == sql::Literal::Kind::kNull) {
+    return UnsupportedError("NULL literals are not supported", lit.span);  // BindCase takes its own
+  }
   // A DATE or TIMESTAMP literal is named as DuckDB names its cast, as in ExprName.
   const std::string name =
       lit.kind == sql::Literal::Kind::kDate || lit.kind == sql::Literal::Kind::kTimestamp
@@ -3870,6 +3879,11 @@ arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan s
       std::format("cannot mix values of type {} and {} in CASE", ToString(a), ToString(b)), span);
 }
 
+bool IsNullLiteral(const sql::Expr& expr) {
+  const auto* lit = std::get_if<sql::Literal>(&expr);
+  return lit != nullptr && lit->kind == sql::Literal::Kind::kNull;
+}
+
 bool IsStringLiteral(const sql::Expr& expr) {
   const auto* lit = std::get_if<sql::Literal>(&expr);
   return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
@@ -3901,9 +3915,9 @@ std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
 // value's type as it is (a literal stays one; NULL without an ELSE) through the THEN values in
 // written order, so it can depend on their order. An integer literal takes an integer type it fits,
 // else the two types' common one, and counts by its own type next to a DECIMAL; a string literal
-// takes the type folded so far; next to NULL or another literal either becomes a plain type (the
-// string VARCHAR, the pair the integer's type). Values of other types are combined by CaseCommon,
-// the type folded so far named first in an error, as by DuckDB.
+// takes the type folded so far; next to NULL (a missing ELSE or a THEN NULL) or another literal
+// either becomes a plain type (the string VARCHAR, the pair the integer's type). Values of other
+// types are combined by CaseCommon, the type folded so far named first in an error, as by DuckDB.
 arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
                                            const std::vector<const sql::Expr*>& exprs,
                                            bool has_else) {
@@ -3927,6 +3941,16 @@ arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
     const sql::Expr& expr = *exprs[i];
     const SourceSpan span = expr.span();
     const bool first = &expr == exprs[order.front()];
+    if (values[i].expr == nullptr) {
+      // THEN NULL (ADR 0037's NL2): it leaves a type as it is, and a literal its own plain type,
+      // as the NULL of a missing ELSE does.
+      if (folded.kind == kInteger) {
+        folded.kind = kPlain;
+      } else if (folded.kind == kString) {
+        folded = Folded{.kind = kPlain, .type = LogicalType::kVarchar, .value = 0};
+      }
+      continue;
+    }
     if (values[i].stored_as_float) {
       return UnsupportedError(
           "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
@@ -4011,8 +4035,12 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
       ARROW_ASSIGN_OR_RAISE(when, BindBool(*branch.when, bind, input));
     }
     node.whens.push_back(std::move(when.expr));
-    ARROW_ASSIGN_OR_RAISE(Typed then, bind(*branch.then));
-    values.push_back(std::move(then));
+    if (IsNullLiteral(*branch.then)) {
+      values.emplace_back();  // THEN NULL: no expression, a null value of the CASE (NL2)
+    } else {
+      ARROW_ASSIGN_OR_RAISE(Typed then, bind(*branch.then));
+      values.push_back(std::move(then));
+    }
     value_exprs.push_back(&*branch.then);
   }
   if (c.otherwise.has_value()) {
@@ -4023,8 +4051,9 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   // With a DECIMAL value (a decimal literal too), DuckDB's fold of rule 10 types the CASE, and each
   // value is cast to it on the rows that take it; a DOUBLE value makes it DOUBLE, the DECIMALs
   // converted as DuckDB converts them (ADR 0021 rules 8 and 10).
-  if (std::ranges::any_of(values,
-                          [](const Typed& v) { return v.expr->type == LogicalType::kDecimal; })) {
+  if (std::ranges::any_of(values, [](const Typed& v) {
+        return v.expr != nullptr && v.expr->type == LogicalType::kDecimal;
+      })) {
     ARROW_ASSIGN_OR_RAISE(const LogicalType type,
                           DecimalCaseType(values, value_exprs, c.otherwise.has_value()));
     for (std::size_t i = 0; i < c.branches.size(); ++i) {
@@ -4037,12 +4066,13 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   }
   // Otherwise DuckDB's type is the values' common type, where an integer literal takes the others'
   // integer type when it fits and a string literal any type (DATE: the date it spells); antb1 takes
-  // the non-literal values first, so some orders type differently (divergence D20).
+  // the non-literal values first, so some orders type differently (divergence D20). A THEN NULL is
+  // the identity of the fold (CommonValueType, ADR 0037's NL1).
   std::optional<LogicalType> type;
   for (const bool literals : {false, true}) {
     for (std::size_t i = 0; i < values.size(); ++i) {
       const Typed& v = values[i];
-      if (v.literal != literals || IsStringLiteral(*value_exprs[i])) {
+      if (v.expr == nullptr || v.literal != literals || IsStringLiteral(*value_exprs[i])) {
         continue;
       }
       const SourceSpan span = value_exprs[i]->span();
@@ -4103,8 +4133,11 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
   if (c.otherwise.has_value()) {
     node.otherwise = std::move(values.back().expr);
   }
-  const LogicalType result = type.value_or(LogicalType::kVarchar);
-  return Leaf(Expr{.node = std::move(node), .type = result, .name = CaseName(c)});
+  if (!type.has_value()) {
+    // DuckDB's type is NULL, which no column of antb1 holds (ADR 0037's NL1 note).
+    return UnsupportedError("a CASE whose values are all NULL is not supported", c.span);
+  }
+  return Leaf(Expr{.node = std::move(node), .type = *type, .name = CaseName(c)});
 }
 
 namespace {

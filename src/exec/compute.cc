@@ -1987,11 +1987,13 @@ struct Evaluator {
       ARROW_ASSIGN_OR_RAISE(const arrow::Datum taken,
                             arrow::compute::CallFunction("and", {filled, remaining}, ctx));
       const ArrayPtr taken_rows = taken.make_array();
-      ARROW_ASSIGN_OR_RAISE(
-          ArrayPtr values,
-          EvaluateSelected(*c.thens[i], static_cast<const arrow::BooleanArray&>(*taken_rows),
-                           e.type));
-      ARROW_ASSIGN_OR_RAISE(result, Scatter(result, taken_rows, values));
+      if (c.thens[i] != nullptr) {  // a null THEN leaves its rows NULL
+        ARROW_ASSIGN_OR_RAISE(
+            ArrayPtr values,
+            EvaluateSelected(*c.thens[i], static_cast<const arrow::BooleanArray&>(*taken_rows),
+                             e.type));
+        ARROW_ASSIGN_OR_RAISE(result, Scatter(result, taken_rows, values));
+      }
       ARROW_ASSIGN_OR_RAISE(const arrow::Datum rest,
                             arrow::compute::CallFunction("and_not", {remaining, taken_rows}, ctx));
       remaining = rest.make_array();

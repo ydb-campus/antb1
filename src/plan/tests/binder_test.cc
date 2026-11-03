@@ -2109,6 +2109,20 @@ TEST(BinderTest, DecimalCaseValuesFoldLikeDuckDb) {
            Case{.table = "t",
                 .expr = "CASE WHEN i32 > 0 THEN 2.5 WHEN i32 > 1 THEN i16 ELSE 7 END",
                 .type = dec(11, 1)},
+           // THEN NULL (ADR 0037's NL2) leaves a type as it is and makes a literal its own type,
+           // as a missing ELSE does: 7 is INTEGER next to NULL, SMALLINT next to s16.
+           Case{.table = "dec", .expr = "CASE WHEN i > 0 THEN NULL ELSE r END", .type = dec(9, 4)},
+           Case{
+               .table = "dec",
+               .expr = "CASE WHEN i > 0 THEN NULL WHEN i > 1 THEN s16 WHEN i > 2 THEN r ELSE 7 END",
+               .type = dec(14, 4)},
+           Case{
+               .table = "dec",
+               .expr = "CASE WHEN i > 0 THEN s16 WHEN i > 1 THEN NULL WHEN i > 2 THEN r ELSE 7 END",
+               .type = dec(9, 4)},
+           Case{.table = "dec",
+                .expr = "CASE WHEN i > 0 THEN r WHEN i > 1 THEN NULL ELSE 7 END",
+                .type = dec(14, 4)},
            // A DOUBLE value, in any position.
            Case{.table = "dec", .expr = "CASE WHEN i = 1 THEN 1.5 ELSE f END", .type = real},
            Case{.table = "dec", .expr = "CASE WHEN i = 1 THEN f ELSE 1.5 END", .type = real},
@@ -2145,6 +2159,9 @@ TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
            Case{.expr = "CASE WHEN i32 = 1 THEN -(7) ELSE i16 END", .type = LogicalType::kInteger},
            Case{.expr = "CASE WHEN i32 = 1 THEN '2020-01-01' WHEN i32 = 2 THEN dt END",
                 .type = LogicalType::kDate},
+           // DuckDB: INTEGER, its 7 next to the THEN NULL.
+           Case{.expr = "CASE WHEN i32 = 1 THEN NULL WHEN i32 = 2 THEN i16 ELSE 7 END",
+                .type = LogicalType::kSmallInt},
        }) {
     const std::string sql = "SELECT " + std::string(c.expr) + " FROM t";
     auto plan = BindSql(sql, catalog);
@@ -2160,6 +2177,45 @@ TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
   const auto detail = GetSqlError(string_first.status());
   ASSERT_NE(detail, nullptr);
   EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+}
+
+// THEN NULL (ADR 0037's NL2) is a null value of the CASE: the identity of its type, named NULL as
+// DuckDB names it. A CASE of NULLs only has DuckDB's NULL type, which antb1 has not (exit 4); a
+// string literal made VARCHAR by a NULL does not mix with a DECIMAL (exit 1, as in DuckDB).
+TEST(BinderTest, ThenNullIsANullValueOfTheCase) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : {
+           std::pair{"SELECT CASE WHEN i32 = 1 THEN NULL ELSE i16 END FROM t",
+                     LogicalType::kSmallInt},
+           std::pair{"SELECT CASE i32 WHEN 1 THEN i64 WHEN 2 THEN NULL END FROM t",
+                     LogicalType::kBigInt},
+           std::pair{"SELECT CASE WHEN i32 = 1 THEN NULL ELSE 'x' END FROM t",
+                     LogicalType::kVarchar},
+           std::pair{"SELECT CASE WHEN i32 = 1 THEN NULL WHEN i32 = 2 THEN 7 END FROM t",
+                     LogicalType::kInteger},
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  auto named = BindSql("SELECT CASE i32 WHEN 1 THEN NULL ELSE i16 END FROM t", catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[0].name, "CASE  WHEN ((i32 = 1)) THEN (NULL) ELSE i16 END");
+  for (const auto& [sql, kind] : {
+           std::pair{"SELECT CASE WHEN i32 = 1 THEN NULL END FROM t",
+                     SqlErrorDetail::Kind::kUnsupported},
+           std::pair{
+               "SELECT CASE WHEN i32 = 1 THEN NULL WHEN i32 = 2 THEN NULL ELSE NULL END FROM t",
+               SqlErrorDetail::Kind::kUnsupported},
+           std::pair{"SELECT CASE WHEN i > 0 THEN NULL WHEN i > 1 THEN r ELSE 'x' END FROM dec",
+                     SqlErrorDetail::Kind::kBind},
+       }) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), kind) << sql << ": " << plan.status().ToString();
+  }
 }
 
 // No integer-only rewrite applies to DECIMAL (ADR 0021 rule 18): SUM(p + 1) sums p + 1, and

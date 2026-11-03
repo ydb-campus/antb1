@@ -1010,6 +1010,12 @@ TEST_F(ComputeTest, CaseEvaluatesEachBranchOnItsRows) {
   ASSERT_TRUE(no_else.ok()) << no_else.status().ToString();
   EXPECT_TRUE((*no_else)->type()->Equals(*arrow::int32()));
   EXPECT_EQ((*no_else)->ToString(), "[\n  null,\n  30000,\n  null,\n  null,\n  null\n]");
+  // A null THEN (THEN NULL, ADR 0037's NL2) leaves its rows NULL and still takes them, even where
+  // a later value would overflow.
+  auto null_then =
+      Eval(make({big, small}, {nullptr, doubled}, column, LogicalType::kSmallInt), {x});
+  ASSERT_TRUE(null_then.ok()) << null_then.status().ToString();
+  EXPECT_EQ((*null_then)->ToString(), "[\n  2,\n  null,\n  null,\n  -6,\n  200\n]");
   // The overflow still fails where the branch answers it.
   auto overflow = Eval(make({big}, {doubled}, nullptr, LogicalType::kSmallInt), {x});
   EXPECT_TRUE(overflow.status().IsExecutionError()) << overflow.status().ToString();

@@ -1550,6 +1550,44 @@ TEST(ParserTest, ElseNullIsACaseWithoutElse) {
   }
 }
 
+// THEN NULL, before WHEN, ELSE or END, is a NULL literal (ADR 0037's NL2), which the unparser
+// writes back; any other NULL, also in parentheses or as an operand, stays unsupported.
+TEST(ParserTest, ThenNullIsANullLiteral) {
+  for (const std::string_view sql : {
+           "SELECT CASE WHEN a > 1 THEN NULL ELSE b END FROM t",
+           "SELECT CASE a WHEN 1 THEN NULL WHEN 2 THEN b END FROM t",
+           "SELECT SUM(CASE WHEN a = 1 THEN b WHEN a = 2 THEN null END) FROM t",
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    const Expr& item = *stmt->items.at(0).expr();
+    const auto* c = std::get_if<CaseExpr>(&item);
+    if (const auto* call = std::get_if<AggregateCall>(&item);
+        call != nullptr && call->arg.has_value()) {
+      c = std::get_if<CaseExpr>(&**call->arg);
+    }
+    ASSERT_NE(c, nullptr) << sql;
+    EXPECT_TRUE(std::ranges::any_of(c->branches, [](const CaseBranch& b) {
+      const auto* lit = std::get_if<Literal>(&*b.then);
+      return lit != nullptr && lit->kind == Literal::Kind::kNull;
+    })) << sql;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+  }
+  for (const std::string_view sql : {
+           "SELECT CASE WHEN a > 1 THEN (NULL) END FROM t",
+           "SELECT CASE WHEN a > 1 THEN NULL + 1 END FROM t",
+           "SELECT CASE WHEN NULL THEN 1 END FROM t",
+           "SELECT CASE WHEN a > 1 THEN 1 ELSE NULL + 1 END FROM t",
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_FALSE(stmt.has_value()) << sql;
+    EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(stmt.error().message.contains("NULL literals are not supported")) << sql;
+  }
+}
+
 // A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
 // in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
 TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
@@ -2994,10 +3032,11 @@ INSTANTIATE_TEST_SUITE_P(
                    "NULL literals are not supported"},
         RejectCase{"LimitNull", "SELECT a FROM events LIMIT ^NULL", kUnsupported, 4,
                    "NULL literals are not supported"},
-        // ELSE NULL END alone is a CASE without ELSE; NULL as a THEN value, as an operand of the
-        // ELSE value or in parentheses is still a NULL literal.
-        RejectCase{"ThenNull", "SELECT CASE WHEN a > 1 THEN ^NULL ELSE 1 END FROM events",
-                   kUnsupported, 4, "NULL literals are not supported"},
+        // ELSE NULL END alone is a CASE without ELSE and THEN NULL alone a NULL value (NL2); NULL
+        // as an operand of a value or in parentheses is still an unsupported NULL literal.
+        RejectCase{"ThenNullOperand",
+                   "SELECT CASE WHEN a > 1 THEN ^NULL + 1 ELSE 1 END FROM events", kUnsupported, 4,
+                   "NULL literals are not supported"},
         RejectCase{"ElseNullOperand",
                    "SELECT CASE WHEN a > 1 THEN 1 ELSE ^NULL + 1 END FROM events", kUnsupported, 4,
                    "NULL literals are not supported"},

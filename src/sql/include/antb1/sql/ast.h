@@ -60,7 +60,8 @@ struct ColumnRef {
 };
 
 struct Literal {
-  enum class Kind : std::uint8_t { kInteger, kDecimal, kString, kDate, kTimestamp };
+  // kNull: NULL, only as a whole CASE value (THEN NULL; ELSE NULL END is a CASE without ELSE).
+  enum class Kind : std::uint8_t { kInteger, kDecimal, kString, kDate, kTimestamp, kNull };
   Kind kind = Kind::kInteger;
   bool negative = false;  // leading '-' (integers/decimals only)
   std::string
