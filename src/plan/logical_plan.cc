@@ -476,11 +476,17 @@ std::string ToString(const Constant& constant) {
   if (const auto* d = std::get_if<double>(&constant.value)) {
     return std::format("{}", *d);
   }
-  return "'" + EscapeText(std::get<std::string>(constant.value), '\'') + "'";
+  if (const auto* text = std::get_if<std::string>(&constant.value)) {
+    return "'" + EscapeText(*text, '\'') + "'";
+  }
+  return "NULL";
 }
 
 arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& constant) {
   const LogicalType type = constant.type;
+  if (std::holds_alternative<std::monostate>(constant.value)) {
+    return arrow::MakeNullScalar(ToArrow(type));
+  }
   if (const auto* v = std::get_if<Int128>(&constant.value)) {
     switch (type.id()) {
       case LogicalType::kSmallInt:
@@ -512,9 +518,9 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
     if (type == LogicalType::kDouble) {
       return std::make_shared<arrow::DoubleScalar>(*d);
     }
-  } else if (type == LogicalType::kVarchar) {
-    return std::make_shared<arrow::BinaryScalar>(
-        arrow::Buffer::FromString(std::get<std::string>(constant.value)));
+  } else if (const auto* text = std::get_if<std::string>(&constant.value);
+             text != nullptr && type == LogicalType::kVarchar) {
+    return std::make_shared<arrow::BinaryScalar>(arrow::Buffer::FromString(*text));
   }
   return arrow::Status::Invalid("a ", ToString(type), " constant holds a value of another type");
 }

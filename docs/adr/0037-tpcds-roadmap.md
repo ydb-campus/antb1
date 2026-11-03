@@ -135,7 +135,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 2** | **NULL as a value** | | |
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes (the NL1 update below) | | Built |
 | NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 (the NL2 update below) | | Built |
-| NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union | 27 | Planned |
+| NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union (the NL3 update below) | 27 | Built |
 | NL4 | IS NULL and IS NOT NULL | 76, 93 | Planned |
 | NL5 | COALESCE | | Planned |
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
@@ -340,6 +340,20 @@ the queries write besides `ELSE NULL END`, which was already a `CASE` without `E
 - **All NULL.** A `CASE` whose values are all NULL keeps exit 4.
 - **What it unlocks.** Two of the 99 queries get past this refusal and now stop later: one at `stddev_samp`, one at a
   cast to DECIMAL. The ratchet does not change.
+
+Update (2026-11-03, NL3): built for UNION ALL. NULL items of INTERSECT and EXCEPT wait for X4c and X4d, which reuse it.
+
+- **Parsing.** `NULL` or `NULL AS name` as a whole select item parses to NL2's `kNull` literal. A query that is no
+  compound refuses it once its block and tail are parsed, so a later parse error in that block now comes first. An
+  implicit alias (`NULL x`) and NULL in an expression stay unsupported.
+- **The fold.** The binder binds the item as a NULL of INTEGER flagged `OutputColumn::null_item`. `BindUnionAll`
+  folds over the other blocks, with NULL as the identity, and computes a NULL of the column's type below the union in
+  each block that writes one. A column that is NULL in every block keeps exit 4.
+- **NULL constants.** `plan::Constant` holds a NULL as `std::monostate`, and `ToArrowScalar` makes Arrow's NULL of
+  the type. `TruthOver` decides it first: no predicate that reads a NULL is true. So a WHERE above the union rules
+  out a branch whose column is NULL, through `ConstantColumn`, which now reads a constant of a `ComputeNode`.
+- **The ratchet.** Query 27 passes: 51 of the 99. The other queries with NULL items need INTERSECT, EXCEPT or UNION,
+  or a later item.
 
 ## Alternatives considered
 

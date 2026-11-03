@@ -348,6 +348,22 @@ TEST(LogicalPlanTest, ConstantText) {
   EXPECT_EQ(ToString(Constant{.type = LogicalType::Decimal(38, 0), .value = Int128{-7}}), "-7");
 }
 
+// A NULL constant (ADR 0037's NL3) is Arrow's NULL of its type, and prints as NULL.
+TEST(LogicalPlanTest, ANullConstantIsArrowsNullOfItsType) {
+  for (const LogicalType type :
+       {LogicalType(LogicalType::kSmallInt), LogicalType(LogicalType::kHugeInt),
+        LogicalType::Decimal(9, 2), LogicalType(LogicalType::kDouble),
+        LogicalType(LogicalType::kVarchar), LogicalType(LogicalType::kDate),
+        LogicalType(LogicalType::kTimestamp), LogicalType(LogicalType::kBoolean)}) {
+    const Constant null{.type = type, .value = std::monostate{}};
+    auto scalar = ToArrowScalar(null);
+    ASSERT_TRUE(scalar.ok()) << ToString(type) << ": " << scalar.status().ToString();
+    EXPECT_FALSE((*scalar)->is_valid) << ToString(type);
+    EXPECT_TRUE((*scalar)->type->Equals(*ToArrow(type))) << ToString(type);
+    EXPECT_EQ(ToString(null), "NULL");
+  }
+}
+
 TEST(LogicalPlanTest, ArrowScalars) {
   const auto scalar = [](const Constant& c) {
     auto s = ToArrowScalar(c);

@@ -1389,6 +1389,65 @@ TEST(BinderTest, UnionAllTypes) {
   }
 }
 
+// A NULL item of a block (ADR 0037's NL3) is the identity of the union's fold, in any block; its
+// column's name is the first block's (NULL, or its alias); each block that writes it computes a
+// NULL of the union's type below the union. A column that is NULL in every block has DuckDB's NULL
+// type, which antb1 does not support (exit 4).
+TEST(BinderTest, UnionAllNullItems) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT NULL FROM t UNION ALL SELECT s FROM t", LogicalType::kVarchar},
+           {"SELECT dt FROM t UNION ALL SELECT NULL FROM t", LogicalType::kDate},
+           {"SELECT i16 FROM t UNION ALL SELECT NULL FROM t UNION ALL SELECT i32 FROM t",
+            LogicalType::kInteger},
+           {"SELECT NULL AS x FROM dec UNION ALL SELECT p FROM dec UNION ALL SELECT NULL FROM dec "
+            "UNION ALL SELECT b FROM dec",
+            LogicalType::Decimal(21, 2)},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  auto plan = BindSql("SELECT NULL, i16 FROM t UNION ALL SELECT s, NULL AS y FROM t", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan->output[0].name, "NULL");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kVarchar);
+  EXPECT_EQ(plan->output[1].name, "i16");
+  EXPECT_EQ(plan->output[1].type, LogicalType::kSmallInt);
+  const auto* node = std::get_if<UnionAllNode>(plan->root.get());
+  ASSERT_NE(node, nullptr) << Explain(*plan);
+  for (const LogicalNodePtr& input : node->inputs) {
+    const auto* compute = std::get_if<ComputeNode>(input.get());
+    ASSERT_NE(compute, nullptr) << Explain(*plan);
+    ASSERT_EQ(compute->exprs.size(), 1U) << Explain(*plan);
+    const auto* constant = std::get_if<ConstantExpr>(&compute->exprs[0]->node);
+    ASSERT_NE(constant, nullptr) << Explain(*plan);
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(constant->value.value));
+  }
+  EXPECT_EQ(std::get<ComputeNode>(*node->inputs[0]).exprs[0]->type, LogicalType::kVarchar);
+  EXPECT_EQ(std::get<ComputeNode>(*node->inputs[1]).exprs[0]->type, LogicalType::kSmallInt);
+
+  // Its alias inside a HAVING expression is NULL in an expression: unsupported, never INTEGER.
+  const auto in_having = BindSql(
+      "SELECT NULL AS x, COUNT(*) AS c FROM t HAVING x + 1 > 0 UNION ALL SELECT dt, 2 FROM t",
+      catalog);
+  ASSERT_FALSE(in_having.ok());
+  const auto having_detail = GetSqlError(in_having.status());
+  ASSERT_NE(having_detail, nullptr);
+  EXPECT_EQ(having_detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(in_having.status().message().contains("NULL literals are not supported"))
+      << in_having.status().ToString();
+
+  const auto all_null =
+      BindSql("SELECT i16, NULL FROM t UNION ALL SELECT i32, NULL FROM t", catalog);
+  ASSERT_FALSE(all_null.ok());
+  const auto detail = GetSqlError(all_null.status());
+  ASSERT_NE(detail, nullptr);
+  EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(all_null.status().message().contains("whose values are all NULL"))
+      << all_null.status().ToString();
+}
+
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first
 // block's and its ids new; a block whose column is of another type is cast below it, once, to the
 // union's type -- and only such a block.

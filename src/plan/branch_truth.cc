@@ -14,11 +14,15 @@
 namespace antb1::plan {
 namespace {
 
-// A NULL constant (the roadmap's NL3) is never true of a comparison and never IS NOT NULL: a new
-// kind of constant is decided here first.
+// A NULL constant (ADR 0037's NL3) is never true of a comparison and never IS NOT NULL (TruthOver):
+// a new kind of constant is decided here first.
 static_assert(
-    std::variant_size_v<decltype(Constant::value)> == 3,
+    std::variant_size_v<decltype(Constant::value)> == 4,
     "a new kind of Constant is decided in TruthOver before it reaches a UNION ALL branch");
+
+bool IsNull(const std::optional<Constant>& value) {
+  return value.has_value() && std::holds_alternative<std::monostate>(value->value);
+}
 
 // The domain in which two constants compare exactly, or none: DOUBLE (NaN, -0.0, DuckDB's own
 // conversions) and BOOLEAN (no constant is one) are never decided here.
@@ -79,7 +83,7 @@ std::optional<int> Order(const Constant& a, const Constant& b) {
             return -1;
           }
           return x > *y ? 1 : 0;
-        } else if constexpr (std::is_same_v<T, double>) {
+        } else if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::monostate>) {
           return std::nullopt;
         } else if constexpr (std::is_same_v<T, std::string>) {
           const auto* y = std::get_if<std::string>(&b.value);
@@ -171,6 +175,13 @@ std::string_view ToString(BranchTruth truth) {
 
 BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>& column_value,
                       const std::optional<Constant>& other_value) {
+  // A NULL value makes no predicate true: a comparison, IN and NOT IN, LIKE and IS TRUE are NULL,
+  // and IS NOT NULL false. FALSE reads no column.
+  if (predicate.kind != Predicate::Kind::kFalse &&
+      ((predicate.column.has_value() && IsNull(column_value)) ||
+       (predicate.other.has_value() && IsNull(other_value)))) {
+    return BranchTruth::kNever;
+  }
   switch (predicate.kind) {
     case Predicate::Kind::kCompare: {
       const Constant* value = OfItsType(predicate.column, column_value);
