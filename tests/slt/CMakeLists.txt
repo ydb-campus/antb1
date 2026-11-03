@@ -64,7 +64,8 @@ target_include_directories(antb1_slt_tests PRIVATE "${PROJECT_SOURCE_DIR}/fuzz")
 if(ANTB1_HAVE_DUCKDB)
   # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
   # adapter's DECIMAL columns and memory limit, the keywords DuckDB reads as table aliases, DuckDB's
-  # reading of generated joins and the distinct counts DuckDB writes into Parquet footers.
+  # reading of generated joins, the distinct counts DuckDB writes into Parquet footers and the type
+  # fold of CASE values and UNION ALL columns (plan::CommonValueType).
   target_sources(
     antb1_slt_tests
     PRIVATE
@@ -74,6 +75,7 @@ if(ANTB1_HAVE_DUCKDB)
       tests/parquet_hints_oracle_test.cc
       tests/query_gen_oracle_test.cc
       tests/table_alias_oracle_test.cc
+      tests/type_fold_oracle_test.cc
   )
 endif()
 

@@ -23,6 +23,7 @@
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
+#include "antb1/plan/type_fold.h"
 #include "antb1/plan/types.h"
 #include "antb1/sql/ast.h"
 #include "antb1/sql/error.h"
@@ -3835,79 +3836,31 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
 
 namespace {
 
-// The DECIMAL DuckDB gives two CASE values of which one is DECIMAL and the other a DECIMAL or an
-// integer type (ADR 0021 rule 10): with e the larger number of integer digits and s the larger
-// scale, DECIMAL(e + s, s), or DECIMAL(38, 38 - e) beyond 38 digits (the values are rounded); an
-// integer counts by its type's digits (SMALLINT 5, INTEGER 10, BIGINT 19, HUGEINT 38) and keeps
-// the DECIMAL's scale, so beyond 38 digits its large values fail to cast.
-LogicalType CaseDecimal(LogicalType decimal, LogicalType other) {
-  constexpr int kMax = LogicalType::kMaxDecimalWidth;
-  const int p = decimal.width();
-  const int s = decimal.scale();
-  if (other != LogicalType::kDecimal) {
-    const int digits = DecimalOfInteger(other).width();
-    return digits <= p - s ? decimal
-                           : LogicalType::Decimal(Narrow<std::uint8_t>(std::min(kMax, digits + s)),
-                                                  Narrow<std::uint8_t>(s));
-  }
-  const int integers = std::max(p - s, other.width() - other.scale());
-  const int scale = std::max<int>(s, other.scale());
-  if (integers + scale <= kMax) {
-    return LogicalType::Decimal(Narrow<std::uint8_t>(integers + scale),
-                                Narrow<std::uint8_t>(scale));
-  }
-  return LogicalType::Decimal(Narrow<std::uint8_t>(kMax), Narrow<std::uint8_t>(kMax - integers));
-}
+// An integer type or a DECIMAL: the values a union widens exactly (ADR 0036).
+bool IsExactNumber(LogicalType type) { return IsInteger(type) || type == LogicalType::kDecimal; }
 
-// The type DuckDB gives two values of integer types in a CASE or a UNION ALL: unlike arithmetic,
-// USMALLINT with SMALLINT is INTEGER.
-LogicalType CommonInteger(LogicalType a, LogicalType b) {
-  const bool mixed = (a == LogicalType::kUSmallInt && b == LogicalType::kSmallInt) ||
-                     (a == LogicalType::kSmallInt && b == LogicalType::kUSmallInt);
-  return mixed ? LogicalType::kInteger : CombineIntegers(a, b);
-}
-
-// The type DuckDB gives a UNION ALL column's values so far, `so_far`, and the next block's, `next`
-// (ADR 0036): a left fold in written order over each block's own type, so a literal is typed by
-// itself, unlike in CASE. Numbers combine by CASE's rules for integers and DECIMALs, and FLOAT is
-// DOUBLE here, its flag aside. Every other mix -- VARCHAR, DATE or TIMESTAMP with another type, a
-// DOUBLE with an integer or a DECIMAL -- has no exact widening, so no type.
+// The type of a UNION ALL column's values so far, `so_far`, and the next block's, `next` (ADR
+// 0036): a left fold in written order over each block's own type (CommonValueType, ADR 0037's NL1),
+// so a literal is typed by itself, unlike in CASE. antb1 takes the fold's type where both are
+// integers or DECIMALs, whose blocks it casts below the union, and FLOAT is DOUBLE here, its flag
+// aside. Every other mix -- VARCHAR, DATE or TIMESTAMP with another type, a DOUBLE with an integer
+// or a DECIMAL -- has no exact widening, so no type.
 std::optional<LogicalType> UnionAllType(LogicalType so_far, LogicalType next) {
-  if (so_far == next) {
-    return so_far;
+  if (so_far != next && !(IsExactNumber(so_far) && IsExactNumber(next))) {
+    return std::nullopt;
   }
-  if (IsInteger(so_far) && IsInteger(next)) {
-    return CommonInteger(so_far, next);
-  }
-  const bool decimal_so_far = so_far == LogicalType::kDecimal;
-  const bool decimal_next = next == LogicalType::kDecimal;
-  if ((decimal_so_far || decimal_next) && (decimal_so_far || IsInteger(so_far)) &&
-      (decimal_next || IsInteger(next))) {
-    return decimal_so_far ? CaseDecimal(so_far, next) : CaseDecimal(next, so_far);
-  }
-  return std::nullopt;
+  return CommonValueType(so_far, next);
 }
 
-// The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere).
+// The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere): the
+// fold's (CommonValueType, ADR 0037's NL1) for two numbers. antb1 refuses DATE with TIMESTAMP
+// (exit 4) and every other mix, as DuckDB refuses most of them.
 arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
-  if (a == b) {
-    return a;
-  }
-  if (a == LogicalType::kDecimal || b == LogicalType::kDecimal) {
-    const LogicalType decimal = a == LogicalType::kDecimal ? a : b;
-    const LogicalType other = a == LogicalType::kDecimal ? b : a;
-    if (other == LogicalType::kDouble) {
-      return LogicalType::kDouble;
-    }
-    if (other == LogicalType::kDecimal || IsInteger(other)) {
-      return CaseDecimal(decimal, other);
-    }
-  }
-  if (IsInteger(a) && IsInteger(b)) {
-    return CommonInteger(a, b);
-  }
-  if (IsNumeric(a) && IsNumeric(b)) {
-    return LogicalType::kDouble;
+  const auto number = [](LogicalType t) { return IsNumeric(t) || t == LogicalType::kDecimal; };
+  // The fold has a type for any two types; only NULL with NULL is none.
+  if (const ValueType common = CommonValueType(a, b);
+      common.has_value() && (a == b || (number(a) && number(b)))) {
+    return *common;
   }
   if ((a == LogicalType::kDate && b == LogicalType::kTimestamp) ||
       (a == LogicalType::kTimestamp && b == LogicalType::kDate)) {
