@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793717943266,
+  "lastUpdate": 1793727872668,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -15960,6 +15960,678 @@ window.BENCHMARK_DATA = {
             "value": 239.99694766666835,
             "unit": "ms/iter",
             "extra": "iterations: 3\ncpu: 239.97309833333702 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "72a3054a737543e55e26a83079008a95740d5437",
+          "message": "refactor(plan): one duckdb type fold for case values and union all, null as its identity (NL1) (#293)\n\n## Summary\n\nADR 0037's NL1, the first item of phase 2: one DuckDB type fold for CASE\nvalues and UNION ALL columns, with the NULL type as its identity, so\nthat NL2 (NULL as a CASE value) and NL3 (NULL items of set-operation\nbranches) can type NULL through it. No answer changes.\n\n- New public header `src/plan/include/antb1/plan/type_fold.h` (public so\nthe DuckDB oracle test can call it, as `plan::DuckDbFloatOf`):\n- `ValueType = std::optional<LogicalType>`, where `std::nullopt` is the\nNULL type;\n- `CommonValueType(a, b)`: DuckDB's type of two values together. It is\ncommutative but not associative (USMALLINT with SMALLINT is INTEGER), as\nin DuckDB;\n- `DuckDbCaseMixes(a, b)`: which of those mixes DuckDB's CASE takes. It\nrefuses VARCHAR with another type, BOOLEAN with a DECIMAL or DOUBLE, and\nDATE/TIMESTAMP with a number or BOOLEAN.\n- `binder.cc`: `CommonInteger` and `CaseDecimal` moved into the fold,\nthe latter renamed `CommonDecimal`. `UnionAllType` and `CaseCommon` take\nthe fold's type and keep their own acceptance rules: the union takes\nonly exact widenings (ADR 0036); CASE takes numbers only, with the same\nbind and Unsupported errors as before.\n- Docs: ADR 0037 marks NL1 Built and adds a dated note. ADR 0036 now\nnames the fold where it used to name `CaseDecimal`. Two short additions:\nthe architecture.md table row, and the comment over the oracle tests in\ntests/slt/CMakeLists.txt.\n\n**Please confirm the ADR edits.** `docs/adr/0036-union-all.md` and\n`docs/adr/0037-tpcds-roadmap.md` are CODEOWNERS paths. This PR also adds\na public header under `src/plan/include/`.\n\n## Type of change\n\n- [ ] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [x] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics); also add the\n`breaking-change` label\n\n## Verification\n\n```text\n$ pixi run ci\n100% tests passed out of 3354\n$ pixi run test -R 'TypeFold|Binder|UnionAll|Case'\nANTB1-TESTS: PASS preset=dev\n$ pixi run slt-complete\nno diff in any .slt file (no answer changes)\n$ clang-tidy (build/dev) on src/plan/type_fold.cc, src/plan/binder.cc, src/plan/tests/type_fold_test.cc, tests/slt/tests/type_fold_oracle_test.cc\nclean\n$ pixi run lint\nevery hook passes except shellcheck, which fails on this macOS host on shell scripts this PR does not touch (a known local gap); CI runs it on Linux\n```\n\n## Checklist\n\n- [x] `pixi run check` passes locally: its `ci` leg passes; its `lint`\nleg passes except shellcheck on macOS (see above)\n- [x] Tests cover the change: `plan.TypeFoldTest` (4 cases), and the\nDuckDB oracle `TypeFoldOracle` (195 UNION ALL pairs, plus CASE over the\nsame pairs)\n- [x] Docs updated (ADR 0037, ADR 0036, architecture.md)\n- [x] No ClickBench-derived data is committed: no Parquet files, query\nanswers or values from `hits` (ADR-0006)\n- [x] Nothing derived from TPC-H or TPC-DS is committed: no query text\nor fragments, data, answers or TPC tools (ADR-0006)\n- [ ] Changes to governance paths (see `.github/CODEOWNERS`) were agreed\nwith a maintainer: the ADR edits, to be confirmed here\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. Tools and what they did: Claude Code (Claude Opus\n5.5) wrote the code, tests and docs, probed DuckDB's typing, and ran the\nchecks. A reviewer subagent checked the diff; its doc findings are\nfixed.\n- Accountable human (has read and understands the whole diff): @hor911\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-03T20:35:17+03:00",
+          "tree_id": "099977d30d35e363fe3342c8d4a422da9f06f7dd",
+          "url": "https://github.com/ydb-campus/antb1/commit/72a3054a737543e55e26a83079008a95740d5437"
+        },
+        "date": 1793727859777,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 2943.4617726810698,
+            "unit": "ns/iter",
+            "extra": "iterations: 243033\ncpu: 2943.340867289627 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 19883.587438567854,
+            "unit": "ns/iter",
+            "extra": "iterations: 34184\ncpu: 19882.767493564235 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 36741.47173274601,
+            "unit": "ns/iter",
+            "extra": "iterations: 19068\ncpu: 36739.529997902246 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 132799.1261627951,
+            "unit": "ns/iter",
+            "extra": "iterations: 5160\ncpu: 132791.19961240308 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 284316.0769539044,
+            "unit": "ns/iter",
+            "extra": "iterations: 2495\ncpu: 284297.9350701402 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 765662.6586169143,
+            "unit": "ns/iter",
+            "extra": "iterations: 911\ncpu: 765621.2974753019 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 22.096435387096893,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.094975903225812 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 28.984837500000065,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.982766624999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 129.02687580000247,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 129.0111254000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 8.647414913579645,
+            "unit": "ms/iter",
+            "extra": "iterations: 81\ncpu: 8.646868024691361 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 9.702637101449053,
+            "unit": "ms/iter",
+            "extra": "iterations: 69\ncpu: 9.701783275362324 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 25.651769285713858,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 25.649418857142845 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 0.8127575742232342,
+            "unit": "ms/iter",
+            "extra": "iterations: 869\ncpu: 0.8126642232451097 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 68.35323522222501,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 68.34197877777785 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 13.976744379999673,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.974853080000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 16.72496207317092,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 16.722719707317033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 31.357635500000924,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.35397836363635 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 48.09112373333164,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 48.08417493333342 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 205.07221366667258,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 205.04813266666724 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1142.9158419999794,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1142.721483999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 16.630328318180947,
+            "unit": "ms/iter",
+            "extra": "iterations: 44\ncpu: 16.628599863636364 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 20.143721558823433,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.140670676470616 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 32.57163654545407,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 32.56873477272732 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 60.39061889999857,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 60.38465550000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 238.1458759999949,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 238.1141660000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1309.4969579999542,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1309.3650200000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 32.93160152631308,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 32.92859784210515 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 36.24851589999878,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 36.24669189999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 50.0713017142849,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 50.065163499999855 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 99.47345771428218,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 99.46616828571412 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 304.37573300000054,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 304.3357039999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1596.5844639999887,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1596.4112509999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 39.46562527777865,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.462880555555714 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 42.05257976470608,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 42.0499531764708 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 59.242914818179834,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 59.232632363636576 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 113.33953599999329,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 113.32947449999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 328.6158920000162,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 328.5843884999977 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 1815.0167769999825,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1814.7736570000034 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1000",
+            "value": 14.321169039999404,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.32041283999993 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/16384",
+            "value": 16.777606547618365,
+            "unit": "ms/iter",
+            "extra": "iterations: 42\ncpu: 16.77541273809524 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/262144",
+            "value": 32.62369781818238,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 32.62190309090908 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1048576",
+            "value": 53.72791359999951,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 53.71706079999967 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/4194304",
+            "value": 213.58739599999885,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 213.5652566666669 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1000",
+            "value": 17.08313065853556,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 17.080960121951186 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/16384",
+            "value": 20.358687029411225,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.35622699999999 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/262144",
+            "value": 32.89181723809655,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.88686000000022 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1048576",
+            "value": 69.40219799999643,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 69.39562744444476 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/4194304",
+            "value": 246.0051089999903,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 245.97311899999852 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1000",
+            "value": 13.683724380000513,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.682073800000012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/16384",
+            "value": 16.281600840909764,
+            "unit": "ms/iter",
+            "extra": "iterations: 44\ncpu: 16.280630181818236 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/262144",
+            "value": 35.23826105000012,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 35.23389710000018 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1048576",
+            "value": 61.021612416666926,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 61.0158571666671 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/4194304",
+            "value": 167.34069849999855,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 167.32241425000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1000",
+            "value": 16.82030400000047,
+            "unit": "ms/iter",
+            "extra": "iterations: 42\ncpu: 16.81557288095245 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/16384",
+            "value": 20.997844515151925,
+            "unit": "ms/iter",
+            "extra": "iterations: 33\ncpu: 20.996858393939384 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/262144",
+            "value": 36.29721231578742,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 36.29453310526324 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1048576",
+            "value": 78.98735850000094,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 78.97594487500027 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/4194304",
+            "value": 187.4984257500074,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 187.47333674999922 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1000",
+            "value": 9.82253110810833,
+            "unit": "ms/iter",
+            "extra": "iterations: 74\ncpu: 9.821374932432388 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/16384",
+            "value": 10.493635015151451,
+            "unit": "ms/iter",
+            "extra": "iterations: 66\ncpu: 10.492925424242374 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/262144",
+            "value": 13.688451185185226,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 13.686644740740793 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1048576",
+            "value": 17.827472179488105,
+            "unit": "ms/iter",
+            "extra": "iterations: 39\ncpu: 17.8247259230769 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/4194304",
+            "value": 84.74223974999973,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 84.73664537500092 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1000",
+            "value": 10.254502800000052,
+            "unit": "ms/iter",
+            "extra": "iterations: 70\ncpu: 10.25368987142871 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/16384",
+            "value": 10.863829421875693,
+            "unit": "ms/iter",
+            "extra": "iterations: 64\ncpu: 10.862298624999989 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/262144",
+            "value": 16.701678673912383,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 16.69933030434772 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1048576",
+            "value": 26.88125047999847,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 26.878701960000058 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/4194304",
+            "value": 157.93356919999724,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 157.91150139999957 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1000",
+            "value": 10.09059517142857,
+            "unit": "ms/iter",
+            "extra": "iterations: 70\ncpu: 10.089590399999995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/16384",
+            "value": 10.85346017187483,
+            "unit": "ms/iter",
+            "extra": "iterations: 64\ncpu: 10.85231796875008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/262144",
+            "value": 16.135589697674984,
+            "unit": "ms/iter",
+            "extra": "iterations: 43\ncpu: 16.13363360465116 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1048576",
+            "value": 30.6363690952372,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 30.631967523809696 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/4194304",
+            "value": 213.14337399999772,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 213.10796699999912 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1000",
+            "value": 9.779205069444666,
+            "unit": "ms/iter",
+            "extra": "iterations: 72\ncpu: 9.77787238888893 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/16384",
+            "value": 12.290639310344691,
+            "unit": "ms/iter",
+            "extra": "iterations: 58\ncpu: 12.286590913793242 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/262144",
+            "value": 21.637053406250217,
+            "unit": "ms/iter",
+            "extra": "iterations: 32\ncpu: 21.6344688437502 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1048576",
+            "value": 33.300800523807624,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.29735671428512 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/4194304",
+            "value": 107.65563471428712,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 107.64407542857109 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 9.95190777464807,
+            "unit": "ms/iter",
+            "extra": "iterations: 71\ncpu: 9.950933126760566 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 12.436400821428606,
+            "unit": "ms/iter",
+            "extra": "iterations: 56\ncpu: 12.43543462500009 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 23.854645483870552,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 23.84683687096772 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 34.488031649999584,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.48579535000036 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 115.00162833333623,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 114.9861596666663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1000",
+            "value": 13.468016943396885,
+            "unit": "ms/iter",
+            "extra": "iterations: 53\ncpu: 13.466718622641526 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/16384",
+            "value": 14.431961420000334,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.42980752000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/262144",
+            "value": 17.892453769230215,
+            "unit": "ms/iter",
+            "extra": "iterations: 39\ncpu: 17.88988453846157 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1048576",
+            "value": 31.496791227273103,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.493329772727403 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/4194304",
+            "value": 96.68908500000433,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 96.67838214285699 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1000",
+            "value": 13.37603652941162,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 13.374112784313585 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/16384",
+            "value": 14.353035285713926,
+            "unit": "ms/iter",
+            "extra": "iterations: 49\ncpu: 14.351153428571465 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/262144",
+            "value": 20.013336428571296,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 20.011467314285728 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1048576",
+            "value": 45.65554950000156,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 45.651259071428896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/4194304",
+            "value": 169.8720389999835,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 169.85310566666575 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1000",
+            "value": 12.939235054545861,
+            "unit": "ms/iter",
+            "extra": "iterations: 55\ncpu: 12.937640836363522 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/16384",
+            "value": 13.74674703846123,
+            "unit": "ms/iter",
+            "extra": "iterations: 52\ncpu: 13.745073057692117 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/262144",
+            "value": 20.54561773529345,
+            "unit": "ms/iter",
+            "extra": "iterations: 34\ncpu: 20.54272685294102 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1048576",
+            "value": 56.115981538460765,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 56.10806407692337 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/4194304",
+            "value": 228.9691639999963,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 228.9405406666655 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1000",
+            "value": 14.064610274510423,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 14.063612078431323 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/16384",
+            "value": 16.827943333334176,
+            "unit": "ms/iter",
+            "extra": "iterations: 42\ncpu: 16.82615507142838 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/262144",
+            "value": 28.958063090907547,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 28.956406409090686 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1048576",
+            "value": 88.93517577777428,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 88.92376599999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/4194304",
+            "value": 176.6183390000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 176.60325474999894 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 13.727585942307796,
+            "unit": "ms/iter",
+            "extra": "iterations: 52\ncpu: 13.725789480769361 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 16.2449697674415,
+            "unit": "ms/iter",
+            "extra": "iterations: 43\ncpu: 16.242564162790828 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 28.890241541664825,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.885623500000197 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 89.57286583333257,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 89.56657816666791 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 192.29675875000396,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 192.27630174999888 ms\nthreads: 1"
           }
         ]
       }
