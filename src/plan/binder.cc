@@ -2967,7 +2967,7 @@ class Binder {
   // they compute. The scan filter stays directly above the Scan on every branch, where part
   // pruning and ADR 0020's pushdown look for it.
   LogicalNodePtr RelationNode(std::size_t r);
-  // The relations of block `block` joined in the order OrderRelations chose, left-deep.
+  // The relations of block `block` joined in the order OrderRelations chose (a tree of them).
   LogicalNodePtr JoinTree(std::size_t block);
   LogicalNodePtr CoreTree(std::size_t block);
   // The join of LEFT JOIN unit `u`'s two inputs, built on its right input.
@@ -4943,9 +4943,10 @@ bool ExactlyOneRow(const LogicalNode& node) {
 }
 
 // The order the relations of every block join in: each block's relations must be connected to its
-// first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the left-deep order
-// from footer statistics. A unit's inputs are ordered before the block that holds the unit, since
-// its estimate stands in for the unit's rows there.
+// first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the order from footer
+// statistics (its cost search, or the greedy left-deep rule beyond kSearchRelations). A unit's
+// inputs are ordered before the block that holds the unit, since its estimate stands in for the
+// unit's rows there.
 arrow::Status Binder::OrderRelations() { return OrderBlock(0); }
 
 // A relation a one-row join can append (JoinNode kOneRow: no key, no residual, exactly one row on

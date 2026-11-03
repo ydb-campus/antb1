@@ -1,5 +1,6 @@
 #include "antb1/plan/binder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/optimizer.h"
@@ -2339,6 +2341,234 @@ TEST(BinderTest, FiltersDecideWhichRelationProbes) {
   // A conjunct on the other relation moves it the other way again: `ok` is estimated at 7 through
   // one default factor, which is no row at all, so it is the side to build whatever `t` carries.
   EXPECT_EQ(built("SELECT ok.s FROM t JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 = 3"), "ok");
+}
+
+// ---- a pair of facts closed by a cycle (ADR 0037's PF1) ----
+
+// A pair of facts at a scale where joining them on the product alone fails a query: a sales fact, a
+// stock snapshot 8 times its size with 800 rows a product, and their dimensions, around a calendar
+// of 100 years whose roles close a cycle between the facts (whose days span 5 of them). Every key
+// column states its range, so its domain is known; the VARCHAR filters keep the default factor.
+Catalog FactPairCatalog() {
+  struct Column {
+    std::string name;
+    std::shared_ptr<arrow::DataType> type;
+    std::optional<std::pair<int64_t, int64_t>> range;  // in every part
+  };
+  Catalog catalog;
+  const auto add = [&catalog](const std::string& name, int64_t rows,
+                              const std::vector<Column>& columns) {
+    arrow::FieldVector fields;
+    fields.reserve(columns.size());
+    for (const Column& column : columns) {
+      fields.push_back(arrow::field(column.name, column.type));
+    }
+    auto table = std::make_shared<FakeTable>(arrow::schema(fields), rows);
+    for (std::size_t f = 0; f < columns.size(); ++f) {
+      if (const auto& range = columns[f].range; range.has_value()) {
+        table->WithStats(
+            0, Narrow<int>(f),
+            PartStats{.min = range->first, .max = range->second, .null_count = 0, .rows = rows});
+      }
+    }
+    EXPECT_TRUE(catalog.Register(name, table).ok()) << name;
+  };
+  const std::shared_ptr<arrow::DataType>& i32 = arrow::int32();
+  constexpr int64_t kFirst = 18'251;  // the facts' first day, in year 51 of the calendar
+  add("sales", 1'000'000,
+      {{.name = "sa_product", .type = i32, .range = std::pair<int64_t, int64_t>{1, 10'000}},
+       {.name = "sa_buyer", .type = i32, .range = std::pair<int64_t, int64_t>{1, 1'000'000}},
+       {.name = "sa_segment", .type = i32, .range = std::pair<int64_t, int64_t>{1, 5'000}},
+       {.name = "sa_sold",
+        .type = i32,
+        .range = std::pair<int64_t, int64_t>{kFirst, kFirst + 1'824}},
+       {.name = "sa_ship",
+        .type = i32,
+        .range = std::pair<int64_t, int64_t>{kFirst + 1, kFirst + 1'944}},
+       {.name = "sa_qty", .type = i32, .range = std::nullopt}});
+  add("stock", 8'000'000,
+      {{.name = "st_product", .type = i32, .range = std::pair<int64_t, int64_t>{1, 10'000}},
+       {.name = "st_place", .type = i32, .range = std::pair<int64_t, int64_t>{1, 10}},
+       {.name = "st_day",
+        .type = i32,
+        .range = std::pair<int64_t, int64_t>{kFirst, kFirst + 1'820}},
+       {.name = "st_qty", .type = i32, .range = std::nullopt}});
+  add("product", 10'000,
+      {{.name = "pr_id", .type = i32, .range = std::pair<int64_t, int64_t>{1, 10'000}}});
+  add("cal", 36'500,
+      {{.name = "c_day", .type = i32, .range = std::pair<int64_t, int64_t>{1, 36'500}},
+       {.name = "c_week", .type = i32, .range = std::pair<int64_t, int64_t>{1, 5'215}},
+       {.name = "c_year", .type = i32, .range = std::pair<int64_t, int64_t>{1'950, 2'049}}});
+  add("buyer", 1'000'000,
+      {{.name = "b_id", .type = i32, .range = std::pair<int64_t, int64_t>{1, 1'000'000}},
+       {.name = "b_kind", .type = arrow::utf8(), .range = std::nullopt}});
+  add("segment", 5'000,
+      {{.name = "sg_id", .type = i32, .range = std::pair<int64_t, int64_t>{1, 5'000}},
+       {.name = "sg_kind", .type = arrow::utf8(), .range = std::nullopt}});
+  add("place", 10, {{.name = "pl_id", .type = i32, .range = std::pair<int64_t, int64_t>{1, 10}}});
+  return catalog;
+}
+
+// Nine relations, the facts joined on the product and closed by the cycle sales -> sold -> (week)
+// -> stocked -> stock; the shape of tools/fixturegen's bookings and fleet (the CLI goldens
+// explain_join_fact_pair*), at the scale the danger is real.
+constexpr std::string_view kFactPair =
+    "SELECT COUNT(*) FROM sales JOIN buyer ON sa_buyer = b_id JOIN segment ON sa_segment = sg_id "
+    "JOIN cal AS sold ON sa_sold = sold.c_day JOIN cal AS stocked ON sold.c_week = stocked.c_week "
+    "JOIN stock ON st_product = sa_product AND st_day = stocked.c_day JOIN place ON st_place = "
+    "pl_id "
+    "JOIN product ON pr_id = sa_product JOIN cal AS shipped ON sa_ship = shipped.c_day "
+    "WHERE st_qty < sa_qty AND shipped.c_day > sold.c_day AND b_kind = 'x' AND sg_kind = 'y' "
+    "AND sold.c_year = 2001";
+
+// The tables a subtree scans, and its joins.
+std::set<std::string> ScannedTables(const LogicalNode& node) {
+  std::set<std::string> out;
+  std::vector<const LogicalNode*> pending = {&node};
+  while (!pending.empty()) {
+    const LogicalNode* at = pending.back();
+    pending.pop_back();
+    if (const auto* scan = std::get_if<ScanNode>(at)) {
+      out.insert(scan->table_name);
+    }
+    for (const LogicalNodePtr& input : InputsOf(*at)) {
+      pending.push_back(input.get());
+    }
+  }
+  return out;
+}
+
+std::vector<const JoinNode*> JoinsOf(const LogicalNode& node) {
+  std::vector<const JoinNode*> out;
+  std::vector<const LogicalNode*> pending = {&node};
+  while (!pending.empty()) {
+    const LogicalNode* at = pending.back();
+    pending.pop_back();
+    if (const auto* join = std::get_if<JoinNode>(at)) {
+      out.push_back(join);
+    }
+    for (const LogicalNodePtr& input : InputsOf(*at)) {
+      pending.push_back(input.get());
+    }
+  }
+  return out;
+}
+
+// The join where `a`'s and `b`'s relations first meet: one input scans `a` and not `b`, the other
+// `b` and not `a`.
+const JoinNode* JoinBetween(const LogicalNode& root, const std::string& a, const std::string& b) {
+  for (const JoinNode* join : JoinsOf(root)) {
+    const std::set<std::string> left = ScannedTables(*join->left);
+    const std::set<std::string> right = ScannedTables(*join->right);
+    if ((left.contains(a) && !left.contains(b) && right.contains(b) && !right.contains(a)) ||
+        (left.contains(b) && !left.contains(a) && right.contains(a) && !right.contains(b))) {
+      return join;
+    }
+  }
+  return nullptr;
+}
+
+using KeySet = std::set<std::pair<std::string, std::string>>;
+
+// Each key of `join` as the sorted pair of its sides' qualifier.name.
+KeySet KeyNames(const JoinNode& join) {
+  KeySet out;
+  for (const JoinKey& key : join.keys) {
+    std::string left = key.left.qualifier + "." + key.left.name;
+    std::string right = key.right.qualifier + "." + key.right.name;
+    if (right < left) {
+      std::swap(left, right);
+    }
+    out.emplace(std::move(left), std::move(right));
+  }
+  return out;
+}
+
+// The columns the Filters of a subtree compare.
+std::set<std::string> FilteredColumns(const LogicalNode& node) {
+  std::set<std::string> out;
+  std::vector<const LogicalNode*> pending = {&node};
+  while (!pending.empty()) {
+    const LogicalNode* at = pending.back();
+    pending.pop_back();
+    if (const auto* filter = std::get_if<FilterNode>(at)) {
+      for (const Predicate& predicate : filter->predicates) {
+        if (predicate.column.has_value()) {
+          out.insert(predicate.column->name);
+        }
+      }
+    }
+    for (const LogicalNodePtr& input : InputsOf(*at)) {
+      pending.push_back(input.get());
+    }
+  }
+  return out;
+}
+
+const LogicalNode& BuildOf(const JoinNode& join) {
+  return join.build == BuildSide::kLeft ? *join.left : *join.right;
+}
+
+const LogicalNode& ProbeOf(const JoinNode& join) {
+  return join.build == BuildSide::kLeft ? *join.right : *join.left;
+}
+
+// The search reduces the sales side through its filtered dimensions and the year of `sold`
+// first, joins `stocked` through the week, builds that side, and streams the snapshot as the
+// probe of the join of the two facts, on two keys: the product and the snapshot's day against
+// `stocked`'s. Joining the facts
+// on the product alone would be 1M x 800 rows.
+TEST(BinderTest, AFactPairClosedByACycleMeetsOnTwoKeysAfterTheSalesSideShrinks) {
+  const Catalog catalog = FactPairCatalog();
+  auto plan = BindSql(kFactPair, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const JoinNode* meet = JoinBetween(*plan->root, "sales", "stock");
+  ASSERT_NE(meet, nullptr) << Explain(*plan);
+  const KeySet product = {{"sales.sa_product", "stock.st_product"}};
+  EXPECT_EQ(KeyNames(*meet),
+            (KeySet{{"sales.sa_product", "stock.st_product"}, {"stock.st_day", "stocked.c_day"}}))
+      << Explain(*plan);
+  EXPECT_EQ(meet->residual.size(), 1U) << "st_qty < sa_qty";
+  EXPECT_EQ(ScannedTables(ProbeOf(*meet)), std::set<std::string>{"stock"})
+      << "the snapshot streams as the probe\n"
+      << Explain(*plan);
+  const std::set<std::string> filtered = FilteredColumns(BuildOf(*meet));
+  for (const std::string column : {"c_year", "b_kind", "sg_kind"}) {
+    EXPECT_TRUE(filtered.contains(column)) << column << " reduces the sales side first";
+  }
+  const std::vector<const JoinNode*> built = JoinsOf(BuildOf(*meet));
+  EXPECT_TRUE(std::ranges::any_of(built,
+                                  [](const JoinNode* join) {
+                                    return KeyNames(*join) ==
+                                           KeySet{{"sold.c_week", "stocked.c_week"}};
+                                  }))
+      << "the week equality is a key of its own join\n"
+      << Explain(*plan);
+  for (const JoinNode* join : JoinsOf(*plan->root)) {
+    EXPECT_NE(KeyNames(*join), product) << "the facts never join on the product alone";
+  }
+}
+
+// The control: the greedy rule (above 12 relations, or --join-order greedy) probes from the
+// snapshot and builds the whole sales fact, unreduced, keyed on the product and `sold`'s day.
+TEST(BinderTest, TheGreedyRuleMeetsTheFactPairWithTheSalesFactWhole) {
+  const Catalog catalog = FactPairCatalog();
+  auto stmt = sql::Parse(kFactPair);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  auto plan = Bind(*stmt, catalog, BindOptions{.join_order = JoinOrderSearch::kGreedy});
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const JoinNode* meet = JoinBetween(*plan->root, "sales", "stock");
+  ASSERT_NE(meet, nullptr) << Explain(*plan);
+  const bool sales_left = ScannedTables(*meet->left).contains("sales");
+  const LogicalNode& sales = sales_left ? *meet->left : *meet->right;
+  const LogicalNode& stock = sales_left ? *meet->right : *meet->left;
+  EXPECT_EQ(ScannedTables(sales), std::set<std::string>{"sales"}) << Explain(*plan);
+  EXPECT_EQ(&BuildOf(*meet), &sales) << "the sales fact is built\n" << Explain(*plan);
+  EXPECT_TRUE(FilteredColumns(sales).empty()) << "the sales fact meets the snapshot whole";
+  EXPECT_TRUE(FilteredColumns(stock).contains("c_year")) << Explain(*plan);
+  EXPECT_EQ(KeyNames(*meet),
+            (KeySet{{"sales.sa_product", "stock.st_product"}, {"sales.sa_sold", "sold.c_day"}}))
+      << Explain(*plan);
 }
 
 // The join ADR 0023's Path 2 creates for a correlated scalar aggregate is an inner join, so either

@@ -694,11 +694,13 @@ residual and no conjunct of its own branch reads (one could leave it with no row
 first relation that is not one of those, or to the first relation when all are, and the one-row relations then each
 join above them, in FROM order, as a `ONE-ROW` join that appends its row to every row. A subquery conjunct that reads
 one joins above that join, as above every join of its block.
-The relations then join left-deep, greedily, from footer metadata only (row counts, and each key's domain from the
-parts' integer ranges capped at their non-NULL rows, else their distinct-count hints): the relation with
-the most rows (an unknown count counts as the most) is probed first, then the connected relation with the smallest
-estimate joins next, with every edge to the relations already joined as a key, so the edge that closes a cycle
-becomes a second key. Every join builds on the relation it adds. Because the order reads metadata alone, a plan does
+The relations then join in the order and tree shape a cost search chooses from footer metadata only (row counts, and
+each key's domain from the parts' integer ranges capped at their non-NULL rows, else their distinct-count hints; "Join
+order and build sides" under Semantics): every edge between the two inputs of a join is a key of it, so the edge that
+closes a cycle becomes a second key, and a join builds on its right input unless that input is estimated at more than
+`--build-side-ratio` times its left. A block of more than 12 relations, or any block under `--join-order greedy`,
+joins left-deep instead: the relation with the most rows (an unknown count counts as the most) is probed first, then
+the connected relation with the smallest estimate joins next. Because the order reads metadata alone, a plan does
 not depend on the thread count. The executor runs every kind as a hash join: it builds a hash table of the
 input it builds on before it reads the other input, which then streams through it in its rows' order.
 

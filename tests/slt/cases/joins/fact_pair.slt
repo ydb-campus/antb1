@@ -1,0 +1,88 @@
+# A pair of facts joined many-to-many on a model and closed by a cycle through two roles of the calendar (ADR 0037's
+# PF1, tools/fixturegen/star.h): bookings, reduced by its riders and the year of its day, meet the weekly snapshot
+# fleet on the model and on fleet's day against the days of the booking's week. The CLI goldens
+# explain_join_fact_pair* pin the join order; these records pin the answers, whichever way the join is written.
+
+# ---- the inputs, one table at a time ----
+
+query TII nosort
+SELECT MIN(dy_day), COUNT(*), COUNT(DISTINCT dy_week) FROM days WHERE dy_year = 2027
+----
+DATE	BIGINT	BIGINT
+2026-12-28	364	52
+
+query II nosort
+SELECT COUNT(*), COUNT(DISTINCT fl_day) FROM fleet WHERE fl_model = 7
+----
+BIGINT	BIGINT
+312	104
+
+query I nosort
+SELECT COUNT(*) FROM riders WHERE rd_tier = 'gold'
+----
+BIGINT
+80
+
+query II nosort
+SELECT COUNT(*), COUNT(bk_promo) FROM bookings WHERE bk_vehicles > 10
+----
+BIGINT	BIGINT
+900	810
+
+# ---- the pair of facts ----
+
+# Bookings of gold riders in 2027, against the snapshots of their week that held fewer vehicles of the model than the
+# booking asked for, picked up after the booking's day. promos is empty, so the LEFT JOIN pads every row.
+query II nosort fact_pair
+SELECT COUNT(*), COUNT(pm_id) FROM bookings JOIN riders ON bk_rider = rd_id JOIN days AS booked ON bk_day = booked.dy_day JOIN days AS snapped ON booked.dy_week = snapped.dy_week JOIN fleet ON fl_model = bk_model AND fl_day = snapped.dy_day JOIN zones ON fl_zone = zn_id JOIN models ON md_id = bk_model JOIN days AS picked ON bk_pickup = picked.dy_day LEFT JOIN promos ON bk_promo = pm_id WHERE fl_available < bk_vehicles AND picked.dy_day > booked.dy_day AND rd_tier = 'gold' AND booked.dy_year = 2027
+----
+BIGINT	BIGINT
+188	0
+
+# The same join written from the snapshot's side.
+query II nosort fact_pair
+SELECT COUNT(*), COUNT(pm_id) FROM fleet JOIN days AS snapped ON fl_day = snapped.dy_day JOIN days AS booked ON booked.dy_week = snapped.dy_week JOIN bookings ON bk_day = booked.dy_day AND bk_model = fl_model JOIN zones ON fl_zone = zn_id JOIN riders ON bk_rider = rd_id JOIN models ON md_id = bk_model JOIN days AS picked ON bk_pickup = picked.dy_day LEFT JOIN promos ON bk_promo = pm_id WHERE fl_available < bk_vehicles AND picked.dy_day > booked.dy_day AND rd_tier = 'gold' AND booked.dy_year = 2027
+----
+BIGINT	BIGINT
+188	0
+
+# The same join as a comma list, the LEFT JOIN unit inside it.
+query II nosort fact_pair
+SELECT COUNT(*), COUNT(pm_id) FROM fleet, zones, days AS snapped, days AS booked, bookings LEFT JOIN promos ON bk_promo = pm_id, riders, models, days AS picked WHERE fl_zone = zn_id AND fl_day = snapped.dy_day AND booked.dy_week = snapped.dy_week AND bk_day = booked.dy_day AND fl_model = bk_model AND bk_rider = rd_id AND md_id = bk_model AND bk_pickup = picked.dy_day AND fl_available < bk_vehicles AND picked.dy_day > booked.dy_day AND rd_tier = 'gold' AND booked.dy_year = 2027
+----
+BIGINT	BIGINT
+188	0
+
+# Without the cycle the facts join on the model alone: every booking meets all 312 snapshot rows of its model.
+query I nosort
+SELECT COUNT(*) FROM bookings JOIN riders ON bk_rider = rd_id JOIN days AS booked ON bk_day = booked.dy_day JOIN fleet ON fl_model = bk_model JOIN zones ON fl_zone = zn_id WHERE fl_available < bk_vehicles AND rd_tier = 'gold' AND booked.dy_year = 2027
+----
+BIGINT
+18654
+
+# The pair by zone: its bookings and the models they hold.
+query III rowsort
+SELECT zn_id, COUNT(*), COUNT(DISTINCT bk_model) FROM bookings JOIN riders ON bk_rider = rd_id JOIN days AS booked ON bk_day = booked.dy_day JOIN days AS snapped ON booked.dy_week = snapped.dy_week JOIN fleet ON fl_model = bk_model AND fl_day = snapped.dy_day JOIN zones ON fl_zone = zn_id WHERE fl_available < bk_vehicles AND rd_tier = 'gold' AND booked.dy_year = 2027 GROUP BY zn_id
+----
+INTEGER	BIGINT	BIGINT
+1	60	23
+2	71	24
+3	57	23
+
+# ---- what later roadmap items answer ----
+
+# A pickup a week or more after the booking's day (DATE plus an integer, CT5).
+pending CT5
+query I nosort
+SELECT COUNT(*) FROM bookings WHERE bk_pickup >= bk_day + 7
+----
+BIGINT
+585
+
+# The bookings no promotion matches (IS NULL, NL4).
+pending NL4
+query I nosort
+SELECT COUNT(*) FROM bookings LEFT JOIN promos ON bk_promo = pm_id WHERE pm_id IS NULL
+----
+BIGINT
+1800

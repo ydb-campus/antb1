@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -294,6 +295,10 @@ TEST(StarSchema, TablesRowsAndRowGroups) {
       {.name = "shifts", .prefix = "sh_", .rows = 500, .group = 128},
       {.name = "tariffs", .prefix = "tf_", .rows = 9, .group = 4},
       {.name = "promos", .prefix = "pm_", .rows = 0, .group = 4},
+      {.name = "bookings", .prefix = "bk_", .rows = 1800, .group = 512},
+      {.name = "fleet", .prefix = "fl_", .rows = 7488, .group = 2048},
+      {.name = "models", .prefix = "md_", .rows = 26, .group = 8},
+      {.name = "days", .prefix = "dy_", .rows = 1456, .group = 400},
   });
   ASSERT_EQ(tables.size(), kExpected.size());
   std::set<int64_t> row_counts;
@@ -414,6 +419,47 @@ TEST(StarSchema, KeysHoldNullDanglingAndDuplicateValues) {
        .columns = {"sh_driver"},
        .ref_table = "drivers",
        .ref_columns = {"dv_id"}},
+      {.table = "bookings",
+       .columns = {"bk_model"},
+       .ref_table = "models",
+       .ref_columns = {"md_id"}},
+      {.table = "bookings",
+       .columns = {"bk_rider"},
+       .ref_table = "riders",
+       .ref_columns = {"rd_id"}},
+      {.table = "bookings",
+       .columns = {"bk_day"},
+       .ref_table = "days",
+       .ref_columns = {"dy_day"},
+       .dangling = false},
+      {.table = "bookings",
+       .columns = {"bk_pickup"},
+       .ref_table = "days",
+       .ref_columns = {"dy_day"},
+       .dangling = false},
+      {.table = "bookings",
+       .columns = {"bk_promo"},
+       .ref_table = "promos",
+       .ref_columns = {"pm_id"},
+       .unreferenced = false},
+      {.table = "fleet",
+       .columns = {"fl_model"},
+       .ref_table = "models",
+       .ref_columns = {"md_id"},
+       .nulls = false,
+       .dangling = false},
+      {.table = "fleet",
+       .columns = {"fl_zone"},
+       .ref_table = "zones",
+       .ref_columns = {"zn_id"},
+       .nulls = false,
+       .dangling = false},
+      {.table = "fleet",
+       .columns = {"fl_day"},
+       .ref_table = "days",
+       .ref_columns = {"dy_day"},
+       .nulls = false,
+       .dangling = false},
   };
   for (const Ref& ref : refs) {
     const StarTable& from = Named(tables, ref.table);
@@ -576,6 +622,85 @@ TEST(StarSchema, KeysHoldNullDanglingAndDuplicateValues) {
   EXPECT_EQ(std::ranges::max(hours), 120);
 }
 
+// What the join order of the pair of facts reads from the footers (ADR 0037's PF1, the CLI goldens
+// explain_join_fact_pair*): a key's domain is its range capped at its rows, so a key sparse within
+// its range would read as unique and the facts would join on the model alone; the calendar's roles
+// and the snapshot's Mondays must fall where the goldens' filters expect them.
+TEST(StarSchema, TheFactPairKeepsWhatItsJoinOrderReads) {
+  const auto tables = Star();
+  constexpr int64_t kFirstDay = 20'451;  // 2025-12-29, a Monday
+  constexpr int64_t kYear2 = kFirstDay + 364;
+
+  // models: dense and unique; the facts reference 1..24, and bookings the missing 27 too.
+  std::vector<int64_t> md_id = Ints(Named(tables, "models"), "md_id");
+  std::ranges::sort(md_id);
+  std::vector<int64_t> dense(26);
+  std::ranges::iota(dense, 1);
+  EXPECT_EQ(md_id, dense) << "a sparse model key would read as unique";
+  const auto fl_model = Ints(Named(tables, "fleet"), "fl_model");
+  for (int64_t model = 1; model <= 24; ++model) {
+    EXPECT_EQ(CountOf(fl_model, model), 312) << "model " << model;
+  }
+  EXPECT_EQ(fl_model.size(), 7488U);
+  for (const int64_t model : Ints(Named(tables, "bookings"), "bk_model")) {
+    EXPECT_TRUE((model >= 1 && model <= 24) || model == 27) << model;
+  }
+
+  // days: one row a day from kFirstDay, weeks of 7 days from Monday, years of 364 days.
+  const StarTable& days = Named(tables, "days");
+  const auto dy_day = Ints(days, "dy_day");
+  const auto dy_week = Ints(days, "dy_week");
+  const auto dy_year = Ints(days, "dy_year");
+  ASSERT_EQ(dy_day.size(), 1456U);
+  ASSERT_EQ(dy_week.size(), dy_day.size());
+  ASSERT_EQ(dy_year.size(), dy_day.size());
+  for (std::size_t r = 0; r < dy_day.size(); ++r) {
+    const auto i = static_cast<int64_t>(r);
+    EXPECT_EQ(dy_day[r], kFirstDay + i);
+    EXPECT_EQ(dy_week[r], (i / 7) + 1);
+    EXPECT_EQ(dy_year[r], 2026 + (i / 364));
+  }
+
+  // fleet: 72 rows on each of the 104 Mondays of years 2 and 3.
+  const auto fl_day = Ints(Named(tables, "fleet"), "fl_day");
+  std::map<int64_t, int64_t> per_day;
+  for (const int64_t day : fl_day) {
+    ++per_day[day];
+  }
+  EXPECT_EQ(per_day.size(), 104U);
+  for (const auto& [day, rows] : per_day) {
+    EXPECT_EQ((day - kFirstDay) % 7, 0) << day << ": a Monday";
+    EXPECT_GE(day, kYear2);
+    EXPECT_LT(day, kYear2 + 728);
+    EXPECT_EQ(rows, 72) << day;
+  }
+
+  // bookings: every day of years 2 and 3; a pickup 1 to 9 days after its booking's day, inside the
+  // calendar.
+  const StarTable& bookings = Named(tables, "bookings");
+  const auto days_of = Keys(bookings, {"bk_day"});
+  const auto pickups = Keys(bookings, {"bk_pickup"});
+  ASSERT_EQ(days_of.size(), pickups.size());
+  std::set<int64_t> booked;
+  for (std::size_t r = 0; r < days_of.size(); ++r) {
+    const std::optional<std::string>& day_text = days_of[r];
+    const std::optional<std::string>& pickup_text = pickups[r];
+    ASSERT_EQ(day_text.has_value(), pickup_text.has_value()) << "row " << r;
+    if (!day_text.has_value() || !pickup_text.has_value()) {
+      continue;
+    }
+    const int64_t day = std::stoll(*day_text);
+    const int64_t pickup = std::stoll(*pickup_text);
+    booked.insert(day);
+    EXPECT_GE(pickup - day, 1) << "row " << r;
+    EXPECT_LE(pickup - day, 9) << "row " << r;
+    EXPECT_LT(pickup, kFirstDay + 1456) << "row " << r;
+  }
+  EXPECT_EQ(booked.size(), 728U);
+  EXPECT_EQ(*booked.begin(), kYear2);
+  EXPECT_EQ(*booked.rbegin(), kYear2 + 727);
+}
+
 TEST(StarSchema, DoublesAreExactEighths) {
   const auto tables = Star();
   std::vector<std::set<double>> columns;
@@ -623,7 +748,7 @@ class FixtureFilesTest : public ::testing::Test {
 
 TEST_F(FixtureFilesTest, AreByteIdenticalAcrossRuns) {
   ASSERT_TRUE(WriteAllFixtures(dir_ / "b").ok());
-  ASSERT_EQ(files_.size(), 19U);
+  ASSERT_EQ(files_.size(), 23U);
   for (const auto& f : files_) {
     const std::string a = ReadBytes(dir_ / "a" / f.path);
     ASSERT_FALSE(a.empty()) << f.path;
@@ -683,10 +808,10 @@ TEST_F(FixtureFilesTest, RemovesStaleStarFiles) {
   for (const auto& entry : fs::directory_iterator(dir_ / "a" / "star")) {
     star_files += entry.path().extension() == ".parquet" ? 1 : 0;
   }
-  EXPECT_EQ(star_files, 8);
+  EXPECT_EQ(star_files, 12);
   EXPECT_EQ(std::ranges::count_if(files_,
                                   [](const FixtureFile& f) { return f.path.starts_with("star/"); }),
-            8);
+            12);
 }
 
 }  // namespace

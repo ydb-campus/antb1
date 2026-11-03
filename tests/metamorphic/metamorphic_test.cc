@@ -421,7 +421,7 @@ TEST(TablesTxt, RefsJoinColumnsOfOneKind) {
       }
     }
   }
-  EXPECT_EQ(refs, 13) << "the references of the star schema (tools/fixturegen/star.h)";
+  EXPECT_EQ(refs, 21) << "the references of the star schema (tools/fixturegen/star.h)";
 }
 
 }  // namespace

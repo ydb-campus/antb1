@@ -45,7 +45,7 @@ table must match it (`pixi run lint` compares them).
 | `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs and hand-built hash-join plans over the star fixtures |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
-| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
+| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema's first eight tables, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
 | `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`, `parallel.diff.tpcds`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
@@ -129,14 +129,17 @@ platform generates the same data.
 
 `star/` holds the star schema of the join and subquery tests (`tools/fixturegen/star.h` describes every column):
 `trips`, a ride-hailing fact table of 3000 rows, and its dimensions `riders`, `drivers`, `zones`, `cities`, `shifts`,
-`tariffs` and `promos` (empty). Their values are integer formulas of the row number: NULL keys, keys without a match,
-repeated keys (two of them across a row group boundary), a key beyond INTEGER, keys of two types (INTEGER to BIGINT,
-DECIMAL(4,2) to DECIMAL(5,3)), a two-column key, a join cycle, a many-to-many shortcut, a dimension in two roles and
-DOUBLE columns in two tables, and every non-empty table has several row groups. Every column name carries its table's
-prefix (`tr_`, `rd_`, ...) except `label`, a deliberate collision of `zones` and `cities`, and `<prefix>row` numbers
-each table's rows. `tests/slt/tables.txt` declares the references between the tables with `ref=` options
-([tests/slt/README.md](../tests/slt/README.md#layout)), along which the random differential test joins them, and the
-`harness.StarSchema.*` tests pin the properties that the join tests rely on.
+`tariffs` and `promos` (empty); and a second pair of facts, `bookings` and the weekly snapshot `fleet`, joined
+many-to-many on `models` and closed by a cycle through two roles of the calendar `days` ([ADR
+0037](adr/0037-tpcds-roadmap.md)'s PF1, whose join order the CLI goldens `explain_join_fact_pair*` pin). Their values
+are integer formulas of the row number: NULL keys, keys without a match, repeated keys (two of them across a row group
+boundary), a key beyond INTEGER, keys of two types (INTEGER to BIGINT, DECIMAL(4,2) to DECIMAL(5,3)), a two-column key,
+a join cycle, a many-to-many shortcut, dimensions in two and three roles and DOUBLE columns in two tables, and every
+non-empty table has several row groups. Every column name carries its table's prefix (`tr_`, `rd_`, ...) except `label`,
+a deliberate collision of `zones` and `cities`, and `<prefix>row` numbers each table's rows. `tests/slt/tables.txt`
+declares the references between the tables with `ref=` options ([tests/slt/README.md](../tests/slt/README.md#layout)),
+along which the random differential test joins them, and the `harness.StarSchema.*` tests pin the properties that the
+join tests rely on.
 
 The fixtures carry no distinct-count hints, since parquet-cpp writes none. `harness.ParquetDistinctCountOracle.*` has
 DuckDB write a file of its own under the test's temporary directory (single-threaded, without extension autoloading)
@@ -206,8 +209,9 @@ can differ in its last bits between the engines and so order near-ties different
 only on `s`, `i`, the tables and the supported features, so a single case reproduces on its own.
 
 - ctest `diff.random` (label `diff`) runs 300 queries with a fixed seed on every leg, over the tables it names in
-  `tests/slt/CMakeLists.txt`; `diff.decimal` runs 300 more over `decimals`, and `diff.star` 300 over the star schema
-  (`parallel.diff.star` runs them on 4 threads in 97-row batches, so that a row group spans several batches).
+  `tests/slt/CMakeLists.txt`; `diff.decimal` runs 300 more over `decimals`, and `diff.star` 300 over the first eight
+  tables of the star schema, which it names (`parallel.diff.star` runs them on 4 threads in 97-row batches, so that a
+  row group spans several batches).
 - `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and
   `ANTB1_DIFF_COUNT` set the seed and the count. Extra arguments go to `antb1-slt diff`: `--list` prints the queries
   without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that

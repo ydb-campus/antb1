@@ -131,7 +131,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | HC8 | `pending` guards take the Plan's ids: `IsRoadmapId` accepts one or two upper-case letters, digits and an optional lower-case letter | | Built |
 | **Phase 1** | **Performance groundwork** | | |
 | X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned; the key filters stay on X7, unscheduled (the X7a updates below) | | Built |
-| PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures | | Planned |
+| PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures (the PF1 update below) | | Built |
 | **Phase 2** | **NULL as a value** | | |
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes | | Planned |
 | NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 | | Planned |
@@ -266,6 +266,41 @@ Update (2026-11-03, X7a): built as the Optimize pass the note above describes (`
 - NL3 must teach the evaluator NULL constants before a NULL item reaches a union, since a NULL makes a comparison
   neither true nor false. A `static_assert` in `src/plan/branch_truth.cc` stops a new alternative of a constant's
   value until the evaluator decides it.
+
+Update (2026-11-03, PF1): built as pins only, with no estimate changed. The default cost search ([ADR
+0026](0026-join-performance.md)'s C5) already orders the pair of facts the way Q72 needs. Checked locally on Q72 at
+scale factors 0.1 and 1, its unsupported parts replaced, the plan had no large intermediate and stayed far below the
+memory limit.
+
+- **The shape.** The sales-like fact is first reduced through its filtered dimensions and the year of its first
+  calendar role. The second calendar role joins it through the week equality, the only key of that join. That side
+  is built, and the snapshot streams as the probe of the facts' join, on two keys: the product, and the snapshot's day
+  against the second role's.
+- **The literal form loses.** That form takes the product and the week as the facts' two keys. The search does not
+  choose it while the week columns' domains are known: it would carry the snapshot through one more join.
+- **Where it is pinned.** On our own fixtures, a second pair of facts in the star schema: `bookings` and the weekly
+  snapshot `fleet` on `models`, closed through two roles of the calendar `days` (`tools/fixturegen/star.h`). The CLI
+  goldens `explain_join_fact_pair` (the search) and `explain_join_fact_pair_greedy` (the control) pin the order.
+  `plan.BinderTest.AFactPairClosedByACycleMeetsOnTwoKeysAfterTheSalesSideShrinks` and its greedy control assert the
+  same structure over FakeTables at a larger scale, and `tests/slt/cases/joins/fact_pair.slt` the answers. That file's
+  last records wait on NL4 and CT5.
+- **Hazards** that would lose the shape, each a trigger for a guard of its own:
+  - **A sparse key.** A key's domain is its integer range capped at its rows, so a product key sparse within its
+    range reads as unique, and the facts join on it alone. `harness.StarSchema` pins that the fixtures' model key
+    stays dense.
+  - **Unknown LEFT JOIN units.** A LEFT JOIN unit's estimate is always unknown, against ADR 0022's rule 3, and it
+    already changes the plan of the comma spelling in `fact_pair.slt` (with the same answer). This needs a fix of its
+    own.
+  - **The greedy rule.** It replaces the search beyond 12 relations and probes from the snapshot, building the whole
+    sales fact.
+  - **The calendar's width.** A calendar much wider than the facts' days under-estimates the reduced sales side; it is
+    harmless here.
+  - **A cycle equality that is no key** becomes a residual, and the facts meet on the product alone. That happens to
+    a side that reads both roles, such as a difference of the two weeks compared with 0, or to sides with no exact
+    common key type. A computed equality whose sides each read one role stays a key, but without a domain; with both
+    sides computed, the search takes the literal form above.
+  - **Filters the estimate cannot see** (an OR, a NOT) leave the sales side looking large.
+- **Speed, not PF1.** A join on two keys publishes no dynamic key filter (ADR 0029), so the snapshot is read whole.
 
 ## Alternatives considered
 

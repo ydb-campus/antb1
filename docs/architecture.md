@@ -39,9 +39,10 @@ Responsibilities:
 - `plan`: logical types and their Arrow mapping, the `plan::Table` interface, the case-insensitive `Catalog`, the
   binder with exact literal folding (`binder.h`, `literal.h`) and its private name scopes (`src/plan/scope.h`: the
   bindings of a query block and the name rules of [ADR 0022](adr/0022-joins-and-query-blocks.md)) and join order
-  (`src/plan/join_order.h`: greedy and left-deep, estimated from footer row counts, ranges and distinct-count
-  hints), the logical plan (`logical_plan.h`; a `Join` and a `DependentJoin` have two inputs, a `UnionAll` one or
-  more ([ADR 0036](adr/0036-union-all.md)), every other node at most one), the rule
+  (`src/plan/join_order.h`: a cost search over the join trees, greedy and left-deep beyond 12 relations, estimated
+  from footer row counts, ranges and distinct-count hints), the logical plan (`logical_plan.h`; a `Join` and a
+  `DependentJoin` have two inputs, a `UnionAll` one or more ([ADR 0036](adr/0036-union-all.md)), every other node at
+  most one), the rule
   optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
@@ -140,8 +141,9 @@ steps (only step 7 uses more than one thread):
    own branch below them (ADR 0029's D0). A join graph no key connects is a cross product, `kUnsupported`, unless
    every relation the keys leave out is a sub-plan of exactly one row (an aggregate without groups) that no key, no
    residual and no conjunct of its own branch reads: each of those then joins above the others as a one-row join. The
-   relations the keys connect join left-deep in the order the footer row counts, integer ranges and distinct-count
-   hints choose (`src/plan/join_order.h`), each join building on the relation it adds. `HAVING` binds the same way
+   relations the keys connect join in the tree a cost search chooses from the footer row counts, integer ranges and
+   distinct-count hints (`src/plan/join_order.h`; left-deep and greedy beyond 12 relations), each join building on its
+   right input unless the estimates make that side decisively the larger. `HAVING` binds the same way
    against the aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above
    the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,

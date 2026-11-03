@@ -1,0 +1,21 @@
+Output: count_star():BIGINT count(pm_id):BIGINT
+Aggregate COUNT(*), COUNT(promos.pm_id)
+  Join LEFT build=right keys=[bookings.bk_promo = promos.pm_id] carries 20 of 21 unread above
+    Join INNER build=right keys=[fleet.fl_zone = zones.zn_id] carries 19 of 20 unread above
+      Join INNER build=left keys=[bookings.bk_model = fleet.fl_model, snapped.dy_day = fleet.fl_day] residual=[(fl_available < bk_vehicles)] carries 17 of 19 unread above
+        Join INNER build=left keys=[booked.dy_week = snapped.dy_week] carries 11 of 15 unread above
+          Join INNER build=left keys=[bookings.bk_pickup = picked.dy_day] residual=[(picked.dy_day > booked.dy_day)] carries 9 of 13 unread above
+            Join INNER build=right keys=[bookings.bk_model = models.md_id] carries 6 of 12 unread above
+              Join INNER build=right keys=[bookings.bk_day = booked.dy_day] carries 5 of 11 unread above
+                Join INNER build=right keys=[bookings.bk_rider = riders.rd_id] carries 3 of 8 unread above
+                  Scan table=bookings source=parquet(files=1, rows=1800) columns=[bk_model, bk_rider, bk_day, bk_pickup, bk_promo, bk_vehicles]
+                  Filter riders.rd_tier = 'gold'
+                    Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id, rd_tier]
+                Filter booked.dy_year = 2027
+                  Scan table=days source=parquet(files=1, rows=1456) columns=[dy_day, dy_week, dy_year]  [shared #1 of 3, 3 fields]
+              Scan table=models source=parquet(files=1, rows=26) columns=[md_id]
+            Scan table=days source=parquet(files=1, rows=1456) columns=[dy_day]  [shared #1 of 3, 3 fields]
+          Scan table=days source=parquet(files=1, rows=1456) columns=[dy_day, dy_week]  [shared #1 of 3, 3 fields]
+        Scan table=fleet source=parquet(files=1, rows=7488) columns=[fl_model, fl_zone, fl_day, fl_available]
+      Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]
+    Scan table=promos source=parquet(files=1, rows=0) columns=[pm_id]
