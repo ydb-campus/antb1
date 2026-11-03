@@ -104,6 +104,9 @@ struct CountOf {
   Counts& c;
   void operator()(const ColumnRef& column) const { c.dots += column.qualifier.empty() ? 0U : 1U; }
   void operator()(const Literal& lit) const {
+    if (lit.kind == Literal::Kind::kNull) {
+      return;  // THEN NULL: a keyword, which counts nothing
+    }
     c.minuses += lit.negative ? 1U : 0U;
     const bool numeric = lit.kind == Literal::Kind::kInteger || lit.kind == Literal::Kind::kDecimal;
     (numeric ? c.numbers : c.strings) += 1;
@@ -1217,7 +1220,11 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
         c.operand.emplace(RandomExpr(rng, depth - 1, aggregates));
       }
       for (std::size_t n = 1 + rng.Below(2); n > 0; --n) {
-        c.branches.push_back(CaseBranch{.when = sub(aggregates), .then = sub(aggregates)});
+        // THEN NULL (ADR 0037's NL2), a whole value, the only place a NULL literal parses.
+        c.branches.push_back(CaseBranch{
+            .when = sub(aggregates),
+            .then = rng.Percent(10) ? Box<Expr>(Expr(Literal{.kind = Literal::Kind::kNull}))
+                                    : sub(aggregates)});
       }
       if (rng.Percent(50)) {
         c.otherwise.emplace(RandomExpr(rng, depth - 1, aggregates));

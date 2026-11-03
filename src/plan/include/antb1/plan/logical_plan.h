@@ -233,8 +233,8 @@ struct BoolExpr {
 // DECIMAL as DuckDB casts, rounded half away from zero, ADR 0021 rule 10).
 struct CaseExpr {
   std::vector<ExprPtr> whens;  // BOOLEAN
-  std::vector<ExprPtr> thens;  // as many as whens
-  ExprPtr otherwise;           // may be null
+  std::vector<ExprPtr> thens;  // as many as whens; null: NULL (THEN NULL)
+  ExprPtr otherwise;           // may be null: NULL
 };
 
 // The operand's values as the expression's type, unchanged: an exact widening (IsExactWidening),

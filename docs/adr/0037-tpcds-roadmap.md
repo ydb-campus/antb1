@@ -134,7 +134,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures (the PF1 update below) | | Built |
 | **Phase 2** | **NULL as a value** | | |
 | NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes (the NL1 update below) | | Built |
-| NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 | | Planned |
+| NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 (the NL2 update below) | | Built |
 | NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union | 27 | Planned |
 | NL4 | IS NULL and IS NOT NULL | 76, 93 | Planned |
 | NL5 | COALESCE | | Planned |
@@ -324,6 +324,22 @@ their type from it. No answer changes and no refusal message changes.
   needs it.
 - **Pinned** by `plan.TypeFoldTest` and by `TypeFoldOracle`, which checks the fold against the DuckDB library over
   every pair of the engine's types and NULL, for UNION ALL and for CASE.
+
+Update (2026-11-03, NL2): `THEN NULL` is built. It covers a whole value before `WHEN`, `ELSE` or `END`, the only shape
+the queries write besides `ELSE NULL END`, which was already a `CASE` without `ELSE`.
+
+- **Parsing.** The parser makes it a `sql::Literal` of kind `kNull`, which NL3 and NL5 can reuse. Any other NULL stays
+  the parser's unsupported literal, `THEN (NULL)` and `THEN NULL + 1` included.
+- **Binding and execution.** The binder binds it as a null `thens` entry of the plan's `CaseExpr`, as a missing ELSE
+  is a null `otherwise`. The executor leaves its rows NULL.
+- **Typing.**
+  - Without a DECIMAL value, it is the identity of the fold.
+  - DuckDB also makes a literal next to it its own type (`THEN NULL THEN s16 ELSE 7` is INTEGER). That is divergence
+    D20's existing rule for the missing ELSE, whose row now names `THEN NULL` too.
+  - With a DECIMAL value, `DecimalCaseType` folds it as DuckDB does.
+- **All NULL.** A `CASE` whose values are all NULL keeps exit 4.
+- **What it unlocks.** Two of the 99 queries get past this refusal and now stop later: one at `stddev_samp`, one at a
+  cast to DECIMAL. The ratchet does not change.
 
 ## Alternatives considered
 

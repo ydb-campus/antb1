@@ -2121,6 +2121,15 @@ class Parser {
         return Syntax(Peek().span, "expected THEN in CASE, found " + Describe(Peek()));
       }
       Take();
+      // THEN NULL as a whole value (ADR 0037's NL2): a NULL literal, typed by the other values.
+      if (Peek().IsKeyword("NULL") && (PeekAt(1).IsKeyword("WHEN") || PeekAt(1).IsKeyword("ELSE") ||
+                                       PeekAt(1).IsKeyword("END"))) {
+        const SourceSpan null_span = Take().span;
+        out.branches.push_back(CaseBranch{
+            .when = Box<Expr>(*std::move(when)),
+            .then = Box<Expr>(Expr(Literal{.kind = Literal::Kind::kNull, .span = null_span}))});
+        continue;
+      }
       auto then = ParseExpr(context);
       if (!then) {
         return then;
@@ -2134,8 +2143,8 @@ class Parser {
     if (Peek().IsKeyword("ELSE")) {
       Take();
       // ELSE NULL is a CASE without ELSE, in DuckDB too: the same NULL for every row no branch
-      // takes, the same type and the same name (`... ELSE NULL END`). NULL anywhere else, also as
-      // an operand of the ELSE value, is still an unsupported NULL literal.
+      // takes, the same type and the same name (`... ELSE NULL END`). NULL anywhere else but a
+      // whole THEN value, also as an operand of a value, is still an unsupported NULL literal.
       if (Peek().IsKeyword("NULL") && PeekAt(1).IsKeyword("END")) {
         Take();
       } else {

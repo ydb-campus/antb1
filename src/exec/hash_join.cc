@@ -175,7 +175,7 @@ bool IsDeterministic(plan::Function function) {
 // does not compile until it is decided.
 bool IsDeterministic(const plan::ExprPtr& expr) {
   if (expr == nullptr) {
-    return true;  // a CASE without ELSE
+    return true;  // a CASE without ELSE, or THEN NULL
   }
   const auto all = [](const std::vector<plan::ExprPtr>& list) {
     return std::ranges::all_of(list, [](const plan::ExprPtr& e) { return IsDeterministic(e); });
