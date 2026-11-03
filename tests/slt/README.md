@@ -23,7 +23,7 @@ ClickBench query text.
 
 A table's `ref=<column>[+<column>...]:<table>.<column>[+<column>...]` options (repeatable) declare its foreign keys:
 which of its columns reference, pairwise, which columns of a table of the same file, itself included. The star
-schema of the join tests (`tools/fixturegen/star.h`) declares 13, and `tests/tpcds/tables_sf0_01.txt` the 107 of the
+schema of the join tests (`tools/fixturegen/star.h`) declares 21, and `tests/tpcds/tables_sf0_01.txt` the 107 of the
 tables derived from TPC-DS. A ref is a hint for generated joins, not a
 constraint: NULL and dangling keys are intended. The loader checks the syntax and finds the table ASCII
 case-insensitively (`runner/tables.h`); `metamorphic.TablesTxt.RefsJoinColumnsOfOneKind` checks, for `tables.txt`,
@@ -111,7 +111,8 @@ feature removes:
 over the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
 equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal,
 `IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exit 4 as well (the NULLs come from the data, and `COUNT(col)`
-counts them). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
+counts them). `fact_pair.slt` is the exception: its pending records wait on the roadmap's IS NULL (`NL4`) and DATE
+arithmetic (`CT5`). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
 DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats, because
 DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records over
 one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
@@ -193,7 +194,8 @@ pixi run diff-random --list --target-percent 100        # print generated querie
 ```
 
 ctest runs `diff.random` (label `diff`) with a fixed seed and 300 queries over the tables it names, and `diff.decimal`
-(over `decimals`) and `diff.star` (over the star schema of the join tests) with seeds of their own; `parallel.diff.star`
+(over `decimals`) and `diff.star` (over the first eight tables of the star schema of the join tests, which it names,
+so the tables ADR 0037's PF1 added do not change its queries) with seeds of their own; `parallel.diff.star`
 runs the queries of `diff.star` on 4 threads in 97-row batches. `diff.tpch` and `diff.tpcds` run over the data derived
 from TPC-H and TPC-DS, redacted ([docs/testing.md](../../docs/testing.md)), and their parallel runs on 4 threads in
 1000-row batches. Every run prints how many of the declared refs a join can follow (`antb1-slt diff: N of the M

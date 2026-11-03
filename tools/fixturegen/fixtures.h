@@ -93,7 +93,7 @@ struct FixtureFile {
 //   floats.parquet                  MakeFloatTable()
 //   decimals.parquet                MakeDecimalTable(), 5 row groups
 //   empty.parquet                   the partitioned hits schema, 0 rows
-//   star/<name>.parquet             the 8 tables of MakeStarTables() (star.h)
+//   star/<name>.parquet             the 12 tables of MakeStarTables() (star.h)
 arrow::Result<std::vector<FixtureFile>> WriteAllFixtures(const std::filesystem::path& dir);
 
 // Compares the Parquet schema (column path, physical type, logical type, converted type,

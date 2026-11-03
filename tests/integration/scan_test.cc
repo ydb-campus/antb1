@@ -74,7 +74,8 @@ std::shared_ptr<arrow::Table> ScanAll(const plan::Table& table, const std::vecto
 // The tables of the star schema (tools/fixturegen/star.h).
 constexpr auto kStarFiles = std::to_array<std::string_view>(
     {"star/trips.parquet", "star/riders.parquet", "star/drivers.parquet", "star/zones.parquet",
-     "star/cities.parquet", "star/shifts.parquet", "star/tariffs.parquet", "star/promos.parquet"});
+     "star/cities.parquet", "star/shifts.parquet", "star/tariffs.parquet", "star/promos.parquet",
+     "star/bookings.parquet", "star/fleet.parquet", "star/models.parquet", "star/days.parquet"});
 
 TEST(Scan, EveryFixtureTableInTheEngineView) {
   std::vector<std::string_view> files = {"hits_like.parquet",

@@ -19,6 +19,8 @@ namespace {
 
 constexpr int64_t kMarch2026 = 20'513;             // 2026-03-01 in days since 1970-01-01
 constexpr int64_t kJanuary2025 = 20'089;           // 2025-01-01
+constexpr int64_t kFirstDay = 20'451;              // 2025-12-29, a Monday: the first of `days`
+constexpr int64_t kYear2 = kFirstDay + 364;        // 2026-12-28: the first day of `days`' year 2
 constexpr int64_t kBeyondInteger = 4'294'968'296;  // 2^32 + 1000: 1000 in its low 32 bits
 
 // Row i of a column: an integer (days for a DATE, the unscaled value for a DECIMAL, eighths for a
@@ -372,12 +374,96 @@ arrow::Result<StarTable> Promos() {
                   });
 }
 
+// ---- a pair of facts closed by a cycle (ADR 0037's PF1) ----
+
+arrow::Result<StarTable> Bookings() {
+  return MakeStar(
+      "bookings", "bk_", 1800, 512,
+      {
+          {.name = "bk_model",
+           .type = arrow::int32(),
+           .ints = [](int64_t i) -> Cell {
+             if (i % 41 == 7) {
+               return kNull;
+             }
+             return i % 97 == 5 ? 27 : ((7 * i) % 24) + 1;  // 27: no such model
+           }},
+          {.name = "bk_rider",
+           .type = arrow::int64(),
+           .ints = [](int64_t i) { return NullIf(i % 23 == 4, ((7 * i) % 236) + 1); }},
+          {.name = "bk_day",
+           .type = arrow::date32(),
+           .ints = [](int64_t i) { return NullIf(i % 37 == 20, kYear2 + ((29 * i) % 728)); }},
+          {.name = "bk_pickup",
+           .type = arrow::date32(),
+           .ints =
+               [](int64_t i) {
+                 return NullIf(i % 37 == 20, kYear2 + ((29 * i) % 728) + 1 + (i % 9));
+               }},
+          {.name = "bk_promo",
+           .type = arrow::int32(),
+           .ints = [](int64_t i) { return NullIf(i % 10 == 0, (i % 4) + 1); }},
+          {.name = "bk_vehicles",
+           .type = arrow::int32(),
+           .ints = [](int64_t i) { return Cell((i % 20) + 1); }},
+      });
+}
+
+arrow::Result<StarTable> Fleet() {
+  return MakeStar("fleet", "fl_", 7488, 2048,
+                  {
+                      {.name = "fl_model",
+                       .type = arrow::int32(),
+                       .ints = [](int64_t i) { return Cell((i % 24) + 1); }},
+                      {.name = "fl_zone",
+                       .type = arrow::int32(),
+                       .ints = [](int64_t i) { return Cell(((i / 24) % 3) + 1); }},
+                      {.name = "fl_day",
+                       .type = arrow::date32(),
+                       .ints = [](int64_t i) { return Cell(kYear2 + (7 * (i / 72))); }},
+                      {.name = "fl_available",
+                       .type = arrow::int32(),
+                       .ints = [](int64_t i) { return Cell((7 * i) % 50); }},
+                  });
+}
+
+constexpr auto kModelNames = std::to_array<std::string_view>(
+    {"alder",   "birch", "cedar", "dogwood",  "elm",    "fir",     "ginkgo", "hazel",  "ilex",
+     "juniper", "kauri", "larch", "maple",    "nutmeg", "oak",     "pine",   "quince", "rowan",
+     "spruce",  "teak",  "ulmus", "viburnum", "willow", "xylosma", "yew",    "zelkova"});
+
+arrow::Result<StarTable> Models() {
+  return MakeStar(
+      "models", "md_", static_cast<int64_t>(kModelNames.size()), 8,
+      {
+          {.name = "md_id", .type = arrow::int32(), .ints = [](int64_t i) { return Cell(i + 1); }},
+          {.name = "md_name",
+           .type = arrow::utf8(),
+           .texts = [](int64_t i) { return Text(Nth(kModelNames, i)); }},
+      });
+}
+
+arrow::Result<StarTable> Days() {
+  return MakeStar("days", "dy_", 1456, 400,
+                  {
+                      {.name = "dy_day",
+                       .type = arrow::date32(),
+                       .ints = [](int64_t i) { return Cell(kFirstDay + i); }},
+                      {.name = "dy_week",
+                       .type = arrow::int32(),
+                       .ints = [](int64_t i) { return Cell((i / 7) + 1); }},
+                      {.name = "dy_year",
+                       .type = arrow::int16(),
+                       .ints = [](int64_t i) { return Cell(2026 + (i / 364)); }},
+                  });
+}
+
 }  // namespace
 
 arrow::Result<std::vector<StarTable>> MakeStarTables() {
   using Maker = arrow::Result<StarTable> (*)();
-  constexpr auto kMakers =
-      std::to_array<Maker>({Trips, Riders, Drivers, Zones, Cities, Shifts, Tariffs, Promos});
+  constexpr auto kMakers = std::to_array<Maker>({Trips, Riders, Drivers, Zones, Cities, Shifts,
+                                                 Tariffs, Promos, Bookings, Fleet, Models, Days});
   std::vector<StarTable> tables;
   tables.reserve(kMakers.size());
   for (const Maker make : kMakers) {

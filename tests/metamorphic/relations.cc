@@ -225,6 +225,10 @@ constexpr auto kTablePaths = std::to_array<TablePath>({
     {.table = "shifts", .path = "star/shifts.parquet"},
     {.table = "tariffs", .path = "star/tariffs.parquet"},
     {.table = "promos", .path = "star/promos.parquet"},
+    {.table = "bookings", .path = "star/bookings.parquet"},
+    {.table = "fleet", .path = "star/fleet.parquet"},
+    {.table = "models", .path = "star/models.parquet"},
+    {.table = "days", .path = "star/days.parquet"},
 });
 
 constexpr std::array<int64_t, 3> kBatchSizes = {1, 7, kDefaultBatchSize};

@@ -74,9 +74,38 @@
 //   promos (pm_)   0 rows (one empty row group): pm_id INTEGER, pm_code VARCHAR,
 //                  pm_discount DECIMAL(4,2)
 //
+// A pair of facts the join order must keep apart (ADR 0037's PF1): bookings and the fleet's weekly
+// snapshot share the model key many-to-many (about 75 bookings and 312 snapshot rows a model), and
+// a cycle through two roles of `days` closes them: a booking's day, its week, that week's days, a
+// snapshot's day.
+//   bookings (bk_) 1800 rows, groups of 512: the sales-like fact
+//     bk_model     INTEGER -> models.md_id: NULL if i%41==7; 27 (no such model) if i%97==5; else
+//                  7i%24+1 (models 25 and 26 have no booking)
+//     bk_rider     BIGINT -> riders.rd_id: NULL if i%23==4; else 7i%236+1, inside the riders' range
+//     bk_day       DATE -> days.dy_day: NULL if i%37==20; else the first day of year 2 plus 29i%728
+//                  (29 is coprime with 728: every day of years 2 and 3)
+//     bk_pickup    DATE -> days.dy_day (days in a second role): NULL with bk_day; else bk_day + 1
+//                  + i%9
+//     bk_promo     INTEGER -> promos.pm_id: NULL if i%10==0; else i%4+1 (every value dangles)
+//     bk_vehicles  INTEGER: i%20+1
+//   fleet (fl_)    7488 rows, groups of 2048: the snapshot, 24 models in 3 zones on 104 Mondays
+//     fl_model     INTEGER -> models.md_id: i%24+1
+//     fl_zone      INTEGER -> zones.zn_id: (i/24)%3+1
+//     fl_day       DATE -> days.dy_day: the first day of year 2 plus 7*(i/72), a Monday
+//     fl_available INTEGER: 7i%50
+//   models (md_)   26 rows, groups of 8
+//     md_id        INTEGER: i+1, dense and unique (a key sparse within its range would read as
+//                  unique, and the facts would join on it alone)
+//     md_name      VARCHAR: alder birch cedar ... zelkova
+//   days (dy_)     1456 rows, groups of 400: a calendar of four years of 52 weeks
+//     dy_day       DATE: 2025-12-29 (a Monday) plus i, dense and unique
+//     dy_week      INTEGER: i/7+1, Monday to Sunday
+//     dy_year      SMALLINT: 2026+i/364 (the facts are in years 2027 and 2028)
+//
 // Shapes for the join tests: keys of two types (INTEGER to BIGINT, DECIMAL(4,2) to DECIMAL(5,3)),
 // a two-column key (shifts), a join cycle (trips, zones, cities, drivers), a many-to-many shortcut
-// (zn_city = dv_city), a role-playing dimension (zones) and DOUBLE columns in two tables.
+// (zn_city = dv_city), a role-playing dimension (zones, days), DOUBLE columns in two tables, and a
+// many-to-many pair of facts closed by a cycle through two roles of a calendar (bookings, fleet).
 
 namespace antb1::fixturegen {
 
@@ -87,7 +116,8 @@ struct StarTable {
   int64_t row_group_rows = 0;  // fewer than the rows of every non-empty table
 };
 
-// trips, riders, drivers, zones, cities, shifts, tariffs, promos: the order of tables.txt.
+// trips, riders, drivers, zones, cities, shifts, tariffs, promos, bookings, fleet, models, days:
+// the order of tables.txt.
 arrow::Result<std::vector<StarTable>> MakeStarTables();
 
 }  // namespace antb1::fixturegen

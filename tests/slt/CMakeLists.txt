@@ -195,8 +195,9 @@ antb1_add_expect_test(
 # Random differential test (label diff): antb1 vs DuckDB on generated queries (runner/difftest.h),
 # with a fixed seed. `pixi run diff-random` runs more (ANTB1_DIFF_SEED, ANTB1_DIFF_COUNT) over every table.
 # diff.random names its tables (a table added to tables.txt would change every query of the seed);
-# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed, and diff.star the star
-# schema of the join tests (tools/fixturegen/star.h) with another. A new seed must pass `pixi run asan` first:
+# diff.decimal covers the DECIMAL columns of decimals.parquet with its own seed, and diff.star the first eight
+# tables of the star schema of the join tests (tools/fixturegen/star.h) with another; it names them, so the
+# tables added since (ADR 0037's PF1) do not change its queries. A new seed must pass `pixi run asan` first:
 # DuckDB itself leaks on the queries of some seeds (docs/testing.md).
 set(
   _diff_tables
@@ -303,7 +304,44 @@ if(ANTB1_HAVE_DUCKDB)
     PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
 
-  # Self-tests: the differential test must catch every corruption of antb1's results.
+  # Self-tests: the differential test must catch every corruption of antb1's results. They run over the 16
+  # tables tables.txt held before ADR 0037's PF1, in its order: the generator draws over the tables it is
+  # given, so a table added to tables.txt would change their 12 queries.
+  set(
+    _mutate_tables
+    --table
+    hits_like
+    --table
+    hits_like_nulls
+    --table
+    hits_like_split
+    --table
+    hits_like_required
+    --table
+    edge
+    --table
+    floats
+    --table
+    decimals
+    --table
+    empty
+    --table
+    trips
+    --table
+    riders
+    --table
+    drivers
+    --table
+    zones
+    --table
+    cities
+    --table
+    shifts
+    --table
+    tariffs
+    --table
+    promos
+  )
   foreach(
     kind
     IN
@@ -319,6 +357,7 @@ if(ANTB1_HAVE_DUCKDB)
       12
       --mutate
       ${kind}
+      ${_mutate_tables}
     )
     set(
       _require

@@ -124,9 +124,9 @@ int64_t JoinRowsOf(std::span<const JoinEdge> edges, int64_t left, int64_t right,
   return empty ? 0 : std::max<int64_t>(Saturated(Int128{left} * right / divisor), 1);
 }
 
-// Per pair of relations, what an equality between them divides by: the domains of the edges
-// between that pair multiplied, capped at the larger of their row counts. 1 when no edge connects
-// them; `empty` when a key of theirs has no value at all.
+// Per pair of relations, what the equalities between them divide by: the largest domain of the
+// edges between that pair (DivisorsOf). 1 when no edge connects them; `empty` when a key of theirs
+// has no value at all.
 struct PairDivisors {
   std::vector<int64_t> divisor;  // relations x relations, 1 where no edge
   std::vector<bool> empty;
@@ -166,9 +166,11 @@ PairDivisors DivisorsOf(std::size_t n, std::span<const JoinEdge> edges) {
 }
 
 // Dynamic programming over connected subsets (DPccp, Moerkotte and Neumann 2006), minimising the
-// rows the joins carry: cost(S) = cost(S1) + cost(S2) + rows(S) over the splits of S, and 0 for a
-// single relation, whose scan happens in any order. It ignores what a build costs, which rule 5
-// decides from its own estimate, and the scan, which every order pays alike (ADR 0026's C5).
+// rows the joins carry: cost(S) = cost(S1) + cost(S2) + rows(S) + min(rows(S1), rows(S2)) over the
+// splits of S, the last term the side a hash join holds (Consider), and 0 for a single relation,
+// whose scan happens in any order. It charges the smaller input as the held side, whichever side
+// rule 5 then builds from its own estimate, and ignores the scan, which every order pays alike
+// (ADR 0026's C5).
 //
 // Edges are read as pairs of relation masks rather than pairs of indices. Every edge the binder
 // can build today has one relation on each side, so the masks are singletons -- but it makes
@@ -480,20 +482,6 @@ class Orderer {
     return std::max<int64_t>(relations_[relation].rows.value_or(kLargest), 0);
   }
 
-  // The domain of an edge's side on `relation`: unknown is the relation's rows.
-  [[nodiscard]] int64_t Domain(const std::optional<int64_t>& domain, std::size_t relation) const {
-    return domain.has_value() ? std::max<int64_t>(*domain, 0) : Rows(relation);
-  }
-
-  // The estimated rows of joining `candidate` to the joined relations (`rows` of them), or
-  // std::nullopt when no edge joins it to them.
-  // The rows a join of inputs of `left` and `right` rows produces, from the edges between them,
-  // as everything that decides memory must read it: the largest domain of any of those edges
-  // divides, so a second key reads as no more selective than the stronger one. A composite key has
-  // at least as many distinct values as its most selective column, so this never over-states
-  // selectivity -- and under-stating the rows of a build is what materialises a side that does not
-  // fit. ADR 0026's C5 records the query that proved it. This is the estimate a step carries and
-  // the one ChooseBuildSide reads; only the search reads the narrower one below.
   // The edges between `candidate` and the relations joined so far, ascending.
   [[nodiscard]] std::vector<std::size_t> Crossing(std::size_t candidate) const {
     std::vector<std::size_t> out;
@@ -506,6 +494,8 @@ class Orderer {
     return out;
   }
 
+  // The estimated rows of joining `candidate` to the joined relations (`rows` of them, JoinRowsOf),
+  // or std::nullopt when no edge joins it to them.
   [[nodiscard]] std::optional<int64_t> Estimate(std::size_t candidate, int64_t rows) const {
     const std::vector<std::size_t> crossing = Crossing(candidate);
     if (crossing.empty()) {

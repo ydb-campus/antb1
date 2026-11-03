@@ -330,3 +330,72 @@ SELECT COUNT(*), COUNT(label), COUNT(zn_radius) FROM '${FIXTURES}/star/zones.par
 ----
 BIGINT	BIGINT	BIGINT
 40	35	37
+
+# ---- a pair of facts closed by a cycle: bookings, fleet, models and days (ADR 0037's PF1) ----
+# bookings: NULL keys in four columns (bk_pickup with bk_day); fleet: none.
+query IIIIIII nosort
+SELECT COUNT(*), COUNT(bk_model), COUNT(bk_rider), COUNT(bk_day), COUNT(bk_pickup), COUNT(bk_promo),
+  COUNT(bk_vehicles)
+FROM bookings
+----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
+1800	1756	1721	1751	1751	1620	1800
+
+query IIIII nosort
+SELECT COUNT(*), COUNT(fl_model), COUNT(fl_zone), COUNT(fl_day), COUNT(fl_available) FROM fleet
+----
+BIGINT	BIGINT	BIGINT	BIGINT	BIGINT
+7488	7488	7488	7488	7488
+
+# models: a dense key 1..26; the snapshot holds models 1 to 24, 312 rows each, and bookings the missing model 27.
+query IIII nosort
+SELECT COUNT(*), COUNT(DISTINCT md_id), MIN(md_id), MAX(md_id) FROM models
+----
+BIGINT	BIGINT	INTEGER	INTEGER
+26	26	1	26
+
+query III nosort
+SELECT COUNT(DISTINCT fl_model), MIN(fl_model), MAX(fl_model) FROM fleet
+----
+BIGINT	INTEGER	INTEGER
+24	1	24
+
+query I rowsort
+SELECT COUNT(*) FROM fleet GROUP BY fl_model HAVING COUNT(*) <> 312
+----
+BIGINT
+
+query I nosort
+SELECT COUNT(*) FROM bookings WHERE bk_model = 27
+----
+BIGINT
+19
+
+# days: one row a day from Monday 2025-12-29, weeks of 7 days, four years of 364 days.
+query IIIITT nosort
+SELECT COUNT(*), COUNT(DISTINCT dy_week), MIN(dy_year), MAX(dy_year), MIN(dy_day), MAX(dy_day) FROM days
+----
+BIGINT	BIGINT	SMALLINT	SMALLINT	DATE	DATE
+1456	208	2026	2029	2025-12-29	2029-12-23
+
+query II rowsort
+SELECT dy_year, COUNT(*) FROM days GROUP BY dy_year
+----
+SMALLINT	BIGINT
+2026	364
+2027	364
+2028	364
+2029	364
+
+# fleet: 104 Mondays of the years 2027 and 2028; bookings: every day of those years, picked up 1 to 9 days later.
+query ITT nosort
+SELECT COUNT(DISTINCT fl_day), MIN(fl_day), MAX(fl_day) FROM fleet
+----
+BIGINT	DATE	DATE
+104	2026-12-28	2028-12-18
+
+query IITT nosort
+SELECT COUNT(DISTINCT bk_day), COUNT(DISTINCT bk_pickup), MIN(bk_day), MAX(bk_pickup) FROM bookings
+----
+BIGINT	BIGINT	DATE	DATE
+728	734	2026-12-28	2029-01-02

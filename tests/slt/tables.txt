@@ -20,3 +20,9 @@ cities              star/cities.parquet
 shifts              star/shifts.parquet                ref=sh_driver:drivers.dv_id
 tariffs             star/tariffs.parquet
 promos              star/promos.parquet
+# A pair of facts closed by a cycle through two roles of the calendar (ADR 0037's PF1): the facts' model join and the
+# week self-join are left out, since both exceed the generator's row bound.
+bookings            star/bookings.parquet              ref=bk_model:models.md_id ref=bk_rider:riders.rd_id ref=bk_day:days.dy_day ref=bk_pickup:days.dy_day ref=bk_promo:promos.pm_id
+fleet               star/fleet.parquet                 ref=fl_model:models.md_id ref=fl_zone:zones.zn_id ref=fl_day:days.dy_day
+models              star/models.parquet
+days                star/days.parquet

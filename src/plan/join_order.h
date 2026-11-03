@@ -15,8 +15,10 @@
 #include "scope.h"
 
 // The join order of an inner block (docs/adr/0022-joins-and-query-blocks.md, "Join order",
-// decision C9): greedy and left-deep, from footer statistics only, in integer arithmetic, so that a
-// plan depends on metadata alone and is the same for any thread count. Private to the plan module:
+// decision C9; docs/adr/0026-join-performance.md's C5): a cost search over the trees of up to
+// kSearchRelations relations, ADR 0022's greedy left-deep rule beyond, both from footer statistics
+// only, in integer arithmetic, so that a plan depends on metadata alone and is the same for any
+// thread count. Private to the plan module:
 // the binder, the optimizer's unnesting pass (which chooses its own join's build side by the same
 // rule, ADR 0026) and their tests include it.
 
@@ -35,7 +37,8 @@ struct JoinRelation {
 struct JoinEdge {
   std::size_t a = 0;
   std::size_t b = 0;  // not a
-  // The distinct values of each side's column (KeyDomain); unknown: that side's relation's rows.
+  // The distinct values of each side's column (KeyDomain); an unknown one contributes nothing to
+  // what the edge divides by (join_order.cc's DivisorOf).
   std::optional<int64_t> a_domain;
   std::optional<int64_t> b_domain;
 };
@@ -85,11 +88,12 @@ inline constexpr std::size_t kSearchRelations = 12;
 // With `JoinOrderSearch::kCost` and at most kSearchRelations relations, dynamic programming over
 // connected subsets chooses the order: of all the trees the edges allow, including those that are
 // not a chain, it takes one whose joins carry the fewest rows in total. The cost of a subset is the
-// cost of the two it joins plus the rows it produces, and a single relation costs nothing, its scan
-// being the same in any order. The rows of a subset are read with the keys assumed independent --
-// per pair of relations the edges between them multiply, capped at the larger of their row counts,
-// so that two keys between the same pair read as the one composite key they are while two keys to
-// different relations really do narrow twice. Ties keep the plan found first, and the subsets are
+// cost of the two it joins plus the rows it produces and the rows of the smaller of the two, the
+// side a hash join holds; a single relation costs nothing, its scan being the same in any order.
+// The rows of a subset are read with the keys assumed independent (SubsetRows) -- per pair of
+// relations the largest domain of the edges between them divides, so that two keys between the same
+// pair read as the one composite key they are while keys to different relations really do narrow
+// twice. Ties keep the plan found first, and the subsets are
 // visited in a fixed order, so the choice is a function of the relations and the edges alone.
 //
 // With `kGreedy`, or above kSearchRelations relations, ADR 0022's rule instead:
@@ -126,7 +130,8 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
 int64_t SubsetRows(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
                    RelationSet set);
 
-// The cost the search minimises for `steps`: the rows every one of its joins produces, summed.
+// The cost the search minimises for `steps`: the rows every one of its joins produces plus the rows
+// of its smaller input (the side a hash join holds), summed over its steps.
 // Edges that do not join two different relations below relations.size() are a programming error.
 int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
                   std::span<const JoinStep> steps);
@@ -139,7 +144,8 @@ int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinE
 //      spread over a wide range) does not shrink every estimate to 1; 0 when every value is NULL;
 //   2. else, when every part has a distinct-count hint (Table::part_distinct_count), the largest
 //      of them, a lower bound of the column's count;
-//   3. else std::nullopt (the estimate takes the relation's rows).
+//   3. else std::nullopt: unknown, which divides nothing in a join estimate (join_order.cc's
+//      DivisorOf) and gives a predicate its default factor.
 // A table without parts has no value: 0.
 std::optional<int64_t> KeyDomain(const Table& table, int field);
 

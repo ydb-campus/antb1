@@ -27,11 +27,12 @@
 //
 //   [Compute (key casts)] <- [Filter] <- [Compute] <- [Filter] <- Scan (every field)
 //
-// or, for several, those branches under left-deep inner Joins (ADR 0022). A relation may also be a
-// sub-plan: a derived table's or a CTE's block, or a UnionAll of blocks (ADR 0036). A Join and a
-// DependentJoin have two inputs and a UnionAll one or more (two or more as bound; one once the
-// optimizer has ruled the others out), and every walk of a plan visits every input of a node, in
-// order (InputsOf). plan::Optimize rewrites it (WHERE conditions into a union's branches, COUNT(*)
+// or, for several, those branches under inner Joins (ADR 0022, in ADR 0026's order). A relation may
+// also be a sub-plan: a derived table's or a CTE's block, or a UnionAll of blocks (ADR 0036). A
+// Join and a DependentJoin have two inputs and a UnionAll one or more (two or more as bound; one
+// once the optimizer has ruled the others out), and every walk of a plan visits every input of a
+// node, in order (InputsOf). plan::Optimize rewrites it (WHERE conditions into a union's branches,
+// COUNT(*)
 // -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project, projection
 // pruning).
 //

@@ -235,6 +235,60 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
+# A pair of facts joined many-to-many on a model, closed by a cycle through two roles of the calendar (ADR 0037's
+# PF1): the search first reduces bookings through riders and the year of the booking's day, joins the days of that
+# week (the week equality, the only key of its join), and builds that side, so that the snapshot fleet streams as the
+# probe of the join of the two facts, on two keys: the model, and fleet's day against those days. Joining the facts on
+# the model alone would multiply every booking by the model's 312 snapshot rows. The greedy rule, the control, probes
+# from fleet and builds the whole of bookings.
+antb1_add_cli_golden(
+  explain_join_fact_pair
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), COUNT(pm_id) FROM bookings JOIN riders ON bk_rider = rd_id JOIN days AS booked ON bk_day = booked.dy_day JOIN days AS snapped ON booked.dy_week = snapped.dy_week JOIN fleet ON fl_model = bk_model AND fl_day = snapped.dy_day JOIN zones ON fl_zone = zn_id JOIN models ON md_id = bk_model JOIN days AS picked ON bk_pickup = picked.dy_day LEFT JOIN promos ON bk_promo = pm_id WHERE fl_available < bk_vehicles AND picked.dy_day > booked.dy_day AND rd_tier = 'gold' AND booked.dy_year = 2027"
+    --table
+    "bookings=${_f}/star/bookings.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "days=${_f}/star/days.parquet"
+    --table
+    "fleet=${_f}/star/fleet.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "models=${_f}/star/models.parquet"
+    --table
+    "promos=${_f}/star/promos.parquet"
+)
+antb1_add_cli_golden(
+  explain_join_fact_pair_greedy
+  ARGS
+    explain
+    --threads
+    1
+    --join-order
+    greedy
+    -c
+    "SELECT COUNT(*), COUNT(pm_id) FROM bookings JOIN riders ON bk_rider = rd_id JOIN days AS booked ON bk_day = booked.dy_day JOIN days AS snapped ON booked.dy_week = snapped.dy_week JOIN fleet ON fl_model = bk_model AND fl_day = snapped.dy_day JOIN zones ON fl_zone = zn_id JOIN models ON md_id = bk_model JOIN days AS picked ON bk_pickup = picked.dy_day LEFT JOIN promos ON bk_promo = pm_id WHERE fl_available < bk_vehicles AND picked.dy_day > booked.dy_day AND rd_tier = 'gold' AND booked.dy_year = 2027"
+    --table
+    "bookings=${_f}/star/bookings.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "days=${_f}/star/days.parquet"
+    --table
+    "fleet=${_f}/star/fleet.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "models=${_f}/star/models.parquet"
+    --table
+    "promos=${_f}/star/promos.parquet"
+)
 # A FROM list that starts with two tables sharing no predicate: no cross product, since the chain
 # connects them through the third.
 antb1_add_cli_golden(
