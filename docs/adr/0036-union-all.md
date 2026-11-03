@@ -116,9 +116,9 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
      over a count mismatch at the second).
    - **The type fold** runs left to right in written order over each branch's own types (`UnionAllType`):
      - equal types stay, whatever their kind;
-     - integers combine by CASE's integer rule (USMALLINT ∪ SMALLINT is INTEGER), and an integer or DECIMAL with a
-       DECIMAL by `CaseDecimal` -- never by the rest of `CaseCommon`, whose DOUBLE results and exit-1 errors are
-       CASE's;
+     - integers combine as in CASE (USMALLINT ∪ SMALLINT is INTEGER), and an integer or DECIMAL with a DECIMAL by
+       the DECIMAL rule of `plan::CommonValueType` (ADR 0037's NL1), which `UnionAllType` takes only for integers
+       and DECIMALs -- never the fold's DOUBLE, VARCHAR or DATE results, nor CASE's exit-1 errors;
      - FLOAT ∪ FLOAT is FLOAT (D11), and FLOAT ∪ DOUBLE is DOUBLE;
      - every other mix exits 4, naming FLOAT as FLOAT, and D11 where a FLOAT meets an integer or a DECIMAL.
    - **Exactness.** Each branch must widen exactly to the result, else exit 4 (for example, a DECIMAL that DuckDB

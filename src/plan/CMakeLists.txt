@@ -7,6 +7,7 @@ antb1_add_module(
     literal.cc
     scope.cc
     key_type.cc
+    type_fold.cc
     join_order.cc
     or_factoring.cc
     aggregate_placement.cc
@@ -28,6 +29,7 @@ if(ANTB1_BUILD_TESTS)
     SOURCES
       tests/types_test.cc
       tests/literal_test.cc
+      tests/type_fold_test.cc
       tests/binder_test.cc
       tests/scope_test.cc
       tests/join_order_test.cc

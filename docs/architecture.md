@@ -366,7 +366,7 @@ state's groups through a group map, so partial results of separate parts of the 
 | To add | Change | Also update |
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
-| Name resolution or type rules | `src/plan/binder.cc`, `src/plan/scope.cc`, `src/plan/types.cc` | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
+| Name resolution or type rules | `src/plan/binder.cc`, `src/plan/scope.cc`, `src/plan/types.cc`, `src/plan/type_fold.cc` (the common type of CASE values and UNION ALL columns) | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
 | A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds`, the ids a node reads and defines (`MaxColumnId`, `FreeVariables`), the position resolver, `CloneWithFreshIds`, pruning, `EstimateRows`, the shared sub-plans' origins and keys, EXPLAIN, the physical planner); then check the walks that compile for any node but assume a shape, such as the semi-join reduction's gate in `src/plan/optimizer.cc` | tests in `src/plan/tests/` and `src/exec/tests/` |
 | An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |

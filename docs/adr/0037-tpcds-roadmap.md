@@ -133,7 +133,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | X7a | ADR 0036's X7, first part: conjuncts and dynamic key filters into UNION ALL branches, constant branches pruned; the key filters stay on X7, unscheduled (the X7a updates below) | | Built |
 | PF1 | The join order of a many-to-many pair of facts closed by a cycle, pinned on our own fixtures (the PF1 update below) | | Built |
 | **Phase 2** | **NULL as a value** | | |
-| NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes | | Planned |
+| NL1 | One DuckDB type fold, with the NULL type as its identity, for CASE values and UNION ALL; no answer changes (the NL1 update below) | | Built |
 | NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 | | Planned |
 | NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union | 27 | Planned |
 | NL4 | IS NULL and IS NOT NULL | 76, 93 | Planned |
@@ -301,6 +301,25 @@ memory limit.
     sides computed, the search takes the literal form above.
   - **Filters the estimate cannot see** (an OR, a NOT) leave the sales side looking large.
 - **Speed, not PF1.** A join on two keys publishes no dynamic key filter (ADR 0029), so the snapshot is read whole.
+
+Update (2026-11-03, NL1): built as `plan::CommonValueType` (`src/plan/include/antb1/plan/type_fold.h`), the type DuckDB
+gives two values together, with the NULL type (`std::nullopt`) as its identity. It is commutative but not associative,
+as DuckDB's fold is not: a UNION ALL column folds left in written order. `UnionAllType` and `CaseCommon` now take
+their type from it. No answer changes and no refusal message changes.
+
+- **Where CASE and the union differ.** DuckDB's CASE and UNION ALL agree on every pair of numbers, on BOOLEAN with an
+  integer (the integer) and on DATE with TIMESTAMP. The union types every other mix too:
+  - VARCHAR with another type gives VARCHAR;
+  - BOOLEAN with a DECIMAL or a DOUBLE gives the number;
+  - a number or BOOLEAN with a DATE or TIMESTAMP gives the date, whose cast then fails as the query runs.
+
+  DuckDB's CASE refuses those mixes, and `plan::DuckDbCaseMixes` says which. antb1 still accepts less than either:
+  in a union, only integers and DECIMALs, which it widens exactly (ADR 0036); in CASE, numbers only.
+- **The NULL type is not a `LogicalType` yet.** NL2 and NL3 type a NULL value through the fold. A CASE or a column
+  whose values are all NULL keeps DuckDB's NULL type, which no result column holds yet; it stays exit 4 until a PR
+  needs it.
+- **Pinned** by `plan.TypeFoldTest` and by `TypeFoldOracle`, which checks the fold against the DuckDB library over
+  every pair of the engine's types and NULL, for UNION ALL and for CASE.
 
 ## Alternatives considered
 
