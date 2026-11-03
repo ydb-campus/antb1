@@ -1,0 +1,9 @@
+Output: count_star():BIGINT
+Aggregate COUNT(*)
+  Join INNER build=right keys=[trips.tr_rider = r.rd_id]
+    Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_rider]
+    Project riders.rd_id
+      Join LEFT build=right keys=[riders.rd_id = "CAST(pm_id AS BIGINT)"] carries 2 of 3 unread above
+        Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id]
+        Compute CAST(pm_id AS BIGINT)
+          Scan table=promos source=parquet(files=1, rows=0) columns=[pm_id]

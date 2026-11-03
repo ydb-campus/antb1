@@ -238,6 +238,10 @@ entirely, because a pre-grouped relation has exactly one row per key.
   - **A LEFT JOIN carries no row estimate**: the binder keeps one only for the joins its order search ranked, so
     the gate computes its own by ADR 0022's rule 3, locally. Changing what `EstimateRows` answers for a join
     would move `ChooseBuildSide`, which is ADR 0026's decision and not this item's.
+    Update (2026-11-03, a fix found by ADR 0037's PF1): a LEFT JOIN unit now carries the binder's estimate by
+    rule 3, as ADR 0022 always said it should; its blocks of one relation had none. So `EstimateRows`, and through
+    it `ChooseBuildSide` and this gate, read it. No plan of the passing queries derived from TPC-H or TPC-DS
+    changes; the CLI goldens `explain_join_left_unit_*` pin the plans that do.
 - **G2b, perf(plan): perform the rewrite behind the gate.**
   - Update (2026-10-22, G2b): **shipped for SUM, MIN and MAX, and on landing it fired on no query of the 22**
     -- because

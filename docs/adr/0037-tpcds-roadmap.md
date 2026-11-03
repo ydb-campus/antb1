@@ -290,7 +290,11 @@ memory limit.
     stays dense.
   - **Unknown LEFT JOIN units.** A LEFT JOIN unit's estimate is always unknown, against ADR 0022's rule 3, and it
     already changes the plan of the comma spelling in `fact_pair.slt` (with the same answer). This needs a fix of its
-    own.
+    own. Update (2026-11-03): fixed. A unit's blocks of one relation now carry that relation's estimate
+    (`Binder::BlockEstimate`), which every reader of a join's estimate now sees: the join order, a derived
+    table's or CTE's `EstimateRows`, the build-side choice and ADR 0032's gate (its dated update). No plan of the
+    passing queries derived from TPC-H or TPC-DS changes; `explain_join_left_unit_built` and
+    `explain_join_left_unit_derived_built` pin units that are now built.
   - **The greedy rule.** It replaces the search beyond 12 relations and probes from the snapshot, building the whole
     sales fact.
   - **The calendar's width.** A calendar much wider than the facts' days under-estimates the reduced sales side; it is

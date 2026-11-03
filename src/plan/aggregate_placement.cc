@@ -252,11 +252,10 @@ bool MuchNarrower(const AggregatePlacement& placement) {
          placement.grouping_cost >= *placement.pre_grouping_cost * kLeastNarrowing;
 }
 
-// The rows a join outputs. The binder keeps an estimate on the node for the joins its order search
-// ranked, and **not for a LEFT JOIN**, so this computes one the same way ADR 0022's rule 3 does:
+// The rows a join outputs: the estimate the binder keeps on the node (the joins its order search
+// ranked, and a LEFT JOIN unit's by ADR 0022's rule 3), else one computed the same way rule 3 does:
 // the inputs multiplied over the larger of the two key domains, and never below the preserved side
-// for an outer join. Local to this gate on purpose -- EstimateRows feeds ChooseBuildSide, and
-// changing what a join reads as there is ADR 0026's decision and not this item's.
+// for an outer join.
 std::optional<int64_t> JoinRows(const JoinNode& join) {
   if (join.estimate.has_value()) {
     return join.estimate;

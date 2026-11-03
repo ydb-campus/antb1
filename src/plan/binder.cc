@@ -5124,13 +5124,17 @@ std::optional<int64_t> Binder::FilteredRelationRows(std::size_t r) const {
   return kept;
 }
 
-// The rows block `b` outputs, estimated: its last step's, which OrderJoins already saturated.
+// The rows block `b` outputs, estimated: its last step's, which OrderJoins already saturated; for
+// a block of one relation, which has no step, that relation's own (RelationEstimate).
 std::optional<int64_t> Binder::BlockEstimate(std::size_t b) const {
   const JoinBlock& block = blocks_[b];
-  if (block.steps.empty()) {
-    return std::nullopt;
+  if (!block.steps.empty()) {
+    return block.steps.back().estimate;
   }
-  return block.steps.back().estimate;
+  if (block.relations.size() == 1) {
+    return RelationEstimate(block.relations.front());
+  }
+  return std::nullopt;
 }
 
 // The first binding, in FROM order, that relation `r` holds: itself, or the first of the leftmost
