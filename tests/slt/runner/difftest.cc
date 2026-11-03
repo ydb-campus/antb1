@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -21,7 +22,7 @@ namespace {
 
 enum class Outcome : std::uint8_t { kCompared, kUnsupported, kRejected, kFailed };
 
-constexpr std::size_t kMaxListedRejects = 5;
+constexpr std::size_t kMaxListedCases = 5;
 
 struct CaseResult {
   Outcome outcome = Outcome::kCompared;
@@ -32,14 +33,75 @@ CaseResult Fail(Discrepancy d) {
   return CaseResult{.outcome = Outcome::kFailed, .failure = std::move(d)};
 }
 
+// The oracle of one case: `oracle`, until a query fails with a DuckDB internal error
+// (IsDuckDbInternalError); from then on, for the rest of the case, the first of `retries` that
+// answers it.
+class OracleOfCase final : public Engine {
+ public:
+  OracleOfCase(Engine& oracle, std::span<Engine* const> retries)
+      : oracle_(oracle), retries_(retries) {}
+
+  [[nodiscard]] std::string_view name() const override { return oracle_.name(); }
+
+  ExecResult Execute(const std::string& sql) override {
+    ExecResult result = Current().Execute(sql);
+    while (!result.has_value() && IsDuckDbInternalError(result.error())) {
+      if (!first_internal_.has_value()) {
+        first_internal_ = result.error();
+      }
+      if (level_ == retries_.size()) {
+        break;
+      }
+      ++level_;
+      result = Current().Execute(sql);
+    }
+    answered_by_retry_ = answered_by_retry_ || (level_ > 0 && result.has_value());
+    return result;
+  }
+
+  // Back to `oracle`, for the next case.
+  void Reset() {
+    level_ = 0;
+    answered_by_retry_ = false;
+    first_internal_.reset();
+  }
+  // Whether the case asked a retry, and whether one answered.
+  [[nodiscard]] bool retried() const { return level_ > 0; }
+  [[nodiscard]] bool answered_by_retry() const { return answered_by_retry_; }
+  // The case's first DuckDB internal error, if any.
+  [[nodiscard]] const std::optional<EngineError>& first_internal() const { return first_internal_; }
+
+ private:
+  Engine& Current() { return level_ == 0 ? oracle_ : *retries_[level_ - 1]; }
+
+  Engine& oracle_;
+  std::span<Engine* const> retries_;
+  std::size_t level_ = 0;
+  bool answered_by_retry_ = false;
+  std::optional<EngineError> first_internal_;
+};
+
 CaseResult CheckCase(const GeneratedQuery& q, FeatureSet supported_set, Engine& antb1,
-                     Engine& oracle) {
+                     OracleOfCase& oracle) {
   const bool supported = supported_set.Contains(q.features);
   if (q.sql.empty()) {
     return Fail(Discrepancy{.what = "the generator produced no query (a generator bug)"});
   }
   const auto a = antb1.Execute(q.sql);
   const auto o = oracle.Execute(q.sql);
+  if (!o.has_value() && oracle.first_internal().has_value()) {
+    // The internal error is the report's; a retry's other error, as its last word, goes with it.
+    const EngineError& internal = *oracle.first_internal();
+    Discrepancy d = ErrorDiscrepancy(
+        std::format("DuckDB fails with an internal error{} (a DuckDB bug, not a generator bug)",
+                    oracle.retried() ? ", and its retries with fewer optimizers fail" : ""),
+        internal);
+    if (o.error().message != internal.message) {
+      d.detail += "\n  the last retry: " + o.error().message;
+      d.redacted += std::format(", the last retry's: {}", o.error().kind);
+    }
+    return Fail(std::move(d));
+  }
   if (!o.has_value()) {
     return Fail(ErrorDiscrepancy(
         "DuckDB rejects the generated SQL (a generator bug: queries must be valid DuckDB SQL)",
@@ -91,8 +153,10 @@ void Report(const GeneratedQuery& q, uint64_t seed, bool supported, const Discre
 }  // namespace
 
 DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle,
-                  const DiffOptions& options, std::string& out) {
+                  const DiffOptions& options, std::string& out,
+                  std::span<Engine* const> oracle_retries) {
   DiffStats stats;
+  OracleOfCase oracle_of_case(oracle, oracle_retries);
   const FeatureSet supported_set = generator.options().supported;
   const uint64_t first = options.only.value_or(0);
   const uint64_t last = options.only.has_value() ? first + 1 : options.count;
@@ -102,7 +166,17 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
     ++stats.queries;
     stats.supported += supported ? 1 : 0;
     stats.target += q.target_sample ? 1 : 0;
-    const CaseResult r = CheckCase(q, supported_set, antb1, oracle);
+    oracle_of_case.Reset();
+    CaseResult r = CheckCase(q, supported_set, antb1, oracle_of_case);
+    if (oracle_of_case.answered_by_retry()) {
+      ++stats.oracle_retried;
+      if (stats.oracle_retried_cases.size() < kMaxListedCases) {
+        stats.oracle_retried_cases.push_back(q.index);
+      }
+      if (r.outcome == Outcome::kFailed) {
+        r.failure.what += " (DuckDB answered with fewer optimizers, after an internal error)";
+      }
+    }
     switch (r.outcome) {
       case Outcome::kCompared:
         ++stats.compared;
@@ -118,7 +192,7 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
       }
       case Outcome::kRejected:
         ++stats.rejected;
-        if (stats.rejected_cases.size() < kMaxListedRejects) {
+        if (stats.rejected_cases.size() < kMaxListedCases) {
           stats.rejected_cases.push_back(q.index);
         }
         break;
@@ -156,24 +230,35 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
         "set: " +
         line + "\n";
   }
-  if (stats.rejected > 0) {
+  // "<first cases>; see one with <repro>", for a NOTE.
+  const auto listed = [&](const std::vector<uint64_t>& indexes) {
     std::string cases;
-    for (const uint64_t c : stats.rejected_cases) {
+    for (const uint64_t c : indexes) {
       cases += std::format("{}{}", cases.empty() ? "" : " ", c);
     }
-    std::string see;
     if (options.pixi_repro) {
-      see = std::format(
-          "; see one with ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY=<case> pixi run "
+      return std::format(
+          "{}; see one with ANTB1_DIFF_SEED={} ANTB1_DIFF_ONLY=<case> pixi run "
           "diff-random{}",
-          generator.seed(), options.pixi_args);
-    } else if (!options.command.empty()) {
-      see = std::format("; see one with {} --only <case>", options.command);
+          cases, generator.seed(), options.pixi_args);
     }
+    if (!options.command.empty()) {
+      return std::format("{}; see one with {} --only <case>", cases, options.command);
+    }
+    return cases;
+  };
+  if (stats.rejected > 0) {
     out += std::format(
         "antb1-slt diff: NOTE: antb1 rejected {} target-grammar quer{} with a query error instead "
-        "of Unsupported (not failures; first cases: {}{})\n",
-        stats.rejected, stats.rejected == 1 ? "y" : "ies", cases, see);
+        "of Unsupported (not failures; first cases: {})\n",
+        stats.rejected, stats.rejected == 1 ? "y" : "ies", listed(stats.rejected_cases));
+  }
+  if (stats.oracle_retried > 0) {
+    out += std::format(
+        "antb1-slt diff: NOTE: DuckDB failed {} quer{} with an internal error, a DuckDB bug, and "
+        "answered with fewer optimizers instead (first cases: {})\n",
+        stats.oracle_retried, stats.oracle_retried == 1 ? "y" : "ies",
+        listed(stats.oracle_retried_cases));
   }
   if (stats.answered_outside > 0) {
     out += std::format(

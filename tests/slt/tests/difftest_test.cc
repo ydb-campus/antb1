@@ -99,6 +99,214 @@ DiffRun Diff(const QueryGenerator& gen, const std::function<ExecResult(const std
   return r;
 }
 
+// An assertion inside DuckDB, as DuckDbEngine reports it: a DuckDB bug.
+ExecResult InternalError() {
+  return std::unexpected(EngineError{.kind = "INTERNAL Error",
+                                     .message = "INTERNAL Error: Failed to bind column reference",
+                                     .internal = true});
+}
+
+// A case DuckDB fails with an internal error asks the retries in order and is compared with the
+// first that answers; the next case asks the oracle again. Counted and listed, not a failure.
+TEST(RunDiff, AnOracleInternalErrorAsksTheRetriesInOrder) {
+  const auto gen = Generator(0);
+  int oracle_calls = 0;
+  int first_calls = 0;
+  int second_calls = 0;
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [&](const std::string& /*sql*/) {
+    ++oracle_calls;
+    return InternalError();
+  });
+  ScriptedEngine first("duckdb", [&](const std::string& /*sql*/) {
+    ++first_calls;
+    return InternalError();
+  });
+  ScriptedEngine second("duckdb", [&](const std::string& sql) {
+    ++second_calls;
+    return Oracle(sql);
+  });
+  const std::array<Engine*, 2> retries = {&first, &second};
+  std::string out;
+  const DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 20}, out, retries);
+  EXPECT_EQ(stats.failed, 0U) << out;
+  EXPECT_EQ(stats.compared, 20U);
+  EXPECT_EQ(stats.oracle_retried, 20U);
+  EXPECT_EQ(oracle_calls, 20) << "every case asks the oracle first";
+  EXPECT_EQ(first_calls, 20);
+  EXPECT_EQ(second_calls, 20);
+  EXPECT_NE(out.find("NOTE: DuckDB failed 20 queries with an internal error, a DuckDB bug, and "
+                     "answered with fewer optimizers instead (first cases: 0 1 2 3 4; see one "
+                     "with ANTB1_DIFF_SEED=42 ANTB1_DIFF_ONLY=<case> pixi run diff-random)"),
+            std::string::npos)
+      << out;
+  EXPECT_NE(out.find("DIFF: PASS seed=42 queries=20 failed=0"), std::string::npos) << out;
+}
+
+// Where no retry answers, the case fails as a DuckDB bug, never as a generator bug.
+TEST(RunDiff, AnInternalErrorNoRetryAnswersIsADuckDbBug) {
+  const auto gen = Generator(0);
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [](const std::string& /*sql*/) { return InternalError(); });
+  ScriptedEngine retry("duckdb", [](const std::string& /*sql*/) { return InternalError(); });
+  const std::array<Engine*, 1> retries = {&retry};
+  std::string out;
+  DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 3}, out, retries);
+  EXPECT_EQ(stats.failed, 3U);
+  EXPECT_EQ(stats.oracle_retried, 0U) << "no retry answered";
+  EXPECT_NE(out.find("DuckDB fails with an internal error, and its retries with fewer optimizers "
+                     "fail (a DuckDB bug, not a generator bug)"),
+            std::string::npos)
+      << out;
+  EXPECT_EQ(out.find("generator bug:"), std::string::npos) << out;
+
+  out.clear();
+  stats = RunDiff(gen, antb1, oracle, {.count = 1}, out);
+  EXPECT_EQ(stats.failed, 1U);
+  EXPECT_NE(out.find("DuckDB fails with an internal error (a DuckDB bug, not a generator bug)"),
+            std::string::npos)
+      << out;
+}
+
+// Any other DuckDB error is still a generator bug, and asks no retry.
+TEST(RunDiff, AnotherOracleErrorIsAGeneratorBugAndAsksNoRetry) {
+  const auto gen = Generator(0);
+  int retry_calls = 0;
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [](const std::string& /*sql*/) -> ExecResult {
+    return std::unexpected(
+        EngineError{.kind = "Binder Error", .message = "Binder Error: no such column"});
+  });
+  ScriptedEngine retry("duckdb", [&](const std::string& sql) {
+    ++retry_calls;
+    return Oracle(sql);
+  });
+  const std::array<Engine*, 1> retries = {&retry};
+  std::string out;
+  const DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 1}, out, retries);
+  EXPECT_EQ(stats.failed, 1U);
+  EXPECT_EQ(retry_calls, 0);
+  EXPECT_NE(out.find("DuckDB rejects the generated SQL (a generator bug"), std::string::npos)
+      << out;
+}
+
+// A database DuckDB invalidated is a DuckDB bug too, and asks the retries like an internal error.
+TEST(RunDiff, AFatalOracleErrorAsksTheRetries) {
+  const auto gen = Generator(0);
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [](const std::string& /*sql*/) -> ExecResult {
+    return std::unexpected(EngineError{
+        .kind = "FATAL Error",
+        .message = "FATAL Error: Failed: database has been invalidated because of a previous fatal "
+                   "error",
+        .internal = true});
+  });
+  ScriptedEngine retry("duckdb", Oracle);
+  const std::array<Engine*, 1> retries = {&retry};
+  std::string out;
+  const DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 3}, out, retries);
+  EXPECT_EQ(stats.failed, 0U) << out;
+  EXPECT_EQ(stats.oracle_retried, 3U);
+}
+
+// The harness's own error of the oracle (a column type it cannot read) is the generator's or the
+// harness's bug, not DuckDB's, and asks no retry.
+TEST(RunDiff, TheOraclesHarnessErrorIsNoDuckDbBug) {
+  const auto gen = Generator(0);
+  int retry_calls = 0;
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [](const std::string& /*sql*/) -> ExecResult {
+    return std::unexpected(EngineError{.kind = "harness",
+                                       .message = "harness: column 0 has a DuckDB type the "
+                                                  "canonical formatter does not support",
+                                       .internal = true});
+  });
+  ScriptedEngine retry("duckdb", [&](const std::string& sql) {
+    ++retry_calls;
+    return Oracle(sql);
+  });
+  const std::array<Engine*, 1> retries = {&retry};
+  std::string out;
+  const DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 1}, out, retries);
+  EXPECT_EQ(stats.failed, 1U);
+  EXPECT_EQ(retry_calls, 0);
+  EXPECT_NE(out.find("DuckDB rejects the generated SQL (a generator bug"), std::string::npos)
+      << out;
+  EXPECT_EQ(out.find("DuckDB bug"), std::string::npos) << out;
+}
+
+// A retry that fails otherwise (here out of memory) leaves the case a DuckDB bug, reported with the
+// internal error first and the retry's error after it.
+TEST(RunDiff, AnotherErrorOfARetryKeepsTheInternalOne) {
+  const auto gen = Generator(0);
+  ScriptedEngine antb1("antb1", GoodAntb1);
+  ScriptedEngine oracle("duckdb", [](const std::string& /*sql*/) { return InternalError(); });
+  ScriptedEngine retry("duckdb", [](const std::string& /*sql*/) -> ExecResult {
+    return std::unexpected(EngineError{.kind = "Out of Memory Error",
+                                       .message = "Out of Memory Error: could not allocate"});
+  });
+  const std::array<Engine*, 1> retries = {&retry};
+  std::string out;
+  const DiffStats stats = RunDiff(gen, antb1, oracle, {.count = 1}, out, retries);
+  EXPECT_EQ(stats.failed, 1U);
+  EXPECT_EQ(stats.oracle_retried, 0U);
+  const std::size_t internal = out.find("INTERNAL Error: Failed to bind column reference");
+  const std::size_t last = out.find("the last retry: Out of Memory Error: could not allocate");
+  EXPECT_NE(out.find("DuckDB fails with an internal error, and its retries"), std::string::npos)
+      << out;
+  ASSERT_NE(internal, std::string::npos) << out;
+  ASSERT_NE(last, std::string::npos) << out;
+  EXPECT_LT(internal, last);
+  EXPECT_EQ(out.find("generator bug:"), std::string::npos) << out;
+}
+
+// The retry that answered a case answers the comparison's further queries too: a LIMIT without
+// ORDER BY whose rows differ from DuckDB's is compared with the unlimited query's rows, which the
+// retry gives, while the oracle that failed is asked only the case's first query. A case whose rows
+// are wrong says that a retry answered it.
+TEST(RunDiff, TheRetryThatAnsweredAnswersTheFurtherQueries) {
+  const FeatureSet limited = {Feature::kColumns, Feature::kIntegerColumns, Feature::kTableName,
+                              Feature::kLimit};
+  auto gen = QueryGenerator::Make(Tables(), 7, {.supported = limited, .target_percent = 0});
+  ASSERT_TRUE(gen.has_value()) << gen.error();
+  int oracle_calls = 0;
+  int retry_calls = 0;
+  int limits = 0;
+  ScriptedEngine oracle("duckdb", [&](const std::string& /*sql*/) {
+    ++oracle_calls;
+    return InternalError();
+  });
+  // One row of the three under a LIMIT, all three without one.
+  ScriptedEngine retry("duckdb", [&](const std::string& sql) {
+    ++retry_calls;
+    return ExecResult(sql.contains("LIMIT") ? Ints({"1"}) : Ints({"1", "2", "3"}));
+  });
+  const std::array<Engine*, 1> retries = {&retry};
+  const auto run = [&](std::string antb1_row) {
+    oracle_calls = 0;
+    retry_calls = 0;
+    limits = 0;
+    ScriptedEngine antb1("antb1", [&](const std::string& sql) {
+      const bool limit = sql.contains("LIMIT");
+      limits += limit ? 1 : 0;
+      return ExecResult(limit ? Ints({antb1_row}) : Ints({"1", "2", "3"}));
+    });
+    DiffRun r;
+    r.stats = RunDiff(*gen, antb1, oracle, {.count = 40}, r.out, retries);
+    return r;
+  };
+  DiffRun r = run("2");
+  EXPECT_EQ(r.stats.failed, 0U) << r.out;
+  EXPECT_GT(limits, 0) << "the generator writes LIMIT";
+  EXPECT_EQ(oracle_calls, 40);
+  EXPECT_EQ(retry_calls, 40 + limits) << "each LIMIT's unlimited query goes to the retry";
+  r = run("9");
+  EXPECT_EQ(r.stats.failed, static_cast<uint64_t>(limits)) << r.out;
+  EXPECT_NE(r.out.find(" (DuckDB answered with fewer optimizers, after an internal error)"),
+            std::string::npos)
+      << r.out;
+}
+
 TEST(RunDiff, AgreeingEnginesPassAndUnsupportedTargetQueriesAreCounted) {
   const auto gen = Generator(40);
   const DiffRun r = Diff(gen, GoodAntb1, Oracle, {.count = 300});

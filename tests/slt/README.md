@@ -134,6 +134,8 @@ off, and a locked configuration. With the optimizer on, DuckDB 1.5.5 and 1.5.6 f
 queries with an internal error (`where/pushdown.slt`). With it off, DuckDB computes the select list of a
 small `ORDER BY ... LIMIT` for every row the `WHERE` keeps, as antb1 does, so an overflow there fails in both
 engines; only the order of tied rows at the edge of a `LIMIT` can differ, and every comparison accepts that.
+After an internal error the oracle opens its database again, with the same setup: DuckDB invalidates a database
+whose query fails with one while it runs.
 Its memory limit is DuckDB's default (80% of the host's memory) unless a run sets one (`--oracle-memory-limit` of
 `tpch` and `tpcds`); beyond it DuckDB spills to the temp dir.
 A record runs one statement, and only `SELECT`, `EXPLAIN`, `SET` or `LOAD`: the oracle refuses anything else
@@ -175,7 +177,12 @@ ClickBench runner check the same way (`CompareQueryAnswers`). The column types m
   only (divergence D11 in `docs/sql-subset.md`), no clickbench-typed column with `FROM '<path>'`, a DECIMAL compared
   only where DuckDB's common type keeps 38 digits (divergence D13), a DECIMAL `CASE` value only where its cast to the
   `CASE` type cannot fail, a star's qualifier only where rule 1 of ADR 0022 names the FROM item so), so a DuckDB
-  error is a generator bug and fails.
+  error is a generator bug and fails. An internal error (`INTERNAL Error`, an assertion inside DuckDB, or the
+  `FATAL Error` of a database DuckDB invalidated after one) is a DuckDB bug instead: the case asks DuckDB again
+  without its `join_order` optimizer, then with `filter_pushdown` alone (which still makes a comma join's equalities
+  hash joins), and is compared with the first answer, which also answers the comparison's further queries. DuckDB
+  1.5.6 needs that for some joins of three tables with an `OR` across two of them under a `GROUP BY` (a nightly run
+  of 2026-11-02). Such cases are counted in a `NOTE`; one that no retry answers fails as a DuckDB bug.
 - A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and the repro.
 
 ```bash

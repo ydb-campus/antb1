@@ -31,7 +31,13 @@ struct DuckDbEngine::Handles {
   Handles& operator=(const Handles&) = delete;
   Handles(Handles&&) = delete;
   Handles& operator=(Handles&&) = delete;
-  ~Handles() {
+  ~Handles() { Close(); }
+
+  // Opens an in-memory database with `options` and connects to it.
+  std::expected<void, std::string> Connect();
+  // Runs `setup` on the connection, in order.
+  std::expected<void, std::string> RunSetup();
+  void Close() {
     if (conn != nullptr) {
       duckdb_disconnect(&conn);
     }
@@ -42,6 +48,9 @@ struct DuckDbEngine::Handles {
 
   duckdb_database db = nullptr;
   duckdb_connection conn = nullptr;
+  // What Make opened the database with, kept to open it again after an internal error.
+  std::vector<std::pair<std::string, std::string>> options;
+  std::vector<std::string> setup;
 };
 
 namespace {
@@ -455,6 +464,42 @@ ExecResult Query(duckdb_connection conn, const std::string& sql) {
 
 }  // namespace
 
+std::expected<void, std::string> DuckDbEngine::Handles::Connect() {
+  Close();
+  duckdb_config config = nullptr;
+  if (duckdb_create_config(&config) == DuckDBError) {
+    return std::unexpected("duckdb: cannot create a config");
+  }
+  for (const auto& [key, value] : options) {
+    if (duckdb_set_config(config, key.c_str(), value.c_str()) == DuckDBError) {
+      duckdb_destroy_config(&config);
+      return std::unexpected(std::format("duckdb: cannot set {}={}", key, value));
+    }
+  }
+  char* open_error = nullptr;
+  const duckdb_state opened = duckdb_open_ext(nullptr, &db, config, &open_error);
+  duckdb_destroy_config(&config);
+  if (opened == DuckDBError) {
+    std::string message = open_error != nullptr ? open_error : "unknown error";
+    duckdb_free(open_error);
+    return std::unexpected("duckdb: cannot open an in-memory database: " + message);
+  }
+  if (duckdb_connect(db, &conn) == DuckDBError) {
+    return std::unexpected("duckdb: cannot connect");
+  }
+  return {};
+}
+
+std::expected<void, std::string> DuckDbEngine::Handles::RunSetup() {
+  for (const auto& sql : setup) {
+    if (auto result = Query(conn, sql); !result) {
+      return std::unexpected(
+          std::format("duckdb setup failed: {}\n  {}", result.error().message, sql));
+    }
+  }
+  return {};
+}
+
 DuckDbEngine::DuckDbEngine(std::unique_ptr<Handles> handles) : handles_(std::move(handles)) {}
 
 DuckDbEngine::~DuckDbEngine() = default;
@@ -463,7 +508,7 @@ std::string DuckDbEngine::Version() { return duckdb_library_version(); }
 
 std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
     const std::vector<TableDef>& tables, const fs::path& fixtures_dir, const fs::path& temp_dir,
-    std::optional<int64_t> memory_limit) {
+    std::optional<int64_t> memory_limit, Optimizers optimizers) {
   if (memory_limit.has_value() && *memory_limit < 1) {
     return std::unexpected(
         std::format("duckdb: the memory limit must be at least 1 byte, not {}", *memory_limit));
@@ -474,35 +519,17 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   const std::string temp = fs::absolute(temp_dir, ec).lexically_normal().string();
 
   auto handles = std::make_unique<Handles>();
-  duckdb_config config = nullptr;
-  if (duckdb_create_config(&config) == DuckDBError) {
-    return std::unexpected("duckdb: cannot create a config");
-  }
-  std::vector<std::pair<std::string, std::string>> options = {
+  handles->options = {
       {"threads", "1"},
       {"autoinstall_known_extensions", "false"},
       {"autoload_known_extensions", "false"},
       {"temp_directory", temp},
   };
   if (memory_limit.has_value()) {
-    options.emplace_back("memory_limit", std::format("{}B", *memory_limit));  // bytes
+    handles->options.emplace_back("memory_limit", std::format("{}B", *memory_limit));  // bytes
   }
-  for (const auto& [key, value] : options) {
-    if (duckdb_set_config(config, key.c_str(), value.c_str()) == DuckDBError) {
-      duckdb_destroy_config(&config);
-      return std::unexpected(std::format("duckdb: cannot set {}={}", key, value));
-    }
-  }
-  char* open_error = nullptr;
-  const duckdb_state opened = duckdb_open_ext(nullptr, &handles->db, config, &open_error);
-  duckdb_destroy_config(&config);
-  if (opened == DuckDBError) {
-    std::string message = open_error != nullptr ? open_error : "unknown error";
-    duckdb_free(open_error);
-    return std::unexpected("duckdb: cannot open an in-memory database: " + message);
-  }
-  if (duckdb_connect(handles->db, &handles->conn) == DuckDBError) {
-    return std::unexpected("duckdb: cannot connect");
+  if (auto connected = handles->Connect(); !connected) {
+    return std::unexpected(connected.error());
   }
   // File access: the fixtures, the temp directory and the directories of the table files (the
   // ClickBench data directory in the data tests), nothing else. DuckDB checks the resolved path of
@@ -527,7 +554,8 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   for (const auto& dir : allowed) {
     allowed_list += (allowed_list.empty() ? "" : ", ") + SqlString(dir);
   }
-  std::vector<std::string> setup = {
+  std::vector<std::string>& setup = handles->setup;
+  setup = {
       "SET binary_as_string = true",
       std::format("SET allowed_directories = [{}]", allowed_list),
       "SET enable_external_access = false",
@@ -550,18 +578,79 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   // computes the select list of a small ORDER BY ... LIMIT for every row WHERE keeps, as antb1 does
   // (an overflow there fails in both engines), and only the order of tied rows at the edge of a
   // LIMIT can differ, which every comparison accepts.
-  setup.emplace_back("SET disabled_optimizers = 'late_materialization'");
-  setup.emplace_back("SET lock_configuration = true");
-  for (const auto& sql : setup) {
-    if (auto result = Query(handles->conn, sql); !result) {
-      return std::unexpected(
-          std::format("duckdb setup failed: {}\n  {}", result.error().message, sql));
+  //
+  // DuckDB 1.5.6 also fails some joins of three tables with an OR across two of them under a GROUP
+  // BY, with `INTERNAL Error: Failed to bind column reference` (a nightly differential test of
+  // 2026-11-02), unless its join_order optimizer is off. The differential test asks such a query
+  // again of the oracles MakeRetries makes (difftest.h).
+  std::string disabled = "late_materialization";
+  switch (optimizers) {
+    case Optimizers::kAll:
+      break;
+    case Optimizers::kNoJoinOrder:
+      disabled += ",join_order";
+      break;
+    case Optimizers::kFilterPushdownOnly: {
+      const ExecResult names = Query(handles->conn,
+                                     "SELECT string_agg(name, ',' ORDER BY name) FROM "
+                                     "duckdb_optimizers() WHERE name <> 'filter_pushdown'");
+      if (!names.has_value()) {
+        return std::unexpected("duckdb: cannot list its optimizers: " + names.error().message);
+      }
+      const std::optional<std::string> list =
+          names->rows.size() == 1 && names->rows[0].size() == 1 ? names->rows[0][0] : std::nullopt;
+      if (!list.has_value()) {
+        return std::unexpected(std::string("duckdb: cannot list its optimizers"));
+      }
+      disabled = *list;
+      break;
     }
+  }
+  setup.push_back(std::format("SET disabled_optimizers = {}", SqlString(disabled)));
+  setup.emplace_back("SET lock_configuration = true");
+  if (auto ran = handles->RunSetup(); !ran) {
+    return std::unexpected(ran.error());
   }
   return std::unique_ptr<DuckDbEngine>(new DuckDbEngine(std::move(handles)));
 }
 
+std::expected<std::vector<std::unique_ptr<DuckDbEngine>>, std::string> DuckDbEngine::MakeRetries(
+    const std::vector<TableDef>& tables, const fs::path& fixtures_dir, const fs::path& temp_dir,
+    std::optional<int64_t> memory_limit) {
+  std::vector<std::unique_ptr<DuckDbEngine>> out;
+  for (const auto& [optimizers, dir] :
+       {std::pair{Optimizers::kNoJoinOrder, "retry-without-join-order"},
+        std::pair{Optimizers::kFilterPushdownOnly, "retry-with-filter-pushdown-only"}}) {
+    auto engine = Make(tables, fixtures_dir, temp_dir / dir, memory_limit, optimizers);
+    if (!engine) {
+      return std::unexpected(engine.error());
+    }
+    out.push_back(*std::move(engine));
+  }
+  return out;
+}
+
 ExecResult DuckDbEngine::Execute(const std::string& sql) {
+  ExecResult result = Run(sql);
+  if (!result.has_value() && IsDuckDbInternalError(result.error())) {
+    if (auto connected = handles_->Connect(); !connected) {
+      result.error().message += "\n  and the database cannot be opened again: " + connected.error();
+    } else if (auto ran = handles_->RunSetup(); !ran) {
+      handles_->Close();
+      result.error().message += "\n  and the database cannot be opened again: " + ran.error();
+    }
+  }
+  return result;
+}
+
+ExecResult DuckDbEngine::Run(const std::string& sql) {
+  if (handles_->conn == nullptr) {
+    return std::unexpected(EngineError{
+        .kind = "harness",
+        .message = "harness: the database could not be opened again after an internal error",
+        .unsupported = false,
+        .internal = true});
+  }
   ExtractedStatements statements;
   const idx_t count = duckdb_extract_statements(handles_->conn, sql.c_str(), statements.out());
   if (count == 0) {

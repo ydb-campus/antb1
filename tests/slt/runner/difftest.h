@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,12 @@
 //     (the engine type names, e.g. HUGEINT vs BIGINT or DECIMAL(15,2) vs DECIMAL(16,2), not only
 //     I/R/D/T) or different results: a failure. The generator only writes SQL that DuckDB
 //     accepts, so the oracle runs every query, also those antb1 does not support (a DuckDB error
-//     is a generator bug).
+//     is a generator bug);
+//   - but a DuckDB internal error ("INTERNAL Error", an assertion inside DuckDB) is a DuckDB bug:
+//     the case asks the `oracle_retries` instead, in order, each running fewer of DuckDB's
+//     optimizers (DuckDbEngine::Optimizers), and is compared with the first that answers, which
+//     also answers the comparison's further queries. Such a case is counted and listed in a NOTE;
+//     if no retry answers, it fails as a DuckDB bug, as any other DuckDB internal error does.
 // A failure prints the seed, the case index, the features, the SQL, at most 5 differing rows and
 // the repro: `ANTB1_DIFF_SEED=<seed> ANTB1_DIFF_ONLY=<index> pixi run diff-random` over the tables
 // of that task, and the command line with `--only <index>`. With `redact` it prints no SQL and no
@@ -57,14 +63,18 @@ struct DiffStats {
   uint64_t answered_outside = 0;  // compared queries that use features outside the supported set
   uint64_t rejected = 0;          // antb1 query errors (not Unsupported) outside the supported set
   std::vector<uint64_t> rejected_cases;  // the first few indexes, for the summary
+  uint64_t oracle_retried = 0;           // cases a retry answered, after a DuckDB internal error
+  std::vector<uint64_t> oracle_retried_cases;  // the first few indexes, for the summary
   uint64_t failed = 0;
   // For every Unsupported answer: +1 for each of its features outside the supported set.
   std::array<uint64_t, kFeatureCount> unsupported_by_feature{};
 };
 
 // Runs the queries [0, options.count), or just options.only, and appends the report (failures and
-// summary lines, ending with "DIFF: PASS|FAIL ...") to `out`.
+// summary lines, ending with "DIFF: PASS|FAIL ...") to `out`. `oracle_retries` answer, in order, a
+// case `oracle` fails with an internal error.
 DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle,
-                  const DiffOptions& options, std::string& out);
+                  const DiffOptions& options, std::string& out,
+                  std::span<Engine* const> oracle_retries = {});
 
 }  // namespace antb1::slt
