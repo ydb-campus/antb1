@@ -884,6 +884,12 @@ TEST(JoinOrderTest, PredicateRowsFromTheDefaultFactors) {
   const Predicate not_null{.kind = Predicate::Kind::kIsNotNull, .column = BoundColumn{}};
   EXPECT_EQ(PredicateRows(100, not_null, ColumnRange{.non_null = 60, .exact = true}, 100), 60);
   EXPECT_EQ(PredicateRows(100, not_null, none, std::nullopt), 90);
+  // IS NULL is its complement: the NULL rows when the null count is exact.
+  const Predicate is_null{.kind = Predicate::Kind::kIsNull, .column = BoundColumn{}};
+  EXPECT_EQ(PredicateRows(100, is_null, ColumnRange{.non_null = 60, .exact = true}, 100), 40);
+  EXPECT_EQ(PredicateRows(100, is_null, none, std::nullopt), 10);
+  // Rows another conjunct cut below the table's non-NULL count still keep one row, never none.
+  EXPECT_EQ(PredicateRows(40, is_null, ColumnRange{.non_null = 60, .exact = true}, 100), 1);
   // A folded conjunct that is true for no row keeps none, whatever the statistics say.
   EXPECT_EQ(PredicateRows(100, Predicate{.kind = Predicate::Kind::kFalse}, Hundred(), 100), 0);
 }

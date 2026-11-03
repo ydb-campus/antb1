@@ -80,7 +80,6 @@ BIGINT
 585
 
 # The bookings no promotion matches (IS NULL, NL4).
-pending NL4
 query I nosort
 SELECT COUNT(*) FROM bookings LEFT JOIN promos ON bk_promo = pm_id WHERE pm_id IS NULL
 ----

@@ -432,6 +432,9 @@ struct ExprNameOf {
                                          ExprName(*between.low), ExprName(*between.high));
     return between.negated ? "(NOT " + name + ")" : name;
   }
+  std::string operator()(const sql::IsNullExpr& is_null) const {
+    return std::format("({} IS {}NULL)", ExprName(*is_null.operand), is_null.negated ? "NOT " : "");
+  }
   std::string operator()(const sql::FunctionCall& call) const {
     std::string args;
     for (const sql::Expr& arg : call.args) {
@@ -554,6 +557,9 @@ struct ReadsColumnOf {
     return ReadsColumn(*between.operand, aggregates) || ReadsColumn(*between.low, aggregates) ||
            ReadsColumn(*between.high, aggregates);
   }
+  bool operator()(const sql::IsNullExpr& is_null) const {
+    return ReadsColumn(*is_null.operand, aggregates);
+  }
   bool operator()(const sql::FunctionCall& call) const {
     return std::ranges::any_of(call.args,
                                [this](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
@@ -616,6 +622,7 @@ struct CollectRefsOf {
     CollectRefs(*between.low, out);
     CollectRefs(*between.high, out);
   }
+  void operator()(const sql::IsNullExpr& is_null) const { CollectRefs(*is_null.operand, out); }
   void operator()(const sql::FunctionCall& call) const {
     for (const sql::Expr& arg : call.args) {
       CollectRefs(arg, out);
@@ -732,6 +739,14 @@ struct FirstUnsupportedOf {
       return r;
     }
     return Rejection{.span = between.op_span, .message = std::string("BETWEEN") + kConditionsOnly};
+  }
+  std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
+    if (auto r = FirstUnsupported(*is_null.operand)) {
+      return r;
+    }
+    return Rejection{
+        .span = is_null.op_span,
+        .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     const std::optional<FunctionSpec> spec = FindFunction(call);
@@ -1067,6 +1082,10 @@ struct RejectConditionOf {
       }
     }
     return std::nullopt;
+  }
+  // Of any value: a condition as the operand is refused as a value is ((a = 1) IS NULL).
+  std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
+    return FirstUnsupported(*is_null.operand);
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& /*call*/) const {
     return NotACondition(kThisCondition);
@@ -1701,6 +1720,9 @@ struct ContainsAggregateOf {
   bool operator()(const sql::BetweenExpr& between) const {
     return ContainsAggregate(*between.operand) || ContainsAggregate(*between.low) ||
            ContainsAggregate(*between.high);
+  }
+  bool operator()(const sql::IsNullExpr& is_null) const {
+    return ContainsAggregate(*is_null.operand);
   }
   bool operator()(const sql::FunctionCall& call) const {
     return std::ranges::any_of(call.args, ContainsAggregate);
@@ -2469,6 +2491,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::BetweenExpr& /*between*/) const {
       ConditionAsOperand();
     }
+    arrow::Result<Typed> operator()(const sql::IsNullExpr& /*is_null*/) const {
+      ConditionAsOperand();
+    }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
       return binder.BindFunction(call, [this](const sql::Expr& e) { return binder.BindInput(e); });
     }
@@ -2829,6 +2854,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::LikeExpr& /*like*/) const { ConditionAsOperand(); }
     arrow::Result<Typed> operator()(const sql::InExpr& /*in*/) const { ConditionAsOperand(); }
     arrow::Result<Typed> operator()(const sql::BetweenExpr& /*between*/) const {
+      ConditionAsOperand();
+    }
+    arrow::Result<Typed> operator()(const sql::IsNullExpr& /*is_null*/) const {
       ConditionAsOperand();
     }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
@@ -3672,6 +3700,18 @@ struct Binder::BindConditionOf {
   arrow::Result<Predicate> operator()(const sql::BetweenExpr& /*between*/) const {
     NotAConditionLeaf();
   }
+  // operand IS NULL as kIsNull, true or false; IS NOT NULL as a conjunct as kIsNotNull, which a
+  // filter evaluates exactly (BindBool binds a nested one as NOT IS NULL, ADR 0037's NL4).
+  arrow::Result<Predicate> operator()(const sql::IsNullExpr& is_null) const {
+    ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*is_null.operand));
+    if (is_null.negated && nested) {
+      return arrow::Status::Invalid("a nested IS NOT NULL binds as NOT IS NULL");
+    }
+    return Predicate{
+        .kind = is_null.negated ? Predicate::Kind::kIsNotNull : Predicate::Kind::kIsNull,
+        .column = column_of(operand),
+        .span = is_null.span};
+  }
   arrow::Result<Predicate> operator()(const sql::FunctionCall& /*call*/) const {
     NotAConditionLeaf();
   }
@@ -3833,6 +3873,17 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNot) {
     ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(*unary->operand, bind, input));
+    return Leaf(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(arg.expr)}},
+                     .type = LogicalType::kBoolean,
+                     .name = ExprName(expr)});
+  }
+  if (const auto* is_null = std::get_if<sql::IsNullExpr>(&expr);
+      is_null != nullptr && is_null->negated) {
+    // IS NOT NULL inside an expression is NOT (IS NULL): false for NULL, where the folded
+    // kIsNotNull of a filter would be NULL (ADR 0037's NL4).
+    sql::IsNullExpr positive = *is_null;
+    positive.negated = false;
+    ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(sql::Expr(std::move(positive)), bind, input));
     return Leaf(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(arg.expr)}},
                      .type = LogicalType::kBoolean,
                      .name = ExprName(expr)});
@@ -5859,6 +5910,7 @@ struct FoldDateCastsOf {
     FoldDateCasts(*between.low);
     FoldDateCasts(*between.high);
   }
+  void operator()(sql::IsNullExpr& is_null) const { FoldDateCasts(*is_null.operand); }
   // Into its block too, although CheckSupported refuses the form right after: an unfolded cast
   // inside a block is a programming error for whoever answers it, so J5 inherits none.
   void operator()(sql::SubqueryExpr& s) const {

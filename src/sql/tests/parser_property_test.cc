@@ -165,6 +165,7 @@ struct CountOf {
     CountAll(in.list, sql, c);
   }
   // BETWEEN's own AND is an AND token.
+  void operator()(const IsNullExpr& is_null) const { Count(*is_null.operand, sql, c); }
   void operator()(const BetweenExpr& between) const {
     ++c.and_count;
     Count(*between.operand, sql, c);

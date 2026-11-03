@@ -246,6 +246,8 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
     }
     case plan::Predicate::Kind::kIsTrue:
       return column;
+    case plan::Predicate::Kind::kIsNull:  // two-valued, in a filter and in an expression alike
+      return arrow::compute::CallFunction("is_null", {column}, &kernels);
     case plan::Predicate::Kind::kIsNotNull:
     case plan::Predicate::Kind::kFalse: {
       ARROW_ASSIGN_OR_RAISE(arrow::Datum valid,

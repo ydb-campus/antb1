@@ -1,0 +1,173 @@
+# IS NULL and IS NOT NULL (ADR 0037's NL4, docs/sql-subset.md): true or false, never NULL, over any value; a
+# comparison-level operator, so `x + 1 IS NULL` tests the sum and `NOT x IS NULL` negates the test. In WHERE, under OR
+# and NOT, in CASE WHEN and in HAVING; after a LEFT JOIN it keeps the rows the join pads (an anti join).
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent IS NULL
+----
+BIGINT
+5
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent IS NOT NULL
+----
+BIGINT
+35
+
+query I rowsort
+SELECT zn_id FROM zones WHERE zn_parent IS NULL OR zn_id = 1
+----
+INTEGER
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT zn_id FROM zones WHERE NOT (zn_parent IS NOT NULL) AND zn_city <> 9
+----
+INTEGER
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT zn_id FROM zones WHERE NOT zn_parent IS NULL AND zn_parent + 1 > 4
+----
+INTEGER
+10
+14
+15
+19
+20
+24
+25
+29
+30
+34
+35
+39
+40
+9
+
+query II nosort
+SELECT COUNT(*), SUM(CASE WHEN tr_day IS NULL THEN 1 ELSE 0 END) FROM trips
+----
+BIGINT	HUGEINT
+3000	81
+
+query II nosort
+SELECT zn_city, COUNT(CASE WHEN zn_parent IS NOT NULL THEN 1 END) FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	7
+2	7
+3	6
+4	6
+5	7
+9	1
+NULL	1
+
+query ID nosort
+SELECT id, CASE WHEN d9_2 IS NULL THEN 0 ELSE d9_2 END FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(12,2)
+0	-6.25
+1	9999999.99
+2	-9999999.99
+3	0.00
+4	0.00
+5	5.00
+6	-3.75
+7	1.25
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE d9_2 * 2 IS NULL
+----
+BIGINT
+6
+
+query T rowsort
+SELECT label FROM zones WHERE label IS NOT NULL AND zn_id <= 3
+----
+VARCHAR
+center
+north
+south
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING MAX(zn_parent) IS NULL OR zn_city = 1
+----
+SMALLINT	BIGINT
+1	8
+
+query II rowsort
+SELECT ct_id, COUNT(zn_id) FROM cities LEFT JOIN zones ON ct_id = zn_city WHERE zn_id IS NULL GROUP BY ct_id
+----
+SMALLINT	BIGINT
+6	0
+
+query I nosort
+SELECT COUNT(*) FROM trips LEFT JOIN zones ON tr_pickup = zn_id WHERE zn_id IS NULL AND tr_row < 1000
+----
+BIGINT
+69
+
+# In a LEFT JOIN's ON: a condition on the null-supplying side alone filters that side below the join; one over both
+# sides is a residual of the join. Either way the preserved side keeps every row.
+
+query II rowsort
+SELECT ct_id, COUNT(zn_id) FROM cities LEFT JOIN zones ON ct_id = zn_city AND zn_parent IS NULL GROUP BY ct_id
+----
+SMALLINT	BIGINT
+1	1
+2	1
+3	1
+4	1
+5	1
+6	0
+
+query II rowsort
+SELECT ct_id, COUNT(zn_id) FROM cities LEFT JOIN zones ON ct_id = zn_city AND zn_parent IS NOT NULL GROUP BY ct_id
+----
+SMALLINT	BIGINT
+1	7
+2	7
+3	6
+4	6
+5	7
+6	0
+
+query II rowsort
+SELECT ct_id, COUNT(zn_id) FROM cities LEFT JOIN zones ON ct_id = zn_city AND (zn_parent IS NULL OR ct_id > 4) GROUP BY ct_id
+----
+SMALLINT	BIGINT
+1	1
+2	1
+3	1
+4	1
+5	8
+6	0
+
+# Over a UNION ALL whose blocks write NULL or another constant, a WHERE above it rules blocks out by IS [NOT] NULL.
+
+query II rowsort
+SELECT u, COUNT(*) FROM (SELECT zn_parent AS u FROM zones UNION ALL SELECT NULL FROM cities UNION ALL SELECT 7 FROM cities) AS q WHERE u IS NULL GROUP BY u
+----
+INTEGER	BIGINT
+NULL	11
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT zn_parent AS u FROM zones UNION ALL SELECT NULL FROM cities UNION ALL SELECT 7 FROM cities) AS q WHERE u IS NOT NULL
+----
+BIGINT
+41
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT zn_parent AS u FROM zones UNION ALL SELECT NULL FROM cities UNION ALL SELECT 7 FROM cities) AS q WHERE NOT (u IS NOT NULL) OR u = 7
+----
+BIGINT
+17

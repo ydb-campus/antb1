@@ -798,6 +798,11 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
       return 0;
     case Predicate::Kind::kIsNotNull:
       return range.exact ? std::min(rows, range.non_null) : scaled(kNotNullDefault, kDefaultScale);
+    case Predicate::Kind::kIsNull:
+      // The complement of IS NOT NULL, never none: `rows` may already be cut by other conjuncts,
+      // while the null count is the whole table's.
+      return range.exact ? complement(std::min(rows, range.non_null))
+                         : scaled(kDefaultScale - kNotNullDefault, kDefaultScale);
     case Predicate::Kind::kCompare: {
       switch (predicate.op) {
         case CompareOp::kEq:

@@ -1448,6 +1448,44 @@ TEST(BinderTest, UnionAllNullItems) {
       << all_null.status().ToString();
 }
 
+// IS NULL (ADR 0037's NL4) binds as kIsNull wherever it is; IS NOT NULL as a WHERE conjunct as
+// the folded kIsNotNull, which a filter evaluates alike, and inside an expression as NOT (IS
+// NULL), which is false for NULL. A condition as the operand is refused as a value, and so is IS
+// NULL outside a condition.
+TEST(BinderTest, IsNullAndIsNotNull) {
+  const Catalog catalog = MakeCatalog();
+  const auto explain = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  EXPECT_TRUE(explain("SELECT i16 FROM t WHERE s IS NULL").contains("Filter s IS NULL"));
+  EXPECT_TRUE(explain("SELECT i16 FROM t WHERE s IS NOT NULL").contains("Filter s IS NOT NULL"));
+  EXPECT_TRUE(
+      explain("SELECT i16 FROM t WHERE i32 + 1 IS NULL").contains("Filter \"(i32 + 1)\" IS NULL"));
+  EXPECT_TRUE(explain("SELECT i16 FROM t WHERE i16 = 1 OR s IS NOT NULL")
+                  .contains("((i16 = 1) OR (s IS NOT NULL))"));
+
+  auto named = BindSql(
+      "SELECT CASE WHEN s IS NOT NULL THEN 1 ELSE 0 END AS a, SUM(CASE WHEN dt IS NULL THEN 1 END) "
+      "FROM t GROUP BY 1",
+      catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[1].name, "sum(CASE  WHEN ((dt IS NULL)) THEN (1) ELSE NULL END)");
+
+  for (const std::string_view sql : {
+           "SELECT s IS NULL FROM t",
+           "SELECT i16 FROM t WHERE (i16 = 1) IS NULL",
+       }) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported)
+        << sql << ": " << plan.status().ToString();
+  }
+}
+
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first
 // block's and its ids new; a block whose column is of another type is cast below it, once, to the
 // union's type -- and only such a block.
