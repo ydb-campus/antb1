@@ -261,7 +261,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -537,19 +537,19 @@ INSTANTIATE_TEST_SUITE_P(
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
                   "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
                   "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC and SUBSTRING)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -1483,6 +1483,69 @@ TEST(BinderTest, IsNullAndIsNotNull) {
     ASSERT_NE(detail, nullptr) << sql;
     EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported)
         << sql << ": " << plan.status().ToString();
+  }
+}
+
+// COALESCE (ADR 0037's NL5) types its arguments as CASE's values, folded from the first through
+// the rest in written order, as DuckDB does: an integer literal takes the others' integer type when
+// it fits, and with a DECIMAL the order of the arguments can change the type. DuckDB names it in
+// upper case; a mix CASE refuses is refused here too, naming COALESCE.
+TEST(BinderTest, CoalesceTypesItsArgumentsAsCaseDoes) {
+  const Catalog catalog = MakeCatalog();
+  const auto dec = [](int width, int scale) {
+    return LogicalType::Decimal(static_cast<std::uint8_t>(width), static_cast<std::uint8_t>(scale));
+  };
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT COALESCE(s16, 7) FROM dec", LogicalType::kSmallInt},
+           {"SELECT COALESCE(7, s16) FROM dec", LogicalType::kSmallInt},
+           {"SELECT COALESCE(s16, 70000) FROM dec", LogicalType::kInteger},
+           {"SELECT COALESCE(r, 7) FROM dec", dec(14, 4)},
+           {"SELECT COALESCE(u16, s16, r) FROM dec", dec(14, 4)},
+           {"SELECT COALESCE(r, u16, s16) FROM dec", dec(9, 4)},
+           {"SELECT COALESCE(r, s16, 7) FROM dec", dec(14, 4)},
+           {"SELECT COALESCE(7, s16, r) FROM dec", dec(9, 4)},
+           {"SELECT COALESCE(i32) FROM t", LogicalType::kInteger},
+           {"SELECT coalesce(s, 'x') FROM t", LogicalType::kVarchar},
+           {"SELECT COALESCE(dt, '2020-01-01') FROM t", LogicalType::kDate},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(ToString(plan->output[0].type), ToString(type)) << sql;
+  }
+  auto named =
+      BindSql("SELECT coalesce(i32 + 1, i16), SUM(CoAlEsCe(i64, 0)) FROM t GROUP BY 1", catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[0].name, "COALESCE((i32 + 1), i16)");
+  EXPECT_EQ(named->output[1].name, "sum(COALESCE(i64, 0))");
+  // Each argument is in the plan once: a COALESCE nested 60 deep binds at once, to one branch a
+  // level (each argument read twice would double the tree at every level).
+  std::string nested = "i32";
+  for (int i = 0; i < 60; ++i) {
+    nested = std::format("COALESCE({}, i16)", nested);
+  }
+  auto deep = BindSql("SELECT " + nested + " FROM t", catalog);
+  ASSERT_TRUE(deep.ok()) << deep.status().ToString();
+  EXPECT_EQ(deep->output[0].type, LogicalType::kInteger);
+  for (const auto& [sql, kind, message] :
+       std::to_array<std::tuple<std::string_view, SqlErrorDetail::Kind, std::string_view>>({
+           {"SELECT COALESCE(s, i16) FROM t", SqlErrorDetail::Kind::kBind,
+            "cannot mix values of type VARCHAR and SMALLINT in COALESCE"},
+           {"SELECT COALESCE(i16, 'x') FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "a string literal as a COALESCE argument next to SMALLINT values"},
+           {"SELECT COALESCE(dt, TIMESTAMP '2020-01-01 10:00:00') FROM t",
+            SqlErrorDetail::Kind::kUnsupported,
+            "COALESCE values of types DATE and TIMESTAMP are not supported"},
+           {"SELECT COALESCE() FROM t", SqlErrorDetail::Kind::kBind,
+            "COALESCE() takes at least 1 argument"},
+           {"SELECT \"coalesce\"(i16, 0) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "function coalesce() is not supported"},
+       })) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), kind) << sql << ": " << plan.status().ToString();
+    EXPECT_TRUE(plan.status().message().contains(message)) << plan.status().ToString();
   }
 }
 

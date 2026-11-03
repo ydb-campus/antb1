@@ -238,8 +238,10 @@ struct BoolExpr {
 // true (a NULL condition is not), else `otherwise` (NULL when it is null). The values keep their
 // own types; the executor casts each to the expression's type on the rows that take it (to a
 // DECIMAL as DuckDB casts, rounded half away from zero, ADR 0021 rule 10).
+// A null condition is COALESCE's (ADR 0037's NL5): the branch takes the rows where its value is
+// not NULL, computed once for the condition and the value.
 struct CaseExpr {
-  std::vector<ExprPtr> whens;  // BOOLEAN
+  std::vector<ExprPtr> whens;  // BOOLEAN; null: the value IS NOT NULL
   std::vector<ExprPtr> thens;  // as many as whens; null: NULL (THEN NULL)
   ExprPtr otherwise;           // may be null: NULL
 };

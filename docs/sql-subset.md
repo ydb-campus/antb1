@@ -18,7 +18,8 @@ integer arithmetic folded on a side and in an `IN` list), `GROUP BY` and `ORDER 
 DECIMAL, the string
 functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `toDateTime`, `EXTRACT` and
 `date_trunc`, and
-`CASE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`, `'2013-07-01'::DATE`,
+`CASE` and `COALESCE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`,
+`'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
 outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not, and `UNION ALL` of two or more blocks. This
 covers all 43 ClickBench queries (see
@@ -282,8 +283,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
   `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`,
   `substring(varchar, start[, length])`, `toDateTime(integer)`,
-  `EXTRACT(field FROM timestamp)` and `date_trunc('unit', timestamp)`, and `CASE` (both forms, with conditions
-  as below) of them, in the select list, aggregate arguments (not constant ones), `GROUP BY` and `ORDER BY` (literals
+  `EXTRACT(field FROM timestamp)` and `date_trunc('unit', timestamp)`, `CASE` (both forms, with conditions
+  as below) and `COALESCE(value, ...)` of them, in the select list, aggregate arguments (not constant ones),
+  `GROUP BY` and `ORDER BY` (literals
   there are positions or constants, see [Binding](#binding));
 - conditions (`WHERE`, `HAVING` and `CASE WHEN`): `operand <op> literal` in either order, `operand <op> operand`,
   `operand [NOT] LIKE 'pattern'`, `operand [NOT] IN (literal, ...)`, `operand [NOT] BETWEEN low AND high`
@@ -552,6 +554,15 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   `main."substring"(URL, 1, 2)` where `substr(URL, 1, 2)` is plain. Unlike DuckDB, antb1 casts no argument
   implicitly, so a VARCHAR position that parses as a number (`substring(s, '2', 2)`, which DuckDB answers) is a bind
   error; for every other value and position type DuckDB is a binder error as well.
+- `COALESCE(a, b, ..., z)` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL5): the first argument that is not NULL, NULL
+  when every one is; it is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE z END`, so each
+  argument is computed only for the rows no earlier one answered. Its arguments are typed as `CASE`'s values, folded
+  from the first through the rest in written order (`COALESCE(s16, 7)` is SMALLINT; with a DECIMAL the order can
+  change the type, `COALESCE(u16, s16, rate)` DECIMAL(13,3) where `COALESCE(rate, u16, s16)` is DECIMAL(8,3)), with
+  `CASE`'s refusals naming COALESCE (`cannot mix values of type VARCHAR and SMALLINT in COALESCE`, a string literal
+  next to a number unsupported) and its divergence D20 for some orders of literals without a DECIMAL. DuckDB's name:
+  `COALESCE(x, 0)`, in upper case however it is written. A NULL argument is an unsupported NULL literal, and the
+  quoted `"coalesce"(...)` an unsupported function (DuckDB has no function of that name: COALESCE is an operator).
 - Timestamps: `toDateTime(t)` is ClickBench's DuckDB macro `epoch_ms(t * 1000)` (its `duckdb-parquet/create.sql` at
   the pinned commit; the test oracle defines the same macro): `t * 1000` is typed and checked as arithmetic (so a
   SMALLINT `t` above 32 overflows, as in DuckDB), and the result is TIMESTAMP. It takes an integer other than
@@ -1490,7 +1501,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | unsupported | needs SELECT DISTINCT and INTERSECT (X4c) |
 | Q39 | unsupported | needs NULL as a CASE value and stddev_samp (AG2) |
-| Q40 | unsupported | needs COALESCE and an identity CAST (CT1) |
+| Q40 | unsupported | needs an identity CAST (CT1) |
 | Q41 | unsupported | needs SELECT DISTINCT and a correlated COUNT subquery (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
@@ -1499,7 +1510,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs COALESCE, CAST to DECIMAL(p,s), UNION and rank() (phase 9) |
+| Q49 | unsupported | needs CAST to DECIMAL(p,s), UNION and rank() (phase 9) |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
 | Q52 | pass | answered when the ratchet was added |
@@ -1517,7 +1528,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | pass | `UNION ALL` (ADR 0036) |
-| Q67 | unsupported | needs COALESCE, ROLLUP and rank() (phase 9) |
+| Q67 | unsupported | needs ROLLUP and rank() (phase 9) |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
@@ -1525,16 +1536,16 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q72 | unsupported | needs DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q74 | pass | `UNION ALL` (ADR 0036) |
-| Q75 | unsupported | needs COALESCE, CAST to DECIMAL(p,s) and UNION (X4b) |
+| Q75 | unsupported | needs CAST to DECIMAL(p,s) and UNION (X4b) |
 | Q76 | pass | IS NULL (NL4) |
-| Q77 | unsupported | needs COALESCE, ROLLUP and a cross product of multi-row relations (OJ4) |
-| Q78 | unsupported | needs COALESCE and round (FN2) |
+| Q77 | unsupported | needs ROLLUP and a cross product of multi-row relations (OJ4) |
+| Q78 | unsupported | needs round (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
-| Q80 | unsupported | needs COALESCE, concat and ROLLUP (RU3) |
+| Q80 | unsupported | needs concat and ROLLUP (RU3) |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
-| Q84 | unsupported | needs COALESCE and concat (FN5) |
+| Q84 | unsupported | needs concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q87 | unsupported | needs SELECT DISTINCT, parenthesized set-operation branches and EXCEPT (X4d) |

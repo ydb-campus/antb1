@@ -1,0 +1,149 @@
+# COALESCE (ADR 0037's NL5, docs/sql-subset.md): the first argument that is not NULL, NULL when every one is, each
+# argument computed only for the rows no earlier one answered; typed as CASE's values, folded from the first argument
+# through the rest in written order (an integer literal takes the others' integer type when it fits).
+
+query II rowsort
+SELECT zn_id, COALESCE(zn_parent, 0) FROM zones WHERE zn_id <= 8
+----
+INTEGER	INTEGER
+1	0
+2	0
+3	0
+4	0
+5	0
+6	1
+7	2
+8	3
+
+query II rowsort
+SELECT zn_id, COALESCE(zn_parent, zn_city, -1) FROM zones WHERE zn_id <= 8 OR zn_parent IS NULL
+----
+INTEGER	INTEGER
+1	1
+2	2
+3	3
+4	4
+5	5
+6	1
+7	2
+8	3
+
+query I nosort
+SELECT SUM(COALESCE(zn_parent, 100)) FROM zones
+----
+HUGEINT
+677
+
+query II nosort
+SELECT COALESCE(zn_parent, 0) AS p, COUNT(*) FROM zones GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	5
+1	7
+2	7
+3	7
+4	7
+5	6
+77	1
+
+query II nosort
+SELECT zn_city, COALESCE(MAX(zn_parent), 0) FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	1
+2	2
+3	3
+4	4
+5	77
+9	4
+NULL	3
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE COALESCE(zn_parent, 0) = 0
+----
+BIGINT
+5
+
+query ID nosort
+SELECT id, COALESCE(d9_2, 7) FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(12,2)
+0	-6.25
+1	9999999.99
+2	-9999999.99
+3	7.00
+4	0.00
+5	5.00
+6	-3.75
+7	1.25
+
+query ID nosort
+SELECT id, COALESCE(d9_2, d18_4, 0) FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(18,4)
+0	-6.2500
+1	9999999.9900
+2	-9999999.9900
+3	-4.0004
+4	0.0000
+5	5.0000
+6	-3.7500
+7	1.2500
+
+query T rowsort
+SELECT COALESCE(label, 'none') FROM zones WHERE zn_id <= 12
+----
+VARCHAR
+airport
+airport
+center
+center
+docks
+market
+none
+north
+north
+park
+south
+south
+
+query TI nosort
+SELECT COALESCE(tr_day, '2000-01-01') AS d, COUNT(*) FROM trips GROUP BY 1 ORDER BY 1 LIMIT 3
+----
+DATE	BIGINT
+2000-01-01	81
+2026-03-01	94
+2026-03-02	94
+
+query II rowsort
+SELECT ct_id, COALESCE(SUM(zn_parent), 0) FROM cities LEFT JOIN zones ON ct_id = zn_city GROUP BY ct_id
+----
+SMALLINT	HUGEINT
+1	7
+2	14
+3	18
+4	24
+5	107
+6	0
+
+# A later argument is computed only for the rows the earlier ones leave NULL: i16 * 1000 overflows SMALLINT for the
+# rows the first argument answers, and is never computed there.
+
+query I nosort
+SELECT SUM(COALESCE(CASE WHEN i16 > 30 OR i16 < -30 THEN i16 END, i16 * 1000)) FROM edge
+----
+HUGEINT
+6999
+
+# Nested: each argument is computed once, for the rows still open.
+
+query II rowsort
+SELECT zn_id, COALESCE(COALESCE(COALESCE(zn_parent, CASE WHEN zn_id > 3 THEN zn_city END), zn_parent), -zn_id) FROM zones WHERE zn_id <= 6 OR zn_parent IS NULL
+----
+INTEGER	INTEGER
+1	-1
+2	-2
+3	-3
+4	4
+5	5
+6	1
