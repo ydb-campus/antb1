@@ -6350,7 +6350,8 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
     std::vector<ColumnId> cast_ids;
     for (std::size_t i = 0; i < width; ++i) {
       const OutputColumn& out = blocks[k].output[i];
-      const LogicalType type = *columns[i].type;
+      // Every column has a type here: one of NULL items only was refused above.
+      const LogicalType type = columns[i].type.value_or(LogicalType::kInteger);
       ColumnId id = out.id;
       if (out.null_item) {
         // A NULL of the column's type, computed below the union; the block's own NULL column,
@@ -6387,7 +6388,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
   for (std::size_t i = 0; i < width; ++i) {
     node.ids.push_back(ids.Next());
     output.push_back(OutputColumn{.name = blocks[0].output[i].name,
-                                  .type = *columns[i].type,
+                                  .type = columns[i].type.value_or(LogicalType::kInteger),
                                   .id = node.ids.back(),
                                   .stored_as_float = columns[i].stored_as_float});
   }

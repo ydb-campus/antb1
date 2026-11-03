@@ -626,8 +626,8 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   NULLs keeps its type, and the block computes a NULL of the column's type below the union; the name is the first
   block's (`NULL` without an alias). A column that is NULL in every block has DuckDB's NULL type, which antb1 does not
   support (exit code 4), and a NULL item outside a `UNION ALL` block, an implicit alias (`NULL x`) and NULL in an
-  expression, its alias inside `HAVING` included, stay unsupported NULL literals. A `WHERE` above the union rules out a block whose column there is NULL,
-  as for the other constants of a block.
+  expression, its alias inside `HAVING` included, stay unsupported NULL literals. A `WHERE` above the union rules out
+  a block whose column there is NULL, as for the other constants of a block.
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
