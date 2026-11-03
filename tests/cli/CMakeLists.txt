@@ -235,6 +235,41 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
+# A LEFT JOIN unit that is one relation of an inner join (ADR 0022's join-order rule 3): estimated
+# like an inner join of its inputs, never below its left input, so the 240-row unit riders LEFT JOIN
+# promos is built and the 3000 trips probe it.
+antb1_add_cli_golden(
+  explain_join_left_unit_built
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), COUNT(pm_id) FROM trips, riders LEFT JOIN promos ON rd_id = pm_id WHERE tr_rider = rd_id"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "promos=${_f}/star/promos.parquet"
+)
+# The same unit as a derived table: its plan's estimate (EstimateRows) is the unit's now, so the
+# derived table of 240 rows is built and the trips probe it, where it used to read as the largest.
+antb1_add_cli_golden(
+  explain_join_left_unit_derived_built
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips, (SELECT rd_id FROM riders LEFT JOIN promos ON rd_id = pm_id) AS r WHERE tr_rider = r.rd_id"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "promos=${_f}/star/promos.parquet"
+)
 # A pair of facts joined many-to-many on a model, closed by a cycle through two roles of the calendar (ADR 0037's
 # PF1): the search first reduces bookings through riders and the year of the booking's day, joins the days of that
 # week (the week equality, the only key of its join), and builds that side, so that the snapshot fleet streams as the

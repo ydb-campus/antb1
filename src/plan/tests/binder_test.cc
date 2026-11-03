@@ -2612,6 +2612,32 @@ TEST(BinderTest, Path2ChoosesItsBuildSideFromTheEstimates) {
 // to join-order rule 5 that reached a LEFT JOIN unit or a subquery join would crash rather than
 // fail a test. C1 made BuildSide::kLeft reachable from real SQL, which is what makes that worth
 // pinning.
+// A LEFT JOIN unit that is one relation of an inner join is estimated like any relation (ADR 0022's
+// join-order rule 3: an inner join of its inputs, never below its left input), so the unit
+// `ok LEFT JOIN st` (35 rows: 7 x 5, no key domain known) is built and `t` (100) probes. Its blocks
+// of one relation each used to have no estimate, so the unit read as the largest relation: it
+// probed, and `t` was built.
+TEST(BinderTest, ALeftJoinUnitIsEstimatedLikeAnyRelation) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view sql : {
+           "SELECT t.s FROM t, ok LEFT JOIN st ON ok.i16 = st.i16 WHERE t.i16 = ok.i16",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const JoinNode* join = testing::FirstJoin(*plan);
+    ASSERT_NE(join, nullptr) << sql;
+    ASSERT_EQ(join->kind, JoinKind::kInner) << sql << "\n" << Explain(*plan);
+    const LogicalNode& build = join->build == BuildSide::kLeft ? *join->left : *join->right;
+    const LogicalNode& probe = join->build == BuildSide::kLeft ? *join->right : *join->left;
+    EXPECT_EQ(testing::ScannedTable(probe), "t") << sql << "\n" << Explain(*plan);
+    const auto* unit = std::get_if<JoinNode>(&build);
+    ASSERT_NE(unit, nullptr) << sql << ": the unit is built\n" << Explain(*plan);
+    EXPECT_EQ(unit->kind, JoinKind::kLeft) << sql;
+    ASSERT_TRUE(unit->estimate.has_value()) << sql << ": the unit's estimate";
+    EXPECT_GE(unit->estimate.value_or(0), 7) << sql << ": never below its left input";
+  }
+}
+
 TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
   const Catalog catalog = MakeCatalog();
   // Every join of a plan, both inputs of each, however deeply nested.
