@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793661911084,
+  "lastUpdate": 1793704732486,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -13944,6 +13944,678 @@ window.BENCHMARK_DATA = {
             "value": 235.1088193333529,
             "unit": "ms/iter",
             "extra": "iterations: 3\ncpu: 235.05270666666908 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "334225516+antb1-bot[bot]@users.noreply.github.com",
+            "name": "antb1-bot[bot]",
+            "username": "antb1-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a84b445d07750ccdd43b2fd6880775961cc09842",
+          "message": "build(deps): update pixi.lock (#287)\n\n# Dependencies\n\n<details>\n<summary>Explicit dependencies</summary>\n\n|Dependency|Before|After|Change|Environments|\n|-|-|-|-|-|\n\n|[bash](https://prefix.dev/channels/conda-forge/packages/bash)|5.2.37|5.3|Minor\nUpgrade|{default, lint, static} on *all platforms*<br/>gcc on linux-64|\n\n|[pytest](https://prefix.dev/channels/conda-forge/packages/pytest)|9.1.1|9.2.0|Minor\nUpgrade|lint on *all platforms*|\n\n|[cmake](https://prefix.dev/channels/conda-forge/packages/cmake)|4.4.4|4.4.5|Patch\nUpgrade|{default, static} on *all platforms*<br/>gcc on linux-64|\n\n|[libarrow](https://prefix.dev/channels/conda-forge/packages/libarrow)|25.0.0|25.0.1|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libarrow-compute](https://prefix.dev/channels/conda-forge/packages/libarrow-compute)|25.0.0|25.0.1|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libparquet](https://prefix.dev/channels/conda-forge/packages/libparquet)|25.0.0|25.0.1|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[python](https://prefix.dev/channels/conda-forge/packages/python)|3.14.9|3.14.10|Patch\nUpgrade|{default, lint, static} on *all platforms*|\n\n|[clang](https://prefix.dev/channels/conda-forge/packages/clang)|default_cfg_h9152d53_0|default_cfg_h861eeae_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clang](https://prefix.dev/channels/conda-forge/packages/clang)|default_cfg_hb7ba108_0|default_cfg_h194df64_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[clang](https://prefix.dev/channels/conda-forge/packages/clang)|default_cfg_h7f2c8bb_0|default_cfg_h10b8b15_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h3b07fa1_0|default_haef44a1_1|Only\nbuild string|lint on linux-aarch64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h0301843_0|default_h97129e5_1|Only\nbuild string|lint on linux-64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h4b551fb_0|default_h6615c36_1|Only\nbuild string|lint on osx-arm64|\n\n|[clang-tools](https://prefix.dev/channels/conda-forge/packages/clang-tools)|default_hd0d6a29_0|default_hf5d077d_1|Only\nbuild string|default on linux-aarch64|\n\n|[clang-tools](https://prefix.dev/channels/conda-forge/packages/clang-tools)|default_h7e40f3e_0|default_h644c0b2_1|Only\nbuild string|default on osx-arm64|\n\n|[clang-tools](https://prefix.dev/channels/conda-forge/packages/clang-tools)|default_h28e42e8_0|default_h5d24189_1|Only\nbuild string|default on linux-64|\n\n|[clangxx](https://prefix.dev/channels/conda-forge/packages/clangxx)|default_cfg_hb4237c8_0|default_cfg_h918b462_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clangxx](https://prefix.dev/channels/conda-forge/packages/clangxx)|default_cfg_h4dfd17a_0|default_cfg_h6f8e6dd_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clangxx](https://prefix.dev/channels/conda-forge/packages/clangxx)|default_cfg_hb68b953_0|default_cfg_h129fc0e_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n</details>\n\n<details>\n<summary>Implicit dependencies</summary>\n\n|Dependency|Before|After|Change|Environments|\n|-|-|-|-|-|\n\n|[aws-c-auth](https://prefix.dev/channels/conda-forge/packages/aws-c-auth)|0.10.4|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-cal](https://prefix.dev/channels/conda-forge/packages/aws-c-cal)|0.9.14|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-common](https://prefix.dev/channels/conda-forge/packages/aws-c-common)|0.14.2|1.0.5|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-compression](https://prefix.dev/channels/conda-forge/packages/aws-c-compression)|0.3.2|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-event-stream](https://prefix.dev/channels/conda-forge/packages/aws-c-event-stream)|0.7.1|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-http](https://prefix.dev/channels/conda-forge/packages/aws-c-http)|0.11.0|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-io](https://prefix.dev/channels/conda-forge/packages/aws-c-io)|0.27.3|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-mqtt](https://prefix.dev/channels/conda-forge/packages/aws-c-mqtt)|0.16.0|1.0.0|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-s3](https://prefix.dev/channels/conda-forge/packages/aws-c-s3)|0.12.8|1.1.3|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-c-sdkutils](https://prefix.dev/channels/conda-forge/packages/aws-c-sdkutils)|0.2.7|1.0.1|Major\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[aws-checksums](https://prefix.dev/channels/conda-forge/packages/aws-checksums)|0.2.10|1.0.1|Major\nUpgrade|{default, gcc} on linux-64<br/>default on linux-aarch64|\n\n|[aws-checksums](https://prefix.dev/channels/conda-forge/packages/aws-checksums)|0.2.10|1.0.0|Major\nUpgrade|default on osx-arm64|\n\n|[aws-crt-cpp](https://prefix.dev/channels/conda-forge/packages/aws-crt-cpp)|0.40.1|0.43.8|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libexpat](https://prefix.dev/channels/conda-forge/packages/libexpat)|2.8.5|2.9.0|Minor\nUpgrade|{default, lint, static} on *all platforms*<br/>gcc on linux-64|\n\n|[libgoogle-cloud](https://prefix.dev/channels/conda-forge/packages/libgoogle-cloud)|3.8.0|3.12.0|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libgoogle-cloud-storage](https://prefix.dev/channels/conda-forge/packages/libgoogle-cloud-storage)|3.8.0|3.12.0|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libnghttp2](https://prefix.dev/channels/conda-forge/packages/libnghttp2)|1.68.1|1.70.0|Minor\nUpgrade|{default, lint, static} on *all platforms*<br/>gcc on linux-64|\n\n|[libopentelemetry-cpp](https://prefix.dev/channels/conda-forge/packages/libopentelemetry-cpp)|1.27.0|1.30.0|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libopentelemetry-cpp-headers](https://prefix.dev/channels/conda-forge/packages/libopentelemetry-cpp-headers)|1.27.0|1.30.0|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libthrift](https://prefix.dev/channels/conda-forge/packages/libthrift)|0.22.0|0.25.0|Minor\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[nodeenv](https://prefix.dev/channels/conda-forge/packages/nodeenv)|1.11.0|1.12.0|Minor\nUpgrade|lint on *all platforms*|\n\n|[platformdirs](https://prefix.dev/channels/conda-forge/packages/platformdirs)|4.13.5|4.14.2|Minor\nUpgrade|lint on *all platforms*|\n\n|[python-discovery](https://prefix.dev/channels/conda-forge/packages/python-discovery)|1.6.4|1.9.0|Minor\nUpgrade|lint on *all platforms*|\n\n|[virtualenv](https://prefix.dev/channels/conda-forge/packages/virtualenv)|21.14.13|21.15.2|Minor\nUpgrade|lint on *all platforms*|\n\n|[aws-sdk-cpp](https://prefix.dev/channels/conda-forge/packages/aws-sdk-cpp)|1.11.833|1.11.905|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libgrpc](https://prefix.dev/channels/conda-forge/packages/libgrpc)|1.82.1|1.82.2|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[libpython](https://prefix.dev/channels/conda-forge/packages/libpython)|3.14.9|3.14.10|Patch\nUpgrade|{default, lint, static} on *all platforms*|\n\n|[s2n](https://prefix.dev/channels/conda-forge/packages/s2n)|1.7.5|1.7.7|Patch\nUpgrade|default on *all platforms*<br/>gcc on linux-64|\n\n|[cctools](https://prefix.dev/channels/conda-forge/packages/cctools)|llvm23_1_h54b4f4b_6|llvm23_1_h54b4f4b_7|Only\nbuild string|{default, static} on osx-arm64|\n\n|[cctools_impl_osx-arm64](https://prefix.dev/channels/conda-forge/packages/cctools_impl_osx-arm64)|llvm23_1_hf5e010b_6|llvm23_1_hf5e010b_7|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clang-23](https://prefix.dev/channels/conda-forge/packages/clang-23)|default_h63627a2_0|default_hde1afa0_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clang-23](https://prefix.dev/channels/conda-forge/packages/clang-23)|default_hf52b45b_0|default_h807fe02_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[clang-23](https://prefix.dev/channels/conda-forge/packages/clang-23)|default_he646a05_0|default_h6e6c352_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h3b07fa1_0|default_haef44a1_1|Only\nbuild string|default on linux-aarch64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h0301843_0|default_h97129e5_1|Only\nbuild string|default on linux-64|\n\n|[clang-format](https://prefix.dev/channels/conda-forge/packages/clang-format)|default_h4b551fb_0|default_h6615c36_1|Only\nbuild string|default on osx-arm64|\n\n|[clang-format-23](https://prefix.dev/channels/conda-forge/packages/clang-format-23)|default_h8bbc02d_0|default_h8bbc02d_1|Only\nbuild string|{default, lint} on osx-arm64|\n\n|[clang-format-23](https://prefix.dev/channels/conda-forge/packages/clang-format-23)|default_h0acdd01_0|default_h0acdd01_1|Only\nbuild string|{default, lint} on linux-64|\n\n|[clang-format-23](https://prefix.dev/channels/conda-forge/packages/clang-format-23)|default_h01b09c7_0|default_h01b09c7_1|Only\nbuild string|{default, lint} on linux-aarch64|\n\n|[clang-scan-deps](https://prefix.dev/channels/conda-forge/packages/clang-scan-deps)|default_h8bbc02d_0|default_h8bbc02d_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clang-scan-deps](https://prefix.dev/channels/conda-forge/packages/clang-scan-deps)|default_h0acdd01_0|default_h0acdd01_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clang-scan-deps](https://prefix.dev/channels/conda-forge/packages/clang-scan-deps)|default_h01b09c7_0|default_h01b09c7_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[clang_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/clang_impl_linux-64)|default_h6622e89_0|default_h0cdc794_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clang_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/clang_impl_linux-aarch64)|default_hd43bfa6_0|default_hdc023f8_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[clang_impl_osx-arm64](https://prefix.dev/channels/conda-forge/packages/clang_impl_osx-arm64)|default_h8bbc02d_0|default_h8bbc02d_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[clangxx_impl_linux-64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_linux-64)|default_h20a6b4b_0|default_ha9b3e3f_1|Only\nbuild string|{default, static} on linux-64|\n\n|[clangxx_impl_linux-aarch64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_linux-aarch64)|default_he8c0b6d_0|default_h8c0cc4a_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[clangxx_impl_osx-arm64](https://prefix.dev/channels/conda-forge/packages/clangxx_impl_osx-arm64)|default_h7028af0_0|default_h8b65321_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[ld64](https://prefix.dev/channels/conda-forge/packages/ld64)|llvm23_1_hd841b0c_6|llvm23_1_hd841b0c_7|Only\nbuild string|{default, static} on osx-arm64|\n\n|[ld64_osx-arm64](https://prefix.dev/channels/conda-forge/packages/ld64_osx-arm64)|llvm23_1_hc8058f9_6|llvm23_1_hc8058f9_7|Only\nbuild string|{default, static} on osx-arm64|\n\n|[libclang-cpp23.1](https://prefix.dev/channels/conda-forge/packages/libclang-cpp23.1)|default_h8bbc02d_0|default_h8bbc02d_1|Only\nbuild string|{default, lint, static} on osx-arm64|\n\n|[libclang-cpp23.1](https://prefix.dev/channels/conda-forge/packages/libclang-cpp23.1)|default_h0acdd01_0|default_h0acdd01_1|Only\nbuild string|{default, lint, static} on linux-64|\n\n|[libclang-cpp23.1](https://prefix.dev/channels/conda-forge/packages/libclang-cpp23.1)|default_h01b09c7_0|default_h01b09c7_1|Only\nbuild string|{default, lint, static} on linux-aarch64|\n\n|[libclang13](https://prefix.dev/channels/conda-forge/packages/libclang13)|default_h63627a2_0|default_hde1afa0_1|Only\nbuild string|{default, static} on osx-arm64|\n\n|[libclang13](https://prefix.dev/channels/conda-forge/packages/libclang13)|default_hf52b45b_0|default_h807fe02_1|Only\nbuild string|{default, static} on linux-aarch64|\n\n|[libclang13](https://prefix.dev/channels/conda-forge/packages/libclang13)|default_he646a05_0|default_h6e6c352_1|Only\nbuild string|{default, static} on linux-64|\n\n|[pyyaml](https://prefix.dev/channels/conda-forge/packages/pyyaml)|py314h67df5f8_1|py314hd42368d_2|Only\nbuild string|lint on linux-64|\n\n|[pyyaml](https://prefix.dev/channels/conda-forge/packages/pyyaml)|py314h6e9b3f0_1|py314haf53d71_2|Only\nbuild string|lint on osx-arm64|\n\n|[pyyaml](https://prefix.dev/channels/conda-forge/packages/pyyaml)|py314h807365f_1|py314h96efe57_2|Only\nbuild string|lint on linux-aarch64|\n\n|[ukkonen](https://prefix.dev/channels/conda-forge/packages/ukkonen)|py314h9891dd4_0|py314hf3b331d_1|Only\nbuild string|lint on linux-64|\n\n|[ukkonen](https://prefix.dev/channels/conda-forge/packages/ukkonen)|py314h6cfcd04_0|py314hc574cfc_1|Only\nbuild string|lint on osx-arm64|\n\n|[ukkonen](https://prefix.dev/channels/conda-forge/packages/ukkonen)|py314hd7d8586_0|py314h6fbc6c6_1|Only\nbuild string|lint on linux-aarch64|\n\n</details>\n\n[^1]: **Bold** means explicit dependency.\n[^2]: Dependency got downgraded.\n\n\nGenerated by `.github/workflows/pixi-lock-update.yml` with pixi 0.81.0.\nCI runs as for any PR;\na maintainer reviews the diff, approves and squash-merges.\n\nCo-authored-by: antb1-bot[bot] <334225516+antb1-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-11-03T13:52:18+03:00",
+          "tree_id": "9785645aee384f35dbdd44f0b30a30de27426817",
+          "url": "https://github.com/ydb-campus/antb1/commit/a84b445d07750ccdd43b2fd6880775961cc09842"
+        },
+        "date": 1793704731484,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 5160.528370694115,
+            "unit": "ns/iter",
+            "extra": "iterations: 136285\ncpu: 5160.3768426459255 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 28064.016966191288,
+            "unit": "ns/iter",
+            "extra": "iterations: 24873\ncpu: 28062.615325855346 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 52050.16675779222,
+            "unit": "ns/iter",
+            "extra": "iterations: 12803\ncpu: 52046.26571897211 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 222365.87868230898,
+            "unit": "ns/iter",
+            "extra": "iterations: 3157\ncpu: 222289.52518213502 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 497790.85947478365,
+            "unit": "ns/iter",
+            "extra": "iterations: 1409\ncpu: 497725.2966643008 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1490126.9419644235,
+            "unit": "ns/iter",
+            "extra": "iterations: 448\ncpu: 1490052.7834821418 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 41.13098241176725,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.12475064705886 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 48.42547859999892,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 48.418049999999965 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 214.75912599998992,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 214.7467593333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 13.938614199998938,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.937209959999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 27.08768488461671,
+            "unit": "ms/iter",
+            "extra": "iterations: 26\ncpu: 27.085949923076875 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 37.260553894737455,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.25683210526314 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.4024446232464405,
+            "unit": "ms/iter",
+            "extra": "iterations: 499\ncpu: 1.4023532665330694 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 137.1735727999976,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 137.16167020000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 22.978418193548027,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.976531548387126 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 25.15082964285804,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 25.148165535714323 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 53.485543769231576,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.482522000000024 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 95.37607785713524,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.37216057142878 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 294.1609559999847,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 294.1441445000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 1371.8996159999506,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1371.829882 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 27.57726287999958,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.57573211999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 31.128174545456616,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.126187954545447 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 54.61063053845604,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.606806999999804 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 107.62222666666806,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 107.60825166666699 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 341.35498900002403,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 341.3223405000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1598.7346090000756,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1598.5885380000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 56.059655916660255,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 56.05447700000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 58.99030508333188,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 58.985938666666605 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 84.97958862500354,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 84.97395637500027 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 149.2004002000158,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 149.18842079999948 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 411.3783225000134,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 411.3632564999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1953.7551769999482,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1953.6142810000001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 65.30865909091558,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 65.30497281818207 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 69.57701850000149,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 69.57116570000039 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 100.94795885713991,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 100.94358299999989 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 182.67451699998105,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 182.6705200000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 482.24220550002883,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 482.1951575000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 2124.559882999961,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 2124.4020240000054 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1000",
+            "value": 23.378874666665677,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.37789793333324 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/16384",
+            "value": 24.824080928571643,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 24.82238992857155 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/262144",
+            "value": 53.13828023076894,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 53.13644607692352 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1048576",
+            "value": 83.96144949999496,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 83.95671162499951 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/4194304",
+            "value": 294.59296199998636,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 294.570899 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1000",
+            "value": 27.597131239999726,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.594816040000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/16384",
+            "value": 31.270631454545267,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.269313818181775 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/262144",
+            "value": 54.384195615389565,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 54.3811062307689 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1048576",
+            "value": 93.75279628571727,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 93.7446230000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/4194304",
+            "value": 349.65451499999745,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 349.63792000000285 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1000",
+            "value": 22.837891419356076,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.835890967741996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/16384",
+            "value": 25.745761222222225,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 25.745050592592616 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/262144",
+            "value": 57.74282899999624,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 57.738423749999754 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1048576",
+            "value": 95.73966699999151,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 95.73916585714265 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/4194304",
+            "value": 217.32968099998592,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 217.31085733333325 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1000",
+            "value": 27.59717107999677,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 27.596335400000097 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/16384",
+            "value": 34.230145750001384,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.22666305000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/262144",
+            "value": 62.703368727273876,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 62.700874000000155 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1048576",
+            "value": 127.6441314000067,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 127.63257419999972 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/4194304",
+            "value": 237.35511366665682,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 237.3443866666681 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1000",
+            "value": 17.451100024999278,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 17.44999322500007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/16384",
+            "value": 18.60206460526414,
+            "unit": "ms/iter",
+            "extra": "iterations: 38\ncpu: 18.60173518421024 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/262144",
+            "value": 24.117080758620776,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.11453572413791 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1048576",
+            "value": 32.045595181815855,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 32.04488500000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/4194304",
+            "value": 102.76673728570326,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 102.75956371428663 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1000",
+            "value": 17.374284474999513,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 17.37378847500004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/16384",
+            "value": 18.742868135134543,
+            "unit": "ms/iter",
+            "extra": "iterations: 37\ncpu: 18.74105343243225 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/262144",
+            "value": 28.25772476000111,
+            "unit": "ms/iter",
+            "extra": "iterations: 25\ncpu: 28.256560120000245 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1048576",
+            "value": 52.674544384619644,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 52.669896999999054 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/4194304",
+            "value": 289.51910799999797,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 289.4922059999961 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1000",
+            "value": 17.255079275000185,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 17.25301150000007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/16384",
+            "value": 18.699956526314796,
+            "unit": "ms/iter",
+            "extra": "iterations: 38\ncpu: 18.69865757894735 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/262144",
+            "value": 29.418759499999208,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.416697541666537 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1048576",
+            "value": 60.56010288889664,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 60.556313333333065 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/4194304",
+            "value": 267.736708999981,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 267.70772066666854 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1000",
+            "value": 17.533446474999437,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 17.53231630000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/16384",
+            "value": 23.78122393103522,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 23.778726793103264 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/262144",
+            "value": 38.02499527777551,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.02357822222291 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1048576",
+            "value": 74.40376671427528,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 74.39793899999968 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/4194304",
+            "value": 166.87612449999278,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 166.86321050000075 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 17.47765055000059,
+            "unit": "ms/iter",
+            "extra": "iterations: 40\ncpu: 17.47660135000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 24.24688786206765,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.244611241379513 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 38.53640372221889,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.53318172222231 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 63.59767120000015,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 63.5953346000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 162.72692280003866,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 162.72294139999985 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1000",
+            "value": 22.551599354836718,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.550829903225587 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/16384",
+            "value": 24.19668713792848,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.19534755172394 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/262144",
+            "value": 29.489641583334485,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 29.487672041666357 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1048576",
+            "value": 57.454488000000005,
+            "unit": "ms/iter",
+            "extra": "iterations: 12\ncpu: 57.452041000000044 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/4194304",
+            "value": 132.36043560000326,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 132.34835400000122 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1000",
+            "value": 22.60059806451042,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.599398258064742 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/16384",
+            "value": 24.500206103453067,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.498735172413873 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/262144",
+            "value": 34.57587500000727,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.57402055000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1048576",
+            "value": 77.20638922220739,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 77.20328455555621 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/4194304",
+            "value": 279.4195884999908,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 279.4045625000052 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1000",
+            "value": 23.435016799999175,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.43418796666678 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/16384",
+            "value": 26.2208589629659,
+            "unit": "ms/iter",
+            "extra": "iterations: 27\ncpu: 26.21875555555551 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/262144",
+            "value": 37.44358121051798,
+            "unit": "ms/iter",
+            "extra": "iterations: 19\ncpu: 37.44204773684227 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1048576",
+            "value": 84.52097099999871,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 84.51021144444502 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/4194304",
+            "value": 302.4573559999908,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 302.4344065000051 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1000",
+            "value": 23.550402666667953,
+            "unit": "ms/iter",
+            "extra": "iterations: 30\ncpu: 23.547512433333395 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/16384",
+            "value": 32.992153476189266,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.99152923809499 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/262144",
+            "value": 47.98854533332815,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 47.9848147333333 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1048576",
+            "value": 128.1827463999889,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 128.1745394000012 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/4194304",
+            "value": 251.05814866666756,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 251.02934299999902 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 24.448224758622207,
+            "unit": "ms/iter",
+            "extra": "iterations: 29\ncpu: 24.446019862069114 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 33.73010985714721,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 33.72726057142878 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 56.616569615401275,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 56.6081784615394 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 132.76255224997158,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 132.74975374999798 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 246.53778433336507,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 246.52621533333274 ms\nthreads: 1"
           }
         ]
       }
