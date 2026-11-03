@@ -1588,6 +1588,39 @@ TEST(ParserTest, ThenNullIsANullLiteral) {
   }
 }
 
+// NULL as a whole select item, `NULL` or `NULL AS name`, is a NULL literal in a UNION ALL branch
+// (ADR 0037's NL3), which the unparser writes back. A query that is no compound refuses it at the
+// NULL, wherever it is, as do an implicit alias and NULL as an operand.
+TEST(ParserTest, NullItemsOnlyInUnionAllBranches) {
+  for (const std::string_view sql : {
+           "SELECT NULL, a FROM t UNION ALL SELECT b, NULL AS c FROM t",
+           "SELECT a, NULL AS b FROM t UNION ALL SELECT a, b FROM t UNION ALL SELECT NULL, NULL "
+           "FROM t",
+           "SELECT * FROM (SELECT a, NULL FROM t UNION ALL SELECT a, b FROM t) d",
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+  }
+  for (const auto& [sql, column] : std::to_array<std::pair<std::string_view, std::size_t>>({
+           {"SELECT NULL FROM t", 8},
+           {"SELECT a, NULL AS b FROM t ORDER BY a", 11},
+           {"SELECT * FROM (SELECT NULL AS x FROM t) d", 23},
+           {"WITH c AS (SELECT NULL AS x FROM t) SELECT * FROM c", 19},
+           {"SELECT a FROM t WHERE a IN (SELECT NULL FROM t)", 36},
+           {"SELECT NULL x FROM t UNION ALL SELECT 1 FROM t", 8},
+           {"SELECT NULL + 1 FROM t UNION ALL SELECT 1 FROM t", 8},
+       })) {
+    auto stmt = Parse(sql);
+    ASSERT_FALSE(stmt.has_value()) << sql;
+    EXPECT_EQ(stmt.error().kind, ParseError::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(stmt.error().message.contains("NULL literals are not supported")) << sql;
+    EXPECT_EQ(stmt.error().span.offset + 1, column) << sql;
+  }
+}
+
 // A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
 // in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
 TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {

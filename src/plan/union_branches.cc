@@ -196,6 +196,9 @@ std::optional<Constant> ConstantColumn(const LogicalNodePtr& node, ColumnId id) 
             return std::nullopt;
           }
           const Expr& expr = *n.exprs[*at];
+          if (const auto* constant = std::get_if<ConstantExpr>(&expr.node)) {
+            return constant->value;  // the NULL item of a branch (ADR 0037's NL3), for one
+          }
           const auto* cast = std::get_if<CastExpr>(&expr.node);
           if (cast == nullptr || cast->operand == nullptr) {
             return std::nullopt;

@@ -702,12 +702,31 @@ class Parser {
     if (auto status = ParseTail(stmt); !status) {
       return status;
     }
+    if (auto status = RejectNullItem(stmt); !status) {
+      return status;
+    }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     if (!stmt.with.empty()) {
       stmt.span = Cover(stmt.with_span, stmt.span);
     }
     return ParseBlockEnd(stmt.set_operation.empty() ? stmt : *stmt.set_operation.back().query, stmt,
                          end);
+  }
+
+  // A NULL item (ParseSelectItem) of a query that is no compound: DuckDB's NULL type, which no
+  // result column holds in antb1 (ADR 0037's NL3); a UNION ALL branch types it by the others.
+  static Status RejectNullItem(const SelectStatement& stmt) {
+    if (!stmt.set_operation.empty()) {
+      return {};
+    }
+    for (const SelectItem& item : stmt.items) {
+      const SelectExpr* expr = item.expr();
+      const auto* lit = expr != nullptr ? std::get_if<Literal>(expr) : nullptr;
+      if (lit != nullptr && lit->kind == Literal::Kind::kNull) {
+        return Unsupported(lit->span, "NULL literals are not supported");
+      }
+    }
+    return {};
   }
 
   // (UNION ALL block)+, positioned at the UNION after the first block, which `stmt` holds and which
@@ -1022,7 +1041,19 @@ class Parser {
     if (StartsStar()) {
       return ParseStar();
     }
-    auto expr = ParseExpr(Context::kSelect);
+    // NULL as a whole item, `NULL` or `NULL AS name`: the NULL item of a UNION ALL branch (ADR
+    // 0037's NL3). A query that is no compound refuses it once parsed (RejectNullItem).
+    if (Peek().IsKeyword("NULL") &&
+        (PeekAt(1).kind == TokenKind::kComma || PeekAt(1).IsKeyword("AS") || EndsList(PeekAt(1)))) {
+      const SourceSpan span = Take().span;
+      Expected<Expr> null = Expr(Literal{.kind = Literal::Kind::kNull, .span = span});
+      return FinishSelectItem(std::move(null));
+    }
+    return FinishSelectItem(ParseExpr(Context::kSelect));
+  }
+
+  // A select item's expression, and its alias.
+  Expected<SelectItem> FinishSelectItem(Expected<Expr> expr) {
     if (!expr) {
       return std::unexpected(std::move(expr.error()));
     }

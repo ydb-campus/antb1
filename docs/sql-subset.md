@@ -103,7 +103,7 @@ block       = "SELECT" , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
               [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = select_item , { "," , select_item } ;
-select_item = "*" | identifier , "." , "*" | expr , [ [ "AS" ] , identifier ] ;
+select_item = "*" | identifier , "." , "*" | expr , [ [ "AS" ] , identifier ] | "NULL" , [ "AS" , identifier ] ;
 order_item  = expr , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 from_list   = from_item , { "," , from_item
                           | "CROSS" , "JOIN" , from_item
@@ -358,7 +358,8 @@ star (`* AS x`, `t.* x`,
 `* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax error as in DuckDB),
 `t.*` inside an expression,
 `SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`,
-`NULL` literals (but a whole `CASE` value: `THEN NULL`, `ELSE NULL END`), `IS [NOT] NULL`,
+`NULL` literals (but a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL`
+block), `IS [NOT] NULL`,
 `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several
 words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
 other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
@@ -620,7 +621,13 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   or a DECIMAL, a FLOAT with an integer or a DECIMAL (D11) -- which DuckDB answers by casting, failing per row where a
   cast fails. Such a refusal points at the first select item in the query whose type does not fold or widen, or at
   the `*` or `t.*` it expands from (`UNION ALL of INTEGER and VARCHAR values is not supported`); a star's columns
-  count in the column counts.
+  count in the column counts. A block's select item may be `NULL` or `NULL AS name` ([ADR
+  0037](adr/0037-tpcds-roadmap.md)'s NL3): the fold skips it, in any block, so a VARCHAR, DATE or any other type with
+  NULLs keeps its type, and the block computes a NULL of the column's type below the union; the name is the first
+  block's (`NULL` without an alias). A column that is NULL in every block has DuckDB's NULL type, which antb1 does not
+  support (exit code 4), and a NULL item outside a `UNION ALL` block, an implicit alias (`NULL x`) and NULL in an
+  expression, its alias inside `HAVING` included, stay unsupported NULL literals. A `WHERE` above the union rules out
+  a block whose column there is NULL, as for the other constants of a block.
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
@@ -1461,7 +1468,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q24 | unsupported | needs upper (FN4) |
 | Q25 | pass | answered when the ratchet was added |
 | Q26 | pass | answered when the ratchet was added |
-| Q27 | unsupported | needs NULL items of set-operation branches (NL3) |
+| Q27 | pass | NULL items of `UNION ALL` branches (NL3) |
 | Q28 | pass | cross products of one-row inputs |
 | Q29 | pass | constant integer expressions in IN lists |
 | Q30 | pass | answered when the ratchet was added |

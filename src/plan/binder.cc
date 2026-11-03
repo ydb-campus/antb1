@@ -3042,6 +3042,11 @@ class Binder {
     if (!alias.has_value()) {
       return std::nullopt;
     }
+    if (select_.output[*alias].null_item) {
+      // The NULL item of a UNION ALL block has no type of its own here (ADR 0037's NL3): NULL in
+      // an expression stays an unsupported NULL literal.
+      return UnsupportedError("NULL literals are not supported", ref.span);
+    }
     const auto [kind, index] = select_.items[*alias];
     if (kind == ItemKind::kConstant) {
       const Constant& constant = select_.constants[index];
@@ -3355,9 +3360,20 @@ arrow::Status Binder::BindSelectList() {
       continue;
     }
     if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-      ARROW_ASSIGN_OR_RAISE(auto constant, BindConstant(*lit));
-      list.output.push_back(plan::OutputColumn{
-          .name = item.alias.value_or(std::move(constant.second)), .type = constant.first.type});
+      const bool null_item = lit->kind == sql::Literal::Kind::kNull;
+      // A NULL item, which only a UNION ALL branch has (the parser refuses it elsewhere): a NULL
+      // of INTEGER here, which BindUnionAll retypes (ADR 0037's NL3).
+      std::pair<Constant, std::string> constant{
+          Constant{.type = LogicalType::kInteger, .value = std::monostate{}}, "NULL"};
+      if (!null_item) {
+        ARROW_ASSIGN_OR_RAISE(constant, BindConstant(*lit));
+      }
+      list.output.push_back(
+          plan::OutputColumn{.name = item.alias.value_or(std::move(constant.second)),
+                             .type = constant.first.type,
+                             .id = kNoColumnId,
+                             .stored_as_float = false,
+                             .null_item = null_item});
       list.items.emplace_back(ItemKind::kConstant, list.constants.size());
       list.implicit_names.emplace_back();
       list.constants.push_back(std::move(constant.first));
@@ -6220,8 +6236,10 @@ std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
 // block that differs), then the types: each column's is a left fold over the blocks in written
 // order (UnionAllType), and every block's values must widen to it exactly, the one cast the
 // executor runs (CastExpr); a type refusal points at the first select item in the query that fails
-// either. A block whose column is of another type is cast below the union, once, straight to the
-// column's type, and the union's ids are new, since no block defines its rows. Its names are the
+// either. A block's NULL item is the fold's identity (ADR 0037's NL3), and a column of NULL items
+// only is refused. A block whose column is of another type is cast below the union, once, straight
+// to the column's type, a NULL item computed there as a NULL of that type, and the union's ids are
+// new, since no block defines its rows. Its names are the
 // first block's, and its FLOAT flag the AND over the blocks: FLOAT and DOUBLE values make a DOUBLE
 // in DuckDB, whose literals do not fold at FLOAT precision.
 arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
@@ -6254,7 +6272,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
   }
 
   struct Column {
-    LogicalType type;
+    ValueType type;  // std::nullopt: NULL so far, the fold's identity (ADR 0037's NL3)
     bool stored_as_float = false;
   };
   struct Refusal {
@@ -6271,22 +6289,28 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
     }
   };
   for (std::size_t i = 0; i < width; ++i) {
-    Column column{.type = blocks[0].output[i].type,
-                  .stored_as_float = blocks[0].output[i].stored_as_float};
+    Column column{.type = std::nullopt, .stored_as_float = true};
     bool folded = true;
-    for (std::size_t k = 1; k < blocks.size(); ++k) {
+    for (std::size_t k = 0; k < blocks.size(); ++k) {
       const OutputColumn& next = blocks[k].output[i];
-      const std::optional<LogicalType> type = UnionAllType(column.type, next.type);
+      if (next.null_item) {
+        continue;
+      }
+      if (!column.type.has_value()) {
+        column = Column{.type = next.type, .stored_as_float = next.stored_as_float};
+        continue;
+      }
+      const std::optional<LogicalType> type = UnionAllType(*column.type, next.type);
       if (!type.has_value()) {
         // DuckDB makes a FLOAT of FLOAT and integer or DECIMAL values, which antb1 reads as DOUBLE.
         const auto exact_number = [](LogicalType t) {
           return IsInteger(t) || t == LogicalType::kDecimal;
         };
         const bool d11 = (column.stored_as_float && exact_number(next.type)) ||
-                         (next.stored_as_float && exact_number(column.type));
+                         (next.stored_as_float && exact_number(*column.type));
         refuse(k, i,
                std::format("UNION ALL of {} and {} values is not supported{}",
-                           UnionAllTypeName(column.type, column.stored_as_float),
+                           UnionAllTypeName(*column.type, column.stored_as_float),
                            UnionAllTypeName(next.type, next.stored_as_float),
                            d11 ? " (antb1 reads FLOAT as DOUBLE, divergence D11)" : ""));
         folded = false;
@@ -6295,14 +6319,20 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
       column.type = *type;
       column.stored_as_float = column.stored_as_float && next.stored_as_float;
     }
+    if (!column.type.has_value()) {
+      // NULL in every block: DuckDB's NULL type, which no column of antb1 holds.
+      refuse(0, i, "a UNION ALL column whose values are all NULL is not supported");
+      columns.push_back(Column{.type = LogicalType::kInteger, .stored_as_float = false});
+      continue;
+    }
     for (std::size_t k = 0; folded && k < blocks.size(); ++k) {
       const LogicalType from = blocks[k].output[i].type;
-      if (!IsExactWidening(from, column.type)) {
+      if (!blocks[k].output[i].null_item && !IsExactWidening(from, *column.type)) {
         refuse(k, i,
                std::format("UNION ALL of {} and {} values is not supported ({} does not widen "
                            "exactly to {})",
-                           ToString(column.type), ToString(from), ToString(from),
-                           ToString(column.type)));
+                           ToString(*column.type), ToString(from), ToString(from),
+                           ToString(*column.type)));
         break;
       }
     }
@@ -6320,17 +6350,28 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
     std::vector<ColumnId> cast_ids;
     for (std::size_t i = 0; i < width; ++i) {
       const OutputColumn& out = blocks[k].output[i];
+      // Every column has a type here: one of NULL items only was refused above.
+      const LogicalType type = columns[i].type.value_or(LogicalType::kInteger);
       ColumnId id = out.id;
-      if (out.type != columns[i].type) {
+      if (out.null_item) {
+        // A NULL of the column's type, computed below the union; the block's own NULL column,
+        // typed INTEGER, is not read.
+        casts.push_back(std::make_shared<const Expr>(
+            Expr{.node = ConstantExpr{.value = Constant{.type = type, .value = std::monostate{}}},
+                 .type = type,
+                 .name = out.name}));
+        id = ids.Next();
+        cast_ids.push_back(id);
+      } else if (out.type != type) {
         casts.push_back(
             WidenTo(std::make_shared<const Expr>(
                         Expr{.node = ColumnExpr{.id = out.id}, .type = out.type, .name = out.name}),
-                    columns[i].type));
+                    type));
         id = ids.Next();
         cast_ids.push_back(id);
       }
       // The block's own name: the first block's are the union's, which EXPLAIN shows.
-      reads.push_back(BoundColumn{.id = id, .name = out.name, .type = columns[i].type});
+      reads.push_back(BoundColumn{.id = id, .name = out.name, .type = type});
     }
     LogicalNodePtr input = std::move(blocks[k].root);
     if (!casts.empty()) {
@@ -6347,7 +6388,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
   for (std::size_t i = 0; i < width; ++i) {
     node.ids.push_back(ids.Next());
     output.push_back(OutputColumn{.name = blocks[0].output[i].name,
-                                  .type = columns[i].type,
+                                  .type = columns[i].type.value_or(LogicalType::kInteger),
                                   .id = node.ids.back(),
                                   .stored_as_float = columns[i].stored_as_float});
   }

@@ -120,7 +120,9 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
        the DECIMAL rule of `plan::CommonValueType` (ADR 0037's NL1), which `UnionAllType` takes only for integers
        and DECIMALs -- never the fold's DOUBLE, VARCHAR or DATE results, nor CASE's exit-1 errors;
      - FLOAT ∪ FLOAT is FLOAT (D11), and FLOAT ∪ DOUBLE is DOUBLE;
-     - every other mix exits 4, naming FLOAT as FLOAT, and D11 where a FLOAT meets an integer or a DECIMAL.
+     - every other mix exits 4, naming FLOAT as FLOAT, and D11 where a FLOAT meets an integer or a DECIMAL;
+     - a NULL item of a branch is the fold's identity, and a NULL of the result's type below the union (ADR 0037's
+       NL3); a column of NULL items only exits 4.
    - **Exactness.** Each branch must widen exactly to the result, else exit 4 (for example, a DECIMAL that DuckDB
      would round past 38 digits).
    - **The type refusal** is "UNION ALL of T1 and T2 values is not supported", T2 being the refused item's type, at

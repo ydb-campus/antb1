@@ -983,6 +983,24 @@ TEST_F(ComputeTest, ConditionsAreThreeValued) {
 // CASE takes the first branch whose condition is true (NULL is not), else ELSE or NULL; a value is
 // computed only for the rows its branch answers, so a guarded overflow never fails, and a later
 // condition only for the rows no earlier branch took.
+// A NULL constant (the NULL item of a UNION ALL branch, ADR 0037's NL3) is a column of NULLs of
+// its type, one per row.
+TEST_F(ComputeTest, ANullConstantIsAColumnOfNulls) {
+  for (const LogicalType type : {LogicalType(LogicalType::kVarchar), LogicalType::Decimal(15, 2),
+                                 LogicalType(LogicalType::kDate)}) {
+    const auto null = std::make_shared<const plan::Expr>(plan::Expr{
+        .node =
+            plan::ConstantExpr{.value = plan::Constant{.type = type, .value = std::monostate{}}},
+        .type = type,
+        .name = "NULL"});
+    auto out = Eval(null, {Int16s({1, 2, 3})});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_EQ((*out)->length(), 3);
+    EXPECT_EQ((*out)->null_count(), 3);
+    EXPECT_TRUE((*out)->type()->Equals(*plan::ToArrow(type))) << plan::ToString(type);
+  }
+}
+
 TEST_F(ComputeTest, CaseEvaluatesEachBranchOnItsRows) {
   using Kind = plan::Predicate::Kind;
   const auto x = Int16s({1, 30000, std::nullopt, -3, 200});

@@ -91,6 +91,37 @@ TEST(UnionBranchesTest, FindsAConstantThroughTheNodesThatKeepIt) {
   EXPECT_EQ(ConstantColumn(top, ColumnId{20}), std::nullopt) << "a cast of a column";
 }
 
+// The NULL item of a branch is a NULL constant that the binder computes below the union (ADR
+// 0037's NL3), and a WHERE above the union rules that branch out: NULL is never true.
+TEST(UnionBranchesTest, FindsAndRulesOutTheNullItemOfABranch) {
+  const Constant null{.type = LogicalType::kVarchar, .value = std::monostate{}};
+  const LogicalNodePtr branch =
+      Node(ComputeNode{.input = Scan(1),
+                       .exprs = {std::make_shared<const Expr>(
+                           Expr{.node = ConstantExpr{.value = null}, .type = null.type})},
+                       .ids = {ColumnId{5}},
+                       .span = {}});
+  const std::optional<Constant> found = ConstantColumn(branch, ColumnId{5});
+  ASSERT_TRUE(found.has_value());
+  EXPECT_TRUE(std::holds_alternative<std::monostate>(found.value_or(Constant{}).value));
+  const UnionAllNode node{
+      .inputs = {Tagged(Scan(10), Column(ColumnId{10}, LogicalType::kSmallInt), Text("a"), 20),
+                 branch},
+      .columns = {{Column(ColumnId{21}, LogicalType::kVarchar)},
+                  {Column(ColumnId{5}, LogicalType::kVarchar)}},
+      .ids = {ColumnId{30}},
+      .span = {}};
+  const LogicalNodePtr rewritten = FilterIntoUnionBranches(Node(
+      FilterNode{.input = Node(node),
+                 .predicates = {Predicate{.kind = Predicate::Kind::kCompare,
+                                          .column = Column(ColumnId{30}, LogicalType::kVarchar),
+                                          .op = CompareOp::kNe,
+                                          .constant = Text("b")}}}));
+  const auto& out = std::get<UnionAllNode>(*rewritten);
+  ASSERT_EQ(out.inputs.size(), 1U) << "the NULL branch is ruled out";
+  EXPECT_EQ(out.inputs[0], node.inputs[0]);
+}
+
 // A constant reaches the union's type through the binder's widening casts, as they compute it:
 // the same value in a wider integer, multiplied up into a DECIMAL.
 TEST(UnionBranchesTest, WidensAConstantAsTheBindersCastsDo) {

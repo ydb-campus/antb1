@@ -63,6 +63,9 @@ struct OutputColumn {
   // literal folds at FLOAT precision. A sub-plan's binding carries it out, so the divergence
   // survives a derived table or a CTE (ADR 0022's J4 note).
   bool stored_as_float = false;
+  // A NULL item of a UNION ALL branch (ADR 0037's NL3): DuckDB's NULL type, which the union's
+  // fold takes as its identity; `type` (INTEGER) holds until the union types the column.
+  bool null_item = false;
 };
 
 enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe };
@@ -98,8 +101,9 @@ struct Constant {
   LogicalType type = LogicalType::kBigInt;
   // Every integer type and DATE (days since 1970-01-01): Int128 inside the type's range.
   // DECIMAL(p, s): the unscaled value (12.34 in DECIMAL(4,2) is 1234). DOUBLE: double. VARCHAR:
-  // the bytes.
-  std::variant<Int128, double, std::string> value;
+  // the bytes. std::monostate: NULL of any type, only a NULL item of a UNION ALL branch (ADR
+  // 0037's NL3), never a predicate's constant.
+  std::variant<Int128, double, std::string, std::monostate> value;
 };
 
 // `text` with bytes outside printable ASCII and backslashes as \xHH and `quote` characters doubled

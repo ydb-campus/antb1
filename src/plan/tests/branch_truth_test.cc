@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -165,6 +166,39 @@ TEST(BranchTruthTest, AConstantIsNeverNullAndFalseIsNeverTrue) {
   EXPECT_EQ(TruthOver(not_null, std::nullopt, std::nullopt), kUnknown);
   EXPECT_EQ(TruthOver(Predicate{.kind = Predicate::Kind::kFalse}, std::nullopt, std::nullopt),
             kNever);
+}
+
+// A NULL value (the NULL item of a branch, ADR 0037's NL3) makes no predicate that reads it true:
+// a comparison, IN and NOT IN, LIKE and IS TRUE are NULL, IS NOT NULL is false.
+TEST(BranchTruthTest, ANullValueMakesNoPredicateTrue) {
+  const Constant null{.type = LogicalType::kInteger, .value = std::monostate{}};
+  for (const CompareOp op : {CompareOp::kEq, CompareOp::kNe, CompareOp::kLt, CompareOp::kGe}) {
+    EXPECT_EQ(TruthOver(Compare(op, Number(5)), null, std::nullopt), kNever);
+  }
+  EXPECT_EQ(TruthOver(CompareColumns(CompareOp::kEq, LogicalType::kInteger, LogicalType::kInteger),
+                      Number(5), null),
+            kNever);
+  EXPECT_EQ(TruthOver(InList(Predicate::Kind::kIn, LogicalType::kInteger, {Number(5)}), null,
+                      std::nullopt),
+            kNever);
+  EXPECT_EQ(TruthOver(InList(Predicate::Kind::kNotIn, LogicalType::kInteger, {Number(5)}), null,
+                      std::nullopt),
+            kNever);
+  EXPECT_EQ(TruthOver(Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                .column = Col(LogicalType::kInteger)},
+                      null, std::nullopt),
+            kNever);
+  const Constant null_text{.type = LogicalType::kVarchar, .value = std::monostate{}};
+  EXPECT_EQ(TruthOver(Predicate{.kind = Predicate::Kind::kLike,
+                                .column = Col(LogicalType::kVarchar),
+                                .constant = Text("a%")},
+                      null_text, std::nullopt),
+            kNever);
+  const Constant null_bool{.type = LogicalType::kBoolean, .value = std::monostate{}};
+  EXPECT_EQ(
+      TruthOver(Predicate{.kind = Predicate::Kind::kIsTrue, .column = Col(LogicalType::kBoolean)},
+                null_bool, std::nullopt),
+      kNever);
 }
 
 // What is not decided exactly here stays a condition: LIKE (its matcher is exec's), a computed
