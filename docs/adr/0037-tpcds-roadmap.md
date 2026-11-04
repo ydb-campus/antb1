@@ -145,7 +145,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | CT4 | Quotients of numeric literals folded into DOUBLE constants (the CT4 update below) | 21 | Built |
 | CT5 | DATE plus or minus an integer (the CT5 update below) | 72 | Built |
 | **Phase 4** | **Scalar functions** | | |
-| FN1 | Typed overloads for scalar functions | | Planned |
+| FN1 | Typed overloads for scalar functions (ADR 0012's FN1 update) | | Built |
 | FN2 | round | 2, 78 | Planned |
 | FN3 | abs | | Planned |
 | FN4 | upper and lower | 24, 99 | Planned |
