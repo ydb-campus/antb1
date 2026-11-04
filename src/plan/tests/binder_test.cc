@@ -261,7 +261,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -545,19 +545,19 @@ INSTANTIATE_TEST_SUITE_P(
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
                   "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
                   "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -1727,6 +1727,61 @@ TEST(BinderTest, DatePlusOrMinusDays) {
   }
   auto filtered = BindSql("SELECT i32 FROM t WHERE dt >= dt + 7", catalog);
   ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
+}
+
+// round of a DOUBLE (ADR 0037's FN2): with or without a precision, a DOUBLE named as DuckDB names
+// it. DuckDB's DECIMAL and integer overloads, a FLOAT column and a negative or computed precision
+// are unsupported; a VARCHAR is a bind error, and so is a call of three arguments.
+TEST(BinderTest, RoundOfADouble) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, name] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT round(d) FROM t", "round(d)"},
+           {"SELECT ROUND(d, 2) FROM t", "round(d, 2)"},
+           {"SELECT round(i32 / 7, 1 + 2) FROM t", "round((i32 / 7), (1 + 2))"},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, LogicalType::kDouble) << sql;
+    EXPECT_EQ(plan->output[0].name, name) << sql;
+  }
+  for (const auto& [sql, kind, message] :
+       std::to_array<std::tuple<std::string_view, SqlErrorDetail::Kind, std::string_view>>({
+           {"SELECT round(h) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "round() of DECIMAL(38,0) values is not supported (only of a DOUBLE)"},
+           {"SELECT round(i32, 1) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "round() of INTEGER values is not supported"},
+           {"SELECT round(d, -1) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "round() with a precision other than an integer constant of at least 0"},
+           {"SELECT round(d, i32) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "round() with a precision other than an integer constant of at least 0"},
+           {"SELECT round(s) FROM t", SqlErrorDetail::Kind::kBind,
+            "round() needs a DOUBLE, but 's' is VARCHAR"},
+           {"SELECT round(d, 1, 2) FROM t", SqlErrorDetail::Kind::kBind,
+            "round() takes 1 or 2 arguments, not 3"},
+           {"SELECT round(d, 2147483648) FROM t", SqlErrorDetail::Kind::kUnsupported,
+            "round() with a precision other than an integer constant of at least 0"},
+       })) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql;
+    EXPECT_EQ(detail->kind(), kind) << sql << ": " << plan.status().ToString();
+    EXPECT_TRUE(plan.status().message().contains(message)) << plan.status().ToString();
+  }
+  // A FLOAT column: DuckDB rounds it in FLOAT, and antb1 reads it as DOUBLE (D11).
+  Catalog with_float;
+  ASSERT_TRUE(with_float
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32())}), 10,
+                                      std::vector<int>{0}))
+                  .ok());
+  const auto on_float = BindSql("SELECT round(f, 1) FROM tf", with_float);
+  ASSERT_FALSE(on_float.ok());
+  const auto float_detail = GetSqlError(on_float.status());
+  ASSERT_NE(float_detail, nullptr);
+  EXPECT_EQ(float_detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(on_float.status().message().contains("round() of a FLOAT column is not supported"))
+      << on_float.status().ToString();
 }
 
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first

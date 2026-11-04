@@ -146,7 +146,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | CT5 | DATE plus or minus an integer (the CT5 update below) | 72 | Built |
 | **Phase 4** | **Scalar functions** | | |
 | FN1 | Typed overloads for scalar functions (ADR 0012's FN1 update) | | Built |
-| FN2 | round | 2, 78 | Planned |
+| FN2 | round (the FN2 update below) | 2, 78 | Built |
 | FN3 | abs | | Planned |
 | FN4 | upper and lower | 24, 99 | Planned |
 | FN5 | concat | 84 | Planned |
@@ -440,6 +440,17 @@ Update (2026-11-04, CT5): built, and phase 3 is complete. Query 72 passes: 58 of
   that leaves INTEGER or lands on one of DuckDB's infinities fails with its `Date out of range`, as DuckDB adds them.
 - **What stays unsupported.** A DATE minus a DATE, which DuckDB answers as a BIGINT of days, and TIMESTAMP arithmetic
   wait for a query that needs them. The `pending CT5` guard in `tests/slt/cases/joins/fact_pair.slt` is removed.
+
+Update (2026-11-04, FN2): built as two rows of FN1's table, `round(DOUBLE)` and `round(DOUBLE, precision)`. Queries
+2 and 78 pass: 60 of the 99. At scale factor 1, query 78 peaks at 665 MiB in the Debug build, under the 2 GiB limit.
+
+- **The value.** It is computed as DuckDB's `RoundOperator` and `RoundOperatorPrecision` compute it: `std::round`,
+  and at p digits `std::round(x * std::pow(10, p)) / std::pow(10, p)`. The value itself is kept where that result is
+  not finite.
+- **The precision.** It is a constant integer expression of at least 0.
+- **What stays unsupported.** DuckDB's DECIMAL and integer overloads, a FLOAT column (D11) and a negative or
+  computed precision. A new row field, `other_numbers_unsupported`, makes a number that no row of a function takes
+  unsupported rather than a bind error.
 
 ## Alternatives considered
 

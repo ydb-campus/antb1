@@ -165,6 +165,7 @@ bool IsDeterministic(plan::Function function) {
     case plan::Function::kExtract:
     case plan::Function::kDateTrunc:
     case plan::Function::kSubstring:
+    case plan::Function::kRound:
       return true;
   }
   return false;

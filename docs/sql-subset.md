@@ -590,6 +590,12 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   `main."substring"(URL, 1, 2)` where `substr(URL, 1, 2)` is plain. Unlike DuckDB, antb1 casts no argument
   implicitly, so a VARCHAR position that parses as a number (`substring(s, '2', 2)`, which DuckDB answers) is a bind
   error; for every other value and position type DuckDB is a binder error as well.
+- `round(x)` and `round(x, n)` of a DOUBLE ([ADR 0037](adr/0037-tpcds-roadmap.md)'s FN2), n a constant integer
+  expression of at least 0: a DOUBLE, as DuckDB rounds a DOUBLE -- half away from zero, and at n digits
+  `round(x * 10^n) / 10^n` computed in double (so `round(2.675, 2)` of the DOUBLE nearest 2.675 is 2.68, its product
+  being 267.5, while that of 1.005 is 1.0); the value itself where the result is not finite. Named as DuckDB names it
+  (`round(f, 2)`). DuckDB's overloads for a DECIMAL (which give a DECIMAL) and for an integer type, a FLOAT column
+  (D11) and a negative or computed precision are unsupported (exit code 4).
 - `COALESCE(a, b, ..., z)` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL5): the first argument that is not NULL, NULL
   when every one is; it is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE z END`, so each
   argument is computed only for the rows no earlier one answered. Its arguments are typed as `CASE`'s values, folded
@@ -1500,7 +1506,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
 | Q1 | pass | answered when the ratchet was added |
-| Q2 | unsupported | needs round (FN2) |
+| Q2 | pass | round of a DOUBLE (FN2) |
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
 | Q5 | unsupported | needs concat and ROLLUP (RU3) |
@@ -1576,7 +1582,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q75 | unsupported | needs UNION (X4b) |
 | Q76 | pass | IS NULL (NL4) |
 | Q77 | unsupported | needs ROLLUP and a cross product of multi-row relations (OJ4) |
-| Q78 | unsupported | needs round (FN2) |
+| Q78 | pass | round of a DOUBLE (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
 | Q80 | unsupported | needs concat and ROLLUP (RU3) |
 | Q81 | pass | answered when the ratchet was added |

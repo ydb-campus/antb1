@@ -204,9 +204,13 @@ enum class Function : std::uint8_t {
   // (where its strlen, and antb1's, count bytes: divergence D15). args: the value, the start, the
   // length, each evaluated -- the only function whose arguments after the first are no constants.
   kSubstring,
+  // round(double[, precision]): DOUBLE, as DuckDB rounds a DOUBLE (ADR 0037's FN2): half away from
+  // zero, at `precision` digits by round(x * 10^p) / 10^p in double, the value itself where that
+  // is not finite. args: the value, then the precision (an INTEGER constant, at least 0), if any.
+  kRound,
 };
 
-// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring".
+// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round".
 std::string_view ToString(Function function);
 
 // A scalar function of the arguments (constants where the function needs them: the pattern and

@@ -1321,6 +1321,43 @@ TEST_F(ComputeTest, DatePlusOrMinusDaysAsDuckDb) {
   }
 }
 
+// round of a DOUBLE as DuckDB computes it (ADR 0037's FN2): half away from zero; at p digits
+// round(x * 10^p) / 10^p in double, so a halfway case is decided on the binary product; the value
+// itself where the result is not finite.
+TEST_F(ComputeTest, RoundOfADoubleAsDuckDb) {
+  const auto call = [&](std::optional<int> digits) {
+    std::vector<plan::ExprPtr> args{ColumnAt(0, LogicalType::kDouble)};
+    if (digits.has_value()) {
+      args.push_back(ConstantOf(*digits, LogicalType::kInteger));
+    }
+    return std::make_shared<const plan::Expr>(plan::Expr{
+        .node = plan::FunctionExpr{.function = plan::Function::kRound, .args = std::move(args)},
+        .type = LogicalType::kDouble,
+        .name = "round"});
+  };
+  const auto values = [&](std::optional<int> digits, const std::vector<std::optional<double>>& in) {
+    auto out = Eval(call(digits), {Doubles(in)});
+    EXPECT_TRUE(out.ok()) << out.status().ToString();
+    std::vector<std::optional<double>> got;
+    if (out.ok()) {
+      const auto& doubles = static_cast<const arrow::DoubleArray&>(**out);
+      for (int64_t i = 0; i < doubles.length(); ++i) {
+        got.push_back(doubles.IsNull(i) ? std::nullopt : std::optional(doubles.Value(i)));
+      }
+    }
+    return got;
+  };
+  EXPECT_EQ(values(std::nullopt, {2.5, -2.5, -0.4, std::nullopt}),
+            (std::vector<std::optional<double>>{3.0, -3.0, -0.0, std::nullopt}));
+  EXPECT_TRUE(std::signbit(values(std::nullopt, {-0.4}).at(0).value_or(0.0)));
+  EXPECT_EQ(values(2, {2.675, 1.005, 0.125}),
+            (std::vector<std::optional<double>>{2.68, 1.0, 0.13}));
+  EXPECT_EQ(values(10, {1e300}), (std::vector<std::optional<double>>{1e300}));
+  EXPECT_EQ(values(400, {1.5}), (std::vector<std::optional<double>>{1.5}));
+  EXPECT_TRUE(
+      std::isnan(values(2, {std::numeric_limits<double>::quiet_NaN()}).at(0).value_or(0.0)));
+}
+
 // % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted
 // by rule 8 (a BIGINT to its nearest double, a HUGEINT by DuckDB's 128-bit formula), with the
 // dividend's sign (-0.0 too) and NULL for a zero divisor; with a DOUBLE operand a zero divisor

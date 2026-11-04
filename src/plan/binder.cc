@@ -589,6 +589,8 @@ enum class ArgKind : std::uint8_t {
   kInteger,        // a value of an integer type but HUGEINT, computed per row
   kTemporal,       // a TIMESTAMP or a DATE
   kStringLiteral,  // a string literal: a pattern, a replacement, a unit
+  kDouble,         // a DOUBLE value
+  kPrecision,      // a constant integer expression of at least 0, as an INTEGER (round's digits)
 };
 
 bool Accepts(ArgKind kind, LogicalType type) {
@@ -599,8 +601,11 @@ bool Accepts(ArgKind kind, LogicalType type) {
       return IsInteger(type) && type != LogicalType::kHugeInt;
     case ArgKind::kTemporal:
       return type == LogicalType::kTimestamp || type == LogicalType::kDate;
+    case ArgKind::kDouble:
+      return type == LogicalType::kDouble;
     case ArgKind::kStringLiteral:
-      return false;  // a literal, checked as one where the call is bound
+    case ArgKind::kPrecision:
+      return false;  // a constant, checked as one where the call is bound
   }
   return false;
 }
@@ -622,6 +627,9 @@ struct FunctionOverload {
   std::string_view refused_name;          // the function as a refusal of the value's type names it
   std::string_view needs;                 // the value's types as that refusal names them
   bool reserved_name = false;  // DuckDB qualifies and quotes a function whose name it reserves
+  // A number the value does not take is unsupported (DuckDB has an overload for it that antb1
+  // lacks), not a bind error.
+  bool other_numbers_unsupported = false;
 
   [[nodiscard]] bool TakesArgs(std::size_t n) const { return n >= min_args && n <= max_args; }
 };
@@ -676,6 +684,24 @@ constexpr auto kFunctions = std::to_array<FunctionOverload>({
      .result = LogicalType::kVarchar,
      .refused_name = "substr",
      .needs = "a VARCHAR"},
+    // round of a DOUBLE (ADR 0037's FN2), with or without a precision. DuckDB's overloads for a
+    // DECIMAL (a DECIMAL) and an integer type (that type) are unsupported here.
+    {.name = "round",
+     .function = Function::kRound,
+     .args = {ArgKind::kDouble},
+     .result = LogicalType::kDouble,
+     .refused_name = "round",
+     .needs = "a DOUBLE",
+     .other_numbers_unsupported = true},
+    {.name = "round",
+     .function = Function::kRound,
+     .args = {ArgKind::kDouble, ArgKind::kPrecision},
+     .min_args = 2,
+     .max_args = 2,
+     .result = LogicalType::kDouble,
+     .refused_name = "round",
+     .needs = "a DOUBLE",
+     .other_numbers_unsupported = true},
 });
 
 // COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
@@ -949,7 +975,7 @@ struct FirstUnsupportedOf {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
                                               "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
-                                              "DATE_TRUNC, SUBSTRING and COALESCE)",
+                                              "DATE_TRUNC, SUBSTRING, ROUND and COALESCE)",
                                               Clip(call.name))};
     }
     if (overloads.front().function == Function::kRegexpReplace && call.args.size() == 4) {
@@ -2835,6 +2861,29 @@ class Binder {
         name += value.expr->name;
         continue;
       }
+      if (spec->args.at(i) == ArgKind::kPrecision) {
+        // A constant integer expression of at least 0, as DuckDB's INTEGER precision; any other
+        // precision (a negative one, a column) is unsupported.
+        std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(call.args[i]);
+        if (folded.has_value() && !folded->ok()) {
+          return folded->status();
+        }
+        const std::optional<Int128> digits =
+            folded.has_value() ? std::optional((**folded).value) : std::nullopt;
+        if (!digits.has_value() || *digits < 0 || *digits > RangeOf(LogicalType::kInteger).max) {
+          return UnsupportedError(std::format("{}() with a precision other than an integer "
+                                              "constant of at least 0 is not supported",
+                                              spec->name),
+                                  call.args[i].span());
+        }
+        name += ExprName(call.args[i]);
+        integers.push_back(std::make_shared<const Expr>(Expr{
+            .node =
+                ConstantExpr{.value = Constant{.type = LogicalType::kInteger, .value = *digits}},
+            .type = LogicalType::kInteger,
+            .name = ExprName(call.args[i])}));
+        continue;
+      }
       if (spec->args.at(i) == ArgKind::kInteger) {
         ARROW_ASSIGN_OR_RAISE(const Typed arg, bind_arg(call.args[i]));
         if (!Accepts(ArgKind::kInteger, arg.expr->type)) {
@@ -2867,12 +2916,26 @@ class Binder {
     const auto chosen = std::ranges::find_if(overloads, [&](const FunctionOverload& o) {
       return o.TakesArgs(call.args.size()) && Accepts(o.args.at(o.value_arg), value.expr->type);
     });
+    const SourceSpan value_span = call.args[spec->value_arg].span();
     if (chosen == overloads.end()) {
+      const LogicalType type = value.expr->type;
+      if (spec->other_numbers_unsupported && (IsNumeric(type) || type == LogicalType::kDecimal)) {
+        return UnsupportedError(std::format("{}() of {} values is not supported (only of {})",
+                                            spec->refused_name, ToString(type), spec->needs),
+                                value_span);
+      }
       return BindError(std::format("{}() needs {}, but {}", spec->refused_name, spec->needs,
                                    DescribeOperand(value)),
-                       call.args[spec->value_arg].span());
+                       value_span);
     }
     spec = &*chosen;
+    if (value.stored_as_float && spec->args.at(spec->value_arg) == ArgKind::kDouble) {
+      // DuckDB's FLOAT overload rounds in FLOAT, and antb1 reads the column as DOUBLE.
+      return UnsupportedError(std::format("{}() of a FLOAT column is not supported (antb1 reads "
+                                          "FLOAT as DOUBLE, divergence D11)",
+                                          spec->refused_name),
+                              value_span);
+    }
     const LogicalType type =
         spec->result.has_value() ? LogicalType(*spec->result) : value.expr->type;
     if (spec->function == Function::kEpochMs) {
