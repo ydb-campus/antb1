@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <deque>
 #include <format>
@@ -1034,6 +1035,9 @@ std::array<sql::Expr, 2> BetweenComparisons(const sql::BetweenExpr& between) {
 // Whether `expr` is a constant integer expression the binder folds (FoldConstant), overflowing or
 // not.
 bool IsConstantInteger(const sql::Expr& expr);
+// A constant integer expression, or a quotient of numeric literals (ADR 0037's CT4): a constant
+// that a comparison, a bound or an IN list folds into the literal of its value (FoldConstant).
+bool IsFoldableConstant(const sql::Expr& expr);
 
 // Whether `stmt` aggregates every row it reads rather than projecting them (Shape::kGlobal when it
 // also has no GROUP BY).
@@ -1114,11 +1118,12 @@ struct RejectConditionOf {
         }
         for (const sql::Expr* side : {&*binary.left, &*binary.right}) {
           if (!IsOperand(*side) && !std::holds_alternative<sql::Literal>(*side) &&
-              !IsConstantInteger(*side)) {
+              !IsFoldableConstant(*side)) {
             return Rejection{.span = side->span(),
                              .message =
                                  "a constant expression in a comparison is not supported "
-                                 "(only integer literals under +, - and * are folded)"};
+                                 "(only integer literals under +, - and * and a quotient of "
+                                 "two numbers are folded)"};
           }
         }
         return std::nullopt;
@@ -1173,11 +1178,12 @@ struct RejectConditionOf {
       return r;
     }
     for (const sql::Expr& value : in.list) {
-      if (!std::holds_alternative<sql::Literal>(value) && !IsConstantInteger(value)) {
+      if (!std::holds_alternative<sql::Literal>(value) && !IsFoldableConstant(value)) {
         return Rejection{
             .span = value.span(),
             .message =
-                "only literals and constant integer expressions are supported in an IN list"};
+                "only literals, constant integer expressions and quotients of numbers are "
+                "supported in an IN list"};
       }
     }
     return std::nullopt;
@@ -2061,9 +2067,73 @@ bool IsConstantInteger(const sql::Expr& expr) {
   return !std::holds_alternative<sql::Literal>(expr) && FoldTyped(expr).has_value();
 }
 
-// The literal of a constant integer expression's value, spanning it (IsConstantInteger), or the
-// bind error of its overflow.
+// The double DuckDB divides when `expr` is a number it converts for a DOUBLE division: a constant
+// integer expression (a literal, negated or not, included) converted by the type DuckDB gives it --
+// an INTEGER or a BIGINT to the nearest double, a HUGEINT by DuckDB's two's-complement formula
+// (DuckDbHugeintToDouble) -- or a decimal or exponent literal, negated or not, as DuckDbDoubleOf
+// converts it (symmetric in its sign). std::nullopt for anything else.
+std::optional<double> DivisionOperand(const sql::Expr& expr) {
+  if (std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(expr); folded.has_value()) {
+    if (!folded->ok()) {
+      return std::nullopt;
+    }
+    const TypedConstant constant = **folded;
+    if (constant.type == LogicalType::kHugeInt) {
+      return DuckDbHugeintToDouble(constant.value);
+    }
+    return static_cast<double>(static_cast<int64_t>(constant.value));  // INTEGER or BIGINT
+  }
+  if (const auto* lit = std::get_if<sql::Literal>(&expr);
+      lit != nullptr &&
+      (lit->kind == sql::Literal::Kind::kInteger || lit->kind == sql::Literal::Kind::kDecimal)) {
+    return DuckDbDoubleOf(lit->text, lit->negative);
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
+    if (const std::optional<double> inner = DivisionOperand(*unary->operand)) {
+      return -*inner;
+    }
+  }
+  return std::nullopt;
+}
+
+// `a / b` of two numbers (DivisionOperand) as the DOUBLE DuckDB computes for it (ADR 0037's CT4):
+// both converted to double and divided, so 2.0 / 3.0 is 0.6666666666666666. std::nullopt for any
+// other expression, and for a quotient that is not finite (a zero divisor), which stays refused.
+std::optional<double> ConstantQuotient(const sql::Expr& expr) {
+  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
+  if (binary == nullptr || binary->op != sql::BinaryOp::kDivide) {
+    return std::nullopt;
+  }
+  const std::optional<double> left = DivisionOperand(*binary->left);
+  const std::optional<double> right = DivisionOperand(*binary->right);
+  if (!left.has_value() || !right.has_value()) {
+    return std::nullopt;
+  }
+  const double quotient = *left / *right;
+  if (!std::isfinite(quotient)) {
+    return std::nullopt;
+  }
+  return quotient;
+}
+
+bool IsFoldableConstant(const sql::Expr& expr) {
+  return IsConstantInteger(expr) || ConstantQuotient(expr).has_value();
+}
+
+// The literal of a foldable constant's value, spanning it (IsFoldableConstant): a constant integer
+// expression's integer, or the bind error of its overflow; a quotient's DOUBLE, written with an
+// exponent so that it reads back as that DOUBLE (DuckDbTypesAsDouble).
 arrow::Result<sql::Literal> FoldConstant(const sql::Expr& expr) {
+  if (const std::optional<double> quotient = ConstantQuotient(expr)) {
+    std::array<char, 64> buf{};
+    const auto written = std::to_chars(buf.data(), buf.data() + buf.size(), std::fabs(*quotient),
+                                       std::chars_format::scientific);
+    return sql::Literal{.kind = sql::Literal::Kind::kDecimal,
+                        .negative = std::signbit(*quotient),
+                        .text = std::string(buf.data(), written.ptr),
+                        .span = expr.span()};
+  }
   auto folded = FoldTyped(expr);
   ANTB1_CHECK(folded.has_value());
   ARROW_ASSIGN_OR_RAISE(const TypedConstant constant, *std::move(folded));
@@ -3736,7 +3806,7 @@ struct Binder::BindConditionOf {
     // folds as any literal; one that overflows its type is a bind error.
     for (const bool left : {true, false}) {
       const sql::Expr& side = left ? *binary.left : *binary.right;
-      if (std::holds_alternative<sql::Literal>(side) || !IsConstantInteger(side)) {
+      if (std::holds_alternative<sql::Literal>(side) || !IsFoldableConstant(side)) {
         continue;
       }
       ARROW_ASSIGN_OR_RAISE(sql::Literal folded, FoldConstant(side));
@@ -3898,6 +3968,8 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
     } else if (IsConstantInteger(*value)) {
       auto folded = FoldTyped(*value);
       any_wide = any_wide || (folded.has_value() && folded->ok() && wide((*folded)->type));
+    } else if (IsFoldableConstant(*value)) {
+      is_double = true;  // a quotient of numbers, a DOUBLE (CT4)
     } else {
       ARROW_ASSIGN_OR_RAISE(const Typed typed, bind(*value));
       const LogicalType type = typed.expr->type;
