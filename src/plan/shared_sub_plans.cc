@@ -190,7 +190,7 @@ class Origins {
   // by its path, as two sides' columns of one table are.
   [[nodiscard]] std::string CallOrigin(const AggregateCall& call, const LogicalNode& at) const {
     return std::format("agg({},{},{})", static_cast<int>(call.kind), Key(call.arg, at),
-                       static_cast<int>(call.type.id()));
+                       ToString(call.type));
   }
 
   std::unordered_map<std::uint32_t, int> of_;
@@ -208,7 +208,7 @@ class Origins {
 // not make -- and it would be the same error as hanging identity on a display format, which the
 // column keys above deliberately avoid.
 std::string ConstantKey(const Constant& constant) {
-  return std::format("{}:{}", static_cast<int>(constant.type.id()), ToString(constant));
+  return std::format("{}:{}", ToString(constant.type), ToString(constant));
 }
 
 // `p`, read by `at`, as a key. With `local`, its columns are the operand-local ones of a
@@ -276,7 +276,7 @@ std::string ExprKey(const ExprPtr& expr, const Origins& origins, const LogicalNo
         }
       },
       expr->node);
-  return std::format("{}:{}", node, static_cast<int>(expr->type.id()));
+  return std::format("{}:{}", node, ToString(expr->type));
 }
 
 void Origins::Define(const ComputeNode& node, const LogicalNode& at) {
@@ -325,7 +325,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
           std::string key = "aggregate(";
           for (const AggregateCall& call : n.aggregates) {
             key += std::format("{},{},{};", static_cast<int>(call.kind),
-                               origins.Key(call.arg, node), static_cast<int>(call.type.id()));
+                               origins.Key(call.arg, node), ToString(call.type));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, GroupAggregateNode>) {
@@ -337,7 +337,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
           key += ';';
           for (const AggregateCall& call : n.aggregates) {
             key += std::format("{},{},{};", static_cast<int>(call.kind),
-                               origins.Key(call.arg, node), static_cast<int>(call.type.id()));
+                               origins.Key(call.arg, node), ToString(call.type));
           }
           return key + ')';
         } else if constexpr (std::is_same_v<T, JoinNode>) {

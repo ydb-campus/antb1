@@ -1915,9 +1915,9 @@ struct Evaluator {
     if (cast.operand == nullptr) {
       return arrow::Status::Invalid("a cast without an operand");
     }
-    if (!plan::IsExactWidening(cast.operand->type, e.type)) {
+    if (!plan::IsExecutableCast(cast.operand->type, e.type)) {
       return arrow::Status::Invalid("a cast of ", plan::ToString(cast.operand->type), " to ",
-                                    plan::ToString(e.type), " is not an exact widening");
+                                    plan::ToString(e.type), " is not one the executor runs");
     }
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr values, (*this)(*cast.operand));
     return Convert(values, *cast.operand, e.type);
