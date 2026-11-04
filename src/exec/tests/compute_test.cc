@@ -1184,11 +1184,10 @@ TEST_F(ComputeTest, CastWidensExactly) {
 // (ADR 0037's CT2): rounded half away from zero where the scale shrinks, and failing with DuckDB's
 // error on a value the DECIMAL cannot hold. It rejects every other cast as a plan error.
 TEST_F(ComputeTest, CastRejectsWhatIsNoExactWidening) {
-  const auto narrowing =
-      Eval(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::kInteger), {Int64s({1})});
-  EXPECT_TRUE(narrowing.status().IsInvalid()) << narrowing.status().ToString();
-  EXPECT_EQ(narrowing.status().message(),
-            "a cast of BIGINT to INTEGER is not one the executor runs");
+  const auto to_date =
+      Eval(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::kDate), {Int64s({1})});
+  EXPECT_TRUE(to_date.status().IsInvalid()) << to_date.status().ToString();
+  EXPECT_EQ(to_date.status().message(), "a cast of BIGINT to DATE is not one the executor runs");
   const LogicalType price = LogicalType::Decimal(15, 3);
   auto rounded = Eval(CastOf(ColumnAt(0, price), LogicalType::Decimal(15, 2)),
                       {Decimals(price, {"1.235", "-1.235", "1.234"})});
@@ -1209,6 +1208,77 @@ TEST_F(ComputeTest, CastRejectsWhatIsNoExactWidening) {
   EXPECT_EQ(beyond.status().message(),
             "Casting value \"123456.78\" to type DECIMAL(5,3) failed: value is out of range! when "
             "casting from source column c");
+}
+
+// Casts to an integer type (ADR 0037's CT3), checked as DuckDB checks them: an integer kept, a
+// DECIMAL rounded half away from zero, a DOUBLE half to even; a value the type cannot hold fails
+// with DuckDB's error, which names the types by their physical names.
+TEST_F(ComputeTest, CastsToIntegerTypesRoundAndCheckAsDuckDb) {
+  const LogicalType d = LogicalType::Decimal(9, 2);
+  auto decimals = Eval(CastOf(ColumnAt(0, d), LogicalType::kInteger),
+                       {Decimals(d, {"250", "-250", "249", "-50"})});
+  ASSERT_TRUE(decimals.ok()) << decimals.status().ToString();
+  EXPECT_EQ((*decimals)->ToString(), "[\n  3,\n  -3,\n  2,\n  -1\n]");
+  auto doubles = Eval(CastOf(ColumnAt(0, LogicalType::kDouble), LogicalType::kBigInt),
+                      {Doubles({2.5, -2.5, 3.5, 0.49999999999999994})});
+  ASSERT_TRUE(doubles.ok()) << doubles.status().ToString();
+  EXPECT_EQ((*doubles)->ToString(), "[\n  2,\n  -2,\n  4,\n  0\n]");
+  // A HUGEINT and a 38-digit DECIMAL as sources, to a narrower type and to HUGEINT.
+  const LogicalType h = LogicalType::kHugeInt;
+  const LogicalType wide = LogicalType::Decimal(38, 1);
+  auto from_huge = Eval(CastOf(ColumnAt(0, h), LogicalType::kInteger), {Decimals(h, {"-7"})});
+  ASSERT_TRUE(from_huge.ok()) << from_huge.status().ToString();
+  EXPECT_EQ((*from_huge)->ToString(), "[\n  -7\n]");
+  auto to_huge = Eval(CastOf(ColumnAt(0, wide), h), {Decimals(wide, {"-25"})});
+  ASSERT_TRUE(to_huge.ok()) << to_huge.status().ToString();
+  EXPECT_TRUE((*to_huge)->type()->Equals(*plan::ToArrow(h)));
+  EXPECT_EQ((*to_huge)->ToString(), "[\n  -3\n]");
+  // DOUBLE to HUGEINT is not a cast the executor runs: DuckDB's HUGEINT reaches 2^127.
+  EXPECT_TRUE(
+      Eval(CastOf(ColumnAt(0, LogicalType::kDouble), h), {Doubles({1e38})}).status().IsInvalid());
+  const auto fails = [&](const plan::ExprPtr& expr, const std::shared_ptr<arrow::Array>& input) {
+    auto out = Eval(expr, {input});
+    EXPECT_TRUE(out.status().IsExecutionError()) << out.status().ToString();
+    return out.status().message();
+  };
+  EXPECT_EQ(
+      fails(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::kSmallInt), Int64s({1, 70000})),
+      "Type INT64 with value 70000 can't be cast because the value is out of range for the "
+      "destination type INT16 when casting from source column c");
+  EXPECT_EQ(fails(CastOf(ColumnAt(0, d), LogicalType::kSmallInt), Decimals(d, {"4000060"})),
+            "Failed to cast decimal value 40001 to type INT16 when casting from source column c");
+  EXPECT_EQ(
+      fails(CastOf(ColumnAt(0, LogicalType::kDouble), LogicalType::kInteger), Doubles({1e10})),
+      "Type DOUBLE with value 10000000000.0 can't be cast because the value is out of range "
+      "for the destination type INT32 when casting from source column c");
+  EXPECT_EQ(fails(CastOf(ColumnAt(0, h), LogicalType::kSmallInt), Decimals(h, {"40000"})),
+            "Type INT128 with value 40000 can't be cast because the value is out of range for the "
+            "destination type INT16 when casting from source column c");
+  // A DOUBLE that rounds past the type's maximum fails (divergence D28: DuckDB's answer depends
+  // on the platform).
+  EXPECT_EQ(
+      fails(CastOf(ColumnAt(0, LogicalType::kDouble), LogicalType::kSmallInt), Doubles({32767.5})),
+      "Type DOUBLE with value 32767.5 can't be cast because the value is out of range for "
+      "the destination type INT16 when casting from source column c");
+  EXPECT_EQ(
+      fails(CastOf(ColumnAt(0, LogicalType::kDouble), LogicalType::kUSmallInt), Doubles({65535.5})),
+      "Type DOUBLE with value 65535.5 can't be cast because the value is out of range for "
+      "the destination type UINT16 when casting from source column c");
+  EXPECT_EQ(fails(CastOf(ColumnAt(0, LogicalType::kDouble), LogicalType::kUSmallInt),
+                  Doubles({std::numeric_limits<double>::quiet_NaN()})),
+            "Type DOUBLE with value nan can't be cast because the value is out of range for the "
+            "destination type UINT16 when casting from source column c");
+}
+
+// DuckDB's text of a DOUBLE in a message: fixed below 1e16 with a fraction digit, else scientific.
+TEST(DuckDbDoubleTextTest, PrintsAsDuckDb) {
+  EXPECT_EQ(DuckDbDoubleText(1e10), "10000000000.0");
+  EXPECT_EQ(DuckDbDoubleText(1e15), "1000000000000000.0");
+  EXPECT_EQ(DuckDbDoubleText(1e16), "1e+16");
+  EXPECT_EQ(DuckDbDoubleText(1.5e17), "1.5e+17");
+  EXPECT_EQ(DuckDbDoubleText(-3000000000.25), "-3000000000.25");
+  EXPECT_EQ(DuckDbDoubleText(1.25e-5), "1.25e-05");
+  EXPECT_EQ(DuckDbDoubleText(-std::numeric_limits<double>::infinity()), "-inf");
 }
 
 // % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted

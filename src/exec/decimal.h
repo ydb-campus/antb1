@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -73,6 +74,24 @@ arrow::Status DecimalCastError(Int128 value, plan::LogicalType from, plan::Logic
 // from zero where the scale shrinks. A value that does not fit `to`'s width, even one beyond its
 // own declared width, fails with DecimalCastError; NULL stays NULL.
 arrow::Result<std::shared_ptr<arrow::Array>> CastToDecimal(const arrow::Array& values,
+                                                           plan::LogicalType from,
+                                                           plan::LogicalType to,
+                                                           std::string_view column,
+                                                           arrow::MemoryPool* pool);
+
+// DuckDB's text of a DOUBLE in a message: the shortest digits that read back as the value, fixed
+// with at least one fraction digit (10000000000.0) from 1e-4 to below 1e16 and scientific beyond
+// (1e+20, 1.25e-05), nan, inf and -inf.
+std::string DuckDbDoubleText(double value);
+
+// An integer, decimal128/decimal64 or DOUBLE array of logical type `from` cast to the integer type
+// `to` as DuckDB casts it (ADR 0037's CT3): an integer kept, a DECIMAL rounded half away from zero,
+// a DOUBLE (not to HUGEINT) rounded half to even; a value outside `to` (a DOUBLE NaN or infinity
+// too, or one that rounds past the type's maximum: divergence D28) fails with
+// DuckDB's conversion error, which names the integer types by their physical names (INT16, INT32,
+// INT64, INT128, UINT16), followed by ` when casting from source column <column>` when `column`
+// is not empty. NULL stays NULL.
+arrow::Result<std::shared_ptr<arrow::Array>> CastToInteger(const arrow::Array& values,
                                                            plan::LogicalType from,
                                                            plan::LogicalType to,
                                                            std::string_view column,

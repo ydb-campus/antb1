@@ -4391,9 +4391,9 @@ namespace {
 // constant (a literal, negated or in parentheses, or arithmetic of them) in an integer type's
 // range, in a DECIMAL(p,s) without leaving its p digits, or in a DOUBLE up to 2^53; a decimal
 // literal in a DECIMAL's p digits, rounded half away from zero where the scale shrinks as DuckDB
-// casts (CT2), or in an integer type when it has no fraction; a string literal as VARCHAR or
-// TIMESTAMP. std::nullopt for anything else, which is cast as a value or refused, as is a constant
-// DuckDB would fail to convert.
+// casts (CT2), or in an integer type's range rounded the same way (CT3); a string literal as
+// VARCHAR or TIMESTAMP. std::nullopt for anything else, which is cast as a value or refused, as is
+// a constant DuckDB would fail to convert.
 std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, LogicalType to) {
   const auto in_decimal = [&to](Int128 unscaled, int scale) -> std::optional<Constant> {
     const std::optional<Int128> scaled = Rescale(unscaled, scale, to.scale());
@@ -4436,8 +4436,11 @@ std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, Logic
     std::optional<Constant> out;
     if (to == LogicalType::kDecimal) {
       out = in_decimal(decimal->unscaled, scale);
-    } else if (IsInteger(to) && decimal->unscaled % PowerOfTen(scale) == 0) {
-      out = in_integer(decimal->unscaled / PowerOfTen(scale));
+    } else if (IsInteger(to)) {
+      // Rounded half away from zero, as DuckDB casts a DECIMAL to an integer (CT3).
+      if (const std::optional<Int128> rounded = Rescale(decimal->unscaled, scale, 0)) {
+        out = in_integer(*rounded);
+      }
     }
     if (!out.has_value()) {
       return std::nullopt;
@@ -4474,8 +4477,9 @@ std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, Logic
 // CAST(x AS T) (ADR 0037's CT1 and CT2): a constant that T holds is that constant (CastConstant);
 // otherwise a cast the executor runs (IsExecutableCast) is its CastExpr: an identity (a FLOAT
 // column as DOUBLE drops its FLOAT flag: the value is the DOUBLE antb1 reads), an exact widening,
-// or an integer or a DECIMAL cast to a DECIMAL, checked and rounded as DuckDB casts. Every other
-// cast is unsupported (CT3 and CT4 answer more), as is a constant DuckDB would fail to convert.
+// an integer or a DECIMAL cast to a DECIMAL, or an integer, a DECIMAL or a DOUBLE cast to an
+// integer type, checked and rounded as DuckDB casts. Every other cast is unsupported, as is a
+// constant DuckDB would fail to convert.
 // Named as DuckDB names a cast.
 template <class BindFn>
 arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& bind) {
