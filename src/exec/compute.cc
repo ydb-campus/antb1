@@ -1215,8 +1215,7 @@ struct Evaluator {
     return result->make_array();
   }
 
-  arrow::Result<ArrayPtr> Evaluate(const plan::FunctionExpr& function,
-                                   const plan::Expr& /*e*/) const {
+  arrow::Result<ArrayPtr> Evaluate(const plan::FunctionExpr& function, const plan::Expr& e) const {
     if (function.args.empty()) {
       return arrow::Status::Invalid("function without arguments");
     }
@@ -1244,8 +1243,62 @@ struct Evaluator {
         return Substring(function, text);
       case plan::Function::kRound:
         return Round(function, *text);
+      case plan::Function::kAbs:
+        return Abs(*text, e.type);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // abs(x) as DuckDB computes it (ADR 0037's FN3), in x's own type: fabs of a DOUBLE (-0.0 is 0.0,
+  // NaN stays NaN); the magnitude of an integer, failing with DuckDB's `Overflow on abs(<min>)` on
+  // an integer type's minimum; the magnitude of a DECIMAL or HUGEINT, whose range is symmetric.
+  arrow::Result<ArrayPtr> Abs(const arrow::Array& values, plan::LogicalType type) const {
+    if (type == plan::LogicalType::kDouble) {
+      const auto& doubles = static_cast<const arrow::DoubleArray&>(values);
+      arrow::DoubleBuilder builder(pool);
+      ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+      for (int64_t i = 0; i < values.length(); ++i) {
+        if (values.IsNull(i)) {
+          builder.UnsafeAppendNull();
+        } else {
+          builder.UnsafeAppend(std::fabs(doubles.Value(i)));
+        }
+      }
+      ArrayPtr out;
+      ARROW_RETURN_NOT_OK(builder.Finish(&out));
+      return out;
+    }
+    if (type == plan::LogicalType::kDecimal || type == plan::LogicalType::kHugeInt) {
+      ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
+      DecimalColumnBuilder builder(
+          type == plan::LogicalType::kHugeInt ? plan::LogicalType::Decimal(38, 0) : type, pool);
+      ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+      for (int64_t i = 0; i < values.length(); ++i) {
+        const Int128 value = read.values[static_cast<std::size_t>(i)];
+        if (values.IsNull(i)) {
+          builder.UnsafeAppendNull();
+        } else {
+          builder.UnsafeAppend(value < 0 ? -value : value);  // within +-(10^38 - 1)
+        }
+      }
+      ArrayPtr out;
+      ARROW_RETURN_NOT_OK(builder.Finish(&out));
+      return out;
+    }
+    if (!plan::IsInteger(type)) {
+      return arrow::Status::Invalid("abs of a ", plan::ToString(type));
+    }
+    ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
+    const plan::IntegerRange range = plan::RangeOf(type);
+    for (int64_t i = 0; i < values.length(); ++i) {
+      const Int128 value = read.values[static_cast<std::size_t>(i)];
+      if (!values.IsNull(i) && value < 0 && -value > range.max) {
+        return arrow::Status::ExecutionError("Overflow on abs(", Int128ToString(value), ")");
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(const arrow::Datum magnitude,
+                          arrow::compute::CallFunction("abs", {values.Slice(0)}, ctx));
+    return magnitude.make_array();
   }
 
   // round(x[, p]) of a DOUBLE, as DuckDB's RoundOperator and RoundOperatorPrecision compute it

@@ -1321,6 +1321,56 @@ TEST_F(ComputeTest, DatePlusOrMinusDaysAsDuckDb) {
   }
 }
 
+// abs as DuckDB computes it (ADR 0037's FN3): in the argument's own type; fabs of a DOUBLE (-0.0 is
+// 0.0, NaN stays NaN); an integer type's minimum fails with DuckDB's overflow error; a DECIMAL's
+// range is symmetric.
+TEST_F(ComputeTest, AbsAsDuckDb) {
+  const auto abs_of = [](plan::ExprPtr operand) {
+    const LogicalType type = operand->type;
+    return std::make_shared<const plan::Expr>(plan::Expr{
+        .node = plan::FunctionExpr{.function = plan::Function::kAbs, .args = {std::move(operand)}},
+        .type = type,
+        .name = "abs"});
+  };
+  auto doubles =
+      Eval(abs_of(ColumnAt(0, LogicalType::kDouble)), {Doubles({-2.5, -0.0, std::nullopt, 3.0})});
+  ASSERT_TRUE(doubles.ok()) << doubles.status().ToString();
+  const auto& d = static_cast<const arrow::DoubleArray&>(**doubles);
+  EXPECT_EQ(d.Value(0), 2.5);
+  EXPECT_FALSE(std::signbit(d.Value(1)));
+  EXPECT_TRUE(d.IsNull(2));
+  auto nan = Eval(abs_of(ColumnAt(0, LogicalType::kDouble)),
+                  {Doubles({std::numeric_limits<double>::quiet_NaN()})});
+  ASSERT_TRUE(nan.ok()) << nan.status().ToString();
+  EXPECT_TRUE(std::isnan(static_cast<const arrow::DoubleArray&>(**nan).Value(0)));
+  auto smallints =
+      Eval(abs_of(ColumnAt(0, LogicalType::kSmallInt)), {Int16s({-3, 32767, std::nullopt})});
+  ASSERT_TRUE(smallints.ok()) << smallints.status().ToString();
+  EXPECT_EQ((*smallints)->ToString(), "[\n  3,\n  32767,\n  null\n]");
+  auto minimum = Eval(abs_of(ColumnAt(0, LogicalType::kSmallInt)), {Int16s({1, -32768})});
+  EXPECT_TRUE(minimum.status().IsExecutionError()) << minimum.status().ToString();
+  EXPECT_EQ(minimum.status().message(), "Overflow on abs(-32768)");
+  auto big = Eval(abs_of(ColumnAt(0, LogicalType::kBigInt)),
+                  {Int64s({std::numeric_limits<int64_t>::min()})});
+  EXPECT_EQ(big.status().message(), "Overflow on abs(-9223372036854775808)");
+  const LogicalType dec = LogicalType::Decimal(9, 3);
+  auto decimals = Eval(abs_of(ColumnAt(0, dec)), {Decimals(dec, {"-1250", "999999999"})});
+  ASSERT_TRUE(decimals.ok()) << decimals.status().ToString();
+  EXPECT_EQ((*decimals)->ToString(), "[\n  1.250,\n  999999.999\n]");
+  // A wide DECIMAL and a HUGEINT (decimal128(38,0)), whose ranges are symmetric too.
+  const LogicalType wide = LogicalType::Decimal(38, 1);
+  auto wides = Eval(abs_of(ColumnAt(0, wide)),
+                    {Decimals(wide, {"-99999999999999999999999999999999999999", std::nullopt})});
+  ASSERT_TRUE(wides.ok()) << wides.status().ToString();
+  EXPECT_TRUE((*wides)->type()->Equals(*plan::ToArrow(wide)));
+  EXPECT_EQ((*wides)->ToString(), "[\n  9999999999999999999999999999999999999.9,\n  null\n]");
+  const LogicalType huge = LogicalType::kHugeInt;
+  auto huges = Eval(abs_of(ColumnAt(0, huge)), {Decimals(huge, {"-170141183460469231731"})});
+  ASSERT_TRUE(huges.ok()) << huges.status().ToString();
+  EXPECT_TRUE((*huges)->type()->Equals(*plan::ToArrow(huge)));
+  EXPECT_EQ((*huges)->ToString(), "[\n  170141183460469231731\n]");
+}
+
 // round of a DOUBLE as DuckDB computes it (ADR 0037's FN2): half away from zero; at p digits
 // round(x * 10^p) / 10^p in double, so a halfway case is decided on the binary product; the value
 // itself where the result is not finite.
