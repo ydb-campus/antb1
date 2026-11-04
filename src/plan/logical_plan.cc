@@ -341,8 +341,10 @@ bool IsExactWidening(LogicalType from, LogicalType to) {
 }
 
 bool IsExecutableCast(LogicalType from, LogicalType to) {
-  return IsExactWidening(from, to) ||
-         (to == LogicalType::kDecimal && (IsInteger(from) || from == LogicalType::kDecimal));
+  const bool exact_number = IsInteger(from) || from == LogicalType::kDecimal;
+  return IsExactWidening(from, to) || (to == LogicalType::kDecimal && exact_number) ||
+         (IsInteger(to) &&
+          (exact_number || (from == LogicalType::kDouble && to != LogicalType::kHugeInt)));
 }
 
 bool SameExpr(const Expr& a, const Expr& b) {

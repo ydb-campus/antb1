@@ -1,5 +1,8 @@
 #include "decimal.h"
 
+#include <array>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -8,11 +11,14 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
+#include <vector>
 
 #include <arrow/api.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -191,6 +197,148 @@ arrow::Result<ArrayPtr> CastToDecimal(const arrow::Array& values, plan::LogicalT
   ArrayPtr out;
   ARROW_RETURN_NOT_OK(builder.Finish(&out));
   return out;
+}
+
+std::string DuckDbDoubleText(double value) {
+  if (std::isnan(value)) {
+    return "nan";
+  }
+  if (std::isinf(value)) {
+    return value > 0 ? "inf" : "-inf";
+  }
+  std::array<char, 64> buf{};
+  const auto scientific =
+      std::to_chars(buf.data(), buf.data() + buf.size(), value, std::chars_format::scientific);
+  std::string text(buf.data(), scientific.ptr);
+  const std::size_t e = text.find('e');
+  const int exponent = e == std::string::npos ? 0 : std::stoi(text.substr(e + 1));
+  if (exponent < -4 || exponent >= 16) {
+    return text;  // 1e+20, 1.25e-05: two exponent digits at least, as DuckDB prints them
+  }
+  const auto fixed =
+      std::to_chars(buf.data(), buf.data() + buf.size(), value, std::chars_format::fixed);
+  text.assign(buf.data(), fixed.ptr);
+  return text.contains('.') ? text : text + ".0";
+}
+
+namespace {
+
+// DuckDB's physical name of an integer type, as its conversion errors print it.
+std::string_view PhysicalName(plan::LogicalType type) {
+  switch (type.id()) {
+    case plan::LogicalType::kSmallInt:
+      return "INT16";
+    case plan::LogicalType::kInteger:
+      return "INT32";
+    case plan::LogicalType::kBigInt:
+      return "INT64";
+    case plan::LogicalType::kHugeInt:
+      return "INT128";
+    case plan::LogicalType::kUSmallInt:
+      return "UINT16";
+    default:
+      return "?";
+  }
+}
+
+// The integer of each row of `values` that `convert` gives (a NULL row stays NULL), appended to
+// `builder` as it is computed: one pass, no buffer of the values.
+template <class Builder, class Convert>
+arrow::Result<ArrayPtr> BuildIntegers(Builder builder, const arrow::Array& values,
+                                      const Convert& convert) {
+  ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+  for (int64_t i = 0; i < values.length(); ++i) {
+    if (values.IsNull(i)) {
+      builder.UnsafeAppendNull();
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Int128 value, convert(i));
+    if constexpr (std::is_same_v<Builder, DecimalColumnBuilder>) {
+      builder.UnsafeAppend(value);
+    } else {
+      builder.UnsafeAppend(static_cast<Builder::value_type>(value));
+    }
+  }
+  ArrayPtr out;
+  ARROW_RETURN_NOT_OK(builder.Finish(&out));
+  return out;
+}
+
+// The integers `convert` gives for `values`, as a column of the integer type `to`.
+template <class Convert>
+arrow::Result<ArrayPtr> IntegersOf(const arrow::Array& values, plan::LogicalType to,
+                                   arrow::MemoryPool* pool, const Convert& convert) {
+  switch (to.id()) {
+    case plan::LogicalType::kSmallInt:
+      return BuildIntegers(arrow::Int16Builder(pool), values, convert);
+    case plan::LogicalType::kInteger:
+      return BuildIntegers(arrow::Int32Builder(pool), values, convert);
+    case plan::LogicalType::kBigInt:
+      return BuildIntegers(arrow::Int64Builder(pool), values, convert);
+    case plan::LogicalType::kUSmallInt:
+      return BuildIntegers(arrow::UInt16Builder(pool), values, convert);
+    case plan::LogicalType::kHugeInt:
+      return BuildIntegers(DecimalColumnBuilder(plan::LogicalType::Decimal(38, 0), pool), values,
+                           convert);
+    default:
+      return arrow::Status::Invalid("a cast to ", plan::ToString(to), ", which is no integer type");
+  }
+}
+
+std::string SourceSuffix(std::string_view column) {
+  return column.empty() ? std::string()
+                        : std::format(" when casting from source column {}", column);
+}
+
+}  // namespace
+
+arrow::Result<ArrayPtr> CastToInteger(const arrow::Array& values, plan::LogicalType from,
+                                      plan::LogicalType to, std::string_view column,
+                                      arrow::MemoryPool* pool) {
+  const plan::IntegerRange range = plan::RangeOf(to);
+  if (from == plan::LogicalType::kDouble) {
+    if (to == plan::LogicalType::kHugeInt) {
+      // DuckDB's HUGEINT reaches 2^127, antb1's 38 digits: IsExecutableCast admits no such cast.
+      return arrow::Status::Invalid("a cast of DOUBLE to HUGEINT, which the executor does not run");
+    }
+    const auto& doubles = static_cast<const arrow::DoubleArray&>(values);
+    // The range as doubles: [min, max + 1), each a power of two or zero for these types, so exact,
+    // as DuckDB checks a DOUBLE before it rounds it.
+    const auto low = static_cast<double>(range.min);
+    const double high = static_cast<double>(range.max) + 1.0;
+    return IntegersOf(values, to, pool, [&](int64_t i) -> arrow::Result<Int128> {
+      const double value = doubles.Value(i);
+      // Half to even, as DuckDB rounds a DOUBLE. A value just below max + 1 that rounds up to it
+      // has no value of the type: DuckDB's conversion of it depends on the platform (32767.5 to
+      // SMALLINT is -32768 on arm64), and antb1 fails it as out of range (divergence D28).
+      const double rounded = std::nearbyint(value);
+      if (std::isnan(value) || value < low || value >= high || rounded >= high) {
+        return arrow::Status::ExecutionError(
+            "Type DOUBLE with value ", DuckDbDoubleText(value),
+            " can't be cast because the value is out of range for the destination type ",
+            PhysicalName(to), SourceSuffix(column));
+      }
+      return static_cast<Int128>(rounded);
+    });
+  }
+  ARROW_ASSIGN_OR_RAISE(const UnscaledValues read, ReadUnscaled(values));
+  return IntegersOf(values, to, pool, [&](int64_t i) -> arrow::Result<Int128> {
+    const Int128 value = read.values[static_cast<std::size_t>(i)];
+    // A DECIMAL rounds half away from zero (Rescale); an integer is kept.
+    const std::optional<Int128> integer = Rescale(value, read.scale, 0);
+    if (integer.has_value() && *integer >= range.min && *integer <= range.max) {
+      return *integer;
+    }
+    if (from == plan::LogicalType::kDecimal) {
+      return arrow::Status::ExecutionError("Failed to cast decimal value ",
+                                           Int128ToString(integer.value_or(value)), " to type ",
+                                           PhysicalName(to), SourceSuffix(column));
+    }
+    return arrow::Status::ExecutionError(
+        "Type ", PhysicalName(from), " with value ", Int128ToString(value),
+        " can't be cast because the value is out of range for the destination type ",
+        PhysicalName(to), SourceSuffix(column));
+  });
 }
 
 arrow::Result<ArrayPtr> CompareExact(const arrow::Array& left, const arrow::Array& right,

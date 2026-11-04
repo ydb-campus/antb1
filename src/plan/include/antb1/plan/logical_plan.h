@@ -250,7 +250,9 @@ struct CaseExpr {
 // widening (IsExactWidening), which the binder makes of a join key side that is not of the key's
 // type (ADR 0022) and of a CAST that changes no value (ADR 0037's CT1); rescaled as DuckDB casts
 // for an integer or a DECIMAL cast to a DECIMAL (CT2), rounded half away from zero where the scale
-// shrinks and failing on a value the DECIMAL cannot hold. Named CAST(<operand> AS <TYPE>). The
+// shrinks and failing on a value the DECIMAL cannot hold; as DuckDB casts for an integer, a DECIMAL
+// or a DOUBLE cast to an integer type (CT3), a DECIMAL rounded half away from zero and a DOUBLE
+// half to even, failing on a value the type cannot hold. Named CAST(<operand> AS <TYPE>). The
 // executor evaluates no other cast.
 struct CastExpr {
   ExprPtr operand;
@@ -263,8 +265,9 @@ struct CastExpr {
 // largest value: 5, 10, 19 or 38 for HUGEINT) and, from a DECIMAL, at least its scale.
 bool IsExactWidening(LogicalType from, LogicalType to);
 
-// Whether the executor casts `from` to `to`: an exact widening, or an integer type or a DECIMAL to
-// any DECIMAL, checked (CastExpr).
+// Whether the executor casts `from` to `to`: an exact widening; an integer type or a DECIMAL to any
+// DECIMAL; an integer type or a DECIMAL to any integer type, a DOUBLE to one but HUGEINT (whose 38
+// digits hold less than DuckDB's 2^127) (CastExpr, checked).
 bool IsExecutableCast(LogicalType from, LogicalType to);
 
 // A scalar expression, typed as DuckDB types it (docs/sql-subset.md). Integer arithmetic is exact

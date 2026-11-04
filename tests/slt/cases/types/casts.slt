@@ -140,3 +140,53 @@ DECIMAL(5,1)
 
 statement error
 SELECT CAST(d9_2 AS DECIMAL(4, 2)) FROM decimals
+
+# Checked casts to an integer type (ADR 0037's CT3): an integer narrowed, a DECIMAL rounded half away from zero, a
+# DOUBLE half to even, and a value the type cannot hold failing with DuckDB's conversion error.
+
+query II rowsort
+SELECT tr_row, CAST(tr_row AS SMALLINT) FROM trips WHERE tr_row < 5
+----
+INTEGER	SMALLINT
+0	0
+1	1
+2	2
+3	3
+4	4
+
+query II nosort
+SELECT id, CAST(d9_2 AS INTEGER) FROM decimals WHERE id < 8 AND d9_2 < 1000 ORDER BY id
+----
+INTEGER	INTEGER
+0	-6
+2	-10000000
+4	0
+5	5
+6	-4
+7	1
+
+query ID nosort
+SELECT CAST(d9_2 * 10 AS BIGINT), d9_2 * 10 FROM decimals WHERE id < 8 AND d9_2 < 1000 ORDER BY id
+----
+BIGINT	DECIMAL(18,2)
+-63	-62.50
+-100000000	-99999999.90
+0	0.00
+50	50.00
+-38	-37.50
+13	12.50
+
+query II nosort
+SELECT CAST(2.5 AS INTEGER), CAST(-2.5 AS SMALLINT) FROM cities LIMIT 1
+----
+INTEGER	SMALLINT
+3	-3
+
+query I nosort
+SELECT SUM(CAST(tr_fare * 4 AS INTEGER)) FROM trips WHERE tr_row < 100
+----
+HUGEINT
+5979
+
+statement error
+SELECT CAST(d9_2 AS SMALLINT) FROM decimals

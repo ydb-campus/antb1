@@ -292,10 +292,16 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   string literal as VARCHAR or TIMESTAMP. An integer or a DECIMAL cast to any DECIMAL (CT2) is checked as DuckDB
   checks it: rescaled, rounded half away from zero where the scale shrinks (`CAST(-1.25 AS DECIMAL(5,1))` is -1.3),
   and failing the query with DuckDB's conversion error on a value the DECIMAL cannot hold (`Could not cast value
-  12345 to DECIMAL(3,1) when casting from source column b`, an execution error). Every other cast is unsupported
-  (exit code 4: `CAST of DOUBLE values to DECIMAL(12,2) is not supported`), a narrowing of an integer, a rounding to
-  an integer or a conversion between kinds, which DuckDB answers or fails at run time, as is a constant DuckDB fails
-  to convert and a cast to a type antb1 has none for (`FLOAT`, `INTERVAL`, `VARCHAR(10)`). The
+  12345 to DECIMAL(3,1) when casting from source column b`, an execution error). An integer, a DECIMAL or a DOUBLE
+  cast to any integer type (CT3) is checked the same way: a DECIMAL rounded half away from zero (`CAST(2.5 AS
+  INTEGER)` is 3), a DOUBLE half to even (2.5 is 2; not to HUGEINT, whose 38 digits hold less than DuckDB's), and a
+  value the type cannot hold, a DOUBLE NaN or infinity or one that rounds past the maximum (divergence D28)
+  included, failing with DuckDB's error, which names the integer types by their physical names (`Type INT64 with
+  value 70000 can't be cast because the value is out of range for the destination type INT16`, `Failed to cast
+  decimal value 40001 to type INT16`). Every other cast is unsupported (exit code 4: `CAST of DOUBLE values to
+  DECIMAL(12,2) is not supported`), a conversion between kinds that DuckDB answers or fails at run time (VARCHAR to a
+  number, a number to DATE), as is a constant DuckDB fails to convert and a cast to a type antb1 has none for
+  (`FLOAT`, `INTERVAL`, `VARCHAR(10)`). The
   name is DuckDB's, the type as DuckDB names it whatever alias was written: `CAST(s AS INTEGER)`, `CAST(f AS
   "DOUBLE")`, `CAST(n AS DECIMAL(12, 2))`;
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -1361,6 +1367,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D25 | A moved Compute over rows a join above discards | computes a grouped aggregate on one input of a join below it (ADR 0032), and where the aggregate's argument is an expression a `Compute` above the join defines, that `Compute` travels DOWN with the partial -- a partial cannot aggregate a column that does not exist below it. The expression is then computed for every row of the aggregated side, including the rows the joins above discard | computes it above the join, so only for the rows that survive | the answers agree: a discarded row contributes to no group in either plan. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23 and D24), and `tests/slt/cases/aggregates/placement.slt` pins the overflow against DuckDB's own answer, with a control whose call refuses the placement and so answers in both engines |
 | D26 | Errors of the blocks of a `UNION ALL` that a `LIMIT` does not need | a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run, so their errors -- an overflow, say -- are never reported ([ADR 0036](adr/0036-union-all.md)) | runs at least the first vector of every block, so an error in a later block fails the query | the answers agree where no block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23, D24 and D25), and `tests/slt/cases/setops/errors.slt` pins it: antb1's answer under `onlyif antb1`, DuckDB's error under `onlyif duckdb`, and with `ORDER BY` a control that fails in both |
 | D27 | Errors of the blocks of a `UNION ALL` that a condition on it does not rule out by their constants | a `WHERE` condition on a union goes on top of each block, above the block's select list, and rules a block out only where the block's constants decide it ([ADR 0036](adr/0036-union-all.md)'s X7a; never for a `LIKE` or a DOUBLE, and never for a condition the binder computes, such as a `NOT`, which stays above the union). Any other block runs, so an error of its select list -- an overflow, say -- fails the query, even on rows a condition on another column rejects | rules out a block whose constants make a `LIKE`, a DOUBLE comparison or a `NOT` never true too, and filters a column below the select list, so that error is never reported | the answers agree where no block fails; the random generator writes no arithmetic that can overflow and tags no block with a constant, and `tests/slt/cases/setops/errors.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb`, and the conditions both engines decide as records both pass |
+| D28 | A DOUBLE cast to an integer type that rounds to one past the type's maximum (`CAST(32767.5 AS SMALLINT)`, half to even) | fails the query with DuckDB's out-of-range conversion error | answers what its platform's conversion of the rounded value gives (-32768 on arm64; an x86 build may give another value) | `exec.ComputeTest.CastsToIntegerTypesRoundAndCheckAsDuckDb` |
 
 ## ClickBench status
 

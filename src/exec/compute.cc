@@ -1927,10 +1927,14 @@ struct Evaluator {
   // 10; a failed cast names a column), otherwise as CastTo converts them.
   arrow::Result<ArrayPtr> Convert(const ArrayPtr& values, const plan::Expr& expr,
                                   plan::LogicalType target) const {
+    const std::string column =
+        std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
     if (target == plan::LogicalType::kDecimal && expr.type != target) {
-      const std::string column =
-          std::holds_alternative<plan::ColumnExpr>(expr.node) ? expr.name : std::string();
       return CastToDecimal(*values, expr.type, target, column, pool);
+    }
+    // A narrowing to an integer type, checked as DuckDB checks it (ADR 0037's CT3).
+    if (plan::IsInteger(target) && !plan::IsExactWidening(expr.type, target)) {
+      return CastToInteger(*values, expr.type, target, column, pool);
     }
     return CastTo(values, plan::ToArrow(target), ctx);
   }

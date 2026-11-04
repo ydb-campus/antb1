@@ -141,7 +141,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
 | CT1 | A general cast expression: identity casts, exact widenings and constants that fit (the CT1 update below) | 40 | Built |
 | CT2 | Checked casts to DECIMAL(p,s) (the CT2 update below) | 61, 90 | Built |
-| CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types | | Planned |
+| CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types (the CT3 update below) | | Built |
 | CT4 | Quotients of numeric literals folded into DOUBLE constants | 21 | Planned |
 | CT5 | DATE plus or minus an integer | 72 | Planned |
 | **Phase 4** | **Scalar functions** | | |
@@ -408,6 +408,19 @@ Update (2026-11-04, CT2): built. Queries 61 and 90 pass: 56 of the 99.
 - **Shared sub-plans.** An expression's key now holds its full type, a DECIMAL's width and scale included, so two
   sub-plans that cast one column to different DECIMALs are no longer computed once. They were grouped since CT1,
   for exact widenings to different scales.
+
+Update (2026-11-04, CT3): built, for integer sources too. No query passes from it alone: query 54, the one that
+casts to an integer, also needs constructs of a later phase.
+
+- **The casts.** `plan::IsExecutableCast` admits an integer type, a DECIMAL or a DOUBLE cast to any integer type.
+  The new `exec::CastToInteger` runs it as DuckDB casts: an integer kept, a DECIMAL rounded half away from zero, a
+  DOUBLE half to even. A decimal literal folds with the DECIMAL rounding.
+- **Errors.** A value the type cannot hold fails with DuckDB's conversion error, which names the integer types by
+  their physical names (INT16, INT32, INT64, INT128, UINT16) and a DOUBLE as DuckDB prints it
+  (`exec::DuckDbDoubleText`).
+- **Range of a DOUBLE.** A DOUBLE is checked against `[min, max + 1)` before rounding, as DuckDB checks it. A value
+  that then rounds past the maximum fails, where DuckDB's answer depends on the platform (divergence D28).
+- **Not covered.** DOUBLE to HUGEINT stays unsupported: DuckDB's HUGEINT reaches 2^127, antb1's 38 digits.
 
 ## Alternatives considered
 
