@@ -1180,16 +1180,25 @@ TEST_F(ComputeTest, CastWidensExactly) {
 
 // Anything but an exact widening is a malformed plan, and a DECIMAL value beyond its own declared
 // width (a file can hold one) fails the cast with DuckDB's conversion error, naming the column.
+// The executor casts an exact widening, and an integer or a DECIMAL to any DECIMAL, checked
+// (ADR 0037's CT2): rounded half away from zero where the scale shrinks, and failing with DuckDB's
+// error on a value the DECIMAL cannot hold. It rejects every other cast as a plan error.
 TEST_F(ComputeTest, CastRejectsWhatIsNoExactWidening) {
   const auto narrowing =
       Eval(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::kInteger), {Int64s({1})});
   EXPECT_TRUE(narrowing.status().IsInvalid()) << narrowing.status().ToString();
-  EXPECT_EQ(narrowing.status().message(), "a cast of BIGINT to INTEGER is not an exact widening");
-  const LogicalType price = LogicalType::Decimal(15, 2);
-  const auto scale =
-      Eval(CastOf(ColumnAt(0, price), LogicalType::Decimal(15, 3)), {Decimals(price, {"1"})});
-  EXPECT_EQ(scale.status().message(),
-            "a cast of DECIMAL(15,2) to DECIMAL(15,3) is not an exact widening");
+  EXPECT_EQ(narrowing.status().message(),
+            "a cast of BIGINT to INTEGER is not one the executor runs");
+  const LogicalType price = LogicalType::Decimal(15, 3);
+  auto rounded = Eval(CastOf(ColumnAt(0, price), LogicalType::Decimal(15, 2)),
+                      {Decimals(price, {"1.235", "-1.235", "1.234"})});
+  ASSERT_TRUE(rounded.ok()) << rounded.status().ToString();
+  EXPECT_EQ((*rounded)->ToString(), "[\n  1.24,\n  -1.24,\n  1.23\n]");
+  auto from_integer = Eval(CastOf(ColumnAt(0, LogicalType::kBigInt), LogicalType::Decimal(5, 1)),
+                           {Int64s({1234, 12345})});
+  EXPECT_TRUE(from_integer.status().IsExecutionError()) << from_integer.status().ToString();
+  EXPECT_EQ(from_integer.status().message(),
+            "Could not cast value 12345 to DECIMAL(5,1) when casting from source column c");
   const auto empty = std::make_shared<const plan::Expr>(
       plan::Expr{.node = plan::CastExpr{}, .type = LogicalType::kBigInt, .name = "cast"});
   EXPECT_TRUE(Eval(empty, {Int64s({1})}).status().IsInvalid());

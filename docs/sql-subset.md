@@ -288,10 +288,14 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   DOUBLE is the DOUBLE antb1 reads); an exact widening (an integer type into a wider one or into a DECIMAL with
   enough integer digits, a DECIMAL into one with at least its integer digits and its scale) converts; and a constant
   that T holds exactly folds into a constant of T: an integer constant in T's range, in a DECIMAL's digits or, up to
-  2^53, in a DOUBLE; a decimal literal in a DECIMAL of at least its scale, or in an integer type when it has no
-  fraction; a string literal as VARCHAR or TIMESTAMP. Every other cast is unsupported (exit code 4: `CAST of BIGINT
-  values to DECIMAL(12,2) is not supported`), a narrowing, a rounding or a conversion between kinds, which DuckDB
-  answers or fails at run time, as is a cast to a type antb1 has none for (`FLOAT`, `INTERVAL`, `VARCHAR(10)`). The
+  2^53, in a DOUBLE; a decimal literal in a DECIMAL's digits, or in an integer type when it has no fraction; a
+  string literal as VARCHAR or TIMESTAMP. An integer or a DECIMAL cast to any DECIMAL (CT2) is checked as DuckDB
+  checks it: rescaled, rounded half away from zero where the scale shrinks (`CAST(-1.25 AS DECIMAL(5,1))` is -1.3),
+  and failing the query with DuckDB's conversion error on a value the DECIMAL cannot hold (`Could not cast value
+  12345 to DECIMAL(3,1) when casting from source column b`, an execution error). Every other cast is unsupported
+  (exit code 4: `CAST of DOUBLE values to DECIMAL(12,2) is not supported`), a narrowing of an integer, a rounding to
+  an integer or a conversion between kinds, which DuckDB answers or fails at run time, as is a constant DuckDB fails
+  to convert and a cast to a type antb1 has none for (`FLOAT`, `INTERVAL`, `VARCHAR(10)`). The
   name is DuckDB's, the type as DuckDB names it whatever alias was written: `CAST(s AS INTEGER)`, `CAST(f AS
   "DOUBLE")`, `CAST(n AS DECIMAL(12, 2))`;
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
@@ -1480,7 +1484,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q2 | unsupported | needs round (FN2) |
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
-| Q5 | unsupported | needs CAST to DECIMAL(p,s), concat and ROLLUP (RU3) |
+| Q5 | unsupported | needs concat and ROLLUP (RU3) |
 | Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | unsupported | needs INTERSECT (X4c) |
@@ -1493,7 +1497,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
 | Q17 | unsupported | needs stddev_samp (AG2) |
-| Q18 | unsupported | needs CAST to DECIMAL(p,s) and ROLLUP (RU3) |
+| Q18 | unsupported | needs ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q21 | unsupported | needs a quotient of literals folded into DOUBLE (CT4) |
@@ -1524,7 +1528,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs CAST to DECIMAL(p,s), UNION and rank() (phase 9) |
+| Q49 | unsupported | needs UNION and rank() (phase 9) |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
 | Q52 | pass | answered when the ratchet was added |
@@ -1536,7 +1540,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q58 | unsupported | needs scalar subqueries that are not aggregates (SQ4) |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | pass | `UNION ALL` (ADR 0036) |
-| Q61 | unsupported | needs CAST to DECIMAL(p,s) (CT2) |
+| Q61 | pass | CAST to DECIMAL(p,s) (CT2) |
 | Q62 | pass | `*` next to other select items |
 | Q63 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q64 | pass | answered when the ratchet was added |
@@ -1550,7 +1554,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q72 | unsupported | needs DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q74 | pass | `UNION ALL` (ADR 0036) |
-| Q75 | unsupported | needs CAST to DECIMAL(p,s) and UNION (X4b) |
+| Q75 | unsupported | needs UNION (X4b) |
 | Q76 | pass | IS NULL (NL4) |
 | Q77 | unsupported | needs ROLLUP and a cross product of multi-row relations (OJ4) |
 | Q78 | unsupported | needs round (FN2) |
@@ -1565,7 +1569,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q87 | unsupported | needs SELECT DISTINCT, parenthesized set-operation branches and EXCEPT (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
-| Q90 | unsupported | needs NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
+| Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
 | Q93 | pass | IS NOT NULL (NL4) |

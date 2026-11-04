@@ -99,6 +99,22 @@ TEST(SharedSubPlansTest, SharesNoNodeWhoseContentDiffers) {
                    "(SELECT p FROM dec WHERE p > 1.5e0) AS b WHERE a.p = b.p"),
             (std::vector<std::string>{"Scan 2x1"}))
       << "two constants of different types must not be shared";
+  // Casts of one column to DECIMALs that differ only in scale or width compute different values
+  // (ADR 0037's CT2 rounds); an expression's key is its full type, not the type's kind.
+  EXPECT_EQ(
+      Groups("SELECT COUNT(*) FROM "
+             "(SELECT CAST(p AS DECIMAL(15,1)) AS x, COUNT(*) AS n FROM dec GROUP BY 1) AS a, "
+             "(SELECT CAST(p AS DECIMAL(15,0)) AS x, COUNT(*) AS n FROM dec GROUP BY 1) AS b "
+             "WHERE a.n = b.n"),
+      (std::vector<std::string>{"Scan 2x1"}))
+      << "casts to DECIMAL(15,1) and DECIMAL(15,0) must not be shared";
+  EXPECT_EQ(
+      Groups("SELECT COUNT(*) FROM "
+             "(SELECT CAST(p AS DECIMAL(16,2)) AS x, COUNT(*) AS n FROM dec GROUP BY 1) AS a, "
+             "(SELECT CAST(p AS DECIMAL(17,2)) AS x, COUNT(*) AS n FROM dec GROUP BY 1) AS b "
+             "WHERE a.n = b.n"),
+      (std::vector<std::string>{"Scan 2x1"}))
+      << "nor casts to DECIMAL(16,2) and DECIMAL(17,2)";
 }
 
 // An ordered or limited sub-plan is never a member: a shared result cannot hand two consumers an

@@ -340,6 +340,11 @@ bool IsExactWidening(LogicalType from, LogicalType to) {
          from.width() - from.scale() <= integer_digits;
 }
 
+bool IsExecutableCast(LogicalType from, LogicalType to) {
+  return IsExactWidening(from, to) ||
+         (to == LogicalType::kDecimal && (IsInteger(from) || from == LogicalType::kDecimal));
+}
+
 bool SameExpr(const Expr& a, const Expr& b) {
   return a.type == b.type && a.node.index() == b.node.index() &&
          std::visit(SameNode{.other = b}, a.node);

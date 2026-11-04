@@ -140,7 +140,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | NL5 | COALESCE (the NL5 update below) | | Built |
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
 | CT1 | A general cast expression: identity casts, exact widenings and constants that fit (the CT1 update below) | 40 | Built |
-| CT2 | Checked casts to DECIMAL(p,s) | 61, 90 | Planned |
+| CT2 | Checked casts to DECIMAL(p,s) (the CT2 update below) | 61, 90 | Built |
 | CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types | | Planned |
 | CT4 | Quotients of numeric literals folded into DOUBLE constants | 21 | Planned |
 | CT5 | DATE plus or minus an integer | 72 | Planned |
@@ -393,6 +393,21 @@ Update (2026-11-04, CT1): built. Query 40 passes: 54 of the 99.
   a type to itself), so a `GROUP BY` of it groups by the cast, as in DuckDB, and not by the bare column.
 - **What answers more later.** CT2 answers checked casts to DECIMAL (two queries reach that refusal now), and CT3 the
   integer casts of DOUBLE and DECIMAL.
+
+Update (2026-11-04, CT2): built. Queries 61 and 90 pass: 56 of the 99.
+
+- **What it answers.** An integer or a DECIMAL cast to any DECIMAL is the executor's `CastExpr`, which
+  `plan::IsExecutableCast` admits beside the exact widenings. It runs `CastToDecimal`, the conversion CASE values
+  already used, so it rescales as DuckDB casts: rounded half away from zero where the scale shrinks, and failing with
+  DuckDB's conversion error, naming the source column, on a value the DECIMAL cannot hold. A decimal literal folds
+  into a constant with the same rounding.
+- **What it does not.** A DOUBLE to DECIMAL stays unsupported: DuckDB's binary-to-decimal rounding is not
+  reproduced. So does a constant that does not fit, which DuckDB fails to convert on any row (exit 4 here).
+- **Join keys.** A key whose side is such a cast is no longer taken to have its column's domain, since rounding can
+  merge values; only an exact widening is.
+- **Shared sub-plans.** An expression's key now holds its full type, a DECIMAL's width and scale included, so two
+  sub-plans that cast one column to different DECIMALs are no longer computed once. They were grouped since CT1,
+  for exact widenings to different scales.
 
 ## Alternatives considered
 

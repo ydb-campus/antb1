@@ -4387,17 +4387,18 @@ arrow::Result<Typed> Binder::BindCoalesce(const sql::FunctionCall& call, const B
 
 namespace {
 
-// `expr` as a constant of `to` (ADR 0037's CT1) where it is one that `to` holds exactly: an
-// integer constant (a literal, negated or in parentheses, or arithmetic of them) in an integer
-// type's range, in a DECIMAL(p,s) without leaving its p digits, or in a DOUBLE up to 2^53; a
-// decimal literal in a DECIMAL of a scale at least its own, or in an integer type when it has no
-// fraction; a string literal as VARCHAR or TIMESTAMP. std::nullopt for anything else, which is
-// cast as a value or refused, as is a constant DuckDB would round or fail to convert.
+// `expr` as a constant of `to` (ADR 0037's CT1) where it is one that `to` holds: an integer
+// constant (a literal, negated or in parentheses, or arithmetic of them) in an integer type's
+// range, in a DECIMAL(p,s) without leaving its p digits, or in a DOUBLE up to 2^53; a decimal
+// literal in a DECIMAL's p digits, rounded half away from zero where the scale shrinks as DuckDB
+// casts (CT2), or in an integer type when it has no fraction; a string literal as VARCHAR or
+// TIMESTAMP. std::nullopt for anything else, which is cast as a value or refused, as is a constant
+// DuckDB would fail to convert.
 std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, LogicalType to) {
   const auto in_decimal = [&to](Int128 unscaled, int scale) -> std::optional<Constant> {
     const std::optional<Int128> scaled = Rescale(unscaled, scale, to.scale());
     const Int128 limit = PowerOfTen(to.width());
-    if (scale > int{to.scale()} || !scaled.has_value() || *scaled >= limit || *scaled <= -limit) {
+    if (!scaled.has_value() || *scaled >= limit || *scaled <= -limit) {
       return std::nullopt;
     }
     return Constant{.type = to, .value = *scaled};
@@ -4470,10 +4471,12 @@ std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, Logic
 
 }  // namespace
 
-// CAST(x AS T) (ADR 0037's CT1): a constant that T holds exactly is that constant; x of type T is
-// itself (a FLOAT column as DOUBLE drops its FLOAT flag: the value is the DOUBLE antb1 reads); an
-// exact widening is the executor's CastExpr. Every other cast is unsupported (CT2 to CT4 answer
-// more), as is a constant DuckDB would round or fail to convert. Named as DuckDB names a cast.
+// CAST(x AS T) (ADR 0037's CT1 and CT2): a constant that T holds is that constant (CastConstant);
+// otherwise a cast the executor runs (IsExecutableCast) is its CastExpr: an identity (a FLOAT
+// column as DOUBLE drops its FLOAT flag: the value is the DOUBLE antb1 reads), an exact widening,
+// or an integer or a DECIMAL cast to a DECIMAL, checked and rounded as DuckDB casts. Every other
+// cast is unsupported (CT3 and CT4 answer more), as is a constant DuckDB would fail to convert.
+// Named as DuckDB names a cast.
 template <class BindFn>
 arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& bind) {
   ARROW_ASSIGN_OR_RAISE(const std::optional<CastTarget> target, CastTargetOf(cast));
@@ -4497,7 +4500,7 @@ arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& b
   }
   // An identity too is a CastExpr (IsExactWidening holds of a type and itself): a computed value,
   // so a GROUP BY of it groups by the cast and not by its column, as in DuckDB.
-  if (!value.literal && IsExactWidening(from, to)) {
+  if (!value.literal && IsExecutableCast(from, to)) {
     return Leaf(Expr{.node = CastExpr{.operand = value.expr}, .type = to, .name = std::move(name)});
   }
   return UnsupportedError(
@@ -5176,7 +5179,9 @@ BoundColumn Binder::JoinKeyColumn(std::size_t r, const ExprPtr& side, LogicalTyp
 
 std::optional<int64_t> Binder::KeyDomainOf(const Expr& side) {
   const Expr* inner = &side;
-  if (const auto* cast = std::get_if<CastExpr>(&inner->node)) {  // an exact widening is injective
+  // An exact widening is injective; a checked cast to a DECIMAL may round values together.
+  if (const auto* cast = std::get_if<CastExpr>(&inner->node);
+      cast != nullptr && IsExactWidening(cast->operand->type, side.type)) {
     inner = cast->operand.get();
   }
   const auto* column = std::get_if<ColumnExpr>(&inner->node);
