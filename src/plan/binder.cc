@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -582,41 +583,99 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
 // neither is a constant.
 bool ReadsColumn(const sql::Expr& expr, bool aggregates = false);
 
-// The scalar functions the binder answers: one value argument, the others string literals (the
-// pattern and the replacement of regexp_replace, the unit of date_trunc). toDateTime is
-// ClickBench's DuckDB macro, epoch_ms(t * 1000).
-struct FunctionSpec {
-  std::string_view name;  // lower case, as DuckDB names the result
-  Function function;
-  std::size_t args;            // the fewest arguments it takes
-  std::size_t max_args = 0;    // the most, or 0 for exactly `args`
-  std::size_t value_arg = 0;   // the value argument
-  bool integer_args = false;   // the other arguments are integer expressions, not string literals
-  bool reserved_name = false;  // DuckDB qualifies and quotes a function whose name it reserves
-
-  [[nodiscard]] std::size_t most_args() const { return max_args == 0 ? args : max_args; }
-  [[nodiscard]] bool TakesArgs(std::size_t n) const { return n >= args && n <= most_args(); }
+// What an argument of a scalar function takes (ADR 0012's function table).
+enum class ArgKind : std::uint8_t {
+  kVarchar,        // a VARCHAR value
+  kInteger,        // a value of an integer type but HUGEINT, computed per row
+  kTemporal,       // a TIMESTAMP or a DATE
+  kStringLiteral,  // a string literal: a pattern, a replacement, a unit
 };
 
-constexpr auto kFunctions = std::to_array<FunctionSpec>({
-    {.name = "strlen", .function = Function::kStrlen, .args = 1},
-    {.name = "regexp_replace", .function = Function::kRegexpReplace, .args = 3},
-    {.name = "todatetime", .function = Function::kEpochMs, .args = 1},
-    {.name = "date_trunc", .function = Function::kDateTrunc, .args = 2, .value_arg = 1},
+bool Accepts(ArgKind kind, LogicalType type) {
+  switch (kind) {
+    case ArgKind::kVarchar:
+      return type == LogicalType::kVarchar;
+    case ArgKind::kInteger:
+      return IsInteger(type) && type != LogicalType::kHugeInt;
+    case ArgKind::kTemporal:
+      return type == LogicalType::kTimestamp || type == LogicalType::kDate;
+    case ArgKind::kStringLiteral:
+      return false;  // a literal, checked as one where the call is bound
+  }
+  return false;
+}
+
+// One overload of a scalar function the binder answers: the kinds of its arguments in order (the
+// first `min_args` of them required), which one is its value -- the argument the kernel reads first
+// and a type refusal names -- and its result type, fixed or the value's own. The overloads of one
+// name are adjacent rows of kFunctions, share the position of the value and the kinds of the other
+// arguments, and are told apart by their arity and the value's type, first match first.
+// toDateTime is ClickBench's DuckDB macro, epoch_ms(t * 1000).
+struct FunctionOverload {
+  std::string_view name;  // lower case, as DuckDB names the result
+  Function function;
+  std::array<ArgKind, 3> args{};
+  std::size_t min_args = 1;
+  std::size_t max_args = 1;
+  std::size_t value_arg = 0;
+  std::optional<LogicalType::Id> result;  // std::nullopt: the value's type
+  std::string_view refused_name;          // the function as a refusal of the value's type names it
+  std::string_view needs;                 // the value's types as that refusal names them
+  bool reserved_name = false;  // DuckDB qualifies and quotes a function whose name it reserves
+
+  [[nodiscard]] bool TakesArgs(std::size_t n) const { return n >= min_args && n <= max_args; }
+};
+
+constexpr auto kFunctions = std::to_array<FunctionOverload>({
+    {.name = "strlen",
+     .function = Function::kStrlen,
+     .args = {ArgKind::kVarchar},
+     .result = LogicalType::kBigInt,
+     .refused_name = "strlen",
+     .needs = "a VARCHAR"},
+    {.name = "regexp_replace",
+     .function = Function::kRegexpReplace,
+     .args = {ArgKind::kVarchar, ArgKind::kStringLiteral, ArgKind::kStringLiteral},
+     .min_args = 3,
+     .max_args = 3,
+     .result = LogicalType::kVarchar,
+     .refused_name = "regexp_replace",
+     .needs = "a VARCHAR"},
+    {.name = "todatetime",
+     .function = Function::kEpochMs,
+     .args = {ArgKind::kInteger},
+     .result = LogicalType::kTimestamp,
+     .refused_name = "toDateTime",
+     .needs = "an integer (seconds)"},
+    {.name = "date_trunc",
+     .function = Function::kDateTrunc,
+     .args = {ArgKind::kStringLiteral, ArgKind::kTemporal},
+     .min_args = 2,
+     .max_args = 2,
+     .value_arg = 1,
+     .result = LogicalType::kTimestamp,
+     .refused_name = "date_trunc",
+     .needs = "a TIMESTAMP or DATE"},
     // substring's start and length are evaluated per row, so a column or an expression stands
     // where every other function takes a string literal. DuckDB reserves the name `substring`, so
     // it names the result main."substring"(...) where it names substr(...) plainly.
     {.name = "substring",
      .function = Function::kSubstring,
-     .args = 2,
+     .args = {ArgKind::kVarchar, ArgKind::kInteger, ArgKind::kInteger},
+     .min_args = 2,
      .max_args = 3,
-     .integer_args = true,
+     .result = LogicalType::kVarchar,
+     .refused_name = "substring",
+     .needs = "a VARCHAR",
      .reserved_name = true},
     {.name = "substr",
      .function = Function::kSubstring,
-     .args = 2,
+     .args = {ArgKind::kVarchar, ArgKind::kInteger, ArgKind::kInteger},
+     .min_args = 2,
      .max_args = 3,
-     .integer_args = true},
+     .result = LogicalType::kVarchar,
+     .refused_name = "substr",
+     .needs = "a VARCHAR"},
 });
 
 // COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
@@ -625,10 +684,32 @@ bool IsCoalesce(const sql::FunctionCall& call) {
   return !call.quoted && AsciiLower(call.name) == "coalesce";
 }
 
-std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
+// The overloads of the function `call` names, adjacent in kFunctions; none for a function the
+// binder does not answer.
+std::span<const FunctionOverload> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
-  const auto* spec = std::ranges::find(kFunctions, name, &FunctionSpec::name);
-  return spec == kFunctions.end() ? std::nullopt : std::optional(*spec);
+  const auto* first = std::ranges::find(kFunctions, name, &FunctionOverload::name);
+  const auto* last = std::find_if(first, kFunctions.end(),
+                                  [&name](const FunctionOverload& o) { return o.name != name; });
+  return {first, last};
+}
+
+// The fewest and the most arguments any overload of a function takes.
+std::pair<std::size_t, std::size_t> ArityRange(std::span<const FunctionOverload> overloads) {
+  std::size_t least = std::numeric_limits<std::size_t>::max();
+  std::size_t most = 0;
+  for (const FunctionOverload& o : overloads) {
+    least = std::min(least, o.min_args);
+    most = std::max(most, o.max_args);
+  }
+  return {least, most};
+}
+
+// The first overload that takes `n` arguments, or nullptr.
+const FunctionOverload* WithArity(std::span<const FunctionOverload> overloads, std::size_t n) {
+  const auto found =
+      std::ranges::find_if(overloads, [n](const FunctionOverload& o) { return o.TakesArgs(n); });
+  return found == overloads.end() ? nullptr : &*found;
 }
 
 // DuckDB re-serializes a function's name and quotes it only where the identifier needs quoting,
@@ -640,11 +721,12 @@ std::string FunctionNameOpening(const sql::FunctionCall& call) {
   if (IsCoalesce(call)) {
     return "COALESCE(";  // an operator to DuckDB, named in upper case however it is written
   }
-  const std::optional<FunctionSpec> spec = FindFunction(call);
-  if (!spec.has_value() || !spec->reserved_name) {
+  const std::span<const FunctionOverload> overloads = FindFunction(call);
+  if (overloads.empty() || !overloads.front().reserved_name) {
     return AsciiLower(call.name) + "(";
   }
-  return call.quoted ? std::format("\"{}\"(", spec->name) : std::format("main.\"{}\"(", spec->name);
+  const std::string_view name = overloads.front().name;
+  return call.quoted ? std::format("\"{}\"(", name) : std::format("main.\"{}\"(", name);
 }
 
 struct ReadsColumnOf {
@@ -862,28 +944,28 @@ struct FirstUnsupportedOf {
     if (IsCoalesce(call)) {
       return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
     }
-    const std::optional<FunctionSpec> spec = FindFunction(call);
-    if (!spec.has_value()) {
+    const std::span<const FunctionOverload> overloads = FindFunction(call);
+    if (overloads.empty()) {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
                                               "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
                                               "DATE_TRUNC, SUBSTRING and COALESCE)",
                                               Clip(call.name))};
     }
-    if (spec->function == Function::kRegexpReplace && call.args.size() == 4) {
+    if (overloads.front().function == Function::kRegexpReplace && call.args.size() == 4) {
       // DuckDB's options argument ('g', 'i', ...): valid there, not here.
       return Rejection{.span = call.args[3].span(),
                        .message =
                            "regexp_replace() with options (a fourth argument) is not "
                            "supported"};
     }
-    if (!spec->TakesArgs(call.args.size())) {
+    const FunctionOverload* spec = WithArity(overloads, call.args.size());
+    if (spec == nullptr) {
       return std::nullopt;  // a bind error (the binder reports the arity), as in DuckDB
     }
     for (std::size_t i = 0; i < call.args.size(); ++i) {
-      // An integer argument is an expression like any other, so nothing is checked statically: its
-      // type is checked where the call is bound.
-      if (i != spec->value_arg && !spec->integer_args &&
+      // Only a literal argument is checked here; a value's type is checked where the call is bound.
+      if (i != spec->value_arg && spec->args.at(i) == ArgKind::kStringLiteral &&
           !std::holds_alternative<sql::Literal>(call.args[i])) {
         return Rejection{
             .span = call.args[i].span(),
@@ -2697,16 +2779,19 @@ class Binder {
     if (IsCoalesce(call)) {
       return BindCoalesce(call, bind_arg);
     }
-    const std::optional<FunctionSpec> spec = FindFunction(call);
-    if (!spec.has_value()) {
+    const std::span<const FunctionOverload> overloads = FindFunction(call);
+    if (overloads.empty()) {
       return UnsupportedError("this function is not supported", call.name_span);
     }
-    if (!spec->TakesArgs(call.args.size())) {
-      const std::string takes =
-          spec->max_args == 0 ? std::format("{} argument{}", spec->args, spec->args == 1 ? "" : "s")
-                              : std::format("{} or {} arguments", spec->args, spec->most_args());
-      return BindError(std::format("{}() takes {}, not {}", spec->name, takes, call.args.size()),
-                       call.span);
+    const FunctionOverload* spec = WithArity(overloads, call.args.size());
+    if (spec == nullptr) {
+      const auto [least, most] = ArityRange(overloads);
+      const std::string takes = least == most
+                                    ? std::format("{} argument{}", least, least == 1 ? "" : "s")
+                                    : std::format("{} or {} arguments", least, most);
+      return BindError(
+          std::format("{}() takes {}, not {}", overloads.front().name, takes, call.args.size()),
+          call.span);
     }
     ARROW_ASSIGN_OR_RAISE(Typed value, bind_arg(call.args[spec->value_arg]));
     // DuckDB re-serializes a function's name, quoting it only where the identifier needs quoting:
@@ -2723,9 +2808,9 @@ class Binder {
         name += value.expr->name;
         continue;
       }
-      if (spec->integer_args) {
+      if (spec->args.at(i) == ArgKind::kInteger) {
         ARROW_ASSIGN_OR_RAISE(const Typed arg, bind_arg(call.args[i]));
-        if (!IsInteger(arg.expr->type) || arg.expr->type == LogicalType::kHugeInt) {
+        if (!Accepts(ArgKind::kInteger, arg.expr->type)) {
           return BindError(std::format("argument {} of {}() must be an integer, but {}", i + 1,
                                        spec->name, DescribeOperand(arg)),
                            call.args[i].span());
@@ -2751,55 +2836,29 @@ class Binder {
           .name = LiteralName(*lit)}));
     }
     name += ')';
-    const SourceSpan value_span = call.args[spec->value_arg].span();
-    LogicalType type = LogicalType::kVarchar;
-    switch (spec->function) {
-      case Function::kStrlen:
-      case Function::kRegexpReplace:
-        if (value.expr->type != LogicalType::kVarchar) {
-          return BindError(
-              std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(value)),
-              value_span);
-        }
-        type = spec->function == Function::kStrlen ? LogicalType::kBigInt : LogicalType::kVarchar;
-        break;
-      case Function::kEpochMs: {
-        // toDateTime(t) is epoch_ms(t * 1000): the product is typed and checked as arithmetic.
-        if (!IsInteger(value.expr->type) || value.expr->type == LogicalType::kHugeInt) {
-          return BindError(std::format("toDateTime() needs an integer (seconds), but {}",
-                                       DescribeOperand(value)),
-                           value_span);
-        }
-        const sql::Literal thousand{
-            .kind = sql::Literal::Kind::kInteger, .negative = false, .text = "1000", .span = {}};
-        const sql::BinaryExpr product{.op = sql::BinaryOp::kMultiply,
-                                      .left = sql::Box<sql::Expr>(call.args[0]),
-                                      .right = sql::Box<sql::Expr>(sql::Expr(thousand)),
-                                      .op_span = call.name_span,
-                                      .span = call.span};
-        ARROW_ASSIGN_OR_RAISE(Typed literal, LiteralOperand(thousand));
-        ARROW_ASSIGN_OR_RAISE(value, Arith(product, std::move(value), std::move(literal)));
-        type = LogicalType::kTimestamp;
-        break;
-      }
-      case Function::kDateTrunc:
-        if (value.expr->type != LogicalType::kTimestamp && value.expr->type != LogicalType::kDate) {
-          return BindError(
-              std::format("date_trunc() needs a TIMESTAMP or DATE, but {}", DescribeOperand(value)),
-              value_span);
-        }
-        type = LogicalType::kTimestamp;
-        break;
-      case Function::kSubstring:
-        if (value.expr->type != LogicalType::kVarchar) {
-          return BindError(
-              std::format("{}() needs a VARCHAR, but {}", spec->name, DescribeOperand(value)),
-              value_span);
-        }
-        type = LogicalType::kVarchar;
-        break;
-      case Function::kExtract:
-        return arrow::Status::Invalid("EXTRACT is no function call");
+    // The overload whose value takes the value's type, among those of this arity.
+    const auto chosen = std::ranges::find_if(overloads, [&](const FunctionOverload& o) {
+      return o.TakesArgs(call.args.size()) && Accepts(o.args.at(o.value_arg), value.expr->type);
+    });
+    if (chosen == overloads.end()) {
+      return BindError(std::format("{}() needs {}, but {}", spec->refused_name, spec->needs,
+                                   DescribeOperand(value)),
+                       call.args[spec->value_arg].span());
+    }
+    spec = &*chosen;
+    const LogicalType type =
+        spec->result.has_value() ? LogicalType(*spec->result) : value.expr->type;
+    if (spec->function == Function::kEpochMs) {
+      // toDateTime(t) is epoch_ms(t * 1000): the product is typed and checked as arithmetic.
+      const sql::Literal thousand{
+          .kind = sql::Literal::Kind::kInteger, .negative = false, .text = "1000", .span = {}};
+      const sql::BinaryExpr product{.op = sql::BinaryOp::kMultiply,
+                                    .left = sql::Box<sql::Expr>(call.args[0]),
+                                    .right = sql::Box<sql::Expr>(sql::Expr(thousand)),
+                                    .op_span = call.name_span,
+                                    .span = call.span};
+      ARROW_ASSIGN_OR_RAISE(Typed literal, LiteralOperand(thousand));
+      ARROW_ASSIGN_OR_RAISE(value, Arith(product, std::move(value), std::move(literal)));
     }
     std::vector<ExprPtr> args{std::move(value.expr)};
     args.insert(args.end(), literals.begin(), literals.end());

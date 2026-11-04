@@ -85,6 +85,17 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   `substring` is also the first function whose arguments after the value are **evaluated per row** rather than
   constants, so `FunctionSpec` carries their kind and `FunctionExpr::args` holds bound expressions for them; the
   evaluator walks UTF-8 codepoints itself, since Arrow's slice kernels take a constant window.
+  Update (2026-11-04, ADR 0037's FN1): the table is a list of typed **overloads** (`FunctionOverload` in
+  `src/plan/binder.cc`), so that a function with several signatures (round, abs) is a row per signature and one
+  kernel.
+  - **One row.** Each row has the kind of each argument (a VARCHAR, an integer type but HUGEINT, a TIMESTAMP or
+    DATE, a string literal), an arity range, the position of the value, and a result type: fixed, or the value's
+    own.
+  - **Choosing a row.** A function's overloads are adjacent rows. They share the value's position and the kinds of
+    the other arguments, and the binder picks the first row whose arity takes the call and whose value accepts its
+    type.
+  - **Refusals.** The arity refusal names the range over all of a function's overloads, and the type refusal the
+    first row of that arity, so every message of the five functions is unchanged.
   Update: conditions are BOOLEAN expressions (`PredicateExpr` leaves bound and folded as `WHERE` comparisons,
   `BoolExpr` for `AND`/`OR`/`NOT`) and `CASE` a `CaseExpr`; BOOLEAN is an internal type, never a column of a table
   or a result. A `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed by a `Compute` and filtered with a new
