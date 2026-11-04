@@ -65,11 +65,13 @@ if(ANTB1_HAVE_DUCKDB)
   # Against the DuckDB library: plan::DuckDbFloatOf on seeded random literals, long runs of ties, the
   # adapter's DECIMAL columns and memory limit, the keywords DuckDB reads as table aliases, DuckDB's
   # reading of generated joins, the distinct counts DuckDB writes into Parquet footers and the type
-  # fold of CASE values and UNION ALL columns (plan::CommonValueType).
+  # fold of CASE values and UNION ALL columns (plan::CommonValueType) and upper() and lower() of every
+  # codepoint (exec::CaseConvertValue).
   target_sources(
     antb1_slt_tests
     PRIVATE
       tests/duckdb_engine_test.cc
+      tests/case_mapping_oracle_test.cc
       tests/float_literal_oracle_test.cc
       tests/ordered_compare_oracle_test.cc
       tests/parquet_hints_oracle_test.cc
@@ -77,6 +79,8 @@ if(ANTB1_HAVE_DUCKDB)
       tests/table_alias_oracle_test.cc
       tests/type_fold_oracle_test.cc
   )
+  # exec: exec::CaseConvertValue, which case_mapping_oracle_test.cc checks on every codepoint.
+  target_link_libraries(antb1_slt_tests PRIVATE antb1::exec)
 endif()
 
 # Test cases: tests/slt/cases/<area>/<file>.slt -> slt.<area>.<file> (+ oracle.<area>.<file>).

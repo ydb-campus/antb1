@@ -257,11 +257,12 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     Expressions, BindErrorTest,
     ::testing::Values(
-        ErrorCase{R"(SELECT "lower"(url) FROM t)", kUnsupported, R"("lower")",
-                  "function lower() is not supported"},
+        ErrorCase{R"(SELECT "md5"(url) FROM t)", kUnsupported, R"("md5")",
+                  "function md5() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -530,8 +531,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "regexp_replace() with options (a fourth argument) is not supported"},
         ErrorCase{"SELECT regexp_replace(s, 'a', 'b', 'g', 'x') FROM t", kBind,
                   "regexp_replace(s, 'a', 'b', 'g', 'x')", "takes 3 arguments, not 5"},
-        ErrorCase{"SELECT strlen(lower(s)) FROM t", kUnsupported, "lower",
-                  "function lower() is not supported"},
+        ErrorCase{"SELECT strlen(md5(s)) FROM t", kUnsupported, "md5",
+                  "function md5() is not supported"},
         ErrorCase{"SELECT SUM(i16) + 1 AS total FROM t GROUP BY total", kBind, "total",
                   "GROUP BY cannot refer to the aggregate 'total'"},
         ErrorCase{"SELECT s FROM t GROUP BY s HAVING SUM(i16) + 1 > s", kBind, ">",
@@ -543,21 +544,26 @@ INSTANTIATE_TEST_SUITE_P(
                   "ORDER BY a constant expression is not supported"},
         ErrorCase{"SELECT SUM(1 + 2) FROM t", kUnsupported, "1 + 2",
                   "constant aggregate arguments are not supported"},
-        ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
-                  "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+        ErrorCase{"SELECT md5(url) FROM t", kUnsupported, "md5",
+                  "function md5() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT SUM(sqrt(a)) FROM t", kUnsupported, "sqrt",
                   "function sqrt() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "COALESCE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -604,16 +610,16 @@ INSTANTIATE_TEST_SUITE_P(
                   "CASE WHEN a = 1 THEN b END", "this condition is not supported"},
         ErrorCase{"SELECT a FROM t WHERE EXTRACT(year FROM dt)", kUnsupported,
                   "EXTRACT(year FROM dt)", "this condition is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE lower(url)", kUnsupported, "lower",
-                  "function lower() is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE lower(url) LIKE 'x%'", kUnsupported, "lower",
-                  "function lower() is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE url LIKE lower(title)", kUnsupported, "lower",
-                  "function lower() is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE lower(url) IN ('x')", kUnsupported, "lower",
-                  "function lower() is not supported"},
-        ErrorCase{"SELECT a FROM t WHERE url IN ('x', lower(title))", kUnsupported, "lower",
-                  "function lower() is not supported"}));
+        ErrorCase{"SELECT a FROM t WHERE md5(url)", kUnsupported, "md5",
+                  "function md5() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE md5(url) LIKE 'x%'", kUnsupported, "md5",
+                  "function md5() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE url LIKE md5(title)", kUnsupported, "md5",
+                  "function md5() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE md5(url) IN ('x')", kUnsupported, "md5",
+                  "function md5() is not supported"},
+        ErrorCase{"SELECT a FROM t WHERE url IN ('x', md5(title))", kUnsupported, "md5",
+                  "function md5() is not supported"}));
 
 // Casts: CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are DATE literals spanning the cast,
 // with their bind errors (D4, D5). A cast to a type antb1 has no type for is kUnsupported before
@@ -649,7 +655,7 @@ INSTANTIATE_TEST_SUITE_P(
         // Every other cast, at its first unsupported part in source order.
         ErrorCase{"SELECT TRY_CAST('2013-07-01' AS DATE) FROM t", kUnsupported, "TRY_CAST",
                   "TRY_CAST is not supported"},
-        ErrorCase{"SELECT try_cast(lower(nope) AS INT) FROM t", kUnsupported, "try_cast",
+        ErrorCase{"SELECT try_cast(md5(nope) AS INT) FROM t", kUnsupported, "try_cast",
                   "TRY_CAST is not supported"},
         ErrorCase{"SELECT CAST(i16 AS FLOAT) FROM t", kUnsupported, "FLOAT",
                   "CAST to FLOAT is not supported"},
@@ -671,8 +677,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "CAST of DECIMAL(3,2) values to DECIMAL(2,1) is not supported"},
         ErrorCase{"SELECT CAST(d AS DECIMAL(5,1)) FROM t", kUnsupported, "CAST(d AS DECIMAL(5,1))",
                   "CAST of DOUBLE values to DECIMAL(5,1) is not supported"},
-        ErrorCase{"SELECT CAST(lower(s) AS INT) FROM t", kUnsupported, "lower",
-                  "function lower() is not supported"},
+        ErrorCase{"SELECT CAST(md5(s) AS INT) FROM t", kUnsupported, "md5",
+                  "function md5() is not supported"},
         ErrorCase{"SELECT (i16 = 1)::VARCHAR FROM t", kUnsupported, "=",
                   "comparisons are only supported in conditions"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
@@ -834,19 +840,19 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE strlen(t.s, 1) > 1", kBind, "strlen(t.s, 1)",
                   "strlen() takes 1 argument, not 2"},
         // Query order.
-        ErrorCase{"SELECT lower(s), t.i16 FROM t, u", kUnsupported, "lower",
-                  "function lower() is not supported"},
+        ErrorCase{"SELECT md5(s), t.i16 FROM t, u", kUnsupported, "md5",
+                  "function md5() is not supported"},
         ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, "u", "a cross product is not supported"},
-        ErrorCase{"SELECT nope FROM t, u WHERE lower(s) = 'x'", kUnsupported, "lower",
-                  "function lower() is not supported"},
+        ErrorCase{"SELECT nope FROM t, u WHERE md5(s) = 'x'", kUnsupported, "md5",
+                  "function md5() is not supported"},
         // The select list beats the connectivity check, and an alias names the binding in it.
         ErrorCase{"SELECT i16 FROM t AS a, u", kBind, "i16",
                   "column name 'i16' is ambiguous: it matches a.i16 and u.i16"},
         // An ON is checked with the FROM list, before WHERE: its unsupported function comes first.
-        ErrorCase{"SELECT i16 FROM t JOIN u ON lower(t.s) = u.s WHERE lower(s) = 'x'", kUnsupported,
-                  "lower", "function lower() is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE lower(s) = 'x' GROUP BY t.i16", kUnsupported, "lower",
-                  "function lower() is not supported"}));
+        ErrorCase{"SELECT i16 FROM t JOIN u ON md5(t.s) = u.s WHERE md5(s) = 'x'", kUnsupported,
+                  "md5", "function md5() is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE md5(s) = 'x' GROUP BY t.i16", kUnsupported, "md5",
+                  "function md5() is not supported"}));
 
 // Derived tables and WITH lists bind as sub-plans (ADR 0022's J4), so what is left here is what a
 // sub-plan does not change: an unsupported construct anywhere in the statement is still reported
@@ -856,13 +862,13 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     NestedQueries, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT lower(s) FROM (SELECT s FROM t)", kUnsupported, "lower",
-                  "function lower() is not supported"},
+        ErrorCase{"SELECT md5(s) FROM (SELECT s FROM t)", kUnsupported, "md5",
+                  "function md5() is not supported"},
         // Beside a sub-plan, and inside a block a CTE reaches: the walk finds both.
-        ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE lower(s) = 'x'", kUnsupported,
-                  "lower", "function lower() is not supported"},
-        ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT lower(s) FROM (SELECT s FROM c) AS a",
-                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT nope FROM (SELECT i16 FROM t) WHERE md5(s) = 'x'", kUnsupported, "md5",
+                  "function md5() is not supported"},
+        ErrorCase{"WITH c AS (SELECT i16 FROM t) SELECT md5(s) FROM (SELECT s FROM c) AS a",
+                  kUnsupported, "md5", "function md5() is not supported"},
         // A keyless LEFT JOIN inside a sub-plan is reported at its own connector -- inside a
         // derived table, and inside the body of a CTE something references. (Both shapes answer
         // when the join has a key: LeftJoinsBindInsideSubPlans covers that.)
@@ -928,8 +934,8 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
         ErrorCase{"SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1", kUnsupported,
                   "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT lower(s) FROM t ORDER BY 1", kUnsupported,
-                  "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT md5(s) FROM t ORDER BY 1", kUnsupported,
+                  "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
                   kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM u UNION ALL SELECT i16 "
@@ -949,9 +955,9 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT i32 FROM u "
                   "UNION ALL SELECT i32 FROM t)",
                   kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE lower(s) IN (SELECT s FROM u UNION ALL SELECT s FROM t)",
-                  kUnsupported, "lower", "function lower() is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT lower(s) FROM u UNION ALL SELECT s FROM "
+        ErrorCase{"SELECT i16 FROM t WHERE md5(s) IN (SELECT s FROM u UNION ALL SELECT s FROM t)",
+                  kUnsupported, "md5", "function md5() is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT md5(s) FROM u UNION ALL SELECT s FROM "
                   "t)",
                   kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1) SELECT x "
@@ -1026,20 +1032,20 @@ INSTANTIATE_TEST_SUITE_P(
                   kBind, "UNION ALL",
                   "Set operations can only apply to expressions with the same number of result "
                   "columns"},
-        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT lower(s) FROM t",
-                  kUnsupported, "lower", "function lower() is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT md5(s) FROM t",
+                  kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
-                  "lower(s) AS x FROM t) AS d",
-                  kUnsupported, "lower", "function lower() is not supported"},
-        ErrorCase{"WITH c AS (SELECT lower(s) AS x FROM t) SELECT i16 FROM t UNION ALL SELECT i16 "
+                  "md5(s) AS x FROM t) AS d",
+                  kUnsupported, "md5", "function md5() is not supported"},
+        ErrorCase{"WITH c AS (SELECT md5(s) AS x FROM t) SELECT i16 FROM t UNION ALL SELECT i16 "
                   "FROM u UNION ALL SELECT x FROM c",
-                  kUnsupported, "lower", "function lower() is not supported"},
+                  kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
-                  "WHERE i16 IN (SELECT lower(s) FROM u)",
-                  kUnsupported, "lower", "function lower() is not supported"},
+                  "WHERE i16 IN (SELECT md5(s) FROM u)",
+                  kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT x FROM (SELECT "
-                  "i16 AS x FROM t UNION ALL SELECT lower(s) FROM t) AS d",
-                  kUnsupported, "lower", "function lower() is not supported"}));
+                  "i16 AS x FROM t UNION ALL SELECT md5(s) FROM t) AS d",
+                  kUnsupported, "md5", "function md5() is not supported"}));
 
 // Subqueries in expressions (ADR 0022): the grammar parses all three forms from roadmap PR S4b on.
 // Roadmap PR J5a answers IN and NOT IN as a top-level conjunct of WHERE, of an inner join's ON or
@@ -1821,6 +1827,33 @@ TEST(BinderTest, AbsKeepsItsArgumentsType) {
   ASSERT_FALSE(on_float.ok());
   ASSERT_NE(GetSqlError(on_float.status()), nullptr);
   EXPECT_EQ(GetSqlError(on_float.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+}
+
+// upper and lower (ADR 0037's FN4) and DuckDB's aliases ucase and lcase: a VARCHAR of a VARCHAR,
+// named as written; another type or a second argument is a bind error.
+TEST(BinderTest, UpperAndLowerOfAVarchar) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, name] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT upper(s) FROM t", "upper(s)"},
+           {"SELECT UCASE(s) FROM t", "ucase(s)"},
+           {"SELECT lower(s) FROM t", "lower(s)"},
+           {"SELECT lcase(s) FROM t", "lcase(s)"},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, LogicalType::kVarchar) << sql;
+    EXPECT_EQ(plan->output[0].name, name) << sql;
+  }
+  for (const auto& [sql, message] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT upper(i32) FROM t", "upper() needs a VARCHAR, but 'i32' is INTEGER"},
+           {"SELECT lcase(s, s) FROM t", "lcase"},
+       })) {
+    const auto bad = BindSql(sql, catalog);
+    ASSERT_FALSE(bad.ok()) << sql;
+    ASSERT_NE(GetSqlError(bad.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(bad.status())->kind(), SqlErrorDetail::Kind::kBind) << sql;
+    EXPECT_TRUE(bad.status().message().contains(message)) << bad.status().ToString();
+  }
 }
 
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first

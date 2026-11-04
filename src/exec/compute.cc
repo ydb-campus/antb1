@@ -25,6 +25,8 @@
 #include <arrow/util/utf8.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
+#include "antb1/exec/case_mapping.h"
 #include "antb1/exec/filter.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
@@ -1245,8 +1247,72 @@ struct Evaluator {
         return Round(function, *text);
       case plan::Function::kAbs:
         return Abs(*text, e.type);
+      case plan::Function::kUpper:
+      case plan::Function::kLower:
+        return CaseConvert(*text, function.function == plan::Function::kUpper);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // upper or lower of VARCHAR values (ADR 0037's FN4), each codepoint mapped as DuckDB 1.5.6 maps
+  // it (CaseConvertValue). A value whose bytes are no valid UTF-8 -- antb1 reads any BYTE_ARRAY as
+  // VARCHAR (divergence D15) -- stays as it is.
+  arrow::Result<ArrayPtr> CaseConvert(const arrow::Array& values, bool upper) const {
+    const auto& binary = static_cast<const arrow::BinaryArray&>(values);
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr ascii, AsciiCaseConvert(binary, upper));
+    if (ascii != nullptr) {
+      return ascii;
+    }
+    arrow::BinaryBuilder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(binary.length()));
+    ARROW_RETURN_NOT_OK(builder.ReserveData(binary.total_values_length()));
+    std::string converted;
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      if (binary.IsNull(i)) {
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+        continue;
+      }
+      const std::string_view value = binary.GetView(i);
+      if (CaseConvertValue(value, upper, converted)) {
+        ARROW_RETURN_NOT_OK(builder.Append(converted));
+      } else {
+        ARROW_RETURN_NOT_OK(builder.Append(value));
+      }
+    }
+    ArrayPtr out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
+  }
+
+  // CaseConvert of a batch whose value bytes are all ASCII, where every value keeps its length: one
+  // pass maps the data buffer, and the offsets and validity stay the input's own buffers. nullptr
+  // when the batch holds no bytes or a byte that is not ASCII, which the value-by-value path takes.
+  arrow::Result<ArrayPtr> AsciiCaseConvert(const arrow::BinaryArray& binary, bool upper) const {
+    if (binary.length() == 0) {
+      return nullptr;
+    }
+    const int64_t begin = binary.value_offset(0);
+    const int64_t end = binary.value_offset(binary.length());
+    if (end == begin) {
+      return nullptr;
+    }
+    // The offsets index the data buffer from its start, so the new buffer keeps the bytes before
+    // the first value (a slice's) as zeros.
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> mapped, arrow::AllocateBuffer(end, pool));
+    const std::uint8_t* in = binary.value_data()->data();
+    std::uint8_t* out = mapped->mutable_data();
+    std::memset(out, 0, Narrow<std::size_t>(begin));
+    for (int64_t i = begin; i < end; ++i) {
+      const std::uint8_t c = in[i];
+      if (c >= 0x80U) {
+        return nullptr;
+      }
+      const bool flips = upper ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z');
+      out[i] = flips ? static_cast<std::uint8_t>(c ^ 0x20U) : c;
+    }
+    std::shared_ptr<arrow::ArrayData> data = binary.data()->Copy();
+    data->buffers[2] = std::move(mapped);
+    return arrow::MakeArray(data);
   }
 
   // abs(x) as DuckDB computes it (ADR 0037's FN3), in x's own type: fabs of a DOUBLE (-0.0 is 0.0,

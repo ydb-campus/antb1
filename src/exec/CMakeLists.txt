@@ -13,6 +13,7 @@ antb1_add_module(
     compute.cc
     parallel_compute.cc
     like.cc
+    case_mapping.cc
     project.cc
     scalar_aggregate.cc
     aggregate_set.cc

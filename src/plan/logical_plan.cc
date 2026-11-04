@@ -415,6 +415,10 @@ std::string_view ToString(Function function) {
       return "round";
     case Function::kAbs:
       return "abs";
+    case Function::kUpper:
+      return "upper";
+    case Function::kLower:
+      return "lower";
   }
   return "?";
 }
