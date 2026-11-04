@@ -1,6 +1,8 @@
 #include "antb1/plan/binder.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstddef>
 #include <deque>
 #include <format>
@@ -9,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -370,7 +373,96 @@ std::string TypeText(const sql::CastExpr& cast) {
   return cast.type_params.empty() ? out : out + ")";
 }
 
-[[noreturn]] void UnfoldedCast();
+// A cast's target (ADR 0037's CT1): antb1's type, and the type as DuckDB names it in a result name
+// (CAST(x AS "DOUBLE"), CAST(x AS DECIMAL(12, 2))), whatever alias was written (INT is INTEGER).
+struct CastTarget {
+  LogicalType type;
+  std::string name;
+};
+
+struct CastTypeName {
+  std::string_view written;  // as the parser keeps it, upper case
+  LogicalType::Id type;
+  std::string_view name;  // DuckDB's
+};
+
+constexpr auto kCastTypes = std::to_array<CastTypeName>({
+    {.written = "SMALLINT", .type = LogicalType::kSmallInt, .name = "SMALLINT"},
+    {.written = "INT2", .type = LogicalType::kSmallInt, .name = "SMALLINT"},
+    {.written = "SHORT", .type = LogicalType::kSmallInt, .name = "SMALLINT"},
+    {.written = "INTEGER", .type = LogicalType::kInteger, .name = "INTEGER"},
+    {.written = "INT", .type = LogicalType::kInteger, .name = "INTEGER"},
+    {.written = "INT4", .type = LogicalType::kInteger, .name = "INTEGER"},
+    {.written = "SIGNED", .type = LogicalType::kInteger, .name = "INTEGER"},
+    {.written = "BIGINT", .type = LogicalType::kBigInt, .name = "BIGINT"},
+    {.written = "INT8", .type = LogicalType::kBigInt, .name = "BIGINT"},
+    {.written = "LONG", .type = LogicalType::kBigInt, .name = "BIGINT"},
+    {.written = "HUGEINT", .type = LogicalType::kHugeInt, .name = "\"HUGEINT\""},
+    {.written = "INT128", .type = LogicalType::kHugeInt, .name = "\"HUGEINT\""},
+    {.written = "USMALLINT", .type = LogicalType::kUSmallInt, .name = "\"USMALLINT\""},
+    {.written = "UINT16", .type = LogicalType::kUSmallInt, .name = "\"USMALLINT\""},
+    {.written = "DOUBLE", .type = LogicalType::kDouble, .name = "\"DOUBLE\""},
+    {.written = "FLOAT8", .type = LogicalType::kDouble, .name = "\"DOUBLE\""},
+    {.written = "VARCHAR", .type = LogicalType::kVarchar, .name = "VARCHAR"},
+    {.written = "TEXT", .type = LogicalType::kVarchar, .name = "VARCHAR"},
+    {.written = "STRING", .type = LogicalType::kVarchar, .name = "VARCHAR"},
+    {.written = "DATE", .type = LogicalType::kDate, .name = "\"DATE\""},
+    {.written = "TIMESTAMP", .type = LogicalType::kTimestamp, .name = "TIMESTAMP"},
+    {.written = "DATETIME", .type = LogicalType::kTimestamp, .name = "TIMESTAMP"},
+    {.written = "BOOLEAN", .type = LogicalType::kBoolean, .name = "BOOLEAN"},
+    {.written = "BOOL", .type = LogicalType::kBoolean, .name = "BOOLEAN"},
+});
+
+bool IsDecimalName(std::string_view type) { return type == "DECIMAL" || type == "NUMERIC"; }
+
+// Whether antb1 has a type for the cast's target: one of kCastTypes without parameters, or a
+// DECIMAL with at most two (whose values CastTargetOf checks).
+bool KnownCastTarget(const sql::CastExpr& cast) {
+  if (IsDecimalName(cast.type)) {
+    return cast.type_params.size() <= 2;
+  }
+  return cast.type_params.empty() && std::ranges::find(kCastTypes, std::string_view(cast.type),
+                                                       &CastTypeName::written) != kCastTypes.end();
+}
+
+// The cast's target, std::nullopt where KnownCastTarget is false. A DECIMAL is DECIMAL(18,3) bare
+// and DECIMAL(p,0) with one parameter, as in DuckDB; a width outside 1 to 38 or a scale above it
+// is DuckDB's bind error.
+arrow::Result<std::optional<CastTarget>> CastTargetOf(const sql::CastExpr& cast) {
+  if (!KnownCastTarget(cast)) {
+    return std::nullopt;
+  }
+  if (!IsDecimalName(cast.type)) {
+    const auto* entry =
+        std::ranges::find(kCastTypes, std::string_view(cast.type), &CastTypeName::written);
+    return CastTarget{.type = LogicalType(entry->type), .name = std::string(entry->name)};
+  }
+  if (cast.type_params.empty()) {
+    return CastTarget{.type = LogicalType::Decimal(18, 3), .name = "DECIMAL"};
+  }
+  std::vector<int> params;
+  for (const std::string& text : cast.type_params) {
+    int value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+      value = std::numeric_limits<int>::max();  // beyond any width: the range error below
+    }
+    params.push_back(value);
+  }
+  const int width = params[0];
+  const int scale = params.size() > 1 ? params[1] : 0;
+  if (width < 1 || width > int{LogicalType::kMaxDecimalWidth}) {
+    return BindError("DECIMAL type width must be between 1 and 38", cast.type_span);
+  }
+  if (scale > width) {
+    return BindError("DECIMAL type scale cannot be greater than width", cast.type_span);
+  }
+  return CastTarget{
+      .type = LogicalType::Decimal(Narrow<std::uint8_t>(width), Narrow<std::uint8_t>(scale)),
+      .name = params.size() > 1 ? std::format("DECIMAL({}, {})", width, scale)
+                                : std::format("DECIMAL({})", width)};
+}
+
 [[noreturn]] void RejectedSubquery();
 // The opening of a function call's result name, through to its '(' (defined with the function table
 // below, which knows which names DuckDB reserves). One rule for both name builders: ExprNameOf,
@@ -446,7 +538,15 @@ struct ExprNameOf {
   std::string operator()(const sql::ExtractExpr& e) const {
     return std::format("main.date_part('{}', {})", ExtractFieldName(e.field), ExprName(*e.source));
   }
-  std::string operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+  std::string operator()(const sql::CastExpr& cast) const {
+    std::string type = TypeText(cast);
+    if (const arrow::Result<std::optional<CastTarget>> target = CastTargetOf(cast); target.ok()) {
+      if (const std::optional<CastTarget>& known = *target; known.has_value()) {
+        type = known->name;
+      }
+    }
+    return std::format("CAST({} AS {})", ExprName(*cast.operand), type);
+  }
   std::string operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
 };
 
@@ -866,7 +966,8 @@ struct FirstUnsupportedOf {
     }
     return FirstUnsupported(*e.source);
   }
-  // Every cast that FoldDateCasts left: all but CAST('YYYY-MM-DD' AS DATE), in source order.
+  // Every cast that FoldDateCasts left (all but CAST('YYYY-MM-DD' AS DATE)): to a type antb1 has
+  // (ADR 0037's CT1), whose operands the binder then checks.
   std::optional<Rejection> operator()(const sql::CastExpr& cast) const {
     if (cast.try_cast) {
       return Rejection{.span = cast.op_span, .message = "TRY_CAST is not supported"};
@@ -874,16 +975,11 @@ struct FirstUnsupportedOf {
     if (auto r = FirstUnsupported(*cast.operand)) {
       return r;
     }
-    if (cast.type != "DATE" || !cast.type_params.empty()) {
+    if (!KnownCastTarget(cast)) {
       return Rejection{.span = cast.type_span,
-                       .message = std::format("CAST to {} is not supported (only a string literal "
-                                              "cast to DATE is)",
-                                              Clip(TypeText(cast)))};
+                       .message = std::format("CAST to {} is not supported", Clip(TypeText(cast)))};
     }
-    return Rejection{.span = cast.operand->span(),
-                     .message =
-                         "CAST to DATE is only supported for a string literal "
-                         "('YYYY-MM-DD')"};
+    return std::nullopt;
   }
   // Every subquery in an expression, which the grammar parses from roadmap PR S4b on (ADR 0022).
   // This is the one place the forms are refused, so the condition walk and every binder visitor
@@ -2202,9 +2298,8 @@ bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantEx
 //   BindConditionWith binds a leaf.
 [[noreturn]] void ConditionAsOperand() { ANTB1_CHECK(false); }
 [[noreturn]] void NotAConditionLeaf() { ANTB1_CHECK(false); }
-// - UnfoldedCast: FoldDateCasts turned the casts the binder answers into DATE literals, and
-//   CheckSupported rejected every other one, except in the arguments of a call with the wrong
-//   number of them, which BindFunction rejects before it binds or names an argument.
+// - UnfoldedCast: a cast is a value (BindCast, ADR 0037's CT1), never a condition leaf:
+//   RejectCondition refuses a bare cast as a condition.
 [[noreturn]] void UnfoldedCast() { ANTB1_CHECK(false); }
 // - RejectedSubquery: CheckSupported rejects every subquery in an expression before any name
 //   resolves (FirstUnsupportedOf), so nothing that binds one is ever reached. Roadmap PR J5 and
@@ -2516,7 +2611,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindInput(x); });
     }
-    arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+    arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
+      return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindInput(e); });
+    }
     arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
   };
 
@@ -2884,7 +2981,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::ExtractExpr& e) const {
       return binder.BindExtract(e, [this](const sql::Expr& x) { return binder.BindOutput(x); });
     }
-    arrow::Result<Typed> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
+    arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
+      return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindOutput(e); });
+    }
     arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
   };
 
@@ -3052,6 +3151,8 @@ class Binder {
   arrow::Result<Typed> BindCase(const sql::CaseExpr& c, const BindFn& bind, bool input);
   template <class BindFn>
   arrow::Result<Typed> BindCoalesce(const sql::FunctionCall& call, const BindFn& bind);
+  template <class BindFn>
+  arrow::Result<Typed> BindCast(const sql::CastExpr& cast, const BindFn& bind);
   struct Moved {
     enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
     const sql::Expr* operand = nullptr;
@@ -4282,6 +4383,126 @@ arrow::Result<Typed> Binder::BindCoalesce(const sql::FunctionCall& call, const B
   }
   node.otherwise = values.back().expr;
   return Leaf(Expr{.node = std::move(node), .type = *type, .name = std::move(name)});
+}
+
+namespace {
+
+// `expr` as a constant of `to` (ADR 0037's CT1) where it is one that `to` holds exactly: an
+// integer constant (a literal, negated or in parentheses, or arithmetic of them) in an integer
+// type's range, in a DECIMAL(p,s) without leaving its p digits, or in a DOUBLE up to 2^53; a
+// decimal literal in a DECIMAL of a scale at least its own, or in an integer type when it has no
+// fraction; a string literal as VARCHAR or TIMESTAMP. std::nullopt for anything else, which is
+// cast as a value or refused, as is a constant DuckDB would round or fail to convert.
+std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, LogicalType to) {
+  const auto in_decimal = [&to](Int128 unscaled, int scale) -> std::optional<Constant> {
+    const std::optional<Int128> scaled = Rescale(unscaled, scale, to.scale());
+    const Int128 limit = PowerOfTen(to.width());
+    if (scale > int{to.scale()} || !scaled.has_value() || *scaled >= limit || *scaled <= -limit) {
+      return std::nullopt;
+    }
+    return Constant{.type = to, .value = *scaled};
+  };
+  const auto in_integer = [&to](Int128 value) -> std::optional<Constant> {
+    const IntegerRange range = RangeOf(to);
+    if (value < range.min || value > range.max) {
+      return std::nullopt;
+    }
+    return Constant{.type = to, .value = value};
+  };
+  const auto* lit = std::get_if<sql::Literal>(&expr);
+  if (lit != nullptr && lit->kind == sql::Literal::Kind::kString) {
+    if (to == LogicalType::kVarchar) {
+      return Constant{.type = to, .value = lit->text};
+    }
+    if (to == LogicalType::kTimestamp) {
+      const auto micros = ParseTimestamp(lit->text);
+      if (!micros.has_value()) {
+        return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit->text) + "': expected " +
+                             std::string(kTimestampForm),
+                         lit->span);
+      }
+      return Constant{.type = to, .value = Int128{*micros}};
+    }
+    return std::nullopt;
+  }
+  if (lit != nullptr && lit->kind == sql::Literal::Kind::kDecimal &&
+      !IsApproximateNumber(lit->text)) {
+    const auto decimal = ParseDecimalLiteral(lit->text, lit->negative);
+    if (!decimal.has_value()) {
+      return std::nullopt;
+    }
+    const int scale = decimal->type.scale();
+    std::optional<Constant> out;
+    if (to == LogicalType::kDecimal) {
+      out = in_decimal(decimal->unscaled, scale);
+    } else if (IsInteger(to) && decimal->unscaled % PowerOfTen(scale) == 0) {
+      out = in_integer(decimal->unscaled / PowerOfTen(scale));
+    }
+    if (!out.has_value()) {
+      return std::nullopt;
+    }
+    return *out;
+  }
+  std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(expr);
+  if (!folded.has_value()) {
+    return std::nullopt;
+  }
+  if (!folded->ok()) {
+    return folded->status();
+  }
+  const Int128 value = (**folded).value;
+  std::optional<Constant> out;
+  if (IsInteger(to)) {
+    out = in_integer(value);
+  } else if (to == LogicalType::kDecimal) {
+    out = in_decimal(value, 0);
+  } else if (to == LogicalType::kDouble) {
+    constexpr Int128 kExact = 9007199254740992;  // 2^53: every integer up to it is a DOUBLE
+    if (value >= -kExact && value <= kExact) {
+      out = Constant{.type = to, .value = static_cast<double>(value)};
+    }
+  }
+  if (!out.has_value()) {
+    return std::nullopt;
+  }
+  return *out;
+}
+
+}  // namespace
+
+// CAST(x AS T) (ADR 0037's CT1): a constant that T holds exactly is that constant; x of type T is
+// itself (a FLOAT column as DOUBLE drops its FLOAT flag: the value is the DOUBLE antb1 reads); an
+// exact widening is the executor's CastExpr. Every other cast is unsupported (CT2 to CT4 answer
+// more), as is a constant DuckDB would round or fail to convert. Named as DuckDB names a cast.
+template <class BindFn>
+arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& bind) {
+  ARROW_ASSIGN_OR_RAISE(const std::optional<CastTarget> target, CastTargetOf(cast));
+  if (!target.has_value()) {
+    return UnsupportedError(std::format("CAST to {} is not supported", Clip(TypeText(cast))),
+                            cast.type_span);
+  }
+  const LogicalType to = target->type;
+  std::string name = std::format("CAST({} AS {})", ExprName(*cast.operand), target->name);
+  if (std::optional<arrow::Result<Constant>> constant = CastConstant(*cast.operand, to)) {
+    ARROW_ASSIGN_OR_RAISE(Constant value, *std::move(constant));
+    return Leaf(Expr{.node = ConstantExpr{.value = std::move(value)}, .type = to, .name = name});
+  }
+  ARROW_ASSIGN_OR_RAISE(const Typed value, bind(*cast.operand));
+  const LogicalType from = value.expr->type;
+  if (value.literal && from == LogicalType::kDouble) {
+    // A number DuckDB types as DOUBLE (1e3), which antb1 answers as no value of its own.
+    return UnsupportedError(std::format("CAST of the number {} to {} is not supported",
+                                        ExprName(*cast.operand), ToString(to)),
+                            cast.span);
+  }
+  // An identity too is a CastExpr (IsExactWidening holds of a type and itself): a computed value,
+  // so a GROUP BY of it groups by the cast and not by its column, as in DuckDB.
+  if (!value.literal && IsExactWidening(from, to)) {
+    return Leaf(Expr{.node = CastExpr{.operand = value.expr}, .type = to, .name = std::move(name)});
+  }
+  return UnsupportedError(
+      std::format("CAST of {} values to {} is not supported", ToString(from), ToString(to)),
+      cast.span);
 }
 
 namespace {

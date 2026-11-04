@@ -1,0 +1,98 @@
+# CAST (ADR 0037's CT1, docs/sql-subset.md): a cast that changes no value -- an identity, an exact widening, a constant
+# the type holds exactly -- under DuckDB's aliases of the types, named as DuckDB names a cast.
+
+query II rowsort
+SELECT ct_id, CAST(ct_id AS INT) + 40000 FROM cities
+----
+SMALLINT	INTEGER
+1	40001
+2	40002
+3	40003
+4	40004
+5	40005
+6	40006
+
+query II rowsort
+SELECT zn_id, CAST(zn_parent AS BIGINT) * 1000000000 FROM zones WHERE zn_id <= 8
+----
+INTEGER	BIGINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	1000000000
+7	2000000000
+8	3000000000
+
+query ID nosort
+SELECT id, CAST(id AS NUMERIC(12, 2)) + d9_2 FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(13,2)
+0	-6.25
+1	10000000.99
+2	-9999997.99
+3	NULL
+4	4.00
+5	10.00
+6	2.25
+7	8.25
+
+query ID nosort
+SELECT id, CAST(d9_2 AS DECIMAL(14, 4)) FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(14,4)
+0	-6.2500
+1	9999999.9900
+2	-9999999.9900
+3	NULL
+4	0.0000
+5	5.0000
+6	-3.7500
+7	1.2500
+
+query T nosort
+SELECT CAST(tr_day AS DATE) FROM trips WHERE tr_row < 5 ORDER BY tr_row
+----
+DATE
+2026-03-01
+2026-03-02
+2026-03-03
+2026-03-04
+2026-03-05
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE CAST(tr_day AS DATE) >= DATE '2026-03-15'
+----
+BIGINT
+1598
+
+query DDRIT nosort
+SELECT CAST(0 AS DECIMAL(7,2)), CAST(-1.5 AS DECIMAL), CAST(3 AS DOUBLE), CAST(2.0 AS SMALLINT), CAST('x' AS TEXT) FROM cities LIMIT 1
+----
+DECIMAL(7,2)	DECIMAL(18,3)	DOUBLE	SMALLINT	VARCHAR
+0.00	-1.500	3	2	x
+
+query II nosort
+SELECT ct_id::INT4 AS u, SUM(CAST(ct_id AS HUGEINT)) FROM cities GROUP BY u ORDER BY u
+----
+INTEGER	HUGEINT
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+
+query T nosort
+SELECT CAST('2020-01-02 03:04:05' AS TIMESTAMP) FROM cities LIMIT 1
+----
+TIMESTAMP
+2020-01-02 03:04:05
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CAST(ct_id AS BIGINT) DESC LIMIT 2
+----
+SMALLINT
+6
+5

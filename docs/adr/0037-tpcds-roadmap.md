@@ -139,7 +139,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | NL4 | IS NULL and IS NOT NULL (the NL4 update below) | 76, 93 | Built |
 | NL5 | COALESCE (the NL5 update below) | | Built |
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
-| CT1 | A general cast expression: identity casts, exact widenings and constants that fit | 40 | Planned |
+| CT1 | A general cast expression: identity casts, exact widenings and constants that fit (the CT1 update below) | 40 | Built |
 | CT2 | Checked casts to DECIMAL(p,s) | 61, 90 | Planned |
 | CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types | | Planned |
 | CT4 | Quotients of numeric literals folded into DOUBLE constants | 21 | Planned |
@@ -381,6 +381,18 @@ Update (2026-11-04, NL5): built, and phase 2 is complete. No query passes from i
 - **Typing.** It shares the CASE value typing, now one function, `ValuesType`, with DuckDB's fold from the first
   argument in written order (the first kept as it is, like an ELSE value). The refusals name COALESCE.
 - **NULL arguments.** A NULL argument stays an unsupported NULL literal.
+
+Update (2026-11-04, CT1): built. Query 40 passes: 54 of the 99.
+
+- **Binding.** `CAST(x AS T)` binds for every T that antb1 has a type for, under DuckDB's aliases (`INT`, `INT4`,
+  `NUMERIC`, `FLOAT8`, `TEXT`, ...). It answers three kinds of cast: an identity, which keeps the value; an exact
+  widening, which is the executor's `CastExpr`; and a constant that T holds exactly, folded into a constant of T. The
+  result is named as DuckDB names a cast.
+- **Refusals.** A cast to a type antb1 has none for stays CheckSupported's refusal, before any name is resolved.
+  Every other cast is unsupported at bind time, naming the two types. An identity is computed (a `CastExpr` of
+  a type to itself), so a `GROUP BY` of it groups by the cast, as in DuckDB, and not by the bare column.
+- **What answers more later.** CT2 answers checked casts to DECIMAL (two queries reach that refusal now), and CT3 the
+  integer casts of DOUBLE and DECIMAL.
 
 ## Alternatives considered
 
