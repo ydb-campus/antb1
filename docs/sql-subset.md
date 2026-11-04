@@ -550,9 +550,15 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   type (`smallint_col + 1` is SMALLINT, `smallint_col + 40000` INTEGER); two integer types give the wider one, where
   USMALLINT with SMALLINT gives BIGINT; an integer literal alone is INTEGER, BIGINT or HUGEINT by its value; DOUBLE
   with anything is DOUBLE, and so is a number DuckDB types as DOUBLE (`1e3`); a decimal literal is a DECIMAL (below);
-  `/` is always DOUBLE; unary `-` keeps the type. DATE arithmetic, negating a USMALLINT (DuckDB wraps it), `//` and
-  `%` of HUGEINT values and arithmetic on FLOAT columns (divergence D11) are unsupported; arithmetic on VARCHAR is a
-  bind error. The result name is DuckDB's: `(a + 1)`, `-(a)`, `sum((a + 1))`, with columns as written and decimal
+  `/` is always DOUBLE; unary `-` keeps the type. A DATE plus or minus a number of days, or days plus a DATE
+  ([ADR 0037](adr/0037-tpcds-roadmap.md)'s CT5), is a DATE, the days a SMALLINT, USMALLINT or INTEGER (`d + 7`);
+  another integer type, a DECIMAL or a DOUBLE as the days, and days minus a DATE, are DuckDB's bind error (`No
+  function matches the given name and argument types '+(DATE, BIGINT)'`); an infinite DATE stays itself, and a
+  result that leaves INTEGER or lands on one of DuckDB's infinities fails the query (`Date out of range`). Other
+  DATE arithmetic (a DATE minus a DATE) and TIMESTAMP arithmetic, negating a
+  USMALLINT (DuckDB wraps it), `//` and `%` of HUGEINT values and arithmetic on FLOAT columns (divergence D11) are
+  unsupported; arithmetic on VARCHAR is a bind error. The result name is DuckDB's: `(a + 1)`, `-(a)`, `sum((a + 1))`,
+  with columns as written and decimal
   literals by their value (`(a + 7.50)`).
 - DECIMAL arithmetic ([ADR 0021](adr/0021-decimal-semantics.md) rules 4 to 6, 8 and 9): `+`, `-`, `*` and `%` of a
   DECIMAL (a column, an expression or a decimal literal) with a DECIMAL or an integer, which counts as DECIMAL(5,0)
@@ -1564,7 +1570,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q69 | pass | answered when the ratchet was added |
 | Q70 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q71 | pass | `UNION ALL` (ADR 0036) |
-| Q72 | unsupported | needs DATE plus an integer (CT5) |
+| Q72 | pass | DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q74 | pass | `UNION ALL` (ADR 0036) |
 | Q75 | unsupported | needs UNION (X4b) |

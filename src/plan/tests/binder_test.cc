@@ -453,7 +453,11 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT s + 1 FROM t", kBind, "+",
                   "arithmetic operator '+' needs numbers, but 's' is VARCHAR"},
         ErrorCase{"SELECT -s FROM t", kBind, "-", "needs a number, but 's' is VARCHAR"},
-        ErrorCase{"SELECT dt + 1 FROM t", kUnsupported, "+", "DATE arithmetic"},
+        ErrorCase{"SELECT dt - dt FROM t", kUnsupported, "-", "DATE arithmetic"},
+        ErrorCase{"SELECT dt + i64 FROM t", kBind, "+",
+                  "No function matches the given name and argument types '+(DATE, BIGINT)'"},
+        ErrorCase{"SELECT 1 - dt FROM t", kBind, "-",
+                  "No function matches the given name and argument types '-(INTEGER, DATE)'"},
         ErrorCase{"SELECT -u16 FROM t", kUnsupported, "-", "negating a USMALLINT is not supported"},
         ErrorCase{"SELECT SUM(i64) % 2 FROM t", kUnsupported, "%", "'%' in HUGEINT"},
         // DECIMAL (ADR 0021).
@@ -629,7 +633,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "cannot compare VARCHAR column 's' with a DATE literal"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE < i64", kBind,
                   "'2013-07-01'::DATE", "cannot compare BIGINT column 'i64' with a DATE literal"},
-        ErrorCase{"SELECT CAST('2013-07-01' AS DATE) + 1 FROM t", kUnsupported, "+",
+        ErrorCase{"SELECT CAST('2013-07-01' AS DATE) * 2 FROM t", kUnsupported, "*",
                   "DATE arithmetic"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE '2013-07-01'::DATE", kUnsupported,
                   "'2013-07-01'::DATE", "conditions other than comparisons"},
@@ -1703,6 +1707,26 @@ TEST(BinderTest, QuotientsOfNumbersFoldIntoDoubles) {
     const auto plan = BindSql(sql, catalog);
     EXPECT_FALSE(plan.ok()) << sql;
   }
+}
+
+// A DATE plus or minus a number of days, or days plus a DATE (ADR 0037's CT5), is a DATE, named as
+// DuckDB names arithmetic; the days are a SMALLINT, USMALLINT or INTEGER.
+TEST(BinderTest, DatePlusOrMinusDays) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, name] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT dt + 7 FROM t", "(dt + 7)"},
+           {"SELECT dt - i32 FROM t", "(dt - i32)"},
+           {"SELECT i16 + dt FROM t", "(i16 + dt)"},
+           {"SELECT dt + u16 FROM t", "(dt + u16)"},
+           {"SELECT DATE '2020-01-01' + 30 FROM t", "(CAST('2020-01-01' AS \"DATE\") + 30)"},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, LogicalType::kDate) << sql;
+    EXPECT_EQ(plan->output[0].name, name) << sql;
+  }
+  auto filtered = BindSql("SELECT i32 FROM t WHERE dt >= dt + 7", catalog);
+  ASSERT_TRUE(filtered.ok()) << filtered.status().ToString();
 }
 
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first

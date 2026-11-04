@@ -143,7 +143,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | CT2 | Checked casts to DECIMAL(p,s) (the CT2 update below) | 61, 90 | Built |
 | CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types (the CT3 update below) | | Built |
 | CT4 | Quotients of numeric literals folded into DOUBLE constants (the CT4 update below) | 21 | Built |
-| CT5 | DATE plus or minus an integer | 72 | Planned |
+| CT5 | DATE plus or minus an integer (the CT5 update below) | 72 | Built |
 | **Phase 4** | **Scalar functions** | | |
 | FN1 | Typed overloads for scalar functions (ADR 0012's FN1 update) | | Built |
 | FN2 | round | 2, 78 | Planned |
@@ -430,6 +430,16 @@ Update (2026-11-04, CT4): built. Query 21 passes: 57 of the 99.
 - **The value.** It is the DOUBLE DuckDB computes: each side converted to a double by `plan::DuckDbDoubleOf`, then
   divided. It is written as a literal with an exponent, so that it reads back as that DOUBLE and is compared as one.
 - **What stays refused.** A zero divisor, which DuckDB divides into an infinity. A quotient inside other arithmetic.
+
+Update (2026-11-04, CT5): built, and phase 3 is complete. Query 72 passes: 58 of the 99.
+
+- **Typing.** A DATE plus or minus days, or days plus a DATE, is a DATE (`ArithType`). The days are a SMALLINT,
+  USMALLINT or INTEGER, as DuckDB's `+(DATE, INTEGER)` takes them; another number, or days minus a DATE, is DuckDB's
+  bind error.
+- **Execution.** The executor adds the days in 64 bits (`DateArith`). An infinite DATE stays itself, and a result
+  that leaves INTEGER or lands on one of DuckDB's infinities fails with its `Date out of range`, as DuckDB adds them.
+- **What stays unsupported.** A DATE minus a DATE, which DuckDB answers as a BIGINT of days, and TIMESTAMP arithmetic
+  wait for a query that needs them. The `pending CT5` guard in `tests/slt/cases/joins/fact_pair.slt` is removed.
 
 ## Alternatives considered
 

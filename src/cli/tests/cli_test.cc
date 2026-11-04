@@ -304,7 +304,7 @@ TEST_F(CliTest, VersionVerboseNamesTheBuild) {
 
 TEST_F(CliTest, QueriesRunEveryShape) {
   auto r = Invoke({"query", "--clickbench", "-c",
-                   "SELECT COUNT(*), MIN(EventDate), SUM(EventDate + 1) FROM t", "--table",
+                   "SELECT COUNT(*), MIN(EventDate), MIN(EventDate - EventDate) FROM t", "--table",
                    "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported) << "DATE arithmetic is outside the subset: " << r.err;
   r = Invoke({"query", "--clickbench", "-c",
