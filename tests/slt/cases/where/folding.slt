@@ -352,3 +352,31 @@ SELECT COUNT(*) FROM edge WHERE i64 < 1e400
 ----
 BIGINT
 10
+
+# A quotient of two numbers (ADR 0037's CT4) folds into the DOUBLE DuckDB computes: each side converted to a double and
+# divided.
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE d9_2 BETWEEN 2.0 / 3.0 AND 7 / 2
+----
+BIGINT
+5
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > 10 / 3 AND tr_row < 500
+----
+BIGINT
+484
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id IN (6 / 3, 9 / 2.0, -(1.5) / -0.5)
+----
+SMALLINT
+2
+3
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE d18_4 < -(10) / 4.0
+----
+BIGINT
+11

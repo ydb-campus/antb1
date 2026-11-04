@@ -271,7 +271,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING a IN (1, COUNT(*))", kUnsupported, "COUNT(*)",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 'x' LIKE 'y'", kUnsupported, "'x'",
                   "LIKE needs a column or an aggregate on the left"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 IN (1)", kUnsupported, "1",
@@ -283,7 +284,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
                   "LIKE is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
@@ -353,7 +355,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "supported"},
         ErrorCase{"SELECT i32 FROM t WHERE 1 // 1 = i32", kUnsupported, "1 // 1",
                   "a constant expression in a comparison is not supported (only integer literals "
-                  "under +, - and * are folded)"},
+                  "under +, - and * and a quotient of two numbers are folded)"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 > 2 * 1.5", kUnsupported, "2 * 1.5",
                   "a constant expression in a comparison is not supported"},
         // Constant integer arithmetic folds in DuckDB's types; an overflow is a bind error at
@@ -375,9 +377,11 @@ INSTANTIATE_TEST_SUITE_P(
         // The same in an IN list: a constant that does not fold stays unsupported, an overflow
         // is the comparison's bind error (D17) and a HUGEINT past 38 digits is unsupported.
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 1 // 1)", kUnsupported, "1 // 1",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 NOT IN (2 * 1.5, 1)", kUnsupported, "2 * 1.5",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 2147483647 + 1)", kBind, "2147483647 + 1",
                   "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT i32 FROM t WHERE h IN (99999999999999999999999999999999999999 + 1)",
@@ -670,7 +674,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
                   "CAST(i16 AS VARCHAR)", "CAST of SMALLINT values to VARCHAR is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "2::INT",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported,
                   "'x%'::VARCHAR", "LIKE with a column or an aggregate as the pattern"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kBind, "i16",
@@ -813,7 +818,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
-                  "only literals and constant integer expressions are supported in an IN list"},
+                  "only literals, constant integer expressions and quotients of numbers are "
+                  "supported in an IN list"},
         // A call with the wrong number of arguments stays a bind error whatever its arguments
         // (CheckSupported does not look into them, and the binder reports the arity before it
         // binds one).
@@ -1666,6 +1672,36 @@ TEST(BinderTest, CastsThatChangeNoValue) {
     ASSERT_NE(compute, nullptr) << sql << "\n" << Explain(*plan);
     ASSERT_EQ(compute->exprs.size(), 1U) << sql << "\n" << Explain(*plan);
     EXPECT_EQ(compute->exprs[0]->node.index(), c.node) << sql << "\n" << Explain(*plan);
+  }
+}
+
+// A quotient of two numbers (ADR 0037's CT4) in a comparison, a BETWEEN bound or an IN list folds
+// into the DOUBLE DuckDB computes for it: both converted to double and divided. One by zero, or of
+// anything but numbers, stays refused.
+TEST(BinderTest, QuotientsOfNumbersFoldIntoDoubles) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, filter] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT i32 FROM t WHERE d > 2.0 / 3.0", "Filter d > 0.6666666666666666"},
+           {"SELECT i32 FROM t WHERE d < -(1.5) / 3", "Filter d < -0.5"},
+           {"SELECT i32 FROM t WHERE d BETWEEN 1 / 3 AND 7 / 2", "d >= 0.3333333333333333"},
+           {"SELECT i32 FROM t WHERE d IN (1 / 2, 2 / 4.0)", "IN (0.5, 0.5)"},
+           {"SELECT i32 FROM t WHERE i32 = 6 / 3", "Filter i32 = 2"},
+           // An integer converts by DuckDB's type for it: a negated HUGEINT literal is negated
+           // before DuckDB's two's-complement conversion, and a HUGEINT-typed value that fits a
+           // BIGINT converts as a HUGEINT.
+           {"SELECT i32 FROM t WHERE d = -(9223372036854776833) / 1",
+            "Filter d = -9223372036854775808"},
+           {"SELECT i32 FROM t WHERE d = (-18014398509481987 + 0 * 100000000000000000000) / 1",
+            "Filter d = -18014398509481984"},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_TRUE(Explain(*plan).contains(filter)) << sql << "\n" << Explain(*plan);
+  }
+  for (const std::string_view sql :
+       {"SELECT i32 FROM t WHERE d > 1 / 0", "SELECT i32 FROM t WHERE d > s / 2.0 / 3.0 + 1"}) {
+    const auto plan = BindSql(sql, catalog);
+    EXPECT_FALSE(plan.ok()) << sql;
   }
 }
 

@@ -321,8 +321,14 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   value in DuckDB's
   types (each literal `INTEGER` when its magnitude fits, else `BIGINT` or `HUGEINT` by its value, so `-2147483648`
   is a `BIGINT`; each operation in the wider type of its operands); one that overflows `INTEGER` or `BIGINT` is a
-  bind error (exit code 1, divergence D17), and a `HUGEINT` value of more than 38 digits is unsupported. Other
-  constant expressions (`/`, `//`, `%`, decimals) are unsupported. DuckDB compares the three values of a `BETWEEN` in
+  bind error (exit code 1, divergence D17), and a `HUGEINT` value of more than 38 digits is unsupported. A quotient
+  of two numbers ([ADR 0037](adr/0037-tpcds-roadmap.md)'s CT4) -- integer or decimal literals, negated or not, or
+  constant integer expressions -- is the DOUBLE DuckDB computes for it, each side converted to a double as DuckDB
+  converts it (an integer by the type DuckDB gives it, a HUGEINT by its own formula) and then divided (`x BETWEEN
+  2.0 / 3.0 AND 3.0 / 2.0` compares with 0.6666666666666666 and 1.5); a
+  zero divisor stays unsupported (DuckDB divides it into an infinity). Other constant expressions (`//`, `%`, a
+  quotient inside other arithmetic, decimals under `+`, `-` and `*`) are unsupported. DuckDB compares the three
+  values of a `BETWEEN` in
   one common type and antb1 each comparison in its own, so when a bound is `DOUBLE` (a `DOUBLE` column, a literal
   with an exponent or of more than 38 digits) and the operand is not, a `BETWEEN` that also has a `BIGINT` or
   `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, a decimal literal and
@@ -1507,7 +1513,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q18 | unsupported | needs ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
-| Q21 | unsupported | needs a quotient of literals folded into DOUBLE (CT4) |
+| Q21 | pass | a quotient of literals folded into DOUBLE (CT4) |
 | Q22 | unsupported | needs ROLLUP (RU3) |
 | Q23 | pass | `*` next to other select items |
 | Q24 | unsupported | needs upper (FN4) |

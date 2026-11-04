@@ -142,7 +142,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | CT1 | A general cast expression: identity casts, exact widenings and constants that fit (the CT1 update below) | 40 | Built |
 | CT2 | Checked casts to DECIMAL(p,s) (the CT2 update below) | 61, 90 | Built |
 | CT3 | DOUBLE and DECIMAL to integer types, and DuckDB's names of the integer types (the CT3 update below) | | Built |
-| CT4 | Quotients of numeric literals folded into DOUBLE constants | 21 | Planned |
+| CT4 | Quotients of numeric literals folded into DOUBLE constants (the CT4 update below) | 21 | Built |
 | CT5 | DATE plus or minus an integer | 72 | Planned |
 | **Phase 4** | **Scalar functions** | | |
 | FN1 | Typed overloads for scalar functions | | Planned |
@@ -421,6 +421,15 @@ casts to an integer, also needs constructs of a later phase.
 - **Range of a DOUBLE.** A DOUBLE is checked against `[min, max + 1)` before rounding, as DuckDB checks it. A value
   that then rounds past the maximum fails, where DuckDB's answer depends on the platform (divergence D28).
 - **Not covered.** DOUBLE to HUGEINT stays unsupported: DuckDB's HUGEINT reaches 2^127, antb1's 38 digits.
+
+Update (2026-11-04, CT4): built. Query 21 passes: 57 of the 99.
+
+- **Where it folds.** A quotient of two numbers, in a comparison, a `BETWEEN` bound or an `IN` list, folds where a
+  constant integer expression already folded (`IsFoldableConstant`, `FoldConstant`). A number here is an integer or
+  decimal literal, negated or not, or a constant integer expression.
+- **The value.** It is the DOUBLE DuckDB computes: each side converted to a double by `plan::DuckDbDoubleOf`, then
+  divided. It is written as a literal with an exponent, so that it reads back as that DOUBLE and is compared as one.
+- **What stays refused.** A zero divisor, which DuckDB divides into an infinity. A quotient inside other arithmetic.
 
 ## Alternatives considered
 
