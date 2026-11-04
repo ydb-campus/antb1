@@ -1977,6 +1977,23 @@ struct Evaluator {
                           arrow::MakeArrayOfNull(arrow::boolean(), n, pool));
     for (std::size_t i = 0; i < c.whens.size(); ++i) {
       const auto& open = static_cast<const arrow::BooleanArray&>(*remaining);
+      if (c.whens[i] == nullptr) {
+        // COALESCE's argument: computed once, for the open rows, which still hold NULL in the
+        // result; it answers the ones where it is not NULL, and the rest stay open.
+        if (c.thens[i] == nullptr) {
+          return arrow::Status::Invalid("a CASE branch with neither a condition nor a value");
+        }
+        ARROW_ASSIGN_OR_RAISE(ArrayPtr values, EvaluateSelected(*c.thens[i], open, e.type));
+        ARROW_ASSIGN_OR_RAISE(result, Scatter(result, remaining, values));
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum valid,
+                              arrow::compute::CallFunction("is_valid", {result}, ctx));
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum taken,
+                              arrow::compute::CallFunction("and", {valid, remaining}, ctx));
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum rest,
+                              arrow::compute::CallFunction("and_not", {remaining, taken}, ctx));
+        remaining = rest.make_array();
+        continue;
+      }
       ARROW_ASSIGN_OR_RAISE(ArrayPtr compact,
                             EvaluateSelected(*c.whens[i], open, plan::LogicalType::kBoolean));
       ARROW_ASSIGN_OR_RAISE(const ArrayPtr condition, Scatter(no_condition, remaining, compact));

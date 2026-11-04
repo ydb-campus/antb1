@@ -137,7 +137,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | NL2 | NULL literals as CASE values (THEN and ELSE), typed by NL1's fold; a NULL anywhere else still exits 4 (the NL2 update below) | | Built |
 | NL3 | NULL items of set-operation branches: the fold accepts a NULL column, cast below the union (the NL3 update below) | 27 | Built |
 | NL4 | IS NULL and IS NOT NULL (the NL4 update below) | 76, 93 | Built |
-| NL5 | COALESCE | | Planned |
+| NL5 | COALESCE (the NL5 update below) | | Built |
 | **Phase 3** | **Casts, constants and DATE arithmetic** | | |
 | CT1 | A general cast expression: identity casts, exact widenings and constants that fit | 40 | Planned |
 | CT2 | Checked casts to DECIMAL(p,s) | 61, 90 | Planned |
@@ -370,6 +370,17 @@ Update (2026-11-04, NL4): built. Queries 76 and 93 pass: 53 of the 99.
   join order estimates it from the null count.
 - **Outer joins.** Nothing assumes that a `WHERE` on the null-supplying side of a `LEFT JOIN` rejects the padded
   rows. Above the join, `IS NULL` keeps them, which is the anti-join shape; PF3 may plan it as an anti join.
+
+Update (2026-11-04, NL5): built, and phase 2 is complete. No query passes from it alone: the eight that need
+`COALESCE` now stop at a later construct.
+
+- **Binding.** `COALESCE(a, ..., z)` binds as a plan `CaseExpr` whose branches have no condition: a null `when`
+  takes the rows where the branch's value is not NULL, and `z` is the ELSE. Each argument is in the plan once and is
+  computed once, only for the rows the earlier ones left NULL, as in DuckDB. A nested COALESCE therefore stays linear;
+  binding `a` both as an `IS NOT NULL` condition and as a value doubled the tree at every level.
+- **Typing.** It shares the CASE value typing, now one function, `ValuesType`, with DuckDB's fold from the first
+  argument in written order (the first kept as it is, like an ELSE value). The refusals name COALESCE.
+- **NULL arguments.** A NULL argument stays an unsupported NULL literal.
 
 ## Alternatives considered
 

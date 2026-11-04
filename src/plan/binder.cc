@@ -518,6 +518,12 @@ constexpr auto kFunctions = std::to_array<FunctionSpec>({
      .integer_args = true},
 });
 
+// COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
+// Unquoted only: DuckDB's COALESCE is an operator, and "coalesce"(...) a function it does not have.
+bool IsCoalesce(const sql::FunctionCall& call) {
+  return !call.quoted && AsciiLower(call.name) == "coalesce";
+}
+
 std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
   const std::string name = AsciiLower(call.name);
   const auto* spec = std::ranges::find(kFunctions, name, &FunctionSpec::name);
@@ -530,6 +536,9 @@ std::optional<FunctionSpec> FindFunction(const sql::FunctionCall& call) {
 // main."substring" when the call was written unquoted and "substring" when it was quoted, lower
 // case either way, since DuckDB resolves a quoted function name case-insensitively.
 std::string FunctionNameOpening(const sql::FunctionCall& call) {
+  if (IsCoalesce(call)) {
+    return "COALESCE(";  // an operator to DuckDB, named in upper case however it is written
+  }
   const std::optional<FunctionSpec> spec = FindFunction(call);
   if (!spec.has_value() || !spec->reserved_name) {
     return AsciiLower(call.name) + "(";
@@ -749,12 +758,15 @@ struct FirstUnsupportedOf {
         .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
+    if (IsCoalesce(call)) {
+      return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
+    }
     const std::optional<FunctionSpec> spec = FindFunction(call);
     if (!spec.has_value()) {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
                                               "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
-                                              "DATE_TRUNC and SUBSTRING)",
+                                              "DATE_TRUNC, SUBSTRING and COALESCE)",
                                               Clip(call.name))};
     }
     if (spec->function == Function::kRegexpReplace && call.args.size() == 4) {
@@ -2515,6 +2527,9 @@ class Binder {
   // A function call with its first argument bound by `bind_arg` (the scope's binder).
   template <class BindArg>
   arrow::Result<Typed> BindFunction(const sql::FunctionCall& call, const BindArg& bind_arg) {
+    if (IsCoalesce(call)) {
+      return BindCoalesce(call, bind_arg);
+    }
     const std::optional<FunctionSpec> spec = FindFunction(call);
     if (!spec.has_value()) {
       return UnsupportedError("this function is not supported", call.name_span);
@@ -3035,6 +3050,8 @@ class Binder {
   // CASE with its conditions and values bound in the scope of `bind`, typed as DuckDB types it.
   template <class BindFn>
   arrow::Result<Typed> BindCase(const sql::CaseExpr& c, const BindFn& bind, bool input);
+  template <class BindFn>
+  arrow::Result<Typed> BindCoalesce(const sql::FunctionCall& call, const BindFn& bind);
   struct Moved {
     enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
     const sql::Expr* operand = nullptr;
@@ -3928,10 +3945,20 @@ std::optional<LogicalType> UnionAllType(LogicalType so_far, LogicalType next) {
   return CommonValueType(so_far, next);
 }
 
+// Where values are typed together, as the refusals name it: CASE's values, or COALESCE's
+// arguments (ADR 0037's NL5), which DuckDB types alike.
+struct ValuesContext {
+  std::string_view name;   // "CASE"
+  std::string_view value;  // "a CASE value"
+};
+constexpr ValuesContext kCaseValues{.name = "CASE", .value = "a CASE value"};
+constexpr ValuesContext kCoalesceValues{.name = "COALESCE", .value = "a COALESCE argument"};
+
 // The type DuckDB gives two CASE values (a string literal takes the other's type elsewhere): the
 // fold's (CommonValueType, ADR 0037's NL1) for two numbers. antb1 refuses DATE with TIMESTAMP
 // (exit 4) and every other mix, as DuckDB refuses most of them.
-arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span) {
+arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan span,
+                                      ValuesContext context = kCaseValues) {
   const auto number = [](LogicalType t) { return IsNumeric(t) || t == LogicalType::kDecimal; };
   // The fold has a type for any two types; only NULL with NULL is none.
   if (const ValueType common = CommonValueType(a, b);
@@ -3940,10 +3967,12 @@ arrow::Result<LogicalType> CaseCommon(LogicalType a, LogicalType b, SourceSpan s
   }
   if ((a == LogicalType::kDate && b == LogicalType::kTimestamp) ||
       (a == LogicalType::kTimestamp && b == LogicalType::kDate)) {
-    return UnsupportedError("CASE values of types DATE and TIMESTAMP are not supported", span);
+    return UnsupportedError(
+        std::format("{} values of types DATE and TIMESTAMP are not supported", context.name), span);
   }
-  return BindError(
-      std::format("cannot mix values of type {} and {} in CASE", ToString(a), ToString(b)), span);
+  return BindError(std::format("cannot mix values of type {} and {} in {}", ToString(a),
+                               ToString(b), context.name),
+                   span);
 }
 
 bool IsNullLiteral(const sql::Expr& expr) {
@@ -3987,20 +4016,14 @@ std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
 // types are combined by CaseCommon, the type folded so far named first in an error, as by DuckDB.
 arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
                                            const std::vector<const sql::Expr*>& exprs,
-                                           bool has_else) {
+                                           const std::vector<std::size_t>& order, bool first_kept,
+                                           ValuesContext context) {
   struct Folded {
     enum class Kind : std::uint8_t { kNull, kPlain, kInteger, kString };
     Kind kind = Kind::kNull;
     LogicalType type = LogicalType::kVarchar;  // kPlain, and kInteger's own type
     Int128 value = 0;                          // kInteger
   };
-  std::vector<std::size_t> order;
-  if (has_else) {
-    order.push_back(values.size() - 1);
-  }
-  for (std::size_t i = 0; i + (has_else ? 1 : 0) < values.size(); ++i) {
-    order.push_back(i);
-  }
   using enum Folded::Kind;
   Folded folded;
   const sql::Expr* string_literal = nullptr;
@@ -4019,10 +4042,10 @@ arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
       continue;
     }
     if (values[i].stored_as_float) {
-      return UnsupportedError(
-          "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
-          "divergence D11)",
-          span);
+      return UnsupportedError(std::format("a FLOAT column as {} is not supported (antb1 reads "
+                                          "FLOAT as DOUBLE, divergence D11)",
+                                          context.value),
+                              span);
     }
     Folded next{.kind = kPlain, .type = values[i].expr->type, .value = 0};
     if (IsStringLiteral(expr)) {
@@ -4033,7 +4056,7 @@ arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
     } else if (const auto literal = CaseIntegerLiteral(expr)) {
       next = Folded{.kind = kInteger, .type = literal->type, .value = literal->value};
     }
-    if (first && has_else) {
+    if (first && first_kept) {
       folded = next;
       continue;
     }
@@ -4069,17 +4092,101 @@ arrow::Result<LogicalType> DecimalCaseType(const std::vector<Typed>& values,
         continue;
       }
     }
-    ARROW_ASSIGN_OR_RAISE(const LogicalType type, CaseCommon(folded.type, next.type, span));
+    ARROW_ASSIGN_OR_RAISE(const LogicalType type,
+                          CaseCommon(folded.type, next.type, span, context));
     folded = Folded{.kind = kPlain, .type = type, .value = 0};
   }
   if (string_literal != nullptr) {
     // DuckDB casts the string to the number.
-    return UnsupportedError(std::format("a string literal as a CASE value next to {} values is not "
-                                        "supported",
-                                        ToString(folded.type)),
+    return UnsupportedError(std::format("a string literal as {} next to {} values is not supported",
+                                        context.value, ToString(folded.type)),
                             string_literal->span());
   }
   return folded.type;
+}
+
+// DuckDB's type of values typed together -- CASE's, folded from the ELSE value through the THEN
+// values, or COALESCE's, from the first argument through the rest -- in `order` (DECIMALs), the
+// first kept as
+// it is (a literal stays one) when `first_kept`, else folded next to NULL. std::nullopt where every
+// value is NULL (a null Typed: THEN NULL). With a DECIMAL value (a decimal literal too), DuckDB's
+// fold of rule 10 types them (DecimalCaseType), and each value is cast to it on the rows that take
+// it; a DOUBLE value makes it DOUBLE, the DECIMALs converted as DuckDB converts them (ADR 0021
+// rules 8 and 10). Otherwise DuckDB's type is the values' common type, where an integer literal
+// takes the others' integer type when it fits and a string literal any type (DATE: the date it
+// spells, which replaces the literal in `values`); antb1 takes the non-literal values first, so
+// some orders type differently (divergence D20). A THEN NULL is the identity of the fold
+// (CommonValueType, ADR 0037's NL1).
+arrow::Result<std::optional<LogicalType>> ValuesType(std::vector<Typed>& values,
+                                                     const std::vector<const sql::Expr*>& exprs,
+                                                     const std::vector<std::size_t>& order,
+                                                     bool first_kept, ValuesContext context) {
+  if (std::ranges::any_of(values, [](const Typed& v) {
+        return v.expr != nullptr && v.expr->type == LogicalType::kDecimal;
+      })) {
+    return DecimalCaseType(values, exprs, order, first_kept, context);
+  }
+  std::optional<LogicalType> type;
+  // In written order (CASE: the THEN values, then the ELSE value).
+  for (const bool literals : {false, true}) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      const Typed& v = values[i];
+      if (v.expr == nullptr || v.literal != literals || IsStringLiteral(*exprs[i])) {
+        continue;
+      }
+      const SourceSpan span = exprs[i]->span();
+      if (v.stored_as_float) {
+        return UnsupportedError(std::format("a FLOAT column as {} is not supported (antb1 reads "
+                                            "FLOAT as DOUBLE, divergence D11)",
+                                            context.value),
+                                span);
+      }
+      if (!type.has_value()) {
+        type = v.expr->type;
+      } else if (!(v.literal && IsInteger(*type) && Fits(*v.expr, *type))) {
+        ARROW_ASSIGN_OR_RAISE(type, CaseCommon(*type, v.expr->type, span, context));
+      }
+    }
+  }
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (!IsStringLiteral(*exprs[i])) {
+      continue;
+    }
+    const auto& lit = std::get<sql::Literal>(*exprs[i]);
+    if (!type.has_value()) {
+      type = LogicalType::kVarchar;
+    }
+    if (*type == LogicalType::kDate) {
+      const auto days = ParseDate(lit.text);
+      if (!days.has_value()) {
+        return BindError("invalid date '" + Clip(lit.text) + "': expected YYYY-MM-DD", lit.span);
+      }
+      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kDate,
+                                                                   .value = Int128{*days}}},
+                            .type = LogicalType::kDate,
+                            .name = values[i].expr->name});
+    } else if (*type == LogicalType::kTimestamp) {
+      const auto micros = ParseTimestamp(lit.text);
+      if (!micros.has_value()) {
+        return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit.text) + "': expected " +
+                             std::string(kTimestampForm),
+                         lit.span);
+      }
+      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kTimestamp,
+                                                                   .value = Int128{*micros}}},
+                            .type = LogicalType::kTimestamp,
+                            .name = values[i].expr->name});
+    } else if (IsNumeric(*type)) {
+      // DuckDB casts the string to the number ('1' next to SMALLINT is 1).
+      return UnsupportedError(std::format("a string literal as {} next to {} values is not "
+                                          "supported",
+                                          context.value, ToString(*type)),
+                              lit.span);
+    } else if (*type != LogicalType::kVarchar) {
+      ARROW_RETURN_NOT_OK(CaseCommon(*type, LogicalType::kVarchar, lit.span, context));
+    }
+  }
+  return type;
 }
 
 }  // namespace
@@ -4115,85 +4222,17 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
     values.push_back(std::move(otherwise));
     value_exprs.push_back(&**c.otherwise);
   }
-  // With a DECIMAL value (a decimal literal too), DuckDB's fold of rule 10 types the CASE, and each
-  // value is cast to it on the rows that take it; a DOUBLE value makes it DOUBLE, the DECIMALs
-  // converted as DuckDB converts them (ADR 0021 rules 8 and 10).
-  if (std::ranges::any_of(values, [](const Typed& v) {
-        return v.expr != nullptr && v.expr->type == LogicalType::kDecimal;
-      })) {
-    ARROW_ASSIGN_OR_RAISE(const LogicalType type,
-                          DecimalCaseType(values, value_exprs, c.otherwise.has_value()));
-    for (std::size_t i = 0; i < c.branches.size(); ++i) {
-      node.thens.push_back(std::move(values[i].expr));
-    }
-    if (c.otherwise.has_value()) {
-      node.otherwise = std::move(values.back().expr);
-    }
-    return Leaf(Expr{.node = std::move(node), .type = type, .name = CaseName(c)});
+  // Folded from the ELSE value (NULL without an ELSE) through the THEN values in written order.
+  std::vector<std::size_t> order;
+  if (c.otherwise.has_value()) {
+    order.push_back(values.size() - 1);
   }
-  // Otherwise DuckDB's type is the values' common type, where an integer literal takes the others'
-  // integer type when it fits and a string literal any type (DATE: the date it spells); antb1 takes
-  // the non-literal values first, so some orders type differently (divergence D20). A THEN NULL is
-  // the identity of the fold (CommonValueType, ADR 0037's NL1).
-  std::optional<LogicalType> type;
-  for (const bool literals : {false, true}) {
-    for (std::size_t i = 0; i < values.size(); ++i) {
-      const Typed& v = values[i];
-      if (v.expr == nullptr || v.literal != literals || IsStringLiteral(*value_exprs[i])) {
-        continue;
-      }
-      const SourceSpan span = value_exprs[i]->span();
-      if (v.stored_as_float) {
-        return UnsupportedError(
-            "a FLOAT column as a CASE value is not supported (antb1 reads FLOAT as DOUBLE, "
-            "divergence D11)",
-            span);
-      }
-      if (!type.has_value()) {
-        type = v.expr->type;
-      } else if (!(v.literal && IsInteger(*type) && Fits(*v.expr, *type))) {
-        ARROW_ASSIGN_OR_RAISE(type, CaseCommon(*type, v.expr->type, span));
-      }
-    }
+  for (std::size_t i = 0; i < c.branches.size(); ++i) {
+    order.push_back(i);
   }
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    if (!IsStringLiteral(*value_exprs[i])) {
-      continue;
-    }
-    const auto& lit = std::get<sql::Literal>(*value_exprs[i]);
-    if (!type.has_value()) {
-      type = LogicalType::kVarchar;
-    }
-    if (*type == LogicalType::kDate) {
-      const auto days = ParseDate(lit.text);
-      if (!days.has_value()) {
-        return BindError("invalid date '" + Clip(lit.text) + "': expected YYYY-MM-DD", lit.span);
-      }
-      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kDate,
-                                                                   .value = Int128{*days}}},
-                            .type = LogicalType::kDate,
-                            .name = values[i].expr->name});
-    } else if (*type == LogicalType::kTimestamp) {
-      const auto micros = ParseTimestamp(lit.text);
-      if (!micros.has_value()) {
-        return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit.text) + "': expected " +
-                             std::string(kTimestampForm),
-                         lit.span);
-      }
-      values[i] = Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kTimestamp,
-                                                                   .value = Int128{*micros}}},
-                            .type = LogicalType::kTimestamp,
-                            .name = values[i].expr->name});
-    } else if (IsNumeric(*type)) {
-      // DuckDB casts the string to the number ('1' next to SMALLINT is 1).
-      return UnsupportedError(std::format("a string literal as a CASE value next to {} values is "
-                                          "not supported",
-                                          ToString(*type)),
-                              lit.span);
-    } else if (*type != LogicalType::kVarchar) {
-      ARROW_RETURN_NOT_OK(CaseCommon(*type, LogicalType::kVarchar, lit.span));
-    }
-  }
+  ARROW_ASSIGN_OR_RAISE(
+      const std::optional<LogicalType> type,
+      ValuesType(values, value_exprs, order, /*first_kept=*/c.otherwise.has_value(), kCaseValues));
   for (std::size_t i = 0; i < c.branches.size(); ++i) {
     node.thens.push_back(std::move(values[i].expr));
   }
@@ -4205,6 +4244,44 @@ arrow::Result<Typed> Binder::BindCase(const sql::CaseExpr& c, const BindFn& bind
     return UnsupportedError("a CASE whose values are all NULL is not supported", c.span);
   }
   return Leaf(Expr{.node = std::move(node), .type = *type, .name = CaseName(c)});
+}
+
+// COALESCE(a, b, ..., z) (ADR 0037's NL5): the first of its arguments that is not NULL, as
+// CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE z END, each argument computed
+// once, for the rows no earlier one answered (a CaseExpr branch without a condition). DuckDB types
+// the arguments as CASE's values, folded from the first through the rest in written order
+// (ValuesType), and names it COALESCE(a, b).
+template <class BindFn>
+arrow::Result<Typed> Binder::BindCoalesce(const sql::FunctionCall& call, const BindFn& bind) {
+  if (call.args.empty()) {
+    return BindError("COALESCE() takes at least 1 argument", call.span);
+  }
+  std::vector<Typed> values;
+  std::vector<const sql::Expr*> exprs;
+  std::vector<std::size_t> order;
+  std::string name = "COALESCE(";
+  for (std::size_t i = 0; i < call.args.size(); ++i) {
+    ARROW_ASSIGN_OR_RAISE(Typed value, bind(call.args[i]));
+    name += (i == 0 ? "" : ", ") + value.expr->name;
+    values.push_back(std::move(value));
+    exprs.push_back(&call.args[i]);
+    order.push_back(i);
+  }
+  name += ')';
+  ARROW_ASSIGN_OR_RAISE(const std::optional<LogicalType> type,
+                        ValuesType(values, exprs, order, /*first_kept=*/true, kCoalesceValues));
+  if (!type.has_value()) {
+    return arrow::Status::Invalid("COALESCE without a typed argument");  // no argument is NULL
+  }
+  // Each argument but the last is a branch without a condition, which takes the rows where the
+  // argument is not NULL: computed once, so a nested COALESCE stays one tree of its arguments.
+  CaseExpr node;
+  for (std::size_t i = 0; i + 1 < values.size(); ++i) {
+    node.whens.emplace_back();
+    node.thens.push_back(values[i].expr);
+  }
+  node.otherwise = values.back().expr;
+  return Leaf(Expr{.node = std::move(node), .type = *type, .name = std::move(name)});
 }
 
 namespace {
