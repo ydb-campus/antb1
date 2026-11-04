@@ -261,7 +261,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "function md5() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
@@ -546,23 +547,28 @@ INSTANTIATE_TEST_SUITE_P(
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT md5(url) FROM t", kUnsupported, "md5",
                   "function md5() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT SUM(sqrt(a)) FROM t", kUnsupported, "sqrt",
                   "function sqrt() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, "
+                  "CONCAT and "
                   "COALESCE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
@@ -1854,6 +1860,42 @@ TEST(BinderTest, UpperAndLowerOfAVarchar) {
     EXPECT_EQ(GetSqlError(bad.status())->kind(), SqlErrorDetail::Kind::kBind) << sql;
     EXPECT_TRUE(bad.status().message().contains(message)) << bad.status().ToString();
   }
+}
+
+// concat (ADR 0037's FN5): a VARCHAR of one or more VARCHAR values, named as written. A value of
+// another type is unsupported (DuckDB casts it to VARCHAR), at that value; concat() is a bind
+// error.
+TEST(BinderTest, ConcatOfVarchars) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, name] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT concat(s) FROM t", "concat(s)"},
+           {"SELECT CONCAT(s, 'x', s, upper(s)) FROM t", "concat(s, 'x', s, upper(s))"},
+           {"SELECT concat('a', concat(s, s)) FROM t", "concat('a', concat(s, s))"},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, LogicalType::kVarchar) << sql;
+    EXPECT_EQ(plan->output[0].name, name) << sql;
+  }
+  for (const auto& [sql, span] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT concat(i32, s) FROM t", "i32"},
+           {"SELECT concat(s, 'x', d) FROM t", "d"},
+           {"SELECT concat(i32, d) FROM t", "i32"},  // the first refused value
+       })) {
+    const auto bad = BindSql(sql, catalog);
+    ASSERT_FALSE(bad.ok()) << sql;
+    ASSERT_NE(GetSqlError(bad.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(bad.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(bad.status().message().contains("concat() of ")) << bad.status().ToString();
+    const SourceSpan at = GetSqlError(bad.status())->span();
+    EXPECT_EQ(sql.substr(at.offset, at.length), span) << sql;
+  }
+  const auto none = BindSql("SELECT concat() FROM t", catalog);
+  ASSERT_FALSE(none.ok());
+  ASSERT_NE(GetSqlError(none.status()), nullptr);
+  EXPECT_EQ(GetSqlError(none.status())->kind(), SqlErrorDetail::Kind::kBind);
+  EXPECT_TRUE(none.status().message().contains("concat() takes at least 1 argument, not 0"))
+      << none.status().ToString();
 }
 
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first

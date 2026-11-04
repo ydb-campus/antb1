@@ -419,6 +419,8 @@ std::string_view ToString(Function function) {
       return "upper";
     case Function::kLower:
       return "lower";
+    case Function::kConcat:
+      return "concat";
   }
   return "?";
 }

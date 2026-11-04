@@ -633,9 +633,18 @@ struct FunctionOverload {
   // A number the value does not take is unsupported (DuckDB has an overload for it that antb1
   // lacks), not a bind error.
   bool other_numbers_unsupported = false;
+  // Any other type of value is unsupported (DuckDB casts it), not a bind error.
+  bool other_types_unsupported = false;
+  // Every argument is a value of the kind args[0] names, and there may be any number of them from
+  // min_args on (max_args is kAnyNumber).
+  bool variadic = false;
 
   [[nodiscard]] bool TakesArgs(std::size_t n) const { return n >= min_args && n <= max_args; }
+  // The kind of argument i, which TakesArgs admits.
+  [[nodiscard]] ArgKind KindAt(std::size_t i) const { return variadic ? args[0] : args.at(i); }
 };
+
+constexpr std::size_t kAnyNumber = std::numeric_limits<std::size_t>::max();
 
 constexpr auto kFunctions = std::to_array<FunctionOverload>({
     {.name = "strlen",
@@ -736,6 +745,17 @@ constexpr auto kFunctions = std::to_array<FunctionOverload>({
      .result = LogicalType::kVarchar,
      .refused_name = "lcase",
      .needs = "a VARCHAR"},
+    // concat of VARCHAR values (ADR 0037's FN5): a NULL value is skipped, so the result is never
+    // NULL. DuckDB casts a value of any other type to VARCHAR; antb1 does not yet.
+    {.name = "concat",
+     .function = Function::kConcat,
+     .args = {ArgKind::kVarchar},
+     .max_args = kAnyNumber,
+     .result = LogicalType::kVarchar,
+     .refused_name = "concat",
+     .needs = "a VARCHAR",
+     .other_types_unsupported = true,
+     .variadic = true},
 });
 
 // COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
@@ -1006,12 +1026,12 @@ struct FirstUnsupportedOf {
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
-      return Rejection{
-          .span = call.name_span,
-          .message = std::format("function {}() is not supported (only COUNT, SUM, "
-                                 "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
-                                 "DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and COALESCE)",
-                                 Clip(call.name))};
+      return Rejection{.span = call.name_span,
+                       .message = std::format(
+                           "function {}() is not supported (only COUNT, SUM, "
+                           "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
+                           "DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER, CONCAT and COALESCE)",
+                           Clip(call.name))};
     }
     if (overloads.front().function == Function::kRegexpReplace && call.args.size() == 4) {
       // DuckDB's options argument ('g', 'i', ...): valid there, not here.
@@ -1026,7 +1046,7 @@ struct FirstUnsupportedOf {
     }
     for (std::size_t i = 0; i < call.args.size(); ++i) {
       // Only a literal argument is checked here; a value's type is checked where the call is bound.
-      if (i != spec->value_arg && spec->args.at(i) == ArgKind::kStringLiteral &&
+      if (i != spec->value_arg && spec->KindAt(i) == ArgKind::kStringLiteral &&
           !std::holds_alternative<sql::Literal>(call.args[i])) {
         return Rejection{
             .span = call.args[i].span(),
@@ -2861,6 +2881,22 @@ class Binder {
     return std::visit(BindInputOf{.binder = *this}, static_cast<const sql::ExprNode&>(expr));
   }
 
+  // The refusal of a value no overload of `spec`'s arity takes: unsupported where DuckDB has an
+  // overload antb1 lacks, else a bind error, as DuckDB's.
+  static arrow::Status RefusedValue(const FunctionOverload& spec, const Typed& value,
+                                    SourceSpan span) {
+    const LogicalType type = value.expr->type;
+    if (spec.other_types_unsupported ||
+        (spec.other_numbers_unsupported && (IsNumeric(type) || type == LogicalType::kDecimal))) {
+      return UnsupportedError(std::format("{}() of {} values is not supported (only of {})",
+                                          spec.refused_name, ToString(type), spec.needs),
+                              span);
+    }
+    return BindError(
+        std::format("{}() needs {}, but {}", spec.refused_name, spec.needs, DescribeOperand(value)),
+        span);
+  }
+
   // A function call with its first argument bound by `bind_arg` (the scope's binder).
   template <class BindArg>
   arrow::Result<Typed> BindFunction(const sql::FunctionCall& call, const BindArg& bind_arg) {
@@ -2874,14 +2910,22 @@ class Binder {
     const FunctionOverload* spec = WithArity(overloads, call.args.size());
     if (spec == nullptr) {
       const auto [least, most] = ArityRange(overloads);
-      const std::string takes = least == most
-                                    ? std::format("{} argument{}", least, least == 1 ? "" : "s")
-                                    : std::format("{} or {} arguments", least, most);
+      const std::string plural = least == 1 ? "" : "s";
+      std::string takes = std::format("{} or {} arguments", least, most);
+      if (most == kAnyNumber) {
+        takes = std::format("at least {} argument{}", least, plural);
+      } else if (least == most) {
+        takes = std::format("{} argument{}", least, plural);
+      }
       return BindError(
           std::format("{}() takes {}, not {}", overloads.front().name, takes, call.args.size()),
           call.span);
     }
     ARROW_ASSIGN_OR_RAISE(Typed value, bind_arg(call.args[spec->value_arg]));
+    if (spec->variadic && !Accepts(spec->KindAt(0), value.expr->type)) {
+      // Before the values after it, so that the first refused value is the one reported.
+      return RefusedValue(*spec, value, call.args[spec->value_arg].span());
+    }
     // DuckDB re-serializes a function's name, quoting it only where the identifier needs quoting:
     // `strlen` is plain however it was written (`"strlen"` and `"STRLEN"` included), while
     // `substring` -- a word DuckDB reserves -- is `main."substring"` when the call was written
@@ -2890,13 +2934,23 @@ class Binder {
     std::string name = FunctionNameOpening(call);
     std::vector<ExprPtr> literals;
     std::vector<ExprPtr> integers;
+    std::vector<ExprPtr> values;  // a variadic function's values after the first
     for (std::size_t i = 0; i < call.args.size(); ++i) {
       name += i == 0 ? "" : ", ";
       if (i == spec->value_arg) {
         name += value.expr->name;
         continue;
       }
-      if (spec->args.at(i) == ArgKind::kPrecision) {
+      if (spec->variadic) {
+        ARROW_ASSIGN_OR_RAISE(const Typed arg, bind_arg(call.args[i]));
+        if (!Accepts(spec->KindAt(i), arg.expr->type)) {
+          return RefusedValue(*spec, arg, call.args[i].span());
+        }
+        name += arg.expr->name;
+        values.push_back(arg.expr);
+        continue;
+      }
+      if (spec->KindAt(i) == ArgKind::kPrecision) {
         // A constant integer expression of at least 0, as DuckDB's INTEGER precision; any other
         // precision (a negative one, a column) is unsupported.
         std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(call.args[i]);
@@ -2919,7 +2973,7 @@ class Binder {
             .name = ExprName(call.args[i])}));
         continue;
       }
-      if (spec->args.at(i) == ArgKind::kInteger) {
+      if (spec->KindAt(i) == ArgKind::kInteger) {
         ARROW_ASSIGN_OR_RAISE(const Typed arg, bind_arg(call.args[i]));
         if (!Accepts(ArgKind::kInteger, arg.expr->type)) {
           return BindError(std::format("argument {} of {}() must be an integer, but {}", i + 1,
@@ -2953,15 +3007,7 @@ class Binder {
     });
     const SourceSpan value_span = call.args[spec->value_arg].span();
     if (chosen == overloads.end()) {
-      const LogicalType type = value.expr->type;
-      if (spec->other_numbers_unsupported && (IsNumeric(type) || type == LogicalType::kDecimal)) {
-        return UnsupportedError(std::format("{}() of {} values is not supported (only of {})",
-                                            spec->refused_name, ToString(type), spec->needs),
-                                value_span);
-      }
-      return BindError(std::format("{}() needs {}, but {}", spec->refused_name, spec->needs,
-                                   DescribeOperand(value)),
-                       value_span);
+      return RefusedValue(*spec, value, value_span);
     }
     spec = &*chosen;
     if (value.stored_as_float && (spec->args.at(spec->value_arg) == ArgKind::kDouble ||
@@ -2987,6 +3033,7 @@ class Binder {
       ARROW_ASSIGN_OR_RAISE(value, Arith(product, std::move(value), std::move(literal)));
     }
     std::vector<ExprPtr> args{std::move(value.expr)};
+    args.insert(args.end(), values.begin(), values.end());
     args.insert(args.end(), literals.begin(), literals.end());
     args.insert(args.end(), integers.begin(), integers.end());
     return Leaf(Expr{.node = FunctionExpr{.function = spec->function, .args = std::move(args)},

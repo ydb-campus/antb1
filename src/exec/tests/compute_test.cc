@@ -761,6 +761,39 @@ TEST_F(ComputeTest, UpperAndLowerMapCodepointsAsDuckDb) {
   }
 }
 
+// concat joins each row's values in order and skips a NULL one, so a row of NULLs is '' and never
+// NULL (ADR 0037's FN5, as DuckDB); a constant argument counts on every row, and bytes are joined
+// as they are, UTF-8 or not.
+TEST_F(ComputeTest, ConcatSkipsNullValues) {
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  using Values = std::vector<std::optional<std::string>>;
+  const auto left = testing::Strings({"a", std::nullopt, std::nullopt, "\xC3", ""});
+  const auto right = testing::Strings({"b", "y", std::nullopt, "\xA9!", std::nullopt});
+  const auto call = [&](std::vector<plan::ExprPtr> args) {
+    return Eval(Call(plan::Function::kConcat, std::move(args), LogicalType::kVarchar),
+                {left, right});
+  };
+  auto one = call({ColumnAt(0, LogicalType::kVarchar)});
+  ASSERT_TRUE(one.ok()) << one.status().ToString();
+  EXPECT_EQ(values(*one), (Values{"a", "", "", "\xC3", ""}));
+  auto three = call({ColumnAt(0, LogicalType::kVarchar), StringConstant("-"),
+                     ColumnAt(1, LogicalType::kVarchar)});
+  ASSERT_TRUE(three.ok()) << three.status().ToString();
+  EXPECT_EQ(values(*three), (Values{"a-b", "-y", "-", "\xC3-\xA9!", "-"}));
+  auto joined = call({ColumnAt(0, LogicalType::kVarchar), ColumnAt(1, LogicalType::kVarchar)});
+  ASSERT_TRUE(joined.ok()) << joined.status().ToString();
+  EXPECT_EQ(values(*joined), (Values{"ab", "y", "", "\xC3\xA9!", ""}));
+  EXPECT_EQ((*joined)->null_count(), 0);
+}
+
 // strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one
 // character, not a newline), \0 and \1 in the replacement; NULL stays NULL; a bad pattern is an
 // execution error (DuckDB 1.5.5).
