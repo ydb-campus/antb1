@@ -711,6 +711,31 @@ constexpr auto kFunctions = std::to_array<FunctionOverload>({
      .args = {ArgKind::kNumber},
      .refused_name = "abs",
      .needs = "a number"},
+    // upper and lower of a VARCHAR (ADR 0037's FN4), with DuckDB's aliases ucase and lcase.
+    {.name = "upper",
+     .function = Function::kUpper,
+     .args = {ArgKind::kVarchar},
+     .result = LogicalType::kVarchar,
+     .refused_name = "upper",
+     .needs = "a VARCHAR"},
+    {.name = "ucase",
+     .function = Function::kUpper,
+     .args = {ArgKind::kVarchar},
+     .result = LogicalType::kVarchar,
+     .refused_name = "ucase",
+     .needs = "a VARCHAR"},
+    {.name = "lower",
+     .function = Function::kLower,
+     .args = {ArgKind::kVarchar},
+     .result = LogicalType::kVarchar,
+     .refused_name = "lower",
+     .needs = "a VARCHAR"},
+    {.name = "lcase",
+     .function = Function::kLower,
+     .args = {ArgKind::kVarchar},
+     .result = LogicalType::kVarchar,
+     .refused_name = "lcase",
+     .needs = "a VARCHAR"},
 });
 
 // COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
@@ -981,11 +1006,12 @@ struct FirstUnsupportedOf {
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
-      return Rejection{.span = call.name_span,
-                       .message = std::format("function {}() is not supported (only COUNT, SUM, "
-                                              "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
-                                              "DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)",
-                                              Clip(call.name))};
+      return Rejection{
+          .span = call.name_span,
+          .message = std::format("function {}() is not supported (only COUNT, SUM, "
+                                 "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
+                                 "DATE_TRUNC, SUBSTRING, ROUND, ABS, UPPER, LOWER and COALESCE)",
+                                 Clip(call.name))};
     }
     if (overloads.front().function == Function::kRegexpReplace && call.args.size() == 4) {
       // DuckDB's options argument ('g', 'i', ...): valid there, not here.

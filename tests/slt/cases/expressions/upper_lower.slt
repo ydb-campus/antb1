@@ -1,0 +1,76 @@
+# upper and lower, and their aliases ucase and lcase (ADR 0037's FN4, docs/sql-subset.md): each codepoint mapped by
+# Unicode's simple case mapping as DuckDB maps it, NULL for NULL.
+
+query TTTTT rowsort
+SELECT u, upper(u), lower(u), ucase(u), lcase(u) FROM edge
+----
+VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
+(empty)	(empty)	(empty)	(empty)	(empty)
+NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL
+\x28empty)	(EMPTY)	\x28empty)	(EMPTY)	\x28empty)
+a	A	a	A	a
+back\\slash	BACK\\SLASH	back\\slash	BACK\\SLASH	back\\slash
+line\nbreak	LINE\nBREAK	line\nbreak	LINE\nBREAK	line\nbreak
+tab\there	TAB\tHERE	tab\there	TAB\tHERE	tab\there
+trailing space\x20	TRAILING SPACE\x20	trailing space\x20	TRAILING SPACE\x20	trailing space\x20
+x\x7fy	X\x7fY	x\x7fy	X\x7fY	x\x7fy
+Привет, мир	ПРИВЕТ, МИР	привет, мир	ПРИВЕТ, МИР	привет, мир
+日本語	日本語	日本語	日本語	日本語
+
+query TT rowsort
+SELECT upper(lower(u)), lower(upper(u)) FROM edge WHERE u IS NOT NULL
+----
+VARCHAR	VARCHAR
+(EMPTY)	\x28empty)
+(empty)	(empty)
+A	a
+BACK\\SLASH	back\\slash
+LINE\nBREAK	line\nbreak
+TAB\tHERE	tab\there
+TRAILING SPACE\x20	trailing space\x20
+X\x7fY	x\x7fy
+ПРИВЕТ, МИР	привет, мир
+日本語	日本語
+
+query TI nosort
+SELECT upper(Title) AS t, COUNT(*) FROM hits_like WHERE Title <> '' GROUP BY t ORDER BY COUNT(*) DESC, t LIMIT 8
+----
+VARCHAR	BIGINT
+QUICK	80
+LEMON	79
+ORBIT	75
+ΛΌΓΟΣ	72
+MAPLE	70
+GAMMA	69
+RIVER	69
+OMEGA	67
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE lower(Title) LIKE '%café%' OR upper(Title) LIKE '%ПОГОДА%'
+----
+BIGINT
+1583
+
+query TT nosort
+SELECT upper('abc'), upper(label) FROM cities ORDER BY ct_id
+----
+VARCHAR	VARCHAR
+ABC	CENTER
+ABC	HARBOR
+ABC	HILLS
+ABC	AIRPORT
+ABC	OLD TOWN
+ABC	OUTSKIRTS
+
+query I nosort
+SELECT COUNT(DISTINCT lower(URL)) - COUNT(DISTINCT URL) FROM hits_like
+----
+BIGINT
+0
+
+statement error
+SELECT upper(i16) FROM edge
+
+statement error
+SELECT lower(u, u) FROM edge

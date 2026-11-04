@@ -703,6 +703,62 @@ TEST_F(ComputeTest, SubstringSlicesCodepointsPerRow) {
   }
 }
 
+// upper and lower map each codepoint as DuckDB does (ADR 0037's FN4; every codepoint is checked
+// against DuckDB by tests/slt/tests/case_mapping_oracle_test.cc): a mapping may change a value's
+// byte length either way, NULL stays NULL, and a value whose bytes are no valid UTF-8 stays as it
+// is as a whole, even after a valid prefix (an unannotated Parquet BYTE_ARRAY is VARCHAR, D15).
+TEST_F(ComputeTest, UpperAndLowerMapCodepointsAsDuckDb) {
+  const auto values = [](const std::shared_ptr<arrow::Array>& array) {
+    std::vector<std::optional<std::string>> out;
+    const auto& binary = static_cast<const arrow::BinaryArray&>(*array);
+    out.reserve(Narrow<std::size_t>(binary.length()));
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      out.push_back(binary.IsNull(i) ? std::nullopt : std::optional(binary.GetString(i)));
+    }
+    return out;
+  };
+  using Values = std::vector<std::optional<std::string>>;
+  // U+00DF (2 bytes) upper-cases to U+1E9E (3 bytes), U+017F (2 bytes) to 'S'; the Kelvin sign
+  // U+212A (3 bytes) lower-cases to 'k'.
+  const auto text =
+      testing::Strings({"Stra\xC3\x9F"
+                        "e",
+                        std::nullopt, "", "\xC5\xBF\xE2\x84\xAA", "a\xC3\xA9\xFF", "\xC0\xAF",
+                        "\xED\xA0\x80", "ab\xC3",
+                        "\x80"
+                        "A",
+                        "\xF4\x90\x80\x80"});
+  const auto call = [&](plan::Function function) {
+    return Eval(Call(function, {ColumnAt(0, LogicalType::kVarchar)}, LogicalType::kVarchar),
+                {text});
+  };
+  // Rows 4 to 9 are no UTF-8: an invalid byte after a valid prefix, an overlong '/', a surrogate, a
+  // cut-off sequence, a stray continuation byte and a codepoint past U+10FFFF.
+  const Values invalid{"a\xC3\xA9\xFF",
+                       "\xC0\xAF",
+                       "\xED\xA0\x80",
+                       "ab\xC3",
+                       "\x80"
+                       "A",
+                       "\xF4\x90\x80\x80"};
+  auto upper = call(plan::Function::kUpper);
+  ASSERT_TRUE(upper.ok()) << upper.status().ToString();
+  Values expected{
+      "STRA\xE1\xBA\x9E"
+      "E",
+      std::nullopt, "", "S\xE2\x84\xAA"};
+  expected.insert(expected.end(), invalid.begin(), invalid.end());
+  EXPECT_EQ(values(*upper), expected);
+  auto lower = call(plan::Function::kLower);
+  ASSERT_TRUE(lower.ok()) << lower.status().ToString();
+  expected = {
+      "stra\xC3\x9F"
+      "e",
+      std::nullopt, "", "\xC5\xBFk"};
+  expected.insert(expected.end(), invalid.begin(), invalid.end());
+  EXPECT_EQ(values(*lower), expected);
+}
+
 // strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one
 // character, not a newline), \0 and \1 in the replacement; NULL stays NULL; a bad pattern is an
 // execution error (DuckDB 1.5.5).

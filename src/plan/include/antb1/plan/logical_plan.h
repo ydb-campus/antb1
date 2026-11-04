@@ -211,9 +211,14 @@ enum class Function : std::uint8_t {
   // abs(number): its type, as DuckDB's abs keeps it (ADR 0037's FN3): fabs of a DOUBLE, the
   // magnitude of an integer or a DECIMAL; an integer type's minimum is DuckDB's overflow error.
   kAbs,
+  // upper(varchar) and lower(varchar): VARCHAR, each codepoint mapped by Unicode's simple case
+  // mapping as DuckDB maps it (ADR 0037's FN4); bytes that are no UTF-8 stay as they are (D15).
+  kUpper,
+  kLower,
 };
 
-// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round", "abs".
+// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round", "abs",
+// "upper", "lower".
 std::string_view ToString(Function function);
 
 // A scalar function of the arguments (constants where the function needs them: the pattern and

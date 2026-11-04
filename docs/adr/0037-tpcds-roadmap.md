@@ -148,7 +148,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | FN1 | Typed overloads for scalar functions (ADR 0012's FN1 update) | | Built |
 | FN2 | round (the FN2 update below) | 2, 78 | Built |
 | FN3 | abs (the FN3 update below) | | Built |
-| FN4 | upper and lower | 24, 99 | Planned |
+| FN4 | upper and lower (the FN4 update below) | 24, 99 | Built |
 | FN5 | concat | 84 | Planned |
 | **Phase 5** | **Aggregation and grouping sets** | | |
 | AG1 | Integer AVG finalized as DuckDB finalizes it | | Planned |
@@ -459,6 +459,18 @@ Update (2026-11-04, FN3): built as one row of FN1's table that keeps its value's
   DuckDB's `Overflow on abs(<min>)` at the type's minimum; the magnitude for a DECIMAL or HUGEINT, whose ranges are
   symmetric.
 - **What stays unsupported.** A FLOAT column (D11).
+
+Update (2026-11-04, FN4): built as four rows of FN1's table, `upper` and `lower` and DuckDB's aliases `ucase` and
+`lcase`. Queries 24 and 99 pass.
+
+- **The mapping.** DuckDB maps each codepoint to one codepoint by the simple case mapping of its bundled utf8proc.
+  Arrow's `utf8_upper` and `utf8_lower` use the utf8proc that Arrow links, whose Unicode version differs: it maps 110
+  codepoints differently, and the conda and static builds link different versions. So antb1 carries DuckDB's own
+  table, `src/exec/unicode_case.inc`, written from the DuckDB CLI by `tools/unicode/case_tables.py`. A harness test
+  compares every codepoint with the DuckDB library the tests link, so a DuckDB upgrade that changes a mapping fails
+  it.
+- **Bytes that are not UTF-8.** DuckDB cannot read them as VARCHAR. antb1 returns such a value unchanged, which
+  extends divergence D15.
 
 ## Alternatives considered
 

@@ -432,10 +432,10 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   // (table nope is not registered either; a LEFT JOIN is answered from roadmap PR J6 on).
   for (const char* sql :
        {"SELECT nope, row_number() OVER () FROM t",
-        "SELECT AdvEngineID FROM t ORDER BY lower(AdvEngineID)",
+        "SELECT AdvEngineID FROM t ORDER BY md5(AdvEngineID)",
         "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t",
         "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
-        "SELECT COUNT(*) FROM (SELECT lower(AdvEngineID) FROM t)"}) {
+        "SELECT COUNT(*) FROM (SELECT md5(AdvEngineID) FROM t)"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();

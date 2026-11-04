@@ -25,6 +25,7 @@
 #include <arrow/util/utf8.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/exec/case_mapping.h"
 #include "antb1/exec/filter.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
@@ -1245,8 +1246,37 @@ struct Evaluator {
         return Round(function, *text);
       case plan::Function::kAbs:
         return Abs(*text, e.type);
+      case plan::Function::kUpper:
+      case plan::Function::kLower:
+        return CaseConvert(*text, function.function == plan::Function::kUpper);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // upper or lower of VARCHAR values (ADR 0037's FN4), each codepoint mapped as DuckDB 1.5.6 maps
+  // it (CaseConvertValue). A value whose bytes are no valid UTF-8 -- antb1 reads any BYTE_ARRAY as
+  // VARCHAR (divergence D15) -- stays as it is.
+  arrow::Result<ArrayPtr> CaseConvert(const arrow::Array& values, bool upper) const {
+    const auto& binary = static_cast<const arrow::BinaryArray&>(values);
+    arrow::BinaryBuilder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(binary.length()));
+    ARROW_RETURN_NOT_OK(builder.ReserveData(binary.total_values_length()));
+    std::string converted;
+    for (int64_t i = 0; i < binary.length(); ++i) {
+      if (binary.IsNull(i)) {
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+        continue;
+      }
+      const std::string_view value = binary.GetView(i);
+      if (CaseConvertValue(value, upper, converted)) {
+        ARROW_RETURN_NOT_OK(builder.Append(converted));
+      } else {
+        ARROW_RETURN_NOT_OK(builder.Append(value));
+      }
+    }
+    ArrayPtr out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
   }
 
   // abs(x) as DuckDB computes it (ADR 0037's FN3), in x's own type: fabs of a DOUBLE (-0.0 is 0.0,
