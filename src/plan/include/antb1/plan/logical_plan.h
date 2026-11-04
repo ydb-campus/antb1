@@ -208,9 +208,12 @@ enum class Function : std::uint8_t {
   // zero, at `precision` digits by round(x * 10^p) / 10^p in double, the value itself where that
   // is not finite. args: the value, then the precision (an INTEGER constant, at least 0), if any.
   kRound,
+  // abs(number): its type, as DuckDB's abs keeps it (ADR 0037's FN3): fabs of a DOUBLE, the
+  // magnitude of an integer or a DECIMAL; an integer type's minimum is DuckDB's overflow error.
+  kAbs,
 };
 
-// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round".
+// "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round", "abs".
 std::string_view ToString(Function function);
 
 // A scalar function of the arguments (constants where the function needs them: the pattern and

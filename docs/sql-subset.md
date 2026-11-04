@@ -596,6 +596,10 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   being 267.5, while that of 1.005 is 1.0); the value itself where the result is not finite. Named as DuckDB names it
   (`round(f, 2)`). DuckDB's overloads for a DECIMAL (which give a DECIMAL) and for an integer type, a FLOAT column
   (D11) and a negative or computed precision are unsupported (exit code 4).
+- `abs(x)` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s FN3): the magnitude of a number, in its own type, as DuckDB's
+  abs keeps it -- an integer type (`abs(-7)` is INTEGER), a DECIMAL, a DOUBLE (`fabs`: -0.0 is 0.0, NaN stays NaN);
+  an integer type's minimum fails the query with DuckDB's `Overflow on abs(-32768)` (an execution error). A FLOAT
+  column is unsupported (D11), a VARCHAR a bind error. Named `abs(x)`.
 - `COALESCE(a, b, ..., z)` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL5): the first argument that is not NULL, NULL
   when every one is; it is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE z END`, so each
   argument is computed only for the rows no earlier one answered. Its arguments are typed as `CASE`'s values, folded

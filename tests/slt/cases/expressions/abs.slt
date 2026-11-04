@@ -1,0 +1,73 @@
+# abs (ADR 0037's FN3, docs/sql-subset.md): the magnitude, in the argument's own type -- an integer type, a DECIMAL, a
+# DOUBLE -- with DuckDB's overflow error on an integer type's minimum.
+
+query IIII rowsort
+SELECT i16, abs(i16), abs(i32), abs(i16 - 100) FROM edge WHERE i16 > -32768
+----
+SMALLINT	SMALLINT	INTEGER	SMALLINT
+-1	1	1	101
+-100	100	100000	200
+-12345	12345	54321	12445
+0	0	0	100
+1	1	1	99
+100	100	100000	0
+12345	12345	NULL	12245
+32767	32767	2147483647	32667
+7	7	7	93
+
+query ID nosort
+SELECT id, abs(d9_2) FROM decimals WHERE id < 8 ORDER BY id
+----
+INTEGER	DECIMAL(9,2)
+0	6.25
+1	9999999.99
+2	9999999.99
+3	NULL
+4	0.00
+5	5.00
+6	3.75
+7	1.25
+
+query R nosort
+SELECT SUM(abs(tr_fare / 3 - 5)) FROM trips WHERE tr_row < 200
+----
+DOUBLE
+393.75000000000006
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE abs(tr_fare - 15) < 2
+----
+BIGINT
+448
+
+query II nosort
+SELECT abs(-7), abs(ct_id - 4) FROM cities ORDER BY ct_id
+----
+INTEGER	SMALLINT
+7	3
+7	2
+7	1
+7	0
+7	1
+7	2
+
+statement error
+SELECT abs(i16) FROM edge
+
+query I nosort
+SELECT abs(SUM(i64) - 1) FROM edge
+----
+HUGEINT
+5
+
+query D nosort
+SELECT abs(SUM(d38_10)) FROM decimals
+----
+DECIMAL(38,10)
+9019544933642220.0677999994
+
+query RRR nosort
+SELECT abs(-(tr_fare / 4 * 0)), abs(tr_fare / 0 - tr_fare / 0), abs(-(tr_fare / 4)) FROM trips WHERE tr_row = 3
+----
+DOUBLE	DOUBLE	DOUBLE
+0	nan	6.3125

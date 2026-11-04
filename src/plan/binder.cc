@@ -590,6 +590,7 @@ enum class ArgKind : std::uint8_t {
   kTemporal,       // a TIMESTAMP or a DATE
   kStringLiteral,  // a string literal: a pattern, a replacement, a unit
   kDouble,         // a DOUBLE value
+  kNumber,         // a value of an integer type, a DECIMAL or a DOUBLE
   kPrecision,      // a constant integer expression of at least 0, as an INTEGER (round's digits)
 };
 
@@ -603,6 +604,8 @@ bool Accepts(ArgKind kind, LogicalType type) {
       return type == LogicalType::kTimestamp || type == LogicalType::kDate;
     case ArgKind::kDouble:
       return type == LogicalType::kDouble;
+    case ArgKind::kNumber:
+      return IsNumeric(type) || type == LogicalType::kDecimal;
     case ArgKind::kStringLiteral:
     case ArgKind::kPrecision:
       return false;  // a constant, checked as one where the call is bound
@@ -702,6 +705,12 @@ constexpr auto kFunctions = std::to_array<FunctionOverload>({
      .refused_name = "round",
      .needs = "a DOUBLE",
      .other_numbers_unsupported = true},
+    // abs of any number, in its own type (ADR 0037's FN3).
+    {.name = "abs",
+     .function = Function::kAbs,
+     .args = {ArgKind::kNumber},
+     .refused_name = "abs",
+     .needs = "a number"},
 });
 
 // COALESCE(value, ...), which the binder answers as a CASE (ADR 0037's NL5), not a Function.
@@ -975,7 +984,7 @@ struct FirstUnsupportedOf {
       return Rejection{.span = call.name_span,
                        .message = std::format("function {}() is not supported (only COUNT, SUM, "
                                               "AVG, MIN, MAX, STRLEN, REGEXP_REPLACE, TODATETIME, "
-                                              "DATE_TRUNC, SUBSTRING, ROUND and COALESCE)",
+                                              "DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)",
                                               Clip(call.name))};
     }
     if (overloads.front().function == Function::kRegexpReplace && call.args.size() == 4) {
@@ -2929,8 +2938,9 @@ class Binder {
                        value_span);
     }
     spec = &*chosen;
-    if (value.stored_as_float && spec->args.at(spec->value_arg) == ArgKind::kDouble) {
-      // DuckDB's FLOAT overload rounds in FLOAT, and antb1 reads the column as DOUBLE.
+    if (value.stored_as_float && (spec->args.at(spec->value_arg) == ArgKind::kDouble ||
+                                  spec->args.at(spec->value_arg) == ArgKind::kNumber)) {
+      // DuckDB's FLOAT overload computes in FLOAT, and antb1 reads the column as DOUBLE.
       return UnsupportedError(std::format("{}() of a FLOAT column is not supported (antb1 reads "
                                           "FLOAT as DOUBLE, divergence D11)",
                                           spec->refused_name),

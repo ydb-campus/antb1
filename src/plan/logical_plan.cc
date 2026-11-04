@@ -413,6 +413,8 @@ std::string_view ToString(Function function) {
       return "substring";
     case Function::kRound:
       return "round";
+    case Function::kAbs:
+      return "abs";
   }
   return "?";
 }

@@ -261,7 +261,7 @@ INSTANTIATE_TEST_SUITE_P(
                   "function lower() is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY year(d)", kUnsupported, "year",
                   "function year() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 < 2", kUnsupported, "2",
                   "comparisons between two literals are not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING COUNT(*)", kUnsupported, "COUNT(*)",
@@ -545,19 +545,19 @@ INSTANTIATE_TEST_SUITE_P(
                   "constant aggregate arguments are not supported"},
         ErrorCase{"SELECT lower(url) FROM t", kUnsupported, "lower",
                   "function lower() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE length(url) > 5", kUnsupported, "length",
                   "function length() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
         ErrorCase{"SELECT a FROM t WHERE d > now()", kUnsupported, "now",
                   "function now() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
-        ErrorCase{"SELECT SUM(abs(a)) FROM t", kUnsupported, "abs",
-                  "function abs() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
+        ErrorCase{"SELECT SUM(sqrt(a)) FROM t", kUnsupported, "sqrt",
+                  "function sqrt() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
         ErrorCase{"SELECT left(url, 3) FROM t", kUnsupported, "left",
                   "function left() is not supported (only COUNT, SUM, AVG, MIN, MAX, STRLEN, "
-                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND and COALESCE)"},
+                  "REGEXP_REPLACE, TODATETIME, DATE_TRUNC, SUBSTRING, ROUND, ABS and COALESCE)"},
         ErrorCase{"SELECT COUNT(1) FROM t", kUnsupported, "1",
                   "constant aggregate arguments are not supported (use COUNT(*))"},
         ErrorCase{"SELECT SUM('x') FROM t", kUnsupported, "'x'",
@@ -1782,6 +1782,45 @@ TEST(BinderTest, RoundOfADouble) {
   EXPECT_EQ(float_detail->kind(), SqlErrorDetail::Kind::kUnsupported);
   EXPECT_TRUE(on_float.status().message().contains("round() of a FLOAT column is not supported"))
       << on_float.status().ToString();
+}
+
+// abs (ADR 0037's FN3) keeps its argument's type, as DuckDB's does: an integer type, a DECIMAL, a
+// DOUBLE, a literal's own type; named abs(x). A FLOAT column is unsupported (D11), and a VARCHAR is
+// a bind error.
+TEST(BinderTest, AbsKeepsItsArgumentsType) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT abs(i16) FROM t", LogicalType::kSmallInt},
+           {"SELECT abs(u16) FROM t", LogicalType::kUSmallInt},
+           {"SELECT abs(i64 - 1) FROM t", LogicalType::kBigInt},
+           {"SELECT abs(h) FROM t", LogicalType::Decimal(38, 0)},
+           {"SELECT abs(d) FROM t", LogicalType::kDouble},
+           {"SELECT abs(-7) FROM t", LogicalType::kInteger},
+           {"SELECT abs(-1.25) FROM t", LogicalType::Decimal(3, 2)},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(ToString(plan->output[0].type), ToString(type)) << sql;
+  }
+  auto named = BindSql("SELECT ABS(i32 - 3) FROM t", catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[0].name, "abs((i32 - 3))");
+  const auto text = BindSql("SELECT abs(s) FROM t", catalog);
+  ASSERT_FALSE(text.ok());
+  ASSERT_NE(GetSqlError(text.status()), nullptr);
+  EXPECT_EQ(GetSqlError(text.status())->kind(), SqlErrorDetail::Kind::kBind);
+  EXPECT_TRUE(text.status().message().contains("abs() needs a number, but 's' is VARCHAR"))
+      << text.status().ToString();
+  Catalog with_float;
+  ASSERT_TRUE(with_float
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32())}), 10,
+                                      std::vector<int>{0}))
+                  .ok());
+  const auto on_float = BindSql("SELECT abs(f) FROM tf", with_float);
+  ASSERT_FALSE(on_float.ok());
+  ASSERT_NE(GetSqlError(on_float.status()), nullptr);
+  EXPECT_EQ(GetSqlError(on_float.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
 }
 
 // A UNION ALL's plan (ADR 0036): one node over its blocks in written order, its names the first

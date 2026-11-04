@@ -147,7 +147,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 4** | **Scalar functions** | | |
 | FN1 | Typed overloads for scalar functions (ADR 0012's FN1 update) | | Built |
 | FN2 | round (the FN2 update below) | 2, 78 | Built |
-| FN3 | abs | | Planned |
+| FN3 | abs (the FN3 update below) | | Built |
 | FN4 | upper and lower | 24, 99 | Planned |
 | FN5 | concat | 84 | Planned |
 | **Phase 5** | **Aggregation and grouping sets** | | |
@@ -451,6 +451,14 @@ Update (2026-11-04, FN2): built as two rows of FN1's table, `round(DOUBLE)` and 
 - **What stays unsupported.** DuckDB's DECIMAL and integer overloads, a FLOAT column (D11) and a negative or
   computed precision. A new row field, `other_numbers_unsupported`, makes a number that no row of a function takes
   unsupported rather than a bind error.
+
+Update (2026-11-04, FN3): built as one row of FN1's table that keeps its value's type. A new argument kind,
+`kNumber`, takes any number. No query passes from it alone: the five that call abs need windows (phase 9).
+
+- **The value.** It is computed as DuckDB's abs: `fabs` for a DOUBLE; the magnitude for an integer type, with
+  DuckDB's `Overflow on abs(<min>)` at the type's minimum; the magnitude for a DECIMAL or HUGEINT, whose ranges are
+  symmetric.
+- **What stays unsupported.** A FLOAT column (D11).
 
 ## Alternatives considered
 
