@@ -215,10 +215,13 @@ enum class Function : std::uint8_t {
   // mapping as DuckDB maps it (ADR 0037's FN4); bytes that are no UTF-8 stay as they are (D15).
   kUpper,
   kLower,
+  // concat(varchar, ...): VARCHAR, the values in order with each NULL skipped, so never NULL
+  // (ADR 0037's FN5).
+  kConcat,
 };
 
 // "strlen", "regexp_replace", "epoch_ms", "extract", "date_trunc", "substring", "round", "abs",
-// "upper", "lower".
+// "upper", "lower", "concat".
 std::string_view ToString(Function function);
 
 // A scalar function of the arguments (constants where the function needs them: the pattern and

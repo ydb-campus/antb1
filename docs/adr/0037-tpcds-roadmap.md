@@ -149,7 +149,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | FN2 | round (the FN2 update below) | 2, 78 | Built |
 | FN3 | abs (the FN3 update below) | | Built |
 | FN4 | upper and lower (the FN4 update below) | 24, 99 | Built |
-| FN5 | concat | 84 | Planned |
+| FN5 | concat (the FN5 update below) | 84 | Built |
 | **Phase 5** | **Aggregation and grouping sets** | | |
 | AG1 | Integer AVG finalized as DuckDB finalizes it | | Planned |
 | AG2 | stddev_samp | 17, 39 | Planned |
@@ -471,6 +471,13 @@ Update (2026-11-04, FN4): built as four rows of FN1's table, `upper` and `lower`
   it.
 - **Bytes that are not UTF-8.** DuckDB cannot read them as VARCHAR. antb1 returns such a value unchanged, which
   extends divergence D15.
+
+Update (2026-11-04, FN5): built as one row of FN1's table, which gains variadic rows: every argument of such a row is
+a value of its first kind, from `min_args` on. Query 84 passes.
+
+- **The value.** DuckDB's concat: the values in order, a NULL one skipped, so the result is never NULL.
+- **What stays unsupported.** A value of a type other than VARCHAR, which DuckDB casts to VARCHAR (a new row field,
+  `other_types_unsupported`, makes it unsupported rather than a bind error), and the `||` operator.
 
 ## Alternatives considered
 

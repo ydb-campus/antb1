@@ -169,6 +169,7 @@ bool IsDeterministic(plan::Function function) {
     case plan::Function::kAbs:
     case plan::Function::kUpper:
     case plan::Function::kLower:
+    case plan::Function::kConcat:
       return true;
   }
   return false;

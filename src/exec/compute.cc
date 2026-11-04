@@ -1250,8 +1250,45 @@ struct Evaluator {
       case plan::Function::kUpper:
       case plan::Function::kLower:
         return CaseConvert(*text, function.function == plan::Function::kUpper);
+      case plan::Function::kConcat:
+        return Concat(function, text);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // concat of VARCHAR values (ADR 0037's FN5), as DuckDB's: each row's values in order, a NULL one
+  // skipped, so a row whose values are all NULL is '' and never NULL. `first` is the first
+  // argument, already computed.
+  arrow::Result<ArrayPtr> Concat(const plan::FunctionExpr& function, const ArrayPtr& first) const {
+    std::vector<ArrayPtr> parts{first};
+    int64_t bytes = 0;
+    for (std::size_t i = 1; i < function.args.size(); ++i) {
+      ARROW_ASSIGN_OR_RAISE(ArrayPtr part, (*this)(*function.args[i]));
+      parts.push_back(std::move(part));
+    }
+    std::vector<const arrow::BinaryArray*> values;
+    values.reserve(parts.size());
+    for (const ArrayPtr& part : parts) {
+      values.push_back(&static_cast<const arrow::BinaryArray&>(*part));
+      bytes += values.back()->total_values_length();
+    }
+    arrow::BinaryBuilder builder(pool);
+    const int64_t rows = first->length();
+    ARROW_RETURN_NOT_OK(builder.Reserve(rows));
+    // A bound, not the size: a NULL value's bytes count too. Arrow's own overflow check fails the
+    // query where a batch's result outgrows 2 GiB.
+    ARROW_RETURN_NOT_OK(builder.ReserveData(bytes));
+    for (int64_t row = 0; row < rows; ++row) {
+      ARROW_RETURN_NOT_OK(builder.Append("", 0));
+      for (const arrow::BinaryArray* value : values) {
+        if (!value->IsNull(row)) {
+          ARROW_RETURN_NOT_OK(builder.ExtendCurrent(value->GetView(row)));
+        }
+      }
+    }
+    ArrayPtr out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
   }
 
   // upper or lower of VARCHAR values (ADR 0037's FN4), each codepoint mapped as DuckDB 1.5.6 maps

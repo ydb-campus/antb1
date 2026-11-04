@@ -607,6 +607,11 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   (`src/exec/unicode_case.inc`, written by `tools/unicode/case_tables.py`), since the utf8proc Arrow links maps over
   a hundred codepoints differently; a test compares every codepoint with DuckDB. A value that is not UTF-8 stays as
   it is (D15). Any other argument type or count is a bind error. Named as written (`ucase(u)`).
+- `concat(a, b, ...)` of one or more VARCHAR values ([ADR 0037](adr/0037-tpcds-roadmap.md)'s FN5): a VARCHAR, the
+  values joined in order as DuckDB joins them, a NULL value skipped, so the result is never NULL (`concat(s)` of a
+  NULL `s` is `''`). Named as written (`concat('<', s, '>')`). DuckDB casts a value of any other type to VARCHAR; in
+  antb1 such a value is unsupported (exit code 4), the first one in the call reported, as is the `||` operator.
+  `concat()` is a bind error, as in DuckDB.
 - `COALESCE(a, b, ..., z)` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL5): the first argument that is not NULL, NULL
   when every one is; it is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE z END`, so each
   argument is computed only for the rows no earlier one answered. Its arguments are typed as `CASE`'s values, folded
@@ -1599,7 +1604,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
-| Q84 | unsupported | needs concat (FN5) |
+| Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q87 | unsupported | needs SELECT DISTINCT, parenthesized set-operation branches and EXCEPT (X4d) |

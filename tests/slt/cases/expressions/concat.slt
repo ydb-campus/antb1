@@ -1,0 +1,69 @@
+# concat (ADR 0037's FN5, docs/sql-subset.md): the VARCHAR values of a row joined in order, a NULL one skipped, so
+# never NULL.
+
+query TTT rowsort
+SELECT u, concat(u), concat('[', u, ']') FROM edge
+----
+VARCHAR	VARCHAR	VARCHAR
+(empty)	(empty)	[]
+NULL	(empty)	[]
+NULL	(empty)	[]
+\x28empty)	\x28empty)	[(empty)]
+a	a	[a]
+back\\slash	back\\slash	[back\\slash]
+line\nbreak	line\nbreak	[line\nbreak]
+tab\there	tab\there	[tab\there]
+trailing space\x20	trailing space\x20	[trailing space ]
+x\x7fy	x\x7fy	[x\x7fy]
+Привет, мир	Привет, мир	[Привет, мир]
+日本語	日本語	[日本語]
+
+query TT rowsort
+SELECT concat(u, '|', upper(u)), concat(concat(u, u), COALESCE(u, '?')) FROM edge
+----
+VARCHAR	VARCHAR
+(empty)|(EMPTY)	(empty)(empty)(empty)
+a|A	aaa
+back\\slash|BACK\\SLASH	back\\slashback\\slashback\\slash
+line\nbreak|LINE\nBREAK	line\nbreakline\nbreakline\nbreak
+tab\there|TAB\tHERE	tab\theretab\theretab\there
+trailing space |TRAILING SPACE\x20	trailing space trailing space trailing space\x20
+x\x7fy|X\x7fY	x\x7fyx\x7fyx\x7fy
+|	(empty)
+|	?
+|	?
+Привет, мир|ПРИВЕТ, МИР	Привет, мирПривет, мирПривет, мир
+日本語|日本語	日本語日本語日本語
+
+query TI nosort
+SELECT concat(label, '/', label) AS l, COUNT(*) FROM cities GROUP BY l ORDER BY l
+----
+VARCHAR	BIGINT
+airport/airport	1
+center/center	1
+harbor/harbor	1
+hills/hills	1
+old town/old town	1
+outskirts/outskirts	1
+
+query I nosort
+SELECT COUNT(*) FROM hits_like WHERE concat(Title, URL) LIKE '%café%http%'
+----
+BIGINT
+844
+
+query TI nosort
+SELECT concat(substring(URL, 1, 5), '~') AS p, COUNT(*) AS n FROM hits_like GROUP BY p ORDER BY n DESC, p LIMIT 5
+----
+VARCHAR	BIGINT
+https~	9805
+~	195
+
+query I nosort
+SELECT SUM(strlen(concat(Title, Referer))) - SUM(strlen(Title)) - SUM(strlen(Referer)) FROM hits_like WHERE Title IS NOT NULL AND Referer IS NOT NULL
+----
+HUGEINT
+0
+
+statement error
+SELECT concat() FROM edge
