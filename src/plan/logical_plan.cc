@@ -411,6 +411,8 @@ std::string_view ToString(Function function) {
       return "date_trunc";
     case Function::kSubstring:
       return "substring";
+    case Function::kRound:
+      return "round";
   }
   return "?";
 }

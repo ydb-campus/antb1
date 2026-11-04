@@ -1242,8 +1242,43 @@ struct Evaluator {
       }
       case plan::Function::kSubstring:
         return Substring(function, text);
+      case plan::Function::kRound:
+        return Round(function, *text);
     }
     return arrow::Status::Invalid("unknown function");
+  }
+
+  // round(x[, p]) of a DOUBLE, as DuckDB's RoundOperator and RoundOperatorPrecision compute it
+  // (ADR 0037's FN2): std::round, half away from zero; with a precision p, std::round(x * 10^p)
+  // divided by 10^p, 10^p being std::pow(10, p); the value itself where the result is not finite.
+  arrow::Result<ArrayPtr> Round(const plan::FunctionExpr& function,
+                                const arrow::Array& values) const {
+    std::optional<double> modifier;
+    if (function.args.size() > 1) {
+      const auto* constant = std::get_if<plan::ConstantExpr>(&function.args[1]->node);
+      const auto* precision =
+          constant != nullptr ? std::get_if<Int128>(&constant->value.value) : nullptr;
+      if (precision == nullptr || *precision < 0) {
+        return arrow::Status::Invalid("round() without a non-negative constant precision");
+      }
+      modifier = std::pow(10.0, static_cast<double>(*precision));
+    }
+    const auto& doubles = static_cast<const arrow::DoubleArray&>(values);
+    arrow::DoubleBuilder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(values.length()));
+    for (int64_t i = 0; i < values.length(); ++i) {
+      if (values.IsNull(i)) {
+        builder.UnsafeAppendNull();
+        continue;
+      }
+      const double x = doubles.Value(i);
+      const double rounded =
+          modifier.has_value() ? std::round(x * *modifier) / *modifier : std::round(x);
+      builder.UnsafeAppend(std::isfinite(rounded) ? rounded : x);
+    }
+    ArrayPtr out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
   }
 
   // The codepoints of `value`, counting as DuckDB counts them: a byte that is no UTF-8 continuation
