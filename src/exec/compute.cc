@@ -1670,6 +1670,9 @@ struct Evaluator {
   }
 
   arrow::Result<ArrayPtr> Evaluate(const plan::ArithExpr& arith, const plan::Expr& e) const {
+    if (e.type == plan::LogicalType::kDate) {
+      return DateArith(arith);
+    }
     if (e.type == plan::LogicalType::kDecimal) {
       // The whole tree in one pass where it is one the program covers, which is what keeps a chain
       // of DECIMAL arithmetic from writing an array per operation and reading it back for the one
@@ -1749,6 +1752,40 @@ struct Evaluator {
       return HugeIntArith(*left, right.get(), arith.op, pool);
     }
     return KernelArith(left, right, arith.op, e.type);
+  }
+
+  // A DATE plus or minus a number of days, or days plus a DATE (ADR 0037's CT5), as DuckDB adds
+  // them: an infinite DATE stays itself; otherwise the days of the result, failing with DuckDB's
+  // `Date out of range` where they leave INTEGER or land on one of its infinities (+-INT32_MAX).
+  arrow::Result<ArrayPtr> DateArith(const plan::ArithExpr& arith) const {
+    const bool left_date = arith.left->type == plan::LogicalType::kDate;
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr dates, (*this)(left_date ? *arith.left : *arith.right));
+    ARROW_ASSIGN_OR_RAISE(ArrayPtr days, (*this)(left_date ? *arith.right : *arith.left));
+    ARROW_ASSIGN_OR_RAISE(days, CastTo(days, arrow::int32(), ctx));
+    const auto& d = static_cast<const arrow::Date32Array&>(*dates);
+    const auto& n = static_cast<const arrow::Int32Array&>(*days);
+    const bool subtract = arith.op == plan::ArithOp::kSubtract;
+    arrow::Date32Builder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(d.length()));
+    for (int64_t i = 0; i < d.length(); ++i) {
+      if (d.IsNull(i) || n.IsNull(i)) {
+        builder.UnsafeAppendNull();
+        continue;
+      }
+      if (d.Value(i) == kDateInfinity || d.Value(i) == -kDateInfinity) {
+        builder.UnsafeAppend(d.Value(i));
+        continue;
+      }
+      const int64_t value = int64_t{d.Value(i)} + (subtract ? -int64_t{n.Value(i)} : n.Value(i));
+      if (value < std::numeric_limits<int32_t>::min() || value >= kDateInfinity ||
+          value == -kDateInfinity) {
+        return arrow::Status::ExecutionError("Date out of range");
+      }
+      builder.UnsafeAppend(static_cast<int32_t>(value));
+    }
+    ArrayPtr out;
+    ARROW_RETURN_NOT_OK(builder.Finish(&out));
+    return out;
   }
 
   // A constant operand as the one scalar value it is, of `type`; nothing when the operand is not a

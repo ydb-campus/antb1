@@ -73,3 +73,44 @@ BIGINT	DATE
 3477670019347388496	2013-07-31
 4306430868111253586	2013-07-31
 5862655407271182817	2013-07-31
+
+# A DATE plus or minus a number of days, or days plus a DATE (ADR 0037's CT5): a DATE, the days a SMALLINT, USMALLINT
+# or INTEGER.
+
+query TTTT nosort
+SELECT tr_day, tr_day + 7, tr_day - 31, 1 + tr_day FROM trips WHERE tr_row < 4 ORDER BY tr_row
+----
+DATE	DATE	DATE	DATE
+2026-03-01	2026-03-08	2026-01-29	2026-03-02
+2026-03-02	2026-03-09	2026-01-30	2026-03-03
+2026-03-03	2026-03-10	2026-01-31	2026-03-04
+2026-03-04	2026-03-11	2026-02-01	2026-03-05
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day + 10 > DATE '2026-03-25' AND tr_day - 1 <= DATE '2026-03-28'
+----
+BIGINT
+1317
+
+query TI nosort
+SELECT tr_day + CAST(tr_row AS SMALLINT) AS d, COUNT(*) FROM trips WHERE tr_row < 50 GROUP BY 1 ORDER BY 1 LIMIT 3
+----
+DATE	BIGINT
+2026-03-01	1
+2026-03-03	1
+2026-03-05	1
+
+query T nosort
+SELECT MAX(DATE '2020-02-28' + ct_id) FROM cities
+----
+DATE
+2020-03-05
+
+statement error
+SELECT tr_day + 2147483000 FROM trips
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_day + CAST(tr_row % 3 AS INTEGER)) FROM trips
+----
+BIGINT	BIGINT
+3000	2919

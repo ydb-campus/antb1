@@ -2213,6 +2213,33 @@ arrow::Result<LogicalType> DecimalArithType(ArithOp op, const Typed& l, const Ty
 // The type DuckDB gives `l <op> r` (docs/sql-subset.md), or the error for operands it cannot take.
 arrow::Result<LogicalType> ArithType(sql::BinaryOp sql_op, ArithOp op, const Typed& l,
                                      const Typed& r, SourceSpan span) {
+  // A DATE plus or minus a number of days, or days plus a DATE (ADR 0037's CT5): a DATE, as in
+  // DuckDB, whose days are an INTEGER (SMALLINT and USMALLINT widen to it); another integer type
+  // is DuckDB's bind error.
+  const bool left_date = l.expr->type == LogicalType::kDate;
+  const bool right_date = r.expr->type == LogicalType::kDate;
+  if (right_date && !left_date && op == ArithOp::kSubtract && IsNumeric(l.expr->type)) {
+    return BindError(std::format("No function matches the given name and argument types '-({}, "
+                                 "DATE)'",
+                                 ToString(l.expr->type)),
+                     span);  // days minus a DATE
+  }
+  if ((left_date && !right_date && (op == ArithOp::kAdd || op == ArithOp::kSubtract)) ||
+      (right_date && !left_date && op == ArithOp::kAdd)) {
+    const Typed& days = left_date ? r : l;
+    const LogicalType type = days.expr->type;
+    if (type == LogicalType::kSmallInt || type == LogicalType::kUSmallInt ||
+        type == LogicalType::kInteger) {
+      return LogicalType::kDate;
+    }
+    if (IsInteger(type) || type == LogicalType::kDecimal || type == LogicalType::kDouble) {
+      return BindError(
+          std::format("No function matches the given name and argument types "
+                      "'{}({}, {})'",
+                      sql::ToString(sql_op), ToString(l.expr->type), ToString(r.expr->type)),
+          span);
+    }
+  }
   for (const Typed* t : {&l, &r}) {
     if (t->expr->type == LogicalType::kDate || t->expr->type == LogicalType::kTimestamp) {
       const std::string type = ToString(t->expr->type);

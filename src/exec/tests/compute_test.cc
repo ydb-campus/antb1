@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1279,6 +1280,45 @@ TEST(DuckDbDoubleTextTest, PrintsAsDuckDb) {
   EXPECT_EQ(DuckDbDoubleText(-3000000000.25), "-3000000000.25");
   EXPECT_EQ(DuckDbDoubleText(1.25e-5), "1.25e-05");
   EXPECT_EQ(DuckDbDoubleText(-std::numeric_limits<double>::infinity()), "-inf");
+}
+
+// A DATE plus or minus days (ADR 0037's CT5), as DuckDB adds them: NULL stays NULL, an infinite
+// DATE stays itself, and a result that leaves INTEGER or lands on an infinity (+-INT32_MAX) fails.
+TEST_F(ComputeTest, DatePlusOrMinusDaysAsDuckDb) {
+  constexpr int32_t kInf = std::numeric_limits<int32_t>::max();
+  const auto dates = [](const std::vector<std::optional<int32_t>>& values) {
+    return testing::ArrayOf<arrow::Date32Builder, int32_t>(arrow::date32(), values);
+  };
+  const auto plus = [&](const std::shared_ptr<arrow::Array>& d,
+                        const std::shared_ptr<arrow::Array>& n, ArithOp op) {
+    return Eval(Arith(op, ColumnAt(0, LogicalType::kDate), ColumnAt(1, LogicalType::kInteger),
+                      LogicalType::kDate),
+                {d, n});
+  };
+  auto added = plus(dates({0, 10, std::nullopt, kInf, -kInf, 0}),
+                    testing::Int32s({5, -20, 1, 3, 3, std::nullopt}), ArithOp::kAdd);
+  ASSERT_TRUE(added.ok()) << added.status().ToString();
+  const auto& out = static_cast<const arrow::Date32Array&>(**added);
+  EXPECT_EQ(out.Value(0), 5);
+  EXPECT_EQ(out.Value(1), -10);
+  EXPECT_TRUE(out.IsNull(2));
+  EXPECT_EQ(out.Value(3), kInf) << "infinity stays itself";
+  EXPECT_EQ(out.Value(4), -kInf) << "-infinity stays itself";
+  EXPECT_TRUE(out.IsNull(5));
+  // The ends: INT32_MAX - 1 and INT32_MIN are dates, INT32_MAX and -INT32_MAX DuckDB's infinities.
+  auto top = plus(dates({0}), testing::Int32s({kInf - 1}), ArithOp::kAdd);
+  ASSERT_TRUE(top.ok()) << top.status().ToString();
+  auto bottom = plus(dates({-1}), testing::Int32s({kInf}), ArithOp::kSubtract);
+  ASSERT_TRUE(bottom.ok()) << bottom.status().ToString();
+  EXPECT_EQ(static_cast<const arrow::Date32Array&>(**bottom).Value(0),
+            std::numeric_limits<int32_t>::min());
+  for (const auto& [d, n, op] :
+       {std::tuple{0, kInf, ArithOp::kAdd}, std::tuple{0, kInf, ArithOp::kSubtract},
+        std::tuple{1, kInf - 1, ArithOp::kAdd}, std::tuple{-2, kInf, ArithOp::kSubtract}}) {
+    auto failed = plus(dates({d}), testing::Int32s({n}), op);
+    EXPECT_TRUE(failed.status().IsExecutionError()) << d << " " << n;
+    EXPECT_EQ(failed.status().message(), "Date out of range") << d << " " << n;
+  }
 }
 
 // % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted

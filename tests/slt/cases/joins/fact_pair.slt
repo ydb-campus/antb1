@@ -69,10 +69,9 @@ INTEGER	BIGINT	BIGINT
 2	71	24
 3	57	23
 
-# ---- what later roadmap items answer ----
+# ---- what roadmap items NL4 and CT5 answer ----
 
 # A pickup a week or more after the booking's day (DATE plus an integer, CT5).
-pending CT5
 query I nosort
 SELECT COUNT(*) FROM bookings WHERE bk_pickup >= bk_day + 7
 ----
