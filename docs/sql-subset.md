@@ -280,6 +280,20 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   ([Binding](#binding));
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
+- other casts ([ADR 0037](adr/0037-tpcds-roadmap.md)'s CT1), `CAST(x AS T)` and `x::T` to SMALLINT (`INT2`,
+  `SHORT`), INTEGER (`INT`, `INT4`, `SIGNED`), BIGINT (`INT8`, `LONG`), HUGEINT (`INT128`), USMALLINT (`UINT16`),
+  `DECIMAL(p,s)` or `NUMERIC(p,s)` (`DECIMAL(p)` is scale 0, a bare `DECIMAL` DECIMAL(18,3); a width outside 1 to 38
+  or a scale above it is DuckDB's bind error), DOUBLE (`FLOAT8`), VARCHAR (`TEXT`, `STRING`), DATE, TIMESTAMP
+  (`DATETIME`) and BOOLEAN (`BOOL`), where the cast changes no value: a value of type T is itself (a FLOAT column as
+  DOUBLE is the DOUBLE antb1 reads); an exact widening (an integer type into a wider one or into a DECIMAL with
+  enough integer digits, a DECIMAL into one with at least its integer digits and its scale) converts; and a constant
+  that T holds exactly folds into a constant of T: an integer constant in T's range, in a DECIMAL's digits or, up to
+  2^53, in a DOUBLE; a decimal literal in a DECIMAL of at least its scale, or in an integer type when it has no
+  fraction; a string literal as VARCHAR or TIMESTAMP. Every other cast is unsupported (exit code 4: `CAST of BIGINT
+  values to DECIMAL(12,2) is not supported`), a narrowing, a rounding or a conversion between kinds, which DuckDB
+  answers or fails at run time, as is a cast to a type antb1 has none for (`FLOAT`, `INTERVAL`, `VARCHAR(10)`). The
+  name is DuckDB's, the type as DuckDB names it whatever alias was written: `CAST(s AS INTEGER)`, `CAST(f AS
+  "DOUBLE")`, `CAST(n AS DECIMAL(12, 2))`;
 - value expressions: columns, literals, aggregates, arithmetic (`+ - * / // %`, unary `-`), the functions
   `strlen(varchar)`, `regexp_replace(varchar, 'pattern', 'replacement')`,
   `substring(varchar, start[, length])`, `toDateTime(integer)`,
@@ -351,7 +365,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 
 Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
 fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
-condition, `TRY_CAST` and every other cast, such as `CAST(a AS BIGINT)` or `CAST(d AS DATE)`) parses, and is then
+condition, `TRY_CAST` and a cast to a type antb1 has no type for, such as `CAST(a AS FLOAT)`) parses, and is then
 rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`,
 the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
@@ -1291,7 +1305,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS BIGINT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -1482,7 +1496,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q18 | unsupported | needs CAST to DECIMAL(p,s) and ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
-| Q21 | unsupported | needs an identity CAST and a quotient of literals folded into DOUBLE (CT4) |
+| Q21 | unsupported | needs a quotient of literals folded into DOUBLE (CT4) |
 | Q22 | unsupported | needs ROLLUP (RU3) |
 | Q23 | pass | `*` next to other select items |
 | Q24 | unsupported | needs upper (FN4) |
@@ -1501,7 +1515,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | unsupported | needs SELECT DISTINCT and INTERSECT (X4c) |
 | Q39 | unsupported | needs NULL as a CASE value and stddev_samp (AG2) |
-| Q40 | unsupported | needs an identity CAST (CT1) |
+| Q40 | pass | an identity CAST (CT1) |
 | Q41 | unsupported | needs SELECT DISTINCT and a correlated COUNT subquery (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |

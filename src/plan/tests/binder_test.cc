@@ -608,7 +608,9 @@ INSTANTIATE_TEST_SUITE_P(
                   "function lower() is not supported"}));
 
 // Casts: CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are DATE literals spanning the cast,
-// with their bind errors (D4, D5); every other cast is kUnsupported, before any name is resolved.
+// with their bind errors (D4, D5). A cast to a type antb1 has no type for is kUnsupported before
+// any name is resolved; one to a type it has is bound (ADR 0037's CT1), and kUnsupported there
+// unless it is an identity, an exact widening or a constant the type holds.
 INSTANTIATE_TEST_SUITE_P(
     Casts, BindErrorTest,
     ::testing::Values(
@@ -641,46 +643,53 @@ INSTANTIATE_TEST_SUITE_P(
                   "TRY_CAST is not supported"},
         ErrorCase{"SELECT try_cast(lower(nope) AS INT) FROM t", kUnsupported, "try_cast",
                   "TRY_CAST is not supported"},
-        ErrorCase{"SELECT CAST(i16 AS BIGINT) FROM t", kUnsupported, "BIGINT",
-                  "CAST to BIGINT is not supported (only a string literal cast to DATE is)"},
-        ErrorCase{"SELECT nope::varchar FROM t", kUnsupported, "varchar",
-                  "CAST to VARCHAR is not supported"},
-        ErrorCase{"SELECT CAST(h AS decimal(15,2)) FROM t", kUnsupported, "decimal(15,2)",
-                  "CAST to DECIMAL(15, 2) is not supported"},
+        ErrorCase{"SELECT CAST(i16 AS FLOAT) FROM t", kUnsupported, "FLOAT",
+                  "CAST to FLOAT is not supported"},
+        ErrorCase{"SELECT CAST(nope AS INTERVAL) FROM t", kUnsupported, "INTERVAL",
+                  "CAST to INTERVAL is not supported"},
+        ErrorCase{"SELECT nope::varchar FROM t", kBind, "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT CAST(h AS decimal(15,2)) FROM t", kUnsupported,
+                  "CAST(h AS decimal(15,2))",
+                  "CAST of DECIMAL(38,0) values to DECIMAL(15,2) is not supported"},
+        ErrorCase{"SELECT CAST(i16 AS DECIMAL(40, 2)) FROM t", kBind, "DECIMAL(40, 2)",
+                  "DECIMAL type width must be between 1 and 38"},
+        ErrorCase{"SELECT CAST(i16 AS DECIMAL(4, 5)) FROM t", kBind, "DECIMAL(4, 5)",
+                  "DECIMAL type scale cannot be greater than width"},
         ErrorCase{"SELECT CAST('2013-07-01' AS DATE(3)) FROM t", kUnsupported, "DATE(3)",
                   "CAST to DATE(3) is not supported"},
-        ErrorCase{"SELECT CAST(dt AS DATE) FROM t", kUnsupported, "dt",
-                  "CAST to DATE is only supported for a string literal ('YYYY-MM-DD')"},
-        ErrorCase{"SELECT CAST(DATE '2013-07-01' AS DATE) FROM t", kUnsupported,
-                  "DATE '2013-07-01'", "CAST to DATE is only supported for a string literal"},
-        ErrorCase{"SELECT '2013-07-01'::DATE::DATE FROM t", kUnsupported, "'2013-07-01'::DATE",
-                  "CAST to DATE is only supported for a string literal"},
-        ErrorCase{"SELECT CAST(20130701 AS DATE) FROM t", kUnsupported, "20130701",
-                  "CAST to DATE is only supported for a string literal"},
+        ErrorCase{"SELECT CAST(20130701 AS DATE) FROM t", kUnsupported, "CAST(20130701 AS DATE)",
+                  "CAST of INTEGER values to DATE is not supported"},
+        ErrorCase{"SELECT CAST(70000 AS SMALLINT) FROM t", kUnsupported, "CAST(70000 AS SMALLINT)",
+                  "CAST of INTEGER values to SMALLINT is not supported"},
+        ErrorCase{"SELECT CAST(1.25 AS DECIMAL(5,1)) FROM t", kUnsupported,
+                  "CAST(1.25 AS DECIMAL(5,1))",
+                  "CAST of DECIMAL(3,2) values to DECIMAL(5,1) is not supported"},
         ErrorCase{"SELECT CAST(lower(s) AS INT) FROM t", kUnsupported, "lower",
                   "function lower() is not supported"},
         ErrorCase{"SELECT (i16 = 1)::VARCHAR FROM t", kUnsupported, "=",
                   "comparisons are only supported in conditions"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
-                  "VARCHAR", "CAST to VARCHAR is not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS BOOLEAN)", kUnsupported, "BOOLEAN",
-                  "CAST to BOOLEAN is not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "INT",
-                  "CAST to INT is not supported"},
-        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported, "VARCHAR",
-                  "CAST to VARCHAR is not supported"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kUnsupported, "INT",
-                  "CAST to INT is not supported"},
-        ErrorCase{"SELECT i16 FROM t ORDER BY CAST(i16 AS BIGINT) DESC", kUnsupported, "BIGINT",
-                  "CAST to BIGINT is not supported"},
-        ErrorCase{"SELECT SUM(i16::BIGINT) FROM t", kUnsupported, "BIGINT",
-                  "CAST to BIGINT is not supported"},
+                  "CAST(i16 AS VARCHAR)", "CAST of SMALLINT values to VARCHAR is not supported"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "2::INT",
+                  "only literals and constant integer expressions are supported in an IN list"},
+        ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported,
+                  "'x%'::VARCHAR", "LIKE with a column or an aggregate as the pattern"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kBind, "i16",
+                  "must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY CAST(i16 AS SMALLINT)", kBind, "i16",
+                  "must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT CAST(i16 AS SMALLINT) AS z, i16 FROM t GROUP BY z", kBind, "i16",
+                  "must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT CAST(1e3 AS DOUBLE) FROM t", kUnsupported, "CAST(1e3 AS DOUBLE)",
+                  "CAST of the number 1e3 to DOUBLE is not supported"},
+        ErrorCase{"SELECT CAST('2020-1-2' AS TIMESTAMP) FROM t", kBind, "'2020-1-2'",
+                  "invalid timestamp '2020-1-2'"},
+        ErrorCase{"SELECT CAST(2147483647 + 1 AS BIGINT) FROM t", kBind, "2147483647 + 1",
+                  "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT COUNT(*) FROM t GROUP BY i16 HAVING SUM(i16)::BIGINT > 1", kUnsupported,
-                  "BIGINT", "CAST to BIGINT is not supported"},
-        ErrorCase{"SELECT CASE WHEN i16 = 1 THEN CAST(i16 AS INT) END FROM t", kUnsupported, "INT",
-                  "CAST to INT is not supported"},
+                  "SUM(i16)::BIGINT", "CAST of HUGEINT values to BIGINT is not supported"},
         ErrorCase{"SELECT EXTRACT(year FROM CAST(i64 AS TIMESTAMP)) FROM t", kUnsupported,
-                  "TIMESTAMP", "CAST to TIMESTAMP is not supported"},
+                  "CAST(i64 AS TIMESTAMP)", "CAST of BIGINT values to TIMESTAMP is not supported"},
         ErrorCase{"SELECT date_trunc('day'::VARCHAR, dt) FROM t", kUnsupported, "'day'::VARCHAR",
                   "the unit of date_trunc() must be a string literal"},
         // A call with the wrong number of arguments is a bind error whatever its arguments
@@ -1546,6 +1555,84 @@ TEST(BinderTest, CoalesceTypesItsArgumentsAsCaseDoes) {
     ASSERT_NE(detail, nullptr) << sql;
     EXPECT_EQ(detail->kind(), kind) << sql << ": " << plan.status().ToString();
     EXPECT_TRUE(plan.status().message().contains(message)) << plan.status().ToString();
+  }
+}
+
+// CAST (ADR 0037's CT1): an identity keeps the value, an exact widening is a CastExpr, a constant
+// the type holds exactly folds into a constant of it; named as DuckDB names a cast, whatever alias
+// of the type was written.
+TEST(BinderTest, CastsThatChangeNoValue) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view expr;
+    LogicalType type;
+    std::string_view name;
+    std::size_t node;  // the variant index of the bound expression
+  };
+  const std::size_t constant_node = Expr{.node = ConstantExpr{}}.node.index();
+  const std::size_t cast_node = Expr{.node = CastExpr{}}.node.index();
+  for (const Case& c : {
+           Case{.expr = "CAST(dt AS DATE)",
+                .type = LogicalType::kDate,
+                .name = "CAST(dt AS \"DATE\")",
+                .node = cast_node},
+           Case{.expr = "i16::INT",
+                .type = LogicalType::kInteger,
+                .name = "CAST(i16 AS INTEGER)",
+                .node = cast_node},
+           Case{.expr = "CAST(i32 AS NUMERIC(12,2))",
+                .type = LogicalType::Decimal(12, 2),
+                .name = "CAST(i32 AS DECIMAL(12, 2))",
+                .node = cast_node},
+           Case{.expr = "CAST(u16 AS INT8)",
+                .type = LogicalType::kBigInt,
+                .name = "CAST(u16 AS BIGINT)",
+                .node = cast_node},
+           Case{.expr = "CAST(d AS FLOAT8)",
+                .type = LogicalType::kDouble,
+                .name = "CAST(d AS \"DOUBLE\")",
+                .node = cast_node},
+           Case{.expr = "CAST(0 AS DECIMAL(7,2))",
+                .type = LogicalType::Decimal(7, 2),
+                .name = "CAST(0 AS DECIMAL(7, 2))",
+                .node = constant_node},
+           Case{.expr = "CAST(-1.5 AS DECIMAL)",
+                .type = LogicalType::Decimal(18, 3),
+                .name = "CAST(-1.5 AS DECIMAL)",
+                .node = constant_node},
+           Case{.expr = "CAST(2.0 AS SMALLINT)",
+                .type = LogicalType::kSmallInt,
+                .name = "CAST(2.0 AS SMALLINT)",
+                .node = constant_node},
+           Case{.expr = "CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))",
+                .type = LogicalType::Decimal(38, 0),
+                .name = "CAST(99999999999999999999999999999999999999 AS DECIMAL(38, 0))",
+                .node = constant_node},
+           Case{.expr = "CAST(3 AS DOUBLE)",
+                .type = LogicalType::kDouble,
+                .name = "CAST(3 AS \"DOUBLE\")",
+                .node = constant_node},
+           Case{.expr = "CAST('x' AS TEXT)",
+                .type = LogicalType::kVarchar,
+                .name = "CAST('x' AS VARCHAR)",
+                .node = constant_node},
+           Case{.expr = "CAST('2020-01-02 03:04:05' AS DATETIME)",
+                .type = LogicalType::kTimestamp,
+                .name = "CAST('2020-01-02 03:04:05' AS TIMESTAMP)",
+                .node = constant_node},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.expr) + " FROM t";
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(ToString(plan->output[0].type), ToString(c.type)) << sql;
+    EXPECT_EQ(plan->output[0].name, c.name) << sql;
+    EXPECT_FALSE(plan->output[0].stored_as_float) << sql;
+    const auto* project = std::get_if<ProjectNode>(plan->root.get());
+    ASSERT_NE(project, nullptr) << Explain(*plan);
+    const auto* compute = std::get_if<ComputeNode>(project->input.get());
+    ASSERT_NE(compute, nullptr) << sql << "\n" << Explain(*plan);
+    ASSERT_EQ(compute->exprs.size(), 1U) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(compute->exprs[0]->node.index(), c.node) << sql << "\n" << Explain(*plan);
   }
 }
 
