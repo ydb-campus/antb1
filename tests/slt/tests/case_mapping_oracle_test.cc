@@ -5,8 +5,10 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <gtest/gtest.h>
@@ -47,10 +49,11 @@ TEST(CaseMappingOracle, MatchesDuckDbOnEveryCodepoint) {
 
   // Only the codepoints DuckDB changes come back; every other one must stay as it is.
   for (const bool upper : {true, false}) {
-    const std::string function = upper ? "upper" : "lower";
+    const std::string_view function = upper ? "upper" : "lower";
     auto result = (*duckdb)->Execute(
-        "SELECT r::VARCHAR, " + function + "(chr(r::INTEGER)) FROM range(1, 1114112) t(r) " +
-        "WHERE (r < 55296 OR r > 57343) AND " + function + "(chr(r::INTEGER)) <> chr(r::INTEGER)");
+        std::format("SELECT r::VARCHAR, {0}(chr(r::INTEGER)) FROM range(1, 1114112) t(r) "
+                    "WHERE (r < 55296 OR r > 57343) AND {0}(chr(r::INTEGER)) <> chr(r::INTEGER)",
+                    function));
     ASSERT_TRUE(result.has_value()) << result.error().message;
     std::map<char32_t, std::string> changed;
     for (const auto& row : result->rows) {

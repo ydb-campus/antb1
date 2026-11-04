@@ -720,43 +720,45 @@ TEST_F(ComputeTest, UpperAndLowerMapCodepointsAsDuckDb) {
   using Values = std::vector<std::optional<std::string>>;
   // U+00DF (2 bytes) upper-cases to U+1E9E (3 bytes), U+017F (2 bytes) to 'S'; the Kelvin sign
   // U+212A (3 bytes) lower-cases to 'k'.
-  const auto text =
-      testing::Strings({"Stra\xC3\x9F"
-                        "e",
-                        std::nullopt, "", "\xC5\xBF\xE2\x84\xAA", "a\xC3\xA9\xFF", "\xC0\xAF",
-                        "\xED\xA0\x80", "ab\xC3",
-                        "\x80"
-                        "A",
-                        "\xF4\x90\x80\x80"});
+  const auto text = testing::Strings({"Stra\xC3\x9F\x65", std::nullopt, "", "\xC5\xBF\xE2\x84\xAA",
+                                      "a\xC3\xA9\xFF", "\xC0\xAF", "\xED\xA0\x80", "ab\xC3",
+                                      "\x80\x41", "\xF4\x90\x80\x80"});
   const auto call = [&](plan::Function function) {
     return Eval(Call(function, {ColumnAt(0, LogicalType::kVarchar)}, LogicalType::kVarchar),
                 {text});
   };
   // Rows 4 to 9 are no UTF-8: an invalid byte after a valid prefix, an overlong '/', a surrogate, a
   // cut-off sequence, a stray continuation byte and a codepoint past U+10FFFF.
-  const Values invalid{"a\xC3\xA9\xFF",
-                       "\xC0\xAF",
-                       "\xED\xA0\x80",
-                       "ab\xC3",
-                       "\x80"
-                       "A",
-                       "\xF4\x90\x80\x80"};
+  const Values invalid{"a\xC3\xA9\xFF", "\xC0\xAF", "\xED\xA0\x80",
+                       "ab\xC3",        "\x80\x41", "\xF4\x90\x80\x80"};
   auto upper = call(plan::Function::kUpper);
   ASSERT_TRUE(upper.ok()) << upper.status().ToString();
-  Values expected{
-      "STRA\xE1\xBA\x9E"
-      "E",
-      std::nullopt, "", "S\xE2\x84\xAA"};
+  Values expected{"STRA\xE1\xBA\x9E\x45", std::nullopt, "", "S\xE2\x84\xAA"};
   expected.insert(expected.end(), invalid.begin(), invalid.end());
   EXPECT_EQ(values(*upper), expected);
   auto lower = call(plan::Function::kLower);
   ASSERT_TRUE(lower.ok()) << lower.status().ToString();
-  expected = {
-      "stra\xC3\x9F"
-      "e",
-      std::nullopt, "", "\xC5\xBFk"};
+  expected = {"stra\xC3\x9F\x65", std::nullopt, "", "\xC5\xBFk"};
   expected.insert(expected.end(), invalid.begin(), invalid.end());
   EXPECT_EQ(values(*lower), expected);
+  // A batch of ASCII bytes only maps its data buffer in one pass and keeps the input's offsets and
+  // validity; so does a slice of one, whose offsets do not start at 0.
+  const auto ascii = testing::Strings({"skip", "MiXed 1-z", std::nullopt, "", "@[`{"});
+  for (const auto& [input, upper_case] :
+       {std::pair{ascii, Values{"SKIP", "MIXED 1-Z", std::nullopt, "", "@[`{"}},
+        std::pair{ascii->Slice(1), Values{"MIXED 1-Z", std::nullopt, "", "@[`{"}}}) {
+    auto up = Eval(
+        Call(plan::Function::kUpper, {ColumnAt(0, LogicalType::kVarchar)}, LogicalType::kVarchar),
+        {input});
+    ASSERT_TRUE(up.ok()) << up.status().ToString();
+    EXPECT_EQ(values(*up), upper_case);
+    EXPECT_EQ((*up)->data()->buffers[1], input->data()->buffers[1]) << "the offsets are shared";
+    auto down = Eval(
+        Call(plan::Function::kLower, {ColumnAt(0, LogicalType::kVarchar)}, LogicalType::kVarchar),
+        {input});
+    ASSERT_TRUE(down.ok()) << down.status().ToString();
+    EXPECT_EQ(values(*down)[0], input->length() == 5 ? "skip" : "mixed 1-z");
+  }
 }
 
 // strlen counts bytes; regexp_replace replaces the first match with RE2 in UTF-8 mode (`.` is one
