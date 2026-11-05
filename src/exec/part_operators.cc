@@ -265,6 +265,76 @@ bool PartKeepsFirstKeys(const std::vector<plan::BoundColumn>& keys) {
 
 }  // namespace
 
+// ---- PartGrouper ----
+
+arrow::Result<PartGrouper> PartGrouper::Make(const std::vector<plan::BoundColumn>& keys,
+                                             const std::vector<plan::AggregateCall>& aggregates,
+                                             int input_width, const ExecContext& part_ctx) {
+  PartGrouper grouper;
+  grouper.groups_ = std::make_shared<PartGroups>();
+  ARROW_ASSIGN_OR_RAISE(grouper.groups_->table,
+                        GroupTable::Make(keys, aggregates, input_width, part_ctx.pool,
+                                         part_ctx.budget, PartKeepsFirstKeys(keys)));
+  grouper.decide_after_ = std::min<int64_t>(kRouteDecisionRows, part_ctx.batch_size);
+  grouper.decided_ = !MayRouteRows(keys, aggregates);
+  return grouper;
+}
+
+arrow::Status PartGrouper::Add(const arrow::RecordBatch& rows, ProfileNode* profile) {
+  GroupTable& table = *groups_->table;
+  if (route_) {
+    // Routed rows are Arrow buffers of the query's pool: the budget counts them.
+    const ProfileTimer routing(profile, "routed_path");
+    ARROW_ASSIGN_OR_RAISE(auto split, table.RouteRows(rows));
+    for (std::size_t p = 0; p < split.size(); ++p) {
+      if (split[p]->num_rows() > 0) {
+        groups_->rows[p].push_back(std::move(split[p]));
+      }
+    }
+    routed_ += rows.num_rows();
+    return arrow::Status::OK();
+  }
+  {
+    const ProfileTimer local(profile, "local_path");
+    ARROW_RETURN_NOT_OK(table.Consume(rows));
+  }
+  consumed_ += rows.num_rows();
+  // A part that reduces less than 4 to 1 would insert most of its groups twice (its table, then the
+  // partition's), which costs more than inserting its rows once in the partitions. The decision
+  // waits for enough rows (a selective filter can leave a batch a few rows, which never reduce),
+  // and is made once, from the part's data alone.
+  if (!decided_ && consumed_ >= decide_after_) {
+    decided_ = true;
+    if (int64_t{table.num_groups()} * 4 > consumed_) {
+      route_ = true;
+      groups_->rows.resize(GroupTable::kPartitions);
+    }
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* profile) {
+  GroupTable& table = *groups_->table;
+  {
+    const ProfileTimer partitioning(profile, "local_path");
+    ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
+  }
+  if (profile != nullptr) {
+    // What the local path bought: the rows the parts aggregated themselves and the groups they
+    // came to, so the reduction the routing rule tests can be read off rather than inferred from
+    // the group count. With local_path and routed_path -- each path's whole cost across both the
+    // workers and the lanes, summed over threads -- this says which path a query should have
+    // taken and why, which no single-threaded benchmark of the tables can show.
+    profile->Add("local_rows", MetricUnit::kCount, consumed_);
+    profile->Add("local_groups", MetricUnit::kCount, table.num_groups());
+    if (routed_ > 0) {
+      profile->Add("raw_parts", MetricUnit::kCount, 1);
+      profile->Add("raw_rows", MetricUnit::kCount, routed_);
+    }
+  }
+  return std::move(groups_);
+}
+
 // ---- PartGroupAggregateOperator ----
 
 PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts,
@@ -296,73 +366,18 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   merged_ = false;
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
-               aggregates = aggregates_, width = input_width_, profile = profile(),
-               may_route = MayRouteRows(keys_, aggregates_)](
+               aggregates = aggregates_, width = input_width_, profile = profile()](
                   int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
-    auto groups = std::make_shared<PartGroups>();
-    ARROW_ASSIGN_OR_RAISE(groups->table,
-                          GroupTable::Make(keys, aggregates, width, part_ctx.pool, part_ctx.budget,
-                                           PartKeepsFirstKeys(keys)));
-    GroupTable& table = *groups->table;
-    // After its first kRouteDecisionRows rows (or batch), a part whose groups are more than 1/4 of
-    // its rows stops aggregating on its own: its other rows go straight to the partitions. A part
-    // that reduces less than 4 to 1 would insert most of its groups twice (its table, then the
-    // partition's), which costs more than inserting its rows once in the partitions. The decision
-    // waits for enough rows (a selective filter can leave a batch a few rows, which never reduce),
-    // and is made once, from the part's data alone.
-    const int64_t decide_after = std::min<int64_t>(kRouteDecisionRows, part_ctx.batch_size);
-    bool decided = !may_route;
-    int64_t consumed = 0;
-    bool route = false;
-    int64_t routed = 0;
+    ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
+                          PartGrouper::Make(keys, aggregates, width, part_ctx));
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
           ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
-          if (route) {
-            // Routed rows are Arrow buffers of the query's pool: the budget counts them.
-            const ProfileTimer routing(profile, "routed_path");
-            ARROW_ASSIGN_OR_RAISE(auto split, table.RouteRows(*rows));
-            for (std::size_t p = 0; p < split.size(); ++p) {
-              if (split[p]->num_rows() > 0) {
-                groups->rows[p].push_back(std::move(split[p]));
-              }
-            }
-            routed += rows->num_rows();
-            return true;
-          }
-          {
-            const ProfileTimer local(profile, "local_path");
-            ARROW_RETURN_NOT_OK(table.Consume(*rows));
-          }
-          consumed += rows->num_rows();
-          if (!decided && consumed >= decide_after) {
-            decided = true;
-            if (int64_t{table.num_groups()} * 4 > consumed) {
-              route = true;
-              groups->rows.resize(GroupTable::kPartitions);
-            }
-          }
+          ARROW_RETURN_NOT_OK(grouper.Add(*rows, profile));
           return true;
         }));
-    {
-      const ProfileTimer partitioning(profile, "local_path");
-      ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
-    }
-    if (profile != nullptr) {
-      // What the local path bought: the rows the parts aggregated themselves and the groups they
-      // came to, so the reduction the routing rule tests can be read off rather than inferred from
-      // the group count. With local_path and routed_path -- each path's whole cost across both the
-      // workers and the lanes, summed over threads -- this says which path a query should have
-      // taken and why, which no single-threaded benchmark of the tables can show.
-      profile->Add("local_rows", MetricUnit::kCount, consumed);
-      profile->Add("local_groups", MetricUnit::kCount, table.num_groups());
-      if (routed > 0) {
-        profile->Add("raw_parts", MetricUnit::kCount, 1);
-        profile->Add("raw_rows", MetricUnit::kCount, routed);
-      }
-    }
-    return groups;
+    return grouper.Finish(profile);
   };
   // The lanes take window_ as their max_pending (Merge): one value bounds the parts ahead of the
   // consumer and the parts it has handed on, so that neither can change without the other.
@@ -527,6 +542,389 @@ arrow::Status PartGroupAggregateOperator::Close() {
   rows_.clear();
   next_table_ = 0;
   next_chunk_ = 0;
+  built_ = 0;
+  opened_ = false;
+  return arrow::Status::OK();
+}
+
+// ---- PartGroupingSetsOperator ----
+
+PartGroupingSetsOperator::PartGroupingSetsOperator(
+    PartPipeline pipeline, int64_t num_parts, int input_width, std::vector<plan::BoundColumn> keys,
+    const std::vector<std::vector<std::size_t>>& sets, std::vector<plan::AggregateCall> aggregates,
+    const std::vector<plan::GroupingCall>& grouping, bool per_set)
+    : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
+      num_parts_(num_parts),
+      input_width_(input_width),
+      keys_(std::move(keys)),
+      aggregates_(std::move(aggregates)),
+      shape_(std::make_unique<GroupingSetsShape>(
+          PlanGroupingSets(sets, !per_set && MergesExactly(keys_, aggregates_)))),
+      schema_(GroupingSetsSchema(keys_, aggregates_, grouping.size())) {
+  for (std::size_t s = 0; s < shape_->sets.size(); ++s) {
+    if (shape_->root(s)) {
+      roots_.push_back(s);
+    }
+    set_schemas_.push_back(SetSchema(keys_, shape_->sets[s], aggregates_));
+    grouping_.push_back(GroupingValues(shape_->sets[s], grouping));
+  }
+}
+
+PartGroupingSetsOperator::~PartGroupingSetsOperator() = default;
+
+arrow::Status PartGroupingSetsOperator::Open(ExecContext& ctx) {
+  ARROW_RETURN_NOT_OK(Close());
+  pool_ = ctx.pool;
+  budget_ = ctx.budget;
+  executor_ = ctx.executor;
+  window_ = MergeWindow(ctx);
+  threads_ = ctx.executor == nullptr ? 1 : static_cast<std::size_t>(std::max(ctx.threads, 1));
+  merged_ = false;
+  opened_ = true;
+  std::vector<std::vector<plan::BoundColumn>> root_keys;
+  root_keys.reserve(roots_.size());
+  for (const std::size_t r : roots_) {
+    root_keys.push_back(SetKeys(keys_, shape_->sets[r]));
+  }
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys_of = std::move(root_keys),
+               aggregates = aggregates_, width = input_width_, profile = profile()](
+                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartRoots> {
+    const ProfileTimer part_time(profile, "part_time");
+    std::vector<PartGrouper> groupers;
+    groupers.reserve(keys_of.size());
+    for (const std::vector<plan::BoundColumn>& keys : keys_of) {
+      ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
+                            PartGrouper::Make(keys, aggregates, width, part_ctx));
+      groupers.push_back(std::move(grouper));
+    }
+    ARROW_RETURN_NOT_OK(
+        RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
+          ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
+          for (PartGrouper& grouper : groupers) {
+            ARROW_RETURN_NOT_OK(grouper.Add(*rows, profile));
+          }
+          return true;
+        }));
+    auto roots = std::make_shared<std::vector<std::shared_ptr<PartGroups>>>();
+    roots->reserve(groupers.size());
+    for (PartGrouper& grouper : groupers) {
+      ARROW_ASSIGN_OR_RAISE(auto groups, grouper.Finish(profile));
+      roots->push_back(std::move(groups));
+    }
+    return roots;
+  };
+  scheduler_ = std::make_unique<PartScheduler<PartRoots>>(num_parts_, std::move(task), ctx.executor,
+                                                          window_, ctx.budget);
+  return arrow::Status::OK();
+}
+
+arrow::Status PartGroupingSetsOperator::Merge() {
+  // Every root's partitions, made before the first part so that a run over no parts has them: a
+  // table without keys has one partition (GroupTable::Partition), any other kPartitions.
+  tables_.clear();
+  tables_.resize(shape_->sets.size());
+  std::size_t lanes_count = 1;
+  for (const std::size_t r : roots_) {
+    const std::size_t partitions = shape_->sets[r].empty() ? 1 : GroupTable::kPartitions;
+    lanes_count = std::max(lanes_count, partitions);
+    for (std::size_t p = 0; p < partitions; ++p) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto table, GroupTable::Make(SetKeys(keys_, shape_->sets[r]), aggregates_, input_width_,
+                                       pool_, budget_));
+      tables_[r].push_back(std::move(table));
+    }
+  }
+  // Partitions are disjoint: each merges the parts in part order in its own lane, every root's
+  // partition p in lane p.
+  PartitionLanes lanes(lanes_count, executor_, window_, budget_);
+  scheduler_->set_before_retry([&lanes] { lanes.Wait(); });
+  arrow::Status status;
+  for (int64_t index = 0; !scheduler_->done(); ++index) {
+    arrow::Result<PartRoots> part = [&] {
+      const ProfileTimer wait(profile(), "wait");
+      return scheduler_->Next();
+    }();
+    if (!part.ok()) {
+      status = part.status();
+      break;
+    }
+    for (std::size_t i = 0; i < roots_.size(); ++i) {
+      ANTB1_CHECK((**part)[i]->table->num_partitions() == tables_[roots_[i]].size());
+    }
+    status = lanes.Add(index, [this, roots = *std::move(part)](std::size_t p) -> arrow::Status {
+      for (std::size_t i = 0; i < roots_.size(); ++i) {
+        std::vector<std::unique_ptr<GroupTable>>& tables = tables_[roots_[i]];
+        if (p >= tables.size()) {
+          continue;
+        }
+        const PartGroups& groups = *(*roots)[i];
+        {
+          const ProfileTimer merging(profile(), "local_path");
+          ARROW_RETURN_NOT_OK(tables[p]->MergePartition(*groups.table, p));
+        }
+        if (p < groups.rows.size()) {  // the part's other rows, after its first batch's groups
+          const ProfileTimer merging(profile(), "routed_path");
+          for (const auto& rows : groups.rows[p]) {
+            ARROW_RETURN_NOT_OK(tables[p]->Consume(*rows));
+          }
+        }
+      }
+      return arrow::Status::OK();
+    });
+    if (!status.ok()) {
+      break;
+    }
+  }
+  scheduler_->set_before_retry(nullptr);
+  // A merge failure is of an earlier part than any failure of the scheduler seen after it.
+  {
+    const ProfileTimer tail(profile(), "lanes_tail");  // merging after the last part came
+    ARROW_RETURN_NOT_OK(lanes.Finish());
+  }
+  return status;
+}
+
+arrow::Status PartGroupingSetsOperator::Derive() {
+  const GroupingSetsShape& shape = *shape_;
+  const std::size_t sets = shape.sets.size();
+  std::size_t partitions = 1;
+  for (const std::size_t r : roots_) {
+    partitions = std::max(partitions, tables_[r].size());
+  }
+  // All of a root partition's groups, as MergeProjected takes them.
+  const auto every = [](const GroupTable& table) {
+    std::vector<std::uint32_t> groups(table.num_groups());
+    std::ranges::iota(groups, 0U);
+    return groups;
+  };
+  // The projected keys of a root partition's groups, or a batch of no columns for the empty set.
+  const auto projected = [&](const std::optional<arrow::compute::ExecBatch>& uniques,
+                             std::size_t set, std::size_t groups) {
+    return uniques.has_value() ? ProjectKeys(*uniques, shape.columns[set])
+                               : arrow::compute::ExecBatch({}, static_cast<int64_t>(groups));
+  };
+  // Every other set is merged in one of two ways, decided per set from the root's largest partition
+  // (a pure function of the data, so the same on any number of threads). Where a partition's groups
+  // reduce at least 4 to 1 by the set's keys (always for the empty set), each partition first
+  // merges them into a table of its own, partitioned by the set's keys, whose partitions the final
+  // tables then gather: two merges, but the second over few groups. Otherwise each partition only
+  // splits its groups by the hash of the set's keys and the final tables merge them straight from
+  // the root's, once: a set about as fine as its root gains nothing from a first merge, which would
+  // insert every group twice (the RU2 update of ADR 0038).
+  std::vector<std::uint8_t> reduce(sets, 1);  // not vector<bool>: the probes write it in parallel
+  std::vector<std::vector<std::unique_ptr<GroupTable>>> partial(sets);
+  std::vector<std::vector<std::optional<KeyBuckets>>> buckets(sets);
+  std::vector<std::size_t> probes;  // the other sets whose way the probe decides
+  for (std::size_t s = 0; s < sets; ++s) {
+    if (!shape.root(s)) {
+      partial[s].resize(tables_[shape.sources[s]].size());
+      buckets[s].resize(tables_[shape.sources[s]].size());
+      if (!shape.sets[s].empty()) {
+        probes.push_back(s);
+      }
+    }
+  }
+  std::vector<std::size_t> largest(sets, 0);  // per root: its largest partition
+  std::vector<std::optional<arrow::compute::ExecBatch>> probe_keys(sets);
+  for (const std::size_t r : roots_) {
+    for (std::size_t p = 1; p < tables_[r].size(); ++p) {
+      if (tables_[r][p]->num_groups() > tables_[r][largest[r]]->num_groups()) {
+        largest[r] = p;
+      }
+    }
+    if (!shape.sets[r].empty() && tables_[r][largest[r]]->num_groups() > 0 &&
+        std::ranges::any_of(probes, [&](std::size_t s) { return shape.sources[s] == r; })) {
+      ARROW_ASSIGN_OR_RAISE(probe_keys[r], tables_[r][largest[r]]->uniques());
+    }
+  }
+  ARROW_RETURN_NOT_OK(ForEach(executor_, probes.size(), [&](std::size_t i) -> arrow::Status {
+    const std::size_t s = probes[i];
+    const std::size_t r = shape.sources[s];
+    const GroupTable& root = *tables_[r][largest[r]];
+    if (root.num_groups() == 0) {
+      return arrow::Status::OK();  // no groups: either way merges nothing
+    }
+    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_,
+                                                       input_width_, pool_, budget_));
+    ARROW_RETURN_NOT_OK(
+        table->MergeProjected(root, projected(probe_keys[r], s, root.num_groups()), every(root)));
+    reduce[s] = int64_t{table->num_groups()} * 4 <= int64_t{root.num_groups()} ? 1 : 0;
+    if (reduce[s] != 0) {
+      ARROW_RETURN_NOT_OK(table->Partition());
+      partial[s][largest[r]] = std::move(table);  // the probe is that partition's first merge
+    }
+    return arrow::Status::OK();
+  }));
+  probe_keys.clear();
+  if (profile() != nullptr) {
+    profile()->Add("direct_sets", MetricUnit::kCount,
+                   std::ranges::count_if(probes, [&](std::size_t s) { return reduce[s] == 0; }));
+  }
+  // (a) Per partition of the roots, in parallel: each other set's first merge, or its split.
+  ARROW_RETURN_NOT_OK(ForEach(executor_, partitions, [&](std::size_t p) -> arrow::Status {
+    for (const std::size_t r : roots_) {
+      if (p >= tables_[r].size() || tables_[r][p]->num_groups() == 0) {
+        continue;
+      }
+      const GroupTable& root = *tables_[r][p];
+      std::optional<arrow::compute::ExecBatch> uniques;
+      for (std::size_t s = 0; s < sets; ++s) {
+        if (shape.root(s) || shape.sources[s] != r || partial[s][p] != nullptr) {
+          continue;
+        }
+        if (!uniques.has_value() && !shape.sets[r].empty()) {
+          ARROW_ASSIGN_OR_RAISE(uniques, root.uniques());
+        }
+        if (reduce[s] == 0) {
+          ARROW_ASSIGN_OR_RAISE(buckets[s][p], SplitByKeys(projected(uniques, s, root.num_groups()),
+                                                           GroupTable::kPartitions, pool_));
+          continue;
+        }
+        ARROW_ASSIGN_OR_RAISE(
+            auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_,
+                                         pool_, budget_));
+        ARROW_RETURN_NOT_OK(
+            table->MergeProjected(root, projected(uniques, s, root.num_groups()), every(root)));
+        ARROW_RETURN_NOT_OK(table->Partition());
+        partial[s][p] = std::move(table);
+      }
+    }
+    return arrow::Status::OK();
+  }));
+  // (b) The barrier: every partition is merged or split. (c) Per other set and partition of its own
+  // keys, in parallel: the final table gathers that partition from every root partition, in order.
+  struct Final {
+    std::size_t set = 0;
+    std::size_t partition = 0;
+  };
+  std::vector<Final> finals;
+  for (std::size_t s = 0; s < sets; ++s) {
+    if (shape.root(s)) {
+      continue;
+    }
+    const std::size_t own = shape.sets[s].empty() ? 1 : GroupTable::kPartitions;
+    tables_[s].resize(own);
+    for (std::size_t q = 0; q < own; ++q) {
+      finals.push_back(Final{.set = s, .partition = q});
+    }
+  }
+  ARROW_RETURN_NOT_OK(ForEach(executor_, finals.size(), [&](std::size_t i) -> arrow::Status {
+    const auto [s, q] = finals[i];
+    const std::vector<std::unique_ptr<GroupTable>>& roots = tables_[shape.sources[s]];
+    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_,
+                                                       input_width_, pool_, budget_));
+    for (std::size_t p = 0; p < roots.size(); ++p) {
+      if (partial[s][p] != nullptr) {
+        ARROW_RETURN_NOT_OK(table->MergePartition(*partial[s][p], q));
+      } else if (buckets[s][p].has_value()) {
+        ARROW_RETURN_NOT_OK(
+            table->MergeProjected(*roots[p], buckets[s][p]->keys[q], buckets[s][p]->rows[q]));
+      }
+    }
+    tables_[s][q] = std::move(table);
+    return arrow::Status::OK();
+  }));
+  return arrow::Status::OK();
+}
+
+arrow::Status PartGroupingSetsOperator::Prepare() {
+  const GroupingSetsShape& shape = *shape_;
+  ARROW_RETURN_NOT_OK(Merge());
+  merged_ = true;
+  scheduler_.reset();
+  PartsDone();
+  {
+    const ProfileTimer derive(profile(), "derive");
+    ARROW_RETURN_NOT_OK(Derive());
+  }
+  int64_t groups = 0;
+  for (std::size_t s = 0; s < shape.sets.size(); ++s) {
+    if (shape.sets[s].empty()) {
+      ARROW_RETURN_NOT_OK(tables_[s].front()->EnsureGroup());  // a row even over no input
+    }
+    // Every set's finalize errors before the first row, which a LIMIT may stop before.
+    for (const auto& table : tables_[s]) {
+      ARROW_RETURN_NOT_OK(table->CheckFinalize());
+      groups += table->num_groups();
+    }
+  }
+  if (profile() != nullptr) {
+    profile()->Add("groups", MetricUnit::kCount, groups);
+  }
+  rows_.assign(shape.sets.size(), {});
+  emitted_.assign(shape.sets.size(), false);
+  return arrow::Status::OK();
+}
+
+arrow::Result<Batch> PartGroupingSetsOperator::Next() {
+  if (!opened_) {
+    return arrow::Status::Invalid("part grouping sets: Next() before Open() or after Close()");
+  }
+  const GroupingSetsShape& shape = *shape_;
+  if (!merged_) {
+    // A failure leaves the operator closed: its tables are not all made, so a later Next() fails
+    // rather than read them.
+    if (auto status = Prepare(); !status.ok()) {
+      opened_ = false;
+      return status;
+    }
+  }
+  for (; next_entry_ < shape.entries.size();
+       ++next_entry_, next_partition_ = 0, next_batch_ = 0, built_ = 0) {
+    const std::size_t s = shape.entries[next_entry_];
+    if (!emitted_[s] && rows_[s].empty()) {
+      rows_[s].resize(tables_[s].size());
+    }
+    for (; next_partition_ < rows_[s].size(); ++next_partition_, next_batch_ = 0) {
+      if (!emitted_[s] && next_partition_ == built_) {
+        const ProfileTimer build(profile(), "build");
+        ARROW_RETURN_NOT_OK(BuildRows(s));
+      }
+      std::vector<std::shared_ptr<arrow::RecordBatch>>& rows = rows_[s][next_partition_];
+      if (next_batch_ < rows.size()) {
+        return Batch{.data = rows[next_batch_++], .selection = {}};
+      }
+      if (shape.last_entries[s] == next_entry_) {
+        rows = {};  // gives the memory back
+      }
+    }
+    emitted_[s] = true;
+  }
+  return Batch{};
+}
+
+arrow::Status PartGroupingSetsOperator::BuildRows(std::size_t set) {
+  // As PartGroupAggregateOperator::BuildRows: as many partitions as threads (one under memory
+  // pressure), each table gone once its rows are built.
+  const bool pressure = budget_ != nullptr && budget_->under_pressure();
+  const std::size_t wave = pressure ? 1 : std::max<std::size_t>(1, threads_);
+  const std::size_t first = built_;
+  const std::size_t count = std::min(wave, tables_[set].size() - first);
+  built_ += count;
+  return ForEach(executor_, count, [this, set, first](std::size_t i) -> arrow::Status {
+    const std::size_t p = first + i;
+    while (true) {
+      ARROW_ASSIGN_OR_RAISE(auto chunk, tables_[set][p]->NextChunk(set_schemas_[set]));
+      if (chunk == nullptr) {
+        break;
+      }
+      ARROW_ASSIGN_OR_RAISE(auto rows,
+                            SetRows(*chunk, shape_->sets[set], grouping_[set], schema_, pool_));
+      rows_[set][p].push_back(std::move(rows));
+    }
+    tables_[set][p].reset();
+    return arrow::Status::OK();
+  });
+}
+
+arrow::Status PartGroupingSetsOperator::Close() {
+  scheduler_.reset();
+  tables_.clear();
+  rows_.clear();
+  emitted_.clear();
+  next_entry_ = 0;
+  next_partition_ = 0;
+  next_batch_ = 0;
   built_ = 0;
   opened_ = false;
   return arrow::Status::OK();

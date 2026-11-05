@@ -164,6 +164,31 @@ class Origins {
       Set(call.id, CallOrigin(call, at));
     }
   }
+  void Define(const GroupingSetsNode& node, const LogicalNode& at) {
+    for (std::size_t i = 0; i < node.key_ids.size() && i < node.keys.size(); ++i) {
+      Set(node.key_ids[i], std::format("gkey({})", Key(node.keys[i], at)));
+    }
+    for (const AggregateCall& call : node.aggregates) {
+      Set(call.id, std::format("g{}", CallOrigin(call, at)));
+    }
+    // A GROUPING column by its arguments' keys and the sets: what decides its values.
+    std::string sets;
+    for (const std::vector<std::size_t>& set : node.sets) {
+      for (const std::size_t k : set) {
+        sets += k < node.keys.size() ? Key(node.keys[k], at) : std::string("-");
+        sets += ',';
+      }
+      sets += ';';
+    }
+    for (const GroupingCall& call : node.grouping) {
+      std::string origin = "grouping(";
+      for (const std::size_t k : call.args) {
+        origin += k < node.keys.size() ? Key(node.keys[k], at) : std::string("-");
+        origin += ',';
+      }
+      Set(call.id, std::format("{}|{})", origin, sets));
+    }
+  }
   void Define(const RowCountNode& node, const LogicalNode& /*at*/) {
     Set(node.id, std::format("rowcount({})", node.table_name));
   }
@@ -368,7 +393,8 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
           return key + ')';
         } else if constexpr (std::is_same_v<T, SortNode> || std::is_same_v<T, LimitNode> ||
                              std::is_same_v<T, RowCountNode> ||
-                             std::is_same_v<T, DependentJoinNode>) {
+                             std::is_same_v<T, DependentJoinNode> ||
+                             std::is_same_v<T, GroupingSetsNode>) {
           // Not shareable, so no sub-plan holding one is a candidate (shared_sub_plans.h).
           return std::nullopt;
         } else {

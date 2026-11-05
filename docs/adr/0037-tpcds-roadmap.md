@@ -155,7 +155,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | AG2 | stddev_samp, with the rest of DuckDB's variance family (the AG2 update below) | 17, 39 | Built |
 | AG3 | SELECT DISTINCT (the AG3 update below) | | Built |
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 and RU1 updates below; ADR 0038) | | Built |
-| RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Planned |
+| RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Built |
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Planned |
 | RU4 | GROUPING() and GROUPING_ID() | | Planned |
 | RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Planned |
@@ -599,6 +599,18 @@ parallel operator comes with RU2, as an update of ADR 0038, not in RU1, which bu
   `GROUP BY (cube)`; a later `GROUPING SETS` item is no longer a syntax error.
 - **Tests.** `.slt` records under `pending RU3` to `pending RU6`, and the generator's four new Features wait in
   `kGeneratorPending` for those items.
+
+Update (2026-11-05, RU2): built. `GroupingSetsNode` is in every pass that walks a plan. `GroupingSetsOperator` and
+`PartGroupingSetsOperator` run it in ADR 0038's two levels, with one table per set for calls that do not merge
+exactly. No SQL binds to the node before RU3, so no query passes from it alone.
+
+- **The second level** merges each set either from per-partition tables or straight from the root's, chosen per set
+  by how much the root's largest partition reduces. ADR 0038's RU2 update has the measurements: at 20 million rows
+  on 14 threads, two levels cost 1.08 to 1.20 times the finest set alone where it reduces the input, against 1.42 to
+  2.37 for one table per set, and the two are within 5 % where it does not.
+- **Tests.** Plan-level tests cover the node in every visitor. Exec tests check both operators against every set's
+  GROUP BY (ROLLUP, CUBE, duplicates, two roots, the empty set over no input, the fallback), at 1 and 4 threads,
+  with every set's errors raised before the first row.
 
 ## Alternatives considered
 

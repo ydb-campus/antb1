@@ -17,6 +17,7 @@
 #include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
+#include "antb1/exec/grouping_sets.h"
 #include "antb1/exec/join_table.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/profile.h"
@@ -1367,6 +1368,24 @@ struct Builder {
     Name("GroupAggregate");
     ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
     return std::make_unique<GroupAggregateOperator>(std::move(input), node.keys, node.aggregates);
+  }
+  // ROLLUP, CUBE and GROUPING SETS (ADR 0038): over a part pipeline, every root set grouped per
+  // part and merged in part order, the other sets merged from them; otherwise serially.
+  OperatorResult operator()(const plan::GroupingSetsNode& node) const {
+    if (const plan::ScanNode* scan = PipelineScan(node.input)) {
+      ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node.input, *scan, slot));
+      ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
+      const int width = sample->output_schema()->num_fields();
+      Name("PartGroupingSets");
+      return WithBuilds(std::make_unique<PartGroupingSetsOperator>(
+                            std::move(parts.pipeline), parts.count, width, node.keys, node.sets,
+                            node.aggregates, node.grouping),
+                        parts.builds, slot);
+    }
+    Name("GroupingSets");
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
+    return std::make_unique<GroupingSetsOperator>(std::move(input), node.keys, node.sets,
+                                                  node.aggregates, node.grouping);
   }
   OperatorResult operator()(const plan::SortNode& node) const {
     Name("Sort");

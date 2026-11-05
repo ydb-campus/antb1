@@ -8,6 +8,9 @@
 // or a chain; and every set derived from the finest set's final groups, as a star or a chain.
 // Counts merge through kSumCounts, HUGEINT sums through SUM, MIN and MAX through themselves, so
 // every way gives the same groups. GSETS_ROWS sets the input's rows (default 20,000,000).
+// BM_Operator times the engine's own parallel operators on 1 and 14 threads: the finest set alone,
+// the two-level PartGroupingSetsOperator, and that operator with every set aggregated from the
+// input.
 
 #include <algorithm>
 #include <array>
@@ -16,12 +19,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/thread_pool.h>
 #include <benchmark/benchmark.h>
 
 #include "antb1/common/narrow.h"
@@ -30,6 +35,8 @@
 #include "antb1/exec/operator.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
+
+#include "part_operators.h"  // src/exec: the parallel operators, timed directly
 
 namespace antb1::bench {
 namespace {
@@ -406,6 +413,98 @@ void BM_RollUp(benchmark::State& state, Profile p, Way way) {
   state.counters["after_ms"] = after_ms / n;
   state.counters["peak_MiB"] = static_cast<double>(peak) / (1024.0 * 1024.0);
 }
+
+// ---- the engine's operators (ADR 0038's RU2 update) ----
+
+// ROLLUP of every key of `p` through the engine's parallel operators, on `threads` threads (an
+// executor even for one, as the engine runs), over parts of kBatchesPerPart batches: the finest set
+// alone (PartGroupAggregateOperator), the two-level PartGroupingSetsOperator, and the same
+// operator with every set aggregated from the input (`per_set`, DuckDB's design).
+enum class Operated : std::uint8_t { kFinest, kTwoLevel, kPerSet };
+
+arrow::Result<int64_t> Operate(Profile p, Operated mode, int threads, exec::MemoryBudget& budget) {
+  static std::array<std::optional<std::vector<arrow::RecordBatchVector>>, 5> made;
+  auto& slot = made.at(static_cast<std::size_t>(p));
+  if (!slot.has_value()) {
+    slot = PartsOf(Input(p));
+  }
+  const std::vector<arrow::RecordBatchVector>& parts = *slot;
+  const int keys = KeysOf(p);
+  const exec::PartPipeline pipeline =
+      [&parts](int64_t part) -> arrow::Result<std::unique_ptr<exec::Operator>> {
+    return std::make_unique<Source>(parts.at(static_cast<std::size_t>(part)));
+  };
+  const auto count = static_cast<int64_t>(parts.size());
+  std::unique_ptr<exec::Operator> op;
+  if (mode == Operated::kFinest) {
+    const exec::GroupAggregateOperator serial(std::make_unique<Source>(parts.front()), Prefix(keys),
+                                              InputCalls(keys));
+    op = std::make_unique<exec::PartGroupAggregateOperator>(
+        pipeline, count, keys + 1, Prefix(keys), InputCalls(keys), serial.output_schema());
+  } else {
+    std::vector<std::vector<std::size_t>> sets;
+    for (int level = keys; level >= 0; --level) {
+      std::vector<std::size_t> set(static_cast<std::size_t>(level));
+      std::ranges::iota(set, std::size_t{0});
+      sets.push_back(std::move(set));
+    }
+    op = std::make_unique<exec::PartGroupingSetsOperator>(
+        pipeline, count, keys + 1, Prefix(keys), std::move(sets), InputCalls(keys),
+        std::vector<plan::GroupingCall>{}, mode == Operated::kPerSet);
+  }
+  ARROW_ASSIGN_OR_RAISE(auto pool, arrow::internal::ThreadPool::Make(threads));
+  exec::ExecContext ctx{
+      .pool = &budget, .executor = pool.get(), .threads = threads, .budget = &budget};
+  ARROW_RETURN_NOT_OK(op->Open(ctx));
+  int64_t rows = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(const exec::Batch batch, op->Next());
+    if (batch.end()) {
+      break;
+    }
+    rows += batch.data->num_rows();
+  }
+  ARROW_RETURN_NOT_OK(op->Close());
+  return rows;
+}
+
+void BM_Operator(benchmark::State& state, Profile p, Operated mode) {
+  (void)Input(p);  // built outside the timed loop
+  const auto threads = static_cast<int>(state.range(0));
+  int64_t rows = 0;
+  int64_t peak = 0;
+  for (auto _ : state) {
+    exec::MemoryBudget budget(std::nullopt);
+    const auto result = Operate(p, mode, threads, budget);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      return;
+    }
+    rows = *result;
+    peak = budget.max_memory();
+  }
+  state.counters["rows"] = static_cast<double>(rows);
+  state.counters["peak_MiB"] = static_cast<double>(peak) / (1024.0 * 1024.0);
+}
+
+#define ANTB1_OPERATOR(profile, mode)                                                      \
+  BENCHMARK_CAPTURE(BM_Operator, profile##_##mode, Profile::k##profile, Operated::k##mode) \
+      ->Unit(benchmark::kMillisecond)                                                      \
+      ->UseRealTime()                                                                      \
+      ->Iterations(3)                                                                      \
+      ->Arg(1)                                                                             \
+      ->Arg(14)
+
+#define ANTB1_OPERATOR_ALL(profile)  \
+  ANTB1_OPERATOR(profile, Finest);   \
+  ANTB1_OPERATOR(profile, TwoLevel); \
+  ANTB1_OPERATOR(profile, PerSet)
+
+ANTB1_OPERATOR_ALL(HierLow);
+ANTB1_OPERATOR_ALL(HierMid);
+ANTB1_OPERATOR_ALL(HierHigh);
+ANTB1_OPERATOR_ALL(IndepHigh);
+ANTB1_OPERATOR_ALL(Wide8);
 
 #define ANTB1_ROLLUP(profile, way)                                                \
   BENCHMARK_CAPTURE(BM_RollUp, profile##_##way, Profile::k##profile, Way::k##way) \

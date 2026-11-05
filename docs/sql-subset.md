@@ -965,9 +965,9 @@ are those of `antb1 query`.
 It shows what no logical plan holds, because the physical planner is what decides it:
 
 - part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,
-  `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` under the operator that
-  prepares it, laid out exactly as `--analyze` lays them out; no part pipeline goes through a `UnionAll`, so each of
-  its inputs runs its own parts and what reads the union runs on one thread (ADR 0036);
+  `PartGroupingSets`, `PartTopN`), and each hash join split into its `HashJoin` probe and the `HashBuild` under the
+  operator that prepares it, laid out exactly as `--analyze` lays them out; no part pipeline goes through a `UnionAll`,
+  so each of its inputs runs its own parts and what reads the union runs on one thread (ADR 0036);
 - a `Scan` that applies predicates of the `Filter` above it while it reads: `, N pushed predicates`
   ([ADR 0020](adr/0020-filter-pushdown.md));
 - a `Scan` a dynamic join filter could be applied to ([ADR 0029](adr/0029-dynamic-join-filters.md)):

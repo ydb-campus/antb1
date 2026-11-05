@@ -678,6 +678,16 @@ TEST_F(PartOperatorsTest, EachSinkOpensItsWindowAheadOfAFailedFirstPart) {
            },
        .width = 2,
        .window = kMergeWindow},
+      {.name = "grouping sets",
+       .make =
+           [&](plan::LogicalNodePtr input) {
+             return Node(plan::GroupingSetsNode{.input = std::move(input),
+                                                .keys = {x, y},
+                                                .sets = {{0, 1}, {1}, {}},
+                                                .aggregates = {count}});
+           },
+       .width = 3,
+       .window = kMergeWindow},
       {.name = "top-N",
        .make =
            [&](plan::LogicalNodePtr input) {

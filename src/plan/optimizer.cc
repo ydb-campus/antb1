@@ -384,6 +384,19 @@ struct Pruner {
     // test that prunes a hand-built one gets this rule.
     return node;
   }
+  // Needs its keys and its calls' arguments, as a GroupAggregate does.
+  LogicalNodePtr operator()(const GroupingSetsNode& group) const {
+    Needed below;
+    for (const BoundColumn& key : group.keys) {
+      Need(below, key);
+    }
+    for (const AggregateCall& call : group.aggregates) {
+      if (call.arg.has_value()) {
+        Need(below, *call.arg);
+      }
+    }
+    return Over(std::move(below));
+  }
   // Keeps every output, as a Project does: a column nothing above reads is still computed in every
   // branch, as a derived table's is (narrowing both is a later item of ADR 0036).
   LogicalNodePtr operator()(const UnionAllNode& union_all) const {
