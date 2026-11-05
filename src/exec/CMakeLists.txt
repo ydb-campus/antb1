@@ -29,6 +29,8 @@ antb1_add_module(
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
+    grouping_sets_shape.cc
+    grouping_sets.cc
     join_table.cc
     key_filter.cc
     materialized_table.cc
@@ -59,6 +61,7 @@ if(ANTB1_BUILD_TESTS)
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
       tests/grouped_sum_alias_test.cc
+      tests/grouping_sets_test.cc
       tests/sort_test.cc
       tests/like_test.cc
       tests/scan_filter_test.cc

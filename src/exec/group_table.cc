@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -136,6 +137,57 @@ GroupTable::GroupTable(std::vector<plan::BoundColumn> keys,
       keep_first_keys_(first_keys) {}
 
 GroupTable::~GroupTable() = default;
+
+arrow::compute::ExecBatch ProjectKeys(const arrow::compute::ExecBatch& keys,
+                                      std::span<const std::size_t> columns) {
+  std::vector<arrow::Datum> values;
+  values.reserve(columns.size());
+  for (const std::size_t column : columns) {
+    values.push_back(keys.values.at(column));
+  }
+  return {std::move(values), keys.length};
+}
+
+arrow::Result<KeyBuckets> SplitByKeys(const arrow::compute::ExecBatch& keys, std::size_t partitions,
+                                      arrow::MemoryPool* pool) {
+  ANTB1_CHECK(std::has_single_bit(partitions));
+  KeyBuckets out;
+  out.rows.resize(partitions);
+  ARROW_ASSIGN_OR_RAISE(const std::vector<std::uint64_t> hashes, KeyHashes(keys));
+  for (std::uint32_t row = 0; row < hashes.size(); ++row) {
+    out.rows[static_cast<std::size_t>(hashes[row]) & (partitions - 1)].push_back(row);
+  }
+  // One Take per column with the rows in partition order, sliced per partition.
+  arrow::UInt32Builder order(pool);
+  ARROW_RETURN_NOT_OK(order.Reserve(keys.length));
+  for (const std::vector<std::uint32_t>& rows : out.rows) {
+    ARROW_RETURN_NOT_OK(order.AppendValues(rows));
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto indices, order.Finish());
+  arrow::compute::ExecContext kernels(pool);
+  std::vector<std::shared_ptr<arrow::Array>> columns;
+  columns.reserve(keys.values.size());
+  for (const arrow::Datum& column : keys.values) {
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(column, indices, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             &kernels));
+    columns.push_back(taken.make_array());
+  }
+  out.keys.reserve(partitions);
+  std::int64_t offset = 0;
+  for (const std::vector<std::uint32_t>& rows : out.rows) {
+    const auto length = static_cast<std::int64_t>(rows.size());
+    std::vector<arrow::Datum> values;
+    values.reserve(columns.size());
+    for (const std::shared_ptr<arrow::Array>& column : columns) {
+      values.emplace_back(column->Slice(offset, length));
+    }
+    out.keys.emplace_back(std::move(values), length);
+    offset += length;
+  }
+  return out;
+}
 
 arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
     std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
@@ -387,10 +439,16 @@ arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
   // Exactly one row per new group, since the keys of a part are unique: with as many rows found as
   // there are new groups, every position was written.
   ANTB1_CHECK(found == groups);
+  return AddKeyRows(keys, positions);
+}
+
+arrow::Status GroupTable::AddKeyRows(const arrow::compute::ExecBatch& keys,
+                                     std::span<const std::uint32_t> positions) {
+  const std::size_t groups = positions.size();
   // One index array for every chunk, sliced rather than rebuilt: a chunk's Take reads its own rows
   // out of it and a slice allocates nothing.
   arrow::UInt32Builder indices(pool_);
-  ARROW_RETURN_NOT_OK(indices.AppendValues(positions));
+  ARROW_RETURN_NOT_OK(indices.AppendValues(positions.data(), Narrow<std::int64_t>(groups)));
   ARROW_ASSIGN_OR_RAISE(const auto rows, indices.Finish());
   for (std::size_t begin = 0; begin < groups; begin += kMaxMergeChunk) {
     const std::size_t end = std::min(groups, begin + kMaxMergeChunk);
@@ -409,6 +467,57 @@ arrow::Status GroupTable::AddUniqueGroups(const arrow::compute::ExecBatch& keys,
         AddGroups(num_groups_ + static_cast<std::uint32_t>(end - begin), std::move(first)));
   }
   return arrow::Status::OK();
+}
+
+arrow::Status GroupTable::MergeProjected(const GroupTable& source,
+                                         const arrow::compute::ExecBatch& keys,
+                                         std::span<const std::uint32_t> from) {
+  ANTB1_CHECK(source.states_.size() == states_.size());
+  if (from.empty()) {
+    return arrow::Status::OK();
+  }
+  std::vector<std::uint32_t> no_keys;
+  KeyIds ids;
+  std::span<const std::uint32_t> to;
+  if (keys_.empty()) {
+    ARROW_RETURN_NOT_OK(EnsureGroup());
+    no_keys.assign(from.size(), 0);
+    to = no_keys;
+  } else {
+    ANTB1_CHECK(keys.values.size() == keys_.size());
+    ANTB1_CHECK(std::cmp_equal(keys.length, from.size()));
+    ANTB1_CHECK(keep_first_keys_);  // its groups are emitted: NextChunk reads the first keys
+    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(keys));
+    to = ids.ids;
+    const std::uint32_t after = ids.after;
+    if (after > num_groups_) {
+      // Many source groups make one group here: its keys are the first such source group's.
+      constexpr std::uint32_t kUnset = std::numeric_limits<std::uint32_t>::max();
+      std::vector<std::uint32_t> positions(after - num_groups_, kUnset);
+      std::size_t found = 0;
+      for (std::size_t i = 0; i < to.size() && found < positions.size(); ++i) {
+        const std::uint32_t id = to[i];
+        if (id >= num_groups_ && positions[id - num_groups_] == kUnset) {
+          positions[id - num_groups_] = Narrow<std::uint32_t>(i);
+          ++found;
+        }
+      }
+      ANTB1_CHECK(found == positions.size());
+      ARROW_RETURN_NOT_OK(AddKeyRows(keys, positions));
+    }
+  }
+  for (std::size_t i = 0; i < states_.size(); ++i) {
+    ARROW_RETURN_NOT_OK(states_[i]->MergeGroups(*source.states_[i], from, to));
+  }
+  return Account();
+}
+
+arrow::Status GroupTable::EnsureGroup() {
+  ANTB1_CHECK(keys_.empty());
+  if (num_groups_ == 0) {
+    ARROW_RETURN_NOT_OK(AddGroups(1, {}));
+  }
+  return Account();
 }
 
 arrow::Status GroupTable::Partition() { return Partition(keys_.size(), {}); }

@@ -461,6 +461,15 @@ struct MapReferences {
     }
     return std::make_shared<const LogicalNode>(std::move(node));
   }
+  LogicalNodePtr operator()(GroupingSetsNode node) const {
+    for (BoundColumn& key : node.keys) {
+      Column(key);
+    }
+    for (AggregateCall& call : node.aggregates) {
+      Column(call.arg);
+    }
+    return Over(std::move(node));
+  }
 };
 
 // The id and the position of every column reference that has an id, from the root down.

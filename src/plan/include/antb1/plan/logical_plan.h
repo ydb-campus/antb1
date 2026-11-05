@@ -332,6 +332,7 @@ struct ComputeNode;
 struct ProjectNode;
 struct AggregateNode;
 struct GroupAggregateNode;
+struct GroupingSetsNode;
 struct SortNode;
 struct LimitNode;
 struct RowCountNode;
@@ -339,9 +340,9 @@ struct JoinNode;
 struct DependentJoinNode;
 struct UnionAllNode;
 
-using LogicalNode =
-    std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode, GroupAggregateNode,
-                 SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode, UnionAllNode>;
+using LogicalNode = std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode,
+                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode, JoinNode,
+                                 DependentJoinNode, UnionAllNode, GroupingSetsNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -416,6 +417,34 @@ struct GroupAggregateNode {
   std::vector<BoundColumn> keys;  // distinct input columns
   std::vector<ColumnId> key_ids;  // per key: its output column
   std::vector<AggregateCall> aggregates;
+  SourceSpan span;  // GROUP BY and its list
+};
+
+// A GROUPING(a, ...) call of a grouping-sets aggregation (DuckDB's GROUPING and GROUPING_ID): a
+// BIGINT per row, bit n-1-i set when argument i is not in the row's set (the first argument the
+// most significant bit).
+struct GroupingCall {
+  std::vector<std::size_t> args;  // indices into the node's keys, 1 to 63 of them
+  ColumnId id = kNoColumnId;      // the result column
+  SourceSpan span;                // the call in the query
+};
+
+// ROLLUP, CUBE and GROUPING SETS (docs/adr/0038-grouping-sets.md): the GROUP BY of each set of
+// keys, as GroupAggregateNode groups (NULL a key value, DOUBLE keys normalized), its rows one after
+// another in the order of `sets`. A key that a set lacks is NULL in that set's rows; a set listed
+// twice emits its groups twice; the empty set gives one row even over no input rows, as a global
+// aggregation does, and a set of keys none. Output: the keys, then one column per call, then one
+// BIGINT per GROUPING call. Row order within a set is unspecified (deterministic for a given input
+// in the executor). A node of its own rather than a field of GroupAggregateNode: the rules that
+// match a GroupAggregate by shape must not apply to it unseen.
+struct GroupingSetsNode {
+  LogicalNodePtr input;
+  std::vector<BoundColumn> keys;  // distinct input columns: every key of every set
+  std::vector<ColumnId> key_ids;  // per key: its output column
+  // Each set as indices into `keys`, ascending and distinct, in DuckDB's order, duplicates kept.
+  std::vector<std::vector<std::size_t>> sets;
+  std::vector<AggregateCall> aggregates;
+  std::vector<GroupingCall> grouping;
   SourceSpan span;  // GROUP BY and its list
 };
 

@@ -86,6 +86,7 @@ struct NodeNameOf {
   std::string_view operator()(const JoinNode& /*node*/) const { return "Join"; }
   std::string_view operator()(const DependentJoinNode& /*node*/) const { return "DependentJoin"; }
   std::string_view operator()(const UnionAllNode& /*node*/) const { return "UnionAll"; }
+  std::string_view operator()(const GroupingSetsNode& /*node*/) const { return "GroupingSets"; }
 };
 
 struct InputsOfNode {
@@ -107,6 +108,9 @@ struct InputsOfNode {
     return {node.left, node.right};
   }
   std::vector<LogicalNodePtr> operator()(const UnionAllNode& node) const { return node.inputs; }
+  std::vector<LogicalNodePtr> operator()(const GroupingSetsNode& node) const {
+    return {node.input};
+  }
 };
 
 // A copy of a node over `inputs` (as many as InputsOfNode returns).
@@ -127,6 +131,7 @@ struct WithInputsOfNode {
   LogicalNodePtr operator()(const ProjectNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const AggregateNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const GroupAggregateNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const GroupingSetsNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const SortNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const LimitNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const RowCountNode& node) const {
@@ -575,6 +580,16 @@ std::vector<ColumnId> CallIds(std::vector<ColumnId> ids, const std::vector<Aggre
   return ids;
 }
 
+// A grouping-sets node's output: its keys, its calls, its GROUPING columns.
+std::vector<ColumnId> GroupingSetsIds(const GroupingSetsNode& node) {
+  std::vector<ColumnId> ids = CallIds(node.key_ids, node.aggregates);
+  ids.reserve(ids.size() + node.grouping.size());
+  for (const GroupingCall& call : node.grouping) {
+    ids.push_back(call.id);
+  }
+  return ids;
+}
+
 // The output ids of a join of `kind` over inputs with these output ids, and then `own` where the
 // node defines a column of its own (a dependent join's `mark`; kNoColumnId for a plain join, which
 // defines none). One rule for both shapes of OutputIds: ADR 0023's "One output-id contract".
@@ -622,6 +637,9 @@ struct OutputIdsOf {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
   }
   std::vector<ColumnId> operator()(const UnionAllNode& node) const { return node.ids; }
+  std::vector<ColumnId> operator()(const GroupingSetsNode& node) const {
+    return GroupingSetsIds(node);
+  }
 };
 
 // The ids a plan reads and the ids it defines, gathered over the whole tree. One overload per node
@@ -729,6 +747,18 @@ struct IdsOfNode {
     }
     for (const ColumnId id : node.ids) {
       Define(id);
+    }
+  }
+  void operator()(const GroupingSetsNode& node) const {
+    for (const BoundColumn& key : node.keys) {
+      Read(key);
+    }
+    for (const ColumnId id : node.key_ids) {
+      Define(id);
+    }
+    Calls(node.aggregates);
+    for (const GroupingCall& call : node.grouping) {
+      Define(call.id);
     }
   }
 };
@@ -965,6 +995,52 @@ class Resolver {
     }
     return {.node = changed ? MakeNode(std::move(out)) : self,
             .ids = CallIds(group.key_ids, group.aggregates)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const GroupingSetsNode& node) {
+    Resolved input = Walk(node.input);
+    CheckSize("GroupingSets", "keys", node.key_ids.size(), node.keys.size());
+    if (node.sets.empty()) {
+      Fail("GroupingSets: no sets");
+    }
+    for (const std::vector<std::size_t>& set : node.sets) {
+      for (std::size_t i = 0; i < set.size(); ++i) {
+        if (set[i] >= node.keys.size()) {
+          Fail(std::format("GroupingSets: key {} of a set, of {} keys", set[i], node.keys.size()));
+        } else if (i > 0 && set[i] <= set[i - 1]) {
+          Fail("GroupingSets: a set's keys are not ascending and distinct");
+        }
+      }
+    }
+    GroupingSetsNode out = node;
+    bool changed = input.node != node.input;
+    out.input = input.node;
+    for (BoundColumn& key : out.keys) {
+      if (Resolve("GroupingSets", key, input.ids)) {
+        changed = true;
+      }
+    }
+    for (const ColumnId id : node.key_ids) {
+      Define("GroupingSets", id);
+    }
+    for (AggregateCall& call : out.aggregates) {
+      if (Resolve("GroupingSets", call.arg, input.ids)) {
+        changed = true;
+      }
+      Define("GroupingSets", call.id);
+    }
+    for (const GroupingCall& call : node.grouping) {
+      if (call.args.empty() || call.args.size() >= 64) {
+        Fail(std::format("GroupingSets: GROUPING of {} arguments", call.args.size()));
+      }
+      for (const std::size_t arg : call.args) {
+        if (arg >= node.keys.size()) {
+          Fail(std::format("GroupingSets: GROUPING of key {}, of {} keys", arg, node.keys.size()));
+        }
+      }
+      Define("GroupingSets", call.id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = GroupingSetsIds(node)};
   }
 
   Resolved Visit(const LogicalNodePtr& self, const SortNode& sort) {
@@ -1291,6 +1367,19 @@ struct FreshIds {
     }
     for (ColumnId& id : node.ids) {
       id = Mint(id);  // never passed through, as ResolvePositions Defines every one
+    }
+    return node;
+  }
+  LogicalNode operator()(GroupingSetsNode node) const {
+    for (BoundColumn& key : node.keys) {
+      Rename(key);
+    }
+    for (ColumnId& id : node.key_ids) {
+      id = Mint(id);
+    }
+    Calls(node.aggregates);
+    for (GroupingCall& call : node.grouping) {
+      call.id = Mint(call.id);
     }
     return node;
   }

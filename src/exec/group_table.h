@@ -31,6 +31,20 @@ namespace antb1::exec {
 // the keys. Without columns every row has the same hash.
 arrow::Result<std::vector<std::uint64_t>> KeyHashes(const arrow::compute::ExecBatch& keys);
 
+// The columns `columns` of `keys`, in that order.
+arrow::compute::ExecBatch ProjectKeys(const arrow::compute::ExecBatch& keys,
+                                      std::span<const std::size_t> columns);
+
+// Rows of keys split by the hash of all their columns (KeyHashes), as GroupTable::Partition splits
+// a table's groups over `partitions` (a power of two) partitions: per partition, its rows (indices
+// into `keys`, ascending) and their keys, in that order.
+struct KeyBuckets {
+  std::vector<arrow::compute::ExecBatch> keys;
+  std::vector<std::vector<std::uint32_t>> rows;
+};
+arrow::Result<KeyBuckets> SplitByKeys(const arrow::compute::ExecBatch& keys, std::size_t partitions,
+                                      arrow::MemoryPool* pool);
+
 // The groups of a GROUP BY: a key table over the keys (key_table.h; NULL is a key value; DOUBLE
 // keys are normalized first, so -0.0 groups with 0.0 and every NaN with every other NaN), one
 // GroupedAggregateState per call, and each group's key values as first seen, in chunks of new
@@ -106,6 +120,20 @@ class GroupTable {
   // not run on a part the lanes share).
   arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
 
+  // Folds groups `from` of `source` -- a table with the same calls over keys that include this
+  // table's -- into the groups of their keys here, many source groups to one (the second level of
+  // grouping sets, docs/adr/0038-grouping-sets.md). Row i of `keys` is the keys of group from[i],
+  // projected to this table's (ProjectKeys of source's uniques(), possibly split by SplitByKeys).
+  // A new group's keys are the normalized keys of the first source group that makes it: the key
+  // values themselves for every type but DOUBLE, so never project a DOUBLE key. Only after
+  // source's last Consume or Merge; source is read, not changed, so tables that merge disjoint
+  // groups of one source can run on different threads.
+  arrow::Status MergeProjected(const GroupTable& source, const arrow::compute::ExecBatch& keys,
+                               std::span<const std::uint32_t> from);
+  // Adds the one group of a table without keys if it has none: the empty grouping set has a row
+  // even over no input, as a global aggregation does.
+  arrow::Status EnsureGroup();
+
   [[nodiscard]] std::uint32_t num_groups() const { return num_groups_; }
   // OK when NextChunk would finalize every group without an error; otherwise the first call's error
   // (GroupedAggregateState::CheckFinalize).
@@ -133,6 +161,10 @@ class GroupTable {
   // needs two and a Concatenate to gather the same values out of part's chunks.
   arrow::Status AddUniqueGroups(const arrow::compute::ExecBatch& keys,
                                 std::span<const std::uint32_t> to, std::uint32_t after);
+  // Adds one new group per position, in order, with the keys of row positions[i] of `keys`, in
+  // chunks of at most kMaxMergeChunk groups.
+  arrow::Status AddKeyRows(const arrow::compute::ExecBatch& keys,
+                           std::span<const std::uint32_t> positions);
   arrow::Status Account();
   // The partition of a key hash. The count is a power of two (checked in Make), so this masks
   // rather than divides: RouteRows runs it once a row, where a constant count let the compiler do

@@ -98,7 +98,8 @@ groups to one nearly as large as the input; each figure is the time against the 
   only a smaller source saves. The chain, each set from the next finer one, took 1.65, 2.63 and 3.62 times there: it
   won only where its later sets are much smaller (8 keys), and each of its steps waits for the one before, which PF11
   avoids by chaining inside a partition.
-- RU2 measures its operator on the engine's parallel path against these and records the numbers as an update here.
+- RU2 measures its operator on the engine's parallel path against these and records the numbers as an update here
+  (the RU2 update below).
 
 ## Consequences
 
@@ -111,6 +112,46 @@ groups to one nearly as large as the input; each figure is the time against the 
   ROLLUP equals the UNION ALL of its sets, the `()` row equals the ungrouped aggregate, and CUBE and ROLLUP equal their
   GROUPING SETS. DuckDB answers a lone `COUNT(*)` over `GROUPING SETS ((), ())` from statistics with one row; the
   generator keeps that shape out.
+
+## Update (2026-11-05, RU2): the operator, measured
+
+RU2 builds `GroupingSetsNode`, `GroupingSetsOperator` (serial) and `PartGroupingSetsOperator` (over a part pipeline).
+
+- **What changed from the decision.**
+  - **The exactness rule** also leaves out a HUGEINT sum and a DECIMAL sum wider than 18 digits: their 128-bit
+    additions check for overflow one at a time, so the grouping of the additions decides whether the query fails.
+    It admits AVG of a DATE or a TIMESTAMP, which merges exactly.
+  - **The second level takes one of two ways per set**, decided from the root's largest partition, which makes the
+    choice a pure function of the data:
+    - **Reduce first:** where that partition's groups reduce at least 4 to 1 by the set's keys, and always for `()`,
+      each partition first merges its groups into a table of the set's own, and the set's final partitions gather
+      those.
+    - **Direct:** otherwise, each partition only splits its groups by the hash of the set's keys, and the final
+      partitions merge them straight from the root's tables, once each.
+
+    The first build merged every set twice, through a table per partition. On the input-sized profiles it took
+    about twice the time of one table per set (Wide8 on one thread: 269 ms against 134 ms over 300 thousand rows).
+- **Measured** with `antb1-bench-gsets` (`BM_Operator`). The input is the Evidence's synthetic profiles, 20 million
+  rows, as in-memory parts of 128Ki rows through the operators' own part pipelines, on Apple silicon (14 cores).
+  Each figure is the time against the finest set alone (`PartGroupAggregateOperator`); every arm runs on an executor
+  of that many threads:
+
+  | Profile (groups of the finest set) | Two levels, 1 thread | One table per set, 1 thread | Two levels, 14 threads | One table per set, 14 threads |
+  | --- | --- | --- | --- | --- |
+  | hierarchy, 10 thousand | 1.03 | 2.63 | 1.20 | 2.37 |
+  | hierarchy, 1 million | 1.06 | 1.56 | 1.08 | 1.42 |
+  | hierarchy, 12.6 million | 1.28 | 1.30 | 1.26 | 1.20 |
+  | 4 independent keys, 18.1 million | 1.72 | 1.89 | 1.82 | 1.84 |
+  | 8 keys, 19.3 million | 3.05 | 3.75 | 3.26 | 3.66 |
+
+  - **Where the finest set reduces the input,** two levels cost a few percent more than the finest set alone, and one
+    table per set up to 2.6 times.
+  - **Where it barely does,** the two ways are within 5 % of each other at 14 threads (two levels 5 % slower on the
+    12.6-million hierarchy), as the Evidence predicted: merging from about as many groups as rows is as much work
+    as aggregating the rows.
+  - **Memory:** on the 8-key profile two levels peaked at 6.2 GiB against 4.6 to 5.7 GiB for one table per set. The
+    root's tables stay until the sets merged from them are built. RU6 bounds the peak with CUBE's batches, and
+    PF11 would merge the sets inside each partition.
 
 ## Alternatives considered
 

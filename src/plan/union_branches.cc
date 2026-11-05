@@ -222,6 +222,7 @@ std::optional<Constant> ConstantColumn(const LogicalNodePtr& node, ColumnId id) 
           return n.constants[*at];
         } else if constexpr (std::is_same_v<T, ScanNode> || std::is_same_v<T, AggregateNode> ||
                              std::is_same_v<T, GroupAggregateNode> ||
+                             std::is_same_v<T, GroupingSetsNode> ||
                              std::is_same_v<T, RowCountNode> || std::is_same_v<T, JoinNode> ||
                              std::is_same_v<T, DependentJoinNode> ||
                              std::is_same_v<T, UnionAllNode>) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -18,6 +19,7 @@
 
 #include "aggregate_set.h"
 #include "group_table.h"
+#include "grouping_sets_shape.h"
 #include "outer_groups.h"
 #include "part_scheduler.h"
 #include "partition_lanes.h"
@@ -154,6 +156,37 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> KeepFirstRows(
     std::vector<std::shared_ptr<arrow::RecordBatch>> rows, const RowComparator& comparator,
     int64_t keep, arrow::MemoryPool* pool, MemoryBudget* budget);
 
+// A part's groups by one list of keys: its own table (partitioned), and, when the part stopped
+// aggregating on its own (its first batch hardly reduced), the rest of its rows routed to the
+// partitions.
+struct PartGroups {
+  std::shared_ptr<GroupTable> table;
+  std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
+};
+
+// Makes the PartGroups of one part, batch by batch (PartGroupAggregateOperator's parts and each
+// root of PartGroupingSetsOperator's): after its first kRouteDecisionRows rows (or batch), a part
+// whose groups are more than 1/4 of its rows stops aggregating on its own and routes its other rows
+// to the partitions, when its keys and calls allow it (MayRouteRows).
+class PartGrouper {
+ public:
+  static arrow::Result<PartGrouper> Make(const std::vector<plan::BoundColumn>& keys,
+                                         const std::vector<plan::AggregateCall>& aggregates,
+                                         int input_width, const ExecContext& part_ctx);
+  // Adds a batch's rows (without a selection).
+  arrow::Status Add(const arrow::RecordBatch& rows, ProfileNode* profile);
+  // Partitions the part's table, records the part's metrics, and hands its groups over.
+  arrow::Result<std::shared_ptr<PartGroups>> Finish(ProfileNode* profile);
+
+ private:
+  std::shared_ptr<PartGroups> groups_;
+  int64_t decide_after_ = 0;
+  bool decided_ = true;
+  bool route_ = false;
+  int64_t consumed_ = 0;
+  int64_t routed_ = 0;
+};
+
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the
 // executor and split into partitions by the hash of its keys (GroupTable::Partition). The parts are
 // merged in part order into one table per partition, each partition in its own lane on the
@@ -182,12 +215,6 @@ class PartGroupAggregateOperator final : public PartSink {
   arrow::Status Close() override;
 
  private:
-  // A part's groups: its own table (partitioned), and, when the part stopped aggregating on its own
-  // (its first batch hardly reduced), the rest of its rows routed to the partitions.
-  struct PartGroups {
-    std::shared_ptr<GroupTable> table;
-    std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
-  };
   using PartTable = std::shared_ptr<PartGroups>;
 
   std::shared_ptr<const PartPipeline> pipeline_;
@@ -218,6 +245,78 @@ class PartGroupAggregateOperator final : public PartSink {
   arrow::Status BuildRows();
   int64_t window_ = 1;
   std::unique_ptr<PartScheduler<PartTable>> scheduler_;
+};
+
+// ROLLUP, CUBE and GROUPING SETS over a part pipeline (plan::GroupingSetsNode;
+// docs/adr/0038-grouping-sets.md), as GroupingSetsOperator answers them, in parallel. Each part
+// aggregates every root set (a set aggregated from the input: every set no other set contains when
+// every call merges exactly, else every distinct set) into a table of its own (PartGrouper, as
+// PartGroupAggregateOperator's parts do); the parts merge in part order, each partition in its own
+// lane, every root's partition p in lane p. Then the second level, in one pass and one barrier:
+// each partition merges its root groups into a table per other set (MergeProjected), in parallel
+// over the partitions; after the barrier, each of those sets' final tables gathers one of its own
+// partitions from every partition's table, in partition order, in parallel over the sets and
+// their partitions. Every set's finalize errors come before the first row. Output: as
+// GroupingSetsOperator, each set's rows partition by partition, built as many partitions at a
+// time as threads. The partitions are a constant, so the result is the same for any number of
+// threads; for a set merged from another it is the same as for that set's own partitioned GROUP BY
+// (the calls merge exactly), and a root's rows are those of PartGroupAggregateOperator.
+class PartGroupingSetsOperator final : public PartSink {
+ public:
+  PartGroupingSetsOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
+                           std::vector<plan::BoundColumn> keys,
+                           const std::vector<std::vector<std::size_t>>& sets,
+                           std::vector<plan::AggregateCall> aggregates,
+                           const std::vector<plan::GroupingCall>& grouping, bool per_set = false);
+  ~PartGroupingSetsOperator() override;
+
+  [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
+    return schema_;
+  }
+  arrow::Status Open(ExecContext& ctx) override;
+  arrow::Result<Batch> Next() override;
+  arrow::Status Close() override;
+
+ private:
+  // A part's groups, per root (in roots_ order).
+  using PartRoots = std::shared_ptr<std::vector<std::shared_ptr<PartGroups>>>;
+
+  // The first Next(): both levels, every set's finalize checked.
+  arrow::Status Prepare();
+  // Runs every part and merges it into the roots' tables, each partition in its own lane.
+  arrow::Status Merge();
+  // The second level: every other set's tables from its root's.
+  arrow::Status Derive();
+  // Builds the rows of set `set`'s next partitions (from built_ on) in parallel.
+  arrow::Status BuildRows(std::size_t set);
+
+  std::shared_ptr<const PartPipeline> pipeline_;
+  int64_t num_parts_;
+  int input_width_;
+  std::vector<plan::BoundColumn> keys_;
+  std::vector<plan::AggregateCall> aggregates_;
+  std::unique_ptr<GroupingSetsShape> shape_;
+  std::vector<std::size_t> roots_;                           // the root sets
+  std::vector<std::shared_ptr<arrow::Schema>> set_schemas_;  // per distinct set: its table's
+  std::vector<std::vector<std::int64_t>> grouping_;          // per distinct set: GROUPING values
+  std::shared_ptr<arrow::Schema> schema_;
+  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+  MemoryBudget* budget_ = nullptr;
+  arrow::internal::Executor* executor_ = nullptr;
+  // Per distinct set, per partition: the set's merged groups, until its rows are built.
+  std::vector<std::vector<std::unique_ptr<GroupTable>>> tables_;
+  // Per distinct set, per partition: its rows, kept to the set's last entry.
+  std::vector<std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>>> rows_;
+  std::vector<bool> emitted_;       // per distinct set: whether an entry has emitted it
+  std::size_t next_entry_ = 0;      // the entry of the list being emitted
+  std::size_t next_partition_ = 0;  // its partition being emitted
+  std::size_t next_batch_ = 0;      // and that partition's next batch
+  std::size_t built_ = 0;           // the partitions of the entry's set whose rows are built
+  std::size_t threads_ = 1;
+  bool opened_ = false;
+  bool merged_ = false;
+  int64_t window_ = 1;
+  std::unique_ptr<PartScheduler<PartRoots>> scheduler_;
 };
 
 // Whether PartTwoLevelAggregateOperator runs an aggregation by `keys` (none: a global one) with

@@ -576,6 +576,15 @@ struct RowsOf {
     return Saturated(rows);
   }
 
+  // At most every input row's group in every set, and the empty set's row over no input.
+  std::optional<int64_t> operator()(const GroupingSetsNode& node) const {
+    const std::optional<int64_t> rows = Input(node);
+    if (!rows.has_value()) {
+      return std::nullopt;
+    }
+    return Saturated(Int128{std::max<int64_t>(*rows, 1)} * Int128{std::ssize(node.sets)});
+  }
+
   template <class Node>
   static std::optional<int64_t> Input(const Node& node) {
     return EstimateRows(*node.input);

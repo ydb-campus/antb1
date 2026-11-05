@@ -211,6 +211,30 @@ struct NodeLine {
         "UnionAll inputs={} columns=[{}]", node.inputs.size(),
         node.columns.empty() ? std::string() : Join(node.columns.front(), ColumnName, ", "));
   }
+  // The sets by their keys' names, `()` for the empty one; a GROUPING call by its arguments'.
+  std::string operator()(const GroupingSetsNode& node) const {
+    const auto keys = [&node](const std::vector<std::size_t>& indices) {
+      return Join(
+          indices,
+          [&node](std::size_t k) {
+            return k < node.keys.size() ? ColumnName(node.keys[k]) : std::string("?");
+          },
+          ", ");
+    };
+    std::string line =
+        "GroupingSets keys=[" + Join(node.keys, ColumnName, ", ") + "] sets=[" +
+        Join(
+            node.sets,
+            [&keys](const std::vector<std::size_t>& set) { return "(" + keys(set) + ")"; }, ", ") +
+        "]";
+    if (!node.aggregates.empty()) {
+      line += " " + Join(node.aggregates, AggregateText, ", ");
+    }
+    for (const GroupingCall& call : node.grouping) {
+      line += " GROUPING(" + keys(call.args) + ")";
+    }
+    return line;
+  }
 };
 
 // Per node that heads a group of equivalent sub-plans, the suffix its line carries.
