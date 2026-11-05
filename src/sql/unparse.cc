@@ -123,6 +123,30 @@ std::string List(const std::vector<Expr>& exprs) {
   return out;
 }
 
+// A grouping element in its canonical form (ADR 0038): ROLLUP (a, (b, c)), CUBE (...),
+// GROUPING SETS ((a, b), ()), a composite (a, b) and the empty set ().
+std::string Element(const GroupingElement& element) {
+  std::string inner;
+  for (const GroupingElement& child : element.elements) {
+    inner += (inner.empty() ? "" : ", ") + Element(child);
+  }
+  switch (element.kind) {
+    case GroupingElement::Kind::kExpr:
+      return List(element.exprs);
+    case GroupingElement::Kind::kRow:
+      return "(" + List(element.exprs) + ")";
+    case GroupingElement::Kind::kEmpty:
+      return "()";
+    case GroupingElement::Kind::kRollup:
+      return "ROLLUP (" + inner + ")";
+    case GroupingElement::Kind::kCube:
+      return "CUBE (" + inner + ")";
+    case GroupingElement::Kind::kSets:
+      return "GROUPING SETS (" + inner + ")";
+  }
+  return {};
+}
+
 struct SqlOf {
   std::string operator()(const ColumnRef& column) const { return Column(column); }
   std::string operator()(const Literal& lit) const { return LiteralSql(lit); }
@@ -270,7 +294,7 @@ std::string FromList(const std::vector<FromItem>& from) {
 
 // A block: SELECT through HAVING.
 std::string BlockSql(const SelectStatement& block) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 20, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   std::string sql = block.distinct ? "SELECT DISTINCT " : "SELECT ";
   for (std::size_t i = 0; i < block.items.size(); ++i) {
@@ -293,6 +317,13 @@ std::string BlockSql(const SelectStatement& block) {
   if (!block.where.empty()) {
     sql += " WHERE " + Conjuncts(block.where);
   }
+  if (!block.grouping.empty()) {
+    std::string items;
+    for (const GroupingElement& element : block.grouping) {
+      items += (items.empty() ? "" : ", ") + Element(element);
+    }
+    sql += " GROUP BY " + items;
+  }
   if (!block.group_by.empty()) {
     sql += " GROUP BY " + List(block.group_by);
   }
@@ -306,7 +337,7 @@ std::string BlockSql(const SelectStatement& block) {
 // or a compound's blocks joined by UNION ALL, then ORDER BY, LIMIT and OFFSET, which are the
 // compound's.
 std::string StatementSql(const SelectStatement& stmt) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 20, "revisit this walk");
   std::string sql;
   for (std::size_t i = 0; i < stmt.with.size(); ++i) {
     const CommonTableExpr& cte = stmt.with[i];

@@ -1035,6 +1035,12 @@ struct FirstUnsupportedOf {
     if (IsCoalesce(call)) {
       return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
     }
+    if (const std::string name = AsciiLower(call.name);
+        !call.quoted && (name == "grouping" || name == "grouping_id")) {
+      // GROUPING() and its alias GROUPING_ID() read the grouping sets (ADR 0038).
+      return Rejection{.span = call.name_span,
+                       .message = std::format("{}() is not supported yet (ADR 0037's RU4)", name)};
+    }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
       return Rejection{.span = call.name_span,
@@ -1216,6 +1222,12 @@ bool IsFoldableConstant(const sql::Expr& expr);
 // Whether `stmt` aggregates every row it reads rather than projecting them (Shape::kGlobal when it
 // also has no GROUP BY).
 bool IsAggregateQuery(const sql::SelectStatement& stmt);
+
+// Whether `stmt` has a GROUP BY: a plain list or one in grouping-set syntax (ADR 0038). The test
+// for a grouped block, so that a ROLLUP's block is never taken for an ungrouped one.
+bool HasGroupBy(const sql::SelectStatement& stmt) {
+  return !stmt.group_by.empty() || !stmt.grouping.empty();
+}
 
 // `expr` as a scalar subquery -- `(query)` used as a value -- or nullptr when it is anything else.
 const sql::SubqueryExpr* AsScalarSubquery(const sql::Expr& expr) {
@@ -1498,7 +1510,7 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
     // once the block is bound, which is when the binder knows it reads nothing out.
     const sql::SelectStatement& query = *form.subquery->query;
     std::string_view clause;
-    if (!query.group_by.empty()) {
+    if (HasGroupBy(query)) {
       clause = "GROUP BY";
     } else if (query.distinct) {
       clause = "DISTINCT";  // a GROUP BY of its select list (ADR 0037's AG3)
@@ -1544,7 +1556,7 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
     return r;
   }
   const sql::SelectStatement& query = *form.subquery->query;
-  if (!query.group_by.empty() || !query.having.empty() || query.limit.has_value() ||
+  if (HasGroupBy(query) || !query.having.empty() || query.limit.has_value() ||
       query.offset.has_value() || !IsAggregateQuery(query)) {
     return Rejection{.span = form.subquery->op_span,
                      .message =
@@ -2834,7 +2846,7 @@ class Binder {
         relations_(scope_.bindings().size()) {
     // One block: BindBlock binds a UNION ALL by its blocks (BindUnionAll), each of which comes
     // here. Bound here, a UNION ALL would read as a block with no select list.
-    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -3163,7 +3175,7 @@ class Binder {
   // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
   // without its `+ constant` layers (they add no NULL), as DuckDB does.
   arrow::Result<std::optional<SumRewrite>> RewritableSum(const sql::AggregateCall& call) {
-    if (!stmt_.group_by.empty() || call.kind != sql::AggKind::kSum || call.distinct ||
+    if (HasGroupBy(stmt_) || call.kind != sql::AggKind::kSum || call.distinct ||
         !call.arg.has_value()) {
       return std::nullopt;
     }
@@ -3884,7 +3896,7 @@ arrow::Status Binder::BindSelectList() {
     list.implicit_names.emplace_back();
     list.exprs.push_back(&expr);
   }
-  if (stmt_.group_by.empty() && IsAggregateQuery(stmt_) && first_column.has_value()) {
+  if (!HasGroupBy(stmt_) && IsAggregateQuery(stmt_) && first_column.has_value()) {
     return BindError(std::format("column '{}' must be inside an aggregate function: a query with "
                                  "aggregates cannot also select plain columns (there is no "
                                  "GROUP BY)",
@@ -6167,7 +6179,7 @@ arrow::Result<LogicalPlan> Binder::Bind() {
   BuildBlocks();
   ARROW_RETURN_NOT_OK(BindSelectList());
   ARROW_RETURN_NOT_OK(BindWhere());
-  if (!stmt_.group_by.empty()) {
+  if (HasGroupBy(stmt_)) {
     shape_ = Shape::kGrouped;
     ARROW_RETURN_NOT_OK(BindGroupBy());
     ARROW_RETURN_NOT_OK(CheckGrouped());
@@ -6675,7 +6687,7 @@ void FoldDateCasts(sql::Expr& expr) {
 // nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
 // the folded statement, so folding per level would fold a copy nothing reads).
 void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (sql::CommonTableExpr& cte : stmt.with) {
     FoldDateCastsInBlock(*cte.query);
@@ -6692,6 +6704,19 @@ void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
     for (sql::Expr& expr : *clause) {
       FoldDateCasts(expr);
     }
+  }
+  // A grouping element's expressions, though CheckBlock refuses the element (ADR 0038): no
+  // unfolded cast reaches whoever answers it.
+  const auto fold_element = [](this const auto& self, sql::GroupingElement& element) -> void {
+    for (sql::Expr& expr : element.exprs) {
+      FoldDateCasts(expr);
+    }
+    for (sql::GroupingElement& child : element.elements) {
+      self(child);
+    }
+  };
+  for (sql::GroupingElement& element : stmt.grouping) {
+    fold_element(element);
   }
   for (sql::FromItem& item : stmt.from) {  // an ON is a conjunction like WHERE (rule 10)
     for (sql::Expr& expr : item.on) {
@@ -6807,8 +6832,47 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
   return std::nullopt;
 }
 
+// A GROUP BY element in grouping-set syntax (ADR 0038): an expression is checked as any GROUP BY
+// item; any other element is refused at its keyword or parenthesis, naming the item of ADR 0037's
+// phase 5 that answers it.
+arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
+  using Kind = sql::GroupingElement::Kind;
+  std::string_view what;
+  std::string_view item;
+  switch (element.kind) {
+    case Kind::kExpr:
+      for (const sql::Expr& expr : element.exprs) {
+        ARROW_RETURN_NOT_OK(CheckValue(expr));
+      }
+      return arrow::Status::OK();
+    case Kind::kRollup:
+      what = "GROUP BY ROLLUP";
+      item = "RU3";
+      break;
+    case Kind::kCube:
+      what = "GROUP BY CUBE";
+      item = "RU6";
+      break;
+    case Kind::kSets:
+      what = "GROUP BY GROUPING SETS";
+      item = "RU5";
+      break;
+    case Kind::kRow:
+      what = "a composite grouping set (a, b)";
+      item = "RU5";
+      break;
+    case Kind::kEmpty:
+      what = "the empty grouping set ()";
+      item = "RU5";
+      break;
+  }
+  return Reject(
+      Rejection{.span = element.span,
+                .message = std::format("{} is not supported yet (ADR 0037's {})", what, item)});
+}
+
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
     // A UNION ALL keeps its clauses in its blocks, which ReachableBlocks lists before it, so what
@@ -6827,6 +6891,9 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false));
   for (const sql::Expr& expr : stmt.group_by) {
     ARROW_RETURN_NOT_OK(CheckValue(expr));
+  }
+  for (const sql::GroupingElement& element : stmt.grouping) {
+    ARROW_RETURN_NOT_OK(CheckGroupingElement(element));
   }
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true));
   for (const sql::OrderItem& item : stmt.order_by) {
@@ -7017,7 +7084,7 @@ std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
 arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
                                         const BindOptions& options, ColumnIdSource& ids,
                                         const CteFrame& own, const Scope* outer) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
   ANTB1_CHECK(stmt.order_by.empty());
@@ -7185,7 +7252,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
                                     bool inside_exists) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;

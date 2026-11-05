@@ -94,6 +94,9 @@ TEST(RelationCountTest, CountsASubqueryAsOnePlusItsBody) {
   EXPECT_EQ(Count("SELECT 1 FROM t JOIN u ON a IN (SELECT a FROM v)"), 4U);
   EXPECT_EQ(Count("SELECT a FROM t GROUP BY a HAVING COUNT(*) > (SELECT COUNT(*) FROM u)"), 3U);
   EXPECT_EQ(Count("SELECT a FROM t ORDER BY (SELECT MAX(a) FROM u)"), 3U);
+  // In grouping-set syntax (ADR 0038): a subquery inside a container or a composite counts too.
+  EXPECT_EQ(Count("SELECT 1 FROM t GROUP BY ROLLUP (a, (b, (SELECT MAX(a) FROM u)))"), 3U);
+  EXPECT_EQ(Count("SELECT 1 FROM t GROUP BY GROUPING SETS ((), CUBE ((SELECT 1 FROM u, v)))"), 4U);
   // Nested: the inner subquery belongs to the outer one's body, and one in the IN operand to the
   // expression that holds it.
   EXPECT_EQ(Count("SELECT 1 FROM t WHERE a IN (SELECT a FROM u WHERE b IN (SELECT b FROM v))"), 5U);

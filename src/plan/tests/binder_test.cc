@@ -2061,6 +2061,67 @@ TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
   EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
+// Grouping sets in the grammar (ADR 0037's RU1, ADR 0038): each element is refused at its keyword
+// or parenthesis, naming the item that answers it, after the plain GROUP BY items before it are
+// checked; GROUPING() and GROUPING_ID() name RU4.
+TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, span, item] :
+       std::to_array<std::tuple<std::string_view, std::string_view, std::string_view>>({
+           {"SELECT i16 FROM t GROUP BY ROLLUP (i16, s)", "ROLLUP (i16, s)", "RU3"},
+           {"SELECT i16 FROM t GROUP BY i16, CUBE (s)", "CUBE (s)", "RU6"},
+           {"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), ())", "GROUPING SETS ((i16), ())",
+            "RU5"},
+           {"SELECT i16 FROM t GROUP BY (i16, s)", "(i16, s)", "RU5"},
+           {"SELECT COUNT(*) FROM t GROUP BY ()", "()", "RU5"},
+           {"SELECT GROUPING(i16) FROM t GROUP BY i16", "GROUPING", "RU4"},
+           {"SELECT grouping_id(i16) FROM t GROUP BY i16", "grouping_id", "RU4"},
+       })) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    ASSERT_NE(GetSqlError(bound.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(bound.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_EQ(SpanText(sql, bound.status()), span) << sql;
+    EXPECT_TRUE(bound.status().message().contains(std::format("ADR 0037's {}", item)))
+        << bound.status().ToString();
+  }
+  // A plain item before the element is checked first: its own refusal wins.
+  const auto first = BindSql("SELECT 1 FROM t GROUP BY md5(s), ROLLUP (i16)", catalog);
+  ASSERT_FALSE(first.ok());
+  EXPECT_TRUE(first.status().message().contains("md5")) << first.status().ToString();
+  // In a derived table, a CTE and a subquery's block too.
+  for (const std::string_view sql : {
+           "SELECT i16 FROM (SELECT i16 FROM t GROUP BY ROLLUP (i16)) AS d",
+           "WITH c AS (SELECT i16 FROM t GROUP BY ROLLUP (i16)) SELECT i16 FROM c",
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM t GROUP BY ROLLUP (i16))",
+       }) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    EXPECT_EQ(SpanText(sql, bound.status()), "ROLLUP (i16)") << sql;
+    EXPECT_TRUE(bound.status().message().contains("ADR 0037's RU3")) << bound.status().ToString();
+  }
+}
+
+// A block with a GROUP BY in grouping-set syntax is a grouped block wherever the binder asks
+// (HasGroupBy): an EXISTS or a scalar subquery over one is refused as over a plain GROUP BY, with
+// the same message at the same span.
+TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view outer : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM t GROUP BY {})",
+           "SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM t GROUP BY {})",
+       }) {
+    const std::string plain = std::vformat(outer, std::make_format_args("i16"));
+    const std::string rollup = std::vformat(outer, std::make_format_args("ROLLUP (i16)"));
+    const auto expected = BindSql(plain, catalog);
+    const auto bound = BindSql(rollup, catalog);
+    ASSERT_FALSE(expected.ok()) << plain;
+    ASSERT_FALSE(bound.ok()) << rollup;
+    EXPECT_EQ(bound.status().message(), expected.status().message()) << rollup;
+    EXPECT_EQ(SpanText(rollup, bound.status()), SpanText(plain, expected.status())) << rollup;
+  }
+}
+
 // SELECT DISTINCT (ADR 0037's AG3): a GroupAggregate without calls over the Project of the select
 // list, below the Sort and the Limit; every item a key of its own (`a, a` keeps two columns); over
 // a grouped block, above its aggregation; none over a global aggregate's one row. ORDER BY takes a

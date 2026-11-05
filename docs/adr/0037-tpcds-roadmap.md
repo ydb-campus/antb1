@@ -154,7 +154,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | AG1 | Integer AVG finalized as DuckDB finalizes it (the AG1 update below) | | Built |
 | AG2 | stddev_samp, with the rest of DuckDB's variance family (the AG2 update below) | 17, 39 | Built |
 | AG3 | SELECT DISTINCT (the AG3 update below) | | Built |
-| RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 update below) | | Planned |
+| RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 and RU1 updates below; ADR 0038) | | Built |
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Planned |
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Planned |
 | RU4 | GROUPING() and GROUPING_ID() | | Planned |
@@ -484,7 +484,7 @@ a value of its first kind, from `min_args` on. Query 84 passes.
 
 Update (2026-11-05, phase 5): the maintainer's decision. Phase 5 answers every form of grouping sets, not ROLLUP
 alone: RU1, RU3 and RU4 widen, RU5 and RU6 are new, and RU2 takes the maintainer's design direction. RU1's ADR decides
-the design in full and repeats the measurements below on the engine's parallel operator.
+the design in full and records the measurements below; RU2 measures its operator (the RU1 update below).
 
 - **The forms.** ROLLUP, CUBE and GROUPING SETS as DuckDB accepts them: nested sets, composite elements such as
   `ROLLUP((a, b), c)`, plain keys and several clauses combined (the cross product of their set lists), the empty set
@@ -587,6 +587,18 @@ CT3 and FN2 built).
   code 4. `DISTINCT ON (...)` is unsupported too.
 - **Tests.** The generator writes DISTINCT on the outer block from a stream of its own, ordering only by aliases and
   positions then, and three metamorphic relations hold for it.
+
+Update (2026-11-05, RU1): built, with [ADR 0038](0038-grouping-sets.md), which decides the grouping sets' semantics,
+plan node and two-level execution and records the measurements of the phase 5 update. The measurement on the engine's
+parallel operator comes with RU2, as an update of ADR 0038, not in RU1, which builds no operator.
+
+- **The grammar.** Every form DuckDB parses, kept whole in `SelectStatement::grouping`, refused by the binder at its
+  keyword or parenthesis with exit code 4 naming RU3, RU5 or RU6; GROUPING() and GROUPING_ID() name RU4. DuckDB's
+  syntax errors are antb1's: `ROLLUP ()`, `()` inside ROLLUP or CUBE, `GROUPING SETS ()`, a list after
+  `GROUP BY ALL`. `rollup` and `cube` stay names before anything but `(`, which repairs the round trip of
+  `GROUP BY (cube)`; a later `GROUPING SETS` item is no longer a syntax error.
+- **Tests.** `.slt` records under `pending RU3` to `pending RU6`, and the generator's four new Features wait in
+  `kGeneratorPending` for those items.
 
 ## Alternatives considered
 

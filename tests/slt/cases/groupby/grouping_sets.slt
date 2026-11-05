@@ -1,0 +1,188 @@
+# Grouping sets (ADR 0038): ROLLUP, CUBE, GROUPING SETS and GROUPING(), each pending on the item of ADR 0037's phase 5
+# that answers it; the forms DuckDB's grammar does not have are syntax errors in both engines.
+
+pending RU3
+query IIII rowsort
+SELECT zn_city, zn_parent % 3, COUNT(*), SUM(zn_id) FROM zones GROUP BY ROLLUP (zn_city, zn_parent % 3)
+----
+SMALLINT	INTEGER	BIGINT	HUGEINT
+1	1	7	147
+1	NULL	1	1
+1	NULL	8	148
+2	2	7	154
+2	NULL	1	2
+2	NULL	8	156
+3	0	6	123
+3	NULL	1	3
+3	NULL	7	126
+4	1	6	129
+4	NULL	1	4
+4	NULL	7	133
+5	2	7	175
+5	NULL	1	5
+5	NULL	8	180
+9	1	1	39
+9	NULL	1	39
+NULL	0	1	38
+NULL	NULL	1	38
+NULL	NULL	40	820
+
+pending RU3
+query IIID rowsort
+SELECT tr_rider % 3 AS r, tr_driver % 2 AS d, COUNT(*), SUM(tr_fare) FROM trips GROUP BY r, ROLLUP (d)
+----
+BIGINT	INTEGER	BIGINT	DECIMAL(38,2)
+0	0	458	6892.75
+0	1	456	6789.50
+0	NULL	36	556.00
+0	NULL	950	14238.25
+1	0	470	7014.25
+1	1	459	6878.25
+1	NULL	29	396.75
+1	NULL	958	14289.25
+2	0	456	6907.75
+2	1	470	7025.75
+2	NULL	35	549.75
+2	NULL	961	14483.25
+NULL	0	64	934.75
+NULL	1	63	988.00
+NULL	NULL	131	1981.75
+NULL	NULL	4	59.00
+
+pending RU3
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY ROLLUP (zn_city, zn_city)
+----
+SMALLINT	BIGINT
+1	8
+1	8
+2	8
+2	8
+3	7
+3	7
+4	7
+4	7
+5	8
+5	8
+9	1
+9	1
+NULL	1
+NULL	1
+NULL	40
+
+pending RU4
+query IIII rowsort
+SELECT zn_city, zn_parent % 2, GROUPING(zn_city), GROUPING_ID(zn_city, zn_parent % 2) FROM zones GROUP BY ROLLUP (zn_city, zn_parent % 2)
+----
+SMALLINT	INTEGER	BIGINT	BIGINT
+1	1	0	0
+1	NULL	0	0
+1	NULL	0	1
+2	0	0	0
+2	NULL	0	0
+2	NULL	0	1
+3	1	0	0
+3	NULL	0	0
+3	NULL	0	1
+4	0	0	0
+4	NULL	0	0
+4	NULL	0	1
+5	1	0	0
+5	NULL	0	0
+5	NULL	0	1
+9	0	0	0
+9	NULL	0	1
+NULL	1	0	0
+NULL	NULL	0	1
+NULL	NULL	1	3
+
+pending RU5
+query III rowsort
+SELECT zn_city, zn_parent % 2, SUM(zn_id) FROM zones GROUP BY GROUPING SETS ((zn_city), (zn_parent % 2), ())
+----
+SMALLINT	INTEGER	HUGEINT
+1	NULL	148
+2	NULL	156
+3	NULL	126
+4	NULL	133
+5	NULL	180
+9	NULL	39
+NULL	0	322
+NULL	1	483
+NULL	NULL	15
+NULL	NULL	38
+NULL	NULL	820
+
+pending RU5
+query II rowsort
+SELECT zn_city, SUM(zn_id) FROM zones GROUP BY zn_city, ()
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	126
+4	133
+5	180
+9	39
+NULL	38
+
+pending RU5
+query I nosort
+SELECT SUM(zn_id) FROM zones GROUP BY ()
+----
+HUGEINT
+820
+
+pending RU5
+query II rowsort
+SELECT zn_city, SUM(zn_id) FROM zones GROUP BY (zn_city, zn_city)
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	126
+4	133
+5	180
+9	39
+NULL	38
+
+pending RU6
+query III rowsort
+SELECT zn_city, zn_parent % 2, COUNT(*) FROM zones GROUP BY CUBE (zn_city, zn_parent % 2)
+----
+SMALLINT	INTEGER	BIGINT
+1	1	7
+1	NULL	1
+1	NULL	8
+2	0	7
+2	NULL	1
+2	NULL	8
+3	1	6
+3	NULL	1
+3	NULL	7
+4	0	6
+4	NULL	1
+4	NULL	7
+5	1	7
+5	NULL	1
+5	NULL	8
+9	0	1
+9	NULL	1
+NULL	0	14
+NULL	1	1
+NULL	1	21
+NULL	NULL	1
+NULL	NULL	40
+NULL	NULL	5
+
+statement error
+SELECT COUNT(*) FROM zones GROUP BY ROLLUP ()
+
+statement error
+SELECT COUNT(*) FROM zones GROUP BY ROLLUP (zn_city, ())
+
+statement error
+SELECT COUNT(*) FROM zones GROUP BY GROUPING SETS ()
+
+statement error
+SELECT COUNT(*) FROM zones GROUP BY ALL, ROLLUP (zn_city)
