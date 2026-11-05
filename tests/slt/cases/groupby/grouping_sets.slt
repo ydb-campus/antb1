@@ -1,5 +1,5 @@
-# Grouping sets (ADR 0038): ROLLUP and GROUPING() (ADR 0037's RU3 and RU4), and CUBE and GROUPING SETS, each pending
-# on the item of ADR 0037's phase 5 that answers it; the forms DuckDB's grammar does not have are syntax errors in both engines.
+# Grouping sets (ADR 0038): ROLLUP, GROUPING(), GROUPING SETS, composites and () (ADR 0037's RU3 to RU5), and CUBE,
+# pending on RU6; the forms DuckDB's grammar does not have are syntax errors in both engines.
 
 query IIII rowsort
 SELECT zn_city, zn_parent % 3, COUNT(*), SUM(zn_id) FROM zones GROUP BY ROLLUP (zn_city, zn_parent % 3)
@@ -840,7 +840,6 @@ SELECT zn_city FROM zones WHERE GROUPING(zn_city) = 0 GROUP BY zn_city
 statement error
 SELECT zn_city, SUM(GROUPING(zn_city)) FROM zones GROUP BY ROLLUP (zn_city)
 
-pending RU5
 query III rowsort
 SELECT zn_city, zn_parent % 2, SUM(zn_id) FROM zones GROUP BY GROUPING SETS ((zn_city), (zn_parent % 2), ())
 ----
@@ -857,7 +856,6 @@ NULL	NULL	15
 NULL	NULL	38
 NULL	NULL	820
 
-pending RU5
 query II rowsort
 SELECT zn_city, SUM(zn_id) FROM zones GROUP BY zn_city, ()
 ----
@@ -870,14 +868,12 @@ SMALLINT	HUGEINT
 9	39
 NULL	38
 
-pending RU5
 query I nosort
 SELECT SUM(zn_id) FROM zones GROUP BY ()
 ----
 HUGEINT
 820
 
-pending RU5
 query II rowsort
 SELECT zn_city, SUM(zn_id) FROM zones GROUP BY (zn_city, zn_city)
 ----
@@ -889,6 +885,125 @@ SMALLINT	HUGEINT
 5	180
 9	39
 NULL	38
+
+# GROUPING SETS: its elements' sets one after another, a nested ROLLUP's in place, two clauses as a cross product.
+query TIII rowsort
+SELECT tr_tariff, tr_promo % 2, tr_driver % 3, COUNT(*) FROM trips GROUP BY GROUPING SETS ((tr_tariff, tr_promo % 2), tr_driver % 3, ROLLUP (tr_tariff))
+----
+VARCHAR	INTEGER	INTEGER	BIGINT
+(empty)	NULL	NULL	284
+(empty)	NULL	NULL	284
+AIRPORT	NULL	NULL	285
+AIRPORT	NULL	NULL	285
+NIGHT	NULL	NULL	284
+NIGHT	NULL	NULL	284
+NULL	0	NULL	2
+NULL	1	NULL	1
+NULL	NULL	0	956
+NULL	NULL	1	985
+NULL	NULL	2	955
+NULL	NULL	NULL	104
+NULL	NULL	NULL	155
+NULL	NULL	NULL	158
+NULL	NULL	NULL	3000
+POOL	NULL	NULL	284
+POOL	NULL	NULL	284
+STD	0	NULL	28
+STD	1	NULL	29
+STD	NULL	NULL	227
+STD	NULL	NULL	284
+Std	NULL	NULL	284
+Std	NULL	NULL	284
+XL	NULL	NULL	284
+XL	NULL	NULL	284
+XL\x20	NULL	NULL	285
+XL\x20	NULL	NULL	285
+std	NULL	NULL	284
+std	NULL	NULL	284
+Ж-1	NULL	NULL	284
+Ж-1	NULL	NULL	284
+
+query IIII rowsort
+SELECT zn_city, zn_parent % 2, COUNT(*), GROUPING(zn_city, zn_parent % 2) FROM zones GROUP BY GROUPING SETS (zn_city, ()), GROUPING SETS ((), zn_parent % 2)
+----
+SMALLINT	INTEGER	BIGINT	BIGINT
+1	1	7	0
+1	NULL	1	0
+1	NULL	8	1
+2	0	7	0
+2	NULL	1	0
+2	NULL	8	1
+3	1	6	0
+3	NULL	1	0
+3	NULL	7	1
+4	0	6	0
+4	NULL	1	0
+4	NULL	7	1
+5	1	7	0
+5	NULL	1	0
+5	NULL	8	1
+9	0	1	0
+9	NULL	1	1
+NULL	0	14	2
+NULL	1	1	0
+NULL	1	21	2
+NULL	NULL	1	1
+NULL	NULL	40	3
+NULL	NULL	5	2
+
+# A set listed twice gives its rows twice; COUNT(DISTINCT) and a DOUBLE sum are aggregated per set.
+query TIR rowsort
+SELECT tr_tariff, COUNT(DISTINCT tr_rider), SUM(tr_distance) FROM trips GROUP BY GROUPING SETS ((tr_tariff), (tr_tariff), ())
+----
+VARCHAR	BIGINT	DOUBLE
+(empty)	121	2658.5
+(empty)	121	2658.5
+AIRPORT	119	2627.25
+AIRPORT	119	2627.25
+NIGHT	119	2787.25
+NIGHT	119	2787.25
+NULL	151	1499.875
+NULL	151	1499.875
+NULL	243	28657.125
+POOL	121	2809.75
+POOL	121	2809.75
+STD	120	2627.125
+STD	120	2627.125
+Std	120	2804.5
+Std	120	2804.5
+XL	121	2799
+XL	121	2799
+XL\x20	121	2813.5
+XL\x20	121	2813.5
+std	121	2613.375
+std	121	2613.375
+Ж-1	121	2617
+Ж-1	121	2617
+
+# () alone is a global aggregate with a row even over no input; a single set of keys is a plain GROUP BY.
+query IR rowsort
+SELECT COUNT(*), SUM(zn_radius) FROM zones WHERE zn_id < 0 GROUP BY ()
+----
+BIGINT	DOUBLE
+0	NULL
+
+query III rowsort
+SELECT zn_city, zn_parent, COUNT(*) FROM zones GROUP BY (zn_city, zn_parent), ()
+----
+SMALLINT	INTEGER	BIGINT
+1	1	7
+1	NULL	1
+2	2	7
+2	NULL	1
+3	3	6
+3	NULL	1
+4	4	6
+4	NULL	1
+5	5	6
+5	77	1
+5	NULL	1
+9	4	1
+NULL	3	1
 
 pending RU6
 query III rowsort

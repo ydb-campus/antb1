@@ -393,34 +393,37 @@ and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` an
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
 Grouping sets ([ADR 0038](adr/0038-grouping-sets.md)) parse in every form DuckDB parses: `ROLLUP (...)` and `CUBE (...)`
 over expressions and composites `(a, b)`, `GROUPING SETS (...)` over any of these, nested ones included, the empty set
-`()`, and a composite as a `GROUP BY` item; `rollup` and `cube` are names unless `(` follows. The binder refuses the
-forms antb1 does not answer yet at their keyword or parenthesis with exit code 4, naming the item of [ADR
-0037](adr/0037-tpcds-roadmap.md) that answers them (GROUPING SETS, `()` and a composite outside `ROLLUP` RU5, CUBE RU6).
-The forms DuckDB's grammar does not have are syntax errors (exit code 1), as there: `ROLLUP ()`, `()` inside `ROLLUP` or
+`()`, and a composite as a `GROUP BY` item; `rollup` and `cube` are names unless `(` follows. The binder refuses `CUBE`
+at its keyword with exit code 4, naming the item of [ADR 0037](adr/0037-tpcds-roadmap.md) that answers it (RU6). The
+forms DuckDB's grammar does not have are syntax errors (exit code 1), as there: `ROLLUP ()`, `()` inside `ROLLUP` or
 `CUBE`, `GROUPING SETS ()`, and a list after `GROUP BY ALL`. The parser refuses with exit code 4 a trailing comma inside
 `ROLLUP`, `CUBE` or `GROUPING SETS`, which DuckDB accepts, and an operator or a cast after a composite (`(a, b) + 1`), a
 row value.
 
-`GROUP BY ROLLUP (...)` is answered (RU3), in every form: of keys and composites, after or between other keys, and
-several of them, as DuckDB expands them. `ROLLUP (e1, ..., en)` groups by each prefix of its elements, from `()` to all
-of them; the items of the `GROUP BY` combine as a cross product, so `x, ROLLUP (a, (b, c))` groups by `(x)`, `(x, a)`
-and `(x, a, b, c)`. A key is an expression, a select alias or a position, as in a plain `GROUP BY`. Each set's rows are
-its own `GROUP BY`, one after another: a key the set lacks is NULL in its rows (as a NULL of the data is: `GROUPING()`
-tells them apart), and the empty set gives one row even over no input rows. A set listed twice (`ROLLUP (a, a)`) gives
-its rows twice. More than 65535 sets is DuckDB's bind error, "Maximum grouping set count of 65535 exceeded". A constant
-in a `ROLLUP` (a constant select item named by alias or position) is refused with exit code 4: DuckDB groups by it, NULL
-in the sets without it, which the select list's constant would not show. So is a constant `GROUP BY` item next to a
-`ROLLUP`, which DuckDB groups by in every set: no set is then `()`, and no input rows give no row. One divergence: antb1
-groups by one key however a column is written, while DuckDB keeps two spellings of it in one list (`t.a` and `a`, or a
-column and its position or alias) as two grouping expressions, each NULL in its own sets, so that its `HAVING` can read
-a different one than its select list (`GROUP BY 1, ROLLUP (a)` with `a` the first item and `HAVING a = 1`). The plan is
-a `GroupingSets` node ([ADR 0038](adr/0038-grouping-sets.md)), run in two levels where every call merges exactly.
-`GROUPING(k1, ..., kn)` and its alias `GROUPING_ID(...)` (RU4) are a BIGINT per row, bit n-1-i set when `ki` is not in
-the row's set (so `GROUPING(a)` is 1 in a row where `a` is rolled up, and 0 over a plain `GROUP BY`), in the select
-list, `HAVING`, `ORDER BY` and expressions there. Each argument must be a `GROUP BY` key written as an expression (not
-an alias or a position), and DuckDB's errors are antb1's: `GROUPING` without a `GROUP BY`, in `WHERE` or inside an
-aggregate, and with 64 or more arguments ("cannot have more than 64 groups"). A `GROUPING` of a constant `GROUP BY`
-item, which DuckDB answers with 0, is refused with exit code 4.
+`GROUP BY ROLLUP (...)` (RU3), `GROUPING SETS (...)`, a composite `(a, b)` and the empty set `()` (RU5) are answered in
+every form, as DuckDB expands them: of keys and composites, nested, after or between other keys, and several of them.
+`GROUPING SETS (s1, ..., sn)` groups by each of its elements' sets, one after another (a nested `ROLLUP`'s in place); a
+composite is one set of its keys and `()` the empty set, so `GROUP BY ()` is the ungrouped aggregate, with its one row
+even over no input rows. `ROLLUP (e1, ..., en)` groups by each prefix of its elements, from `()` to all of them; the
+items of the `GROUP BY` combine as a cross product, so `x, ROLLUP (a, (b, c))` groups by `(x)`, `(x, a)` and `(x, a, b,
+c)`. A key is an expression, a select alias or a position, as in a plain `GROUP BY`. Each set's rows are its own `GROUP
+BY`, one after another: a key the set lacks is NULL in its rows (as a NULL of the data is: `GROUPING()` tells them
+apart), and the empty set gives one row even over no input rows. A set listed twice (`ROLLUP (a, a)`) gives its rows
+twice. More than 65535 sets is DuckDB's bind error, "Maximum grouping set count of 65535 exceeded". A constant in a
+`ROLLUP`, a `GROUPING SETS` or a composite (a constant select item named by alias or position) is refused with exit code
+4: DuckDB groups by it, NULL in the sets without it, which the select list's constant would not show. So is a constant
+`GROUP BY` item next to grouping sets, which DuckDB groups by in every set: no set is then `()`, and no input rows give
+no row. One divergence: antb1 groups by one key however a column is written, while DuckDB keeps two spellings of it in
+one list (`t.a` and `a`, or a column and its position or alias) as two grouping expressions, each NULL in its own sets,
+so that its `HAVING` can read a different one than its select list (`GROUP BY 1, ROLLUP (a)` with `a` the first item and
+`HAVING a = 1`). A single set of every key (`GROUP BY (a, b)`, or `a, ()`) is a plain `GROUP BY`, as DuckDB plans it;
+otherwise the plan is a `GroupingSets` node ([ADR 0038](adr/0038-grouping-sets.md)), run in two levels where every call
+merges exactly. `GROUPING(k1, ..., kn)` and its alias `GROUPING_ID(...)` (RU4) are a BIGINT per row, bit n-1-i set when
+`ki` is not in the row's set (so `GROUPING(a)` is 1 in a row where `a` is rolled up, and 0 over a plain `GROUP BY`), in
+the select list, `HAVING`, `ORDER BY` and expressions there. Each argument must be a `GROUP BY` key written as an
+expression (not an alias or a position), and DuckDB's errors are antb1's: `GROUPING` without a `GROUP BY`, in `WHERE` or
+inside an aggregate, and with 64 or more arguments ("cannot have more than 64 groups"). A `GROUPING` of a constant
+`GROUP BY` item, which DuckDB answers with 0, is refused with exit code 4.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two

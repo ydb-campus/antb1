@@ -737,6 +737,9 @@ constexpr unsigned kRollupRepeatPercent = 10;
 // Share of the grouped queries that select a GROUPING() of their keys (ADR 0037's RU4), drawn from
 // the ROLLUP's stream.
 constexpr unsigned kGroupingPercent = 25;
+// Share of the grouped queries without a ROLLUP whose keys are a GROUPING SETS list (RU5), drawn
+// from the ROLLUP's stream.
+constexpr unsigned kGroupingSetsPercent = 25;
 // Salt of the random stream which every draw that only grouping sets need takes (ROLLUP, and
 // GROUPING() since RU4), so that a query without either is the query this seed generated before the
 // RU3 PR.
@@ -1619,6 +1622,30 @@ class Builder {
       repeat = rollup_rng_.Percent(kRollupRepeatPercent);
       used_.Add(Feature::kRollup);
     }
+    // Or GROUPING SETS (ADR 0037's RU5), from the same stream: the set of every key first (so every
+    // selected key is grouped), then one or two subsets of the keys, () included, each key spelled
+    // the same everywhere. A one-key set is written bare or in parentheses.
+    std::vector<std::vector<std::size_t>> grouping_sets;
+    std::vector<bool> bare;  // per set of one key: written without parentheses
+    if (!keys.empty() && plain == keys.size() && allowed_.Has(Feature::kGroupingSets) &&
+        rollup_rng_.Percent(kGroupingSetsPercent)) {
+      used_.Add(Feature::kGroupingSets);
+      std::vector<std::size_t> every(keys.size());
+      std::ranges::iota(every, std::size_t{0});
+      grouping_sets.push_back(std::move(every));
+      for (std::size_t n = 1 + rollup_rng_.Below(2); n > 0; --n) {
+        std::vector<std::size_t> subset;
+        for (std::size_t k = 0; k < keys.size(); ++k) {
+          if (rollup_rng_.Percent(50)) {
+            subset.push_back(k);
+          }
+        }
+        grouping_sets.push_back(std::move(subset));
+      }
+      for (const auto& set : grouping_sets) {
+        bare.push_back(set.size() == 1 && rollup_rng_.Percent(50));
+      }
+    }
     Keyword("SELECT");
     // Now and then DISTINCT, from a stream of its own: its rows are the distinct rows of the list,
     // whatever its shape, and its ORDER BY takes only select items (OrderBy).
@@ -1671,7 +1698,42 @@ class Builder {
         Column(*column);
       }
     };
-    for (std::size_t i = 0; i < keys.size(); ++i) {
+    if (!grouping_sets.empty()) {
+      // Each key spelled once, its tokens copied into every set that has it.
+      std::vector<std::vector<Token>> spelled;
+      for (const GenColumn* column : keys) {
+        const std::size_t first = tokens_.size();
+        key(column, true);
+        spelled.emplace_back(tokens_.begin() + static_cast<std::ptrdiff_t>(first), tokens_.end());
+        tokens_.resize(first);
+      }
+      used_.Add(Feature::kGroupBy);
+      Keyword("GROUP");
+      Keyword("BY");
+      Keyword("GROUPING");
+      Keyword("SETS");
+      Symbol("(");
+      for (std::size_t s = 0; s < grouping_sets.size(); ++s) {
+        if (s > 0) {
+          Symbol(",");
+        }
+        if (!bare[s]) {
+          Symbol("(");
+        }
+        for (std::size_t i = 0; i < grouping_sets[s].size(); ++i) {
+          if (i > 0) {
+            Symbol(",");
+          }
+          const std::vector<Token>& tokens = spelled[grouping_sets[s][i]];
+          tokens_.insert(tokens_.end(), tokens.begin(), tokens.end());
+        }
+        if (!bare[s]) {
+          Symbol(")");
+        }
+      }
+      Symbol(")");
+    }
+    for (std::size_t i = 0; i < keys.size() && grouping_sets.empty(); ++i) {
       if (i == 0) {
         used_.Add(Feature::kGroupBy);
         Keyword("GROUP");
@@ -3889,7 +3951,7 @@ class Builder {
   Rng& star_rng_;                // the draws that only a star item or a qualified star needs
   Rng& variance_rng_;            // the draws that only the variance family needs
   Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
-  Rng& rollup_rng_;              // the draws that only ROLLUP and GROUPING() need
+  Rng& rollup_rng_;              // the draws that only grouping sets need
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;

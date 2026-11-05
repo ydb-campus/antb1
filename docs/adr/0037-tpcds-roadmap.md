@@ -158,7 +158,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Built |
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Built |
 | RU4 | GROUPING() and GROUPING_ID() | | Built |
-| RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Planned |
+| RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Built |
 | RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Planned |
 | **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
 | X4a | UNION, INTERSECT and EXCEPT in the grammar, with parenthesized branches | | Planned |
@@ -635,6 +635,15 @@ list, HAVING, ORDER BY and expressions there, with DuckDB's errors (no GROUP BY,
 expression, WHERE, inside an aggregate, 64 or more arguments). No query passes from it alone: 70 and 86, which call it,
 also need window functions. The generator selects GROUPING() of a grouped query's keys from the ROLLUP's stream, and two
 metamorphic relations check it: HAVING on its value picks one set's own GROUP BY, and it is 0 over a plain GROUP BY.
+
+Update (2026-11-05, RU5): built. GROUPING SETS (its elements' sets one after another, a nested ROLLUP's in place,
+nested lists included), a composite `(a, b)` as a GROUP BY item and the empty set `()` bind as DuckDB expands them;
+clauses still combine as a cross product, duplicates stay, and the 65535-set limit holds. A single set of every key is a
+plain GroupAggregate, as DuckDB plans it; `GROUP BY ()` alone keeps the GroupingSets node, whose empty set has its row
+even over no input. A constant anywhere in grouping-set syntax is refused (exit code 4). No query derived from TPC-DS
+uses these forms. The generator writes GROUPING SETS from the grouping-set stream (the set of every key first, each key
+spelled the same everywhere), and four metamorphic relations check them: written-out ROLLUP sets are the ROLLUP, a list
+of sets is the union of their GROUP BYs, and `()` is the ungrouped aggregate over rows and over none.
 
 ## Alternatives considered
 
