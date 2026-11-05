@@ -693,6 +693,27 @@ std::vector<Relation> AllRelations() {
            .check = AllEqual()});
     }
   }
+  // CUBE (ADR 0037's RU6): its sets written out as GROUPING SETS, every subset of its keys, and
+  // CUBE of one key is that key's ROLLUP.
+  {
+    const slt::FeatureSet cube = {kCube,    kGroupingSets,  kRollup,         kGroupBy,
+                                  kColumns, kMultipleItems, kIntegerColumns, kCountStar,
+                                  kSum,     kWhere,         kIntegerLiteral, kTableName};
+    r.push_back(
+        {.name = "cube_is_every_subset_of_its_keys",
+         .features = cube,
+         .probes =
+             {Q("SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                "GROUP BY CUBE (OS, IsMobile)"),
+              Q("SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                "GROUP BY GROUPING SETS ((), (OS), (OS, IsMobile), (IsMobile))")},
+         .check = AllEqual()});
+    r.push_back({.name = "cube_of_one_key_is_its_rollup",
+                 .features = cube,
+                 .probes = {Q("SELECT OS, COUNT(*) FROM hits_like GROUP BY CUBE (OS)"),
+                            Q("SELECT OS, COUNT(*) FROM hits_like GROUP BY ROLLUP (OS)")},
+                 .check = AllEqual()});
+  }
   // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
   // across batches and row groups are those of one pass, within the slt tolerance.
   {

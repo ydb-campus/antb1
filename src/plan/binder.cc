@@ -6082,10 +6082,36 @@ arrow::Status Binder::BindGroupBy() {
         }
         return sets;
       }
-      case sql::GroupingElement::Kind::kCube:
-        break;  // refused by CheckSupported
+      case sql::GroupingElement::Kind::kCube: {
+        // Every subset of its elements, depth first, as DuckDB lists them: the set so far, then
+        // each later element added in turn (CUBE (a, b, c): (), (a), (a, b), (a, b, c), (a, c),
+        // (b), (b, c), (c)).
+        std::vector<std::vector<std::size_t>> elements;
+        for (const sql::GroupingElement& inner : element.elements) {
+          ARROW_ASSIGN_OR_RAISE(auto keys, keys_of(inner, "in CUBE"));
+          elements.push_back(std::move(keys));
+        }
+        if (elements.size() >= 16) {  // 2^16 sets: past DuckDB's limit
+          return BindError(
+              std::format("Maximum grouping set count of {} exceeded", kMaxGroupingSets),
+              stmt_.group_by_span);
+        }
+        SetList sets;
+        std::vector<std::size_t> current;
+        std::function<void(std::size_t)> subsets = [&](std::size_t start) {
+          sets.push_back(normalized(current));
+          for (std::size_t i = start; i < elements.size(); ++i) {
+            const std::size_t size = current.size();
+            current.insert(current.end(), elements[i].begin(), elements[i].end());
+            subsets(i + 1);
+            current.resize(size);
+          }
+        };
+        subsets(0);
+        return sets;
+      }
     }
-    return arrow::Status::Invalid("grouping element of an unsupported kind");
+    return arrow::Status::Invalid("grouping element of an unknown kind");
   };
   SetList sets = {{}};
   for (const sql::GroupingElement& element : stmt_.grouping) {
@@ -7028,12 +7054,8 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
 }
 
 // A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
-// item's, its elements in turn; CUBE is refused at its keyword, naming ADR 0037's RU6.
+// item's, its elements in turn.
 arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
-  if (element.kind == sql::GroupingElement::Kind::kCube) {
-    return Reject(Rejection{.span = element.span,
-                            .message = "GROUP BY CUBE is not supported yet (ADR 0037's RU6)"});
-  }
   for (const sql::Expr& expr : element.exprs) {
     ARROW_RETURN_NOT_OK(CheckValue(expr));
   }

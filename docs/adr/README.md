@@ -46,4 +46,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0035](0035-github-releases.md) | Tagged GitHub releases of the standalone binary | Proposed |
 | [0036](0036-union-all.md) | UNION ALL: compound queries and an n-ary plan node | Accepted |
 | [0037](0037-tpcds-roadmap.md) | A roadmap to the 99 queries derived from TPC-DS | Proposed |
-| [0038](0038-grouping-sets.md) | Grouping sets: ROLLUP, CUBE and GROUPING SETS in two levels | Proposed |
+| [0038](0038-grouping-sets.md) | Grouping sets: ROLLUP, CUBE and GROUPING SETS in two levels | Accepted |

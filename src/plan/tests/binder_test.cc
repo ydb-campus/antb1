@@ -2061,39 +2061,73 @@ TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
   EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
-// Grouping sets in the grammar (ADR 0037's RU1, ADR 0038): each element is refused at its keyword
-// or parenthesis, naming the item that answers it, after the plain GROUP BY items before it are
-// checked; GROUPING() and GROUPING_ID() name RU4.
-TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
+// Grouping sets in the grammar (ADR 0037's RU1, ADR 0038): every element is answered since RU6, and
+// the expressions inside one are checked as any GROUP BY item's, at their own span, after the
+// plain items before it, in a derived table, a CTE and a subquery's block too.
+TEST(BinderTest, GroupingElementsAreCheckedLikeAnyGroupByItem) {
   const Catalog catalog = MakeCatalog();
-  for (const auto& [sql, span, item] :
-       std::to_array<std::tuple<std::string_view, std::string_view, std::string_view>>({
-           {"SELECT i16 FROM t GROUP BY i16, CUBE (s)", "CUBE (s)", "RU6"},
-           {"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), CUBE (s))", "CUBE (s)", "RU6"},
-       })) {
+  for (const std::string_view sql : {
+           "SELECT 1 FROM t GROUP BY CUBE (i16, md5(s))",
+           "SELECT 1 FROM t GROUP BY GROUPING SETS ((i16), ROLLUP (md5(s)))",
+           "SELECT 1 FROM (SELECT 1 AS x FROM t GROUP BY CUBE (md5(s))) AS d",
+           "WITH c AS (SELECT 1 AS x FROM t GROUP BY CUBE (md5(s))) SELECT x FROM c",
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM t GROUP BY CUBE (i16, md5(s)))",
+       }) {
     const auto bound = BindSql(sql, catalog);
     ASSERT_FALSE(bound.ok()) << sql;
     ASSERT_NE(GetSqlError(bound.status()), nullptr) << sql;
     EXPECT_EQ(GetSqlError(bound.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
-    EXPECT_EQ(SpanText(sql, bound.status()), span) << sql;
-    EXPECT_TRUE(bound.status().message().contains(std::format("ADR 0037's {}", item)))
-        << bound.status().ToString();
+    EXPECT_EQ(SpanText(sql, bound.status()), "md5") << sql;
   }
   // A plain item before the element is checked first: its own refusal wins.
-  const auto first = BindSql("SELECT 1 FROM t GROUP BY md5(s), CUBE (i16)", catalog);
+  const auto first = BindSql("SELECT 1 FROM t GROUP BY md5(s), CUBE (lower(s))", catalog);
   ASSERT_FALSE(first.ok());
   EXPECT_TRUE(first.status().message().contains("md5")) << first.status().ToString();
-  // In a derived table, a CTE and a subquery's block too.
-  for (const std::string_view sql : {
-           "SELECT i16 FROM (SELECT i16 FROM t GROUP BY CUBE (i16)) AS d",
-           "WITH c AS (SELECT i16 FROM t GROUP BY CUBE (i16)) SELECT i16 FROM c",
-           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM t GROUP BY CUBE (i16))",
-       }) {
-    const auto bound = BindSql(sql, catalog);
-    ASSERT_FALSE(bound.ok()) << sql;
-    EXPECT_EQ(SpanText(sql, bound.status()), "CUBE (i16)") << sql;
-    EXPECT_TRUE(bound.status().message().contains("ADR 0037's RU6")) << bound.status().ToString();
-  }
+}
+
+// GROUP BY CUBE (ADR 0037's RU6): every subset of its elements, depth first as DuckDB lists them,
+// a composite one element, duplicates kept, nested in GROUPING SETS and in a cross product; 16
+// elements are past DuckDB's 65535 sets, and a constant in it is refused.
+TEST(BinderTest, CubeIsEverySubsetDepthFirst) {
+  const Catalog catalog = MakeCatalog();
+  using Sets = std::vector<std::vector<std::size_t>>;
+  const auto sets_of = [&](std::string_view sql) -> Sets {
+    const auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return {};
+    }
+    const auto* node = std::get_if<GroupingSetsNode>(&Nth(*plan, 1));
+    EXPECT_NE(node, nullptr) << sql;
+    return node == nullptr ? Sets{} : node->sets;
+  };
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY CUBE (i16, s, i64)"),
+            (Sets{{}, {0}, {0, 1}, {0, 1, 2}, {0, 2}, {1}, {1, 2}, {2}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY CUBE (i16, (s, i64))"),
+            (Sets{{}, {0}, {0, 1, 2}, {1, 2}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY i32, CUBE (i16, s)"),
+            (Sets{{0}, {0, 1}, {0, 1, 2}, {0, 2}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY CUBE (i16, i16)"), (Sets{{}, {0}, {0}, {0}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY GROUPING SETS (CUBE (i16, s), ())"),
+            (Sets{{}, {0}, {0, 1}, {1}, {}}));
+  const auto cube_of = [](int n) {
+    std::string args = "i16";
+    for (int i = 1; i < n; ++i) {
+      args += std::format(", i16 + {}", i);
+    }
+    return std::format("SELECT COUNT(*) FROM t GROUP BY CUBE ({})", args);
+  };
+  EXPECT_TRUE(BindSql(cube_of(15), catalog).ok());
+  const auto too_many = BindSql(cube_of(16), catalog);
+  ASSERT_FALSE(too_many.ok());
+  EXPECT_TRUE(too_many.status().message().contains("Maximum grouping set count of 65535 exceeded"))
+      << too_many.status().ToString();
+  const auto constant = BindSql("SELECT 'x' AS k, COUNT(*) FROM t GROUP BY CUBE (k, i16)", catalog);
+  ASSERT_FALSE(constant.ok());
+  ASSERT_NE(GetSqlError(constant.status()), nullptr);
+  EXPECT_EQ(GetSqlError(constant.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(constant.status().message().contains("a constant in CUBE is not supported"))
+      << constant.status().ToString();
 }
 
 // GROUP BY ROLLUP (ADR 0037's RU3): a GroupingSets node over the distinct keys, its sets expanded

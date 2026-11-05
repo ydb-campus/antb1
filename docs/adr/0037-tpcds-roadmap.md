@@ -159,7 +159,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Built |
 | RU4 | GROUPING() and GROUPING_ID() | | Built |
 | RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Built |
-| RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Planned |
+| RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Built |
 | **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
 | X4a | UNION, INTERSECT and EXCEPT in the grammar, with parenthesized branches | | Planned |
 | X4b | UNION, after PF5's fallback (the X7a update below) | 75 | Planned |
@@ -644,6 +644,14 @@ even over no input. A constant anywhere in grouping-set syntax is refused (exit 
 uses these forms. The generator writes GROUPING SETS from the grouping-set stream (the set of every key first, each key
 spelled the same everywhere), and four metamorphic relations check them: written-out ROLLUP sets are the ROLLUP, a list
 of sets is the union of their GROUP BYs, and `()` is the ungrouped aggregate over rows and over none.
+
+Update (2026-11-05, RU6): built, and with it phase 5. GROUP BY CUBE binds as DuckDB expands it (every subset of its
+elements, depth first; a composite one element; duplicates kept; 16 elements past the 65535 sets), nested and in a cross
+product like the other forms. The parallel operator merges the sets other than the roots in batches that fit half of
+the memory budget's free bytes by the probe's estimate of their groups, each batch emitted before the next is built
+(ADR 0038's RU6 update); without a limit it is one batch, as before. No query derived from TPC-DS uses CUBE. The
+generator writes CUBE from the grouping-set stream, and two metamorphic relations check it: CUBE is its GROUPING SETS
+written out, and CUBE of one key is its ROLLUP.
 
 ## Alternatives considered
 

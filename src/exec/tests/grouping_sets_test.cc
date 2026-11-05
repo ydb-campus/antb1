@@ -761,6 +761,118 @@ TEST_F(GroupingSetsTest, APartsFailureFailsTheQuery) {
   }
 }
 
+// Runs `sets` of (v, a, d) over 40 parts on `executor` against `budget`; `batches`: the profile's
+// count of the second level's batches. The budget outlives the operator and the rows.
+arrow::Result<std::shared_ptr<arrow::Table>> RunUnder(const std::shared_ptr<MemoryTable>& table,
+                                                      const Sets& sets, MemoryBudget& budget,
+                                                      arrow::internal::Executor* executor,
+                                                      std::optional<int64_t>& batches) {
+  const std::vector<plan::BoundColumn> keys = {ColV(), ColA(), ColD()};
+  plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()), .output = {}};
+  plan.output.assign(OutputWidth(*plan.root),
+                     plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+  ProfileNode root;
+  ARROW_ASSIGN_OR_RAISE(auto op, BuildPhysicalPlan(plan, &root));
+  ExecContext ctx{.pool = &budget,
+                  .executor = executor,
+                  .threads = executor == nullptr ? 1 : kThreads,
+                  .budget = &budget};
+  auto result = Drain(*op, ctx);
+  for (const ProfileMetric& metric : root.metrics()) {
+    if (metric.name == "set_batches") {
+      batches = metric.value;
+    }
+  }
+  return result;
+}
+
+// Under a memory limit the second level merges its sets in batches, each emitted before the next
+// is built (ADR 0037's RU6): over a key about as fine as its rows, a CUBE limited to the peak of a
+// run without a limit cannot merge its seven other sets at once. So can a list whose root comes
+// first, whose later batches merge from a root already emitted. The rows are those of one batch, on
+// any number of threads.
+TEST_F(GroupingSetsTest, SetsMergeInBatchesUnderAMemoryLimit) {
+  const auto pool = Pool();
+  const auto table = Table(/*split=*/true, 40);
+  for (const Sets& sets : {Sets{{}, {0}, {0, 1}, {0, 1, 2}, {0, 2}, {1}, {1, 2}, {2}},
+                           Sets{{0, 1, 2}, {0}, {1}, {2}, {}, {0, 1}, {1, 2}}}) {
+    for (arrow::internal::Executor* executor :
+         {static_cast<arrow::internal::Executor*>(nullptr),
+          static_cast<arrow::internal::Executor*>(pool.get())}) {
+      MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
+      std::optional<int64_t> one;
+      const auto whole = RunUnder(table, sets, unlimited, executor, one);
+      ASSERT_TRUE(whole.ok()) << whole.status().ToString();
+      EXPECT_EQ(one, std::optional<int64_t>(1));
+      // The limit, from the unlimited peak down, until the sets no longer fit one batch: a run
+      // there must finish, in several batches, with the same rows. The estimate counts a root
+      // group's bytes, not a table's fixed cost, which over these few groups is most of it: a limit
+      // just under the need can still run out, and the next one is tried.
+      bool split = false;
+      for (int64_t limit = unlimited.max_memory(); limit > unlimited.max_memory() / 4 && !split;
+           limit = limit * 19 / 20) {
+        MemoryBudget budget(limit, arrow::default_memory_pool());
+        std::optional<int64_t> batches;
+        const auto limited = RunUnder(table, sets, budget, executor, batches);
+        if (!limited.ok()) {
+          ASSERT_TRUE(limited.status().IsOutOfMemory()) << limited.status().ToString();
+          continue;
+        }
+        if (batches.value_or(1) > 1) {
+          split = true;
+          EXPECT_TRUE((*limited)->Equals(**whole));
+          EXPECT_LE(budget.max_memory(), limit);
+        }
+      }
+      EXPECT_TRUE(split) << "no limit split the second level and still finished";
+    }
+  }
+}
+
+// A later batch that runs out of memory fails the query after the earlier batches' rows, and leaves
+// the operator closed: a further Next() fails rather than read half-made tables, and Close() is
+// clean. The limit is found by lowering it until a run fails after its first rows.
+TEST_F(GroupingSetsTest, ALaterBatchOutOfMemoryFailsTheQuery) {
+  const auto table = Table(/*split=*/true, 40);
+  const Sets sets = {{0, 1, 2}, {0}, {1}, {2}, {}, {0, 1}, {1, 2}};
+  const std::vector<plan::BoundColumn> keys = {ColV(), ColA(), ColD()};
+  MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
+  std::optional<int64_t> ignored;
+  ASSERT_TRUE(RunUnder(table, sets, unlimited, nullptr, ignored).ok());
+  bool found = false;
+  for (int64_t limit = unlimited.max_memory(); limit > 0 && !found; limit = limit * 9 / 10) {
+    plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
+                           .output = {}};
+    plan.output.assign(OutputWidth(*plan.root),
+                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+    MemoryBudget budget(limit, arrow::default_memory_pool());
+    auto op = BuildPhysicalPlan(plan);
+    ASSERT_TRUE(op.ok());
+    ExecContext ctx{.pool = &budget, .budget = &budget};
+    ASSERT_TRUE((*op)->Open(ctx).ok());
+    int64_t rows = 0;
+    arrow::Status failure;
+    while (true) {
+      auto batch = (*op)->Next();
+      if (!batch.ok()) {
+        failure = batch.status();
+        break;
+      }
+      if (batch->end()) {
+        break;
+      }
+      rows += batch->data->num_rows();
+    }
+    if (!failure.ok() && rows > 0) {
+      found = true;
+      EXPECT_TRUE(failure.IsOutOfMemory()) << failure.ToString();
+      EXPECT_FALSE((*op)->Next().ok());
+    }
+    EXPECT_TRUE((*op)->Close().ok());
+  }
+  EXPECT_TRUE(found) << "no limit failed a later batch";
+}
+
 // The tables are charged to the query's budget: a limit far below them fails, and cleanly.
 TEST_F(GroupingSetsTest, TablesAreChargedToTheBudget) {
   const auto pool = Pool();

@@ -740,6 +740,9 @@ constexpr unsigned kGroupingPercent = 25;
 // Share of the grouped queries without a ROLLUP whose keys are a GROUPING SETS list (RU5), drawn
 // from the ROLLUP's stream.
 constexpr unsigned kGroupingSetsPercent = 25;
+// Share of the grouped queries without a ROLLUP or GROUPING SETS whose keys are a CUBE (RU6), drawn
+// from the same stream.
+constexpr unsigned kCubePercent = 25;
 // Salt of the random stream which every draw that only grouping sets need takes (ROLLUP, and
 // GROUPING() since RU4), so that a query without either is the query this seed generated before the
 // RU3 PR.
@@ -1616,6 +1619,7 @@ class Builder {
     // or the second after the first one plain, and now and then the last one twice (a duplicate
     // set). Each set is the GROUP BY of its keys, a key NULL in the sets without it.
     std::size_t plain = keys.size();
+    std::string_view wrapper = "ROLLUP";  // the keyword of the keys from `plain` on
     bool repeat = false;
     if (!keys.empty() && allowed_.Has(Feature::kRollup) && rollup_rng_.Percent(kRollupPercent)) {
       plain = keys.size() == 2 && rollup_rng_.Percent(kRollupPlainKeyPercent) ? 1 : 0;
@@ -1645,6 +1649,14 @@ class Builder {
       for (const auto& set : grouping_sets) {
         bare.push_back(set.size() == 1 && rollup_rng_.Percent(50));
       }
+    }
+    // Or a CUBE (RU6), from the same stream, as a ROLLUP is written: all the keys, or the second
+    // after the first one plain.
+    if (!keys.empty() && plain == keys.size() && grouping_sets.empty() &&
+        allowed_.Has(Feature::kCube) && rollup_rng_.Percent(kCubePercent)) {
+      plain = keys.size() == 2 && rollup_rng_.Percent(kRollupPlainKeyPercent) ? 1 : 0;
+      wrapper = "CUBE";
+      used_.Add(Feature::kCube);
     }
     Keyword("SELECT");
     // Now and then DISTINCT, from a stream of its own: its rows are the distinct rows of the list,
@@ -1742,7 +1754,7 @@ class Builder {
         Symbol(",");
       }
       if (i == plain) {
-        Keyword("ROLLUP");
+        Keyword(wrapper);
         Symbol("(");
       }
       const std::size_t first = tokens_.size();
