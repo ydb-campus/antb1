@@ -394,6 +394,8 @@ struct SetBranch {
 struct SelectStatement {
   std::vector<CommonTableExpr> with;   // the WITH list, in order (empty: none)
   SourceSpan with_span;                // the WITH keyword (when with is not empty)
+  bool distinct = false;               // SELECT DISTINCT (ADR 0037's AG3)
+  SourceSpan distinct_span;            // the DISTINCT keyword (when distinct)
   std::vector<SelectItem> items;       // in a block, at least one; stars among them
   std::vector<FromItem> from;          // at least one in a block, empty in a compound: a flat
                                        // list, never a tree (ADR 0022)
@@ -419,7 +421,7 @@ struct SelectStatement {
 // The number of fields of SelectStatement. ast.cc checks it against the struct, and every walk of a
 // statement asserts the number it was written for: a new field fails the build at each of them,
 // which is the only way a walk that forgets it can be found, the compiler checking nothing else.
-inline constexpr std::size_t kSelectStatementFields = 17;
+inline constexpr std::size_t kSelectStatementFields = 19;
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);

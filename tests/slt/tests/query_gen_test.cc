@@ -1442,7 +1442,7 @@ void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& o
 }
 
 void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
-  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (const sql::CommonTableExpr& cte : stmt.with) {
     DeepSubqueries(*cte.query, out);
@@ -2175,6 +2175,41 @@ TEST(QueryGenerator, VarianceFamilyOnlyAsASelectItem) {
   }
   EXPECT_GT(queries, 50) << "queries: " << queries;
   EXPECT_EQ(spellings.size(), 6U);
+}
+
+// SELECT DISTINCT (ADR 0037's AG3): written right after the outer SELECT, its ORDER BY items only
+// select aliases and positions; and from a stream of its own, so a query that writes none is the
+// query the seed wrote without the feature.
+TEST(QueryGenerator, SelectDistinctOrdersBySelectItemsOnly) {
+  const FeatureSet plain = kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase});
+  const std::vector<GenTable> tables = Tables();
+  const auto gen = MakeOver(tables, 73, {.supported = plain, .target_percent = 0});
+  const auto without = MakeOver(
+      tables, 73, {.supported = plain.Minus({Feature::kSelectDistinct}), .target_percent = 0});
+  int queries = 0;
+  int ordered = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kSelectDistinct)) {
+      EXPECT_EQ(q.sql, without.Generate(i).sql) << i;
+      continue;
+    }
+    ++queries;
+    auto stmt = sql::Parse(q.sql);
+    ASSERT_TRUE(stmt.has_value()) << q.sql;
+    EXPECT_TRUE(stmt->distinct) << q.sql;
+    for (const sql::OrderItem& item : stmt->order_by) {
+      ++ordered;
+      const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
+      const bool alias = ref != nullptr && ref->qualifier.empty() &&
+                         std::ranges::any_of(stmt->items, [&](const sql::SelectItem& s) {
+                           return s.alias.has_value() && *s.alias == ref->name;
+                         });
+      EXPECT_TRUE(alias || std::holds_alternative<sql::Literal>(item.expr)) << q.sql;
+    }
+  }
+  EXPECT_GT(queries, 200) << "queries: " << queries;
+  EXPECT_GT(ordered, 20) << "ordered: " << ordered;
 }
 
 // What it writes, with the layout and keyword-case features off so the call is one span of text:

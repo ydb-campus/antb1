@@ -430,12 +430,12 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   // Column nope does not exist (SUM(nope) below is a bind error), but unsupported SQL is
   // rejected before any name is resolved, and so are the join kinds that still parse and wait
   // (table nope is not registered either; a LEFT JOIN is answered from roadmap PR J6 on).
-  for (const char* sql :
-       {"SELECT nope, row_number() OVER () FROM t",
-        "SELECT AdvEngineID FROM t ORDER BY md5(AdvEngineID)",
-        "SELECT SUM(DISTINCT AdvEngineID) FROM t", "SELECT DISTINCT AdvEngineID FROM t",
-        "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
-        "SELECT COUNT(*) FROM (SELECT md5(AdvEngineID) FROM t)"}) {
+  for (const char* sql : {"SELECT nope, row_number() OVER () FROM t",
+                          "SELECT AdvEngineID FROM t ORDER BY md5(AdvEngineID)",
+                          "SELECT SUM(DISTINCT AdvEngineID) FROM t",
+                          "SELECT DISTINCT ON (AdvEngineID) AdvEngineID FROM t",
+                          "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
+                          "SELECT COUNT(*) FROM (SELECT md5(AdvEngineID) FROM t)"}) {
     auto result = session->Execute(sql);
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr) << sql << ": " << result.status().ToString();

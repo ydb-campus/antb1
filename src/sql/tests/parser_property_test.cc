@@ -218,7 +218,7 @@ void Count(const Expr& expr, const std::string& sql, Counts& c) {
 // nested query and of a column alias list, the commas between CTEs and between column aliases, and
 // a string alias (its last byte a quote).
 void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
-  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   for (const SetBranch& branch : stmt.set_operation) {
     CountStatement(*branch.query, sql, want);
@@ -499,10 +499,15 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
   }
   // A compound (ADR 0036) holds its blocks, two or more, each a block of its own in the compound's
   // span after the UNION ALL that joins it; its own block fields are empty.
-  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   ASSERT_NE(stmt.set_operation.size(), 1U) << context;
   ASSERT_EQ(stmt.from.empty(), !stmt.set_operation.empty()) << context;
+  // SELECT DISTINCT's keyword lies in its block, and a compound's DISTINCT is its blocks'.
+  if (stmt.distinct) {
+    ASSERT_TRUE(Within(stmt.distinct_span, stmt.span)) << context;
+    ASSERT_TRUE(stmt.set_operation.empty()) << context;
+  }
   for (const SetBranch& branch : stmt.set_operation) {
     const bool first = &branch == &stmt.set_operation.front();
     const SelectStatement& block = *branch.query;
@@ -1395,6 +1400,8 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
         break;
     }
   }
+  // SELECT DISTINCT (ADR 0037's AG3), for a block (a compound's DISTINCT is its blocks').
+  stmt.distinct = stmt.set_operation.empty() && rng.Percent(20);
   return stmt;
 }
 

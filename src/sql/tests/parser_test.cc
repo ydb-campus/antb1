@@ -166,6 +166,23 @@ TEST(ParserTest, VarianceFamily) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
 }
 
+// SELECT DISTINCT (ADR 0037's AG3): the flag and its keyword's span, unparsed and parsed again;
+// DISTINCT ON is unsupported.
+TEST(ParserTest, SelectDistinct) {
+  constexpr std::string_view kSql = "select Distinct a, b + 1 FROM t ORDER BY 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  EXPECT_TRUE(stmt->distinct);
+  EXPECT_EQ(At(kSql, stmt->distinct_span), "Distinct");
+  EXPECT_EQ(ToSql(*stmt), "SELECT DISTINCT a, b + 1 FROM t ORDER BY 1");
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+  auto plain = Parse("SELECT a, b + 1 FROM t ORDER BY 1");
+  ASSERT_TRUE(plain.has_value());
+  EXPECT_FALSE(EqualIgnoringSpans(*stmt, *plain)) << "DISTINCT is part of the statement";
+}
+
 TEST(ParserTest, AggregatesAreCaseInsensitiveAndAllowSpaces) {
   constexpr std::string_view kSql = "select count ( * ) , Sum( amount ) from events";
   auto stmt = Parse(kSql);
@@ -2504,8 +2521,6 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 8, "GROUPING SETS are not supported"},
         RejectCase{"OrderByInAggregate", "SELECT SUM(a ^ORDER BY b) FROM events", kUnsupported, 5,
                    "ORDER BY is not supported"},
-        RejectCase{"Distinct", "SELECT ^DISTINCT region FROM events", kUnsupported, 8,
-                   "DISTINCT is not supported"},
         RejectCase{"SumDistinct", "SELECT SUM(^distinct user_id) FROM events", kUnsupported, 8,
                    "SUM(DISTINCT ...) is not supported"},
         RejectCase{"FunctionDistinct", "SELECT ^f(DISTINCT a) FROM events", kUnsupported, 1,
@@ -2545,6 +2560,12 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
         RejectCase{"StddevDistinct", "SELECT STDDEV(^DISTINCT a) FROM events", kUnsupported, 8,
                    "STDDEV(DISTINCT ...) is not supported"},
+        RejectCase{"DistinctOn", "SELECT ^DISTINCT ON (a) a FROM events", kUnsupported, 11,
+                   "DISTINCT ON is not supported"},
+        // DISTINCT is SELECT DISTINCT's keyword now, so a qualifier spelled DISTINCT is a syntax
+        // error, as in DuckDB.
+        RejectCase{"DistinctAsQualifier", "SELECT DISTINCT^.a FROM events", kSyntax, 1,
+                   "expected an expression or '*'"},
         RejectCase{"SelectAll", "SELECT ^ALL a FROM events", kUnsupported, 3,
                    "SELECT ALL is not supported"},
         RejectCase{"AllAggregate", "SELECT COUNT(^ALL a) FROM events", kUnsupported, 3,
@@ -3063,8 +3084,9 @@ INSTANTIATE_TEST_SUITE_P(
                    "VALUES is not supported; only SELECT queries are supported"},
         RejectCase{"FromFirstAfterUnionAll", "SELECT a FROM t UNION ALL ^FROM u SELECT a",
                    kUnsupported, 4, "FROM-first queries are not supported"},
-        RejectCase{"DistinctAfterUnionAll", "SELECT a FROM t UNION ALL SELECT ^DISTINCT a FROM u",
-                   kUnsupported, 8, "DISTINCT is not supported"},
+        RejectCase{"DistinctOnAfterUnionAll",
+                   "SELECT a FROM t UNION ALL SELECT ^DISTINCT ON (a) a FROM u", kUnsupported, 11,
+                   "DISTINCT ON is not supported"},
         // A first block in parentheses too, which DuckDB reads in an IN list's or an operand's
         // parentheses when a set operation or a query's tail follows a subquery there: refused at
         // the block's '('.

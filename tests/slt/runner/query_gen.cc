@@ -724,6 +724,11 @@ constexpr unsigned kVariancePercent = 30;
 // Salt of the random stream which every draw that only the variance family needs takes, so that a
 // query without one is the query this seed generated before the AG2 PR.
 constexpr uint64_t kVarianceStreamSalt = 0x76617269616E6365ULL;
+// Share of the outer blocks that are SELECT DISTINCT (ADR 0037's AG3).
+constexpr unsigned kDistinctPercent = 15;
+// Salt of the random stream which every draw that only SELECT DISTINCT needs takes, so that a query
+// without it is the query this seed generated before the AG3 PR.
+constexpr uint64_t kDistinctStreamSalt = 0x64697374696E6374ULL;
 // Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
 // correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
 // EXISTS and the share that add a non-equality residual to the key.
@@ -934,7 +939,7 @@ class Builder {
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
-          Rng& star_rng, Rng& variance_rng, FeatureSet allowed)
+          Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -946,6 +951,7 @@ class Builder {
         union_rng_(union_rng),
         star_rng_(star_rng),
         variance_rng_(variance_rng),
+        distinct_rng_(distinct_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1591,6 +1597,14 @@ class Builder {
     starred_ = false;
     EmitWith(from);
     Keyword("SELECT");
+    // Now and then DISTINCT, from a stream of its own: its rows are the distinct rows of the list,
+    // whatever its shape, and its ORDER BY takes only select items (OrderBy).
+    const bool distinct =
+        allowed_.Has(Feature::kSelectDistinct) && distinct_rng_.Percent(kDistinctPercent);
+    if (distinct) {
+      used_.Add(Feature::kSelectDistinct);
+      Keyword("DISTINCT");
+    }
     SelectList(shape, star_ok, from, cols, numeric, aggs, selected_keys);
     Keyword("FROM");
     EmitFrom(from);
@@ -1623,6 +1637,7 @@ class Builder {
       Position(rng_.Pick(constant_positions_));
     }
     const bool having = Having(shape, from.rows, cols, numeric, aggs, keys);
+    distinct_ = distinct;  // set here: a block built for FROM may have changed it
     const bool ordered = OrderBy(shape, cols, numeric, aggs, keys);
     // Any star of the select list over more than kStarMaxRows rows takes a LIMIT, as a lone one
     // does: the guard is FROM's bound, even for a qualified star of a smaller binding.
@@ -1957,9 +1972,12 @@ class Builder {
       return false;
     }
     const bool aggregate = shape == Shape::kAggregates;
-    const std::vector<const GenColumn*>& columns = aggregate ? keys : cols;
+    // SELECT DISTINCT orders by its select items alone: aliases and positions.
+    const std::vector<const GenColumn*> none;
+    const std::vector<const GenColumn*>& listed = aggregate ? keys : cols;
+    const std::vector<const GenColumn*>& columns = distinct_ ? none : listed;
     std::vector<std::pair<Agg, const GenColumn*>> calls;
-    if (aggregate) {
+    if (aggregate && !distinct_) {
       for (const Agg agg : aggs) {
         if (agg == Agg::kCountStar) {
           calls.emplace_back(agg, nullptr);
@@ -3795,15 +3813,17 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
-  Rng& join_rng_;       // the draws that only a join needs
-  Rng& block_rng_;      // the draws that only a nested block needs
-  Rng& left_rng_;       // the draws that only a left join needs
-  Rng& sub_rng_;        // the draws that only an uncorrelated subquery needs
-  Rng& substring_rng_;  // the draws that only substring needs
-  Rng& corr_rng_;       // the draws that only a correlated subquery needs
-  Rng& union_rng_;      // the draws that only a compound needs
-  Rng& star_rng_;       // the draws that only a star item or a qualified star needs
-  Rng& variance_rng_;   // the draws that only the variance family needs
+  Rng& join_rng_;          // the draws that only a join needs
+  Rng& block_rng_;         // the draws that only a nested block needs
+  Rng& left_rng_;          // the draws that only a left join needs
+  Rng& sub_rng_;           // the draws that only an uncorrelated subquery needs
+  Rng& substring_rng_;     // the draws that only substring needs
+  Rng& corr_rng_;          // the draws that only a correlated subquery needs
+  Rng& union_rng_;         // the draws that only a compound needs
+  Rng& star_rng_;          // the draws that only a star item or a qualified star needs
+  Rng& variance_rng_;      // the draws that only the variance family needs
+  Rng& distinct_rng_;      // the draws that only SELECT DISTINCT needs
+  bool distinct_ = false;  // the outer block is SELECT DISTINCT
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -4008,8 +4028,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng union_rng(Mix(seed ^ kUnionStreamSalt));
   Rng star_rng(Mix(seed ^ kStarStreamSalt));
   Rng variance_rng(Mix(seed ^ kVarianceStreamSalt));
+  Rng distinct_rng(Mix(seed ^ kDistinctStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, star_rng, variance_rng, options.supported)
+               union_rng, star_rng, variance_rng, distinct_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4033,11 +4054,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng union_rng(Mix(state ^ kUnionStreamSalt));
   Rng star_rng(Mix(state ^ kStarStreamSalt));
   Rng variance_rng(Mix(state ^ kVarianceStreamSalt));
+  Rng distinct_rng(Mix(state ^ kDistinctStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, star_rng, variance_rng, allowed)
+                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

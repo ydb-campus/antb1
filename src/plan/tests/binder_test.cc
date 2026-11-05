@@ -2061,6 +2061,76 @@ TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
   EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
+// SELECT DISTINCT (ADR 0037's AG3): a GroupAggregate without calls over the Project of the select
+// list, below the Sort and the Limit; every item a key of its own (`a, a` keeps two columns); over
+// a grouped block, above its aggregation; none over a global aggregate's one row. ORDER BY takes a
+// position, an alias or a select item written again, and refuses anything else.
+TEST(BinderTest, SelectDistinct) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT DISTINCT i16, i16, s FROM t ORDER BY 1 DESC LIMIT 3", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  ASSERT_EQ(plan->output.size(), 3U);
+  EXPECT_EQ(plan->output[1].name, "i16");
+  const auto& limit = std::get<LimitNode>(Nth(*plan, 0));
+  EXPECT_EQ(limit.limit, 3);
+  const auto& sort = std::get<SortNode>(Nth(*plan, 1));
+  const auto& dedup = std::get<GroupAggregateNode>(Nth(*plan, 2));
+  EXPECT_TRUE(dedup.aggregates.empty());
+  ASSERT_EQ(dedup.keys.size(), 3U);
+  ASSERT_EQ(sort.keys.size(), 1U);
+  EXPECT_EQ(sort.keys[0].column.id, dedup.key_ids[0]);
+  EXPECT_TRUE(sort.keys[0].descending);
+  EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 3)));
+  for (const auto& sql : std::to_array<std::string_view>(
+           {"SELECT DISTINCT i16 AS x, s FROM t ORDER BY x",
+            "SELECT DISTINCT i16, s FROM t ORDER BY s",
+            "SELECT DISTINCT i16 + 1, s FROM t ORDER BY i16 + 1",
+            "SELECT DISTINCT i16, COUNT(*) AS n FROM t GROUP BY i16, s ORDER BY n"})) {
+    auto ordered = BindSql(sql, catalog);
+    ASSERT_TRUE(ordered.ok()) << sql << ": " << ordered.status().ToString();
+    const auto& above = std::get<SortNode>(Nth(*ordered, 0));
+    const auto& below = std::get<GroupAggregateNode>(Nth(*ordered, 1));
+    EXPECT_TRUE(below.aggregates.empty()) << sql;
+    EXPECT_TRUE(std::ranges::contains(below.key_ids, above.keys[0].column.id)) << sql;
+  }
+  auto grouped = BindSql("SELECT DISTINCT i16, COUNT(*) FROM t GROUP BY i16, s", catalog);
+  ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
+  EXPECT_TRUE(std::get<GroupAggregateNode>(Nth(*grouped, 0)).aggregates.empty());
+  EXPECT_FALSE(std::get<GroupAggregateNode>(Nth(*grouped, 2)).aggregates.empty())
+      << Explain(*grouped);
+  auto global = BindSql("SELECT DISTINCT COUNT(*) FROM t", catalog);
+  ASSERT_TRUE(global.ok()) << global.status().ToString();
+  EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*global, 0))) << Explain(*global);
+  // ORDER BY a select-list column named another way: qualified, or under an alias (through a star:
+  // tests/slt/cases/distinct/select_distinct.slt, since this catalog's t holds an unsupported
+  // type).
+  for (const auto& sql :
+       std::to_array<std::string_view>({"SELECT DISTINCT i16 FROM t ORDER BY t.i16",
+                                        "SELECT DISTINCT i16 AS x, s FROM t ORDER BY i16"})) {
+    auto ordered = BindSql(sql, catalog);
+    ASSERT_TRUE(ordered.ok()) << sql << ": " << ordered.status().ToString();
+    const auto& above = std::get<SortNode>(Nth(*ordered, 0));
+    const auto& below = std::get<GroupAggregateNode>(Nth(*ordered, 1));
+    EXPECT_TRUE(std::ranges::contains(below.key_ids, above.keys[0].column.id)) << sql;
+  }
+  // A correlated EXISTS takes a plain block (ADR 0023's Path 1), so DISTINCT there is refused.
+  const auto exists =
+      BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT s FROM t AS u WHERE u.i32 = t.i32)",
+              catalog);
+  ASSERT_FALSE(exists.ok());
+  ASSERT_NE(GetSqlError(exists.status()), nullptr);
+  EXPECT_EQ(GetSqlError(exists.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(exists.status().message().contains("EXISTS over a subquery with DISTINCT"))
+      << exists.status().ToString();
+  const auto refused = BindSql("SELECT DISTINCT i16 FROM t ORDER BY s", catalog);
+  ASSERT_FALSE(refused.ok());
+  ASSERT_NE(GetSqlError(refused.status()), nullptr);
+  EXPECT_EQ(GetSqlError(refused.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(refused.status().message().contains(
+      "ORDER BY of an expression that is not in the SELECT DISTINCT list is not supported"))
+      << refused.status().ToString();
+}
+
 // The variance family (ADR 0037's AG2): DOUBLE over any number column, an alias bound to its
 // target's kind but named as written; a VARCHAR argument is a bind error.
 TEST(BinderTest, VarianceFamily) {

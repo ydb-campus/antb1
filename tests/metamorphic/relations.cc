@@ -555,6 +555,34 @@ std::vector<Relation> AllRelations() {
                             Q(std::format(kGrouped, "hits_like"))},
                  .check = AllEqual()});
   }
+  // SELECT DISTINCT (ADR 0037's AG3): the distinct rows are the groups of the same list, the
+  // distinct values of a NOT NULL column count as COUNT(DISTINCT), whatever the batch size.
+  {
+    const slt::FeatureSet distinct = {kSelectDistinct, kGroupBy,        kColumns,
+                                      kMultipleItems,  kIntegerColumns, kVarcharColumns,
+                                      kCountStar,      kCountDistinct,  kDerivedTable,
+                                      kWhere,          kIntegerLiteral, kTableName};
+    r.push_back({.name = "distinct_is_group_by",
+                 .features = distinct,
+                 .probes = {Q("SELECT DISTINCT OS, IsMobile FROM hits_like WHERE OS < 30"),
+                            Q("SELECT OS, IsMobile FROM hits_like WHERE OS < 30 GROUP BY OS, "
+                              "IsMobile")},
+                 .check = AllEqual()});
+    r.push_back({.name = "distinct_count_is_count_distinct",
+                 .features = distinct,
+                 .probes = {Q("SELECT COUNT(*) FROM (SELECT DISTINCT OS FROM hits_like) AS d"),
+                            Q("SELECT COUNT(DISTINCT OS) FROM hits_like")},
+                 .check = AllEqual()});
+    Relation sizes{.name = "distinct_batch_size_invariance",
+                   .features = distinct,
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(
+          Q("SELECT DISTINCT OS, URL FROM hits_like_split WHERE OS < 30", batch));
+    }
+    r.push_back(std::move(sizes));
+  }
   // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
   // across batches and row groups are those of one pass, within the slt tolerance.
   {

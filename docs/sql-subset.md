@@ -100,7 +100,7 @@ query       = [ "WITH" , cte , { "," , cte } ] , block , { "UNION" , "ALL" , blo
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
 cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
-block       = "SELECT" , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
+block       = "SELECT" , [ "DISTINCT" ] , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
               [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = select_item , { "," , select_item } ;
@@ -188,7 +188,7 @@ after `UNION ALL` (at `BY`), `INTERSECT` and `EXCEPT`, which DuckDB answers, and
 block, such as one in parentheses (`UNION ALL (SELECT ...)`, and a first block too, also as the first value of an
 `IN` list or inside a parenthesized expression, before a set operation or an `ORDER BY`, `LIMIT` or `OFFSET`:
 `x IN ((SELECT ...) UNION ALL SELECT ...)`, `x = ((SELECT ...) LIMIT 1)`, at its `(`), a `VALUES`
-list, a FROM-first query or `TABLE t`, and, as in any block, `SELECT DISTINCT` and a `SELECT` without `FROM`. After a
+list, a FROM-first query or `TABLE t`, and, as in any block, `DISTINCT ON` and a `SELECT` without `FROM`. After a
 later value of an `IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a
 syntax error, as in DuckDB. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
 `OFFSET` before a `UNION ALL`, and a `UNION ALL` that no block follows (at the end, or before `)`, `ALL`, `DISTINCT`
@@ -219,7 +219,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   qualifiers `between`, `exists`, `interval` and `over`, which DuckDB accepts, are unsupported, and any other reserved
   word before the dot is an error, as in DuckDB, unless the parser takes the word there for the start of a construct
   that it does not support and reports that (exit code 4, where DuckDB gives a syntax error): `ALL`, `ANY`, `ARRAY`,
-  `DISTINCT`, `FALSE`, `NULL`, `SOME` and `TRUE` (`null.a`: NULL literals are not supported; `SELECT DISTINCT.a`).
+  `FALSE`, `NULL`, `SOME` and `TRUE` (`null.a`: NULL literals are not supported).
   `t.*` is a select item of its own (below), with its qualifier written as a column's; inside an expression
   (`1 + t.*`, `(t.*)`, `COUNT(t.*)`) it is unsupported, and so are `a.b.c`, `t.f()` and a qualified name before a
   string (`main.integer '5'`, which DuckDB reads as a typed literal of a qualified type).
@@ -365,8 +365,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner equivalent and an inner join, where the
   select item combines the aggregate with literals and arithmetic alone -- `COUNT` is exit code 4 there, since it
   is 0 over no rows and the rewrite gives an outer row with no group no row at all (divergences D23 and D24).
-  Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with `GROUP BY`, `HAVING`,
-  `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a key, a correlated scalar
+  Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with `GROUP BY`, `DISTINCT`,
+  `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a key, a correlated scalar
   subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or `NOT IN`, whose NULL
   semantics need the set's NULL and empty flags for each binding; at the subquery for one in `HAVING`, whose outer
   references would read the outer block's groups and not its rows; and at the subquery for a conjunct that is both a
@@ -396,7 +396,7 @@ and `SIMILAR TO` also after `NOT`, before a string, also one in parentheses, aft
 star (`* AS x`, `t.* x`,
 `* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax error as in DuckDB),
 `t.*` inside an expression,
-`SELECT DISTINCT`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`,
+`DISTINCT ON`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`,
 `NULL` literals (but a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL`
 block), `IS` but `IS [NOT] NULL` (`IS DISTINCT FROM`, `IS TRUE`), `ISNULL`, `NOTNULL`, a condition as a select item
 (`SELECT a IS NULL`), `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names,
@@ -1188,6 +1188,13 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   every NaN together, as DuckDB does, and the group shows the key as first seen. Over zero input rows there is no
   group, so no row. Groups come in no particular order (deterministic in antb1, not the order of first appearance),
   and the tests compare grouped results without regard to order; with `LIMIT` any groups are a right answer.
+- SELECT DISTINCT ([ADR 0037](adr/0037-tpcds-roadmap.md)'s AG3): the distinct rows of the select list, in any block (a
+  derived table, a CTE, a `UNION ALL` block, a subquery), compared as `GROUP BY` compares keys: NULL is a value,
+  `-0.0` equals `0.0` and every NaN is one value. It applies after `WHERE`, `GROUP BY`, `HAVING` and the select list,
+  and before `ORDER BY`, `LIMIT` and `OFFSET`; over a grouped block it removes repeated rows of the groups. Every item
+  counts, a repeated one too (`SELECT DISTINCT a, a` gives two columns). `ORDER BY` takes a select item: a position,
+  an alias, or an item written again; any other value is unsupported (exit code 4), since DuckDB orders such a query
+  by a value of each distinct row that depends on the order of the rows. `DISTINCT ON (...)` is unsupported.
 - Arithmetic: integer `+`, `-`, `*` and unary `-` compute in the result type, and an overflow fails the query with an
   execution error (exit code 1), as in DuckDB; HUGEINT (a `SUM` result) stays within -(10^38 - 1) to 10^38 - 1
   (divergence D9). `/` divides in DOUBLE: `x / 0` is `inf` or `-inf` and `0 / 0` NaN. `//` truncates toward zero
@@ -1543,7 +1550,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
 | Q5 | unsupported | needs ROLLUP (RU3) |
-| Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
+| Q6 | unsupported | needs scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | unsupported | needs INTERSECT (X4c) |
 | Q9 | unsupported | needs a scalar subquery in the select list (SQ2) |
@@ -1575,10 +1582,10 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q35 | unsupported | needs correlated EXISTS under OR (SQ8) |
 | Q36 | unsupported | needs NULL items of set-operation branches, UNION, rank() and window partition expressions (phase 9) |
 | Q37 | pass | answered when the ratchet was added |
-| Q38 | unsupported | needs SELECT DISTINCT and INTERSECT (X4c) |
+| Q38 | unsupported | needs INTERSECT (X4c) |
 | Q39 | pass | stddev_samp (AG2) |
 | Q40 | pass | an identity CAST (CT1) |
-| Q41 | unsupported | needs SELECT DISTINCT and a correlated COUNT subquery (SQ6) |
+| Q41 | unsupported | needs a correlated COUNT subquery (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q44 | unsupported | needs scalar subqueries inside a condition, scalar subqueries that are not aggregates and rank() (phase 9) |
@@ -1591,7 +1598,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q51 | unsupported | needs FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
-| Q54 | unsupported | needs CAST of a DOUBLE to an integer type, round, SELECT DISTINCT, scalar subqueries inside a condition and scalar subqueries that are not aggregates (SQ4) |
+| Q54 | unsupported | needs scalar subqueries inside a condition and scalar subqueries that are not aggregates (SQ4) |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | pass | `UNION ALL` (ADR 0036) |
 | Q57 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
@@ -1624,7 +1631,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
-| Q87 | unsupported | needs SELECT DISTINCT, parenthesized set-operation branches and EXCEPT (X4d) |
+| Q87 | unsupported | needs parenthesized set-operation branches and EXCEPT (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
