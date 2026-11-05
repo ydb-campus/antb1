@@ -729,6 +729,14 @@ constexpr unsigned kDistinctPercent = 15;
 // Salt of the random stream which every draw that only SELECT DISTINCT needs takes, so that a query
 // without it is the query this seed generated before the AG3 PR.
 constexpr uint64_t kDistinctStreamSalt = 0x64697374696E6374ULL;
+// Share of the GROUP BY lists written as a ROLLUP (ADR 0037's RU3), and, of those, the share of two
+// keys that keep the first one plain before the ROLLUP and the share that repeat a key in it.
+constexpr unsigned kRollupPercent = 30;
+constexpr unsigned kRollupPlainKeyPercent = 30;
+constexpr unsigned kRollupRepeatPercent = 10;
+// Salt of the random stream which every draw that only ROLLUP needs takes, so that a query without
+// it is the query this seed generated before the RU3 PR.
+constexpr uint64_t kRollupStreamSalt = 0x726F6C6C75703A33ULL;
 // Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
 // correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
 // EXISTS and the share that add a non-equality residual to the key.
@@ -939,7 +947,7 @@ class Builder {
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
-          Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, FeatureSet allowed)
+          Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -952,6 +960,7 @@ class Builder {
         star_rng_(star_rng),
         variance_rng_(variance_rng),
         distinct_rng_(distinct_rng),
+        rollup_rng_(rollup_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1605,7 +1614,9 @@ class Builder {
       used_.Add(Feature::kSelectDistinct);
       Keyword("DISTINCT");
     }
+    distinct_items_ = distinct;
     SelectList(shape, star_ok, from, cols, numeric, aggs, selected_keys);
+    distinct_items_ = false;
     Keyword("FROM");
     EmitFrom(from);
     Where(from.where_keys);
@@ -1613,6 +1624,30 @@ class Builder {
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
         allowed_.Has(Feature::kPosition) && !constant_positions_.empty() && rng_.Percent(30);
+    // Now and then the keys are a ROLLUP (ADR 0037's RU3), from a stream of its own: all of them,
+    // or the second after the first one plain, and now and then the last one twice (a duplicate
+    // set). Each set is the GROUP BY of its keys, a key NULL in the sets without it.
+    std::size_t plain = keys.size();
+    bool repeat = false;
+    if (!keys.empty() && allowed_.Has(Feature::kRollup) && rollup_rng_.Percent(kRollupPercent)) {
+      plain = keys.size() == 2 && rollup_rng_.Percent(kRollupPlainKeyPercent) ? 1 : 0;
+      repeat = rollup_rng_.Percent(kRollupRepeatPercent);
+      used_.Add(Feature::kRollup);
+    }
+    // A repeated key is written as its column, spelled the same both times (its tokens copied):
+    // DuckDB keeps two spellings of one column (with and without a qualifier, or a column and its
+    // position) as two grouping expressions, each NULL in its own sets, so that HAVING and the
+    // select list can read different ones; antb1 groups by one key (docs/sql-subset.md).
+    const auto key = [&](const GenColumn* column, bool position_ok) {
+      const auto selected =
+          std::ranges::find_if(key_positions_, [&](const auto& kp) { return kp.first == column; });
+      if (position_ok && selected != key_positions_.end() && allowed_.Has(Feature::kPosition) &&
+          rng_.Percent(40)) {
+        Position(selected->second);
+      } else {
+        Column(*column);
+      }
+    };
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (i == 0) {
         used_.Add(Feature::kGroupBy);
@@ -1621,14 +1656,21 @@ class Builder {
       } else {
         Symbol(",");
       }
-      const auto selected =
-          std::ranges::find_if(key_positions_, [&](const auto& kp) { return kp.first == keys[i]; });
-      if (selected != key_positions_.end() && allowed_.Has(Feature::kPosition) &&
-          rng_.Percent(40)) {
-        Position(selected->second);
-      } else {
-        Column(*keys[i]);
+      if (i == plain) {
+        Keyword("ROLLUP");
+        Symbol("(");
       }
+      const std::size_t first = tokens_.size();
+      key(keys[i], !repeat || i + 1 < keys.size());
+      if (repeat && i + 1 == keys.size()) {
+        const std::vector<Token> spelled(tokens_.begin() + static_cast<std::ptrdiff_t>(first),
+                                         tokens_.end());
+        Symbol(",");
+        tokens_.insert(tokens_.end(), spelled.begin(), spelled.end());
+      }
+    }
+    if (plain < keys.size()) {
+      Symbol(")");
     }
     if (constant_group) {
       used_.Add(Feature::kGroupBy);
@@ -1892,13 +1934,14 @@ class Builder {
   // 0037's AG2), drawn from a stream of its own. Only a select item's AVG gets here: ORDER BY and
   // HAVING take Orderable calls, which AVG is not, and a correlated block writes its own. Both are
   // DOUBLE values that only a value test compares. A DOUBLE column's NaN and infinities would fail
-  // both engines with an out-of-range error, so it keeps its AVG.
+  // both engines with an out-of-range error, so it keeps its AVG. Nor does a SELECT DISTINCT's
+  // item: two values a last digit apart are two rows in one engine and one in the other.
   std::optional<bool> Aggregate(Agg agg, const GenColumn* arg, bool arithmetic = false) {
     static constexpr auto kVarianceNames = std::to_array<std::string_view>(
         {"STDDEV_SAMP", "STDDEV", "STDDEV_POP", "VAR_SAMP", "VARIANCE", "VAR_POP"});
     const bool variance = agg == Agg::kAvg && arg != nullptr &&
                           (arg->kind == ValueKind::kInteger || arg->kind == ValueKind::kDecimal) &&
-                          allowed_.Has(Feature::kVariance) &&
+                          allowed_.Has(Feature::kVariance) && !distinct_items_ &&
                           variance_rng_.Percent(kVariancePercent);
     if (variance) {
       used_.Add(Feature::kVariance);
@@ -3813,17 +3856,19 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
-  Rng& join_rng_;          // the draws that only a join needs
-  Rng& block_rng_;         // the draws that only a nested block needs
-  Rng& left_rng_;          // the draws that only a left join needs
-  Rng& sub_rng_;           // the draws that only an uncorrelated subquery needs
-  Rng& substring_rng_;     // the draws that only substring needs
-  Rng& corr_rng_;          // the draws that only a correlated subquery needs
-  Rng& union_rng_;         // the draws that only a compound needs
-  Rng& star_rng_;          // the draws that only a star item or a qualified star needs
-  Rng& variance_rng_;      // the draws that only the variance family needs
-  Rng& distinct_rng_;      // the draws that only SELECT DISTINCT needs
-  bool distinct_ = false;  // the outer block is SELECT DISTINCT
+  Rng& join_rng_;                // the draws that only a join needs
+  Rng& block_rng_;               // the draws that only a nested block needs
+  Rng& left_rng_;                // the draws that only a left join needs
+  Rng& sub_rng_;                 // the draws that only an uncorrelated subquery needs
+  Rng& substring_rng_;           // the draws that only substring needs
+  Rng& corr_rng_;                // the draws that only a correlated subquery needs
+  Rng& union_rng_;               // the draws that only a compound needs
+  Rng& star_rng_;                // the draws that only a star item or a qualified star needs
+  Rng& variance_rng_;            // the draws that only the variance family needs
+  Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
+  Rng& rollup_rng_;              // the draws that only ROLLUP needs
+  bool distinct_ = false;        // the outer block is SELECT DISTINCT
+  bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -4029,8 +4074,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng star_rng(Mix(seed ^ kStarStreamSalt));
   Rng variance_rng(Mix(seed ^ kVarianceStreamSalt));
   Rng distinct_rng(Mix(seed ^ kDistinctStreamSalt));
+  Rng rollup_rng(Mix(seed ^ kRollupStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, star_rng, variance_rng, distinct_rng, options.supported)
+               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4055,13 +4101,15 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng star_rng(Mix(state ^ kStarStreamSalt));
   Rng variance_rng(Mix(state ^ kVarianceStreamSalt));
   Rng distinct_rng(Mix(state ^ kDistinctStreamSalt));
+  Rng rollup_rng(Mix(state ^ kRollupStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, allowed)
-                         .Build()
-                         .value_or(GeneratedQuery{});
+  GeneratedQuery q =
+      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
+              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, allowed)
+          .Build()
+          .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

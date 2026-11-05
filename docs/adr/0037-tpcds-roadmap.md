@@ -156,7 +156,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | AG3 | SELECT DISTINCT (the AG3 update below) | | Built |
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 and RU1 updates below; ADR 0038) | | Built |
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Built |
-| RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Planned |
+| RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Built |
 | RU4 | GROUPING() and GROUPING_ID() | | Planned |
 | RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Planned |
 | RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Planned |
@@ -611,6 +611,23 @@ exactly. No SQL binds to the node before RU3, so no query passes from it alone.
 - **Tests.** Plan-level tests cover the node in every visitor. Exec tests check both operators against every set's
   GROUP BY (ROLLUP, CUBE, duplicates, two roots, the empty set over no input, the fallback), at 1 and 4 threads,
   with every set's errors raised before the first row.
+
+Update (2026-11-05, RU3): built. `GROUP BY ROLLUP` binds to ADR 0038's `GroupingSetsNode` in every form: keys and
+composites, several clauses (their cross product, the earlier clause varying slowest), duplicate sets kept, and DuckDB's
+limit of 65535 sets. Queries 5, 18, 22 and 80 pass; 69 of the 99 do.
+
+- **Refused:** a constant in a ROLLUP, which DuckDB groups by and shows NULL where rolled up (exit code 4).
+- **A divergence, kept out of the generator:** DuckDB keeps two spellings of one column in a grouping list as two
+  grouping expressions, each NULL in its own sets, so its HAVING can read a different one than its select list; antb1
+  groups by one key, as its plain GROUP BY does (docs/sql-subset.md).
+- **Tests.** `.slt` records over the star schema, the binder's sets and errors, the generator's ROLLUP stream (a salted
+  stream of its own, so no other query of a seed changes), and three metamorphic relations: ROLLUP is the union of
+  its sets' GROUP BYs, its empty set over no rows is the ungrouped aggregate, and its rows do not depend on the batch
+  size or the split.
+- **The harness** pairs the rows of a rowsort block with R columns within the tolerance when their text order separates
+  them (a last-digit difference of a DOUBLE ahead of the other cells), and the generator keeps the variance family out
+  of a SELECT DISTINCT's list (two values a last digit apart are two rows in one engine and one in the other): both
+  failed rare seeds of the variance family before RU3, which made them more frequent.
 
 ## Alternatives considered
 

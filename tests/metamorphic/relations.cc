@@ -583,6 +583,49 @@ std::vector<Relation> AllRelations() {
     }
     r.push_back(std::move(sizes));
   }
+  // GROUP BY ROLLUP (ADR 0037's RU3): its rows are those of each set's own GROUP BY, a key the set
+  // lacks NULL, the empty set's row the ungrouped aggregate's; the same whatever the batch size and
+  // over the split file. The calls merge exactly, so the two-level operator answers them.
+  {
+    const slt::FeatureSet rollup = {
+        kRollup, kGroupBy, kColumns, kMultipleItems, kIntegerColumns, kVarcharColumns, kCountStar,
+        kSum,    kMin,     kCase,    kWhere,         kIntegerLiteral, kTableName};
+    constexpr std::string_view kCalls = "COUNT(*), SUM(ResolutionWidth), MIN(URL)";
+    // NULL in every row (no OS is negative), as a key the set lacks: a NULL item is not supported.
+    constexpr std::string_view kNull = "CASE WHEN OS < 0 THEN OS END";
+    r.push_back(
+        {.name = "rollup_is_the_union_of_its_sets",
+         .features = rollup,
+         .probes = {Q(std::format("SELECT OS, IsMobile, {} FROM hits_like WHERE OS < 30 GROUP BY "
+                                  "ROLLUP (OS, IsMobile)",
+                                  kCalls)),
+                    Q(std::format("SELECT OS, IsMobile, {} FROM hits_like WHERE OS < 30 GROUP BY "
+                                  "OS, IsMobile",
+                                  kCalls)),
+                    Q(std::format("SELECT OS, {}, {} FROM hits_like WHERE OS < 30 GROUP BY OS",
+                                  kNull, kCalls)),
+                    Q(std::format("SELECT MIN({}), MIN({}), {} FROM hits_like WHERE OS < 30", kNull,
+                                  kNull, kCalls))},
+         .check = FirstIsUnionOfRest()});
+    r.push_back(
+        {.name = "rollup_of_no_rows_is_the_ungrouped_aggregate",
+         .features = rollup,
+         .probes = {Q(std::format("SELECT OS, {} FROM hits_like WHERE OS < 0 GROUP BY ROLLUP (OS)",
+                                  kCalls)),
+                    Q(std::format("SELECT MIN(OS), {} FROM hits_like WHERE OS < 0", kCalls))},
+         .check = AllEqual()});
+    constexpr std::string_view kRolled =
+        "SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth), MIN(URL) FROM {} WHERE OS < 30 "
+        "GROUP BY ROLLUP (OS, IsMobile)";
+    Relation sizes{.name = "rollup_batch_size_and_split_invariance",
+                   .features = rollup,
+                   .probes = {Q(std::format(kRolled, "hits_like"))},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kRolled, "hits_like_split"), batch));
+    }
+    r.push_back(std::move(sizes));
+  }
   // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
   // across batches and row groups are those of one pass, within the slt tolerance.
   {

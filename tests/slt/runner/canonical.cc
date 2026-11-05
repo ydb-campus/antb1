@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -84,6 +85,46 @@ bool LinesEqual(std::string_view expected, std::string_view actual, std::string_
     if (!equal) {
       return false;
     }
+  }
+  return true;
+}
+
+// Whether every line of `expected` pairs with its own line of `actual` equal within the R
+// tolerance, rows grouped by their other cells' text: rendering sorts a rowsort block by its whole
+// text, where a last-digit difference of an R cell before the other cells moves a row away from
+// the row it matches. Greedy within each group (the first unpaired equal line), which pairs rows
+// that differ only by such rounding.
+bool PairsWithinTolerance(const std::vector<std::string>& expected,
+                          const std::vector<std::string>& actual, std::string_view types,
+                          double rel_tolerance) {
+  const auto exact = [types](std::string_view line) {
+    std::string key;
+    const std::vector<std::string_view> cells = SplitCells(line);
+    for (std::size_t c = 0; c < cells.size(); ++c) {
+      if (c >= types.size() || types[c] != 'R') {
+        key += cells[c];
+      }
+      key += '\t';
+    }
+    return key;
+  };
+  std::map<std::string, std::vector<std::size_t>> unpaired;  // actual lines by their exact cells
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    unpaired[exact(actual[i])].push_back(i);
+  }
+  for (const std::string& line : expected) {
+    const auto group = unpaired.find(exact(line));
+    if (group == unpaired.end()) {
+      return false;
+    }
+    std::vector<std::size_t>& lines = group->second;
+    const auto match = std::ranges::find_if(lines, [&](std::size_t i) {
+      return LinesEqual(line, actual[i], types, SortMode::kRowSort, rel_tolerance);
+    });
+    if (match == lines.end()) {
+      return false;
+    }
+    lines.erase(match);
   }
   return true;
 }
@@ -263,6 +304,11 @@ std::optional<BlockDiff> CompareBlocks(const std::vector<std::string>& expected,
   }
   if (!first.has_value()) {
     return std::nullopt;  // equal within the R tolerance
+  }
+  // Sorted by text, rows equal within the tolerance may not line up: pair them instead.
+  if (sort == SortMode::kRowSort && types.contains('R') &&
+      PairsWithinTolerance(expected, actual, types, rel_tolerance)) {
+    return std::nullopt;
   }
   return BlockDiff{.reason = "values differ", .first_row = first};
 }

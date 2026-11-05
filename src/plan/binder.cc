@@ -1223,6 +1223,9 @@ bool IsFoldableConstant(const sql::Expr& expr);
 // also has no GROUP BY).
 bool IsAggregateQuery(const sql::SelectStatement& stmt);
 
+// DuckDB's limit on the grouping sets of one GROUP BY.
+constexpr std::size_t kMaxGroupingSets = 65535;
+
 // Whether `stmt` has a GROUP BY: a plain list or one in grouping-set syntax (ADR 0038). The test
 // for a grouped block, so that a ROLLUP's block is never taken for an ungrouped one.
 bool HasGroupBy(const sql::SelectStatement& stmt) {
@@ -3735,8 +3738,11 @@ class Binder {
   std::vector<BoundColumn> keys_;     // GROUP BY keys, as columns of the input
   std::vector<ColumnId> key_ids_;     // per key: its column in the aggregation's output
   std::vector<ExprPtr> key_exprs_;    // per key: its input-scope expression
-  std::vector<ExprPtr> post_exprs_;   // computed over the aggregation's output
-  std::vector<ColumnId> post_ids_;    // per post expression: its column
+  // GROUP BY in grouping-set syntax (ADR 0038): each set as indices into keys_, ascending, in
+  // DuckDB's order, duplicates kept; empty for a plain GROUP BY.
+  std::vector<std::vector<std::size_t>> grouping_sets_;
+  std::vector<ExprPtr> post_exprs_;  // computed over the aggregation's output
+  std::vector<ColumnId> post_ids_;   // per post expression: its column
   std::vector<Predicate> having_;
   std::vector<SortKey> sort_keys_;
   // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
@@ -5856,28 +5862,30 @@ std::size_t Binder::FirstBindingOf(std::size_t r) const {
 // there is a row at all).
 arrow::Status Binder::BindGroupBy() {
   clause_ = Clause::kGroupBy;
-  const auto add = [&](const Typed& t) {
-    const bool duplicate = std::ranges::any_of(
+  // The key of `t`: a new one, or the earlier key of the same expression.
+  const auto add = [&](const Typed& t) -> std::size_t {
+    const auto same = std::ranges::find_if(
         key_exprs_, [&](const ExprPtr& key) { return SameExpr(*key, *t.expr); });
-    if (!duplicate) {
-      keys_.push_back(InputColumn(t));
-      key_ids_.push_back(ids_.Next());
-      key_exprs_.push_back(t.expr);
+    if (same != key_exprs_.end()) {
+      return Narrow<std::size_t>(same - key_exprs_.begin());
     }
+    keys_.push_back(InputColumn(t));
+    key_ids_.push_back(ids_.Next());
+    key_exprs_.push_back(t.expr);
+    return keys_.size() - 1;
   };
   // Select item i as a key: its expression, nothing for a constant, an error for an aggregate.
   const auto item_key = [&](std::size_t i, std::string_view what,
-                            SourceSpan span) -> arrow::Status {
+                            SourceSpan span) -> arrow::Result<std::optional<std::size_t>> {
     const auto [kind, index] = select_.items[i];
     switch (kind) {
       case ItemKind::kAggregate:
         return BindError(std::format("GROUP BY cannot refer to the aggregate {}", what), span);
       case ItemKind::kConstant:
-        break;
+        return std::nullopt;
       case ItemKind::kColumn: {
         const BoundColumn& column = select_.columns[index];
-        add(ColumnLeaf(column.id, column.type, column.name, false));
-        break;
+        return add(ColumnLeaf(column.id, column.type, column.name, false));
       }
       case ItemKind::kExpression: {
         const sql::Expr& expr = *select_.exprs[index];
@@ -5885,28 +5893,27 @@ arrow::Status Binder::BindGroupBy() {
           return BindError(std::format("GROUP BY cannot refer to the aggregate {}", what), span);
         }
         ARROW_ASSIGN_OR_RAISE(const Typed t, BindInput(expr));
-        if (!IsConstantExpr(*t.expr)) {
-          add(t);
+        if (IsConstantExpr(*t.expr)) {
+          return std::nullopt;
         }
-        break;
+        return add(t);
       }
     }
-    return arrow::Status::OK();
+    return std::nullopt;
   };
-  for (const sql::GroupExpr& expr : stmt_.group_by) {
+  // One GROUP BY item's key, or std::nullopt for a constant (no key).
+  const auto key_of = [&](const sql::GroupExpr& expr) -> arrow::Result<std::optional<std::size_t>> {
     if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
       ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select_, "GROUP BY"));
-      if (position.has_value()) {
-        ARROW_RETURN_NOT_OK(
-            item_key(*position, std::format("at position {}", *position + 1), lit->span));
+      if (!position.has_value()) {
+        return std::nullopt;
       }
-      continue;
+      return item_key(*position, std::format("at position {}", *position + 1), lit->span);
     }
     if (const auto* ref = std::get_if<sql::ColumnRef>(&expr)) {
       auto column = Resolve(*ref);
       if (column.ok()) {
-        add(ColumnLeaf(column->id, column->type, column->name, false));
-        continue;
+        return add(ColumnLeaf(column->id, column->type, column->name, false));
       }
       const auto detail = GetSqlError(column.status());
       if (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind) {
@@ -5917,9 +5924,7 @@ arrow::Status Binder::BindGroupBy() {
       if (!alias.has_value()) {
         return column.status();
       }
-      ARROW_RETURN_NOT_OK(
-          item_key(*alias, std::format("'{}'", select_.aliases[*alias].value_or("")), ref->span));
-      continue;
+      return item_key(*alias, std::format("'{}'", select_.aliases[*alias].value_or("")), ref->span);
     }
     ARROW_ASSIGN_OR_RAISE(const Typed t, BindInput(expr));
     std::vector<ColumnId> reads;
@@ -5927,8 +5932,72 @@ arrow::Status Binder::BindGroupBy() {
     if (reads.empty()) {
       return UnsupportedError("GROUP BY a constant expression is not supported", expr.span());
     }
-    add(t);
+    return add(t);
+  };
+  for (const sql::GroupExpr& expr : stmt_.group_by) {
+    ARROW_RETURN_NOT_OK(key_of(expr).status());
   }
+  if (stmt_.grouping.empty()) {
+    return arrow::Status::OK();
+  }
+  // Grouping-set syntax (ADR 0038), expanded as DuckDB expands it: each item gives a list of sets
+  // -- a key one set of itself (a constant none), ROLLUP (e1, ..., en) its prefixes from () to all
+  // n, a composite in it one element of its keys -- and the items combine as a cross product,
+  // earlier items varying slowest. Duplicate sets stay.
+  std::vector<std::vector<std::size_t>> sets = {{}};
+  for (const sql::GroupingElement& element : stmt_.grouping) {
+    std::vector<std::vector<std::size_t>> item_sets;
+    switch (element.kind) {
+      case sql::GroupingElement::Kind::kExpr: {
+        ARROW_ASSIGN_OR_RAISE(const auto key, key_of(element.exprs.front()));
+        if (!key.has_value()) {
+          // DuckDB groups by it in every set, so no set is () and no input gives no row; antb1
+          // keeps no key for a constant, which would make one set () here.
+          return UnsupportedError("a constant GROUP BY item next to ROLLUP is not supported",
+                                  element.exprs.front().span());
+        }
+        item_sets.push_back({*key});
+        break;
+      }
+      case sql::GroupingElement::Kind::kRollup: {
+        std::vector<std::size_t> prefix;
+        item_sets.push_back(prefix);
+        for (const sql::GroupingElement& inner : element.elements) {
+          for (const sql::Expr& expr : inner.exprs) {
+            ARROW_ASSIGN_OR_RAISE(const auto key, key_of(expr));
+            if (!key.has_value()) {
+              // DuckDB groups by it, NULL in the sets without it: the select list would have to
+              // read the key rather than the constant.
+              return UnsupportedError("a constant in ROLLUP is not supported", expr.span());
+            }
+            prefix.push_back(*key);
+          }
+          item_sets.push_back(prefix);
+        }
+        break;
+      }
+      default:  // refused by CheckSupported
+        return arrow::Status::Invalid("grouping element of an unsupported kind");
+    }
+    if (sets.size() * item_sets.size() > kMaxGroupingSets) {
+      return BindError(std::format("Maximum grouping set count of {} exceeded", kMaxGroupingSets),
+                       stmt_.group_by_span);
+    }
+    std::vector<std::vector<std::size_t>> product;
+    product.reserve(sets.size() * item_sets.size());
+    for (const std::vector<std::size_t>& set : sets) {
+      for (const std::vector<std::size_t>& item : item_sets) {
+        std::vector<std::size_t> both = set;
+        both.insert(both.end(), item.begin(), item.end());
+        std::ranges::sort(both);
+        const auto [first, last] = std::ranges::unique(both);
+        both.erase(first, last);
+        product.push_back(std::move(both));
+      }
+    }
+    sets = std::move(product);
+  }
+  grouping_sets_ = std::move(sets);
   return arrow::Status::OK();
 }
 
@@ -6513,12 +6582,22 @@ LogicalPlan Binder::Assemble() {
   switch (shape_) {
     case Shape::kGrouped: {
       // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
-      // last).
-      node = Make(GroupAggregateNode{.input = std::move(node),
+      // last); GroupingSets the same, a key NULL in the sets without it.
+      if (!grouping_sets_.empty()) {
+        node = Make(GroupingSetsNode{.input = std::move(node),
                                      .keys = std::move(keys_),
                                      .key_ids = key_ids_,
+                                     .sets = std::move(grouping_sets_),
                                      .aggregates = select_.aggregates,
+                                     .grouping = {},
                                      .span = stmt_.group_by_span});
+      } else {
+        node = Make(GroupAggregateNode{.input = std::move(node),
+                                       .keys = std::move(keys_),
+                                       .key_ids = key_ids_,
+                                       .aggregates = select_.aggregates,
+                                       .span = stmt_.group_by_span});
+      }
       above();
       // A plain column is the key it groups by (CheckGrouped made sure there is one).
       project([&](ColumnId field) { return key_ids_.at(KeyOf(field).value_or(key_ids_.size())); });
@@ -6705,8 +6784,7 @@ void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
       FoldDateCasts(expr);
     }
   }
-  // A grouping element's expressions, though CheckBlock refuses the element (ADR 0038): no
-  // unfolded cast reaches whoever answers it.
+  // A grouping element's expressions (ADR 0038), as the plain list's.
   const auto fold_element = [](this const auto& self, sql::GroupingElement& element) -> void {
     for (sql::Expr& expr : element.exprs) {
       FoldDateCasts(expr);
@@ -6845,10 +6923,13 @@ arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
         ARROW_RETURN_NOT_OK(CheckValue(expr));
       }
       return arrow::Status::OK();
-    case Kind::kRollup:
-      what = "GROUP BY ROLLUP";
-      item = "RU3";
-      break;
+    case Kind::kRollup:  // of expressions and composites (the parser admits nothing else)
+      for (const sql::GroupingElement& inner : element.elements) {
+        for (const sql::Expr& expr : inner.exprs) {
+          ARROW_RETURN_NOT_OK(CheckValue(expr));
+        }
+      }
+      return arrow::Status::OK();
     case Kind::kCube:
       what = "GROUP BY CUBE";
       item = "RU6";

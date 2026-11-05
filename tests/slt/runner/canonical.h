@@ -54,6 +54,8 @@ struct BlockDiff {
 
 // Compares an expected block with a rendered actual block. I, D and T cells compare exactly; R
 // cells (types[i] == 'R') compare numerically: |a - b| <= 1e-12 + rel_tolerance * max(|a|, |b|).
+// A rowsort block with R columns whose rows do not match line by line matches when its rows pair
+// one to one within the tolerance (the text order can separate rows that differ in a last digit).
 // valuesort loses the columns, so with an R column every value compares numerically (the parser
 // refuses valuesort for records with both R and D columns).
 std::optional<BlockDiff> CompareBlocks(const std::vector<std::string>& expected,
