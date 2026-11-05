@@ -391,15 +391,30 @@ condition, `TRY_CAST` and a cast to a type antb1 has no type for, such as `CAST(
 rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`
 and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
-Grouping sets ([ADR 0038](adr/0038-grouping-sets.md)) parse in every form DuckDB parses: `ROLLUP (...)` and
-`CUBE (...)` over expressions and composites `(a, b)`, `GROUPING SETS (...)` over any of these, nested ones included,
-the empty set `()`, and a composite as a `GROUP BY` item; `rollup` and `cube` are names unless `(` follows. The binder
-refuses each at its keyword or parenthesis with exit code 4, naming the item of [ADR 0037](adr/0037-tpcds-roadmap.md)
-that answers it (ROLLUP RU3, GROUPING SETS, `()` and composites RU5, CUBE RU6), and `GROUPING()` and `GROUPING_ID()`
-naming RU4. The forms DuckDB's grammar does not have are syntax errors (exit code 1), as there: `ROLLUP ()`, `()`
-inside `ROLLUP` or `CUBE`, `GROUPING SETS ()`, and a list after `GROUP BY ALL`. The parser refuses with exit code 4
-a trailing comma inside `ROLLUP`, `CUBE` or `GROUPING SETS`, which DuckDB accepts, and an operator or a cast after a
-composite (`(a, b) + 1`), a row value.
+Grouping sets ([ADR 0038](adr/0038-grouping-sets.md)) parse in every form DuckDB parses: `ROLLUP (...)` and `CUBE (...)`
+over expressions and composites `(a, b)`, `GROUPING SETS (...)` over any of these, nested ones included, the empty set
+`()`, and a composite as a `GROUP BY` item; `rollup` and `cube` are names unless `(` follows. The binder refuses the
+forms antb1 does not answer yet at their keyword or parenthesis with exit code 4, naming the item of [ADR
+0037](adr/0037-tpcds-roadmap.md) that answers them (GROUPING SETS, `()` and a composite outside `ROLLUP` RU5, CUBE RU6),
+and `GROUPING()` and `GROUPING_ID()` naming RU4. The forms DuckDB's grammar does not have are syntax errors (exit code
+1), as there: `ROLLUP ()`, `()` inside `ROLLUP` or `CUBE`, `GROUPING SETS ()`, and a list after `GROUP BY ALL`. The
+parser refuses with exit code 4 a trailing comma inside `ROLLUP`, `CUBE` or `GROUPING SETS`, which DuckDB accepts, and
+an operator or a cast after a composite (`(a, b) + 1`), a row value.
+
+`GROUP BY ROLLUP (...)` is answered (RU3), in every form: of keys and composites, after or between other keys, and
+several of them, as DuckDB expands them. `ROLLUP (e1, ..., en)` groups by each prefix of its elements, from `()` to all
+of them; the items of the `GROUP BY` combine as a cross product, so `x, ROLLUP (a, (b, c))` groups by `(x)`, `(x, a)`
+and `(x, a, b, c)`. A key is an expression, a select alias or a position, as in a plain `GROUP BY`. Each set's rows are
+its own `GROUP BY`, one after another: a key the set lacks is NULL in its rows (as a NULL of the data is, until
+`GROUPING()`, RU4), and the empty set gives one row even over no input rows. A set listed twice (`ROLLUP (a, a)`) gives
+its rows twice. More than 65535 sets is DuckDB's bind error, "Maximum grouping set count of 65535 exceeded". A constant
+in a `ROLLUP` (a constant select item named by alias or position) is refused with exit code 4: DuckDB groups by it, NULL
+in the sets without it, which the select list's constant would not show. So is a constant `GROUP BY` item next to a
+`ROLLUP`, which DuckDB groups by in every set: no set is then `()`, and no input rows give no row. One divergence: antb1
+groups by one key however a column is written, while DuckDB keeps two spellings of it in one list (`t.a` and `a`, or a
+column and its position or alias) as two grouping expressions, each NULL in its own sets, so that its `HAVING` can read
+a different one than its select list (`GROUP BY 1, ROLLUP (a)` with `a` the first item and `HAVING a = 1`). The plan is
+a `GroupingSets` node ([ADR 0038](adr/0038-grouping-sets.md)), run in two levels where every call merges exactly.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two
@@ -1560,7 +1575,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q2 | pass | round of a DOUBLE (FN2) |
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
-| Q5 | unsupported | needs ROLLUP (RU3) |
+| Q5 | pass | ROLLUP (RU3) |
 | Q6 | unsupported | needs scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | unsupported | needs INTERSECT (X4c) |
@@ -1569,15 +1584,15 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q11 | pass | `UNION ALL` (ADR 0036) |
 | Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q13 | pass | answered when the ratchet was added |
-| Q14 | unsupported | needs ROLLUP, INTERSECT and a one-row subquery over a CTE (SQ3) |
+| Q14 | unsupported | needs INTERSECT and a one-row subquery over a CTE (SQ3) |
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
 | Q17 | pass | stddev_samp (AG2) |
-| Q18 | unsupported | needs ROLLUP (RU3) |
+| Q18 | pass | ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q21 | pass | a quotient of literals folded into DOUBLE (CT4) |
-| Q22 | unsupported | needs ROLLUP (RU3) |
+| Q22 | pass | ROLLUP (RU3) |
 | Q23 | pass | `*` next to other select items |
 | Q24 | pass | upper (FN4) |
 | Q25 | pass | answered when the ratchet was added |
@@ -1622,26 +1637,26 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | pass | `UNION ALL` (ADR 0036) |
-| Q67 | unsupported | needs ROLLUP and rank() (phase 9) |
+| Q67 | unsupported | needs rank() (phase 9) |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
-| Q70 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
+| Q70 | unsupported | needs GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q71 | pass | `UNION ALL` (ADR 0036) |
 | Q72 | pass | DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q74 | pass | `UNION ALL` (ADR 0036) |
 | Q75 | unsupported | needs UNION (X4b) |
 | Q76 | pass | IS NULL (NL4) |
-| Q77 | unsupported | needs ROLLUP and a cross product of multi-row relations (OJ4) |
+| Q77 | unsupported | needs a cross product of multi-row relations (OJ4) |
 | Q78 | pass | round of a DOUBLE (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
-| Q80 | unsupported | needs ROLLUP (RU3) |
+| Q80 | pass | ROLLUP (RU3) |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
-| Q86 | unsupported | needs ROLLUP, GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
+| Q86 | unsupported | needs GROUPING(), rank(), windows over aggregates and window partition expressions (phase 9) |
 | Q87 | unsupported | needs parenthesized set-operation branches and EXCEPT (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |

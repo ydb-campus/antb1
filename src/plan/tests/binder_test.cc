@@ -2068,7 +2068,6 @@ TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
   const Catalog catalog = MakeCatalog();
   for (const auto& [sql, span, item] :
        std::to_array<std::tuple<std::string_view, std::string_view, std::string_view>>({
-           {"SELECT i16 FROM t GROUP BY ROLLUP (i16, s)", "ROLLUP (i16, s)", "RU3"},
            {"SELECT i16 FROM t GROUP BY i16, CUBE (s)", "CUBE (s)", "RU6"},
            {"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), ())", "GROUPING SETS ((i16), ())",
             "RU5"},
@@ -2086,20 +2085,108 @@ TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
         << bound.status().ToString();
   }
   // A plain item before the element is checked first: its own refusal wins.
-  const auto first = BindSql("SELECT 1 FROM t GROUP BY md5(s), ROLLUP (i16)", catalog);
+  const auto first = BindSql("SELECT 1 FROM t GROUP BY md5(s), CUBE (i16)", catalog);
   ASSERT_FALSE(first.ok());
   EXPECT_TRUE(first.status().message().contains("md5")) << first.status().ToString();
   // In a derived table, a CTE and a subquery's block too.
   for (const std::string_view sql : {
-           "SELECT i16 FROM (SELECT i16 FROM t GROUP BY ROLLUP (i16)) AS d",
-           "WITH c AS (SELECT i16 FROM t GROUP BY ROLLUP (i16)) SELECT i16 FROM c",
-           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM t GROUP BY ROLLUP (i16))",
+           "SELECT i16 FROM (SELECT i16 FROM t GROUP BY CUBE (i16)) AS d",
+           "WITH c AS (SELECT i16 FROM t GROUP BY CUBE (i16)) SELECT i16 FROM c",
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM t GROUP BY CUBE (i16))",
        }) {
     const auto bound = BindSql(sql, catalog);
     ASSERT_FALSE(bound.ok()) << sql;
-    EXPECT_EQ(SpanText(sql, bound.status()), "ROLLUP (i16)") << sql;
-    EXPECT_TRUE(bound.status().message().contains("ADR 0037's RU3")) << bound.status().ToString();
+    EXPECT_EQ(SpanText(sql, bound.status()), "CUBE (i16)") << sql;
+    EXPECT_TRUE(bound.status().message().contains("ADR 0037's RU6")) << bound.status().ToString();
   }
+}
+
+// GROUP BY ROLLUP (ADR 0037's RU3): a GroupingSets node over the distinct keys, its sets expanded
+// as DuckDB expands them -- a ROLLUP's prefixes from () up, a composite one element, the items'
+// cross product with the earlier ones varying slowest, duplicate sets kept -- and the select list
+// reading the keys' outputs, NULL in the sets without them.
+TEST(BinderTest, RollupBindsToAGroupingSetsNode) {
+  const Catalog catalog = MakeCatalog();
+  const auto sets_of = [&](std::string_view sql) -> std::vector<std::vector<std::size_t>> {
+    const auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return {};
+    }
+    const auto* node = std::get_if<GroupingSetsNode>(&Nth(*plan, 1));
+    EXPECT_NE(node, nullptr) << sql;
+    return node == nullptr ? std::vector<std::vector<std::size_t>>{} : node->sets;
+  };
+  using Sets = std::vector<std::vector<std::size_t>>;
+  EXPECT_EQ(sets_of("SELECT i16, s, COUNT(*) FROM t GROUP BY ROLLUP (i16, s)"),
+            (Sets{{}, {0}, {0, 1}}));
+  EXPECT_EQ(sets_of("SELECT i16, COUNT(*) FROM t GROUP BY ROLLUP (i16, i16)"),
+            (Sets{{}, {0}, {0}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY i32, ROLLUP (i16, (s, i64)), ROLLUP (dt)"),
+            (Sets{{0}, {0, 4}, {0, 1}, {0, 1, 4}, {0, 1, 2, 3}, {0, 1, 2, 3, 4}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY ROLLUP (i16, s), i16"),
+            (Sets{{0}, {0}, {0, 1}}));
+  // An alias and a position name a select item's key.
+  EXPECT_EQ(sets_of("SELECT i16 + 1 AS k, s, COUNT(*) FROM t GROUP BY ROLLUP (k, 2)"),
+            (Sets{{}, {0}, {0, 1}}));
+
+  const auto plan =
+      BindSql("SELECT s, SUM(i32) FROM t GROUP BY ROLLUP (s) HAVING COUNT(*) > 1", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(Explain(*plan),
+            R"x(Output: s:VARCHAR sum(i32):HUGEINT
+Project s, "sum(i32)"
+  Filter "count_star()" > 1
+    GroupingSets keys=[s] sets=[(), (s)] SUM(i32), COUNT(*)
+      Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "Mixed Case", from]
+)x");
+}
+
+// What RU3 refuses or rejects: a constant in a ROLLUP (DuckDB groups by it, NULL where rolled up,
+// which the select list's constant would not show), an aggregate named by position, and more than
+// DuckDB's 65535 sets.
+TEST(BinderTest, RollupErrors) {
+  const Catalog catalog = MakeCatalog();
+  const auto constant =
+      BindSql("SELECT 'x' AS k, COUNT(*) FROM t GROUP BY ROLLUP (k, i16)", catalog);
+  ASSERT_FALSE(constant.ok());
+  ASSERT_NE(GetSqlError(constant.status()), nullptr);
+  EXPECT_EQ(GetSqlError(constant.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_TRUE(constant.status().message().contains("a constant in ROLLUP is not supported"))
+      << constant.status().ToString();
+
+  // A constant next to a ROLLUP: DuckDB's every set groups by it, so no input gives no row.
+  for (const std::string_view sql :
+       {"SELECT 'x' AS k, i16, COUNT(*) FROM t GROUP BY 1, ROLLUP (i16)",
+        "SELECT 'x' AS k, i16, COUNT(*) FROM t GROUP BY k, ROLLUP (i16)",
+        "SELECT i16, COUNT(*) FROM t GROUP BY 'y', ROLLUP (i16)"}) {
+    const auto beside = BindSql(sql, catalog);
+    ASSERT_FALSE(beside.ok()) << sql;
+    ASSERT_NE(GetSqlError(beside.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(beside.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(beside.status().message().contains(
+        "a constant GROUP BY item next to ROLLUP is not supported"))
+        << beside.status().ToString();
+  }
+
+  const auto aggregate = BindSql("SELECT COUNT(*) FROM t GROUP BY ROLLUP (1)", catalog);
+  ASSERT_FALSE(aggregate.ok());
+  EXPECT_TRUE(aggregate.status().message().contains("GROUP BY cannot refer to the aggregate"))
+      << aggregate.status().ToString();
+
+  // 4^8 = 65536 sets: one too many. 4^7 is fine.
+  std::string many = "SELECT COUNT(*) FROM t GROUP BY ROLLUP (i16, i32, i64)";
+  for (int i = 0; i < 6; ++i) {
+    many += ", ROLLUP (i16, i32, i64)";
+  }
+  EXPECT_TRUE(BindSql(many, catalog).ok());
+  many += ", ROLLUP (i16, i32, i64)";
+  const auto too_many = BindSql(many, catalog);
+  ASSERT_FALSE(too_many.ok());
+  EXPECT_TRUE(too_many.status().message().contains("Maximum grouping set count of 65535 exceeded"))
+      << too_many.status().ToString();
+  ASSERT_NE(GetSqlError(too_many.status()), nullptr);
+  EXPECT_EQ(GetSqlError(too_many.status())->kind(), SqlErrorDetail::Kind::kBind);
 }
 
 // A block with a GROUP BY in grouping-set syntax is a grouped block wherever the binder asks

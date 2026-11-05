@@ -188,6 +188,39 @@ TEST(CompareBlocks, RealsUseTheTolerance) {
                   .has_value());
 }
 
+// A rowsort block sorts rows by their text, so a last-digit difference of an R cell ahead of the
+// other cells can order rows differently in the two blocks: they still match, by value.
+TEST(CompareBlocks, RowSortedRealsMatchWhatTheTextOrderSeparates) {
+  // 24.888888888888886 sorts before 24.88888888888889 as text: the rows' other cells decide the
+  // order in one block and not in the other.
+  const std::vector<std::string> expected = {"24.88888888888889\t1", "24.88888888888889\t11",
+                                             "24.88888888888889\t12"};
+  const std::vector<std::string> actual = {"24.888888888888886\t1", "24.888888888888886\t11",
+                                           "24.888888888888886\t12"};
+  EXPECT_FALSE(
+      CompareBlocks(expected, actual, "RI", SortMode::kRowSort, kDefaultRelTolerance).has_value());
+  const std::vector<std::string> mixed = {"24.88888888888889\t11", "24.888888888888886\t1",
+                                          "24.888888888888886\t12"};
+  EXPECT_FALSE(
+      CompareBlocks(expected, mixed, "RI", SortMode::kRowSort, kDefaultRelTolerance).has_value());
+  // NULL among the values, and a real difference, still fail.
+  EXPECT_FALSE(CompareBlocks({"NULL\t2", "1.0\t1"}, {"1.0000000000000002\t1", "NULL\t2"}, "RI",
+                             SortMode::kRowSort, kDefaultRelTolerance)
+                   .has_value());
+  EXPECT_TRUE(CompareBlocks({"1.5\t1", "2.5\t2"}, {"1.5\t2", "2.5\t1"}, "RI", SortMode::kRowSort,
+                            kDefaultRelTolerance)
+                  .has_value());
+  // Two R columns whose last digits order the rows differently in each block.
+  EXPECT_FALSE(
+      CompareBlocks({"0\t106.88888888888887\t8737.333333333334", "0\t106.8888888888889\t2916"},
+                    {"0\t106.88888888888887\t2916", "0\t106.88888888888887\t8737.333333333332"},
+                    "IRR", SortMode::kRowSort, kDefaultRelTolerance)
+          .has_value());
+  // Without rowsort the order is the answer's own.
+  EXPECT_TRUE(
+      CompareBlocks(expected, mixed, "RI", SortMode::kNoSort, kDefaultRelTolerance).has_value());
+}
+
 TEST(CompareBlocks, HashLinesCompareExactly) {
   const std::string a = "3 values hashing to " + Sha256Hex("a");
   const std::string b = "3 values hashing to " + Sha256Hex("b");

@@ -1205,6 +1205,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   for (const auto& e : stmt.group_by) {
     check_columns(e, kNone);
   }
+  for (const sql::Expr* e : sql::GroupingExprs(stmt.grouping)) {
+    check_columns(*e, kNone);
+  }
   for (const sql::Expr& e : stmt.having) {
     check_columns(e, kNone);
   }
@@ -1536,6 +1539,7 @@ void CheckSubquery(const GeneratedQuery& q, const std::vector<GenTable>& tables,
   EXPECT_EQ(block.items.at(0).star(), nullptr);
   EXPECT_TRUE(block.where.empty());
   EXPECT_TRUE(block.group_by.empty());
+  EXPECT_TRUE(block.grouping.empty());
   EXPECT_TRUE(block.having.empty());
   EXPECT_TRUE(block.order_by.empty());
   EXPECT_FALSE(block.limit.has_value());
