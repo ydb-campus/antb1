@@ -446,6 +446,18 @@ std::string_view ToString(AggKind kind) {
       return "MIN";
     case AggKind::kMax:
       return "MAX";
+    case AggKind::kStddevSamp:
+      return "STDDEV_SAMP";
+    case AggKind::kStddev:
+      return "STDDEV";
+    case AggKind::kStddevPop:
+      return "STDDEV_POP";
+    case AggKind::kVarSamp:
+      return "VAR_SAMP";
+    case AggKind::kVariance:
+      return "VARIANCE";
+    case AggKind::kVarPop:
+      return "VAR_POP";
   }
   return "?";
 }

@@ -110,6 +110,16 @@ AggKind ToPlan(sql::AggKind kind) {
       return AggKind::kMin;
     case sql::AggKind::kMax:
       return AggKind::kMax;
+    case sql::AggKind::kStddevSamp:
+    case sql::AggKind::kStddev:
+      return AggKind::kStddevSamp;
+    case sql::AggKind::kStddevPop:
+      return AggKind::kStddevPop;
+    case sql::AggKind::kVarSamp:
+    case sql::AggKind::kVariance:
+      return AggKind::kVarSamp;
+    case sql::AggKind::kVarPop:
+      return AggKind::kVarPop;
   }
   return AggKind::kCountStar;
 }
@@ -556,12 +566,13 @@ std::string ExprName(const sql::Expr& expr) {
   return std::visit(ExprNameOf{}, static_cast<const sql::ExprNode&>(expr));
 }
 
-// count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x), sum((x + 1)).
+// count_star(), count(x), count(DISTINCT x), sum(x), avg(x), min(x), max(x), sum((x + 1)); an
+// alias as written (stddev(x), variance(x)), as DuckDB names it.
 std::string ResultName(const sql::AggregateCall& call) {
   if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
     return "count_star()";
   }
-  return AsciiLower(ToString(ToPlan(call.kind))) + "(" + (call.distinct ? "DISTINCT " : "") +
+  return AsciiLower(sql::ToString(call.kind)) + "(" + (call.distinct ? "DISTINCT " : "") +
          ExprName(**call.arg) + ")";
 }
 
@@ -1590,6 +1601,19 @@ arrow::Result<LogicalType> AggregateType(const sql::AggregateCall& call, const B
     case sql::AggKind::kMin:
     case sql::AggKind::kMax:
       break;
+    case sql::AggKind::kStddevSamp:
+    case sql::AggKind::kStddev:
+    case sql::AggKind::kStddevPop:
+    case sql::AggKind::kVarSamp:
+    case sql::AggKind::kVariance:
+    case sql::AggKind::kVarPop:
+      // DuckDB's variance family takes DOUBLE, any other number cast to it (ADR 0037's AG2).
+      if (!IsNumeric(arg.type) && arg.type != LogicalType::kDecimal) {
+        return BindError(std::format("{} needs a numeric column, but '{}' is {}",
+                                     sql::ToString(call.kind), arg.name, ToString(arg.type)),
+                         call.span);
+      }
+      return LogicalType::kDouble;
   }
   return arg.type;
 }

@@ -718,6 +718,12 @@ constexpr unsigned kSubstringPercent = 55;
 // Salt of the sixth random stream, which every draw that only substring needs takes, so that a
 // query without one is the query this seed generated before the substring PR.
 constexpr uint64_t kSubstringStreamSalt = 0x7375627374722D72ULL;
+// Share of a select item's AVG of an integer or DECIMAL that one of the variance family replaces
+// (ADR 0037's AG2).
+constexpr unsigned kVariancePercent = 30;
+// Salt of the random stream which every draw that only the variance family needs takes, so that a
+// query without one is the query this seed generated before the AG2 PR.
+constexpr uint64_t kVarianceStreamSalt = 0x76617269616E6365ULL;
 // Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
 // correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
 // EXISTS and the share that add a non-equality residual to the key.
@@ -928,7 +934,7 @@ class Builder {
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
-          Rng& star_rng, FeatureSet allowed)
+          Rng& star_rng, Rng& variance_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -939,6 +945,7 @@ class Builder {
         corr_rng_(corr_rng),
         union_rng_(union_rng),
         star_rng_(star_rng),
+        variance_rng_(variance_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1865,9 +1872,26 @@ class Builder {
 
   // `arithmetic`: the argument is an arithmetic expression of the column, when one fits; returns
   // whether its values are exact then (std::nullopt: the plain column).
+  //
+  // Now and then an AVG of an integer or DECIMAL column becomes one of the variance family (ADR
+  // 0037's AG2), drawn from a stream of its own. Only a select item's AVG gets here: ORDER BY and
+  // HAVING take Orderable calls, which AVG is not, and a correlated block writes its own. Both are
+  // DOUBLE values that only a value test compares. A DOUBLE column's NaN and infinities would fail
+  // both engines with an out-of-range error, so it keeps its AVG.
   std::optional<bool> Aggregate(Agg agg, const GenColumn* arg, bool arithmetic = false) {
-    used_.Add(AggFeature(agg));
-    Keyword(AggName(agg));
+    static constexpr auto kVarianceNames = std::to_array<std::string_view>(
+        {"STDDEV_SAMP", "STDDEV", "STDDEV_POP", "VAR_SAMP", "VARIANCE", "VAR_POP"});
+    const bool variance = agg == Agg::kAvg && arg != nullptr &&
+                          (arg->kind == ValueKind::kInteger || arg->kind == ValueKind::kDecimal) &&
+                          allowed_.Has(Feature::kVariance) &&
+                          variance_rng_.Percent(kVariancePercent);
+    if (variance) {
+      used_.Add(Feature::kVariance);
+      Keyword(variance_rng_.Pick(kVarianceNames));
+    } else {
+      used_.Add(AggFeature(agg));
+      Keyword(AggName(agg));
+    }
     Symbol("(");
     std::optional<bool> exact;
     arg_retyped_ = false;
@@ -1880,9 +1904,9 @@ class Builder {
       if (arithmetic && rng_.Percent(30)) {
         exact = Case(*arg, /*aggregated=*/true, /*summed=*/agg == Agg::kSum || agg == Agg::kAvg);
       }
-      // SUM takes only EXTRACT's BIGINT; AVG a TIMESTAMP too.
+      // SUM and the variance family take only EXTRACT's BIGINT; AVG a TIMESTAMP too.
       if (arithmetic && !exact.has_value() && rng_.Percent(25) &&
-          Temporal(*arg, /*number=*/agg == Agg::kSum)) {
+          Temporal(*arg, /*number=*/agg == Agg::kSum || variance)) {
         exact = true;
         arg_retyped_ = true;
       }
@@ -3779,6 +3803,7 @@ class Builder {
   Rng& corr_rng_;       // the draws that only a correlated subquery needs
   Rng& union_rng_;      // the draws that only a compound needs
   Rng& star_rng_;       // the draws that only a star item or a qualified star needs
+  Rng& variance_rng_;   // the draws that only the variance family needs
   FeatureSet allowed_;
   std::vector<Edge> edges_;         // the refs joins can follow
   const FromList* from_ = nullptr;  // the FROM list of the query being written (TryFrom)
@@ -3982,8 +4007,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng corr_rng(Mix(seed ^ kCorrelatedStreamSalt));
   Rng union_rng(Mix(seed ^ kUnionStreamSalt));
   Rng star_rng(Mix(seed ^ kStarStreamSalt));
+  Rng variance_rng(Mix(seed ^ kVarianceStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, star_rng, options.supported)
+               union_rng, star_rng, variance_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4006,11 +4032,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng corr_rng(Mix(state ^ kCorrelatedStreamSalt));
   Rng union_rng(Mix(state ^ kUnionStreamSalt));
   Rng star_rng(Mix(state ^ kStarStreamSalt));
+  Rng variance_rng(Mix(state ^ kVarianceStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, star_rng, allowed)
+                             corr_rng, union_rng, star_rng, variance_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

@@ -141,6 +141,31 @@ TEST(ParserTest, EveryAggregate) {
   EXPECT_EQ(At(kSql, avg->arg_column()->span), R"("Amount")");
 }
 
+// The variance family (ADR 0037's AG2): one kind per spelling, in any case, unparsed under its own
+// name, so an alias round-trips as written.
+TEST(ParserTest, VarianceFamily) {
+  constexpr std::string_view kSql =
+      "SELECT stddev_samp(a), STDDEV(a), Stddev_Pop(a + 1), var_samp(a), variance(a), var_pop(a) "
+      "FROM t";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  constexpr auto kKinds =
+      std::to_array<AggKind>({AggKind::kStddevSamp, AggKind::kStddev, AggKind::kStddevPop,
+                              AggKind::kVarSamp, AggKind::kVariance, AggKind::kVarPop});
+  ASSERT_EQ(stmt->items.size(), kKinds.size());
+  for (std::size_t i = 0; i < kKinds.size(); ++i) {
+    const AggregateCall* agg = AggregateOf(stmt->items[i]);
+    ASSERT_NE(agg, nullptr) << i;
+    EXPECT_EQ(agg->kind, kKinds.at(i)) << i;
+  }
+  EXPECT_EQ(ToSql(*stmt),
+            "SELECT STDDEV_SAMP(a), STDDEV(a), STDDEV_POP(a + 1), VAR_SAMP(a), VARIANCE(a), "
+            "VAR_POP(a) FROM t");
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+}
+
 TEST(ParserTest, AggregatesAreCaseInsensitiveAndAllowSpaces) {
   constexpr std::string_view kSql = "select count ( * ) , Sum( amount ) from events";
   auto stmt = Parse(kSql);
@@ -2518,6 +2543,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "ROLLUP is not supported"},
         RejectCase{"MaxDistinctInOrderBy", "SELECT a FROM events ORDER BY MAX(^DISTINCT a)",
                    kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
+        RejectCase{"StddevDistinct", "SELECT STDDEV(^DISTINCT a) FROM events", kUnsupported, 8,
+                   "STDDEV(DISTINCT ...) is not supported"},
         RejectCase{"SelectAll", "SELECT ^ALL a FROM events", kUnsupported, 3,
                    "SELECT ALL is not supported"},
         RejectCase{"AllAggregate", "SELECT COUNT(^ALL a) FROM events", kUnsupported, 3,

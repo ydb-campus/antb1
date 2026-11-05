@@ -32,6 +32,7 @@
 #include "double_key.h"
 #include "grouped_sum_alias.h"
 #include "temporal_average.h"
+#include "variance.h"
 
 namespace antb1::exec {
 namespace {
@@ -670,6 +671,73 @@ class GroupedDoubleSum final : public GroupedAggregateState {
   std::vector<std::int64_t> counts_;
 };
 
+// ---- The variance family ----
+
+// STDDEV_SAMP, STDDEV_POP, VAR_SAMP or VAR_POP per group (ADR 0037's AG2): each value as DuckDB
+// casts it to DOUBLE, into the group's running moments in row order (variance.h). CheckFinalize
+// raises DuckDB's out-of-range error of any group before the first row.
+class GroupedVariance final : public GroupedAggregateState {
+ public:
+  GroupedVariance(plan::AggKind kind, arrow::MemoryPool* pool) : kind_(kind), pool_(pool) {}
+
+  [[nodiscard]] std::uint32_t num_groups() const override {
+    return static_cast<std::uint32_t>(moments_.size());
+  }
+  void Resize(std::uint32_t num_groups) override { moments_.resize(num_groups); }
+  [[nodiscard]] std::int64_t memory_usage() const override { return VectorBytes(moments_); }
+  arrow::Status Consume(const arrow::Array* values, GroupIds ids) override {
+    if (values == nullptr) {
+      return arrow::Status::Invalid("a variance aggregate needs an argument column");
+    }
+    ARROW_ASSIGN_OR_RAISE(const auto doubles, ToDuckDbDoubles(*values, pool_));
+    ARROW_RETURN_NOT_OK(CheckRows(doubles.get(), arrow::float64().get(), ids, num_groups()));
+    const double* data = doubles->raw_values();
+    const bool nulls = doubles->null_count() != 0;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      if (nulls && doubles->IsNull(static_cast<std::int64_t>(i))) {
+        continue;
+      }
+      AddValue(moments_[ids[i]], data[i]);
+    }
+    return arrow::Status::OK();
+  }
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
+                            GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same,
+                          SameKind<GroupedVariance>(other, from, to, num_groups()));
+    for (std::size_t i = 0; i < from.size(); ++i) {
+      Combine(same->moments_[from[i]], moments_[to[i]]);
+    }
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto groups, GroupRange(moments_, begin, end));
+    arrow::DoubleBuilder builder(pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(groups.size())));
+    for (const Moments& group : groups) {
+      ARROW_ASSIGN_OR_RAISE(const std::optional<double> result, FinalizeVariance(kind_, group));
+      if (result.has_value()) {
+        builder.UnsafeAppend(*result);
+      } else {
+        builder.UnsafeAppendNull();
+      }
+    }
+    return builder.Finish();
+  }
+  [[nodiscard]] arrow::Status CheckFinalize() const override {
+    for (const Moments& group : moments_) {
+      ARROW_RETURN_NOT_OK(FinalizeVariance(kind_, group).status());
+    }
+    return arrow::Status::OK();
+  }
+
+ private:
+  plan::AggKind kind_;
+  arrow::MemoryPool* pool_;
+  std::vector<Moments> moments_;
+};
+
 // ---- MIN and MAX ----
 
 // How MIN and MAX read and store the values of one column type.
@@ -1128,6 +1196,15 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         return invalid();
       }
       return GroupedCountDistinct::Make(plan::ToArrow(*input), pool);
+    case plan::AggKind::kStddevSamp:
+    case plan::AggKind::kStddevPop:
+    case plan::AggKind::kVarSamp:
+    case plan::AggKind::kVarPop:
+      if ((!plan::IsNumeric(*input) && *input != plan::LogicalType::kDecimal) ||
+          result != plan::LogicalType::kDouble) {
+        return invalid();
+      }
+      return std::make_unique<GroupedVariance>(kind, pool);
   }
   return invalid();
 }

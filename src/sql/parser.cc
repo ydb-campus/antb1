@@ -519,6 +519,13 @@ std::optional<AggKind> AggregateOf(const Token& token) {
   if (keyword == "MAX") {
     return AggKind::kMax;
   }
+  // The variance family (ADR 0037's AG2).
+  for (const AggKind kind : {AggKind::kStddevSamp, AggKind::kStddev, AggKind::kStddevPop,
+                             AggKind::kVarSamp, AggKind::kVariance, AggKind::kVarPop}) {
+    if (keyword == ToString(kind)) {
+      return kind;
+    }
+  }
   return std::nullopt;
 }
 

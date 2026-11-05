@@ -9,6 +9,7 @@ antb1_add_module(
     table_scan.cc
     filter.cc
     decimal.cc
+    variance.cc
     scan_filter.cc
     compute.cc
     parallel_compute.cc

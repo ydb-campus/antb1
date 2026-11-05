@@ -42,6 +42,7 @@
 #include "../part_operators.h"
 #include "../part_pruning.h"
 #include "../part_scheduler.h"
+#include "../variance.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -948,6 +949,93 @@ TEST_F(PartOperatorsTest, GroupedDoubleSumsAddPerPart) {
     const auto& expected = running.at(key);
     EXPECT_NEAR(values.first, expected.first, 1e-9 * std::abs(expected.first));
     EXPECT_NEAR(values.second, expected.second, 1e-9 * std::abs(expected.second));
+  }
+}
+
+// The variance family (ADR 0037's AG2) as DOUBLE SUM is above: each part's moments by DuckDB's
+// running update, then the parts combined in part order, so the bits are the same serially and on
+// a pool; grouped, the same rows on one thread and four, and the serial operator's values within
+// rounding.
+TEST_F(PartOperatorsTest, VarianceMergesPartsInOrder) {
+  const auto pool = Pool();
+  const auto d = Column(1, "d", LogicalType::kDouble);
+  const auto aggregate = Node(plan::AggregateNode{
+      .input = Scan(Table()),
+      .aggregates = {{.kind = plan::AggKind::kStddevSamp, .arg = d, .type = LogicalType::kDouble},
+                     {.kind = plan::AggKind::kVarPop, .arg = d, .type = LogicalType::kDouble}}});
+  Moments total;
+  for (int64_t part = 0; part < kParts; ++part) {
+    Moments moments;
+    for (int64_t i = 0; i < kRows; ++i) {
+      AddValue(moments, static_cast<double>((part * kRows) + i) / 10);
+    }
+    Combine(moments, total);
+  }
+  const auto stddev = FinalizeVariance(plan::AggKind::kStddevSamp, total);
+  const auto var_pop = FinalizeVariance(plan::AggKind::kVarPop, total);
+  ASSERT_TRUE(stddev.ok() && var_pop.ok());
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto result = Run(PlanOf(aggregate, 2), executor);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    const auto& first = static_cast<const arrow::DoubleArray&>(*(*result)->column(0)->chunk(0));
+    const auto& second = static_cast<const arrow::DoubleArray&>(*(*result)->column(1)->chunk(0));
+    EXPECT_EQ(first.Value(0), stddev->value_or(std::nan("")));
+    EXPECT_EQ(second.Value(0), var_pop->value_or(std::nan("")));
+  }
+}
+
+TEST_F(PartOperatorsTest, GroupedVarianceIsTheSameOnAnyThreads) {
+  const auto pool = Pool();
+  const auto d = Column(4, "d", LogicalType::kDouble);
+  const auto grouped = [&](const std::shared_ptr<MemoryTable>& table) {
+    const auto scan =
+        Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1, 2, 3, 4}});
+    return PlanOf(
+        Node(plan::GroupAggregateNode{
+            .input = scan,
+            .keys = {Column(1, "g", LogicalType::kBigInt)},
+            .aggregates =
+                {{.kind = plan::AggKind::kVarSamp, .arg = d, .type = LogicalType::kDouble},
+                 {.kind = plan::AggKind::kStddevPop, .arg = d, .type = LogicalType::kDouble}}}),
+        3);
+  };
+  const auto serial = Run(grouped(GroupingTable(false)), nullptr);
+  const auto one_thread = Run(grouped(GroupingTable(true)), nullptr);
+  const auto four_threads = Run(grouped(GroupingTable(true)), pool.get());
+  ASSERT_TRUE(serial.ok() && one_thread.ok() && four_threads.ok());
+  EXPECT_TRUE(SameRows(**four_threads, **one_thread));
+  const auto by_key = [](const arrow::Table& table) {
+    std::map<std::optional<int64_t>, std::pair<std::optional<double>, std::optional<double>>> out;
+    const auto combined = table.CombineChunksToBatch().ValueOrDie();
+    const auto& keys = static_cast<const arrow::Int64Array&>(*combined->column(0));
+    const auto value = [&](int column, int64_t row) -> std::optional<double> {
+      const auto& doubles = static_cast<const arrow::DoubleArray&>(*combined->column(column));
+      return doubles.IsNull(row) ? std::nullopt : std::optional(doubles.Value(row));
+    };
+    for (int64_t i = 0; i < combined->num_rows(); ++i) {
+      out[keys.IsNull(i) ? std::nullopt : std::optional(keys.Value(i))] = {value(1, i),
+                                                                           value(2, i)};
+    }
+    return out;
+  };
+  const auto parts = by_key(**one_thread);
+  const auto running = by_key(**serial);
+  ASSERT_EQ(parts.size(), running.size());
+  for (const auto& [key, values] : parts) {
+    const auto& expected = running.at(key);
+    ASSERT_EQ(values.first.has_value(), expected.first.has_value());
+    ASSERT_EQ(values.second.has_value(), expected.second.has_value());
+    const double nan = std::nan("");
+    const double first = expected.first.value_or(nan);
+    const double second = expected.second.value_or(nan);
+    if (values.first.has_value()) {
+      EXPECT_NEAR(values.first.value_or(nan), first, 1e-9 * std::abs(first));
+    }
+    if (values.second.has_value()) {
+      EXPECT_NEAR(values.second.value_or(nan), second, 1e-9 * std::abs(second));
+    }
   }
 }
 

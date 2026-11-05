@@ -469,6 +469,14 @@ std::string_view ToString(AggKind kind) {
       return "MAX";
     case AggKind::kSumCounts:
       return "SUM_COUNTS";
+    case AggKind::kStddevSamp:
+      return "STDDEV_SAMP";
+    case AggKind::kStddevPop:
+      return "STDDEV_POP";
+    case AggKind::kVarSamp:
+      return "VAR_SAMP";
+    case AggKind::kVarPop:
+      return "VAR_POP";
   }
   return "?";
 }

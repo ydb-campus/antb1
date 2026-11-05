@@ -13,6 +13,7 @@
 #include <optional>
 #include <ranges>
 #include <regex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -200,7 +201,7 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     const std::string sql = Lower(q.sql);
     const bool aggregate = std::ranges::any_of(
         std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
-                       Feature::kMin, Feature::kMax, Feature::kCountDistinct}),
+                       Feature::kMin, Feature::kMax, Feature::kCountDistinct, Feature::kVariance}),
         [&](Feature f) { return q.features.Has(f); });
     // A select list of constants, arithmetic, string functions or CASE only is a projection too: a
     // row per table row.
@@ -1398,6 +1399,13 @@ Feature AggFeatureOf(sql::AggKind kind) {
       return Feature::kMin;
     case sql::AggKind::kMax:
       return Feature::kMax;
+    case sql::AggKind::kStddevSamp:
+    case sql::AggKind::kStddev:
+    case sql::AggKind::kStddevPop:
+    case sql::AggKind::kVarSamp:
+    case sql::AggKind::kVariance:
+    case sql::AggKind::kVarPop:
+      return Feature::kVariance;
   }
   return Feature::kCountStar;
 }
@@ -1612,7 +1620,8 @@ TEST(QueryGenerator, SubqueryQueriesStayUncorrelated) {
       ASSERT_NO_FATAL_FAILURE(CheckSubquery(q, tables, cov)) << i;
       const bool aggregate = std::ranges::any_of(
           std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
-                         Feature::kMin, Feature::kMax, Feature::kCountDistinct}),
+                         Feature::kMin, Feature::kMax, Feature::kCountDistinct,
+                         Feature::kVariance}),
           [&](Feature f) { return q.features.Has(f); });
       const bool rows =
           q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
@@ -2127,6 +2136,45 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(avg, 0) << "avg: " << avg;
   EXPECT_GT(avg_integer, 0) << "avg over an integer: " << avg_integer;
   EXPECT_GT(avg_decimal, 0) << "avg over a DECIMAL: " << avg_decimal;
+}
+
+// The variance family (ADR 0037's AG2): written in the select list only, over an integer or a
+// DECIMAL column, in each of its six spellings, never after ORDER BY, HAVING or WHERE; and from a
+// stream of its own, so a query that writes none is the query the seed wrote without the feature.
+TEST(QueryGenerator, VarianceFamilyOnlyAsASelectItem) {
+  const FeatureSet plain = kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase});
+  const std::vector<GenTable> tables = Tables();
+  const auto gen = MakeOver(tables, 71, {.supported = plain, .target_percent = 0});
+  const auto without =
+      MakeOver(tables, 71, {.supported = plain.Minus({Feature::kVariance}), .target_percent = 0});
+  static const std::regex variance_call(
+      R"(\b(STDDEV_SAMP|STDDEV_POP|STDDEV|VAR_SAMP|VARIANCE|VAR_POP)\()", std::regex::icase);
+  std::set<std::string> spellings;
+  int queries = 0;
+  for (uint64_t i = 0; i < 6000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kVariance)) {
+      EXPECT_EQ(q.sql, without.Generate(i).sql) << i;
+      continue;
+    }
+    ++queries;
+    std::smatch m;
+    ASSERT_TRUE(std::regex_search(q.sql, m, variance_call)) << q.sql;
+    spellings.insert(m[1].str());
+    // In a select list: nothing but select items between the nearest SELECT before it and it.
+    for (auto it = std::sregex_iterator(q.sql.begin(), q.sql.end(), variance_call);
+         it != std::sregex_iterator(); ++it) {
+      const std::string before = q.sql.substr(0, static_cast<std::size_t>(it->position()));
+      const std::size_t select = before.rfind("SELECT");
+      ASSERT_NE(select, std::string::npos) << q.sql;
+      const std::string items = before.substr(select);
+      for (const std::string_view word : {" FROM ", " WHERE ", " HAVING ", " ORDER BY "}) {
+        EXPECT_FALSE(items.contains(word)) << word << " in " << q.sql;
+      }
+    }
+  }
+  EXPECT_GT(queries, 50) << "queries: " << queries;
+  EXPECT_EQ(spellings.size(), 6U);
 }
 
 // What it writes, with the layout and keyword-case features off so the call is one span of text:
