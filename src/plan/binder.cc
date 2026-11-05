@@ -9,6 +9,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -33,6 +34,7 @@
 #include "antb1/sql/ast.h"
 #include "antb1/sql/error.h"
 #include "antb1/sql/parser.h"
+#include "antb1/sql/unparse.h"
 
 #include "join_order.h"
 #include "key_type.h"
@@ -949,6 +951,15 @@ std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs)
 constexpr const char* kConditionsOnly =
     " is only supported in conditions (WHERE, HAVING and CASE WHEN)";
 
+// GROUPING(...) or its alias GROUPING_ID(...) (ADR 0038), unquoted: which keys a row's set lacks.
+bool IsGroupingCall(const sql::FunctionCall& call) {
+  if (call.quoted) {
+    return false;
+  }
+  const std::string name = AsciiLower(call.name);
+  return name == "grouping" || name == "grouping_id";
+}
+
 struct FirstUnsupportedOf {
   // A qualified name is no rejection: the scope resolves it among the bindings it names, and says
   // so when none does (rules 1 to 3 of ADR 0022).
@@ -1035,11 +1046,8 @@ struct FirstUnsupportedOf {
     if (IsCoalesce(call)) {
       return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
     }
-    if (const std::string name = AsciiLower(call.name);
-        !call.quoted && (name == "grouping" || name == "grouping_id")) {
-      // GROUPING() and its alias GROUPING_ID() read the grouping sets (ADR 0038).
-      return Rejection{.span = call.name_span,
-                       .message = std::format("{}() is not supported yet (ADR 0037's RU4)", name)};
+    if (IsGroupingCall(call)) {
+      return FirstUnsupportedIn(call.args);  // the keys it reads (ADR 0038)
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
@@ -2903,6 +2911,13 @@ class Binder {
       ConditionAsOperand();
     }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
+      if (IsGroupingCall(call)) {
+        // A row's set exists only above the aggregation: in WHERE, an aggregate's argument or a
+        // projection, as DuckDB's binder says.
+        return HasGroupBy(binder.stmt_)
+                   ? BindError("GROUPING function is not supported here", call.span)
+                   : binder.GroupingOutput(call);
+      }
       return binder.BindFunction(call, [this](const sql::Expr& e) { return binder.BindInput(e); });
     }
     arrow::Result<Typed> operator()(const sql::CaseExpr& c) const {
@@ -3255,6 +3270,62 @@ class Binder {
     return ColumnLeaf(agg.id, agg.type, ResultName(call), FloatResult(agg));
   }
 
+  // GROUPING(k1, ..., kn) as an output column of the grouping-sets node (added when new): a BIGINT,
+  // bit n-1-i set when k_i is not in the row's set. Each argument must be a GROUP BY key as an
+  // expression -- not an alias, not a position -- as DuckDB matches them; the arguments bind first,
+  // so an outer query's column is refused as any outer reference there is.
+  arrow::Result<Typed> GroupingOutput(const sql::FunctionCall& call) {
+    std::vector<ExprPtr> args;
+    args.reserve(call.args.size());
+    for (const sql::Expr& arg : call.args) {
+      auto bound = BindInput(arg);
+      const auto detail = bound.ok() ? nullptr : GetSqlError(bound.status());
+      if (!bound.ok() && (detail == nullptr || detail->kind() != SqlErrorDetail::Kind::kBind)) {
+        return bound.status();
+      }
+      args.push_back(bound.ok() ? bound->expr : nullptr);
+    }
+    if (!HasGroupBy(stmt_)) {
+      return BindError("GROUPING statement cannot be used without groups", call.span);
+    }
+    if (call.args.empty()) {
+      return BindError("GROUPING needs at least one argument", call.span);
+    }
+    if (call.args.size() >= 64) {
+      return BindError("GROUPING statement cannot have more than 64 groups", call.span);
+    }
+    GroupingCall bound{.args = {}, .id = kNoColumnId, .span = call.span};
+    std::string name = "GROUPING(";
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const auto key = args[i] == nullptr ? key_exprs_.end()
+                                          : std::ranges::find_if(key_exprs_, [&](const ExprPtr& k) {
+                                              return SameExpr(*k, *args[i]);
+                                            });
+      if (key == key_exprs_.end() && constant_group_item_ && args[i] != nullptr &&
+          IsConstantExpr(*args[i])) {
+        // DuckDB groups by a constant item, so GROUPING of it is 0; antb1 keeps no key for one.
+        return UnsupportedError("GROUPING of a constant GROUP BY item is not supported",
+                                call.args[i].span());
+      }
+      if (key == key_exprs_.end()) {
+        return BindError(std::format("GROUPING child \"{}\" must be a grouping column",
+                                     sql::ToSql(call.args[i])),
+                         call.args[i].span());
+      }
+      bound.args.push_back(Narrow<std::size_t>(key - key_exprs_.begin()));
+      name += std::format("{}{}", i == 0 ? "" : ", ", args[i]->name);
+    }
+    name += ')';
+    const auto same = std::ranges::find_if(
+        grouping_calls_, [&](const GroupingCall& c) { return c.args == bound.args; });
+    if (same != grouping_calls_.end()) {
+      return ColumnLeaf(same->id, LogicalType::kBigInt, name, false);
+    }
+    bound.id = ids_.Next();
+    grouping_calls_.push_back(bound);
+    return ColumnLeaf(bound.id, LogicalType::kBigInt, name, false);
+  }
+
   // DuckDB's MIN and MAX of a FLOAT column are FLOAT; the other aggregates are not.
   [[nodiscard]] bool FloatResult(const AggregateCall& agg) const {
     return (agg.kind == AggKind::kMin || agg.kind == AggKind::kMax) && agg.arg.has_value() &&
@@ -3315,6 +3386,9 @@ class Binder {
       ConditionAsOperand();
     }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
+      if (IsGroupingCall(call)) {
+        return binder.GroupingOutput(call);
+      }
       return binder.BindFunction(call, [this](const sql::Expr& e) { return binder.BindOutput(e); });
     }
     arrow::Result<Typed> operator()(const sql::CaseExpr& c) const {
@@ -3741,8 +3815,10 @@ class Binder {
   // GROUP BY in grouping-set syntax (ADR 0038): each set as indices into keys_, ascending, in
   // DuckDB's order, duplicates kept; empty for a plain GROUP BY.
   std::vector<std::vector<std::size_t>> grouping_sets_;
-  std::vector<ExprPtr> post_exprs_;  // computed over the aggregation's output
-  std::vector<ColumnId> post_ids_;   // per post expression: its column
+  std::vector<GroupingCall> grouping_calls_;  // GROUPING(...) calls, in the order first bound
+  bool constant_group_item_ = false;          // a plain GROUP BY item that is a constant (no key)
+  std::vector<ExprPtr> post_exprs_;           // computed over the aggregation's output
+  std::vector<ColumnId> post_ids_;            // per post expression: its column
   std::vector<Predicate> having_;
   std::vector<SortKey> sort_keys_;
   // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
@@ -5935,7 +6011,8 @@ arrow::Status Binder::BindGroupBy() {
     return add(t);
   };
   for (const sql::GroupExpr& expr : stmt_.group_by) {
-    ARROW_RETURN_NOT_OK(key_of(expr).status());
+    ARROW_ASSIGN_OR_RAISE(const auto key, key_of(expr));
+    constant_group_item_ = constant_group_item_ || !key.has_value();
   }
   if (stmt_.grouping.empty()) {
     return arrow::Status::OK();
@@ -6583,13 +6660,17 @@ LogicalPlan Binder::Assemble() {
     case Shape::kGrouped: {
       // GroupAggregate outputs the keys, then the aggregates (hidden HAVING and ORDER BY ones
       // last); GroupingSets the same, a key NULL in the sets without it.
-      if (!grouping_sets_.empty()) {
+      if (!grouping_sets_.empty() || !grouping_calls_.empty()) {
+        if (grouping_sets_.empty()) {  // GROUPING over a plain GROUP BY: one set, every key
+          grouping_sets_.emplace_back(keys_.size());
+          std::iota(grouping_sets_.front().begin(), grouping_sets_.front().end(), std::size_t{0});
+        }
         node = Make(GroupingSetsNode{.input = std::move(node),
                                      .keys = std::move(keys_),
                                      .key_ids = key_ids_,
                                      .sets = std::move(grouping_sets_),
                                      .aggregates = select_.aggregates,
-                                     .grouping = {},
+                                     .grouping = grouping_calls_,
                                      .span = stmt_.group_by_span});
       } else {
         node = Make(GroupAggregateNode{.input = std::move(node),

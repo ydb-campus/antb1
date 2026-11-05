@@ -626,6 +626,31 @@ std::vector<Relation> AllRelations() {
     }
     r.push_back(std::move(sizes));
   }
+  // GROUPING() (ADR 0037's RU4): HAVING on its value picks one set's rows, which are that set's own
+  // GROUP BY; over a plain GROUP BY it is 0 in every row.
+  {
+    const slt::FeatureSet grouping = {
+        kRollup,         kGroupingFunction, kGroupBy,   kColumns,     kMultipleItems,
+        kIntegerColumns, kCountStar,        kSum,       kCase,        kHaving,
+        kWhere,          kIntegerLiteral,   kTableName, kDerivedTable};
+    constexpr std::string_view kNull = "CASE WHEN OS < 0 THEN OS END";  // no OS is negative
+    r.push_back(
+        {.name = "grouping_picks_a_set",
+         .features = grouping,
+         .probes =
+             {Q("SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                "GROUP BY ROLLUP (OS, IsMobile) HAVING GROUPING(OS, IsMobile) = 1"),
+              Q(std::format("SELECT OS, {}, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE "
+                            "OS < 30 GROUP BY OS",
+                            kNull))},
+         .check = AllEqual()});
+    r.push_back({.name = "grouping_of_a_plain_group_by_is_zero",
+                 .features = grouping,
+                 .probes = {Q("SELECT COUNT(*) FROM (SELECT OS FROM hits_like GROUP BY OS) AS d"),
+                            Q("SELECT COUNT(*) FROM (SELECT OS FROM hits_like GROUP BY OS HAVING "
+                              "GROUPING(OS) = 0) AS d")},
+                 .check = AllEqual()});
+  }
   // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
   // across batches and row groups are those of one pass, within the slt tolerance.
   {

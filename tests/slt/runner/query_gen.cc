@@ -734,8 +734,12 @@ constexpr uint64_t kDistinctStreamSalt = 0x64697374696E6374ULL;
 constexpr unsigned kRollupPercent = 30;
 constexpr unsigned kRollupPlainKeyPercent = 30;
 constexpr unsigned kRollupRepeatPercent = 10;
-// Salt of the random stream which every draw that only ROLLUP needs takes, so that a query without
-// it is the query this seed generated before the RU3 PR.
+// Share of the grouped queries that select a GROUPING() of their keys (ADR 0037's RU4), drawn from
+// the ROLLUP's stream.
+constexpr unsigned kGroupingPercent = 25;
+// Salt of the random stream which every draw that only grouping sets need takes (ROLLUP, and
+// GROUPING() since RU4), so that a query without either is the query this seed generated before the
+// RU3 PR.
 constexpr uint64_t kRollupStreamSalt = 0x726F6C6C75703A33ULL;
 // Share of the queries that have a correlated candidate and no uncorrelated subquery which take a
 // correlated conjunct (ADR 0023's T3), and, of those, the share that write NOT EXISTS rather than
@@ -1605,6 +1609,16 @@ class Builder {
     aggregate_emitted_ = false;
     starred_ = false;
     EmitWith(from);
+    // Now and then the keys are a ROLLUP (ADR 0037's RU3), from a stream of its own: all of them,
+    // or the second after the first one plain, and now and then the last one twice (a duplicate
+    // set). Each set is the GROUP BY of its keys, a key NULL in the sets without it.
+    std::size_t plain = keys.size();
+    bool repeat = false;
+    if (!keys.empty() && allowed_.Has(Feature::kRollup) && rollup_rng_.Percent(kRollupPercent)) {
+      plain = keys.size() == 2 && rollup_rng_.Percent(kRollupPlainKeyPercent) ? 1 : 0;
+      repeat = rollup_rng_.Percent(kRollupRepeatPercent);
+      used_.Add(Feature::kRollup);
+    }
     Keyword("SELECT");
     // Now and then DISTINCT, from a stream of its own: its rows are the distinct rows of the list,
     // whatever its shape, and its ORDER BY takes only select items (OrderBy).
@@ -1617,6 +1631,25 @@ class Builder {
     distinct_items_ = distinct;
     SelectList(shape, star_ok, from, cols, numeric, aggs, selected_keys);
     distinct_items_ = false;
+    // Now and then GROUPING() (or its alias GROUPING_ID()) of some of the keys, last in the list,
+    // from the ROLLUP's stream: over a ROLLUP it tells a rolled-up NULL from one of the data, over
+    // a plain GROUP BY it is 0 (ADR 0037's RU4).
+    if (shape == Shape::kAggregates && !keys.empty() && allowed_.Has(Feature::kGroupingFunction) &&
+        allowed_.Has(Feature::kMultipleItems) && rollup_rng_.Percent(kGroupingPercent)) {
+      used_.Add(Feature::kGroupingFunction);
+      used_.Add(Feature::kMultipleItems);
+      Symbol(",");
+      Keyword(rollup_rng_.Percent(20) ? "GROUPING_ID" : "GROUPING");
+      Symbol("(");
+      const std::size_t args = 1 + rollup_rng_.Below(keys.size());
+      for (std::size_t i = 0; i < args; ++i) {
+        if (i > 0) {
+          Symbol(",");
+        }
+        Column(*rollup_rng_.Pick(keys));
+      }
+      Symbol(")");
+    }
     Keyword("FROM");
     EmitFrom(from);
     Where(from.where_keys);
@@ -1624,16 +1657,6 @@ class Builder {
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
         allowed_.Has(Feature::kPosition) && !constant_positions_.empty() && rng_.Percent(30);
-    // Now and then the keys are a ROLLUP (ADR 0037's RU3), from a stream of its own: all of them,
-    // or the second after the first one plain, and now and then the last one twice (a duplicate
-    // set). Each set is the GROUP BY of its keys, a key NULL in the sets without it.
-    std::size_t plain = keys.size();
-    bool repeat = false;
-    if (!keys.empty() && allowed_.Has(Feature::kRollup) && rollup_rng_.Percent(kRollupPercent)) {
-      plain = keys.size() == 2 && rollup_rng_.Percent(kRollupPlainKeyPercent) ? 1 : 0;
-      repeat = rollup_rng_.Percent(kRollupRepeatPercent);
-      used_.Add(Feature::kRollup);
-    }
     // A repeated key is written as its column, spelled the same both times (its tokens copied):
     // DuckDB keeps two spellings of one column (with and without a qualifier, or a column and its
     // position) as two grouping expressions, each NULL in its own sets, so that HAVING and the
@@ -3866,7 +3889,7 @@ class Builder {
   Rng& star_rng_;                // the draws that only a star item or a qualified star needs
   Rng& variance_rng_;            // the draws that only the variance family needs
   Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
-  Rng& rollup_rng_;              // the draws that only ROLLUP needs
+  Rng& rollup_rng_;              // the draws that only ROLLUP and GROUPING() need
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;

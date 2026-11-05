@@ -2073,8 +2073,6 @@ TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
             "RU5"},
            {"SELECT i16 FROM t GROUP BY (i16, s)", "(i16, s)", "RU5"},
            {"SELECT COUNT(*) FROM t GROUP BY ()", "()", "RU5"},
-           {"SELECT GROUPING(i16) FROM t GROUP BY i16", "GROUPING", "RU4"},
-           {"SELECT grouping_id(i16) FROM t GROUP BY i16", "grouping_id", "RU4"},
        })) {
     const auto bound = BindSql(sql, catalog);
     ASSERT_FALSE(bound.ok()) << sql;
@@ -2187,6 +2185,83 @@ TEST(BinderTest, RollupErrors) {
       << too_many.status().ToString();
   ASSERT_NE(GetSqlError(too_many.status()), nullptr);
   EXPECT_EQ(GetSqlError(too_many.status())->kind(), SqlErrorDetail::Kind::kBind);
+}
+
+// GROUPING(...) and GROUPING_ID(...) (ADR 0037's RU4): a BIGINT column of the grouping-sets node
+// per distinct argument list, its arguments the keys they name as expressions; over a plain GROUP
+// BY the node has one set of every key. DuckDB's errors otherwise.
+TEST(BinderTest, GroupingCallsAreColumnsOfTheNode) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan = BindSql(
+      "SELECT i16, s, GROUPING(i16, s), grouping_id(s), COUNT(*) FROM t GROUP BY ROLLUP (i16, s) "
+      "HAVING GROUPING(i16, s) < 3 ORDER BY GROUPING(s)",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const GroupingSetsNode* node = nullptr;
+  for (int depth = 0; depth < 6 && node == nullptr; ++depth) {
+    node = std::get_if<GroupingSetsNode>(&Nth(*plan, depth));
+  }
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(node->grouping.size(), 2U);  // GROUPING(i16, s) once, GROUPING(s) once
+  EXPECT_EQ(node->grouping[0].args, (std::vector<std::size_t>{0, 1}));
+  EXPECT_EQ(node->grouping[1].args, (std::vector<std::size_t>{1}));
+  EXPECT_EQ(plan->output[2].name, "GROUPING(i16, s)");
+  EXPECT_EQ(plan->output[3].name, "GROUPING(s)");
+  EXPECT_EQ(plan->output[3].type, LogicalType::kBigInt);
+
+  const auto plain = BindSql("SELECT i16, GROUPING(i16) FROM t GROUP BY i16", catalog);
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  const auto* one = std::get_if<GroupingSetsNode>(&Nth(*plain, 1));
+  ASSERT_NE(one, nullptr);
+  EXPECT_EQ(one->sets, (std::vector<std::vector<std::size_t>>{{0}}));
+
+  for (const auto& [sql, message] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT GROUPING(i16) FROM t", "GROUPING statement cannot be used without groups"},
+           {"SELECT GROUPING(i16), COUNT(*) FROM t",
+            "GROUPING statement cannot be used without groups"},
+           {"SELECT i16, GROUPING(s) FROM t GROUP BY ROLLUP (i16)",
+            "GROUPING child \"s\" must be a grouping column"},
+           {"SELECT i16 AS k, GROUPING(k) FROM t GROUP BY ROLLUP (i16)",
+            "GROUPING child \"k\" must be a grouping column"},
+           {"SELECT i16, GROUPING(1) FROM t GROUP BY ROLLUP (i16)",
+            "GROUPING child \"1\" must be a grouping column"},
+           {"SELECT i16 FROM t WHERE GROUPING(i16) = 0 GROUP BY i16",
+            "GROUPING function is not supported here"},
+           {"SELECT i16, SUM(GROUPING(i16)) FROM t GROUP BY ROLLUP (i16)",
+            "GROUPING function is not supported here"},
+           {"SELECT i16, GROUPING() FROM t GROUP BY i16", "GROUPING needs at least one argument"},
+       })) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    ASSERT_NE(GetSqlError(bound.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(bound.status())->kind(), SqlErrorDetail::Kind::kBind) << sql;
+    EXPECT_TRUE(bound.status().message().contains(message)) << bound.status().ToString();
+  }
+  // Refused rather than wrong: GROUPING of a constant GROUP BY item, which DuckDB answers (0), and
+  // of an enclosing query's column, refused as any outer reference outside WHERE is.
+  for (const std::string_view sql : {"SELECT i16, GROUPING('x') FROM t GROUP BY i16, 'x'",
+                                     "SELECT 1, GROUPING(1) FROM t GROUP BY 1",
+                                     "SELECT i16 FROM t WHERE i16 IN (SELECT i32 FROM u GROUP BY "
+                                     "i32 HAVING GROUPING(t.i16) = 0)"}) {
+    const auto refused = BindSql(sql, catalog);
+    ASSERT_FALSE(refused.ok()) << sql;
+    ASSERT_NE(GetSqlError(refused.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(refused.status())->kind(), SqlErrorDetail::Kind::kUnsupported)
+        << refused.status().ToString();
+  }
+  // 64 arguments are DuckDB's error; 63 are fine.
+  const auto list = [](int n) {
+    std::string args = "i16";
+    for (int i = 1; i < n; ++i) {
+      args += ", i16";
+    }
+    return std::format("SELECT GROUPING({}) FROM t GROUP BY i16", args);
+  };
+  EXPECT_TRUE(BindSql(list(63), catalog).ok());
+  const auto many = BindSql(list(64), catalog);
+  ASSERT_FALSE(many.ok());
+  EXPECT_TRUE(many.status().message().contains("cannot have more than 64 groups"))
+      << many.status().ToString();
 }
 
 // A block with a GROUP BY in grouping-set syntax is a grouped block wherever the binder asks
