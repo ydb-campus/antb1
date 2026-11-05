@@ -2061,6 +2061,45 @@ TEST(BinderDeathTest, AStatementWithoutAFromItemAborts) {
   EXPECT_DEATH((void)Bind(stmt, catalog), "from.empty");
 }
 
+// The variance family (ADR 0037's AG2): DOUBLE over any number column, an alias bound to its
+// target's kind but named as written; a VARCHAR argument is a bind error.
+TEST(BinderTest, VarianceFamily) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT stddev_samp(i16), STDDEV(i64), stddev_pop(d), var_samp(h), VARIANCE(u16), "
+      "var_pop(i32 + 1) FROM t";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto names =
+      std::to_array<std::string_view>({"stddev_samp(i16)", "stddev(i64)", "stddev_pop(d)",
+                                       "var_samp(h)", "variance(u16)", "var_pop((i32 + 1))"});
+  ASSERT_EQ(plan->output.size(), names.size());
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    EXPECT_EQ(plan->output[i].name, names.at(i));
+    EXPECT_EQ(plan->output[i].type, LogicalType::kDouble) << names.at(i);
+  }
+  const AggregateNode* found = nullptr;
+  for (int depth = 0; depth < 4 && found == nullptr; ++depth) {
+    found = std::get_if<AggregateNode>(&Nth(*plan, depth));
+  }
+  ASSERT_NE(found, nullptr) << Explain(*plan);
+  const AggregateNode& agg = *found;
+  const auto kinds =
+      std::to_array<AggKind>({AggKind::kStddevSamp, AggKind::kStddevSamp, AggKind::kStddevPop,
+                              AggKind::kVarSamp, AggKind::kVarSamp, AggKind::kVarPop});
+  ASSERT_EQ(agg.aggregates.size(), kinds.size()) << Explain(*plan);
+  for (std::size_t i = 0; i < kinds.size(); ++i) {
+    EXPECT_EQ(agg.aggregates[i].kind, kinds.at(i)) << i;
+  }
+  const auto text = BindSql("SELECT var_pop(s) FROM t", catalog);
+  ASSERT_FALSE(text.ok());
+  ASSERT_NE(GetSqlError(text.status()), nullptr);
+  EXPECT_EQ(GetSqlError(text.status())->kind(), SqlErrorDetail::Kind::kBind);
+  EXPECT_TRUE(
+      text.status().message().contains("VAR_POP needs a numeric column, but 's' is VARCHAR"))
+      << text.status().ToString();
+}
+
 TEST(BinderTest, CountStarIsAnAggregateOverAScanOfEveryField) {
   const Catalog catalog = MakeCatalog();
   constexpr std::string_view kSql = "SELECT COUNT(*) FROM t";

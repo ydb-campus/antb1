@@ -1116,9 +1116,10 @@ Literal RandomLiteral(Rng& rng) {
 // A random expression of at most `depth` levels; aggregates only where `aggregates` allows them
 // (never nested).
 Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
-  static constexpr auto kKinds =
-      std::to_array<AggKind>({AggKind::kCountStar, AggKind::kCount, AggKind::kSum, AggKind::kAvg,
-                              AggKind::kMin, AggKind::kMax});
+  static constexpr auto kKinds = std::to_array<AggKind>(
+      {AggKind::kCountStar, AggKind::kCount, AggKind::kSum, AggKind::kAvg, AggKind::kMin,
+       AggKind::kMax, AggKind::kStddevSamp, AggKind::kStddev, AggKind::kStddevPop,
+       AggKind::kVarSamp, AggKind::kVariance, AggKind::kVarPop});
   static constexpr auto kBinary = std::to_array<BinaryOp>(
       {BinaryOp::kAdd, BinaryOp::kSubtract, BinaryOp::kMultiply, BinaryOp::kDivide,
        BinaryOp::kIntegerDivide, BinaryOp::kModulo, BinaryOp::kEq, BinaryOp::kNe, BinaryOp::kLt,

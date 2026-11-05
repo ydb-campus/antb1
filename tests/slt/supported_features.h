@@ -26,22 +26,23 @@ namespace antb1::slt {
 
 enum class Feature : std::uint8_t {
   // SELECT list
-  kCountStar,           // COUNT(*)
-  kCountColumn,         // COUNT(col)
-  kSum,                 // SUM(numeric col)
-  kAvg,                 // AVG(numeric col)
-  kMin,                 // MIN(col)
-  kMax,                 // MAX(col)
-  kCountDistinct,       // COUNT(DISTINCT col)
-  kColumns,             // plain column references (a projection)
-  kStar,                // SELECT *
-  kMultipleItems,       // more than one select item
-  kAlias,               // <item> [AS] alias
-  kConstant,            // a literal select item (an integer, a string or a DATE)
-  kArithmetic,          // + - * / // % and unary - of a column and a constant
-  kStringFunctions,     // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
-  kSubstring,           // substring(varchar, start[, length]), in the comma and standard spellings
-  kCase,                // CASE WHEN <condition> THEN .. [ELSE ..] END
+  kCountStar,        // COUNT(*)
+  kCountColumn,      // COUNT(col)
+  kSum,              // SUM(numeric col)
+  kAvg,              // AVG(numeric col)
+  kMin,              // MIN(col)
+  kMax,              // MAX(col)
+  kCountDistinct,    // COUNT(DISTINCT col)
+  kVariance,         // STDDEV_SAMP, STDDEV, STDDEV_POP, VAR_SAMP, VARIANCE or VAR_POP(numeric col)
+  kColumns,          // plain column references (a projection)
+  kStar,             // SELECT *
+  kMultipleItems,    // more than one select item
+  kAlias,            // <item> [AS] alias
+  kConstant,         // a literal select item (an integer, a string or a DATE)
+  kArithmetic,       // + - * / // % and unary - of a column and a constant
+  kStringFunctions,  // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
+  kSubstring,        // substring(varchar, start[, length]), in the comma and standard spellings
+  kCase,             // CASE WHEN <condition> THEN .. [ELSE ..] END
   kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, an inner ON, HAVING,
                         // CASE WHEN)
   kTimestamps,          // toDateTime(integer), EXTRACT(field FROM ..) and date_trunc('unit', ..)
@@ -139,6 +140,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "max";
     case Feature::kCountDistinct:
       return "count_distinct";
+    case Feature::kVariance:
+      return "variance";
     case Feature::kColumns:
       return "columns";
     case Feature::kStar:
@@ -347,6 +350,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kMin,
     Feature::kMax,
     Feature::kCountDistinct,
+    Feature::kVariance,
     Feature::kColumns,
     Feature::kStar,
     Feature::kMultipleItems,

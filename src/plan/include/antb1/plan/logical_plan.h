@@ -91,9 +91,17 @@ enum class AggKind : std::uint8_t {
   kMax,
   kCountDistinct,
   kSumCounts,
+  // The variance family (ADR 0037's AG2), DOUBLE over any number, as DuckDB's STDDevBaseOperation
+  // computes it: the sample and population standard deviation and variance (STDDEV and VARIANCE
+  // bind to the sample forms).
+  kStddevSamp,
+  kStddevPop,
+  kVarSamp,
+  kVarPop,
 };
 
-// "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for COUNT(*), COUNT(col) and COUNT(DISTINCT col)).
+// "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for COUNT(*), COUNT(col) and COUNT(DISTINCT col)),
+// "STDDEV_SAMP", "STDDEV_POP", "VAR_SAMP", "VAR_POP".
 std::string_view ToString(AggKind kind);
 
 // A constant of a column's logical type, folded exactly from a SQL literal by the binder.

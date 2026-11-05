@@ -32,6 +32,7 @@
 #include "part_pruning.h"
 #include "part_scheduler.h"
 #include "partition_lanes.h"
+#include "variance.h"
 
 namespace antb1::exec {
 
@@ -226,10 +227,14 @@ namespace {
 
 // Whether a part's rows may go straight to the partitions (unaggregated) when its own table does
 // not reduce them: with keys, and without a DOUBLE SUM or AVG, whose rounding follows the parts
-// (docs/adr/0013-parallel-execution.md), or a HUGEINT one or one of a DECIMAL beyond 18 digits.
+// (docs/adr/0013-parallel-execution.md), a HUGEINT one or one of a DECIMAL beyond 18 digits, or a
+// variance aggregate, whose DOUBLE moments follow the parts too (ADR 0037's AG2).
 bool MayRouteRows(const std::vector<plan::BoundColumn>& keys,
                   const std::vector<plan::AggregateCall>& calls) {
   return !keys.empty() && std::ranges::none_of(calls, [](const plan::AggregateCall& call) {
+    if (IsVarianceKind(call.kind)) {
+      return true;
+    }
     // These sums check for a 128-bit overflow at every addition, so the grouping of the additions
     // decides whether a query fails (values of at most 18 digits cannot reach it).
     if ((call.kind != plan::AggKind::kSum && call.kind != plan::AggKind::kAvg) ||

@@ -555,6 +555,32 @@ std::vector<Relation> AllRelations() {
                             Q(std::format(kGrouped, "hits_like"))},
                  .check = AllEqual()});
   }
+  // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
+  // across batches and row groups are those of one pass, within the slt tolerance.
+  {
+    const slt::FeatureSet variance = {kGroupBy,       kVariance,       kColumns,
+                                      kMultipleItems, kIntegerColumns, kArithmetic,
+                                      kWhere,         kIntegerLiteral, kTableName};
+    r.push_back({.name = "variance_is_stddev_squared",
+                 .features = variance,
+                 .probes = {Q("SELECT OS, VAR_SAMP(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                              "GROUP BY OS"),
+                            Q("SELECT OS, STDDEV_SAMP(ResolutionWidth) * STDDEV(ResolutionWidth) "
+                              "FROM hits_like WHERE OS < 30 GROUP BY OS")},
+                 .check = AllEqual()});
+    constexpr std::string_view kMoments =
+        "SELECT OS, STDDEV_POP(ResolutionWidth), VAR_POP(UserID), VARIANCE(ResolutionWidth) FROM "
+        "{} WHERE OS < 30 GROUP BY OS";
+    Relation sizes{.name = "variance_batch_size_and_layout_invariance",
+                   .features = variance,
+                   .probes = {},
+                   .check = AllEqual()};
+    for (const int64_t batch : kBatchSizes) {
+      sizes.probes.push_back(Q(std::format(kMoments, "hits_like_split"), batch));
+    }
+    sizes.probes.push_back(Q(std::format(kMoments, "hits_like")));
+    r.push_back(std::move(sizes));
+  }
   // A nullable key with dangling values (the star schema's tr_driver, tools/fixturegen/star.h) over
   // row groups of 1200 rows: the same groups, the NULL group among them, whatever the batch size.
   {

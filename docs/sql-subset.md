@@ -135,7 +135,8 @@ primary     = column_ref | literal | "(" , expr , ")" | "(" , query , ")" | agg_
 type        = identifier , [ "(" , integer , { "," , integer } , ")" ] ;
 agg_call    = "COUNT" , "(" , "*" , ")"
             | "COUNT" , "(" , "DISTINCT" , expr , ")"
-            | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" ) , "(" , expr , ")" ;
+            | ( "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP"
+              | "VAR_SAMP" | "VARIANCE" | "VAR_POP" ) , "(" , expr , ")" ;
 cmp_op      = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" ;
 literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , string_literal
             | "TIMESTAMP" , string_literal ;
@@ -518,8 +519,8 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   (`column 'b' must appear in the GROUP BY clause or be inside an aggregate function`).
 - Result types: `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)` are BIGINT; `SUM` of an integer column is
   HUGEINT and of a DOUBLE column DOUBLE; `AVG` of a number is DOUBLE and of a DATE or TIMESTAMP TIMESTAMP, as in
-  DuckDB; `MIN` and `MAX` have the type of their column. `SUM` of a VARCHAR, DATE or TIMESTAMP and `AVG` of a VARCHAR
-  are bind errors.
+  DuckDB; `MIN` and `MAX` have the type of their column; the variance family is DOUBLE. `SUM` of a VARCHAR, DATE or
+  TIMESTAMP and `AVG` of a VARCHAR are bind errors.
 - Result names follow DuckDB: a plain column is named as declared in the table (`SELECT regionid` gives
   `RegionID`); an aggregate is named `count_star()`, `count(x)`, `count(DISTINCT x)`, `sum(x)`, `avg(x)`, `min(x)`
   or `max(x)`, with the argument as written in the query, double-quoted when it is not a plain identifier or is a
@@ -1169,7 +1170,18 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   nearest microsecond with halves down, a negative one toward zero).
 - MIN and MAX: return the input type; VARCHAR compares byte-wise and DATE chronologically. They use Arrow's
   `min_max` kernel, over only the selected rows under `WHERE` (divergence D10 for NaN).
-- NULL: aggregates skip NULLs. Over zero input rows `COUNT` returns 0 and `SUM`, `AVG`, `MIN` and `MAX` return NULL.
+- The variance family ([ADR 0037](adr/0037-tpcds-roadmap.md)'s AG2): `STDDEV_SAMP`, `STDDEV_POP`, `VAR_SAMP` and
+  `VAR_POP`, with DuckDB's aliases `STDDEV` (of `STDDEV_SAMP`) and `VARIANCE` (of `VAR_SAMP`), of any number column.
+  They return DOUBLE, computed as DuckDB computes them: each value cast to DOUBLE as DuckDB casts it (a DECIMAL by
+  [ADR 0021](adr/0021-decimal-semantics.md) rule 8), a running count, mean and sum of squared deviations updated per
+  value, partial states combined by Chan's formula. The sample forms are NULL over at most one value, the population
+  forms NULL over none and 0 over one. A result that is not finite (a NaN or infinite value, or an overflow) fails
+  the query with DuckDB's message (`STDDEV_SAMP is out of range!`, `STDDEV_POP ...`, `VARSAMP ...`, `VARPOP ...`; an
+  alias reports its target), before the first row. The result depends on the order of the additions, which differs
+  between the engines in parallel runs, so the oracle compares it with the DOUBLE tolerance; antb1 merges in part
+  order, so its result is the same for any number of threads. `DISTINCT` is unsupported (exit code 4), and a
+  non-number is a bind error. Named as written (`stddev(x)`).
+- NULL: aggregates skip NULLs. Over zero input rows `COUNT` returns 0 and every other aggregate returns NULL.
   A predicate that evaluates to NULL rejects the row.
 - GROUP BY: one row per distinct combination of the keys; the aggregates of a group are exactly those of the same
   rows without `GROUP BY`. NULL is a key value (all NULLs form one group). A DOUBLE key groups `-0.0` with `0.0` and
@@ -1542,7 +1554,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q14 | unsupported | needs ROLLUP, INTERSECT and a one-row subquery over a CTE (SQ3) |
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
-| Q17 | unsupported | needs stddev_samp (AG2) |
+| Q17 | pass | stddev_samp (AG2) |
 | Q18 | unsupported | needs ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
 | Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
@@ -1564,7 +1576,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q36 | unsupported | needs NULL items of set-operation branches, UNION, rank() and window partition expressions (phase 9) |
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | unsupported | needs SELECT DISTINCT and INTERSECT (X4c) |
-| Q39 | unsupported | needs NULL as a CASE value and stddev_samp (AG2) |
+| Q39 | pass | stddev_samp (AG2) |
 | Q40 | pass | an identity CAST (CT1) |
 | Q41 | unsupported | needs SELECT DISTINCT and a correlated COUNT subquery (SQ6) |
 | Q42 | pass | answered when the ratchet was added |

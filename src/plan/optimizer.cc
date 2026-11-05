@@ -822,6 +822,12 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
       // 0 over no rows, by design (ADR 0032's G2c). Unreachable today, since the unnesting runs
       // before the exchange that makes one, and correct if that ever changes.
       case AggKind::kSumCounts:
+      // The variance family is NULL over no rows too, but stays out of the rewrite until a query
+      // needs it there (ADR 0037's AG2).
+      case AggKind::kStddevSamp:
+      case AggKind::kStddevPop:
+      case AggKind::kVarSamp:
+      case AggKind::kVarPop:
         return false;
     }
     return false;

@@ -27,6 +27,7 @@
 #include "double_key.h"
 #include "row_mask.h"
 #include "temporal_average.h"
+#include "variance.h"
 
 namespace antb1::exec {
 namespace {
@@ -519,6 +520,44 @@ class DoubleSumState final : public AggregateState {
   int64_t count_ = 0;
 };
 
+// ---- The variance family ----
+
+// STDDEV_SAMP, STDDEV_POP, VAR_SAMP or VAR_POP of a number column (ADR 0037's AG2): each value as
+// DuckDB casts it to DOUBLE, into DuckDB's running moments in row order (variance.h).
+class VarianceState final : public AggregateState {
+ public:
+  VarianceState(plan::AggKind kind, arrow::MemoryPool* pool) : kind_(kind), pool_(pool) {}
+
+  arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
+    ARROW_ASSIGN_OR_RAISE(const auto doubles, ToDuckDbDoubles(values, pool_));
+    ARROW_RETURN_NOT_OK(CheckInput(*doubles, selection, *arrow::float64()));
+    ARROW_ASSIGN_OR_RAISE(const RowMask mask,
+                          RowMask::Make(doubles.get(), selection, doubles->length(), pool_));
+    const double* data = doubles->raw_values();
+    mask.ForEachRun([&](int64_t position, int64_t length) {
+      for (int64_t i = position; i < position + length; ++i) {
+        AddValue(moments_, data[i]);
+      }
+    });
+    return arrow::Status::OK();
+  }
+  arrow::Status Merge(const AggregateState& other) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<VarianceState>(other));
+    Combine(same->moments_, moments_);
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const override {
+    ARROW_ASSIGN_OR_RAISE(const std::optional<double> result, FinalizeVariance(kind_, moments_));
+    return OneDouble(result, pool);
+  }
+
+ private:
+  plan::AggKind kind_;
+  arrow::MemoryPool* pool_;
+  Moments moments_;
+};
+
 // ---- MIN and MAX ----
 
 // Whether `scalar` is a DOUBLE NaN (DOUBLE is the engine's only floating-point type).
@@ -718,6 +757,15 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
         return invalid();
       }
       return CountDistinctState::Make(plan::ToArrow(*input), pool);
+    case plan::AggKind::kStddevSamp:
+    case plan::AggKind::kStddevPop:
+    case plan::AggKind::kVarSamp:
+    case plan::AggKind::kVarPop:
+      if ((!plan::IsNumeric(*input) && *input != plan::LogicalType::kDecimal) ||
+          result != plan::LogicalType::kDouble) {
+        return invalid();
+      }
+      return std::make_unique<VarianceState>(kind, pool);
   }
   return invalid();
 }

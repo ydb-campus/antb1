@@ -150,6 +150,12 @@ bool Decomposable(AggKind kind) {
     case AggKind::kSumCounts:  // a sum of counts is itself one, being associative
       return true;
     case AggKind::kCountDistinct:
+    // The variance family's merge (Chan's combine) is order-dependent DOUBLE arithmetic, and a
+    // partial of it would have to carry three values (ADR 0037's AG2).
+    case AggKind::kStddevSamp:
+    case AggKind::kStddevPop:
+    case AggKind::kVarSamp:
+    case AggKind::kVarPop:
       return false;
   }
   return false;

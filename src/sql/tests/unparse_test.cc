@@ -630,6 +630,8 @@ TEST(AstTest, ToStringNamesKindsAndOperators) {
   EXPECT_EQ(ToString(AggKind::kAvg), "AVG");
   EXPECT_EQ(ToString(AggKind::kMin), "MIN");
   EXPECT_EQ(ToString(AggKind::kMax), "MAX");
+  EXPECT_EQ(ToString(AggKind::kStddev), "STDDEV");
+  EXPECT_EQ(ToString(AggKind::kVariance), "VARIANCE");
   EXPECT_EQ(ToString(CompareOp::kEq), "=");
   EXPECT_EQ(ToString(CompareOp::kNe), "<>");
   EXPECT_EQ(ToString(CompareOp::kLt), "<");

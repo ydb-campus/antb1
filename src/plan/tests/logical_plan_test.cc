@@ -52,6 +52,8 @@ TEST(LogicalPlanTest, OperatorAndAggregateNames) {
   EXPECT_EQ(ToString(AggKind::kAvg), "AVG");
   EXPECT_EQ(ToString(AggKind::kMin), "MIN");
   EXPECT_EQ(ToString(AggKind::kMax), "MAX");
+  EXPECT_EQ(ToString(AggKind::kStddevSamp), "STDDEV_SAMP");
+  EXPECT_EQ(ToString(AggKind::kVarPop), "VAR_POP");
 }
 
 ExprPtr Column(int index, LogicalType type = LogicalType::kSmallInt) {

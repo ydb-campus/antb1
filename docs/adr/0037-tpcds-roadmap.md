@@ -152,7 +152,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | FN5 | concat (the FN5 update below) | 84 | Built |
 | **Phase 5** | **Aggregation and grouping sets** | | |
 | AG1 | Integer AVG finalized as DuckDB finalizes it (the AG1 update below) | | Built |
-| AG2 | stddev_samp | 17, 39 | Planned |
+| AG2 | stddev_samp, with the rest of DuckDB's variance family (the AG2 update below) | 17, 39 | Built |
 | AG3 | SELECT DISTINCT | | Planned |
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 update below) | | Planned |
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Planned |
@@ -558,6 +558,21 @@ DuckDB's to the bit on each platform. No query passes from it alone.
   2^53.
 - **The generator** now compares an integer AVG in correlated blocks, where ADR 0023 allowed only a DECIMAL one. A
   DOUBLE AVG stays out: each engine adds its values in its own order.
+
+Update (2026-11-05, AG2): built as DuckDB's variance family, not `stddev_samp` alone: `stddev_samp`, `stddev_pop`,
+`var_samp` and `var_pop`, and the aliases `stddev` and `variance`. Queries 17 and 39 pass: 65 of the 99.
+
+- **The value.** DuckDB's STDDevBaseOperation, operation for operation: each value cast to DOUBLE as DuckDB casts it,
+  a running count, mean and sum of squared deviations (Welford's update), partial states combined by Chan's formula,
+  and DuckDB's finalization: NULL over no values, and over one for the sample forms; 0 over one for the population
+  forms; DuckDB's out-of-range error for a result that is not finite.
+- **Order.** The result depends on the order of the additions, as a DOUBLE SUM's does. antb1 merges in part order
+  and never routes a part's rows unaggregated, so its result is the same for any number of threads. The oracle
+  compares it with the DOUBLE tolerance, since DuckDB's parallel merge order differs.
+- **Names.** Each spelling is a kind of its own in the parser, so a result is named as written (`stddev(x)`), and an
+  alias binds to its target.
+- **What stays unsupported.** `DISTINCT`, as for every aggregate but COUNT. The generator writes the family as select
+  items over integer and DECIMAL columns, from a stream of its own, and two metamorphic relations hold for it.
 
 ## Alternatives considered
 

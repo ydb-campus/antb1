@@ -480,6 +480,142 @@ TEST_F(GroupedAggregateTest, IntegerAvgDividesAsDuckDb) {
   }
 }
 
+std::shared_ptr<arrow::Array> DoubleColumn(const std::vector<std::optional<double>>& values) {
+  return testing::ArrayOf<arrow::DoubleBuilder, double>(arrow::float64(), values);
+}
+
+// The variance family (ADR 0037's AG2), scalar and grouped: against a two-pass reference within a
+// tolerance (the running update rounds differently), merged partial states against one pass,
+// DuckDB's NULL and 0 rules for zero and one value, DuckDB's out-of-range errors (a NaN value
+// included, and in a group a LIMIT never reads, through CheckFinalize), and every number type cast
+// to DOUBLE as DuckDB casts it.
+TEST_F(GroupedAggregateTest, VarianceFamilyAsDuckDb) {
+  constexpr auto kKinds = std::to_array<AggKind>(
+      {AggKind::kStddevSamp, AggKind::kStddevPop, AggKind::kVarSamp, AggKind::kVarPop});
+  const auto reference = [](AggKind kind, const std::vector<double>& xs) -> std::optional<double> {
+    const bool sample = kind == AggKind::kStddevSamp || kind == AggKind::kVarSamp;
+    if (xs.empty() || (sample && xs.size() == 1)) {
+      return std::nullopt;
+    }
+    const double mean = std::accumulate(xs.begin(), xs.end(), 0.0) / static_cast<double>(xs.size());
+    double squares = 0;
+    for (const double x : xs) {
+      squares += (x - mean) * (x - mean);
+    }
+    const double variance = squares / static_cast<double>(sample ? xs.size() - 1 : xs.size());
+    return kind == AggKind::kStddevSamp || kind == AggKind::kStddevPop ? std::sqrt(variance)
+                                                                       : variance;
+  };
+  const auto scalar_of = [](AggKind kind, plan::LogicalType type,
+                            const arrow::Array& values) -> arrow::Result<std::optional<double>> {
+    ARROW_ASSIGN_OR_RAISE(auto state, MakeAggregateState(kind, type, LogicalType::kDouble));
+    ARROW_RETURN_NOT_OK(state->Consume(values, nullptr));
+    ARROW_ASSIGN_OR_RAISE(const auto out, state->Finalize(arrow::default_memory_pool()));
+    const auto& doubles = static_cast<const arrow::DoubleArray&>(*out);
+    return doubles.IsNull(0) ? std::nullopt : std::optional(doubles.Value(0));
+  };
+  // Values and groups: group 0 holds 300 values, group 1 one value, group 2 none.
+  Rng rng(11);
+  std::vector<std::optional<double>> values;
+  std::vector<std::uint32_t> ids;
+  std::vector<double> group0;
+  for (int i = 0; i < 300; ++i) {
+    const double x = (static_cast<double>(rng.Below(20000)) / 7.0) - 1000.0;
+    values.emplace_back(i % 17 == 0 ? std::nullopt : std::optional(x));
+    ids.push_back(0);
+    if (i % 17 != 0) {
+      group0.push_back(x);
+    }
+  }
+  values.emplace_back(42.5);
+  ids.push_back(1);
+  const auto array = DoubleColumn(values);
+  for (const AggKind kind : kKinds) {
+    SCOPED_TRACE(plan::ToString(kind));
+    const Call call{.kind = kind, .input = LogicalType::kDouble, .result = LogicalType::kDouble};
+    auto single = MakeGrouped(call);
+    single->Resize(3);
+    ASSERT_TRUE(single->Consume(array.get(), ids).ok());
+    const auto out = Finalized(*single);
+    const auto& doubles = static_cast<const arrow::DoubleArray&>(*out);
+    const std::optional<double> reference_value = reference(kind, group0);
+    ASSERT_TRUE(reference_value.has_value());
+    const double want = reference_value.value_or(std::nan(""));
+    EXPECT_NEAR(doubles.Value(0), want, std::abs(want) * 1e-12);
+    const bool sample = kind == AggKind::kStddevSamp || kind == AggKind::kVarSamp;
+    EXPECT_EQ(doubles.IsNull(1), sample) << "one value";
+    if (!sample) {
+      EXPECT_EQ(doubles.Value(1), 0.0) << "one value";
+    }
+    EXPECT_TRUE(doubles.IsNull(2)) << "no value";
+    // Partial states of three slices merged into one equal the single pass within the tolerance.
+    auto merged = MakeGrouped(call);
+    merged->Resize(3);
+    for (const auto& [begin, end] :
+         std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 100}, {100, 101}, {101, 301}}) {
+      auto part = MakeGrouped(call);
+      part->Resize(3);
+      const auto slice = array->Slice(begin, end - begin);
+      ASSERT_TRUE(
+          part->Consume(slice.get(), std::span(ids).subspan(static_cast<std::size_t>(begin),
+                                                            static_cast<std::size_t>(end - begin)))
+              .ok());
+      const std::vector<std::uint32_t> all{0, 1, 2};
+      ASSERT_TRUE(merged->MergeGroups(*part, all, all).ok());
+    }
+    const auto merged_out = Finalized(*merged);
+    EXPECT_NEAR(static_cast<const arrow::DoubleArray&>(*merged_out).Value(0), want,
+                std::abs(want) * 1e-12);
+    // The scalar state over group 0's rows.
+    const auto scalar =
+        scalar_of(kind, LogicalType::kDouble,
+                  *DoubleColumn(std::vector<std::optional<double>>(group0.begin(), group0.end())));
+    ASSERT_TRUE(scalar.ok()) << scalar.status().ToString();
+    const std::optional<double> scalar_value = scalar.ValueOr(std::nullopt);
+    ASSERT_TRUE(scalar_value.has_value());
+    EXPECT_NEAR(scalar_value.value_or(std::nan("")), want, std::abs(want) * 1e-12);
+    // Out of range: a result that is not finite, from huge values or a NaN.
+    const auto message_of = [](AggKind k) -> std::string {
+      if (k == AggKind::kStddevSamp) {
+        return "STDDEV_SAMP is out of range!";
+      }
+      if (k == AggKind::kStddevPop) {
+        return "STDDEV_POP is out of range!";
+      }
+      return k == AggKind::kVarSamp ? "VARSAMP is out of range!" : "VARPOP is out of range!";
+    };
+    const std::string message = message_of(kind);
+    for (const auto& bad : {std::vector<std::optional<double>>{1e308, -1e308},
+                            std::vector<std::optional<double>>{std::nan(""), 1.0}}) {
+      const auto failed = scalar_of(kind, LogicalType::kDouble, *DoubleColumn(bad));
+      EXPECT_TRUE(failed.status().IsExecutionError()) << failed.status().ToString();
+      EXPECT_EQ(failed.status().message(), message);
+      auto grouped = MakeGrouped(call);
+      grouped->Resize(2);
+      ASSERT_TRUE(grouped->Consume(DoubleColumn(bad).get(), std::vector<std::uint32_t>{1, 1}).ok());
+      EXPECT_EQ(grouped->CheckFinalize().message(), message) << "group 1, never read first";
+    }
+  }
+  // Every number type, cast to DOUBLE as DuckDB casts it: 1, 2 and 4 in each give DuckDB 1.5.6's
+  // bits, which the running update gives and a two-pass computation misses by an ulp.
+  const std::optional<double> expected = 2.333333333333333;
+  for (const auto& [type, numbers] :
+       std::vector<std::pair<LogicalType, std::shared_ptr<arrow::Array>>>{
+           {LogicalType::kSmallInt, testing::Int16s({1, 2, 4})},
+           {LogicalType::kInteger, testing::Int32s({1, 2, 4})},
+           {LogicalType::kBigInt, testing::Int64s({1, 2, 4})},
+           {LogicalType::kUSmallInt, testing::UInt16s({1, 2, 4})},
+           {LogicalType::kHugeInt, testing::Decimals(LogicalType::kHugeInt, {"1", "2", "4"})},
+           {LogicalType::Decimal(5, 2), testing::Decimals(5, 2, {"100", "200", "400"})},
+           {LogicalType::Decimal(30, 2), testing::Decimals(30, 2, {"100", "200", "400"})},
+           {LogicalType::kDouble, DoubleColumn({1.0, 2.0, 4.0})}}) {
+    SCOPED_TRACE(plan::ToString(type));
+    const auto got = scalar_of(AggKind::kVarSamp, type, *numbers);
+    ASSERT_TRUE(got.ok()) << got.status().ToString();
+    EXPECT_EQ(*got, expected);
+  }
+}
+
 TEST_F(GroupedAggregateTest, RejectsBadInput) {
   auto count = MakeGrouped(
       {.kind = AggKind::kCount, .input = LogicalType::kBigInt, .result = LogicalType::kBigInt});

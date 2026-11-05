@@ -69,7 +69,22 @@ struct Literal {
   SourceSpan span;
 };
 
-enum class AggKind : std::uint8_t { kCountStar, kCount, kSum, kAvg, kMin, kMax };
+// The variance family (ADR 0037's AG2) has one kind per spelling, aliases included, so that a call
+// unparses and is named as written.
+enum class AggKind : std::uint8_t {
+  kCountStar,
+  kCount,
+  kSum,
+  kAvg,
+  kMin,
+  kMax,
+  kStddevSamp,
+  kStddev,  // DuckDB's alias of STDDEV_SAMP
+  kStddevPop,
+  kVarSamp,
+  kVariance,  // DuckDB's alias of VAR_SAMP
+  kVarPop,
+};
 
 struct AggregateCall {
   AggKind kind = AggKind::kCountStar;
