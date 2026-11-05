@@ -163,10 +163,10 @@ RU2 builds `GroupingSetsNode`, `GroupingSetsOperator` (serial) and `PartGrouping
   - The probes (RU2) also estimate each set's groups: the probe table's groups over the root partition's, times the
     root's groups, and at most those.
   - A batch takes sets while their estimated bytes fit half of the budget's free bytes, at the bytes of a root group
-    (the budget's charge after the first level over the roots' groups), and at least one set. Without a limit it is
-    every set at once, the RU2 operator. The estimate counts groups, not a table's fixed cost (64 tables a set at most,
-    each with its key table's first buffers), which matters only for sets of few groups: a limit just above the roots
-    can still run out in a batch of many small sets.
+    (the budget's charge after the first level over the roots' groups, at least 64 bytes), and at least one set. Without
+    a limit it is every set at once, the RU2 operator. The estimate counts groups, not a table's fixed cost (64 tables a
+    set at most, each with its key table's first buffers), which matters only for sets of few groups: a limit just above
+    the roots can still run out in a batch of many small sets.
   - A root stays until the last set merged from it is built: its `NextChunk` moves out only its first-seen keys, so
     its key table and states still serve later batches.
   - A set's rows do not depend on its batch, so the result is the same under any limit and any number of threads.

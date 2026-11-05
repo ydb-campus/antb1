@@ -551,6 +551,10 @@ arrow::Status PartGroupAggregateOperator::Close() {
 
 // ---- PartGroupingSetsOperator ----
 
+// The fewest bytes a merged group is taken to hold when the second level's batches are sized: its
+// keys and one state each, at the least.
+constexpr int64_t kMinGroupBytes = 64;
+
 PartGroupingSetsOperator::PartGroupingSetsOperator(
     PartPipeline pipeline, int64_t num_parts, int input_width, std::vector<plan::BoundColumn> keys,
     const std::vector<std::vector<std::size_t>>& sets, std::vector<plan::AggregateCall> aggregates,
@@ -771,12 +775,14 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     }
     return arrow::Status::OK();
   }));
-  // The bytes of a group, as the roots hold them: the budget's charge after the first level.
+  // The bytes of a group, as the roots hold them: the budget's charge after the first level, and
+  // at least kMinGroupBytes, so that an estimate is never 0 and a limit always weighs every set.
   int64_t groups = 0;
   for (const std::size_t r : roots_) {
     groups += root_groups[r];
   }
-  group_bytes_ = budget_ != nullptr && groups > 0 ? budget_->bytes_allocated() / groups : 0;
+  group_bytes_ = std::max<int64_t>(
+      kMinGroupBytes, budget_ != nullptr && groups > 0 ? budget_->bytes_allocated() / groups : 0);
   if (profile() != nullptr) {
     profile()->Add("direct_sets", MetricUnit::kCount,
                    std::ranges::count_if(probes, [&](std::size_t s) { return reduce_[s] == 0; }));
