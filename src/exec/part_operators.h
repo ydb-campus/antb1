@@ -9,6 +9,7 @@
 #include <optional>
 #include <vector>
 
+#include <arrow/compute/exec.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
@@ -252,15 +253,19 @@ class PartGroupAggregateOperator final : public PartSink {
 // aggregates every root set (a set aggregated from the input: every set no other set contains when
 // every call merges exactly, else every distinct set) into a table of its own (PartGrouper, as
 // PartGroupAggregateOperator's parts do); the parts merge in part order, each partition in its own
-// lane, every root's partition p in lane p. Then the second level, in one pass and one barrier:
-// each partition merges its root groups into a table per other set (MergeProjected), in parallel
-// over the partitions; after the barrier, each of those sets' final tables gathers one of its own
-// partitions from every partition's table, in partition order, in parallel over the sets and
-// their partitions. Every set's finalize errors come before the first row. Output: as
-// GroupingSetsOperator, each set's rows partition by partition, built as many partitions at a
-// time as threads. The partitions are a constant, so the result is the same for any number of
-// threads; for a set merged from another it is the same as for that set's own partitioned GROUP BY
-// (the calls merge exactly), and a root's rows are those of PartGroupAggregateOperator.
+// lane, every root's partition p in lane p. Then the second level, in batches of the other sets
+// (NextBatch: as many as fit half of the memory budget's free bytes by the probe's estimate, all of
+// them without a limit), each in one pass and one barrier: each partition merges its root groups
+// into a table per set of the batch (MergeProjected), in parallel over the partitions; after the
+// barrier, each of those sets' final tables gathers one of its own partitions from every
+// partition's table, in partition order, in parallel over the sets and their partitions. A batch
+// is emitted before the next is built, and a root stays until the last set merged from it is. The
+// roots' and the first batch's finalize errors come before the first row, a later batch's when it
+// is built. Output: as GroupingSetsOperator, each set's rows partition by partition, built as many
+// partitions at a time as threads. The partitions are a constant and a set's rows do not depend on
+// its batch, so the result is the same for any number of threads and any memory limit; for a set
+// merged from another it is the same as for that set's own partitioned GROUP BY (the calls merge
+// exactly), and a root's rows are those of PartGroupAggregateOperator.
 class PartGroupingSetsOperator final : public PartSink {
  public:
   PartGroupingSetsOperator(PartPipeline pipeline, int64_t num_parts, int input_width,
@@ -281,12 +286,23 @@ class PartGroupingSetsOperator final : public PartSink {
   // A part's groups, per root (in roots_ order).
   using PartRoots = std::shared_ptr<std::vector<std::shared_ptr<PartGroups>>>;
 
-  // The first Next(): both levels, every set's finalize checked.
+  // The first Next(): the first level, the probes and the first batch of the second level, the
+  // roots' and that batch's finalize checked.
   arrow::Status Prepare();
   // Runs every part and merges it into the roots' tables, each partition in its own lane.
   arrow::Status Merge();
-  // The second level: every other set's tables from its root's.
-  arrow::Status Derive();
+  // Decides each other set's way (reduced per partition first, or merged straight from the root)
+  // and estimates its groups, from the root's largest partition.
+  arrow::Status Probe();
+  // The other sets to merge next, by their entries from `from_entry` on: as many as fit half of the
+  // budget's free bytes by their estimates, at least one; all of them without a limit.
+  [[nodiscard]] std::vector<std::size_t> NextBatch(std::size_t from_entry) const;
+  // The second level for `batch`: its sets' tables from their roots', in one pass and one barrier.
+  arrow::Status DeriveBatch(const std::vector<std::size_t>& batch);
+  // A root partition's groups projected to `set`'s keys.
+  [[nodiscard]] arrow::compute::ExecBatch Projected(
+      const std::optional<arrow::compute::ExecBatch>& uniques, std::size_t set,
+      std::size_t groups) const;
   // Builds the rows of set `set`'s next partitions (from built_ on) in parallel.
   arrow::Status BuildRows(std::size_t set);
 
@@ -307,7 +323,18 @@ class PartGroupingSetsOperator final : public PartSink {
   std::vector<std::vector<std::unique_ptr<GroupTable>>> tables_;
   // Per distinct set, per partition: its rows, kept to the set's last entry.
   std::vector<std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>>> rows_;
-  std::vector<bool> emitted_;       // per distinct set: whether an entry has emitted it
+  std::vector<bool> emitted_;  // per distinct set: whether an entry has emitted it
+  // The second level's state (Probe, DeriveBatch), per distinct set: its way (1: reduced first),
+  // its estimated groups, its probe's first merge until merged, whether merged, and per root the
+  // sets left to merge from it.
+  std::vector<std::uint8_t> reduce_;
+  std::vector<int64_t> estimate_;
+  std::vector<std::vector<std::unique_ptr<GroupTable>>> partial_;
+  std::vector<bool> derived_;
+  std::vector<std::size_t> pending_;
+  int64_t group_bytes_ = 0;  // a root group's bytes, by the budget's charge after the first level
+  int64_t batches_ = 0;      // the second level's batches, for the profile
+  int64_t groups_ = 0;       // every set's groups, for the profile
   std::size_t next_entry_ = 0;      // the entry of the list being emitted
   std::size_t next_partition_ = 0;  // its partition being emitted
   std::size_t next_batch_ = 0;      // and that partition's next batch

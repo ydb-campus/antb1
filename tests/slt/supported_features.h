@@ -350,9 +350,9 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly. Stars among
 // the select items and qualified stars waited here from the PR that answered them to the one that
 // taught the generator (its ninth stream).
-// ADR 0038's grammar (ADR 0037's RU1) waits here for the PR that answers it: CUBE for RU6, which
-// teaches the generator its form (RU3 taught it ROLLUP, RU4 GROUPING(), RU5 GROUPING SETS).
-inline constexpr FeatureSet kGeneratorPending = {Feature::kCube};
+// ADR 0038's grammar (ADR 0037's RU1) waited here for the PRs that answered it, each teaching the
+// generator its form: ROLLUP in RU3, GROUPING() in RU4, GROUPING SETS in RU5 and CUBE in RU6.
+inline constexpr FeatureSet kGeneratorPending = {};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)
@@ -372,6 +372,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kRollup,
     Feature::kGroupingFunction,
     Feature::kGroupingSets,
+    Feature::kCube,
     Feature::kColumns,
     Feature::kStar,
     Feature::kMultipleItems,

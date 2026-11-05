@@ -4,8 +4,8 @@ Date: 2026-11-05
 
 ## Status
 
-Proposed (2026-11-05, with ADR 0037's RU1, which builds the grammar). The plan node and its operator are RU2, the
-forms RU3 (ROLLUP), RU5 (GROUPING SETS and `()`) and RU6 (CUBE), GROUPING() RU4. Accepted when RU6 is built.
+Accepted (2026-11-05, with ADR 0037's RU6). Proposed with RU1, which built the grammar; the plan node and its
+operator are RU2, the forms RU3 (ROLLUP), RU5 (GROUPING SETS and `()`) and RU6 (CUBE), GROUPING() RU4.
 
 ## Context
 
@@ -152,6 +152,29 @@ RU2 builds `GroupingSetsNode`, `GroupingSetsOperator` (serial) and `PartGrouping
   - **Memory:** on the 8-key profile two levels peaked at 6.2 GiB against 4.6 to 5.7 GiB for one table per set. The
     root's tables stay until the sets merged from them are built. RU6 bounds the peak with CUBE's batches, and
     PF11 would merge the sets inside each partition.
+
+## Update (2026-11-05, RU6): CUBE, and the second level in batches
+
+- **CUBE** expands as DuckDB lists it: every subset of its elements, depth first (`CUBE (a, b, c)`: `()`, `(a)`,
+  `(a, b)`, `(a, b, c)`, `(a, c)`, `(b)`, `(b, c)`, `(c)`), a composite one element, duplicates kept. Sixteen elements
+  are DuckDB's "Maximum grouping set count of 65535 exceeded".
+- **Batches.** `PartGroupingSetsOperator` merges the sets other than the roots in batches, in the order of their first
+  entries, each batch emitted before the next is built:
+  - The probes (RU2) also estimate each set's groups: the probe table's groups over the root partition's, times the
+    root's groups, and at most those.
+  - A batch takes sets while their estimated bytes fit half of the budget's free bytes, at the bytes of a root group
+    (the budget's charge after the first level over the roots' groups), and at least one set. Without a limit it is
+    every set at once, the RU2 operator. The estimate counts groups, not a table's fixed cost (64 tables a set at most,
+    each with its key table's first buffers), which matters only for sets of few groups: a limit just above the roots
+    can still run out in a batch of many small sets.
+  - A root stays until the last set merged from it is built: its `NextChunk` moves out only its first-seen keys, so
+    its key table and states still serve later batches.
+  - A set's rows do not depend on its batch, so the result is the same under any limit and any number of threads.
+- **Errors.** The roots' and the first batch's finalize errors come before the first row; a later batch's when it is
+  built, after the earlier batches' rows. With the calls that merge exactly, a later set can fail only where its
+  DECIMAL sum passes 38 digits, which needs about 10^20 input rows.
+- **The serial `GroupingSetsOperator`** still builds every set before its first row: it runs only over inputs that are
+  no part pipeline.
 
 ## Alternatives considered
 
