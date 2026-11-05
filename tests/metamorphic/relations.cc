@@ -651,6 +651,48 @@ std::vector<Relation> AllRelations() {
                               "GROUPING(OS) = 0) AS d")},
                  .check = AllEqual()});
   }
+  // GROUPING SETS, composites and () (ADR 0037's RU5): the sets of a ROLLUP written out are the
+  // ROLLUP, a list of sets is the union of their GROUP BYs, and () is the ungrouped aggregate, with
+  // its row over no input too.
+  {
+    const slt::FeatureSet sets = {kGroupingSets,  kRollup,         kGroupBy,        kColumns,
+                                  kMultipleItems, kIntegerColumns, kCountStar,      kSum,
+                                  kCase,          kWhere,          kIntegerLiteral, kTableName};
+    constexpr std::string_view kNull = "CASE WHEN OS < 0 THEN OS END";  // no OS is negative
+    r.push_back(
+        {.name = "grouping_sets_of_a_rollup_are_the_rollup",
+         .features = sets,
+         .probes =
+             {Q("SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                "GROUP BY GROUPING SETS ((OS, IsMobile), (OS), ())"),
+              Q("SELECT OS, IsMobile, COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE OS < 30 "
+                "GROUP BY ROLLUP (OS, IsMobile)")},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "grouping_sets_are_the_union_of_their_group_bys",
+         .features = sets,
+         .probes =
+             {Q("SELECT OS, IsMobile, COUNT(*) FROM hits_like WHERE OS < 30 GROUP BY GROUPING "
+                "SETS ((OS), (IsMobile))"),
+              Q(std::format("SELECT OS, {}, COUNT(*) FROM hits_like WHERE OS < 30 GROUP BY OS",
+                            kNull)),
+              Q(std::format("SELECT {}, IsMobile, COUNT(*) FROM hits_like WHERE OS < 30 GROUP BY "
+                            "IsMobile",
+                            "CASE WHEN IsMobile < 0 THEN IsMobile END"))},
+         .check = FirstIsUnionOfRest()});
+    for (const std::string_view where : {"OS < 30", "OS < 0"}) {
+      r.push_back(
+          {.name = std::format("empty_set_is_the_ungrouped_aggregate_{}",
+                               where == "OS < 0" ? "of_no_rows" : "of_rows"),
+           .features = sets,
+           .probes = {Q(std::format("SELECT COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE {} "
+                                    "GROUP BY ()",
+                                    where)),
+                      Q(std::format("SELECT COUNT(*), SUM(ResolutionWidth) FROM hits_like WHERE {}",
+                                    where))},
+           .check = AllEqual()});
+    }
+  }
   // The variance family (ADR 0037's AG2): VAR_SAMP is STDDEV_SAMP squared, and the moments merged
   // across batches and row groups are those of one pass, within the slt tolerance.
   {

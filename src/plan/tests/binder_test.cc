@@ -2069,10 +2069,7 @@ TEST(BinderTest, GroupingSetsAreRefusedNamingTheirItem) {
   for (const auto& [sql, span, item] :
        std::to_array<std::tuple<std::string_view, std::string_view, std::string_view>>({
            {"SELECT i16 FROM t GROUP BY i16, CUBE (s)", "CUBE (s)", "RU6"},
-           {"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), ())", "GROUPING SETS ((i16), ())",
-            "RU5"},
-           {"SELECT i16 FROM t GROUP BY (i16, s)", "(i16, s)", "RU5"},
-           {"SELECT COUNT(*) FROM t GROUP BY ()", "()", "RU5"},
+           {"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), CUBE (s))", "CUBE (s)", "RU6"},
        })) {
     const auto bound = BindSql(sql, catalog);
     ASSERT_FALSE(bound.ok()) << sql;
@@ -2140,6 +2137,62 @@ Project s, "sum(i32)"
 )x");
 }
 
+// GROUPING SETS, composites and () (ADR 0037's RU5): a GROUPING SETS list is its elements' sets
+// one after another (a nested ROLLUP's in place), clauses still combine as a cross product, and a
+// single set of every key is a plain GroupAggregate, as DuckDB plans it; () alone keeps the node,
+// whose empty set has a row even over no input.
+TEST(BinderTest, GroupingSetsComposeAndASingleSetIsAPlainGroupBy) {
+  const Catalog catalog = MakeCatalog();
+  using Sets = std::vector<std::vector<std::size_t>>;
+  const auto sets_of = [&](std::string_view sql) -> Sets {
+    const auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return {};
+    }
+    const auto* node = std::get_if<GroupingSetsNode>(&Nth(*plan, 1));
+    EXPECT_NE(node, nullptr) << sql;
+    return node == nullptr ? Sets{} : node->sets;
+  };
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY GROUPING SETS ((i16, s), (i16), ())"),
+            (Sets{{0, 1}, {0}, {}}));
+  EXPECT_EQ(
+      sets_of("SELECT COUNT(*) FROM t GROUP BY i32, GROUPING SETS (i16, (s, i64), ROLLUP (dt))"),
+      (Sets{{0, 1}, {0, 2, 3}, {0}, {0, 4}}));
+  EXPECT_EQ(
+      sets_of("SELECT COUNT(*) FROM t GROUP BY GROUPING SETS (i16, s), GROUPING SETS (i32, i64)"),
+      (Sets{{0, 2}, {0, 3}, {1, 2}, {1, 3}}));
+  EXPECT_EQ(
+      sets_of(
+          "SELECT COUNT(*) FROM t GROUP BY GROUPING SETS ((i16), (i16), GROUPING SETS (i16, ()))"),
+      (Sets{{0}, {0}, {0}, {}}));
+  EXPECT_EQ(sets_of("SELECT COUNT(*) FROM t GROUP BY ()"), (Sets{{}}));
+  for (const std::string_view sql :
+       {"SELECT i16, s, COUNT(*) FROM t GROUP BY (i16, s)",
+        "SELECT i16, COUNT(*) FROM t GROUP BY i16, ()",
+        "SELECT i16, COUNT(*) FROM t GROUP BY GROUPING SETS ((i16))"}) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_TRUE(std::holds_alternative<GroupAggregateNode>(Nth(*plan, 1))) << Explain(*plan);
+  }
+  for (const auto& [sql, message] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT 'x' AS k, COUNT(*) FROM t GROUP BY GROUPING SETS ((k), ())",
+            "a constant in GROUPING SETS is not supported"},
+           {"SELECT 'x' AS k, COUNT(*) FROM t GROUP BY k, ()",
+            "a constant GROUP BY item next to grouping sets is not supported"},
+       })) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    ASSERT_NE(GetSqlError(bound.status()), nullptr) << sql;
+    EXPECT_EQ(GetSqlError(bound.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_TRUE(bound.status().message().contains(message)) << bound.status().ToString();
+  }
+  const auto plain_column = BindSql("SELECT i16, COUNT(*) FROM t GROUP BY ()", catalog);
+  ASSERT_FALSE(plain_column.ok());
+  EXPECT_TRUE(plain_column.status().message().contains("must appear in the GROUP BY clause"))
+      << plain_column.status().ToString();
+}
+
 // What RU3 refuses or rejects: a constant in a ROLLUP (DuckDB groups by it, NULL where rolled up,
 // which the select list's constant would not show), an aggregate named by position, and more than
 // DuckDB's 65535 sets.
@@ -2163,7 +2216,7 @@ TEST(BinderTest, RollupErrors) {
     ASSERT_NE(GetSqlError(beside.status()), nullptr) << sql;
     EXPECT_EQ(GetSqlError(beside.status())->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
     EXPECT_TRUE(beside.status().message().contains(
-        "a constant GROUP BY item next to ROLLUP is not supported"))
+        "a constant GROUP BY item next to grouping sets is not supported"))
         << beside.status().ToString();
   }
 

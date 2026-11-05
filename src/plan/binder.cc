@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -6018,61 +6019,96 @@ arrow::Status Binder::BindGroupBy() {
     return arrow::Status::OK();
   }
   // Grouping-set syntax (ADR 0038), expanded as DuckDB expands it: each item gives a list of sets
-  // -- a key one set of itself (a constant none), ROLLUP (e1, ..., en) its prefixes from () to all
-  // n, a composite in it one element of its keys -- and the items combine as a cross product,
-  // earlier items varying slowest. Duplicate sets stay.
-  std::vector<std::vector<std::size_t>> sets = {{}};
-  for (const sql::GroupingElement& element : stmt_.grouping) {
-    std::vector<std::vector<std::size_t>> item_sets;
+  // -- a key one set of itself, a composite (a, b) one set of its keys, () the empty set,
+  // ROLLUP (e1, ..., en) its prefixes from () to all n, GROUPING SETS (...) its elements' lists one
+  // after another -- and the items combine as a cross product, earlier items varying slowest.
+  // Duplicate sets stay. A constant is no key, so it is refused anywhere in grouping-set syntax:
+  // DuckDB groups by it, NULL in the sets without it, or in every set beside them.
+  const auto keys_of = [&](const sql::GroupingElement& element,
+                           std::string_view where) -> arrow::Result<std::vector<std::size_t>> {
+    std::vector<std::size_t> keys;
+    for (const sql::Expr& expr : element.exprs) {
+      ARROW_ASSIGN_OR_RAISE(const auto key, key_of(expr));
+      if (!key.has_value()) {
+        return UnsupportedError(std::format("a constant {} is not supported", where), expr.span());
+      }
+      keys.push_back(*key);
+    }
+    return keys;
+  };
+  using SetList = std::vector<std::vector<std::size_t>>;
+  const auto normalized = [](std::vector<std::size_t> set) {
+    std::ranges::sort(set);
+    const auto [first, last] = std::ranges::unique(set);
+    set.erase(first, last);
+    return set;
+  };
+  // A std::function rather than a lambda with an explicit object parameter: GCC 15 crashes on that
+  // one's recursive call (an internal compiler error).
+  std::function<arrow::Result<SetList>(const sql::GroupingElement&, std::string_view)> expand;
+  expand = [&](const sql::GroupingElement& element,
+               std::string_view where) -> arrow::Result<SetList> {
     switch (element.kind) {
-      case sql::GroupingElement::Kind::kExpr: {
-        ARROW_ASSIGN_OR_RAISE(const auto key, key_of(element.exprs.front()));
-        if (!key.has_value()) {
-          // DuckDB groups by it in every set, so no set is () and no input gives no row; antb1
-          // keeps no key for a constant, which would make one set () here.
-          return UnsupportedError("a constant GROUP BY item next to ROLLUP is not supported",
-                                  element.exprs.front().span());
-        }
-        item_sets.push_back({*key});
-        break;
+      case sql::GroupingElement::Kind::kExpr:
+      case sql::GroupingElement::Kind::kRow:
+      case sql::GroupingElement::Kind::kEmpty: {
+        ARROW_ASSIGN_OR_RAISE(auto keys,
+                              keys_of(element, element.kind == sql::GroupingElement::Kind::kRow
+                                                   ? "in a composite grouping set"
+                                                   : where));
+        return SetList{normalized(std::move(keys))};
       }
       case sql::GroupingElement::Kind::kRollup: {
+        SetList sets = {{}};
         std::vector<std::size_t> prefix;
-        item_sets.push_back(prefix);
         for (const sql::GroupingElement& inner : element.elements) {
-          for (const sql::Expr& expr : inner.exprs) {
-            ARROW_ASSIGN_OR_RAISE(const auto key, key_of(expr));
-            if (!key.has_value()) {
-              // DuckDB groups by it, NULL in the sets without it: the select list would have to
-              // read the key rather than the constant.
-              return UnsupportedError("a constant in ROLLUP is not supported", expr.span());
-            }
-            prefix.push_back(*key);
-          }
-          item_sets.push_back(prefix);
+          ARROW_ASSIGN_OR_RAISE(const auto keys, keys_of(inner, "in ROLLUP"));
+          prefix.insert(prefix.end(), keys.begin(), keys.end());
+          sets.push_back(normalized(prefix));
         }
-        break;
+        return sets;
       }
-      default:  // refused by CheckSupported
-        return arrow::Status::Invalid("grouping element of an unsupported kind");
+      case sql::GroupingElement::Kind::kSets: {
+        SetList sets;
+        for (const sql::GroupingElement& inner : element.elements) {
+          ARROW_ASSIGN_OR_RAISE(auto inner_sets, expand(inner, "in GROUPING SETS"));
+          if (sets.size() + inner_sets.size() > kMaxGroupingSets) {
+            return BindError(
+                std::format("Maximum grouping set count of {} exceeded", kMaxGroupingSets),
+                stmt_.group_by_span);
+          }
+          sets.insert(sets.end(), std::make_move_iterator(inner_sets.begin()),
+                      std::make_move_iterator(inner_sets.end()));
+        }
+        return sets;
+      }
+      case sql::GroupingElement::Kind::kCube:
+        break;  // refused by CheckSupported
     }
+    return arrow::Status::Invalid("grouping element of an unsupported kind");
+  };
+  SetList sets = {{}};
+  for (const sql::GroupingElement& element : stmt_.grouping) {
+    ARROW_ASSIGN_OR_RAISE(const SetList item_sets,
+                          expand(element, "GROUP BY item next to grouping sets"));
     if (sets.size() * item_sets.size() > kMaxGroupingSets) {
       return BindError(std::format("Maximum grouping set count of {} exceeded", kMaxGroupingSets),
                        stmt_.group_by_span);
     }
-    std::vector<std::vector<std::size_t>> product;
+    SetList product;
     product.reserve(sets.size() * item_sets.size());
     for (const std::vector<std::size_t>& set : sets) {
       for (const std::vector<std::size_t>& item : item_sets) {
         std::vector<std::size_t> both = set;
         both.insert(both.end(), item.begin(), item.end());
-        std::ranges::sort(both);
-        const auto [first, last] = std::ranges::unique(both);
-        both.erase(first, last);
-        product.push_back(std::move(both));
+        product.push_back(normalized(std::move(both)));
       }
     }
     sets = std::move(product);
+  }
+  // One set of every key is a plain GROUP BY (as DuckDB plans it): `GROUP BY (a, b)`, `a, ()`.
+  if (sets.size() == 1 && !sets.front().empty()) {
+    return arrow::Status::OK();
   }
   grouping_sets_ = std::move(sets);
   return arrow::Status::OK();
@@ -6991,46 +7027,20 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
   return std::nullopt;
 }
 
-// A GROUP BY element in grouping-set syntax (ADR 0038): an expression is checked as any GROUP BY
-// item; any other element is refused at its keyword or parenthesis, naming the item of ADR 0037's
-// phase 5 that answers it.
+// A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
+// item's, its elements in turn; CUBE is refused at its keyword, naming ADR 0037's RU6.
 arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
-  using Kind = sql::GroupingElement::Kind;
-  std::string_view what;
-  std::string_view item;
-  switch (element.kind) {
-    case Kind::kExpr:
-      for (const sql::Expr& expr : element.exprs) {
-        ARROW_RETURN_NOT_OK(CheckValue(expr));
-      }
-      return arrow::Status::OK();
-    case Kind::kRollup:  // of expressions and composites (the parser admits nothing else)
-      for (const sql::GroupingElement& inner : element.elements) {
-        for (const sql::Expr& expr : inner.exprs) {
-          ARROW_RETURN_NOT_OK(CheckValue(expr));
-        }
-      }
-      return arrow::Status::OK();
-    case Kind::kCube:
-      what = "GROUP BY CUBE";
-      item = "RU6";
-      break;
-    case Kind::kSets:
-      what = "GROUP BY GROUPING SETS";
-      item = "RU5";
-      break;
-    case Kind::kRow:
-      what = "a composite grouping set (a, b)";
-      item = "RU5";
-      break;
-    case Kind::kEmpty:
-      what = "the empty grouping set ()";
-      item = "RU5";
-      break;
+  if (element.kind == sql::GroupingElement::Kind::kCube) {
+    return Reject(Rejection{.span = element.span,
+                            .message = "GROUP BY CUBE is not supported yet (ADR 0037's RU6)"});
   }
-  return Reject(
-      Rejection{.span = element.span,
-                .message = std::format("{} is not supported yet (ADR 0037's {})", what, item)});
+  for (const sql::Expr& expr : element.exprs) {
+    ARROW_RETURN_NOT_OK(CheckValue(expr));
+  }
+  for (const sql::GroupingElement& inner : element.elements) {
+    ARROW_RETURN_NOT_OK(CheckGroupingElement(inner));
+  }
+  return arrow::Status::OK();
 }
 
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
