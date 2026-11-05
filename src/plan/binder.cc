@@ -6090,7 +6090,7 @@ arrow::Status Binder::BindOrderBy() {
       ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select_, "ORDER BY"));
       if (position.has_value()) {
         ARROW_ASSIGN_OR_RAISE(key, ItemOutput(*position));
-        select_item = *position;
+        select_item = position;
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
