@@ -154,10 +154,12 @@ Queries are those a PR completes when the PRs merge in this order.
 | AG1 | Integer AVG finalized as DuckDB finalizes it | | Planned |
 | AG2 | stddev_samp | 17, 39 | Planned |
 | AG3 | SELECT DISTINCT | | Planned |
-| RU1 | ROLLUP and GROUPING() in the grammar, refused by the binder, with an ADR for grouping sets | | Planned |
-| RU2 | A grouping-sets plan node and its operator | | Planned |
-| RU3 | GROUP BY ROLLUP | 5, 18, 22, 80 | Planned |
-| RU4 | GROUPING() | | Planned |
+| RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 update below) | | Planned |
+| RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Planned |
+| RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Planned |
+| RU4 | GROUPING() and GROUPING_ID() | | Planned |
+| RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Planned |
+| RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Planned |
 | **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
 | X4a | UNION, INTERSECT and EXCEPT in the grammar, with parenthesized branches | | Planned |
 | X4b | UNION, after PF5's fallback (the X7a update below) | 75 | Planned |
@@ -185,11 +187,12 @@ Queries are those a PR completes when the PRs merge in this order.
 | PF3 | LEFT JOIN as INNER or anti join where WHERE rejects the padded rows | | Conditional |
 | PF4 | One aggregation for one-row subqueries over the same rows | | Conditional |
 | PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared; the fallback lands before X4b at the latest (the X7a update below) | | Conditional |
-| PF6 | A partial aggregate below the join under a ROLLUP | | Conditional |
+| PF6 | A partial aggregate below the join under a grouping-sets node: grouped by its join keys and every column of its side that any set groups by (ADR 0032's condition 3 over the union of the sets), with AVG as a (SUM, COUNT) partial (the phase 5 update below) | | Conditional |
 | PF7 | One-row and single joins on the branch of the relation they read | | Conditional |
 | PF8 | Hash-set membership for long IN lists | | Conditional |
 | PF9 | One candidate per probe row for semi and anti residuals that read no build column but its keys (ADR 0022's E2c) | | Built |
 | PF10 | A derived table's or CTE reference's row estimate after its conditions, without the union branches they rule out, for the join order and the build sides | | Conditional |
+| PF11 | Grouping sets merged inside the finest set's partitions: the finest set partitioned by a key prefix that most sets share, so that those sets need no second exchange (the phase 5 update below) | | Conditional |
 | **Closing** | | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
@@ -478,6 +481,71 @@ a value of its first kind, from `min_args` on. Query 84 passes.
 - **The value.** DuckDB's concat: the values in order, a NULL one skipped, so the result is never NULL.
 - **What stays unsupported.** A value of a type other than VARCHAR, which DuckDB casts to VARCHAR (a new row field,
   `other_types_unsupported`, makes it unsupported rather than a bind error), and the `||` operator.
+
+Update (2026-11-05, phase 5): the maintainer's decision. Phase 5 answers every form of grouping sets, not ROLLUP
+alone: RU1, RU3 and RU4 widen, RU5 and RU6 are new, and RU2 takes the maintainer's design direction. RU1's ADR decides
+the design in full and repeats the measurements below on the engine's parallel operator.
+
+- **The forms.** ROLLUP, CUBE and GROUPING SETS as DuckDB accepts them: nested sets, composite elements such as
+  `ROLLUP((a, b), c)`, plain keys and several clauses combined (the cross product of their set lists), the empty set
+  `()` as a GROUP BY item or a GROUPING SETS element, and expressions, positions, aliases and constants as keys.
+  - Duplicate sets stay, as in DuckDB: `ROLLUP(a, a)` emits the groups of `(a)` twice. RU3 meets them first, and with
+    them DuckDB's limit of 65535 sets.
+  - Where DuckDB raises an error the binder raises it too: more than 65535 sets, 64 or more GROUPING arguments, a
+    GROUPING argument that is not a key, and GROUPING in WHERE or inside an aggregate.
+  - The forms DuckDB does not parse, such as `ROLLUP ()`, `ROLLUP (a, ())` and `GROUP BY ALL, ROLLUP (a)`, become
+    syntax errors (exit code 1) in RU1; today they exit 4.
+- **Two levels (RU2).** Each set that no other set contains is aggregated once from the input, as a GROUP BY is today:
+  each part's rows into a partial table, then the parts merged partition by partition. For ROLLUP and CUBE that is the
+  finest set alone, the union of every set's keys. Every other set is merged from the merged groups of a set that
+  contains it, all of them in one pass over those groups with one barrier, not as a chain of sets that each wait for
+  the one before.
+  - A GROUPING SETS list builds no table for a union of its keys that it does not list: `GROUPING SETS ((a), (b))`
+    aggregates both of its sets from the input.
+  - Sets merge where every call merges exactly: COUNT(*) and COUNT(x), integer and DECIMAL SUM and AVG (a 128-bit sum
+    and a count), and MIN and MAX of types other than DOUBLE, with no DOUBLE key. The aggregates of the nine queries
+    that use ROLLUP all merge exactly.
+  - Otherwise each set is aggregated from the input rows into a table of its own, as DuckDB does: COUNT(DISTINCT)
+    does not merge from finer groups, and a DOUBLE sum, the sign of a zero and the first spelling of a DOUBLE key
+    depend on the order of the merge.
+  - The parts' partial groups are no source for the other sets: a part of 128Ki rows barely reduces fine keys, so each
+    set would then merge about as many partial groups as there are input rows.
+- **Measured** on synthetic data: 20 million rows, ROLLUP of 4 and 8 keys over five key profiles, from a finest set of
+  10 thousand groups to one nearly as large as the input. Each figure is the time against the finest set alone.
+  - A local prototype on the engine's GroupAggregateOperator, one thread:
+
+    | Every other set ... | Time |
+    | --- | --- |
+    | merged from the finest set's groups, each from the next finer set | 0.99 to 1.77 times |
+    | merged from the finest set's groups, each from the finest set | 1.00 to 2.61 times |
+    | aggregated from the input rows, one table per set | 1.25 to 4.01 times |
+    | merged from each part's partial groups | 1.08 to 4.14 times |
+    | from the input rows copied once per set with a set id (the survey's "hidden set id"; rejected) | 1.81 to 6.47 times |
+
+  - DuckDB 1.5.6 in SQL, each set re-aggregated by a parallel aggregation of its own over a materialized set, against
+    DuckDB's one-pass operator:
+    - At one thread, each set from the next finer set took 1.00 to 2.13 times, each from the finest set 1.02 to 3.31,
+      and the operator 1.35 to 3.18.
+    - At 14 threads, where the finest set reduces the input, each set from the finest set took 1.07 and 1.11 times
+      against the operator's 2.32 and 1.45.
+    - Where the finest set barely reduces the input, each set from the finest set took 1.35, 2.24 and 4.36 times
+      against the operator's 1.34, 2.03 and 4.34. Merging a set from about as many groups as there are input rows is
+      about as much work as aggregating it from the rows; only a smaller source saves. The chain, each set from the
+      next finer one, took 1.65, 2.63 and 3.62: it lost on two of the three and won on the eight-key profile.
+- **PF11.** The finest set's merged groups are partitioned by the hash of all its keys, so one group of a coarser set
+  lies in many partitions and its merge needs a second exchange. PF11 partitions the finest set by a key prefix that
+  most sets share instead, such as a ROLLUP's leading keys with enough distinct values. The sets that contain the
+  prefix then merge inside each partition, in a chain with nothing between its steps; the rest, at least `()`, merge
+  each partition's few rows once every partition finishes. It is pulled in front of a grouping-sets PR when the budget
+  gate fires on it or a profile shows the exchange.
+- **CUBE (RU6).** One pass fills every merged set's table at once, and CUBE has 2^n - 1 of them. RU6 merges its sets
+  from the finest set in batches that fit the memory budget, one pass and one barrier per batch, each batch emitted
+  before the next. The fallback, one table per set fed from the input, holds them all, up to the memory limit.
+- **PF6** now names any grouping-sets node, groups by ADR 0032's condition 3 over the union of the sets, and takes AVG
+  as a (SUM, COUNT) partial. As written it could not help RU3, whose queries 18 and 22 average only.
+- **docs/sql-subset.md** no longer says that queries 5 and 80 need concat, which FN5 built, and it lists how the
+  parser refuses grouping sets today: `GROUP BY a, GROUPING SETS (...)` is a syntax error (exit code 1), which RU1
+  makes exit code 4.
 
 ## Alternatives considered
 

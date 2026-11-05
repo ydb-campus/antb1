@@ -385,6 +385,9 @@ condition, `TRY_CAST` and a cast to a type antb1 has no type for, such as `CAST(
 rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`,
 the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
+Grouping sets wait for phase 5 of [ADR 0037](adr/0037-tpcds-roadmap.md): the parser rejects `ROLLUP`, `CUBE` and
+`GROUPING SETS` as the first `GROUP BY` item, and a later `ROLLUP` or `CUBE` is an unsupported function; a later
+`GROUPING SETS` is still a syntax error (exit code 1) until RU1.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two
@@ -1525,7 +1528,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q2 | pass | round of a DOUBLE (FN2) |
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
-| Q5 | unsupported | needs concat and ROLLUP (RU3) |
+| Q5 | unsupported | needs ROLLUP (RU3) |
 | Q6 | unsupported | needs SELECT DISTINCT, scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | unsupported | needs INTERSECT (X4c) |
@@ -1600,7 +1603,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q77 | unsupported | needs ROLLUP and a cross product of multi-row relations (OJ4) |
 | Q78 | pass | round of a DOUBLE (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
-| Q80 | unsupported | needs concat and ROLLUP (RU3) |
+| Q80 | unsupported | needs ROLLUP (RU3) |
 | Q81 | pass | answered when the ratchet was added |
 | Q82 | pass | answered when the ratchet was added |
 | Q83 | pass | answered when the ratchet was added |
