@@ -157,7 +157,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 and RU1 updates below; ADR 0038) | | Built |
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Built |
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Built |
-| RU4 | GROUPING() and GROUPING_ID() | | Planned |
+| RU4 | GROUPING() and GROUPING_ID() | | Built |
 | RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Planned |
 | RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Planned |
 | **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
@@ -628,6 +628,13 @@ limit of 65535 sets. Queries 5, 18, 22 and 80 pass; 69 of the 99 do.
   them (a last-digit difference of a DOUBLE ahead of the other cells), and the generator keeps the variance family out
   of a SELECT DISTINCT's list (two values a last digit apart are two rows in one engine and one in the other): both
   failed rare seeds of the variance family before RU3, which made them more frequent.
+
+Update (2026-11-05, RU4): built. `GROUPING()` and `GROUPING_ID()` are columns of ADR 0038's `GroupingSetsNode`
+(a GROUPING call per distinct argument list; over a plain GROUP BY the node has one set of every key), in the select
+list, HAVING, ORDER BY and expressions there, with DuckDB's errors (no GROUP BY, an argument that is no key as an
+expression, WHERE, inside an aggregate, 64 or more arguments). No query passes from it alone: 70 and 86, which call it,
+also need window functions. The generator selects GROUPING() of a grouped query's keys from the ROLLUP's stream, and two
+metamorphic relations check it: HAVING on its value picks one set's own GROUP BY, and it is 0 over a plain GROUP BY.
 
 ## Alternatives considered
 
