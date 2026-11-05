@@ -95,18 +95,6 @@ std::optional<Int128> Rescale(Int128 value, int from, int to) {
   return halves / 2;
 }
 
-double ExactDivideToDouble(Int128 numerator, int64_t denominator) {
-  ANTB1_CHECK(denominator > 0);
-  const Int128 den = denominator;
-  const Int128 quotient = numerator / den;
-  const Int128 remainder = numerator % den;
-  // Split into integral quotient and fractional remainder so large sums do not lose the fraction.
-  // Accurate to about 1 ulp; oracle comparisons of AVG use a relative tolerance.
-  const auto whole = static_cast<long double>(quotient);
-  const long double frac = static_cast<long double>(remainder) / static_cast<long double>(den);
-  return static_cast<double>(whole + frac);
-}
-
 namespace {
 
 // DuckDB's Hugeint::TryCast to a floating type (CastBigintToFloating), from the two's-complement
@@ -192,6 +180,11 @@ double DuckDbDecimalAverage(Int128 sum, int64_t count, int width, int scale) {
   const long double divisor =
       static_cast<long double>(count) * static_cast<long double>(power_of_ten);
   return static_cast<double>(DuckDbHugeintToReal<long double>(sum) / divisor);
+}
+
+double DuckDbIntegerAverage(Int128 sum, int64_t count, bool smallint) {
+  // A SMALLINT averages as a DECIMAL of width up to 4 does, any wider integer as a wider DECIMAL.
+  return DuckDbDecimalAverage(sum, count, smallint ? 4 : 38, 0);
 }
 
 }  // namespace antb1

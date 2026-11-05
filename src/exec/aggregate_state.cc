@@ -322,8 +322,11 @@ class IntegerSumState final : public AggregateState {
   [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
       arrow::MemoryPool* pool) const override {
     if (average_) {
-      return OneDouble(
-          count_ == 0 ? std::nullopt : std::optional(ExactDivideToDouble(sum_, count_)), pool);
+      return OneDouble(count_ == 0
+                           ? std::nullopt
+                           : std::optional(DuckDbIntegerAverage(
+                                 sum_, count_, std::is_same_v<ArrowType, arrow::Int16Type>)),
+                       pool);
     }
     return OneSum(count_ == 0 ? std::nullopt : std::optional(sum_), plan::LogicalType::kHugeInt,
                   pool);
@@ -455,7 +458,7 @@ class HugeIntSumState final : public AggregateState {
         return OneDouble(std::nullopt, pool);
       }
       return OneDouble(decimal ? DuckDbDecimalAverage(sum_, count_, input_.width(), input_.scale())
-                               : ExactDivideToDouble(sum_, count_),
+                               : DuckDbIntegerAverage(sum_, count_, /*smallint=*/false),
                        pool);
     }
     const plan::LogicalType result =

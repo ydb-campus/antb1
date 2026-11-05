@@ -159,11 +159,13 @@ arrow::Result<std::shared_ptr<arrow::Array>> DecimalAverages(std::span<const Int
   return builder.Finish();
 }
 
-// sum / count per group as DOUBLE (exact for integers), NULL for a group without values.
+// sum / count per group as DOUBLE, NULL for a group without values: an integer sum as DuckDB
+// divides it (DuckDbIntegerAverage; `smallint` for a SMALLINT's), a DOUBLE sum in double.
 template <class Sum>
 arrow::Result<std::shared_ptr<arrow::Array>> Averages(std::span<const Sum> sums,
                                                       std::span<const std::int64_t> counts,
-                                                      arrow::MemoryPool* pool) {
+                                                      arrow::MemoryPool* pool,
+                                                      bool smallint = false) {
   arrow::DoubleBuilder builder(pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(static_cast<std::int64_t>(sums.size())));
   for (std::size_t g = 0; g < sums.size(); ++g) {
@@ -172,7 +174,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> Averages(std::span<const Sum> sums,
     } else if constexpr (std::is_same_v<Sum, double>) {
       builder.UnsafeAppend(sums[g] / static_cast<double>(counts[g]));
     } else {
-      builder.UnsafeAppend(ExactDivideToDouble(sums[g], counts[g]));
+      builder.UnsafeAppend(DuckDbIntegerAverage(sums[g], counts[g], smallint));
     }
   }
   return builder.Finish();
@@ -276,7 +278,7 @@ class GroupedIntegerSum final : public GroupedAggregateState {
       std::uint32_t begin, std::uint32_t end, arrow::MemoryPool* pool) const override {
     ARROW_ASSIGN_OR_RAISE(const auto sums, GroupRange(sums_, begin, end));
     ARROW_ASSIGN_OR_RAISE(const auto counts, GroupRange(counts_, begin, end));
-    return average_ ? Averages(sums, counts, pool)
+    return average_ ? Averages(sums, counts, pool, std::is_same_v<ArrowType, arrow::Int16Type>)
                     : HugeInts(sums, counts, plan::LogicalType::kHugeInt, pool);
   }
 

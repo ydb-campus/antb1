@@ -22,8 +22,8 @@
 //              BIGINT, 0 over no rows
 //   SUM(c)     integers exactly in 128 bits, returned as HUGEINT (decimal128(38, 0)); an overflow
 //              of HUGEINT's range is an ExecutionError. DOUBLE: DOUBLE. NULL over no values
-//   AVG(c)     integers: the exact 128-bit sum divided once by the count (ExactDivideToDouble);
-//              DOUBLE: sum / count. DOUBLE, NULL over no values
+//   AVG(c)     integers: the exact 128-bit sum divided once by the count as DuckDB divides it
+//              (DuckDbIntegerAverage); DOUBLE: sum / count. DOUBLE, NULL over no values
 //   MIN/MAX(c) Arrow's min_max over the selected values (VARCHAR byte-wise, DATE chronologically);
 //              NaN is ignored, in every batch split: NaN only when every value is NaN. The
 //              column's type, NULL over no values

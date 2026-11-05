@@ -467,6 +467,9 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   among them, are pinned as `pending` records in tests/slt/cases/subqueries/, where `slt-complete` catches a mistake
   rather than a fixed seed. Three relations rather than the two named above: the EXISTS partition is written twice,
   once with an inner-only conjunct of the subquery.
+- Update (2026-11-05, ADR 0037's AG1): an integer AVG now agrees with DuckDB to the bit on each platform, as a
+  DECIMAL one does, so the generator compares it in correlated blocks too. A DOUBLE AVG stays out: each engine adds its
+  values in its own order.
 - Update (2026-10-13, S5): **S5 is `substring`,** recovered after ADR 0022's roadmap shipped. The front-end ids of the
   2026-10-02 roadmap are cited here and in ADR 0022 but listed in neither, as the C-decisions are, and S1 and S5 were
   cited only in this ADR; this records what they mean before the detour has to be repeated. Of the three queries U2

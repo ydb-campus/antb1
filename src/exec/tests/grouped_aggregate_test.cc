@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,7 @@
 
 #include "../decimal.h"
 #include "../group_table.h"
+#include "../grouped_sum_alias.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -421,6 +423,59 @@ TEST_F(GroupedAggregateTest, MergingSubsetsOfGroups) {
       EXPECT_TRUE(
           even->MergeGroups(*part, std::vector<std::uint32_t>{0, 1}, std::vector<std::uint32_t>{0})
               .IsInvalid());
+    }
+  }
+}
+
+// An integer AVG divides as DuckDB does (ADR 0037's AG1) in every state that finalizes one, scalar
+// and grouped, of each integer type and through the SUM/AVG alias. Three values of 2^53 + 1 average
+// to 2^53 + 2 where long double is double, since the sum rounds before the division, and to 2^53
+// where it is wider. A SMALLINT's sum divides in double, which 2051 values summing to 2051709 tell
+// apart from an 80-bit long double: 1000.3456850316919 against 1000.3456850316918, the INTEGER
+// answer there (DuckDB 1.5.6 answers 1000.3456850316919 for both on Apple silicon).
+TEST_F(GroupedAggregateTest, IntegerAvgDividesAsDuckDb) {
+  constexpr int kDigits = std::numeric_limits<long double>::digits;
+  const double big = kDigits > 53 ? 9007199254740992.0 : 9007199254740994.0;
+  const double smallint_avg = 1000.3456850316919;
+  const double integer_avg = kDigits == 64 ? 1000.3456850316918 : 1000.3456850316919;
+  const auto big_bigints = testing::Int64s({9007199254740993, 9007199254740993, 9007199254740993});
+  const auto big_hugeints = testing::Decimals(
+      LogicalType::kHugeInt, {"9007199254740993", "9007199254740993", "9007199254740993"});
+  std::vector<std::optional<std::int16_t>> smalls(2051, std::int16_t{1000});
+  smalls[0] = 1709;
+  std::vector<std::optional<std::int32_t>> ints(smalls.begin(), smalls.end());
+  const auto small_values = testing::Int16s(smalls);
+  const auto int_values = testing::Int32s(ints);
+  const auto first = [](const std::shared_ptr<arrow::Array>& out) {
+    return static_cast<const arrow::DoubleArray&>(*out).Value(0);
+  };
+  for (const auto& [type, values, expected] :
+       std::vector<std::tuple<LogicalType, std::shared_ptr<arrow::Array>, double>>{
+           {LogicalType::kBigInt, big_bigints, big},
+           {LogicalType::kHugeInt, big_hugeints, big},
+           {LogicalType::kSmallInt, small_values, smallint_avg},
+           {LogicalType::kInteger, int_values, integer_avg}}) {
+    SCOPED_TRACE(plan::ToString(type));
+    auto scalar = MakeAggregateState(AggKind::kAvg, type, LogicalType::kDouble);
+    ASSERT_TRUE(scalar.ok()) << scalar.status().ToString();
+    ASSERT_TRUE((*scalar)->Consume(*values, nullptr).ok());
+    auto scalar_out = (*scalar)->Finalize(arrow::default_memory_pool());
+    ASSERT_TRUE(scalar_out.ok()) << scalar_out.status().ToString();
+    EXPECT_EQ(first(*scalar_out), expected);
+    const std::vector<std::uint32_t> ids(static_cast<std::size_t>(values->length()), 0);
+    auto grouped =
+        MakeGrouped({.kind = AggKind::kAvg, .input = type, .result = LogicalType::kDouble});
+    ASSERT_NE(grouped, nullptr);
+    grouped->Resize(1);
+    ASSERT_TRUE(grouped->Consume(values.get(), ids).ok());
+    EXPECT_EQ(first(Finalized(*grouped)), expected);
+    // The AVG that reads a SUM's accumulator (grouped_sum_alias.h), where the SUM's state has one.
+    auto sum = MakeGrouped({.kind = AggKind::kSum, .input = type, .result = LogicalType::kHugeInt});
+    ASSERT_NE(sum, nullptr);
+    sum->Resize(1);
+    ASSERT_TRUE(sum->Consume(values.get(), ids).ok());
+    if (const auto alias = MakeSumAlias(*sum, /*average=*/true); alias != nullptr) {
+      EXPECT_EQ(first(Finalized(*alias)), expected);
     }
   }
 }

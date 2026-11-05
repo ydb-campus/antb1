@@ -47,10 +47,13 @@ int CompareScaled(Int128 a, int a_scale, Int128 b, int b_scale);
 // half away from zero (q = value / (f / 2), then q +- 1, then q / 2, with f = 10^(from - to)).
 std::optional<Int128> Rescale(Int128 value, int from, int to);
 
-// numerator/denominator (denominator > 0) as a double, used for AVG over integers. Accurate to
-// about 1 ulp (exact integer accumulation, then one long double division); oracle comparisons use a
-// relative tolerance.
-double ExactDivideToDouble(Int128 numerator, int64_t denominator);
+// DuckDB's AVG of `count` (> 0) integers from the exact sum of their values (ADR 0037's AG1): a
+// SMALLINT's sum as an int64 divided by the count in double (IntegerAverageOperation); any other
+// integer's sum as a long double from its two 64-bit halves, divided by the count in long double,
+// then rounded to double (IntegerAverageOperationHugeint, HugeintAverageOperation). DuckDB averages
+// a USMALLINT as a BIGINT. long double is the platform's, as in DuckDB's own build, so the result
+// is DuckDB's to the bit on each platform: DuckDbDecimalAverage at scale 0.
+double DuckDbIntegerAverage(Int128 sum, int64_t count, bool smallint);
 
 // DuckDB's AVG of `count` (> 0) DECIMAL(width, scale) values from the exact sum of their unscaled
 // values (ADR 0021 rule 13): the sum as a long double from its two 64-bit halves (lower + upper *

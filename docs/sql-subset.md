@@ -1158,8 +1158,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   threads (likewise for DECIMAL, D18).
   Over DOUBLE it returns DOUBLE: it adds each row group's values (of each group), then the row group sums in order
   (the same for any number of threads; see Execution below). DOUBLE `AVG` sums the same way.
-- AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, so
-  the DOUBLE result is accurate to about one ulp (the oracle tests use a tight relative tolerance). Over DOUBLE it
+- AVG: over integer columns the sum accumulates exactly in 128 bits and is divided by the count once at the end, as
+  DuckDB divides it ([ADR 0037](adr/0037-tpcds-roadmap.md)'s AG1): a SMALLINT's sum in double, any other integer's as
+  a long double divided by the count in long double, then rounded to DOUBLE, so the result is DuckDB's to the bit on
+  each platform (past 2^53 it can differ from the correctly rounded mean, and between platforms). Over DOUBLE it
   returns DOUBLE. Over DATE and TIMESTAMP it averages the microseconds (a DATE's midnight; its infinities as the
   TIMESTAMP ones, summed as their int64 values as DuckDB sums them, so that with finite values they give a large
   finite TIMESTAMP; a DATE beyond the TIMESTAMP range an error) in 128 bits and returns a TIMESTAMP, rounded as DuckDB

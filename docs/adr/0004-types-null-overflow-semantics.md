@@ -51,7 +51,9 @@ antb1 follows DuckDB's semantics for everything in the supported subset:
 - Integer SUM accumulates in 128 bits (`antb1::Int128`) and returns HUGEINT, represented as Arrow
   `decimal128(38, 0)`; it never overflows or wraps. Integer AVG accumulates the sum exactly in 128 bits and divides
   by the count once at the end, which keeps the DOUBLE result within about one ulp of the exact mean. MIN and MAX
-  return the input type.
+  return the input type. Update (2026-11-05, ADR 0037's AG1): the division is DuckDB's, so integer AVG is DuckDB's
+  to the bit on each platform: a SMALLINT's sum divided in double, any other integer's sum as a long double divided
+  by the count in long double (`DuckDbIntegerAverage`).
 - NULL: aggregates skip NULLs; over zero rows COUNT returns 0 and SUM, AVG, MIN and MAX return NULL; a predicate
   that is NULL rejects the row.
 - Every intentional difference from DuckDB is registered in the divergence table of

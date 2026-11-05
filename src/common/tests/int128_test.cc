@@ -30,12 +30,33 @@ TEST(Int128Test, CheckedAddDetectsOverflow) {
   EXPECT_FALSE(CheckedAdd(kInt128Min, -1).has_value());
 }
 
-TEST(Int128Test, ExactDivideMatchesDoubleForSmallValues) {
-  EXPECT_DOUBLE_EQ(ExactDivideToDouble(7, 2), 3.5);
-  EXPECT_DOUBLE_EQ(ExactDivideToDouble(-7, 2), -3.5);
-  // Sum of two INT64_MAX values averaged must not overflow.
-  const Int128 sum = static_cast<Int128>(INT64_MAX) * 2;
-  EXPECT_DOUBLE_EQ(ExactDivideToDouble(sum, 2), static_cast<double>(INT64_MAX));
+// DuckDB's integer AVG (ADR 0037's AG1): exact for small values; past 2^53 the sum is rounded to
+// the platform's long double before the division, as DuckDB rounds it. Three values of 2^53 + 1:
+// where long double is double the sum rounds to 3 * 2^53 + 4 and the average to 2^53 + 2 (DuckDB
+// 1.5.6 on Apple silicon answers 9007199254740994); a wider long double keeps the sum, and the
+// average 2^53 + 1 rounds to even, 2^53. A SMALLINT's int64 sum divides in double.
+TEST(Int128Test, IntegerAverageAsDuckDb) {
+  EXPECT_EQ(DuckDbIntegerAverage(7, 2, false), 3.5);
+  EXPECT_EQ(DuckDbIntegerAverage(-7, 2, false), -3.5);
+  EXPECT_EQ(DuckDbIntegerAverage(7, 2, true), 3.5);
+  // The sum of two INT64_MAX values: past int64, averaged without overflow.
+  const Int128 two_max = static_cast<Int128>(INT64_MAX) * 2;
+  EXPECT_EQ(DuckDbIntegerAverage(two_max, 2, false), static_cast<double>(INT64_MAX));
+  const auto past = Int128{9007199254740993};  // 2^53 + 1
+  const bool wide = std::numeric_limits<long double>::digits > std::numeric_limits<double>::digits;
+  EXPECT_EQ(DuckDbIntegerAverage(past * 3, 3, false),
+            wide ? 9007199254740992.0 : 9007199254740994.0);
+  // A negative sum's upper half is -1, which DuckDB converts as -(2^64 - 1 - lower) - 1: where long
+  // double is double, 3 * 2^53 + 2 rounds to even, 3 * 2^53, and so does the - 1, so DuckDB answers
+  // -9007199254740992 here and not the mirror of the positive average; a wider long double gives
+  // -(2^53 + 1), which rounds to even, the same.
+  EXPECT_EQ(DuckDbIntegerAverage(-past * 3, 3, false), -9007199254740992.0);
+  // A SMALLINT's sum divides in double on every platform; any other integer's in long double,
+  // which rounds 2051709 / 2051 differently where it has 64 bits (x86-64's 80-bit format).
+  EXPECT_EQ(DuckDbIntegerAverage(2051709, 2051, true), 1000.3456850316919);
+  EXPECT_EQ(
+      DuckDbIntegerAverage(2051709, 2051, false),
+      std::numeric_limits<long double>::digits == 64 ? 1000.3456850316918 : 1000.3456850316919);
 }
 
 // Parses a decimal integer of up to 39 digits (test data only).

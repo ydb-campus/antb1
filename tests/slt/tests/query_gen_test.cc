@@ -2059,16 +2059,33 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
 }
 
 // The Path 2 form: an ungrouped SUM, AVG, MIN or MAX over the inner table, correlated through the
-// key and compared with a literal in either order. AVG appears only over a DECIMAL argument, where
-// ADR 0021 rule 13 makes the two engines agree bit for bit.
+// key and compared with a literal in either order. AVG appears only over a DECIMAL or an integer
+// argument, where ADR 0021 rule 13 and ADR 0037's AG1 make the two engines agree bit for bit.
 TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   const FeatureSet plain =
       Union(kSupportedFeatures, {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate})
           .Minus({Feature::kLayout, Feature::kKeywordCase});
-  const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 71, {.supported = plain, .target_percent = 0});
+  // The kind of the column an AVG reads, by its name (qualifier and case aside).
+  const auto kind_of = [&tables](std::string name) -> std::optional<ValueKind> {
+    name = name.substr(name.rfind('.') + 1);
+    std::erase(name, '"');
+    std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
+    for (const GenTable& t : tables) {
+      for (const GenColumn& c : t.columns) {
+        if (c.name == name) {
+          return c.kind;
+        }
+      }
+    }
+    return std::nullopt;
+  };
   int calls = 0;
   int literal_first = 0;
   int avg = 0;
+  int avg_integer = 0;
+  int avg_decimal = 0;
   for (uint64_t i = 0; i < 4000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedAggregate)) {
@@ -2089,8 +2106,14 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
     if (!subquery_first) {
       ++literal_first;
     }
-    if (block.contains("AVG(")) {
+    if (const std::size_t open = block.find("AVG("); open != std::string::npos) {
       ++avg;
+      const std::size_t begin = open + 4;
+      const auto kind = kind_of(block.substr(begin, block.find(')', begin) - begin));
+      ASSERT_TRUE(kind.has_value()) << q.sql;
+      EXPECT_TRUE(kind == ValueKind::kInteger || kind == ValueKind::kDecimal) << q.sql;
+      avg_integer += kind == ValueKind::kInteger ? 1 : 0;
+      avg_decimal += kind == ValueKind::kDecimal ? 1 : 0;
     }
     EXPECT_FALSE(q.features.Has(Feature::kInSubquery)) << q.sql;
     EXPECT_FALSE(q.features.Has(Feature::kScalarSubquery)) << q.sql;
@@ -2098,9 +2121,12 @@ TEST(QueryGenerator, CorrelatedAggregateComparesALiteralInEitherOrder) {
   EXPECT_GT(calls, 150) << "calls: " << calls;
   EXPECT_GT(literal_first, 20) << "literal_first: " << literal_first;
   EXPECT_LT(literal_first, calls) << "both orders";
-  // AVG is generated, and only over a DECIMAL argument -- CorrelatedAggregateFits is what enforces
-  // the type, and the differential runs are what would catch it if the rule were wrong.
+  // AVG is generated, over both an integer and a DECIMAL argument and over nothing else --
+  // CorrelatedAggregateFits is what enforces the type, and the differential runs are what would
+  // catch it if the rule were wrong.
   EXPECT_GT(avg, 0) << "avg: " << avg;
+  EXPECT_GT(avg_integer, 0) << "avg over an integer: " << avg_integer;
+  EXPECT_GT(avg_decimal, 0) << "avg over a DECIMAL: " << avg_decimal;
 }
 
 // What it writes, with the layout and keyword-case features off so the call is one span of text:
