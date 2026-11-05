@@ -18,6 +18,13 @@ target_link_libraries(
     antb1::build_options
 )
 
+# Prototype measurements for grouping sets (ADR 0038's Evidence): not run by any test.
+add_executable(antb1-bench-gsets grouping_sets_bench.cc)
+target_link_libraries(
+  antb1-bench-gsets
+  PRIVATE antb1::plan antb1::exec antb1::common benchmark::benchmark antb1::build_options
+)
+
 if(ANTB1_BUILD_TESTS)
   # --benchmark_dry_run: one iteration of every benchmark. TMPDIR keeps BM_ScanColumn's file in the build tree.
   set(_tmp "${CMAKE_CURRENT_BINARY_DIR}/tmp")

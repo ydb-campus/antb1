@@ -99,6 +99,17 @@ void CountAll(const std::vector<Expr>& exprs, const std::string& sql, Counts& c)
   }
 }
 
+// A grouping element (ADR 0038): its expressions, and for anything but a plain expression one pair
+// of parentheses and the commas between its items.
+void CountElement(const GroupingElement& element, const std::string& sql, Counts& c) {
+  CountAll(element.exprs, sql, c);
+  c.commas += Separators(element.elements.size());
+  for (const GroupingElement& child : element.elements) {
+    CountElement(child, sql, c);
+  }
+  c.parens += element.kind == GroupingElement::Kind::kExpr ? 0U : 1U;
+}
+
 struct CountOf {
   const std::string& sql;
   Counts& c;
@@ -218,7 +229,7 @@ void Count(const Expr& expr, const std::string& sql, Counts& c) {
 // nested query and of a column alias list, the commas between CTEs and between column aliases, and
 // a string alias (its last byte a quote).
 void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 20, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   for (const SetBranch& branch : stmt.set_operation) {
     CountStatement(*branch.query, sql, want);
@@ -263,6 +274,10 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
     Count(e, sql, want);
   }
   CountAll(stmt.group_by, sql, want);
+  want.commas += Separators(stmt.grouping.size());
+  for (const GroupingElement& element : stmt.grouping) {
+    CountElement(element, sql, want);
+  }
   for (const Expr& e : stmt.having) {
     Count(e, sql, want);
   }
@@ -499,10 +514,20 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
   }
   // A compound (ADR 0036) holds its blocks, two or more, each a block of its own in the compound's
   // span after the UNION ALL that joins it; its own block fields are empty.
-  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  static_assert(kSelectStatementFields == 20, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   ASSERT_NE(stmt.set_operation.size(), 1U) << context;
   ASSERT_EQ(stmt.from.empty(), !stmt.set_operation.empty()) << context;
+  // Grouping elements and plain GROUP BY items never mix, and a compound's are its blocks'
+  // (ADR 0038).
+  ASSERT_TRUE(stmt.grouping.empty() || stmt.group_by.empty()) << context;
+  for (const GroupingElement& element : stmt.grouping) {
+    ASSERT_TRUE(Within(element.span, stmt.span)) << context;
+    for (const Expr* e : GroupingExprs({element})) {
+      ASSERT_TRUE(Within(e->span(), element.span)) << context;
+    }
+  }
+  ASSERT_TRUE(stmt.grouping.empty() || stmt.set_operation.empty()) << context;
   // SELECT DISTINCT's keyword lies in its block, and a compound's DISTINCT is its blocks'.
   if (stmt.distinct) {
     ASSERT_TRUE(Within(stmt.distinct_span, stmt.span)) << context;
@@ -1281,6 +1306,39 @@ std::vector<std::string> RandomColumnAliases(Rng& rng) {
 
 // A random statement whose queries nest at most `blocks` levels deep: a WITH list (names that
 // differ ASCII case-insensitively, as the parser demands) and derived tables.
+// A grouping element (ADR 0038) as the parser builds one: in ROLLUP and CUBE only expressions and
+// composites, anywhere else any element, nested GROUPING SETS included, `depth` levels at most.
+GroupingElement RandomElement(Rng& rng, std::size_t depth, bool in_rollup) {
+  using Kind = GroupingElement::Kind;
+  GroupingElement element;
+  const std::size_t pick = depth == 0 ? 0 : rng.Below(in_rollup ? 2 : 6);
+  const auto exprs = [&](std::size_t n) {
+    for (; n > 0; --n) {
+      element.exprs.push_back(RandomExpr(rng, 2, false));
+    }
+  };
+  switch (pick) {
+    case 0:
+      element.kind = Kind::kExpr;
+      exprs(1);
+      break;
+    case 1:
+      element.kind = Kind::kRow;
+      exprs(2 + rng.Below(2));
+      break;
+    case 2:
+      element.kind = Kind::kEmpty;
+      break;
+    default:
+      element.kind = std::array{Kind::kRollup, Kind::kCube, Kind::kSets}.at(pick - 3);
+      for (std::size_t n = 1 + rng.Below(3); n > 0; --n) {
+        element.elements.push_back(RandomElement(rng, depth - 1, element.kind != Kind::kSets));
+      }
+      break;
+  }
+  return element;
+}
+
 SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   static constexpr auto kNulls =
       std::to_array<NullsOrder>({NullsOrder::kDefault, NullsOrder::kFirst, NullsOrder::kLast});
@@ -1368,6 +1426,18 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   if (rng.Percent(35)) {
     for (std::size_t n = 1 + rng.Below(3); n > 0; --n) {
       stmt.group_by.push_back(RandomExpr(rng, 2, false));
+    }
+  }
+  // Grouping sets (ADR 0038) instead of a plain list now and then: a list in which some element is
+  // grouping-set syntax, as the parser keeps it.
+  if (stmt.group_by.empty() && rng.Percent(20)) {
+    for (std::size_t n = 1 + rng.Below(3); n > 0; --n) {
+      stmt.grouping.push_back(RandomElement(rng, 2, false));
+    }
+    if (std::ranges::all_of(stmt.grouping, [](const GroupingElement& e) {
+          return e.kind == GroupingElement::Kind::kExpr;
+        })) {
+      stmt.grouping.push_back(GroupingElement{.kind = GroupingElement::Kind::kEmpty});
     }
   }
   if (rng.Percent(25)) {

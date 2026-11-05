@@ -257,6 +257,18 @@ struct Expr : ExprNode {
 using SelectExpr = Expr;
 using GroupExpr = Expr;
 
+// A GROUP BY item in grouping-set syntax (ADR 0038), as DuckDB parses it: an expression, a
+// composite `(a, b)`, the empty set `()`, ROLLUP (...) or CUBE (...) over expressions and
+// composites, or GROUPING SETS (...) over any of these, nested ones included.
+struct GroupingElement {
+  enum class Kind : std::uint8_t { kExpr, kRow, kEmpty, kRollup, kCube, kSets };
+  Kind kind = Kind::kExpr;
+  std::vector<Expr> exprs;  // kExpr: one; kRow: two or more
+  std::vector<GroupingElement>
+      elements;     // kRollup and kCube: kExpr or kRow; kSets: any, one or more
+  SourceSpan span;  // the element, its keyword and parentheses included
+};
+
 // kLike and kNotLike: column [NOT] LIKE 'pattern' (the pattern is always the literal, on the
 // right). kIn and kNotIn: column [NOT] IN (literal, ...), the values in Comparison::list.
 enum class CompareOp : std::uint8_t { kEq, kNe, kLt, kLe, kGt, kGe, kLike, kNotLike, kIn, kNotIn };
@@ -392,18 +404,21 @@ struct SetBranch {
 // A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET), or a compound of
 // blocks. A derived table and a common table expression hold a query of their own.
 struct SelectStatement {
-  std::vector<CommonTableExpr> with;   // the WITH list, in order (empty: none)
-  SourceSpan with_span;                // the WITH keyword (when with is not empty)
-  bool distinct = false;               // SELECT DISTINCT (ADR 0037's AG3)
-  SourceSpan distinct_span;            // the DISTINCT keyword (when distinct)
-  std::vector<SelectItem> items;       // in a block, at least one; stars among them
-  std::vector<FromItem> from;          // at least one in a block, empty in a compound: a flat
-                                       // list, never a tree (ADR 0022)
-  std::vector<Expr> where;             // conjuncts: the top-level AND chain, split
-  std::vector<GroupExpr> group_by;     // GROUP BY items (aliases and positions: see the binder)
-  SourceSpan group_by_span;            // GROUP BY and its list (when group_by is not empty)
-  std::vector<Expr> having;            // conjuncts, as in WHERE
-  SourceSpan having_span;              // HAVING and its predicate (when having is not empty)
+  std::vector<CommonTableExpr> with;  // the WITH list, in order (empty: none)
+  SourceSpan with_span;               // the WITH keyword (when with is not empty)
+  bool distinct = false;              // SELECT DISTINCT (ADR 0037's AG3)
+  SourceSpan distinct_span;           // the DISTINCT keyword (when distinct)
+  std::vector<SelectItem> items;      // in a block, at least one; stars among them
+  std::vector<FromItem> from;         // at least one in a block, empty in a compound: a flat
+                                      // list, never a tree (ADR 0022)
+  std::vector<Expr> where;            // conjuncts: the top-level AND chain, split
+  std::vector<GroupExpr> group_by;    // GROUP BY items (aliases and positions: see the binder)
+  // The whole GROUP BY list when an item of it is in grouping-set syntax (ADR 0038); group_by is
+  // then empty.
+  std::vector<GroupingElement> grouping;
+  SourceSpan group_by_span;  // GROUP BY and its list (when group_by or grouping is not empty)
+  std::vector<Expr> having;  // conjuncts, as in WHERE
+  SourceSpan having_span;    // HAVING and its predicate (when having is not empty)
   std::vector<OrderItem> order_by;     // ORDER BY items
   SourceSpan order_by_span;            // ORDER BY and its list (when order_by is not empty)
   std::optional<std::int64_t> limit;   // non-negative
@@ -421,7 +436,7 @@ struct SelectStatement {
 // The number of fields of SelectStatement. ast.cc checks it against the struct, and every walk of a
 // statement asserts the number it was written for: a new field fails the build at each of them,
 // which is the only way a walk that forgets it can be found, the compiler checking nothing else.
-inline constexpr std::size_t kSelectStatementFields = 19;
+inline constexpr std::size_t kSelectStatementFields = 20;
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);
@@ -431,6 +446,10 @@ std::string_view ToString(Connector connector);  // "", ",", "CROSS JOIN", "INNE
 
 bool EqualIgnoringSpans(const Expr& a, const Expr& b);
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);
+
+// Every expression of `elements`, nested elements' included, in the order written: what a walk of a
+// statement's expressions visits in its GROUP BY when the list is in grouping-set syntax.
+std::vector<const Expr*> GroupingExprs(const std::vector<GroupingElement>& elements);
 
 // The levels of an expression tree: the nodes on its longest path from the root to a leaf (a leaf
 // alone is 1). The parser accepts no tree deeper than kMaxExpressionDepth (parser.h).

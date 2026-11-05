@@ -26,24 +26,28 @@ namespace antb1::slt {
 
 enum class Feature : std::uint8_t {
   // SELECT list
-  kCountStar,        // COUNT(*)
-  kCountColumn,      // COUNT(col)
-  kSum,              // SUM(numeric col)
-  kAvg,              // AVG(numeric col)
-  kMin,              // MIN(col)
-  kMax,              // MAX(col)
-  kCountDistinct,    // COUNT(DISTINCT col)
-  kVariance,         // STDDEV_SAMP, STDDEV, STDDEV_POP, VAR_SAMP, VARIANCE or VAR_POP(numeric col)
-  kSelectDistinct,   // SELECT DISTINCT
-  kColumns,          // plain column references (a projection)
-  kStar,             // SELECT *
-  kMultipleItems,    // more than one select item
-  kAlias,            // <item> [AS] alias
-  kConstant,         // a literal select item (an integer, a string or a DATE)
-  kArithmetic,       // + - * / // % and unary - of a column and a constant
-  kStringFunctions,  // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
-  kSubstring,        // substring(varchar, start[, length]), in the comma and standard spellings
-  kCase,             // CASE WHEN <condition> THEN .. [ELSE ..] END
+  kCountStar,         // COUNT(*)
+  kCountColumn,       // COUNT(col)
+  kSum,               // SUM(numeric col)
+  kAvg,               // AVG(numeric col)
+  kMin,               // MIN(col)
+  kMax,               // MAX(col)
+  kCountDistinct,     // COUNT(DISTINCT col)
+  kVariance,          // STDDEV_SAMP, STDDEV, STDDEV_POP, VAR_SAMP, VARIANCE or VAR_POP(numeric col)
+  kSelectDistinct,    // SELECT DISTINCT
+  kRollup,            // GROUP BY ROLLUP (...) (ADR 0038)
+  kCube,              // GROUP BY CUBE (...)
+  kGroupingSets,      // GROUP BY GROUPING SETS (...), a composite (a, b) or the empty set ()
+  kGroupingFunction,  // GROUPING(...) and GROUPING_ID(...)
+  kColumns,           // plain column references (a projection)
+  kStar,              // SELECT *
+  kMultipleItems,     // more than one select item
+  kAlias,             // <item> [AS] alias
+  kConstant,          // a literal select item (an integer, a string or a DATE)
+  kArithmetic,        // + - * / // % and unary - of a column and a constant
+  kStringFunctions,   // strlen(varchar) and regexp_replace(varchar, 'pattern', 'replacement')
+  kSubstring,         // substring(varchar, start[, length]), in the comma and standard spellings
+  kCase,              // CASE WHEN <condition> THEN .. [ELSE ..] END
   kBooleanExpressions,  // OR, NOT and parenthesized AND in conditions (WHERE, an inner ON, HAVING,
                         // CASE WHEN)
   kTimestamps,          // toDateTime(integer), EXTRACT(field FROM ..) and date_trunc('unit', ..)
@@ -145,6 +149,14 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "variance";
     case Feature::kSelectDistinct:
       return "distinct";
+    case Feature::kRollup:
+      return "rollup";
+    case Feature::kCube:
+      return "cube";
+    case Feature::kGroupingSets:
+      return "grouping_sets";
+    case Feature::kGroupingFunction:
+      return "grouping_function";
     case Feature::kColumns:
       return "columns";
     case Feature::kStar:
@@ -338,7 +350,10 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // commit, since TargetSamplesCoverTheWholeGrammar asserts the generated set exactly. Stars among
 // the select items and qualified stars waited here from the PR that answered them to the one that
 // taught the generator (its ninth stream).
-inline constexpr FeatureSet kGeneratorPending = {};
+// ADR 0038's grammar (ADR 0037's RU1) waits here for the PRs that answer it: ROLLUP for RU3,
+// GROUPING() for RU4, GROUPING SETS for RU5 and CUBE for RU6, each teaching the generator its form.
+inline constexpr FeatureSet kGeneratorPending = {
+    Feature::kRollup, Feature::kCube, Feature::kGroupingSets, Feature::kGroupingFunction};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

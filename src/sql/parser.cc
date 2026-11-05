@@ -792,7 +792,7 @@ class Parser {
 
   // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
   static SelectStatement TakeBlock(SelectStatement& stmt) {
-    static_assert(kSelectStatementFields == 19, "revisit this walk");
+    static_assert(kSelectStatementFields == 20, "revisit this walk");
     SelectStatement block;
     block.distinct = std::exchange(stmt.distinct, false);
     block.distinct_span = std::exchange(stmt.distinct_span, {});
@@ -800,6 +800,7 @@ class Parser {
     block.from = std::exchange(stmt.from, {});
     block.where = std::exchange(stmt.where, {});
     block.group_by = std::exchange(stmt.group_by, {});
+    block.grouping = std::exchange(stmt.grouping, {});
     block.group_by_span = std::exchange(stmt.group_by_span, {});
     block.having = std::exchange(stmt.having, {});
     block.having_span = std::exchange(stmt.having_span, {});
@@ -1339,6 +1340,13 @@ class Parser {
     if (!lhs) {
       return lhs;
     }
+    return ParseInfixLoop(context, min_precedence, *std::move(lhs));
+  }
+
+  // The operators that follow `first`, the left operand already parsed at this frame's level, as
+  // ParseExprAtDepth applies them after a prefix.
+  Expected<Expr> ParseInfixLoop(Context context, int min_precedence, Expr first) {
+    Expected<Expr> lhs = std::move(first);
     while (true) {
       if (auto error = UnsupportedOperator(); error.has_value()) {
         return std::unexpected(std::move(*error));
@@ -1580,7 +1588,13 @@ class Parser {
   Expected<Expr> ParsePostfix(Context context) {
     const std::size_t begin = Peek().span.offset;
     const std::size_t outer_peak = std::exchange(peak_, depth_);
-    auto expr = ParsePrimary(context);
+    auto expr = ParseCasts(begin, ParsePrimary(context));
+    peak_ = std::max(outer_peak, peak_);
+    return expr;
+  }
+
+  // The casts `::T` that follow `expr`, an operand that starts at offset `begin`.
+  Expected<Expr> ParseCasts(std::size_t begin, Expected<Expr> expr) {
     while (expr && Peek().kind == TokenKind::kDoubleColon) {
       const SourceSpan op = Peek().span;
       // ToSql writes CAST(<operand> AS T): one level more for the operand.
@@ -1600,7 +1614,6 @@ class Parser {
                            .type_span = type->span,
                            .span = SourceSpan{.offset = begin, .length = last_end_ - begin}});
     }
-    peak_ = std::max(outer_peak, peak_);
     return expr;
   }
 
@@ -2864,7 +2877,8 @@ class Parser {
     return {};
   }
 
-  // GROUP BY expr (',' expr)*, positioned at GROUP.
+  // GROUP BY item (',' item)*, positioned at GROUP. An item is an expression or, in grouping-set
+  // syntax (ADR 0038), an element; when any item is one, the whole list is stmt.grouping.
   Status ParseGroupBy(SelectStatement& stmt) {
     const std::size_t begin = Take().span.offset;
     if (!Peek().IsKeyword("BY")) {
@@ -2872,25 +2886,20 @@ class Parser {
     }
     Take();
     if (Peek().IsKeyword("ALL")) {
+      if (PeekAt(1).kind == TokenKind::kComma) {  // DuckDB's grammar has no list after ALL
+        return Syntax(PeekAt(1).span, "expected the end of GROUP BY ALL, found ','");
+      }
       return Unsupported(Peek().span, "GROUP BY ALL is not supported");
     }
-    if (Peek().IsKeyword("GROUPING") && PeekAt(1).IsKeyword("SETS")) {
-      return Unsupported(Peek().span, "GROUPING SETS are not supported");
-    }
-    if (Peek().IsKeyword("ROLLUP") || Peek().IsKeyword("CUBE")) {
-      return Unsupported(Peek().span, KeywordOf(Peek()) + " is not supported");
-    }
+    std::vector<GroupingElement> items;
+    bool sets = false;
     while (true) {
-      // The empty grouping set, which DuckDB answers (one group, as without GROUP BY).
-      if (Peek().kind == TokenKind::kLeftParen && PeekAt(1).kind == TokenKind::kRightParen) {
-        return Unsupported(Cover(Peek().span, PeekAt(1).span),
-                           "GROUP BY () (the empty grouping set) is not supported");
+      auto item = ParseGroupingElement(ElementPlace::kList);
+      if (!item) {
+        return std::unexpected(std::move(item.error()));
       }
-      auto expr = ParseExpr(Context::kGroupBy);
-      if (!expr) {
-        return std::unexpected(std::move(expr.error()));
-      }
-      stmt.group_by.push_back(*std::move(expr));
+      sets = sets || item->kind != GroupingElement::Kind::kExpr;
+      items.push_back(*std::move(item));
       if (Peek().kind != TokenKind::kComma) {
         break;
       }
@@ -2899,8 +2908,202 @@ class Parser {
         return Unsupported(comma, "a trailing comma in GROUP BY is not supported");
       }
     }
+    if (sets) {
+      stmt.grouping = std::move(items);
+    } else {
+      for (GroupingElement& item : items) {
+        stmt.group_by.push_back(std::move(item.exprs.front()));
+      }
+    }
     stmt.group_by_span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     return {};
+  }
+
+  // Where a grouping element stands: the GROUP BY list, inside GROUPING SETS, or inside ROLLUP or
+  // CUBE, which take expressions and composites only.
+  enum class ElementPlace : std::uint8_t { kList, kSets, kRollup };
+
+  Expected<GroupingElement> ParseGroupingElement(ElementPlace place) {
+    const Token& first = Peek();
+    if (place != ElementPlace::kRollup) {
+      // ROLLUP and CUBE are names but before '(' (a column `cube` stays one), as in DuckDB.
+      const bool paren = PeekAt(1).kind == TokenKind::kLeftParen;
+      if (first.IsKeyword("ROLLUP") && paren) {
+        return ParseGroupingContainer(GroupingElement::Kind::kRollup);
+      }
+      if (first.IsKeyword("CUBE") && paren) {
+        return ParseGroupingContainer(GroupingElement::Kind::kCube);
+      }
+      if (first.IsKeyword("GROUPING") && PeekAt(1).IsKeyword("SETS")) {
+        return ParseGroupingContainer(GroupingElement::Kind::kSets);
+      }
+    }
+    if (first.kind == TokenKind::kLeftParen && !OpensNestedQuery(0)) {
+      const std::size_t depth = depth_;
+      const std::size_t outer_peak = peak_;
+      auto result = ParseParenthesizedElement(place);
+      depth_ = depth;
+      peak_ = std::max(outer_peak, peak_);
+      return result;
+    }
+    auto expr = ParseExpr(Context::kGroupBy);
+    if (!expr) {
+      return std::unexpected(std::move(expr.error()));
+    }
+    const SourceSpan span = expr->span();
+    std::vector<Expr> exprs;
+    exprs.push_back(*std::move(expr));
+    return GroupingElement{.kind = GroupingElement::Kind::kExpr,
+                           .exprs = std::move(exprs),
+                           .elements = {},
+                           .span = span};
+  }
+
+  // '(' at a grouping element, one level down as any parenthesis: the empty set `()` (not inside
+  // ROLLUP or CUBE, where DuckDB's grammar has none), a composite `(a, b)`, or an expression whose
+  // first operand is parenthesized, `(a)` or `(a) + 1`, which the operators after the ')' extend
+  // as they extend a parenthesized prefix.
+  Expected<GroupingElement> ParseParenthesizedElement(ElementPlace place) {
+    if (auto error = Deeper(); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    peak_ = depth_;
+    const SourceSpan open = Take().span;
+    if (Peek().kind == TokenKind::kRightParen) {
+      if (place == ElementPlace::kRollup) {
+        return Syntax(Peek().span, "expected an expression or a list in (), found ')'");
+      }
+      const SourceSpan close = Take().span;
+      return GroupingElement{.kind = GroupingElement::Kind::kEmpty,
+                             .exprs = {},
+                             .elements = {},
+                             .span = Cover(open, close)};
+    }
+    auto first = ParseExpr(Context::kGroupBy);
+    if (!first) {
+      return std::unexpected(std::move(first.error()));
+    }
+    if (auto error = ParenthesizedFirstBlock(*first); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    const auto closing = [&] -> Status {
+      if (Peek().kind != TokenKind::kRightParen) {
+        return Syntax(Peek().span, "expected ) to close the ( at offset " +
+                                       std::to_string(open.offset) + ", found " + Describe(Peek()));
+      }
+      return {};
+    };
+    if (Peek().kind == TokenKind::kComma) {
+      const SourceSpan comma = Peek().span;
+      std::vector<Expr> exprs;
+      exprs.push_back(*std::move(first));
+      while (Peek().kind == TokenKind::kComma) {
+        Take();
+        auto next = ParseExpr(Context::kGroupBy);
+        if (!next) {
+          return std::unexpected(std::move(next.error()));
+        }
+        exprs.push_back(*std::move(next));
+      }
+      if (auto status = closing(); !status) {
+        return std::unexpected(std::move(status.error()));
+      }
+      const SourceSpan close = Take().span;
+      // An operator or a cast after a composite makes it a row value, as in an expression.
+      if (UnsupportedOperator().has_value() || InfixPrecedence() != 0) {
+        return Unsupported(comma, "row values ((a, b)) are not supported");
+      }
+      return GroupingElement{.kind = GroupingElement::Kind::kRow,
+                             .exprs = std::move(exprs),
+                             .elements = {},
+                             .span = Cover(open, close)};
+    }
+    if (auto status = closing(); !status) {
+      return std::unexpected(std::move(status.error()));
+    }
+    Take();
+    // The rest of an expression whose first operand is `(first)`: its casts, then its operators.
+    auto operand = ParseCasts(open.offset, *std::move(first));
+    if (!operand) {
+      return std::unexpected(std::move(operand.error()));
+    }
+    auto expr = ParseInfixLoop(Context::kGroupBy, kOrPrecedence, *std::move(operand));
+    if (!expr) {
+      return std::unexpected(std::move(expr.error()));
+    }
+    std::vector<Expr> exprs;
+    exprs.push_back(*std::move(expr));
+    return GroupingElement{
+        .kind = GroupingElement::Kind::kExpr,
+        .exprs = std::move(exprs),
+        .elements = {},
+        .span = SourceSpan{.offset = open.offset, .length = last_end_ - open.offset}};
+  }
+
+  // ROLLUP (...), CUBE (...) or GROUPING SETS (...), positioned at its keyword, one level down: at
+  // least one element, as in DuckDB, whose grammar has no empty list.
+  Expected<GroupingElement> ParseGroupingContainer(GroupingElement::Kind kind) {
+    const std::size_t depth = depth_;
+    const std::size_t outer_peak = peak_;
+    auto result = ParseGroupingContainerAtDepth(kind);
+    depth_ = depth;
+    peak_ = std::max(outer_peak, peak_);
+    return result;
+  }
+
+  static std::string_view ContainerName(GroupingElement::Kind kind) {
+    switch (kind) {
+      case GroupingElement::Kind::kRollup:
+        return "ROLLUP";
+      case GroupingElement::Kind::kCube:
+        return "CUBE";
+      default:
+        return "GROUPING SETS";
+    }
+  }
+
+  Expected<GroupingElement> ParseGroupingContainerAtDepth(GroupingElement::Kind kind) {
+    if (auto error = Deeper(); error.has_value()) {
+      return std::unexpected(std::move(*error));
+    }
+    peak_ = depth_;
+    const SourceSpan keyword = Take().span;
+    if (kind == GroupingElement::Kind::kSets) {
+      Take();  // SETS
+    }
+    const std::string_view name = ContainerName(kind);
+    if (Peek().kind != TokenKind::kLeftParen) {
+      return Syntax(Peek().span,
+                    std::format("expected ( after {}, found {}", name, Describe(Peek())));
+    }
+    Take();
+    std::vector<GroupingElement> elements;
+    while (true) {
+      if (Peek().kind == TokenKind::kRightParen) {
+        return Syntax(Peek().span, std::format("expected an element in {} (...), found ')'", name));
+      }
+      auto element = ParseGroupingElement(
+          kind == GroupingElement::Kind::kSets ? ElementPlace::kSets : ElementPlace::kRollup);
+      if (!element) {
+        return std::unexpected(std::move(element.error()));
+      }
+      elements.push_back(*std::move(element));
+      if (Peek().kind != TokenKind::kComma) {
+        break;
+      }
+      const SourceSpan comma = Take().span;
+      if (Peek().kind == TokenKind::kRightParen) {  // DuckDB accepts it; GROUP BY's own is refused
+        return Unsupported(comma,
+                           std::format("a trailing comma in {} (...) is not supported", name));
+      }
+    }
+    if (Peek().kind != TokenKind::kRightParen) {
+      return Syntax(Peek().span,
+                    std::format("expected ) to close {} (, found {}", name, Describe(Peek())));
+    }
+    const SourceSpan close = Take().span;
+    return GroupingElement{
+        .kind = kind, .exprs = {}, .elements = std::move(elements), .span = Cover(keyword, close)};
   }
 
   // ORDER BY order_item (',' order_item)*, positioned at ORDER.
@@ -3072,7 +3275,7 @@ class Parser {
   // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
   // `query`'s ORDER BY, LIMIT and OFFSET.
   Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
-    static_assert(kSelectStatementFields == 19, "revisit this walk");
+    static_assert(kSelectStatementFields == 20, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};
@@ -3102,8 +3305,8 @@ class Parser {
     // the query's ORDER BY, LIMIT and OFFSET.
     const bool ordered_or_later =
         !query.order_by.empty() || query.limit.has_value() || query.offset.has_value();
-    const bool grouped_or_later =
-        !block.group_by.empty() || !block.having.empty() || ordered_or_later;
+    const bool grouped_or_later = !block.group_by.empty() || !block.grouping.empty() ||
+                                  !block.having.empty() || ordered_or_later;
     std::vector<std::string_view> next;
     if (!grouped_or_later) {
       next.emplace_back(block.where.empty() ? "WHERE" : "AND");

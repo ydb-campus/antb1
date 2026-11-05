@@ -183,6 +183,69 @@ TEST(ParserTest, SelectDistinct) {
   EXPECT_FALSE(EqualIgnoringSpans(*stmt, *plain)) << "DISTINCT is part of the statement";
 }
 
+// Grouping sets (ADR 0038), in every form DuckDB parses: each GROUP BY list in grouping-set
+// syntax goes to `grouping` whole, unparses canonically and parses back to the same tree; a plain
+// list stays in `group_by`, a parenthesized expression included; `rollup` and `cube` are names
+// unless '(' follows.
+TEST(ParserTest, GroupingSets) {
+  using Kind = GroupingElement::Kind;
+  struct Case {
+    std::string_view group_by;
+    std::string_view canonical;
+    std::vector<Kind> kinds;  // of the top-level elements
+  };
+  for (const Case& c : std::vector<Case>{
+           {.group_by = "ROLLUP (a, b)", .canonical = "ROLLUP (a, b)", .kinds = {Kind::kRollup}},
+           {.group_by = "rollup(a), b",
+            .canonical = "ROLLUP (a), b",
+            .kinds = {Kind::kRollup, Kind::kExpr}},
+           {.group_by = "CUBE ((a, b), c)",
+            .canonical = "CUBE ((a, b), c)",
+            .kinds = {Kind::kCube}},
+           {.group_by = "GROUPING SETS (a, b)",
+            .canonical = "GROUPING SETS (a, b)",
+            .kinds = {Kind::kSets}},
+           {.group_by = "GROUPING SETS ((a, b), ROLLUP (c), ())",
+            .canonical = "GROUPING SETS ((a, b), ROLLUP (c), ())",
+            .kinds = {Kind::kSets}},
+           {.group_by = "GROUPING SETS (GROUPING SETS ((a), (b)))",
+            .canonical = "GROUPING SETS (GROUPING SETS (a, b))",
+            .kinds = {Kind::kSets}},
+           {.group_by = "(a, b)", .canonical = "(a, b)", .kinds = {Kind::kRow}},
+           {.group_by = "a, ()", .canonical = "a, ()", .kinds = {Kind::kExpr, Kind::kEmpty}},
+           {.group_by = "()", .canonical = "()", .kinds = {Kind::kEmpty}},
+           {.group_by = "ROLLUP (a + 1, (b, c)), CUBE (d)",
+            .canonical = "ROLLUP (a + 1, (b, c)), CUBE (d)",
+            .kinds = {Kind::kRollup, Kind::kCube}},
+       }) {
+    const std::string sql = std::format("SELECT 1 FROM t GROUP BY {}", c.group_by);
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    EXPECT_TRUE(stmt->group_by.empty()) << sql;
+    ASSERT_EQ(stmt->grouping.size(), c.kinds.size()) << sql;
+    for (std::size_t i = 0; i < c.kinds.size(); ++i) {
+      EXPECT_EQ(stmt->grouping[i].kind, c.kinds[i]) << sql << " element " << i;
+    }
+    EXPECT_EQ(ToSql(*stmt), std::format("SELECT 1 FROM t GROUP BY {}", c.canonical)) << sql;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << sql;
+  }
+  // Plain lists: no element syntax, so `group_by` as before.
+  for (const std::string_view group_by :
+       {"(a)", "(a) + 1, b", "rollup, cube", "(cube)", "(a)::INTEGER", "(a)::INTEGER::BIGINT * 2",
+        "(a) IS NULL", "(a) BETWEEN 1 AND 2, (b) IN (1)", "((a) + 1)"}) {
+    const std::string sql = std::format("SELECT 1 FROM t GROUP BY {}", group_by);
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    EXPECT_TRUE(stmt->grouping.empty()) << sql;
+    EXPECT_FALSE(stmt->group_by.empty()) << sql;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << sql;
+  }
+}
+
 TEST(ParserTest, AggregatesAreCaseInsensitiveAndAllowSpaces) {
   constexpr std::string_view kSql = "select count ( * ) , Sum( amount ) from events";
   auto stmt = Parse(kSql);
@@ -1973,6 +2036,45 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
   }
 }
 
+// Grouping elements (ADR 0038) count a level each, as a parenthesis does: the deepest accepted
+// nesting has exactly kMaxExpressionDepth levels. After a parenthesized first operand, an item's
+// casts and operators count as they do in any other clause.
+TEST(ParserTest, GroupingElementsCountTheirDepth) {
+  using Sql = std::function<std::string(std::size_t)>;
+  const auto group_by = [](const std::string& items) {
+    return "SELECT 1 FROM t GROUP BY " + items;
+  };
+  const auto calls = [](std::size_t k) { return Repeat("f(", k) + "a" + std::string(k, ')'); };
+  for (const auto& [name, sql] : std::vector<std::pair<std::string_view, Sql>>{
+           {"nested GROUPING SETS",
+            [&](std::size_t n) {
+              return group_by(Repeat("GROUPING SETS (", n) + "a" + std::string(n, ')'));
+            }},
+           {"composite in ROLLUP",
+            [&](std::size_t n) { return group_by("ROLLUP ((b, " + calls(n) + "))"); }},
+           {"empty set in GROUPING SETS",
+            [&](std::size_t n) {
+              return group_by(Repeat("GROUPING SETS (", n) + "()" + std::string(n, ')'));
+            }},
+       }) {
+    const std::size_t first = FirstTooDeep(sql);
+    ASSERT_GT(first, 1U) << name;
+    auto deepest = Parse(sql(first - 1));
+    ASSERT_TRUE(deepest.has_value()) << name;
+    EXPECT_EQ(Depth(*deepest), kMaxExpressionDepth) << name;
+  }
+  for (const auto& [name, item] : std::vector<std::pair<std::string_view, Sql>>{
+           {"casts", [](std::size_t n) { return "(a)" + Repeat("::INTEGER", n); }},
+           {"operators", [](std::size_t n) { return "(a)" + Repeat(" + 1", n); }},
+           {"deep operand", [&](std::size_t n) { return "(" + calls(n) + ") + 1"; }},
+       }) {
+    EXPECT_EQ(
+        FirstTooDeep([&](std::size_t n) { return group_by(item(n)); }),
+        FirstTooDeep([&](std::size_t n) { return "SELECT 1 FROM t GROUP BY a HAVING " + item(n); }))
+        << name;
+  }
+}
+
 // Every level of the tree counts, also where a chain's operators push its left operand (and its
 // earlier right operands) down: without parentheses or casts, the deepest accepted tree has exactly
 // kMaxExpressionDepth levels.
@@ -2481,13 +2583,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT without FROM is not supported"},
         RejectCase{"GroupByAll", "SELECT a FROM events GROUP BY ^ALL", kUnsupported, 3,
                    "GROUP BY ALL is not supported"},
-        RejectCase{"GroupByEmptyGroupingSet", "SELECT COUNT(*) FROM events GROUP BY ^()",
-                   kUnsupported, 2, "GROUP BY () (the empty grouping set) is not supported"},
-        RejectCase{"GroupByEmptyGroupingSetAfterAKey", "SELECT a FROM events GROUP BY a, ^()",
-                   kUnsupported, 2, "GROUP BY () (the empty grouping set) is not supported"},
-        RejectCase{"GroupByEmptyGroupingSetInADerivedTable",
-                   "SELECT n FROM (SELECT COUNT(*) AS n FROM events GROUP BY ^()) s", kUnsupported,
-                   2, "GROUP BY () (the empty grouping set) is not supported"},
         RejectCase{
             "ExtractStringField", "SELECT EXTRACT(^'year' FROM d) FROM events", kUnsupported, 6,
             "a string or quoted field name in EXTRACT is not supported; write the field as a "
@@ -2517,8 +2612,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "aggregate FILTER clauses are not supported"},
         RejectCase{"OrderByUsing", "SELECT a FROM events ORDER BY a ^USING <", kUnsupported, 5,
                    "ORDER BY ... USING is not supported"},
-        RejectCase{"GroupingSets", "SELECT a FROM events GROUP BY ^GROUPING SETS ((a))",
-                   kUnsupported, 8, "GROUPING SETS are not supported"},
         RejectCase{"OrderByInAggregate", "SELECT SUM(a ^ORDER BY b) FROM events", kUnsupported, 5,
                    "ORDER BY is not supported"},
         RejectCase{"SumDistinct", "SELECT SUM(^distinct user_id) FROM events", kUnsupported, 8,
@@ -2554,14 +2647,41 @@ INSTANTIATE_TEST_SUITE_P(
                    "NOT NULL (IS NOT NULL) is not supported"},
         RejectCase{"PostfixNot", "SELECT a ^NOT b FROM events", kUnsupported, 3,
                    "NOT is not supported"},
-        RejectCase{"Rollup", "SELECT a FROM events GROUP BY ^ROLLUP (a)", kUnsupported, 6,
-                   "ROLLUP is not supported"},
         RejectCase{"MaxDistinctInOrderBy", "SELECT a FROM events ORDER BY MAX(^DISTINCT a)",
                    kUnsupported, 8, "MAX(DISTINCT ...) is not supported"},
         RejectCase{"StddevDistinct", "SELECT STDDEV(^DISTINCT a) FROM events", kUnsupported, 8,
                    "STDDEV(DISTINCT ...) is not supported"},
         RejectCase{"DistinctOn", "SELECT ^DISTINCT ON (a) a FROM events", kUnsupported, 11,
                    "DISTINCT ON is not supported"},
+        // Grouping-set forms DuckDB's grammar does not have (ADR 0038): syntax errors, as there.
+        RejectCase{"EmptyRollup", "SELECT 1 FROM t GROUP BY ROLLUP (^)", kSyntax, 1,
+                   "expected an element in ROLLUP (...), found ')'"},
+        RejectCase{"EmptySetInRollup", "SELECT 1 FROM t GROUP BY ROLLUP (a, (^))", kSyntax, 1,
+                   "expected an expression or a list in (), found ')'"},
+        RejectCase{"EmptyGroupingSets", "SELECT 1 FROM t GROUP BY GROUPING SETS (^)", kSyntax, 1,
+                   "expected an element in GROUPING SETS (...), found ')'"},
+        RejectCase{"GroupByAllList", "SELECT 1 FROM t GROUP BY ALL^, ROLLUP (a)", kSyntax, 1,
+                   "expected the end of GROUP BY ALL, found ','"},
+        // DuckDB accepts a trailing comma inside a container; the parser refuses it, as it refuses
+        // GROUP BY's own.
+        RejectCase{"TrailingCommaInRollup", "SELECT 1 FROM t GROUP BY ROLLUP (a^,)", kUnsupported,
+                   1, "a trailing comma in ROLLUP (...) is not supported"},
+        RejectCase{"TrailingCommaInCube", "SELECT 1 FROM t GROUP BY CUBE (a, (b, c)^,)",
+                   kUnsupported, 1, "a trailing comma in CUBE (...) is not supported"},
+        RejectCase{"TrailingCommaInGroupingSets", "SELECT 1 FROM t GROUP BY GROUPING SETS (a^,)",
+                   kUnsupported, 1, "a trailing comma in GROUPING SETS (...) is not supported"},
+        RejectCase{"TrailingCommaInComposite", "SELECT 1 FROM t GROUP BY (a, b, ^)", kSyntax, 1,
+                   "expected an expression"},
+        // An operator or a cast after a composite makes it a row value, as in an expression.
+        RejectCase{"RowValueInGroupBy", "SELECT 1 FROM t GROUP BY (a^, b) + 1", kUnsupported, 1,
+                   "row values ((a, b)) are not supported"},
+        RejectCase{"RowValueCastInGroupBy", "SELECT 1 FROM t GROUP BY ROLLUP ((a^, b)::INTEGER)",
+                   kUnsupported, 1, "row values ((a, b)) are not supported"},
+        RejectCase{"RowValueIsInGroupBy", "SELECT 1 FROM t GROUP BY (a^, b) IS NULL", kUnsupported,
+                   1, "row values ((a, b)) are not supported"},
+        RejectCase{"ParenthesizedQueryInGroupBy",
+                   "SELECT 1 FROM t GROUP BY (^(SELECT a FROM u) UNION ALL SELECT a FROM u)",
+                   kUnsupported, 1, "parenthesized queries are not supported"},
         // DISTINCT is SELECT DISTINCT's keyword now, so a qualifier spelled DISTINCT is a syntax
         // error, as in DuckDB.
         RejectCase{"DistinctAsQualifier", "SELECT DISTINCT^.a FROM events", kSyntax, 1,

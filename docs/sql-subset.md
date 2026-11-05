@@ -101,7 +101,12 @@ query       = [ "WITH" , cte , { "," , cte } ] , block , { "UNION" , "ALL" , blo
               [ limit_offset ] ;
 cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
 block       = "SELECT" , [ "DISTINCT" ] , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
-              [ "GROUP" , "BY" , expr , { "," , expr } ] , [ "HAVING" , expr ] ;
+              [ "GROUP" , "BY" , group_item , { "," , group_item } ] , [ "HAVING" , expr ] ;
+group_item  = expr | grouping ;   (* grouping elements parse, and are refused: see below *)
+grouping    = "(" , ")" | "(" , expr , "," , expr , { "," , expr } , ")"
+            | ( "ROLLUP" | "CUBE" ) , "(" , rollup_item , { "," , rollup_item } , ")"
+            | "GROUPING" , "SETS" , "(" , group_item , { "," , group_item } , ")" ;
+rollup_item = expr | "(" , expr , "," , expr , { "," , expr } , ")" ;
 limit_offset = "LIMIT" , integer , [ "OFFSET" , integer ] | "OFFSET" , integer , [ "LIMIT" , integer ] ;
 select_list = select_item , { "," , select_item } ;
 select_item = "*" | identifier , "." , "*" | expr , [ [ "AS" ] , identifier ] | "NULL" , [ "AS" , identifier ] ;
@@ -383,12 +388,18 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 Every other expression (function calls other than the five aggregates and the functions above, `EXTRACT` of other
 fields, a condition used as a value, as in `SELECT a = 1`, a comparison of two constants, a bare column as a
 condition, `TRY_CAST` and a cast to a type antb1 has no type for, such as `CAST(a AS FLOAT)`) parses, and is then
-rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`,
-the empty grouping set `GROUP BY ()` and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
+rejected by the binder with exit code 4 at its first unsupported token, before any name is resolved. `GROUP BY ALL`
+and `ORDER BY ALL` are rejected by the parser, and so are `SUM`, `AVG`, `MIN` and
 `MAX` with `DISTINCT`, and a string or quoted field name in `EXTRACT` (`EXTRACT('year' FROM d)`), which DuckDB accepts.
-Grouping sets wait for phase 5 of [ADR 0037](adr/0037-tpcds-roadmap.md): the parser rejects `ROLLUP`, `CUBE` and
-`GROUPING SETS` as the first `GROUP BY` item, and a later `ROLLUP` or `CUBE` is an unsupported function; a later
-`GROUPING SETS` is still a syntax error (exit code 1) until RU1.
+Grouping sets ([ADR 0038](adr/0038-grouping-sets.md)) parse in every form DuckDB parses: `ROLLUP (...)` and
+`CUBE (...)` over expressions and composites `(a, b)`, `GROUPING SETS (...)` over any of these, nested ones included,
+the empty set `()`, and a composite as a `GROUP BY` item; `rollup` and `cube` are names unless `(` follows. The binder
+refuses each at its keyword or parenthesis with exit code 4, naming the item of [ADR 0037](adr/0037-tpcds-roadmap.md)
+that answers it (ROLLUP RU3, GROUPING SETS, `()` and composites RU5, CUBE RU6), and `GROUPING()` and `GROUPING_ID()`
+naming RU4. The forms DuckDB's grammar does not have are syntax errors (exit code 1), as there: `ROLLUP ()`, `()`
+inside `ROLLUP` or `CUBE`, `GROUPING SETS ()`, and a list after `GROUP BY ALL`. The parser refuses with exit code 4
+a trailing comma inside `ROLLUP`, `CUBE` or `GROUPING SETS`, which DuckDB accepts, and an operator or a cast after a
+composite (`(a, b) + 1`), a row value.
 
 Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
 a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two

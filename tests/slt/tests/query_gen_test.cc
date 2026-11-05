@@ -1442,7 +1442,7 @@ void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& o
 }
 
 void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
-  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (const sql::CommonTableExpr& cte : stmt.with) {
     DeepSubqueries(*cte.query, out);
@@ -1465,6 +1465,9 @@ void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::Sub
   }
   for (const sql::Expr& e : stmt.group_by) {
     DeepSubqueries(e, out);
+  }
+  for (const sql::Expr* e : sql::GroupingExprs(stmt.grouping)) {
+    DeepSubqueries(*e, out);
   }
   for (const sql::Expr& conjunct : stmt.having) {
     DeepSubqueries(conjunct, out);
