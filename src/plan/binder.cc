@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -6042,8 +6043,11 @@ arrow::Status Binder::BindGroupBy() {
     set.erase(first, last);
     return set;
   };
-  const auto expand = [&](this const auto& self, const sql::GroupingElement& element,
-                          std::string_view where) -> arrow::Result<SetList> {
+  // A std::function rather than a lambda with an explicit object parameter: GCC 15 crashes on that
+  // one's recursive call (an internal compiler error).
+  std::function<arrow::Result<SetList>(const sql::GroupingElement&, std::string_view)> expand;
+  expand = [&](const sql::GroupingElement& element,
+               std::string_view where) -> arrow::Result<SetList> {
     switch (element.kind) {
       case sql::GroupingElement::Kind::kExpr:
       case sql::GroupingElement::Kind::kRow:
@@ -6067,7 +6071,7 @@ arrow::Status Binder::BindGroupBy() {
       case sql::GroupingElement::Kind::kSets: {
         SetList sets;
         for (const sql::GroupingElement& inner : element.elements) {
-          ARROW_ASSIGN_OR_RAISE(auto inner_sets, self(inner, "in GROUPING SETS"));
+          ARROW_ASSIGN_OR_RAISE(auto inner_sets, expand(inner, "in GROUPING SETS"));
           if (sets.size() + inner_sets.size() > kMaxGroupingSets) {
             return BindError(
                 std::format("Maximum grouping set count of {} exceeded", kMaxGroupingSets),
