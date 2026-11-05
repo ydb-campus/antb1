@@ -2326,14 +2326,15 @@ class Builder {
   }
 
   // Whether a correlated block may aggregate `arg` with `agg` and compare the result with a
-  // literal exactly in both engines. Orderable's rule, plus AVG of a DECIMAL: ADR 0021 rule 13
-  // makes a DECIMAL AVG agree bit for bit, while an integer or DOUBLE one divides to a double and
-  // is only accurate to about one ulp -- which a value test tolerates and a WHERE comparison,
-  // deciding row membership, does not. Orderable itself is left alone: widening it would move
-  // every existing HAVING and ORDER BY seed.
+  // literal exactly in both engines. Orderable's rule, plus AVG of a DECIMAL or an integer: ADR
+  // 0021 rule 13 and ADR 0037's AG1 make both agree bit for bit, while a DOUBLE AVG adds its values
+  // in another order in each engine and is only accurate to about one ulp -- which a value test
+  // tolerates and a WHERE comparison, deciding row membership, does not. Orderable itself is left
+  // alone: widening it would move every existing HAVING and ORDER BY seed.
   static bool CorrelatedAggregateFits(Agg agg, const GenColumn* arg) {
     if (agg == Agg::kAvg) {
-      return arg != nullptr && arg->kind == ValueKind::kDecimal;
+      return arg != nullptr &&
+             (arg->kind == ValueKind::kDecimal || arg->kind == ValueKind::kInteger);
     }
     return (agg == Agg::kSum || agg == Agg::kMin || agg == Agg::kMax) && Orderable(agg, arg);
   }

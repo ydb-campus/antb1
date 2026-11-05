@@ -151,7 +151,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | FN4 | upper and lower (the FN4 update below) | 24, 99 | Built |
 | FN5 | concat (the FN5 update below) | 84 | Built |
 | **Phase 5** | **Aggregation and grouping sets** | | |
-| AG1 | Integer AVG finalized as DuckDB finalizes it | | Planned |
+| AG1 | Integer AVG finalized as DuckDB finalizes it (the AG1 update below) | | Built |
 | AG2 | stddev_samp | 17, 39 | Planned |
 | AG3 | SELECT DISTINCT | | Planned |
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 update below) | | Planned |
@@ -546,6 +546,18 @@ the design in full and repeats the measurements below on the engine's parallel o
 - **docs/sql-subset.md** no longer says that queries 5 and 80 need concat, which FN5 built, and it lists how the
   parser refuses grouping sets today: `GROUP BY a, GROUPING SETS (...)` is a syntax error (exit code 1), which RU1
   makes exit code 4.
+
+Update (2026-11-05, AG1): built. An integer AVG divides its exact 128-bit sum by the count as DuckDB does, so it is
+DuckDB's to the bit on each platform. No query passes from it alone.
+
+- **The division** (`DuckDbIntegerAverage`, DuckDB's DECIMAL average at scale 0): a SMALLINT's sum as an int64,
+  divided in double; any other integer's sum as a long double from its two 64-bit halves, divided by the count in long
+  double, then rounded to DOUBLE. DuckDB averages a USMALLINT as a BIGINT. Before, antb1 divided the exact quotient
+  and remainder separately, within about one ulp of the mean, which differs past 2^53: three BIGINT values of 2^53 + 1
+  now average to 2^53 + 2 in both engines on Apple silicon, where long double is double; an 80-bit long double gives
+  2^53.
+- **The generator** now compares an integer AVG in correlated blocks, where ADR 0023 allowed only a DECIMAL one. A
+  DOUBLE AVG stays out: each engine adds its values in its own order.
 
 ## Alternatives considered
 

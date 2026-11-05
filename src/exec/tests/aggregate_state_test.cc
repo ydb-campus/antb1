@@ -276,7 +276,8 @@ TEST_F(AggregateStateTest, AvgDividesTheExactSumOnce) {
   ASSERT_TRUE(state->Consume(*Int64s({std::nullopt, 7}), Bools({true, false}).get()).ok());
   const auto result = Result(*state);
   const Int128 sum = (static_cast<Int128>(kI64Max) * 2) + 1;
-  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(*result).Value(0), ExactDivideToDouble(sum, 3));
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(*result).Value(0),
+            DuckDbIntegerAverage(sum, 3, /*smallint=*/false));
 
   auto small = Make(AggKind::kAvg, LogicalType::kSmallInt, LogicalType::kDouble);
   ASSERT_TRUE(small->Consume(*Int16s({1, 2, std::nullopt}), nullptr).ok());
