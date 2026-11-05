@@ -153,7 +153,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 5** | **Aggregation and grouping sets** | | |
 | AG1 | Integer AVG finalized as DuckDB finalizes it (the AG1 update below) | | Built |
 | AG2 | stddev_samp, with the rest of DuckDB's variance family (the AG2 update below) | 17, 39 | Built |
-| AG3 | SELECT DISTINCT | | Planned |
+| AG3 | SELECT DISTINCT (the AG3 update below) | | Built |
 | RU1 | Grouping sets in the grammar: ROLLUP, CUBE and GROUPING SETS in every form DuckDB accepts, GROUPING() and GROUPING_ID(); refused by the binder with exit code 4 naming the item that answers each form, and the forms DuckDB does not parse made syntax errors; with the ADR for grouping sets (the phase 5 update below) | | Planned |
 | RU2 | A grouping-sets plan node and its operator, in two levels: each set that no other set contains aggregated once from the input, every other set merged from the groups of a set that contains it; one table per set fed from the input for calls that do not merge exactly (the phase 5 update below) | | Planned |
 | RU3 | GROUP BY ROLLUP, in every form, duplicate sets kept, with DuckDB's limit of 65535 sets | 5, 18, 22, 80 | Planned |
@@ -573,6 +573,20 @@ Update (2026-11-05, AG2): built as DuckDB's variance family, not `stddev_samp` a
   alias binds to its target.
 - **What stays unsupported.** `DISTINCT`, as for every aggregate but COUNT. The generator writes the family as select
   items over integer and DECIMAL columns, from a stream of its own, and two metamorphic relations hold for it.
+
+Update (2026-11-05, AG3): built. No query passes from it alone: the five that use it need later items too, and
+docs/sql-subset.md's table no longer lists it for them (nor, for query 54, the DOUBLE-to-integer cast and round that
+CT3 and FN2 built).
+
+- **The plan.** A GroupAggregate of every select-list column, without calls, between the block's Project and its
+  Sort, so it removes repeated rows of the select list after HAVING and before ORDER BY and LIMIT, in any block.
+  Every item is a key of its own, so a repeated item keeps its column; over a global aggregate's one row it is left
+  out. Being an ordinary GROUP BY, it compares as one and runs on the parallel operators already built.
+- **ORDER BY.** It takes a select item: a position, an alias, or an item written again. DuckDB orders by any other
+  value through `first()` of each distinct row, which depends on the order of the rows, so antb1 refuses it with exit
+  code 4. `DISTINCT ON (...)` is unsupported too.
+- **Tests.** The generator writes DISTINCT on the outer block from a stream of its own, ordering only by aliases and
+  positions then, and three metamorphic relations hold for it.
 
 ## Alternatives considered
 

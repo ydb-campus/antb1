@@ -34,6 +34,7 @@ enum class Feature : std::uint8_t {
   kMax,              // MAX(col)
   kCountDistinct,    // COUNT(DISTINCT col)
   kVariance,         // STDDEV_SAMP, STDDEV, STDDEV_POP, VAR_SAMP, VARIANCE or VAR_POP(numeric col)
+  kSelectDistinct,   // SELECT DISTINCT
   kColumns,          // plain column references (a projection)
   kStar,             // SELECT *
   kMultipleItems,    // more than one select item
@@ -142,6 +143,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "count_distinct";
     case Feature::kVariance:
       return "variance";
+    case Feature::kSelectDistinct:
+      return "distinct";
     case Feature::kColumns:
       return "columns";
     case Feature::kStar:
@@ -351,6 +354,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kMax,
     Feature::kCountDistinct,
     Feature::kVariance,
+    Feature::kSelectDistinct,
     Feature::kColumns,
     Feature::kStar,
     Feature::kMultipleItems,

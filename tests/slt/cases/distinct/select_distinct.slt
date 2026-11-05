@@ -1,0 +1,209 @@
+# SELECT DISTINCT (ADR 0037's AG3, docs/sql-subset.md): the distinct rows of the select list, NULLs one value, DOUBLE
+# -0.0 and 0.0 one value and every NaN one value, in any block.
+
+query I rowsort
+SELECT DISTINCT zn_parent FROM zones
+----
+INTEGER
+1
+2
+3
+4
+5
+77
+NULL
+
+query II rowsort
+SELECT DISTINCT zn_parent % 3, zn_city FROM zones
+----
+INTEGER	SMALLINT
+0	3
+0	NULL
+1	1
+1	4
+1	9
+2	2
+2	5
+NULL	1
+NULL	2
+NULL	3
+NULL	4
+NULL	5
+
+query TII rowsort
+SELECT DISTINCT label, tr_rider % 4, tr_rider % 4 FROM trips JOIN cities ON tr_rider % 6 + 1 = ct_id
+----
+VARCHAR	BIGINT	BIGINT
+airport	1	1
+airport	3	3
+center	0	0
+center	2	2
+harbor	1	1
+harbor	3	3
+hills	0	0
+hills	2	2
+old town	0	0
+old town	2	2
+outskirts	1	1
+outskirts	3	3
+
+query D rowsort
+SELECT DISTINCT d9_2 FROM decimals
+----
+DECIMAL(9,2)
+-1.25
+-2.50
+-3.75
+-5.00
+-6.25
+-9999999.99
+0.00
+1.25
+2.50
+3.75
+5.00
+6.25
+9999999.99
+NULL
+
+query R rowsort
+SELECT DISTINCT d FROM edge
+----
+DOUBLE
+-0.3333333333333333
+-0.5
+-9007199254740992
+0
+0.1
+0.3333333333333333
+0.6666666666666666
+123456789.125
+9.99999993e-10
+922337203685477632
+NULL
+
+query IT nosort
+SELECT DISTINCT tr_rider % 5 AS r, 'x' FROM trips ORDER BY r DESC NULLS FIRST LIMIT 3 OFFSET 1
+----
+BIGINT	VARCHAR
+4	x
+3	x
+2	x
+
+query II nosort
+SELECT DISTINCT tr_rider % 3, COUNT(*) // 50 AS band FROM trips GROUP BY tr_rider % 7, tr_rider % 3 HAVING COUNT(*) > 10 ORDER BY 1, 2
+----
+BIGINT	BIGINT
+0	2
+0	3
+1	2
+1	3
+2	2
+2	3
+NULL	2
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT DISTINCT tr_rider % 11, tr_driver % 2 FROM trips) AS d
+----
+BIGINT
+36
+
+query I nosort
+WITH c AS (SELECT DISTINCT zn_city FROM zones) SELECT COUNT(*) FROM c
+----
+BIGINT
+7
+
+query I rowsort
+SELECT DISTINCT zn_city FROM zones UNION ALL SELECT DISTINCT ct_id FROM cities
+----
+SMALLINT
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+6
+9
+NULL
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rider IN (SELECT DISTINCT rd_id FROM riders WHERE rd_id < 20)
+----
+BIGINT
+220
+
+query I nosort
+SELECT DISTINCT i16 + 1 FROM edge WHERE i16 < 100 ORDER BY i16 + 1
+----
+SMALLINT
+-32767
+-12344
+-99
+0
+1
+2
+8
+
+query T rowsort
+SELECT DISTINCT cities.label FROM cities LEFT JOIN zones ON zn_city = ct_id WHERE zn_id IS NULL
+----
+VARCHAR
+outskirts
+
+query IITI nosort
+SELECT DISTINCT * FROM cities ORDER BY ct_id
+----
+INTEGER	SMALLINT	VARCHAR	INTEGER
+0	1	center	120000
+1	2	harbor	45000
+2	3	hills	30000
+3	4	airport	NULL
+4	5	old town	8000
+5	6	outskirts	2500
+
+query I nosort
+SELECT DISTINCT zn_city FROM zones ORDER BY zones.zn_city
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+query II nosort
+SELECT DISTINCT zn_parent AS x, zn_city FROM zones ORDER BY zn_parent, zn_city
+----
+INTEGER	SMALLINT
+1	1
+2	2
+3	3
+3	NULL
+4	4
+4	9
+5	5
+77	5
+NULL	1
+NULL	2
+NULL	3
+NULL	4
+NULL	5
+
+query IITII nosort
+SELECT DISTINCT *, ct_id % 2 FROM cities ORDER BY ct_id % 2, ct_id
+----
+INTEGER	SMALLINT	VARCHAR	INTEGER	SMALLINT
+1	2	harbor	45000	0
+3	4	airport	NULL	0
+5	6	outskirts	2500	0
+0	1	center	120000	1
+2	3	hills	30000	1
+4	5	old town	8000	1

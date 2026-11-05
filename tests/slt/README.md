@@ -107,15 +107,15 @@ feature removes:
   PR ----` when an ADR defers the SQL until a query needs it, and `# ---- DuckDB only, for good: ... ----` for
   DuckDB's own error texts.
 
-`cases/joins/` and `cases/subqueries/` hold the pending corpus of the join and subquery PRs of ADRs 0022 and 0023,
-over the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
-equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal,
-`IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exit 4 as well (the NULLs come from the data, and `COUNT(col)`
-counts them). `fact_pair.slt` is the exception: its pending records wait on the roadmap's IS NULL (`NL4`) and DATE
-arithmetic (`CT5`). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`, where
-DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats, because
-DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records over
-one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
+`cases/joins/` and `cases/subqueries/` hold the pending corpus of the join and subquery PRs of ADRs 0022 and 0023, over
+the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
+equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal, `IS
+NULL`, `SELECT DISTINCT` or `COALESCE`, which exited 4 as well when it was written (the NULLs come from the data, and
+`COUNT(col)` counts them). `fact_pair.slt` is the exception: its pending records wait on the roadmap's IS NULL (`NL4`)
+and DATE arithmetic (`CT5`). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`,
+where DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats,
+because DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records
+over one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
 
 ## Canonical values
 

@@ -792,8 +792,10 @@ class Parser {
 
   // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
   static SelectStatement TakeBlock(SelectStatement& stmt) {
-    static_assert(kSelectStatementFields == 17, "revisit this walk");
+    static_assert(kSelectStatementFields == 19, "revisit this walk");
     SelectStatement block;
+    block.distinct = std::exchange(stmt.distinct, false);
+    block.distinct_span = std::exchange(stmt.distinct_span, {});
     block.items = std::exchange(stmt.items, {});
     block.from = std::exchange(stmt.from, {});
     block.where = std::exchange(stmt.where, {});
@@ -1021,10 +1023,15 @@ class Parser {
   }
 
   Status ParseSelectList(SelectStatement& stmt) {
-    const Token& first = Peek();
-    if (first.IsKeyword("DISTINCT")) {
-      return Unsupported(first.span, "DISTINCT is not supported");
+    if (Peek().IsKeyword("DISTINCT")) {
+      // SELECT DISTINCT (ADR 0037's AG3); DuckDB's DISTINCT ON (...) is another feature.
+      stmt.distinct = true;
+      stmt.distinct_span = Take().span;
+      if (Peek().IsKeyword("ON") && PeekAt(1).kind == TokenKind::kLeftParen) {
+        return Unsupported(Cover(stmt.distinct_span, Peek().span), "DISTINCT ON is not supported");
+      }
     }
+    const Token& first = Peek();
     if (first.IsKeyword("ALL")) {
       return Unsupported(first.span, "SELECT ALL is not supported");
     }
@@ -3065,7 +3072,7 @@ class Parser {
   // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
   // `query`'s ORDER BY, LIMIT and OFFSET.
   Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
-    static_assert(kSelectStatementFields == 17, "revisit this walk");
+    static_assert(kSelectStatementFields == 19, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};

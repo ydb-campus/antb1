@@ -17,11 +17,12 @@ namespace {
 // compiling when a field is added or removed, and the constant has to follow -- at which point
 // every walk that asserts the old count stops compiling too (ast.h).
 [[maybe_unused]] void CheckSelectStatementFields(const SelectStatement& stmt) {
-  [[maybe_unused]] const auto& [with, with_span, items, from, where, group_by, group_by_span,
-                                having, having_span, order_by, order_by_span, limit, limit_span,
-                                offset, offset_span, span, set_operation] = stmt;
+  [[maybe_unused]] const auto& [with, with_span, distinct, distinct_span, items, from, where,
+                                group_by, group_by_span, having, having_span, order_by,
+                                order_by_span, limit, limit_span, offset, offset_span, span,
+                                set_operation] = stmt;
 }
-static_assert(kSelectStatementFields == 17, "name every field in CheckSelectStatementFields");
+static_assert(kSelectStatementFields == 19, "name every field in CheckSelectStatementFields");
 // Likewise kSelectItemKinds is the number of SelectItem::value's alternatives.
 static_assert(std::variant_size_v<decltype(SelectItem::value)> == kSelectItemKinds,
               "a new kind of select item: update kSelectItemKinds, then every walk asserting it");
@@ -171,11 +172,12 @@ bool Eq(const SelectItem& a, const SelectItem& b) {
 }
 
 bool Eq(const SelectStatement& a, const SelectStatement& b) {
-  static_assert(kSelectStatementFields == 17, "revisit this walk");
-  if (a.with.size() != b.with.size() || a.items.size() != b.items.size() ||
-      a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
-      a.from.size() != b.from.size() || !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) ||
-      !Eq(a.having, b.having) || a.set_operation.size() != b.set_operation.size()) {
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
+  if (a.distinct != b.distinct || a.with.size() != b.with.size() ||
+      a.items.size() != b.items.size() || a.order_by.size() != b.order_by.size() ||
+      a.limit != b.limit || a.offset != b.offset || a.from.size() != b.from.size() ||
+      !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) || !Eq(a.having, b.having) ||
+      a.set_operation.size() != b.set_operation.size()) {
     return false;
   }
   for (std::size_t i = 0; i < a.with.size(); ++i) {
@@ -613,7 +615,7 @@ std::size_t Depth(const Expr& expr) {
 // long list costs no stack; a nested query, and each branch of a compound, is one level below the
 // statement that holds it.
 std::size_t Depth(const SelectStatement& stmt) {
-  static_assert(kSelectStatementFields == 17, "revisit this walk");
+  static_assert(kSelectStatementFields == 19, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   std::size_t deepest = 0;
   for (const CommonTableExpr& cte : stmt.with) {

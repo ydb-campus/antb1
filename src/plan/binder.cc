@@ -1500,6 +1500,8 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
     std::string_view clause;
     if (!query.group_by.empty()) {
       clause = "GROUP BY";
+    } else if (query.distinct) {
+      clause = "DISTINCT";  // a GROUP BY of its select list (ADR 0037's AG3)
     } else if (!query.having.empty()) {
       clause = "HAVING";
     } else if (query.limit.has_value()) {
@@ -2832,7 +2834,7 @@ class Binder {
         relations_(scope_.bindings().size()) {
     // One block: BindBlock binds a UNION ALL by its blocks (BindUnionAll), each of which comes
     // here. Bound here, a UNION ALL would read as a block with no select list.
-    static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
@@ -3725,6 +3727,9 @@ class Binder {
   std::vector<ColumnId> post_ids_;    // per post expression: its column
   std::vector<Predicate> having_;
   std::vector<SortKey> sort_keys_;
+  // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
+  // sort reads above the dedup instead.
+  std::vector<std::size_t> sort_items_;
   std::vector<SubqueryJoin> where_subqueries_;
   std::vector<SubqueryJoin> having_subqueries_;
 };
@@ -6058,18 +6063,44 @@ arrow::Status Binder::BindHaving() {
 arrow::Status Binder::BindOrderBy() {
   clause_ = Clause::kOrderBy;
   alias_fallback_ = true;
+  // SELECT DISTINCT sorts its distinct rows, so an item must be one of them: a position, an alias,
+  // or a select item written again. DuckDB orders by any other value's first() per row, which
+  // depends on the order of the rows.
+  const bool distinct = stmt_.distinct && shape_ != Shape::kGlobal;
+  const bool plain_list = select_.items.size() == stmt_.items.size() &&
+                          std::ranges::none_of(stmt_.items, [](const sql::SelectItem& i) {
+                            return i.star() != nullptr;
+                          });
   for (const sql::OrderItem& item : stmt_.order_by) {
     std::optional<Typed> key;
+    std::optional<std::size_t> select_item;
+    const auto same_item = [&] -> std::optional<std::size_t> {
+      if (!distinct || !plain_list) {
+        return std::nullopt;
+      }
+      for (std::size_t i = 0; i < stmt_.items.size(); ++i) {
+        const sql::SelectExpr* expr = stmt_.items[i].expr();
+        if (expr != nullptr && sql::EqualIgnoringSpans(*expr, item.expr)) {
+          return i;
+        }
+      }
+      return std::nullopt;
+    };
     if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
       ARROW_ASSIGN_OR_RAISE(const auto position, PositionOf(*lit, select_, "ORDER BY"));
       if (position.has_value()) {
         ARROW_ASSIGN_OR_RAISE(key, ItemOutput(*position));
+        select_item = *position;
       }
     } else if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
                ref != nullptr && ref->qualifier.empty() &&
                FindOrderAlias(select_, ref->name).has_value()) {  // t.x never names an alias
       const std::size_t alias = FindOrderAlias(select_, ref->name).value_or(0);
       ARROW_ASSIGN_OR_RAISE(key, ItemOutput(alias));
+      select_item = alias;
+    } else if (const std::optional<std::size_t> same = same_item()) {
+      ARROW_ASSIGN_OR_RAISE(key, ItemOutput(*same));
+      select_item = same;
     } else if (const auto* name = std::get_if<sql::ColumnRef>(&item.expr);
                name != nullptr && name->qualifier.empty() &&
                OnlyTheSelectListResolves(scope_, select_, *name)) {
@@ -6102,12 +6133,31 @@ arrow::Status Binder::BindOrderBy() {
       continue;
     }
     const BoundColumn column = ScopedColumn(*key);
+    if (distinct && !select_item.has_value()) {
+      // A table column or expression the select list also has as a column of its own.
+      for (std::size_t i = 0; i < select_.items.size() && !select_item.has_value(); ++i) {
+        ARROW_ASSIGN_OR_RAISE(const std::optional<Typed> output, ItemOutput(i));
+        const auto* leaf =
+            output.has_value() ? std::get_if<ColumnExpr>(&output->expr->node) : nullptr;
+        if (leaf != nullptr && leaf->id == column.id) {
+          select_item = i;
+        }
+      }
+      if (!select_item.has_value()) {
+        return UnsupportedError(
+            "ORDER BY of an expression that is not in the SELECT DISTINCT list is not supported",
+            item.expr.span());
+      }
+    }
     const bool repeated =
         std::ranges::any_of(sort_keys_, [&](const SortKey& k) { return k.column.id == column.id; });
     if (!repeated) {
       sort_keys_.push_back(SortKey{.column = column,
                                    .descending = item.descending,
                                    .nulls_first = item.nulls == sql::NullsOrder::kFirst});
+      if (distinct) {
+        sort_items_.push_back(select_item.value_or(0));
+      }
     }
   }
   return arrow::Status::OK();
@@ -6358,6 +6408,9 @@ void Binder::PushSemiJoinsDown() {
 }
 
 LogicalPlan Binder::Assemble() {
+  // SELECT DISTINCT over more than one row (ADR 0037's AG3): a GROUP BY of the select list's
+  // columns, without calls, between the Project that makes them and the Sort.
+  const bool distinct = stmt_.distinct && shape_ != Shape::kGlobal;
   PushSemiJoinsDown();
   LogicalNodePtr node = JoinTree(0);
   node = SubqueryJoins(std::move(node), where_subqueries_);
@@ -6399,7 +6452,7 @@ LogicalPlan Binder::Assemble() {
                           .predicates = std::move(having_),
                           .span = Cover(stmt_.having.front().span(), stmt_.having.back().span())});
     }
-    if (!sort_keys_.empty()) {
+    if (!sort_keys_.empty() && !distinct) {
       node = Make(SortNode{
           .input = std::move(node), .keys = std::move(sort_keys_), .span = stmt_.order_by_span});
     }
@@ -6483,6 +6536,38 @@ LogicalPlan Binder::Assemble() {
         }
       }
       break;
+    }
+  }
+  if (distinct) {
+    const auto& select_list = std::get<ProjectNode>(*node);
+    std::vector<BoundColumn> keys;
+    std::vector<ColumnId> key_ids;
+    for (std::size_t i = 0; i < select_.output.size(); ++i) {
+      keys.push_back(BoundColumn{.index = -1,
+                                 .id = select_list.ids[i],
+                                 .name = select_.output[i].name,
+                                 .type = select_.output[i].type});
+      key_ids.push_back(ids_.Next());
+      select_.output[i].id = key_ids.back();
+    }
+    node = Make(GroupAggregateNode{.input = std::move(node),
+                                   .keys = std::move(keys),
+                                   .key_ids = key_ids,
+                                   .aggregates = {},
+                                   .span = stmt_.distinct_span});
+    if (!sort_keys_.empty()) {
+      std::vector<SortKey> keys_above;
+      for (std::size_t k = 0; k < sort_keys_.size(); ++k) {
+        const std::size_t item = sort_items_.at(k);
+        keys_above.push_back(SortKey{.column = BoundColumn{.index = -1,
+                                                           .id = key_ids.at(item),
+                                                           .name = select_.output[item].name,
+                                                           .type = select_.output[item].type},
+                                     .descending = sort_keys_[k].descending,
+                                     .nulls_first = sort_keys_[k].nulls_first});
+      }
+      node = Make(SortNode{
+          .input = std::move(node), .keys = std::move(keys_above), .span = stmt_.order_by_span});
     }
   }
   const int64_t offset = stmt_.offset.value_or(0);
@@ -6590,7 +6675,7 @@ void FoldDateCasts(sql::Expr& expr) {
 // nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
 // the folded statement, so folding per level would fold a copy nothing reads).
 void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   for (sql::CommonTableExpr& cte : stmt.with) {
     FoldDateCastsInBlock(*cte.query);
@@ -6723,7 +6808,7 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
 }
 
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
     // A UNION ALL keeps its clauses in its blocks, which ReachableBlocks lists before it, so what
@@ -6932,7 +7017,7 @@ std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
 arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
                                         const BindOptions& options, ColumnIdSource& ids,
                                         const CteFrame& own, const Scope* outer) {
-  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
   ANTB1_CHECK(stmt.order_by.empty());
@@ -7100,7 +7185,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
                                     bool inside_exists) {
-  static_assert(sql::kSelectStatementFields == 17, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 19, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
