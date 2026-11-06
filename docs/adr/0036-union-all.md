@@ -14,7 +14,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   INTERSECT in 3 and EXCEPT in 1, one query using two kinds.
   - Every compound is the query of a derived table (19 queries) or of a CTE (4). None is the whole statement, and
     none has ORDER BY or LIMIT on the compound.
-  - Every compound has two or three branches, and a branch may GROUP BY (7 queries).
+  - Every compound has two or three branches, and a branch may GROUP BY (7 queries). Correction (2026-11-06,
+    [ADR 0039](0039-set-operations.md)'s review): 8 queries, not 7: 4, 11, 14, 23, 27, 36, 66 and 74.
   - Only queries with INTERSECT, EXCEPT or UNION parenthesize a branch (8, 14, 49 and 87). Correction
     (2026-10-31, [ADR 0037](0037-tpcds-roadmap.md)'s survey): only 87 does, all three of its branches. In 8, 14 and 49
     the parenthesis before an operator closes something inside the branch (a condition, a list or a subquery).
@@ -29,7 +30,12 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
   different types is therefore answerable only where each branch widens exactly to the union's type.
 - **DuckDB's typing of a set operation is not CASE's** (checked against the pinned 1.5.6):
   - Each column's type is a left fold over the branches in written order. `USMALLINT ∪ SMALLINT ∪ DECIMAL(9,2)` is
-    DECIMAL(12,2), but `SMALLINT ∪ DECIMAL(9,2) ∪ USMALLINT` is DECIMAL(9,2).
+    DECIMAL(12,2), but `SMALLINT ∪ DECIMAL(9,2) ∪ USMALLINT` is DECIMAL(9,2). Correction (2026-11-06,
+    [ADR 0039](0039-set-operations.md)): that holds wherever every operand after an operator's first, all through
+    DuckDB's tree, is a block or a run of UNION ALL nested in parentheses, which is spliced into a parent run of
+    UNION ALL; every compound this ADR answers is such. DuckDB folds along its tree where an INTERSECT follows a
+    UNION or an EXCEPT, or where parentheses hold a compound that is not spliced: `USMALLINT ∩ (SMALLINT ∩
+    DECIMAL(9,2))` is DECIMAL(9,2) (ADR 0039's Types rule).
   - Each branch keeps its own types, a literal's included: `1 ∪ SMALLINT` is INTEGER, and a string literal next to a
     number is VARCHAR.
   - Every type mix binds; a cast that cannot work fails per row at run time.
@@ -105,7 +111,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
    - Update (2026-10-30, X3): the static check of a compound is now its tail alone (X5), and it still returns
      before `CheckFromList`; a compound as a subquery's query is refused where the subquery conjunct is checked (X6).
    - These stay exit 4 until X4: `UNION` without `ALL`, `BY NAME`, `INTERSECT`, `EXCEPT`, and a parenthesized or
-     non-SELECT branch.
+     non-SELECT branch. Update (2026-11-06): [ADR 0039](0039-set-operations.md) answers UNION, INTERSECT, EXCEPT and
+     parenthesized branches in its items X4a to X4d; `BY NAME` and non-SELECT branches stay on X4.
    - ORDER BY, LIMIT or OFFSET before a `UNION ALL` is a syntax error, as in DuckDB.
 5. **The binding (X3).**
    - **Scope.** A compound's WITH list is visible to every branch. Each branch binds as a block of its own with
@@ -173,8 +180,8 @@ binding, which answers UNION ALL in derived tables, CTE bodies and statements. X
 | X1 | The plan node and `UnionAllOperator`; every visitor; the reduction's gate. No SQL. | Built |
 | X2 | `UNION ALL` in the grammar, the AST, the unparser and the walkers, refused by the binder with exit code 4; the random generator writes it (a pending feature) | Built |
 | X3 | The binder answers it in derived tables, CTE bodies and statements; `.slt` from DuckDB; the TPC-DS ratchet; D26 | Built |
-| X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules these as X4a-X4d in its phase 6; `BY NAME` and non-SELECT branches stay on X4, unscheduled, and keep their `pending X4` guards |
-| X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it |
+| X4 | `UNION` [DISTINCT], `INTERSECT` and `EXCEPT` as UNION ALL plus a branch marker plus a GROUP BY over every column (a `GroupTable` treats NULLs as equal); parenthesized branches and INTERSECT's precedence | Trigger: X3 merged; queries 8, 14, 36, 38, 49, 75 and 87. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules these as X4a-X4d in its phase 6; `BY NAME` and non-SELECT branches stay on X4, unscheduled, and keep their `pending X4` guards. Update (2026-11-06): [ADR 0039](0039-set-operations.md) replaces this design: one n-ary set-operation node per maximal tree of UNION, INTERSECT and EXCEPT, with one hash table keyed on every column, while UNION ALL stays this ADR's node |
+| X5 | ORDER BY, LIMIT and OFFSET on a compound, with the harness's query rewrites | Trigger: a query that needs it. Update (2026-11-06): [ADR 0039](0039-set-operations.md)'s X4a answers a parenthesized branch's own WITH or tail; X5 keeps the tail of an outermost compound and a second tail after a parenthesized query that has its own |
 | X6 | A compound as the query of IN, EXISTS or a scalar subquery | Trigger: a query that needs it |
 | X7 | Performance: filters into branches with constant-branch pruning; one part pipeline over every branch; dropping a union's unread columns (and a derived table's); sharing union-topped sub-plans once the cap falls back to recomputation | Trigger: a profile at a large scale factor. Update (2026-10-31): [ADR 0037](0037-tpcds-roadmap.md) schedules the filters and pruning as X7a and the sharing as its guard PF5. Update (2026-11-02, ADR 0037's X7a update): X7a defers the dynamic key filters into branches that ADR 0037 had given it; they stay here, unscheduled, with the part pipeline and the dropping of unread columns, until a profile or the SF 1 budget shows a join above a union whose key filter would cut a measured share of a passing query's time. Update (2026-11-03): X7a is built, the filters into the branches and the pruning |
 
