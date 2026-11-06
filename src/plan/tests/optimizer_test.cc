@@ -632,6 +632,17 @@ TEST(OptimizerTest, AFalseConditionAboveAUnionStaysAsItIs) {
             "        Scan table=u source=fake columns=[i32]\n");
 }
 
+// A condition above a UNION stays above its set operation (divergence D27's extension, ADR 0039),
+// even one that its inputs' constants decide, until PF15 moves it into every input.
+TEST(OptimizerTest, AConditionAboveAUnionStaysAboveItsSetOperation) {
+  const std::string sql =
+      "SELECT x FROM (SELECT i16 AS x, 'a' AS tag FROM t UNION SELECT i32 AS x, 'b' AS tag FROM u) "
+      "AS v WHERE tag = 'a'";
+  const std::string explain = Explain(Optimized(sql));
+  EXPECT_TRUE(explain.contains("Filter tag = 'a'\n    SetOperation inputs=2")) << explain;
+  EXPECT_TRUE(explain.contains("Scan table=u")) << "no input ruled out\n" << explain;
+}
+
 // A branch's constant is read through the binder's widening cast below the union, and compared in
 // the union's type: an integer as a BIGINT or a DECIMAL, a DECIMAL at a larger scale.
 TEST(OptimizerTest, UnionBranchesDecideThroughTheirWideningCasts) {

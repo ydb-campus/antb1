@@ -970,17 +970,24 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
-// The set operators other than UNION ALL wait for ADR 0039's items (ADR 0037's X4b, X4c and X4d):
-// the first in written order within a compound is refused at its operator, a parenthesized
-// compound's before those of the compound around it, and before the compound's tail, which X5 keeps
-// at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a update).
+// INTERSECT and EXCEPT wait for ADR 0039's items (ADR 0037's X4c and X4d): the first in written
+// order within a compound is refused at its operator, a parenthesized compound's before those of
+// the compound around it, and before the compound's tail, which X5 keeps at any depth -- a
+// parenthesized compound's own tail too (ADR 0039's X4a update). A tail and a subquery's refusal
+// name the compound by its root operator.
 INSTANTIATE_TEST_SUITE_P(
     SetOperatorRefusals, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u", kUnsupported, "UNION",
-                  "UNION is not supported yet (ADR 0037's X4b)"},
-        ErrorCase{"SELECT i16 FROM t UNION DISTINCT SELECT i16 FROM u", kUnsupported,
-                  "UNION DISTINCT", "UNION is not supported yet (ADR 0037's X4b)"},
+        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u ORDER BY 1", kUnsupported,
+                  "ORDER BY 1", "ORDER BY on a UNION is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION DISTINCT SELECT i16 FROM u LIMIT 2", kUnsupported,
+                  "LIMIT 2", "LIMIT on a UNION is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u UNION ALL SELECT i16 FROM t OFFSET 1",
+                  kUnsupported, "OFFSET 1", "OFFSET on a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t)",
+                  kUnsupported, "IN", "a subquery over a UNION is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u EXCEPT SELECT i16 FROM t)",
+                  kUnsupported, "EXISTS", "a subquery over an EXCEPT is not supported"},
         ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u", kUnsupported, "INTERSECT",
                   "INTERSECT is not supported yet (ADR 0037's X4c)"},
         ErrorCase{"SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u", kUnsupported,
@@ -994,8 +1001,8 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
         ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u) AS d",
                   kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
-        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION SELECT i16 FROM t)",
-                  kUnsupported, "UNION", "UNION is not supported yet (ADR 0037's X4b)"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u EXCEPT ALL SELECT i16 FROM t)",
+                  kUnsupported, "EXCEPT ALL", "EXCEPT ALL is not supported yet (ADR 0037's X4d)"},
         ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM t UNION ALL (SELECT i16 FROM u "
                   "INTERSECT SELECT i16 FROM t)",
                   kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
@@ -2041,6 +2048,156 @@ TEST(BinderTest, ParenthesizedUnionAllBranches) {
   ASSERT_NE(detail, nullptr) << plan.status().ToString();
   EXPECT_EQ(detail->kind(), kBind);
   EXPECT_EQ(detail->span().offset, sql.rfind("UNION ALL"));
+}
+
+// UNION [DISTINCT] (ADR 0039's X4b): a maximal region of UNION is one SetOperation node over its
+// leaves and UNION ALL subtrees in written order, a run of UNION ALL a UnionAll; a parenthesized
+// run of UNION is spliced. Every node's ids are new, and the names are the first leaf's.
+TEST(BinderTest, UnionPlans) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view explain;  // consecutive lines of its EXPLAIN
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 AS x FROM t UNION SELECT i16 FROM u",
+                .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[x]"},
+           Case{.sql = "SELECT i16 FROM t UNION SELECT i16 FROM u UNION DISTINCT SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=(0 UNION 1 UNION 2)"},
+           Case{.sql = "SELECT i16 FROM t UNION (SELECT i16 FROM u UNION SELECT i16 FROM t)",
+                .explain = "SetOperation inputs=3 formula=(0 UNION 1 UNION 2)"},
+           Case{.sql = "SELECT i16 FROM t UNION SELECT i16 FROM u UNION ALL SELECT i16 FROM t",
+                .explain = "UnionAll inputs=2 columns=[i16]\n  SetOperation inputs=2"},
+           Case{.sql = "SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION SELECT i16 FROM t",
+                .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n  UnionAll "
+                           "inputs=2"},
+           Case{
+               .sql = "SELECT i16 FROM t UNION (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
+               .explain = "SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n  Project i16"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_TRUE(explain.contains(c.explain)) << c.sql << "\n" << explain;
+  }
+  auto plan = BindSql("SELECT i16 AS x FROM t UNION ALL SELECT i16 FROM u UNION SELECT i32 FROM t",
+                      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(plan->output[0].name, "x");
+  EXPECT_EQ(plan->output[0].type, LogicalType::kInteger);
+  const auto* node = std::get_if<SetOperationNode>(plan->root.get());
+  ASSERT_NE(node, nullptr) << Explain(*plan);
+  const auto* inner = std::get_if<UnionAllNode>(node->inputs[0].get());
+  ASSERT_NE(inner, nullptr) << Explain(*plan);
+  for (const LogicalNodePtr& input : node->inputs) {
+    for (const ColumnId id : OutputIds(*input)) {
+      EXPECT_FALSE(std::ranges::contains(node->ids, id)) << "the node's ids are new";
+    }
+  }
+  EXPECT_EQ(node->columns[0][0].id, inner->ids[0]) << "the node reads the UnionAll's ids";
+  EXPECT_EQ(node->columns[0][0].name, "x") << "a UnionAll is named by its first leaf";
+  EXPECT_EQ(node->columns[1][0].name, "i32") << "each leaf reads under its own names";
+}
+
+// Types fold along DuckDB's tree (ADR 0039's Types rule): a run of UNION, or of UNION ALL, as one
+// list in written order, spliced through parentheses; a run next to the other as a binary node.
+// Each leaf is cast once, straight to the root's type, below the nodes.
+TEST(BinderTest, UnionTypesFoldAlongTheTree) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT u16 FROM dec UNION SELECT s16 FROM dec UNION SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT u16 FROM dec UNION (SELECT s16 FROM dec UNION SELECT r FROM dec)",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT u16 FROM dec UNION ALL SELECT s16 FROM dec UNION SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT u16 FROM dec UNION ALL (SELECT s16 FROM dec UNION SELECT r FROM dec)",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT u16 FROM dec UNION (SELECT s16 FROM dec UNION ALL SELECT r FROM dec)",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT NULL FROM dec UNION ALL (SELECT NULL FROM dec UNION SELECT r FROM dec)",
+            LogicalType::Decimal(9, 4)},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  auto plan = BindSql("SELECT u16 FROM dec UNION ALL (SELECT s16 FROM dec UNION SELECT r FROM dec)",
+                      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto* root = std::get_if<UnionAllNode>(plan->root.get());
+  ASSERT_NE(root, nullptr) << Explain(*plan);
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(*root->inputs[0])) << Explain(*plan);
+  const auto* node = std::get_if<SetOperationNode>(root->inputs[1].get());
+  ASSERT_NE(node, nullptr) << "no cast above the inner node\n" << Explain(*plan);
+  const auto* cast = std::get_if<ComputeNode>(node->inputs[0].get());
+  ASSERT_NE(cast, nullptr) << Explain(*plan);
+  EXPECT_EQ(cast->exprs[0]->type, LogicalType::Decimal(9, 4)) << "straight to the root's type";
+  EXPECT_FALSE(std::holds_alternative<ComputeNode>(*node->inputs[1])) << Explain(*plan);
+}
+
+// A UNION's errors name the operator: a count that differs at the operator before the operand, a
+// run of UNION after all its leaves bound but a binary node right after its operands (DuckDB's
+// order, ADR 0039's rule 6); a type refusal at the first item in the query that fails.
+TEST(BinderTest, UnionErrors) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    SqlErrorDetail::Kind kind;
+    std::string_view at;
+    std::string_view message;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t UNION SELECT i16, i32 FROM u UNION SELECT nope FROM t",
+                .kind = kBind,
+                .at = "nope",
+                .message = "nope"},
+           Case{
+               .sql = "SELECT i16 FROM t UNION SELECT i16, i32 FROM u UNION ALL SELECT nope FROM t",
+               .kind = kBind,
+               .at = "UNION SELECT",
+               .message = "the same number of result columns"},
+           Case{.sql = "SELECT s FROM t UNION SELECT i16 FROM u",
+                .kind = kUnsupported,
+                .at = "i16 FROM u",
+                .message = "UNION of VARCHAR and SMALLINT values is not supported"},
+           Case{.sql = "SELECT i16 FROM t UNION ALL (SELECT s FROM u UNION SELECT s FROM t)",
+                .kind = kUnsupported,
+                .at = "s FROM u",
+                .message = "UNION ALL of SMALLINT and VARCHAR values is not supported"},
+           Case{.sql = "SELECT NULL FROM t UNION SELECT NULL FROM u",
+                .kind = kUnsupported,
+                .at = "NULL FROM t",
+                .message = "a UNION column whose values are all NULL is not supported"},
+           // A nested run of NULL items is the identity of its parent's fold; the root names its
+           // own operator.
+           Case{.sql = "SELECT NULL FROM t UNION ALL (SELECT NULL FROM t UNION SELECT NULL FROM u)",
+                .kind = kUnsupported,
+                .at = "NULL FROM t",
+                .message = "a UNION ALL column whose values are all NULL is not supported"},
+           // An operand that fails the fold stops it: the first item in the query that fails is
+           // refused, here the second leaf's, not the nested run's later one.
+           Case{.sql = "SELECT i16 FROM t UNION SELECT s FROM t UNION (SELECT i16 FROM u UNION ALL "
+                       "SELECT s FROM u)",
+                .kind = kUnsupported,
+                .at = "s FROM t",
+                .message = "UNION of SMALLINT and VARCHAR values is not supported"},
+           // An edge into a nested node must widen exactly too: the inner run's DECIMAL with a
+           // scale does not widen to the root's DECIMAL(38,0), refused at its first leaf.
+           Case{.sql = "SELECT h FROM t UNION ALL (SELECT p FROM dec UNION SELECT p FROM dec)",
+                .kind = kUnsupported,
+                .at = "p FROM dec",
+                .message = "does not widen exactly to DECIMAL(38,0)"},
+       }) {
+    const std::string sql(c.sql);
+    auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << plan.status().ToString();
+    EXPECT_EQ(detail->kind(), c.kind) << sql;
+    EXPECT_EQ(detail->span().offset, sql.find(c.at)) << sql << ": " << plan.status().ToString();
+    EXPECT_TRUE(plan.status().ToString().contains(c.message)) << plan.status().ToString();
+  }
 }
 
 // A CTE that only a UNION ALL's last block reads is found in the UNION ALL's frame, and a WITH list
@@ -5472,6 +5629,15 @@ TEST(BinderTest, UnionAllFloatFlagIsTheAndOverItsBlocks) {
            std::pair{"SELECT COUNT(*) FROM (SELECT d AS x FROM tf UNION ALL SELECT f FROM tf) AS u "
                      "WHERE x = 0.1",
                      0.1},
+           // Through a nested UNION (ADR 0039's X4b): the AND over every leaf, a NULL item none.
+           std::pair{
+               "SELECT COUNT(*) FROM (SELECT f AS x FROM tf UNION ALL (SELECT f FROM tf UNION "
+               "SELECT NULL FROM tf)) AS u WHERE x = 0.1",
+               as_float},
+           std::pair{
+               "SELECT COUNT(*) FROM (SELECT f AS x FROM tf UNION ALL (SELECT f FROM tf UNION "
+               "SELECT d FROM tf)) AS u WHERE x = 0.1",
+               0.1},
        }) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();

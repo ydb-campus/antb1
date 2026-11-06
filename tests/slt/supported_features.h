@@ -117,6 +117,9 @@ enum class Feature : std::uint8_t {
   kUnionAll,  // (SELECT ... UNION ALL SELECT ...) as a nested query
   // A compound's branch in parentheses (ADR 0039's X4a): a block, or a run of UNION ALL blocks.
   kSetOpParentheses,  // (SELECT ... UNION ALL (SELECT ...))
+  // UNION [DISTINCT] among a compound's operators (ADR 0039's X4b), its copies then reading rows of
+  // their own through a condition; every compound also records kUnionAll.
+  kUnion,  // (SELECT ... WHERE c < 3 UNION SELECT ... WHERE c >= 5)
   // Stars among the select items (ADR 0022 rule 5); a star item also records kStar and
   // kMultipleItems, a qualified star kStar.
   kStarItems,      // a star next to another select item, or a second star: SELECT a, *
@@ -271,6 +274,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "union_all";
     case Feature::kSetOpParentheses:
       return "setop_parentheses";
+    case Feature::kUnion:
+      return "union";
     case Feature::kStarItems:
       return "star_items";
     case Feature::kQualifiedStar:
@@ -433,6 +438,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedAggregate,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
+    Feature::kUnion,
     Feature::kStarItems,
     Feature::kQualifiedStar,
 };

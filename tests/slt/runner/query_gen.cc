@@ -771,6 +771,15 @@ constexpr unsigned kSetOpParenthesesPercent = 40;
 // 0039: parentheses since X4a), so that a query without one is the query this seed generated
 // before.
 constexpr uint64_t kSetOpStreamSalt = 0x7365746F702D726EULL;
+// Share of a compound's operators written UNION rather than UNION ALL (ADR 0039's X4b), and of the
+// copies of a compound with a UNION that read rows of their own through a condition, so that UNION
+// is no plain DISTINCT of one block.
+constexpr unsigned kUnionDistinctPercent = 40;
+constexpr unsigned kCopyConditionPercent = 75;
+// Salt of the random stream which every draw that only a set operator needs takes (X4b's UNION
+// since X4b), so that a query without one is the query this seed generated before, its parentheses
+// included.
+constexpr uint64_t kSetOperatorStreamSalt = 0x7365746F702D6F70ULL;
 // Share of the projections where a star may stand that take one among their items (`a, *`), of the
 // lone stars that take a second one (`*, t.*`), and of the stars written qualified (`t.*`) where
 // a FROM item can be named.
@@ -925,6 +934,16 @@ struct Binding {
   static constexpr std::size_t kNoCopy = std::numeric_limits<std::size_t>::max();
   std::size_t paren_first = kNoCopy;
   std::size_t paren_last = kNoCopy;
+  // Per copy (ADR 0039's X4b): the operator before it is UNION, not UNION ALL (unused for the
+  // first), and the condition that keeps its own rows, if any: `inner[column] < value` or
+  // `inner[column] >= value`. Empty: every operator UNION ALL, no condition.
+  struct CopyCondition {
+    std::size_t column = 0;
+    bool less = false;
+    int64_t value = 0;
+  };
+  std::vector<bool> distinct;
+  std::vector<std::optional<CopyCondition>> conditions;
 };
 
 // One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
@@ -970,7 +989,7 @@ class Builder {
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
-          FeatureSet allowed)
+          Rng& operator_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -985,6 +1004,7 @@ class Builder {
         distinct_rng_(distinct_rng),
         rollup_rng_(rollup_rng),
         setop_rng_(setop_rng),
+        operator_rng_(operator_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1517,6 +1537,54 @@ class Builder {
         b.paren_first = setop_rng_.Below(b.copies);
         b.paren_last = std::min(b.copies - 1, b.paren_first + setop_rng_.Below(2));
       }
+      DrawSetOperators(b);
+    }
+  }
+
+  // Now and then UNION for some of a compound's operators (ADR 0039's X4b), drawn from the set
+  // operators' own stream, and then a condition per copy that keeps rows of its own: a comparison
+  // of an INTEGER column with a literal inside its data's non-negative range (a small one inside
+  // its type where the data's is unknown). No UNION over a
+  // DOUBLE column, whose -0.0 and NaN a deduplication may keep either way (divergence D29). The
+  // row bound stays the copies' sum, which a UNION and a condition only lower.
+  void DrawSetOperators(Binding& b) {
+    if (!allowed_.Has(Feature::kUnion) || !allowed_.Has(Feature::kIntegerLiteral) ||
+        std::ranges::any_of(b.columns,
+                            [](const GenColumn& c) { return c.kind == ValueKind::kDouble; })) {
+      return;
+    }
+    std::vector<bool> distinct(b.copies, false);
+    bool any = false;
+    for (std::size_t copy = 1; copy < b.copies; ++copy) {
+      distinct[copy] = operator_rng_.Percent(kUnionDistinctPercent);
+      any = any || distinct[copy];
+    }
+    if (!any) {
+      return;
+    }
+    b.distinct = std::move(distinct);
+    std::vector<std::size_t> candidates;
+    for (std::size_t i = 0; i < b.columns.size(); ++i) {
+      const GenColumn& c = b.columns[i];
+      if (c.kind == ValueKind::kInteger && c.data_max.value_or(c.max) >= 0) {
+        candidates.push_back(i);
+      }
+    }
+    b.conditions.assign(b.copies, std::nullopt);
+    for (std::size_t copy = 0; copy < b.copies && !candidates.empty(); ++copy) {
+      if (!operator_rng_.Percent(kCopyConditionPercent)) {
+        continue;
+      }
+      const std::size_t column = candidates[operator_rng_.Below(candidates.size())];
+      const GenColumn& c = b.columns[column];
+      // The data's range, or a small one inside the type where the data's is unknown.
+      const int64_t low = std::max<int64_t>(0, c.data_min.value_or(0));
+      const int64_t high = c.data_max.value_or(std::min<int64_t>(c.max, 100));
+      const auto span = static_cast<uint64_t>(high - low) + 1;
+      b.conditions[copy] =
+          Binding::CopyCondition{.column = column,
+                                 .less = operator_rng_.Below(2) == 0,
+                                 .value = low + static_cast<int64_t>(operator_rng_.Below(span))};
     }
   }
 
@@ -2730,9 +2798,14 @@ class Builder {
     Symbol("(");
     for (std::size_t copy = 0; copy < b.copies; ++copy) {
       if (copy > 0) {
+        // Every compound records kUnionAll, a UNION among its operators kUnion too.
         used_.Add(Feature::kUnionAll);
         Keyword("UNION");
-        Keyword("ALL");
+        if (!b.distinct.empty() && b.distinct[copy]) {
+          used_.Add(Feature::kUnion);
+        } else {
+          Keyword("ALL");
+        }
       }
       if (copy == b.paren_first) {
         used_.Add(Feature::kSetOpParentheses);
@@ -2750,6 +2823,16 @@ class Builder {
       Keyword("FROM");
       used_.Add(Feature::kTableName);
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
+      const std::optional<Binding::CopyCondition> drawn =
+          b.conditions.empty() ? std::nullopt : b.conditions[copy];
+      if (drawn.has_value()) {
+        const Binding::CopyCondition& condition = *drawn;
+        used_.Add(Feature::kIntegerLiteral);
+        Keyword("WHERE");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.inner[condition.column]});
+        Symbol(condition.less ? "<" : ">=");
+        tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(condition.value)});
+      }
       if (copy == b.paren_last) {
         Symbol(")");
       }
@@ -3993,6 +4076,7 @@ class Builder {
   Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
   Rng& rollup_rng_;              // the draws that only grouping sets need
   Rng& setop_rng_;               // the draws that only a set operation's form needs
+  Rng& operator_rng_;            // the draws that only a set operator other than UNION ALL needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4202,8 +4286,9 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng distinct_rng(Mix(seed ^ kDistinctStreamSalt));
   Rng rollup_rng(Mix(seed ^ kRollupStreamSalt));
   Rng setop_rng(Mix(seed ^ kSetOpStreamSalt));
+  Rng operator_rng(Mix(seed ^ kSetOperatorStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng,
+               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                options.supported)
            .Build()
            .has_value()) {
@@ -4231,14 +4316,15 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng distinct_rng(Mix(state ^ kDistinctStreamSalt));
   Rng rollup_rng(Mix(state ^ kRollupStreamSalt));
   Rng setop_rng(Mix(state ^ kSetOpStreamSalt));
+  Rng operator_rng(Mix(state ^ kSetOperatorStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q =
-      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, allowed)
-          .Build()
-          .value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
+                             setop_rng, operator_rng, allowed)
+                         .Build()
+                         .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;
