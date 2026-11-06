@@ -232,6 +232,7 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
   static_assert(kSelectStatementFields == 20, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   for (const SetBranch& branch : stmt.set_operation) {
+    want.parens += IsNestedQuery(*branch.query) ? 1U : 0U;  // a nested branch's own (ADR 0039)
     CountStatement(*branch.query, sql, want);
   }
   want.numbers += (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
@@ -512,8 +513,9 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
     ASSERT_TRUE(Within(cte.query->span, cte.span)) << context;
     ASSERT_NO_FATAL_FAILURE(CheckStatement(*cte.query, sql));
   }
-  // A compound (ADR 0036) holds its blocks, two or more, each a block of its own in the compound's
-  // span after the UNION ALL that joins it; its own block fields are empty.
+  // A compound (ADR 0036, ADR 0039) holds its branches, two or more, each in the compound's span
+  // after the operator that joins it: a block, or a parenthesized query with its own WITH list,
+  // compound or tail. Its own block fields are empty.
   static_assert(kSelectStatementFields == 20, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   ASSERT_NE(stmt.set_operation.size(), 1U) << context;
@@ -540,13 +542,19 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
     ASSERT_EQ(branch.op_span.length == 0, first) << context;
     if (!first) {
       ASSERT_TRUE(Within(branch.op_span, stmt.span)) << context;
-      ASSERT_EQ(UpperText(sql, SourceSpan{.offset = branch.op_span.offset, .length = 5}), "UNION")
+      const std::string_view op = ToString(branch.op);
+      ASSERT_EQ(UpperText(sql, SourceSpan{.offset = branch.op_span.offset, .length = op.size()}),
+                op)
           << context;
       ASSERT_LT(branch.op_span.offset, block.span.offset) << context;
     }
-    ASSERT_TRUE(block.with.empty() && block.order_by.empty() && !block.limit.has_value() &&
-                !block.offset.has_value() && block.set_operation.empty())
-        << context;
+    if (IsNestedQuery(block)) {
+      // In parentheses: a '(' before it, after the operator.
+      const std::size_t from =
+          first ? stmt.span.offset : branch.op_span.offset + branch.op_span.length;
+      ASSERT_GT(block.span.offset, from) << context;
+      ASSERT_NE(sql.substr(from, block.span.offset - from).find('('), std::string::npos) << context;
+    }
     ASSERT_NO_FATAL_FAILURE(CheckStatement(block, sql));
   }
   if (!stmt.set_operation.empty()) {
@@ -874,14 +882,32 @@ std::vector<std::string_view> Skeleton(Rng& rng) {
       }
     }
   }
-  // A compound (ADR 0036): one or two more blocks after UNION ALL, before the compound's LIMIT.
+  // A compound (ADR 0036, ADR 0039): one or two more blocks after a set operator, some in
+  // parentheses, before the compound's LIMIT.
   if (rng.Percent(15)) {
     for (std::size_t i = 1 + rng.Below(2); i > 0; --i) {
+      static constexpr auto kSetOps =
+          std::to_array<std::string_view>({"UNION", "INTERSECT", "EXCEPT", "union"});
+      static constexpr auto kQuantifiers =
+          std::to_array<std::string_view>({"ALL", "all", "DISTINCT", ""});
+      tokens.push_back(rng.Pick(kSetOps));
+      if (const std::string_view q = rng.Pick(kQuantifiers); !q.empty()) {
+        tokens.push_back(q);
+      }
+      const bool parenthesized = rng.Percent(25);
+      if (parenthesized) {
+        tokens.emplace_back("(");
+      }
       tokens.insert(tokens.end(),
-                    {"UNION", rng.Percent(50) ? "ALL" : "all", "SELECT",
-                     rng.Percent(20) ? "*" : rng.Pick(kNames), "FROM", rng.Pick(kNames)});
+                    {"SELECT", rng.Percent(20) ? "*" : rng.Pick(kNames), "FROM", rng.Pick(kNames)});
       if (rng.Percent(30)) {
         tokens.insert(tokens.end(), {"WHERE", rng.Pick(kNames), rng.Pick(kOps), "1"});
+      }
+      if (parenthesized) {
+        if (rng.Percent(40)) {
+          tokens.insert(tokens.end(), {"LIMIT", "3"});
+        }
+        tokens.emplace_back(")");
       }
     }
   }
@@ -1472,6 +1498,29 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   }
   // SELECT DISTINCT (ADR 0037's AG3), for a block (a compound's DISTINCT is its blocks').
   stmt.distinct = stmt.set_operation.empty() && rng.Percent(20);
+  // Now and then a compound (ADR 0036, ADR 0039): the block becomes its first branch, which keeps
+  // the WITH list and the tail, and one or two more follow under random operators, each a random
+  // query -- in parentheses when it has a WITH list, a compound or a tail of its own.
+  if (blocks > 0 && rng.Percent(15)) {
+    static_assert(kSelectStatementFields == 20, "revisit this walk");
+    static constexpr auto kOps =
+        std::to_array<SetOp>({SetOp::kUnion, SetOp::kIntersect, SetOp::kExcept});
+    SelectStatement first;
+    first.distinct = std::exchange(stmt.distinct, false);
+    first.items = std::exchange(stmt.items, {});
+    first.from = std::exchange(stmt.from, {});
+    first.where = std::exchange(stmt.where, {});
+    first.group_by = std::exchange(stmt.group_by, {});
+    first.grouping = std::exchange(stmt.grouping, {});
+    first.having = std::exchange(stmt.having, {});
+    stmt.set_operation.push_back(SetBranch{.query = Box<SelectStatement>(std::move(first))});
+    for (std::size_t n = 1 + rng.Below(2); n > 0; --n) {
+      stmt.set_operation.push_back(
+          SetBranch{.query = Box<SelectStatement>(RandomStatement(rng, blocks - 1)),
+                    .op = rng.Pick(kOps),
+                    .all = rng.Percent(50)});
+    }
+  }
   return stmt;
 }
 
@@ -1479,6 +1528,8 @@ TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
   std::size_t with_lists = 0;
   std::size_t derived_tables = 0;
   std::size_t column_lists = 0;
+  std::size_t compounds = 0;
+  std::size_t nested_branches = 0;
   for (const std::uint64_t seed : kSeeds) {
     Rng rng(seed);
     for (int i = 0; i < 300; ++i) {
@@ -1492,6 +1543,10 @@ TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
       ASSERT_EQ(ToSql(*parsed), sql);
       ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
       with_lists += stmt.with.empty() ? 0U : 1U;
+      compounds += stmt.set_operation.empty() ? 0U : 1U;
+      for (const SetBranch& branch : stmt.set_operation) {
+        nested_branches += IsNestedQuery(*branch.query) ? 1U : 0U;
+      }
       for (const FromItem& item : stmt.from) {
         derived_tables += item.table() == nullptr ? 1U : 0U;
         column_lists += item.columns.empty() ? 0U : 1U;
@@ -1503,6 +1558,9 @@ TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
   EXPECT_GT(with_lists, 100U);
   EXPECT_GT(derived_tables, 150U);
   EXPECT_GT(column_lists, 20U);
+  // And the compounds (ADR 0039), some of whose branches are parenthesized queries.
+  EXPECT_GT(compounds, 100U);
+  EXPECT_GT(nested_branches, 30U);
 }
 
 // A comparison written literal-first has the normalized form of the column-first one.
@@ -1556,6 +1614,26 @@ std::string ThreeBlocks(std::string_view last) {
 }
 
 class CompoundWalkTest : public ::testing::TestWithParam<LastBlockCase> {};
+
+// A last branch in parentheses (ADR 0039), with a WITH list and a tail of its own: a walk reaches
+// its constructs through the branch, and the parentheses come back in the canonical form.
+TEST(ParserPropertyTest, WalksReachANestedLastBranch) {
+  const std::string sql =
+      ThreeBlocks("(WITH c AS (SELECT f(f(f(a))) AS a FROM t) SELECT a FROM c ORDER BY a LIMIT 2)");
+  auto stmt = Parse(sql);
+  ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+  ASSERT_EQ(stmt->set_operation.size(), 3U) << sql;
+  EXPECT_TRUE(IsNestedQuery(*stmt->set_operation[2].query));
+  ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
+  EXPECT_EQ(Depth(*stmt), 6U) << "f(f(f(a))) in the CTE of the last branch";
+  auto changed = Parse(ThreeBlocks(
+      "(WITH c AS (SELECT f(f(f(b))) AS a FROM t) SELECT a FROM c ORDER BY a LIMIT 2)"));
+  ASSERT_TRUE(changed.has_value());
+  EXPECT_FALSE(EqualIgnoringSpans(*stmt, *changed));
+  auto again = Parse(ToSql(*stmt));
+  ASSERT_TRUE(again.has_value()) << ToSql(*stmt);
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+}
 
 TEST_P(CompoundWalkTest, WalksReachTheLastOfThreeBlocks) {
   const LastBlockCase& c = GetParam();

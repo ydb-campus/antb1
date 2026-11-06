@@ -693,6 +693,19 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   EXPECT_GT(same, 400);
 }
 
+// The blocks of a nested query: itself, or the copies of a compound (ADR 0036), which parentheses
+// may group (ADR 0039's X4a): the leaves of its tree, one run of UNION ALL.
+std::vector<const sql::SelectStatement*> CopiesOf(const sql::SelectStatement& query) {
+  if (query.set_operation.empty()) {
+    return {&query};
+  }
+  std::vector<const sql::SelectStatement*> copies;
+  for (const sql::SetTree& leaf : sql::SetOperationTree(query).operands) {
+    copies.push_back(leaf.leaf);
+  }
+  return copies;
+}
+
 bool Nests(const GeneratedQuery& q) {
   return q.features.Has(Feature::kDerivedTable) || q.features.Has(Feature::kCommonTableExpr);
 }
@@ -730,8 +743,7 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
       const auto* derived_table = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
       const sql::SelectStatement& block =
           derived_table != nullptr ? *derived_table->query : *ast->with.at(0).query;
-      const auto copies =
-          static_cast<int64_t>(std::max<std::size_t>(1, block.set_operation.size()));
+      const auto copies = static_cast<int64_t>(CopiesOf(block).size());
       EXPECT_EQ(q.row_bound, plain.row_bound * copies) << q.sql;
       continue;
     }
@@ -808,15 +820,11 @@ TEST(QueryGenerator, NestedBlocksProjectColumnsUnderTheirOwnNames) {
     ASSERT_EQ(derived_source == nullptr, cte) << "the FROM item matches the form recorded";
     const sql::SelectStatement& nested = cte ? *ast->with.front().query : *derived_source->query;
     // The block, or each of its copies when it is a compound (ADR 0036).
-    std::vector<const sql::SelectStatement*> blocks = {&nested};
+    const std::vector<const sql::SelectStatement*> blocks = CopiesOf(nested);
     if (!nested.set_operation.empty()) {
       ++compounds;
       EXPECT_TRUE(nested.items.empty()) << "a compound's select lists are its blocks'";
       EXPECT_TRUE(nested.from.empty()) << "a compound's FROM lists are its blocks'";
-      blocks.clear();
-      for (const sql::SetBranch& branch : nested.set_operation) {
-        blocks.push_back(&*branch.query);
-      }
     }
     for (const sql::SelectStatement* block : blocks) {
       EXPECT_FALSE(block->items.empty());
@@ -1712,11 +1720,12 @@ TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
     const auto* derived = std::get_if<sql::DerivedTable>(&item.source);
     const sql::SelectStatement& nested =
         derived != nullptr ? *derived->query : *ast->with.at(0).query;
-    ASSERT_GE(nested.set_operation.size(), 2U);
-    ASSERT_LE(nested.set_operation.size(), 3U);
+    const std::vector<const sql::SelectStatement*> copies = CopiesOf(nested);
+    ASSERT_GE(copies.size(), 2U);
+    ASSERT_LE(copies.size(), 3U);
     // The first and third streams pick the table and nest it, so the plain query nests the same
     // table in one block, bounded by the table's rows, which the compound reads once per copy.
-    EXPECT_EQ(q.row_bound, static_cast<int64_t>(nested.set_operation.size()) * plain.row_bound);
+    EXPECT_EQ(q.row_bound, static_cast<int64_t>(copies.size()) * plain.row_bound);
     // The copies are one block, each spelled as the generator spells any name (case, quotes).
     const auto reads = [](const sql::SelectStatement& block) {
       std::vector<std::string> names;
@@ -1728,11 +1737,66 @@ TEST(QueryGenerator, UnionAllChangesOnlyUnionQueries) {
       names.push_back(table == nullptr ? "?" : Lower(table->name));
       return names;
     };
-    for (const sql::SetBranch& branch : nested.set_operation) {
-      EXPECT_EQ(reads(*branch.query), reads(*nested.set_operation.front().query));
+    for (const sql::SelectStatement* copy : copies) {
+      EXPECT_EQ(reads(*copy), reads(*copies.front()));
     }
   }
   EXPECT_GT(took, 100) << "took: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// Parentheses in a compound (ADR 0039's X4a) come from the set operations' own stream, so every
+// seed that declines them generates the query it did before; one that takes them writes the same
+// copies, a copy or a run of two in parentheses, which read back as the same leaves.
+TEST(QueryGenerator, SetOpParenthesesChangeOnlyTheirQueries) {
+  const auto with = MakeOver(Tables(), 73, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      Tables(), 73,
+      {.supported = kSupportedFeatures.Minus({Feature::kSetOpParentheses}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kSetOpParentheses)) << plain.sql;
+    if (!q.features.Has(Feature::kSetOpParentheses)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_TRUE(q.features.Has(Feature::kUnionAll));
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    const auto ast = sql::Parse(q.sql);
+    const auto plain_ast = sql::Parse(plain.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    ASSERT_TRUE(plain_ast.has_value()) << plain_ast.error().message;
+    const auto nested = [](const sql::SelectStatement& stmt) -> const sql::SelectStatement& {
+      const auto* derived = std::get_if<sql::DerivedTable>(&stmt.from.at(0).source);
+      return derived != nullptr ? *derived->query : *stmt.with.at(0).query;
+    };
+    const auto copies = CopiesOf(nested(*ast));
+    const auto plain_copies = CopiesOf(nested(*plain_ast));
+    ASSERT_EQ(copies.size(), plain_copies.size());
+    // The same columns of the same table, spelled as the generator spells any name (the spelling
+    // draws shift with the parentheses' tokens).
+    const auto reads = [](const sql::SelectStatement& block) {
+      std::vector<std::string> names;
+      for (const sql::SelectItem& select_item : block.items) {
+        const auto* column = std::get_if<sql::ColumnRef>(select_item.expr());
+        names.push_back(column == nullptr ? "?" : Lower(column->name));
+      }
+      const sql::TableRef* table = block.from.at(0).table();
+      names.push_back(table == nullptr ? "?" : Lower(table->name));
+      return names;
+    };
+    for (std::size_t k = 0; k < copies.size(); ++k) {
+      EXPECT_EQ(reads(*copies[k]), reads(*plain_copies[k])) << k;
+    }
+  }
+  EXPECT_GT(took, 50) << "took: " << took;
   EXPECT_GT(same, 6000);
 }
 
@@ -1759,7 +1823,7 @@ TEST(QueryGenerator, UnionAllRowBoundGuardsSelectStar) {
     const auto* derived = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
     const sql::SelectStatement& nested =
         derived != nullptr ? *derived->query : *ast->with.at(0).query;
-    const auto copies = static_cast<int64_t>(nested.set_operation.size());
+    const auto copies = static_cast<int64_t>(CopiesOf(nested).size());
     EXPECT_EQ(q.row_bound, copies * table.rows);
     if (!q.features.Has(Feature::kStar)) {
       continue;

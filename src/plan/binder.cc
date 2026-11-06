@@ -2780,8 +2780,8 @@ bool IsAggregateQuery(const sql::SelectStatement& stmt) {
 struct BoundBlock {
   LogicalPlan plan;
   std::vector<BindingColumn> columns;
-  // Per column of a block (none of a compound's): the select item it comes from, its expression or
-  // the star that expands to it, which a UNION ALL's refusal points at.
+  // Per column: the select item it comes from, its expression or the star that expands to it, which
+  // a UNION ALL's refusal points at; a compound's are its first leaf's.
   std::vector<SourceSpan> spans;
 };
 
@@ -7053,6 +7053,28 @@ std::optional<Rejection> RejectUnionAllTail(const sql::SelectStatement& stmt) {
   return std::nullopt;
 }
 
+// The first operator of a compound other than UNION ALL, in written order, which ADR 0039's items
+// answer: UNION X4b, INTERSECT [ALL] X4c, EXCEPT [ALL] X4d.
+std::optional<Rejection> RejectSetOperator(const sql::SelectStatement& stmt) {
+  static_assert(sql::kSetBranchFields == 4, "revisit this walk");
+  for (std::size_t k = 1; k < stmt.set_operation.size(); ++k) {
+    const sql::SetBranch& branch = stmt.set_operation[k];
+    if (branch.op == sql::SetOp::kUnion && branch.all) {
+      continue;
+    }
+    std::string_view item = "X4b";
+    if (branch.op == sql::SetOp::kIntersect) {
+      item = "X4c";
+    } else if (branch.op == sql::SetOp::kExcept) {
+      item = "X4d";
+    }
+    const std::string what = std::string(sql::ToString(branch.op)) + (branch.all ? " ALL" : "");
+    return Rejection{.span = branch.op_span,
+                     .message = std::format("{} is not supported yet (ADR 0037's {})", what, item)};
+  }
+  return std::nullopt;
+}
+
 // A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
 // item's, its elements in turn.
 arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
@@ -7069,8 +7091,12 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
-    // A UNION ALL keeps its clauses in its blocks, which ReachableBlocks lists before it, so what
-    // is left is its tail; its FROM list is empty, which CheckFromList must never see.
+    // A compound keeps its clauses in its branches, which ReachableBlocks lists before it, so what
+    // is left is its tail and its operators; its FROM list is empty, which CheckFromList must never
+    // see. A nested compound is a reachable block of its own, checked the same way.
+    if (auto r = RejectSetOperator(stmt)) {
+      return Reject(*r);
+    }
     if (auto r = RejectUnionAllTail(stmt)) {
       return Reject(*r);
     }
@@ -7179,6 +7205,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer,
                                     bool outer_encloses = false, bool inside_exists = false);
+BoundBlock BoundBlockOf(LogicalPlan plan);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
 // own name, and the de-duplication then runs over the result -- so `(SELECT 1 AS x, 2 AS x) s`
@@ -7275,23 +7302,37 @@ std::string UnionAllTypeName(LogicalType type, bool stored_as_float) {
 // new, since no block defines its rows. Its names are the
 // first block's, and its FLOAT flag the AND over the blocks: FLOAT and DOUBLE values make a DOUBLE
 // in DuckDB, whose literals do not fold at FLOAT precision.
-arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
-                                        const BindOptions& options, ColumnIdSource& ids,
-                                        const CteFrame& own, const Scope* outer) {
+arrow::Result<BoundBlock> BindUnionAll(const sql::SelectStatement& stmt, const Catalog& catalog,
+                                       const BindOptions& options, ColumnIdSource& ids,
+                                       const CteFrame& own, const Scope* outer) {
   static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the UNION ALL's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
   ANTB1_CHECK(stmt.order_by.empty());
   ANTB1_CHECK(!stmt.limit.has_value());
   ANTB1_CHECK(!stmt.offset.has_value());
+  // The leaves of DuckDB's tree (ADR 0039): CheckBlock refused every operator but UNION ALL, so it
+  // is one run, a parenthesized run spliced into it -- its leaves fold as one list in written
+  // order. A leaf is a block, or a parenthesized query with its own WITH list or tail, bound on its
+  // own.
+  const sql::SetTree tree = sql::SetOperationTree(stmt);
+  ANTB1_CHECK(tree.leaf == nullptr);
+  ANTB1_CHECK(tree.op == sql::SetOp::kUnion);
+  ANTB1_CHECK(tree.all);
+  std::vector<const sql::SetTree*> leaves;
+  leaves.reserve(tree.operands.size());
+  for (const sql::SetTree& operand : tree.operands) {
+    ANTB1_CHECK(operand.leaf != nullptr);
+    leaves.push_back(&operand);
+  }
   std::vector<LogicalPlan> blocks;
-  std::vector<std::vector<SourceSpan>> spans;  // per block: per column, what a refusal points at
-  blocks.reserve(stmt.set_operation.size());
-  spans.reserve(stmt.set_operation.size());
-  for (const sql::SetBranch& branch : stmt.set_operation) {
+  std::vector<std::vector<SourceSpan>> spans;  // per leaf: per column, what a refusal points at
+  blocks.reserve(leaves.size());
+  spans.reserve(leaves.size());
+  for (const sql::SetTree* leaf : leaves) {
     ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
-                          BindBlock(*branch.query, catalog, options, ids, &own, outer));
-    ANTB1_CHECK(bound.spans.size() == bound.plan.output.size());  // a block, never a compound
+                          BindBlock(*leaf->leaf, catalog, options, ids, &own, outer));
+    ANTB1_CHECK(bound.spans.size() == bound.plan.output.size());
     blocks.push_back(std::move(bound.plan));
     spans.push_back(std::move(bound.spans));
   }
@@ -7300,7 +7341,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
     if (blocks[k].output.size() != width) {
       return BindError(
           "Set operations can only apply to expressions with the same number of result columns",
-          stmt.set_operation[k].op_span);
+          leaves[k]->op_span);
     }
   }
 
@@ -7376,7 +7417,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
                             .message = std::move(first->message)});
   }
 
-  UnionAllNode node{.span = stmt.set_operation[1].op_span};
+  UnionAllNode node{.span = leaves[1]->op_span};
   for (std::size_t k = 0; k < blocks.size(); ++k) {
     std::vector<BoundColumn> reads;
     std::vector<ExprPtr> casts;
@@ -7411,7 +7452,7 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
       input = Make(ComputeNode{.input = std::move(input),
                                .exprs = std::move(casts),
                                .ids = std::move(cast_ids),
-                               .span = stmt.set_operation[k].query->span});
+                               .span = leaves[k]->leaf->span});
     }
     node.inputs.push_back(std::move(input));
     node.columns.push_back(std::move(reads));
@@ -7425,7 +7466,10 @@ arrow::Result<LogicalPlan> BindUnionAll(const sql::SelectStatement& stmt, const 
                                   .id = node.ids.back(),
                                   .stored_as_float = columns[i].stored_as_float});
   }
-  return LogicalPlan{.root = Make(std::move(node)), .output = std::move(output)};
+  BoundBlock bound =
+      BoundBlockOf(LogicalPlan{.root = Make(std::move(node)), .output = std::move(output)});
+  bound.spans = std::move(spans.front());
+  return bound;
 }
 
 // A bound block's columns: its root's, each with its FLOAT flag.
@@ -7474,8 +7518,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
     // No subquery's query is a UNION ALL (RejectSubqueryConjunct refuses it, ADR 0036's X6), so it
     // is never an EXISTS block, and only its blocks' own subqueries read enclosing blocks.
     ANTB1_CHECK(!(outer_encloses || inside_exists));
-    ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, BindUnionAll(stmt, catalog, options, ids, own, outer));
-    return BoundBlockOf(std::move(plan));
+    return BindUnionAll(stmt, catalog, options, ids, own, outer);
   }
 
   // One binding per FROM item, in FROM order and from one id source, so that a relation's index is

@@ -189,6 +189,15 @@ class Counter {
     std::size_t total = 0;
     for (const sql::SetBranch& branch : block.set_operation) {
       const sql::SelectStatement& query = *branch.query;
+      if (sql::IsNestedQuery(query)) {
+        // A parenthesized branch with its own WITH list, compound or tail (ADR 0039): its whole
+        // count, reported at the branch, since its items are no block's of this compound.
+        total = AddSaturating(total, Count(query, &frame));
+        if (total > kMaxRelations) {
+          return RelationOverflow{.span = query.span};
+        }
+        continue;
+      }
       const CteFrame& inner = MakeFrame(query, &frame);
       for (const sql::FromItem& item : query.from) {
         total = AddSaturating(total, Item(item, inner));

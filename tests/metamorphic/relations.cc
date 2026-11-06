@@ -1703,6 +1703,24 @@ std::vector<Relation> AllRelations() {
                                   kLow)),
                     Q(both, 1), Q(both, 7)},
          .check = AllEqual()});
+    // Parentheses (ADR 0039's X4a) change nothing of a UNION ALL's rows: a run in parentheses is
+    // spliced into the run around it, and a parenthesized block is the block.
+    constexpr std::string_view kMid =
+        "SELECT tr_row, tr_rider FROM trips WHERE tr_row >= 1000 AND tr_row < 1100";
+    r.push_back(
+        {.name = "union_all_parentheses_change_no_row",
+         .features = SetWith(unioned, kSetOpParentheses),
+         .probes =
+             {Q(std::format("SELECT tr_row, tr_rider FROM ({} UNION ALL {} UNION ALL {}) AS u",
+                            kLow, kMid, kHigh)),
+              Q(std::format("SELECT tr_row, tr_rider FROM ({} UNION ALL ({} UNION ALL {})) AS u",
+                            kLow, kMid, kHigh)),
+              Q(std::format("SELECT tr_row, tr_rider FROM (({} UNION ALL {}) UNION ALL ({})) AS u",
+                            kLow, kMid, kHigh)),
+              Q(std::format("SELECT tr_row, tr_rider FROM ((({}) UNION ALL {}) UNION ALL {}) AS u",
+                            kLow, kMid, kHigh),
+                7)},
+         .check = AllEqual()});
     r.push_back(
         {.name = "union_all_count_sums_its_blocks",
          .features = SetWith(unioned, kCountStar),

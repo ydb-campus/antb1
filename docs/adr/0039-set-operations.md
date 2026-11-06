@@ -350,6 +350,25 @@ set operations and pins them with records.
   - a micro benchmark in bench/ of the node against the sketch, recorded as an update here, as ADR 0038's RU2 update
     records its operator.
 
+## Update (2026-11-06, X4a): the grammar, built
+
+- **Built as decided:** the flat list with `SetBranch::op` and `all` and the `kSetBranchFields` tripwire,
+  `sql::SetOperationTree`, the unparser's parentheses, `relation_count`'s nested branches, and the binder's refusals
+  of UNION, INTERSECT and EXCEPT naming X4b, X4c and X4d. UNION ALL answers parenthesized branches through
+  `BindUnionAll`, which takes the tree's leaves, so a parenthesized run of UNION ALL is spliced and typed with its
+  parent. The tree's tests come from DuckDB's `json_serialize_sql` on synthetic SQL.
+- **A compound's own tail stays X5 at any depth** (the maintainer's decision at the item's start). Rule 7's last line
+  narrows: X4a answers a parenthesized branch's own WITH list, and a parenthesized block's own ORDER BY, LIMIT and
+  OFFSET, but not a parenthesized compound's, which needs X5's binding of a tail over a compound's output.
+- **Syntax errors, as in DuckDB's parser:** a WITH list before a parenthesized query that has one of its own, and an
+  ORDER BY, LIMIT or OFFSET after a parenthesized query that has the same clause. Another clause after it stays exit
+  code 4 (X5), as rule 7 says.
+- **Depth:** each pair of parentheses around a query counts a level against the parser's limit, so redundant
+  parentheses cannot recurse without bound; the tree holds no level for them.
+- **NULL items:** a parenthesized compound with a WITH list of its own binds on its own, and a column of NULL items in
+  it is still exit code 4: no plan column holds DuckDB's NULL type yet, so rule 4's "reaches its parent as one" waits
+  for the item that needs it.
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:

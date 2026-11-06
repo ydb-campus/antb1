@@ -970,6 +970,41 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
+// The set operators other than UNION ALL wait for ADR 0039's items (ADR 0037's X4b, X4c and X4d):
+// the first in written order within a compound is refused at its operator, a parenthesized
+// compound's before those of the compound around it, and before the compound's tail, which X5 keeps
+// at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a update).
+INSTANTIATE_TEST_SUITE_P(
+    SetOperatorRefusals, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u", kUnsupported, "UNION",
+                  "UNION is not supported yet (ADR 0037's X4b)"},
+        ErrorCase{"SELECT i16 FROM t UNION DISTINCT SELECT i16 FROM u", kUnsupported,
+                  "UNION DISTINCT", "UNION is not supported yet (ADR 0037's X4b)"},
+        ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u", kUnsupported, "INTERSECT",
+                  "INTERSECT is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u", kUnsupported,
+                  "INTERSECT ALL", "INTERSECT ALL is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t EXCEPT SELECT i16 FROM u", kUnsupported, "EXCEPT",
+                  "EXCEPT is not supported yet (ADR 0037's X4d)"},
+        ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u", kUnsupported, "EXCEPT ALL",
+                  "EXCEPT ALL is not supported yet (ADR 0037's X4d)"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t "
+                  "INTERSECT SELECT i16 FROM u ORDER BY 1",
+                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
+        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u) AS d",
+                  kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION SELECT i16 FROM t)",
+                  kUnsupported, "UNION", "UNION is not supported yet (ADR 0037's X4b)"},
+        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM t UNION ALL (SELECT i16 FROM u "
+                  "INTERSECT SELECT i16 FROM t)",
+                  kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
+                  "LIMIT 1)",
+                  kUnsupported, "LIMIT 1", "LIMIT on a UNION ALL is not supported"},
+        ErrorCase{"(SELECT i16 FROM t UNION ALL SELECT i16 FROM u) ORDER BY 1", kUnsupported,
+                  "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"}));
+
 // A UNION ALL's binding (ADR 0036), as in DuckDB: every block binds before the column counts are
 // compared, and those before the types; a count that differs is a bind error at the UNION ALL
 // before the block. A block binds against the scope the UNION ALL has -- a name that only an
@@ -1962,6 +1997,44 @@ TEST(BinderTest, UnionAllCountErrorIsAtTheBlocksUnionAll) {
   const Catalog catalog = MakeCatalog();
   const std::string sql =
       "SELECT i16 FROM t UNION ALL SELECT i16 FROM u UNION ALL SELECT i16, i32 FROM t";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_FALSE(plan.ok());
+  const auto detail = GetSqlError(plan.status());
+  ASSERT_NE(detail, nullptr) << plan.status().ToString();
+  EXPECT_EQ(detail->kind(), kBind);
+  EXPECT_EQ(detail->span().offset, sql.rfind("UNION ALL"));
+}
+
+// Parenthesized branches of a UNION ALL (ADR 0039's X4a): a run of UNION ALL in parentheses is
+// spliced into its parent and typed with it, as one list in written order; one with a WITH list of
+// its own is typed on its own first, as DuckDB does. A parenthesized block keeps its own tail.
+TEST(BinderTest, ParenthesizedUnionAllBranches) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT r FROM dec UNION ALL SELECT s16 FROM dec UNION ALL SELECT u16 FROM dec",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT r FROM dec UNION ALL (SELECT s16 FROM dec UNION ALL SELECT u16 FROM dec)",
+            LogicalType::Decimal(9, 4)},
+           {"(SELECT r FROM dec UNION ALL SELECT s16 FROM dec) UNION ALL SELECT u16 FROM dec",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT r FROM dec UNION ALL (WITH c AS (SELECT s16, u16 FROM dec) SELECT s16 FROM c "
+            "UNION ALL SELECT u16 FROM c)",
+            LogicalType::Decimal(14, 4)},
+           {"(SELECT r FROM dec ORDER BY r LIMIT 1) UNION ALL (SELECT s16 FROM dec LIMIT 2)",
+            LogicalType::Decimal(9, 4)},
+           {"((SELECT i16 FROM t)) UNION ALL ((SELECT i32 FROM u))", LogicalType::kInteger},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  // The names are leaf 0's, through the parentheses.
+  auto named = BindSql("(SELECT i16 AS x FROM t LIMIT 2) UNION ALL SELECT i32 FROM u", catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[0].name, "x");
+  // A count that differs is reported at the operator before the leaf, inside the parentheses too.
+  const std::string sql =
+      "SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION ALL SELECT i16, i32 FROM t)";
   auto plan = BindSql(sql, catalog);
   ASSERT_FALSE(plan.ok());
   const auto detail = GetSqlError(plan.status());

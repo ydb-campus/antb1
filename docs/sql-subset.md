@@ -96,9 +96,11 @@ and the executor runs it. Keywords are case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
-query       = [ "WITH" , cte , { "," , cte } ] , block , { "UNION" , "ALL" , block } ,
+query       = [ "WITH" , cte , { "," , cte } ] , primary ,
+              { ( "UNION" | "INTERSECT" | "EXCEPT" ) , [ "ALL" | "DISTINCT" ] , primary } ,
               [ "ORDER" , "BY" , order_item , { "," , order_item } ] ,
               [ limit_offset ] ;
+primary     = block | "(" , query , ")" ;
 cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
 block       = "SELECT" , [ "DISTINCT" ] , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
               [ "GROUP" , "BY" , group_item , { "," , group_item } ] , [ "HAVING" , expr ] ;
@@ -181,28 +183,39 @@ unsupported first) is a syntax error at the repeated name, before its query is p
 reuse a name. The binder answers both ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each is a sub-plan with its
 own scope, and one binding of the block that reads it.
 
-Compounds: `UNION ALL` joins two or more blocks into one query, which stands wherever a query does: as the whole
-statement, a derived table's query, a CTE's query or the query of a subquery
-([ADR 0036](adr/0036-union-all.md)). A `WITH` list before the first block belongs to the compound, and so do an
-`ORDER BY`, `LIMIT` and `OFFSET` after the last block: they apply to all of its rows, never to the last block alone.
-Each block is one level below the compound for the depth limit: a later block is parsed a level down, so its depth
-error is where it passes the limit, and the first block moves down at the first `UNION ALL`, which is where it is
-reported when that makes it too deep. A compound of any number of blocks parses. Unsupported (exit code
-4), each at its first token: `UNION` without `ALL` (`UNION DISTINCT` too), `UNION BY NAME` (at `UNION`) and `BY NAME`
-after `UNION ALL` (at `BY`), `INTERSECT` and `EXCEPT`, which DuckDB answers, and a block that is not a `SELECT`
-block, such as one in parentheses (`UNION ALL (SELECT ...)`, and a first block too, also as the first value of an
-`IN` list or inside a parenthesized expression, before a set operation or an `ORDER BY`, `LIMIT` or `OFFSET`:
-`x IN ((SELECT ...) UNION ALL SELECT ...)`, `x = ((SELECT ...) LIMIT 1)`, at its `(`), a `VALUES`
-list, a FROM-first query or `TABLE t`, and, as in any block, `DISTINCT ON` and a `SELECT` without `FROM`. After a
-later value of an `IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a
-syntax error, as in DuckDB. Syntax errors (exit code 1), as in DuckDB: an `ORDER BY`, `LIMIT` or
-`OFFSET` before a `UNION ALL`, and a `UNION ALL` that no block follows (at the end, or before `)`, `ALL`, `DISTINCT`
-or `WITH`). The binder answers a compound as the whole statement, a derived table's query and a CTE's query
-([Binding](#binding)). Its own `ORDER BY`, `LIMIT` and `OFFSET` are unsupported (exit code 4) at the first of them,
-after any construct in its blocks that is unsupported anyway, until ADR 0036's X5; so is a compound as the query of an
-`IN`, `EXISTS` or scalar subquery, at the subquery's `IN`, `EXISTS` or `(` once the other side of its conjunct is
-checked, until X6 -- a compound in the FROM list of a subquery's query is answered. A compound in a CTE that nothing
-references is never checked or bound, tail included, as no such CTE is.
+Compounds: `UNION`, `INTERSECT` and `EXCEPT`, each with `ALL` or `DISTINCT` (the default), join two or more primaries
+into one query, which stands wherever a query does: as the whole statement, a derived table's query, a CTE's query or
+the query of a subquery ([ADR 0036](adr/0036-union-all.md), [ADR 0039](adr/0039-set-operations.md)). A primary is a
+block or a query in parentheses, which may have a `WITH` list, a compound and an `ORDER BY`, `LIMIT` and `OFFSET` of
+its own; a block in parentheses is the block, and a query that is one parenthesized query is that query (`((q))` is
+`q`). A `WITH` list before the first primary belongs to the compound, and so do an `ORDER BY`, `LIMIT` and `OFFSET`
+after the last one: they apply to all of its rows, never to the last primary alone. The parser keeps the branches in
+one flat list, each with the operator written before it; `INTERSECT` binds tighter than `UNION` and `EXCEPT`, which
+associate to the left, as in DuckDB (ADR 0039's tree). Each branch is one level below the compound for the depth
+limit: a later branch is parsed a level down, so its depth error is where it passes the limit, and the first one
+moves down at the first operator, which is where it is reported when that makes it too deep; each pair of
+parentheses around a query counts a level too. A compound of any number of branches parses. Unsupported (exit code
+4): `UNION [ALL | DISTINCT] BY NAME` (at `BY`); a primary that is not a `SELECT` block or a parenthesized query, at
+its first token: a `VALUES` list, a FROM-first query or `TABLE t`; a set operation after a parenthesized subquery
+that is the first value of an `IN` list or of a parenthesized expression, or such a subquery before an `ORDER BY`,
+`LIMIT` or `OFFSET` (`x IN ((SELECT ...) UNION ALL SELECT ...)`, `x = ((SELECT ...) LIMIT 1)`, at its `(`); an `ORDER
+BY`, `LIMIT` or `OFFSET` after a parenthesized query that has another of them of its own (`(q LIMIT 5) ORDER BY 1`),
+which DuckDB answers; and, as in any block, `DISTINCT ON` and a `SELECT` without `FROM`. After a later value of an
+`IN` list or inside a larger operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a syntax error, as in
+DuckDB. Syntax errors (exit code 1), as in DuckDB: an operator after an `ORDER BY`, `LIMIT` or `OFFSET` outside
+parentheses; an operator that no primary follows (at the end, or before `)`, a second `ALL` or `DISTINCT`, or
+`WITH`: a query with its own `WITH` list goes in parentheses); `BY NAME` after `INTERSECT` or `EXCEPT`; a
+parenthesized query with its own `WITH` list after a `WITH` list; and an `ORDER BY`, `LIMIT` or `OFFSET` after a
+parenthesized query that has the same clause. The binder answers a compound of `UNION ALL` alone, parenthesized
+branches included, as the whole statement, a derived table's query and a CTE's query ([Binding](#binding)). `UNION`,
+`INTERSECT` and `EXCEPT` are unsupported (exit code 4), until ADR 0037's X4b, X4c and X4d: at the first of them in
+written order within a compound, a parenthesized compound's before those of the compound around it. A
+compound's own `ORDER BY`, `LIMIT` and `OFFSET` -- the outermost compound's, or a parenthesized one's
+-- are unsupported (exit code 4) at the first of them, after any construct in its branches that is unsupported
+anyway, until ADR 0036's X5; a parenthesized block's own are answered. So is a compound as the query of an `IN`,
+`EXISTS` or scalar subquery unsupported, at the subquery's `IN`, `EXISTS` or `(` once the other side of its conjunct
+is checked, until X6 -- a compound in the FROM list of a subquery's query is answered. A compound in a CTE that
+nothing references is never checked or bound, tail included, as no such CTE is.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -283,7 +296,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   code 4 too, before the per-item checks;
 - `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
   answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
-  ([Binding](#binding));
+  ([Binding](#binding)); a branch in parentheses, a block with its own `ORDER BY`, `LIMIT` and `OFFSET` or a query
+  with its own `WITH` list (ADR 0039's X4a);
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - other casts ([ADR 0037](adr/0037-tpcds-roadmap.md)'s CT1), `CAST(x AS T)` and `x::T` to SMALLINT (`INT2`,
@@ -484,7 +498,7 @@ query) that starts with no `SELECT` or `WITH` (`(VALUES (1))`, `(FROM t)`, `(TAB
 statement other than a query after a `WITH` list, which DuckDB runs (`WITH c AS (...) INSERT ...`, also `UPDATE`,
 `DELETE` and `MERGE`); and in
 a nested query `SELECT` without `FROM` (`(SELECT 1)`, which DuckDB answers), a trailing comma in its select list, FROM
-list or `GROUP BY`, and the clauses that are unsupported after a statement (`INTERSECT`, `FETCH`, ...). As elsewhere, a
+list or `GROUP BY`, and the clauses that are unsupported after a statement (`FETCH`, `QUALIFY`, ...). As elsewhere, a
 construct is reported at its first token, so some of these are unsupported where DuckDB gives a syntax error, among
 others: a trailing comma in a nested `ORDER BY` (`(SELECT ... ORDER BY a,)`); a nested query that `;` or the end of the
 input cuts short (`(SELECT 1;`, `FROM (SELECT 1`, `FROM (SELECT a FROM t,`); `MATERIALIZED` without `(`; `RECURSIVE`
@@ -725,7 +739,14 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   38 - e) beyond 38 digits; an integer keeps the DECIMAL's scale and widens it to its own digits (SMALLINT and
   USMALLINT 5, INTEGER 10, BIGINT 19, HUGEINT 38), DECIMAL(min(38, digits + s), s). So the order of the blocks can
   change the type: USMALLINT, SMALLINT and DECIMAL(9,2) make DECIMAL(12,2), but SMALLINT, DECIMAL(9,2) and USMALLINT
-  DECIMAL(9,2); and BIGINT with DECIMAL(38,30) is DECIMAL(38,30), to which the BIGINT does not widen exactly.
+  DECIMAL(9,2); and BIGINT with DECIMAL(38,30) is DECIMAL(38,30), to which the BIGINT does not widen exactly. A
+  parenthesized branch (ADR 0039's X4a): a run of `UNION ALL` in parentheses is spliced into the run around it, its
+  blocks folded in the same written-order list (DECIMAL(9,2), then SMALLINT and USMALLINT in parentheses, is
+  DECIMAL(9,2)), while one with a `WITH` list of its own, and a parenthesized block with its own `ORDER BY`, `LIMIT`
+  or `OFFSET`, is typed on its own first and folds as one branch (the same blocks with a `WITH` list in the
+  parentheses: INTEGER, then DECIMAL(12,2)); a count that differs is reported at the operator before the branch, inside
+  the parentheses too, and the names are the first block's, through them. A nested compound's column of NULL items is
+  still unsupported (exit code 4).
   FLOAT with FLOAT is FLOAT and FLOAT with DOUBLE is DOUBLE: a column of FLOAT values alone keeps comparing with
   literals at FLOAT precision, one with a DOUBLE block does not (divergence D11). Every block's values must widen
   exactly to the column's type, which a block of another type is cast to once, below the union; values that do not,
@@ -1672,7 +1693,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs rank(), windows over aggregates and window partition expressions (phase 9) |
-| Q87 | unsupported | needs parenthesized set-operation branches and EXCEPT (X4d) |
+| Q87 | unsupported | needs EXCEPT (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |

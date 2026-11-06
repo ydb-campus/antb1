@@ -23,6 +23,11 @@ namespace {
                                 set_operation] = stmt;
 }
 static_assert(kSelectStatementFields == 20, "name every field in CheckSelectStatementFields");
+// Likewise kSetBranchFields for SetBranch.
+[[maybe_unused]] void CheckSetBranchFields(const SetBranch& branch) {
+  [[maybe_unused]] const auto& [query, op, all, op_span] = branch;
+}
+static_assert(kSetBranchFields == 4, "name every field in CheckSetBranchFields");
 // Likewise kSelectItemKinds is the number of SelectItem::value's alternatives.
 static_assert(std::variant_size_v<decltype(SelectItem::value)> == kSelectItemKinds,
               "a new kind of select item: update kSelectItemKinds, then every walk asserting it");
@@ -217,8 +222,11 @@ bool Eq(const SelectStatement& a, const SelectStatement& b) {
       return false;
     }
   }
+  static_assert(kSetBranchFields == 4, "revisit this walk");
   for (std::size_t i = 0; i < a.set_operation.size(); ++i) {
-    if (!Eq(*a.set_operation[i].query, *b.set_operation[i].query)) {
+    const SetBranch& x = a.set_operation[i];
+    const SetBranch& y = b.set_operation[i];
+    if (x.op != y.op || x.all != y.all || !Eq(*x.query, *y.query)) {
       return false;
     }
   }
@@ -506,6 +514,95 @@ std::string_view ToString(NullsOrder nulls) {
       return "NULLS LAST";
   }
   return "?";
+}
+
+std::string_view ToString(SetOp op) {
+  switch (op) {
+    case SetOp::kUnion:
+      return "UNION";
+    case SetOp::kIntersect:
+      return "INTERSECT";
+    case SetOp::kExcept:
+      return "EXCEPT";
+  }
+  return "";
+}
+
+bool IsNestedQuery(const SelectStatement& query) {
+  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  return !query.with.empty() || !query.set_operation.empty() || !query.order_by.empty() ||
+         query.limit.has_value() || query.offset.has_value();
+}
+
+namespace {
+
+// The levels of the tree: INTERSECT binds tighter than UNION and EXCEPT.
+int Precedence(SetOp op) { return op == SetOp::kIntersect ? 2 : 1; }
+
+// A branch's query as an operand: a parenthesized compound without a WITH list or tail of its own
+// is its tree; anything else is a leaf.
+SetTree Operand(const SetBranch& branch) {
+  const SelectStatement& query = *branch.query;
+  if (!query.set_operation.empty() && query.with.empty() && query.order_by.empty() &&
+      !query.limit.has_value() && !query.offset.has_value()) {
+    SetTree tree = SetOperationTree(query);
+    // Its first leaf follows the operator written before the parentheses.
+    SetTree* first = &tree;
+    while (first->leaf == nullptr) {
+      first = &first->operands.front();
+    }
+    first->op_span = branch.op_span;
+    return tree;
+  }
+  return SetTree{.leaf = &query, .op_span = branch.op_span};
+}
+
+// `left` op `right`: a run of one operator and quantifier. A left operand that is such a run takes
+// the right operand (a left fold either way); a right operand that is such a run is spliced only
+// for UNION, whose run DuckDB types as one list (ADR 0039's Types rule).
+SetTree Combine(SetTree left, SetTree right, const SetBranch& branch) {
+  const auto same = [&](const SetTree& t) {
+    return t.leaf == nullptr && t.op == branch.op && t.all == branch.all;
+  };
+  SetTree run;
+  if (same(left)) {
+    run = std::move(left);
+  } else {
+    run = SetTree{.op = branch.op, .all = branch.all, .op_span = branch.op_span};
+    run.operands.push_back(std::move(left));
+  }
+  if (branch.op == SetOp::kUnion && same(right)) {
+    for (SetTree& operand : right.operands) {
+      run.operands.push_back(std::move(operand));
+    }
+  } else {
+    run.operands.push_back(std::move(right));
+  }
+  return run;
+}
+
+}  // namespace
+
+SetTree SetOperationTree(const SelectStatement& compound) {
+  static_assert(kSetBranchFields == 4, "revisit this walk");
+  const std::vector<SetBranch>& branches = compound.set_operation;
+  // Two levels, each folded to the left: the pending UNION/EXCEPT operand, and the INTERSECT run
+  // being built after it.
+  std::optional<SetTree> outer;
+  const SetBranch* outer_op = nullptr;
+  SetTree term = Operand(branches.front());
+  for (std::size_t i = 1; i < branches.size(); ++i) {
+    const SetBranch& branch = branches[i];
+    if (Precedence(branch.op) == 2) {
+      term = Combine(std::move(term), Operand(branch), branch);
+      continue;
+    }
+    outer = outer.has_value() ? Combine(std::move(*outer), std::move(term), *outer_op)
+                              : std::move(term);
+    outer_op = &branch;
+    term = Operand(branch);
+  }
+  return outer.has_value() ? Combine(std::move(*outer), std::move(term), *outer_op) : term;
 }
 
 std::string_view ToString(Connector connector) {

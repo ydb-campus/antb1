@@ -334,8 +334,8 @@ std::string BlockSql(const SelectStatement& block) {
 }
 
 // A query: its WITH list, each name quoted (WITH "c"("x") AS (...), "d" AS (...)), then its block,
-// or a compound's blocks joined by UNION ALL, then ORDER BY, LIMIT and OFFSET, which are the
-// compound's.
+// or a compound's branches joined by their operators, then ORDER BY, LIMIT and OFFSET, which are
+// the compound's.
 std::string StatementSql(const SelectStatement& stmt) {
   static_assert(kSelectStatementFields == 20, "revisit this walk");
   std::string sql;
@@ -353,8 +353,15 @@ std::string StatementSql(const SelectStatement& stmt) {
   if (stmt.set_operation.empty()) {
     sql += BlockSql(stmt);
   }
+  static_assert(kSetBranchFields == 4, "revisit this walk");
   for (std::size_t i = 0; i < stmt.set_operation.size(); ++i) {
-    sql += (i == 0 ? "" : " UNION ALL ") + BlockSql(*stmt.set_operation[i].query);
+    const SetBranch& branch = stmt.set_operation[i];
+    if (i > 0) {
+      sql += " " + std::string(ToString(branch.op)) + (branch.all ? " ALL " : " ");
+    }
+    // A branch with its own WITH list, compound or tail is written in parentheses (ADR 0039).
+    sql += IsNestedQuery(*branch.query) ? "(" + StatementSql(*branch.query) + ")"
+                                        : BlockSql(*branch.query);
   }
   for (std::size_t i = 0; i < stmt.order_by.size(); ++i) {
     const OrderItem& item = stmt.order_by[i];
