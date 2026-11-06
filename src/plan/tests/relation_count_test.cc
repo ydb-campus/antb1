@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "antb1/common/source_span.h"
 #include "antb1/sql/parser.h"
 
 // The relation count of ADR 0022's limit, on its own: the binder's use of it is pinned by
@@ -279,10 +281,10 @@ TEST(RelationCountTest, CountsANestedBranchAgainstTheLimit) {
   EXPECT_TRUE(Exceeds(sql));
   auto stmt = sql::Parse(sql);
   ASSERT_TRUE(stmt.has_value());
-  const auto over = RelationsExceedLimit(*stmt);
-  ASSERT_TRUE(over.has_value());
-  ASSERT_TRUE(over->span.has_value());
-  EXPECT_EQ(over->span->offset, sql.find("SELECT 1 FROM t1"));
+  const std::optional<RelationOverflow> over = RelationsExceedLimit(*stmt);
+  const std::optional<SourceSpan> span = over.has_value() ? over->span : std::nullopt;
+  ASSERT_TRUE(span.has_value());
+  EXPECT_EQ(span.value_or(SourceSpan{}).offset, sql.find("SELECT 1 FROM t1"));
   // A WITH list of its own: the same.
   EXPECT_TRUE(Exceeds("SELECT 1 FROM t UNION ALL (WITH c AS (SELECT 1 FROM v) " + inner +
                       " UNION ALL " + other + ")"));
