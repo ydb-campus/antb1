@@ -1,7 +1,7 @@
-# UNION ALL's errors and what is not answered yet (ADR 0036): column counts that differ are a bind error in both
-# engines; the other set operations (X4), a UNION ALL's own ORDER BY, LIMIT and OFFSET (X5) and a subquery over a
-# UNION ALL (X6) wait on their roadmap items; values with no exact common type stay DuckDB's; the errors of the
-# blocks a condition rules out (X7a); and divergences D26 and D27.
+# UNION ALL's errors and what is not answered yet (ADR 0036, ADR 0039): column counts that differ are a bind error in
+# both engines; UNION, INTERSECT and EXCEPT (X4b, X4c, X4d) and BY NAME (X4), a compound's own ORDER BY, LIMIT and
+# OFFSET at any depth (X5) and a subquery over a UNION ALL (X6) wait on their roadmap items; values with no exact
+# common type stay DuckDB's; the errors of the blocks a condition rules out (X7a); and divergences D26 and D27.
 
 # ---- the input ----
 
@@ -27,9 +27,9 @@ SELECT ct_id FROM cities UNION ALL SELECT ct_id, label FROM cities UNION ALL SEL
 statement error zn_id
 SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM cities
 
-# ---- the other set operations (ADR 0036's X4) ----
+# ---- the other set operations (ADR 0039's X4b, X4c and X4d; BY NAME stays ADR 0036's X4) ----
 
-pending X4
+pending X4b
 query I rowsort
 SELECT ct_id FROM cities UNION SELECT zn_city FROM zones
 ----
@@ -43,7 +43,7 @@ SMALLINT
 9
 NULL
 
-pending X4
+pending X4b
 query I rowsort
 SELECT ct_id FROM cities UNION DISTINCT SELECT zn_city FROM zones
 ----
@@ -57,7 +57,7 @@ SMALLINT
 9
 NULL
 
-pending X4
+pending X4c
 query I rowsort
 SELECT ct_id FROM cities INTERSECT SELECT zn_city FROM zones
 ----
@@ -68,7 +68,7 @@ SMALLINT
 4
 5
 
-pending X4
+pending X4d
 query I rowsort
 SELECT ct_id FROM cities EXCEPT SELECT zn_city FROM zones
 ----
@@ -89,7 +89,7 @@ SMALLINT
 5
 6
 
-pending X4
+# A parenthesized branch, which ADR 0039's X4a answers for UNION ALL (more in union_all.slt).
 query I rowsort
 SELECT ct_id FROM cities UNION ALL (SELECT zn_city FROM zones WHERE zn_id < 3)
 ----
@@ -126,6 +126,44 @@ query I nosort
 SELECT COUNT(*) FROM (SELECT ct_id FROM cities UNION ALL SELECT zn_city FROM zones OFFSET 40) AS u
 ----
 BIGINT
+6
+
+# A parenthesized compound's own tail is X5's too (ADR 0039's X4a update), and so is a second tail after a
+# parenthesized query that has its own, which would need a compound of one branch; DuckDB answers both.
+
+pending X5
+query I rowsort
+SELECT ct_id FROM cities UNION ALL (SELECT zn_city FROM zones UNION ALL SELECT zn_id FROM zones ORDER BY 1 LIMIT 2)
+----
+INTEGER
+1
+1
+1
+2
+3
+4
+5
+6
+
+pending X5
+query I nosort
+SELECT COUNT(*) FROM ((SELECT ct_id FROM cities LIMIT 4) ORDER BY 1) AS u
+----
+BIGINT
+4
+
+pending X5
+query I rowsort
+SELECT ct_id FROM cities UNION ALL ((SELECT zn_id FROM zones ORDER BY zn_id OFFSET 1) LIMIT 2)
+----
+INTEGER
+1
+2
+2
+3
+3
+4
+5
 6
 
 # ---- a subquery over a UNION ALL (ADR 0036's X6) ----

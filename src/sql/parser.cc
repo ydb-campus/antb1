@@ -137,13 +137,10 @@ constexpr auto kOtherStatements = std::to_array<std::string_view>({
 
 // Clauses that can follow the select list, the FROM list, the predicate or LIMIT. The join keywords
 // are not among them: the FROM list parses them, and elsewhere they are syntax errors, as in
-// DuckDB. Nor is UNION, which joins blocks (ParseCompound): only its forms without ALL are
-// unsupported.
+// DuckDB. Nor are the set operators, which join primaries (ParseCompound, ADR 0039).
 constexpr auto kUnsupportedClauses = std::to_array<Construct>({
-    {.keyword = "EXCEPT", .message = "EXCEPT is not supported"},
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
-    {.keyword = "INTERSECT", .message = "INTERSECT is not supported"},
     {.keyword = "QUALIFY", .message = "QUALIFY is not supported"},
     {.keyword = "USING", .message = "USING SAMPLE is not supported"},
     {.keyword = "WINDOW", .message = "WINDOW is not supported"},
@@ -379,8 +376,8 @@ constexpr std::string_view kTypedLiterals =
     "typed literals other than DATE '...', TIMESTAMP '...' and prefixed strings (E'...') are not "
     "supported";
 
-// The kUnsupported message of a query in parentheses where a block starts (NotAQuery), also of the
-// first block of a compound in an expression's parentheses (ParenthesizedFirstBlock).
+// The kUnsupported message of a query in an expression's parentheses whose first block is a
+// subquery (ParenthesizedFirstBlock, ADR 0036's X6).
 constexpr std::string_view kParenthesizedQuery = "parenthesized queries are not supported";
 
 constexpr std::size_t kMaxQuotedText = 32;
@@ -606,7 +603,8 @@ std::unexpected<ParseError> ReservedQualifier(SourceSpan span, std::string_view 
 bool IsClauseKeyword(std::string_view keyword) {
   return keyword == "FROM" || keyword == "WHERE" || keyword == "GROUP" || keyword == "HAVING" ||
          keyword == "ORDER" || keyword == "LIMIT" || keyword == "OFFSET" || keyword == "INTO" ||
-         keyword == "UNION" || Find(kUnsupportedClauses, keyword).has_value();
+         keyword == "UNION" || keyword == "INTERSECT" || keyword == "EXCEPT" ||
+         Find(kUnsupportedClauses, keyword).has_value();
 }
 
 std::string_view Expectation(Context context) {
@@ -623,9 +621,6 @@ ParseError NotAQuery(const Token& token, bool statement_start) {
   if (Contains(kOtherStatements, keyword)) {
     return UnsupportedError(token.span,
                             keyword + " is not supported; only SELECT queries are supported");
-  }
-  if (token.kind == TokenKind::kLeftParen) {
-    return UnsupportedError(token.span, kParenthesizedQuery);
   }
   if (token.kind == TokenKind::kEnd && statement_start) {
     return SyntaxError(token.span, "empty query; expected SELECT");
@@ -680,48 +675,125 @@ class Parser {
     return stmt;
   }
 
-  // query := [WITH cte (',' cte)*] block (UNION ALL block)* [ORDER BY ...] [LIMIT/OFFSET], ending
-  // at `end`. ORDER BY, LIMIT and OFFSET after a compound's last block are the compound's (ADR
-  // 0036), so the tail is parsed after every block. Its span starts at the WITH.
-  Status ParseQuery(SelectStatement& stmt, BlockEnd end) {
+  // query := [WITH cte (',' cte)*] compound [ORDER BY ...] [LIMIT/OFFSET], ending at `end`, where
+  // compound := primary ((UNION | INTERSECT | EXCEPT) [ALL | DISTINCT] primary)* and primary :=
+  // block | '(' query ')' (ADR 0039). ORDER BY, LIMIT and OFFSET after a compound's last branch are
+  // the compound's (ADR 0036), so the tail is parsed after every branch. A query that is one
+  // parenthesized query is that query (`((q))` is q). A `branch` is a parenthesized primary, whose
+  // NULL items its compound decides on (RejectNullItem). Its span starts at the WITH.
+  Status ParseQuery(SelectStatement& stmt, BlockEnd end, bool branch = false) {
     if (Peek().IsKeyword("WITH")) {
       if (auto status = ParseWith(stmt); !status) {
         return status;
       }
     }
     const BlockScope scope(*this, end);
-    if (!Peek().IsKeyword("SELECT")) {
+    const bool parenthesized = Peek().kind == TokenKind::kLeftParen;
+    if (!parenthesized && !Peek().IsKeyword("SELECT")) {
       return std::unexpected(NotAQuery(Peek(), end == BlockEnd::kStatement && stmt.with.empty()));
     }
     const std::size_t begin = Peek().span.offset;
-    // The first block's own deepest level, apart from the WITH list's: a compound lifts it.
+    // The first primary's own deepest level, apart from the WITH list's: a compound lifts it.
     const std::size_t outer_peak = peak_;
     peak_ = depth_;
-    if (auto status = ParseBlockCore(stmt); !status) {
-      return status;
-    }
-    if (Peek().IsKeyword("UNION")) {
-      if (auto status = ParseCompound(stmt); !status) {
+    // A parenthesized query alone that brings a tail of its own: no tail may follow it (below).
+    bool own_tail = false;
+    // The last primary was written in parentheses: no block clause can follow it.
+    bool closed = parenthesized;
+    if (parenthesized) {
+      auto inner = ParseNestedQuery(/*branch=*/true);
+      if (!inner) {
+        return std::unexpected(std::move(inner.error()));
+      }
+      if (IsSetOperator(Peek())) {
+        if (auto status = ParseCompound(stmt, std::move(inner->query), closed); !status) {
+          return status;
+        }
+      } else if (auto status = Unwrap(stmt, *inner->query); !status) {
         return status;
+      } else {
+        own_tail = !stmt.order_by.empty() || stmt.limit.has_value() || stmt.offset.has_value();
+      }
+    } else {
+      if (auto status = ParseBlockCore(stmt); !status) {
+        return status;
+      }
+      if (IsSetOperator(Peek())) {
+        if (auto status = ParseCompound(stmt, Box<SelectStatement>(TakeBlock(stmt)), closed);
+            !status) {
+          return status;
+        }
       }
     }
     peak_ = std::max(outer_peak, peak_);
+    if (own_tail && IsTailKeyword(Peek())) {
+      return SecondTail(stmt);
+    }
     if (auto status = ParseTail(stmt); !status) {
       return status;
     }
-    if (auto status = RejectNullItem(stmt); !status) {
-      return status;
+    if (!branch) {
+      if (auto status = RejectNullItem(stmt); !status) {
+        return status;
+      }
     }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     if (!stmt.with.empty()) {
       stmt.span = Cover(stmt.with_span, stmt.span);
     }
-    return ParseBlockEnd(stmt.set_operation.empty() ? stmt : *stmt.set_operation.back().query, stmt,
-                         end);
+    // The block whose clauses could still continue: none after a parenthesized primary.
+    const SelectStatement* open = nullptr;
+    if (!closed) {
+      open = stmt.set_operation.empty() ? &stmt : &*stmt.set_operation.back().query;
+    }
+    return ParseBlockEnd(open, stmt, end);
+  }
+
+  static bool IsSetOperator(const Token& token) {
+    return token.IsKeyword("UNION") || token.IsKeyword("INTERSECT") || token.IsKeyword("EXCEPT");
+  }
+
+  static bool IsTailKeyword(const Token& token) {
+    return token.IsKeyword("ORDER") || token.IsKeyword("LIMIT") || token.IsKeyword("OFFSET");
+  }
+
+  // `stmt` (its WITH list, if any) becomes `inner`, a parenthesized query that stands alone. A WITH
+  // list on both sides is DuckDB's parser error.
+  static Status Unwrap(SelectStatement& stmt, SelectStatement& inner) {
+    if (!stmt.with.empty() && !inner.with.empty()) {
+      return Syntax(inner.with_span,
+                    "unexpected WITH: a parenthesized query after a WITH list cannot have a WITH "
+                    "list of its own");
+    }
+    std::vector<CommonTableExpr> with = std::move(stmt.with);
+    const SourceSpan with_span = stmt.with_span;
+    stmt = std::move(inner);
+    if (!with.empty()) {
+      stmt.with = std::move(with);
+      stmt.with_span = with_span;
+    }
+    return {};
+  }
+
+  // ORDER BY, LIMIT or OFFSET after a parenthesized query that has a tail of its own: one clause
+  // twice is DuckDB's parser error; another would need a compound of one branch, which ADR 0039
+  // leaves to X5.
+  Status SecondTail(const SelectStatement& stmt) {
+    const Token& token = Peek();
+    const bool repeated = (token.IsKeyword("ORDER") && !stmt.order_by.empty()) ||
+                          (token.IsKeyword("LIMIT") && stmt.limit.has_value()) ||
+                          (token.IsKeyword("OFFSET") && stmt.offset.has_value());
+    if (repeated) {
+      return Syntax(token.span, "unexpected " + Describe(token) +
+                                    ": the parenthesized query before it has one already");
+    }
+    return Unsupported(token.span,
+                       "ORDER BY, LIMIT or OFFSET after a parenthesized query with its own is not "
+                       "supported");
   }
 
   // A NULL item (ParseSelectItem) of a query that is no compound: DuckDB's NULL type, which no
-  // result column holds in antb1 (ADR 0037's NL3); a UNION ALL branch types it by the others.
+  // result column holds in antb1 (ADR 0037's NL3); a compound's branch types it by the others.
   static Status RejectNullItem(const SelectStatement& stmt) {
     if (!stmt.set_operation.empty()) {
       return {};
@@ -736,58 +808,100 @@ class Parser {
     return {};
   }
 
-  // (UNION ALL block)+, positioned at the UNION after the first block, which `stmt` holds and which
-  // becomes the compound's first branch. Each block of a compound is one level below the query, so
-  // the first one moves down a level once it is known to be a branch -- the depth error at the
-  // first UNION ALL when that is too deep -- and each later one is parsed a level down.
-  Status ParseCompound(SelectStatement& stmt) {
+  // (operator primary)+, positioned at the operator after the first primary, `first`, which becomes
+  // the compound's first branch. Each branch of a compound is one level below the query, so the
+  // first one moves down a level once it is known to be a branch -- the depth error at the first
+  // operator when that is too deep -- and each later one is parsed a level down (a parenthesized
+  // one by ParseNestedQuery, whose '(' is that level).
+  // `closed` ends up telling whether the last branch was written in parentheses.
+  Status ParseCompound(SelectStatement& stmt, Box<SelectStatement> first, bool& closed) {
+    static_assert(kSetBranchFields == 4, "revisit this walk");
     const std::size_t depth = depth_;
     const std::size_t first_peak = peak_;
-    stmt.set_operation.push_back(
-        SetBranch{.query = Box<SelectStatement>(TakeBlock(stmt)), .op_span = {}});
-    while (Peek().IsKeyword("UNION")) {
-      auto op = ParseUnionAll();
+    stmt.set_operation.push_back(SetBranch{.query = std::move(first)});
+    while (IsSetOperator(Peek())) {
+      auto op = ParseSetOperator();
       if (!op) {
         return std::unexpected(std::move(op.error()));
       }
       if (stmt.set_operation.size() == 1) {
-        if (auto error = Lifted(first_peak, *op); error.has_value()) {
+        if (auto error = Lifted(first_peak, op->op_span); error.has_value()) {
           return std::unexpected(std::move(*error));
         }
       }
-      // A level that always fits: the first block's peak, at least this query's level, moved down
-      // it above. So a later block's depth error is where that block passes the limit.
-      ++depth_;
-      peak_ = std::max(peak_, depth_);
-      if (!Peek().IsKeyword("SELECT")) {
-        return std::unexpected(NotAQuery(Peek(), /*statement_start=*/false));
+      if (Peek().kind == TokenKind::kLeftParen) {
+        auto inner = ParseNestedQuery(/*branch=*/true);
+        if (!inner) {
+          return std::unexpected(std::move(inner.error()));
+        }
+        stmt.set_operation.push_back(SetBranch{.query = std::move(inner->query),
+                                               .op = op->op,
+                                               .all = op->all,
+                                               .op_span = op->op_span});
+        closed = true;
+      } else {
+        // A level that always fits: the first branch's peak, at least this query's level, moved
+        // down it above. So a later block's depth error is where that block passes the limit.
+        ++depth_;
+        peak_ = std::max(peak_, depth_);
+        if (Peek().IsKeyword("WITH")) {
+          return Syntax(Peek().span, "unexpected WITH after " + std::string(ToString(op->op)) +
+                                         (op->all ? " ALL" : "") +
+                                         "; a query with a WITH list of its own goes in "
+                                         "parentheses");
+        }
+        if (!Peek().IsKeyword("SELECT")) {
+          return std::unexpected(NotAQuery(Peek(), /*statement_start=*/false));
+        }
+        SelectStatement block;
+        if (auto status = ParseBlockCore(block); !status) {
+          return status;
+        }
+        depth_ = depth;
+        stmt.set_operation.push_back(SetBranch{.query = Box<SelectStatement>(std::move(block)),
+                                               .op = op->op,
+                                               .all = op->all,
+                                               .op_span = op->op_span});
+        closed = false;
       }
-      SelectStatement block;
-      if (auto status = ParseBlockCore(block); !status) {
-        return status;
-      }
-      depth_ = depth;
-      stmt.set_operation.push_back(
-          SetBranch{.query = Box<SelectStatement>(std::move(block)), .op_span = *op});
     }
     return {};
   }
 
-  // UNION ALL, positioned at the UNION: its span. UNION without ALL (DISTINCT included) and BY NAME
-  // are unsupported (ADR 0036's X4).
-  Expected<SourceSpan> ParseUnionAll() {
+  // UNION, INTERSECT or EXCEPT and its ALL or DISTINCT, positioned at the operator. BY NAME after
+  // UNION [ALL | DISTINCT] is unsupported (ADR 0036's X4); after INTERSECT or EXCEPT, and ALL with
+  // DISTINCT, it is DuckDB's syntax error. An operator of a compound: SetBranch without its query.
+  struct SetOperator {
+    SetOp op;
+    bool all;
+    SourceSpan op_span;
+  };
+
+  Expected<SetOperator> ParseSetOperator() {
     const Token keyword = Take();
+    SetOp op = SetOp::kExcept;
+    if (keyword.IsKeyword("UNION")) {
+      op = SetOp::kUnion;
+    } else if (keyword.IsKeyword("INTERSECT")) {
+      op = SetOp::kIntersect;
+    }
+    SetOperator branch{.op = op, .all = false, .op_span = keyword.span};
+    if (Peek().IsKeyword("ALL") || Peek().IsKeyword("DISTINCT")) {
+      branch.all = Peek().IsKeyword("ALL");
+      branch.op_span = Cover(keyword.span, Take().span);
+      if (Peek().IsKeyword("ALL") || Peek().IsKeyword("DISTINCT")) {
+        return Syntax(Peek().span, "unexpected " + Describe(Peek()) + " after " +
+                                       std::string(ToString(branch.op)) +
+                                       (branch.all ? " ALL" : " DISTINCT"));
+      }
+    }
     if (Peek().IsKeyword("BY")) {
-      return Unsupported(keyword.span, "UNION BY NAME is not supported");
+      if (branch.op == SetOp::kUnion) {
+        return Unsupported(Peek().span, "UNION BY NAME is not supported");
+      }
+      return Syntax(Peek().span, "unexpected BY: only UNION takes BY NAME");
     }
-    if (!Peek().IsKeyword("ALL")) {
-      return Unsupported(keyword.span, "UNION without ALL is not supported");
-    }
-    const SourceSpan op = Cover(keyword.span, Take().span);
-    if (Peek().IsKeyword("BY")) {
-      return Unsupported(Peek().span, "UNION BY NAME is not supported");
-    }
-    return op;
+    return branch;
   }
 
   // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
@@ -936,7 +1050,7 @@ class Parser {
   // '(' query ')', positioned at the '(': the query of a derived table or of a CTE, one level below
   // the current one (the depth error at the '('). The statement is built on the heap, so a level
   // of nesting keeps none on the stack.
-  Expected<DerivedTable> ParseNestedQuery() {
+  Expected<DerivedTable> ParseNestedQuery(bool branch = false) {
     const std::size_t depth = depth_;
     const std::size_t outer_peak = peak_;
     if (auto error = Deeper(); error.has_value()) {
@@ -945,7 +1059,7 @@ class Parser {
     peak_ = depth_;
     const SourceSpan open = Take().span;
     DerivedTable out{.query = Box<SelectStatement>(SelectStatement{}), .span = {}};
-    auto status = ParseQuery(*out.query, BlockEnd::kParenthesis);
+    auto status = ParseQuery(*out.query, BlockEnd::kParenthesis, branch);
     depth_ = depth;
     peak_ = std::max(outer_peak, peak_);
     if (!status) {
@@ -3274,7 +3388,7 @@ class Parser {
   // kUnsupportedClauses there is unsupported; anything else is a syntax error that names what may
   // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
   // `query`'s ORDER BY, LIMIT and OFFSET.
-  Status ParseBlockEnd(const SelectStatement& block, const SelectStatement& query, BlockEnd end) {
+  Status ParseBlockEnd(const SelectStatement* block, const SelectStatement& query, BlockEnd end) {
     static_assert(kSelectStatementFields == 20, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
@@ -3294,27 +3408,31 @@ class Parser {
     if (auto construct = Find(kUnsupportedClauses, keyword); construct.has_value()) {
       return Unsupported(token.span, *construct);
     }
-    // A block's UNION is taken before its ORDER BY (ParseQuery), so one here follows the tail: a
-    // syntax error, as in DuckDB.
-    if (keyword == "UNION") {
-      return Syntax(token.span,
-                    "unexpected UNION after ORDER BY, LIMIT or OFFSET; those come after the last "
-                    "query of a UNION ALL and apply to all of it");
+    // A block's set operator is taken before its ORDER BY (ParseQuery), so one here follows the
+    // tail: a syntax error, as in DuckDB.
+    if (IsSetOperator(token)) {
+      return Syntax(token.span, "unexpected " + keyword +
+                                    " after ORDER BY, LIMIT or OFFSET; those come after the last "
+                                    "query of a compound and apply to all of it, and a query with "
+                                    "its own goes in parentheses");
     }
-    // The clauses that could still follow, in grammar order: a UNION ALL follows any block before
-    // the query's ORDER BY, LIMIT and OFFSET.
+    // The clauses that could still follow, in grammar order: a set operator follows any primary
+    // before the query's ORDER BY, LIMIT and OFFSET, and a block's clauses only its open block.
     const bool ordered_or_later =
         !query.order_by.empty() || query.limit.has_value() || query.offset.has_value();
-    const bool grouped_or_later = !block.group_by.empty() || !block.grouping.empty() ||
-                                  !block.having.empty() || ordered_or_later;
+    const bool grouped_or_later = block == nullptr || !block->group_by.empty() ||
+                                  !block->grouping.empty() || !block->having.empty() ||
+                                  ordered_or_later;
     std::vector<std::string_view> next;
     if (!grouped_or_later) {
-      next.emplace_back(block.where.empty() ? "WHERE" : "AND");
+      next.emplace_back(block->where.empty() ? "WHERE" : "AND");
       next.emplace_back("GROUP BY");
     }
     if (!ordered_or_later) {
-      next.emplace_back(block.having.empty() ? "HAVING" : "AND");
-      next.emplace_back("UNION ALL");
+      if (block != nullptr) {
+        next.emplace_back(block->having.empty() ? "HAVING" : "AND");
+      }
+      next.emplace_back("UNION, INTERSECT, EXCEPT");
       next.emplace_back("ORDER BY");
     }
     if (!query.limit.has_value()) {

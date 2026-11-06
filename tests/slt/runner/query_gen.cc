@@ -764,6 +764,13 @@ constexpr unsigned kUnionPercent = 30;
 // Salt of the eighth random stream, which every draw that only a compound needs takes, so that a
 // query without one is the query this seed generated before the compound PR.
 constexpr uint64_t kUnionStreamSalt = 0x756E696F6E2D726EULL;
+// Share of the compounds whose copies are written with parentheses (ADR 0039's X4a): one copy in
+// them, or a run of two, which the binder splices back into the compound.
+constexpr unsigned kSetOpParenthesesPercent = 40;
+// Salt of the random stream which every draw that only a set operation's form needs takes (ADR
+// 0039: parentheses since X4a), so that a query without one is the query this seed generated
+// before.
+constexpr uint64_t kSetOpStreamSalt = 0x7365746F702D726EULL;
 // Share of the projections where a star may stand that take one among their items (`a, *`), of the
 // lone stars that take a second one (`*, t.*`), and of the stars written qualified (`t.*`) where
 // a FROM item can be named.
@@ -913,6 +920,11 @@ struct Binding {
   // The block's copies, joined by UNION ALL (ADR 0036): the same columns of the same table in each,
   // so their types agree, and as many times the table's rows (FromList::rows counts them).
   std::size_t copies = 1;
+  // The copies [paren_first, paren_last] in one pair of parentheses (ADR 0039's X4a); kNoCopy:
+  // none.
+  static constexpr std::size_t kNoCopy = std::numeric_limits<std::size_t>::max();
+  std::size_t paren_first = kNoCopy;
+  std::size_t paren_last = kNoCopy;
 };
 
 // One correlated subquery this query could write (ADR 0023's T3): an equality between a column of
@@ -957,7 +969,8 @@ class Builder {
   // `join_rng`: the query's second stream, which every draw that only a join needs takes.
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
-          Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, FeatureSet allowed)
+          Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -971,6 +984,7 @@ class Builder {
         variance_rng_(variance_rng),
         distinct_rng_(distinct_rng),
         rollup_rng_(rollup_rng),
+        setop_rng_(setop_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1496,6 +1510,13 @@ class Builder {
     if (allowed_.Has(Feature::kUnionAll) && union_rng_.Percent(kUnionPercent)) {
       b.copies = 2 + union_rng_.Below(2);
       from.rows *= static_cast<int64_t>(b.copies);
+      // Now and then parentheses around one copy or a run of two (ADR 0039's X4a), drawn from the
+      // set operations' own stream: the rows are the same.
+      if (allowed_.Has(Feature::kSetOpParentheses) &&
+          setop_rng_.Percent(kSetOpParenthesesPercent)) {
+        b.paren_first = setop_rng_.Below(b.copies);
+        b.paren_last = std::min(b.copies - 1, b.paren_first + setop_rng_.Below(2));
+      }
     }
   }
 
@@ -2713,6 +2734,10 @@ class Builder {
         Keyword("UNION");
         Keyword("ALL");
       }
+      if (copy == b.paren_first) {
+        used_.Add(Feature::kSetOpParentheses);
+        Symbol("(");
+      }
       Keyword("SELECT");
       for (std::size_t i = 0; i < b.inner.size(); ++i) {
         if (i > 0) {
@@ -2725,6 +2750,9 @@ class Builder {
       Keyword("FROM");
       used_.Add(Feature::kTableName);
       tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = b.table->name});
+      if (copy == b.paren_last) {
+        Symbol(")");
+      }
     }
     Symbol(")");
   }
@@ -3964,6 +3992,7 @@ class Builder {
   Rng& variance_rng_;            // the draws that only the variance family needs
   Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
   Rng& rollup_rng_;              // the draws that only grouping sets need
+  Rng& setop_rng_;               // the draws that only a set operation's form needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4172,8 +4201,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng variance_rng(Mix(seed ^ kVarianceStreamSalt));
   Rng distinct_rng(Mix(seed ^ kDistinctStreamSalt));
   Rng rollup_rng(Mix(seed ^ kRollupStreamSalt));
+  Rng setop_rng(Mix(seed ^ kSetOpStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, options.supported)
+               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng,
+               options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4199,12 +4230,13 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng variance_rng(Mix(state ^ kVarianceStreamSalt));
   Rng distinct_rng(Mix(state ^ kDistinctStreamSalt));
   Rng rollup_rng(Mix(state ^ kRollupStreamSalt));
+  Rng setop_rng(Mix(state ^ kSetOpStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q =
       Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, allowed)
+              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

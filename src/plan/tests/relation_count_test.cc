@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <format>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "antb1/common/source_span.h"
 #include "antb1/sql/parser.h"
 
 // The relation count of ADR 0022's limit, on its own: the binder's use of it is pinned by
@@ -260,6 +262,33 @@ TEST(RelationCountTest, CountsACompoundsBlocks) {
   EXPECT_EQ(Count("WITH c AS (SELECT a FROM t UNION ALL SELECT b FROM u) SELECT 1 FROM c"), 3U);
   // The compound's own ORDER BY: its subquery counts one plus its body, after the blocks.
   EXPECT_EQ(Count("SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY (SELECT MAX(c) FROM v)"), 4U);
+}
+
+// A branch in parentheses with a compound of its own (ADR 0039) counts its blocks against the limit
+// too, and is reported at the branch: its FROM items are no block's of the outer compound.
+TEST(RelationCountTest, CountsANestedBranchAgainstTheLimit) {
+  std::string inner = "SELECT 1 FROM t1";
+  for (std::size_t i = 2; i <= 150; ++i) {
+    inner += std::format(", t{}", i);
+  }
+  std::string other = "SELECT 1 FROM u1";
+  for (std::size_t i = 2; i <= 150; ++i) {
+    other += std::format(", u{}", i);
+  }
+  const std::string nested = "(" + inner + " UNION ALL " + other + ")";
+  EXPECT_EQ(Count("SELECT 1 FROM t UNION ALL " + nested), kMaxRelations + 1) << "saturated";
+  const std::string sql = "SELECT 1 FROM t UNION ALL " + nested;
+  EXPECT_TRUE(Exceeds(sql));
+  auto stmt = sql::Parse(sql);
+  ASSERT_TRUE(stmt.has_value());
+  const std::optional<RelationOverflow> over = RelationsExceedLimit(*stmt);
+  const std::optional<SourceSpan> span = over.has_value() ? over->span : std::nullopt;
+  ASSERT_TRUE(span.has_value());
+  EXPECT_EQ(span.value_or(SourceSpan{}).offset, sql.find("SELECT 1 FROM t1"));
+  // A WITH list of its own: the same.
+  EXPECT_TRUE(Exceeds("SELECT 1 FROM t UNION ALL (WITH c AS (SELECT 1 FROM v) " + inner +
+                      " UNION ALL " + other + ")"));
+  EXPECT_EQ(Count("SELECT 1 FROM t UNION ALL (SELECT 1 FROM u UNION ALL SELECT 1 FROM v, w)"), 4U);
 }
 
 // A compound's blocks come before it, since its own clauses follow them in the query; a CTE the

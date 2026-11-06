@@ -748,6 +748,164 @@ TEST(ParserTest, UnionAllCompounds) {
   EXPECT_FALSE(EqualIgnoringSpans(two, parsed("SELECT a FROM t")));
 }
 
+// The set operators (ADR 0039): each branch records the operator written before it and its ALL;
+// DISTINCT is the default, and a parenthesized branch is a plain block unless it has a WITH list,
+// a compound or a tail of its own. A query that is one parenthesized query is that query.
+TEST(ParserTest, SetOperatorsAndParentheses) {
+  constexpr std::string_view kSql =
+      "SELECT a FROM t UNION SELECT a FROM u INTERSECT ALL (SELECT a FROM v) EXCEPT DISTINCT "
+      "(SELECT a FROM w ORDER BY a LIMIT 2) union all (WITH c AS (SELECT a FROM t) SELECT a FROM c "
+      "EXCEPT ALL SELECT a FROM u)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->set_operation.size(), 5U);
+  const std::vector<std::pair<SetOp, bool>> ops = {{SetOp::kUnion, false},
+                                                   {SetOp::kUnion, false},
+                                                   {SetOp::kIntersect, true},
+                                                   {SetOp::kExcept, false},
+                                                   {SetOp::kUnion, true}};
+  const std::vector<std::string_view> op_texts = {"", "UNION", "INTERSECT ALL", "EXCEPT DISTINCT",
+                                                  "union all"};
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    const SetBranch& branch = stmt->set_operation[i];
+    EXPECT_EQ(At(kSql, branch.op_span), op_texts[i]) << i;
+    if (i > 0) {
+      EXPECT_EQ(branch.op, ops[i].first) << i;
+      EXPECT_EQ(branch.all, ops[i].second) << i;
+    }
+  }
+  EXPECT_FALSE(IsNestedQuery(*stmt->set_operation[2].query)) << "(SELECT a FROM v) is a block";
+  EXPECT_EQ(At(kSql, stmt->set_operation[2].query->span), "SELECT a FROM v");
+  const SelectStatement& tail = *stmt->set_operation[3].query;
+  EXPECT_TRUE(IsNestedQuery(tail));
+  EXPECT_EQ(tail.limit, std::optional<std::int64_t>(2));
+  const SelectStatement& with = *stmt->set_operation[4].query;
+  EXPECT_TRUE(IsNestedQuery(with));
+  ASSERT_EQ(with.with.size(), 1U);
+  ASSERT_EQ(with.set_operation.size(), 2U);
+  EXPECT_EQ(with.set_operation[1].op, SetOp::kExcept);
+  EXPECT_TRUE(with.set_operation[1].all);
+  EXPECT_EQ(Depth(*stmt), 3U) << "a column of the nested compound's branches, two levels below";
+  const std::string canonical = ToSql(*stmt);
+  EXPECT_EQ(canonical,
+            "SELECT a FROM t UNION SELECT a FROM u INTERSECT ALL SELECT a FROM v EXCEPT (SELECT a "
+            "FROM w ORDER BY a LIMIT 2) UNION ALL (WITH \"c\" AS (SELECT a FROM t) SELECT a FROM c "
+            "EXCEPT ALL SELECT a FROM u)");
+  auto again = Parse(canonical);
+  ASSERT_TRUE(again.has_value()) << canonical << ": " << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
+
+  const auto parsed = [](std::string_view sql) {
+    auto s = Parse(sql);
+    EXPECT_TRUE(s.has_value()) << sql << ": " << (s.has_value() ? "" : s.error().message);
+    return s.value_or(SelectStatement{});
+  };
+  // DISTINCT is the default; the operators and their ALL tell compounds apart.
+  EXPECT_TRUE(EqualIgnoringSpans(parsed("SELECT a FROM t UNION DISTINCT SELECT a FROM u"),
+                                 parsed("SELECT a FROM t UNION SELECT a FROM u")));
+  EXPECT_FALSE(EqualIgnoringSpans(parsed("SELECT a FROM t UNION SELECT a FROM u"),
+                                  parsed("SELECT a FROM t UNION ALL SELECT a FROM u")));
+  EXPECT_FALSE(EqualIgnoringSpans(parsed("SELECT a FROM t INTERSECT SELECT a FROM u"),
+                                  parsed("SELECT a FROM t EXCEPT SELECT a FROM u")));
+  // Parentheses around a plain block are no nesting; around a whole query they are none either,
+  // and the query's own tail and a WITH list before them stay.
+  EXPECT_TRUE(EqualIgnoringSpans(parsed("(SELECT a FROM t) UNION ALL ((SELECT a FROM u))"),
+                                 parsed("SELECT a FROM t UNION ALL SELECT a FROM u")));
+  EXPECT_TRUE(EqualIgnoringSpans(parsed("((SELECT a FROM t WHERE a > 1))"),
+                                 parsed("SELECT a FROM t WHERE a > 1")));
+  EXPECT_TRUE(EqualIgnoringSpans(parsed("(SELECT a FROM t) ORDER BY 1 LIMIT 3"),
+                                 parsed("SELECT a FROM t ORDER BY 1 LIMIT 3")));
+  EXPECT_TRUE(EqualIgnoringSpans(parsed("WITH c AS (SELECT a FROM t) (SELECT a FROM c)"),
+                                 parsed("WITH c AS (SELECT a FROM t) SELECT a FROM c")));
+  EXPECT_TRUE(
+      EqualIgnoringSpans(parsed("SELECT a FROM ((SELECT a FROM t) UNION ALL SELECT a FROM u) s"),
+                         parsed("SELECT a FROM (SELECT a FROM t UNION ALL SELECT a FROM u) s")));
+  // A parenthesized compound stays a branch of its own: the tree, not the list, splices it.
+  const SelectStatement nested =
+      parsed("SELECT a FROM t UNION ALL (SELECT a FROM u UNION ALL SELECT a FROM v)");
+  ASSERT_EQ(nested.set_operation.size(), 2U);
+  EXPECT_EQ(nested.set_operation[1].query->set_operation.size(), 2U);
+}
+
+// The tree of a compound follows DuckDB's parse (checked with json_serialize_sql on DuckDB 1.5.6):
+// INTERSECT binds tighter, UNION and EXCEPT associate to the left, a chain of one operator and
+// quantifier is one run, and a parenthesized run of UNION or of UNION ALL is spliced into its
+// parent run (ADR 0039). A leaf prints its table, `nested` a parenthesized query with its own WITH
+// or tail.
+TEST(ParserTest, SetOperationTreeFollowsDuckDb) {
+  const std::function<std::string(const SetTree&)> text = [&](const SetTree& tree) {
+    if (tree.leaf != nullptr) {
+      if (IsNestedQuery(*tree.leaf)) {
+        return std::string("nested");
+      }
+      return std::get<TableRef>(tree.leaf->from.at(0).source).name;
+    }
+    std::string out = "(" + std::string(ToString(tree.op)) + (tree.all ? " ALL" : "");
+    for (const SetTree& operand : tree.operands) {
+      out += " " + text(operand);
+    }
+    return out + ")";
+  };
+  const std::vector<std::pair<std::string_view, std::string_view>> cases = {
+      {"SELECT x FROM a UNION SELECT x FROM b INTERSECT SELECT x FROM c",
+       "(UNION a (INTERSECT b c))"},
+      {"SELECT x FROM c EXCEPT SELECT x FROM a INTERSECT SELECT x FROM b",
+       "(EXCEPT c (INTERSECT a b))"},
+      {"SELECT x FROM a EXCEPT SELECT x FROM b UNION SELECT x FROM c", "(UNION (EXCEPT a b) c)"},
+      {"SELECT x FROM a EXCEPT SELECT x FROM b EXCEPT SELECT x FROM c", "(EXCEPT a b c)"},
+      {"SELECT x FROM a UNION ALL SELECT x FROM b UNION SELECT x FROM c",
+       "(UNION (UNION ALL a b) c)"},
+      {"SELECT x FROM a UNION SELECT x FROM b UNION ALL SELECT x FROM c",
+       "(UNION ALL (UNION a b) c)"},
+      {"SELECT x FROM a UNION ALL SELECT x FROM b INTERSECT SELECT x FROM c",
+       "(UNION ALL a (INTERSECT b c))"},
+      {"SELECT x FROM a INTERSECT ALL SELECT x FROM b EXCEPT ALL SELECT x FROM c",
+       "(EXCEPT ALL (INTERSECT ALL a b) c)"},
+      {"SELECT x FROM c EXCEPT ALL SELECT x FROM a INTERSECT ALL SELECT x FROM b",
+       "(EXCEPT ALL c (INTERSECT ALL a b))"},
+      {"SELECT x FROM a UNION ALL (SELECT x FROM b UNION ALL SELECT x FROM c)",
+       "(UNION ALL a b c)"},
+      {"SELECT x FROM a UNION (SELECT x FROM b UNION SELECT x FROM c)", "(UNION a b c)"},
+      {"SELECT x FROM a UNION ALL (SELECT x FROM b UNION SELECT x FROM c)",
+       "(UNION ALL a (UNION b c))"},
+      {"SELECT x FROM a INTERSECT (SELECT x FROM b INTERSECT SELECT x FROM c)",
+       "(INTERSECT a (INTERSECT b c))"},
+      {"SELECT x FROM a EXCEPT (SELECT x FROM b EXCEPT SELECT x FROM c)",
+       "(EXCEPT a (EXCEPT b c))"},
+      {"(SELECT x FROM a UNION SELECT x FROM b) EXCEPT SELECT x FROM c", "(EXCEPT (UNION a b) c)"},
+      {"SELECT x FROM a UNION DISTINCT SELECT x FROM b UNION SELECT x FROM c", "(UNION a b c)"},
+      {"SELECT x FROM a UNION SELECT x FROM b INTERSECT SELECT x FROM c INTERSECT SELECT x FROM d "
+       "EXCEPT SELECT x FROM e",
+       "(EXCEPT (UNION a (INTERSECT b c d)) e)"},
+      {"SELECT x FROM a UNION ALL (SELECT x FROM b UNION ALL SELECT x FROM c LIMIT 5)",
+       "(UNION ALL a nested)"},
+      {"SELECT x FROM a UNION ALL (WITH w AS (SELECT x FROM d) SELECT x FROM b UNION ALL SELECT x "
+       "FROM c)",
+       "(UNION ALL a nested)"},
+      {"(SELECT x FROM a INTERSECT SELECT x FROM b) INTERSECT SELECT x FROM c",
+       "(INTERSECT a b c)"},
+      {"SELECT x FROM a EXCEPT SELECT x FROM b UNION ALL SELECT x FROM c EXCEPT SELECT x FROM d",
+       "(EXCEPT (UNION ALL (EXCEPT a b) c) d)"},
+  };
+  for (const auto& [sql, expected] : cases) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    const SetTree tree = SetOperationTree(*stmt);
+    EXPECT_EQ(text(tree), expected) << sql;
+  }
+  // A leaf keeps the operator written before it, a run the one before its second operand.
+  constexpr std::string_view kSql =
+      "SELECT x FROM a UNION ALL (SELECT x FROM b UNION ALL SELECT x FROM c)";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value());
+  const SetTree tree = SetOperationTree(*stmt);
+  ASSERT_EQ(tree.operands.size(), 3U);
+  EXPECT_EQ(tree.operands[0].op_span, SourceSpan{});
+  EXPECT_EQ(At(kSql, tree.operands[1].op_span), "UNION ALL");
+  EXPECT_EQ(tree.operands[2].op_span.offset, kSql.find("UNION ALL SELECT x FROM c"));
+  EXPECT_EQ(tree.op_span.offset, kSql.find("UNION ALL"));
+}
+
 // A compound wherever a nested query stands (ADR 0036): a CTE's query, a scalar subquery, a derived
 // table, IN and EXISTS. Each holder's span runs through its ')', its query's through the compound's
 // tail, and each block's through its own last clause: the tail is the compound's, no block's.
@@ -2907,8 +3065,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "VALUES is not supported; only SELECT queries are supported"},
         RejectCase{"SubqueryFromFirst", "SELECT a FROM (^FROM events)", kUnsupported, 4,
                    "FROM-first queries are not supported"},
-        RejectCase{"SubqueryParenthesized", "SELECT a FROM (^(SELECT 1))", kUnsupported, 1,
-                   "parenthesized queries are not supported"},
+        RejectCase{"SubqueryParenthesized", "SELECT a FROM ((SELECT 1^))", kUnsupported, 1,
+                   "SELECT without FROM is not supported"},
         // In two pairs of parentheses a table or a path starts a join, and what starts a query in
         // one pair starts one in two; within three tokens VALUES does (it is a query in DuckDB
         // before '(').
@@ -2923,14 +3081,14 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DoublyParenthesizedJoinOfAQualifiedTable",
                    "SELECT a FROM ^((over.x CROSS JOIN u))", kUnsupported, 1,
                    "parenthesized joins in FROM are not supported"},
-        RejectCase{"DoublyParenthesizedValues", "SELECT a FROM (^(values (1)))", kUnsupported, 1,
-                   "parenthesized queries are not supported"},
-        RejectCase{"DoublyParenthesizedJoinOfValues", "SELECT a FROM (^(values JOIN u ON a = b))",
-                   kUnsupported, 1, "parenthesized queries are not supported"},
-        RejectCase{"DoublyParenthesizedDescribe", "SELECT a FROM (^(describe events))",
-                   kUnsupported, 1, "parenthesized queries are not supported"},
-        RejectCase{"DoublyParenthesizedPivotWider", "SELECT a FROM (^(PIVOT_WIDER events ON a))",
-                   kUnsupported, 1, "parenthesized queries are not supported"},
+        RejectCase{"DoublyParenthesizedValues", "SELECT a FROM ((^values (1)))", kUnsupported, 6,
+                   "VALUES is not supported"},
+        RejectCase{"DoublyParenthesizedJoinOfValues", "SELECT a FROM ((^values JOIN u ON a = b))",
+                   kUnsupported, 6, "VALUES is not supported"},
+        RejectCase{"DoublyParenthesizedDescribe", "SELECT a FROM ((^describe events))",
+                   kUnsupported, 8, "DESCRIBE is not supported"},
+        RejectCase{"DoublyParenthesizedPivotWider", "SELECT a FROM ((^PIVOT_WIDER events ON a))",
+                   kUnsupported, 11, "PIVOT_WIDER is not supported"},
         RejectCase{"SubqueryWith", "SELECT a FROM (WITH x AS (SELECT 1^) SELECT * FROM x)",
                    kUnsupported, 1, "SELECT without FROM is not supported"},
         RejectCase{"SubqueryTable", "SELECT a FROM (^TABLE events)", kUnsupported, 5,
@@ -2963,12 +3121,8 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "a trailing comma in GROUP BY is not supported"},
         RejectCase{"SubqueryTrailingCommaInOrderBy", "SELECT a FROM (SELECT a FROM t ORDER BY a^,)",
                    kUnsupported, 1, "a trailing comma in ORDER BY is not supported"},
-        RejectCase{"SubqueryUnion", "SELECT a FROM (SELECT a FROM t ^UNION SELECT a FROM u)",
-                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"SubqueryFetch", "SELECT a FROM (SELECT a FROM t ^FETCH FIRST 1 ROWS ONLY) s",
                    kUnsupported, 5, "FETCH is not supported"},
-        RejectCase{"UnionAfterSubquery", "SELECT a FROM (SELECT a FROM t) s ^UNION SELECT a FROM u",
-                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"SubqueryInSubquery", "SELECT a FROM (SELECT a FROM (^VALUES (1)) v) w",
                    kUnsupported, 6, "VALUES is not supported"},
         // After a derived table, what DuckDB gives a meaning there (not AT: time travel reads a
@@ -3057,10 +3211,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "WITH c AS (^pivot_longer t ON a INTO NAME k VALUE v) SELECT * FROM c",
                    kUnsupported, 12,
                    "PIVOT_LONGER is not supported; only SELECT queries are supported"},
-        RejectCase{"CteParenthesizedQuery", "WITH c AS (^(SELECT a FROM t)) SELECT a FROM c",
-                   kUnsupported, 1, "parenthesized queries are not supported"},
-        RejectCase{"CteUnion", "WITH c AS (SELECT a FROM t ^UNION SELECT a FROM u) SELECT a FROM c",
-                   kUnsupported, 5, "UNION without ALL is not supported"},
         RejectCase{"FromFirstAfterWith", "WITH c AS (SELECT a FROM t) ^FROM c", kUnsupported, 4,
                    "FROM-first queries are not supported"},
         RejectCase{"ValuesAfterWith", "WITH c AS (SELECT a FROM t) ^VALUES (1)", kUnsupported, 6,
@@ -3072,10 +3222,6 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"PivotLongerAfterWith",
                    "WITH c AS (SELECT a FROM t) ^Pivot_Longer c ON a INTO NAME k VALUE v",
                    kUnsupported, 12, "PIVOT_LONGER is not supported"},
-        RejectCase{"ParenthesizedQueryAfterWith", "WITH c AS (SELECT a FROM t) ^(SELECT a FROM c)",
-                   kUnsupported, 1, "parenthesized queries are not supported"},
-        RejectCase{"UnionAfterWith", "WITH c AS (SELECT a FROM t) SELECT a FROM c ^UNION SELECT 1",
-                   kUnsupported, 5, "UNION without ALL is not supported"},
         // Reported at their first token, where DuckDB gives a syntax error (docs/sql-subset.md).
         RejectCase{"SubqueryCutShort", "SELECT a FROM (SELECT 1^", kUnsupported, 0,
                    "SELECT without FROM is not supported"},
@@ -3168,8 +3314,6 @@ INSTANTIATE_TEST_SUITE_P(
                    2, "AT TIME ZONE is not supported"},
         RejectCase{"AtTimeZoneInWhere", "SELECT a FROM events WHERE ts ^at time zone 'UTC' = 1",
                    kUnsupported, 2, "AT TIME ZONE is not supported"},
-        RejectCase{"Union", "SELECT a FROM events ^UNION SELECT a FROM users", kUnsupported, 5,
-                   "UNION without ALL is not supported"},
         // UNION ALL parses (ADR 0036): its second block is what lacks a FROM.
         RejectCase{"UnionAllAfterWhere", "SELECT a FROM events WHERE a = 1 UNION ALL SELECT 1^",
                    kUnsupported, 0, "SELECT without FROM is not supported"},
@@ -3179,27 +3323,21 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT a FROM (SELECT a FROM t UNION ALL SELECT 1^)", kUnsupported, 1,
                    "SELECT without FROM is not supported"},
         // The forms of a set operation other than UNION ALL (ADR 0036's X4).
-        RejectCase{"UnionDistinct", "SELECT a FROM t ^UNION DISTINCT SELECT a FROM u", kUnsupported,
-                   5, "UNION without ALL is not supported"},
-        RejectCase{"UnionByName", "SELECT a FROM t ^UNION BY NAME SELECT a FROM u", kUnsupported, 5,
+        RejectCase{"UnionByName", "SELECT a FROM t UNION ^BY NAME SELECT a FROM u", kUnsupported, 2,
                    "UNION BY NAME is not supported"},
+        RejectCase{"UnionDistinctByName", "SELECT a FROM t UNION DISTINCT ^BY NAME SELECT a FROM u",
+                   kUnsupported, 2, "UNION BY NAME is not supported"},
+        // An ORDER BY, LIMIT or OFFSET after a parenthesized query that has its own would need a
+        // compound of one branch (ADR 0039: X5); DuckDB answers it.
+        RejectCase{"SecondTail", "(SELECT a FROM t LIMIT 5) ^ORDER BY 1", kUnsupported, 5,
+                   "ORDER BY, LIMIT or OFFSET after a parenthesized query with its own"},
+        RejectCase{"SecondTailOfABranch",
+                   "SELECT a FROM t UNION ALL ((SELECT a FROM u OFFSET 1) ^LIMIT 2)", kUnsupported,
+                   5, "ORDER BY, LIMIT or OFFSET after a parenthesized query with its own"},
         RejectCase{"UnionAllByName", "SELECT a FROM t UNION ALL ^BY NAME SELECT a FROM u",
                    kUnsupported, 2, "UNION BY NAME is not supported"},
-        RejectCase{"UnionAfterUnionAll",
-                   "SELECT a FROM t UNION ALL SELECT a FROM u ^UNION SELECT a FROM v", kUnsupported,
-                   5, "UNION without ALL is not supported"},
-        RejectCase{"IntersectAfterUnionAll",
-                   "SELECT a FROM t UNION ALL SELECT a FROM u ^INTERSECT SELECT a FROM v",
-                   kUnsupported, 9, "INTERSECT is not supported"},
-        RejectCase{"ExceptInACompoundCte",
-                   "WITH c AS (SELECT a FROM t UNION ALL SELECT a FROM u ^EXCEPT SELECT a FROM v) "
-                   "SELECT a FROM c",
-                   kUnsupported, 6, "EXCEPT is not supported"},
         // A block of a compound is a SELECT block: no parentheses, VALUES, FROM-first query or
         // DISTINCT (ADR 0036).
-        RejectCase{"ParenthesizedBlockAfterUnionAll",
-                   "SELECT a FROM t UNION ALL ^(SELECT a FROM u)", kUnsupported, 1,
-                   "parenthesized queries are not supported"},
         RejectCase{"ValuesAfterUnionAll", "SELECT a FROM t UNION ALL ^VALUES (1)", kUnsupported, 6,
                    "VALUES is not supported; only SELECT queries are supported"},
         RejectCase{"FromFirstAfterUnionAll", "SELECT a FROM t UNION ALL ^FROM u SELECT a",
@@ -3234,10 +3372,6 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"ParenthesizedBlockOfANotInSubqueryBeforeOffset",
                    "SELECT a FROM t WHERE a NOT IN (^(SELECT b FROM u) OFFSET 1)", kUnsupported, 1,
                    "parenthesized queries are not supported"},
-        RejectCase{"Intersect", "SELECT a FROM events ^INTERSECT SELECT a FROM users", kUnsupported,
-                   9, "INTERSECT is not supported"},
-        RejectCase{"Except", "SELECT a FROM events ^EXCEPT SELECT a FROM users", kUnsupported, 6,
-                   "EXCEPT is not supported"},
         RejectCase{"LikeEscape", "SELECT a FROM events WHERE url LIKE 'x!%' ^ESCAPE '!'",
                    kUnsupported, 6, "LIKE ... ESCAPE is not supported"},
         RejectCase{"ILike", "SELECT a FROM events WHERE url ^ILIKE '%x%'", kUnsupported, 5,
@@ -3291,8 +3425,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "string concatenation (||) is not supported"},
         RejectCase{"TableFunction", "SELECT * FROM ^read_parquet('x.parquet')", kUnsupported, 12,
                    "table functions are not supported"},
-        RejectCase{"ParenthesizedQuery", "^(SELECT a FROM events)", kUnsupported, 1,
-                   "parenthesized queries are not supported"},
         RejectCase{"Any", "SELECT a FROM events WHERE a = ^ANY (SELECT 1)", kUnsupported, 3,
                    "ANY (quantified comparisons) is not supported"},
         RejectCase{"MultipleStatements", "SELECT a FROM events; ^SELECT b FROM events",
@@ -3652,13 +3784,43 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 5, "unexpected UNION after ORDER BY, LIMIT or OFFSET"},
         RejectCase{"UnionAllAtTheEnd", "SELECT a FROM t UNION ALL^", kSyntax, 0,
                    "expected SELECT, found end of input"},
+        // The set operators' syntax errors, as in DuckDB (ADR 0039).
+        RejectCase{"IntersectByName", "SELECT a FROM t INTERSECT ^BY NAME SELECT a FROM u", kSyntax,
+                   2, "unexpected BY: only UNION takes BY NAME"},
+        RejectCase{"ExceptAllByName", "SELECT a FROM t EXCEPT ALL ^BY NAME SELECT a FROM u",
+                   kSyntax, 2, "unexpected BY: only UNION takes BY NAME"},
+        RejectCase{"UnionDistinctAll", "SELECT a FROM t UNION DISTINCT ^ALL SELECT a FROM u",
+                   kSyntax, 3, "unexpected keyword ALL after UNION DISTINCT"},
+        RejectCase{"UnionEmptyParentheses", "SELECT a FROM t UNION (^)", kSyntax, 1,
+                   "expected SELECT, found ')'"},
+        RejectCase{"IntersectWith",
+                   "SELECT a FROM t INTERSECT ^WITH c AS (SELECT a FROM t) SELECT a FROM c",
+                   kSyntax, 4, "unexpected WITH after INTERSECT; a query with a WITH list"},
+        RejectCase{"IntersectAfterTail", "SELECT a FROM t LIMIT 1 ^INTERSECT SELECT a FROM u",
+                   kSyntax, 9, "unexpected INTERSECT after ORDER BY, LIMIT or OFFSET"},
+        RejectCase{"ExceptAfterAParenthesizedTail",
+                   "(SELECT a FROM t UNION ALL SELECT a FROM u) LIMIT 1 ^EXCEPT SELECT a FROM v",
+                   kSyntax, 6, "unexpected EXCEPT after ORDER BY, LIMIT or OFFSET"},
+        RejectCase{"WithBeforeAParenthesizedWith",
+                   "WITH c AS (SELECT a FROM t) (^WITH d AS (SELECT a FROM c) SELECT a FROM d)",
+                   kSyntax, 4, "unexpected WITH: a parenthesized query after a WITH list"},
+        RejectCase{"WhereAfterAParenthesizedBranch",
+                   "SELECT a FROM t UNION ALL (SELECT a FROM u) ^WHERE a = 1", kSyntax, 5,
+                   "unexpected keyword WHERE; expected UNION, INTERSECT, EXCEPT, ORDER BY, LIMIT, "
+                   "OFFSET or the end of the query"},
+        RejectCase{"RepeatedLimitAfterParentheses", "(SELECT a FROM t LIMIT 5) ^LIMIT 1", kSyntax,
+                   5,
+                   "unexpected keyword LIMIT: the parenthesized query before it has one already"},
+        // DuckDB spells it EXCLUDE: EXCEPT ends the select list there.
+        RejectCase{"StarExcept", "SELECT * ^EXCEPT (a) FROM t", kSyntax, 6,
+                   "'*' needs a FROM clause, found keyword EXCEPT"},
         RejectCase{"UnionAllAll", "SELECT a FROM t UNION ALL ^ALL SELECT a FROM u", kSyntax, 3,
-                   "expected SELECT, found keyword ALL"},
+                   "unexpected keyword ALL after UNION ALL"},
         RejectCase{"UnionAllDistinct", "SELECT a FROM t UNION ALL ^DISTINCT SELECT a FROM u",
-                   kSyntax, 8, "expected SELECT, found keyword DISTINCT"},
+                   kSyntax, 8, "unexpected keyword DISTINCT after UNION ALL"},
         RejectCase{"UnionAllWith",
                    "SELECT a FROM t UNION ALL ^WITH c AS (SELECT a FROM t) SELECT a FROM c",
-                   kSyntax, 4, "expected SELECT, found keyword WITH"},
+                   kSyntax, 4, "unexpected WITH after UNION ALL; a query with a WITH list"},
         RejectCase{"UnionAllBeforeAParen", "SELECT a FROM (SELECT a FROM t UNION ALL ^)", kSyntax,
                    1, "expected SELECT, found ')'"},
         // A set operation after a subquery starts a compound (whose parenthesized first block is
@@ -3777,7 +3939,8 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"ReservedInWhere", "SELECT a FROM events WHERE ^LIMIT 5", kSyntax, 5,
                    "expected an expression, found keyword LIMIT"},
         RejectCase{"MissingOperator", "SELECT a FROM events WHERE a ^b", kSyntax, 1,
-                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION, INTERSECT, "
+                   "EXCEPT, ORDER BY, "
                    "LIMIT, OFFSET or the end of the query"},
         RejectCase{"DoubleEquals", "SELECT a FROM events WHERE a = ^= 1", kSyntax, 1,
                    "expected an expression, found '='"},
@@ -3824,13 +3987,15 @@ INSTANTIATE_TEST_SUITE_P(
                    "unexpected identifier ROWS; expected OFFSET or the end of the query"},
         RejectCase{"QuotedRowsAfterOffset", "SELECT a FROM events OFFSET 5 ^\"ROWS\"", kSyntax, 6,
                    "unexpected quoted identifier; expected LIMIT or the end of the query"},
-        RejectCase{"DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
-                   "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, UNION ALL, "
-                   "ORDER BY, LIMIT, OFFSET or the end of the query"},
+        RejectCase{
+            "DuplicateWhere", "SELECT a FROM events WHERE a = 1 ^WHERE b = 2", kSyntax, 5,
+            "unexpected keyword WHERE; expected AND, GROUP BY, HAVING, UNION, INTERSECT, EXCEPT, "
+            "ORDER BY, LIMIT, OFFSET or the end of the query"},
         RejectCase{"DuplicateLimit", "SELECT a FROM events LIMIT 1 ^LIMIT 2", kSyntax, 5,
                    "unexpected keyword LIMIT; expected OFFSET or the end of the query"},
         RejectCase{"StrayParen", "SELECT a FROM events^)", kSyntax, 1,
-                   "unexpected ')'; expected WHERE, GROUP BY, HAVING, UNION ALL, ORDER BY, LIMIT, "
+                   "unexpected ')'; expected WHERE, GROUP BY, HAVING, UNION, INTERSECT, EXCEPT, "
+                   "ORDER BY, LIMIT, "
                    "OFFSET or the end of the query"},
         RejectCase{"GroupWithoutBy", "SELECT a FROM events GROUP ^a", kSyntax, 1,
                    "expected BY after GROUP, found identifier a"},
@@ -3851,11 +4016,13 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"GroupByAfterOrderBy", "SELECT a FROM events ORDER BY a ^GROUP BY a", kSyntax, 5,
                    "unexpected keyword GROUP; expected LIMIT, OFFSET or the end of the query"},
         RejectCase{"WhereAfterGroupBy", "SELECT a FROM events GROUP BY a ^WHERE a = 1", kSyntax, 5,
-                   "unexpected keyword WHERE; expected HAVING, UNION ALL, ORDER BY, LIMIT, OFFSET "
+                   "unexpected keyword WHERE; expected HAVING, UNION, INTERSECT, EXCEPT, ORDER BY, "
+                   "LIMIT, OFFSET "
                    "or the end of the query"},
         RejectCase{"GroupByAfterHaving", "SELECT a FROM events HAVING COUNT(*) > 1 ^GROUP BY a",
                    kSyntax, 5,
-                   "unexpected keyword GROUP; expected AND, UNION ALL, ORDER BY, LIMIT, OFFSET or "
+                   "unexpected keyword GROUP; expected AND, UNION, INTERSECT, EXCEPT, ORDER BY, "
+                   "LIMIT, OFFSET or "
                    "the end of the query"},
         RejectCase{"HavingAfterOrderBy", "SELECT a FROM events ORDER BY a ^HAVING COUNT(*) > 1",
                    kSyntax, 6, "unexpected keyword HAVING; expected LIMIT, OFFSET or the end"},
@@ -4022,7 +4189,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected ',' or FROM, found keyword JOIN"},
         RejectCase{"JoinAfterWhere", "SELECT a FROM events WHERE a = 1 ^JOIN users ON a = b",
                    kSyntax, 4,
-                   "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "unexpected keyword JOIN; expected AND, GROUP BY, HAVING, UNION, INTERSECT, "
+                   "EXCEPT, ORDER BY, "
                    "LIMIT, OFFSET or the end of the query"},
         // A join keyword after a list comma is no clause, so the comma is no trailing comma.
         RejectCase{"JoinAfterSelectComma", "SELECT a, ^JOIN FROM events", kSyntax, 4,
@@ -4139,14 +4307,16 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"DotAtEnd", "SELECT e.^", kSyntax, 0,
                    "expected a column name after '.', found end of input"},
         // Derived tables and WITH lists where DuckDB gives a syntax error too.
-        RejectCase{"SubqueryUnclosed", "SELECT a FROM (SELECT a FROM t^", kSyntax, 0,
-                   "unexpected end of input; expected WHERE, GROUP BY, HAVING, UNION ALL, "
-                   "ORDER BY, LIMIT, OFFSET or ')'"},
+        RejectCase{
+            "SubqueryUnclosed", "SELECT a FROM (SELECT a FROM t^", kSyntax, 0,
+            "unexpected end of input; expected WHERE, GROUP BY, HAVING, UNION, INTERSECT, EXCEPT, "
+            "ORDER BY, LIMIT, OFFSET or ')'"},
         // A UNION ALL may follow any block before the compound's tail, in a nested query too.
         RejectCase{"MissingOperatorInACompoundInADerivedTable",
                    "SELECT a FROM (SELECT a FROM t UNION ALL SELECT a FROM u WHERE a = 1 ^b)",
                    kSyntax, 1,
-                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION ALL, ORDER BY, "
+                   "unexpected identifier b; expected AND, GROUP BY, HAVING, UNION, INTERSECT, "
+                   "EXCEPT, ORDER BY, "
                    "LIMIT, OFFSET or ')'"},
         RejectCase{"SubquerySemicolon", "SELECT a FROM (SELECT a FROM t ORDER BY a^;)", kSyntax, 1,
                    "unexpected ';'; expected LIMIT, OFFSET or ')'"},
@@ -4602,21 +4772,16 @@ TEST(ParserRobustnessTest, MegabyteOfParentheses) {
     auto result = Parse(sql);
     ASSERT_FALSE(result.has_value()) << prefix;
     EXPECT_EQ(result.error().kind, ParseError::Kind::kUnsupported) << prefix;
-    // In an expression (ON too) the parentheses nest up to the depth limit; a query and LIMIT take
-    // none, and in FROM the first opens a derived table, whose query a '(' cannot start.
-    const bool expression = !prefix.empty() && !prefix.ends_with("FROM ") &&
-                            !prefix.ends_with("JOIN ") && !prefix.ends_with("LIMIT ");
-    const bool from_item = prefix.ends_with("FROM ") || prefix.ends_with("JOIN ");
+    // In an expression (ON too) the parentheses nest up to the depth limit, and so do the
+    // parenthesized queries where a query starts (ADR 0039), in FROM after the derived table's
+    // first; LIMIT takes none.
+    const bool nesting = !prefix.ends_with("LIMIT ");
     const SourceSpan span = result.error().span;
     EXPECT_EQ(span.length, 1U) << prefix;
-    if (expression) {
+    if (nesting) {
       EXPECT_GT(span.offset, prefix.size()) << prefix;
       EXPECT_LE(span.offset, prefix.size() + 256) << prefix;
       EXPECT_TRUE(result.error().message.starts_with("expressions deeper than 256 levels"))
-          << result.error().message;
-    } else if (from_item) {
-      EXPECT_EQ(span.offset, prefix.size() + 1) << prefix;
-      EXPECT_TRUE(result.error().message.starts_with("parenthesized queries are not supported"))
           << result.error().message;
     } else {
       EXPECT_EQ(span.offset, prefix.size()) << prefix;

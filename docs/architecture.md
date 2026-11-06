@@ -106,9 +106,10 @@ steps (only step 7 uses more than one thread):
    by precedence climbing with a depth limit, and the FROM clause is a flat list of items (tables, paths or derived
    tables, with their aliases and joins). A derived table and each query of a `WITH` list are `SelectStatement`s of
    their own, held in heap boxes, and every such nested query counts against the same depth limit. A compound
-   (blocks joined by `UNION ALL`) keeps its blocks in a flat list of boxes, each one level below it, and owns the
-   `WITH` list before them and the `ORDER BY`, `LIMIT` and `OFFSET` after them
-   ([ADR 0036](adr/0036-union-all.md)). Syntax outside the
+   (branches joined by `UNION`, `INTERSECT` or `EXCEPT`, each a block or a parenthesized query) keeps its branches in a
+   flat list of boxes, each with the operator written before it and one level below it, and owns the `WITH` list
+   before them and the `ORDER BY`, `LIMIT` and `OFFSET` after them ([ADR 0036](adr/0036-union-all.md),
+   [ADR 0039](adr/0039-set-operations.md)); `sql::SetOperationTree` gives DuckDB's tree of it. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an
@@ -125,8 +126,11 @@ steps (only step 7 uses more than one thread):
    a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*` names a
    FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT column
    instead, whose fields DuckDB expands). A `UNION ALL` binds
-   each of its blocks so, in its own CTE frame and scope, then folds their types into one `UnionAll` node, casting
-   below it the blocks of another type ([ADR 0036](adr/0036-union-all.md)). Columns resolve there,
+   each leaf of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of
+   `UNION ALL` is spliced into the run around it), in its own CTE frame and scope, then folds their types into one
+   `UnionAll` node, casting below it the leaves of another type ([ADR 0036](adr/0036-union-all.md),
+   [ADR 0039](adr/0039-set-operations.md)); the other set operators exit 4 until ADR 0037's X4b to X4d.
+   Columns resolve there,
    an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
    are checked, and every `WHERE` literal is folded exactly into its column's type

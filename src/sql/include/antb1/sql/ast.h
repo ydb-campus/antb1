@@ -394,15 +394,25 @@ struct CommonTableExpr {
   SourceSpan span;          // the name through the query's ')'
 };
 
-// One query of a compound (docs/adr/0036-union-all.md): a block -- SELECT through HAVING, with no
-// WITH list, ORDER BY, LIMIT or OFFSET of its own -- and the UNION ALL written before it.
+// A set operator (docs/adr/0039-set-operations.md). UNION ALL is kUnion with SetBranch::all.
+enum class SetOp : std::uint8_t { kUnion, kIntersect, kExcept };
+
+// One query of a compound (ADR 0036, ADR 0039) and the operator written before it. The query is a
+// block -- SELECT through HAVING, with no WITH list, ORDER BY, LIMIT, OFFSET or compound of its own
+// -- or a parenthesized query that has one of those (IsNestedQuery); a parenthesized block without
+// them is stored as a plain block. Precedence is not stored: SetOperationTree builds it.
 struct SetBranch {
   Box<SelectStatement> query;
-  SourceSpan op_span;  // UNION ALL (empty for the first branch)
+  SetOp op = SetOp::kUnion;  // the operator before the query (unused for the first branch)
+  bool all = false;          // ALL; DISTINCT, written or not, is false
+  SourceSpan op_span;        // the operator and its ALL or DISTINCT (empty for the first branch)
 };
 
+// The number of fields of SetBranch: ast.cc checks it, and every walk of a branch asserts it.
+inline constexpr std::size_t kSetBranchFields = 4;
+
 // A query: an optional WITH list and a block (SELECT through LIMIT and OFFSET), or a compound of
-// blocks. A derived table and a common table expression hold a query of their own.
+// branches. A derived table and a common table expression hold a query of their own.
 struct SelectStatement {
   std::vector<CommonTableExpr> with;  // the WITH list, in order (empty: none)
   SourceSpan with_span;               // the WITH keyword (when with is not empty)
@@ -426,7 +436,8 @@ struct SelectStatement {
   std::optional<std::int64_t> offset;  // non-negative
   SourceSpan offset_span;              // OFFSET and its value (when offset)
   SourceSpan span;                     // WITH or SELECT .. last token of the query (without ';')
-  // A compound: two or more blocks joined by UNION ALL, in the order written, or none. When set,
+  // A compound: two or more branches joined by UNION, INTERSECT or EXCEPT (SetBranch), in the
+  // order written, or none. When set,
   // the block's own fields (items through having_span) are empty, and the WITH list, ORDER BY,
   // LIMIT and OFFSET belong to the compound. A walk of a statement that reads those fields must
   // also walk the branches (kSelectStatementFields).
@@ -443,6 +454,30 @@ std::string_view ToString(CompareOp op);
 std::string_view ToString(BinaryOp op);          // "+", "//", "<>", "AND", ...
 std::string_view ToString(NullsOrder nulls);     // "", "NULLS FIRST" or "NULLS LAST"
 std::string_view ToString(Connector connector);  // "", ",", "CROSS JOIN", "INNER JOIN", "LEFT JOIN"
+std::string_view ToString(SetOp op);             // "UNION", "INTERSECT" or "EXCEPT"
+
+// A branch query that is no plain block: a parenthesized query with its own WITH list, compound,
+// ORDER BY, LIMIT or OFFSET (SetBranch).
+bool IsNestedQuery(const SelectStatement& query);
+
+// DuckDB's tree of a compound (ADR 0039's tree rule). INTERSECT [ALL] binds tighter than UNION and
+// EXCEPT, which associate to the left; a chain of one operator and quantifier is one run of two or
+// more operands, in written order. A branch that is a parenthesized compound without a WITH list or
+// tail of its own is a subtree, spliced into its parent when both are runs of UNION, or both of
+// UNION ALL (DuckDB folds the types of such a run as one list); a left operand that is a run of the
+// same operator and quantifier merges, which is the same left fold.
+struct SetTree {
+  // A leaf: a branch's query, a block or a parenthesized query with its own WITH list or tail.
+  const SelectStatement* leaf = nullptr;
+  SetOp op = SetOp::kUnion;       // a run's operator
+  bool all = false;               // a run's quantifier
+  std::vector<SetTree> operands;  // a run's operands, two or more; empty for a leaf
+  // A leaf: the operator written before it (empty for the compound's first branch). A run: the
+  // operator before its second operand.
+  SourceSpan op_span;
+};
+// The tree of `compound`, which has two or more branches.
+SetTree SetOperationTree(const SelectStatement& compound);
 
 bool EqualIgnoringSpans(const Expr& a, const Expr& b);
 bool EqualIgnoringSpans(const SelectStatement& a, const SelectStatement& b);

@@ -1198,3 +1198,105 @@ NULL	6
 2026-03-03	1
 2026-03-04	1
 2026-03-05	1
+
+# ---- parenthesized branches (ADR 0039's X4a) ----
+# A branch in parentheses: a plain block, or a query with its own WITH list or tail. A run of UNION ALL in parentheses is
+# spliced into the run around it, so its blocks fold as one list in written order; one with a WITH list of its own is
+# typed on its own first. A query that is one parenthesized query is that query.
+
+query I rowsort
+(SELECT ct_id FROM cities WHERE ct_id < 3) UNION ALL (SELECT zn_city FROM zones WHERE zn_id < 3)
+----
+SMALLINT
+1
+1
+2
+2
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id < 2 UNION ALL (SELECT zn_id FROM zones ORDER BY zn_id DESC LIMIT 2) UNION ALL (SELECT ct_id FROM cities ORDER BY ct_id OFFSET 4)
+----
+INTEGER
+1
+39
+40
+5
+6
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id < 2 UNION ALL (WITH z AS (SELECT zn_id FROM zones) SELECT zn_id FROM z WHERE zn_id < 3)
+----
+INTEGER
+1
+1
+2
+
+query I nosort
+((SELECT ct_id FROM cities WHERE ct_id > 4)) ORDER BY 1
+----
+SMALLINT
+5
+6
+
+query I nosort
+(SELECT ct_id FROM cities) ORDER BY 1 DESC LIMIT 2
+----
+SMALLINT
+6
+5
+
+query I nosort
+WITH c AS (SELECT ct_id FROM cities) (SELECT COUNT(*) FROM c)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM ((SELECT ct_id FROM cities) UNION ALL (SELECT zn_id FROM zones) UNION ALL ((SELECT ct_id FROM cities LIMIT 1))) AS u
+----
+BIGINT
+47
+
+query I nosort
+SELECT x FROM (SELECT ct_id AS x FROM cities WHERE ct_id = 1 UNION ALL (SELECT zn_id FROM zones WHERE zn_id = 2 UNION ALL SELECT ct_id FROM cities WHERE ct_id = 3)) AS u ORDER BY x
+----
+INTEGER
+1
+2
+3
+
+# Names come from leaf 0, through the parentheses.
+query I nosort
+SELECT y FROM ((SELECT ct_id AS y FROM cities ORDER BY ct_id LIMIT 1) UNION ALL SELECT zn_id FROM zones WHERE zn_id = 2) AS u ORDER BY y
+----
+INTEGER
+1
+2
+
+# The splice decides the type: DECIMAL(9,2), SMALLINT and USMALLINT fold as one list to DECIMAL(9,2); with a WITH list
+# of its own the parenthesized run is INTEGER first, which DECIMAL(9,2) widens to DECIMAL(12,2).
+query D rowsort
+SELECT d9_2 FROM decimals WHERE id < 2 UNION ALL (SELECT i16 FROM edge WHERE id < 2 UNION ALL SELECT u16 FROM edge WHERE id < 2)
+----
+DECIMAL(9,2)
+-32768.00
+-6.25
+0.00
+32767.00
+65535.00
+9999999.99
+
+query D rowsort
+SELECT d9_2 FROM decimals WHERE id < 2 UNION ALL (WITH e AS (SELECT i16, u16 FROM edge WHERE id < 2) SELECT i16 FROM e UNION ALL SELECT u16 FROM e)
+----
+DECIMAL(12,2)
+-32768.00
+-6.25
+0.00
+32767.00
+65535.00
+9999999.99
+
+# A column count that differs is a bind error inside the parentheses too.
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities UNION ALL (SELECT ct_id FROM cities UNION ALL SELECT ct_id, ct_id FROM cities)
