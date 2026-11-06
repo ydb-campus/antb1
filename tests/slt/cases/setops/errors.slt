@@ -1,5 +1,5 @@
 # UNION ALL's errors and what is not answered yet (ADR 0036, ADR 0039): column counts that differ are a bind error in
-# both engines; UNION, INTERSECT and EXCEPT (X4b, X4c, X4d) and BY NAME (X4), a compound's own ORDER BY, LIMIT and
+# both engines; INTERSECT and EXCEPT (X4c, X4d) and BY NAME (X4), a compound's own ORDER BY, LIMIT and
 # OFFSET at any depth (X5) and a subquery over a UNION ALL (X6) wait on their roadmap items; values with no exact
 # common type stay DuckDB's; the errors of the blocks a condition rules out (X7a); and divergences D26 and D27.
 
@@ -27,35 +27,7 @@ SELECT ct_id FROM cities UNION ALL SELECT ct_id, label FROM cities UNION ALL SEL
 statement error zn_id
 SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM cities
 
-# ---- the other set operations (ADR 0039's X4b, X4c and X4d; BY NAME stays ADR 0036's X4) ----
-
-pending X4b
-query I rowsort
-SELECT ct_id FROM cities UNION SELECT zn_city FROM zones
-----
-SMALLINT
-1
-2
-3
-4
-5
-6
-9
-NULL
-
-pending X4b
-query I rowsort
-SELECT ct_id FROM cities UNION DISTINCT SELECT zn_city FROM zones
-----
-SMALLINT
-1
-2
-3
-4
-5
-6
-9
-NULL
+# ---- the other set operations (ADR 0039's X4c and X4d, UNION answered in union.slt; BY NAME stays ADR 0036's X4) ----
 
 pending X4c
 query I rowsort

@@ -1754,6 +1754,50 @@ std::vector<Relation> AllRelations() {
                  .check = AllEqual()});
   }
 
+  // ---- UNION [DISTINCT] (ADR 0039's X4b) ----
+  // A UNION is the distinct rows of its operands: ADR 0036's sketch, a SELECT DISTINCT over their
+  // UNION ALL, which antb1 answers through another plan, gives the same rows (the in-engine oracle
+  // of ADR 0039), as does any form, operand order, parenthesization and batch size; a UNION of a
+  // block with itself is the block's DISTINCT. The operands overlap, so the deduplication matters.
+  // INTEGER columns only: the sketch keeps the first -0.0 or NaN of any operand (divergence D29).
+  {
+    const slt::FeatureSet unioned = {kColumns, kMultipleItems,  kIntegerColumns, kTableName,
+                                     kWhere,   kIntegerLiteral, kDerivedTable,   kUnionAll,
+                                     kUnion,   kWhereAnd};
+    constexpr std::string_view kLow = "SELECT tr_rider, tr_pickup FROM trips WHERE tr_row < 600";
+    constexpr std::string_view kMid =
+        "SELECT tr_rider, tr_pickup FROM trips WHERE tr_row >= 400 AND tr_row < 1000";
+    constexpr std::string_view kHigh = "SELECT tr_rider, tr_pickup FROM trips WHERE tr_row >= 900";
+    const auto over = [](std::string_view query) {
+      return std::format("SELECT tr_rider, tr_pickup FROM ({}) AS u", query);
+    };
+    const std::string three = std::format("{} UNION {} UNION {}", kLow, kMid, kHigh);
+    r.push_back({.name = "union_is_the_distinct_of_its_union_all",
+                 .features = SetWith(unioned, kSelectDistinct),
+                 .probes = {Q(over(three)),
+                            Q(std::format("SELECT DISTINCT tr_rider, tr_pickup FROM ({} UNION ALL "
+                                          "{} UNION ALL {}) AS u",
+                                          kLow, kMid, kHigh))},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "union_forms_orders_and_parentheses_equal",
+         .features = SetWith(unioned, kCommonTableExpr, kSetOpParentheses),
+         .probes = {Q(over(three)),
+                    Q(std::format("WITH u AS ({}) SELECT tr_rider, tr_pickup FROM u", three)),
+                    Q(over(std::format("{} UNION {} UNION {}", kHigh, kLow, kMid))),
+                    Q(over(std::format("{} UNION ({} UNION {})", kLow, kMid, kHigh))),
+                    Q(over(std::format("({} UNION {}) UNION DISTINCT {}", kLow, kMid, kHigh))),
+                    Q(over(std::format("{} UNION ({} UNION ALL {})", kLow, kMid, kHigh))),
+                    Q(over(three), 1), Q(over(three), 7)},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "union_of_a_block_with_itself_is_its_distinct",
+         .features = SetWith(unioned, kSelectDistinct),
+         .probes = {Q(over(std::format("{} UNION {}", kMid, kMid))),
+                    Q(std::format("SELECT DISTINCT tr_rider, tr_pickup FROM ({}) AS u", kMid))},
+         .check = AllEqual()});
+  }
+
   // ---- stars among the select items (ADR 0022 rule 5) ----
   // A star is the columns it reads, where it stands: `*` every FROM item's in FROM order, `t.*` the
   // item's, whichever name rule 1 gives it (the table's, an alias, a path's file name) and however

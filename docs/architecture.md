@@ -109,12 +109,13 @@ steps (only step 7 uses more than one thread):
    (branches joined by `UNION`, `INTERSECT` or `EXCEPT`, each a block or a parenthesized query) keeps its branches in a
    flat list of boxes, each with the operator written before it and one level below it, and owns the `WITH` list
    before them and the `ORDER BY`, `LIMIT` and `OFFSET` after them ([ADR 0036](adr/0036-union-all.md),
-   [ADR 0039](adr/0039-set-operations.md)); `sql::SetOperationTree` gives DuckDB's tree of it. Syntax outside the
+   [ADR 0039](adr/0039-set-operations.md)); `sql::SetOperationTree` gives DuckDB's tree of it, whose levels (each
+   change of operator or quantifier can nest one) count against the depth limit too. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an
    `IN` subquery anywhere but as a top-level conjunct of `WHERE`, of an inner `ON` or of `HAVING`, a lateral
-   reference, more than 256 relations counting every sub-plan and every subquery, a `UNION ALL`'s own `ORDER BY`,
+   reference, more than 256 relations counting every sub-plan and every subquery, a compound's own `ORDER BY`,
    `LIMIT` or `OFFSET` and a subquery over one (ADR 0036's X5 and X6), many expressions) is `kUnsupported` before
    any name resolves, over every block
    the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
@@ -125,11 +126,13 @@ steps (only step 7 uses more than one thread):
    table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
    a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*` names a
    FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT column
-   instead, whose fields DuckDB expands). A `UNION ALL` binds
+   instead, whose fields DuckDB expands). A compound of `UNION` and `UNION ALL` binds
    each leaf of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of
-   `UNION ALL` is spliced into the run around it), in its own CTE frame and scope, then folds their types into one
-   `UnionAll` node, casting below it the leaves of another type ([ADR 0036](adr/0036-union-all.md),
-   [ADR 0039](adr/0039-set-operations.md)); the other set operators exit 4 until ADR 0037's X4b to X4d.
+   one operator is spliced into the run around it), in its own CTE frame and scope, checking a run's column counts in
+   DuckDB's order, then folds their types along the tree and casts each leaf of another type once, straight to the
+   root's type: a run of `UNION ALL` becomes a `UnionAll` node and each maximal region of `UNION` one `SetOperation`
+   node (`SetOperationBinder`, [ADR 0036](adr/0036-union-all.md), [ADR 0039](adr/0039-set-operations.md));
+   `INTERSECT` and `EXCEPT` exit 4 until ADR 0037's X4c and X4d.
    Columns resolve there,
    an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
@@ -159,8 +162,8 @@ steps (only step 7 uses more than one thread):
    `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new columns of one type each
    ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one. `SetOperation` answers one tree of UNION,
    INTERSECT and EXCEPT, ALL or not, over one or more inputs: new columns of one type each, every one of them a key,
-   and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); no SQL binds to it
-   before ADR 0037's X4b.
+   and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); the binder makes one
+   per maximal region of `UNION` since ADR 0037's X4b.
     Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).

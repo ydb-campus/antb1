@@ -1,0 +1,460 @@
+# UNION [DISTINCT] (ADR 0039's X4b): each distinct row of the operands, rows compared as GROUP BY keys (NULL equals
+# NULL), alone or next to UNION ALL in any nesting. The names are the first leaf's; each column's type folds along
+# DuckDB's tree: a run of UNION, or of UNION ALL, as one list in written order, a run next to the other as a binary
+# node. Divergences D27, D29 and D30 at the end.
+
+# ---- the inputs ----
+
+query II nosort
+SELECT COUNT(*), COUNT(DISTINCT zn_city) FROM zones
+----
+BIGINT	BIGINT
+40	6
+
+# ---- rows: duplicates within and across the operands, NULLs ----
+
+query I rowsort
+SELECT zn_city FROM zones UNION SELECT ct_id FROM cities
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+query I rowsort
+SELECT zn_city FROM zones UNION DISTINCT SELECT zn_city FROM zones
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+query II rowsort
+SELECT zn_city, zn_parent FROM zones WHERE zn_id < 12 UNION SELECT zn_city, zn_parent FROM zones WHERE zn_id > 30
+----
+SMALLINT	INTEGER
+1	1
+1	NULL
+2	2
+2	NULL
+3	3
+3	NULL
+4	4
+4	NULL
+5	5
+5	77
+5	NULL
+9	4
+NULL	3
+
+query I rowsort
+SELECT zn_parent FROM zones WHERE zn_parent IS NULL UNION SELECT zn_parent FROM zones WHERE zn_parent IS NULL
+----
+INTEGER
+NULL
+
+query IT rowsort
+SELECT ct_id, label FROM cities UNION SELECT ct_id, label FROM cities WHERE ct_id < 3 UNION SELECT ct_id + 10, label FROM cities WHERE ct_id > 4
+----
+SMALLINT	VARCHAR
+1	center
+15	old town
+16	outskirts
+2	harbor
+3	hills
+4	airport
+5	old town
+6	outskirts
+
+# An empty operand still removes the other's duplicates.
+query I rowsort
+SELECT zn_city FROM zones UNION SELECT ct_id FROM cities WHERE ct_id < 0
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+# ---- next to UNION ALL: one node per run of UNION, a UnionAll per run of UNION ALL ----
+
+query I rowsort
+SELECT zn_city FROM zones UNION SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id < 3
+----
+SMALLINT
+1
+1
+2
+2
+3
+4
+5
+6
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id < 3 UNION ALL SELECT ct_id FROM cities WHERE ct_id < 3 UNION SELECT zn_city FROM zones
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities UNION ALL (SELECT zn_city FROM zones UNION SELECT ct_id FROM cities)
+----
+SMALLINT
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+6
+6
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities UNION (SELECT zn_city FROM zones UNION ALL SELECT ct_id FROM cities)
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities UNION SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities UNION SELECT zn_city FROM zones
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+# A parenthesized run of UNION is spliced into the run around it.
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id < 2 UNION (SELECT zn_city FROM zones UNION SELECT ct_id FROM cities) UNION SELECT 7 FROM cities
+----
+INTEGER
+1
+2
+3
+4
+5
+6
+7
+9
+NULL
+
+# A parenthesized branch with its own WITH list or tail is a leaf.
+query I rowsort
+SELECT ct_id FROM cities UNION (WITH z AS (SELECT zn_city FROM zones) SELECT zn_city FROM z)
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id > 4 UNION (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 3)
+----
+INTEGER
+1
+2
+3
+5
+6
+
+# ---- where a compound stands: a derived table, a CTE, below GROUP BY and a join ----
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT zn_city FROM zones UNION SELECT ct_id FROM cities) AS u
+----
+BIGINT
+8
+
+query II rowsort
+WITH u AS (SELECT zn_city AS c FROM zones UNION SELECT ct_id FROM cities) SELECT c, COUNT(*) FROM u GROUP BY c
+----
+SMALLINT	BIGINT
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+9	1
+NULL	1
+
+query IT rowsort
+SELECT u.c, ct.label FROM (SELECT zn_city AS c FROM zones WHERE zn_id < 6 UNION SELECT ct_id FROM cities WHERE ct_id > 5) AS u JOIN cities AS ct ON u.c = ct.ct_id
+----
+SMALLINT	VARCHAR
+1	center
+2	harbor
+3	hills
+4	airport
+5	old town
+6	outskirts
+
+query II rowsort
+SELECT tr_pickup % 3, COUNT(*) FROM (SELECT tr_pickup FROM trips WHERE tr_row < 500 UNION SELECT tr_dropoff FROM trips WHERE tr_row < 500) AS u GROUP BY tr_pickup % 3
+----
+INTEGER	BIGINT
+0	14
+1	15
+2	14
+NULL	1
+
+query I nosort
+WITH u AS (SELECT ct_id AS c FROM cities UNION SELECT zn_city FROM zones) SELECT COUNT(*) FROM u AS a JOIN u AS b ON a.c = b.c
+----
+BIGINT
+7
+
+# ---- types: the tree's fold ----
+
+query I rowsort
+SELECT i16 FROM edge UNION SELECT i32 FROM edge
+----
+INTEGER
+-1
+-100
+-100000
+-12345
+-2147483648
+-32768
+-7
+0
+1
+100
+100000
+12345
+2147483647
+32767
+54321
+7
+NULL
+
+query D rowsort
+SELECT d9_2 FROM decimals UNION SELECT d18_4 FROM decimals
+----
+DECIMAL(18,4)
+-1.0001
+-1.2500
+-2.0002
+-2.5000
+-3.0003
+-3.7500
+-4.0004
+-5.0000
+-5.0005
+-6.2500
+-9999999.9900
+0.0000
+1.0001
+1.2500
+12345678901234.5678
+2.0002
+2.5000
+3.0003
+3.7500
+4.0004
+5.0000
+5.0005
+6.2500
+9999999.9900
+99999999999999.9999
+NULL
+
+query T rowsort
+SELECT label FROM cities UNION SELECT label FROM cities WHERE ct_id < 3
+----
+VARCHAR
+airport
+center
+harbor
+hills
+old town
+outskirts
+
+# Written order would fold USMALLINT and SMALLINT to INTEGER, then DECIMAL(12,2); the parenthesized UNION folds first,
+# SMALLINT and DECIMAL(9,2) to DECIMAL(9,2), and USMALLINT fits it.
+query D rowsort
+SELECT u16 FROM edge UNION ALL (SELECT i16 FROM edge UNION SELECT d9_2 FROM decimals)
+----
+DECIMAL(9,2)
+-1.00
+-1.25
+-100.00
+-12345.00
+-2.50
+-3.75
+-32768.00
+-5.00
+-6.25
+-9999999.99
+0.00
+0.00
+1.00
+1.00
+1.25
+100.00
+12.00
+12345.00
+15887.00
+15917.00
+2.00
+2.50
+3.75
+32767.00
+32768.00
+40000.00
+5.00
+6.25
+65535.00
+7.00
+7.00
+9999999.99
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT u16 FROM edge UNION ALL SELECT i16 FROM edge UNION SELECT d9_2 FROM decimals
+----
+DECIMAL(12,2)
+-1.00
+-1.25
+-100.00
+-12345.00
+-2.50
+-3.75
+-32768.00
+-5.00
+-6.25
+-9999999.99
+0.00
+1.00
+1.25
+100.00
+12.00
+12345.00
+15887.00
+15917.00
+2.00
+2.50
+3.75
+32767.00
+32768.00
+40000.00
+5.00
+6.25
+65535.00
+7.00
+9999999.99
+NULL
+
+# A NULL item is the fold's identity.
+query I rowsort
+SELECT NULL FROM cities WHERE ct_id < 3 UNION SELECT ct_id FROM cities WHERE ct_id < 3
+----
+SMALLINT
+1
+2
+NULL
+
+# ---- errors ----
+
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities UNION SELECT ct_id, label FROM cities
+
+# A run of UNION binds every leaf before it compares the counts.
+statement error nope
+SELECT ct_id FROM cities UNION SELECT ct_id, label FROM cities UNION SELECT nope FROM cities
+
+# A UNION next to a UNION ALL is a binary node: its counts are compared before the next leaf binds.
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities UNION SELECT ct_id, label FROM cities UNION ALL SELECT nope FROM cities
+
+# ---- divergence D29: which of -0.0 and 0.0 a UNION keeps ----
+# Over an empty block, a block of 0.0 and one of -0.0 (d * 0 of a positive and a negative d): antb1 keeps the value
+# first seen in written order, 0.0; DuckDB, at one thread, reads the first block and then the others from the last
+# back, and keeps -0.0.
+
+onlyif antb1
+query R rowsort
+SELECT d FROM edge WHERE i16 = 2 UNION SELECT d * 0 FROM edge WHERE i16 = 1 UNION SELECT d * 0 FROM edge WHERE i16 = 7
+----
+DOUBLE
+0
+
+onlyif duckdb
+query R rowsort
+SELECT d FROM edge WHERE i16 = 2 UNION SELECT d * 0 FROM edge WHERE i16 = 1 UNION SELECT d * 0 FROM edge WHERE i16 = 7
+----
+DOUBLE
+-0
+
+# ---- divergence D30: which error a UNION reports when several blocks fail ----
+# antb1 reports the first failing block in written order, the addition; DuckDB, under its deduplication, reads the
+# first block and then the others from the last back, and reports the multiplication.
+
+onlyif antb1
+statement error Overflow in addition
+SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 + 1 FROM edge UNION SELECT i16 * 2 FROM edge) AS u
+
+onlyif duckdb
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 + 1 FROM edge UNION SELECT i16 * 2 FROM edge) AS u
+
+# ---- divergence D27: a condition above a UNION stays above it ----
+# antb1 runs every block in full, so the second block's overflow fails the query although the condition keeps only the
+# first block's rows; DuckDB pushes the condition into each block and rules the second one out.
+
+onlyif antb1
+statement error Overflow
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag = 'a'
+
+onlyif duckdb
+query I nosort
+SELECT MAX(x) FROM (SELECT ct_id AS x, 'a' AS tag FROM cities UNION SELECT ct_id + 9223372036854775807, 'b' FROM cities) AS u WHERE tag = 'a'
+----
+BIGINT
+6

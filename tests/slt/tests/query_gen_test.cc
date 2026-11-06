@@ -693,16 +693,26 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   EXPECT_GT(same, 400);
 }
 
+// The leaves of a compound's tree in written order, appended to `out`.
+void CollectLeaves(const sql::SetTree& tree, std::vector<const sql::SelectStatement*>& out) {
+  if (tree.leaf != nullptr) {
+    out.push_back(tree.leaf);
+    return;
+  }
+  for (const sql::SetTree& operand : tree.operands) {
+    CollectLeaves(operand, out);
+  }
+}
+
 // The blocks of a nested query: itself, or the copies of a compound (ADR 0036), which parentheses
-// may group (ADR 0039's X4a): the leaves of its tree, one run of UNION ALL.
+// may group (ADR 0039's X4a): the leaves of its tree, where a run of UNION, or of UNION ALL, can be
+// the other's operand (X4b).
 std::vector<const sql::SelectStatement*> CopiesOf(const sql::SelectStatement& query) {
   if (query.set_operation.empty()) {
     return {&query};
   }
   std::vector<const sql::SelectStatement*> copies;
-  for (const sql::SetTree& leaf : sql::SetOperationTree(query).operands) {
-    copies.push_back(leaf.leaf);
-  }
+  CollectLeaves(sql::SetOperationTree(query), copies);
   return copies;
 }
 
@@ -1798,6 +1808,68 @@ TEST(QueryGenerator, SetOpParenthesesChangeOnlyTheirQueries) {
   }
   EXPECT_GT(took, 50) << "took: " << took;
   EXPECT_GT(same, 6000);
+}
+
+// UNION among a compound's operators (ADR 0039's X4b) comes from the set operators' own stream, so
+// every seed that declines it generates the query it did before, parentheses included; one that
+// takes it writes the same copies of the same block, some of them with a condition of their own,
+// and keeps the copies' row bound.
+TEST(QueryGenerator, UnionChangesOnlyTheirQueries) {
+  const auto with = MakeOver(Tables(), 73, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(Tables(), 73,
+               {.supported = kSupportedFeatures.Minus({Feature::kUnion}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  int conditions = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kUnion)) << plain.sql;
+    if (!q.features.Has(Feature::kUnion)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_TRUE(q.features.Has(Feature::kUnionAll)) << "every compound records kUnionAll";
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    const auto ast = sql::Parse(q.sql);
+    const auto plain_ast = sql::Parse(plain.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    ASSERT_TRUE(plain_ast.has_value()) << plain_ast.error().message;
+    const auto nested = [](const sql::SelectStatement& stmt) -> const sql::SelectStatement& {
+      const auto* derived = std::get_if<sql::DerivedTable>(&stmt.from.at(0).source);
+      return derived != nullptr ? *derived->query : *stmt.with.at(0).query;
+    };
+    const sql::SelectStatement& compound = nested(*ast);
+    EXPECT_TRUE(std::ranges::any_of(compound.set_operation, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kUnion && !branch.all;
+    })) << "a UNION among the operators";
+    const auto copies = CopiesOf(compound);
+    const auto plain_copies = CopiesOf(nested(*plain_ast));
+    ASSERT_EQ(copies.size(), plain_copies.size());
+    const auto reads = [](const sql::SelectStatement& block) {
+      std::vector<std::string> names;
+      for (const sql::SelectItem& select_item : block.items) {
+        const auto* column = std::get_if<sql::ColumnRef>(select_item.expr());
+        names.push_back(column == nullptr ? "?" : Lower(column->name));
+      }
+      const sql::TableRef* table = block.from.at(0).table();
+      names.push_back(table == nullptr ? "?" : Lower(table->name));
+      return names;
+    };
+    for (std::size_t k = 0; k < copies.size(); ++k) {
+      EXPECT_EQ(reads(*copies[k]), reads(*plain_copies[k])) << k;
+      EXPECT_TRUE(plain_copies[k]->where.empty()) << k;
+      conditions += copies[k]->where.empty() ? 0 : 1;
+    }
+  }
+  EXPECT_GT(took, 50) << "took: " << took;
+  EXPECT_GT(same, 6000);
+  EXPECT_GT(conditions, took) << "most copies of a compound with a UNION read rows of their own";
 }
 
 // The copies multiply the rows that every row guard of the query reads (Nest): over a table of 20

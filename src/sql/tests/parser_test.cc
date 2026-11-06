@@ -2460,6 +2460,47 @@ TEST(ParserTest, CompoundBlocksAreOneLevelDown) {
   EXPECT_GT(Depth(*deepest) + 2, kMaxExpressionDepth) << "no room for one more compound";
 }
 
+// The levels of a compound's tree (SetOperationTree): a leaf is one.
+std::size_t TreeDepth(const SetTree& tree) {
+  std::size_t deepest = 0;
+  for (const SetTree& operand : tree.operands) {
+    deepest = std::max(deepest, TreeDepth(operand));
+  }
+  return deepest + 1;
+}
+
+// A compound's list is flat, but its tree nests a level each time the operator or its quantifier
+// changes (ADR 0039): the change lifts what was parsed before it, so alternating UNION and UNION
+// ALL counts against the depth limit, at the operator that passes it, while a run of one operator
+// of any length stays one level.
+TEST(ParserTest, AlternatingSetOperatorsCountTheirLevels) {
+  const auto alternating = [](std::size_t n) {
+    std::string sql = "SELECT a FROM t";
+    for (std::size_t i = 0; i < n; ++i) {
+      sql += i % 2 == 0 ? " UNION SELECT a FROM t" : " UNION ALL SELECT a FROM t";
+    }
+    return sql;
+  };
+  const std::size_t first = FirstTooDeep(alternating);
+  EXPECT_EQ(first, 256U) << "the first operator lifts the first block, each change one more";
+  auto deepest = Parse(alternating(first - 1));
+  ASSERT_TRUE(deepest.has_value()) << deepest.error().message;
+  EXPECT_LE(TreeDepth(SetOperationTree(*deepest)), kMaxExpressionDepth);
+  const std::string too_deep = alternating(first);
+  auto refused = Parse(too_deep);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_EQ(refused.error().span.offset, too_deep.rfind(" UNION") + 1) << "at the last operator";
+  // DISTINCT is UNION's default, so it does not alternate with UNION.
+  std::string same = "SELECT a FROM t";
+  for (int i = 0; i < 3000; ++i) {
+    same += i % 2 == 0 ? " UNION SELECT a FROM t" : " UNION DISTINCT SELECT a FROM t";
+  }
+  auto run = Parse(same);
+  ASSERT_TRUE(run.has_value()) << run.error().message;
+  EXPECT_EQ(TreeDepth(SetOperationTree(*run)), 2U);
+}
+
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
 // binder tells them apart.
 TEST(ParserTest, ConstantsAndPositions) {

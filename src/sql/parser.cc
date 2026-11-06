@@ -813,7 +813,13 @@ class Parser {
   // first one moves down a level once it is known to be a branch -- the depth error at the first
   // operator when that is too deep -- and each later one is parsed a level down (a parenthesized
   // one by ParseNestedQuery, whose '(' is that level).
-  // `closed` ends up telling whether the last branch was written in parentheses.
+  // `closed` ends up telling whether the last branch was written in parentheses. The list is flat,
+  // but its tree (SetOperationTree) is not: an operator or quantifier other than the one before it
+  // can start a new run whose first operand is everything so far, one level down, so it lifts what
+  // was parsed. A compound that alternates UNION and UNION ALL thus counts its alternations
+  // against kMaxDepth, and the code that walks its tree (binding, destroying) stays shallow. The
+  // operands of an INTERSECT run, which nests to the right of a UNION, count one level short: the
+  // binder refuses INTERSECT until ADR 0037's X4c, which counts that level.
   Status ParseCompound(SelectStatement& stmt, Box<SelectStatement> first, bool& closed) {
     static_assert(kSetBranchFields == 4, "revisit this walk");
     const std::size_t depth = depth_;
@@ -826,6 +832,11 @@ class Parser {
       }
       if (stmt.set_operation.size() == 1) {
         if (auto error = Lifted(first_peak, op->op_span); error.has_value()) {
+          return std::unexpected(std::move(*error));
+        }
+      } else if (const SetBranch& last = stmt.set_operation.back();
+                 last.op != op->op || last.all != op->all) {
+        if (auto error = Lifted(peak_, op->op_span); error.has_value()) {
           return std::unexpected(std::move(*error));
         }
       }

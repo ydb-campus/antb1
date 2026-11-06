@@ -417,6 +417,37 @@ set operations and pins them with records.
     as one bit. Narrowing those copies to bytes under a DISTINCT root is a candidate for X4p, which revisits the
     memberships per lane anyway.
 
+## Update (2026-11-06, X4b): UNION, built
+
+- **Built as decided:** UNION [DISTINCT] binds alone or next to UNION ALL in any nesting. One binder over the tree
+  (`SetOperationBinder`) replaces `BindUnionAll`: it binds the leaves, checks each run's column counts in rule 6's
+  order, folds the types along the tree, casts each leaf once to the root's type, and builds a `UnionAllNode` per run
+  of UNION ALL and a `SetOperationNode` per maximal region of the other operators. The region walk is generic, so X4c
+  and X4d only lift their refusals. Q75 passes, and the ratchet is at 70.
+- **A depth guard the design did not have.** The parser kept the branch list flat and counted no level for it, but
+  the tree nests one level each time the operator or its quantifier changes (`a UNION b UNION ALL c UNION d …` is
+  left-deep). With X4b binding such trees, their recursive walks, the tree's own destructor included, could run as deep
+  as the alternations. The parser now lifts what it has parsed at each such change, counting it against the depth
+  limit of 256 (exit code 4 at the operator that passes it), as each pair of query parentheses counts since X4a. A run
+  of one operator of any length stays one level.
+- **Messages name the operator.** A type refusal names the run's operator (`UNION of VARCHAR and SMALLINT values…`).
+  A compound's own tail (X5) and a subquery over a compound (X6) name its root operator (`ORDER BY on a UNION is not
+  supported`, `a subquery over an EXCEPT is not supported`), where they named UNION ALL whatever the compound was.
+- **The oracle is a relation.** For UNION, ADR 0036's sketch is a SELECT DISTINCT over the operands' UNION ALL, which
+  antb1 answers through a GroupAggregate. The metamorphic relations compare the two, and any form, operand order,
+  parenthesization and batch size. The marker form waits for X4c and X4d, whose formulas need the markers.
+- **The generator** draws UNION for some of a compound's operators from a stream of its own, so a query without one is
+  the query its seed gave before, parentheses included. It gives each copy of such a compound a condition of its own,
+  so that the copies differ, and writes no UNION over a DOUBLE column (D29). Every compound records `kUnionAll`, and
+  one with a UNION records `kUnion` too.
+- **Divergences:** D27, D29 and D30 are extended to UNION and pinned with records of both engines' answers in
+  `tests/slt/cases/setops/union.slt`. D29's `(B EXCEPT C) UNION A` and `(N INTERSECT ALL N) UNION E` cases wait for
+  X4d and X4c.
+- **The SF 1 budget** (ADR 0037's decision 6) holds, so X4p stays a guard. At SF 1, Q75 peaks at 85 MiB, against
+  1.5 GiB. On Apple silicon, antb1 answers it in 3.4 s in Debug and 9.7 s under AddressSanitizer. Its shard (2 of 8)
+  takes 63 s under AddressSanitizer here, against an inner timeout of 870 s. Even at the slowest CI-to-local ratio
+  seen so far (5.9x), that is about 370 s, inside the gate's 60% (522 s).
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:
