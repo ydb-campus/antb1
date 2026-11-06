@@ -30,7 +30,8 @@
 // or, for several, those branches under inner Joins (ADR 0022, in ADR 0026's order). A relation may
 // also be a sub-plan: a derived table's or a CTE's block, or a UnionAll of blocks (ADR 0036). A
 // Join and a DependentJoin have two inputs and a UnionAll one or more (two or more as bound; one
-// once the optimizer has ruled the others out), and every walk of a plan visits every input of a
+// once the optimizer has ruled the others out), a SetOperation one or more (ADR 0039), and every
+// walk of a plan visits every input of a
 // node, in order (InputsOf). plan::Optimize rewrites it (WHERE conditions into a union's branches,
 // COUNT(*)
 // -> RowCount, GROUP BY keys that are functions of other keys, Limit below Project, projection
@@ -339,10 +340,12 @@ struct RowCountNode;
 struct JoinNode;
 struct DependentJoinNode;
 struct UnionAllNode;
+struct SetOperationNode;
 
-using LogicalNode = std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode,
-                                 GroupAggregateNode, SortNode, LimitNode, RowCountNode, JoinNode,
-                                 DependentJoinNode, UnionAllNode, GroupingSetsNode>;
+using LogicalNode =
+    std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode, GroupAggregateNode,
+                 SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode, UnionAllNode,
+                 GroupingSetsNode, SetOperationNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -587,6 +590,52 @@ struct UnionAllNode {
   SourceSpan span;                                // the first UNION ALL
 };
 
+// A term of a set operation's formula (docs/adr/0039-set-operations.md), in postfix: an input,
+// or an operator over the `operands` terms before it, n-ary (a left-deep run of one operator).
+enum class SetTermKind : std::uint8_t {
+  kInput,
+  kUnion,         // [X1] OR ... OR [Xn]: 0 or 1
+  kIntersect,     // [X1] AND ... AND [Xn]: 0 or 1
+  kIntersectAll,  // min(X1, ..., Xn)
+  kExcept,        // [X1] AND NOT [X2] ... AND NOT [Xn]: 0 or 1
+  kExceptAll,     // max(X1 - X2 - ... - Xn, 0)
+};
+struct SetTerm {
+  SetTermKind kind = SetTermKind::kInput;
+  std::size_t input = 0;     // kInput: the input it reads
+  std::size_t operands = 2;  // an operator: how many terms before it are its operands
+};
+
+// UNION [DISTINCT], INTERSECT [ALL] and EXCEPT [ALL] of one or more inputs, one node per maximal
+// tree of them (ADR 0039): each output row is a distinct row of the inputs, compared as GROUP BY
+// keys (NULL a value, DOUBLE keys normalized), repeated as many times as `formula` gives it from
+// the row's count in each input (X1 to Xn above; [x] is 1 for x > 0). Output: one column per id,
+// of each input's columns[k][i], one type in every input as in a UnionAll; the ids are new columns.
+// A DISTINCT root shows each row as first seen among the starters (SetStarters), an ALL root its
+// normalized keys. Row order is unspecified (deterministic for a given input in the executor).
+struct SetOperationNode {
+  std::vector<LogicalNodePtr> inputs;  // one or more, in the order written
+  std::vector<std::vector<BoundColumn>>
+      columns;                   // per input: one per output column, every one a key
+  std::vector<ColumnId> ids;     // per output column
+  std::vector<SetTerm> formula;  // postfix; the last term is the root
+  SourceSpan span;               // the first operator
+};
+
+// Why `formula` is not one tree over `inputs` inputs, or std::nullopt: postfix, every input read
+// exactly once and in order, an operator of one or more operands, one root that is an operator.
+std::optional<std::string> CheckSetFormula(const std::vector<SetTerm>& formula, std::size_t inputs);
+// Per input of a formula that checks: whether it is a starter, whose rows can make a result row and
+// so insert their groups; the others only look theirs up. An input starts itself, a UNION with all
+// its operands' starters, an INTERSECT or EXCEPT (ALL or not) with its first operand's.
+std::vector<bool> SetStarters(const std::vector<SetTerm>& formula, std::size_t inputs);
+// Per input: whether a term reads its count rather than its presence -- every operand of an EXCEPT
+// ALL, and an INTERSECT ALL's operands where its own count is read (at the root, or by an operator
+// that reads counts).
+std::vector<bool> SetCounted(const std::vector<SetTerm>& formula, std::size_t inputs);
+// The formula as EXPLAIN writes it: `0 UNION (1 INTERSECT 2)`.
+std::string SetFormulaText(const std::vector<SetTerm>& formula);
+
 struct LogicalPlan {
   LogicalNodePtr root;
   // Result columns of root: names (aliases applied), types and ids (OutputIds(*root)).
@@ -594,14 +643,15 @@ struct LogicalPlan {
 };
 
 // "Scan", "Filter", "Compute", "Project", "Aggregate", "GroupAggregate", "Sort", "Limit",
-// "RowCount", "Join", "DependentJoin" or "UnionAll".
+// "RowCount", "Join", "DependentJoin", "UnionAll", "GroupingSets" or "SetOperation".
 std::string_view NodeName(const LogicalNode& node);
 
 // The span of the query text a node was bound from.
 SourceSpan SpanOf(const LogicalNode& node);
 
 // The inputs of a node, in order: none for leaves (Scan, RowCount), left then right for a Join and
-// a DependentJoin, the branches in the order written for a UnionAll, and one for the others.
+// a DependentJoin, the branches in the order written for a UnionAll and a SetOperation, and one for
+// the others.
 std::vector<LogicalNodePtr> InputsOf(const LogicalNode& node);
 
 // A copy of the node over other inputs, in the order of InputsOf. A count that differs from the
@@ -661,8 +711,9 @@ LogicalPlan ResolvePositions(const LogicalPlan& plan,
 // id, or whose id is not exactly once among the ids it reads; a column defined twice in the plan,
 // or without an id; a list of ids whose length differs from its columns'; output ids that are not
 // the root's; a join key of two types, a join without keys or a one-row join with keys, a residual
-// that is not BOOLEAN, a build side the join's kind does not allow; a UnionAll without inputs,
-// without one column per output in each input, or whose column has two types), else the
+// that is not BOOLEAN, a build side the join's kind does not allow; a UnionAll or SetOperation
+// without inputs, without one column per output in each input, or whose column has two types; a
+// SetOperation whose formula does not check), else the
 // first index that differs from its resolved position, e.g. "Filter: column #12 is at 3, not 4".
 std::optional<std::string> PositionMismatch(const LogicalPlan& plan);
 

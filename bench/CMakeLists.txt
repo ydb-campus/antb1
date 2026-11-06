@@ -27,6 +27,15 @@ target_link_libraries(
 # It times src/exec's parallel operators directly, which no public header declares.
 target_include_directories(antb1-bench-gsets PRIVATE ${PROJECT_SOURCE_DIR}/src/exec)
 
+# Prototype measurements for set operations (ADR 0039's X4s update): not run by any test.
+add_executable(antb1-bench-setops set_operation_bench.cc)
+target_link_libraries(
+  antb1-bench-setops
+  PRIVATE antb1::plan antb1::exec antb1::common benchmark::benchmark antb1::build_options
+)
+# It times src/exec's SetOperationOperator and UnionAllOperator, which no public header declares.
+target_include_directories(antb1-bench-setops PRIVATE ${PROJECT_SOURCE_DIR}/src/exec)
+
 if(ANTB1_BUILD_TESTS)
   # --benchmark_dry_run: one iteration of every benchmark. TMPDIR keeps BM_ScanColumn's file in the build tree.
   set(_tmp "${CMAKE_CURRENT_BINARY_DIR}/tmp")

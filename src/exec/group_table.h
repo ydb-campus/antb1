@@ -82,8 +82,15 @@ class GroupTable {
   GroupTable& operator=(GroupTable&&) = delete;
   ~GroupTable();
 
-  // Adds the rows of a batch without a selection.
-  arrow::Status Consume(const arrow::RecordBatch& rows);
+  // Adds the rows of a batch without a selection. With `group_ids`, each row's group is written
+  // there too (a set operation's starters, docs/adr/0039-set-operations.md); without, nothing is
+  // copied.
+  arrow::Status Consume(const arrow::RecordBatch& rows,
+                        std::vector<std::uint32_t>* group_ids = nullptr);
+  // The group of each row of a batch without a selection, null where no group has its keys: adds
+  // no group and touches no state (the inputs of a set operation that only look up). DOUBLE keys
+  // are normalized first, as Consume normalizes them. For a table with keys.
+  arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(const arrow::RecordBatch& rows);
   // Adds the groups of `part` (a table over the same keys and calls, of the rows after this
   // table's): a group new to this table keeps part's first-seen key values; states merge. Only
   // for a table that keeps first-seen keys.

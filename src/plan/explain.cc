@@ -211,6 +211,15 @@ struct NodeLine {
         "UnionAll inputs={} columns=[{}]", node.inputs.size(),
         node.columns.empty() ? std::string() : Join(node.columns.front(), ColumnName, ", "));
   }
+  // The formula over the inputs by position (ADR 0039), the columns as the first input names them.
+  std::string operator()(const SetOperationNode& node) const {
+    return std::format(
+        "SetOperation inputs={} formula=({}) columns=[{}]", node.inputs.size(),
+        CheckSetFormula(node.formula, node.inputs.size()).has_value()
+            ? std::string("?")
+            : SetFormulaText(node.formula),
+        node.columns.empty() ? std::string() : Join(node.columns.front(), ColumnName, ", "));
+  }
   // The sets by their keys' names, `()` for the empty one; a GROUPING call by its arguments'.
   std::string operator()(const GroupingSetsNode& node) const {
     const auto keys = [&node](const std::vector<std::size_t>& indices) {
@@ -292,7 +301,8 @@ void Render(const LogicalNode& node, std::size_t depth, const SharedNotes& notes
     out += note->second;
   }
   out += '\n';
-  // A Join's left input, then its right one; a UnionAll's inputs in the order written.
+  // A Join's left input, then its right one; a UnionAll's and a SetOperation's inputs in the order
+  // written.
   for (const LogicalNodePtr& input : InputsOf(node)) {
     if (input != nullptr) {
       Render(*input, depth + 1, notes, out);

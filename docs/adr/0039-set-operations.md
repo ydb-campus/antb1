@@ -369,6 +369,54 @@ set operations and pins them with records.
   it is still exit code 4: no plan column holds DuckDB's NULL type yet, so rule 4's "reaches its parent as one" waits
   for the item that needs it.
 
+## Update (2026-11-06, X4s): the node and the serial operator, built
+
+- **Built as decided:** `plan::SetOperationNode` with `SetTerm` formulas in postfix, every exhaustive visit, the three
+  walks the compiler does not flag (each named by a test), and `exec::SetOperationOperator` over one `GroupTable`
+  with starters, lookups, bits and counts. Nothing binds the node yet; the physical planner plans it, so a
+  hand-built plan runs end to end with its profile.
+- **Helpers in `plan`,** shared by the operator and the tests: `CheckSetFormula` (each input once, in written order; a
+  single root that is an operator; an operator of one operand allowed, so PF15 can leave a node of one input),
+  `SetStarters`, `SetCounted` and `SetFormulaText`, the formula as EXPLAIN prints it.
+- **`EstimateRows`** bounds an INTERSECT by its known operands, the smallest of them, where an unknown operand would
+  have made the whole estimate unknown: a row of an INTERSECT is in each operand, so any one of them bounds it.
+- **`GroupTable::Consume`** gives its group ids to a caller that asks for them, and `GroupTable::Lookup` normalizes
+  DOUBLE keys as `Consume` does. `KeyTable::Lookup` wraps Arrow 25's `Grouper::Lookup`, with `Consume`'s workaround for
+  a fixed-width key column without a values buffer.
+- **The profile** counts over all inputs, not per input: the starters' rows, the lookups' rows and hits, and the
+  groups. A per-input split can come with X4p, whose lanes report per input anyway.
+- **Tests stand in for the oracle** until X4b gives the node SQL: a randomized test compares the operator with the
+  forms' multiset definitions computed in the test, over random formulas of two to five inputs, NULLs included, at
+  batch sizes 1 and 7.
+- **Measured** with `bench/set_operation_bench.cc` (`antb1-bench-setops`) on Apple silicon, one thread, the median of
+  five runs of three iterations each. Each input has 4 million rows of two key columns, INTEGER and BIGINT, as
+  in-memory batches. The inputs draw their keys from shifted ranges, so all three overlap in a quarter of a range.
+  The range holds either 10 thousand values (few distinct rows) or 4 million (most rows distinct). The sketch is a
+  UnionAll over the inputs with a marker column per input, a GroupAggregate with a COUNT per marker (no markers
+  for a UNION), and the markers' condition checked on its groups. The batches hold the markers already, so the
+  sketch's projection is not timed.
+
+  | Operation | Distinct rows | Node | Sketch | Node peak | Sketch peak |
+  | --- | --- | --- | --- | --- | --- |
+  | A INTERSECT B INTERSECT C | few | 77.5 ms | 71.3 ms | 0.9 MiB | 1.5 MiB |
+  | A EXCEPT B | few | 47.2 ms | 41.8 ms | 0.9 MiB | 1.3 MiB |
+  | A UNION B UNION C | few | 54.6 ms | 51.7 ms | 1.1 MiB | 1.0 MiB |
+  | A INTERSECT B INTERSECT C | most | 234 ms | 456 ms | 164 MiB | 456 MiB |
+  | A EXCEPT B | most | 177 ms | 265 ms | 160 MiB | 276 MiB |
+  | A UNION B UNION C | most | 341 ms | 329 ms | 325 MiB | 264 MiB |
+
+  - **INTERSECT and EXCEPT over mostly distinct rows:** the node takes 0.51 and 0.67 of the sketch's time, and 0.36
+    and 0.58 of its peak memory, because its lookups add no group.
+  - **Few distinct rows:** the node is 6% to 13% slower. Hashing dominates both, and a lookup costs about what an
+    insert of a known key costs. The node also pays for its own bookkeeping: the ids of each starter batch and a bit
+    or count per row. That bookkeeping took about a quarter of the samples until its loops kept the vectors'
+    pointers in locals (a `uint8_t` store may alias anything) and the formula ran one operand at a time, which
+    cut the node's time by 4% to 6%.
+  - **UNION over mostly distinct rows:** the node is 4% to 11% slower than the sketch over four runs. Its peak is
+    23% higher: a bit per input and group, and an 8-byte count of copies per group, which a DISTINCT root needs only
+    as one bit. Narrowing those copies to bytes under a DISTINCT root is a candidate for X4p, which revisits the
+    memberships per lane anyway.
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:

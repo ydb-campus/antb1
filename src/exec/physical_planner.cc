@@ -40,6 +40,7 @@
 #include "part_operators.h"
 #include "part_pruning.h"
 #include "profiled_operator.h"
+#include "set_operation.h"
 #include "shared_builds.h"
 #include "union_all.h"
 
@@ -1579,6 +1580,47 @@ struct Builder {
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<UnionAllOperator> union_all,
                           UnionAllOperator::Make(std::move(inputs), std::move(columns), types));
     return union_all;
+  }
+  OperatorResult operator()(const plan::SetOperationNode& node) const {
+    // As a union's inputs (above): each planned on its own and read one after another on the
+    // consumer's thread, with nothing above travelling into one (docs/adr/0039-set-operations.md).
+    if (part.has_value()) {
+      return arrow::Status::Invalid("a set operation inside a part pipeline");
+    }
+    Name("SetOperation");
+    std::vector<std::unique_ptr<Operator>> inputs;
+    std::vector<std::vector<int>> columns;
+    inputs.reserve(node.inputs.size());
+    columns.reserve(node.columns.size());
+    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
+      ARROW_ASSIGN_OR_RAISE(auto input, Build(node.inputs[k], std::nullopt, Input(k)));
+      inputs.push_back(std::move(input));
+    }
+    for (const std::vector<plan::BoundColumn>& input : node.columns) {
+      std::vector<int>& picked = columns.emplace_back();
+      for (const plan::BoundColumn& column : input) {
+        picked.push_back(column.index);
+      }
+    }
+    std::vector<plan::LogicalType> types;
+    if (!node.columns.empty()) {
+      for (const plan::BoundColumn& column : node.columns.front()) {
+        types.push_back(column.type);
+      }
+    }
+    for (std::size_t k = 1; k < node.columns.size(); ++k) {
+      for (std::size_t i = 0; i < node.columns[k].size() && i < types.size(); ++i) {
+        if (node.columns[k][i].type != types[i]) {
+          return arrow::Status::Invalid("set operation: column ", i, " is ",
+                                        plan::ToString(types[i]), " in input 0 and ",
+                                        plan::ToString(node.columns[k][i].type), " in input ", k);
+        }
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        std::unique_ptr<SetOperationOperator> set_operation,
+        SetOperationOperator::Make(std::move(inputs), std::move(columns), types, node.formula));
+    return set_operation;
   }
 };
 

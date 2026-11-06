@@ -42,6 +42,10 @@ class KeyTable {
 
   // The group of each row of `keys`, adding the groups that are new.
   virtual arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) = 0;
+  // The group of each row of `keys`, null for a row whose keys no group has: adds no group (a set
+  // operation's inputs that only look up, docs/adr/0039-set-operations.md).
+  virtual arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
+      const arrow::compute::ExecBatch& keys) = 0;
   // Every group's keys in id order, of the types the table was made for (normalized, NULLs kept).
   // It can be called again; the arrays stay valid after later calls.
   [[nodiscard]] virtual arrow::Result<arrow::compute::ExecBatch> Uniques() const = 0;

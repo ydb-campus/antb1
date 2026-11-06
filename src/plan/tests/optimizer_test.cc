@@ -461,6 +461,17 @@ struct MapReferences {
     }
     return std::make_shared<const LogicalNode>(std::move(node));
   }
+  LogicalNodePtr operator()(SetOperationNode node) const {
+    for (std::vector<BoundColumn>& input : node.columns) {
+      for (BoundColumn& column : input) {
+        Column(column);
+      }
+    }
+    for (LogicalNodePtr& input : node.inputs) {
+      input = Map(input);
+    }
+    return std::make_shared<const LogicalNode>(std::move(node));
+  }
   LogicalNodePtr operator()(GroupingSetsNode node) const {
     for (BoundColumn& key : node.keys) {
       Column(key);
@@ -1729,6 +1740,98 @@ TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverAUnion) {
   ASSERT_EQ(restriction->keys.size(), 1U) << Explain(plan);
   EXPECT_EQ(restriction->keys[0].left.id, FieldOf(71, 1).id);
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// A set operation of FourFieldsRows(11, rows) and FourFieldsRows(31, rows), UNION, whose four
+// columns are #71 to #74, as FourFieldsUnion's (ADR 0039).
+LogicalNodePtr FourFieldsSetOperation(int64_t rows) {
+  SetOperationNode node{.inputs = {FourFieldsRows(11, rows), FourFieldsRows(31, rows)},
+                        .columns = {{}, {}},
+                        .ids = {},
+                        .formula = {SetTerm{.kind = SetTermKind::kInput, .input = 0},
+                                    SetTerm{.kind = SetTermKind::kInput, .input = 1},
+                                    SetTerm{.kind = SetTermKind::kUnion, .operands = 2}},
+                        .span = {}};
+  for (int field = 0; field < 4; ++field) {
+    node.columns[0].push_back(FieldOf(11, field));
+    node.columns[1].push_back(FieldOf(31, field));
+    node.ids.push_back(FieldOf(71, field).id);
+  }
+  return Node(std::move(node));
+}
+
+// A set operation below the aggregation stops the offer as a union does (ReadsAJoinOrUnion, ADR
+// 0039): its arm drops it, so the reduction restricts the key over it.
+TEST(OptimizerTest, TheSemiJoinReductionRestrictsOneKeyOverASetOperation) {
+  const std::vector<ExprPtr> one = {Compare(FieldOf(71, 1), FieldOf(1, 1), CompareOp::kEq)};
+  const LogicalPlan plan = Optimized(
+      PlanOverJoin(Node(DependentJoinNode{
+                       .kind = JoinKind::kOneRow,
+                       .left = FourFieldsRows(1, 10),
+                       .right = Node(AggregateNode{
+                           .input = CorrelatedBlockOver(FourFieldsSetOperation(1000), one, 50),
+                           .aggregates = {AggregateCall{.kind = AggKind::kMin,
+                                                        .arg = FieldOf(71, 2),
+                                                        .type = LogicalType::kBigInt,
+                                                        .id = ColumnId{140}}}}),
+                       .span = {}}),
+                   1));
+  const auto* restriction = RestrictionUnder(plan);
+  ASSERT_NE(restriction, nullptr) << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi) << Explain(plan);
+  EXPECT_TRUE(std::holds_alternative<SetOperationNode>(*restriction->left))
+      << "its probe is the set operation: " << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// A set operation reads every input in full, as a GROUP BY does, so a LIMIT above it limits no
+// GroupAggregate below it: ADR 0018's rewrite of dependent keys runs there, where under a union it
+// does not.
+TEST(OptimizerTest, ASetOperationReadsItsInputsInFull) {
+  static const Catalog catalog = MakeCatalog();
+  const auto keys_below = [](bool set_operation) {
+    auto bound = BindSql("SELECT i32, i32 + 1 FROM t GROUP BY i32, i32 + 1", catalog);
+    EXPECT_TRUE(bound.ok()) << bound.status().ToString();
+    ColumnId last = MaxColumnId(*bound->root);
+    const LogicalNodePtr second = CloneWithFreshIds(bound->root, last);
+    std::vector<std::vector<BoundColumn>> columns(2);
+    std::vector<ColumnId> ids;
+    const std::vector<ColumnId> second_ids = OutputIds(*second);
+    for (std::size_t i = 0; i < bound->output.size(); ++i) {
+      const OutputColumn& out = bound->output[i];
+      columns[0].push_back(BoundColumn{.id = out.id, .name = out.name, .type = out.type});
+      columns[1].push_back(BoundColumn{.id = second_ids[i], .name = out.name, .type = out.type});
+      last = ColumnId{std::to_underlying(last) + 1};
+      ids.push_back(last);
+    }
+    const LogicalNodePtr below =
+        set_operation
+            ? Node(SetOperationNode{.inputs = {bound->root, second},
+                                    .columns = columns,
+                                    .ids = ids,
+                                    .formula = {SetTerm{.kind = SetTermKind::kInput, .input = 0},
+                                                SetTerm{.kind = SetTermKind::kInput, .input = 1},
+                                                SetTerm{.kind = SetTermKind::kUnion}},
+                                    .span = {}})
+            : Node(UnionAllNode{
+                  .inputs = {bound->root, second}, .columns = columns, .ids = ids, .span = {}});
+    const LogicalPlan plan = Optimized(ResolvePositions(
+        PlanOver(Node(LimitNode{.input = below, .limit = 1, .offset = 0, .span = {}}))));
+    std::vector<std::size_t> keys;
+    const std::function<void(const LogicalNodePtr&)> walk = [&](const LogicalNodePtr& node) {
+      if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
+        keys.push_back(group->keys.size());
+      }
+      for (const LogicalNodePtr& input : InputsOf(*node)) {
+        walk(input);
+      }
+    };
+    walk(plan.root);
+    return keys;
+  };
+  EXPECT_EQ(keys_below(true), (std::vector<std::size_t>{1, 1})) << "rewritten below the node";
+  EXPECT_EQ(keys_below(false), (std::vector<std::size_t>{2, 2}))
+      << "a union keeps the Limit's hold";
 }
 
 // A union keeps every column, as a Project does, and asks each input for the columns it reads of

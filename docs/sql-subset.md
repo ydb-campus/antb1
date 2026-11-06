@@ -829,7 +829,9 @@ anti, null-aware anti or one-row), key pairs of one type each, residual conditio
 builds on. A `UnionAll` has two or more, or one once the optimizer has ruled the others out
 ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of the next, and so on; its columns are new,
 of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
-union by a `Compute`. A query produces inner `Join`s: the binder factors
+union by a `Compute`. A `SetOperation` ([ADR 0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT
+and EXCEPT, ALL or not, over one or more inputs, every column a key, the tree a formula over its inputs; the binder
+produces none yet (ADR 0037's X4b). A query produces inner `Join`s: the binder factors
 each element of `WHERE` and of an inner `ON` (below, below) and sends every conjunct that leaves it to the relations
 it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side

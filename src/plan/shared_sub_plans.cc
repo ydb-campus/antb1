@@ -205,6 +205,17 @@ class Origins {
       Set(node.ids[i], origin + ')');
     }
   }
+  // A set operation's column likewise, under a mark of its own: no union's column is one of it.
+  void Define(const SetOperationNode& node, const LogicalNode& at) {
+    for (std::size_t i = 0; i < node.ids.size(); ++i) {
+      std::string origin = "s(";
+      for (const std::vector<BoundColumn>& input : node.columns) {
+        origin += i < input.size() ? Key(input[i], at) : std::string("-");
+        origin += ',';
+      }
+      Set(node.ids[i], origin + ')');
+    }
+  }
   void Define(const FilterNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const SortNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const LimitNode& /*node*/, const LogicalNode& /*at*/) {}
@@ -391,6 +402,24 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
             key += ';';
           }
           return key + ')';
+        } else if constexpr (std::is_same_v<T, SetOperationNode>) {
+          // Keyed as a union is, with its formula, so that one repeated whole is one group, which
+          // exec declines to hold (WorthSharing: no aggregate); nothing below it is collected
+          // (SharedSubPlans, ADR 0039).
+          std::string key = "setop(";
+          for (const SetTerm& term : n.formula) {
+            key +=
+                std::format("{}:{}:{},", std::to_underlying(term.kind), term.input, term.operands);
+          }
+          key += ';';
+          for (const std::vector<BoundColumn>& input : n.columns) {
+            for (const BoundColumn& column : input) {
+              key += origins.Key(column, node);
+              key += ',';
+            }
+            key += ';';
+          }
+          return key + ')';
         } else if constexpr (std::is_same_v<T, SortNode> || std::is_same_v<T, LimitNode> ||
                              std::is_same_v<T, RowCountNode> ||
                              std::is_same_v<T, DependentJoinNode> ||
@@ -546,8 +575,9 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
     // collected, so a branch is never held on its own either -- whatever the copies hold that has
     // no key (a Sort, a RowCount), and in whatever order they list their branches. An
     // aggregate-topped branch held alone can outgrow MaterializedTable::kMaxBytes, and a result
-    // past the cap fails the query.
-    if (std::holds_alternative<UnionAllNode>(*node)) {
+    // past the cap fails the query. Nor under a set operation, for the same reason (ADR 0039).
+    if (std::holds_alternative<UnionAllNode>(*node) ||
+        std::holds_alternative<SetOperationNode>(*node)) {
       return;
     }
     for (const LogicalNodePtr& input : InputsOf(*node)) {
@@ -577,8 +607,9 @@ std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
     }
     // Nor below a union, where no member is: a copy of a sub-plan under a union would otherwise
     // report a group whose members another group already holds, which exec would then compute and
-    // hold for no consumer.
-    if (std::holds_alternative<UnionAllNode>(*node)) {
+    // hold for no consumer. Nor below a set operation (ADR 0039).
+    if (std::holds_alternative<UnionAllNode>(*node) ||
+        std::holds_alternative<SetOperationNode>(*node)) {
       return;
     }
     for (const LogicalNodePtr& input : InputsOf(*node)) {

@@ -1604,6 +1604,49 @@ TEST_F(PhysicalPlannerTest, MalformedUnionsAreInvalidNotUnsupported) {
   }
 }
 
+// A set operation (docs/adr/0039-set-operations.md) over two scans, one of them filtered: each
+// input planned on its own, as a union's, its parts read on the consumer's thread. Table()'s x
+// minus Repeated()'s, and the ALL form's copies; a malformed formula is Invalid, a bug.
+TEST_F(PhysicalPlannerTest, ASetOperationOverTwoScans) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto set_operation = [&](plan::SetTermKind kind, std::size_t operands = 2) {
+    return Node(plan::SetOperationNode{
+        .inputs = {Node(plan::ScanNode{.table = Table(true), .table_name = "t", .fields = {0}}),
+                   Node(plan::FilterNode{
+                       .input = Node(
+                           plan::ScanNode{.table = Repeated(), .table_name = "r", .fields = {0}}),
+                       .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(2))}})},
+        .columns = {{x}, {x}},
+        .ids = {},
+        .formula = {plan::SetTerm{.kind = plan::SetTermKind::kInput, .input = 0},
+                    plan::SetTerm{.kind = plan::SetTermKind::kInput, .input = 1},
+                    plan::SetTerm{.kind = kind, .operands = operands}},
+        .span = {}});
+  };
+  using Values = std::vector<std::optional<int64_t>>;
+  const auto sorted = [&](plan::LogicalNodePtr input) {
+    return Run(PlanOf(
+        Node(plan::SortNode{.input = std::move(input), .keys = {plan::SortKey{.column = x}}})));
+  };
+  const auto except = sorted(set_operation(plan::SetTermKind::kExcept));
+  ASSERT_NE(except, nullptr);
+  EXPECT_EQ(Int64Column(*except, 0), (Values{0, 1, 3, 5, 6, 7, 8, 9}));
+  const auto intersect = sorted(set_operation(plan::SetTermKind::kIntersect));
+  ASSERT_NE(intersect, nullptr);
+  EXPECT_EQ(Int64Column(*intersect, 0), (Values{2, 4}));
+  // Repeated()'s 2, 2, 2 and 4 EXCEPT ALL nothing of Table()'s: the right side's copies are what an
+  // EXCEPT ALL with the inputs the other way round keeps.
+  auto reversed = std::get<plan::SetOperationNode>(*set_operation(plan::SetTermKind::kExceptAll));
+  std::swap(reversed.inputs[0], reversed.inputs[1]);
+  const auto all = sorted(Node(std::move(reversed)));
+  ASSERT_NE(all, nullptr);
+  EXPECT_EQ(Int64Column(*all, 0), (Values{2, 2}));
+
+  const auto broken = BuildPhysicalPlan(PlanOf(set_operation(plan::SetTermKind::kUnion, 3)));
+  EXPECT_TRUE(broken.status().IsInvalid()) << broken.status().ToString();
+  EXPECT_EQ(plan::GetSqlError(broken.status()), nullptr);
+}
+
 // A union none of whose branches is left is FALSE over a union of its first branch (ADR 0036's
 // X7a): above the union, which ends every part pipeline, it reads nothing -- neither the branch's
 // parts nor its join's build. FALSE on top of the branch instead still prepares the join's build
