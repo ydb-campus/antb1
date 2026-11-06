@@ -41,8 +41,8 @@ Responsibilities:
   bindings of a query block and the name rules of [ADR 0022](adr/0022-joins-and-query-blocks.md)) and join order
   (`src/plan/join_order.h`: a cost search over the join trees, greedy and left-deep beyond 12 relations, estimated
   from footer row counts, ranges and distinct-count hints), the logical plan (`logical_plan.h`; a `Join` and a
-  `DependentJoin` have two inputs, a `UnionAll` one or more ([ADR 0036](adr/0036-union-all.md)), every other node at
-  most one), the rule
+  `DependentJoin` have two inputs, a `UnionAll` ([ADR 0036](adr/0036-union-all.md)) and a `SetOperation`
+  ([ADR 0039](adr/0039-set-operations.md)) one or more, every other node at most one), the rule
   optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
   `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
@@ -63,7 +63,7 @@ Responsibilities:
   readers, applies the filter to the filter's columns as it decodes them (strings as views into the decoded pages,
   piece by piece) and copies only the rows that pass, for every column.
 - `exec`: pull-based, batch-at-a-time physical operators (`TableScan`, `Filter`, `Compute`, `Project`,
-  `ScalarAggregate`, `GroupAggregate`, `GroupingSets`, `Sort`, `Limit`, `RowCount`, `UnionAll`; see
+  `ScalarAggregate`, `GroupAggregate`, `GroupingSets`, `Sort`, `Limit`, `RowCount`, `UnionAll`, `SetOperation`; see
   [Execution](#execution)), the exact aggregate states (scalar and grouped), the row comparator and sort buffer, the
   join hash table (`JoinTableBuilder`, `JoinTable`) and the hash joins' operators (`JoinBuild`, `BuildsFirstOperator`,
   `HashJoinOperator`, which the physical planner plans every join with; see [Execution](#execution)), the physical
@@ -151,12 +151,16 @@ steps (only step 7 uses more than one thread):
    against the aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above
    the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
    nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`, `Join`, `DependentJoin`, `UnionAll`, `GroupingSets`) plus the output columns. `GroupingSets` (ROLLUP,
-   CUBE and GROUPING SETS, [ADR 0038](adr/0038-grouping-sets.md)) holds the distinct keys, the sets as lists of key
-   indices, the calls and the GROUPING calls; no SQL binds to it before ADR 0037's RU3. A correlated subquery binds to a
+   `RowCount`, `Join`, `DependentJoin`, `UnionAll`, `GroupingSets`, `SetOperation`) plus the output columns.
+   `GroupingSets` (ROLLUP, CUBE and GROUPING SETS, [ADR 0038](adr/0038-grouping-sets.md)) holds the distinct keys,
+   the sets as lists of key indices, the calls and the GROUPING calls; no SQL binds to it before ADR 0037's RU3. A
+   correlated subquery binds to a
    `DependentJoin`, whose right input reads columns of its left input as free variables (`plan::FreeVariables`). A
    `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new columns of one type each
-   ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one.
+   ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one. `SetOperation` answers one tree of UNION,
+   INTERSECT and EXCEPT, ALL or not, over one or more inputs: new columns of one type each, every one of them a key,
+   and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); no SQL binds to it
+   before ADR 0037's X4b.
     Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
@@ -169,8 +173,8 @@ steps (only step 7 uses more than one thread):
    without a `Sort` reads it (ADR 0018);
    `Limit` below `Project`; a grouped aggregate computed as partials on one input of its join, where the gate admits
    it (ADR 0032's G2b); and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
-   inputs for what is used above it plus its keys and residuals; a `Project` and a `UnionAll` keep every output, a
-   union asking each input for the columns it maps). Every rule visits every input of a node
+   inputs for what is used above it plus its keys and residuals; a `Project`, a `UnionAll` and a `SetOperation`
+   keep every output, each asking its inputs for the columns it maps). Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
    `Bind` and `Optimize`, `plan::ResolvePositions`, sets every position from the ids; the executor reads positions
@@ -356,6 +360,7 @@ builds, outermost first and each after the builds its input probes, then the pro
 | `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that empties its join, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |
 | `UnionAllOperator` | `UnionAll` | the batches of each input in input order, on the consumer's thread (an input that is a part pipeline runs its own parts); an input is opened when the previous one is exhausted and closed before the next one opens, so one input's resources at a time and none of an input a `Limit` never reaches; each batch rebuilt in the union's schema (input 0's names, nullable fields) with its selection kept, no row copied; the first failing input in order decides the error ([ADR 0036](adr/0036-union-all.md)) |
+| `SetOperationOperator` | `SetOperation` | one `GroupTable` keyed on every column, the inputs read in full in written order, one open at a time as in `UnionAllOperator`; the rows of a starter (an input that can bring a row into the result: `plan::SetStarters`) insert their groups, every other input's only look theirs up (`KeyTable::Lookup`) and add none; per group and input a presence bit, or a count where the formula reads one (`plan::SetCounted`), charged to the budget; after the last input the formula gives each group its copies, in chunks: under a DISTINCT root each kept group once with its keys as first seen among the starters, selected over the table's chunks; under an ALL root each group repeated by its copies with its normalized keys, in batches of at most 64Ki rows; the first failing input in order decides the error ([ADR 0039](adr/0039-set-operations.md)) |
 
 The aggregate states (`src/exec/include/antb1/exec/aggregate_state.h`) implement `Consume(values, selection)`,
 `Merge` and `Finalize`. `COUNT(*)` is the true count of the selection; `COUNT(col)`, `SUM` and `AVG` walk the runs

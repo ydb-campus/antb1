@@ -87,6 +87,7 @@ struct NodeNameOf {
   std::string_view operator()(const DependentJoinNode& /*node*/) const { return "DependentJoin"; }
   std::string_view operator()(const UnionAllNode& /*node*/) const { return "UnionAll"; }
   std::string_view operator()(const GroupingSetsNode& /*node*/) const { return "GroupingSets"; }
+  std::string_view operator()(const SetOperationNode& /*node*/) const { return "SetOperation"; }
 };
 
 struct InputsOfNode {
@@ -108,6 +109,7 @@ struct InputsOfNode {
     return {node.left, node.right};
   }
   std::vector<LogicalNodePtr> operator()(const UnionAllNode& node) const { return node.inputs; }
+  std::vector<LogicalNodePtr> operator()(const SetOperationNode& node) const { return node.inputs; }
   std::vector<LogicalNodePtr> operator()(const GroupingSetsNode& node) const {
     return {node.input};
   }
@@ -151,6 +153,11 @@ struct WithInputsOfNode {
   }
   LogicalNodePtr operator()(const UnionAllNode& node) const {
     UnionAllNode out = node;
+    out.inputs = std::move(inputs);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  LogicalNodePtr operator()(const SetOperationNode& node) const {
+    SetOperationNode out = node;
     out.inputs = std::move(inputs);
     return std::make_shared<const LogicalNode>(std::move(out));
   }
@@ -555,6 +562,160 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> ToArrowScalar(const Constant& cons
   return arrow::Status::Invalid("a ", ToString(type), " constant holds a value of another type");
 }
 
+namespace {
+
+// A set operation's formula as a tree (CheckSetFormula has passed).
+struct SetTreeNode {
+  SetTermKind kind = SetTermKind::kInput;
+  std::size_t input = 0;
+  std::vector<SetTreeNode> operands;
+};
+
+SetTreeNode SetTreeOf(const std::vector<SetTerm>& formula) {
+  std::vector<SetTreeNode> stack;
+  for (const SetTerm& term : formula) {
+    if (term.kind == SetTermKind::kInput) {
+      stack.push_back(SetTreeNode{.kind = term.kind, .input = term.input, .operands = {}});
+      continue;
+    }
+    ANTB1_CHECK(term.operands <= stack.size());
+    SetTreeNode node{.kind = term.kind, .input = 0, .operands = {}};
+    const auto first = stack.end() - static_cast<std::ptrdiff_t>(term.operands);
+    node.operands.assign(std::make_move_iterator(first), std::make_move_iterator(stack.end()));
+    stack.erase(first, stack.end());
+    stack.push_back(std::move(node));
+  }
+  ANTB1_CHECK(stack.size() == 1);
+  return std::move(stack.front());
+}
+
+void MarkStarters(const SetTreeNode& node, std::vector<bool>& starters) {
+  switch (node.kind) {
+    case SetTermKind::kInput:
+      starters.at(node.input) = true;
+      return;
+    case SetTermKind::kUnion:
+      for (const SetTreeNode& operand : node.operands) {
+        MarkStarters(operand, starters);
+      }
+      return;
+    case SetTermKind::kIntersect:
+    case SetTermKind::kIntersectAll:
+    case SetTermKind::kExcept:
+    case SetTermKind::kExceptAll:
+      MarkStarters(node.operands.front(), starters);
+      return;
+  }
+}
+
+// `read`: whether the term above reads this term's count rather than its presence.
+void MarkCounted(const SetTreeNode& node, bool read, std::vector<bool>& counted) {
+  bool operands_read = false;
+  switch (node.kind) {
+    case SetTermKind::kInput:
+      counted.at(node.input) = read;
+      return;
+    case SetTermKind::kExceptAll:
+      operands_read = true;  // even for presence: max(X1 - X2, 0) > 0 needs the counts
+      break;
+    case SetTermKind::kIntersectAll:
+      operands_read = read;  // [min(X1, X2)] is [X1] AND [X2]
+      break;
+    case SetTermKind::kUnion:
+    case SetTermKind::kIntersect:
+    case SetTermKind::kExcept:
+      break;
+  }
+  for (const SetTreeNode& operand : node.operands) {
+    MarkCounted(operand, operands_read, counted);
+  }
+}
+
+std::string_view SetTermName(SetTermKind kind) {
+  switch (kind) {
+    case SetTermKind::kInput:
+      return "";
+    case SetTermKind::kUnion:
+      return "UNION";
+    case SetTermKind::kIntersect:
+      return "INTERSECT";
+    case SetTermKind::kIntersectAll:
+      return "INTERSECT ALL";
+    case SetTermKind::kExcept:
+      return "EXCEPT";
+    case SetTermKind::kExceptAll:
+      return "EXCEPT ALL";
+  }
+  return "";
+}
+
+std::string SetTreeText(const SetTreeNode& node, bool nested) {
+  if (node.kind == SetTermKind::kInput) {
+    return std::to_string(node.input);
+  }
+  std::string text = nested ? "(" : "";
+  for (std::size_t i = 0; i < node.operands.size(); ++i) {
+    if (i > 0 || node.operands.size() == 1) {
+      text += (i > 0 ? " " : "") + std::string(SetTermName(node.kind)) + " ";
+    }
+    text += SetTreeText(node.operands[i], true);
+  }
+  return text + (nested ? ")" : "");
+}
+
+}  // namespace
+
+std::optional<std::string> CheckSetFormula(const std::vector<SetTerm>& formula,
+                                           std::size_t inputs) {
+  if (formula.empty()) {
+    return "an empty formula";
+  }
+  std::size_t depth = 0;  // terms on the stack
+  std::size_t next = 0;   // the input the next kInput must read
+  for (std::size_t t = 0; t < formula.size(); ++t) {
+    const SetTerm& term = formula[t];
+    if (term.kind == SetTermKind::kInput) {
+      if (term.input != next) {
+        return std::format("term {} reads input {} where input {} comes next", t, term.input, next);
+      }
+      ++next;
+      ++depth;
+      continue;
+    }
+    if (term.operands == 0 || term.operands > depth) {
+      return std::format("term {} has {} operands of the {} terms before it", t, term.operands,
+                         depth);
+    }
+    depth -= term.operands - 1;
+  }
+  if (next != inputs) {
+    return std::format("the formula reads {} of {} inputs", next, inputs);
+  }
+  if (depth != 1) {
+    return std::format("the formula leaves {} terms, not one root", depth);
+  }
+  if (formula.back().kind == SetTermKind::kInput) {
+    return std::string("the root is an input, not an operator");
+  }
+  return std::nullopt;
+}
+
+std::vector<bool> SetStarters(const std::vector<SetTerm>& formula, std::size_t inputs) {
+  std::vector<bool> starters(inputs, false);
+  MarkStarters(SetTreeOf(formula), starters);
+  return starters;
+}
+
+std::vector<bool> SetCounted(const std::vector<SetTerm>& formula, std::size_t inputs) {
+  std::vector<bool> counted(inputs, false);
+  MarkCounted(SetTreeOf(formula), /*read=*/true, counted);
+  return counted;
+}
+
+std::string SetFormulaText(const std::vector<SetTerm>& formula) {
+  return SetTreeText(SetTreeOf(formula), false);
+}
+
 std::string_view NodeName(const LogicalNode& node) { return std::visit(NodeNameOf{}, node); }
 
 SourceSpan SpanOf(const LogicalNode& node) {
@@ -637,6 +798,7 @@ struct OutputIdsOf {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
   }
   std::vector<ColumnId> operator()(const UnionAllNode& node) const { return node.ids; }
+  std::vector<ColumnId> operator()(const SetOperationNode& node) const { return node.ids; }
   std::vector<ColumnId> operator()(const GroupingSetsNode& node) const {
     return GroupingSetsIds(node);
   }
@@ -740,6 +902,16 @@ struct IdsOfNode {
   }
   void operator()(const DependentJoinNode& node) const { Define(node.mark); }
   void operator()(const UnionAllNode& node) const {
+    for (const std::vector<BoundColumn>& input : node.columns) {
+      for (const BoundColumn& column : input) {
+        Read(column);
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define(id);
+    }
+  }
+  void operator()(const SetOperationNode& node) const {
     for (const std::vector<BoundColumn>& input : node.columns) {
       for (const BoundColumn& column : input) {
         Read(column);
@@ -1194,6 +1366,46 @@ class Resolver {
     return {.node = changed ? MakeNode(std::move(out)) : self, .ids = node.ids};
   }
 
+  // As a union's (above), and its formula must be one tree over its inputs (CheckSetFormula).
+  Resolved Visit(const LogicalNodePtr& self, const SetOperationNode& node) {
+    if (node.inputs.empty()) {
+      Fail(std::format("SetOperation: {} inputs", node.inputs.size()));
+    }
+    if (node.columns.size() != node.inputs.size()) {
+      Fail(std::format("SetOperation: {} column lists for {} inputs", node.columns.size(),
+                       node.inputs.size()));
+    }
+    if (const std::optional<std::string> formula =
+            CheckSetFormula(node.formula, node.inputs.size())) {
+      Fail("SetOperation: " + *formula);
+    }
+    SetOperationNode out = node;
+    bool changed = false;
+    for (std::size_t k = 0; k < node.inputs.size(); ++k) {
+      Resolved input = Walk(node.inputs[k]);
+      changed = changed || input.node != node.inputs[k];
+      out.inputs[k] = input.node;
+      if (k >= out.columns.size()) {
+        continue;
+      }
+      CheckSize("SetOperation", "columns", node.ids.size(), out.columns[k].size());
+      for (std::size_t i = 0; i < out.columns[k].size(); ++i) {
+        BoundColumn& column = out.columns[k][i];
+        if (Resolve("SetOperation", column, input.ids)) {
+          changed = true;
+        }
+        if (i < out.columns[0].size() && column.type != out.columns[0][i].type) {
+          Fail(std::format("SetOperation: column {} is {} in input 0 and {} in input {}", i,
+                           ToString(out.columns[0][i].type), ToString(column.type), k));
+        }
+      }
+    }
+    for (const ColumnId id : node.ids) {
+      Define("SetOperation", id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = node.ids};
+  }
+
   std::set<ColumnId> defined_;
   // One frame per dependent join on the path to the node being walked: the ids its left input
   // outputs, which its right input may read as free variables. Empty outside a right input, so a
@@ -1367,6 +1579,17 @@ struct FreshIds {
     }
     for (ColumnId& id : node.ids) {
       id = Mint(id);  // never passed through, as ResolvePositions Defines every one
+    }
+    return node;
+  }
+  LogicalNode operator()(SetOperationNode node) const {
+    for (std::vector<BoundColumn>& input : node.columns) {
+      for (BoundColumn& column : input) {
+        Rename(column);
+      }
+    }
+    for (ColumnId& id : node.ids) {
+      id = Mint(id);  // new columns, as a union's
     }
     return node;
   }

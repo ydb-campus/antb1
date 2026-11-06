@@ -178,7 +178,9 @@ LogicalNodePtr DependentKeys(const LogicalNodePtr& node, bool limited) {
   } else if (std::holds_alternative<SortNode>(*node)) {
     limited = false;
   }
-  const bool group = std::holds_alternative<GroupAggregateNode>(*node);
+  // A set operation reads every input in full (ADR 0039), as a GROUP BY does.
+  const bool group = std::holds_alternative<GroupAggregateNode>(*node) ||
+                     std::holds_alternative<SetOperationNode>(*node);
   LogicalNodePtr current = MapInputs(
       node, [&](const LogicalNodePtr& input) { return DependentKeys(input, limited && !group); });
   if (const auto* aggregate = std::get_if<GroupAggregateNode>(current.get());
@@ -385,6 +387,20 @@ struct Pruner {
     return node;
   }
   // Needs its keys and its calls' arguments, as a GroupAggregate does.
+  // Keeps every output and every input column: each is a key of the deduplication, so no column can
+  // go unread (ADR 0039), unlike a union's.
+  LogicalNodePtr operator()(const SetOperationNode& set) const {
+    std::vector<LogicalNodePtr> inputs;
+    inputs.reserve(set.inputs.size());
+    for (std::size_t k = 0; k < set.inputs.size(); ++k) {
+      Needed below;
+      for (const BoundColumn& column : set.columns.at(k)) {
+        Need(below, column);
+      }
+      inputs.push_back(Prune(set.inputs[k], std::move(below)));
+    }
+    return WithInputs(*node, std::move(inputs));
+  }
   LogicalNodePtr operator()(const GroupingSetsNode& group) const {
     Needed below;
     for (const BoundColumn& key : group.keys) {
@@ -879,7 +895,8 @@ bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
   if (node == nullptr) {
     return false;
   }
-  if (std::holds_alternative<JoinNode>(*node) || std::holds_alternative<UnionAllNode>(*node)) {
+  if (std::holds_alternative<JoinNode>(*node) || std::holds_alternative<UnionAllNode>(*node) ||
+      std::holds_alternative<SetOperationNode>(*node)) {
     return true;
   }
   return std::ranges::any_of(InputsOf(*node), ReadsAJoinOrUnion);
@@ -928,8 +945,9 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // part pipeline for one to travel.
   //
   // So the test is total rather than incidental: LogicalNode's multi-input alternatives are the two
-  // joins and the union, and the offer crosses none of them (a union's arm drops it, its inputs
-  // being pipelines of their own), so a subtree with no join and no union *is* the chain an offer
+  // joins, the union and the set operation (ADR 0039), and the offer crosses none of them (a
+  // union's and a set operation's arms drop it, their inputs being pipelines of their own), so a
+  // subtree with no join and no union *is* the chain an offer
   // could travel, and ReadsAJoinOrUnion is false exactly where one could arrive.
   // src/exec/tests/aggregate_filter_test.cc pins that invariant, because threading the offer
   // through a join or a union is a natural change to make and would silently leave this gate paying

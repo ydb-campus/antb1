@@ -576,6 +576,54 @@ struct RowsOf {
     return Saturated(rows);
   }
 
+  // Following the formula (ADR 0039): a UNION its operands' rows added up, an INTERSECT the
+  // smallest operand's, an EXCEPT its first operand's -- the ALL forms alike, a bound on the copies
+  // -- unknown where an operand it reads is unknown, except that an INTERSECT is bounded by its
+  // known operands.
+  std::optional<int64_t> operator()(const SetOperationNode& node) const {
+    if (CheckSetFormula(node.formula, node.inputs.size()).has_value()) {
+      return std::nullopt;
+    }
+    std::vector<std::optional<int64_t>> stack;
+    for (const SetTerm& term : node.formula) {
+      if (term.kind == SetTermKind::kInput) {
+        stack.push_back(EstimateRows(*node.inputs.at(term.input)));
+        continue;
+      }
+      const auto first = stack.end() - static_cast<std::ptrdiff_t>(term.operands);
+      std::optional<int64_t> rows;
+      switch (term.kind) {
+        case SetTermKind::kUnion: {
+          Int128 sum = 0;
+          bool known = true;
+          for (auto it = first; it != stack.end(); ++it) {
+            known = known && it->has_value();
+            sum += std::max<int64_t>(it->value_or(0), 0);
+          }
+          rows = known ? std::optional<int64_t>(Saturated(sum)) : std::nullopt;
+          break;
+        }
+        case SetTermKind::kIntersect:
+        case SetTermKind::kIntersectAll:
+          for (auto it = first; it != stack.end(); ++it) {
+            if (it->has_value()) {
+              const int64_t operand = it->value_or(0);
+              rows = std::min(rows.value_or(operand), operand);
+            }
+          }
+          break;
+        case SetTermKind::kExcept:
+        case SetTermKind::kExceptAll:
+        case SetTermKind::kInput:
+          rows = *first;
+          break;
+      }
+      stack.erase(first, stack.end());
+      stack.push_back(rows);
+    }
+    return stack.back();
+  }
+
   // At most every input row's group in every set, and the empty set's row over no input.
   std::optional<int64_t> operator()(const GroupingSetsNode& node) const {
     const std::optional<int64_t> rows = Input(node);

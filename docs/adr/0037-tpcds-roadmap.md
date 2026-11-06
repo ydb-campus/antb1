@@ -164,7 +164,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Built |
 | **Phase 6** | **Set operations ([ADR 0039](0039-set-operations.md); ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
 | X4a | UNION, INTERSECT and EXCEPT, with ALL or DISTINCT, in the grammar: an operator on each branch of the flat list, `sql::SetOperationTree`, parenthesized branches with or without their own WITH or tail, answered for UNION ALL and typed by ADR 0039's Types rule; the other operators refused with exit code 4 naming X4b, X4c or X4d (the phase 6 and X4a updates below) | | Built |
-| X4s | The set-operation plan node and its serial operator: one hash table keyed on every column, the inputs that start a row inserting and the others looking up, a formula over a bit or a count per input; no SQL (the phase 6 update below) | | Planned |
+| X4s | The set-operation plan node and its serial operator: one hash table keyed on every column, the inputs that start a row inserting and the others looking up, a formula over a bit or a count per input; no SQL (the phase 6 and X4s updates below) | | Built |
 | X4b | UNION [DISTINCT], with DuckDB's tree fold of types | 75 | Planned |
 | X4c | INTERSECT and INTERSECT ALL, also in trees with UNION and UNION ALL | 8, 38 | Planned |
 | X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered | 87 | Planned |
@@ -693,6 +693,10 @@ SQL). UNION ALL answers parenthesized branches; the binder refuses the other ope
 X4c or X4d. The maintainer narrowed the item at its start: a compound's own tail stays X5 at any depth, so X4a answers
 a parenthesized branch's own WITH list and a parenthesized block's own tail, not a parenthesized compound's (ADR
 0039's X4a update). No query passes from it alone: Q87 now stops at EXCEPT.
+
+Update (2026-11-06, X4s): built. `plan::SetOperationNode` and the serial `exec::SetOperationOperator`, reached only
+through hand-built plans, as X1 and RU2 were; no query's plan or answer changes, and the ratchet stays at 69. ADR
+0039's X4s update records the details and the micro benchmark against ADR 0036's sketch.
 
 ## Alternatives considered
 

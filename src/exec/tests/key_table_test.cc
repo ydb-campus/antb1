@@ -11,6 +11,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -569,6 +570,65 @@ TEST_P(KeyTableTest, AGroupByGivesTheSameRowsWithEveryKind) {
   }
   std::ranges::sort(single);
   EXPECT_EQ(single, expected);
+}
+
+// Lookup (a set operation's inputs that only look up, docs/adr/0039-set-operations.md): a known
+// row's id, null for a row no group has -- NULL keys and columns without a values buffer included
+// -- and no group added.
+TEST_P(KeyTableTest, LookupFindsKnownRowsAndAddsNone) {
+  const std::unique_ptr<KeyTable> table = MakeTable({arrow::int64(), arrow::int64()});
+  ASSERT_NE(table, nullptr);
+  auto ids = table->Consume(BatchOf({Int64s({1, std::nullopt, 2}), Int64s({1, 1, std::nullopt})}));
+  ASSERT_TRUE(ids.ok()) << ids.status().ToString();
+  const std::vector<std::uint32_t> consumed(ids->ids.begin(), ids->ids.end());
+  auto found = table->Lookup(
+      BatchOf({Int64s({std::nullopt, 2, 1, 3, 2}), Int64s({1, std::nullopt, 1, 1, 2})}));
+  ASSERT_TRUE(found.ok()) << found.status().ToString();
+  const arrow::UInt32Array& got = **found;
+  ASSERT_EQ(got.length(), 5);
+  EXPECT_TRUE(got.IsValid(0));
+  EXPECT_EQ(got.Value(0), consumed[1]);
+  EXPECT_EQ(got.Value(1), consumed[2]);
+  EXPECT_EQ(got.Value(2), consumed[0]);
+  EXPECT_TRUE(got.IsNull(3));
+  EXPECT_TRUE(got.IsNull(4));
+  EXPECT_EQ(table->num_groups(), 3U) << "a lookup adds no group";
+  // A column of NULLs without a values buffer: found where (NULL, NULL) is a group, else null.
+  auto none = table->Lookup(BatchOf({NullsWithoutValues(2), NullsWithoutValues(2)}));
+  ASSERT_TRUE(none.ok()) << none.status().ToString();
+  EXPECT_EQ((*none)->null_count(), 2);
+  ASSERT_TRUE(table->Consume(BatchOf({Int64s({std::nullopt}), Int64s({std::nullopt})})).ok());
+  auto some = table->Lookup(BatchOf({NullsWithoutValues(2), NullsWithoutValues(2)}));
+  ASSERT_TRUE(some.ok()) << some.status().ToString();
+  EXPECT_EQ((*some)->null_count(), 0);
+}
+
+// GroupTable's side: Consume hands out the groups it computed when asked, and Lookup normalizes a
+// DOUBLE key as Consume does, so -0.0 finds 0.0's group and any NaN finds NaN's.
+TEST_P(KeyTableTest, GroupTableConsumeIdsAndLookupNormalizeDoubles) {
+  MemoryBudget budget(std::nullopt);
+  auto table = GroupTable::Make({Column(0, "d", LogicalType::kDouble)}, {}, 1, &budget, &budget,
+                                /*first_keys=*/true, GroupTable::kPartitions, {.kind = GetParam()});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  const auto schema = arrow::schema({arrow::field("d", arrow::float64())});
+  const auto doubles = [&schema](std::vector<double> values) {
+    arrow::DoubleBuilder builder;
+    EXPECT_TRUE(builder.AppendValues(values).ok());
+    const auto n = static_cast<std::int64_t>(values.size());
+    return arrow::RecordBatch::Make(schema, n, {builder.Finish().ValueOrDie()});
+  };
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  std::vector<std::uint32_t> ids;
+  ASSERT_TRUE((*table)->Consume(*doubles({0.0, nan, 1.5, 0.0}), &ids).ok());
+  ASSERT_EQ(ids.size(), 4U);
+  EXPECT_EQ(ids[0], ids[3]);
+  EXPECT_EQ((*table)->num_groups(), 3U);
+  auto found = (*table)->Lookup(*doubles({-0.0, -nan, 2.5}));
+  ASSERT_TRUE(found.ok()) << found.status().ToString();
+  EXPECT_EQ((*found)->Value(0), ids[0]);
+  EXPECT_EQ((*found)->Value(1), ids[1]);
+  EXPECT_TRUE((*found)->IsNull(2));
+  EXPECT_EQ((*table)->num_groups(), 3U);
 }
 
 INSTANTIATE_TEST_SUITE_P(, KeyTableTest, ::testing::ValuesIn(kKinds), ParamName);

@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/array.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
 #include <arrow/compute/exec.h>
@@ -68,6 +69,24 @@ class GrouperKeyTable final : public KeyTable {
         return ConsumeWithValues(with_values);
       }
       return ConsumeWithValues(keys);
+    });
+  }
+
+  arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
+      const arrow::compute::ExecBatch& keys) override {
+    return NoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
+      const auto lookup = [this](const arrow::compute::ExecBatch& batch)
+          -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum datum,
+                              grouper_->Lookup(arrow::compute::ExecSpan(batch)));
+        return std::static_pointer_cast<arrow::UInt32Array>(datum.make_array());
+      };
+      if (std::ranges::any_of(keys.values,
+                              [](const arrow::Datum& key) { return LacksValues(*key.array()); })) {
+        ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch with_values, WithValues(keys, pool_));
+        return lookup(with_values);
+      }
+      return lookup(keys);
     });
   }
 

@@ -369,6 +369,29 @@ set operations and pins them with records.
   it is still exit code 4: no plan column holds DuckDB's NULL type yet, so rule 4's "reaches its parent as one" waits
   for the item that needs it.
 
+## Update (2026-11-06, X4s): the node and the serial operator, built
+
+- **Built as decided:** `plan::SetOperationNode` with `SetTerm` formulas in postfix, every exhaustive visit, the three
+  walks the compiler does not flag (each named by a test), and `exec::SetOperationOperator` over one `GroupTable`
+  with starters, lookups, bits and counts. Nothing binds the node yet; the physical planner plans it, so a
+  hand-built plan runs end to end with its profile.
+- **Helpers in `plan`,** shared by the operator and the tests: `CheckSetFormula` (each input once, in written order; a
+  single root that is an operator; an operator of one operand allowed, so PF15 can leave a node of one input),
+  `SetStarters`, `SetCounted` and `SetFormulaText`, the formula as EXPLAIN prints it.
+- **`EstimateRows`** bounds an INTERSECT by its known operands, the smallest of them, where an unknown operand would
+  have made the whole estimate unknown: a row of an INTERSECT is in each operand, so any one of them bounds it.
+- **`GroupTable::Consume`** gives its group ids to a caller that asks for them, and `GroupTable::Lookup` normalizes
+  DOUBLE keys as `Consume` does. `KeyTable::Lookup` wraps Arrow 25's `Grouper::Lookup`, with `Consume`'s workaround for
+  a fixed-width key column without a values buffer.
+- **The profile** counts over all inputs, not per input: the starters' rows, the lookups' rows and hits, and the
+  groups. A per-input split can come with X4p, whose lanes report per input anyway.
+- **Tests stand in for the oracle** until X4b gives the node SQL: a randomized test compares the operator with the
+  forms' multiset definitions computed in the test, over random formulas of two to five inputs, NULLs included, at
+  batch sizes 1 and 7.
+- **The micro benchmark** is `bench/set_operation_bench.cc` (`antb1-bench-setops`): a three-input INTERSECT, a
+  two-input EXCEPT and a three-input UNION, the node against the sketch, on one thread, with few or mostly distinct
+  rows. Its numbers are recorded here once measured on a quiet machine.
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:

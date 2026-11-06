@@ -38,6 +38,7 @@ if(ANTB1_BUILD_TESTS)
       tests/relation_count_test.cc
       tests/column_ids_test.cc
       tests/grouping_sets_node_test.cc
+      tests/set_operation_node_test.cc
       tests/folding_test.cc
       tests/branch_truth_test.cc
       tests/union_branches_test.cc

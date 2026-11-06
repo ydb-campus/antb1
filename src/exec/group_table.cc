@@ -263,7 +263,23 @@ arrow::Status GroupTable::AddGroups(std::uint32_t after,
   return arrow::Status::OK();
 }
 
-arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
+arrow::Result<std::shared_ptr<arrow::UInt32Array>> GroupTable::Lookup(
+    const arrow::RecordBatch& rows) {
+  ANTB1_CHECK(!keys_.empty());
+  std::vector<arrow::Datum> keys;
+  keys.reserve(keys_.size());
+  for (const plan::BoundColumn& key : keys_) {
+    std::shared_ptr<arrow::Array> column = rows.column(key.index);
+    if (key.type == plan::LogicalType::kDouble) {
+      ARROW_ASSIGN_OR_RAISE(column, NormalizeDoubleKey(column, pool_));
+    }
+    keys.emplace_back(std::move(column));
+  }
+  return key_table_->Lookup(arrow::compute::ExecBatch(std::move(keys), rows.num_rows()));
+}
+
+arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows,
+                                  std::vector<std::uint32_t>* group_ids_out) {
   const std::int64_t n = rows.num_rows();
   std::vector<std::uint32_t> no_keys;
   KeyIds ids;  // holds the group ids until the states have consumed the rows
@@ -311,6 +327,9 @@ arrow::Status GroupTable::Consume(const arrow::RecordBatch& rows) {
     const arrow::Array* values =
         call.arg.has_value() ? rows.column(call.arg->index).get() : nullptr;
     ARROW_RETURN_NOT_OK(states_[i]->Consume(values, group_ids));
+  }
+  if (group_ids_out != nullptr) {
+    group_ids_out->assign(group_ids.begin(), group_ids.end());
   }
   return Account();
 }

@@ -36,6 +36,7 @@ antb1_add_module(
     materialized_table.cc
     shared_builds.cc
     limit.cc
+    set_operation.cc
     union_all.cc
     gather.cc
     hash_join.cc
@@ -80,6 +81,7 @@ if(ANTB1_BUILD_TESTS)
       tests/hash_join_test.cc
       tests/pool_vector_test.cc
       tests/key_table_test.cc
+      tests/set_operation_test.cc
       tests/union_all_test.cc
     LIBS ArrowCompute::arrow_compute_${ANTB1_ARROW_LINKAGE}
   )
