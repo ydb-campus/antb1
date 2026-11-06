@@ -2501,6 +2501,40 @@ TEST(ParserTest, AlternatingSetOperatorsCountTheirLevels) {
   EXPECT_EQ(TreeDepth(SetOperationTree(*run)), 2U);
 }
 
+// INTERSECT binds tighter (ADR 0039), so a run of it after a UNION or EXCEPT is that run's right
+// operand, a level deeper: its branches after the first are parsed a further level down, and pass
+// the depth limit one level sooner than a branch of the UNION itself. A run of INTERSECT with no
+// UNION before it is the compound's first operand, or the compound, and takes no such level.
+TEST(ParserTest, AnIntersectTermIsOneLevelDeeper) {
+  const auto calls = [](std::size_t k) { return Repeat("f(", k) + "a" + std::string(k, ')'); };
+  const auto plain = [&](std::size_t k) { return "SELECT " + calls(k) + " FROM t"; };
+  const auto in_union = [&](std::size_t k) {
+    return "SELECT a FROM t UNION SELECT a FROM t UNION " + plain(k);
+  };
+  const auto in_term = [&](std::size_t k) {
+    return "SELECT a FROM t UNION SELECT a FROM t INTERSECT " + plain(k);
+  };
+  const auto parenthesized = [&](std::size_t k) {
+    return "SELECT a FROM t UNION SELECT a FROM t INTERSECT (" + plain(k) + ")";
+  };
+  const auto parenthesized_union = [&](std::size_t k) {
+    return "SELECT a FROM t UNION SELECT a FROM t UNION (" + plain(k) + ")";
+  };
+  const auto first_run = [&](std::size_t k) {
+    return "SELECT a FROM t INTERSECT SELECT a FROM t INTERSECT " + plain(k);
+  };
+  const std::size_t at_union = FirstTooDeep(in_union);
+  EXPECT_EQ(FirstTooDeep(in_term), at_union - 1);
+  EXPECT_EQ(FirstTooDeep(parenthesized), FirstTooDeep(parenthesized_union) - 1);
+  EXPECT_EQ(FirstTooDeep(first_run), at_union);
+  // The error is inside the branch that passes the limit, not at an operator.
+  const std::string too_deep = in_term(at_union - 1);
+  auto refused = Parse(too_deep);
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error().kind, ParseError::Kind::kUnsupported);
+  EXPECT_GE(refused.error().span.offset, too_deep.rfind("SELECT f("));
+}
+
 // Literals are select items (constants), and in GROUP BY and ORDER BY positions or constants; the
 // binder tells them apart.
 TEST(ParserTest, ConstantsAndPositions) {

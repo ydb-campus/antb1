@@ -817,14 +817,16 @@ class Parser {
   // but its tree (SetOperationTree) is not: an operator or quantifier other than the one before it
   // can start a new run whose first operand is everything so far, one level down, so it lifts what
   // was parsed. A compound that alternates UNION and UNION ALL thus counts its alternations
-  // against kMaxDepth, and the code that walks its tree (binding, destroying) stays shallow. The
-  // operands of an INTERSECT run, which nests to the right of a UNION, count one level short: the
-  // binder refuses INTERSECT until ADR 0037's X4c, which counts that level.
+  // against kMaxDepth, and the code that walks its tree (binding, destroying) stays shallow. An
+  // INTERSECT binds tighter, so a run of it after a UNION or EXCEPT is that run's right operand,
+  // one level deeper: its branches after the first are parsed a further level down (the first was
+  // lifted with the rest at the operator that started the run).
   Status ParseCompound(SelectStatement& stmt, Box<SelectStatement> first, bool& closed) {
     static_assert(kSetBranchFields == 4, "revisit this walk");
     const std::size_t depth = depth_;
     const std::size_t first_peak = peak_;
     stmt.set_operation.push_back(SetBranch{.query = std::move(first)});
+    bool after_outer = false;  // a UNION or EXCEPT came before: an INTERSECT run nests under it
     while (IsSetOperator(Peek())) {
       auto op = ParseSetOperator();
       if (!op) {
@@ -840,8 +842,16 @@ class Parser {
           return std::unexpected(std::move(*error));
         }
       }
+      const bool nested_term = op->op == SetOp::kIntersect && after_outer;
+      after_outer = after_outer || op->op != SetOp::kIntersect;
       if (Peek().kind == TokenKind::kLeftParen) {
+        if (nested_term) {
+          if (auto error = Deeper(); error.has_value()) {
+            return std::unexpected(std::move(*error));
+          }
+        }
         auto inner = ParseNestedQuery(/*branch=*/true);
+        depth_ = depth;
         if (!inner) {
           return std::unexpected(std::move(inner.error()));
         }
@@ -855,6 +865,12 @@ class Parser {
         // down it above. So a later block's depth error is where that block passes the limit.
         ++depth_;
         peak_ = std::max(peak_, depth_);
+        // An INTERSECT term's branch one level further down, which may not fit.
+        if (nested_term) {
+          if (auto error = Deeper(); error.has_value()) {
+            return std::unexpected(std::move(*error));
+          }
+        }
         if (Peek().IsKeyword("WITH")) {
           return Syntax(Peek().span, "unexpected WITH after " + std::string(ToString(op->op)) +
                                          (op->all ? " ALL" : "") +

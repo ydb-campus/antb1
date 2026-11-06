@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -702,6 +703,18 @@ void CollectLeaves(const sql::SetTree& tree, std::vector<const sql::SelectStatem
   for (const sql::SetTree& operand : tree.operands) {
     CollectLeaves(operand, out);
   }
+}
+
+// Whether a compound has a branch whose operator passes `pred`, in parentheses too.
+bool AnyOperator(const sql::SelectStatement& query,
+                 const std::function<bool(const sql::SetBranch&)>& pred) {
+  for (std::size_t k = 0; k < query.set_operation.size(); ++k) {
+    const sql::SetBranch& branch = query.set_operation[k];
+    if ((k > 0 && pred(branch)) || AnyOperator(*branch.query, pred)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The blocks of a nested query: itself, or the copies of a compound (ADR 0036), which parentheses
@@ -1845,7 +1858,7 @@ TEST(QueryGenerator, UnionChangesOnlyTheirQueries) {
       return derived != nullptr ? *derived->query : *stmt.with.at(0).query;
     };
     const sql::SelectStatement& compound = nested(*ast);
-    EXPECT_TRUE(std::ranges::any_of(compound.set_operation, [](const sql::SetBranch& branch) {
+    EXPECT_TRUE(AnyOperator(compound, [](const sql::SetBranch& branch) {
       return branch.op == sql::SetOp::kUnion && !branch.all;
     })) << "a UNION among the operators";
     const auto copies = CopiesOf(compound);
@@ -1863,13 +1876,61 @@ TEST(QueryGenerator, UnionChangesOnlyTheirQueries) {
     };
     for (std::size_t k = 0; k < copies.size(); ++k) {
       EXPECT_EQ(reads(*copies[k]), reads(*plain_copies[k])) << k;
-      EXPECT_TRUE(plain_copies[k]->where.empty()) << k;
+      if (!plain.features.Has(Feature::kIntersect)) {
+        EXPECT_TRUE(plain_copies[k]->where.empty()) << k << ": only another operator draws one";
+      }
       conditions += copies[k]->where.empty() ? 0 : 1;
     }
   }
   EXPECT_GT(took, 50) << "took: " << took;
   EXPECT_GT(same, 6000);
   EXPECT_GT(conditions, took) << "most copies of a compound with a UNION read rows of their own";
+}
+
+// INTERSECT and INTERSECT ALL (ADR 0039's X4c) come from the same stream and draw as UNION does, so
+// every seed that declines them generates the query it did before; one that takes one keeps the
+// copies and their row bound, and writes ALL only with kSetOpAll.
+TEST(QueryGenerator, IntersectChangesOnlyTheirQueries) {
+  const auto with = MakeOver(Tables(), 73, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(Tables(), 73,
+               {.supported = kSupportedFeatures.Minus({Feature::kIntersect, Feature::kSetOpAll}),
+                .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  int all = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kIntersect)) << plain.sql;
+    EXPECT_FALSE(plain.features.Has(Feature::kSetOpAll)) << plain.sql;
+    if (!q.features.Has(Feature::kIntersect)) {
+      ++same;
+      EXPECT_FALSE(q.features.Has(Feature::kSetOpAll)) << q.sql;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    const auto* derived = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
+    const sql::SelectStatement& compound =
+        derived != nullptr ? *derived->query : *ast->with.at(0).query;
+    const bool intersect = AnyOperator(
+        compound, [](const sql::SetBranch& branch) { return branch.op == sql::SetOp::kIntersect; });
+    const bool intersect_all = AnyOperator(compound, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kIntersect && branch.all;
+    });
+    EXPECT_TRUE(intersect) << "an INTERSECT among the operators";
+    EXPECT_EQ(intersect_all, q.features.Has(Feature::kSetOpAll));
+    all += intersect_all ? 1 : 0;
+  }
+  EXPECT_GT(took, 50) << "took: " << took;
+  EXPECT_GT(all, 10) << "INTERSECT ALL: " << all;
+  EXPECT_GT(same, 6000);
 }
 
 // The copies multiply the rows that every row guard of the query reads (Nest): over a table of 20

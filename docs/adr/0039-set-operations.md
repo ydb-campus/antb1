@@ -448,6 +448,33 @@ set operations and pins them with records.
   takes 63 s under AddressSanitizer here, against an inner timeout of 870 s. Even at the slowest CI-to-local ratio
   seen so far (5.9x), that is about 370 s, inside the gate's 60% (522 s).
 
+## Update (2026-11-07, X4c): INTERSECT, built
+
+- **Built as decided:** INTERSECT [DISTINCT] and INTERSECT ALL bind tighter than UNION, in the same regions as X4b's
+  UNION, with the formula keeping the precedence (`0 UNION (1 INTERSECT 2)`). X4b's binder already walked any region
+  and checked a non-UNION run's column counts after each operand, so the item mostly lifts the refusal. Q8 and Q38
+  pass, and the ratchet is at 72.
+- **The binary type check:** a run of INTERSECT is DuckDB's binary nodes, so each step's two sides must widen exactly
+  to that step's type, and a refusal names INTERSECT. A spliced run of UNION keeps X4b's one-list check.
+- **The parser's INTERSECT level,** which X4b's guard counted one short: a run of INTERSECT after a UNION or EXCEPT
+  is that run's right operand. Its branches after the first now parse a further level down, so the depth limit bounds
+  the tree there too.
+- **Divergences, each pinned in `tests/slt/cases/setops/intersect.slt` with both engines' answers:**
+  - D29: `(N INTERSECT ALL N) UNION E` prints -0.0 in antb1 and 0.0 in DuckDB, and an INTERSECT ALL root prints the
+    normalized value in both.
+  - D30: DuckDB builds the right operand first, so with both operands failing it reports the right one's error.
+  - D31 is new in docs/sql-subset.md: with an empty right operand, DuckDB returns no rows where an overflow past the
+    left operand's first 2,048 rows fails antb1.
+- **The oracle:** ADR 0036's marker sketch as SQL is a metamorphic relation: a GROUP BY of every column whose HAVING
+  reads the 1-or-NULL markers, and for INTERSECT ALL the smaller count through a CASE, compared grouped with COUNT(*).
+  The generator draws INTERSECT and INTERSECT ALL (features `kIntersect` and `kSetOpAll`) from X4b's operator stream,
+  with UNION keeping its old draws.
+- **The SF 1 budget holds,** so PF12 and PF13 stay guards:
+  - Q8 peaks at 5 MiB and Q38 at 25 MiB.
+  - On Apple silicon, antb1 answers them in 0.8 s and 1.6 s in Debug, and 1.5 s and 4.7 s under AddressSanitizer.
+  - Their shard (7 of 8) takes 66 s under AddressSanitizer here, about 390 s at the slowest CI-to-local ratio seen
+    (5.9x), inside the gate's 522 s.
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:
