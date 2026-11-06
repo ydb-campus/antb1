@@ -96,6 +96,8 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    X4 with their `pending X4` guards; X7a and PF5, ADR 0036's X7 in two parts; and W1 onward, which the window ADR
    numbers. None collides with an earlier ADR's ids. A `pending` line takes one upper-case letter today; HC8 makes it
    take two before any PR writes such a guard. Update (2026-11-01, HC8): it does, so `pending NL2` and the like parse.
+   Update (2026-11-06, phase 6): X4s and X4p join the X4 ids; X4s is an item of phase 6, and X4p and PF12 to PF15
+   are guards ([ADR 0039](0039-set-operations.md)).
 
 ## Consequences
 
@@ -160,11 +162,12 @@ Queries are those a PR completes when the PRs merge in this order.
 | RU4 | GROUPING() and GROUPING_ID() | | Built |
 | RU5 | GROUP BY GROUPING SETS and GROUP BY () | | Built |
 | RU6 | GROUP BY CUBE, its sets merged in batches that fit the memory budget | | Built |
-| **Phase 6** | **Set operations (ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
-| X4a | UNION, INTERSECT and EXCEPT in the grammar, with parenthesized branches | | Planned |
-| X4b | UNION, after PF5's fallback (the X7a update below) | 75 | Planned |
-| X4c | INTERSECT | 8, 38 | Planned |
-| X4d | EXCEPT | 87 | Planned |
+| **Phase 6** | **Set operations ([ADR 0039](0039-set-operations.md); ADR 0036's X4 without `BY NAME` and non-SELECT branches)** | | |
+| X4a | UNION, INTERSECT and EXCEPT, with ALL or DISTINCT, in the grammar: an operator on each branch of the flat list, `sql::SetOperationTree`, parenthesized branches with or without their own WITH or tail, answered for UNION ALL and typed by ADR 0039's Types rule; the other operators refused with exit code 4 naming X4b, X4c or X4d (the phase 6 update below) | | Planned |
+| X4s | The set-operation plan node and its serial operator: one hash table keyed on every column, the inputs that start a row inserting and the others looking up, a formula over a bit or a count per input; no SQL (the phase 6 update below) | | Planned |
+| X4b | UNION [DISTINCT], with DuckDB's tree fold of types | 75 | Planned |
+| X4c | INTERSECT and INTERSECT ALL, also in trees with UNION and UNION ALL | 8, 38 | Planned |
+| X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered | 87 | Planned |
 | **Phase 7** | **Join kinds** | | |
 | OJ1 | One table of join-kind properties, read by every rule that tells kinds apart | | Planned |
 | OJ2 | A FULL join kind and its operator | | Planned |
@@ -186,13 +189,18 @@ Queries are those a PR completes when the PRs merge in this order.
 | PF2 | Filters into derived tables and CTE references: through their Projects, GROUP BY keys and inner joins to the scan of the relation that defines the column | | Conditional |
 | PF3 | LEFT JOIN as INNER or anti join where WHERE rejects the padded rows | | Conditional |
 | PF4 | One aggregation for one-row subqueries over the same rows | | Conditional |
-| PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared; the fallback lands before X4b at the latest (the X7a update below) | | Conditional |
+| PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared; the fallback lands before the first PR that makes such a result shareable, which no X4 item does (the X7a update below and its phase 6 note) | | Conditional |
 | PF6 | A partial aggregate below the join under a grouping-sets node: grouped by its join keys and every column of its side that any set groups by (ADR 0032's condition 3 over the union of the sets), with AVG as a (SUM, COUNT) partial (the phase 5 update below) | | Conditional |
 | PF7 | One-row and single joins on the branch of the relation they read | | Conditional |
 | PF8 | Hash-set membership for long IN lists | | Conditional |
 | PF9 | One candidate per probe row for semi and anti residuals that read no build column but its keys (ADR 0022's E2c) | | Built |
 | PF10 | A derived table's or CTE reference's row estimate after its conditions, without the union branches they rule out, for the join order and the build sides | | Conditional |
 | PF11 | Grouping sets merged inside the finest set's partitions: the finest set partitioned by a key prefix that most sets share, so that those sets need no second exchange (the phase 5 update below) | | Conditional |
+| X4p | The set-operation operator over parallel inputs: each part of a starter deduplicated, with a count where its count is read, and merged into per-partition lanes; the other inputs routed by key hash and looked up per lane (ADR 0039) | | Conditional |
+| PF12 | A set-operation input's own DISTINCT dropped where only its presence is read and no LIMIT or OFFSET of the input sits above it, so that its rows feed X4p's lanes (ADR 0039) | | Conditional |
+| PF13 | The smallest input as the starter of a region of INTERSECT and INTERSECT ALL alone, with no DOUBLE or FLOAT column under a DISTINCT root (ADR 0039) | | Conditional |
+| PF14 | Set-operation inputs that a constant column makes pairwise disjoint, each deduplicated on its own and freed before the next (ADR 0039) | | Conditional |
+| PF15 | Conditions above a set operation moved into every input, an input they rule out dropped and the formula simplified (ADR 0039) | | Conditional |
 | **Closing** | | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
@@ -254,7 +262,10 @@ Update (2026-11-02, X7a's design, agreed with the maintainer before its PR): fou
   runs there. X7a is not such a PR, since its unions of one input stay out of sharing. X4b is the latest: it compiles
   UNION to a GROUP BY over a UNION ALL, which ADR 0030's sharing collects, so a CTE whose body is a UNION, referenced
   more than once, would hold the union's distinct rows. None of the 99 has a CTE whose body is a UNION, INTERSECT or
-  EXCEPT referenced more than once, so this trigger guards SQL beyond them.
+  EXCEPT referenced more than once, so this trigger guards SQL beyond them. Update (2026-11-06, phase 6): X4b no
+  longer compiles UNION to a GROUP BY over a UNION ALL. [ADR 0039](0039-set-operations.md)'s set-operation node is
+  keyed and refused at the top, and nothing below it is collected, so no X4 item makes a result topped by a union or
+  a set operation shareable, and the trigger waits for the first PR that does.
 
 Update (2026-11-03, X7a): built as the Optimize pass the note above describes (`src/plan/union_branches.h`).
 
@@ -345,6 +356,9 @@ the queries write besides `ELSE NULL END`, which was already a `CASE` without `E
   cast to DECIMAL. The ratchet does not change.
 
 Update (2026-11-03, NL3): built for UNION ALL. NULL items of INTERSECT and EXCEPT wait for X4c and X4d, which reuse it.
+Correction (2026-11-06, [ADR 0039](0039-set-operations.md)'s review): UNION's NULL items wait for X4b too. Of the
+99, only query 36 writes NULL items under a set operation other than UNION ALL, and that operation is a UNION. It
+is the one other query the ratchet bullet below means, and it also needs window functions.
 
 - **Parsing.** `NULL` or `NULL AS name` as a whole select item parses to NL2's `kNull` literal. A query that is no
   compound refuses it once its block and tail are parsed, so a later parse error in that block now comes first. An
@@ -653,6 +667,26 @@ the memory budget's free bytes by the probe's estimate of their groups, each bat
 generator writes CUBE from the grouping-set stream, and two metamorphic relations check it: CUBE is its GROUPING SETS
 written out, and CUBE of one key is its ROLLUP.
 
+Update (2026-11-06, phase 6): the maintainer's decisions, with [ADR 0039](0039-set-operations.md), which decides the
+set operations' semantics, plan node and operator ahead of the code and replaces ADR 0036's X4 sketch.
+
+- **One node.** Each maximal tree of UNION [DISTINCT], INTERSECT [ALL] and EXCEPT [ALL] is one n-ary plan node,
+  answered with one hash table keyed on every column. The inputs that can start a row insert, the others look up, and
+  a formula over a bit or a count per input picks the rows. No join is involved, so the phase needs no OJ5, and no
+  GroupAggregate, so no rule written for one applies to it.
+- **UNION ALL stays ADR 0036's,** a pass-through node and operator of its own. It is not fused into the new node, an
+  option ADR 0039 recommends against, and no plan holds a UnionAll that the query does not write.
+- **The items.**
+  - X4a widens to the full grammar and parenthesized branches, which X4a itself answers for UNION ALL.
+  - X4s is new: the node and a serial operator, with no SQL, as ADR 0036's X1 and RU2 were.
+  - X4c and X4d also answer INTERSECT ALL and EXCEPT ALL, which the operator counts from X4s on.
+  - X4p and PF12 to PF15 are new guards.
+  - The queries each item completes do not change: the ratchet reaches 73 with X4d.
+- **PF5 no longer comes before X4b.** The node is keyed and refused at the top, and nothing below it is collected, so
+  no X4 item makes a result topped by a union or a set operation shareable (the X7a update's phase 6 note).
+- **X5 narrows** to the tail of an outermost compound and a second tail after a parenthesized query that has its own:
+  X4a answers a parenthesized branch's own WITH or tail.
+
 ## Alternatives considered
 
 - **The features that complete the most queries first.** Rejected by the maintainer: the aim is all 99, and a layer
@@ -660,7 +694,8 @@ written out, and CUBE of one key is its ROLLUP.
 - **Window functions in parallel with phases 2 to 8**, since they are the longest chain. Rejected by the maintainer:
   windows are designed as a generic engine part once the layers they rest on exist, and their scope is decided then.
 - **One ADR per phase.** Rejected: the ids need one home, while each feature's design belongs to the ADR that
-  deferred it (0004, 0012, 0021, 0022, 0023, 0036) or to a new one for grouping sets and for windows.
+  deferred it (0004, 0012, 0021, 0022, 0023, 0036) or to a new one for grouping sets and for windows. Update
+  (2026-11-06, phase 6): set operations other than UNION ALL got a new one too, [ADR 0039](0039-set-operations.md).
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 this implementation does not comply with all requirements of the TPC-DS Benchmark.
