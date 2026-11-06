@@ -115,6 +115,7 @@ Rows Sorted(const arrow::Table& table) {
 Rows RunSet(const std::vector<Rows>& inputs, std::vector<SetTerm> formula, std::size_t batch = 1024,
             bool select_odd = false) {
   std::vector<std::unique_ptr<Operator>> sources;
+  sources.reserve(inputs.size());
   for (const Rows& rows : inputs) {
     sources.push_back(Source(rows, batch, select_odd));
   }
@@ -229,7 +230,7 @@ TEST_F(SetOperationTest, OnlyStartersInsertGroups) {
 // among the starters; an ALL root the normalized one (0.0, NaN), as DuckDB prints the ALL forms.
 TEST_F(SetOperationTest, DoubleSpelling) {
   const auto schema = arrow::schema({arrow::field("d", arrow::float64())});
-  const auto doubles = [&schema](std::vector<double> values) {
+  const auto doubles = [&schema](const std::vector<double>& values) {
     std::vector<Batch> batches;
     arrow::DoubleBuilder builder;
     EXPECT_TRUE(builder.AppendValues(values).ok());
@@ -239,10 +240,11 @@ TEST_F(SetOperationTest, DoubleSpelling) {
     return std::make_unique<ScriptedSource>(schema, std::move(batches));
   };
   const double nan = std::numeric_limits<double>::quiet_NaN();
-  const auto run = [&](std::vector<double> first, std::vector<double> second, SetTermKind kind) {
+  const auto run = [&](const std::vector<double>& first, const std::vector<double>& second,
+                       SetTermKind kind) {
     std::vector<std::unique_ptr<Operator>> inputs;
-    inputs.push_back(doubles(std::move(first)));
-    inputs.push_back(doubles(std::move(second)));
+    inputs.push_back(doubles(first));
+    inputs.push_back(doubles(second));
     auto op = SetOperationOperator::Make(std::move(inputs), {{0}, {0}}, {LogicalType::kDouble},
                                          {In(0), In(1), Op(kind)});
     EXPECT_TRUE(op.ok()) << op.status().ToString();
@@ -517,7 +519,7 @@ TEST_F(SetOperationTest, RandomFormulasMatchTheDefinitions) {
   for (const std::uint64_t seed : {1U, 2U, 3U, 4U, 5U}) {
     std::mt19937_64 rng(seed);
     for (int trial = 0; trial < 60; ++trial) {
-      const std::size_t n = 2 + rng() % 4;
+      const std::size_t n = 2 + (rng() % 4);
       const std::vector<SetTerm> formula = RandomFormula(rng, n);
       std::vector<Rows> inputs(n);
       std::map<Row, std::vector<int64_t>> counts;

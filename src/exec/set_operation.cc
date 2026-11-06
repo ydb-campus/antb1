@@ -12,6 +12,7 @@
 
 #include <arrow/api.h>
 #include <arrow/compute/api_vector.h>
+#include <arrow/util/bit_util.h>
 
 #include "antb1/common/narrow.h"
 #include "antb1/exec/profile.h"
@@ -22,49 +23,60 @@ namespace {
 
 using plan::SetTermKind;
 
-// The value of an operator term over its operands' values, row by row (X1 to Xn, counts or 0/1).
+// The value of an operator term over its operands' values (X1 to Xn, counts or 0/1), one operand
+// at a time over all the chunk's groups, so each loop is a plain one the compiler vectorizes.
 void Combine(SetTermKind kind, std::span<const std::vector<int64_t>> operands,
              std::vector<int64_t>& out) {
-  const std::size_t n = operands.front().size();
-  out.assign(n, 0);
-  for (std::size_t i = 0; i < n; ++i) {
-    int64_t value = 0;
+  const std::vector<int64_t>& first = operands.front();
+  const std::span<const std::vector<int64_t>> rest = operands.subspan(1);
+  const std::size_t n = first.size();
+  out.resize(n);
+  switch (kind) {
+    case SetTermKind::kUnion:
+    case SetTermKind::kIntersect:
+    case SetTermKind::kExcept:
+      for (std::size_t i = 0; i < n; ++i) {
+        out[i] = first[i] > 0 ? 1 : 0;
+      }
+      break;
+    case SetTermKind::kIntersectAll:
+    case SetTermKind::kExceptAll:
+    case SetTermKind::kInput:
+      std::ranges::copy(first, out.begin());
+      break;
+  }
+  for (const std::vector<int64_t>& v : rest) {
     switch (kind) {
       case SetTermKind::kUnion:
-        value = std::ranges::any_of(operands, [i](const auto& v) { return v[i] > 0; }) ? 1 : 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = out[i] != 0 || v[i] > 0 ? 1 : 0;
+        }
         break;
       case SetTermKind::kIntersect:
-        value = std::ranges::all_of(operands, [i](const auto& v) { return v[i] > 0; }) ? 1 : 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = out[i] != 0 && v[i] > 0 ? 1 : 0;
+        }
         break;
       case SetTermKind::kExcept:
-        value =
-            operands.front()[i] > 0 && std::ranges::all_of(operands.subspan(1),
-                                                           [i](const auto& v) { return v[i] == 0; })
-                ? 1
-                : 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = out[i] != 0 && v[i] == 0 ? 1 : 0;
+        }
         break;
       case SetTermKind::kIntersectAll:
-        value = operands.front()[i];
-        for (const auto& v : operands.subspan(1)) {
-          value = std::min(value, v[i]);
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = std::min(out[i], v[i]);
         }
         break;
       case SetTermKind::kExceptAll:
-        // max(X1 - X2 - ... - Xn, 0): every count is at least 0, so the difference stays within
-        // int64 while it is positive, and stops there once it is not.
-        value = operands.front()[i];
-        for (const auto& v : operands.subspan(1)) {
-          if (value <= 0) {
-            break;
-          }
-          value -= v[i];
+        // max(X1 - X2 - ... - Xn, 0), clamped after each operand: every count is at least 0, so
+        // that is the same value, and a difference of two values at least 0 stays within int64.
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = std::max<int64_t>(out[i] - v[i], 0);
         }
-        value = std::max<int64_t>(value, 0);
         break;
       case SetTermKind::kInput:
         break;
     }
-    out[i] = value;
   }
 }
 
@@ -224,15 +236,22 @@ arrow::Status SetOperationOperator::Build() {
       if (rows->num_rows() == 0) {
         continue;
       }
+      // Hoisted: a write through bits (uint8_t) may alias anything, so the compiler would reload
+      // counted_[k] and each vector's data on every row.
+      const bool counted = counted_[k];
       if (starters_[k]) {
         starter_rows += rows->num_rows();
         ARROW_RETURN_NOT_OK(table_->Consume(*rows, &ids));
         ARROW_RETURN_NOT_OK(Grow());
-        for (const std::uint32_t group : ids) {
-          if (counted_[k]) {
-            ++counts_[k][group];
-          } else {
-            bits_[k][group] = 1;
+        if (counted) {
+          int64_t* const counts = counts_[k].data();
+          for (const std::uint32_t group : ids) {
+            ++counts[group];
+          }
+        } else {
+          std::uint8_t* const bits = bits_[k].data();
+          for (const std::uint32_t group : ids) {
+            bits[group] = 1;
           }
         }
         continue;
@@ -241,17 +260,31 @@ arrow::Status SetOperationOperator::Build() {
       // group's copies (docs/adr/0039-set-operations.md).
       lookup_rows += rows->num_rows();
       ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::UInt32Array> found, table_->Lookup(*rows));
-      for (int64_t i = 0; i < found->length(); ++i) {
-        if (found->IsNull(i)) {
-          continue;
+      lookup_hits += found->length() - found->null_count();
+      const std::uint32_t* const groups = found->raw_values();
+      const std::uint8_t* const valid =
+          found->null_count() == 0 ? nullptr : found->null_bitmap_data();
+      const auto offset = Narrow<std::uint64_t>(found->offset());
+      const int64_t length = found->length();
+      const auto add = [&](auto mark) {
+        if (valid == nullptr) {
+          for (int64_t i = 0; i < length; ++i) {
+            mark(groups[i]);
+          }
+          return;
         }
-        ++lookup_hits;
-        const std::uint32_t group = found->Value(i);
-        if (counted_[k]) {
-          ++counts_[k][group];
-        } else {
-          bits_[k][group] = 1;
+        for (int64_t i = 0; i < length; ++i) {
+          if (arrow::bit_util::GetBit(valid, offset + static_cast<std::uint64_t>(i))) {
+            mark(groups[i]);
+          }
         }
+      };
+      if (counted) {
+        int64_t* const counts = counts_[k].data();
+        add([counts](std::uint32_t group) { ++counts[group]; });
+      } else {
+        std::uint8_t* const bits = bits_[k].data();
+        add([bits](std::uint32_t group) { bits[group] = 1; });
       }
     }
     // Closed before the next input opens: its builds and its parts' windows are gone by then.
@@ -282,9 +315,12 @@ arrow::Status SetOperationOperator::Evaluate() {
     for (const plan::SetTerm& term : formula_) {
       if (term.kind == SetTermKind::kInput) {
         std::vector<int64_t>& values = stack.emplace_back(end - begin, 0);
-        for (std::size_t g = begin; g < end; ++g) {
-          values[g - begin] =
-              counted_[term.input] ? counts_[term.input][g] : int64_t{bits_[term.input][g]};
+        if (counted_[term.input]) {
+          const int64_t* const counts = counts_[term.input].data();
+          std::copy(counts + begin, counts + end, values.begin());
+        } else {
+          const std::uint8_t* const bits = bits_[term.input].data();
+          std::copy(bits + begin, bits + end, values.begin());
         }
         continue;
       }

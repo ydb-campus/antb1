@@ -388,9 +388,34 @@ set operations and pins them with records.
 - **Tests stand in for the oracle** until X4b gives the node SQL: a randomized test compares the operator with the
   forms' multiset definitions computed in the test, over random formulas of two to five inputs, NULLs included, at
   batch sizes 1 and 7.
-- **The micro benchmark** is `bench/set_operation_bench.cc` (`antb1-bench-setops`): a three-input INTERSECT, a
-  two-input EXCEPT and a three-input UNION, the node against the sketch, on one thread, with few or mostly distinct
-  rows. Its numbers are recorded here once measured on a quiet machine.
+- **Measured** with `bench/set_operation_bench.cc` (`antb1-bench-setops`) on Apple silicon, one thread, the median of
+  five runs of three iterations each. Each input has 4 million rows of two key columns, INTEGER and BIGINT, as
+  in-memory batches. The inputs draw their keys from shifted ranges, so all three overlap in a quarter of a range.
+  The range holds either 10 thousand values (few distinct rows) or 4 million (most rows distinct). The sketch is a
+  UnionAll over the inputs with a marker column per input, a GroupAggregate with a COUNT per marker (no markers
+  for a UNION), and the markers' condition checked on its groups. The batches hold the markers already, so the
+  sketch's projection is not timed.
+
+  | Operation | Distinct rows | Node | Sketch | Node peak | Sketch peak |
+  | --- | --- | --- | --- | --- | --- |
+  | A INTERSECT B INTERSECT C | few | 77.5 ms | 71.3 ms | 0.9 MiB | 1.5 MiB |
+  | A EXCEPT B | few | 47.2 ms | 41.8 ms | 0.9 MiB | 1.3 MiB |
+  | A UNION B UNION C | few | 54.6 ms | 51.7 ms | 1.1 MiB | 1.0 MiB |
+  | A INTERSECT B INTERSECT C | most | 234 ms | 456 ms | 164 MiB | 456 MiB |
+  | A EXCEPT B | most | 177 ms | 265 ms | 160 MiB | 276 MiB |
+  | A UNION B UNION C | most | 341 ms | 329 ms | 325 MiB | 264 MiB |
+
+  - **INTERSECT and EXCEPT over mostly distinct rows:** the node takes 0.51 and 0.67 of the sketch's time, and 0.36
+    and 0.58 of its peak memory, because its lookups add no group.
+  - **Few distinct rows:** the node is 6% to 13% slower. Hashing dominates both, and a lookup costs about what an
+    insert of a known key costs. The node also pays for its own bookkeeping: the ids of each starter batch and a bit
+    or count per row. That bookkeeping took about a quarter of the samples until its loops kept the vectors'
+    pointers in locals (a `uint8_t` store may alias anything) and the formula ran one operand at a time, which
+    cut the node's time by 4% to 6%.
+  - **UNION over mostly distinct rows:** the node is 4% to 11% slower than the sketch over four runs. Its peak is
+    23% higher: a bit per input and group, and an 8-byte count of copies per group, which a DISTINCT root needs only
+    as one bit. Narrowing those copies to bytes under a DISTINCT root is a candidate for X4p, which revisits the
+    memberships per lane anyway.
 
 ## Evidence
 

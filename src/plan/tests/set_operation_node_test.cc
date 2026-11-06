@@ -63,7 +63,7 @@ SetOperationNode Over(std::vector<SetTerm> formula, std::vector<std::optional<in
   }
   SetOperationNode node{.ids = {ColumnId{90}, ColumnId{91}}, .formula = std::move(formula)};
   for (std::size_t k = 0; k < inputs; ++k) {
-    const auto first = static_cast<std::uint32_t>(1 + 10 * k);
+    const auto first = static_cast<std::uint32_t>(1 + (10 * k));
     node.inputs.push_back(Scan(first, k < rows.size() ? rows[k] : std::optional<int64_t>(100)));
     node.columns.push_back({Column(ColumnId{first}, "i16"),
                             Column(ColumnId{first + 1}, "i32", LogicalType::kInteger)});
@@ -104,45 +104,46 @@ TEST(SetOperationNodeTest, StartersAndCountedInputs) {
   };
   const std::vector<Case> cases = {
       // A INTERSECT B INTERSECT C: A alone inserts.
-      {{In(0), In(1), In(2), Op(SetTermKind::kIntersect, 3)},
-       {true, false, false},
-       {false, false, false},
-       "0 INTERSECT 1 INTERSECT 2"},
+      {.formula = {In(0), In(1), In(2), Op(SetTermKind::kIntersect, 3)},
+       .starters = {true, false, false},
+       .counted = {false, false, false},
+       .text = "0 INTERSECT 1 INTERSECT 2"},
       // (A UNION B) INTERSECT C: both of the first operand's.
-      {{In(0), In(1), Op(SetTermKind::kUnion), In(2), Op(SetTermKind::kIntersect)},
-       {true, true, false},
-       {false, false, false},
-       "(0 UNION 1) INTERSECT 2"},
+      {.formula = {In(0), In(1), Op(SetTermKind::kUnion), In(2), Op(SetTermKind::kIntersect)},
+       .starters = {true, true, false},
+       .counted = {false, false, false},
+       .text = "(0 UNION 1) INTERSECT 2"},
       // A UNION (B INTERSECT C)
-      {{In(0), In(1), In(2), Op(SetTermKind::kIntersect), Op(SetTermKind::kUnion)},
-       {true, true, false},
-       {false, false, false},
-       "0 UNION (1 INTERSECT 2)"},
+      {.formula = {In(0), In(1), In(2), Op(SetTermKind::kIntersect), Op(SetTermKind::kUnion)},
+       .starters = {true, true, false},
+       .counted = {false, false, false},
+       .text = "0 UNION (1 INTERSECT 2)"},
       // A EXCEPT (B EXCEPT C): C's bit matters only through B, yet B is no starter.
-      {{In(0), In(1), In(2), Op(SetTermKind::kExcept), Op(SetTermKind::kExcept)},
-       {true, false, false},
-       {false, false, false},
-       "0 EXCEPT (1 EXCEPT 2)"},
+      {.formula = {In(0), In(1), In(2), Op(SetTermKind::kExcept), Op(SetTermKind::kExcept)},
+       .starters = {true, false, false},
+       .counted = {false, false, false},
+       .text = "0 EXCEPT (1 EXCEPT 2)"},
       // (A INTERSECT ALL B) EXCEPT ALL C: counts everywhere.
-      {{In(0), In(1), Op(SetTermKind::kIntersectAll), In(2), Op(SetTermKind::kExceptAll)},
-       {true, false, false},
-       {true, true, true},
-       "(0 INTERSECT ALL 1) EXCEPT ALL 2"},
+      {.formula = {In(0), In(1), Op(SetTermKind::kIntersectAll), In(2),
+                   Op(SetTermKind::kExceptAll)},
+       .starters = {true, false, false},
+       .counted = {true, true, true},
+       .text = "(0 INTERSECT ALL 1) EXCEPT ALL 2"},
       // (A EXCEPT ALL B) UNION C: an EXCEPT ALL needs counts even for presence.
-      {{In(0), In(1), Op(SetTermKind::kExceptAll), In(2), Op(SetTermKind::kUnion)},
-       {true, false, true},
-       {true, true, false},
-       "(0 EXCEPT ALL 1) UNION 2"},
+      {.formula = {In(0), In(1), Op(SetTermKind::kExceptAll), In(2), Op(SetTermKind::kUnion)},
+       .starters = {true, false, true},
+       .counted = {true, true, false},
+       .text = "(0 EXCEPT ALL 1) UNION 2"},
       // (A INTERSECT ALL B) UNION C: presence only, so bits.
-      {{In(0), In(1), Op(SetTermKind::kIntersectAll), In(2), Op(SetTermKind::kUnion)},
-       {true, false, true},
-       {false, false, false},
-       "(0 INTERSECT ALL 1) UNION 2"},
+      {.formula = {In(0), In(1), Op(SetTermKind::kIntersectAll), In(2), Op(SetTermKind::kUnion)},
+       .starters = {true, false, true},
+       .counted = {false, false, false},
+       .text = "(0 INTERSECT ALL 1) UNION 2"},
       // An ALL root reads counts.
-      {{In(0), In(1), Op(SetTermKind::kIntersectAll)},
-       {true, false},
-       {true, true},
-       "0 INTERSECT ALL 1"},
+      {.formula = {In(0), In(1), Op(SetTermKind::kIntersectAll)},
+       .starters = {true, false},
+       .counted = {true, true},
+       .text = "0 INTERSECT ALL 1"},
   };
   for (const Case& c : cases) {
     const std::size_t inputs = c.starters.size();
@@ -251,7 +252,7 @@ TEST(SetOperationNodeTest, IsKeyedAndNothingBelowItIsShared) {
     SetOperationNode node{.ids = {ColumnId{own}, ColumnId{own + 1}},
                           .formula = {In(0), In(1), Op(SetTermKind::kIntersect)}};
     for (std::uint32_t k = 0; k < 2; ++k) {
-      const std::uint32_t at = first + 10 * k;
+      const std::uint32_t at = first + (10 * k);
       node.inputs.push_back(Scan(at, 100, table));
       node.columns.push_back(
           {Column(ColumnId{at}, "i16"), Column(ColumnId{at + 1}, "i32", LogicalType::kInteger)});

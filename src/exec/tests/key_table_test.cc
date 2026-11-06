@@ -611,7 +611,7 @@ TEST_P(KeyTableTest, GroupTableConsumeIdsAndLookupNormalizeDoubles) {
                                 /*first_keys=*/true, GroupTable::kPartitions, {.kind = GetParam()});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
   const auto schema = arrow::schema({arrow::field("d", arrow::float64())});
-  const auto doubles = [&schema](std::vector<double> values) {
+  const auto doubles = [&schema](const std::vector<double>& values) {
     arrow::DoubleBuilder builder;
     EXPECT_TRUE(builder.AppendValues(values).ok());
     const auto n = static_cast<std::int64_t>(values.size());
