@@ -1,0 +1,432 @@
+# INTERSECT [DISTINCT] and INTERSECT ALL (ADR 0039's X4c): each distinct row of the left operand that the right one
+# holds, and min(m, n) copies of a row held m and n times; rows compared as GROUP BY keys (NULL equals NULL).
+# INTERSECT binds tighter than UNION and EXCEPT, and a run of it types as DuckDB's binary nodes. Divergences D29, D30
+# and D31 at the end.
+
+# ---- the inputs ----
+
+query III nosort
+SELECT COUNT(*), COUNT(DISTINCT zn_city), COUNT(zn_parent) FROM zones
+----
+BIGINT	BIGINT	BIGINT
+40	6	35
+
+# ---- rows ----
+
+query I rowsort
+SELECT ct_id FROM cities INTERSECT SELECT zn_city FROM zones
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT DISTINCT SELECT ct_id FROM cities WHERE ct_id < 4
+----
+SMALLINT
+1
+2
+3
+
+query II rowsort
+SELECT zn_city, zn_parent FROM zones WHERE zn_id < 30 INTERSECT SELECT zn_city, zn_parent FROM zones WHERE zn_id > 10
+----
+SMALLINT	INTEGER
+1	1
+2	2
+3	3
+4	4
+5	5
+
+# NULL equals NULL.
+query I rowsort
+SELECT zn_parent FROM zones INTERSECT SELECT zn_parent FROM zones WHERE zn_parent IS NULL OR zn_parent < 3
+----
+INTEGER
+1
+2
+NULL
+
+# An empty operand empties the result.
+query I rowsort
+SELECT zn_city FROM zones INTERSECT SELECT ct_id FROM cities WHERE ct_id < 0
+----
+SMALLINT
+
+query I rowsort
+SELECT zn_city FROM zones WHERE zn_id < 0 INTERSECT SELECT ct_id FROM cities
+----
+SMALLINT
+
+# ---- INTERSECT ALL: min(m, n) copies ----
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 20
+----
+SMALLINT
+1
+1
+1
+1
+2
+2
+2
+2
+3
+3
+3
+4
+4
+4
+5
+5
+5
+5
+9
+NULL
+
+query I rowsort
+SELECT zn_city FROM zones WHERE zn_id > 20 INTERSECT ALL SELECT zn_city FROM zones
+----
+SMALLINT
+1
+1
+1
+1
+2
+2
+2
+2
+3
+3
+3
+4
+4
+4
+5
+5
+5
+5
+9
+NULL
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT ALL SELECT ct_id FROM cities
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query II rowsort
+SELECT zn_city, zn_parent FROM zones INTERSECT ALL SELECT zn_city, zn_parent FROM zones WHERE zn_id % 2 = 0
+----
+SMALLINT	INTEGER
+1	1
+1	1
+1	1
+1	1
+2	2
+2	2
+2	2
+2	NULL
+3	3
+3	3
+3	3
+4	4
+4	4
+4	4
+4	NULL
+5	5
+5	5
+5	5
+5	77
+NULL	3
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id < 15
+----
+SMALLINT
+1
+1
+1
+2
+2
+2
+3
+3
+3
+4
+4
+4
+5
+5
+
+# ---- precedence, parentheses and mixes ----
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_id > 4 UNION SELECT zn_city FROM zones WHERE zn_id < 10 INTERSECT SELECT ct_id FROM cities WHERE ct_id < 3
+----
+SMALLINT
+1
+2
+5
+6
+
+query I rowsort
+(SELECT ct_id FROM cities WHERE ct_id > 4 UNION SELECT zn_city FROM zones WHERE zn_id < 10) INTERSECT SELECT ct_id FROM cities WHERE ct_id < 3
+----
+SMALLINT
+1
+2
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities WHERE ct_id < 3
+----
+SMALLINT
+1
+1
+2
+2
+3
+4
+5
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT (SELECT ct_id FROM cities WHERE ct_id < 3 UNION ALL SELECT ct_id FROM cities WHERE ct_id > 4)
+----
+SMALLINT
+1
+2
+5
+
+query I rowsort
+(SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 20) UNION ALL SELECT ct_id FROM cities
+----
+SMALLINT
+1
+1
+1
+1
+1
+2
+2
+2
+2
+2
+3
+3
+3
+3
+4
+4
+4
+4
+5
+5
+5
+5
+5
+6
+9
+NULL
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 10 INTERSECT SELECT ct_id FROM cities
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT zn_city FROM zones INTERSECT SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 10
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+query I rowsort
+SELECT ct_id FROM cities UNION ALL SELECT ct_id FROM cities INTERSECT ALL SELECT zn_city FROM zones
+----
+SMALLINT
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+6
+
+# ---- where a compound stands ----
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT zn_city FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 20) AS u
+----
+BIGINT
+20
+
+query II rowsort
+WITH i AS (SELECT zn_city AS c FROM zones INTERSECT ALL SELECT zn_city FROM zones WHERE zn_id > 10) SELECT c, COUNT(*) FROM i GROUP BY c
+----
+SMALLINT	BIGINT
+1	6
+2	6
+3	5
+4	5
+5	6
+9	1
+NULL	1
+
+query IT rowsort
+SELECT i.c, ct.label FROM (SELECT zn_city AS c FROM zones INTERSECT SELECT ct_id FROM cities WHERE ct_id > 2) AS i JOIN cities AS ct ON i.c = ct.ct_id
+----
+SMALLINT	VARCHAR
+3	hills
+4	airport
+5	old town
+
+query II rowsort
+SELECT tr_pickup % 4, COUNT(*) FROM (SELECT tr_pickup FROM trips WHERE tr_row < 1500 INTERSECT SELECT tr_dropoff FROM trips WHERE tr_row >= 1000) AS u GROUP BY tr_pickup % 4
+----
+INTEGER	BIGINT
+0	10
+1	10
+2	10
+3	10
+
+# ---- types: binary nodes ----
+
+query I rowsort
+SELECT i16 FROM edge INTERSECT SELECT i32 FROM edge
+----
+INTEGER
+-1
+0
+1
+7
+NULL
+
+query D rowsort
+SELECT d9_2 FROM decimals INTERSECT ALL SELECT d18_4 FROM decimals
+----
+DECIMAL(18,4)
+0.0000
+0.0000
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# SMALLINT UNION ALL (USMALLINT INTERSECT DECIMAL(9,2)): the INTERSECT folds first, so DECIMAL(9,2), where written
+# order would give DECIMAL(12,2).
+query D rowsort
+SELECT i16 FROM edge UNION ALL SELECT u16 FROM edge INTERSECT SELECT d9_2 FROM decimals
+----
+DECIMAL(9,2)
+-1.00
+-100.00
+-12345.00
+-32768.00
+0.00
+0.00
+1.00
+100.00
+12345.00
+32767.00
+7.00
+NULL
+NULL
+NULL
+
+query D rowsort
+SELECT u16 FROM edge INTERSECT (SELECT i16 FROM edge INTERSECT SELECT d9_2 FROM decimals)
+----
+DECIMAL(9,2)
+0.00
+NULL
+
+query T rowsort
+SELECT label FROM cities INTERSECT SELECT label FROM cities WHERE ct_id < 3
+----
+VARCHAR
+center
+harbor
+
+# ---- errors ----
+
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities INTERSECT SELECT ct_id, label FROM cities
+
+# A binary node compares the counts right after its two operands, before the next leaf binds.
+statement error Set operations can only apply to expressions with the same number of result columns
+SELECT ct_id FROM cities INTERSECT SELECT ct_id, label FROM cities INTERSECT SELECT nope FROM cities
+
+# ---- divergence D29 under ALL ----
+# An ALL root prints the normalized value in both engines: -0.0 as 0.0.
+
+query R rowsort
+SELECT d * 0 FROM edge WHERE i16 = 7 INTERSECT ALL SELECT d * 0 FROM edge WHERE i16 = 7
+----
+DOUBLE
+0
+
+# Below a DISTINCT root, antb1 keeps the value first seen among the starters, -0.0; DuckDB passes an INTERSECT ALL's rows
+# on normalized, 0.0.
+
+onlyif antb1
+query R rowsort
+(SELECT d * 0 FROM edge WHERE i16 = 7 INTERSECT ALL SELECT d * 0 FROM edge WHERE i16 = 7) UNION SELECT d FROM edge WHERE i16 = 2
+----
+DOUBLE
+-0
+
+onlyif duckdb
+query R rowsort
+(SELECT d * 0 FROM edge WHERE i16 = 7 INTERSECT ALL SELECT d * 0 FROM edge WHERE i16 = 7) UNION SELECT d FROM edge WHERE i16 = 2
+----
+DOUBLE
+0
+
+# ---- divergence D30: which error an INTERSECT reports when both operands fail ----
+# antb1 reads the operands in written order and reports the left one's, the addition; DuckDB builds the right operand
+# first and reports the multiplication.
+
+onlyif antb1
+statement error Overflow in addition
+SELECT i16 + 1 FROM edge INTERSECT SELECT i16 * 2 FROM edge
+
+onlyif duckdb
+statement error Overflow in multiplication
+SELECT i16 + 1 FROM edge INTERSECT SELECT i16 * 2 FROM edge
+
+# ---- divergence D31: an INTERSECT whose right operand turns out empty ----
+# antb1 reads the left operand in full, so an overflow in its rows past the first 2,048 fails the query; DuckDB stops
+# the left operand's pipeline after its first vector and returns no rows.
+
+onlyif antb1
+statement error Overflow
+SELECT tr_row + CASE WHEN tr_row > 2500 THEN 9223372036854775807 ELSE 0 END FROM trips INTERSECT SELECT tr_row FROM trips WHERE tr_row < 0
+
+onlyif duckdb
+query I nosort
+SELECT tr_row + CASE WHEN tr_row > 2500 THEN 9223372036854775807 ELSE 0 END FROM trips INTERSECT SELECT tr_row FROM trips WHERE tr_row < 0
+----
+BIGINT

@@ -1798,6 +1798,78 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
+  // ---- INTERSECT [ALL] (ADR 0039's X4c) ----
+  // ADR 0036's sketch, which antb1 answers through a UnionAll and a GroupAggregate, is the oracle:
+  // the operands' UNION ALL with a 1-or-NULL marker per operand, grouped by every column, keeps a
+  // group both markers count (INTERSECT) and as many copies as the smaller count (INTERSECT ALL,
+  // compared grouped with COUNT(*)). The operands overlap; INTEGER columns only (divergence D29).
+  {
+    const slt::FeatureSet intersected = {kColumns,  kMultipleItems, kIntegerColumns, kTableName,
+                                         kWhere,    kWhereAnd,      kIntegerLiteral, kDerivedTable,
+                                         kUnionAll, kIntersect};
+    constexpr std::string_view kA = "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row < 1800";
+    constexpr std::string_view kB = "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row >= 1200";
+    constexpr std::string_view kC =
+        "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row >= 600 AND tr_row < 2400";
+    const auto over = [](std::string_view query) {
+      return std::format("SELECT tr_pickup, tr_dropoff FROM ({}) AS u", query);
+    };
+    const auto marked = [&](std::string_view a, std::string_view b) {
+      // Each block with its markers: a block's columns, then 1 or NULL per operand.
+      const auto with = [](std::string_view block, std::string_view markers) {
+        const std::size_t from = block.find(" FROM ");
+        return std::format("{}, {}{}", block.substr(0, from), markers, block.substr(from));
+      };
+      return std::format("({} UNION ALL {})", with(a, "1 AS m0, NULL AS m1"), with(b, "NULL, 1"));
+    };
+    const slt::FeatureSet sketched =
+        SetWith(intersected, kConstant, kAlias, kGroupBy, kHaving, kCountColumn);
+    r.push_back(
+        {.name = "intersect_matches_its_sketch",
+         .features = sketched,
+         .probes = {Q(over(std::format("{} INTERSECT {}", kA, kB))),
+                    Q(std::format("SELECT tr_pickup, tr_dropoff FROM {} AS u GROUP BY tr_pickup, "
+                                  "tr_dropoff HAVING COUNT(m0) > 0 AND COUNT(m1) > 0",
+                                  marked(kA, kB)))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "intersect_all_matches_its_sketch",
+         .features = SetWith(sketched, kSetOpAll, kCountStar, kCase),
+         .probes = {Q(std::format("SELECT tr_pickup, tr_dropoff, COUNT(*) FROM ({} INTERSECT ALL "
+                                  "{}) AS u GROUP BY tr_pickup, tr_dropoff",
+                                  kA, kB)),
+                    Q(std::format("SELECT tr_pickup, tr_dropoff, CASE WHEN COUNT(m0) < COUNT(m1) "
+                                  "THEN COUNT(m0) ELSE COUNT(m1) END FROM {} AS u GROUP BY "
+                                  "tr_pickup, tr_dropoff HAVING COUNT(m0) > 0 AND COUNT(m1) > 0",
+                                  marked(kA, kB)))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "intersect_of_a_block_with_itself_is_its_distinct",
+         .features = SetWith(intersected, kSelectDistinct),
+         .probes = {Q(over(std::format("{} INTERSECT {}", kC, kC))),
+                    Q(std::format("SELECT DISTINCT tr_pickup, tr_dropoff FROM ({}) AS u", kC))},
+         .check = AllEqual()});
+    // A ∩ (B ∪ C) = (A ∩ B) ∪ (A ∩ C), and INTERSECT binds tighter than UNION: A ∪ B ∩ C is
+    // A ∪ (B ∩ C), in any form and batch size.
+    r.push_back({.name = "intersect_distributes_over_union",
+                 .features = SetWith(intersected, kUnion, kSetOpParentheses),
+                 .probes = {Q(over(std::format("{} INTERSECT ({} UNION {})", kA, kB, kC))),
+                            Q(over(std::format("({} INTERSECT {}) UNION ({} INTERSECT {})", kA, kB,
+                                               kA, kC)))},
+                 .check = AllEqual()});
+    r.push_back({.name = "intersect_binds_tighter_than_union",
+                 .features = SetWith(intersected, kUnion, kSetOpParentheses, kCommonTableExpr),
+                 .probes = {Q(over(std::format("{} UNION {} INTERSECT {}", kA, kB, kC))),
+                            Q(over(std::format("{} UNION ({} INTERSECT {})", kA, kB, kC))),
+                            Q(std::format("WITH u AS ({} UNION {} INTERSECT {}) SELECT tr_pickup, "
+                                          "tr_dropoff FROM u",
+                                          kA, kB, kC)),
+                            Q(over(std::format("{} INTERSECT {} UNION {}", kB, kC, kA))),
+                            Q(over(std::format("{} UNION {} INTERSECT {}", kA, kB, kC)), 1),
+                            Q(over(std::format("{} UNION {} INTERSECT {}", kA, kB, kC)), 7)},
+                 .check = AllEqual()});
+  }
+
   // ---- stars among the select items (ADR 0022 rule 5) ----
   // A star is the columns it reads, where it stands: `*` every FROM item's in FROM order, `t.*` the
   // item's, whichever name rule 1 gives it (the table's, an alias, a path's file name) and however

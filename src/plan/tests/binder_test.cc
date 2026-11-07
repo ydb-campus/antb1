@@ -970,8 +970,8 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
-// INTERSECT and EXCEPT wait for ADR 0039's items (ADR 0037's X4c and X4d): the first in written
-// order within a compound is refused at its operator, a parenthesized compound's before those of
+// EXCEPT waits for ADR 0039's item (ADR 0037's X4d): the first in written order within a compound
+// is refused at its operator, a parenthesized compound's before those of
 // the compound around it, and before the compound's tail, which X5 keeps at any depth -- a
 // parenthesized compound's own tail too (ADR 0039's X4a update). A tail and a subquery's refusal
 // name the compound by its root operator.
@@ -988,10 +988,11 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "IN", "a subquery over a UNION is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u EXCEPT SELECT i16 FROM t)",
                   kUnsupported, "EXISTS", "a subquery over an EXCEPT is not supported"},
-        ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u", kUnsupported, "INTERSECT",
-                  "INTERSECT is not supported yet (ADR 0037's X4c)"},
-        ErrorCase{"SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u", kUnsupported,
-                  "INTERSECT ALL", "INTERSECT ALL is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u LIMIT 1", kUnsupported, "LIMIT 1",
+                  "LIMIT on an INTERSECT is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u INTERSECT ALL SELECT i16 "
+                  "FROM t)",
+                  kUnsupported, "IN", "a subquery over an INTERSECT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t EXCEPT SELECT i16 FROM u", kUnsupported, "EXCEPT",
                   "EXCEPT is not supported yet (ADR 0037's X4d)"},
         ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u", kUnsupported, "EXCEPT ALL",
@@ -999,13 +1000,14 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t "
                   "INTERSECT SELECT i16 FROM u ORDER BY 1",
                   kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u) AS d",
-                  kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u EXCEPT "
+                  "SELECT i16 FROM t) AS d",
+                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
         ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u EXCEPT ALL SELECT i16 FROM t)",
                   kUnsupported, "EXCEPT ALL", "EXCEPT ALL is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM t UNION ALL (SELECT i16 FROM u "
-                  "INTERSECT SELECT i16 FROM t)",
-                  kUnsupported, "INTERSECT", "INTERSECT is not supported yet (ADR 0037's X4c)"},
+        ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM t UNION ALL (SELECT i16 FROM u "
+                  "EXCEPT SELECT i16 FROM t)",
+                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
         ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
                   "LIMIT 1)",
                   kUnsupported, "LIMIT 1", "LIMIT on a UNION ALL is not supported"},
@@ -2198,6 +2200,102 @@ TEST(BinderTest, UnionErrors) {
     EXPECT_EQ(detail->span().offset, sql.find(c.at)) << sql << ": " << plan.status().ToString();
     EXPECT_TRUE(plan.status().ToString().contains(c.message)) << plan.status().ToString();
   }
+}
+
+// INTERSECT [ALL] (ADR 0039's X4c) binds tighter than UNION: a region of UNION and INTERSECT is
+// one SetOperation node whose formula keeps the precedence, UNION ALL subtrees its inputs.
+TEST(BinderTest, IntersectPlans) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view explain;  // consecutive lines of its EXPLAIN
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u",
+                .explain = "SetOperation inputs=2 formula=(0 INTERSECT 1) columns=[x]"},
+           Case{.sql = "SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u",
+                .explain = "SetOperation inputs=2 formula=(0 INTERSECT ALL 1) columns=[i16]"},
+           Case{.sql = "SELECT i16 FROM t UNION SELECT i16 FROM u INTERSECT SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=(0 UNION (1 INTERSECT 2))"},
+           Case{.sql = "SELECT i16 FROM t INTERSECT SELECT i16 FROM u UNION SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=((0 INTERSECT 1) UNION 2)"},
+           Case{.sql =
+                    "SELECT i16 FROM t INTERSECT SELECT i16 FROM u INTERSECT ALL SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=((0 INTERSECT 1) INTERSECT ALL 2)"},
+           Case{.sql = "(SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u) UNION ALL SELECT i16 "
+                       "FROM t",
+                .explain = "UnionAll inputs=2 columns=[i16]\n  SetOperation inputs=2 "
+                           "formula=(0 INTERSECT ALL 1)"},
+           Case{
+               .sql = "SELECT i16 FROM t INTERSECT (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
+               .explain = "SetOperation inputs=2 formula=(0 INTERSECT 1) columns=[i16]\n  Project "
+                          "i16"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_TRUE(explain.contains(c.explain)) << c.sql << "\n" << explain;
+  }
+}
+
+// A run of INTERSECT is DuckDB's binary nodes, ((A ∩ B) ∩ C), and its operand a tree's node, so
+// its types fold pairwise, below any UNION around it (ADR 0039's Types rule); each step's two sides
+// must widen exactly to that step's type.
+TEST(BinderTest, IntersectTypesFoldAsBinaryNodes) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           // SMALLINT UNION ALL (USMALLINT INTERSECT DECIMAL(9,4)): the INTERSECT folds first.
+           {"SELECT s16 FROM dec UNION ALL SELECT u16 FROM dec INTERSECT SELECT r FROM dec",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT u16 FROM dec INTERSECT (SELECT s16 FROM dec INTERSECT SELECT r FROM dec)",
+            LogicalType::Decimal(9, 4)},
+           {"SELECT u16 FROM dec INTERSECT SELECT s16 FROM dec INTERSECT SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT u16 FROM dec UNION ALL SELECT s16 FROM dec UNION ALL SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  // Each step's left side too, before the run's later operands: p and h fold to DECIMAL(38,0), to
+  // which p does not widen exactly, so the refusal is at p -- past a leading NULL item -- where a
+  // one-list check would fold on and fail at the VARCHAR operand.
+  for (const std::string step : {
+           "SELECT p FROM dec INTERSECT SELECT h FROM t INTERSECT SELECT s FROM t",
+           "SELECT NULL FROM dec INTERSECT SELECT p FROM dec INTERSECT SELECT h FROM t",
+       }) {
+    auto refused = BindSql(step, catalog);
+    ASSERT_FALSE(refused.ok()) << step;
+    const auto step_detail = GetSqlError(refused.status());
+    ASSERT_NE(step_detail, nullptr) << refused.status().ToString();
+    EXPECT_EQ(step_detail->span().offset, step.find("p FROM dec")) << step;
+    EXPECT_TRUE(refused.status().ToString().contains(
+        "INTERSECT of DECIMAL(38,0) and DECIMAL(15,2) values is not supported (DECIMAL(15,2) "
+        "does not widen exactly to DECIMAL(38,0))"))
+        << refused.status().ToString();
+  }
+  const std::string sql = "SELECT h FROM t INTERSECT SELECT p FROM dec";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_FALSE(plan.ok());
+  const auto detail = GetSqlError(plan.status());
+  ASSERT_NE(detail, nullptr) << plan.status().ToString();
+  EXPECT_EQ(detail->kind(), kUnsupported);
+  EXPECT_EQ(detail->span().offset, sql.find("p FROM dec"));
+  EXPECT_TRUE(plan.status().ToString().contains(
+      "INTERSECT of DECIMAL(38,0) and DECIMAL(15,2) values is not supported (DECIMAL(15,2) does "
+      "not widen exactly to DECIMAL(38,0))"))
+      << plan.status().ToString();
+  // A count that differs: a binary node checks right after its two operands, before the next leaf
+  // binds.
+  const std::string counts =
+      "SELECT i16 FROM t INTERSECT SELECT i16, i32 FROM u INTERSECT SELECT nope FROM t";
+  auto counted = BindSql(counts, catalog);
+  ASSERT_FALSE(counted.ok());
+  const auto count_detail = GetSqlError(counted.status());
+  ASSERT_NE(count_detail, nullptr) << counted.status().ToString();
+  EXPECT_EQ(count_detail->kind(), kBind);
+  EXPECT_EQ(count_detail->span().offset, counts.find("INTERSECT"));
 }
 
 // A CTE that only a UNION ALL's last block reads is found in the UNION ALL's frame, and a WITH list

@@ -7069,19 +7069,17 @@ std::optional<Rejection> RejectCompoundTail(const sql::SelectStatement& stmt) {
   return std::nullopt;
 }
 
-// The first operator of a compound other than UNION, ALL or not, in written order, which ADR
-// 0039's items answer: INTERSECT [ALL] X4c, EXCEPT [ALL] X4d.
+// The first EXCEPT [ALL] of a compound in written order, which ADR 0039's X4d answers.
 std::optional<Rejection> RejectSetOperator(const sql::SelectStatement& stmt) {
   static_assert(sql::kSetBranchFields == 4, "revisit this walk");
   for (std::size_t k = 1; k < stmt.set_operation.size(); ++k) {
     const sql::SetBranch& branch = stmt.set_operation[k];
-    if (branch.op == sql::SetOp::kUnion) {
+    if (branch.op != sql::SetOp::kExcept) {
       continue;
     }
-    const std::string_view item = branch.op == sql::SetOp::kIntersect ? "X4c" : "X4d";
     return Rejection{.span = branch.op_span,
-                     .message = std::format("{} is not supported yet (ADR 0037's {})",
-                                            SetOperatorName(branch.op, branch.all), item)};
+                     .message = std::format("{} is not supported yet (ADR 0037's X4d)",
+                                            SetOperatorName(branch.op, branch.all))};
   }
   return std::nullopt;
 }
@@ -7463,11 +7461,22 @@ class SetOperationBinder {
     }
     // The operands in written order, each folded into the run's type as soon as it is known, so
     // the first item in the query that fails is refused: a later operand is not folded once an
-    // earlier one fails, nor is the run once an operand's own fold failed below it.
+    // earlier one fails, nor is the run once an operand's own fold failed below it. A run DuckDB
+    // does not splice (INTERSECT) is its binary nodes, ((A op B) op C): each step's two sides must
+    // widen exactly to that step's type, as the whole run's operands must to its type below.
     const std::string name = SetOperatorName(tree.op, tree.all);
+    const bool binary = tree.op != sql::SetOp::kUnion;
+    const auto not_exact = [&](std::size_t leaf, LogicalType from, LogicalType to) {
+      Refuse(
+          leaf, i,
+          std::format("{} of {} and {} values is not supported ({} does not widen exactly to {})",
+                      name, ToString(to), ToString(from), ToString(from), ToString(to)));
+      return Column{.failed = true};
+    };
     std::vector<Column> parts;
     parts.reserve(tree.operands.size());
     Column column;
+    const sql::SetTree* typed = nullptr;  // the operand that first gave `column` a type
     for (const sql::SetTree& operand : tree.operands) {
       parts.push_back(Fold(operand, i));
       const Column& next = parts.back();
@@ -7479,6 +7488,7 @@ class SetOperationBinder {
       }
       if (!column.type.has_value()) {
         column = next;
+        typed = &operand;
         continue;
       }
       const std::optional<LogicalType> type = UnionAllType(*column.type, *next.type);
@@ -7496,6 +7506,13 @@ class SetOperationBinder {
                            d11 ? " (antb1 reads FLOAT as DOUBLE, divergence D11)" : ""));
         return Column{.failed = true};
       }
+      if (binary && !IsExactWidening(*column.type, *type)) {
+        // The left side folded so far: refused at its first typed operand, past NULL items.
+        return not_exact(LeafIndex(*typed), *column.type, *type);
+      }
+      if (binary && !IsExactWidening(*next.type, *type)) {
+        return not_exact(LeafIndex(operand), *next.type, *type);
+      }
       column.type = *type;
       column.stored_as_float = column.stored_as_float && next.stored_as_float;
     }
@@ -7509,11 +7526,7 @@ class SetOperationBinder {
       }
       const LogicalType from = parts[k].type.value_or(to);  // has a value here
       if (!IsExactWidening(from, to)) {
-        Refuse(LeafIndex(tree.operands[k]), i,
-               std::format("{} of {} and {} values is not supported ({} does not widen exactly to "
-                           "{})",
-                           name, ToString(to), ToString(from), ToString(from), ToString(to)));
-        return Column{.failed = true};
+        return not_exact(LeafIndex(tree.operands[k]), from, to);
       }
     }
     return column;

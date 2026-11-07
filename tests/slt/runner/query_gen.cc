@@ -771,14 +771,18 @@ constexpr unsigned kSetOpParenthesesPercent = 40;
 // 0039: parentheses since X4a), so that a query without one is the query this seed generated
 // before.
 constexpr uint64_t kSetOpStreamSalt = 0x7365746F702D726EULL;
-// Share of a compound's operators written UNION rather than UNION ALL (ADR 0039's X4b), and of the
-// copies of a compound with a UNION that read rows of their own through a condition, so that UNION
-// is no plain DISTINCT of one block.
-constexpr unsigned kUnionDistinctPercent = 40;
+// Shares of a compound's operators, one draw each (ADR 0039): below the first bound UNION (X4b),
+// below the second INTERSECT and below the third INTERSECT ALL (X4c), each where its features are
+// allowed, and UNION ALL otherwise -- so turning one feature off changes only the queries that
+// draw it. Then the share of the copies of a compound with any of them that read rows of their own
+// through a condition, so that the copies differ.
+constexpr unsigned kUnionBelow = 40;
+constexpr unsigned kIntersectBelow = 60;
+constexpr unsigned kIntersectAllBelow = 72;
 constexpr unsigned kCopyConditionPercent = 75;
-// Salt of the random stream which every draw that only a set operator needs takes (X4b's UNION
-// since X4b), so that a query without one is the query this seed generated before, its parentheses
-// included.
+// Salt of the random stream which every draw that only a set operator other than UNION ALL needs
+// takes (since X4b), so that a query without one is the query this seed generated before, its
+// parentheses included.
 constexpr uint64_t kSetOperatorStreamSalt = 0x7365746F702D6F70ULL;
 // Share of the projections where a star may stand that take one among their items (`a, *`), of the
 // lone stars that take a second one (`*, t.*`), and of the stars written qualified (`t.*`) where
@@ -934,15 +938,16 @@ struct Binding {
   static constexpr std::size_t kNoCopy = std::numeric_limits<std::size_t>::max();
   std::size_t paren_first = kNoCopy;
   std::size_t paren_last = kNoCopy;
-  // Per copy (ADR 0039's X4b): the operator before it is UNION, not UNION ALL (unused for the
-  // first), and the condition that keeps its own rows, if any: `inner[column] < value` or
-  // `inner[column] >= value`. Empty: every operator UNION ALL, no condition.
+  // Per copy (ADR 0039's X4b and X4c): the operator before it (unused for the first), and the
+  // condition that keeps its own rows, if any: `inner[column] < value` or `inner[column] >= value`.
+  // Empty: every operator UNION ALL, no condition.
+  enum class CopyOp : std::uint8_t { kUnionAll, kUnion, kIntersect, kIntersectAll };
   struct CopyCondition {
     std::size_t column = 0;
     bool less = false;
     int64_t value = 0;
   };
-  std::vector<bool> distinct;
+  std::vector<CopyOp> ops;
   std::vector<std::optional<CopyCondition>> conditions;
 };
 
@@ -1541,28 +1546,39 @@ class Builder {
     }
   }
 
-  // Now and then UNION for some of a compound's operators (ADR 0039's X4b), drawn from the set
-  // operators' own stream, and then a condition per copy that keeps rows of its own: a comparison
-  // of an INTEGER column with a literal inside its data's non-negative range (a small one inside
-  // its type where the data's is unknown). No UNION over a
+  // Now and then UNION, INTERSECT or INTERSECT ALL for some of a compound's operators (ADR 0039's
+  // X4b and X4c), drawn from the set operators' own stream, and then a condition per copy that
+  // keeps rows of its own: a comparison of an INTEGER column with a literal inside its data's
+  // non-negative range (a small one inside its type where the data's is unknown). None over a
   // DOUBLE column, whose -0.0 and NaN a deduplication may keep either way (divergence D29). The
-  // row bound stays the copies' sum, which a UNION and a condition only lower.
+  // row bound stays the copies' sum, which these operators and a condition only lower.
   void DrawSetOperators(Binding& b) {
-    if (!allowed_.Has(Feature::kUnion) || !allowed_.Has(Feature::kIntegerLiteral) ||
+    const bool union_ok = allowed_.Has(Feature::kUnion);
+    const bool intersect_ok = allowed_.Has(Feature::kIntersect);
+    const bool all_ok = intersect_ok && allowed_.Has(Feature::kSetOpAll);
+    if ((!union_ok && !intersect_ok) || !allowed_.Has(Feature::kIntegerLiteral) ||
         std::ranges::any_of(b.columns,
                             [](const GenColumn& c) { return c.kind == ValueKind::kDouble; })) {
       return;
     }
-    std::vector<bool> distinct(b.copies, false);
+    using CopyOp = Binding::CopyOp;
+    std::vector<CopyOp> ops(b.copies, CopyOp::kUnionAll);
     bool any = false;
     for (std::size_t copy = 1; copy < b.copies; ++copy) {
-      distinct[copy] = operator_rng_.Percent(kUnionDistinctPercent);
-      any = any || distinct[copy];
+      const std::size_t draw = operator_rng_.Below(100);
+      if (draw < kUnionBelow) {
+        ops[copy] = union_ok ? CopyOp::kUnion : CopyOp::kUnionAll;
+      } else if (draw < kIntersectBelow) {
+        ops[copy] = intersect_ok ? CopyOp::kIntersect : CopyOp::kUnionAll;
+      } else if (draw < kIntersectAllBelow) {
+        ops[copy] = all_ok ? CopyOp::kIntersectAll : CopyOp::kUnionAll;
+      }
+      any = any || ops[copy] != CopyOp::kUnionAll;
     }
     if (!any) {
       return;
     }
-    b.distinct = std::move(distinct);
+    b.ops = std::move(ops);
     std::vector<std::size_t> candidates;
     for (std::size_t i = 0; i < b.columns.size(); ++i) {
       const GenColumn& c = b.columns[i];
@@ -2798,13 +2814,27 @@ class Builder {
     Symbol("(");
     for (std::size_t copy = 0; copy < b.copies; ++copy) {
       if (copy > 0) {
-        // Every compound records kUnionAll, a UNION among its operators kUnion too.
+        // Every compound records kUnionAll, and each other operator among its operators its own.
         used_.Add(Feature::kUnionAll);
-        Keyword("UNION");
-        if (!b.distinct.empty() && b.distinct[copy]) {
-          used_.Add(Feature::kUnion);
-        } else {
-          Keyword("ALL");
+        switch (b.ops.empty() ? Binding::CopyOp::kUnionAll : b.ops[copy]) {
+          case Binding::CopyOp::kUnionAll:
+            Keyword("UNION");
+            Keyword("ALL");
+            break;
+          case Binding::CopyOp::kUnion:
+            used_.Add(Feature::kUnion);
+            Keyword("UNION");
+            break;
+          case Binding::CopyOp::kIntersect:
+            used_.Add(Feature::kIntersect);
+            Keyword("INTERSECT");
+            break;
+          case Binding::CopyOp::kIntersectAll:
+            used_.Add(Feature::kIntersect);
+            used_.Add(Feature::kSetOpAll);
+            Keyword("INTERSECT");
+            Keyword("ALL");
+            break;
         }
       }
       if (copy == b.paren_first) {
