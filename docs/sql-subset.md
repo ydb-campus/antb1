@@ -1748,7 +1748,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q74 | pass | `UNION ALL` (ADR 0036) |
 | Q75 | pass | `UNION` (X4b) |
 | Q76 | pass | IS NULL (NL4) |
-| Q77 | unsupported | needs a cross product of multi-row relations (OJ4) |
+| Q77 | unsupported | needs a cross product of multi-row relations (OJ4b, [ADR 0040](adr/0040-nested-loop-joins.md)) |
 | Q78 | pass | round of a DOUBLE (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
 | Q80 | pass | ROLLUP (RU3) |
