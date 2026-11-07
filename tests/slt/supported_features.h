@@ -124,7 +124,10 @@ enum class Feature : std::uint8_t {
   // their
   // own as for kUnion.
   kIntersect,  // (SELECT ... WHERE c < 3 INTERSECT SELECT ... WHERE c >= 1)
-  // The ALL form of INTERSECT (X4c) and, with X4d, of EXCEPT; recorded with the operator's feature.
+  // EXCEPT [DISTINCT] among a compound's operators (ADR 0039's X4d); the copies read rows of their
+  // own as for kUnion.
+  kExcept,  // (SELECT ... WHERE c < 3 EXCEPT SELECT ... WHERE c >= 1)
+  // The ALL form of INTERSECT (X4c) and EXCEPT (X4d); recorded with the operator's feature.
   kSetOpAll,  // (SELECT ... INTERSECT ALL SELECT ...)
   // Stars among the select items (ADR 0022 rule 5); a star item also records kStar and
   // kMultipleItems, a qualified star kStar.
@@ -284,6 +287,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "union";
     case Feature::kIntersect:
       return "intersect";
+    case Feature::kExcept:
+      return "except";
     case Feature::kSetOpAll:
       return "setop_all";
     case Feature::kStarItems:
@@ -450,6 +455,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kSetOpParentheses,
     Feature::kUnion,
     Feature::kIntersect,
+    Feature::kExcept,
     Feature::kSetOpAll,
     Feature::kStarItems,
     Feature::kQualifiedStar,

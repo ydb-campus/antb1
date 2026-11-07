@@ -7069,21 +7069,6 @@ std::optional<Rejection> RejectCompoundTail(const sql::SelectStatement& stmt) {
   return std::nullopt;
 }
 
-// The first EXCEPT [ALL] of a compound in written order, which ADR 0039's X4d answers.
-std::optional<Rejection> RejectSetOperator(const sql::SelectStatement& stmt) {
-  static_assert(sql::kSetBranchFields == 4, "revisit this walk");
-  for (std::size_t k = 1; k < stmt.set_operation.size(); ++k) {
-    const sql::SetBranch& branch = stmt.set_operation[k];
-    if (branch.op != sql::SetOp::kExcept) {
-      continue;
-    }
-    return Rejection{.span = branch.op_span,
-                     .message = std::format("{} is not supported yet (ADR 0037's X4d)",
-                                            SetOperatorName(branch.op, branch.all))};
-  }
-  return std::nullopt;
-}
-
 // A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
 // item's, its elements in turn.
 arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
@@ -7101,11 +7086,9 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
     // A compound keeps its clauses in its branches, which ReachableBlocks lists before it, so what
-    // is left is its tail and its operators; its FROM list is empty, which CheckFromList must never
-    // see. A nested compound is a reachable block of its own, checked the same way.
-    if (auto r = RejectSetOperator(stmt)) {
-      return Reject(*r);
-    }
+    // is left is its tail and its operators, every one of which ADR 0039 answers (X4b to X4d); its
+    // FROM list is empty, which CheckFromList must never see. A nested compound is a reachable
+    // block of its own, checked the same way.
     if (auto r = RejectCompoundTail(stmt)) {
       return Reject(*r);
     }
@@ -7462,8 +7445,9 @@ class SetOperationBinder {
     // The operands in written order, each folded into the run's type as soon as it is known, so
     // the first item in the query that fails is refused: a later operand is not folded once an
     // earlier one fails, nor is the run once an operand's own fold failed below it. A run DuckDB
-    // does not splice (INTERSECT) is its binary nodes, ((A op B) op C): each step's two sides must
-    // widen exactly to that step's type, as the whole run's operands must to its type below.
+    // does not splice (INTERSECT, EXCEPT) is its binary nodes, ((A op B) op C): each step's two
+    // sides must widen exactly to that step's type, as the whole run's operands must to its type
+    // below.
     const std::string name = SetOperatorName(tree.op, tree.all);
     const bool binary = tree.op != sql::SetOp::kUnion;
     const auto not_exact = [&](std::size_t leaf, LogicalType from, LogicalType to) {

@@ -21,7 +21,7 @@ functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `t
 `CASE` and `COALESCE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`,
 `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not, and `UNION ALL`, `UNION` and `INTERSECT`
+outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not, and `UNION ALL`, `UNION`, `INTERSECT` and `EXCEPT`
 of two or more blocks. This covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). All 22 queries derived from TPC-H pass
 (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
@@ -210,15 +210,14 @@ operand (`(SELECT ...) + 1 UNION ALL ...`), a set operation stays a syntax error
 follows (at the end, or before `)`, a second `ALL` or `DISTINCT`, or `WITH`: a query with its own `WITH` list goes in
 parentheses); `BY NAME` after `INTERSECT` or `EXCEPT`; a parenthesized query with its own `WITH` list after a `WITH`
 list; and an `ORDER BY`, `LIMIT` or `OFFSET` after a parenthesized query that has the same clause. The binder answers a
-compound of `UNION`, `UNION ALL`, `INTERSECT` and `INTERSECT ALL`, in any nesting and with parenthesized branches, as
-the whole statement, a derived table's query and a CTE's query ([Binding](#binding)). `EXCEPT` is unsupported (exit code
-4), until ADR 0037's X4d: at the first one in written order within a compound, a parenthesized compound's before those
-of the compound around it. A compound's own `ORDER BY`, `LIMIT` and `OFFSET` -- the outermost compound's, or a
-parenthesized one's -- are unsupported (exit code 4) at the first of them, after any construct in its branches that is
-unsupported anyway, until ADR 0036's X5; a parenthesized block's own are answered. So is a compound as the query of an
-`IN`, `EXISTS` or scalar subquery unsupported, at the subquery's `IN`, `EXISTS` or `(` once the other side of its
-conjunct is checked, until X6 -- a compound in the FROM list of a subquery's query is answered. A compound in a CTE that
-nothing references is never checked or bound, tail included, as no such CTE is.
+compound of `UNION`, `INTERSECT` and `EXCEPT`, `ALL` or not, in any nesting and with parenthesized branches, as the
+whole statement, a derived table's query and a CTE's query ([Binding](#binding)). A compound's own `ORDER BY`, `LIMIT`
+and `OFFSET` -- the outermost compound's, or a parenthesized one's -- are unsupported (exit code 4) at the first of
+them, after any construct in its branches that is unsupported anyway, until ADR 0036's X5; a parenthesized block's own
+are answered. So is a compound as the query of an `IN`, `EXISTS` or scalar subquery unsupported, at the subquery's `IN`,
+`EXISTS` or `(` once the other side of its conjunct is checked, until X6 -- a compound in the FROM list of a subquery's
+query is answered. A compound in a CTE that nothing references is never checked or bound, tail included, as no such CTE
+is.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -304,6 +303,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
 - `UNION` [`DISTINCT`] wherever `UNION ALL` stands, alone or next to it in any nesting: each distinct row of its
   operands, with types folded along DuckDB's tree (ADR 0039's X4b, [Binding](#binding));
 - `INTERSECT` [`DISTINCT`] and `INTERSECT ALL`, binding tighter than `UNION`, in the same places (ADR 0039's X4c);
+- `EXCEPT` [`DISTINCT`] and `EXCEPT ALL`, at `UNION`'s level and associating to the left (ADR 0039's X4d);
 - date casts: `CAST('YYYY-MM-DD' AS DATE)` and `'YYYY-MM-DD'::DATE` are the literal `DATE 'YYYY-MM-DD'`
   wherever it may stand, as in DuckDB (which names all three `CAST('YYYY-MM-DD' AS "DATE")`);
 - other casts ([ADR 0037](adr/0037-tpcds-roadmap.md)'s CT1), `CAST(x AS T)` and `x::T` to SMALLINT (`INT2`,
@@ -791,6 +791,13 @@ reports instead: `SELECT *, nope FROM t` over such a column exits 4 at `*`.
   `UNION ALL` USMALLINT `INTERSECT` DECIMAL(9,2) is DECIMAL(9,2): the `INTERSECT` folds first. An `INTERSECT ALL`
   root prints each row's normalized value; below a DISTINCT root it keeps the value first seen in its left operand
   (D29). Both operands are read in full, the left one first (D30, D31).
+- `EXCEPT` [`DISTINCT`] and `EXCEPT ALL` ([ADR 0039](adr/0039-set-operations.md)'s X4d) share `UNION`'s level and
+  associate to the left: `a EXCEPT b UNION c` is `(a EXCEPT b) UNION c`, and `a EXCEPT b INTERSECT c` is
+  `a EXCEPT (b INTERSECT c)`. A run of `EXCEPT` is binary, as a run of `INTERSECT` is, for its column counts and its
+  types. Only the left operand's rows can reach the result: a block in a later operand is read in full but only looked
+  up. An `EXCEPT ALL` root prints each row's normalized value; below a DISTINCT root a row keeps the value first seen
+  among the blocks that can bring rows in, even one whose own row an `EXCEPT` removed (D29). Every operand is read, the
+  left one first, even when the left one is empty (D30).
 - Conditions with `OR` and `NOT` (and `AND` below them): each comparison, `LIKE` and `IN` is bound and folded exactly
   as a `WHERE` comparison, and a `WHERE` or `HAVING` conjunct with `OR` or `NOT` is computed as one condition and
   filters on it.
@@ -860,7 +867,8 @@ builds on. A `UnionAll` has two or more, or one once the optimizer has ruled the
 of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
 union by a `Compute`. A `SetOperation` ([ADR 0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT
 and EXCEPT, ALL or not, over one or more inputs, every column a key, the tree a formula over its inputs; the binder
-makes one per maximal region of `UNION` and `INTERSECT` [`ALL`] (X4b, X4c), its inputs the region's blocks and
+makes one per maximal region of `UNION`, `INTERSECT` [`ALL`] and `EXCEPT` [`ALL`] (X4b to X4d), its inputs the
+region's blocks and
 `UnionAll` subtrees in written order, and EXPLAIN prints its formula with the tree's precedence
 (`SetOperation inputs=3 formula=(0 UNION (1 INTERSECT 2)) columns=[a]`). A query produces
 inner `Join`s: the binder factors
@@ -1367,6 +1375,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   of a row its operands hold m and n times, each copy with its normalized value (`-0.0` as `0.0`, every NaN as one).
   Both read every operand in full, in written order, even after one turns out empty (D31); only the left operand's
   distinct rows are held -- the others are looked up and add none.
+- EXCEPT: each distinct row of its left operand that no other operand holds; EXCEPT ALL: max(m - n - ..., 0) copies of
+  a row its operands hold m, n, ... times, each copy with its normalized value. Both read every operand in full, in
+  written order, the left one first even when it is empty (D30); only the left operand's distinct rows are held.
 - VARCHAR: values are raw bytes. Unannotated BYTE_ARRAY columns (as in ClickBench) are VARCHAR and are never
   validated as UTF-8.
 - DECIMAL: a DECIMAL(p,s) value is an exact integer of at most p digits, the unscaled value, times 10^-s ([ADR
@@ -1530,9 +1541,9 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D26 | Errors of the blocks of a `UNION ALL` that a `LIMIT` does not need | a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run, so their errors -- an overflow, say -- are never reported ([ADR 0036](adr/0036-union-all.md)) | runs at least the first vector of every block, so an error in a later block fails the query | the answers agree where no block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23, D24 and D25), and `tests/slt/cases/setops/errors.slt` pins it: antb1's answer under `onlyif antb1`, DuckDB's error under `onlyif duckdb`, and with `ORDER BY` a control that fails in both |
 | D27 | Errors of the blocks of a `UNION ALL` or a `UNION` that a condition on it does not rule out by their constants | a `WHERE` condition on a union goes on top of each block, above the block's select list, and rules a block out only where the block's constants decide it ([ADR 0036](adr/0036-union-all.md)'s X7a; never for a `LIKE` or a DOUBLE, and never for a condition the binder computes, such as a `NOT`, which stays above the union). Any other block runs, so an error of its select list -- an overflow, say -- fails the query, even on rows a condition on another column rejects. A condition above a `UNION` stays above it ([ADR 0039](adr/0039-set-operations.md)'s X4b, until its PF15), so every block runs in full | rules out a block whose constants make a `LIKE`, a DOUBLE comparison or a `NOT` never true too, and filters a column below the select list, so that error is never reported | the answers agree where no block fails; the random generator writes no arithmetic that can overflow and tags no block with a constant, and `tests/slt/cases/setops/errors.slt` and `union.slt` pin it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb`, and the conditions both engines decide as records both pass |
 | D28 | A DOUBLE cast to an integer type that rounds to one past the type's maximum (`CAST(32767.5 AS SMALLINT)`, half to even) | fails the query with DuckDB's out-of-range conversion error | answers what its platform's conversion of the rounded value gives (-32768 on arm64; an x86 build may give another value) | `exec.ComputeTest.CastsToIntegerTypesRoundAndCheckAsDuckDb` |
-| D29 | Which of `-0.0` and `0.0`, or which NaN, a deduplication keeps | a `GROUP BY` key, a `SELECT DISTINCT` row and a `UNION` or `INTERSECT` row show the value their group saw first, in input order and then part order (a set operation's blocks in written order, among those that can bring a row in: an `INTERSECT`'s left operand), the same on any number of threads, and a condition above the deduplication tests that kept value; an `INTERSECT ALL` root shows the normalized value | shows a value that depends on its plan and threads, and can change between runs: `SELECT DISTINCT` over a `UNION ALL` of an empty block, a block holding `0.0` and one holding `-0.0` shows `-0.0` at one thread (D30's order), where antb1 shows `0.0`, and so does a `UNION` of the same three blocks; it passes an `INTERSECT ALL`'s rows on normalized, so `(N INTERSECT ALL N) UNION E`, with N holding `-0.0` and E empty, shows `0.0` where antb1 shows `-0.0`; and it moves a condition on the value below the deduplication, so one that tells `-0.0` from `0.0` tests every row's own value: over `0.0`, `-0.0` and `3.0`, `SELECT DISTINCT` and then `WHERE 1 / d < 0` gives `-0.0` in DuckDB and no row in antb1 | the fixtures' DOUBLE columns hold no `-0.0` and no NaN, and the one FLOAT `-0.0` (`floats.parquet`) is compared only through counts (`tests/slt/cases/groupby/keys.slt`); the random generator groups by no DOUBLE key, writes no `UNION` over a DOUBLE column and never reads a FLOAT column (D11); `tests/slt/cases/setops/union.slt` and `intersect.slt` pin the `UNION` and `INTERSECT ALL` cases with both engines' answers. [ADR 0039](adr/0039-set-operations.md) extends this row to EXCEPT with its X4d |
-| D30 | Which error a query reports when several blocks of a `UNION ALL`, a `UNION` or an `INTERSECT` fail | the first failing block in written order, since a union runs its blocks one after another ([ADR 0036](adr/0036-union-all.md)) | follows its pipeline order: at one thread, under an aggregate, a sort or a join's build side, it runs the first block and then the others from the last back, so `COUNT(*)` over three blocks whose second and third fail reports the third's error, as does a `UNION`, whose own deduplication is such a sink; it builds an `INTERSECT`'s right operand before it reads the left one, so with both failing it reports the right one's error; streamed to the client it runs them in written order; above one thread its choice varies between runs | the answers agree where at most one block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23 to D27), and each error record of `tests/slt/cases/setops/errors.slt` has one failing block; `union.slt` and `intersect.slt` pin the `UNION` and `INTERSECT` cases with both engines' errors. [ADR 0039](adr/0039-set-operations.md) extends this row to EXCEPT with its X4d |
-| D31 | An `INTERSECT` whose right operand turns out empty | reads the left operand in full, so an error anywhere in it -- an overflow, say -- fails the query | stops each pipeline that streams into the join after the first vector of 2,048 rows that reaches it with a row, and returns no rows; below an aggregate, a `DISTINCT`, a sort, a join's build side or another set operation it reads the left operand in full too ([ADR 0039](adr/0039-set-operations.md)) | the answers agree where no left row fails; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/setops/intersect.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's empty answer under `onlyif duckdb` |
+| D29 | Which of `-0.0` and `0.0`, or which NaN, a deduplication keeps | a `GROUP BY` key, a `SELECT DISTINCT` row and a `UNION`, `INTERSECT` or `EXCEPT` row show the value their group saw first, in input order and then part order (a set operation's blocks in written order, among those that can bring a row in: an `INTERSECT`'s or `EXCEPT`'s left operand, even a block whose own row an `EXCEPT` then removed), the same on any number of threads, and a condition above the deduplication tests that kept value; an `INTERSECT ALL` or `EXCEPT ALL` root shows the normalized value | shows a value that depends on its plan and threads, and can change between runs: `SELECT DISTINCT` over a `UNION ALL` of an empty block, a block holding `0.0` and one holding `-0.0` shows `-0.0` at one thread (D30's order), where antb1 shows `0.0`, and so does a `UNION` of the same three blocks; it passes an `INTERSECT ALL`'s rows on normalized, so `(N INTERSECT ALL N) UNION E`, with N holding `-0.0` and E empty, shows `0.0` where antb1 shows `-0.0`; `(B EXCEPT C) UNION A`, with B holding `-0.0` and C and A `0.0`, shows `0.0` where antb1 shows `-0.0`; it drops an `EXCEPT ALL` whose later operands a `LIMIT 0` or a constant condition empties, so `N EXCEPT ALL (P LIMIT 0)` shows `-0.0` where antb1 shows `0.0`; and it moves a condition on the value below the deduplication, so one that tells `-0.0` from `0.0` tests every row's own value: over `0.0`, `-0.0` and `3.0`, `SELECT DISTINCT` and then `WHERE 1 / d < 0` gives `-0.0` in DuckDB and no row in antb1 | the fixtures' DOUBLE columns hold no `-0.0` and no NaN, and the one FLOAT `-0.0` (`floats.parquet`) is compared only through counts (`tests/slt/cases/groupby/keys.slt`); the random generator groups by no DOUBLE key, writes no set operator but `UNION ALL` over a DOUBLE column and never reads a FLOAT column (D11); `tests/slt/cases/setops/union.slt`, `intersect.slt` and `except.slt` pin the set operations' cases with both engines' answers ([ADR 0039](adr/0039-set-operations.md)) |
+| D30 | Which error a query reports when several blocks of a `UNION ALL` or a set operation fail | the first failing block in written order, since a union runs its blocks one after another ([ADR 0036](adr/0036-union-all.md)) | follows its pipeline order: at one thread, under an aggregate, a sort or a join's build side, it runs the first block and then the others from the last back, so `COUNT(*)` over three blocks whose second and third fail reports the third's error, as does a `UNION`, whose own deduplication is such a sink; it builds an `INTERSECT`'s or `EXCEPT`'s right operand before it reads the left one, so with both failing it reports the right one's error, and it skips the other operand where a `LIMIT 0` or a constant empties an `INTERSECT`'s operand or an `EXCEPT`'s first one, which antb1 still reads; streamed to the client it runs them in written order; above one thread its choice varies between runs | the answers agree where at most one block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23 to D27), and each error record of `tests/slt/cases/setops/errors.slt` has one failing block; `union.slt`, `intersect.slt` and `except.slt` pin the set operations' cases with both engines' errors ([ADR 0039](adr/0039-set-operations.md)) |
+| D31 | An `INTERSECT` whose right operand turns out empty | reads the left operand in full, so an error anywhere in it -- an overflow, say -- fails the query | stops each pipeline that streams into the join after the first vector of 2,048 rows that reaches it with a row, and returns no rows; below an aggregate, a `DISTINCT`, a sort, a join's build side or another set operation it reads the left operand in full too; an `INTERSECT ALL`, an `EXCEPT` and an `EXCEPT ALL` read it in full in both engines ([ADR 0039](adr/0039-set-operations.md)) | the answers agree where no left row fails; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/setops/intersect.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's empty answer under `onlyif duckdb` |
 
 ## ClickBench status
 
@@ -1738,7 +1749,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
 | Q86 | unsupported | needs rank(), windows over aggregates and window partition expressions (phase 9) |
-| Q87 | unsupported | needs EXCEPT (X4d) |
+| Q87 | pass | `EXCEPT` (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |

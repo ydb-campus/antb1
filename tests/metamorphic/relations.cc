@@ -1870,6 +1870,84 @@ std::vector<Relation> AllRelations() {
                  .check = AllEqual()});
   }
 
+  // ---- EXCEPT [ALL] (ADR 0039's X4d) ----
+  // ADR 0036's marker sketch is the oracle again: a group the first marker counts and the second
+  // does not (EXCEPT), and COUNT(m0) - COUNT(m1) copies where that is positive (EXCEPT ALL,
+  // compared grouped with COUNT(*)). The identities of ADR 0039's Tests rebuild an operand from the
+  // others.
+  {
+    const slt::FeatureSet excepted = {kColumns,  kMultipleItems, kIntegerColumns, kTableName,
+                                      kWhere,    kWhereAnd,      kIntegerLiteral, kDerivedTable,
+                                      kUnionAll, kExcept};
+    constexpr std::string_view kA = "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row < 1800";
+    constexpr std::string_view kB = "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row >= 1200";
+    constexpr std::string_view kC =
+        "SELECT tr_pickup, tr_dropoff FROM trips WHERE tr_row >= 600 AND tr_row < 2400";
+    const auto over = [](std::string_view query) {
+      return std::format("SELECT tr_pickup, tr_dropoff FROM ({}) AS u", query);
+    };
+    const auto marked = [](std::string_view a, std::string_view b) {
+      const auto with = [](std::string_view block, std::string_view markers) {
+        const std::size_t from = block.find(" FROM ");
+        return std::format("{}, {}{}", block.substr(0, from), markers, block.substr(from));
+      };
+      return std::format("({} UNION ALL {})", with(a, "1 AS m0, NULL AS m1"), with(b, "NULL, 1"));
+    };
+    const slt::FeatureSet sketched =
+        SetWith(excepted, kConstant, kAlias, kGroupBy, kHaving, kCountColumn);
+    r.push_back(
+        {.name = "except_matches_its_sketch",
+         .features = sketched,
+         .probes = {Q(over(std::format("{} EXCEPT {}", kA, kB))),
+                    Q(std::format("SELECT tr_pickup, tr_dropoff FROM {} AS u GROUP BY tr_pickup, "
+                                  "tr_dropoff HAVING COUNT(m0) > 0 AND COUNT(m1) = 0",
+                                  marked(kA, kB)))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "except_all_matches_its_sketch",
+         .features = SetWith(sketched, kSetOpAll, kCountStar, kArithmetic),
+         .probes = {Q(std::format("SELECT tr_pickup, tr_dropoff, COUNT(*) FROM ({} EXCEPT ALL {}) "
+                                  "AS u GROUP BY tr_pickup, tr_dropoff",
+                                  kA, kC)),
+                    Q(std::format(
+                        "SELECT tr_pickup, tr_dropoff, COUNT(m0) - COUNT(m1) FROM {} AS u "
+                        "GROUP BY tr_pickup, tr_dropoff HAVING COUNT(m0) > COUNT(m1)",
+                        marked(kA, kC)))},
+         .check = AllEqual()});
+    // (A - B) ∪all (A ∩ B) = DISTINCT A, and (A -all B) ∪all (A ∩all B) = A as bags.
+    r.push_back(
+        {.name = "except_and_intersect_rebuild_the_distinct_operand",
+         .features = SetWith(excepted, kIntersect, kSelectDistinct, kSetOpParentheses),
+         .probes = {Q(over(
+                        std::format("({} EXCEPT {}) UNION ALL ({} INTERSECT {})", kA, kB, kA, kB))),
+                    Q(std::format("SELECT DISTINCT tr_pickup, tr_dropoff FROM ({}) AS u", kA))},
+         .check = AllEqual()});
+    r.push_back({.name = "except_all_and_intersect_all_rebuild_the_operand",
+                 .features = SetWith(excepted, kIntersect, kSetOpAll, kSetOpParentheses),
+                 .probes = {Q(over(std::format("({} EXCEPT ALL {}) UNION ALL ({} INTERSECT ALL {})",
+                                               kA, kC, kA, kC))),
+                            Q(over(kA))},
+                 .check = AllEqual()});
+    // (A - B) - C = A - (B ∪ C) = A - (B ∪all C), and A ∩ B = A - (A - B).
+    r.push_back({.name = "except_of_two_is_except_of_their_union",
+                 .features = SetWith(excepted, kUnion, kSetOpParentheses),
+                 .probes = {Q(over(std::format("{} EXCEPT {} EXCEPT {}", kA, kB, kC))),
+                            Q(over(std::format("{} EXCEPT ({} UNION {})", kA, kB, kC))),
+                            Q(over(std::format("{} EXCEPT ({} UNION ALL {})", kA, kB, kC))),
+                            Q(over(std::format("{} EXCEPT {} EXCEPT {}", kA, kB, kC)), 7)},
+                 .check = AllEqual()});
+    r.push_back({.name = "intersect_is_except_of_the_except",
+                 .features = SetWith(excepted, kIntersect, kSetOpParentheses),
+                 .probes = {Q(over(std::format("{} INTERSECT {}", kA, kB))),
+                            Q(over(std::format("{} EXCEPT ({} EXCEPT {})", kA, kA, kB)))},
+                 .check = AllEqual()});
+    r.push_back({.name = "except_of_a_block_from_itself_is_empty",
+                 .features = SetWith(excepted, kCountStar),
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM ({} EXCEPT {}) AS u", kC, kC)),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_row < 0")},
+                 .check = AllEqual()});
+  }
+
   // ---- stars among the select items (ADR 0022 rule 5) ----
   // A star is the columns it reads, where it stands: `*` every FROM item's in FROM order, `t.*` the
   // item's, whichever name rule 1 gives it (the table's, an alias, a path's file name) and however
