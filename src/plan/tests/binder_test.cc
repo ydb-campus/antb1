@@ -970,11 +970,9 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
-// EXCEPT waits for ADR 0039's item (ADR 0037's X4d): the first in written order within a compound
-// is refused at its operator, a parenthesized compound's before those of
-// the compound around it, and before the compound's tail, which X5 keeps at any depth -- a
-// parenthesized compound's own tail too (ADR 0039's X4a update). A tail and a subquery's refusal
-// name the compound by its root operator.
+// Every set operator is answered (ADR 0039's X4b to X4d); what stays refused is a compound's own
+// tail, which X5 keeps at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a
+// update) -- and a subquery over a compound (X6). Both name the compound by its root operator.
 INSTANTIATE_TEST_SUITE_P(
     SetOperatorRefusals, BindErrorTest,
     ::testing::Values(
@@ -993,21 +991,14 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u INTERSECT ALL SELECT i16 "
                   "FROM t)",
                   kUnsupported, "IN", "a subquery over an INTERSECT ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t EXCEPT SELECT i16 FROM u", kUnsupported, "EXCEPT",
-                  "EXCEPT is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u", kUnsupported, "EXCEPT ALL",
-                  "EXCEPT ALL is not supported yet (ADR 0037's X4d)"},
+        ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u OFFSET 3", kUnsupported,
+                  "OFFSET 3", "OFFSET on an EXCEPT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t "
                   "INTERSECT SELECT i16 FROM u ORDER BY 1",
-                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT x FROM (SELECT i16 AS x FROM t INTERSECT SELECT i16 FROM u EXCEPT "
-                  "SELECT i16 FROM t) AS d",
-                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u EXCEPT ALL SELECT i16 FROM t)",
-                  kUnsupported, "EXCEPT ALL", "EXCEPT ALL is not supported yet (ADR 0037's X4d)"},
-        ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM t UNION ALL (SELECT i16 FROM u "
-                  "EXCEPT SELECT i16 FROM t)",
-                  kUnsupported, "EXCEPT", "EXCEPT is not supported yet (ADR 0037's X4d)"},
+                  kUnsupported, "ORDER BY 1", "ORDER BY on an EXCEPT is not supported"},
+        ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u EXCEPT ALL SELECT i16 FROM t "
+                  "LIMIT 2)",
+                  kUnsupported, "LIMIT 2", "LIMIT on an EXCEPT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL (SELECT i16 FROM u UNION ALL SELECT i16 FROM t "
                   "LIMIT 1)",
                   kUnsupported, "LIMIT 1", "LIMIT on a UNION ALL is not supported"},
@@ -2296,6 +2287,58 @@ TEST(BinderTest, IntersectTypesFoldAsBinaryNodes) {
   ASSERT_NE(count_detail, nullptr) << counted.status().ToString();
   EXPECT_EQ(count_detail->kind(), kBind);
   EXPECT_EQ(count_detail->span().offset, counts.find("INTERSECT"));
+}
+
+// EXCEPT [ALL] (ADR 0039's X4d) shares UNION's level and associates to the left; INTERSECT binds
+// tighter. A region of the three is one SetOperation node; a run of EXCEPT is binary, as
+// INTERSECT's is, and its types fold pair by pair.
+TEST(BinderTest, ExceptPlansAndTypes) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view sql;
+    std::string_view explain;  // consecutive lines of its EXPLAIN
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 AS x FROM t EXCEPT SELECT i16 FROM u",
+                .explain = "SetOperation inputs=2 formula=(0 EXCEPT 1) columns=[x]"},
+           Case{
+               .sql = "SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u EXCEPT ALL SELECT i16 FROM t",
+               .explain = "SetOperation inputs=3 formula=(0 EXCEPT ALL 1 EXCEPT ALL 2)"},
+           Case{.sql = "SELECT i16 FROM t EXCEPT SELECT i16 FROM u UNION SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=((0 EXCEPT 1) UNION 2)"},
+           Case{.sql = "SELECT i16 FROM t UNION SELECT i16 FROM u EXCEPT SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=((0 UNION 1) EXCEPT 2)"},
+           Case{.sql = "SELECT i16 FROM t EXCEPT (SELECT i16 FROM u UNION SELECT i16 FROM t)",
+                .explain = "SetOperation inputs=3 formula=(0 EXCEPT (1 UNION 2))"},
+           Case{.sql = "SELECT i16 FROM t EXCEPT SELECT i16 FROM u INTERSECT SELECT i16 FROM t",
+                .explain = "SetOperation inputs=3 formula=(0 EXCEPT (1 INTERSECT 2))"},
+           Case{.sql = "(SELECT i16 FROM t INTERSECT ALL SELECT i16 FROM u) EXCEPT ALL SELECT i16 "
+                       "FROM t",
+                .explain = "SetOperation inputs=3 formula=((0 INTERSECT ALL 1) EXCEPT ALL 2)"},
+           Case{.sql = "SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t",
+                .explain = "SetOperation inputs=2 formula=(0 EXCEPT 1) columns=[i16]\n  UnionAll "
+                           "inputs=2"},
+       }) {
+    auto plan = BindSql(c.sql, catalog);
+    ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
+    const std::string explain = Explain(*plan);
+    EXPECT_TRUE(explain.contains(c.explain)) << c.sql << "\n" << explain;
+  }
+  for (const auto& [sql, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"SELECT s16 FROM dec EXCEPT SELECT u16 FROM dec EXCEPT SELECT r FROM dec",
+            LogicalType::Decimal(14, 4)},
+           {"SELECT s16 FROM dec EXCEPT (SELECT u16 FROM dec EXCEPT SELECT r FROM dec)",
+            LogicalType::Decimal(9, 4)},
+       })) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(plan->output[0].type, type) << sql;
+  }
+  const std::string sql = "SELECT p FROM dec EXCEPT ALL SELECT h FROM t";
+  auto plan = BindSql(sql, catalog);
+  ASSERT_FALSE(plan.ok());
+  EXPECT_TRUE(plan.status().ToString().contains("EXCEPT ALL of DECIMAL(38,0) and DECIMAL(15,2)"))
+      << plan.status().ToString();
 }
 
 // A CTE that only a UNION ALL's last block reads is found in the UNION ALL's frame, and a WITH list

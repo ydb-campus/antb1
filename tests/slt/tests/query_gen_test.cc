@@ -1876,7 +1876,7 @@ TEST(QueryGenerator, UnionChangesOnlyTheirQueries) {
     };
     for (std::size_t k = 0; k < copies.size(); ++k) {
       EXPECT_EQ(reads(*copies[k]), reads(*plain_copies[k])) << k;
-      if (!plain.features.Has(Feature::kIntersect)) {
+      if (!plain.features.Has(Feature::kIntersect) && !plain.features.Has(Feature::kExcept)) {
         EXPECT_TRUE(plain_copies[k]->where.empty()) << k << ": only another operator draws one";
       }
       conditions += copies[k]->where.empty() ? 0 : 1;
@@ -1904,9 +1904,8 @@ TEST(QueryGenerator, IntersectChangesOnlyTheirQueries) {
     const auto plain = without.Generate(i);
     EXPECT_FALSE(plain.features.Has(Feature::kIntersect)) << plain.sql;
     EXPECT_FALSE(plain.features.Has(Feature::kSetOpAll)) << plain.sql;
-    if (!q.features.Has(Feature::kIntersect)) {
+    if (!q.features.Has(Feature::kIntersect) && !q.features.Has(Feature::kSetOpAll)) {
       ++same;
-      EXPECT_FALSE(q.features.Has(Feature::kSetOpAll)) << q.sql;
       EXPECT_EQ(q.sql, plain.sql) << i;
       EXPECT_EQ(q.features, plain.features) << i;
       continue;
@@ -1924,12 +1923,65 @@ TEST(QueryGenerator, IntersectChangesOnlyTheirQueries) {
     const bool intersect_all = AnyOperator(compound, [](const sql::SetBranch& branch) {
       return branch.op == sql::SetOp::kIntersect && branch.all;
     });
+    const bool except_all = AnyOperator(compound, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kExcept && branch.all;
+    });
+    // kSetOpAll is recorded exactly with an ALL form other than UNION ALL.
+    EXPECT_EQ(intersect_all || except_all, q.features.Has(Feature::kSetOpAll));
+    if (!q.features.Has(Feature::kIntersect)) {
+      continue;  // an EXCEPT ALL, which kSetOpAll's absence turns into UNION ALL
+    }
     EXPECT_TRUE(intersect) << "an INTERSECT among the operators";
-    EXPECT_EQ(intersect_all, q.features.Has(Feature::kSetOpAll));
     all += intersect_all ? 1 : 0;
   }
   EXPECT_GT(took, 50) << "took: " << took;
   EXPECT_GT(all, 10) << "INTERSECT ALL: " << all;
+  EXPECT_GT(same, 6000);
+}
+
+// EXCEPT and EXCEPT ALL (ADR 0039's X4d) draw as UNION and INTERSECT do, so every seed that
+// declines them generates the query it did before; one that takes one keeps the copies and their
+// row bound.
+TEST(QueryGenerator, ExceptChangesOnlyTheirQueries) {
+  const auto with = MakeOver(Tables(), 73, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(Tables(), 73,
+               {.supported = kSupportedFeatures.Minus({Feature::kExcept}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  int all = 0;
+  for (uint64_t i = 0; i < 8000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kExcept)) << plain.sql;
+    if (!q.features.Has(Feature::kExcept)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    const auto ast = sql::Parse(q.sql);
+    ASSERT_TRUE(ast.has_value()) << ast.error().message;
+    const auto* derived = std::get_if<sql::DerivedTable>(&ast->from.at(0).source);
+    const sql::SelectStatement& compound =
+        derived != nullptr ? *derived->query : *ast->with.at(0).query;
+    EXPECT_TRUE(AnyOperator(compound, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kExcept;
+    })) << "an EXCEPT among the operators";
+    const bool except_all = AnyOperator(compound, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kExcept && branch.all;
+    });
+    const bool intersect_all = AnyOperator(compound, [](const sql::SetBranch& branch) {
+      return branch.op == sql::SetOp::kIntersect && branch.all;
+    });
+    EXPECT_EQ(intersect_all || except_all, q.features.Has(Feature::kSetOpAll));
+    all += except_all ? 1 : 0;
+  }
+  EXPECT_GT(took, 50) << "took: " << took;
+  EXPECT_GT(all, 10) << "EXCEPT ALL: " << all;
   EXPECT_GT(same, 6000);
 }
 

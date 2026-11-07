@@ -127,13 +127,13 @@ steps (only step 7 uses more than one thread):
    table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
    a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*` names a
    FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT column
-   instead, whose fields DuckDB expands). A compound of `UNION`, `UNION ALL` and `INTERSECT` [`ALL`] binds
-   each leaf of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of
-   one operator is spliced into the run around it), in its own CTE frame and scope, checking a run's column counts in
-   DuckDB's order, then folds their types along the tree (a run of `INTERSECT` as binary nodes) and casts each leaf
-   of another type once, straight to the root's type: a run of `UNION ALL` becomes a `UnionAll` node and each maximal
-   region of the other operators one `SetOperation` node (`SetOperationBinder`, [ADR 0036](adr/0036-union-all.md),
-   [ADR 0039](adr/0039-set-operations.md)); `EXCEPT` exits 4 until ADR 0037's X4d.
+   instead, whose fields DuckDB expands). A compound of `UNION`, `INTERSECT` and `EXCEPT`, `ALL` or not, binds each leaf
+   of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of one
+   operator is spliced into the run around it), in its own CTE frame and scope, checking a run's column counts in
+   DuckDB's order, then folds their types along the tree (a run of `INTERSECT` or `EXCEPT` as binary nodes) and casts
+   each leaf of another type once, straight to the root's type: a run of `UNION ALL` becomes a `UnionAll` node and each
+   maximal region of the other operators one `SetOperation` node (`SetOperationBinder`, [ADR
+   0036](adr/0036-union-all.md), [ADR 0039](adr/0039-set-operations.md)).
    Columns resolve there,
    an `ON` seeing only its
    own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
@@ -164,7 +164,7 @@ steps (only step 7 uses more than one thread):
    ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one. `SetOperation` answers one tree of UNION,
    INTERSECT and EXCEPT, ALL or not, over one or more inputs: new columns of one type each, every one of them a key,
    and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); the binder makes one
-   per maximal region of `UNION` and `INTERSECT` [`ALL`] since ADR 0037's X4b and X4c.
+   per maximal region of `UNION`, `INTERSECT` [`ALL`] and `EXCEPT` [`ALL`] since ADR 0037's X4b to X4d.
     Every column gets a `plan::ColumnId` where it is created (a field, a computed
    expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
    by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).

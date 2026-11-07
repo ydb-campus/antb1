@@ -167,7 +167,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | X4s | The set-operation plan node and its serial operator: one hash table keyed on every column, the inputs that start a row inserting and the others looking up, a formula over a bit or a count per input; no SQL (the phase 6 and X4s updates below) | | Built |
 | X4b | UNION [DISTINCT], with DuckDB's tree fold of types (the X4b update below) | 75 | Built |
 | X4c | INTERSECT and INTERSECT ALL, also in trees with UNION and UNION ALL (the X4c update below) | 8, 38 | Built |
-| X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered | 87 | Planned |
+| X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered (the X4d update below) | 87 | Built |
 | **Phase 7** | **Join kinds** | | |
 | OJ1 | One table of join-kind properties, read by every rule that tells kinds apart | | Planned |
 | OJ2 | A FULL join kind and its operator | | Planned |
@@ -706,6 +706,11 @@ parser now counts each change of operator in a compound against the depth limit,
 Update (2026-11-07, X4c): built. INTERSECT and INTERSECT ALL bind tighter than UNION, in the same regions, a run of
 INTERSECT typed as DuckDB's binary nodes. Q8 and Q38 pass, so the ratchet is at 72. Both stay far inside the SF 1
 budget (ADR 0039's X4c update), so PF12 and PF13 stay guards. Q14 now needs only SQ3, and Q87 only X4d.
+
+Update (2026-11-07, X4d): built, and with it phase 6. EXCEPT and EXCEPT ALL answer at UNION's level, so every tree of
+UNION, INTERSECT and EXCEPT, ALL or not, is answered, and no set operator is refused. Q87 passes, so the ratchet is at
+73, as phase 6 planned. X4p and PF12 to PF15 stay guards: no query of the phase misses the SF 1 budget (ADR 0039's
+X4c and X4d updates). ADR 0036's X4 keeps `BY NAME` and non-SELECT branches, and X5 and X6 stay as they were.
 
 ## Alternatives considered
 

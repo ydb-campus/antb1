@@ -475,6 +475,33 @@ set operations and pins them with records.
   - Their shard (7 of 8) takes 66 s under AddressSanitizer here, about 390 s at the slowest CI-to-local ratio seen
     (5.9x), inside the gate's 522 s.
 
+## Update (2026-11-07, X4d): EXCEPT, built
+
+- **Built as decided:** EXCEPT and EXCEPT ALL share UNION's level and associate to the left, in the same regions as the
+  other operators. The binder's last refusal goes: X4b's region walk, X4c's binary type check and both parser levels
+  already covered EXCEPT. Q87 passes, and the ratchet is at 73, which completes phase 6 as planned.
+- **Divergences, each pinned in `tests/slt/cases/setops/except.slt` with both engines' answers:**
+  - D29: `(B EXCEPT C) UNION A`, with B holding -0.0 and C and A 0.0, prints -0.0 in antb1, from B's row that the
+    EXCEPT removed, and 0.0 in DuckDB.
+  - D29: `N EXCEPT ALL (P LIMIT 0)` prints antb1's normalized 0.0, and -0.0 in DuckDB, whose planner drops the EXCEPT
+    ALL.
+  - D30: with both operands failing, DuckDB reports the right one's error. With the left operand emptied by a LIMIT 0,
+    DuckDB skips the right one and answers, where antb1 still reads it and fails.
+- **The oracle and the identities** of the Tests section are metamorphic relations:
+  - the marker sketch for EXCEPT, and for EXCEPT ALL with COUNT(m0) - COUNT(m1) copies;
+  - (A − B) ∪all (A ∩ B) = DISTINCT A, and (A −all B) ∪all (A ∩all B) = A;
+  - (A − B) − C = A − (B ∪ C) = A − (B ∪all C);
+  - A ∩ B = A − (A − B);
+  - A − A = ∅.
+
+  The generator draws EXCEPT and EXCEPT ALL (feature `kExcept`, with `kSetOpAll`) in bands of the operator stream
+  above X4c's, so UNION and INTERSECT keep their draws.
+- **The SF 1 budget holds:** Q87 peaks at 25 MiB. On Apple silicon antb1 answers it in 2.0 s in Debug and 4.9 s
+  under AddressSanitizer. Its shard (2 of 8) takes 72 s under AddressSanitizer here, about 425 s at the slowest
+  CI-to-local ratio seen (5.9x), inside the gate's 522 s.
+- **Every item of this ADR is built** (X4a to X4d with X4s). X4p and PF12 to PF15 stay guards, and the status stays
+  Proposed until the maintainer decides otherwise.
+
 ## Evidence
 
 Checked on synthetic data only, against DuckDB 1.5.6, during the review and while this ADR was written:
