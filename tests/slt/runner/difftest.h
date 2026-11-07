@@ -42,7 +42,12 @@ namespace antb1::slt {
 
 struct DiffOptions {
   uint64_t count = 0;
-  std::optional<uint64_t> only;  // run just this query index
+  std::optional<uint64_t> only;  // run just this query index (whatever the shard)
+  // Run only the indexes i of 0..count-1 with i % shard_count == shard_index: one of shard_count
+  // interleaved slices of the same queries, so that several tests share a seed's run (antb1-slt
+  // diff --shard K/N) and each slice draws from every part of it.
+  uint64_t shard_index = 0;
+  uint64_t shard_count = 1;
   bool redact = false;
   // The tables are those of `pixi run diff-random` (tests/slt/tables.txt), which then reproduces
   // a case with ANTB1_DIFF_SEED and ANTB1_DIFF_ONLY.

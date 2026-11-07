@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <optional>
 #include <string>
@@ -341,6 +342,35 @@ TEST(RunDiff, MismatchPrintsSeedCaseSqlRowsAndRepro) {
   EXPECT_NE(r.out.find("antb1-slt diff --seed 42 --only 0"), std::string::npos);
   EXPECT_NE(r.out.find("... 4 more failure(s) not shown"), std::string::npos) << r.out;
   EXPECT_NE(r.out.find("DIFF: FAIL"), std::string::npos);
+}
+
+// A shard (antb1-slt diff --shard K/N) runs the indexes i % N == K - 1 of the run, so the N slices
+// together run each query of the seed exactly once; --only runs its query whatever the slice.
+TEST(RunDiff, ShardsRunInterleavedSlicesOfTheSameQueries) {
+  const auto gen = Generator(0);
+  const auto mismatch = [](const std::string&) { return ExecResult(Ints({"13"})); };
+  std::vector<std::string> cases;
+  for (const uint64_t shard : {0U, 1U}) {
+    const DiffRun r = Diff(gen, mismatch, Oracle,
+                           {.count = 7,
+                            .shard_index = shard,
+                            .shard_count = 2,
+                            .command = "antb1-slt diff --seed 42",
+                            .max_reports = 100});
+    EXPECT_EQ(r.stats.queries, shard == 0 ? 4U : 3U);
+    for (uint64_t i = 0; i < 7; ++i) {
+      const bool ran = r.out.contains(std::format("FAIL diff case {} ", i));
+      EXPECT_EQ(ran, i % 2 == shard) << "case " << i << " of slice " << shard;
+      if (ran) {
+        cases.push_back(std::format("{}", i));
+      }
+    }
+  }
+  EXPECT_EQ(cases.size(), 7U) << "every query once";
+  const DiffRun only =
+      Diff(gen, mismatch, Oracle, {.count = 7, .only = 2, .shard_index = 1, .shard_count = 2});
+  EXPECT_EQ(only.stats.queries, 1U);
+  EXPECT_TRUE(only.out.contains("FAIL diff case 2 ")) << only.out;
 }
 
 // A run over some of the tables of `pixi run diff-random` (`--table`) reproduces a case with the

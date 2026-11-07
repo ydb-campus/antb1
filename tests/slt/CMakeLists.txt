@@ -270,25 +270,29 @@ if(ANTB1_HAVE_DUCKDB)
     PROPERTIES LABELS diff FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
   )
   # The same queries (seed) on 4 threads with 700-row batches: DuckDB's answers, and the 1-thread results byte for
-  # byte. (Seed 20260929 makes DuckDB itself leak under ASan: MIN of VARCHAR with GROUP BY and LIMIT.)
-  antb1_slt_args(
-    _args
-    parallel.diff.random
-    --threads
-    4
-    --same-as-threads
-    1
-    --batch-size
-    700
-  )
-  add_test(
-    NAME parallel.diff.random
-    COMMAND antb1-slt diff ${_args} ${_diff_tables} --seed 20260925 --count 300
-  )
-  set_tests_properties(
-    parallel.diff.random
-    PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
-  )
+  # byte. (Seed 20260929 makes DuckDB itself leak under ASan: MIN of VARCHAR with GROUP BY and LIMIT.) In two
+  # interleaved halves of the 300 queries (--shard), since the whole took 200 to 300 seconds under ASan against the
+  # 300-second timeout: together they run every query diff.random runs.
+  foreach(_half 1 2)
+    antb1_slt_args(
+      _args
+      parallel.diff.random.${_half}of2
+      --threads
+      4
+      --same-as-threads
+      1
+      --batch-size
+      700
+    )
+    add_test(
+      NAME parallel.diff.random.${_half}of2
+      COMMAND antb1-slt diff ${_args} ${_diff_tables} --seed 20260925 --count 300 --shard ${_half}/2
+    )
+    set_tests_properties(
+      parallel.diff.random.${_half}of2
+      PROPERTIES LABELS parallel FIXTURES_REQUIRED antb1_fixtures TIMEOUT 300
+    )
+  endforeach()
   # diff.star on 4 threads with 97-row batches, fewer than the rows of every part of trips and shifts, so that a part
   # spans several batches.
   antb1_slt_args(

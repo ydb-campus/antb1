@@ -161,6 +161,9 @@ DiffStats RunDiff(const QueryGenerator& generator, Engine& antb1, Engine& oracle
   const uint64_t first = options.only.value_or(0);
   const uint64_t last = options.only.has_value() ? first + 1 : options.count;
   for (uint64_t i = first; i < last; ++i) {
+    if (!options.only.has_value() && i % options.shard_count != options.shard_index) {
+      continue;  // another slice's
+    }
     const GeneratedQuery q = generator.Generate(i);
     const bool supported = supported_set.Contains(q.features);
     ++stats.queries;
