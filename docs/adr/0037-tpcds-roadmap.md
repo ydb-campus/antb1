@@ -172,7 +172,9 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ1 | One table of join-kind properties, read by every rule that tells kinds apart (the OJ1 update below) | | Built |
 | OJ2 | A FULL join kind and its operator (the OJ2 update below) | | Built |
 | OJ3 | FULL OUTER JOIN (the OJ3 update below) | 97 | Built |
-| OJ4 | Cross products of multi-row relations | 77 | Planned |
+| OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md)) | | Planned |
+| OJ4b | Cross products and joins without an equality key in the binder and the join-order cost search (ADR 0040) | 77 | Planned |
+| OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040) | | Planned |
 | OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |
 | **Phase 8** | **Subqueries** | | |
 | SQ1 | Uncorrelated one-row subqueries as values inside conditions | | Planned |
@@ -739,6 +741,11 @@ build and 4.5 s under ASan, and peaks at 56 MiB; its ASan shard (8 of 8) takes 7
 windows. RIGHT JOIN stays exit code 4, since no query of the 99 needs it.
 A subquery condition in an inner ON inside a FULL JOIN's left input exits 4 although DuckDB answers it; it is a
 candidate for phase 8, which would place its semi join inside that input. The other two refusals match DuckDB's.
+
+Update (2026-11-07, OJ4): [ADR 0040](0040-nested-loop-joins.md) designs it. The maintainer widened OJ4 from Q77's cross
+product to every join without an equality key, inner, LEFT and FULL, run as a nested loop whose conditions are
+residuals. The join-order cost search places cross products. OJ4 splits into OJ4a (the executor), OJ4b (inner joins
+in the binder and the join order; Q77) and OJ4c (LEFT and FULL JOINs).
 
 ## Alternatives considered
 

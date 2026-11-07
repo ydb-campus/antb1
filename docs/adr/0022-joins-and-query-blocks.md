@@ -317,6 +317,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     an aggregate without GROUP BY, HAVING, LIMIT or OFFSET -- that no key, residual or condition of its own reads.
     It joins the key-connected others as a one-row join, after them in FROM order. A condition on it alone stays
     refused, as it could leave the join's right input with no row; a subquery conjunct that reads it joins above.
+  - Update (2026-11-07, [ADR 0040](0040-nested-loop-joins.md)): cross products get a design. Once ADR 0037's OJ4b
+    is built, a disconnected graph is no longer refused. A join with no equality key, inner and later LEFT and FULL,
+    is a nested loop whose conditions are residuals, and the join-order cost search places cross products. The
+    one-row joins above stay as they are.
 - **Join order (J2b, decision C9): greedy and left-deep, from footer statistics only.**
   1. The probe is the relation with the largest footer row count (for a sub-plan or a fixed unit, its estimate).
   2. Then, of the relations connected to those already joined, the one that gives the smallest estimated result
