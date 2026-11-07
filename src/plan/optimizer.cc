@@ -783,7 +783,7 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
   // probe it with far fewer rows. A null-aware anti join (NOT IN) still cannot emit its build rows,
   // so it keeps building on the subquery side whatever the estimates say.
   const std::optional<int64_t> left_rows = EstimateRows(*left);
-  const bool chooses = join.kind == JoinKind::kSemi || join.kind == JoinKind::kAnti;
+  const bool chooses = Traits(join.kind).may_build_left;
   const BuildSide build = chooses
                               ? ChooseBuildSide(left_rows, EstimateRows(*right), build_side_ratio)
                               : BuildSide::kRight;

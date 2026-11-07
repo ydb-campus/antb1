@@ -391,7 +391,7 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
     ARROW_ASSIGN_OR_RAISE(columns_, MakeJoinColumns(table_, ctx.budget));
-    if (kind_ == plan::JoinKind::kOneRow) {
+    if (plan::Traits(kind_).keyless) {
       // A planner bug, never an answer: SQL plans only an aggregate without groups here.
       if (table_->num_rows() != 1) {
         return arrow::Status::Invalid("a one-row join's right input returned ", table_->num_rows(),
@@ -425,16 +425,8 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
-bool EmitsBuildRows(plan::JoinKind kind, plan::BuildSide side) {
-  return kind != plan::JoinKind::kInner && side == plan::BuildSide::kLeft;
-}
-
-bool EmitsUnmatchedBuildRows(plan::JoinKind kind, plan::BuildSide side) {
-  return EmitsBuildRows(kind, side) && kind != plan::JoinKind::kSemi;
-}
-
 bool EmptiesJoin(plan::JoinKind kind, const JoinTable& table) {
-  return (kind == plan::JoinKind::kInner || kind == plan::JoinKind::kSemi) && table.num_rows() == 0;
+  return plan::EmptyBuildEmptiesJoin(kind) && table.num_rows() == 0;
 }
 
 arrow::Status PrepareBuilds(std::span<const std::shared_ptr<JoinBuild>> builds, ExecContext& ctx) {
@@ -665,13 +657,15 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   const plan::JoinKind kind = build->kind();
   const std::string_view kind_name = plan::ToString(kind);
   const JoinBuildSpec& spec = *build->spec();
+  const plan::JoinKindTraits traits = plan::Traits(kind);
   const bool emits_build = EmitsBuildRows(kind, build_side);
   const bool emits_unmatched = EmitsUnmatchedBuildRows(kind, build_side);
-  if (emits_build && kind != plan::JoinKind::kSemi && kind != plan::JoinKind::kAnti) {
-    // The plan is legal and the planner may express it; the operator cannot run it yet. A
-    // null-aware anti join would have to suppress every row once any probe key is NULL, and a left
+  if (build_side == plan::BuildSide::kLeft && !traits.may_build_left) {
+    // A kind the operator cannot build on its left input (plan::JoinKindTraits::may_build_left). A
+    // null-aware anti join would have to suppress every row once any probe key is NULL, a left
     // outer join emits matched pairs during the probe as well as padded rows after it -- neither
-    // of which this operator does. Semi is ADR 0026's C2b, anti its C2c.
+    // of which this operator does -- and a one-row join builds its single row. Semi is ADR 0026's
+    // C2b, anti its C2c.
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join that builds on its left input is not implemented");
   }
@@ -683,15 +677,14 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join over a build that did not keep its NULL keys");
   }
-  if ((kind == plan::JoinKind::kOneRow) != spec.keys().empty()) {
+  if (traits.keyless != spec.keys().empty()) {
     return arrow::Status::Invalid("a ", kind_name, " hash join over a build ",
                                   spec.keys().empty() ? "without" : "with", " keys");
   }
-  if (kind == plan::JoinKind::kNullAwareAnti && spec.keys().size() != 1) {
+  if (traits.null_aware && spec.keys().size() != 1) {
     return arrow::Status::Invalid("a ", kind_name, " hash join of ", spec.keys().size(), " keys");
   }
-  if ((kind == plan::JoinKind::kNullAwareAnti || kind == plan::JoinKind::kOneRow) &&
-      !residual.empty()) {
+  if (!traits.residuals && !residual.empty()) {
     return arrow::Status::Invalid("a ", kind_name, " hash join with residuals");
   }
   const arrow::Schema& probe_schema = *probe->output_schema();
@@ -711,10 +704,10 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
                                     " for a build key of type ", build_type.ToString());
     }
   }
-  // Semi, anti and null-aware anti joins pass the probe's batches on: its schema, the same object,
-  // so that a build of their output takes it (JoinBuildPart checks the schema).
-  const bool pass_through = kind == plan::JoinKind::kSemi || kind == plan::JoinKind::kAnti ||
-                            kind == plan::JoinKind::kNullAwareAnti;
+  // A join that filters its left input (semi, anti and null-aware anti) passes the probe's batches
+  // on: its schema, the same object, so that a build of their output takes it (JoinBuildPart checks
+  // the schema).
+  const bool pass_through = traits.filters_left;
   // A join that emits its build rows outputs the build's own schema object, for the same reason the
   // pass-through kinds output the probe's: a build above it takes the object as it is.
   std::shared_ptr<arrow::Schema> schema;
@@ -765,9 +758,12 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       schema_(std::move(schema)),
       kind_(build_->kind()),
       emits_build_(EmitsBuildRows(build_->kind(), build_side)) {
-  if (kind_ == plan::JoinKind::kInner || residual_.empty()) {
+  // A join whose output is its matches alone (inner) filters the pairs by its residuals as it
+  // forms them; any other kind reads them per candidate, to decide what to keep or pad.
+  if (plan::OutputsMatchesOnly(kind_) || residual_.empty()) {
     return;
   }
+  const plan::JoinKindTraits traits = plan::Traits(kind_);
   // The columns the residuals read, of the probe's columns, then the build's (Make checked them),
   // in order: a column's place among them is its index in a batch of candidate pairs.
   std::vector<int> read;
@@ -815,7 +811,7 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       return plan::ColumnExpr{.index = Narrow<int>(at), .id = column.id};
     }));
   }
-  if (kind_ == plan::JoinKind::kSemi || kind_ == plan::JoinKind::kAnti) {
+  if (traits.filters_left && !traits.null_aware) {
     const std::vector<plan::BoundColumn>& keys = build_->spec()->keys();
     const auto is_key = [&keys](int column) {
       return std::ranges::any_of(
@@ -858,7 +854,13 @@ arrow::Status HashJoinOperator::Start() {
     End();  // no row can come out: the input is never opened
     return arrow::Status::OK();
   }
-  if (emits_build_ && kind_ != plan::JoinKind::kSemi && table_->num_rows() == 0) {
+  // The probe side's unmatched rows are padded where the kind pads that side (a right probe for a
+  // left build, a left probe for a right one): such a join must still read its probe.
+  const plan::JoinKindTraits traits = plan::Traits(kind_);
+  const bool pads_probe =
+      build_side_ == plan::BuildSide::kLeft ? traits.pads_left : traits.pads_right;
+  if (emits_build_ && EmitsUnmatchedBuildRows(kind_, build_side_) && !pads_probe &&
+      table_->num_rows() == 0) {
     // No mark can be set, so the probe cannot change which build rows come out: all of them do.
     // End() leaves the input unopened, as EmptiesJoin does for the mirrored kinds, and the sink
     // still emits the retained NULL-key rows. It also keeps Keep::kAll off this path, where Pull
@@ -1177,7 +1179,10 @@ int64_t HashJoinOperator::KeepPassingOrPadded(int64_t count, int64_t passing, bo
 arrow::Result<int64_t> HashJoinOperator::NextSlots() {
   const int64_t length = batch_.data->num_rows();
   const int64_t limit = std::min<int64_t>(batch_size_, std::numeric_limits<std::uint32_t>::max());
-  const bool pads = kind_ == plan::JoinKind::kLeft;
+  // A probe row without a match is padded where the kind pads the probe's side: the left input's
+  // rows (`pads_right`) for a right build, the right input's (`pads_left`) for a left one.
+  const plan::JoinKindTraits traits = plan::Traits(kind_);
+  const bool pads = build_side_ == plan::BuildSide::kRight ? traits.pads_right : traits.pads_left;
   // Calls emit(probe row, candidate (kPadded: none), slot, whether it is the row's last candidate)
   // for the slots from (row_, taken_) on, at most `limit` of them; the position after the last.
   const auto walk = [&](const auto& emit) {

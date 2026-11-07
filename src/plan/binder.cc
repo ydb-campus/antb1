@@ -2849,7 +2849,7 @@ struct SubqueryJoin {
   // Whether this join leaves a column above the node it stands on: its own computed layer, and a
   // one-row join's appended row. A semi or null-aware anti join outputs its left input's columns
   // alone, so one of those with no layer of its own adds nothing.
-  [[nodiscard]] bool AddsColumns() const { return !exprs.empty() || kind == JoinKind::kOneRow; }
+  [[nodiscard]] bool AddsColumns() const { return !exprs.empty() || Traits(kind).outputs_right; }
 };
 
 class Binder {
@@ -3804,6 +3804,9 @@ class Binder {
   // A LEFT JOIN unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
   // reordered and always built on its right input, whose two inputs are inner blocks of their own.
   struct Unit {
+    // Its kind, whose traits (join_kind.h) decide where a WHERE or an ON conjunct over one input
+    // may go and the unit's row floor: LEFT for a LEFT JOIN, the only connector that makes a unit.
+    JoinKind kind = JoinKind::kLeft;
     std::size_t left = 0;           // into blocks_: its left input, the preserved side
     std::size_t right = 0;          // into blocks_: its right input, the null-supplying side
     std::vector<JoinKey> keys;      // its ON's equalities between the two inputs (at least one)
@@ -5047,7 +5050,10 @@ void Binder::BuildBlocks() {
     ANTB1_CHECK(!group.empty());  // the parser gives the first FROM item kFirst
     const std::size_t left = NewBlock(group);
     const std::size_t right = NewBlock({i});
-    units_.push_back(Unit{.left = left, .right = right, .span = stmt_.from[i].connector_span});
+    units_.push_back(Unit{.kind = JoinKind::kLeft,
+                          .left = left,
+                          .right = right,
+                          .span = stmt_.from[i].connector_span});
     unit_at_[i] = units_.size() - 1;
     relations_.push_back(Relation{.unit = units_.size() - 1});
     group.assign({relations_.size() - 1});
@@ -5075,12 +5081,21 @@ std::size_t Binder::DescendTo(std::size_t block, const std::vector<std::size_t>&
     if (!unit.has_value()) {
       return block;
     }
-    const std::size_t left = units_[*unit].left;
-    const auto inside = [&](std::size_t b) { return BlockHolds(left, b); };
-    if (!std::ranges::all_of(bindings, inside)) {
-      return block;  // it reads the null-supplying side: it stays above the unit
+    // A conjunct over one input of the unit moves into it where the join never pads that input's
+    // columns with NULLs, which a WHERE above would test: a LEFT JOIN's left input. One that reads
+    // a padded input, or both, stays above the unit.
+    const Unit& at = units_[*unit];
+    const JoinKindTraits traits = Traits(at.kind);
+    const auto inside = [&](std::size_t input) {
+      return std::ranges::all_of(bindings, [&](std::size_t b) { return BlockHolds(input, b); });
+    };
+    if (!traits.pads_left && inside(at.left)) {
+      block = at.left;
+    } else if (!traits.pads_right && inside(at.right)) {
+      block = at.right;
+    } else {
+      return block;
     }
-    block = left;
   }
 }
 
@@ -5198,10 +5213,11 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
           ref->span);
     }
   }
-  if (reads_right && !reads_left) {
-    // Rule 11: it filters the right input alone, below the padding, which keeps the same rows. It
-    // is classified inside that input, which is an inner block of its own, so a right input of
-    // several relations routes it to the right one of them.
+  if (reads_right && !reads_left && !Traits(units_[u].kind).pads_left) {
+    // Rule 11: it filters the right input alone, below the join, which keeps the same rows where a
+    // right row without a match never comes out on its own (no `pads_left`: a LEFT JOIN). It is
+    // classified inside that input, which is an inner block of its own, so a right input of several
+    // relations routes it to the right one of them.
     const std::size_t outer = block_;
     block_ = right;
     const arrow::Status status = BindConjunct(conjunct, element);
@@ -5559,7 +5575,7 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
     // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
     // outlive the statement.
     std::vector<JoinKey> keys;
-    if (!join.dependent && join.kind != JoinKind::kOneRow) {
+    if (!join.dependent && !Traits(join.kind).keyless) {
       keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
     }
     if (join.dependent) {
@@ -5883,7 +5899,16 @@ std::optional<int64_t> Binder::UnitEstimate(std::size_t u) const {
   }
   const Int128 divisor = std::max<int64_t>(units_[u].divisor, 1);
   const Int128 joined = Int128{*left} * Int128{*right} / divisor;
-  return std::max(*left, Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max()));
+  int64_t rows = Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max());
+  // A join that pads an input's unmatched rows outputs at least that input's rows.
+  const JoinKindTraits traits = Traits(units_[u].kind);
+  if (traits.pads_right) {
+    rows = std::max(rows, *left);
+  }
+  if (traits.pads_left) {
+    rows = std::max(rows, *right);
+  }
+  return rows;
 }
 
 // The rows of a binding's relation after the conjuncts routed to its Scan (ADR 0026): the
@@ -6461,7 +6486,7 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
 // which is what the executor requires of an outer join (ADR 0022, "Build sides").
 LogicalNodePtr Binder::UnitNode(std::size_t u) {
   Unit& unit = units_[u];
-  return Make(JoinNode{.kind = JoinKind::kLeft,
+  return Make(JoinNode{.kind = unit.kind,
                        .left = JoinTree(unit.left),
                        .right = JoinTree(unit.right),
                        .keys = std::move(unit.keys),
@@ -6584,8 +6609,11 @@ std::optional<std::size_t> Binder::PushableSemiJoin(const SubqueryJoin& join) co
   // read is this relation too. The last two cannot fire today and are kept as the precondition they
   // state: a computed probe's key belongs to no binding, so the lookup below refuses it anyway, and
   // only a one-row join carries a filter, which the kind already excludes.
-  if (join.kind != JoinKind::kSemi || join.dependent || !join.exprs.empty() ||
-      !join.filter.empty()) {
+  // A kind that keeps exactly the left rows with a match (a semi join): one that filters its left
+  // input and drops its unmatched rows.
+  const JoinKindTraits traits = Traits(join.kind);
+  if (!(traits.filters_left && traits.drops_unmatched_left) || join.dependent ||
+      !join.exprs.empty() || !join.filter.empty()) {
     return std::nullopt;
   }
   const std::optional<ColumnLocation> location = scope_.Find(join.left_key.id);

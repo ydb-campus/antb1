@@ -1308,11 +1308,14 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     const auto boolean = expr(0, LogicalType::kBoolean);
     // A semi join (ADR 0026's C2b) and an anti join (its C2c) that build on their left input run:
     // they are the two KeepTheSameRows cases below, not malformed plans.
-    for (const plan::JoinKind kind :
-         {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kLeft}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
                      "a join that builds on its left input and cannot emit its rows");
     }
+    // A well-formed one-row join (no key) that builds on its left input reaches the build-side
+    // check itself (its kind has no `may_build_left`).
+    expect_invalid(kind_of(plan::JoinKind::kOneRow, {}, {}, plan::BuildSide::kLeft),
+                   "a one-row join that builds on its left input");
     expect_invalid(kind_of(plan::JoinKind::kOneRow, key(x, x), {}), "a one-row join with a key");
     expect_invalid(kind_of(plan::JoinKind::kOneRow, {}, {boolean}),
                    "a one-row join with a residual");

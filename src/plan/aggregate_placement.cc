@@ -175,23 +175,16 @@ bool Exchangeable(const JoinNode& join) {
   if (!join.residual.empty()) {
     return false;
   }
-  switch (join.kind) {
-    case JoinKind::kInner:
-    case JoinKind::kLeft:
-      return true;
-    // Refused, and the reason is conservatism rather than illegality. The right input's columns
-    // are not output, so no aggregate can read that side -- but a placement on the LEFT side would
-    // be sound: every row of a group shares the join key, so a group matches entirely or not at
-    // all, and the exchange holds as it does for an inner join. Neither query ADR 0032 measures
-    // has this shape, and admitting it would widen what the gate of item G2 has to classify
-    // before anything has asked for it.
-    case JoinKind::kSemi:
-    case JoinKind::kAnti:
-    case JoinKind::kNullAwareAnti:
-    case JoinKind::kOneRow:  // and this one has no keys to group by
-      return false;
-  }
-  return false;
+  // Both inputs' columns, so an aggregate can read either side (inner and left joins). A filter of
+  // the left input is refused, and the reason is conservatism rather than illegality: the right
+  // input's columns are not output, so no aggregate can read that side -- but a placement on the
+  // LEFT side would be sound, since every row of a group shares the join key, so a group matches
+  // entirely or not at all. Neither query ADR 0032 measures has this shape, and admitting it would
+  // widen what the gate of item G2 has to classify before anything has asked for it. A keyless join
+  // has no keys to group by, and a join that pads its left input is refused until a kind that does
+  // exists and is measured (ADR 0037's OJ2).
+  const JoinKindTraits traits = Traits(join.kind);
+  return traits.outputs_right && !traits.keyless && !traits.pads_left;
 }
 
 // The per-row cost of grouping by one column, coarsely: what a hash table hashes, compares and
@@ -292,7 +285,16 @@ std::optional<int64_t> JoinRows(const JoinNode& join) {
   }
   const int64_t rows =
       Int128ToInt64(Int128{*left} * Int128{*right} / divisor).value_or(kLargestRows);
-  return join.kind == JoinKind::kLeft ? std::max(rows, *left) : rows;
+  // A join that pads an input's unmatched rows outputs at least that input's rows.
+  const JoinKindTraits traits = Traits(join.kind);
+  int64_t floor = rows;
+  if (traits.pads_right) {
+    floor = std::max(floor, *left);
+  }
+  if (traits.pads_left) {
+    floor = std::max(floor, *right);
+  }
+  return floor;
 }
 
 // Whether the gate admits a placement: both of the two arguments for one, and nothing else. Asked
@@ -375,7 +377,7 @@ std::optional<AggregatePlacement> PlacementAt(const LogicalNodePtr& node,
       continue;
     }
     const auto* join_above = std::get_if<JoinNode>(above.get());
-    if (join_above != nullptr && join_above->kind != JoinKind::kInner) {
+    if (join_above != nullptr && !OutputsMatchesOnly(join_above->kind)) {
       return std::nullopt;
     }
   }
@@ -412,7 +414,9 @@ std::optional<AggregatePlacement> PlacementAt(const LogicalNodePtr& node,
                          .left_is_aggregated = left_aggregated,
                          .pre_grouping = {},
                          .grouping_from_aggregated_side = 0,
-                         .needs_identity = join.kind == JoinKind::kLeft && !left_aggregated};
+                         // the aggregated side is the one the join pads
+                         .needs_identity = left_aggregated ? Traits(join.kind).pads_left
+                                                           : Traits(join.kind).pads_right};
   // A key names a column of its own input by construction (JoinKey), and where the two key types
   // differ the widening is a Compute on that input's branch -- so the widened column is below the
   // join too, and grouping by it is grouping by a function of the column it widened.

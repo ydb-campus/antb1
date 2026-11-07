@@ -42,9 +42,12 @@ Responsibilities:
   (`src/plan/join_order.h`: a cost search over the join trees, greedy and left-deep beyond 12 relations, estimated
   from footer row counts, ranges and distinct-count hints), the logical plan (`logical_plan.h`; a `Join` and a
   `DependentJoin` have two inputs, a `UnionAll` ([ADR 0036](adr/0036-union-all.md)) and a `SetOperation`
-  ([ADR 0039](adr/0039-set-operations.md)) one or more, every other node at most one), the rule
-  optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and `arrow::Status` in
-  `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
+  ([ADR 0039](adr/0039-set-operations.md)) one or more, every other node at most one), the join kinds and their
+  table of properties (`join_kind.h`: which columns a kind outputs, which rows it pads, filters or drops, its keys and
+  residuals, the side it may build on), which every rule that tells kinds apart reads -- the binder's LEFT JOIN unit,
+  the optimizer, aggregate placement, the physical planner and the hash join -- rather than a list of kinds (ADR
+  0037's OJ1), the rule optimizer (`optimizer.h`), EXPLAIN, and the error boundary between `std::expected` and
+  `arrow::Status` in `src/plan/include/antb1/plan/sql_status.h` ([ADR 0005](adr/0005-error-boundary.md)).
 - `io`: `io::ParquetTable`, which implements `plan::Table` over one or more Parquet files with identical schemas,
   and glob expansion. Its `Scan` reads the requested top-level fields file by file (one `parquet::arrow::FileReader`
   at a time, single-threaded, mapping each field to its Parquet leaf columns, without pre-buffering, so it holds

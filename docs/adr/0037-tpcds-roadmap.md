@@ -169,7 +169,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | X4c | INTERSECT and INTERSECT ALL, also in trees with UNION and UNION ALL (the X4c update below) | 8, 38 | Built |
 | X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered (the X4d update below) | 87 | Built |
 | **Phase 7** | **Join kinds** | | |
-| OJ1 | One table of join-kind properties, read by every rule that tells kinds apart | | Planned |
+| OJ1 | One table of join-kind properties, read by every rule that tells kinds apart (the OJ1 update below) | | Built |
 | OJ2 | A FULL join kind and its operator | | Planned |
 | OJ3 | FULL OUTER JOIN | 97 | Planned |
 | OJ4 | Cross products of multi-row relations | 77 | Planned |
@@ -711,6 +711,15 @@ Update (2026-11-07, X4d): built, and with it phase 6. EXCEPT and EXCEPT ALL answ
 UNION, INTERSECT and EXCEPT, ALL or not, is answered, and no set operator is refused. Q87 passes, so the ratchet is at
 73, as phase 6 planned. X4p and PF12 to PF15 stay guards: no query of the phase misses the SF 1 budget (ADR 0039's
 X4c and X4d updates). ADR 0036's X4 keeps `BY NAME` and non-SELECT branches, and X5 and X6 stay as they were.
+
+Update (2026-11-07, OJ1): built, and with it phase 7 begins. `plan::JoinKindTraits` (`join_kind.h`) gives each join kind
+one row of properties: the columns it outputs, the rows it pads, filters or drops, its keys and residuals, the side it
+may build on. `Traits(JoinKind)` is an exhaustive switch, so OJ2's FULL kind does not compile without its row. The rules
+that told kinds apart by listing them now read the table: the binder's LEFT JOIN unit (where a WHERE or an ON conjunct
+may move, and its row floor, which never named the join kind), the optimizer's build side, aggregate placement, the
+physical planner's dynamic filters and the hash join. The switches that dispatch a per-kind algorithm (the operator's
+output paths, unnesting) stay switches, which the compiler checks. No plan or answer changes; a property test of the
+operator holds each kind to its row.
 
 ## Alternatives considered
 
