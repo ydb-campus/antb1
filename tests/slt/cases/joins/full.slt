@@ -1,0 +1,338 @@
+# FULL [OUTER] JOIN over the star schema (ADR 0037's OJ3): the padding of both inputs, NULL and duplicate keys, ON
+# conditions over either input or both, WHERE above the join, empty inputs, keys of two types, chains with inner and
+# LEFT joins in several FROM orders, and FULL JOINs inside derived tables and CTEs. Every join here has an equality
+# key whose common type is not DOUBLE.
+
+# ---- the padding of both inputs ----
+
+# A city without a zone (6), a zone without a city (37: NULL, 38: city 9) and the cities with zones.
+query III rowsort
+SELECT ct_id, zn_city, COUNT(*) FROM cities FULL JOIN zones ON ct_id = zn_city GROUP BY ct_id, zn_city
+----
+SMALLINT	SMALLINT	BIGINT
+1	1	8
+2	2	8
+3	3	7
+4	4	7
+5	5	8
+6	NULL	1
+NULL	9	1
+NULL	NULL	1
+
+# COALESCE of the two keys names each key once; the padded city counts no zone.
+query II rowsort
+SELECT COALESCE(ct_id, zn_city) AS k, COUNT(zn_id) FROM cities FULL OUTER JOIN zones ON ct_id = zn_city GROUP BY k
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+6	0
+9	1
+NULL	1
+
+# NULL keys on both sides never match: the trips with a NULL driver and the driver with a NULL id come out padded,
+# with the drivers that have no trip and the trips of drivers that do not exist.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+3008	3000	2585
+
+# The padded rows of each input, one input at a time.
+query I rowsort
+SELECT dv_id FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE tr_row IS NULL
+----
+BIGINT
+4294968296
+4330
+4367
+4404
+4441
+4478
+4515
+NULL
+
+query II rowsort
+SELECT tr_driver, COUNT(*) FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE dv_row IS NULL GROUP BY tr_driver
+----
+INTEGER	BIGINT
+2850	29
+4552	29
+4589	29
+4626	29
+4663	29
+4700	29
+4737	29
+4774	29
+4811	29
+4848	29
+4885	29
+NULL	104
+
+# Duplicate keys on the right input: the 8 repeated rider keys each match twice, the 8 missing ones pad trips.
+query IIII nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(rd_row), COUNT(DISTINCT rd_id) FROM trips FULL JOIN riders ON tr_rider = rd_id
+----
+BIGINT	BIGINT	BIGINT	BIGINT
+3100	3096	2845	232
+
+# Padding of every type: VARCHAR, DECIMAL and the empty string next to NULL; the tariff with a NULL code is padded.
+query ITTDDT rowsort
+SELECT tr_row, tr_tariff, tf_code, tr_rate, tf_rate, tf_label FROM trips FULL JOIN tariffs ON tr_tariff = tf_code WHERE tr_row < 10 OR tr_row IS NULL
+----
+INTEGER	VARCHAR	VARCHAR	DECIMAL(4,2)	DECIMAL(5,3)	VARCHAR
+0	STD	STD	1.00	1.000	standard
+1	Std	Std	1.00	1.250	standard
+2	Ж-1	Ж-1	1.00	1.750	center
+3	NULL	NULL	1.00	NULL	NULL
+4	AIRPORT	AIRPORT	1.00	2.000	airport
+5	XL\x20	XL\x20	1.00	2.500	xl
+6	std	NULL	NULL	NULL	NULL
+7	NIGHT	NIGHT	1.25	1.500	night
+8	(empty)	(empty)	1.25	2.125	center
+9	POOL	POOL	1.25	0.875	pool
+NULL	NULL	NULL	NULL	NULL	unknown
+
+# ---- ON conditions ----
+
+# A conjunct over the right input: the drivers that fail it are padded, and so are their trips.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id AND dv_city = 2
+----
+BIGINT	BIGINT	BIGINT
+3076	3000	684
+
+# A conjunct over the left input: the trips that fail it are padded, and so are the drivers left without a trip.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id AND tr_fare > 20
+----
+BIGINT	BIGINT	BIGINT
+3008	3000	779
+
+# A conjunct across both inputs.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(sh_row) FROM trips FULL JOIN shifts ON tr_driver = sh_driver AND sh_day < tr_day
+----
+BIGINT	BIGINT	BIGINT
+7591	7579	6797
+
+# The two-column key, whose two repeated pairs match twice.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(sh_row) FROM trips FULL JOIN shifts ON tr_driver = sh_driver AND tr_day = sh_day
+----
+BIGINT	BIGINT	BIGINT
+3055	3002	500
+
+# A conjunct no row passes pads every row of both inputs.
+query III nosort
+SELECT COUNT(*), COUNT(ct_row), COUNT(zn_row) FROM cities FULL JOIN zones ON ct_id = zn_city AND ct_pop > 1000000
+----
+BIGINT	BIGINT	BIGINT
+46	6	40
+
+# ---- WHERE above the join ----
+
+# A WHERE conjunct over either input filters the joined rows, and the rows padded on that input fail it.
+query II nosort
+SELECT COUNT(*), COUNT(dv_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE tr_fare > 20
+----
+BIGINT	BIGINT
+897	771
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE dv_city = 2
+----
+BIGINT	BIGINT
+609	608
+
+# IS NULL on either side keeps the rows without a match.
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE tr_row IS NULL OR dv_row IS NULL
+----
+BIGINT	BIGINT	BIGINT
+431	423	8
+
+# The join's own key spelled again in WHERE drops every padded row: the inner join is left.
+query III nosort
+SELECT COUNT(*), COUNT(ct_row), COUNT(zn_row) FROM cities FULL JOIN zones ON ct_id = zn_city WHERE ct_id = zn_city
+----
+BIGINT	BIGINT	BIGINT
+38	38	38
+
+# ---- empty inputs ----
+
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(pm_row) FROM trips FULL JOIN promos ON tr_promo = pm_id
+----
+BIGINT	BIGINT	BIGINT
+3000	3000	0
+
+query III nosort
+SELECT COUNT(*), COUNT(tr_row), COUNT(pm_row) FROM promos FULL JOIN trips ON pm_id = tr_promo
+----
+BIGINT	BIGINT	BIGINT
+3000	3000	0
+
+query I nosort
+SELECT COUNT(*) FROM promos AS a FULL JOIN promos AS b ON a.pm_id = b.pm_id
+----
+BIGINT
+0
+
+# ---- keys of two types ----
+
+# DECIMAL keys of two types: 0.88, 2.25 and NULL rates of trips, 2.125, 0.875 and NULL rates of tariffs are padded.
+query DDI rowsort
+SELECT tr_rate, tf_rate, COUNT(*) FROM trips FULL JOIN tariffs ON tr_rate = tf_rate GROUP BY tr_rate, tf_rate
+----
+DECIMAL(4,2)	DECIMAL(5,3)	BIGINT
+0.88	NULL	343
+1.00	1.000	348
+1.25	1.250	350
+1.50	1.500	348
+1.75	1.750	350
+2.00	2.000	345
+2.25	NULL	343
+2.50	2.500	342
+NULL	0.875	1
+NULL	2.125	1
+NULL	NULL	232
+
+# INTEGER against BIGINT: driver 2^32+1000 does not wrap onto driver 1000.
+query II rowsort
+SELECT dv_id, COUNT(tr_row) FROM trips FULL JOIN drivers ON tr_driver = dv_id WHERE dv_id < 1100 OR dv_id > 100000 GROUP BY dv_id
+----
+BIGINT	BIGINT
+1000	29
+1037	29
+1074	29
+4294968296	0
+
+# ---- chains ----
+
+# An inner join before the FULL JOIN is its left input (ADR 0022's FROM order), the conditions of its ON included,
+# though the FULL JOIN pads that input.
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(rd_row) FROM cities JOIN zones ON ct_id = zn_city FULL JOIN riders ON ct_id = rd_city
+----
+BIGINT	BIGINT	BIGINT
+1801	1793	1786
+
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(rd_row) FROM cities JOIN zones ON ct_id = zn_city AND ct_pop > 40000 FULL JOIN riders ON zn_city = rd_city
+----
+BIGINT	BIGINT	BIGINT
+1318	1232	1318
+
+# An inner join after it, keyed on its left input: the rows it pads on the left meet no driver.
+query III nosort
+SELECT COUNT(*), COUNT(ct_row), COUNT(dv_row) FROM zones FULL JOIN cities ON zn_city = ct_id JOIN drivers ON dv_city = zn_city
+----
+BIGINT	BIGINT	BIGINT
+668	668	668
+
+# Keyed on its right input: the rows it pads on the right meet no driver.
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(dv_row) FROM zones FULL JOIN cities ON zn_city = ct_id JOIN drivers ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+668	668	668
+
+# A comma sibling before the FULL JOIN's group, joined to it in WHERE.
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM drivers, zones FULL JOIN cities ON zn_city = ct_id WHERE dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+668	668	668
+
+# A FULL JOIN after a LEFT JOIN, a LEFT JOIN after a FULL JOIN, and two FULL JOINs.
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM trips LEFT JOIN zones ON tr_pickup = zn_id FULL JOIN cities ON zn_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+3001	2793	2656
+
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(rd_row) FROM zones FULL JOIN cities ON zn_city = ct_id LEFT JOIN riders ON rd_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+1796	1795	1778
+
+query IIII nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row), COUNT(dv_row) FROM zones FULL JOIN cities ON zn_city = ct_id FULL JOIN drivers ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT	BIGINT
+687	678	677	676
+
+# A LEFT JOIN inside the FULL JOIN's left input: its ON conjunct over its right input still filters that input.
+query IIII nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row), COUNT(dv_row) FROM zones LEFT JOIN cities ON zn_city = ct_id AND ct_pop > 40000 FULL JOIN drivers ON dv_city = zn_city
+----
+BIGINT	BIGINT	BIGINT	BIGINT
+686	678	360	676
+
+# ---- in nested blocks ----
+
+# Two grouped derived tables, each key once, joined so that every key of either comes out.
+query IIII nosort
+SELECT COUNT(*), COUNT(t.d), COUNT(s.d), SUM(t.n) FROM (SELECT tr_driver AS d, COUNT(*) AS n FROM trips GROUP BY tr_driver) t FULL JOIN (SELECT sh_driver AS d, COUNT(*) AS n FROM shifts GROUP BY sh_driver) s ON t.d = s.d
+----
+BIGINT	BIGINT	BIGINT	HUGEINT
+102	100	90	3000
+
+# A FULL JOIN inside a CTE, grouped above.
+query II rowsort
+WITH c AS (SELECT COALESCE(ct_id, zn_city) AS k, zn_id FROM cities FULL JOIN zones ON ct_id = zn_city) SELECT k, COUNT(*) FROM c GROUP BY k
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+6	1
+9	1
+NULL	1
+
+# Ordered with the padded keys first, and limited.
+query II nosort
+SELECT ct_id, zn_id FROM cities FULL JOIN zones ON ct_id = zn_city ORDER BY ct_id NULLS FIRST, zn_id LIMIT 5
+----
+SMALLINT	INTEGER
+NULL	38
+NULL	39
+1	1
+1	6
+1	11
+
+# ---- DuckDB only: a FULL JOIN without a key, which exits 4 on antb1 (ADR 0022) ----
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM cities FULL JOIN zones ON ct_id < zn_city
+----
+BIGINT
+90
+
+# A WHERE equality over the FULL JOIN's left input stays above the join, where it also drops the rows padded on the
+# left, so it is no key of that input: drivers CROSS JOIN trips is a cross product, which exits 4 on antb1 (where
+# a LEFT JOIN takes the same equality as its left input's key).
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM drivers CROSS JOIN trips FULL JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id
+----
+BIGINT
+2577
+
+# A subquery conjunct in the ON of an inner join inside the FULL JOIN's left input would bind above every join of the
+# block, where it would drop the rows the FULL JOIN pads on the left (zones and drivers of city 1 meet the 5 other
+# cities padded), so it exits 4 on antb1. Under a LEFT JOIN, which never pads its left input, it is answered.
+onlyif duckdb
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT ct_id FROM cities WHERE ct_id = 1) FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+28	23	28

@@ -2561,7 +2561,8 @@ class Parser {
       if (!item) {
         return std::unexpected(std::move(item.error()));
       }
-      if (connector == Connector::kInner || connector == Connector::kLeft) {
+      if (connector == Connector::kInner || connector == Connector::kLeft ||
+          connector == Connector::kFull) {
         if (auto status = ParseOn(*item); !status) {
           return status;
         }
@@ -2592,7 +2593,7 @@ class Parser {
 
   struct JoinKeywords {
     Connector connector = Connector::kInner;
-    SourceSpan span;  // CROSS JOIN, [INNER] JOIN or LEFT [OUTER] JOIN
+    SourceSpan span;  // CROSS JOIN, [INNER] JOIN, LEFT [OUTER] JOIN or FULL [OUTER] JOIN
   };
 
   // The join keywords at the next token, or std::nullopt when none starts there (the FROM list
@@ -2621,8 +2622,11 @@ class Parser {
     if (keyword == "LEFT") {
       return take(Connector::kLeft, PeekAt(1).IsKeyword("OUTER") ? 3 : 2);
     }
-    if (keyword == "RIGHT" || keyword == "FULL") {
-      return Unsupported(token.span, keyword + " JOIN is not supported");
+    if (keyword == "FULL") {
+      return take(Connector::kFull, PeekAt(1).IsKeyword("OUTER") ? 3 : 2);
+    }
+    if (keyword == "RIGHT") {
+      return Unsupported(token.span, "RIGHT JOIN is not supported");
     }
     if (keyword == "NATURAL") {
       return Unsupported(token.span, "NATURAL JOIN is not supported");

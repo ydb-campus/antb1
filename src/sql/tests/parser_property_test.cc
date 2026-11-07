@@ -592,7 +592,8 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
                 item.span.offset + item.span.length)
           << context;
     }
-    const bool joined = item.connector == Connector::kInner || item.connector == Connector::kLeft;
+    const bool joined = item.connector == Connector::kInner || item.connector == Connector::kLeft ||
+                        item.connector == Connector::kFull;
     ASSERT_EQ(!item.on.empty(), joined) << context;
     ASSERT_EQ(item.on_span.length > 0, joined);
     ASSERT_TRUE(SpanInside(item.on_span, sql));
@@ -1004,6 +1005,7 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     R"(SELECT COUNT(*) FROM a, "B" b CROSS JOIN 'c.parquet' AS 'c' LEFT OUTER JOIN d ON a.k = )"
     "d.k OR d.k = 1",
     "select x.a from t x inner join u on x.a = u.b, v left join w on v.c = w.c where x.a < 3",
+    "SELECT a.k, b.k FROM a FULL OUTER JOIN b ON a.k = b.k AND b.v > 1 full join c ON b.k = c.k",
     "WITH c(x) AS (SELECT a FROM t WHERE a > 1), d AS (SELECT * FROM c) SELECT x FROM d LIMIT 3",
     "SELECT s.a, COUNT(*) FROM (SELECT a, b FROM 'p.parquet' WHERE b <> 'x') AS s(a) JOIN u ON "
     "s.a = u.a GROUP BY s.a",
@@ -1412,8 +1414,9 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   // 1 to 4 FROM items, each a name, a quoted name, a path or a derived table, joined by random
   // connectors, with random aliases (a derived table's with a column alias list or not) and ON
   // predicates.
-  static constexpr auto kConnectors = std::to_array<Connector>(
-      {Connector::kComma, Connector::kCross, Connector::kInner, Connector::kLeft});
+  static constexpr auto kConnectors =
+      std::to_array<Connector>({Connector::kComma, Connector::kCross, Connector::kInner,
+                                Connector::kLeft, Connector::kFull});
   const std::size_t items = 1 + rng.Below(4);
   for (std::size_t i = 0; i < items; ++i) {
     FromItem item;
@@ -1441,7 +1444,8 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
         item.columns = RandomColumnAliases(rng);
       }
     }
-    if (item.connector == Connector::kInner || item.connector == Connector::kLeft) {
+    if (item.connector == Connector::kInner || item.connector == Connector::kLeft ||
+        item.connector == Connector::kFull) {
       item.on = RandomPredicate(rng, false);
     }
     stmt.from.push_back(std::move(item));

@@ -876,6 +876,24 @@ docs/sql-subset.md sections it changes.
   - **No dynamic filter** (ADR 0029) narrows either input, no aggregate is placed below it (ADR 0032), and no
     condition moves below it: both inputs' unmatched rows come out.
 
+- Update (2026-11-07, ADR 0037's OJ3): **FULL [OUTER] JOIN in SQL.** The parser takes `FULL [OUTER] JOIN ... ON` as
+  it takes a LEFT JOIN, and the binder makes it the same unit (J6's rules above) with the FULL kind. Where the J6
+  rules name the preserved or the null-supplying side, the kind's row in ADR 0037's OJ1 table now decides, and a
+  FULL JOIN pads both:
+  - **Its ON.** Its keys are found as a LEFT JOIN's are. Every other conjunct is a residual, even one over a single
+    input, since a row of either input that fails it is padded and not dropped. Rule 10's visibility and the exit
+    code 4 of a FULL JOIN without a key are the LEFT JOIN's.
+  - **WHERE.** A conjunct over either input stays above the unit, where it sees the padded rows.
+  - **An inner join's ON before the unit** in FROM order belongs to a join inside the unit's left input, and binds
+    there although the unit pads that input. A WHERE conjunct over that input does not move there, so a WHERE
+    equality is no key of it: `FROM a CROSS JOIN b FULL JOIN c ON ... WHERE <a = b>` is a cross product, exit code 4,
+    where DuckDB answers (a LEFT JOIN takes the equality as its left input's key). A conjunct of such an inner ON
+    that would bind above every join of the block, as a subquery conjunct (T2b's semi join), a reader of an
+    enclosing block's column (ADR 0023's block-top filter) and one that reads a comma sibling before the join group
+    do, exits 4: above the unit it would drop the rows the unit pads on the left. Under a LEFT JOIN, whose left input
+    is never padded, each is answered as before.
+  - `RIGHT [OUTER] JOIN` stays exit code 4.
+
 ## Alternatives considered
 
 - **Arrow's Acero hash join:** a complete join, but not installed, so linking it needs a new package, a new module

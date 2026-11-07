@@ -707,6 +707,11 @@ constexpr unsigned kLeftPercent = 25;
 // Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
 // query without one is the query this seed generated before the left-join PR.
 constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
+// Share of the LEFT JOIN promotions that a FULL JOIN replaces (ADR 0037's OJ3).
+constexpr unsigned kFullPercent = 40;
+// Salt of the random stream which every draw that only a FULL JOIN needs takes, so that a query
+// without one is the query this seed generated before the FULL JOIN PR.
+constexpr uint64_t kFullStreamSalt = 0x66756C6C2D726E67ULL;
 // Share of the queries with a usable probe that take an uncorrelated subquery (ADR 0022's T2b).
 constexpr unsigned kSubqueryPercent = 25;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
@@ -890,11 +895,12 @@ struct SubqueryCandidate {
 };
 
 // How a FROM item joins the items before it.
-enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin, kLeft };
+enum class FromConnector : std::uint8_t { kFirst, kComma, kCross, kJoin, kLeft, kFull };
 
 // Whether the connector writes an ON (so the item's keys go there, not in WHERE).
 bool IsJoin(FromConnector connector) {
-  return connector == FromConnector::kJoin || connector == FromConnector::kLeft;
+  return connector == FromConnector::kJoin || connector == FromConnector::kLeft ||
+         connector == FromConnector::kFull;
 }
 
 // An equality of two key columns of two FROM items, written in either order.
@@ -913,13 +919,15 @@ struct Binding {
   bool as_keyword = false;  // AS before the alias
   FromConnector connector = FromConnector::kFirst;
   bool inner_keyword = false;  // INNER JOIN
-  bool outer_keyword = false;  // kLeft: LEFT OUTER JOIN
-  // kLeft: the FROM position its join group starts at, which is the first item its ON may read
-  // (rule 10 of ADR 0022: a LEFT JOIN's ON sees its own two inputs, so not a comma sibling before
-  // the group — DuckDB refuses one with "Non-inner join on correlated columns not supported").
-  // 0 for every other connector, where the clause is a no-op.
+  bool outer_keyword = false;  // kLeft and kFull: LEFT OUTER JOIN, FULL OUTER JOIN
+  // kLeft and kFull: the FROM position its join group starts at, which is the first item its ON may
+  // read (rule 10 of ADR 0022: a LEFT JOIN's ON sees its own two inputs, so not a comma sibling
+  // before the group — DuckDB refuses one with "Non-inner join on correlated columns not
+  // supported"). The same for a kJoin inside a FULL JOIN's left input, whose ON may not read
+  // such a sibling either (ADR 0022's OJ3 update). 0 for every other item, where the clause is a
+  // no-op.
   std::size_t on_scope_start = 0;
-  std::vector<KeyPair> on;  // kJoin and kLeft: the keys of its ON (at least one)
+  std::vector<KeyPair> on;  // kJoin, kLeft and kFull: the keys of its ON (at least one)
   // A join's copy of the table's columns, so that every binding's columns have their own
   // addresses (a table may stand twice); `columns` views it, or the table's columns when the
   // query reads one table.
@@ -1004,7 +1012,7 @@ class Builder {
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
-          Rng& operator_rng, FeatureSet allowed)
+          Rng& operator_rng, Rng& full_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1020,6 +1028,7 @@ class Builder {
         rollup_rng_(rollup_rng),
         setop_rng_(setop_rng),
         operator_rng_(operator_rng),
+        full_rng_(full_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1416,6 +1425,29 @@ class Builder {
           b.outer_keyword = left_rng_.Percent(50);
           b.on_scope_start = group;
           from.rows = bound;
+          // Now and then a FULL JOIN instead (ADR 0037's OJ3), from a stream of its own, so a
+          // query that stays LEFT is the query this seed gave before. Its ON obeys the same scope.
+          // It pads its left input, so nothing that joins that input may stand above it: no key
+          // between two of its items in WHERE (a CROSS JOIN's), which leaves the input a cross
+          // product, and no inner ON in it that reads a comma sibling before the group. Both are
+          // exit code 4 (ADR 0022's OJ3 update), where a key between such a sibling and the input
+          // in WHERE joins the sibling to the whole FULL JOIN, and is answered.
+          const auto stays_inside = [&](const PlannedKey& key) {
+            const std::size_t at = home(key);
+            const bool from_sibling = std::min(position[key.child], position[key.parent]) < group;
+            return at < group || at >= k || IsJoin(from.bindings[at].connector) != from_sibling;
+          };
+          const int64_t full =
+              FullJoinRowBound(matched, left_rows, last_multiplicity, b.table->rows);
+          if (allowed_.Has(Feature::kFullJoin) && full <= RowLimit(planned) &&
+              std::ranges::all_of(keys, stays_inside) && full_rng_.Percent(kFullPercent)) {
+            b.connector = FromConnector::kFull;
+            from.rows = full;
+            // An inner ON in the left input draws its extra conjunct from the group alone too.
+            for (std::size_t j = group + 1; j < k; ++j) {
+              from.bindings[j].on_scope_start = group;
+            }
+          }
         }
       }
     }
@@ -2927,6 +2959,14 @@ class Builder {
           }
           Keyword("JOIN");
           break;
+        case FromConnector::kFull:
+          used_.Add(Feature::kFullJoin);  // its own feature, as kLeftJoin is
+          Keyword("FULL");
+          if (b.outer_keyword) {
+            Keyword("OUTER");
+          }
+          Keyword("JOIN");
+          break;
       }
       if (!b.inner.empty() && !b.as_cte) {
         used_.Add(Feature::kDerivedTable);
@@ -4132,6 +4172,7 @@ class Builder {
   Rng& rollup_rng_;              // the draws that only grouping sets need
   Rng& setop_rng_;               // the draws that only a set operation's form needs
   Rng& operator_rng_;            // the draws that only a set operator other than UNION ALL needs
+  Rng& full_rng_;                // the draws that only a FULL JOIN needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4166,6 +4207,12 @@ int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b) {
        SaturatingProduct(b.non_null, a.max_multiplicity),
        SaturatingProduct(SaturatingProduct(std::min(a.distinct, b.distinct), a.max_multiplicity),
                          b.max_multiplicity)});
+}
+
+int64_t FullJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity,
+                         int64_t right_rows) {
+  // The rows of the LEFT JOIN, and at most one padded row per right row.
+  return SaturatingSum(LeftJoinRowBound(matched, left_rows, right_multiplicity), right_rows);
 }
 
 int64_t LeftJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity) {
@@ -4342,9 +4389,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng rollup_rng(Mix(seed ^ kRollupStreamSalt));
   Rng setop_rng(Mix(seed ^ kSetOpStreamSalt));
   Rng operator_rng(Mix(seed ^ kSetOperatorStreamSalt));
+  Rng full_rng(Mix(seed ^ kFullStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-               options.supported)
+               full_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4372,12 +4420,13 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng rollup_rng(Mix(state ^ kRollupStreamSalt));
   Rng setop_rng(Mix(state ^ kSetOpStreamSalt));
   Rng operator_rng(Mix(state ^ kSetOperatorStreamSalt));
+  Rng full_rng(Mix(state ^ kFullStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
                              corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
-                             setop_rng, operator_rng, allowed)
+                             setop_rng, operator_rng, full_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

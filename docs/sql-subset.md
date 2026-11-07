@@ -48,9 +48,10 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
 - SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS TRUE`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
-  `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT [OUTER] JOIN ... ON`, with aliases and qualified names, is answered
-  as long as a join key connects every relation — so a comma list or a `CROSS JOIN` needs an equality between its
-  relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` needs one between its own two inputs, in its `ON` —
+  `CROSS JOIN`, `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON` or `FULL [OUTER] JOIN ... ON`, with aliases and
+  qualified names, is answered as long as a join key connects every relation — so a comma list or a `CROSS JOIN`
+  needs an equality between its relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` or a `FULL JOIN` needs
+  one between its own two inputs, in its `ON` —
   or the relation is a derived table or a CTE reference of exactly one row (an aggregate without `GROUP BY`,
   `HAVING`, `LIMIT` or `OFFSET`) that no condition but a subquery conjunct reads; such a relation joins the others
   as one row.
@@ -116,7 +117,8 @@ order_item  = expr , [ "ASC" | "DESC" ] , [ "NULLS" , ( "FIRST" | "LAST" ) ] ;
 from_list   = from_item , { "," , from_item
                           | "CROSS" , "JOIN" , from_item
                           | [ "INNER" ] , "JOIN" , from_item , "ON" , expr
-                          | "LEFT" , [ "OUTER" ] , "JOIN" , from_item , "ON" , expr } ;
+                          | "LEFT" , [ "OUTER" ] , "JOIN" , from_item , "ON" , expr
+                          | "FULL" , [ "OUTER" ] , "JOIN" , from_item , "ON" , expr } ;
 from_item   = ( identifier | string_literal ) , [ [ "AS" ] , identifier | "AS" , string_literal ]
             | "(" , query , ")" , [ ( [ "AS" ] , identifier | "AS" , string_literal ) , [ columns ] ] ;
 columns     = "(" , identifier , { "," , identifier } , ")" ;
@@ -278,24 +280,30 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `OVER` is read quoted only (`FROM "over"`): unquoted, these words are no table names (divergence D21), so
   `WITH over AS (...) SELECT a FROM over` is a syntax error, which DuckDB answers.
 - The canonical form (`sql::ToSql`, [ADR 0008](adr/0008-parser-and-unparser.md)) writes every alias quoted after `AS`
-  (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, a qualifier as written, a nested query
-  in parentheses, CTE names and column aliases quoted (`WITH "c"("x") AS (...)`, `FROM (...) AS "s"("x")`), a star
-  where it stands among the select items (`*`, or `t.*` with its qualifier as written), and a compound's blocks
-  joined by `UNION ALL` in upper case.
+  (`FROM t AS "a"`), `JOIN` as `INNER JOIN`, `LEFT OUTER JOIN` as `LEFT JOIN`, `FULL OUTER JOIN` as `FULL JOIN`, a
+  qualifier as written, a nested query in parentheses, CTE names and column aliases quoted (`WITH "c"("x") AS (...)`,
+  `FROM (...) AS "s"("x")`), a star where it stands among the select items (`*`, or `t.*` with its qualifier as
+  written), and a compound's blocks joined by `UNION ALL` in upper case.
 
 **What the binder answers today.** Of the grammar above, antb1 answers:
 
-- FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN`, `[INNER] JOIN ... ON` or
-  `LEFT [OUTER] JOIN ... ON`, with qualified column names (`t.x`) anywhere in the query, and derived tables and
-  `WITH` lists, each a sub-plan of its own. A `LEFT JOIN` is one fixed unit: it is never reordered, its `ON` reads
-  its own two inputs only, an `ON` conjunct over the right input alone filters that input, and every other one is a
-  residual of the join — including one that reads only the preserved side, since a left row that fails it is padded
-  and not dropped. A `WHERE` conjunct over the null-supplying side stays above the join. An equality is a key only
-  when each of its sides reads one relation of one input, since a side that is an expression is computed on that
-  relation's own branch; a side over two of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality
-  key between its two inputs is exit code 4, as a cross product is. More than 256 relations, counting a
-  derived table, a CTE reference and a subquery in an expression as one plus the relations of their body, is exit
-  code 4 too, before the per-item checks;
+- FROM: tables and paths, with an alias or without, joined by commas, `CROSS JOIN`, `[INNER] JOIN ... ON` or `LEFT
+  [OUTER] JOIN ... ON`, with qualified column names (`t.x`) anywhere in the query, and derived tables and `WITH` lists,
+  each a sub-plan of its own. A `LEFT JOIN` is one fixed unit: it is never reordered, its `ON` reads its own two inputs
+  only, an `ON` conjunct over the right input alone filters that input, and every other one is a residual of the join —
+  including one that reads only the preserved side, since a left row that fails it is padded and not dropped. A `WHERE`
+  conjunct over the null-supplying side stays above the join. An equality is a key only when each of its sides reads one
+  relation of one input, since a side that is an expression is computed on that relation's own branch; a side over two
+  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is exit code 4,
+  as a cross product is. A `FULL JOIN` (ADR 0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct
+  over either input alone is a residual, since a row of either that fails it is padded and not dropped; a `WHERE`
+  conjunct over either input stays above the join; the `ON` of an inner join before it in FROM order still binds inside
+  its left input, which that join is part of, while a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN
+  b FULL JOIN c ON ... WHERE a.k = b.k` is a cross product, exit code 4), and a conjunct of that inner `ON` that would
+  bind above every join of the block (a subquery conjunct, a column of an enclosing block, a comma sibling before the
+  join group) is exit code 4, since it would drop the rows the `FULL JOIN` pads on the left; and the same `ON` rules and
+  exit code 4 hold as for a `LEFT JOIN`. More than 256 relations, counting a derived table, a CTE reference and a
+  subquery in an expression as one plus the relations of their body, is exit code 4 too, before the per-item checks;
 - `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
   answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
   ([Binding](#binding)); a branch in parentheses, a block with its own `ORDER BY`, `LIMIT` and `OFFSET` or a query
@@ -366,42 +374,41 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `WHERE` or `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any
   comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
   DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
-- uncorrelated subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as a
-  `WHERE` conjunct) or of `HAVING`. `IN` in its three spellings `x IN (query)`, `x NOT IN (query)` and
-  `NOT (x IN (query))`: `x` is an operand as above, the query is a block of its own with one column, and the two
-  share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi join, which keeps a row
-  once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join, which keeps every row
-  of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no match, and faces a
-  set with no NULL in it. And a comparison `x <op> (query)` in either order, where the query is an aggregate over
-  every row and so returns exactly one row: it becomes a keyless one-row join that appends that row's column, with
-  the comparison directly above it, which then follows every rule a comparison of two operands does — the `DECIMAL`
-  and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence D11),
-  which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which the
-  comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
+- uncorrelated subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as a `WHERE`
+  conjunct, except inside a `FULL JOIN`'s left input: exit code 4, above) or of `HAVING`. `IN` in its three spellings `x
+  IN (query)`, `x NOT IN (query)` and `NOT (x IN (query))`: `x` is an operand as above, the query is a block of its own
+  with one column, and the two share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi
+  join, which keeps a row once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join,
+  which keeps every row of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no
+  match, and faces a set with no NULL in it. And a comparison `x <op> (query)` in either order, where the query is an
+  aggregate over every row and so returns exactly one row: it becomes a keyless one-row join that appends that row's
+  column, with the comparison directly above it, which then follows every rule a comparison of two operands does — the
+  `DECIMAL` and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence
+  D11), which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which
+  the comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
   block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written --
-  except that a `WHERE` semi join whose key reads one relation of the block runs on that relation's own branch,
-  below those joins, which answers the same and carries fewer rows through them (ADR 0029's D0). An
-  `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any
-  subquery does not make the outer block an aggregate query. A column count other than one is a bind error.
-  A **correlated** subquery -- one that reads a column of the block enclosing it -- is answered where it is a
-  top-level `WHERE` conjunct: the binder plans it as a dependent join, which the optimizer's unnesting pass turns
-  into ordinary joins ([ADR 0023](adr/0023-unnesting.md)). `EXISTS` and `NOT EXISTS` become a semi or anti join,
-  keyed on the equality they correlate through, over a block of `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`,
-  `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner equivalent and an inner join, where the
-  select item combines the aggregate with literals and arithmetic alone -- `COUNT` is exit code 4 there, since it
-  is 0 over no rows and the rewrite gives an outer row with no group no row at all (divergences D23 and D24).
-  Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with `GROUP BY`, `DISTINCT`,
-  `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a key, a correlated scalar
-  subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or `NOT IN`, whose NULL
-  semantics need the set's NULL and empty flags for each binding; at the subquery for one in `HAVING`, whose outer
-  references would read the outer block's groups and not its rows; and at the subquery for a conjunct that is both a
-  subquery conjunct and a reader of an enclosing block's column, which neither unnesting path handles. An outer
-  reference is read only in a `WHERE`
-  conjunct of the subquery's own block, an inner join's `ON` included, and only one block out; in a select list,
-  `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral
-  reference) it is exit code 4 at the reference, each with its own message. A star in an `EXISTS` block is checked
-  by name but not expanded: an `ORDER BY` position there counts its columns, and one that names a column of it is
-  exit code 4 (one out of range is a bind error, as in DuckDB);
+  except that a `WHERE` semi join whose key reads one relation of the block runs on that relation's own branch, below
+  those joins, which answers the same and carries fewer rows through them (ADR 0029's D0). An `IN` query may have its
+  own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any subquery does not make the outer
+  block an aggregate query. A column count other than one is a bind error. A **correlated** subquery -- one that reads a
+  column of the block enclosing it -- is answered where it is a top-level `WHERE` conjunct: the binder plans it as a
+  dependent join, which the optimizer's unnesting pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)).
+  `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through, over a block of
+  `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`, `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner
+  equivalent and an inner join, where the select item combines the aggregate with literals and arithmetic alone --
+  `COUNT` is exit code 4 there, since it is 0 over no rows and the rewrite gives an outer row with no group no row at
+  all (divergences D23 and D24). Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with
+  `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a
+  key, a correlated scalar subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or
+  `NOT IN`, whose NULL semantics need the set's NULL and empty flags for each binding; at the subquery for one in
+  `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the subquery for a
+  conjunct that is both a subquery conjunct and a reader of an enclosing block's column, which neither unnesting path
+  handles. An outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON`
+  included, and only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL
+  JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference,
+  each with its own message. A star in an `EXISTS` block is checked by name but not expanded: an `ORDER BY` position
+  there counts its columns, and one that names a column of it is exit code 4 (one out of range is a bind error, as in
+  DuckDB);
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -446,54 +453,49 @@ key written as an expression (not an alias or a position), and DuckDB's errors a
 BY`, in `WHERE` or inside an aggregate, and with 64 or more arguments ("cannot have more than 64 groups"). A `GROUPING`
 of a constant `GROUP BY` item, which DuckDB answers with 0, is refused with exit code 4.
 
-Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others:
-a star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two
-and `SIMILAR TO` also after `NOT`, before a string, also one in parentheses, after any `*` or `t.*`), an alias after a
-star (`* AS x`, `t.* x`,
-`* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax error as in DuckDB),
-`t.*` inside an expression,
-`DISTINCT ON`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`,
-`NULL` literals (but a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL`
-block), `IS` but `IS [NOT] NULL` (`IS DISTINCT FROM`, `IS TRUE`), `ISNULL`, `NOTNULL`, a condition as a select item
-(`SELECT a IS NULL`), `AT TIME ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names,
-type names of several
-words (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters
-other than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
-typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`,
-`LIMIT integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET`
-(`OFFSET 5 ROWS`, also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a
-column there (`LIMIT a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax
-errors, and DuckDB refuses them too, and so are an operator after a star (`* + 1`, `t.* = 1`, `* ISNULL`) and a star
-with no FROM (`SELECT 1, *`). Known gaps, among others: a star in parentheses (`(*)`), `ORDER BY *` and `GROUP BY *`
-are syntax errors, which DuckDB answers;
-`LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and conditions
-(`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a trailing
-comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN ASYMMETRIC`
-(`asymmetric` is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`, `FROM x: t`), an exponent without
-digits (`1e`, which DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which DuckDB reads as
-`1 AS x`), named arguments (`round(x := 2.5)`), a slice without its lower bound (`b[:2]`; `b[1:2]` is unsupported), a
-`$` inside a name (`a$b`, which antb1 reads as a parameter), a one-parameter lambda (`lambda x: x + 1`) and a string
-that continues after a line break (`'a'` and `'b'` on the next line, which DuckDB reads as `'ab'`), also in a nested
-query; inside the arguments of a call some of them are unsupported (exit code 4) instead. In FROM:
-`JOIN ... USING`, `NATURAL`, `RIGHT` and `FULL` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL`
-joins, nested joins (a `JOIN` before the `ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery
-or a table function (also one with a qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions
-(also those named by the 13 reserved words that DuckDB takes as function names, `CROSS`, `FULL`, `ILIKE`, `INNER`,
-`IS`, `JOIN`, `LEFT`, `LIKE`, `NATURAL`, `OUTER`, `OVER`, `RIGHT` and `SIMILAR`: `FROM t, left(1)`), the reserved
-words `between`, `exists`, `interval` and `over` as qualifiers of a table or a table function, which DuckDB accepts
-(`FROM t, over.x`, `FROM over.f(1)`, `LATERAL over.f(1)`), column alias lists (`t AS a(x, y)`), `PIVOT`, `UNPIVOT`,
-`AT (...)` (time travel), `TABLESAMPLE`, a trailing comma, and an empty, escape or dollar-quoted string as a table
-alias (`AS ''`, `AS E'x'`, `AS $$x$$`, which DuckDB accepts). Malformed SQL, such
-as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1, and so is a join keyword where DuckDB has none
-(`SELECT 1 JOIN u`, a `JOIN` after `WHERE`) or without the rest of its join (`LEFT u`, `NATURAL LEFT u`, also before
-the `ON` of a `JOIN`), `LATERAL` before a table or a path (`FROM t, LATERAL u`), a trailing comma of the FROM list
-before `FROM` or `INTO` (`FROM t, FROM u`), and a table or a path in parentheses that `)`, `,`, `;` or the end
-follows. An unsupported construct is reported at its first token, and the parser looks at most three tokens ahead, so
-a malformed FROM form that starts like an unsupported one is unsupported too (exit code 4, where DuckDB gives a syntax
-error), such as a table in parentheses that anything else follows (`FROM (t a)`, `FROM (f(1))`, and a reserved
-qualifier: `FROM (over.x)`), `LATERAL` in parentheses before `(`, a name or a reserved word that DuckDB takes as a
-function name or a qualifier (`FROM (LATERAL t)`, `FROM (LATERAL between)`), `LATERAL` before a qualified name
-without a call (`LATERAL s.t`, `LATERAL over.x`) or `NATURAL LEFT OUTER u`.
+Outside the grammar, the parser recognizes common SQL and rejects it with exit code 4 and a source span, among others: a
+star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `GLOB` or `SIMILAR TO`, the first two and
+`SIMILAR TO` also after `NOT`, before a string, also one in parentheses, after any `*` or `t.*`), an alias after a star
+(`* AS x`, `t.* x`, `* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax
+error as in DuckDB), `t.*` inside an expression, `DISTINCT ON`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals (but
+a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL` block), `IS` but `IS [NOT]
+NULL` (`IS DISTINCT FROM`, `IS TRUE`), `ISNULL`, `NOTNULL`, a condition as a select item (`SELECT a IS NULL`), `AT TIME
+ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
+(`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
+than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
+typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`, `LIMIT
+integer '5'`, `LIMIT E'5'`), a percentage, `LIMIT ALL` and `ROW` or `ROWS` after the value of `OFFSET` (`OFFSET 5 ROWS`,
+also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, as in DuckDB); a column there (`LIMIT
+a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and DuckDB
+refuses them too, and so are an operator after a star (`* + 1`, `t.* = 1`, `* ISNULL`) and a star with no FROM (`SELECT
+1, *`). Known gaps, among others: a star in parentheses (`(*)`), `ORDER BY *` and `GROUP BY *` are syntax errors, which
+DuckDB answers; `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and
+conditions (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a
+trailing comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN
+ASYMMETRIC` (`asymmetric` is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`, `FROM x: t`), an
+exponent without digits (`1e`, which DuckDB reads as `1 AS e`), a number that a name follows directly (`1x`, which
+DuckDB reads as `1 AS x`), named arguments (`round(x := 2.5)`), a slice without its lower bound (`b[:2]`; `b[1:2]` is
+unsupported), a `$` inside a name (`a$b`, which antb1 reads as a parameter), a one-parameter lambda (`lambda x: x + 1`)
+and a string that continues after a line break (`'a'` and `'b'` on the next line, which DuckDB reads as `'ab'`), also in
+a nested query; inside the arguments of a call some of them are unsupported (exit code 4) instead. In FROM: `JOIN ...
+USING`, `NATURAL` and `RIGHT` joins, `SEMI`, `ANTI`, `ASOF` and `POSITIONAL` joins, nested joins (a `JOIN` before the
+`ON` of an earlier one) and joins in parentheses, `LATERAL` before a subquery or a table function (also one with a
+qualified name: `LATERAL main.range(3)`), `schema.table`, `ONLY`, table functions (also those named by the 13 reserved
+words that DuckDB takes as function names, `CROSS`, `FULL`, `ILIKE`, `INNER`, `IS`, `JOIN`, `LEFT`, `LIKE`, `NATURAL`,
+`OUTER`, `OVER`, `RIGHT` and `SIMILAR`: `FROM t, left(1)`), the reserved words `between`, `exists`, `interval` and
+`over` as qualifiers of a table or a table function, which DuckDB accepts (`FROM t, over.x`, `FROM over.f(1)`, `LATERAL
+over.f(1)`), column alias lists (`t AS a(x, y)`), `PIVOT`, `UNPIVOT`, `AT (...)` (time travel), `TABLESAMPLE`, a
+trailing comma, and an empty, escape or dollar-quoted string as a table alias (`AS ''`, `AS E'x'`, `AS $$x$$`, which
+DuckDB accepts). Malformed SQL, such as `SELECT COUNT(*) FORM t`, is a syntax error with exit code 1, and so is a join
+keyword where DuckDB has none (`SELECT 1 JOIN u`, a `JOIN` after `WHERE`) or without the rest of its join (`LEFT u`,
+`FULL OUTER u`, `NATURAL LEFT u`, also before the `ON` of a `JOIN`), `LATERAL` before a table or a path (`FROM t,
+LATERAL u`), a trailing comma of the FROM list before `FROM` or `INTO` (`FROM t, FROM u`), and a table or a path in
+parentheses that `)`, `,`, `;` or the end follows. An unsupported construct is reported at its first token, and the
+parser looks at most three tokens ahead, so a malformed FROM form that starts like an unsupported one is unsupported too
+(exit code 4, where DuckDB gives a syntax error), such as a table in parentheses that anything else follows (`FROM (t
+a)`, `FROM (f(1))`, and a reserved qualifier: `FROM (over.x)`), `LATERAL` in parentheses before `(`, a name or a
+reserved word that DuckDB takes as a function name or a qualifier (`FROM (LATERAL t)`, `FROM (LATERAL between)`),
+`LATERAL` before a qualified name without a call (`LATERAL s.t`, `LATERAL over.x`) or `NATURAL LEFT OUTER u`.
 
 In `WITH` lists and nested queries, these are unsupported (exit code 4): `WITH RECURSIVE`, `MATERIALIZED`,
 `NOT MATERIALIZED` and `USING KEY`; a string literal as a CTE name or a column alias (`WITH 'c' AS`, `s('x')`) and a
@@ -863,8 +865,8 @@ the keys, then the aggregates, one row per group; a `Project` above it restores 
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
 anti, null-aware anti, one-row or full), key pairs of one type each, residual conditions over both inputs and the input
 it builds on; what each kind does with its rows is one table, `plan::JoinKindTraits`. A full join (ADR 0037's OJ2) gives
-every match, each left row without one padded with NULLs and each right row without one padded with NULLs; no SQL
-binds to it before OJ3. A `UnionAll` has two or more, or one once the optimizer has ruled the others out
+every match, each left row without one padded with NULLs and each right row without one padded with NULLs; `FULL
+OUTER JOIN` binds to it (OJ3). A `UnionAll` has two or more, or one once the optimizer has ruled the others out
 ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of the next, and so on; its columns are new,
 of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
 union by a `Compute`. A `SetOperation` ([ADR 0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT
@@ -902,6 +904,8 @@ input it builds on before it reads the other input, which then streams through i
   empty, and none when its build input has a NULL key, though it still reads the other input to its end.
 - A left join keeps each row with each of its matches, in the build input's order, and pads a row without one once
   with NULLs of the right input's types (a NULL key included).
+- A full join gives a left join's rows, then each build row that no row matched, the NULL-key ones included, padded
+  once with NULLs of the left input's types, after the whole probe.
 - The residual conditions of a semi, anti or left join decide which candidates (the build rows with a row's key) are
   matches. They are evaluated in the order written, each on the candidates the ones before it passed (NULL counts as
   false), on every candidate of every row, without stopping at a row's first match, so whether an overflow fails the
@@ -993,7 +997,7 @@ Project RegionID, c
         Scan table=t source=parquet(files=1, rows=10000) columns=[EventTime, RegionID]
 ```
 
-A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI` or `ONE-ROW`), the input it builds
+A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI`, `ONE-ROW` or `FULL`), the input it builds
 on, its key pairs and, when it has any, its residual conditions; its left input follows, then its right input, both
 indented. A column whose binding the plan records is shown qualified, as `a.k`. It ends with `carries N of M unread
 above` where the join's output holds columns no node above it reads -- its own keys and residual columns, usually,
@@ -1231,7 +1235,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   `x IS NULL` and `x IS NOT NULL` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s NL4) are never NULL: true or false for
   any value `x`, an expression too (`x + 1 IS NULL`), so `NOT (x IS NOT NULL)` keeps the rows where `x` is NULL. They
   are named as DuckDB names them (`(x IS NULL)`); EXPLAIN shows `x IS NULL` and, for a `WHERE` conjunct, `x IS NOT
-  NULL`. Above a `LEFT JOIN`, `IS NULL` on a column of the null-supplying side keeps the rows the join pads. A
+  NULL`. Above a `LEFT JOIN`, `IS NULL` on a column of the null-supplying side keeps the rows the join pads, and
+  above a `FULL JOIN` on a column of either side. A
   condition as the operand (`(a = 1) IS NULL`, a chained comparison) is unsupported.
 - BETWEEN: `a BETWEEN lo AND hi` is `lo <= a AND a <= hi` in three-valued logic, both bounds inclusive: a range with
   `lo > hi` matches nothing, and a NULL operand (or a NULL bound column) makes it NULL, which rejects the row;
@@ -1454,7 +1459,7 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   nodes over a scan -- a sorted or aggregated subquery, say -- keeps building on its right input, since there is no
   pipeline for the join to be the sink of; a probe scan whose row groups the statistics all prune does take this
   plan, and returns the whole preserved side for `NOT EXISTS` and no row for `EXISTS`. An `EXISTS` or `NOT EXISTS`
-  that is not correlated, a `NOT IN` and a `LEFT JOIN` always build on their right input.
+  that is not correlated, a `NOT IN`, a `LEFT JOIN` and a `FULL JOIN` always build on their right input.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
   batches; their results are combined in file and row group order, so a result is the same for any number of
   threads, and deterministic. A DOUBLE `SUM` or `AVG` adds up every row group (per group with `GROUP BY`),
@@ -1717,7 +1722,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q48 | pass | answered when the ratchet was added |
 | Q49 | unsupported | needs rank() (phase 9) |
 | Q50 | pass | answered when the ratchet was added |
-| Q51 | unsupported | needs FULL OUTER JOIN, running window aggregates and windows over aggregates (phase 9) |
+| Q51 | unsupported | needs running window aggregates and windows over aggregates (phase 9); its `FULL OUTER JOIN` is answered (OJ3) |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q54 | unsupported | needs scalar subqueries inside a condition and scalar subqueries that are not aggregates (SQ4) |
@@ -1763,7 +1768,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q94 | pass | answered when the ratchet was added |
 | Q95 | pass | answered when the ratchet was added |
 | Q96 | pass | answered when the ratchet was added |
-| Q97 | unsupported | needs FULL OUTER JOIN (OJ3) |
+| Q97 | pass | `FULL OUTER JOIN` (OJ3) |
 | Q98 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q99 | pass | lower (FN4) |
 

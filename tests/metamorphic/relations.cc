@@ -1635,6 +1635,86 @@ std::vector<Relation> AllRelations() {
                  .check = AllEqual()});
   }
 
+  // ---- full outer joins (ADR 0037's OJ3) ----
+  // A FULL JOIN is symmetric: its inputs swapped give the same rows, with an ON conjunct over
+  // either input too. Its rows are the LEFT JOIN's and the right input's rows that match nothing,
+  // padded: as a multiset, and as counts against NOT EXISTS (3008 = 3000 + 8). A WHERE conjunct
+  // that rejects the NULLs of one input leaves the outer join that preserves that input, and one
+  // over both inputs leaves the inner join. Batch sizes change nothing, in a chain of two FULL
+  // JOINs too.
+  {
+    const slt::FeatureSet full = {kColumns,        kMultipleItems,  kCountStar,
+                                  kCountColumn,    kTableName,      kJoinOn,
+                                  kCompareColumns, kIntegerColumns, kFullJoin};
+    constexpr std::string_view kTripsDrivers = "trips FULL JOIN drivers ON tr_driver = dv_id";
+    for (const auto& [name, residual] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"full_join_is_symmetric", ""},
+             {"full_join_is_symmetric_right_residual", " AND dv_city = 2"},
+             {"full_join_is_symmetric_left_residual", " AND tr_fare > 20"}}) {
+      r.push_back(
+          {.name = name,
+           .features = SetWith(full, kWhere, kIntegerLiteral, kDecimalColumns),
+           .probes = {Q(std::format("SELECT tr_row, dv_row FROM {}{}", kTripsDrivers, residual)),
+                      Q(std::format("SELECT tr_row, dv_row FROM drivers FULL OUTER JOIN trips "
+                                    "ON dv_id = tr_driver{}",
+                                    residual))},
+           .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "full_join_is_left_join_and_unmatched_right_rows",
+         .features = SetWith(full, kLeftJoin, kWhere),
+         .probes = {Q(std::format("SELECT tr_row, dv_row FROM {}", kTripsDrivers)),
+                    Q("SELECT tr_row, dv_row FROM trips LEFT JOIN drivers ON tr_driver = dv_id"),
+                    Q("SELECT tr_row, dv_row FROM drivers LEFT JOIN trips ON dv_id = tr_driver "
+                      "WHERE tr_row IS NULL")},
+         .check = FirstIsUnionOfRest()});
+    r.push_back({.name = "full_join_counts_left_join_and_not_exists",
+                 .features = SetWith(full, kLeftJoin, kQualifiedName, kCorrelatedExists),
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM {}", kTripsDrivers)),
+                            Q("SELECT COUNT(*) FROM trips LEFT JOIN drivers ON tr_driver = dv_id"),
+                            Q("SELECT COUNT(*) FROM drivers WHERE NOT EXISTS "
+                              "(SELECT * FROM trips WHERE trips.tr_driver = drivers.dv_id)")},
+                 .check = FirstEqualsSumOfRest()});
+    r.push_back(
+        {.name = "full_join_under_null_rejecting_where_on_the_left_is_a_left_join",
+         .features = SetWith(full, kLeftJoin, kWhere, kWhereAnd, kIntegerLiteral, kDecimalColumns),
+         .probes = {Q(std::format("SELECT tr_row, dv_row FROM {} WHERE tr_fare > 20",
+                                  kTripsDrivers)),
+                    Q("SELECT tr_row, dv_row FROM trips LEFT JOIN drivers ON tr_driver = dv_id "
+                      "WHERE tr_fare > 20")},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "full_join_under_null_rejecting_where_on_the_right_is_a_left_join",
+         .features = SetWith(full, kLeftJoin, kWhere, kIntegerLiteral),
+         .probes = {Q(std::format("SELECT tr_row, dv_row FROM {} WHERE dv_city = 2",
+                                  kTripsDrivers)),
+                    Q("SELECT tr_row, dv_row FROM drivers LEFT JOIN trips ON dv_id = tr_driver "
+                      "WHERE dv_city = 2")},
+         .check = AllEqual()});
+    r.push_back({.name = "full_join_under_where_on_both_inputs_is_inner",
+                 .features = SetWith(full, kWhere, kWhereAnd, kIntegerLiteral, kDecimalColumns),
+                 .probes = {Q(std::format(
+                                "SELECT tr_row, dv_row FROM {} WHERE tr_fare > 20 AND dv_city = 2",
+                                kTripsDrivers)),
+                            Q("SELECT tr_row, dv_row FROM trips JOIN drivers ON tr_driver = dv_id "
+                              "WHERE tr_fare > 20 AND dv_city = 2")},
+                 .check = AllEqual()});
+    constexpr std::string_view kChain =
+        "SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row), COUNT(dv_row) FROM zones FULL JOIN cities "
+        "ON zn_city = ct_id FULL JOIN drivers ON dv_city = ct_id";
+    const std::string residual =
+        std::format("SELECT tr_row, dv_row FROM {} AND tr_fare > 20", kTripsDrivers);
+    r.push_back({.name = "full_join_batch_size_invariance",
+                 .features = SetWith(full, kWhere, kIntegerLiteral, kDecimalColumns),
+                 .probes = {Q(residual, 1), Q(residual, 7), Q(residual)},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "full_join_chain_batch_size_invariance",
+         .features = full,
+         .probes = {Q(std::string(kChain), 1), Q(std::string(kChain), 7), Q(std::string(kChain))},
+         .check = AllEqual()});
+  }
+
   // ---- correlated subqueries (ADR 0023; pending until U2 and U3 declare their feature) ----
   // Each carries only its own Feature, so U2 activates the EXISTS family and U3 the aggregate one
   // without waiting for the other: the two PRs run side by side.

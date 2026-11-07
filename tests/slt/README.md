@@ -211,10 +211,10 @@ among the select items; it is empty today. A `Feature` added for grammar the gen
 PR that teaches it takes it out again -- in the same commit, since the grammar-coverage test asserts the generated set
 exactly.
 
-Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a
-ref from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas,
-`CROSS JOIN` or `[INNER] JOIN ... ON`, each key's equalities in the ON of the later of its two FROM items or in `WHERE`,
-so that they connect every item. The FROM order may start with two tables that share no key; a second edge between two
+Over tables with refs, a query that may use a join feature joins 2 or 3 tables along the refs 60% of the time when a ref
+from or to the table it starts from can be followed (`runner/query_gen.h`): inner joins written with commas, `CROSS
+JOIN` or `[INNER] JOIN ... ON`, each key's equalities in the ON of the later of its two FROM items or in `WHERE`, so
+that they connect every item. The FROM order may start with two tables that share no key; a second edge between two
 joined tables now and then adds a second key, and an ON now and then one condition of `WHERE`'s forms over the items up
 to its own (ADR 0022 rule 10; it needs and uses the feature `where`). Aliases `t1` to `t3` stand where a table comes
 twice or a path names another table (rule 1), and at random otherwise; a name that two items have is always qualified
@@ -222,19 +222,21 @@ twice or a path names another table (rule 1), and at random otherwise; a name th
 columns of one kind only, never DOUBLE, and DECIMALs only within 38 common digits (D13). `LoadGenTables` counts each
 key's non-NULL rows, distinct keys and largest multiplicity over every file, and a join stays within max(10,000, its
 largest table's rows) by a true bound: `JoinRowBound` of the first ref it follows, and for a third table that bound
-times the largest multiplicity of the third table's key. With the feature `left_join` one of a query's joins now
-and then becomes a `LEFT [OUTER] JOIN` (25% of the eligible items): the FROM item the walk added last, and only when
-every key that touches it reaches back no further than its own join group, since a `LEFT JOIN`'s ON sees its own two
-inputs alone and DuckDB refuses one that reads an earlier comma sibling ("Non-inner join on correlated columns not
-supported"). Its bound is `LeftJoinRowBound`, which adds the left rows a padded row stands for; a query has one such
-item at most, and its draws come from a fourth random stream, so a query that joins inner is the query the seed gave
-before the feature. The bound stands in for the table's rows wherever the generator needs a row count (a select list
-with a star above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT` literals in `HAVING`). Every
-draw that only a join needs comes from a second random stream of the seed and the query index, so a query that joins
-nothing is the query the same tables give without refs: `diff.random`, `diff.decimal` and `diff.tpch` keep their
-queries, and only the join queries of `diff.star` are new. The join features are declared supported, so every
-generated join is compared against DuckDB like any other query. The generated joins never use single-table aliases,
-and never meet a bind error or an exit code 4 of the join rules: `.slt` files cover those.
+times the largest multiplicity of the third table's key. With the feature `left_join` one of a query's joins now and
+then becomes a `LEFT [OUTER] JOIN` (25% of the eligible items): the FROM item the walk added last, and only when every
+key that touches it reaches back no further than its own join group, since a `LEFT JOIN`'s ON sees its own two inputs
+alone and DuckDB refuses one that reads an earlier comma sibling ("Non-inner join on correlated columns not supported").
+Its bound is `LeftJoinRowBound`, which adds the left rows a padded row stands for; a query has one such item at most,
+and its draws come from a fourth random stream, so a query that joins inner is the query the seed gave before the
+feature. With the feature `full_join` 40% of those items become a `FULL [OUTER] JOIN` instead (ADR 0037's OJ3), bounded
+by `FullJoinRowBound`, which adds the right input's rows, from a random stream of its own, so a query whose `LEFT JOIN`
+stays is the query the seed gave before. The bound stands in for the table's rows wherever the generator needs a row
+count (a select list with a star above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT` literals in
+`HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query index, so a
+query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal` and `diff.tpch`
+keep their queries, and only the join queries of `diff.star` are new. The join features are declared supported, so every
+generated join is compared against DuckDB like any other query. The generated joins never use single-table aliases, and
+never meet a bind error or an exit code 4 of the join rules: `.slt` files cover those.
 
 The refs also carry the uncorrelated subqueries (ADR 0022's T2b, feature `in_subquery` or `scalar_subquery`): a
 query with a usable probe takes one as a further top-level `AND` conjunct of `WHERE` 25% of the time, which may be
