@@ -820,6 +820,24 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT t.i16 FROM t CROSS JOIN u FULL JOIN ok ON t.i16 = ok.i16 "
                   "WHERE t.i32 = u.i32",
                   kUnsupported, "u", "a cross product is not supported"},
+        // An inner join's ON inside a FULL JOIN's left input binds inside that input, which the
+        // FULL JOIN pads, so a conjunct of it that would bind above every join of the block -- a
+        // subquery, a column of an enclosing block, a comma sibling before the join group -- would
+        // drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left input, those
+        // are answered.
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM "
+                  "dec) FULL JOIN ok ON u.i16 = ok.i16",
+                  kUnsupported, "IN",
+                  "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t WHERE EXISTS (SELECT * FROM u JOIN dec ON u.i32 = dec.i AND "
+                  "dec.b = t.i64 FULL JOIN ok ON u.i16 = ok.i16)",
+                  kUnsupported, "dec.b = t.i64",
+                  "a column of an enclosing block in the ON of a join inside a FULL JOIN's left "
+                  "input is not supported"},
+        ErrorCase{"SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND dec.i = t.i32 FULL JOIN ok "
+                  "ON u.i16 = ok.i16",
+                  kUnsupported, "dec.i = t.i32",
+                  "the ON of a join inside a FULL JOIN's left input must read that input only"},
         // The missing tables are still missing, and that bind error comes first, as in DuckDB.
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kBind, "nope",
                   "table 'nope' does not exist"},

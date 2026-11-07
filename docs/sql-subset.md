@@ -299,9 +299,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   over either input alone is a residual, since a row of either that fails it is padded and not dropped; a `WHERE`
   conjunct over either input stays above the join; the `ON` of an inner join before it in FROM order still binds inside
   its left input, which that join is part of, while a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN
-  b FULL JOIN c ON ... WHERE a.k = b.k` is a cross product, exit code 4); and the same `ON` rules and exit code 4 hold
-  as for a `LEFT JOIN`. More than 256 relations, counting a derived table, a CTE reference and a subquery in an
-  expression as one plus the relations of their body, is exit code 4 too, before the per-item checks;
+  b FULL JOIN c ON ... WHERE a.k = b.k` is a cross product, exit code 4), and a conjunct of that inner `ON` that would
+  bind above every join of the block (a subquery conjunct, a column of an enclosing block, a comma sibling before the
+  join group) is exit code 4, since it would drop the rows the `FULL JOIN` pads on the left; and the same `ON` rules and
+  exit code 4 hold as for a `LEFT JOIN`. More than 256 relations, counting a derived table, a CTE reference and a
+  subquery in an expression as one plus the relations of their body, is exit code 4 too, before the per-item checks;
 - `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
   answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
   ([Binding](#binding)); a branch in parentheses, a block with its own `ORDER BY`, `LIMIT` and `OFFSET` or a query
@@ -373,39 +375,40 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
   DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
 - uncorrelated subqueries, as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON` (which counts as a `WHERE`
-  conjunct) or of `HAVING`. `IN` in its three spellings `x IN (query)`, `x NOT IN (query)` and `NOT (x IN (query))`: `x`
-  is an operand as above, the query is a block of its own with one column, and the two share a join key type (an exact
-  widening from each, so never a `DOUBLE`). `IN` is a semi join, which keeps a row once when it has a match, so it is
-  exact with NULLs too; `NOT IN` is a null-aware anti join, which keeps every row of an empty set, a NULL `x` included,
-  and otherwise only a row whose `x` is not NULL, has no match, and faces a set with no NULL in it. And a comparison `x
-  <op> (query)` in either order, where the query is an aggregate over every row and so returns exactly one row: it
-  becomes a keyless one-row join that appends that row's column, with the comparison directly above it, which then
-  follows every rule a comparison of two operands does — the `DECIMAL` and `DATE` pairs it admits, its folding of a
-  literal side, and its refusal of a `FLOAT` column (divergence D11), which the column carries across the block
-  boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which the comparison rejects, and `COUNT` is 0, which it
-  compares as usual; both as in DuckDB. The join sits above its block's inner joins, or above the aggregation for a
-  `HAVING` conjunct, in the order the conjuncts are written -- except that a `WHERE` semi join whose key reads one
-  relation of the block runs on that relation's own branch, below those joins, which answers the same and carries fewer
-  rows through them (ADR 0029's D0). An `IN` query may have its own `GROUP BY` and `HAVING`, and nothing is pulled out
-  of it; an aggregate inside any subquery does not make the outer block an aggregate query. A column count other than
-  one is a bind error. A **correlated** subquery -- one that reads a column of the block enclosing it -- is answered
-  where it is a top-level `WHERE` conjunct: the binder plans it as a dependent join, which the optimizer's unnesting
-  pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)). `EXISTS` and `NOT EXISTS` become a semi or anti
-  join, keyed on the equality they correlate through, over a block of `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`,
-  `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner equivalent and an inner join, where the select
-  item combines the aggregate with literals and arithmetic alone -- `COUNT` is exit code 4 there, since it is 0 over no
-  rows and the rewrite gives an outer row with no group no row at all (divergences D23 and D24). Every other correlated
-  shape is exit code 4: an uncorrelated `EXISTS`, a block with `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an
-  aggregate inside `EXISTS`, a correlated `EXISTS` without a key, a correlated scalar subquery whose outer column has no
-  inner equivalent, and at the `IN` a correlated `IN` or `NOT IN`, whose NULL semantics need the set's NULL and empty
-  flags for each binding; at the subquery for one in `HAVING`, whose outer references would read the outer block's
-  groups and not its rows; and at the subquery for a conjunct that is both a subquery conjunct and a reader of an
-  enclosing block's column, which neither unnesting path handles. An outer reference is read only in a `WHERE` conjunct
-  of the subquery's own block, an inner join's `ON` included, and only one block out; in a select list, `GROUP BY`,
-  `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL JOIN`'s `ON`, further out, or in a derived table or a CTE (a
-  lateral reference) it is exit code 4 at the reference, each with its own message. A star in an `EXISTS` block is
-  checked by name but not expanded: an `ORDER BY` position there counts its columns, and one that names a column of it
-  is exit code 4 (one out of range is a bind error, as in DuckDB);
+  conjunct, except inside a `FULL JOIN`'s left input: exit code 4, above) or of `HAVING`. `IN` in its three spellings `x
+  IN (query)`, `x NOT IN (query)` and `NOT (x IN (query))`: `x` is an operand as above, the query is a block of its own
+  with one column, and the two share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi
+  join, which keeps a row once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join,
+  which keeps every row of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no
+  match, and faces a set with no NULL in it. And a comparison `x <op> (query)` in either order, where the query is an
+  aggregate over every row and so returns exactly one row: it becomes a keyless one-row join that appends that row's
+  column, with the comparison directly above it, which then follows every rule a comparison of two operands does — the
+  `DECIMAL` and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence
+  D11), which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which
+  the comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
+  block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written --
+  except that a `WHERE` semi join whose key reads one relation of the block runs on that relation's own branch, below
+  those joins, which answers the same and carries fewer rows through them (ADR 0029's D0). An `IN` query may have its
+  own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any subquery does not make the outer
+  block an aggregate query. A column count other than one is a bind error. A **correlated** subquery -- one that reads a
+  column of the block enclosing it -- is answered where it is a top-level `WHERE` conjunct: the binder plans it as a
+  dependent join, which the optimizer's unnesting pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)).
+  `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through, over a block of
+  `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`, `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner
+  equivalent and an inner join, where the select item combines the aggregate with literals and arithmetic alone --
+  `COUNT` is exit code 4 there, since it is 0 over no rows and the rewrite gives an outer row with no group no row at
+  all (divergences D23 and D24). Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with
+  `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a
+  key, a correlated scalar subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or
+  `NOT IN`, whose NULL semantics need the set's NULL and empty flags for each binding; at the subquery for one in
+  `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the subquery for a
+  conjunct that is both a subquery conjunct and a reader of an enclosing block's column, which neither unnesting path
+  handles. An outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON`
+  included, and only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL
+  JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference,
+  each with its own message. A star in an `EXISTS` block is checked by name but not expanded: an `ORDER BY` position
+  there counts its columns, and one that names a column of it is exit code 4 (one out of range is a bind error, as in
+  DuckDB);
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 

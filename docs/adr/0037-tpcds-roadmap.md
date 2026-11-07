@@ -733,9 +733,12 @@ Update (2026-11-07, OJ3): built. `FULL [OUTER] JOIN ... ON` binds to OJ2's kind 
 fixed unit of its block, whose kind's row in OJ1's table decides where a condition goes. So every ON conjunct over one
 input stays a residual, and every WHERE conjunct over either input stays above the join. One rule needed code: the ON of
 an inner join before the unit in FROM order is a condition of a join inside the unit's left input, so it binds there
-although the FULL JOIN pads that input. Q97 passes, so the ratchet is at 74. At SF 1, Q97 takes 1.5 s in the Debug build
-and 4.5 s under ASan, and peaks at 56 MiB; its ASan shard (8 of 8) takes 71 s. Q51 now needs only phase 9's windows.
-RIGHT JOIN stays exit code 4, since no query of the 99 needs it.
+although the FULL JOIN pads that input, and a conjunct of it that would bind above every join of the block (a subquery,
+an outer reference, a comma sibling) exits 4. Q97 passes, so the ratchet is at 74. At SF 1, Q97 takes 1.5 s in the Debug
+build and 4.5 s under ASan, and peaks at 56 MiB; its ASan shard (8 of 8) takes 71 s. Q51 now needs only phase 9's
+windows. RIGHT JOIN stays exit code 4, since no query of the 99 needs it.
+A subquery condition in an inner ON inside a FULL JOIN's left input exits 4 although DuckDB answers it; it is a
+candidate for phase 8, which would place its semi join inside that input. The other two refusals match DuckDB's.
 
 ## Alternatives considered
 

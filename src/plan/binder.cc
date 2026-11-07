@@ -3485,6 +3485,9 @@ class Binder {
   // left input of a single outer join unit of it, that input (ADR 0022's "One relation" rule, whose
   // conjunct moves on into the unit's left input and may become a key there). A conjunct that
   // reads the null-supplying side stops at the unit, so it filters its rows, padded ones included.
+  // The innermost outer join unit whose left input holds the inner join at FROM position `item`
+  // and that pads that input (a FULL JOIN), or std::nullopt.
+  [[nodiscard]] std::optional<std::size_t> PaddedUnitAround(std::size_t item) const;
   [[nodiscard]] std::size_t DescendTo(std::size_t block,
                                       const std::vector<std::size_t>& bindings) const;
   // The blocks and outer join units of the FROM list, before anything is classified.
@@ -3727,9 +3730,6 @@ class Binder {
   // first but not the second. Set at each clause's entry; the clauses bind in sequence
   // (Binder::Bind) and a subquery's block gets its own Binder, so it needs no saving and restoring.
   Clause clause_ = Clause::kSelect;
-  // While an inner join's ON binds, its FROM position: an ON before an outer join unit in FROM
-  // order is a condition of a join inside that unit's left input (DescendTo).
-  std::optional<std::size_t> on_position_;
   // Whether `outer` is the scope of the query block that directly encloses this one, which only a
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
@@ -3829,6 +3829,13 @@ class Binder {
   std::vector<std::size_t> unit_at_;
   std::vector<JoinBlock> blocks_;  // blocks_[0] is the statement's own; a unit's inputs follow
   std::size_t block_ = 0;          // the block the conjunct being bound is classified in
+  // While an inner join's ON binds, its FROM position: an ON before an outer join unit in FROM
+  // order is a condition of a join inside that unit's left input (DescendTo).
+  std::optional<std::size_t> on_position_;
+  // While an inner join's ON binds inside the left input of a unit that pads it (a FULL JOIN), the
+  // innermost such unit: every conjunct of that ON must stay inside its left input, since above
+  // the unit it would drop the rows the unit pads on the left (CheckInsidePaddedLeft).
+  std::optional<std::size_t> padded_unit_;
 
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
@@ -5076,6 +5083,20 @@ std::size_t Binder::NewBlock(std::vector<std::size_t> relations) {
   return blocks_.size() - 1;
 }
 
+std::optional<std::size_t> Binder::PaddedUnitAround(std::size_t item) const {
+  // A unit's left input is its join group before it: the items from the last comma on. So it holds
+  // `item` when the unit comes later and no comma stands between them.
+  for (std::size_t p = item + 1; p < stmt_.from.size(); ++p) {
+    if (stmt_.from[p].connector == sql::Connector::kComma) {
+      return std::nullopt;
+    }
+    if (unit_at_[p] != kNoUnit && Traits(units_[unit_at_[p]].kind).pads_left) {
+      return unit_at_[p];
+    }
+  }
+  return std::nullopt;
+}
+
 std::size_t Binder::DescendTo(std::size_t block, const std::vector<std::size_t>& bindings) const {
   if (bindings.empty()) {
     return block;
@@ -5136,6 +5157,18 @@ std::vector<std::size_t> Binder::LocalsOf(std::size_t block,
 
 arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element) {
   const std::vector<std::size_t> bindings = RelationsRead(conjunct);
+  // An inner ON inside a FULL JOIN's left input that reads a FROM item outside that input (a comma
+  // sibling before its join group, which rule 10 lets it see) would be classified above the unit.
+  if (padded_unit_.has_value() &&
+      (bindings.empty() || !std::ranges::all_of(bindings, [&](std::size_t b) {
+        return BlockHolds(units_[*padded_unit_].left, b);
+      }))) {
+    return UnsupportedError(
+        std::format("the ON of a join inside a {} JOIN's left input must read that input only, "
+                    "and this reads a FROM item outside it",
+                    ToString(units_[*padded_unit_].kind)),
+        element);
+  }
   const std::size_t outer = block_;
   block_ = DescendTo(block_, bindings);
   const arrow::Status status = ClassifyConjunct(conjunct, element, bindings);
@@ -5688,6 +5721,7 @@ arrow::Status Binder::BindWhere() {
     visible_ = OnVisibility(stmt_.from, i);
     clause_ = Clause::kInnerOn;
     on_position_ = i;
+    padded_unit_ = PaddedUnitAround(i);
     if (connector == sql::Connector::kLeft || connector == sql::Connector::kFull) {
       // An outer join's ON stays with its join and goes by its own rules, so it is classified into
       // the unit rather than flattened into this block's conjuncts.
@@ -5701,6 +5735,7 @@ arrow::Status Binder::BindWhere() {
     }
   }
   on_position_.reset();
+  padded_unit_.reset();
   visible_ = {};  // WHERE sees every binding, in one level
   clause_ = Clause::kWhere;
   const std::vector<const sql::Expr*> where_siblings = Conjuncts(stmt_.where);
@@ -5740,6 +5775,16 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
           .span = form->subquery->op_span,
           .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
                      "not supported"});
+    }
+    // Both routes below put the conjunct above every join of the block, which a unit that pads
+    // the conjunct's join (an inner join inside a FULL JOIN's left input) must not have above it.
+    if (padded_unit_.has_value() && (outer || form.has_value())) {
+      return Reject(Rejection{
+          .span = form.has_value() ? form->subquery->op_span : conjunct.expr->span(),
+          .message = std::format("{} in the ON of a join inside a {} JOIN's left input is not "
+                                 "supported",
+                                 form.has_value() ? "a subquery" : "a column of an enclosing block",
+                                 ToString(units_[*padded_unit_].kind))});
     }
     // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
     // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
