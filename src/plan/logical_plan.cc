@@ -451,6 +451,8 @@ std::string_view ToString(JoinKind kind) {
       return "NULL-AWARE ANTI";
     case JoinKind::kOneRow:
       return "ONE-ROW";
+    case JoinKind::kFull:
+      return "FULL";
   }
   return "?";
 }
@@ -1246,10 +1248,11 @@ class Resolver {
     } else if (!keyless && join.keys.empty()) {
       Fail(std::format("Join: {} join without keys", ToString(join.kind)));
     }
-    if (join.build == BuildSide::kLeft && keyless) {
+    if (join.build == BuildSide::kLeft && (keyless || Traits(join.kind).pads_left)) {
       // Every other kind may build on either input in a plan since ADR 0026's C2b (the executor
       // runs those whose traits say `may_build_left`); a keyless join may not, because its right
-      // input is the single-row side by definition.
+      // input is the single-row side by definition, and nor may one that pads its left input's
+      // columns (FULL, ADR 0037's OJ2), whose build-emitting sink runs on a right build only.
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
     }
     JoinNode out = join;
@@ -1297,6 +1300,7 @@ class Resolver {
       case JoinKind::kInner:
       case JoinKind::kLeft:
       case JoinKind::kNullAwareAnti:
+      case JoinKind::kFull:
         // Only the three kinds the binder plans (ADR 0023): a correlation is a predicate of the
         // right input, so there is nothing for the other kinds to match on.
         Fail(std::format("DependentJoin: a {} dependent join", ToString(join.kind)));

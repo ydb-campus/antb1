@@ -853,6 +853,29 @@ docs/sql-subset.md sections it changes.
     never reaches rule 11 for a conjunct on the preserved side. Shipping J6 before J5 makes the
     ratchet 12 of 22, not the 16 the Consequences below assume; J5a then makes it 14 and J5b 16.
 
+- Update (2026-11-07, ADR 0037's OJ2): **a FULL join kind and its operator.** `JoinKind::kFull` gives every match,
+  each left row without one padded with NULLs and each right row without one padded with NULLs. Its row in ADR 0037's
+  OJ1 table (`plan::JoinKindTraits`) pads both inputs. No SQL binds to it before OJ3 (`FULL OUTER JOIN`, which keeps
+  exiting 4 until then). The design:
+  - **It builds on its right input only.** A plan that builds it on its left fails `ResolvePositions`. The build keeps
+    its NULL-key rows, which it emits padded.
+  - **The probe** runs as a left join's does: the 1:1 window path on a unique build without residuals, the padded
+    slots otherwise. It marks, in the build's `JoinMarks`, the build row of every pair it emits (every candidate
+    without residuals, the pairs that pass them otherwise). The marks are an idempotent OR, so a part that runs again
+    after running out of memory sets the same ones.
+  - **Over a part pipeline,** the join ends that pipeline as ADR 0026's C2b sink (`PartRightJoinOperator`). Its parts
+    hand on their pairs and padded rows, which the sink hands on in part order. Once every part is in, the marks are
+    final and the sink emits the build rows no mark selects, then the NULL-key rows, in `JoinTable::rows()` order,
+    with NULL probe columns. The rows and their order are the same on any number of threads.
+  - **Over a serial probe,** which has no pipeline to end, the probe operator prepares its own marks and emits the
+    same rows itself once its input ends. Flipping the build side, which C2b's semi and anti joins fall back to, would
+    not change what a FULL join must emit.
+  - **Its output fields are all nullable,** since either side's unmatched rows are padded.
+  - **Its row estimate** is at most every match and every row of both inputs, saturated
+    (`plan::PaddedJoinRows`).
+  - **No dynamic filter** (ADR 0029) narrows either input, no aggregate is placed below it (ADR 0032), and no
+    condition moves below it: both inputs' unmatched rows come out.
+
 ## Alternatives considered
 
 - **Arrow's Acero hash join:** a complete join, but not installed, so linking it needs a new package, a new module

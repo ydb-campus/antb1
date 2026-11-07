@@ -170,7 +170,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | X4d | EXCEPT and EXCEPT ALL, after which every tree of the operators is answered (the X4d update below) | 87 | Built |
 | **Phase 7** | **Join kinds** | | |
 | OJ1 | One table of join-kind properties, read by every rule that tells kinds apart (the OJ1 update below) | | Built |
-| OJ2 | A FULL join kind and its operator | | Planned |
+| OJ2 | A FULL join kind and its operator (the OJ2 update below) | | Built |
 | OJ3 | FULL OUTER JOIN | 97 | Planned |
 | OJ4 | Cross products of multi-row relations | 77 | Planned |
 | OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |
@@ -720,6 +720,14 @@ may move, and its row floor, which never named the join kind), the optimizer's b
 physical planner's dynamic filters and the hash join. The switches that dispatch a per-kind algorithm (the operator's
 output paths, unnesting) stay switches, which the compiler checks. No plan or answer changes; a property test of the
 operator holds each kind to its row.
+
+Update (2026-11-07, OJ2): built. `JoinKind::kFull` and its operator: the probe runs as a left join's and marks the
+build rows it matches, and the build rows no mark selects come out after the probe, padded on the left. Over a part
+pipeline they come from ADR 0026's sink, after the parts' rows in part order; over a serial probe, from the probe
+itself. ADR 0022's OJ2 update records the design. No SQL reaches the kind before OJ3, so no query changes and the
+ratchet stays at 73. OJ1's table took the kind as one row: the dynamic filters, aggregate placement and the
+empty-build shortcut refuse it through their traits. What needed code: the operator, its sink, the planner's serial
+fallback, the estimates, the kind's name, and the refusals of a left build and of a FULL dependent join.
 
 ## Alternatives considered
 

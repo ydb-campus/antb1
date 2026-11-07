@@ -62,17 +62,24 @@ arrow::Status Fit(std::vector<T>& values, std::size_t size, MemoryReservation& m
 // because a left join pads a probe row without a match with NULLs. An inner join no longer produces
 // one of those -- its paths emit the rows that matched and nothing else (ADR 0026's C8) -- so for
 // inner joins this is wider than it has to be, which costs a validity bitmap nobody reads and never
-// a wrong answer.
+// a wrong answer. The probe's are nullable too where `nullable_probe`: a FULL join pads the build's
+// unmatched rows with NULLs in the probe's columns (ADR 0037's OJ2).
 std::shared_ptr<arrow::Schema> JoinSchema(const arrow::Schema& probe, const arrow::Schema& build,
-                                          plan::BuildSide build_side) {
+                                          plan::BuildSide build_side, bool nullable_probe) {
   arrow::FieldVector build_fields;
   build_fields.reserve(static_cast<std::size_t>(build.num_fields()));
   for (const std::shared_ptr<arrow::Field>& field : build.fields()) {
     build_fields.push_back(field->WithNullable(true));
   }
+  arrow::FieldVector probe_fields = probe.fields();
+  if (nullable_probe) {
+    for (std::shared_ptr<arrow::Field>& field : probe_fields) {
+      field = field->WithNullable(true);
+    }
+  }
   const bool build_left = build_side == plan::BuildSide::kLeft;
-  arrow::FieldVector fields = build_left ? build_fields : probe.fields();
-  const arrow::FieldVector& right = build_left ? probe.fields() : build_fields;
+  arrow::FieldVector fields = build_left ? build_fields : probe_fields;
+  const arrow::FieldVector& right = build_left ? probe_fields : build_fields;
   fields.insert(fields.end(), right.begin(), right.end());
   return arrow::schema(std::move(fields));
 }
@@ -490,19 +497,136 @@ arrow::Status BuildsFirstOperator::Close() {
   return status;
 }
 
-// ---- HashJoinOperator ----
+// ---- BuildRowEmitter ----
+
+BuildRowEmitter::BuildRowEmitter(std::shared_ptr<arrow::Schema> schema, int left_width,
+                                 bool unmatched)
+    : schema_(std::move(schema)), left_width_(left_width), unmatched_(unmatched) {}
+
+void BuildRowEmitter::Reset() {
+  position_ = 0;
+  null_chunk_ = 0;
+  null_row_ = 0;
+  rows_.clear();
+}
+
+arrow::Result<arrow::ArrayVector> BuildRowEmitter::LeftNulls(int64_t rows,
+                                                             arrow::MemoryPool* pool) const {
+  arrow::ArrayVector columns;
+  columns.reserve(static_cast<std::size_t>(left_width_));
+  for (int c = 0; c < left_width_; ++c) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
+                          arrow::MakeArrayOfNull(schema_->field(c)->type(), rows, pool));
+    columns.push_back(std::move(null));
+  }
+  return columns;
+}
+
+arrow::Result<std::optional<Batch>> BuildRowEmitter::Next(JoinBuild& build, int64_t batch_size,
+                                                          arrow::MemoryPool* pool,
+                                                          ProfileNode* profile) {
+  const std::shared_ptr<const JoinTable>& table = build.table();
+  const std::shared_ptr<const JoinColumns>& build_columns = build.columns();
+  const JoinMarks* marks = build.marks();
+  if (table == nullptr || build_columns == nullptr || marks == nullptr) {
+    return arrow::Status::Invalid("a join that emits its build rows lost its build");
+  }
+  const int64_t num_rows = table->num_rows();
+  rows_.clear();
+  while (position_ < num_rows && std::cmp_less(rows_.size(), batch_size)) {
+    const auto at = static_cast<std::uint32_t>(position_);
+    ++position_;
+    if (marks->marked(at) != unmatched_) {
+      rows_.push_back(table->rows()[at]);
+    }
+  }
+  if (rows_.empty()) {
+    // The keyed rows are done. A join that emits unmatched rows then emits the retained NULL-key
+    // ones, every one of which is unmatched; the two never share a batch, since these are slices of
+    // their own batches and a JoinRowRef addresses chunks() alone.
+    return unmatched_ ? NextNullKeyed(*table, batch_size, pool, profile)
+                      : arrow::Result<std::optional<Batch>>(std::nullopt);
+  }
+  if (profile != nullptr) {
+    profile->Add("emitted", MetricUnit::kCount, static_cast<int64_t>(rows_.size()));
+  }
+  const ProfileTimer gather(profile, "gather");
+  const auto rows = static_cast<int64_t>(rows_.size());
+  ARROW_ASSIGN_OR_RAISE(arrow::ArrayVector columns, LeftNulls(rows, pool));
+  columns.reserve(static_cast<std::size_t>(schema_->num_fields()));
+  const JoinBuildSpec& spec = build_columns->table->spec();
+  for (int c = left_width_; c < schema_->num_fields(); ++c) {
+    const int b = c - left_width_;  // the build's column
+    // A column the build did not retain: the schema still has the field and nothing above the join
+    // reads it, which is why it was dropped, so NULLs of its type satisfy the contract without the
+    // build having held the data. Cheaper than the gather it replaces, not just smaller.
+    if (!spec.retains(b)) {
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
+                            arrow::MakeArrayOfNull(schema_->field(c)->type(), rows, pool));
+      columns.push_back(std::move(null));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
+                          arrow::MakeBuilder(schema_->field(c)->type(), pool));
+    ARROW_RETURN_NOT_OK(
+        (GatherRows<false, JoinRowRef>(build_columns->arrays.column(b), rows_, *builder)));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
+    columns.push_back(std::move(column));
+  }
+  return Batch{.data = arrow::RecordBatch::Make(schema_, rows, std::move(columns)),
+               .selection = {}};
+}
+
+arrow::Result<std::optional<Batch>> BuildRowEmitter::NextNullKeyed(const JoinTable& table,
+                                                                   int64_t batch_size,
+                                                                   arrow::MemoryPool* pool,
+                                                                   ProfileNode* profile) {
+  const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks = table.null_chunks();
+  while (null_chunk_ < chunks.size()) {
+    const std::shared_ptr<arrow::RecordBatch>& chunk = chunks[null_chunk_];
+    const int64_t left = chunk->num_rows() - null_row_;
+    if (left <= 0) {
+      ++null_chunk_;
+      null_row_ = 0;
+      continue;
+    }
+    const int64_t rows = std::min(left, batch_size);
+    const std::shared_ptr<arrow::RecordBatch> slice = chunk->Slice(null_row_, rows);
+    null_row_ += rows;
+    if (profile != nullptr) {
+      profile->Add("emitted", MetricUnit::kCount, rows);
+    }
+    // The slice's own schema is the build input's; the output carries the join's, whose key fields
+    // are nullable because of exactly these rows. The build's columns are the same arrays: no copy.
+    ARROW_ASSIGN_OR_RAISE(arrow::ArrayVector columns, LeftNulls(rows, pool));
+    const arrow::ArrayVector& build_columns = slice->columns();
+    columns.insert(columns.end(), build_columns.begin(), build_columns.end());
+    return Batch{.data = arrow::RecordBatch::Make(schema_, rows, std::move(columns)),
+                 .selection = {}};
+  }
+  return std::nullopt;
+}
 
 // ---- PartRightJoinOperator ----
 
 PartRightJoinOperator::PartRightJoinOperator(PartPipeline pipeline, int64_t num_parts,
                                              std::shared_ptr<arrow::Schema> schema,
-                                             std::shared_ptr<JoinBuild> build)
+                                             std::shared_ptr<JoinBuild> build,
+                                             plan::BuildSide build_side)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       schema_(std::move(schema)),
       build_(std::move(build)) {
   ANTB1_CHECK(build_ != nullptr);
-  unmatched_ = EmitsUnmatchedBuildRows(build_->kind(), plan::BuildSide::kLeft);
+  ANTB1_CHECK(build_->spec() != nullptr);
+  const plan::JoinKind kind = build_->kind();
+  hands_on_ = plan::EmitsProbeAndBuildRows(kind, build_side);
+  // The output is the probe's columns, then the build's, for a join whose probe hands rows on; the
+  // build's alone otherwise.
+  const int left_width =
+      hands_on_ ? schema_->num_fields() - build_->spec()->schema()->num_fields() : 0;
+  ANTB1_CHECK(left_width >= 0);
+  emitter_ = BuildRowEmitter(schema_, left_width, EmitsUnmatchedBuildRows(kind, build_side));
 }
 
 PartRightJoinOperator::~PartRightJoinOperator() = default;
@@ -515,19 +639,27 @@ arrow::Status PartRightJoinOperator::Open(ExecContext& ctx) {
   // part runs before the scheduler below exists, so this is the one moment at which the marks can
   // be made: every part's probe then finds them through the build they share.
   ARROW_RETURN_NOT_OK(build_->PrepareMarks(ctx));
-  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), profile = profile()](
-                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<bool> {
+  auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), profile = profile(),
+               hands_on = hands_on_](int64_t part,
+                                     const std::atomic<bool>& stop) -> arrow::Result<PartBatches> {
     const ProfileTimer part_time(profile, "part_time");
-    // The part's probe marks and hands nothing on: a batch with no selected row never reaches
-    // `consume` (RunPart drops it), so this asks for every batch and expects none.
+    auto batches = std::make_shared<std::vector<Batch>>();
+    // A marking probe hands nothing on: a batch with no selected row never reaches `consume`
+    // (RunPart drops it), so this asks for every batch and expects none. A FULL join's probe hands
+    // on its pairs and padded rows, which this keeps for the part's turn.
     ARROW_RETURN_NOT_OK(
-        RunPart(*pipeline, part, part_ctx, stop, [](const Batch&) -> arrow::Result<bool> {
-          return arrow::Status::Invalid("a join that emits its build rows handed on a probe batch");
+        RunPart(*pipeline, part, part_ctx, stop, [&](Batch batch) -> arrow::Result<bool> {
+          if (!hands_on) {
+            return arrow::Status::Invalid(
+                "a join that emits its build rows handed on a probe batch");
+          }
+          batches->push_back(std::move(batch));
+          return true;
         }));
-    return true;
+    return batches;
   };
-  scheduler_ = std::make_unique<PartScheduler<bool>>(num_parts_, std::move(task), ctx.executor,
-                                                     PartWindow(ctx), ctx.budget);
+  scheduler_ = std::make_unique<PartScheduler<PartBatches>>(
+      num_parts_, std::move(task), ctx.executor, PartWindow(ctx), ctx.budget);
   return arrow::Status::OK();
 }
 
@@ -536,12 +668,17 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
     return arrow::Status::Invalid("right join: Next() before Open()");
   }
   while (!probed_) {
+    if (current_ != nullptr && next_ < current_->size()) {
+      return std::move((*current_)[next_++]);  // released as it is handed on
+    }
+    current_.reset();
+    next_ = 0;
     if (scheduler_->done()) {
       probed_ = true;  // every part is in: no probe runs any more, so the marks are final
       scheduler_.reset();
       break;
     }
-    const arrow::Result<bool> part = [&] {
+    arrow::Result<PartBatches> part = [&] {
       const ProfileTimer wait(profile(), "wait");
       return scheduler_->Next();
     }();
@@ -549,11 +686,13 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
       ended_ = true;  // a failed run: its parts are not done, so the build is not released here
       return part.status();
     }
+    current_ = *std::move(part);
   }
   if (ended_) {
     return Batch{};
   }
-  ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out, NextMarked());
+  ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out,
+                        emitter_.Next(*build_, batch_size_, pool_, profile()));
   if (out.has_value()) {
     return *std::move(out);
   }
@@ -562,91 +701,17 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
   return Batch{};
 }
 
-arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextMarked() {
-  const std::shared_ptr<const JoinTable>& table = build_->table();
-  const std::shared_ptr<const JoinColumns>& build_columns = build_->columns();
-  const JoinMarks* marks = build_->marks();
-  if (table == nullptr || build_columns == nullptr || marks == nullptr) {
-    return arrow::Status::Invalid("a join that emits its build rows lost its build");
-  }
-  const int64_t num_rows = table->num_rows();
-  rows_.clear();
-  while (position_ < num_rows && std::cmp_less(rows_.size(), batch_size_)) {
-    const auto at = static_cast<std::uint32_t>(position_);
-    ++position_;
-    if (marks->marked(at) != unmatched_) {
-      rows_.push_back(table->rows()[at]);
-    }
-  }
-  if (rows_.empty()) {
-    // The keyed rows are done. A join that emits unmatched rows then emits the retained NULL-key
-    // ones, every one of which is unmatched; the two never share a batch, since these are slices of
-    // their own batches and a JoinRowRef addresses chunks() alone.
-    return unmatched_ ? NextNullKeyed(*table) : arrow::Result<std::optional<Batch>>(std::nullopt);
-  }
-  if (profile() != nullptr) {
-    profile()->Add("emitted", MetricUnit::kCount, static_cast<int64_t>(rows_.size()));
-  }
-  const ProfileTimer gather(profile(), "gather");
-  const auto rows = static_cast<int64_t>(rows_.size());
-  arrow::ArrayVector columns;
-  columns.reserve(static_cast<std::size_t>(schema_->num_fields()));
-  const JoinBuildSpec& spec = build_columns->table->spec();
-  for (int c = 0; c < schema_->num_fields(); ++c) {
-    // A column the build did not retain: the schema still has the field and nothing above the join
-    // reads it, which is why it was dropped, so NULLs of its type satisfy the contract without the
-    // build having held the data. Cheaper than the gather it replaces, not just smaller.
-    if (!spec.retains(c)) {
-      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
-                            arrow::MakeArrayOfNull(schema_->field(c)->type(), rows, pool_));
-      columns.push_back(std::move(null));
-      continue;
-    }
-    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
-                          arrow::MakeBuilder(schema_->field(c)->type(), pool_));
-    ARROW_RETURN_NOT_OK(
-        (GatherRows<false, JoinRowRef>(build_columns->arrays.column(c), rows_, *builder)));
-    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> column, builder->Finish());
-    columns.push_back(std::move(column));
-  }
-  return Batch{.data = arrow::RecordBatch::Make(schema_, rows, std::move(columns)),
-               .selection = {}};
-}
-
-arrow::Result<std::optional<Batch>> PartRightJoinOperator::NextNullKeyed(const JoinTable& table) {
-  const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks = table.null_chunks();
-  while (null_chunk_ < chunks.size()) {
-    const std::shared_ptr<arrow::RecordBatch>& chunk = chunks[null_chunk_];
-    const int64_t left = chunk->num_rows() - null_row_;
-    if (left <= 0) {
-      ++null_chunk_;
-      null_row_ = 0;
-      continue;
-    }
-    const int64_t rows = std::min(left, batch_size_);
-    const std::shared_ptr<arrow::RecordBatch> slice = chunk->Slice(null_row_, rows);
-    null_row_ += rows;
-    if (profile() != nullptr) {
-      profile()->Add("emitted", MetricUnit::kCount, rows);
-    }
-    // The slice's own schema is the build input's; the output carries this operator's, whose key
-    // fields are nullable because of exactly these rows. The columns are the same arrays: no copy.
-    return Batch{.data = arrow::RecordBatch::Make(schema_, rows, slice->columns()),
-                 .selection = {}};
-  }
-  return std::nullopt;
-}
-
 arrow::Status PartRightJoinOperator::Close() {
   scheduler_.reset();  // stops the parts still running and waits for them
-  rows_.clear();
-  position_ = 0;
-  null_chunk_ = 0;
-  null_row_ = 0;
+  current_.reset();
+  next_ = 0;
+  emitter_.Reset();
   probed_ = false;
   ended_ = false;
   return arrow::Status::OK();
 }
+
+// ---- HashJoinOperator ----
 
 arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build, std::vector<int> probe_keys,
@@ -708,10 +773,15 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   // on: its schema, the same object, so that a build of their output takes it (JoinBuildPart checks
   // the schema).
   const bool pass_through = traits.filters_left;
-  // A join that emits its build rows outputs the build's own schema object, for the same reason the
-  // pass-through kinds output the probe's: a build above it takes the object as it is.
+  // A join that emits its build rows and none of its probe's outputs the build's own schema object,
+  // for the same reason the pass-through kinds output the probe's: a build above it takes the
+  // object as it is. One that emits both (a FULL join) outputs both inputs' columns, every one of
+  // them nullable, since either side's unmatched rows are padded.
+  const bool both = plan::EmitsProbeAndBuildRows(kind, build_side);
   std::shared_ptr<arrow::Schema> schema;
-  if (emits_unmatched) {
+  if (both) {
+    schema = JoinSchema(probe_schema, *spec.schema(), build_side, /*nullable_probe=*/true);
+  } else if (emits_unmatched) {
     // Its tail emits the rows whose keys are NULL, so those columns really can carry one even where
     // the build input's field says they cannot. Every other column keeps the input's nullability.
     arrow::FieldVector fields = spec.schema()->fields();
@@ -725,7 +795,7 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   } else if (pass_through) {
     schema = probe->output_schema();
   } else {
-    schema = JoinSchema(probe_schema, *spec.schema(), build_side);
+    schema = JoinSchema(probe_schema, *spec.schema(), build_side, /*nullable_probe=*/false);
   }
   // A residual reads the left input's columns, then the right one's (the probe's and the build's,
   // in the order of the sides).
@@ -758,6 +828,12 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       schema_(std::move(schema)),
       kind_(build_->kind()),
       emits_build_(EmitsBuildRows(build_->kind(), build_side)) {
+  if (prepares_ && plan::EmitsProbeAndBuildRows(kind_, build_side)) {
+    own_tail_ = true;
+    tail_rows_ =
+        BuildRowEmitter(schema_, schema_->num_fields() - build_->spec()->schema()->num_fields(),
+                        EmitsUnmatchedBuildRows(kind_, build_side));
+  }
   // A join whose output is its matches alone (inner) filters the pairs by its residuals as it
   // forms them; any other kind reads them per candidate, to decide what to keep or pad.
   if (plan::OutputsMatchesOnly(kind_) || residual_.empty()) {
@@ -870,6 +946,10 @@ arrow::Status HashJoinOperator::Start() {
   }
   if (emits_build_) {
     ARROW_ASSIGN_OR_RAISE(empty_, arrow::RecordBatch::MakeEmpty(schema_, ctx_.pool));
+    if (own_tail_) {
+      // No sink makes them: this serial probe emits its own tail once its input ends.
+      ARROW_RETURN_NOT_OK(build_->PrepareMarks(ctx_));
+    }
     marks_ = build_->marks();
     if (marks_ == nullptr) {
       // The sink makes them after the build is prepared and before any part runs; without them a
@@ -900,6 +980,7 @@ arrow::Status HashJoinOperator::Start() {
     case plan::JoinKind::kInner:
     case plan::JoinKind::kSemi:
     case plan::JoinKind::kLeft:
+    case plan::JoinKind::kFull:
       keep_ = Keep::kMatched;
       break;
   }
@@ -926,6 +1007,15 @@ arrow::Result<Batch> HashJoinOperator::Next() {
       return *std::move(out);
     }
   }
+  if (tailing_) {
+    ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out,
+                          tail_rows_.Next(*build_, batch_size_, ctx_.pool, profile()));
+    if (out.has_value()) {
+      return *std::move(out);
+    }
+    tailing_ = false;
+    End();
+  }
   return Batch{};
 }
 
@@ -934,6 +1024,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
     case plan::JoinKind::kInner:
       return table_->unique() ? NextWindow() : NextPairs();
     case plan::JoinKind::kLeft:
+    // A FULL join probes as a left join does, and marks the build rows its pairs match on the way
+    // (marks_), so that the rows no mark selects come out after the probe (ADR 0037's OJ2).
+    case plan::JoinKind::kFull:
       return table_->unique() && residual_.empty() ? NextLeftWindow() : NextPadded();
     case plan::JoinKind::kOneRow:
       return NextOneRow();
@@ -959,6 +1052,14 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
 arrow::Status HashJoinOperator::Pull() {
   ARROW_ASSIGN_OR_RAISE(Batch in, input_->Next());
   if (in.end()) {
+    if (own_tail_) {
+      // The marks are final: the build rows no probe row matched come next, and the build stays
+      // until they have (End releases it).
+      done_ = true;
+      tailing_ = true;
+      batch_ = Batch{};
+      return arrow::Status::OK();
+    }
     End();
     return arrow::Status::OK();
   }
@@ -1110,6 +1211,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextLeftWindow() {
     const JoinMatches& m = matches_[static_cast<std::size_t>(begin + i)];
     build_rows_[static_cast<std::size_t>(i)] =
         m.end > m.begin ? table_rows[m.begin] : JoinRowRef{.chunk = kNoChunk, .row = 0};
+    if (marks_ != nullptr && m.end > m.begin) {
+      marks_->Mark(m.begin);  // a FULL join: the build row this one matched
+    }
   }
   ARROW_ASSIGN_OR_RAISE(const arrow::ArrayVector build, GatherBuild<true>(rows));
   const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
@@ -1123,8 +1227,23 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPadded() {
     batch_ = Batch{};
     return std::nullopt;
   }
+  // A FULL join marks the build rows of the pairs it emits: every candidate without residuals,
+  // the pairs that pass them otherwise -- before the slots are compacted to the rows that come out.
+  if (marks_ != nullptr && residual_.empty()) {
+    for (int64_t slot = 0; slot < rows; ++slot) {
+      const std::uint32_t at = build_positions_[static_cast<std::size_t>(slot)];
+      if (at != kPadded) {
+        marks_->Mark(at);
+      }
+    }
+  }
   if (!residual_.empty()) {
     ARROW_ASSIGN_OR_RAISE(const int64_t passing, PassingSlots(rows));
+    if (marks_ != nullptr) {
+      for (int64_t i = 0; i < passing; ++i) {
+        marks_->Mark(build_positions_[pair_slots_[static_cast<std::size_t>(i)]]);
+      }
+    }
     rows = KeepPassingOrPadded(rows, passing, continues);
     if (rows == 0) {
       return std::nullopt;
@@ -1239,8 +1358,8 @@ arrow::Result<int64_t> HashJoinOperator::NextSlots() {
         last_[slot] = last ? 1 : 0;
       }
       if (emits_build_) {
-        build_positions_[slot] = candidate;  // never kPadded: only a left join pads, and it emits
-      }  // its probe's rows
+        build_positions_[slot] = candidate;  // kPadded for a FULL join's padded slot: not marked
+      }
     });
   }
   row_ = row;
@@ -1616,6 +1735,8 @@ arrow::Status HashJoinOperator::Close() {
     input_opened_ = false;
   }
   End();
+  tailing_ = false;
+  tail_rows_.Reset();
   opened_ = false;
   started_ = false;
   done_ = false;

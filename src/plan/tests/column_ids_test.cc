@@ -486,7 +486,7 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth
 
 TEST(ColumnIdsTest, EveryJoinKindResolves) {
   for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-                              JoinKind::kNullAwareAnti}) {
+                              JoinKind::kNullAwareAnti, JoinKind::kFull}) {
     JoinNode join = Join(kind);
     join.residual = {Residual(kC, kF)};
     const LogicalPlan resolved = ResolvePositions(Plan(Node(join)));
@@ -499,7 +499,7 @@ TEST(ColumnIdsTest, EveryJoinKindResolves) {
                               JoinKind::kNullAwareAnti}) {
     EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(Join(kind, BuildSide::kLeft))))),
               std::nullopt)
-        << "every kind but ONE-ROW may build on either input: " << ToString(kind);
+        << "every kind but ONE-ROW and FULL may build on either input: " << ToString(kind);
   }
 }
 
@@ -520,6 +520,10 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   JoinNode one_row = Join(JoinKind::kOneRow, BuildSide::kLeft);
   one_row.keys.clear();
   EXPECT_EQ(PositionMismatch(Plan(Node(one_row))), "Join: ONE-ROW join builds on its left input");
+  // A FULL join pads its left input's columns, and its sink runs on a right build only (ADR 0037's
+  // OJ2).
+  EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kFull, BuildSide::kLeft)))),
+            "Join: FULL join builds on its left input");
 
   JoinNode residual = Join(JoinKind::kInner);
   residual.residual = {Leaf(kA, 0)};
