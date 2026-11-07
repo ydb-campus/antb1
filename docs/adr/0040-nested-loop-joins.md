@@ -35,8 +35,8 @@ It is accepted when OJ4c is built.
   - There is no size guard.
 - **DuckDB 1.5.6**, checked on synthetic data:
   - It answers inner, LEFT and FULL joins on `<`, `<>`, OR and no condition at all.
-  - It plans them as `CROSS_PRODUCT`, `NESTED_LOOP_JOIN`, `PIECEWISE_MERGE_JOIN` (one inequality) or `IE_JOIN` (two
-    inequalities).
+  - It plans them as `CROSS_PRODUCT`, `NESTED_LOOP_JOIN`, `BLOCKWISE_NL_JOIN` (an OR, or `ON true`),
+    `PIECEWISE_MERGE_JOIN` (inequalities) or `IE_JOIN` (two inequalities, at some sizes).
   - A condition that is NULL is false, so a LEFT JOIN pads the left rows no pair passes, and a FULL JOIN pads the
     right rows too.
   - It has no output-size guard.
@@ -47,8 +47,12 @@ It is accepted when OJ4c is built.
   The inner, semi, anti, LEFT and FULL paths walk those ranges in output batches of at most `batch_size` pairs. They
   evaluate the residuals on the pairs, and pad and mark as each kind does. No path holds all m×n pairs.
 
-  What stops a keyless multi-row join today is the plan contract: the trait `keyless` means "exactly one row", and the
-  checks enforce it.
+  What stops a keyless multi-row join today:
+  - The plan contract: the trait `keyless` means "exactly one row", and the checks enforce it.
+  - The executor's keyless build: `JoinBuildSpec::Keyless` keeps every column of its input, where a keyed build
+    keeps only the ones read above. It also never keeps NULL-key rows, which the operator requires of a FULL join
+    built on its right input.
+  - `Pull` looks every probe row up with `Find`, which is Invalid on a keyless build.
 
 ## Decision
 
@@ -86,16 +90,22 @@ It is accepted when OJ4c is built.
 ### The join order
 
 1. **The cost search also considers cross products.** DPccp ([ADR 0026](0026-join-performance.md)'s C5) enumerates
-   the connected complement pairs as today. It also considers every split of a subset into two sides that no edge
-   connects, with the same cost:
+   the connected complement pairs as today, whose two sides are each connected. It then also considers every other
+   split of a subset into two sides that both have a plan. Such a split is either of two kinds:
+   - **a cross split**, when no edge connects its two sides: a step with no edges, which the binder builds as a
+     keyless inner join;
+   - **a keyed split with a side that is not connected**, such as a cross of two small relations on one side and a
+     large relation that an edge joins to both on the other. It is keyed on every edge between the sides, as `Emit`
+     already collects them.
+
+   Every split is costed alike:
    - cost(S) = cost(S1) + cost(S2) + rows(S) + min(rows(S1), rows(S2));
    - rows(S) of a cross split is the product, which is also the pairs its nested loop evaluates. Residuals have no
      selectivity in today's estimates.
 
-   Within one subset, the connected pairs are applied first, and a cross split replaces the best only when it is
-   strictly cheaper. So a plan changes only where a cross is estimated to cost less. A typical case is two small
-   relations crossed before a large one joins both on a two-column key. Such a split is a step with no edges, and
-   the binder builds it as a keyless inner join.
+   Within one subset, the DPccp pairs are applied first, and any other split replaces the best only when it is
+   strictly cheaper. So a plan changes only where a split that reads a cross is estimated to cost less. The typical
+   case is two small relations crossed below a large one that joins both on a two-column key.
 
    Every split of up to 12 relations is about 3^12 / 2 ≈ 2.7·10^5 pairs, which is cheap next to the query.
 2. **The greedy order** is used beyond 12 relations, or with `--join-order greedy`. It keeps rules 1 to 5 over the
@@ -104,32 +114,43 @@ It is accepted when OJ4c is built.
 
 ### The execution
 
-1. **The operator is the hash join's.** A keyless build takes `JoinBuildSpec::Keyless`. It never hashes or looks
-   up: each selected probe row's candidates are the whole build, and an unselected row's are none. The inner,
-   LEFT and FULL paths, the residuals, the padding, the marks, the part pipelines and the shared build then run
-   unchanged. The probe streams in batches, and the build is charged to the memory budget like any build.
+1. **The operator is the hash join's.** A keyless build takes `JoinBuildSpec::Keyless`, which OJ4a extends:
+   - it keeps only the columns read above, as a keyed build does;
+   - a FULL join's keyless build is accepted although it keeps no NULL-key rows, since it has no keys.
+
+   `Pull` gains a keyless path: no hash and no `Find`, but each selected probe row's candidates are the whole
+   build, and an unselected row's none. Over those ranges, the inner, LEFT and FULL paths run as they do for a hash
+   join, with the residuals, the padding, the marks, the part pipelines and the shared build. The probe streams in
+   batches, and the build is charged to the memory budget like any build.
 2. **A keyless build skips the hash directory and the per-row hashes**, which it never reads, as long as its rows
     stay in (part, row) order (OJ4a). Otherwise this becomes a performance item of its own.
 
 ### No size guard
 
- 1. **A cross product is not refused for its size.** The output streams in batches. The build is the side the cost
-    search or rule 5 chose, held in memory and charged to the budget, and running out of memory is an error.
-
-    One caveat is recorded: a part pipeline that ends in a union buffers a part's whole output until that part is
-    handed on, as it does for any fan-out join, and a cross product's output is m × n rows per part. An aggregate,
-    top-N or LIMIT above the join consumes its batches as they come.
+ 1. **A cross product is not refused for its size.** The output streams in batches, and running out of memory is an
+    error. What is held in memory:
+    - **The build.** For an inner join it is the side the cost search or rule 5 chose. A LEFT or FULL unit always
+      builds its right input, whatever the sizes, so a keyless LEFT JOIN with a huge right input holds all of it.
+    - **A cross below a keyed join.** In the typical case of the cost search, the cross's whole m × n output is the
+      build of the keyed join above it: materialised and hashed, not streamed.
+    - **A part pipeline that ends in a union.** It buffers each part's whole output until that part is handed on, as
+      it does for any fan-out join, and up to 2 × threads parts at once until budget pressure shrinks that window. A
+      cross product's output is m × n rows per part, so a single part whose output exceeds the budget fails with
+      out-of-memory. An aggregate, top-N or LIMIT above the join consumes its batches as they come.
 
 ## Consequences
 
 - **Q77 passes once OJ4b is built.** No other query of the 99 changes its answer.
 
-  Where a cross is estimated cheaper, plans of queries that already pass may change. OJ4b compares the EXPLAIN of
-  every passing query derived from TPC-H and TPC-DS before and after the change, locally, and times each changed plan.
-  A cross that loses is pinned and the cost is fixed before OJ4b lands.
+  Where a split that reads a cross is estimated cheaper, plans of queries that already pass may change. OJ4b compares
+  the EXPLAIN of every passing query derived from TPC-H and TPC-DS before and after the change, locally, and times each
+  changed plan. A cross that loses is pinned and the cost is fixed before OJ4b lands.
 - **The random differential test** gets a cross feature (OJ4b) and keyless LEFT and FULL promotions (OJ4c), each on
   a random stream of its own.
-- **The exit-4 cases left:** a keyless semi or anti join, from a correlated subquery without an equality.
+- **The exit-4 cases left, for joins that subqueries make:**
+  - a correlated subquery whose correlation has no equality, as an EXISTS or IN (a semi or anti join) and as a
+    scalar value ([ADR 0023](0023-unnesting.md)'s path 2);
+  - an uncorrelated IN or NOT IN whose two sides have no common key type, such as DOUBLE.
 - **An inequality join evaluates every pair.** This is O(m × n), where a piecewise merge join or an IEJoin would
   sort. No query of the 99 needs those, and they stay possible later behind the same plan shape.
 
