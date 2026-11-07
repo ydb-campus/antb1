@@ -235,15 +235,15 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     return arrow::Status::Invalid("a join without its inputs");
   }
   const std::string_view kind = plan::ToString(join.kind);
-  if (join.kind == plan::JoinKind::kOneRow) {
+  const plan::JoinKindTraits traits = plan::Traits(join.kind);
+  if (traits.keyless) {
     if (!join.keys.empty() || !join.residual.empty()) {
       return arrow::Status::Invalid("a ONE-ROW join with keys or residuals");
     }
   } else if (join.keys.empty()) {
     return arrow::Status::Invalid("a ", kind, " hash join without keys");
   }
-  if (join.kind == plan::JoinKind::kNullAwareAnti &&
-      (join.keys.size() != 1 || !join.residual.empty())) {
+  if (traits.null_aware && (join.keys.size() != 1 || !join.residual.empty())) {
     return arrow::Status::Invalid("a NULL-AWARE ANTI join of ", join.keys.size(), " keys and ",
                                   join.residual.size(), " residuals");
   }
@@ -357,7 +357,7 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
   };
   const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
     std::vector<bool> retain = retain_of(*schema);
-    return join.kind == plan::JoinKind::kOneRow
+    return plan::Traits(join.kind).keyless
                ? JoinBuildSpec::Keyless(std::move(schema))
                : JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys,
                                      std::move(retain));
@@ -671,10 +671,11 @@ constexpr int64_t kFilterKeySpanShare = 8;
 //     continues into its right, so the walk subtracts that width as it descends -- the hazard
 //     LeadingKeyField states, answered rather than avoided. Only FilterNodes and JoinNodes may
 //     stand in the chain; a Compute appends and a Project reorders, so either ends the walk.
-//   - the join must not emit an unmatched probe row, or dropping one would lose an answer. INNER
-//     and SEMI never do; ANTI and LEFT only when they build on their left and emit build rows
-//     (EmitsBuildRows), which is the form ADR 0026's C2b gave them. A null-aware anti join is
-//     excluded outright: it answers from the whole set, not row by row.
+//   - the join must not emit an unmatched probe row, or dropping one would lose an answer
+//     (plan::ProbeDropsUnmatchedRows): INNER and SEMI never do; ANTI and LEFT only when they build
+//     on their left and emit build rows, the form ADR 0026's C2b gave them. A null-aware anti join
+//     is excluded outright -- it answers from the whole set, not row by row -- and so is a one-row
+//     join, which has no key.
 //   - one key, whose column maps to a field of the scan through FilterNodes alone (a Compute
 //     appends, a Project reorders), and whose type the build hashed and a scan decodes the same
 //     (CanPublishKeyFilter).
@@ -725,11 +726,7 @@ std::optional<ProbeKey> ProbeKeyAt(const plan::ScanNode& scan, const PipelineBui
   if (join == nullptr || build == nullptr) {
     return std::nullopt;
   }
-  if (join->kind != plan::JoinKind::kInner && join->kind != plan::JoinKind::kSemi &&
-      !EmitsBuildRows(join->kind, join->build)) {
-    return std::nullopt;
-  }
-  if (join->kind == plan::JoinKind::kNullAwareAnti || join->kind == plan::JoinKind::kOneRow) {
+  if (!plan::ProbeDropsUnmatchedRows(join->kind, join->build)) {
     return std::nullopt;
   }
   // No build on this key can make a filter, whatever happens at run time: it is one key of a type
@@ -797,12 +794,12 @@ std::optional<ProbeKey> ProbeKeyAt(const plan::ScanNode& scan, const PipelineBui
       // anything, and SEMI, ANTI and null-aware ANTI put their left input's columns and no others
       // there whatever side they build on (plan's `JoinIds`). **Unreachable as the code stands**,
       // and kept because what makes it so lives in two other files: a non-inner join building on
-      // its left satisfies `EmitsBuildRows`, so `IsRightJoin` above has already ended the walk,
-      // and `HashJoinOperator::Make` admits build=left for INNER and SEMI alone. A descent to the
-      // right therefore implies a kind whose output concatenates -- by proof, not by construction,
-      // which is the kind of reasoning worth one comparison to not depend on.
-      if (below->kind != plan::JoinKind::kInner && below->kind != plan::JoinKind::kLeft &&
-          below->kind != plan::JoinKind::kOneRow) {
+      // its left satisfies `EmitsBuildRows` (but a keyless one, which `Make` refuses), so
+      // `IsRightJoin` above has already ended the walk, and `HashJoinOperator::Make` admits
+      // build=left only where `may_build_left`. A descent to
+      // the right therefore implies a kind whose output concatenates -- by proof, not by
+      // construction, which is the kind of reasoning worth one comparison to not depend on.
+      if (!plan::Traits(below->kind).outputs_right) {
         return std::nullopt;
       }
       // The width comes from the ids the node reports, so a node that reports none would subtract
@@ -1008,17 +1005,13 @@ std::optional<TableScanOperator::KeyScan> KeyScanOf(const plan::ScanNode& scan,
 // One key, because the aggregate applies it to one column; the probe side's key by id, since that
 // is what survives the nodes in between. The join must not emit an unmatched probe row -- dropping
 // rows from the aggregate's input drops whole groups and so drops probe rows -- which is D1's rule
-// (EmitsBuildRows), and a null-aware anti join and a one-row join are excluded as they are there.
+// (plan::ProbeDropsUnmatchedRows, which also excludes a null-aware anti join and a one-row join).
 AggregateFilter ProbeAggregateFilter(const plan::JoinNode& node, const JoinShape& shape,
                                      const std::shared_ptr<JoinBuild>& build) {
   if (build == nullptr || node.keys.size() != 1 || shape.probe == nullptr) {
     return {};
   }
-  if (node.kind != plan::JoinKind::kInner && node.kind != plan::JoinKind::kSemi &&
-      !EmitsBuildRows(node.kind, node.build)) {
-    return {};
-  }
-  if (node.kind == plan::JoinKind::kNullAwareAnti || node.kind == plan::JoinKind::kOneRow) {
+  if (!plan::ProbeDropsUnmatchedRows(node.kind, node.build)) {
     return {};
   }
   const plan::BoundColumn& key =

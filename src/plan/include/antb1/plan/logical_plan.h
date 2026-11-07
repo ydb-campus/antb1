@@ -15,6 +15,7 @@
 
 #include "antb1/common/int128.h"
 #include "antb1/common/source_span.h"
+#include "antb1/plan/join_kind.h"
 #include "antb1/plan/table.h"
 #include "antb1/plan/types.h"
 
@@ -484,27 +485,6 @@ struct RowCountNode {
   SourceSpan span;            // the COUNT(*) call
 };
 
-// The kinds of joins (ADR 0022). A match is a pair of a left and a right row with equal keys whose
-// residual is true; a NULL key never matches.
-enum class JoinKind : std::uint8_t {
-  kInner,          // every match
-  kLeft,           // every match, and each left row without one, padded with NULLs
-  kSemi,           // each left row with a match, once
-  kAnti,           // each left row without a match
-  kNullAwareAnti,  // as SQL's NOT IN: no left row when the right has a NULL key; every left row
-                   // when it is empty; else each left row with a non-NULL key and no match
-  kOneRow,         // each left row with the right input's single row (no keys)
-};
-
-// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW".
-std::string_view ToString(JoinKind kind);
-
-// The input a join builds its hash table on; the other is probed.
-enum class BuildSide : std::uint8_t { kLeft, kRight };
-
-// "left", "right".
-std::string_view ToString(BuildSide side);
-
 // How much larger a join's build side must be than the side that probes it before the join builds
 // on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 400,
 // the default, flips only a decisive difference and leaves every near-tie as it was, so an estimate
@@ -518,10 +498,11 @@ struct JoinKey {
   BoundColumn right;  // of the right input
 };
 
-// A join of two inputs. Output: inner, left and one-row joins output the left input's columns,
-// then the right input's; semi, anti and null-aware anti joins the left input's only. Every kind
-// but one-row has at least one key, and one-row has none. Only an inner join may build on its
-// left input (ADR 0022: the others build on the side whose rows they do not preserve).
+// A join of two inputs, its rows and columns as its kind's traits say (join_kind.h): the left
+// input's columns, then the right input's where `outputs_right`; at least one key unless `keyless`,
+// and none then. A plan may build any kind but a keyless one on its left input (ADR 0026's C2b and
+// C2c); the executor runs that only where `may_build_left`, and the physical planner builds a left
+// join without a part pipeline on its right input instead.
 struct JoinNode {
   JoinKind kind = JoinKind::kInner;
   LogicalNodePtr left;

@@ -153,28 +153,18 @@ class JoinBuild {
   std::shared_ptr<const KeyFilter> key_filter_;
 };
 
-// Whether a join of `kind` building on `side` outputs its build's rows rather than its probe's
-// (docs/adr/0026-join-performance.md, C2b and C2c): any kind but inner that builds on its left
-// input, since every kind but inner preserves its left input. Such a join marks the build rows its
-// probe matches and emits the rows the marks select once no part of its probe pipeline runs any
+// Whether a join emits its build's rows, and whether the unmatched ones, are the join-kind table's
+// (plan::EmitsBuildRows and plan::EmitsUnmatchedBuildRows in antb1/plan/join_kind.h): one place for
+// the planner, the build and the probe, which must not disagree. Such a join marks the build rows
+// its probe matches and emits the rows the marks select once no part of its probe pipeline runs any
 // more, so it is the sink of that pipeline (PartRightJoinOperator) rather than a node inside it.
-// One function so that the planner, the build and the probe cannot disagree about the direction.
-bool EmitsBuildRows(plan::JoinKind kind, plan::BuildSide side);
-
-// Whether such a join emits the build rows that did *not* match, rather than those that did: an
-// anti or a left outer join building on its left input. Those two need the build to retain the rows
-// whose keys are NULL (JoinBuildSpec::keep_null_keys), because a NULL key never matches and so is
-// unmatched by definition, where a semi join emits only matched rows and needs none of them. One
-// function for the same reason as EmitsBuildRows: the planner asks it to set the flag, the probe
-// asks it to refuse a build without one, and the sink asks it which way round to read the marks --
-// three places that must not disagree, since either disagreement loses rows with no error.
-bool EmitsUnmatchedBuildRows(plan::JoinKind kind, plan::BuildSide side);
 
 // Whether no row can come out of a join of `kind` whose build holds `table`, whatever its probe
-// input holds: an inner or a semi join whose table holds no row. Every other kind reads its probe
-// input: an anti join over no row keeps every selected row, a null-aware anti join over an empty
-// input every selected row (NULL keys included), and one over an input with a NULL key none, but
-// it reads every row, as DuckDB does.
+// input holds: a kind whose empty build empties it (plan::EmptyBuildEmptiesJoin, an inner or a semi
+// join) whose table holds no row. Every other kind reads its probe input: an anti join over no row
+// keeps every selected row, a null-aware anti join over an empty input every selected row (NULL
+// keys included), and one over an input with a NULL key none, but it reads every row, as DuckDB
+// does.
 bool EmptiesJoin(plan::JoinKind kind, const JoinTable& table);
 
 // Prepares `builds` in order and stops after the first one that empties its join (EmptiesJoin):

@@ -756,16 +756,8 @@ std::vector<ColumnId> GroupingSetsIds(const GroupingSetsNode& node) {
 // defines none). One rule for both shapes of OutputIds: ADR 0023's "One output-id contract".
 std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
                               const std::vector<ColumnId>& right, ColumnId own = kNoColumnId) {
-  switch (kind) {
-    case JoinKind::kInner:
-    case JoinKind::kLeft:
-    case JoinKind::kOneRow:
-      left.insert(left.end(), right.begin(), right.end());
-      break;
-    case JoinKind::kSemi:
-    case JoinKind::kAnti:
-    case JoinKind::kNullAwareAnti:
-      break;
+  if (Traits(kind).outputs_right) {
+    left.insert(left.end(), right.begin(), right.end());
   }
   if (own != kNoColumnId) {
     left.push_back(own);
@@ -1248,15 +1240,16 @@ class Resolver {
   Resolved Visit(const LogicalNodePtr& self, const JoinNode& join) {
     Resolved left = Walk(join.left);
     Resolved right = Walk(join.right);
-    const bool one_row = join.kind == JoinKind::kOneRow;
-    if (one_row && !join.keys.empty()) {
+    const bool keyless = Traits(join.kind).keyless;
+    if (keyless && !join.keys.empty()) {
       Fail(std::format("Join: {} join with {} keys", ToString(join.kind), join.keys.size()));
-    } else if (!one_row && join.keys.empty()) {
+    } else if (!keyless && join.keys.empty()) {
       Fail(std::format("Join: {} join without keys", ToString(join.kind)));
     }
-    if (join.build == BuildSide::kLeft && join.kind == JoinKind::kOneRow) {
-      // Every other kind may build on either input since ADR 0026's C2b; a ONE-ROW join may not,
-      // because its right input is the single-row side by definition.
+    if (join.build == BuildSide::kLeft && keyless) {
+      // Every other kind may build on either input in a plan since ADR 0026's C2b (the executor
+      // runs those whose traits say `may_build_left`); a keyless join may not, because its right
+      // input is the single-row side by definition.
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
     }
     JoinNode out = join;
