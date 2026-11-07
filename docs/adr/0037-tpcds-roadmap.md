@@ -172,7 +172,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ1 | One table of join-kind properties, read by every rule that tells kinds apart (the OJ1 update below) | | Built |
 | OJ2 | A FULL join kind and its operator (the OJ2 update below) | | Built |
 | OJ3 | FULL OUTER JOIN (the OJ3 update below) | 97 | Built |
-| OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md)) | | Planned |
+| OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md); its OJ4a update) | | Built |
 | OJ4b | Cross products and joins without an equality key in the binder and the join-order cost search (ADR 0040) | 77 | Planned |
 | OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040) | | Planned |
 | OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |

@@ -197,7 +197,8 @@ steps (only step 7 uses more than one thread):
    `Compute` and `Project` nodes and joins' probes over a `Scan` is a part pipeline, built once per table part
    (see [Execution](#execution)); a `UnionAll` ends one, each of its inputs planned on its own. A `Join` of any kind
    is a hash join
-   ([ADR 0022](adr/0022-joins-and-query-blocks.md)): a build of one input (keyless for a one-row join), made once per
+   ([ADR 0022](adr/0022-joins-and-query-blocks.md)): a build of one input (keyless for a one-row join and for a
+   nested loop, [ADR 0040](adr/0040-nested-loop-joins.md)), made once per
    pipeline before the factory of its parts, and a probe of the other, in that input's part pipeline or over it; a
    malformed join (keys of two types, say) is `Invalid`.
 7. Drain (`exec::Drain`): `Open`, pull batches with `Next` until the end of the stream, `Close` (also after an
@@ -295,45 +296,44 @@ instead of returning it to the system and faulting it back in: unless the variab
 wins) or `ARROW_DEFAULT_MEMORY_POOL` names another pool. The process then keeps its peak resident memory until it
 exits; the budget, which counts allocations, is unchanged.
 
-**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md)). An
-`exec::JoinBuildPart` takes one part of a build input on any thread: it keeps the selected rows whose keys are not
-NULL, splits them into 64 partitions by `exec::KeyHashes` modulo 64 (the GROUP BY rule) with one Take per column,
-and keeps each row's hash. An `exec::JoinTableBuilder` takes the parts on the consumer thread in any order and hands
-them to `exec::PartitionLanes` in part order, so every partition lists its rows in (part, row) order; `Finish`
-builds the partitions in parallel (one at a time under memory pressure) into an immutable `exec::JoinTable`. One
-SMALLINT, INTEGER, BIGINT, USMALLINT, DATE or TIMESTAMP key whose values span fewer than 8 times the rows gets the
-direct layout, an offsets array indexed by the key minus the smallest key; every other key the hashed layout: per
-partition, `bit_ceil(rows)` buckets on the hash bits above the partition's, each listing its distinct keys with
-their hash and range of rows. The rows stay in the parts' taken batches (`JoinTable::chunks`, referenced as
-`JoinRowRef{chunk, row}`, at most 2^32 - 1 rows), each key's rows together and in (part, row) order. The table
-keeps whether any key repeats (`unique`), whether the input had a NULL key (`has_null`) and whether it was empty. A
-keyless build (`JoinBuildSpec::Keyless`, a one-row join's) holds every row as the rows of one key, and has nothing to
-probe.
-`JoinTable::Find` gives every probe row the range of its matches, from any number of threads at once and without a
-lock; neither the thread count nor the order in which parts arrive changes the table, nor the failure of a build that
-fails: the failure of its earliest part, as in the serial order (a merge's before a later part's failed release).
-The hash joins' operators (`src/exec/hash_join.h`) use it. An `exec::JoinBuild` builds a table for a join of its
-kind from a part pipeline (its parts on the pool through the part scheduler) or from any operator drained on the
-consumer thread, after the builds its own input probes (post-order); a one-row join's build must hold one row, whose
-values it then makes once as columns of up to `batch_size` rows (fewer for long VARCHAR values) that every probe
-slices. Every build also takes each chunk's array of each column once (`exec::JoinColumns`), and every gather of its
-rows reads those: asking a batch for a column locks the batch, so a gather over the chunks would lock every chunk on
-every call. An `exec::BuildsFirstOperator` prepares a probe pipeline's builds when it is first pulled, then opens the
-pipeline's sink, and releases them once the sink's parts are done (`exec::PartSink`'s callback). An
-`exec::HashJoinOperator` probes, by its build's kind: an inner join with a build of unique keys keeps the probe
-batch's columns and selects the matched rows, otherwise it takes a (probe row, match) pair per output row, and its
-residuals are evaluated in order, each on the rows the ones before it kept; a left join takes its pairs the same way,
-with NULLs for a row without a match (on its 1:1 path it keeps the probe's selection), and evaluates its residuals on
-candidate pairs, as a semi or anti join does; a semi, anti or null-aware anti join passes on
-slices of the probe batch with the rows it keeps selected; a one-row join appends the slices of its build's values; a
-full join probes as a left join does and marks the build rows its pairs match, and the build rows no mark selects come
-out after the whole probe, padded on the left (ADR 0037's OJ2).
-The residuals of a semi, anti or left join are evaluated (`exec::EvaluateExpr`) on the candidate pairs (a probe row
-and a build row of its key), in batches of at most `batch_size` pairs with only the columns they read, in order, every
-pair evaluated: semi and anti evaluate a probe batch's pairs before its windows, a left join each batch of pairs before
-it emits the passing ones and, after a row's last candidate, the row padded when none passed. The one exception is a
-semi or anti join whose residuals read no build column but its keys: a row's candidates would all give them the same
-values, so the row meets its first candidate only (ADR 0022's E2c).
+**Join builds** ([ADR 0022](adr/0022-joins-and-query-blocks.md)). An `exec::JoinBuildPart` takes one part of a build
+input on any thread: it keeps the selected rows whose keys are not NULL, splits them into 64 partitions by
+`exec::KeyHashes` modulo 64 (the GROUP BY rule) with one Take per column, and keeps each row's hash. An
+`exec::JoinTableBuilder` takes the parts on the consumer thread in any order and hands them to `exec::PartitionLanes` in
+part order, so every partition lists its rows in (part, row) order; `Finish` builds the partitions in parallel (one at a
+time under memory pressure) into an immutable `exec::JoinTable`. One SMALLINT, INTEGER, BIGINT, USMALLINT, DATE or
+TIMESTAMP key whose values span fewer than 8 times the rows gets the direct layout, an offsets array indexed by the key
+minus the smallest key; every other key the hashed layout: per partition, `bit_ceil(rows)` buckets on the hash bits
+above the partition's, each listing its distinct keys with their hash and range of rows. The rows stay in the parts'
+taken batches (`JoinTable::chunks`, referenced as `JoinRowRef{chunk, row}`, at most 2^32 - 1 rows), each key's rows
+together and in (part, row) order. The table keeps whether any key repeats (`unique`), whether the input had a NULL key
+(`has_null`) and whether it was empty. A keyless build (`JoinBuildSpec::Keyless`: a one-row join's, or a nested loop's,
+ADR 0040, which keeps only the columns read above) holds every row as the rows of one key, without hashes or a
+directory, and has nothing to probe: `JoinTable::FindEvery` gives each selected probe row every row as its candidates,
+with no hash and no lookup. `JoinTable::Find` gives every probe row the range of its matches, from any number of threads
+at once and without a lock; neither the thread count nor the order in which parts arrive changes the table, nor the
+failure of a build that fails: the failure of its earliest part, as in the serial order (a merge's before a later part's
+failed release). The hash joins' operators (`src/exec/hash_join.h`) use it. An `exec::JoinBuild` builds a table for a
+join of its kind from a part pipeline (its parts on the pool through the part scheduler) or from any operator drained on
+the consumer thread, after the builds its own input probes (post-order); a one-row join's build must hold one row, whose
+values it then makes once as columns of up to `batch_size` rows (fewer for long VARCHAR values) that every probe slices.
+Every build also takes each chunk's array of each column once (`exec::JoinColumns`), and every gather of its rows reads
+those: asking a batch for a column locks the batch, so a gather over the chunks would lock every chunk on every call. An
+`exec::BuildsFirstOperator` prepares a probe pipeline's builds when it is first pulled, then opens the pipeline's sink,
+and releases them once the sink's parts are done (`exec::PartSink`'s callback). An `exec::HashJoinOperator` probes, by
+its build's kind: an inner join with a build of unique keys keeps the probe batch's columns and selects the matched
+rows, otherwise it takes a (probe row, match) pair per output row, and its residuals are evaluated in order, each on the
+rows the ones before it kept; a left join takes its pairs the same way, with NULLs for a row without a match (on its 1:1
+path it keeps the probe's selection), and evaluates its residuals on candidate pairs, as a semi or anti join does; a
+semi, anti or null-aware anti join passes on slices of the probe batch with the rows it keeps selected; a one-row join
+appends the slices of its build's values; a full join probes as a left join does and marks the build rows its pairs
+match, and the build rows no mark selects come out after the whole probe, padded on the left (ADR 0037's OJ2). The
+residuals of a semi, anti or left join are evaluated (`exec::EvaluateExpr`) on the candidate pairs (a probe row and a
+build row of its key), in batches of at most `batch_size` pairs with only the columns they read, in order, every pair
+evaluated: semi and anti evaluate a probe batch's pairs before its windows, a left join each batch of pairs before it
+emits the passing ones and, after a row's last candidate, the row padded when none passed. The one exception is a semi
+or anti join whose residuals read no build column but its keys: a row's candidates would all give them the same values,
+so the row meets its first candidate only (ADR 0022's E2c).
 
 The physical planner plans every join so. It walks a part pipeline with one helper (`PipelineInput`: through `Filter`,
 `Compute`, `Project` and a join's probe input) to find its scan, the predicates its statistics and its scan use (only a
@@ -366,7 +366,7 @@ the builds, outermost first and each after the builds its input probes, then the
 | `GroupingSetsOperator` | `GroupingSets` over other input | as `PartGroupingSetsOperator` on one thread: a `GroupTable` per root set fed from the input, every other set merged from its root's groups (`GroupTable::MergeProjected`), the sets emitted in list order |
 | `SortOperator` | `Sort`, or `Limit` over `Sort` over other input | reads its whole input into a `SortBuffer`, sorts row references stably with `RowComparator` (DuckDB's order: NULLs last by default, NaN above every number, VARCHAR by bytes; each row carries an order-preserving 64-bit prefix of its first key, so most comparisons are integer compares) and emits the rows in batches, gathered column by column with typed builders from the arrays it took of each chunk as it arrived (asking a batch for a column locks the batch); with a limit it keeps only `limit + offset` rows while it reads (top-N) and emits the window ([ADR 0011](adr/0011-sorting-and-top-n.md)) |
 | `LimitOperator` | `Limit` | skips `offset` rows, passes on at most `limit` rows (narrowing selections, not copying) and then never pulls its input again |
-| `HashJoinOperator` | a `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys; an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a left join the same, with a row without a match padded with NULLs of the build's types, and the probe's selection kept on the 1:1 path; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; the residuals of a semi, anti or left join on the candidate pairs, every pair evaluated (a row's first candidate only, for a semi or anti join whose residuals read no build column but its keys: ADR 0022's E2c), a left join padding a row none of whose candidates passed after its last candidate; a one-row join, windows of the probe batch with its build's values sliced; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input; a FULL join (ADR 0037's OJ2) probes as a left join does and marks the build rows its pairs match, and the build rows no mark selects come out after the whole probe, their probe columns NULL: from the `RightJoin` sink over a part pipeline, or from the operator itself over a serial probe, which then prepares its own marks |
+| `HashJoinOperator` | a `Join`: its probe, in the part pipeline of the input it does not build on, or over that input | for every probe batch, `JoinTable::Find` of its selected rows' keys (`FindEvery` for a nested loop, an inner, left or full join without keys, ADR 0040: every build row is a candidate of every selected row, and its residuals decide, on the paths below); an inner join with a build of unique keys, windows of `batch_size` rows of the probe batch (slices, not copies) selected where they matched, the build's columns gathered by match and NULL elsewhere (`exec::GatherRows`); otherwise a batch of up to `batch_size` (probe row, match) pairs, the probe's columns taken and the build's gathered; then the residuals in order, each on the rows the ones before kept (NULL is false); rows in probe order, each one's matches in the build's (part, row) order; a left join the same, with a row without a match padded with NULLs of the build's types, and the probe's selection kept on the 1:1 path; a semi, anti or null-aware anti join, windows of `batch_size` rows of the probe batch selected where it keeps a row, without a lookup when it keeps every row or none; the residuals of a semi, anti or left join on the candidate pairs, every pair evaluated (a row's first candidate only, for a semi or anti join whose residuals read no build column but its keys: ADR 0022's E2c), a left join padding a row none of whose candidates passed after its last candidate; a one-row join, windows of the probe batch with its build's values sliced; over a serial input it prepares its own `JoinBuild` at its first `Next`; when its build empties the join it never opens its input; a FULL join (ADR 0037's OJ2) probes as a left join does and marks the build rows its pairs match, and the build rows no mark selects come out after the whole probe, their probe columns NULL: from the `RightJoin` sink over a part pipeline, or from the operator itself over a serial probe, which then prepares its own marks |
 | `PartRightJoinOperator` | a `Join` that emits its build rows (`plan::EmitsBuildRows`): a semi or anti join building on its left input, or a FULL join | the sink of the join's own probe pipeline: its parts run on the executor and their probes mark the build rows they match; a semi or anti join's parts hand on no row, a FULL join's their pairs and padded rows, handed on in part order; once every part is in, the build rows the marks select (or do not, plus the NULL-key rows), in `JoinTable::rows()` order, in batches of `batch_size`, behind a FULL join's NULL probe columns (`BuildRowEmitter`); the same rows in the same order on any number of threads ([ADR 0026](adr/0026-join-performance.md), ADR 0037's OJ2) |
 | `BuildsFirstOperator` | the sink of a part pipeline whose probes read builds | prepares the pipeline's builds (`exec::JoinBuild`: the `JoinTable` of a build input's parts, or of a drained operator's batches) at its first `Next`, outermost first and stopping after one that empties its join, then opens the sink and returns its batches; releases the builds once the sink's parts are done, or at `Close` |
 | `RowCountOperator` | `RowCount` | one BIGINT row from the table's exact row count |

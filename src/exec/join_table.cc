@@ -338,15 +338,19 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
 }
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
-    std::shared_ptr<arrow::Schema> schema) {
+    std::shared_ptr<arrow::Schema> schema, std::vector<bool> retain) {
   if (schema == nullptr) {
     return arrow::Status::Invalid("a join build without a schema");
+  }
+  if (!retain.empty() && std::cmp_not_equal(retain.size(), schema->num_fields())) {
+    return arrow::Status::Invalid("a join build retaining ", retain.size(), " of ",
+                                  schema->num_fields(), " columns");
   }
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(std::move(schema), {},
                                                                   /*direct_candidate=*/false,
                                                                   /*keep_null_keys=*/false,
-                                                                  /*retain=*/{}));
+                                                                  std::move(retain)));
   });
 }
 
@@ -496,6 +500,9 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
   ARROW_ASSIGN_OR_RAISE(const RowMask mask,
                         RowMask::Make(key_arrays, batch.selection.get(), length, pool));
   const int64_t kept = mask.CountRows();
+  if (spec_->keys().empty()) {
+    return AppendKeyless(batch, mask, kept, pool);
+  }
   if (kept == 0) {
     // Every selected row has a NULL key. The counters move only after the last fallible call, so a
     // failed retention leaves the part unchanged.
@@ -593,6 +600,67 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
   hash_bytes_ += hash_bytes;
   input_rows_ += selected;
   null_key_rows_ += selected - kept;
+  num_rows_ += kept;
+  return arrow::Status::OK();
+}
+
+arrow::Status JoinBuildPart::AppendKeyless(const Batch& batch, const RowMask& mask, int64_t kept,
+                                           arrow::MemoryPool* pool) {
+  // Nothing hashes, partitions or probes a keyless build's rows (ADR 0040: a one-row join's, or a
+  // nested loop's, whose probe takes every row), so they all go to partition 0 in the order they
+  // came, with no hash: the table then lists them in (part, row) order without a directory.
+  const arrow::RecordBatch& data = *batch.data;
+  const int64_t length = data.num_rows();
+  Piece piece;
+  std::fill(piece.start.begin() + 1, piece.start.end(), Narrow<std::uint32_t>(kept));
+  const std::size_t capacity = pieces_.size() < pieces_.capacity()
+                                   ? pieces_.capacity()
+                                   : std::max<std::size_t>(4, 2 * pieces_.capacity());
+  ARROW_RETURN_NOT_OK(memory_.Resize(MemoryUsage(capacity, null_pieces_.capacity())));
+  pieces_.reserve(capacity);
+  // The selected rows, taken once; a batch of which every row is selected is kept as it is, its
+  // arrays shared rather than copied.
+  std::shared_ptr<arrow::UInt32Array> index_array;
+  if (kept < length) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> index_buffer,
+                          arrow::AllocateBuffer(kept * int64_t{sizeof(std::uint32_t)}, pool));
+    const std::span<std::uint32_t> indices = index_buffer->mutable_span_as<std::uint32_t>();
+    std::size_t at = 0;
+    mask.ForEachRun([&](int64_t position, int64_t count) {
+      for (int64_t row = position; row < position + count; ++row) {
+        indices[at++] = Narrow<std::uint32_t>(row);
+      }
+    });
+    index_array = std::make_shared<arrow::UInt32Array>(kept, std::move(index_buffer));
+  }
+  arrow::compute::ExecContext kernels(pool);
+  arrow::FieldVector fields;
+  arrow::ArrayVector arrays;
+  fields.reserve(static_cast<std::size_t>(data.num_columns()));
+  arrays.reserve(static_cast<std::size_t>(data.num_columns()));
+  for (int c = 0; c < data.num_columns(); ++c) {
+    if (!spec_->retains(c)) {  // a NullArray stands in, as in a keyed build (AppendRows)
+      fields.push_back(data.schema()->field(c)->WithType(arrow::null()));
+      arrays.push_back(std::make_shared<arrow::NullArray>(kept));
+      continue;
+    }
+    fields.push_back(data.schema()->field(c));
+    if (index_array == nullptr) {
+      arrays.push_back(data.column(c));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum one,
+        arrow::compute::Take(data.column(c), index_array,
+                             arrow::compute::TakeOptions::NoBoundsCheck(), &kernels));
+    arrays.push_back(one.make_array());
+  }
+  piece.rows =
+      spec_->retains_all()
+          ? arrow::RecordBatch::Make(data.schema(), kept, std::move(arrays))
+          : arrow::RecordBatch::Make(arrow::schema(std::move(fields)), kept, std::move(arrays));
+  pieces_.push_back(std::move(piece));
+  input_rows_ += kept;
   num_rows_ += kept;
   return arrow::Status::OK();
 }
@@ -753,6 +821,20 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
     }
   }
   rows_.resize(num_rows);
+  if (keys.empty()) {
+    // A keyless build (AppendKeyless): every row in partition 0, in (part, row) order, as rows of
+    // one key that nothing looks up -- no directory.
+    std::size_t at = 0;
+    for (const std::vector<Segment>& partition : segments) {
+      for (const Segment& segment : partition) {
+        for (std::uint32_t row = segment.begin; row < segment.end; ++row) {
+          rows_[at++] = JoinRowRef{.chunk = segment.chunk, .row = row};
+        }
+      }
+    }
+    unique_ = num_rows <= 1;
+    return memory_.Resize(MemoryUsage());
+  }
   if (direct) {
     min_key_ = min_key;
     span_ = span;
@@ -1135,6 +1217,34 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
     }
   });
   return arrow::Status::OK();
+}
+
+arrow::Status JoinTable::FindEvery(int64_t length, const arrow::BooleanArray* selection,
+                                   arrow::MemoryPool* pool, std::span<JoinMatches> out) const {
+  if (!spec_->keys().empty()) {
+    return arrow::Status::Invalid("a probe of every row of a join build with keys");
+  }
+  if (length < 0 || (selection != nullptr && selection->length() != length)) {
+    return arrow::Status::Invalid("a join probe selection over ", length, " rows");
+  }
+  if (std::cmp_less(out.size(), length)) {
+    return arrow::Status::Invalid("room for the matches of ", out.size(), " of ", length,
+                                  " probe rows");
+  }
+  const std::span<JoinMatches> matches = out.first(static_cast<std::size_t>(length));
+  std::ranges::fill(matches, JoinMatches{});
+  if (length == 0 || rows_.empty()) {
+    return arrow::Status::OK();
+  }
+  const JoinMatches every{.begin = 0, .end = Narrow<std::uint32_t>(rows_.size())};
+  return NoBadAlloc("a join probe", [&] -> arrow::Status {
+    ARROW_ASSIGN_OR_RAISE(const RowMask mask, RowMask::Make(std::span<const arrow::Array* const>{},
+                                                            selection, length, pool));
+    mask.ForEachRun([&](int64_t position, int64_t count) {
+      std::fill_n(matches.begin() + position, count, every);
+    });
+    return arrow::Status::OK();
+  });
 }
 
 // ---- JoinTableBuilder ----

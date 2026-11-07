@@ -236,11 +236,12 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   }
   const std::string_view kind = plan::ToString(join.kind);
   const plan::JoinKindTraits traits = plan::Traits(join.kind);
-  if (traits.keyless) {
+  if (traits.one_row) {
     if (!join.keys.empty() || !join.residual.empty()) {
       return arrow::Status::Invalid("a ONE-ROW join with keys or residuals");
     }
-  } else if (join.keys.empty()) {
+  } else if (join.keys.empty() && !traits.nested_loop) {
+    // A nested loop may have no keys (ADR 0040); no other kind may.
     return arrow::Status::Invalid("a ", kind, " hash join without keys");
   }
   if (traits.null_aware && (join.keys.size() != 1 || !join.residual.empty())) {
@@ -295,8 +296,10 @@ arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanN
                              const AggregateFilter* above = nullptr);
 
 // The build of a join of shape `shape`, profiled into `slot` (nullptr: not profiled): keyless for
-// a one-row join. A build input that is a part pipeline is built from its parts, with the builds of
-// its own joins, which the build prepares first; any other input's operator is drained.
+// a one-row join, which keeps every column, and for a nested loop (ADR 0040), which keeps those
+// read above or by its residuals. A build input that is a part pipeline is built from its parts,
+// with the builds of its own joins, which the build prepares first; any other input's operator is
+// drained.
 arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& join,
                                                         const JoinShape& shape, ProfileNode* slot) {
   if (slot != nullptr) {
@@ -357,10 +360,14 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
   };
   const auto spec_of = [&](std::shared_ptr<arrow::Schema> schema) {
     std::vector<bool> retain = retain_of(*schema);
-    return plan::Traits(join.kind).keyless
-               ? JoinBuildSpec::Keyless(std::move(schema))
-               : JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys,
-                                     std::move(retain));
+    if (plan::Traits(join.kind).one_row) {
+      return JoinBuildSpec::Keyless(std::move(schema));
+    }
+    if (join.keys.empty()) {
+      return JoinBuildSpec::Keyless(std::move(schema), std::move(retain));
+    }
+    return JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys,
+                               std::move(retain));
   };
   if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
     ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));
@@ -795,7 +802,7 @@ std::optional<ProbeKey> ProbeKeyAt(const plan::ScanNode& scan, const PipelineBui
       // anything, and SEMI, ANTI and null-aware ANTI put their left input's columns and no others
       // there whatever side they build on (plan's `JoinIds`). **Unreachable as the code stands**,
       // and kept because what makes it so lives in two other files: a non-inner join building on
-      // its left satisfies `EmitsBuildRows` (but a keyless one, which `Make` refuses), so
+      // its left satisfies `EmitsBuildRows` (but a one-row one, which `Make` refuses), so
       // `IsRightJoin` above has already ended the walk, and `HashJoinOperator::Make` admits
       // build=left only where `may_build_left`. A descent to
       // the right therefore implies a kind whose output concatenates -- by proof, not by

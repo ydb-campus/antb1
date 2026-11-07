@@ -509,9 +509,12 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   EXPECT_EQ(PositionMismatch(Plan(Node(types))),
             "Join: key #2 = #5 has two types, BIGINT and INTEGER");
 
+  // An inner, left or full join may be a nested loop without keys (ADR 0040); no other kind may.
   JoinNode keyless = Join(JoinKind::kInner);
   keyless.keys.clear();
-  EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: INNER join without keys");
+  EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), std::nullopt);
+  keyless.kind = JoinKind::kSemi;
+  EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: SEMI join without keys");
   keyless.kind = JoinKind::kNullAwareAnti;
   EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: NULL-AWARE ANTI join without keys");
   EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kOneRow)))),

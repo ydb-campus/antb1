@@ -1118,10 +1118,12 @@ TEST_F(JoinTableTest, RetainedNullKeysAreChargedAndGivenBackOnFailure) {
   EXPECT_GT(failures, 0) << "no limit in the range failed: the test proves nothing";
 }
 
-// A keyless build (a one-row join's) holds every selected row as the rows of one key, NULL values
-// included, in (part, row) order: unique() only for a single row, and no NULL key. It has nothing
-// to probe: Find is Invalid. Keyless needs a schema, and Make still needs keys. The same on one
-// thread and on the pool.
+// A keyless build (a one-row join's, or a nested loop's: ADR 0040) holds every selected row as the
+// rows of one key, NULL values included, in (part, row) order: unique() only for a single row, and
+// no NULL key. It has nothing to probe: Find is Invalid, and FindEvery gives each selected probe
+// row every row and the others none, a build with keys being Invalid there. Keyless needs a
+// schema and a `retain` of its width or none, and Make still needs keys. The same on one thread
+// and on the pool.
 TEST_F(JoinTableTest, KeylessBuildsHoldEveryRowAsOneKey) {
   const auto pool = MakeThreadPool();
   for (arrow::internal::Executor* executor : Executors(pool.get())) {
@@ -1154,6 +1156,27 @@ TEST_F(JoinTableTest, KeylessBuildsHoldEveryRowAsOneKey) {
           std::vector<std::shared_ptr<arrow::Array>>{Int64s({5})}}) {
       EXPECT_TRUE((*table)->Find(keys, nullptr, arrow::default_memory_pool(), out).IsInvalid());
     }
+    // Every row, for each selected probe row; the entries past `length` are left alone.
+    const auto selection = Bools({true, false, std::nullopt, true});
+    for (const arrow::BooleanArray* selected :
+         std::array<const arrow::BooleanArray*, 2>{selection.get(), nullptr}) {
+      std::vector<JoinMatches> every(5, JoinMatches{.begin = 7, .end = 7});
+      ASSERT_TRUE((*table)->FindEvery(4, selected, arrow::default_memory_pool(), every).ok());
+      for (std::size_t row = 0; row < 4; ++row) {
+        const bool chosen = selected == nullptr || row == 0 || row == 3;
+        EXPECT_EQ(every[row].begin, 0U) << row;
+        EXPECT_EQ(every[row].end, chosen ? 3U : 0U) << row;
+      }
+      EXPECT_EQ(every[4].begin, 7U) << "past the probe rows";
+    }
+    EXPECT_TRUE(
+        (*table)->FindEvery(3, selection.get(), arrow::default_memory_pool(), out).IsInvalid())
+        << "a selection of another length";
+    EXPECT_TRUE((*table)->FindEvery(2, nullptr, arrow::default_memory_pool(), out).IsInvalid())
+        << "room for one row's matches";
+    auto keyed = BuildTable(data, executor);
+    ASSERT_TRUE(keyed.ok()) << keyed.status().ToString();
+    EXPECT_TRUE((*keyed)->FindEvery(1, nullptr, arrow::default_memory_pool(), out).IsInvalid());
     // One row.
     BuildData one({LogicalType::kBigInt});
     one.Add(0, {Int64s({std::nullopt, 9})}, Bools({false, true}));
@@ -1167,6 +1190,14 @@ TEST_F(JoinTableTest, KeylessBuildsHoldEveryRowAsOneKey) {
     EXPECT_TRUE((*single)->unique());
   }
   EXPECT_TRUE(JoinBuildSpec::Keyless(nullptr).status().IsInvalid());
+  const auto two =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("y", arrow::int64())});
+  EXPECT_TRUE(JoinBuildSpec::Keyless(two, {true}).status().IsInvalid());
+  auto pruned = JoinBuildSpec::Keyless(two, {false, true});
+  ASSERT_TRUE(pruned.ok()) << pruned.status().ToString();
+  EXPECT_FALSE((*pruned)->retains(0));
+  EXPECT_TRUE((*pruned)->retains(1));
+  EXPECT_FALSE((*pruned)->keep_null_keys());
   EXPECT_TRUE(JoinBuildSpec::Make(arrow::schema({arrow::field("x", arrow::int64())}), {})
                   .status()
                   .IsInvalid());

@@ -24,10 +24,14 @@ TEST(JoinKindTest, EachKindHasItsRow) {
            Row{.kind = JoinKind::kInner,
                .traits = {.outputs_right = true,
                           .drops_unmatched_left = true,
+                          .nested_loop = true,
                           .residuals = true,
                           .may_build_left = true}},
            Row{.kind = JoinKind::kLeft,
-               .traits = {.outputs_right = true, .pads_right = true, .residuals = true}},
+               .traits = {.outputs_right = true,
+                          .pads_right = true,
+                          .nested_loop = true,
+                          .residuals = true}},
            Row{.kind = JoinKind::kSemi,
                .traits = {.filters_left = true,
                           .drops_unmatched_left = true,
@@ -37,11 +41,12 @@ TEST(JoinKindTest, EachKindHasItsRow) {
                .traits = {.filters_left = true, .residuals = true, .may_build_left = true}},
            Row{.kind = JoinKind::kNullAwareAnti,
                .traits = {.filters_left = true, .null_aware = true}},
-           Row{.kind = JoinKind::kOneRow, .traits = {.outputs_right = true, .keyless = true}},
+           Row{.kind = JoinKind::kOneRow, .traits = {.outputs_right = true, .one_row = true}},
            Row{.kind = JoinKind::kFull,
                .traits = {.outputs_right = true,
                           .pads_right = true,
                           .pads_left = true,
+                          .nested_loop = true,
                           .residuals = true}},
        }) {
     SCOPED_TRACE(ToString(row.kind));
@@ -51,7 +56,8 @@ TEST(JoinKindTest, EachKindHasItsRow) {
     EXPECT_EQ(traits.pads_right, row.traits.pads_right);
     EXPECT_EQ(traits.pads_left, row.traits.pads_left);
     EXPECT_EQ(traits.drops_unmatched_left, row.traits.drops_unmatched_left);
-    EXPECT_EQ(traits.keyless, row.traits.keyless);
+    EXPECT_EQ(traits.one_row, row.traits.one_row);
+    EXPECT_EQ(traits.nested_loop, row.traits.nested_loop);
     EXPECT_EQ(traits.null_aware, row.traits.null_aware);
     EXPECT_EQ(traits.residuals, row.traits.residuals);
     EXPECT_EQ(traits.may_build_left, row.traits.may_build_left);
@@ -60,8 +66,9 @@ TEST(JoinKindTest, EachKindHasItsRow) {
 
 // The properties are about rows and columns, so some pairs exclude each other whatever a new kind
 // adds: a filter of the left input outputs no right column and pads nothing; a padded row carries
-// both inputs' columns; a keyless join has a single right row and nothing to refine; NOT IN is a
-// filter; a join that drops its unmatched left rows does not pad them.
+// both inputs' columns; a one-row join has a single right row and nothing to refine; a nested loop
+// (ADR 0040) outputs both inputs and has residuals to decide its matches, all it has without keys;
+// NOT IN is a filter; a join that drops its unmatched left rows does not pad them.
 TEST(JoinKindTest, EveryRowIsConsistent) {
   for (const JoinKind kind : kKinds) {
     SCOPED_TRACE(ToString(kind));
@@ -74,9 +81,15 @@ TEST(JoinKindTest, EveryRowIsConsistent) {
     if (traits.pads_left || traits.pads_right) {
       EXPECT_TRUE(traits.outputs_right);
     }
-    if (traits.keyless) {
+    if (traits.one_row) {
+      EXPECT_FALSE(traits.nested_loop);
       EXPECT_FALSE(traits.residuals);
       EXPECT_FALSE(traits.may_build_left);
+      EXPECT_FALSE(traits.null_aware);
+    }
+    if (traits.nested_loop) {
+      EXPECT_TRUE(traits.outputs_right);
+      EXPECT_TRUE(traits.residuals);
       EXPECT_FALSE(traits.null_aware);
     }
     if (traits.null_aware) {
@@ -90,7 +103,7 @@ TEST(JoinKindTest, EveryRowIsConsistent) {
 }
 
 // The rules derived from the table give what the code gave before it (ADR 0037's OJ1 changed no
-// behavior): a left build emits its rows for every kind but inner (a keyless join never builds on
+// behavior): a left build emits its rows for every kind but inner (a one-row join never builds on
 // its left), the unmatched ones for left, anti and null-aware anti; no right build emits its rows;
 // an empty build empties inner and semi joins; a probe drops its unmatched rows -- the gate of ADR
 // 0029's dynamic filters -- for inner and semi joins built on the right, and for every keyed kind

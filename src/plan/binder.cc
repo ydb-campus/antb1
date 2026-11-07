@@ -5623,7 +5623,7 @@ LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joi
     // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
     // outlive the statement.
     std::vector<JoinKey> keys;
-    if (!join.dependent && !Traits(join.kind).keyless) {
+    if (!join.dependent && !Traits(join.kind).one_row) {
       keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
     }
     if (join.dependent) {

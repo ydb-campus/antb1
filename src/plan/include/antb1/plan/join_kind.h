@@ -8,7 +8,8 @@
 namespace antb1::plan {
 
 // The kinds of joins (ADR 0022). A match is a pair of a left and a right row with equal keys whose
-// residual is true; a NULL key never matches.
+// residual is true; a NULL key never matches. A join without keys (`nested_loop`, ADR 0040) pairs
+// every left row with every right row, and its residuals alone decide the matches.
 enum class JoinKind : std::uint8_t {
   kInner,          // every match
   kLeft,           // every match, and each left row without one, padded with NULLs
@@ -46,8 +47,11 @@ struct JoinKindTraits {
   bool pads_left = false;
   // A left row without a match never comes out.
   bool drops_unmatched_left = false;
-  // The join has no keys, and its right input exactly one row; otherwise it has at least one key.
-  bool keyless = false;
+  // The join has no keys and no residuals, and its right input exactly one row.
+  bool one_row = false;
+  // The join may have no keys (ADR 0040): a nested loop, in which every right row is a candidate
+  // of every left row. Without `one_row` or this, a join has at least one key.
+  bool nested_loop = false;
   // SQL's NOT IN: exactly one key, and a NULL key on either side decides the answer.
   bool null_aware = false;
   // Residual conditions over both inputs may refine its matches.
@@ -63,10 +67,11 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
     case JoinKind::kInner:
       return {.outputs_right = true,
               .drops_unmatched_left = true,
+              .nested_loop = true,
               .residuals = true,
               .may_build_left = true};
     case JoinKind::kLeft:
-      return {.outputs_right = true, .pads_right = true, .residuals = true};
+      return {.outputs_right = true, .pads_right = true, .nested_loop = true, .residuals = true};
     case JoinKind::kSemi:
       return {.filters_left = true,
               .drops_unmatched_left = true,
@@ -77,9 +82,13 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
     case JoinKind::kNullAwareAnti:
       return {.filters_left = true, .null_aware = true};
     case JoinKind::kOneRow:
-      return {.outputs_right = true, .keyless = true};
+      return {.outputs_right = true, .one_row = true};
     case JoinKind::kFull:
-      return {.outputs_right = true, .pads_right = true, .pads_left = true, .residuals = true};
+      return {.outputs_right = true,
+              .pads_right = true,
+              .pads_left = true,
+              .nested_loop = true,
+              .residuals = true};
   }
   return {};
 }
@@ -89,7 +98,7 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
 // as a plain product of its inputs filtered by its keys and residuals.
 constexpr bool OutputsMatchesOnly(JoinKind kind) {
   const JoinKindTraits traits = Traits(kind);
-  return traits.outputs_right && !traits.pads_left && !traits.pads_right && !traits.keyless;
+  return traits.outputs_right && !traits.pads_left && !traits.pads_right && !traits.one_row;
 }
 
 // The rows of a join of `kind` whose matches are estimated at `matches`, over inputs of `left` and
@@ -164,11 +173,12 @@ constexpr bool EmptyBuildEmptiesJoin(JoinKind kind) {
 // condition for filtering the probe side by the build's keys before the join (ADR 0029's dynamic
 // filters, D1, D2 and D5): a left probe (a right build) whose kind drops its unmatched rows, or a
 // right probe (a left build) whose unmatched rows are not padded, since a right row comes out of
-// every kind only as part of a match or not at all. A null-aware or keyless join never takes such a
-// filter: its keys do not decide alone.
+// every kind only as part of a match or not at all. A null-aware or one-row join never takes such a
+// filter: its keys do not decide alone. (A nested loop without keys has none to filter by either,
+// which the filters' own rules check: they need a key.)
 constexpr bool ProbeDropsUnmatchedRows(JoinKind kind, BuildSide build) {
   const JoinKindTraits traits = Traits(kind);
-  if (traits.null_aware || traits.keyless) {
+  if (traits.null_aware || traits.one_row) {
     return false;
   }
   return build == BuildSide::kRight ? traits.drops_unmatched_left : !traits.pads_left;
