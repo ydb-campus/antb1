@@ -46,7 +46,7 @@ table must match it (`pixi run lint` compares them).
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
 | `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema's first eight tables, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
-| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random`, `parallel.diff.star`, `parallel.diff.tpch`, `parallel.diff.tpcds`), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
+| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random.1of2` and `.2of2`, `parallel.diff.star`, `parallel.diff.tpch`, `parallel.diff.tpcds`; the two halves of `diff.random`'s queries are interleaved slices of the same 300, `antb1-slt diff --shard K/N`, so that neither nears the timeout under ASan), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
 | `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the pending check of the `.slt` files, the data derived from TPC-H against DuckDB's answers |
@@ -215,7 +215,7 @@ only on `s`, `i`, the tables and the supported features, so a single case reprod
 - `pixi run diff-random` runs 2000 queries with a random seed, printed first. `ANTB1_DIFF_SEED` and
   `ANTB1_DIFF_COUNT` set the seed and the count. Extra arguments go to `antb1-slt diff`: `--list` prints the queries
   without running them, `--table NAME` restricts the tables, `--target-percent P` sets the share of queries that
-  sample the full target grammar.
+  sample the full target grammar, and `--shard K/N` runs only the queries whose index is K - 1 modulo N.
 - Most queries use only the features declared in `tests/slt/supported_features.h`; for them an antb1 `Unsupported`
   answer is a failure. The rest sample the whole target grammar of [sql-subset.md](sql-subset.md#grammar):
   there an `Unsupported` answer is counted per missing feature and reported, not a failure.

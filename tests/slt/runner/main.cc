@@ -4,7 +4,8 @@
 //                 FILE...
 //   antb1-slt complete --fixtures DIR --tables FILE FILE...
 //   antb1-slt pending --fixtures DIR --tables FILE [--redact] [--mutate KIND] FILE...
-//   antb1-slt diff --fixtures DIR --tables FILE --seed S --count N [--only I] [--table NAME]...
+//   antb1-slt diff --fixtures DIR --tables FILE --seed S --count N [--only I] [--shard K/N]
+//                  [--table NAME]...
 //                  [--redact] [--mutate KIND] [--target-percent P]
 //   antb1-slt queries --fixtures DIR --tables FILE [--redact] [--only LINE] [--mutate KIND] FILE
 //   antb1-slt clickbench --fixtures DIR --tables FILE --status FILE [--redact] [--only N]
@@ -116,7 +117,7 @@ struct Args {
   // DuckDB oracle's (DuckDbEngine::Make)
   std::string memory_limit;
   std::string oracle_memory_limit;
-  std::string shard;      // tpch, tpcds: "K/N", the K-th of N slices of the queries (RatchetShard)
+  std::string shard;      // tpch, tpcds, diff: "K/N", the K-th of N slices of the queries
   std::string shard_map;  // tpch, tpcds: the slices of --shard as a file (ParseShardMap), or empty
   std::string costs;      // tpch, tpcds: the costs file (RatchetCosts), or empty
 };
@@ -497,12 +498,22 @@ int Diff(const Args& args, std::vector<TableDef> tables, const std::string& comm
   for (const auto& name : args.only_tables) {
     pixi_args += " --table " + name;
   }
-  const DiffOptions options{.count = args.count,
-                            .only = args.only,
-                            .redact = args.redact,
-                            .pixi_repro = IsDiffRandomTables(args.tables),
-                            .pixi_args = pixi_args,
-                            .command = command};
+  DiffOptions options{.count = args.count,
+                      .only = args.only,
+                      .redact = args.redact,
+                      .pixi_repro = IsDiffRandomTables(args.tables),
+                      .pixi_args = pixi_args,
+                      .command = command};
+  if (!args.shard.empty()) {
+    const std::optional<RatchetShard> shard = ParseRatchetShard(args.shard);
+    if (!shard.has_value()) {
+      std::println(stderr, "antb1-slt: --shard expects K/N with 1 <= K <= N <= 99, got '{}'",
+                   args.shard);
+      return kExitUsage;
+    }
+    options.shard_index = static_cast<uint64_t>(shard->index);
+    options.shard_count = static_cast<uint64_t>(shard->count);
+  }
   std::string out;
   const DiffStats stats =
       RunDiff(*generator, mutating ? *mutating : **antb1, **oracle, options, out, oracle_retries);
@@ -871,6 +882,9 @@ int Main(std::span<char*> argv, const Environment& env) {
   diff->add_option("--seed", args.seed, "Seed of the query generator")->required();
   diff->add_option("--count", args.count, "Number of queries (indexes 0..count-1)")->required();
   diff->add_option("--only", args.only, "Run only the query with this index (repro)");
+  diff->add_option("--shard", args.shard,
+                   "Run only slice K of N (K/N): the queries at index K - 1, K - 1 + N, ... of "
+                   "0..count-1 (--only runs its query whatever the slice)");
   diff->add_option("--table", args.only_tables, "Generate queries over this table only")
       ->type_name("NAME");
   diff->add_option("--target-percent", args.target_percent,
