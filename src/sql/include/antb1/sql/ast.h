@@ -355,6 +355,7 @@ enum class Connector : std::uint8_t {
   kCross,  // CROSS JOIN
   kInner,  // [INNER] JOIN ... ON
   kLeft,   // LEFT [OUTER] JOIN ... ON
+  kFull,   // FULL [OUTER] JOIN ... ON (ADR 0037's OJ3)
 };
 
 // A query in parentheses as a FROM item: FROM (SELECT ...) [AS] s [(x, ...)].

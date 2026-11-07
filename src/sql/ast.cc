@@ -617,6 +617,8 @@ std::string_view ToString(Connector connector) {
       return "INNER JOIN";
     case Connector::kLeft:
       return "LEFT JOIN";
+    case Connector::kFull:
+      return "FULL JOIN";
   }
   return "?";
 }

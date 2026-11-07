@@ -56,6 +56,10 @@
 // item at most per query, from a fourth random stream, so a query that joins inner is the query
 // this seed gave before the feature.
 //
+// With kFullJoin such a promotion now and then writes a FULL [OUTER] JOIN instead (ADR 0037's
+// OJ3), bounded by FullJoinRowBound, from a random stream of its own, so a query that stays LEFT
+// is the query this seed gave before the feature.
+//
 // The refs also carry uncorrelated subqueries (ADR 0022's T2b): a query with a usable probe now and
 // then takes one more top-level AND conjunct of WHERE -- `x [NOT] IN (q)`, `NOT (x IN (q))`, or
 // `x <op> (q)` and its mirror -- where q is `(SELECT col | MIN(col) | MAX(col) | COUNT(*) FROM t)`
@@ -114,6 +118,14 @@ int64_t JoinRowBound(const GenKeyStats& a, const GenKeyStats& b);
 // knows. The bound holds for any FROM order, since the inner joins above a LEFT JOIN multiply and
 // filter its rows uniformly, but not for a promotion anywhere else in the walk.
 int64_t LeftJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity);
+
+// A true upper bound of the rows of a FULL JOIN (ADR 0037's OJ3): LeftJoinRowBound's, plus
+// `right_rows` for the right input's rows that no left row matches, each padded once, saturating.
+// The generator promotes the same item as for a LEFT JOIN, whose keys all reach back into its own
+// join group, so an item outside the join meets it through the left input's columns only, and the
+// rows that pad those come out NULL there and match nothing: what is left is the LEFT JOIN's rows.
+int64_t FullJoinRowBound(int64_t matched, int64_t left_rows, int64_t right_multiplicity,
+                         int64_t right_rows);
 
 // A ref= option of the tables file (runner/tables.h) to a table of the same LoadGenTables call.
 struct GenRef {

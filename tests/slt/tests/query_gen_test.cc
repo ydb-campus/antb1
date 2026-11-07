@@ -106,7 +106,7 @@ FeatureSet Union(FeatureSet a, FeatureSet b) {
 
 bool Joins(const GeneratedQuery& q) {
   return q.features.Has(Feature::kCommaJoin) || q.features.Has(Feature::kJoinOn) ||
-         q.features.Has(Feature::kLeftJoin);
+         q.features.Has(Feature::kLeftJoin) || q.features.Has(Feature::kFullJoin);
 }
 
 // Whether a query used the tables' refs at all: it joins along one, or holds a subquery, whose
@@ -787,7 +787,9 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
 // bound also decides whether SELECT * needs a LIMIT, but its bound never shrinks: a LEFT JOIN
 // yields max(1, its matches) rows per left row, so at least the rows the inner join yields.
 TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
-  const FeatureSet with_left = Union(kSupportedFeatures, {Feature::kLeftJoin});
+  // Without kFullJoin, whose draws turn some of the promoted queries into FULL JOIN ones.
+  const FeatureSet with_left =
+      Union(kSupportedFeatures.Minus({Feature::kFullJoin}), {Feature::kLeftJoin});
   // target_percent 0: every query draws from `supported`, not from the whole grammar.
   const auto with = MakeOver(JoinTables(), 43, {.supported = with_left, .target_percent = 0});
   const auto without = MakeOver(
@@ -814,6 +816,40 @@ TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
   EXPECT_GT(promoted, 20) << "promoted: " << promoted;
   EXPECT_GT(same, 1000);
   EXPECT_GT(wider, 10) << "bounds that the padding widens: " << wider;
+}
+
+// Every draw a FULL JOIN needs comes from a stream of its own (full_rng_), so allowing kFullJoin
+// changes the queries whose LEFT JOIN becomes a FULL JOIN and no others (ADR 0037's OJ3). Such a
+// query may differ beyond its connector, as a LEFT JOIN query does, since its bound is wider: it
+// is the LEFT JOIN's bound plus the right input's rows.
+TEST(QueryGenerator, FullJoinsChangeOnlyTheirQueries) {
+  const FeatureSet with_full = Union(kSupportedFeatures, {Feature::kFullJoin});
+  const auto with = MakeOver(JoinTables(), 43, {.supported = with_full, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 43, {.supported = with_full.Minus({Feature::kFullJoin}), .target_percent = 0});
+  int full = 0;
+  int same = 0;
+  int wider = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kFullJoin)) << plain.sql;
+    if (q.features.Has(Feature::kFullJoin)) {
+      ++full;
+      EXPECT_FALSE(q.features.Has(Feature::kLeftJoin)) << q.sql;
+      EXPECT_TRUE(plain.features.Has(Feature::kLeftJoin)) << "a FULL JOIN replaces a LEFT JOIN\n"
+                                                          << plain.sql;
+      EXPECT_GE(q.row_bound, plain.row_bound) << q.sql;
+      wider += q.row_bound > plain.row_bound ? 1 : 0;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(full, 10) << "FULL JOINs: " << full;
+  EXPECT_GT(same, 1000);
+  EXPECT_GT(wider, 5) << "bounds that the right input's padding widens: " << wider;
 }
 
 // What a nested query's text holds: the block names the table and projects its columns under their
@@ -1026,6 +1062,9 @@ struct JoinCoverage {
   int left_extra_on = 0;       // its ON holds a conjunct beyond the keys
   int left_sibling_group = 0;  // a comma sibling before its join group (its ON may not read one)
   int left_cross_group = 0;    // a CROSS JOIN inside its left input
+  int full = 0;                // of the LEFT JOIN items, FULL JOIN ones (ADR 0037's OJ3)
+  int full_outer = 0;          // spelled FULL OUTER JOIN
+  int full_three_item = 0;     // a FULL JOIN in a FROM list of three items
 };
 
 // Checks a generated join over JoinTables() against the algorithm, on its AST: 2 or 3 inner FROM
@@ -1054,7 +1093,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   std::vector<Item> items;
   bool comma = false;
   bool join_on = false;
-  bool left = false;
+  bool left = false;  // a LEFT JOIN, or a FULL JOIN, which the walk promotes alike
+  bool full = false;
   std::size_t left_item = std::string::npos;  // the FROM position of the LEFT JOIN, if any
   for (const sql::FromItem& item : stmt.from) {
     ASSERT_NE(item.table(), nullptr) << "a derived table";
@@ -1072,15 +1112,22 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     comma = comma || item.connector == sql::Connector::kComma ||
             item.connector == sql::Connector::kCross;
     join_on = join_on || item.connector == sql::Connector::kInner;
-    if (item.connector == sql::Connector::kLeft) {
-      EXPECT_FALSE(left) << "two LEFT JOINs: the walk promotes at most the item it added last";
+    if (item.connector == sql::Connector::kLeft || item.connector == sql::Connector::kFull) {
+      EXPECT_FALSE(left) << "two outer joins: the walk promotes at most the item it added last";
       left = true;
+      full = item.connector == sql::Connector::kFull;
       left_item = items.size();
-      ++cov.left;
-      cov.left_three_item += stmt.from.size() == 3 ? 1 : 0;
       const std::string connector = plan::AsciiLower(
           std::string_view(q.sql).substr(item.connector_span.offset, item.connector_span.length));
-      cov.left_outer += connector.contains("outer") ? 1 : 0;
+      if (full) {
+        ++cov.full;
+        cov.full_three_item += stmt.from.size() == 3 ? 1 : 0;
+        cov.full_outer += connector.contains("outer") ? 1 : 0;
+      } else {
+        ++cov.left;
+        cov.left_three_item += stmt.from.size() == 3 ? 1 : 0;
+        cov.left_outer += connector.contains("outer") ? 1 : 0;
+      }
     }
     cov.comma += item.connector == sql::Connector::kComma ? 1 : 0;
     cov.cross += item.connector == sql::Connector::kCross ? 1 : 0;
@@ -1110,7 +1157,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   const bool any_path = std::ranges::any_of(items, [](const Item& i) { return i.path; });
   if (count_of("facts") > 1) {
     ++cov.facts_twice;
-    EXPECT_EQ(q.row_bound, 0) << "facts twice, not through the empty codes";
+    // A FULL JOIN pads each row of its right input once, though the inner join yields none.
+    EXPECT_EQ(q.row_bound, full ? items[left_item].table->rows : 0)
+        << "facts twice, not through the empty codes";
   }
   // The item a column reference names, or npos (a select alias, or a broken reference).
   constexpr std::size_t kNone = std::string::npos;
@@ -1258,6 +1307,7 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   bool first_two = false;
   std::vector<int64_t> bounds;
   std::vector<int64_t> left_bounds;
+  std::vector<int64_t> full_bounds;
   for (std::size_t n = 0; n < refs.size(); ++n) {
     for (std::size_t ci = 0; ci < items.size(); ++ci) {
       for (std::size_t pi = 0; pi < items.size(); ++pi) {
@@ -1287,6 +1337,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             const GenKeyStats& right = pi == 1 ? ref->ref_stats : ref->stats;
             left_bounds.push_back(
                 LeftJoinRowBound(matched, items[0].table->rows, right.max_multiplicity));
+            full_bounds.push_back(FullJoinRowBound(matched, items[0].table->rows,
+                                                   right.max_multiplicity, items[1].table->rows));
           }
         }
       }
@@ -1299,8 +1351,13 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   cov.unconnected_start += first_two ? 0 : 1;
   EXPECT_LE(q.row_bound, 10'000);
   if (items.size() == 2) {
-    const std::vector<int64_t>& expected = left ? left_bounds : bounds;
-    EXPECT_TRUE(std::ranges::contains(expected, q.row_bound)) << "bound " << q.row_bound;
+    const std::vector<int64_t>* expected = &bounds;
+    if (full) {
+      expected = &full_bounds;
+    } else if (left) {
+      expected = &left_bounds;
+    }
+    EXPECT_TRUE(std::ranges::contains(*expected, q.row_bound)) << "bound " << q.row_bound;
   }
   // Comparisons of two columns never mix what DuckDB compares otherwise: no DOUBLE key, no
   // common DECIMAL type beyond 38 digits (D13: f_wide against d_fine, d_amount, f_amount or
@@ -1367,7 +1424,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   const bool subquery = HasSubquery(q);
   EXPECT_EQ(q.features.Has(Feature::kTableName),
             subquery || std::ranges::any_of(items, [](const Item& i) { return !i.path; }));
-  EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left);
+  EXPECT_EQ(q.features.Has(Feature::kLeftJoin), left && !full);
+  EXPECT_EQ(q.features.Has(Feature::kFullJoin), full);
   EXPECT_TRUE(!condition || q.features.Has(Feature::kWhere)) << "a condition beyond the keys";
   EXPECT_TRUE(std::ranges::any_of(items, [&](const Item& i) { return i.table->name == q.table; }));
 }
@@ -1410,6 +1468,9 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
   EXPECT_GT(cov.left_extra_on, 0) << "a LEFT JOIN's ON beyond its keys";
   EXPECT_GT(cov.left_sibling_group, 0) << "a comma sibling before a LEFT JOIN's group";
   EXPECT_GT(cov.left_cross_group, 0) << "a CROSS JOIN inside a LEFT JOIN's left input";
+  EXPECT_GT(cov.full, 0) << "a FULL JOIN";
+  EXPECT_GT(cov.full_outer, 0) << "spelled FULL OUTER JOIN";
+  EXPECT_GT(cov.full_three_item, 0) << "a FULL JOIN among three FROM items";
 }
 
 // Join features declared one by one: a join uses only the declared ones, so the walk takes no
@@ -2755,6 +2816,7 @@ TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
   int exact = 0;
   int pads = 0;        // trials whose left join has more rows than its inner join
   int asymmetric = 0;  // trials whose two orientations have different bounds
+  int full_exact = 0;  // trials whose FULL JOIN bound is its rows
   for (int trial = 0; trial < 2000; ++trial) {
     const uint64_t domain = 1 + (next() % 8);
     std::array<std::vector<std::optional<uint64_t>>, 2> sides;
@@ -2791,6 +2853,15 @@ TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
     const int64_t bound =
         LeftJoinRowBound(matched, std::ssize(sides[0]), stats[1].max_multiplicity);
     EXPECT_GE(bound, rows) << trial;
+    // `sides[0] FULL JOIN sides[1]` adds a padded row per right row that no left row matches.
+    int64_t full_rows = rows;
+    for (const auto& key : sides[1]) {
+      full_rows += key.has_value() && counts[0][*key] > 0 ? 0 : 1;
+    }
+    const int64_t full_bound = FullJoinRowBound(matched, std::ssize(sides[0]),
+                                                stats[1].max_multiplicity, std::ssize(sides[1]));
+    EXPECT_GE(full_bound, full_rows) << trial;
+    full_exact += full_bound == full_rows ? 1 : 0;
     EXPECT_GE(bound, inner) << trial << ": a left join has at least its inner join's rows";
     exact += bound == rows ? 1 : 0;
     pads += rows > inner ? 1 : 0;
@@ -2800,6 +2871,7 @@ TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
   EXPECT_GT(exact, 200);
   EXPECT_GT(pads, 1000) << "the trials would not exercise the padding";
   EXPECT_GT(asymmetric, 1000) << "the left input must decide the bound";
+  EXPECT_GT(full_exact, 50) << "a FULL JOIN bound is often exact too";
   // The padding alone, with no matching row at all: every left row still yields one.
   EXPECT_EQ(LeftJoinRowBound(0, 3000, 0), 3000) << "an empty right side pads every left row";
   EXPECT_EQ(LeftJoinRowBound(35, 40, 75), 75) << "40 left rows, each meeting at most 75";
@@ -2807,6 +2879,8 @@ TEST(LeftJoinRowBound, BoundsThePaddedRowsOfSmallKeyMultisets) {
   constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
   EXPECT_EQ(LeftJoinRowBound(kMax, kMax, kMax), kMax);
   EXPECT_EQ(LeftJoinRowBound(0, kMax, 0), kMax) << "the sum saturates too";
+  EXPECT_EQ(FullJoinRowBound(0, 3000, 0, 40), 3040) << "an empty match pads both sides' rows";
+  EXPECT_EQ(FullJoinRowBound(kMax, kMax, kMax, kMax), kMax);
 }
 
 // Arrays with NULLs for the Parquet files of the key statistics test.

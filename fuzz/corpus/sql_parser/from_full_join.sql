@@ -1,0 +1,1 @@
+SELECT a.x, b.y FROM a FULL OUTER JOIN b ON a.k = b.k AND b.y > 1 FULL JOIN c ON b.k = c.k LEFT JOIN d ON c.k = d.k WHERE a.x IS NULL

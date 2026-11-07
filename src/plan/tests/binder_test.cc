@@ -809,6 +809,17 @@ INSTANTIATE_TEST_SUITE_P(
         // an ON too ("Non-inner join on correlated columns not supported").
         ErrorCase{"SELECT u.i16 FROM t, u LEFT JOIN ok ON ok.i16 = u.i16 AND t.i32 > 1",
                   kUnsupported, "t.i32", "a LEFT JOIN's ON must read its own two inputs only"},
+        // A FULL JOIN (ADR 0037's OJ3) goes by the same rules, named after it.
+        ErrorCase{"SELECT t.i16 FROM t FULL OUTER JOIN u ON t.d = u.d", kUnsupported,
+                  "FULL OUTER JOIN",
+                  "a FULL JOIN without a join key between its two inputs is not supported"},
+        ErrorCase{"SELECT u.i16 FROM t, u FULL JOIN ok ON ok.i16 = u.i16 AND t.i32 > 1",
+                  kUnsupported, "t.i32", "a FULL JOIN's ON must read its own two inputs only"},
+        // A WHERE equality over a FULL JOIN's left input stays above the join, which pads that
+        // input, so it is no key there, where a LEFT JOIN's left input takes it as one.
+        ErrorCase{"SELECT t.i16 FROM t CROSS JOIN u FULL JOIN ok ON t.i16 = ok.i16 "
+                  "WHERE t.i32 = u.i32",
+                  kUnsupported, "u", "a cross product is not supported"},
         // The missing tables are still missing, and that bind error comes first, as in DuckDB.
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kBind, "nope",
                   "table 'nope' does not exist"},
@@ -3990,6 +4001,59 @@ TEST(BinderTest, ALeftJoinUnitIsEstimatedLikeAnyRelation) {
     EXPECT_EQ(unit->kind, JoinKind::kLeft) << sql;
     ASSERT_TRUE(unit->estimate.has_value()) << sql << ": the unit's estimate";
     EXPECT_GE(unit->estimate.value_or(0), 7) << sql << ": never below its left input";
+  }
+}
+
+// A FULL JOIN (ADR 0037's OJ3) is an outer join unit of kind FULL, built on its right input. It
+// pads both inputs, so where a LEFT JOIN lets a WHERE conjunct over its left input into that input,
+// and an ON conjunct over its right input filter that input, a FULL JOIN keeps the first above
+// itself and the second as a residual: either input's rows come out whether or not they pass.
+TEST(BinderTest, AFullJoinKeepsOneSidedConditionsAtTheJoin) {
+  const Catalog catalog = MakeCatalog();
+  const auto explain = [&](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  const auto filter_above_join = [](const std::string& text, std::string_view join) {
+    const std::size_t filter = text.find("Filter");
+    return filter != std::string::npos && filter < text.find(join);
+  };
+  const std::string full =
+      explain("SELECT t.i16, ok.i16 FROM t FULL OUTER JOIN ok ON t.i16 = ok.i16 WHERE t.i32 > 1");
+  EXPECT_TRUE(full.contains("Join FULL build=right keys=[")) << full;
+  EXPECT_TRUE(filter_above_join(full, "Join FULL")) << full;
+  const std::string left =
+      explain("SELECT t.i16, ok.i16 FROM t LEFT JOIN ok ON t.i16 = ok.i16 WHERE t.i32 > 1");
+  EXPECT_FALSE(filter_above_join(left, "Join LEFT")) << left;
+  const std::string right_where =
+      explain("SELECT t.i16, ok.i16 FROM t FULL JOIN ok ON t.i16 = ok.i16 WHERE ok.i16 > 1");
+  EXPECT_TRUE(filter_above_join(right_where, "Join FULL")) << right_where;
+  const std::string on = explain(
+      "SELECT t.i16, ok.i16 FROM t FULL JOIN ok ON t.i16 = ok.i16 AND ok.i16 > 1 AND t.i32 < 9");
+  EXPECT_TRUE(on.contains("residual=[")) << on;
+  EXPECT_FALSE(filter_above_join(on, "Join FULL")) << on;
+  const std::string left_on =
+      explain("SELECT t.i16, ok.i16 FROM t LEFT JOIN ok ON t.i16 = ok.i16 AND ok.i16 > 1");
+  EXPECT_FALSE(left_on.contains("residual=[")) << "rule 11 filters a LEFT JOIN's right input\n"
+                                               << left_on;
+  // The ON of an inner join before the unit is a condition of a join inside its left input, though
+  // the unit pads that input; one after it, over the unit's left input alone, filters above it.
+  const std::string inside = explain(
+      "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 > 1 FULL JOIN ok ON u.i16 = ok.i16");
+  EXPECT_GT(inside.find("Join INNER"), inside.find("Join FULL")) << inside;
+  EXPECT_FALSE(filter_above_join(inside, "Join FULL")) << inside;
+  const std::string after = explain(
+      "SELECT t.i16 FROM t FULL JOIN ok ON t.i16 = ok.i16 JOIN u ON u.i16 = ok.i16 AND t.i32 > 1");
+  EXPECT_TRUE(filter_above_join(after, "Join FULL")) << after;
+  // In a chain, a derived table and a CTE.
+  for (const std::string_view sql : {
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 FULL JOIN ok ON u.i16 = ok.i16",
+           "SELECT t.i16 FROM t FULL JOIN ok ON t.i16 = ok.i16 LEFT JOIN u ON u.i16 = ok.i16",
+           "SELECT x FROM (SELECT t.i16 AS x FROM t FULL JOIN ok ON t.i16 = ok.i16) AS d",
+           "WITH c AS (SELECT ok.i16 AS x FROM t FULL JOIN ok ON t.i16 = ok.i16) SELECT x FROM c",
+       }) {
+    EXPECT_TRUE(explain(sql).contains("Join FULL build=right")) << sql;
   }
 }
 

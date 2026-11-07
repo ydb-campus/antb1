@@ -2806,7 +2806,7 @@ enum class Clause : std::uint8_t {
   kSelect,   // the select list, an aggregate's argument included
   kWhere,    // a WHERE conjunct
   kInnerOn,  // an inner join's ON, which is a WHERE conjunct once bound
-  kLeftOn,   // a LEFT JOIN's ON, which stays with its join
+  kLeftOn,   // an outer (LEFT or FULL) join's ON, which stays with its join
   kGroupBy,  // GROUP BY
   kHaving,   // HAVING
   kOrderBy,  // ORDER BY
@@ -2875,7 +2875,7 @@ class Binder {
     static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
-    // OnVisibility and Scope::Find share; BuildBlocks adds one relation per LEFT JOIN unit after
+    // OnVisibility and Scope::Find share; BuildBlocks adds one relation per outer join unit after
     // them, and gathers the relations of each block.
     blocks_.push_back(JoinBlock{});
     for (std::size_t r = 0; r < relations_.size(); ++r) {
@@ -3482,12 +3482,12 @@ class Binder {
   arrow::Status ClassifyConjunct(const sql::Expr& conjunct, SourceSpan element,
                                  const std::vector<std::size_t>& bindings);
   // The block a conjunct over `bindings` is classified in: this one, or, while they all sit in the
-  // left input of a single LEFT JOIN unit of it, that input (ADR 0022's "One relation" rule, whose
+  // left input of a single outer join unit of it, that input (ADR 0022's "One relation" rule, whose
   // conjunct moves on into the unit's left input and may become a key there). A conjunct that
   // reads the null-supplying side stops at the unit, so it filters its rows, padded ones included.
   [[nodiscard]] std::size_t DescendTo(std::size_t block,
                                       const std::vector<std::size_t>& bindings) const;
-  // The blocks and LEFT JOIN units of the FROM list, before anything is classified.
+  // The blocks and outer join units of the FROM list, before anything is classified.
   void BuildBlocks();
   std::size_t NewBlock(std::vector<std::size_t> relations);
   // The ON of the LEFT JOIN at FROM position `item`, classified into unit `u`.
@@ -3501,7 +3501,7 @@ class Binder {
   arrow::Status BindAcrossRelations(const sql::Expr& conjunct,
                                     const std::vector<std::size_t>& relations);
   // The relation of block `block` that holds binding `binding`, by its index in that block: the
-  // binding itself, or the LEFT JOIN unit it is an input of. std::nullopt when the block holds it
+  // binding itself, or the outer join unit it is an input of. std::nullopt when the block holds it
   // nowhere, which only an enclosing block's conjunct can ask.
   [[nodiscard]] std::optional<std::size_t> LocalOf(std::size_t block, std::size_t binding) const;
   // Whether relation `r` holds binding `binding`: it is that binding's relation, or a LEFT JOIN
@@ -3554,7 +3554,7 @@ class Binder {
   // The relations of block `block` joined in the order OrderRelations chose (a tree of them).
   LogicalNodePtr JoinTree(std::size_t block);
   LogicalNodePtr CoreTree(std::size_t block);
-  // The join of LEFT JOIN unit `u`'s two inputs, built on its right input.
+  // The join of outer join unit `u`'s two inputs, built on its right input.
   LogicalNodePtr UnitNode(std::size_t u);
   // The qualifier of the column `id` belongs to (BoundColumn::qualifier, which EXPLAIN shows), or
   // none for a computed column, which belongs to no binding.
@@ -3723,10 +3723,13 @@ class Binder {
   Visibility visible_;  // the clause being bound (the default: every binding, in one level)
   // Which clause is binding, for ADR 0023's rule that an outer reference is answered only in a
   // WHERE conjunct of its own block. `visible_` cannot say it: BindWhere gives an inner join's ON
-  // and a LEFT JOIN's ON the same visibility, and ADR 0023 answers an outer reference in the first
-  // but not the second. Set at each clause's entry; the clauses bind in sequence (Binder::Bind) and
-  // a subquery's block gets its own Binder, so it needs no saving and restoring.
+  // and an outer join's ON the same visibility, and ADR 0023 answers an outer reference in the
+  // first but not the second. Set at each clause's entry; the clauses bind in sequence
+  // (Binder::Bind) and a subquery's block gets its own Binder, so it needs no saving and restoring.
   Clause clause_ = Clause::kSelect;
+  // While an inner join's ON binds, its FROM position: an ON before an outer join unit in FROM
+  // order is a condition of a join inside that unit's left input (DescendTo).
+  std::optional<std::size_t> on_position_;
   // Whether `outer` is the scope of the query block that directly encloses this one, which only a
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
@@ -3761,7 +3764,7 @@ class Binder {
     std::vector<ExprPtr> join_key_exprs;  // a join key's cast, computed above the filters
     std::vector<ColumnId> join_key_ids;   // per key expression: its column
     SourceSpan filter_span;               // the clause elements its conjuncts came from
-    // The LEFT JOIN unit this relation is (into units_), or none for a binding's relation, whose
+    // The outer join unit this relation is (into units_), or none for a binding's relation, whose
     // layers stand on its own Scan. A unit's layers stand on its join, so they never reach a Scan
     // and never pad: a conjunct routed here filters the unit's rows, padded ones included.
     std::optional<std::size_t> unit;
@@ -3801,14 +3804,16 @@ class Binder {
     std::size_t root = 0;
     std::vector<std::size_t> one_row;
   };
-  // A LEFT JOIN unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
+  // An outer join unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
   // reordered and always built on its right input, whose two inputs are inner blocks of their own.
   struct Unit {
     // Its kind, whose traits (join_kind.h) decide where a WHERE or an ON conjunct over one input
-    // may go and the unit's row floor: LEFT for a LEFT JOIN, the only connector that makes a unit.
+    // may go and the unit's row estimate: LEFT for a LEFT JOIN, FULL for a FULL JOIN (ADR 0037's
+    // OJ3), the two connectors that make a unit.
     JoinKind kind = JoinKind::kLeft;
-    std::size_t left = 0;           // into blocks_: its left input, the preserved side
-    std::size_t right = 0;          // into blocks_: its right input, the null-supplying side
+    std::size_t position = 0;  // its FROM position: its connector's item, the right input
+    std::size_t left = 0;      // into blocks_: its left input, preserved (padded too for FULL)
+    std::size_t right = 0;     // into blocks_: its right input, null-supplying (preserved for FULL)
     std::vector<JoinKey> keys;      // its ON's equalities between the two inputs (at least one)
     std::vector<ExprPtr> residual;  // every other ON conjunct, a left-only one included
     SourceSpan span;                // its LEFT JOIN connector
@@ -5029,11 +5034,12 @@ bool Binder::BlockHolds(std::size_t block, std::size_t binding) const {
                              [&](std::size_t r) { return HoldsBinding(r, binding); });
 }
 
-// The blocks and LEFT JOIN units of the FROM list (ADR 0022, "Inner blocks"). The items a comma
+// The blocks and outer join units of the FROM list (ADR 0022, "Inner blocks"). The items a comma
 // separates start groups; within a group CROSS JOIN and INNER JOIN add relations, and a LEFT JOIN
-// makes the group so far its left input and its own item its right input, taking their place as one
-// relation of the group. The statement's own block holds every group's relations. Only the shape is
-// built here: an ON's keys and residual are classified in BindWhere, in FROM order.
+// or a FULL JOIN makes the group so far its left input and its own item its right input, taking
+// their place as one relation of the group. The statement's own block holds every group's
+// relations. Only the shape is built here: an ON's keys and residual are classified in BindWhere,
+// in FROM order.
 void Binder::BuildBlocks() {
   unit_at_.assign(stmt_.from.size(), kNoUnit);
   std::vector<std::size_t> top;    // the relations of the statement's own block
@@ -5043,17 +5049,20 @@ void Binder::BuildBlocks() {
       top.insert(top.end(), group.begin(), group.end());
       group.clear();
     }
-    if (stmt_.from[i].connector != sql::Connector::kLeft) {
+    const sql::Connector connector = stmt_.from[i].connector;
+    if (connector != sql::Connector::kLeft && connector != sql::Connector::kFull) {
       group.push_back(i);
       continue;
     }
     ANTB1_CHECK(!group.empty());  // the parser gives the first FROM item kFirst
     const std::size_t left = NewBlock(group);
     const std::size_t right = NewBlock({i});
-    units_.push_back(Unit{.kind = JoinKind::kLeft,
-                          .left = left,
-                          .right = right,
-                          .span = stmt_.from[i].connector_span});
+    units_.push_back(
+        Unit{.kind = connector == sql::Connector::kFull ? JoinKind::kFull : JoinKind::kLeft,
+             .position = i,
+             .left = left,
+             .right = right,
+             .span = stmt_.from[i].connector_span});
     unit_at_[i] = units_.size() - 1;
     relations_.push_back(Relation{.unit = units_.size() - 1});
     group.assign({relations_.size() - 1});
@@ -5083,13 +5092,16 @@ std::size_t Binder::DescendTo(std::size_t block, const std::vector<std::size_t>&
     }
     // A conjunct over one input of the unit moves into it where the join never pads that input's
     // columns with NULLs, which a WHERE above would test: a LEFT JOIN's left input. One that reads
-    // a padded input, or both, stays above the unit.
+    // a padded input, or both, stays above the unit. The ON of an inner join before the unit in
+    // FROM order is a condition of a join inside its left input, below the unit, so it goes there
+    // whatever the unit pads (a FULL JOIN's left input included).
     const Unit& at = units_[*unit];
     const JoinKindTraits traits = Traits(at.kind);
     const auto inside = [&](std::size_t input) {
       return std::ranges::all_of(bindings, [&](std::size_t b) { return BlockHolds(input, b); });
     };
-    if (!traits.pads_left && inside(at.left)) {
+    const bool on_inside_left = on_position_.has_value() && *on_position_ < at.position;
+    if ((on_inside_left || !traits.pads_left) && inside(at.left)) {
       block = at.left;
     } else if (!traits.pads_right && inside(at.right)) {
       block = at.right;
@@ -5162,9 +5174,9 @@ arrow::Status Binder::ClassifyConjunct(const sql::Expr& conjunct, SourceSpan ele
   return arrow::Status::OK();
 }
 
-// The ON of a LEFT JOIN (ADR 0022's LEFT JOIN rules), conjunct by conjunct and never factored: a
-// hoisted conjunct would have to stay inside the ON anyway, and rule 11 must never push one that
-// reads the preserved side below the join.
+// The ON of a LEFT or FULL JOIN (ADR 0022's LEFT JOIN rules), conjunct by conjunct and never
+// factored: a hoisted conjunct would have to stay inside the ON anyway, and rule 11 must never push
+// one that reads the preserved side below the join.
 arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
   clause_ = Clause::kLeftOn;
   for (const sql::Expr& element : item.on) {
@@ -5177,12 +5189,15 @@ arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
   if (units_[u].keys.empty()) {
     // As a disconnected inner graph is rejected: E1's table and E2's candidate pairs need a key.
     return UnsupportedError(
-        "a LEFT JOIN without a join key between its two inputs is not supported", units_[u].span);
+        std::format("a {} JOIN without a join key between its two inputs is not "
+                    "supported",
+                    ToString(units_[u].kind)),
+        units_[u].span);
   }
   return arrow::Status::OK();
 }
 
-// One ON conjunct of a LEFT JOIN unit: an equality between its two inputs whose sides share an
+// One ON conjunct of an outer join unit: an equality between its two inputs whose sides share an
 // exact key type is a key of the unit; one that reads only its right input is pushed into that
 // input (rule 11); every other conjunct is a residual of the join, one that reads only the left
 // input included, since a left row that fails it is padded and not dropped. A conjunct that reads a
@@ -5207,10 +5222,10 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
     } else if (BlockHolds(right, binding)) {
       reads_right = true;
     } else {
-      return UnsupportedError(
-          "a LEFT JOIN's ON must read its own two inputs only, and this reads a FROM item before "
-          "them",
-          ref->span);
+      return UnsupportedError(std::format("a {} JOIN's ON must read its own two inputs only, and "
+                                          "this reads a FROM item before them",
+                                          ToString(units_[u].kind)),
+                              ref->span);
     }
   }
   if (reads_right && !reads_left && !Traits(units_[u].kind).pads_left) {
@@ -5364,7 +5379,7 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
       const EdgeKey b = side(1);
       JoinBlock& block = blocks_[block_];
       // One equality spelled in both an ON and WHERE is one key, not two of the same join. The
-      // containers are the block's own, so an equality that a LEFT JOIN unit already keys on is a
+      // containers are the block's own, so an equality that an outer join unit already keys on is a
       // conjunct of its own block again: it filters the unit's rows, padded ones included.
       const auto same = [&](const std::pair<EdgeKey, EdgeKey>& keys) {
         return (keys.first.column.id == a.column.id && keys.second.column.id == b.column.id) ||
@@ -5666,15 +5681,17 @@ arrow::Status Binder::BindWhere() {
   // siblings before it, and never a later item. Once bound its conjuncts are WHERE conjuncts.
   for (std::size_t i = 0; i < stmt_.from.size(); ++i) {
     const sql::Connector connector = stmt_.from[i].connector;
-    if (connector != sql::Connector::kInner && connector != sql::Connector::kLeft) {
+    if (connector != sql::Connector::kInner && connector != sql::Connector::kLeft &&
+        connector != sql::Connector::kFull) {
       continue;
     }
     visible_ = OnVisibility(stmt_.from, i);
     clause_ = Clause::kInnerOn;
-    if (connector == sql::Connector::kLeft) {
-      // A LEFT JOIN's ON stays with its join and goes by its own rules, so it is classified into
+    on_position_ = i;
+    if (connector == sql::Connector::kLeft || connector == sql::Connector::kFull) {
+      // An outer join's ON stays with its join and goes by its own rules, so it is classified into
       // the unit rather than flattened into this block's conjuncts.
-      ANTB1_CHECK(unit_at_[i] != kNoUnit);  // BuildBlocks makes one unit per LEFT JOIN
+      ANTB1_CHECK(unit_at_[i] != kNoUnit);  // BuildBlocks makes one unit per outer join
       ARROW_RETURN_NOT_OK(BindUnitOn(unit_at_[i], stmt_.from[i]));
       continue;
     }
@@ -5683,6 +5700,7 @@ arrow::Status Binder::BindWhere() {
       ARROW_RETURN_NOT_OK(BindElement(element, on_siblings));
     }
   }
+  on_position_.reset();
   visible_ = {};  // WHERE sees every binding, in one level
   clause_ = Clause::kWhere;
   const std::vector<const sql::Expr*> where_siblings = Conjuncts(stmt_.where);
@@ -5881,14 +5899,14 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
 }
 
 // The rows of relation `r`, estimated: a binding's own, after the conjuncts routed to it
-// (FilteredRelationRows), and for a LEFT JOIN unit its inputs joined as an inner join, but never
+// (FilteredRelationRows), and for an outer join unit its inputs joined as an inner join, but never
 // below its left input's rows, since every left row yields one (ADR 0022's join-order rule 3).
 std::optional<int64_t> Binder::RelationEstimate(std::size_t r) const {
   const std::optional<std::size_t> unit = relations_[r].unit;
   return unit.has_value() ? UnitEstimate(*unit) : FilteredRelationRows(r);
 }
 
-// The rows a LEFT JOIN unit outputs, estimated: like an inner join of its inputs, by join-order
+// The rows an outer join unit outputs, estimated: like an inner join of its inputs, by join-order
 // rule 3 over the unit's own keys, but never below its left input's rows, since every left row
 // yields one, matched or padded.
 std::optional<int64_t> Binder::UnitEstimate(std::size_t u) const {
@@ -5958,7 +5976,7 @@ std::optional<int64_t> Binder::BlockEstimate(std::size_t b) const {
 }
 
 // The first binding, in FROM order, that relation `r` holds: itself, or the first of the leftmost
-// input of a LEFT JOIN unit. Used for the messages and spans that name a FROM item.
+// input of an outer join unit. Used for the messages and spans that name a FROM item.
 std::size_t Binder::FirstBindingOf(std::size_t r) const {
   const std::optional<std::size_t> unit = relations_[r].unit;
   return unit.has_value() ? FirstBindingOf(blocks_[units_[*unit].left].relations.front()) : r;
@@ -6440,7 +6458,7 @@ arrow::Result<LogicalPlan> Binder::Bind() {
 
 LogicalNodePtr Binder::RelationNode(std::size_t r) {
   Relation& relation = relations_[r];
-  // A binding's own Scan (a fresh one per call), or the join of a LEFT JOIN unit's two inputs,
+  // A binding's own Scan (a fresh one per call), or the join of an outer join unit's two inputs,
   // which is the one join of the plan that is never reordered and always builds on its right.
   LogicalNodePtr node =
       relation.unit.has_value() ? UnitNode(*relation.unit) : scope_.bindings()[r].Node();
@@ -6475,8 +6493,8 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
   return node;
 }
 
-// The join of a LEFT JOIN unit's two inputs: its ON's keys and residual, built on its right input,
-// which is what the executor requires of an outer join (ADR 0022, "Build sides").
+// The join of an outer join unit's two inputs: its ON's keys and residual, built on its right
+// input, which is what the executor requires of an outer join (ADR 0022, "Build sides").
 LogicalNodePtr Binder::UnitNode(std::size_t u) {
   Unit& unit = units_[u];
   return Make(JoinNode{.kind = unit.kind,
@@ -6620,9 +6638,9 @@ std::optional<std::size_t> Binder::PushableSemiJoin(const SubqueryJoin& join) co
   }
   const std::size_t relation = block.relations[locals.front()];
   if (relations_[relation].unit.has_value()) {
-    // A LEFT JOIN unit: its branch is a join of its own and its rows pad. Standing above that join
-    // would answer the same, since a padded row's NULL key matches nothing either way, but a unit
-    // is the one relation this pass has no measurement for, so it keeps its place.
+    // An outer join unit: its branch is a join of its own and its rows pad. Standing above that
+    // join would answer the same, since a padded row's NULL key matches nothing either way, but a
+    // unit is the one relation this pass has no measurement for, so it keeps its place.
     return std::nullopt;
   }
   if (block.steps.empty() || std::ranges::contains(block.one_row, locals.front())) {

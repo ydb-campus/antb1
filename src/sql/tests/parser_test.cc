@@ -420,6 +420,35 @@ TEST(ParserTest, FromListConnectorsAndSpans) {
   EXPECT_EQ(ToString(stmt->from[5].connector), "LEFT JOIN");
 }
 
+// FULL [OUTER] JOIN parses as LEFT [OUTER] JOIN does (ADR 0037's OJ3): its connector spans its
+// words, an ON is required, and it unparses as FULL JOIN. A FULL OUTER without JOIN, and a FULL
+// JOIN without its ON, are syntax errors as in DuckDB.
+TEST(ParserTest, FullJoinParsesAsALeftJoinDoes) {
+  constexpr std::string_view kSql =
+      "SELECT a FROM t FULL JOIN u ON t.a = u.a, v full outer join w ON v.b = w.b AND w.c = 1";
+  auto stmt = Parse(kSql);
+  ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+  ASSERT_EQ(stmt->from.size(), 4U);
+  EXPECT_EQ(stmt->from[1].connector, Connector::kFull);
+  EXPECT_EQ(At(kSql, stmt->from[1].connector_span), "FULL JOIN");
+  EXPECT_EQ(stmt->from[3].connector, Connector::kFull);
+  EXPECT_EQ(At(kSql, stmt->from[3].connector_span), "full outer join");
+  EXPECT_EQ(stmt->from[3].on.size(), 2U);
+  EXPECT_EQ(ToString(Connector::kFull), "FULL JOIN");
+  const std::string text = ToSql(*stmt);
+  EXPECT_TRUE(text.contains("FULL JOIN u ON")) << text;
+  auto again = Parse(text);
+  ASSERT_TRUE(again.has_value()) << again.error().message;
+  EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << text;
+  for (const std::string_view broken :
+       {"SELECT a FROM t FULL OUTER u ON t.a = u.a", "SELECT a FROM t FULL JOIN u"}) {
+    auto error = Parse(broken);
+    ASSERT_FALSE(error.has_value()) << broken;
+    EXPECT_EQ(error.error().kind, ParseError::Kind::kSyntax)
+        << broken << ": " << error.error().message;
+  }
+}
+
 // An alias after AS or without it; a quoted identifier, or after AS a non-empty string; the
 // reserved words BETWEEN, EXISTS, INTERVAL and OVER (as DuckDB); after a name or a path.
 TEST(ParserTest, FromItemAliases) {
@@ -2966,10 +2995,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "RIGHT JOIN is not supported"},
         RejectCase{"RightOuterJoin", "SELECT a FROM events ^right outer join users ON a = b",
                    kUnsupported, 5, "RIGHT JOIN is not supported"},
-        RejectCase{"FullJoin", "SELECT a FROM events ^FULL JOIN users ON a = b", kUnsupported, 4,
-                   "FULL JOIN is not supported"},
-        RejectCase{"FullOuterJoin", "SELECT a FROM events, items ^FULL OUTER JOIN users ON a = b",
-                   kUnsupported, 4, "FULL JOIN is not supported"},
         RejectCase{"NaturalJoin", "SELECT a FROM events ^NATURAL JOIN users", kUnsupported, 7,
                    "NATURAL JOIN is not supported"},
         RejectCase{"NaturalLeftJoin", "SELECT a FROM events ^NATURAL LEFT JOIN users", kUnsupported,
