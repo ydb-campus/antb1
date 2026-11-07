@@ -113,13 +113,15 @@ endforeach()
 # groups without ORDER BY, which the generated queries of a seed can contain. The queries also depend on the generator
 # and on the supported features, so a change to either is checked under ASan too. A failure in antb1 is fixed, never
 # avoided by another seed.
+# Each run is two interleaved halves of the 300 queries (--shard K/2), which together run every query: a whole run
+# took 120 to 270 seconds under ASan on CI's clang-asan leg, and timed out there at its 270-second inner timeout.
 set(_seed 20261002)
 foreach(kind IN ITEMS diff parallel)
   if(kind STREQUAL "diff")
-    set(_name diff.tpch)
+    set(_base diff.tpch)
     set(_options "")
   else()
-    set(_name parallel.diff.tpch)
+    set(_base parallel.diff.tpch)
     set(
       _options
       --threads
@@ -130,17 +132,22 @@ foreach(kind IN ITEMS diff parallel)
       1000
     )
   endif()
-  antb1_slt_args(
-    _args
-    ${_name}
-    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf0_01.txt"
-    --seed
-    ${_seed}
-    --count
-    300
-    ${_options}
-  )
-  _tpch_test(${_name} LABEL ${kind} REQUIRE "DIFF: PASS " COMMAND $<TARGET_FILE:antb1-slt> diff ${_args})
+  foreach(_half 1 2)
+    set(_name ${_base}.${_half}of2)
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf0_01.txt"
+      --seed
+      ${_seed}
+      --count
+      300
+      --shard
+      ${_half}/2
+      ${_options}
+    )
+    _tpch_test(${_name} LABEL ${kind} REQUIRE "DIFF: PASS " COMMAND $<TARGET_FILE:antb1-slt> diff ${_args})
+  endforeach()
 endforeach()
 
 # The ratchet (antb1-slt tpch, tests/slt/runner/ratchet.h): the 22 queries on antb1, and DuckDB for those antb1

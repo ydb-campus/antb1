@@ -45,8 +45,8 @@ table must match it (`pixi run lint` compares them).
 | `integration` | in use | cross-module gtest suites in `tests/integration/` (`integration.*`), including invalid Parquet inputs and hand-built hash-join plans over the star fixtures |
 | `slt` | in use | sqllogictest files run against antb1 (`slt.<area>.<file>`) |
 | `oracle` | in use | the same `.slt` files checked against DuckDB (`oracle.<area>.<file>`) |
-| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds`: seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema's first eight tables, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
-| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random.1of2` and `.2of2`, `parallel.diff.star`, `parallel.diff.tpch`, `parallel.diff.tpcds`; the two halves of `diff.random`'s queries are interleaved slices of the same 300, `antb1-slt diff --shard K/N`, so that neither nears the timeout under ASan), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
+| `diff` | in use | `diff.random`, `diff.decimal`, `diff.star`, `diff.tpch` and `diff.tpcds` (the last two in halves `.1of2` and `.2of2`): seeded random differential queries against DuckDB (fixed seeds, 300 queries each, 200 for `diff.tpcds`; `diff.random` over the tables it names, so a new table does not change its queries, `diff.decimal` over `decimals`, `diff.star` over the star schema's first eight tables, `diff.tpch` and `diff.tpcds` over the data derived from TPC-H and TPC-DS) |
+| `parallel` | in use | parallel execution on 4 engine threads ([ADR 0013](adr/0013-parallel-execution.md)): every `.slt` case file (`parallel.<area>.<file>`) and the random differential queries of `diff.random`, `diff.star`, `diff.tpch` and `diff.tpcds` (`parallel.diff.random.1of2` and `.2of2`, `parallel.diff.star`, `parallel.diff.tpch.1of2` and `.2of2`, `parallel.diff.tpcds.1of2` and `.2of2`; each pair of halves is interleaved slices of the same queries, `antb1-slt diff --shard K/N`, so that neither nears the timeout under ASan), in 1000-, 700- and 97-row batches; every result must also equal the 1-thread result byte for byte (`antb1-slt --same-as-threads 1`) |
 | `metamorphic` | in use | metamorphic relations on the generated fixtures (`metamorphic.*`) |
 | `cli` | in use | golden tests of the `antb1` command line (`cli.<case>`): output formats, errors, exit codes, EXPLAIN |
 | `harness` | in use | self-tests of the harness (`harness.*`): mutated engines, redaction canaries, fixture digest, runner unit tests, the pending check of the `.slt` files, the data derived from TPC-H against DuckDB's answers |
@@ -458,8 +458,9 @@ judge). Linux only, as for TPC-H. So far it holds:
   seconds and antb1's peak memory (`--costs`, [below](#the-ratchet-of-the-queries-derived-from-tpc-h)): the numbers
   of ADR 0037's scale factor 1 budget. `harness.tpcds.status.pass`, `.parse_error` and `.costs` run `antb1-slt tpcds`
   on our own numbered queries (`harness.tpch.status.*` covers the rest of the shared ratchet).
-- `diff.tpcds` (label `diff`) and `parallel.diff.tpcds` (label `parallel`: 4 threads, 1000-row batches, equal to the
-  1-thread results byte for byte): 200 generated queries over the tables at scale factor 0.01, joined along their
+- `diff.tpcds.1of2` and `.2of2` (label `diff`) and `parallel.diff.tpcds.1of2` and `.2of2` (label `parallel`: 4
+  threads, 1000-row batches, equal to the 1-thread results byte for byte): 200 generated queries, in two interleaved
+  halves (`--shard K/2`) as for TPC-H, over the tables at scale factor 0.01, joined along their
   foreign keys, antb1 against DuckDB (`antb1-slt diff`, a fixed seed; ADR 0037's HC7). The run must print that the
   generator can follow all 107 foreign keys, since it drops one it cannot follow without an error. Scale factor 0.01
   and 200 queries, where `diff.tpch` runs 300, keep both runs within the default timeout under AddressSanitizer on a
@@ -508,8 +509,8 @@ the test is withheld, so a broken redaction fails the test without publishing th
 | `tpch.status.sf0_01`, `tpch.status.sf0_1` | `oracle` | the ratchet: the 22 queries on antb1 against DuckDB and `tests/data/tpch_status.json` ([below](#the-ratchet-of-the-queries-derived-from-tpc-h)) |
 | `parallel.tpch.status.sf0_1` | `parallel` | the same on 4 threads with 1000-row batches, equal to the 1-thread results byte for byte |
 | `harness.tpch.answers.sf0_01`, `harness.tpch.answers.sf0_1` | `harness` | the 22 queries on the in-process DuckDB oracle against DuckDB's stored answers (`antb1-slt answers`): the oracle reads the generated files as dbgen meant them |
-| `diff.tpch` | `diff` | 300 generated queries over the tables at scale factor 0.01, antb1 against DuckDB (`antb1-slt diff`, fixed seed) |
-| `parallel.diff.tpch` | `parallel` | the same queries on 4 threads with 1000-row batches, equal to the 1-thread results byte for byte |
+| `diff.tpch.1of2`, `diff.tpch.2of2` | `diff` | 300 generated queries over the tables at scale factor 0.01, antb1 against DuckDB (`antb1-slt diff`, fixed seed), in two interleaved halves (`--shard K/2`) so that neither nears the timeout under ASan |
+| `parallel.diff.tpch.1of2`, `parallel.diff.tpch.2of2` | `parallel` | the same queries and halves on 4 threads with 1000-row batches, equal to the 1-thread results byte for byte |
 | `harness.tpch.answers.redact` | `harness` | `--mutate canary`: every query fails, and the report prints no sentinel, no query text and no sanitizer report |
 | `harness.tpch.drift` | `harness` | query texts that differ from the committed digests fail, and the report gives numbers and digests only |
 | `harness.tpch.generate.duckdb_fails.on_ci`, `.local` | `harness` | a failing duckdb CLI: only its exit code and error kind are printed; `ANTB1_TPCH_SHOW=1` shows its messages locally, never on GitHub Actions |
