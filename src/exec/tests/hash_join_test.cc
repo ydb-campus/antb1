@@ -2984,9 +2984,10 @@ TEST_F(HashJoinTest, ResidualsOverTheBuildKeysMeetOneCandidatePerRow) {
           auto batches = Batches(*join, ContextOf(executor, batch_size));
           ASSERT_TRUE(batches.ok()) << batches.status().ToString();
           EXPECT_EQ(RowsOf(join->output_schema(), *batches), expected);
-          if (kind != plan::JoinKind::kInner) {  // inner applies its residuals to its output
-            EXPECT_EQ(MetricOf(profile, "pairs"), one_pair ? 5 : 124);
-          }
+          // Inner applies its residuals to its output, every candidate pair of it (no alike
+          // candidates: those are a filter's).
+          EXPECT_EQ(MetricOf(profile, "pairs"),
+                    one_pair && kind != plan::JoinKind::kInner ? 5 : 124);
         }
       }
     }
@@ -5631,6 +5632,15 @@ Rows ReferenceFull(const Rows& probe, const Rows& build, const std::vector<int>&
   return out;
 }
 
+// The candidate pairs the residuals of the joins below `node` met, summed (`pairs`).
+int64_t PairsIn(const ProfileNode& node) {
+  int64_t found = MetricOf(node, "pairs").value_or(0);
+  for (const ProfileNode* child : node.children()) {
+    found += PairsIn(*child);
+  }
+  return found;
+}
+
 // A join without keys is a nested loop (ADR 0040): every build row is a candidate of every probe
 // row, and the residuals alone decide which pairs match. Inner (building on either input), left
 // and full joins over builds of no row, one row and fifteen, with no condition (a cross product),
@@ -5731,9 +5741,14 @@ TEST_F(HashJoinPlanTest, NestedLoopsMatchTheReference) {
             SCOPED_TRACE(std::format("{} over {} build rows, {} conditions, batch size {}{}",
                                      c.label, build_rows.size(), conditions, batch_size,
                                      executor == nullptr ? "" : ", four threads"));
-            auto result = RunPlan(plan, ContextOf(executor, batch_size));
+            ProfileNode profile;
+            auto result = RunPlan(plan, ContextOf(executor, batch_size), &profile);
             ASSERT_TRUE(result.ok()) << result.status().ToString();
             EXPECT_EQ(sorted(RowsOf(**result)), expected);
+            if (conditions != 0 && c.label.starts_with("inner")) {
+              // The residuals meet every pair: each probe row with each build row.
+              EXPECT_EQ(PairsIn(profile), std::ssize(probe_rows) * std::ssize(build_rows));
+            }
           }
         }
       }

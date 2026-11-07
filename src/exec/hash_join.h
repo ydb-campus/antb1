@@ -326,10 +326,10 @@ class BuildRowEmitter {
 // ExecContext::pool. Profile: the metrics find (whenever it looks keys up), gather (the rows'
 // columns: the build columns an inner or left join gathers, the probe rows it takes on a path
 // other than 1:1, and the columns of candidate pairs that residuals read; the slices of a one-row
-// join's values), residual, pairs (a semi, anti or left join with residuals: the candidate pairs
-// they met, which alike candidates bring down to a pair per row) and, on the 1:1 path of an inner
-// or left join, window_rows (the rows of the windows its build columns were gathered for, against
-// the rows it emits).
+// join's values), residual, pairs (a join with residuals: the candidate pairs
+// they met, an inner join's on its 1:1 and pairs paths alike, which alike candidates bring down to
+// a pair per row) and, on the 1:1 path of an inner or left join, window_rows (the rows of the
+// windows its build columns were gathered for, against the rows it emits).
 class HashJoinOperator final : public Operator {
  public:
   // The kind is the build's. Invalid without a probe or a build; for a kind other than inner, semi

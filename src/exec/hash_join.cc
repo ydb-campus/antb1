@@ -1633,9 +1633,6 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPairs() {
   });
   row_ = row;
   taken_ = taken;
-  if (!residual_.empty() && profile() != nullptr) {  // the candidate pairs the residuals meet
-    profile()->Add("pairs", MetricUnit::kCount, count);
-  }
   arrow::ArrayVector probe;
   {
     const ProfileTimer gather(profile(), "gather");
@@ -1694,6 +1691,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::ApplyResiduals(Batch out) 
   }
   const ProfileTimer residual(profile(), "residual");
   ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::RecordBatch> rows, Materialize(out, ctx_.pool));
+  if (profile() != nullptr) {  // the candidate pairs the residuals meet, on every inner path
+    profile()->Add("pairs", MetricUnit::kCount, rows->num_rows());
+  }
   arrow::compute::ExecContext kernels(ctx_.pool);
   for (const plan::ExprPtr& expr : residual_) {
     // Only the rows the residuals before passed: a later one never fails on a dropped row.
