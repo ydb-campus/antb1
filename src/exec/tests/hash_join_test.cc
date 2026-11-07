@@ -348,7 +348,9 @@ std::shared_ptr<const JoinBuildSpec> SpecOf(plan::JoinKind kind,
   for (const int key : keys) {
     columns.push_back(Column(key, schema->field(key)->name(), LogicalType::kBigInt));
   }
-  return SpecOf(schema, std::move(columns));
+  // A FULL join's build keeps its NULL-key rows, which it emits padded (a right build is the only
+  // one that may need to: EmitsUnmatchedBuildRows).
+  return SpecOf(schema, std::move(columns), plan::EmitsUnmatchedBuildRows(kind, BuildSide::kRight));
 }
 
 // The build of a join of `kind` of `table`'s parts on these keys (BIGINT columns of the table).
@@ -1477,7 +1479,8 @@ TEST_F(HashJoinTest, ARightJoinSinkRejectsNextBeforeOpen) {
         return arrow::Status::Invalid("no part should be built");
       },
       /*num_parts=*/1, schema,
-      DrainedBuild(plan::JoinKind::kSemi, SourceOf(schema, {Int64s({1}), Int64s({2})}), {0}));
+      DrainedBuild(plan::JoinKind::kSemi, SourceOf(schema, {Int64s({1}), Int64s({2})}), {0}),
+      BuildSide::kLeft);
   EXPECT_TRUE(sink.output_schema()->Equals(*schema));
   EXPECT_TRUE(sink.Next().status().IsInvalid());
   EXPECT_TRUE(sink.Close().ok());
@@ -5455,7 +5458,7 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
   const auto build_schema = Int64Schema({"bk", "bid"});
   for (const plan::JoinKind kind :
        {plan::JoinKind::kInner, plan::JoinKind::kLeft, plan::JoinKind::kSemi, plan::JoinKind::kAnti,
-        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow}) {
+        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kFull}) {
     const plan::JoinKindTraits traits = plan::Traits(kind);
     for (const uint64_t seed : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
       for (const bool empty_build : {false, true}) {
@@ -5508,8 +5511,18 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
         const arrow::Table& table = **result;
         EXPECT_EQ(table.num_columns(), traits.outputs_right ? 4 : 2) << "outputs_right";
         const Rows rows = RowsOf(table);
-        std::vector<int> times(pids.size(), 0);  // how often each probe row comes out
+        std::vector<int> times(pids.size(), 0);        // how often each probe row comes out
+        std::vector<int> build_times(bids.size(), 0);  // and each build row, where it does
         for (const std::vector<std::string>& row : rows) {
+          if (traits.outputs_right && row.at(3) != "null") {
+            const auto bid = static_cast<std::size_t>(std::stoll(row.at(3)) - 100);
+            ASSERT_LT(bid, bids.size());
+            ++build_times[bid];
+          }
+          if (row.at(1) == "null") {
+            EXPECT_TRUE(traits.pads_left) << "pads_left: a row without the probe's columns";
+            continue;
+          }
           const auto pid = static_cast<std::size_t>(std::stoll(row.at(1)));
           ASSERT_LT(pid, pids.size());
           ++times[pid];
@@ -5525,10 +5538,221 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
             EXPECT_GE(times[pid], 1) << "every probe row comes out: " << pid;
           }
         }
+        for (std::size_t bid = 0; bid < bids.size(); ++bid) {
+          if (traits.pads_left) {
+            EXPECT_GE(build_times[bid], 1) << "pads_left: every build row comes out: " << bid;
+          }
+        }
         if (empty_build && plan::EmptyBuildEmptiesJoin(kind)) {
           EXPECT_EQ(rows.size(), 0U) << "EmptyBuildEmptiesJoin";
         }
       }
+    }
+  }
+}
+
+// The FULL join of `probe` and `build` (ADR 0037's OJ2): the left join's rows, then each build row
+// that no probe row matched -- a NULL key never matches, so its row is one of them -- with
+// `probe_width` NULL cells first. Order is the operator's to choose; callers compare sorted rows.
+Rows ReferenceFull(const Rows& probe, const Rows& build, const std::vector<int>& probe_keys,
+                   const std::vector<int>& build_keys, std::size_t probe_width,
+                   std::size_t build_width, const Residual& residual = {}) {
+  Rows out = ReferenceOf(plan::JoinKind::kLeft, probe, build, probe_keys, build_keys, build_width,
+                         residual);
+  for (const std::vector<std::string>& b : build) {
+    const bool matched = std::ranges::any_of(probe, [&](const std::vector<std::string>& p) {
+      return KeysMatch(p, b, probe_keys, build_keys) && (!residual || residual(p, b) == true);
+    });
+    if (!matched) {
+      std::vector<std::string> row(probe_width, "null");
+      row.insert(row.end(), b.begin(), b.end());
+      out.push_back(std::move(row));
+    }
+  }
+  return out;
+}
+
+Rows Sorted(Rows rows) {
+  std::ranges::sort(rows);
+  return rows;
+}
+
+// A FULL join on a serial probe that prepares its own build makes its own marks and emits the
+// build rows no probe row matched once its input ends: the reference's rows, over unique build
+// keys (the 1:1 window path) and repeated ones, NULL keys on both sides, with and without a
+// residual, over an empty build and an empty probe, at one row a batch and seven. Its output's
+// fields are all nullable: either side's unmatched rows are padded.
+TEST_F(HashJoinTest, AFullJoinEmitsItsUnmatchedBuildRowsAfterItsProbe) {
+  const auto probe_schema = arrow::schema(
+      {arrow::field("k", arrow::int64(), false), arrow::field("pid", arrow::int64(), false)});
+  const auto build_schema = arrow::schema(
+      {arrow::field("bk", arrow::int64(), true), arrow::field("bid", arrow::int64(), false)});
+  const std::optional<int64_t> null;
+  struct Case {
+    std::string_view name;
+    std::vector<std::optional<int64_t>> probe_keys;
+    std::vector<std::optional<int64_t>> build_keys;
+  };
+  const std::vector<Case> cases = {
+      {.name = "unique", .probe_keys = {1, 2, 3, 3, 9}, .build_keys = {3, 1, 4, 7}},
+      {.name = "repeated", .probe_keys = {1, 2, 3, 3, 9}, .build_keys = {3, 1, 3, 4, 1}},
+      {.name = "NULL keys", .probe_keys = {1, 5, 3, 3, 9}, .build_keys = {null, 3, null, 5, 8}},
+      {.name = "empty build", .probe_keys = {1, 2, 3}, .build_keys = {}},
+      {.name = "empty probe", .probe_keys = {}, .build_keys = {2, null, 2}},
+  };
+  // bid < 102 (the build's second column, the join's fourth)
+  const plan::ExprPtr residual =
+      Condition(plan::CompareOp::kLt, 102, ColumnAt(3, LogicalType::kBigInt));
+  const Residual holds = [](const std::vector<std::string>&, const std::vector<std::string>& b) {
+    return std::optional<bool>(std::stoll(b[1]) < 102);
+  };
+  for (const Case& c : cases) {
+    for (const bool with_residual : {false, true}) {
+      for (const int64_t batch_size : {1, 7}) {
+        SCOPED_TRACE(
+            std::format("{}{} batch {}", c.name, with_residual ? " residual" : "", batch_size));
+        std::vector<std::optional<int64_t>> pids;
+        pids.reserve(c.probe_keys.size());
+        for (std::size_t i = 0; i < c.probe_keys.size(); ++i) {
+          pids.emplace_back(static_cast<int64_t>(i));
+        }
+        std::vector<std::optional<int64_t>> bids;
+        bids.reserve(c.build_keys.size());
+        for (std::size_t i = 0; i < c.build_keys.size(); ++i) {
+          bids.emplace_back(100 + static_cast<int64_t>(i));
+        }
+        const arrow::ArrayVector probe = {Int64s(c.probe_keys), Int64s(pids)};
+        const arrow::ArrayVector build = {Int64s(c.build_keys), Int64s(bids)};
+        const Rows expected = ReferenceFull(RowsOf(BatchOf(probe_schema, probe)),
+                                            RowsOf(BatchOf(build_schema, build)), {0}, {0}, 2, 2,
+                                            with_residual ? holds : Residual{});
+        auto join = MakeJoin(
+            SourceOf(probe_schema, probe),
+            DrainedBuild(plan::JoinKind::kFull, SourceOf(build_schema, build), {0}), {0},
+            /*prepares=*/true, BuildSide::kRight,
+            with_residual ? std::vector<plan::ExprPtr>{residual} : std::vector<plan::ExprPtr>{});
+        ASSERT_NE(join, nullptr);
+        for (const std::shared_ptr<arrow::Field>& field : join->output_schema()->fields()) {
+          EXPECT_TRUE(field->nullable()) << field->name();
+        }
+        // Drained twice: a re-run makes its marks afresh and emits its tail from the first row.
+        for (int run = 0; run < 2; ++run) {
+          ExecContext ctx = ContextOf(nullptr, batch_size);
+          auto result = Drain(*join, ctx);
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          EXPECT_EQ(Sorted(RowsOf(**result)), Sorted(expected)) << "run " << run;
+        }
+      }
+    }
+  }
+  // Closed in the middle of its tail, then run again: Close releases the build it prepared, and
+  // the next run emits every unmatched build row again.
+  const arrow::ArrayVector probe = {Int64s({1, 2}), Int64s({0, 1})};
+  const arrow::ArrayVector build = {Int64s({7, null, 8, 1}), Int64s({100, 101, 102, 103})};
+  const Rows expected = ReferenceFull(RowsOf(BatchOf(probe_schema, probe)),
+                                      RowsOf(BatchOf(build_schema, build)), {0}, {0}, 2, 2);
+  const auto drained = DrainedBuild(plan::JoinKind::kFull, SourceOf(build_schema, build), {0});
+  auto join = MakeJoin(SourceOf(probe_schema, probe), drained, {0}, /*prepares=*/true);
+  ASSERT_NE(join, nullptr);
+  ExecContext ctx = ContextOf(nullptr, /*batch_size=*/1);
+  ASSERT_TRUE(join->Open(ctx).ok());
+  int64_t tail_rows = 0;
+  while (tail_rows == 0) {  // the probe's two rows, then the first tail row
+    auto batch = join->Next();
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    ASSERT_FALSE(batch->end());
+    tail_rows += RowsOf(batch->data).front()[1] == "null" ? 1 : 0;
+  }
+  EXPECT_TRUE(join->Close().ok());
+  EXPECT_EQ(drained->table(), nullptr) << "Close released the build mid-tail";
+  auto again = Drain(*join, ctx);
+  ASSERT_TRUE(again.ok()) << again.status().ToString();
+  EXPECT_EQ(Sorted(RowsOf(**again)), Sorted(expected));
+}
+
+// A FULL join whose probe is a part pipeline ends it (it emits its build rows): the sink hands on
+// every part's pairs and padded rows in part order, then the build rows no part's probe marked.
+// One thread and the pool give the same rows in the same order, the reference's; a second run of
+// the same sink gives them again, and one stopped after its first batch releases what it holds.
+TEST_F(HashJoinTest, AFullJoinOverPartsGivesTheSameRowsOnAnyNumberOfThreads) {
+  const auto pool = MakeThreadPool();
+  // Build keys 0..9 then 0..4 again, NULL every 7th row; probe keys i % 13, NULL every 11th row:
+  // some rows of each side match nothing.
+  const auto build_table = KeyTable("b", 3, 5, [](int64_t i) -> std::optional<int64_t> {
+    if (i % 7 == 3) {
+      return std::nullopt;
+    }
+    return i % 10;
+  });
+  const auto probe_table = KeyTable("p", 6, 7, [](int64_t i) -> std::optional<int64_t> {
+    if (i % 11 == 5) {
+      return std::nullopt;
+    }
+    return i % 13;
+  });
+  // Unique build keys too (0..14, NULL every 7th), whose probe takes the 1:1 window path.
+  const auto unique_table = KeyTable("u", 3, 5, [](int64_t i) -> std::optional<int64_t> {
+    if (i % 7 == 3) {
+      return std::nullopt;
+    }
+    return i;
+  });
+  const auto probe_width = static_cast<std::size_t>(probe_table->schema()->num_fields());
+  const auto build_width = static_cast<std::size_t>(build_table->schema()->num_fields());
+  // A residual, the build row's id (its fourth column of the join's) below an odd bound: pairs
+  // that match on the key and fail it leave both rows unmatched, unless another pair of each
+  // passes.
+  const auto build_id = static_cast<int>(probe_width) + 1;
+  const plan::ExprPtr residual =
+      Condition(plan::CompareOp::kLt, 9, ColumnAt(build_id, LogicalType::kBigInt));
+  const Residual holds = [](const std::vector<std::string>&, const std::vector<std::string>& b) {
+    return std::optional<bool>(std::stoll(b[1]) < 9);
+  };
+  struct Variant {
+    std::string_view name;
+    std::shared_ptr<MemoryTable> build;
+    bool with_residual;
+  };
+  for (const Variant& v :
+       {Variant{.name = "repeated", .build = build_table, .with_residual = false},
+        Variant{.name = "unique", .build = unique_table, .with_residual = false},
+        Variant{.name = "residual", .build = build_table, .with_residual = true}}) {
+    SCOPED_TRACE(v.name);
+    const Rows expected =
+        ReferenceFull(RowsOf(*probe_table), RowsOf(*v.build), {0}, {0}, probe_width, build_width,
+                      v.with_residual ? holds : Residual{});
+    const std::vector<plan::ExprPtr> residuals =
+        v.with_residual ? std::vector<plan::ExprPtr>{residual} : std::vector<plan::ExprPtr>{};
+    std::shared_ptr<arrow::Table> serial;
+    for (arrow::internal::Executor* executor : Executors(pool.get())) {
+      SCOPED_TRACE(executor == nullptr ? "one thread" : "pool");
+      const auto build = ScanBuild(plan::JoinKind::kFull, v.build, {0});
+      const PartPipeline pipeline =
+          ProbePipeline(probe_table, build, {0}, BuildSide::kRight, residuals);
+      BuildsFirstOperator op(
+          std::make_unique<PartRightJoinOperator>(pipeline, probe_table->num_parts(),
+                                                  SchemaOf(pipeline), build, BuildSide::kRight),
+          {build});
+      for (int run = 0; run < 2; ++run) {
+        ExecContext ctx = ContextOf(executor, 4);
+        auto result = Drain(op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_EQ(Sorted(RowsOf(**result)), Sorted(expected)) << run;
+        if (serial == nullptr) {
+          serial = *result;
+        } else {
+          EXPECT_TRUE((*result)->Equals(*serial)) << "the same rows in the same order " << run;
+        }
+        EXPECT_EQ(build->table(), nullptr) << "released";
+      }
+      // Stopped after its first batch: Close stops the parts and releases the build.
+      ExecContext ctx = ContextOf(executor, 4);
+      ASSERT_TRUE(op.Open(ctx).ok());
+      auto first = op.Next();
+      ASSERT_TRUE(first.ok()) << first.status().ToString();
+      EXPECT_FALSE(first->end());
+      EXPECT_TRUE(op.Close().ok());
+      EXPECT_EQ(build->table(), nullptr) << "released by Close";
     }
   }
 }

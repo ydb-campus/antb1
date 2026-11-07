@@ -861,8 +861,10 @@ row) or `GroupAggregate` (`GROUP BY`:
 the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
 (`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
 its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
-anti, null-aware anti or one-row), key pairs of one type each, residual conditions over both inputs and the input it
-builds on. A `UnionAll` has two or more, or one once the optimizer has ruled the others out
+anti, null-aware anti, one-row or full), key pairs of one type each, residual conditions over both inputs and the input
+it builds on; what each kind does with its rows is one table, `plan::JoinKindTraits`. A full join (ADR 0037's OJ2) gives
+every match, each left row without one padded with NULLs and each right row without one padded with NULLs; no SQL
+binds to it before OJ3. A `UnionAll` has two or more, or one once the optimizer has ruled the others out
 ([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of the next, and so on; its columns are new,
 of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
 union by a `Compute`. A `SetOperation` ([ADR 0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT
@@ -1163,8 +1165,10 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     unmatched by definition), `unique` (1: no key repeats), `direct` (1: the table indexes its one integer key by
     value, ADR 0022) and `cols_dropped` (columns of its input it did not have to hold, because nothing above the join
     reads them: ADR 0026's C8a, and 0 for a build that holds them all);
-  - a `RightJoin`'s `emitted` (the build rows it returned: those the probes marked for a semi join, those they did
-    not plus the retained NULL-key ones for an anti join).
+  - a `RightJoin`'s `emitted` (the build rows it returned after the probe: those the probes marked for a semi join,
+    those they did not plus the retained NULL-key ones for an anti or a full join), and the same `emitted` on the
+    `HashJoin` of a full join whose probe is no part pipeline, which emits those rows itself; their gather counts in
+    its `gather`.
 - The counts do not depend on the number of threads, except under a `LIMIT` (it stops parts that already started,
   and how many depends on the threads) and after a part ran out of memory next to others (it runs again alone). The
   times do depend on the threads.

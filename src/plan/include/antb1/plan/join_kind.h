@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 
 namespace antb1::plan {
@@ -15,9 +17,11 @@ enum class JoinKind : std::uint8_t {
   kNullAwareAnti,  // as SQL's NOT IN: no left row when the right has a NULL key; every left row
                    // when it is empty; else each left row with a non-NULL key and no match
   kOneRow,         // each left row with the right input's single row (no keys)
+  kFull,           // every match, each left row without one padded with NULLs, and each right row
+                   // without one padded with NULLs (ADR 0037's OJ2)
 };
 
-// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW".
+// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW", "FULL".
 std::string_view ToString(JoinKind kind);
 
 // The input a join builds its hash table on; the other is probed.
@@ -74,6 +78,8 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
       return {.filters_left = true, .null_aware = true};
     case JoinKind::kOneRow:
       return {.outputs_right = true, .keyless = true};
+    case JoinKind::kFull:
+      return {.outputs_right = true, .pads_right = true, .pads_left = true, .residuals = true};
   }
   return {};
 }
@@ -86,6 +92,30 @@ constexpr bool OutputsMatchesOnly(JoinKind kind) {
   return traits.outputs_right && !traits.pads_left && !traits.pads_right && !traits.keyless;
 }
 
+// The rows of a join of `kind` whose matches are estimated at `matches`, over inputs of `left` and
+// `right` rows (all at least 0): a padded input's rows each come out at least once, so a join that
+// pads one input gets at least that input's rows (a floor on the estimate, not a bound), and one
+// that pads both every match and every row of both inputs, saturated -- an upper bound, since a
+// FULL join outputs at most that.
+constexpr int64_t PaddedJoinRows(JoinKind kind, int64_t matches, int64_t left, int64_t right) {
+  const JoinKindTraits traits = Traits(kind);
+  if (traits.pads_left && traits.pads_right) {
+    int64_t sum = 0;
+    if (__builtin_add_overflow(matches, left, &sum) || __builtin_add_overflow(sum, right, &sum)) {
+      return std::numeric_limits<int64_t>::max();
+    }
+    return sum;
+  }
+  int64_t rows = matches;
+  if (traits.pads_right) {
+    rows = std::max(rows, left);
+  }
+  if (traits.pads_left) {
+    rows = std::max(rows, right);
+  }
+  return rows;
+}
+
 // Whether a join of `kind` building on `side` outputs its build's rows rather than producing its
 // output from the probe alone (docs/adr/0026-join-performance.md, C2b and C2c): it must remember
 // which build rows matched and emit them -- or those that did not -- after the probe, so it is the
@@ -96,6 +126,16 @@ constexpr bool OutputsMatchesOnly(JoinKind kind) {
 constexpr bool EmitsBuildRows(JoinKind kind, BuildSide side) {
   const JoinKindTraits traits = Traits(kind);
   return side == BuildSide::kLeft ? traits.filters_left || traits.pads_right : traits.pads_left;
+}
+
+// Whether a join of `kind` building on `side` outputs rows from both of its phases: pairs and
+// padded rows while it probes, as an inner or a left join does, and then its build rows that no
+// probe row matched (EmitsBuildRows), padded -- a FULL join (which the executor runs on a right
+// build only: its traits have no `may_build_left`). Its probe
+// hands its rows on and marks the build rows it matched; the rows no mark selects come after the
+// whole probe (ADR 0037's OJ2).
+constexpr bool EmitsProbeAndBuildRows(JoinKind kind, BuildSide side) {
+  return EmitsBuildRows(kind, side) && Traits(kind).outputs_right;
 }
 
 // Whether such a join emits the build rows that did *not* match, rather than only those that did:

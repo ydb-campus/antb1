@@ -1650,6 +1650,56 @@ TEST_F(PhysicalPlannerTest, ASetOperationOverTwoScans) {
   EXPECT_EQ(plan::GetSqlError(broken.status()), nullptr);
 }
 
+// A hand-built FULL join (ADR 0037's OJ2; no SQL reaches it before OJ3): Table()'s x >= 3 against
+// Repeated(), on x. One match (4), six left rows without one (3, 5 .. 9) padded on the right, and
+// five right rows without one (1, 1, 2, 2, 2) padded on the left -- twelve rows, every batch size,
+// whether the probe is a part pipeline (the RightJoin sink hands its parts' rows on, then the
+// unmatched build rows) or a serial input (a Sort, under which the probe emits its own tail: the
+// old fallback, flipping the build side, would have recursed forever).
+TEST_F(PhysicalPlannerTest, AFullJoinRunsOverPartsAndOverASerialProbe) {
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto filtered = Node(plan::FilterNode{
+      .input = Node(plan::ScanNode{.table = Table(true), .table_name = "t", .fields = {0, 1}}),
+      .predicates = {testing::Compare(x, plan::CompareOp::kGe, BigInt(3))}});
+  const auto sorted = Node(plan::SortNode{.input = filtered, .keys = {plan::SortKey{.column = x}}});
+  const auto full_of = [&](const plan::LogicalNodePtr& probe) {
+    return Node(plan::JoinNode{
+        .kind = plan::JoinKind::kFull,
+        .left = probe,
+        .right = Node(plan::ScanNode{.table = Repeated(), .table_name = "r", .fields = {0, 1}}),
+        .keys = {plan::JoinKey{.left = x, .right = x}},
+        .residual = {},
+        .build = plan::BuildSide::kRight,
+        .span = {}});
+  };
+  using Pair = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
+  const std::optional<int64_t> null;
+  std::vector<Pair> expected = {{4, 4},    {3, null}, {5, null}, {6, null}, {7, null}, {8, null},
+                                {9, null}, {null, 1}, {null, 1}, {null, 2}, {null, 2}, {null, 2}};
+  std::ranges::sort(expected);
+  for (const plan::LogicalNodePtr& probe : {filtered, sorted}) {
+    const bool parted = probe == filtered;
+    SCOPED_TRACE(parted ? "a part pipeline" : "a serial probe");
+    for (const int64_t batch_size : {1, 3}) {
+      const auto table = Run(PlanOf(full_of(probe), 4), batch_size);
+      ASSERT_NE(table, nullptr);
+      const auto left = Int64Column(*table, 0);
+      const auto right = Int64Column(*table, 2);
+      std::vector<Pair> pairs;
+      pairs.reserve(left.size());
+      for (std::size_t i = 0; i < left.size(); ++i) {
+        pairs.emplace_back(left[i], right[i]);
+      }
+      std::ranges::sort(pairs);
+      EXPECT_EQ(pairs, expected) << "batch " << batch_size;
+    }
+    ProfileNode profile;
+    ASSERT_TRUE(BuildPhysicalPlan(PlanOf(full_of(probe), 4), &profile).ok());
+    EXPECT_EQ(profile.name(), parted ? "RightJoin" : "HashJoin");
+    EXPECT_TRUE(profile.detail().contains("Join FULL build=right")) << profile.detail();
+  }
+}
+
 // A union none of whose branches is left is FALSE over a union of its first branch (ADR 0036's
 // X7a): above the union, which ends every part pipeline, it reads nothing -- neither the branch's
 // parts nor its join's build. FALSE on top of the branch instead still prepares the join's build

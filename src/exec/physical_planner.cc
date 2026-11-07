@@ -493,9 +493,10 @@ OperatorResult BuildRightJoin(const plan::JoinNode& join, const plan::LogicalNod
     return arrow::Status::Invalid("a join that emits its build rows without its build");
   }
   ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
-  return WithBuilds(std::make_unique<PartRightJoinOperator>(std::move(parts.pipeline), parts.count,
-                                                            sample->output_schema(), build),
-                    parts.builds, slot);
+  return WithBuilds(
+      std::make_unique<PartRightJoinOperator>(std::move(parts.pipeline), parts.count,
+                                              sample->output_schema(), build, join.build),
+      parts.builds, slot);
 }
 
 // The column every call counts distinctly, when every call is COUNT(DISTINCT) of the same column.
@@ -1641,14 +1642,22 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
       return Profiled(BuildRightJoin(std::get<plan::JoinNode>(*node), node, *scan, slot), node,
                       slot);
     }
-    // Its probe has no part pipeline under it, so there are no parts and no sink to emit from. The
-    // build side is a performance choice and never a semantic one (ADR 0026), so the join runs the
-    // way every join ran before C2b instead: building on its right input. The node carries the
-    // side it really runs, so a profile and an EXPLAIN name that one.
-    plan::JoinNode right = std::get<plan::JoinNode>(*node);
-    right.build = plan::BuildSide::kRight;
-    const auto rebuilt = std::make_shared<const plan::LogicalNode>(plan::LogicalNode(right));
-    return Build(rebuilt, part, slot, late, top_n, builds);
+    // Its probe has no part pipeline under it, so there are no parts and no sink to emit from.
+    const auto& join = std::get<plan::JoinNode>(*node);
+    if (!plan::EmitsProbeAndBuildRows(join.kind, join.build)) {
+      // The build side of a semi or anti join is a performance choice and never a semantic one
+      // (ADR 0026), so the join runs the way every join ran before C2b instead: building on its
+      // right input. The node carries the side it really runs, so a profile and an EXPLAIN name
+      // that one.
+      plan::JoinNode right = join;
+      right.build = plan::BuildSide::kRight;
+      const auto rebuilt = std::make_shared<const plan::LogicalNode>(plan::LogicalNode(right));
+      return Build(rebuilt, part, slot, late, top_n, builds);
+    }
+    // A FULL join emits its probe's rows and then its unmatched build rows whatever side it builds
+    // on, so flipping the side would not end the recursion: its serial probe prepares its own
+    // build and marks and emits the build rows itself once its input ends (ADR 0037's OJ2), as
+    // the plain join path below builds it.
   }
   if (!part.has_value()) {
     if (const plan::ScanNode* scan = PipelineScan(node)) {

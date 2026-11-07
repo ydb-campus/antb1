@@ -5899,16 +5899,9 @@ std::optional<int64_t> Binder::UnitEstimate(std::size_t u) const {
   }
   const Int128 divisor = std::max<int64_t>(units_[u].divisor, 1);
   const Int128 joined = Int128{*left} * Int128{*right} / divisor;
-  int64_t rows = Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max());
-  // A join that pads an input's unmatched rows outputs at least that input's rows.
-  const JoinKindTraits traits = Traits(units_[u].kind);
-  if (traits.pads_right) {
-    rows = std::max(rows, *left);
-  }
-  if (traits.pads_left) {
-    rows = std::max(rows, *right);
-  }
-  return rows;
+  return PaddedJoinRows(units_[u].kind,
+                        Int128ToInt64(joined).value_or(std::numeric_limits<int64_t>::max()), *left,
+                        *right);
 }
 
 // The rows of a binding's relation after the conjuncts routed to its Scan (ADR 0026): the

@@ -285,16 +285,7 @@ std::optional<int64_t> JoinRows(const JoinNode& join) {
   }
   const int64_t rows =
       Int128ToInt64(Int128{*left} * Int128{*right} / divisor).value_or(kLargestRows);
-  // A join that pads an input's unmatched rows outputs at least that input's rows.
-  const JoinKindTraits traits = Traits(join.kind);
-  int64_t floor = rows;
-  if (traits.pads_right) {
-    floor = std::max(floor, *left);
-  }
-  if (traits.pads_left) {
-    floor = std::max(floor, *right);
-  }
-  return floor;
+  return PaddedJoinRows(join.kind, rows, *left, *right);
 }
 
 // Whether the gate admits a placement: both of the two arguments for one, and nothing else. Asked

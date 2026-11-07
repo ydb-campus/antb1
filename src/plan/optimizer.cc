@@ -1281,6 +1281,7 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
       case JoinKind::kInner:
       case JoinKind::kLeft:
       case JoinKind::kNullAwareAnti:
+      case JoinKind::kFull:
         return UnsupportedError("a correlated subquery is not supported", dependent->span);
     }
   }
