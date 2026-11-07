@@ -1291,14 +1291,15 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   }
   for (const sql::Expr& conjunct : stmt.where) {
     check_columns(conjunct, kNone);
-    condition = !key_half(conjunct) || condition;
-    // A condition there is answered above the FULL JOIN; an equality of two of its items' columns
-    // would leave them no key below it.
+    const bool key = key_half(conjunct);
+    condition = !key || condition;
+    // A condition there is answered above the FULL JOIN; a key between two of its items would
+    // leave them no key below it.
     const auto* eq = std::get_if<sql::BinaryExpr>(&static_cast<const sql::ExprNode&>(conjunct));
     const sql::ColumnRef* l =
         eq != nullptr && eq->op == sql::BinaryOp::kEq ? AsColumn(*eq->left) : nullptr;
     const sql::ColumnRef* r = l != nullptr ? AsColumn(*eq->right) : nullptr;
-    EXPECT_FALSE(r != nullptr && item_of(*l) != item_of(*r) && in_full_left(item_of(*l)) &&
+    EXPECT_FALSE(key && r != nullptr && item_of(*l) != item_of(*r) && in_full_left(item_of(*l)) &&
                  in_full_left(item_of(*r)))
         << "a WHERE key between two items of a FULL JOIN's left input";
   }

@@ -267,6 +267,13 @@ SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row), COUNT(dv_row) FROM zones FULL JOI
 BIGINT	BIGINT	BIGINT	BIGINT
 687	678	677	676
 
+# A LEFT JOIN inside the FULL JOIN's left input: its ON conjunct over its right input still filters that input.
+query IIII nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row), COUNT(dv_row) FROM zones LEFT JOIN cities ON zn_city = ct_id AND ct_pop > 40000 FULL JOIN drivers ON dv_city = zn_city
+----
+BIGINT	BIGINT	BIGINT	BIGINT
+686	678	360	676
+
 # ---- in nested blocks ----
 
 # Two grouped derived tables, each key once, joined so that every key of either comes out.
