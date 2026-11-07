@@ -14,6 +14,7 @@
 #include <arrow/status.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/narrow.h"
 
 namespace antb1::exec {
 
@@ -82,7 +83,7 @@ class PoolVector {
     if (n > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) / sizeof(T)) {
       return arrow::Status::OutOfMemory("an array of ", n, " values");
     }
-    const auto bytes = static_cast<std::int64_t>(n * sizeof(T));
+    const auto bytes = Narrow<std::int64_t>(n * sizeof(T));  // in range: checked above
     if (buffer_ == nullptr) {
       ARROW_ASSIGN_OR_RAISE(buffer_, arrow::AllocateResizableBuffer(0, pool_));
     }
