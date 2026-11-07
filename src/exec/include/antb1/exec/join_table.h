@@ -48,9 +48,10 @@
 // a JoinRowRef addresses, for the join that must emit the build rows which did not match.
 //
 // A keyless build (JoinBuildSpec::Keyless: a one-row join's, or a nested loop's, ADR 0040) holds
-// every selected row as rows of one key: one hash, one partition, one slot, so unique() means at
-// most one row. It has nothing to probe: its Find is Invalid, and FindEvery gives each selected
-// probe row every row as its candidates.
+// every selected row as rows of one key, in (part, row) order, so unique() means at most one row.
+// It hashes nothing and has no directory: its rows go to one partition as they come, a batch whose
+// rows are all selected kept without a copy. It has nothing to probe: its Find is Invalid, and
+// FindEvery gives each selected probe row every row as its candidates.
 //
 // Errors: what a correct physical plan never sends (a key of a wrong type, a part added twice) is
 // Invalid; passing the memory limit, or 4294967295 rows, is OutOfMemory, and so is std::bad_alloc.
@@ -62,6 +63,7 @@
 namespace antb1::exec {
 
 class PartitionLanes;
+class RowMask;
 
 // The partitions of a build: a constant of its own, never the number of threads. Independent of
 // GroupTable::kPartitions: a join partitions build rows, a GROUP BY its groups.
@@ -198,6 +200,10 @@ class JoinBuildPart {
   };
 
   arrow::Status AppendRows(const Batch& batch, arrow::MemoryPool* pool);
+  // AppendRows' keyless arm: the `kept` rows `mask` selects of `batch`, every one in partition 0,
+  // without hashes, and without a copy when every row of the batch is selected.
+  arrow::Status AppendKeyless(const Batch& batch, const RowMask& mask, int64_t kept,
+                              arrow::MemoryPool* pool);
   // The rows of `batch` that are selected and have a NULL key, appended to null_pieces_; nothing
   // when there is none. `remaining` is how many there are (the selected rows less the kept ones),
   // which is known before the rows are found.

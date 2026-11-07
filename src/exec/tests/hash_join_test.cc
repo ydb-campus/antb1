@@ -672,12 +672,18 @@ TEST_F(HashJoinTest, APrunedBuildHoldsNullsForWhatNothingReadsAndGathersTheRest)
 
 // A nested loop's keyless build (ADR 0040) drops what nothing reads too, as a keyed build does:
 // every probe row meets every build row, the retained columns gathered and the dropped one NULL.
+// Its batches go in without hashes: one whose rows are all selected as it is (a slice here, at an
+// offset), one with a selection taken.
 TEST_F(HashJoinTest, ANestedLoopsBuildHoldsOnlyWhatIsRead) {
   const auto build_schema =
       arrow::schema({arrow::field("k", arrow::int64()), arrow::field("kept", arrow::int64()),
                      arrow::field("dropped", arrow::int64())});
-  const auto build_batch =
-      BatchOf(build_schema, {Int64s({0, 1, 2}), Int64s({10, 11, 12}), Int64s({90, 91, 92})});
+  const auto whole =
+      BatchOf(build_schema, {Int64s({7, 0, 1}), Int64s({17, 10, 11}), Int64s({97, 90, 91})});
+  const auto selected = BatchOf(build_schema, {Int64s({2, 8}), Int64s({12, 18}), Int64s({92, 98})});
+  const std::vector<Batch> build_batches = {
+      Batch{.data = whole->Slice(1), .selection = nullptr},
+      Batch{.data = selected, .selection = Bools({true, false})}};
   const auto probe_schema = arrow::schema({arrow::field("a", arrow::int64())});
   const auto probe = BatchOf(probe_schema, {Int64s({5, 6, std::nullopt, 8})});
   auto spec = JoinBuildSpec::Keyless(build_schema, {true, true, false});
@@ -686,10 +692,8 @@ TEST_F(HashJoinTest, ANestedLoopsBuildHoldsOnlyWhatIsRead) {
     SCOPED_TRACE(batch_size);
     ProfileNode profile;
     auto build = std::make_shared<JoinBuild>(
-        *spec,
-        std::make_unique<ScriptedSource>(
-            build_schema, std::vector<Batch>{Batch{.data = build_batch, .selection = nullptr}}),
-        &profile, plan::JoinKind::kInner);
+        *spec, std::make_unique<ScriptedSource>(build_schema, build_batches), &profile,
+        plan::JoinKind::kInner);
     auto join =
         MakeJoin(std::make_unique<ScriptedSource>(
                      probe_schema, std::vector<Batch>{Batch{.data = probe, .selection = nullptr}}),
@@ -701,6 +705,7 @@ TEST_F(HashJoinTest, ANestedLoopsBuildHoldsOnlyWhatIsRead) {
     const Rows rows = RowsOf(**result);
     ASSERT_EQ(rows.size(), 12U) << "every probe row with every build row, a NULL one included";
     for (const std::vector<std::string>& row : rows) {
+      EXPECT_LT(std::stoll(row.at(1)), 3) << "a row the slice or the selection leaves out";
       EXPECT_EQ(std::stoll(row.at(2)), std::stoll(row.at(1)) + 10) << "a retained column gathers";
       EXPECT_EQ(row.at(3), "null") << "a dropped column gathers as NULL";
     }
