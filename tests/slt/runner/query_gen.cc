@@ -923,7 +923,9 @@ struct Binding {
   // kLeft and kFull: the FROM position its join group starts at, which is the first item its ON may
   // read (rule 10 of ADR 0022: a LEFT JOIN's ON sees its own two inputs, so not a comma sibling
   // before the group — DuckDB refuses one with "Non-inner join on correlated columns not
-  // supported"). 0 for every other connector, where the clause is a no-op.
+  // supported"). The same for a kJoin inside a FULL JOIN's left input, whose ON may not read
+  // such a sibling either (ADR 0022's OJ3 update). 0 for every other item, where the clause is a
+  // no-op.
   std::size_t on_scope_start = 0;
   std::vector<KeyPair> on;  // kJoin, kLeft and kFull: the keys of its ON (at least one)
   // A join's copy of the table's columns, so that every binding's columns have their own
@@ -1425,12 +1427,26 @@ class Builder {
           from.rows = bound;
           // Now and then a FULL JOIN instead (ADR 0037's OJ3), from a stream of its own, so a
           // query that stays LEFT is the query this seed gave before. Its ON obeys the same scope.
+          // It pads its left input, so nothing that joins that input may stand above it: no key
+          // between two of its items in WHERE (a CROSS JOIN's), which leaves the input a cross
+          // product, and no inner ON in it that reads a comma sibling before the group. Both are
+          // exit code 4 (ADR 0022's OJ3 update), where a key between such a sibling and the input
+          // in WHERE joins the sibling to the whole FULL JOIN, and is answered.
+          const auto stays_inside = [&](const PlannedKey& key) {
+            const std::size_t at = home(key);
+            const bool from_sibling = std::min(position[key.child], position[key.parent]) < group;
+            return at < group || at >= k || IsJoin(from.bindings[at].connector) != from_sibling;
+          };
           const int64_t full =
               FullJoinRowBound(matched, left_rows, last_multiplicity, b.table->rows);
           if (allowed_.Has(Feature::kFullJoin) && full <= RowLimit(planned) &&
-              full_rng_.Percent(kFullPercent)) {
+              std::ranges::all_of(keys, stays_inside) && full_rng_.Percent(kFullPercent)) {
             b.connector = FromConnector::kFull;
             from.rows = full;
+            // An inner ON in the left input draws its extra conjunct from the group alone too.
+            for (std::size_t j = group + 1; j < k; ++j) {
+              from.bindings[j].on_scope_start = group;
+            }
           }
         }
       }

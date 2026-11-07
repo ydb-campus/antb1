@@ -825,10 +825,11 @@ INSTANTIATE_TEST_SUITE_P(
         // subquery, a column of an enclosing block, a comma sibling before the join group -- would
         // drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left input, those
         // are answered.
-        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM "
-                  "dec) FULL JOIN ok ON u.i16 = ok.i16",
-                  kUnsupported, "IN",
-                  "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
+        ErrorCase{
+            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM "
+            "dec) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "IN",
+            "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
         ErrorCase{"SELECT t.i16 FROM t WHERE EXISTS (SELECT * FROM u JOIN dec ON u.i32 = dec.i AND "
                   "dec.b = t.i64 FULL JOIN ok ON u.i16 = ok.i16)",
                   kUnsupported, "dec.b = t.i64",

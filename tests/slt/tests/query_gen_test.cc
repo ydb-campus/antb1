@@ -1243,6 +1243,15 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
     }
   }
   bool condition = false;  // a WHERE or ON conjunct that is no key
+  // A FULL JOIN's left input: the items from its group's start up to it, which nothing that joins
+  // them may stand above (ADR 0022's OJ3 update).
+  std::size_t full_group = 0;
+  for (std::size_t g = 1; full && g < left_item; ++g) {
+    full_group = stmt.from[g].connector == sql::Connector::kComma ? g : full_group;
+  }
+  const auto in_full_left = [&](std::size_t item) {
+    return full && item >= full_group && item < left_item;
+  };
   for (std::size_t k = 0; k < stmt.from.size(); ++k) {
     // Rule 10: the items up to this one; those before the last comma are earlier comma siblings.
     std::size_t group = 0;
@@ -1260,6 +1269,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
       });
       extra = !key_half(conjunct) || extra;
     }
+    EXPECT_FALSE(in_full_left(k) && sibling)
+        << "an inner ON inside a FULL JOIN's left input reads a FROM item before its group";
     cov.sibling_on += sibling ? 1 : 0;
     cov.on_condition += extra ? 1 : 0;
     condition = condition || extra;
@@ -1281,6 +1292,15 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   for (const sql::Expr& conjunct : stmt.where) {
     check_columns(conjunct, kNone);
     condition = !key_half(conjunct) || condition;
+    // A condition there is answered above the FULL JOIN; an equality of two of its items' columns
+    // would leave them no key below it.
+    const auto* eq = std::get_if<sql::BinaryExpr>(&static_cast<const sql::ExprNode&>(conjunct));
+    const sql::ColumnRef* l =
+        eq != nullptr && eq->op == sql::BinaryOp::kEq ? AsColumn(*eq->left) : nullptr;
+    const sql::ColumnRef* r = l != nullptr ? AsColumn(*eq->right) : nullptr;
+    EXPECT_FALSE(r != nullptr && item_of(*l) != item_of(*r) && in_full_left(item_of(*l)) &&
+                 in_full_left(item_of(*r)))
+        << "a WHERE key between two items of a FULL JOIN's left input";
   }
   for (const auto& e : stmt.group_by) {
     check_columns(e, kNone);

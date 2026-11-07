@@ -5161,8 +5161,8 @@ arrow::Status Binder::BindConjunct(const sql::Expr& conjunct, SourceSpan element
   // sibling before its join group, which rule 10 lets it see) would be classified above the unit.
   if (padded_unit_.has_value() &&
       (bindings.empty() || !std::ranges::all_of(bindings, [&](std::size_t b) {
-        return BlockHolds(units_[*padded_unit_].left, b);
-      }))) {
+         return BlockHolds(units_[*padded_unit_].left, b);
+       }))) {
     return UnsupportedError(
         std::format("the ON of a join inside a {} JOIN's left input must read that input only, "
                     "and this reads a FROM item outside it",
