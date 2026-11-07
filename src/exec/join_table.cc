@@ -338,15 +338,19 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
 }
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
-    std::shared_ptr<arrow::Schema> schema) {
+    std::shared_ptr<arrow::Schema> schema, std::vector<bool> retain) {
   if (schema == nullptr) {
     return arrow::Status::Invalid("a join build without a schema");
+  }
+  if (!retain.empty() && std::cmp_not_equal(retain.size(), schema->num_fields())) {
+    return arrow::Status::Invalid("a join build retaining ", retain.size(), " of ",
+                                  schema->num_fields(), " columns");
   }
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(std::move(schema), {},
                                                                   /*direct_candidate=*/false,
                                                                   /*keep_null_keys=*/false,
-                                                                  /*retain=*/{}));
+                                                                  std::move(retain)));
   });
 }
 
@@ -1135,6 +1139,34 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
     }
   });
   return arrow::Status::OK();
+}
+
+arrow::Status JoinTable::FindEvery(int64_t length, const arrow::BooleanArray* selection,
+                                   arrow::MemoryPool* pool, std::span<JoinMatches> out) const {
+  if (!spec_->keys().empty()) {
+    return arrow::Status::Invalid("a probe of every row of a join build with keys");
+  }
+  if (length < 0 || (selection != nullptr && selection->length() != length)) {
+    return arrow::Status::Invalid("a join probe selection over ", length, " rows");
+  }
+  if (std::cmp_less(out.size(), length)) {
+    return arrow::Status::Invalid("room for the matches of ", out.size(), " of ", length,
+                                  " probe rows");
+  }
+  const std::span<JoinMatches> matches = out.first(static_cast<std::size_t>(length));
+  std::ranges::fill(matches, JoinMatches{});
+  if (length == 0 || rows_.empty()) {
+    return arrow::Status::OK();
+  }
+  const JoinMatches every{.begin = 0, .end = Narrow<std::uint32_t>(rows_.size())};
+  return NoBadAlloc("a join probe", [&] -> arrow::Status {
+    ARROW_ASSIGN_OR_RAISE(const RowMask mask, RowMask::Make(std::span<const arrow::Array* const>{},
+                                                            selection, length, pool));
+    mask.ForEachRun([&](int64_t position, int64_t count) {
+      std::fill_n(matches.begin() + position, count, every);
+    });
+    return arrow::Status::OK();
+  });
 }
 
 // ---- JoinTableBuilder ----

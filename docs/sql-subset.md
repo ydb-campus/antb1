@@ -857,45 +857,43 @@ A comparison of an integer column with a number is folded exactly at bind time, 
 A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `Filter` (the `WHERE` conjunction, or
 above the aggregation the `HAVING` one), `Compute` (appends one computed column per expression: over the table for
 `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and over the aggregation for select, `HAVING` and
-`ORDER BY` expressions),
-`Project` (the select list's columns, every star expanded where it stands), `Aggregate` (the aggregates, one output
-row) or `GroupAggregate` (`GROUP BY`:
-the keys, then the aggregates, one row per group; a `Project` above it restores the select order), `Sort`
-(`ORDER BY`, below the `Project`, so it can use columns and aggregates the query does not return) and `Limit` (with
-its offset). A `Join` has two inputs ([ADR 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi,
-anti, null-aware anti, one-row or full), key pairs of one type each, residual conditions over both inputs and the input
-it builds on; what each kind does with its rows is one table, `plan::JoinKindTraits`. A full join (ADR 0037's OJ2) gives
-every match, each left row without one padded with NULLs and each right row without one padded with NULLs; `FULL
-OUTER JOIN` binds to it (OJ3). A `UnionAll` has two or more, or one once the optimizer has ruled the others out
-([ADR 0036](adr/0036-union-all.md)): every row of its first input, then of the next, and so on; its columns are new,
-of the types the binder folded, and each input gives them its own columns, a block of another type cast below the
-union by a `Compute`. A `SetOperation` ([ADR 0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT
-and EXCEPT, ALL or not, over one or more inputs, every column a key, the tree a formula over its inputs; the binder
-makes one per maximal region of `UNION`, `INTERSECT` [`ALL`] and `EXCEPT` [`ALL`] (X4b to X4d), its inputs the
-region's blocks and
-`UnionAll` subtrees in written order, and EXPLAIN prints its formula with the tree's precedence
-(`SetOperation inputs=3 formula=(0 UNION (1 INTERSECT 2)) columns=[a]`). A query produces
-inner `Join`s: the binder factors
-each element of `WHERE` and of an inner `ON` (below, below) and sends every conjunct that leaves it to the relations
-it reads, so one relation's conjuncts filter that
+`ORDER BY` expressions), `Project` (the select list's columns, every star expanded where it stands), `Aggregate` (the
+aggregates, one output row) or `GroupAggregate` (`GROUP BY`: the keys, then the aggregates, one row per group; a
+`Project` above it restores the select order), `Sort` (`ORDER BY`, below the `Project`, so it can use columns and
+aggregates the query does not return) and `Limit` (with its offset). A `Join` has two inputs ([ADR
+0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi, anti, null-aware anti, one-row or full), key
+pairs of one type each, residual conditions over both inputs and the input it builds on; what each kind does with its
+rows is one table, `plan::JoinKindTraits`. A full join (ADR 0037's OJ2) gives every match, each left row without one
+padded with NULLs and each right row without one padded with NULLs; `FULL OUTER JOIN` binds to it (OJ3). An inner, left
+or full join may have no key pairs: a nested loop ([ADR 0040](adr/0040-nested-loop-joins.md)), every right row a
+candidate of every left row and its residuals deciding, which no SQL binds to before ADR 0037's OJ4b. A `UnionAll` has
+two or more, or one once the optimizer has ruled the others out ([ADR 0036](adr/0036-union-all.md)): every row of its
+first input, then of the next, and so on; its columns are new, of the types the binder folded, and each input gives them
+its own columns, a block of another type cast below the union by a `Compute`. A `SetOperation` ([ADR
+0039](adr/0039-set-operations.md)) answers one tree of UNION, INTERSECT and EXCEPT, ALL or not, over one or more inputs,
+every column a key, the tree a formula over its inputs; the binder makes one per maximal region of `UNION`, `INTERSECT`
+[`ALL`] and `EXCEPT` [`ALL`] (X4b to X4d), its inputs the region's blocks and `UnionAll` subtrees in written order, and
+EXPLAIN prints its formula with the tree's precedence (`SetOperation inputs=3 formula=(0 UNION (1 INTERSECT 2))
+columns=[a]`). A query produces inner `Join`s: the binder factors each element of `WHERE` and of an inner `ON` (below,
+below) and sends every conjunct that leaves it to the relations it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
 cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
 cross product: exit code 4, naming the item nothing connects -- but for a relation of exactly one row, a derived table
 or a CTE reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no
 residual and no conjunct of its own branch reads (one could leave it with no row). The keys connect the others to the
-first relation that is not one of those, or to the first relation when all are, and the one-row relations then each
-join above them, in FROM order, as a `ONE-ROW` join that appends its row to every row. A subquery conjunct that reads
-one joins above that join, as above every join of its block.
-The relations then join in the order and tree shape a cost search chooses from footer metadata only (row counts, and
-each key's domain from the parts' integer ranges capped at their non-NULL rows, else their distinct-count hints; "Join
-order and build sides" under Semantics): every edge between the two inputs of a join is a key of it, so the edge that
-closes a cycle becomes a second key, and a join builds on its right input unless that input is estimated at more than
-`--build-side-ratio` times its left. A block of more than 12 relations, or any block under `--join-order greedy`,
-joins left-deep instead: the relation with the most rows (an unknown count counts as the most) is probed first, then
-the connected relation with the smallest estimate joins next. Because the order reads metadata alone, a plan does
-not depend on the thread count. The executor runs every kind as a hash join: it builds a hash table of the
-input it builds on before it reads the other input, which then streams through it in its rows' order.
+first relation that is not one of those, or to the first relation when all are, and the one-row relations then each join
+above them, in FROM order, as a `ONE-ROW` join that appends its row to every row. A subquery conjunct that reads one
+joins above that join, as above every join of its block. The relations then join in the order and tree shape a cost
+search chooses from footer metadata only (row counts, and each key's domain from the parts' integer ranges capped at
+their non-NULL rows, else their distinct-count hints; "Join order and build sides" under Semantics): every edge between
+the two inputs of a join is a key of it, so the edge that closes a cycle becomes a second key, and a join builds on its
+right input unless that input is estimated at more than `--build-side-ratio` times its left. A block of more than 12
+relations, or any block under `--join-order greedy`, joins left-deep instead: the relation with the most rows (an
+unknown count counts as the most) is probed first, then the connected relation with the smallest estimate joins next.
+Because the order reads metadata alone, a plan does not depend on the thread count. The executor runs every kind as a
+hash join: it builds a hash table of the input it builds on before it reads the other input, which then streams through
+it in its rows' order.
 
 - An inner join keeps each row's matches in the build input's order; its residual conditions are evaluated in order,
   each on the rows the ones before it kept.

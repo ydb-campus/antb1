@@ -170,3 +170,17 @@ It is accepted when OJ4c is built.
   PostgreSQL: estimates are often unknown, and any threshold would be arbitrary.
 - **Piecewise merge join and IEJoin for inequality joins.** Deferred: they are performance work over the same plan
   shape, and no query of the 99 needs them.
+
+## Updates
+
+- Update (2026-11-08, OJ4a): built. The trait `keyless` is now `one_row`, and `nested_loop` is true for inner, LEFT
+  and FULL joins. A plan's join of those kinds may have no keys. `JoinBuildSpec::Keyless` takes the columns to
+  retain. A FULL join accepts a keyless build. `JoinTable::FindEvery` gives each selected probe row the whole build
+  as its candidates, so the operator's paths run unchanged over them. The inner path reports `pairs` when it has
+  residuals.
+
+  No SQL reaches a nested loop yet: OJ4b's binder does. Two items moved:
+  - The hash directory and the per-row hashes of a keyless build stay for now. Skipping them means a build path of
+    its own, from the part's partitioning to the table, so it is a performance item for when a build measures large.
+  - The measurement of a selective inequality join moves to OJ4b, where SQL reaches the operator and
+    `explain --analyze` splits the gather time from the residual time.

@@ -47,9 +47,10 @@
 // JoinBuildSpec::keep_null_keys it also retains their rows in null_chunks(), apart from everything
 // a JoinRowRef addresses, for the join that must emit the build rows which did not match.
 //
-// A keyless build (JoinBuildSpec::Keyless, a one-row join's) holds every selected row as rows of
-// one key: one hash, one partition, one slot, so unique() means at most one row. It has nothing to
-// probe: its Find is Invalid.
+// A keyless build (JoinBuildSpec::Keyless: a one-row join's, or a nested loop's, ADR 0040) holds
+// every selected row as rows of one key: one hash, one partition, one slot, so unique() means at
+// most one row. It has nothing to probe: its Find is Invalid, and FindEvery gives each selected
+// probe row every row as its candidates.
 //
 // Errors: what a correct physical plan never sends (a key of a wrong type, a part added twice) is
 // Invalid; passing the memory limit, or 4294967295 rows, is OutOfMemory, and so is std::bad_alloc.
@@ -110,9 +111,11 @@ class JoinBuildSpec {
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
       bool keep_null_keys = false, std::vector<bool> retain = {});
-  // The spec of a build without keys, a one-row join's. Invalid without a schema.
+  // The spec of a build without keys: a one-row join's, which keeps every column (an empty
+  // `retain`), or a nested loop's (ADR 0040), which keeps those `retain` says as Make's does. It
+  // keeps no NULL-key rows, having no keys. Invalid without a schema.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Keyless(
-      std::shared_ptr<arrow::Schema> schema);
+      std::shared_ptr<arrow::Schema> schema, std::vector<bool> retain = {});
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const { return schema_; }
   // Empty for a keyless spec.
@@ -284,6 +287,12 @@ class JoinTable {
   arrow::Status Find(std::span<const std::shared_ptr<arrow::Array>> keys,
                      const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                      std::span<JoinMatches> out) const;
+  // A keyless build's probe (ADR 0040's nested loop): the first `length` entries of `out` get
+  // every row, rows()[0, num_rows), for a probe row `selection` selects (every row without one),
+  // and none ({0, 0}) for the others. Invalid for a build with keys, for a selection of another
+  // length and for an `out` shorter than `length`. No hash and no lookup.
+  arrow::Status FindEvery(int64_t length, const arrow::BooleanArray* selection,
+                          arrow::MemoryPool* pool, std::span<JoinMatches> out) const;
 
   // The inserted rows, each key's rows together and in (part, row) order.
   [[nodiscard]] std::span<const JoinRowRef> rows() const { return rows_; }

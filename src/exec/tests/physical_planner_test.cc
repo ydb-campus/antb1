@@ -1243,8 +1243,9 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
         plan::Expr{.node = plan::ColumnExpr{.index = index}, .type = type, .name = "c"});
   };
   const auto join_of = [&](const plan::LogicalNodePtr& probe, std::vector<plan::JoinKey> keys,
-                           std::vector<plan::ExprPtr> residual) {
-    return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                           std::vector<plan::ExprPtr> residual,
+                           plan::JoinKind kind = plan::JoinKind::kInner) {
+    return Node(plan::JoinNode{.kind = kind,
                                .left = probe,
                                .right = scan,
                                .keys = std::move(keys),
@@ -1270,7 +1271,8 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   };
   expect_invalid(Node(plan::JoinNode{}), "no inputs");
   for (const plan::LogicalNodePtr& probe : {scan, sorted}) {
-    expect_invalid(join_of(probe, {}, {}), "no keys");
+    // A nested loop (inner, left, full: ADR 0040) may have no keys; a semi join may not.
+    expect_invalid(join_of(probe, {}, {}, plan::JoinKind::kSemi), "no keys");
     expect_invalid(join_of(probe, key(x, Column(0, "x", LogicalType::kInteger)), {}),
                    "a key of two types");
     expect_invalid(
@@ -1323,7 +1325,7 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     expect_invalid(kind_of(plan::JoinKind::kAnti, {}, {}), "an anti join without keys");
     expect_invalid(kind_of(plan::JoinKind::kNullAwareAnti, {}, {}),
                    "a null-aware anti join without keys");
-    expect_invalid(kind_of(plan::JoinKind::kLeft, {}, {}), "a left join without keys");
+    // A left join without keys is a nested loop (ADR 0040), and well formed.
     expect_invalid(
         kind_of(plan::JoinKind::kNullAwareAnti,
                 {plan::JoinKey{.left = x, .right = x}, plan::JoinKey{.left = y, .right = y}}, {}),
@@ -1354,7 +1356,7 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   for (const plan::LogicalNodePtr& probe : {scan, sorted}) {
     expect_invalid(Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
                                        .left = scan,
-                                       .right = join_of(probe, {}, {}),
+                                       .right = join_of(probe, {}, {}, plan::JoinKind::kSemi),
                                        .keys = key(x, x),
                                        .residual = {},
                                        .build = plan::BuildSide::kRight,

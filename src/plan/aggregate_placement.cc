@@ -180,11 +180,11 @@ bool Exchangeable(const JoinNode& join) {
   // input's columns are not output, so no aggregate can read that side -- but a placement on the
   // LEFT side would be sound, since every row of a group shares the join key, so a group matches
   // entirely or not at all. Neither query ADR 0032 measures has this shape, and admitting it would
-  // widen what the gate of item G2 has to classify before anything has asked for it. A keyless join
+  // widen what the gate of item G2 has to classify before anything has asked for it. A one-row join
   // has no keys to group by, and a join that pads its left input is refused until a kind that does
   // exists and is measured (ADR 0037's OJ2).
   const JoinKindTraits traits = Traits(join.kind);
-  return traits.outputs_right && !traits.keyless && !traits.pads_left;
+  return traits.outputs_right && !traits.one_row && !traits.pads_left;
 }
 
 // The per-row cost of grouping by one column, coarsely: what a hash table hashes, compares and

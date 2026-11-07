@@ -398,7 +398,7 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     ARROW_ASSIGN_OR_RAISE(key_filter_, builder->MakeKeyFilter());
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
     ARROW_ASSIGN_OR_RAISE(columns_, MakeJoinColumns(table_, ctx.budget));
-    if (plan::Traits(kind_).keyless) {
+    if (plan::Traits(kind_).one_row) {
       // A planner bug, never an answer: SQL plans only an aggregate without groups here.
       if (table_->num_rows() != 1) {
         return arrow::Status::Invalid("a one-row join's right input returned ", table_->num_rows(),
@@ -734,7 +734,7 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join that builds on its left input is not implemented");
   }
-  if (emits_unmatched && !spec.keep_null_keys()) {
+  if (emits_unmatched && !spec.keep_null_keys() && !spec.keys().empty()) {
     // It must emit the build rows that did not match, and a row whose key is NULL is one of them,
     // so a build that left those behind cannot answer. The planner decides both from
     // EmitsUnmatchedBuildRows; this is what makes a path that forgets one of them fail loudly
@@ -742,7 +742,9 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join over a build that did not keep its NULL keys");
   }
-  if (traits.keyless != spec.keys().empty()) {
+  // A one-row join has no keys, a nested loop may have none (ADR 0040), and every other join has
+  // at least one. (A keyless build has no NULL keys to keep: the check above is for keyed ones.)
+  if (spec.keys().empty() ? !traits.one_row && !traits.nested_loop : traits.one_row) {
     return arrow::Status::Invalid("a ", kind_name, " hash join over a build ",
                                   spec.keys().empty() ? "without" : "with", " keys");
   }
@@ -1076,7 +1078,13 @@ arrow::Status HashJoinOperator::Pull() {
     }
     ARROW_RETURN_NOT_OK(Fit(matches_, static_cast<std::size_t>(in.data->num_rows()), memory_));
     const ProfileTimer find(profile(), "find");
-    ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
+    if (probe_keys_.empty()) {
+      // A nested loop (ADR 0040): every build row is a candidate of every selected row.
+      ARROW_RETURN_NOT_OK(
+          table_->FindEvery(in.data->num_rows(), in.selection.get(), ctx_.pool, matches_));
+    } else {
+      ARROW_RETURN_NOT_OK(table_->Find(keys_, in.selection.get(), ctx_.pool, matches_));
+    }
   }
   batch_ = std::move(in);
   row_ = 0;
@@ -1625,6 +1633,9 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextPairs() {
   });
   row_ = row;
   taken_ = taken;
+  if (!residual_.empty() && profile() != nullptr) {  // the candidate pairs the residuals meet
+    profile()->Add("pairs", MetricUnit::kCount, count);
+  }
   arrow::ArrayVector probe;
   {
     const ProfileTimer gather(profile(), "gather");

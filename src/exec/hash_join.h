@@ -82,7 +82,8 @@ struct JoinColumns {
 //
 // A one-row join's build (a keyless spec) must hold exactly one row: any other count is Invalid,
 // from Prepare, before any probe part runs (a planner bug: SQL never sees it). Its values are then
-// made once (OneRowValues), from ExecContext::pool.
+// made once (OneRowValues), from ExecContext::pool. A nested loop's keyless build (ADR 0040) may
+// hold any number of rows.
 //
 // Profile (`profile`, nullptr: none): each Prepare's time and instance, the rows the table holds
 // (one batch per chunk of the table), and the metrics parts, part_time, wait, lanes_tail, finish
@@ -240,6 +241,11 @@ class BuildRowEmitter {
 // max(ExecContext::batch_size, 1) rows, resuming inside a probe batch: rows keep the probe order,
 // and a probe row's matches keep the build's (part, row) order.
 //
+// An inner, left or full join over a keyless build is a nested loop (ADR 0040): nothing is hashed
+// or looked up, and each selected probe row's candidates are every build row
+// (JoinTable::FindEvery), which its residuals then decide as a hash join's decide its key's rows.
+// Every path below runs on those candidates as it runs on a key's.
+//
 // - Inner. Output: the left input's columns, then the right input's (whichever side builds); the
 //   build's columns are nullable.
 //   - A build of unique keys (the 1:1 path): each window of at most batch_size rows of a probe
@@ -327,8 +333,9 @@ class BuildRowEmitter {
 class HashJoinOperator final : public Operator {
  public:
   // The kind is the build's. Invalid without a probe or a build; for a kind other than inner, semi
-  // or anti building on the left (not implemented); for an anti one over a build that did not keep
-  // its NULL keys; for a one-row join over a build with keys, or any other kind over a keyless one;
+  // or anti building on the left (not implemented); for an anti one over a keyed build that did not
+  // keep its NULL keys; for a one-row join over a build with keys, or a kind other than one-row,
+  // inner, left or full over a keyless one;
   // for a null-aware anti join of other than one key; for residuals on a null-aware anti or a
   // one-row join; for probe keys (columns of the probe's output, one per build key) outside the
   // probe's output or of another type than their build key; and for a residual that is not BOOLEAN

@@ -14,7 +14,7 @@ namespace antb1::exec {
 // TableScanOperator, Filter -> FilterOperator, Project -> ProjectOperator, Aggregate ->
 // ScalarAggregateOperator, GroupAggregate -> GroupAggregateOperator, Sort -> SortOperator,
 // Limit -> LimitOperator, RowCount -> RowCountOperator, a Join of any kind -> a hash join (a build
-// of one input probed by the other, keyless for a one-row join,
+// of one input probed by the other, keyless for a one-row join and for a nested loop, ADR 0040;
 // docs/adr/0022-joins-and-query-blocks.md), UnionAll -> UnionAllOperator over its inputs'
 // operators, each input planned on its own (docs/adr/0036-union-all.md); a Limit with a positive
 // limit directly over a Sort becomes one SortOperator with that limit (a top-N). A chain of Filter,

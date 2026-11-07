@@ -1242,15 +1242,15 @@ class Resolver {
   Resolved Visit(const LogicalNodePtr& self, const JoinNode& join) {
     Resolved left = Walk(join.left);
     Resolved right = Walk(join.right);
-    const bool keyless = Traits(join.kind).keyless;
-    if (keyless && !join.keys.empty()) {
+    const JoinKindTraits traits = Traits(join.kind);
+    if (traits.one_row && !join.keys.empty()) {
       Fail(std::format("Join: {} join with {} keys", ToString(join.kind), join.keys.size()));
-    } else if (!keyless && join.keys.empty()) {
+    } else if (!traits.one_row && !traits.nested_loop && join.keys.empty()) {
       Fail(std::format("Join: {} join without keys", ToString(join.kind)));
     }
-    if (join.build == BuildSide::kLeft && (keyless || Traits(join.kind).pads_left)) {
+    if (join.build == BuildSide::kLeft && (traits.one_row || traits.pads_left)) {
       // Every other kind may build on either input in a plan since ADR 0026's C2b (the executor
-      // runs those whose traits say `may_build_left`); a keyless join may not, because its right
+      // runs those whose traits say `may_build_left`); a one-row join may not, because its right
       // input is the single-row side by definition, and nor may one that pads its left input's
       // columns (FULL, ADR 0037's OJ2), whose build-emitting sink runs on a right build only.
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));

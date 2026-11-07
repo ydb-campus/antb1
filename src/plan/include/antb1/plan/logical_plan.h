@@ -499,8 +499,9 @@ struct JoinKey {
 };
 
 // A join of two inputs, its rows and columns as its kind's traits say (join_kind.h): the left
-// input's columns, then the right input's where `outputs_right`; at least one key unless `keyless`,
-// and none then. A plan may build any kind but a keyless one on its left input (ADR 0026's C2b and
+// input's columns, then the right input's where `outputs_right`; at least one key unless `one_row`,
+// and none then, or `nested_loop`, which may have none (ADR 0040). A plan may build any kind but a
+// one-row one on its left input (ADR 0026's C2b and
 // C2c); the executor runs that only where `may_build_left`, and the physical planner builds a left
 // join without a part pipeline on its right input instead.
 struct JoinNode {
