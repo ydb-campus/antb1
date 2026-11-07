@@ -162,14 +162,15 @@ endfunction()
 # AddressSanitizer. Measured in the ASan build on a developer's Mac, these 200 take about as long as that test's 300,
 # whose parallel run already takes most of its inner timeout on a slow runner of CI's clang-asan leg, and 300 here
 # would bring this parallel run near it. A query's index alone decides it, so these 200 are the first 200 of any
-# larger count.
+# larger count. Each run is two interleaved halves of them (--shard K/2), as TPC-H's is: the parallel run took up to
+# 258 seconds of its 270-second inner timeout under ASan on CI.
 set(_seed 20261102)
 foreach(kind IN ITEMS diff parallel)
   if(kind STREQUAL "diff")
-    set(_name diff.tpcds)
+    set(_base diff.tpcds)
     set(_options "")
   else()
-    set(_name parallel.diff.tpcds)
+    set(_base parallel.diff.tpcds)
     set(
       _options
       --threads
@@ -180,22 +181,27 @@ foreach(kind IN ITEMS diff parallel)
       1000
     )
   endif()
-  antb1_slt_args(
-    _args
-    ${_name}
-    TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf0_01.txt"
-    --seed
-    ${_seed}
-    --count
-    200
-    ${_options}
-  )
-  _tpcds_test(
-    ${_name}
-    LABEL ${kind}
-    REQUIRE "antb1-slt diff: 107 of the 107 declared refs can be joined\n" "DIFF: PASS "
-    COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
-  )
+  foreach(_half 1 2)
+    set(_name ${_base}.${_half}of2)
+    antb1_slt_args(
+      _args
+      ${_name}
+      TABLES "${CMAKE_CURRENT_SOURCE_DIR}/tables_sf0_01.txt"
+      --seed
+      ${_seed}
+      --count
+      200
+      --shard
+      ${_half}/2
+      ${_options}
+    )
+    _tpcds_test(
+      ${_name}
+      LABEL ${kind}
+      REQUIRE "antb1-slt diff: 107 of the 107 declared refs can be joined\n" "DIFF: PASS "
+      COMMAND $<TARGET_FILE:antb1-slt> diff ${_args}
+    )
+  endforeach()
 endforeach()
 
 # The ratchet (antb1-slt tpcds, tests/slt/runner/ratchet.h): the 99 queries on antb1, and DuckDB for those antb1
