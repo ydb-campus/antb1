@@ -2909,13 +2909,14 @@ enum class Clause : std::uint8_t {
 // The clauses whose outer references ADR 0023 answers.
 bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == Clause::kInnerOn; }
 
-// Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope.
+// Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
+// seen in the given visibility: the clause the subquery is written in (rule 10's for an ON).
 // A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
 // before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
 // `inside_exists` is true only for the block of an EXISTS conjunct, whose select list ADR 0023's
 // Path 1 checks but does not expand.
-using BindBlockFn =
-    std::function<arrow::Result<BoundBlock>(const sql::SelectStatement&, const Scope*, bool)>;
+using BindBlockFn = std::function<arrow::Result<BoundBlock>(const sql::SelectStatement&,
+                                                            const Scope*, Visibility, bool)>;
 
 // One subquery conjunct's join (ADR 0022's J5): above its block's inner joins for a WHERE or
 // inner-ON conjunct, above its aggregation for a HAVING one, in the order the conjuncts are
@@ -2955,9 +2956,9 @@ class Binder {
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
          const BindOptions& options, const Scope* outer = nullptr,
          const BindBlockFn* bind_block = nullptr, bool outer_encloses = false,
-         bool inside_exists = false)
+         bool inside_exists = false, Visibility outer_visible = {})
       : stmt_(stmt),
-        scope_(std::move(bindings), outer),
+        scope_(std::move(bindings), outer, outer_visible),
         outer_encloses_(outer_encloses),
         inside_exists_(inside_exists),
         ids_(ids),
@@ -3303,10 +3304,12 @@ class Binder {
   // constant (literals folded) and the sum and `other` of a signed integer type, is
   // SUM(other) + c * COUNT(other), in HUGEINT: the addition is never computed, so it never
   // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
-  // without its `+ constant` layers (they add no NULL), as DuckDB does.
+  // without its `+ constant` layers (they add no NULL), as DuckDB does. Not in a correlated block,
+  // whose aggregation DuckDB has given groups by the time its rewriter runs: there the addition is
+  // computed, as in DuckDB, and the SUM stays one that ADR 0023's Path 2 answers.
   arrow::Result<std::optional<SumRewrite>> RewritableSum(const sql::AggregateCall& call) {
     if (HasGroupBy(stmt_) || call.kind != sql::AggKind::kSum || call.distinct ||
-        !call.arg.has_value()) {
+        !call.arg.has_value() || Correlated()) {
       return std::nullopt;
     }
     const auto split =
@@ -3769,8 +3772,8 @@ class Binder {
     }
     // Only a name this block does not have at all is an outer reference. One that is ambiguous
     // here, or whose column has no engine type, keeps its own error: an enclosing block that
-    // happens to have the name must not turn a bind error into a refusal, nor (once the binder
-    // plans a dependent join) make an ambiguous name silently read the outer column.
+    // happens to have the name must not turn a bind error into a refusal, nor make an ambiguous
+    // name silently read the outer column.
     if (scope_.LookUp(ref, visible_).outcome != Lookup::Outcome::kMissing) {
       return resolved;
     }
@@ -3780,8 +3783,7 @@ class Binder {
     }
     // An outer reference. ADR 0023 answers one only in a WHERE conjunct of its own block (an inner
     // join's ON counts as WHERE, rule 10) and only one block out; every other one exits 4 here, at
-    // the reference's span, with the rule it broke. Until the binder plans a dependent join, the
-    // allowed one exits 4 too, as kCorrelated.
+    // the reference's span, with the rule it broke.
     if (!outer_encloses_) {
       // A derived table or a CTE: the name is in a sibling or declaring scope, so this is a
       // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
@@ -3795,24 +3797,48 @@ class Binder {
     }
     // The outer reference ADR 0023 answers: resolved in the enclosing block's scope, by its id, so
     // the sub-plan has it as a free variable and becomes a dependent join. An outer name that is
-    // ambiguous there keeps that scope's own bind error, as it does in DuckDB.
-    return outer->scope->Resolve(ref);
+    // ambiguous there keeps that scope's own bind error, as it does in DuckDB, and it is resolved
+    // in the visibility it was found in: an ON's for a subquery of that ON (rule 10).
+    return outer->scope->Resolve(ref, outer->visible);
   }
 
-  // Whether `expr` reads a column that only an enclosing query block has, which makes its conjunct
-  // one for the block-top filter rather than one to classify by the relations it reads (ADR 0023).
-  // A name a select alias of this block also has is that alias, as in Resolve.
-  [[nodiscard]] bool ReadsOuterColumn(const sql::Expr& expr) const {
+  // Whether `expr`, bound in `visible`, reads a column that only an enclosing query block has,
+  // which makes its conjunct one for the block-top filter rather than one to classify by the
+  // relations it reads (ADR 0023). A name a select alias of this block also has is that alias, as
+  // in Resolve.
+  [[nodiscard]] bool ReadsOuterColumn(const sql::Expr& expr, Visibility visible) const {
     if (!outer_encloses_) {
       return false;  // a lateral reference is refused where it resolves, never routed
     }
     std::vector<const sql::ColumnRef*> refs;
     CollectRefs(expr, refs);
-    return std::ranges::any_of(refs, [this](const sql::ColumnRef* ref) {
-      return scope_.LookUp(*ref, visible_).outcome == Lookup::Outcome::kMissing &&
+    return std::ranges::any_of(refs, [this, visible](const sql::ColumnRef* ref) {
+      return scope_.LookUp(*ref, visible).outcome == Lookup::Outcome::kMissing &&
              !(ref->qualifier.empty() && FindAlias(select_, ref->name).has_value()) &&
              scope_.LookUpOuter(*ref).has_value();
     });
+  }
+
+  // Whether this block is correlated: a conjunct of its WHERE or of an inner ON, the clauses where
+  // an outer reference is answered, reads an outer column (ReadsOuterColumn). Its aggregation is
+  // then unnested into one with groups (ADR 0023's Path 2), which DuckDB's sum rewriter -- run
+  // after DuckDB's unnesting, over aggregations without groups -- never rewrites, so RewritableSum
+  // leaves it alone too. Asked while the select list binds, before WHERE does, so it reads the
+  // statement, each clause in the visibility BindWhere binds it in: an ON in its own (rule 10),
+  // where a name that only a later item has besides an enclosing block is that block's.
+  [[nodiscard]] bool Correlated() const {
+    if (!correlated_.has_value()) {
+      correlated_ = std::ranges::any_of(stmt_.where, [this](const sql::Expr& conjunct) {
+        return ReadsOuterColumn(conjunct, Visibility{});
+      });
+      for (std::size_t i = 0; i < stmt_.from.size() && !*correlated_; ++i) {
+        const Visibility on = OnVisibility(stmt_.from, i);
+        correlated_ = std::ranges::any_of(stmt_.from[i].on, [this, on](const sql::Expr& conjunct) {
+          return ReadsOuterColumn(conjunct, on);
+        });
+      }
+    }
+    return *correlated_;
   }
 
   // One WHERE conjunct of this block that reads an outer column: bound as a condition over the
@@ -3824,6 +3850,7 @@ class Binder {
   const sql::SelectStatement& stmt_;
   Scope scope_;
   Visibility visible_;  // the clause being bound (the default: every binding, in one level)
+  mutable std::optional<bool> correlated_;  // Correlated(), once asked
   // Which clause is binding, for ADR 0023's rule that an outer reference is answered only in a
   // WHERE conjunct of its own block. `visible_` cannot say it: BindWhere gives an inner join's ON
   // and an outer join's ON the same visibility, and ADR 0023 answers an outer reference in the
@@ -5630,7 +5657,7 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error.
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound,
-                        (*bind_block_)(*form.subquery->query, &scope_, form.exists()));
+                        (*bind_block_)(*form.subquery->query, &scope_, visible_, form.exists()));
   if (form.exists()) {
     // Before the column-count rule below: an EXISTS block's select list is dropped, so it has no
     // columns at all, and the rule would make it a bind error where ADR 0023 wants an answer.
@@ -5928,7 +5955,7 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
       continue;
     }
     const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(*conjunct.expr);
-    const bool outer = ReadsOuterColumn(*conjunct.expr);
+    const bool outer = ReadsOuterColumn(*conjunct.expr, visible_);
     // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
     // neither route can take it. The subquery route binds the conjunct's other side as an ordinary
     // expression, and the correlated route binds the whole conjunct as a condition, whose every
@@ -7446,7 +7473,8 @@ struct CteFrame {
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer,
-                                    bool outer_encloses = false, bool inside_exists = false);
+                                    bool outer_encloses = false, bool inside_exists = false,
+                                    Visibility outer_visible = {});
 BoundBlock BoundBlockOf(LogicalPlan plan);
 
 // Rule 7: the binding's column names. The alias list renames the leading columns, each losing its
@@ -7898,7 +7926,7 @@ BoundBlock BoundBlockOf(LogicalPlan plan) {
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
-                                    bool inside_exists) {
+                                    bool inside_exists, Visibility outer_visible) {
   static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
@@ -7945,16 +7973,17 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   // A subquery's query is a block of its own: it binds in this block's CTE frame, as its relation
   // count is taken there, and against this block's scope, which the binder passes.
   const BindBlockFn bind_sub = [&](const sql::SelectStatement& block, const Scope* scope,
+                                   Visibility scope_visible,
                                    bool exists_block) -> arrow::Result<BoundBlock> {
     // A subquery expression's block is the one case whose enclosing scope is a query block's, so
     // an outer reference in it may be answered (ADR 0023). A derived table and a CTE get the scope
     // of the preceding FROM items or of the declaring block instead, where a reference out is a
     // lateral one, which ADR 0022 refuses.
     return BindBlock(block, catalog, options, ids, &own, scope, /*outer_encloses=*/true,
-                     exists_block);
+                     exists_block, scope_visible);
   };
   Binder binder(stmt, std::move(bindings), ids, options, outer, &bind_sub, outer_encloses,
-                inside_exists);
+                inside_exists, outer_visible);
   ARROW_ASSIGN_OR_RAISE(LogicalPlan plan, binder.Bind());
   BoundBlock bound = BoundBlockOf(std::move(plan));
   bound.spans = binder.OutputSpans();

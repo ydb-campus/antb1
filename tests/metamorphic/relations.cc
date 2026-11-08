@@ -1860,7 +1860,7 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
-  // ---- correlated subqueries (ADR 0023; pending until U2 and U3 declare their feature) ----
+  // ---- correlated subqueries (ADR 0023's U2 and U3, each declaring its own feature) ----
   // Each carries only its own Feature, so U2 activates the EXISTS family and U3 the aggregate one
   // without waiting for the other: the two PRs run side by side.
   {

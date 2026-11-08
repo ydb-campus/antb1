@@ -497,6 +497,33 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
     replaces a NULL by a NULL and a value by the same value. Every other such conjunct is kept, substituted, as an
     inner condition. The semi-join reduction keys as the join back does.
   - **Unchanged:** an uncorrelated `NOT IN` keeps `=`'s NULL rules, and a null-aware anti join takes no NULL-equal key.
+- Update (2026-11-08, the review before ADR 0037's phase 8): **three wrong answers and a refusal, fixed.** A review of
+  the unnesting against the formalization found them; each was reproduced against DuckDB on synthetic tables, and each
+  is pinned by a test.
+  - **Dropping `c = c` meets the NULL-equal keys.** Path 2 drops an equality that became `c = c` because no outer row
+    could match the NULL group; since OJ5b one can. `o.x = o.y`, with both linked by `IS NOT DISTINCT FROM` to `t.a`,
+    became `t.a = t.a` and was dropped, so an outer row whose `x` and `y` are NULL read the NULL group, where the
+    subquery's WHERE is NULL and reads no row. Such an equality is now kept, substituted, when a side of it is an outer
+    column keyed NULL-equal: the 2015 paper drops this selection only where the column is not nullable, being "simply
+    a not-NULL check". With `=` keys the rule stands, the join back's `=` checking the same.
+  - **A select item has to read an aggregate.** Path 2's strictness test passed a select item that reads none
+    vacuously (`SELECT 1 ... ORDER BY max(t.x)`: a literal is strict, and the select item holds no call), so an outer
+    row with no group was dropped where the subquery gives 1. Every column the join back reads must now be NULL over no
+    rows -- an aggregate call, or a strict combination of one through the Computes and Projects above the aggregation
+    -- and anything else exits 4.
+  - **The scope of an outer reference in an ON.** Binding (U1) gives a name in an ON the FROM items up to its own JOIN.
+    That held for the ON's own names but not for those of a subquery in it, which resolved against every item of the
+    enclosing block, so a later item's column was read where DuckDB reads one further out or rejects the name. An outer
+    lookup now carries the visibility of the place its subquery is written.
+  - **No sum rewrite in a correlated block.** The binder's rewrite of `SUM(x + c)` into `SUM(x) + c * COUNT(x)` made
+    Path 2 refuse a sum it answers, for the COUNT. DuckDB's rewriter never meets the aggregation of a block correlated
+    in its WHERE or an inner ON without groups, its flattening having grouped it by the correlation, so skipping the
+    rewrite there keeps the overflow behaviour DuckDB's. The binder tells such a block by those clauses alone, each ON
+    in its own visibility, as it binds them; an outer reference elsewhere exits 4, and DuckDB, which grouped nothing
+    for it, rewrites.
+  - **Two statements above are stale, the behaviour being right:** explicit casts no longer exit 4 (ADR 0037's CT1
+    binds an exact widening to a cast, which is strict), and a join kind is compiler-checked since ADR 0037's OJ1
+    (`Traits(JoinKind)`, an exhaustive switch), where Binding (U1) says it is not.
 
 ## Alternatives considered
 

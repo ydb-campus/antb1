@@ -626,6 +626,106 @@ TEST(ScopeTest, AnOnDoesNotSeeLaterItems) {
                  {});
 }
 
+// A block written in an ON sees its enclosing block as the ON itself does (rule 10): an outer name
+// of a subquery there neither resolves to a FROM item later than the ON's JOIN nor is made
+// ambiguous by one, and a block further out may then have it. Written in WHERE, the same block sees
+// every item of the enclosing block.
+TEST(ScopeTest, AnOuterLookupSeesTheEnclosingBlockAsItsOnDoes) {
+  ColumnIdSource ids;
+  // SELECT ... FROM t AS x WHERE EXISTS (SELECT ... FROM u JOIN w ON ... AND EXISTS (SELECT ...
+  // FROM v WHERE <ref>) JOIN t AS x ON ...): the innermost block is written in the ON of u JOIN w.
+  const Scope outermost({Aliased("x", "t", T(), ids)});
+  const Scope middle(
+      {TableBinding("u", U(), ids), TableBinding("w", W(), ids), Aliased("x", "t", T(), ids)},
+      &outermost);
+  const Visibility on_w{.inner_begin = 0, .end = 2};
+  const Scope in_on({TableBinding("v", V(), ids)}, &middle, on_w);
+  const Scope in_where({TableBinding("v", V(), ids)}, &middle);
+
+  // x.b: the middle block's x comes after the ON, so the name is the outermost block's x.
+  const auto two_out = in_on.LookUpOuter(QRef("x", "b"));
+  ASSERT_TRUE(two_out.has_value());
+  if (!two_out.has_value()) {
+    return;
+  }
+  EXPECT_EQ(two_out->distance, 2U);
+  EXPECT_EQ(two_out->scope, &outermost);
+  const auto one_out = in_where.LookUpOuter(QRef("x", "b"));
+  ASSERT_TRUE(one_out.has_value());
+  if (!one_out.has_value()) {
+    return;
+  }
+  EXPECT_EQ(one_out->distance, 1U);
+  EXPECT_EQ(one_out->scope, &middle);
+
+  // c: only w.c is seen from the ON, where the later x.c makes it ambiguous in WHERE; the lookup
+  // carries the visibility it was made in, which the binder resolves the name in.
+  const auto c = in_on.LookUpOuter(Ref("c"));
+  ASSERT_TRUE(c.has_value());
+  if (!c.has_value()) {
+    return;
+  }
+  EXPECT_EQ(c->distance, 1U);
+  ASSERT_EQ(c->lookup.outcome, Lookup::Outcome::kFound);
+  EXPECT_EQ(c->lookup.where.binding, 1U);
+  EXPECT_EQ(c->visible.end, on_w.end);
+  ExpectResolves(middle, Ref("c"), c->visible, 1, 0, "w");
+  const auto c_where = in_where.LookUpOuter(Ref("c"));
+  ASSERT_TRUE(c_where.has_value());
+  if (!c_where.has_value()) {
+    return;
+  }
+  EXPECT_EQ(c_where->lookup.outcome, Lookup::Outcome::kAmbiguous);
+
+  // A qualified name that only a later item has, and no block further out: no enclosing block has
+  // it for the ON, which the binder then reports as the block's own missing name.
+  EXPECT_FALSE(in_on.LookUpOuter(QRef("w", "zz")).has_value());
+  const Scope in_first_on({TableBinding("v", V(), ids)}, &middle,
+                          Visibility{.inner_begin = 0, .end = 1});
+  EXPECT_FALSE(in_first_on.LookUpOuter(QRef("w", "g")).has_value());
+  EXPECT_TRUE(in_where.LookUpOuter(QRef("w", "g")).has_value());
+}
+
+// An ON in a comma list sees two levels (rule 10): its join group, then the comma siblings before
+// it. A block written there keeps both for its outer names: a name the group has is the group's,
+// although a comma sibling has it too, and a name only a sibling has is the sibling's.
+TEST(ScopeTest, AnOuterLookupKeepsTheLevelsOfAnOnInACommaList) {
+  ColumnIdSource ids;
+  // FROM t AS a, u AS b JOIN w AS c ON ... EXISTS (SELECT ... FROM v WHERE <ref>): the ON of
+  // b JOIN c sees b and c, then a.
+  const Scope block(
+      {Aliased("a", "t", T(), ids), Aliased("b", "u", U(), ids), Aliased("c", "w", W(), ids)});
+  const Visibility on_c{.inner_begin = 1, .end = 3};
+  const Scope in_on({TableBinding("v", V(), ids)}, &block, on_c);
+  const Scope in_where({TableBinding("v", V(), ids)}, &block);
+
+  // c is a's and c's, and a is a's and b's: the group's own from the ON, ambiguous from WHERE.
+  for (const auto& [name, binding] :
+       {std::pair{"c", std::size_t{2}}, std::pair{"a", std::size_t{1}}}) {
+    const auto in_group = in_on.LookUpOuter(Ref(name));
+    ASSERT_TRUE(in_group.has_value()) << name;
+    if (!in_group.has_value()) {
+      return;
+    }
+    EXPECT_EQ(in_group->lookup.outcome, Lookup::Outcome::kFound) << name;
+    EXPECT_EQ(in_group->lookup.where.binding, binding) << name;
+    EXPECT_EQ(in_group->visible.inner_begin, on_c.inner_begin) << name;
+    const auto everywhere = in_where.LookUpOuter(Ref(name));
+    ASSERT_TRUE(everywhere.has_value()) << name;
+    if (!everywhere.has_value()) {
+      return;
+    }
+    EXPECT_EQ(everywhere->lookup.outcome, Lookup::Outcome::kAmbiguous) << name;
+  }
+  // b is a's alone: the comma sibling's, at the outer level.
+  const auto b = in_on.LookUpOuter(Ref("b"));
+  ASSERT_TRUE(b.has_value());
+  if (!b.has_value()) {
+    return;
+  }
+  ExpectResolves(block, Ref("b"), b->visible, 0, 1, "a");
+}
+
 // Rule 10's visibility of an ON, from the FROM list alone: the items up to and including its own,
 // its join group the inner level. A comma starts a group and so does the first item; JOIN and
 // CROSS JOIN continue the group they join into.

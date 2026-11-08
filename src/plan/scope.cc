@@ -281,8 +281,8 @@ LogicalNodePtr Binding::Node() const {
   return std::visit(NodeOf{.columns = columns_}, source_);
 }
 
-Scope::Scope(std::vector<Binding> bindings, const Scope* outer)
-    : bindings_(std::move(bindings)), outer_(outer) {
+Scope::Scope(std::vector<Binding> bindings, const Scope* outer, Visibility outer_visible)
+    : bindings_(std::move(bindings)), outer_(outer), outer_visible_(outer_visible) {
   ANTB1_DCHECK(IdsAreUnique(bindings_));
 }
 
@@ -312,12 +312,19 @@ arrow::Result<BoundColumn> Scope::Resolve(const sql::ColumnRef& ref, Visibility 
 
 std::optional<Scope::OuterLookup> Scope::LookUpOuter(const sql::ColumnRef& ref) const {
   // Every enclosing scope, not just the nearest: DuckDB answers a reference several blocks out.
-  // An unqualified name counts too, which a check over qualifiers alone would miss.
+  // An unqualified name counts too, which a check over qualifiers alone would miss. Each in the
+  // visibility where the block inside it is written: a subquery in an ON sees the FROM items up to
+  // that ON's JOIN, as the ON does (rule 10), so a later item neither answers a name nor makes it
+  // ambiguous, and a block further out may then have it.
   std::size_t distance = 0;
-  for (const Scope* outer = outer_; outer != nullptr; outer = outer->outer_) {
+  Visibility visible = outer_visible_;
+  for (const Scope* outer = outer_; outer != nullptr;
+       visible = outer->outer_visible_, outer = outer->outer_) {
     ++distance;
-    if (const Lookup lookup = outer->LookUp(ref); lookup.outcome != Lookup::Outcome::kMissing) {
-      return OuterLookup{.distance = distance, .scope = outer, .lookup = lookup};
+    if (const Lookup lookup = outer->LookUp(ref, visible);
+        lookup.outcome != Lookup::Outcome::kMissing) {
+      return OuterLookup{
+          .distance = distance, .scope = outer, .lookup = lookup, .visible = visible};
     }
   }
   return std::nullopt;

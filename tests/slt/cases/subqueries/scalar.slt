@@ -289,7 +289,63 @@ SELECT COUNT(*) FROM zones AS z WHERE 0 < (SELECT SUM(tr_row) FROM trips JOIN dr
 BIGINT
 7
 
+# A correlated SUM of an addition stays a SUM (DuckDB's sum rewriter never rewrites a correlated aggregation).
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE z.zn_id < (SELECT SUM(d.dv_city + 1) FROM drivers AS d WHERE d.dv_city = z.zn_city)
+----
+BIGINT
+30
+
+# The same correlated through an inner ON, and through a name of that ON that the later z2 has too: the ON does not
+# see z2 (rule 10), so zn_city is the outer z.zn_city there.
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE z.zn_id < (SELECT SUM(d.dv_city + 1) FROM drivers AS d JOIN cities AS c ON c.ct_id = d.dv_city AND c.ct_id = z.zn_city)
+----
+BIGINT
+30
+
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE z.zn_id < (SELECT SUM(d.dv_city + 1) FROM drivers AS d JOIN cities AS c ON c.ct_id = d.dv_city AND c.ct_id = zn_city JOIN zones AS z2 ON z2.zn_city = c.ct_id)
+----
+BIGINT
+30
+
+# A subquery in an ON of a comma list: label is the join group's cities', although the comma sibling zones has one
+# too. (An ON that reads a comma sibling as well makes DuckDB 1.5.6 drop every row of a correlated scalar subquery
+# there, which antb1 answers, so no record has that shape.)
+query I nosort
+SELECT COUNT(*) FROM zones AS a, drivers JOIN cities ON ct_id = dv_city AND dv_id <= (SELECT MAX(tr_driver) FROM trips JOIN tariffs ON tf_code = tr_tariff WHERE tf_label = label)
+----
+BIGINT
+1760
+
+# So both engines compute x + 1 there, and fail on the row where it overflows, however the block is correlated; the
+# uncorrelated SUM is rewritten in both and answers.
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge AS e WHERE e.i32 < (SELECT SUM(f.i16 + 1) FROM edge AS f WHERE f.id = e.id)
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge AS e WHERE e.i32 < (SELECT SUM(f.i16 + 1) FROM edge AS f JOIN edge AS g ON g.id = f.id AND g.id = e.id)
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge AS e WHERE e.i32 < (SELECT SUM(f.i16 + 1) FROM edge AS f WHERE f.id IS NOT DISTINCT FROM e.id)
+
+query I nosort
+SELECT COUNT(*) FROM edge AS e WHERE e.i32 < (SELECT SUM(f.i16 + 1) FROM edge AS f)
+----
+BIGINT
+7
+
 # ---- DuckDB only until correlated COUNT gets a PR (ADR 0023: the COUNT bug) ----
+
+# A constant over an aggregate that only ORDER BY has is 1 over no rows too, so every zone passes; the inner join would
+# keep only the zones with a city. (A strict ORDER BY aggregate such as MAX makes DuckDB 1.5.6 drop them too.)
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE 1 = (SELECT 1 FROM cities AS c WHERE c.ct_id = z.zn_city ORDER BY COUNT(*))
+----
+BIGINT
+40
 
 # COUNT over no rows is 0, so the riders without a trip pass: an inner join on the grouped trips would drop them.
 onlyif duckdb

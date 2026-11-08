@@ -6111,9 +6111,7 @@ TEST(BinderTest, AStarInsideExistsIsCheckedButNotExpanded) {
 }
 
 // A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass
-// then rejects: the query exits 4 either way, but through the pass, which is what U2 and U3 replace
-// with a rewrite. This is the one SQL shape that reaches a dependent join in U1: EXISTS waits for
-// U2 and a correlated IN is refused by its shape.
+// then rewrites (Path 2, U3).
 TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   const auto catalog = testing::MakeCatalog();
   auto plan = BindSql(
@@ -6184,6 +6182,120 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   find(find, plain->root);
   EXPECT_EQ(dependent, nullptr) << Explain(*plain);
   EXPECT_TRUE(Optimize(*plain).ok());
+}
+
+// Path 2 joins the outer side to the grouped subquery with an inner join, which gives an outer row
+// with no group no row: right only where the subquery's value is NULL over no rows, so that the
+// comparison above rejects that row too. A select item that reads no aggregate call is not: a
+// constant over an aggregation that an ORDER BY aggregate makes one row (its call is then dropped)
+// is that constant over no rows. Refused, with the strict combinations kept answered.
+TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
+  const auto catalog = testing::MakeCatalog();
+  const auto optimize = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Optimize(*plan) : arrow::Result<LogicalPlan>(plan.status());
+  };
+  for (const std::string_view sql : {
+           "SELECT i16 FROM t WHERE i32 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY COUNT(*))",
+           "SELECT i16 FROM t WHERE i32 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY "
+           "MAX(u.i32))",
+           "SELECT i16 FROM t WHERE i32 = (SELECT 1 + 0 FROM u WHERE u.i64 = t.i64 ORDER BY "
+           "MIN(u.i32))",
+       }) {
+    const auto optimized = optimize(sql);
+    ASSERT_FALSE(optimized.ok()) << sql;
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << sql << ": " << optimized.status().ToString();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
+    EXPECT_EQ(optimized.status().message(),
+              "a correlated scalar subquery whose select item does not combine its aggregate "
+              "strictly is not supported")
+        << sql;
+  }
+  for (const std::string_view sql : {
+           "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u WHERE u.i64 = t.i64)",
+           "SELECT i16 FROM t WHERE i32 < (SELECT MAX(u.i32) + 1 FROM u WHERE u.i64 = t.i64)",
+           "SELECT i16 FROM t WHERE i32 < (SELECT -MIN(u.i32) * 2 FROM u WHERE u.i64 = t.i64 ORDER "
+           "BY MAX(u.i32))",
+           "SELECT i16 FROM t WHERE i64 < (SELECT CAST(AVG(u.i32) AS BIGINT) FROM u WHERE u.i64 = "
+           "t.i64)",
+       }) {
+    const auto optimized = optimize(sql);
+    EXPECT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+  }
+}
+
+// DuckDB's sum rewriter (SUM(x + c) as SUM(x) + c * COUNT(x)) runs after DuckDB's unnesting, over
+// aggregations without groups, so it never rewrites a correlated subquery's aggregation, which has
+// gained the correlation's groups by then. The binder leaves it alone too: a correlated SUM(x + c)
+// stays a SUM, which Path 2 answers, where its COUNT made the query exit 4. Uncorrelated, it is
+// still rewritten.
+TEST(BinderTest, ACorrelatedSumOfAnAdditionIsNotRewritten) {
+  const auto catalog = testing::MakeCatalog();
+  auto correlated = BindSql(
+      "SELECT i16 FROM t WHERE i64 < (SELECT SUM(u.i32 + 1) FROM u WHERE u.i64 = t.i64)", catalog);
+  ASSERT_TRUE(correlated.ok()) << correlated.status().ToString();
+  const auto optimized = Optimize(*correlated);
+  ASSERT_TRUE(optimized.ok()) << optimized.status().ToString();
+  const std::string text = Explain(*optimized);
+  EXPECT_TRUE(text.contains("GroupAggregate keys=[\"u.i64\"] SUM(")) << text;
+  EXPECT_FALSE(text.contains("COUNT(")) << text;
+
+  auto plain = BindSql("SELECT i16 FROM t WHERE i64 < (SELECT SUM(u.i32 + 1) FROM u)", catalog);
+  ASSERT_TRUE(plain.ok()) << plain.status().ToString();
+  EXPECT_TRUE(Explain(*plain).contains("COUNT(")) << Explain(*plain);
+
+  // Correlated through an inner ON, and through a name of that ON that the later d2 has too: the
+  // ON does not see d2 (rule 10), so `i` is the outer dec.i there, and the block is correlated.
+  for (const std::string_view sql :
+       {"SELECT p FROM dec WHERE b < (SELECT SUM(u.i32 + 1) FROM u JOIN ok ON ok.i16 = u.i16 AND "
+        "u.i32 = dec.i)",
+        "SELECT p FROM dec WHERE b < (SELECT SUM(u.i32 + 1) FROM u JOIN ok ON ok.i16 = u.i16 AND "
+        "u.i32 = i JOIN dec AS d2 ON d2.s16 = u.i16)"}) {
+    auto on = BindSql(sql, catalog);
+    ASSERT_TRUE(on.ok()) << sql << ": " << on.status().ToString();
+    const auto unnested = Optimize(*on);
+    ASSERT_TRUE(unnested.ok()) << sql << ": " << unnested.status().ToString();
+    EXPECT_FALSE(Explain(*unnested).contains("COUNT(")) << Explain(*unnested);
+  }
+}
+
+// A subquery in an inner join's ON sees its enclosing block as the ON does (rule 10): the FROM
+// items up to that JOIN. A name only a later item has is no outer reference (DuckDB: "Referenced
+// table not found"), an unqualified name that a later item also has is not ambiguous, and a name
+// that a later item hides from an enclosing block further out is that block's -- which exits 4,
+// being two blocks out, where it once read the later item's column.
+TEST(BinderTest, ASubqueryInAnOnSeesTheItemsTheOnSees) {
+  const auto catalog = testing::MakeCatalog();
+  const auto error_of = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    EXPECT_NE(detail, nullptr) << sql << ": " << plan.status().ToString();
+    return detail == nullptr ? SqlErrorDetail::Kind::kParse : detail->kind();
+  };
+  EXPECT_EQ(error_of("SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND EXISTS (SELECT * FROM dec "
+                     "WHERE dec.i = x.i32) JOIN u AS x ON x.i16 = t.i16"),
+            SqlErrorDetail::Kind::kBind);
+  EXPECT_EQ(error_of("SELECT x.i16 FROM u AS x WHERE EXISTS (SELECT * FROM t JOIN ok ON t.i16 = "
+                     "ok.i16 AND EXISTS (SELECT * FROM dec WHERE dec.i = x.i32) JOIN u AS x ON "
+                     "x.i16 = t.i16)"),
+            SqlErrorDetail::Kind::kUnsupported);
+
+  // i32 is t's and u's; the ON of t JOIN ok sees only t's.
+  auto plan = BindSql(
+      "SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND EXISTS (SELECT * FROM dec WHERE dec.i = "
+      "i32) JOIN u ON u.i16 = t.i16",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status().ToString();
+  // The semi join's key reads t's i32: t's scan reads it, u's does not.
+  const std::string text = Explain(*optimized);
+  EXPECT_TRUE(text.contains("Join SEMI build=right keys=[i32 = \"dec.i\"]")) << text;
+  EXPECT_TRUE(text.contains("Scan table=t source=fake columns=[i16, i32]\n")) << text;
+  EXPECT_TRUE(text.contains("Scan table=u source=fake columns=[i16]\n")) << text;
 }
 
 // A semi join over one relation runs on that relation's own branch rather than above every join of

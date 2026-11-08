@@ -21,7 +21,8 @@ functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `t
 `CASE` and `COALESCE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`,
 `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with `IN`, scalar and `EXISTS` subqueries, correlated or not, and `UNION ALL`, `UNION`, `INTERSECT` and `EXCEPT`
+outer joins, with uncorrelated `IN` subqueries, scalar subqueries correlated or not, correlated `EXISTS` subqueries,
+and `UNION ALL`, `UNION`, `INTERSECT` and `EXCEPT`
 of two or more blocks. This covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). All 22 queries derived from TPC-H pass
 (see [Queries derived from TPC-H](#queries-derived-from-tpc-h)).
@@ -65,8 +66,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   data falls. Every other placement
   exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, two subqueries in one comparison and a subquery that
   is no direct operand among them, and so does a subquery column count
-  other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level `WHERE`
-  conjunct and nowhere else; `TRY_CAST`, a lateral reference, more than 256
+  other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level conjunct of `WHERE` or of
+  an inner join's `ON` and nowhere else; `TRY_CAST`, a lateral reference, more than 256
   relations counting every sub-plan and every subquery: exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
@@ -404,18 +405,22 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   its equivalent, and the join keys on it NULL-equal, so an outer NULL reads the NULL group), where the select item
   combines the aggregate with literals and arithmetic alone --
   `COUNT` is exit code 4 there, since it is 0 over no rows and the rewrite gives an outer row with no group no row at
-  all (divergences D23 and D24). Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with
-  `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a
-  key, a correlated scalar subquery whose outer column has no inner equivalent, and at the `IN` a correlated `IN` or
-  `NOT IN`, whose NULL semantics need the set's NULL and empty flags for each binding; at the subquery for one in
-  `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the subquery for a
-  conjunct that is both a subquery conjunct and a reader of an enclosing block's column, which neither unnesting path
-  handles. An outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON`
-  included, and only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL
-  JOIN`'s `ON`, further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference,
-  each with its own message. A star in an `EXISTS` block is checked by name but not expanded: an `ORDER BY` position
-  there counts its columns, and one that names a column of it is exit code 4 (one out of range is a bind error, as in
-  DuckDB);
+  all (divergences D23 and D24), and so is a select item that reads no aggregate, which is not NULL over no rows either
+  (`SELECT 1` of a block that aggregates only in its `ORDER BY`). An equality of outer columns stays in the subquery
+  when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not true), and a correlated `SUM(x + c)`
+  keeps its form, as in DuckDB (no `COUNT`, below). Every other correlated shape is exit code 4: an uncorrelated
+  `EXISTS`, a block with `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a
+  correlated `EXISTS` without a key, a correlated scalar subquery whose outer column has no inner equivalent, and at the
+  `IN` a correlated `IN` or `NOT IN`, whose NULL semantics need the set's NULL and empty flags for each binding; at the
+  subquery for one in `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the
+  subquery for a conjunct that is both a subquery conjunct and a reader of an enclosing block's column, which neither
+  unnesting path handles. A subquery in an inner join's `ON` sees its block's FROM items as that `ON` does (rule 10 of
+  [ADR 0022](adr/0022-joins-and-query-blocks.md)): an outer name there never resolves to a later item, as in DuckDB. An
+  outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON` included, and
+  only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL JOIN`'s `ON`,
+  further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference, each with its
+  own message. A star in an `EXISTS` block is checked by name but not expanded: an `ORDER BY` position there counts its
+  columns, and one that names a column of it is exit code 4 (one out of range is a bind error, as in DuckDB);
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -1337,7 +1342,9 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   the type's minimum divided by -1 overflows. On DOUBLE, `//` divides (NULL for a zero divisor) and `%` is `fmod`
   (NaN for a zero divisor). NULL operands give NULL. An expression is computed only for the rows that `WHERE` keeps.
   Two rewrites of DuckDB's optimizer are reproduced, so that an overflow fails the same queries: without `GROUP BY`,
-  `SUM(x + c)` (a signed integer `x`, an integer constant `c`) is `SUM(x) + c * COUNT(x)` in HUGEINT; and in every
+  `SUM(x + c)` (a signed integer `x`, an integer constant `c`) is `SUM(x) + c * COUNT(x)` in HUGEINT, except in a
+  subquery correlated in its `WHERE` or an inner join's `ON`, whose aggregation DuckDB has grouped by the correlation
+  when its rewriter runs; and in every
   comparison (`WHERE`, `HAVING`, `CASE WHEN`; `x` a column, a key, an aggregate or an alias), `x + c <op> k`,
   `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c` dividing `k` for
   `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
@@ -1567,7 +1574,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB; a name right after a star and before `,` or `FROM` is an alias there (unsupported), also a word DuckDB keeps as a keyword | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers; a keyword right after a star is a syntax error | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` and the reject case `KeywordAliasAfterAStar` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
 | D22 | `IN` over a doubly parenthesized query | reads `x [NOT] IN ((query))` as an `IN` list holding one scalar subquery, because a `(` opens a nested query only before a reserved query word (divergence D21), and a list of one subquery is unsupported: exit code 4 at the inner `(` | reads an `IN` subquery and answers it exactly as the single-paren form | `plan.SubqueryPlacements/BindErrorTest` pins the refusal and its span, and `tests/slt/cases/subqueries/in.slt` compares the form with DuckDB's own answer under `onlyif duckdb` |
 | D23 | A correlated `EXISTS`'s conjuncts over different rows | unnests it into a semi or anti join (ADR 0023's Path 1), so a conjunct that reads both blocks is a residual, computed only over the candidate pairs a key matches, and a conjunct that reads only the outer block is a residual too, computed over those same pairs rather than over every outer row | plans a delim join and computes the subquery's conjuncts for the bindings of the outer side, so an overflow in such a conjunct can fail in one engine and not the other | the random generator writes no arithmetic that can overflow (as for divergences D14 and D16), and `tests/slt/cases/subqueries/exists.slt` compares every shape Path 1 answers with DuckDB's own answer |
-| D24 | A correlated scalar aggregate over keys no outer row binds | unnests it by equivalence substitution (ADR 0023's Path 2). Where the correlation is on more than one column the aggregation's input is restricted to the keys the outer side binds (the semi-join reduction), and the divergence is narrowed to the keys that restriction's own estimate cannot rule out; on a single column it is not, so the aggregation groups by the correlated key and computes the aggregate's argument, the aggregate and its combination for EVERY key of the subquery's own rows, including keys no outer row binds | computes the subquery only for the bindings of the outer side, joining the domain below the aggregation | the answers agree: an outer row with no group is dropped by the inner join and rejected by the comparison alike. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23), and `tests/slt/cases/subqueries/scalar.slt` compares every shape Path 2 answers with DuckDB's own answer |
+| D24 | A correlated scalar aggregate over keys no outer row binds | unnests it by equivalence substitution (ADR 0023's Path 2): the aggregation groups by the correlated key and computes the aggregate's argument for EVERY row of the subquery's own input, including rows whose key is NULL or bound by no outer row. Where the correlation is on more than one column, or on one column over a join or a union, the groups are restricted to the keys the outer side binds (the semi-join reduction), but above the argument, which is computed all the same; on one column over one table ADR 0029's D5 filter can skip, at run time, the rows whose key no outer row binds | 1.5.6 computes the argument for every row whose correlated key is not NULL, keys no outer row binds included | the answers agree: an outer row with no group is dropped by the inner join and rejected by the comparison alike. Only an ERROR can differ, and in either direction: antb1 fails on a row whose key is NULL, where DuckDB answers, and answers where D5 skips a key that DuckDB computes and fails on. So the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23), and `tests/slt/cases/subqueries/scalar.slt` compares every shape Path 2 answers with DuckDB's own answer |
 | D25 | A moved Compute over rows a join above discards | computes a grouped aggregate on one input of a join below it (ADR 0032), and where the aggregate's argument is an expression a `Compute` above the join defines, that `Compute` travels DOWN with the partial -- a partial cannot aggregate a column that does not exist below it. The expression is then computed for every row of the aggregated side, including the rows the joins above discard | computes it above the join, so only for the rows that survive | the answers agree: a discarded row contributes to no group in either plan. Only an ERROR can differ, so the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23 and D24), and `tests/slt/cases/aggregates/placement.slt` pins the overflow against DuckDB's own answer, with a control whose call refuses the placement and so answers in both engines |
 | D26 | Errors of the blocks of a `UNION ALL` that a `LIMIT` does not need | a `LIMIT` met without `ORDER BY` stops before the blocks it does not need, which never run, so their errors -- an overflow, say -- are never reported ([ADR 0036](adr/0036-union-all.md)) | runs at least the first vector of every block, so an error in a later block fails the query | the answers agree where no block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16, D23, D24 and D25), and `tests/slt/cases/setops/errors.slt` pins it: antb1's answer under `onlyif antb1`, DuckDB's error under `onlyif duckdb`, and with `ORDER BY` a control that fails in both |
 | D27 | Errors of the blocks of a `UNION ALL` or a `UNION` that a condition on it does not rule out by their constants | a `WHERE` condition on a union goes on top of each block, above the block's select list, and rules a block out only where the block's constants decide it ([ADR 0036](adr/0036-union-all.md)'s X7a; never for a `LIKE` or a DOUBLE, and never for a condition the binder computes, such as a `NOT`, which stays above the union). Any other block runs, so an error of its select list -- an overflow, say -- fails the query, even on rows a condition on another column rejects. A condition above a `UNION` stays above it ([ADR 0039](adr/0039-set-operations.md)'s X4b, until its PF15), so every block runs in full | rules out a block whose constants make a `LIKE`, a DOUBLE comparison or a `NOT` never true too, and filters a column below the select list, so that error is never reported | the answers agree where no block fails; the random generator writes no arithmetic that can overflow and tags no block with a constant, and `tests/slt/cases/setops/errors.slt` and `union.slt` pin it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb`, and the conditions both engines decide as records both pass |
