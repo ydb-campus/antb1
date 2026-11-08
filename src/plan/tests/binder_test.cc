@@ -4047,7 +4047,9 @@ TEST(BinderTest, KeylessOuterJoinsAreNestedLoops) {
       explain("SELECT t.i16 FROM t LEFT JOIN ok ON t.i16 < ok.i16 AND ok.i16 > 1");
   const std::size_t loop = left.find("Join LEFT build=right keys=[] residual=[");
   ASSERT_NE(loop, std::string::npos) << left;
-  EXPECT_GT(left.find("Filter"), loop) << "below the join\n" << left;
+  const std::size_t filter = left.find("Filter");
+  ASSERT_NE(filter, std::string::npos) << "the right-only conjunct is a filter\n" << left;
+  EXPECT_GT(filter, loop) << "below the join\n" << left;
   EXPECT_FALSE(left.substr(loop, left.find('\n', loop) - loop).contains("> 1")) << "one residual\n"
                                                                                 << left;
   // A FULL JOIN keeps it a residual, as with a key.

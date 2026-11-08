@@ -1410,7 +1410,15 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   const bool unkeyed_outer = left && q.features.Has(Feature::kCrossJoin);
   if (unkeyed_outer) {
     ++cov.unkeyed_outer;
-    EXPECT_LE(roots.size(), 2U);
+    // The item no key reaches is the outer join's right item, and every other item is keyed to
+    // the first: a cross product never takes an outer join, whose bound does not count a product.
+    const std::size_t keyed = left_item == 0 ? 1 : 0;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+      if (k != left_item) {
+        EXPECT_EQ(root(k), root(keyed)) << "FROM item " << k << " is not keyed to the others";
+      }
+    }
+    EXPECT_EQ(roots.size(), 2U) << "the outer join's right item is joined by no key";
   } else if (q.features.Has(Feature::kCrossJoin)) {
     ++cov.crossed;
     EXPECT_EQ(items.size(), 3U);
