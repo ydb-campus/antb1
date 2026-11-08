@@ -24,6 +24,7 @@
 #include <arrow/util/decimal.h>
 
 #include "antb1/common/int128.h"
+#include "antb1/common/narrow.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -59,8 +60,7 @@ arrow::Status CheckRows(const arrow::Array* values, const arrow::DataType* expec
 // The bytes of vectors' storage (capacity), for memory_usage().
 template <class... Vectors>
 std::int64_t VectorBytes(const Vectors&... vectors) {
-  return (... +
-          static_cast<std::int64_t>(vectors.capacity() * sizeof(typename Vectors::value_type)));
+  return (... + Narrow<std::int64_t>(vectors.capacity() * sizeof(typename Vectors::value_type)));
 }
 
 template <class State>

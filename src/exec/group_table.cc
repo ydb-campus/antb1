@@ -702,7 +702,7 @@ arrow::Status GroupTable::MergePartition(const GroupTable& part, std::size_t par
 }
 
 arrow::Status GroupTable::Account() {
-  auto bytes = static_cast<std::int64_t>(chunk_groups_.capacity() * sizeof(std::uint32_t));
+  auto bytes = Narrow<std::int64_t>(chunk_groups_.capacity() * sizeof(std::uint32_t));
   for (const auto& state : states_) {
     bytes += state->memory_usage();
   }

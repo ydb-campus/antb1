@@ -417,12 +417,13 @@ PartPipeline ProbePipeline(const std::shared_ptr<MemoryTable>& table,
                            const std::shared_ptr<JoinBuild>& build, const std::vector<int>& keys,
                            BuildSide build_side = BuildSide::kRight,
                            const std::vector<plan::ExprPtr>& residual = {}) {
-  return [table, fields = AllFields(*table), build, keys, build_side,
-          residual](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+  // Init-captures of the const references: non-const copies, which moving the closure moves.
+  return [table, fields = AllFields(*table), build, probe_keys = keys, build_side,
+          conditions = residual](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
     ARROW_ASSIGN_OR_RAISE(
         std::unique_ptr<HashJoinOperator> join,
         HashJoinOperator::Make(std::make_unique<TableScanOperator>(table, fields, part), build,
-                               keys, build_side, residual, /*prepares=*/false));
+                               probe_keys, build_side, conditions, /*prepares=*/false));
     return join;
   };
 }
@@ -1314,10 +1315,13 @@ TEST_F(HashJoinTest, NestedBuildsAndChains) {
       std::mutex mu;
       std::vector<std::string> log;  // the tables whose parts were built, in order
       const auto logged = [&](const std::string& name, PartPipeline parts) -> PartPipeline {
-        return [&mu, &log, name, built = std::move(parts)](int64_t part) {
+        // libc++ only, a false positive: the analyzer loses the heap storage of a std::function
+        // moved into a closure.
+        // NOLINTNEXTLINE(clang-analyzer-cplusplus.NewDeleteLeaks)
+        return [&mu, &log, table_name = name, built = std::move(parts)](int64_t part) {
           {
             const std::scoped_lock lock(mu);
-            log.push_back(name);
+            log.push_back(table_name);
           }
           return built(part);
         };
@@ -1922,8 +1926,7 @@ TEST_F(HashJoinTest, BuildColumnsFollowTheTable) {
     }
   }
   // One pointer per chunk and column, counted here rather than by ChunkColumns::MemoryUsage.
-  const auto pointers = static_cast<int64_t>(chunks.size() * static_cast<std::size_t>(fields) *
-                                             sizeof(arrow::Array*));
+  const int64_t pointers = std::ssize(chunks) * int64_t{fields} * int64_t{sizeof(arrow::Array*)};
   EXPECT_EQ(columns->memory.bytes(), pointers);
   build->Release();
   EXPECT_EQ(build->table(), nullptr);
@@ -3803,7 +3806,8 @@ class LoggedTable final : public plan::Table {
 
 // `name` repeated `count` times.
 std::vector<std::string> Repeated(const std::string& name, std::size_t count) {
-  return std::vector<std::string>(count, name);
+  std::vector<std::string> out(count, name);
+  return out;
 }
 
 std::vector<std::string> Concat(std::vector<std::vector<std::string>> parts) {
@@ -5114,13 +5118,16 @@ TEST_F(HashJoinPlanTest, LateMaterializationDeclinesOverAJoin) {
   EXPECT_EQ(detail(joined), "Sort pid DESC NULLS LAST, bid DESC NULLS LAST Limit 2");
   auto result = RunPlan(joined, ContextOf(nullptr));
   ASSERT_TRUE(result.ok()) << result.status().ToString();
-  Rows expected = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
-  std::ranges::sort(expected,
-                    [](const std::vector<std::string>& x, const std::vector<std::string>& y) {
-                      return std::pair(std::stoll(x[2]), std::stoll(x[5])) >
-                             std::pair(std::stoll(y[2]), std::stoll(y[5]));
-                    });
-  expected.resize(2);
+  const Rows joined_rows = ReferenceJoin(RowsOf(*p), RowsOf(*b), {0}, {0});
+  // The two rows with the largest (pid, bid), found by sorting their keys rather than the rows.
+  std::vector<std::pair<std::pair<int64_t, int64_t>, std::size_t>> order;
+  order.reserve(joined_rows.size());
+  for (std::size_t i = 0; i < joined_rows.size(); ++i) {
+    order.emplace_back(std::pair(std::stoll(joined_rows[i][2]), std::stoll(joined_rows[i][5])), i);
+  }
+  std::ranges::sort(order, std::greater<>());
+  ASSERT_GE(order.size(), 2U);
+  const Rows expected = {joined_rows[order[0].second], joined_rows[order[1].second]};
   EXPECT_EQ(RowsOf(**result), expected);
 }
 
