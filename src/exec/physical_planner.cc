@@ -220,16 +220,17 @@ struct JoinShape {
   plan::LogicalNodePtr build;
   std::vector<int> probe_keys;                // columns of the probe input's output
   std::vector<plan::BoundColumn> build_keys;  // columns of the build input's output
+  std::vector<bool> null_equal;               // per key: JoinKey::null_equal
 };
 
 // Invalid, never unsupported, for what a correct plan never holds, in this order: a missing input;
 // a one-row join with keys or residuals; any other kind without keys; a null-aware
-// anti join of other than one key, or with residuals; a residual that is missing or not BOOLEAN; a
-// key whose two columns differ in type (the binder casts them to one type); a DOUBLE or BOOLEAN key
-// (E1's table takes neither: such an equality is a residual). Checked before any profile line names
-// the join by its EXPLAIN text, which reads every residual. The columns of its keys and residuals
-// are checked against its inputs once their operators are made (JoinBuildSpec::Make,
-// HashJoinOperator::Make): Invalid too.
+// anti join of other than one key, with residuals or with a NULL-equal key; a residual that is
+// missing or not BOOLEAN; a key whose two columns differ in type (the binder casts them to one
+// type); a DOUBLE or BOOLEAN key (E1's table takes neither: such an equality is a residual).
+// Checked before any profile line names the join by its EXPLAIN text, which reads every residual.
+// The columns of its keys and residuals are checked against its inputs once their operators are
+// made (JoinBuildSpec::Make, HashJoinOperator::Make): Invalid too.
 arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   if (join.left == nullptr || join.right == nullptr) {
     return arrow::Status::Invalid("a join without its inputs");
@@ -248,6 +249,9 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     return arrow::Status::Invalid("a NULL-AWARE ANTI join of ", join.keys.size(), " keys and ",
                                   join.residual.size(), " residuals");
   }
+  if (traits.null_aware && join.keys.front().null_equal) {
+    return arrow::Status::Invalid("a NULL-AWARE ANTI join with a NULL-equal key");
+  }
   if (std::ranges::any_of(join.residual,
                           [](const plan::ExprPtr& residual) { return residual == nullptr; })) {
     return arrow::Status::Invalid("a join residual that is missing");
@@ -261,7 +265,8 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
   JoinShape shape{.probe = build_left ? join.right : join.left,
                   .build = build_left ? join.left : join.right,
                   .probe_keys = {},
-                  .build_keys = {}};
+                  .build_keys = {},
+                  .null_equal = {}};
   for (const plan::JoinKey& key : join.keys) {
     if (key.left.type != key.right.type) {
       return arrow::Status::Invalid("a join key of two types: ", plan::ToString(key.left.type),
@@ -273,6 +278,7 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     }
     shape.probe_keys.push_back((build_left ? key.right : key.left).index);
     shape.build_keys.push_back(build_left ? key.left : key.right);
+    shape.null_equal.push_back(key.null_equal);
   }
   return shape;
 }
@@ -367,7 +373,7 @@ arrow::Result<std::shared_ptr<JoinBuild>> MakeJoinBuild(const plan::JoinNode& jo
       return JoinBuildSpec::Keyless(std::move(schema), std::move(retain));
     }
     return JoinBuildSpec::Make(std::move(schema), shape.build_keys, keep_null_keys,
-                               std::move(retain));
+                               std::move(retain), shape.null_equal);
   };
   if (const plan::ScanNode* scan = PipelineScan(shape.build)) {
     ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(shape.build, *scan, slot));
@@ -970,7 +976,9 @@ std::optional<ProbeKey> ProbeKeyOf(const plan::ScanNode& scan, const PipelineBui
 //
 // Statistics the table does not have never prune. A part whose key column is entirely NULL always
 // does: a NULL key matches nothing on either side, which is the answer the join gives anyway and is
-// why the build published no NULL key to test against.
+// why the build published no NULL key to test against. A NULL-equal key's NULL does match one of
+// the build's, so a build holding one publishes no values and nothing gets this far (ADR 0037's
+// OJ5).
 bool PartHasNoKey(const plan::ScanNode& scan, const ProbeKey& key, int64_t part) {
   if (!key.build->key_filter()->prunes_parts()) {
     return false;

@@ -519,6 +519,20 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   EXPECT_EQ(PositionMismatch(Plan(Node(keyless))), "Join: NULL-AWARE ANTI join without keys");
   EXPECT_EQ(PositionMismatch(Plan(Node(Join(JoinKind::kOneRow)))),
             "Join: ONE-ROW join with 1 keys");
+  // NOT IN's NULL rules are those of `=`: a null-aware anti join takes no NULL-equal key, which
+  // every other keyed kind may (ADR 0037's OJ5).
+  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+                              JoinKind::kFull, JoinKind::kNullAwareAnti}) {
+    JoinNode null_equal = Join(kind);
+    null_equal.keys[0].null_equal = true;
+    if (kind == JoinKind::kNullAwareAnti) {
+      EXPECT_EQ(PositionMismatch(Plan(Node(null_equal))),
+                "Join: NULL-AWARE ANTI join with a NULL-equal key");
+    } else {
+      EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(null_equal)))), std::nullopt)
+          << ToString(kind);
+    }
+  }
 
   JoinNode one_row = Join(JoinKind::kOneRow, BuildSide::kLeft);
   one_row.keys.clear();

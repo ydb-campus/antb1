@@ -164,12 +164,17 @@ Rows RowsOf(const plan::Table& table) {
   return RowsOf(**read);
 }
 
-// Whether the key cells of probe row `p` equal those of build row `b` (NULL never matching).
+// Whether the key cells of probe row `p` equal those of build row `b`: NULL never matching, except
+// under a key `null_equal` marks (empty: none), where it matches a NULL (ADR 0037's OJ5).
 bool KeysMatch(const std::vector<std::string>& p, const std::vector<std::string>& b,
-               const std::vector<int>& probe_keys, const std::vector<int>& build_keys) {
+               const std::vector<int>& probe_keys, const std::vector<int>& build_keys,
+               const std::vector<bool>& null_equal = {}) {
   for (std::size_t k = 0; k < probe_keys.size(); ++k) {
     const std::string& x = p[static_cast<std::size_t>(probe_keys[k])];
     const std::string& y = b[static_cast<std::size_t>(build_keys[k])];
+    if (k < null_equal.size() && null_equal[k] && x == "null" && y == "null") {
+      continue;
+    }
     if (x == "null" || y == "null" || x != y) {
       return false;
     }
@@ -251,12 +256,14 @@ using Residual = std::function<std::optional<bool>(const std::vector<std::string
 // build cells; semi gives each row with a match, anti each row without one.
 Rows ReferenceOf(plan::JoinKind kind, const Rows& probe, const Rows& build,
                  const std::vector<int>& probe_keys, const std::vector<int>& build_keys,
-                 std::size_t build_width, const Residual& residual = {}) {
+                 std::size_t build_width, const Residual& residual = {},
+                 const std::vector<bool>& null_equal = {}) {
   Rows out;
   for (const std::vector<std::string>& p : probe) {
     bool matched = false;
     for (const std::vector<std::string>& b : build) {
-      if (!KeysMatch(p, b, probe_keys, build_keys) || (residual && residual(p, b) != true)) {
+      if (!KeysMatch(p, b, probe_keys, build_keys, null_equal) ||
+          (residual && residual(p, b) != true)) {
         continue;
       }
       matched = true;
@@ -5624,16 +5631,19 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
 }
 
 // The FULL join of `probe` and `build` (ADR 0037's OJ2): the left join's rows, then each build row
-// that no probe row matched -- a NULL key never matches, so its row is one of them -- with
-// `probe_width` NULL cells first. Order is the operator's to choose; callers compare sorted rows.
+// that no probe row matched -- a NULL key never matches, so its row is one of them, except under a
+// key `null_equal` marks -- with `probe_width` NULL cells first. Order is the operator's to choose;
+// callers compare sorted rows.
 Rows ReferenceFull(const Rows& probe, const Rows& build, const std::vector<int>& probe_keys,
                    const std::vector<int>& build_keys, std::size_t probe_width,
-                   std::size_t build_width, const Residual& residual = {}) {
+                   std::size_t build_width, const Residual& residual = {},
+                   const std::vector<bool>& null_equal = {}) {
   Rows out = ReferenceOf(plan::JoinKind::kLeft, probe, build, probe_keys, build_keys, build_width,
-                         residual);
+                         residual, null_equal);
   for (const std::vector<std::string>& b : build) {
     const bool matched = std::ranges::any_of(probe, [&](const std::vector<std::string>& p) {
-      return KeysMatch(p, b, probe_keys, build_keys) && (!residual || residual(p, b) == true);
+      return KeysMatch(p, b, probe_keys, build_keys, null_equal) &&
+             (!residual || residual(p, b) == true);
     });
     if (!matched) {
       std::vector<std::string> row(probe_width, "null");
@@ -5951,6 +5961,262 @@ TEST_F(HashJoinTest, AFullJoinOverPartsGivesTheSameRowsOnAnyNumberOfThreads) {
       EXPECT_EQ(build->table(), nullptr) << "released by Close";
     }
   }
+}
+
+// ---- NULL-equal keys (ADR 0037's OJ5) ----
+
+// The join of `kind` of `probe` (left) and `build` (right), building on `build_side`, where
+// probe_keys[k] equals build_keys[k], NULL matching NULL where null_equal[k].
+plan::LogicalNodePtr NullEqualJoinOf(plan::JoinKind kind, const plan::LogicalNodePtr& probe,
+                                     const plan::LogicalNodePtr& build,
+                                     const std::vector<plan::BoundColumn>& probe_keys,
+                                     const std::vector<plan::BoundColumn>& build_keys,
+                                     const std::vector<bool>& null_equal, BuildSide build_side,
+                                     std::vector<plan::ExprPtr> residual = {}) {
+  plan::JoinNode join{.kind = kind,
+                      .left = probe,
+                      .right = build,
+                      .keys = {},
+                      .residual = std::move(residual),
+                      .build = build_side,
+                      .span = {}};
+  for (std::size_t k = 0; k < probe_keys.size(); ++k) {
+    join.keys.push_back(
+        plan::JoinKey{.left = probe_keys[k], .right = build_keys[k], .null_equal = null_equal[k]});
+  }
+  return Node(std::move(join));
+}
+
+// A NULL-equal key matches a NULL to a NULL and to no value, for every kind that takes one: inner
+// and semi and anti joins building on either input, left and full joins, with and without
+// residuals, on a BIGINT, a VARCHAR and two-column keys of which one, the other or both are
+// NULL-equal, against the nested-loop reference. Builds with NULL keys once and repeated, with
+// none (where the table is the table of `=` keys) and with nothing but NULLs; in batches of 1 and
+// 64 rows on one thread and of 3 on four.
+TEST_F(HashJoinPlanTest, NullEqualKeysMatchTheNestedLoopReference) {
+  const auto pool = MakeThreadPool();
+  const auto probe_table = MixedTable("p", 6, 7, ProbeKey);
+  const Rows probe_rows = RowsOf(*probe_table);
+  struct BuildCase {
+    std::string label;
+    std::shared_ptr<MemoryTable> table;
+  };
+  const std::vector<BuildCase> builds = {
+      {"unique keys and NULLs", MixedTable("b", 2, 6,
+                                           [](int64_t i) -> std::optional<int64_t> {
+                                             if (i % 4 == 3) {
+                                               return std::nullopt;
+                                             }
+                                             return i;
+                                           })},
+      {"repeated keys and NULLs", MixedTable("b", 3, 5,
+                                             [](int64_t i) -> std::optional<int64_t> {
+                                               if (i % 5 == 2) {
+                                                 return std::nullopt;
+                                               }
+                                               return i % 3;
+                                             })},
+      {"no NULL key", MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })},
+      {"NULL keys only",
+       MixedTable("b", 2, 3, [](int64_t /*i*/) -> std::optional<int64_t> { return std::nullopt; })},
+  };
+  struct KeyCase {
+    std::vector<int> columns;
+    std::vector<bool> null_equal;
+  };
+  const std::vector<KeyCase> key_cases = {{.columns = {0}, .null_equal = {true}},
+                                          {.columns = {1}, .null_equal = {true}},
+                                          {.columns = {0, 1}, .null_equal = {true, true}},
+                                          {.columns = {0, 1}, .null_equal = {false, true}},
+                                          {.columns = {0, 1}, .null_equal = {true, false}}};
+  // Over a pair: the probe's k, s and id, then the build's.
+  const std::vector<plan::ExprPtr> residual = {
+      Comparison(plan::CompareOp::kGe, Times(ColumnAt(5, LogicalType::kBigInt), ConstantOf(3)),
+                 ColumnAt(2, LogicalType::kBigInt))};
+  const Residual holds = [](const std::vector<std::string>& p,
+                            const std::vector<std::string>& b) -> std::optional<bool> {
+    return std::stoll(b[2]) * 3 >= std::stoll(p[2]);
+  };
+  struct KindCase {
+    plan::JoinKind kind;
+    BuildSide side;
+  };
+  const std::vector<KindCase> kinds = {
+      {plan::JoinKind::kInner, BuildSide::kRight}, {plan::JoinKind::kInner, BuildSide::kLeft},
+      {plan::JoinKind::kSemi, BuildSide::kRight},  {plan::JoinKind::kSemi, BuildSide::kLeft},
+      {plan::JoinKind::kAnti, BuildSide::kRight},  {plan::JoinKind::kAnti, BuildSide::kLeft},
+      {plan::JoinKind::kLeft, BuildSide::kRight},  {plan::JoinKind::kFull, BuildSide::kRight}};
+  // Whether some run met a NULL-to-NULL match that `=` keys would not have, so that the case is
+  // not passing for want of one.
+  bool null_matched = false;
+  for (const BuildCase& build : builds) {
+    const Rows build_rows = RowsOf(*build.table);
+    for (const KeyCase& keys : key_cases) {
+      std::vector<plan::BoundColumn> probe_keys;
+      std::vector<plan::BoundColumn> build_keys;
+      for (const int c : keys.columns) {
+        probe_keys.push_back(MixedColumn("p", c));
+        build_keys.push_back(MixedColumn("b", c));
+      }
+      for (const KindCase& kind : kinds) {
+        const plan::JoinKindTraits traits = plan::Traits(kind.kind);
+        for (const bool with_residual : {false, true}) {
+          const Residual conditions = with_residual ? holds : Residual();
+          const Rows expected = kind.kind == plan::JoinKind::kFull
+                                    ? ReferenceFull(probe_rows, build_rows, keys.columns,
+                                                    keys.columns, 3, 3, conditions, keys.null_equal)
+                                    : ReferenceOf(kind.kind, probe_rows, build_rows, keys.columns,
+                                                  keys.columns, 3, conditions, keys.null_equal);
+          const Rows strict = kind.kind == plan::JoinKind::kFull
+                                  ? ReferenceFull(probe_rows, build_rows, keys.columns,
+                                                  keys.columns, 3, 3, conditions)
+                                  : ReferenceOf(kind.kind, probe_rows, build_rows, keys.columns,
+                                                keys.columns, 3, conditions);
+          null_matched = null_matched || expected != strict;
+          const auto plan =
+              PlanOf(NullEqualJoinOf(kind.kind, ScanOf(probe_table, "p"), ScanOf(build.table, "b"),
+                                     probe_keys, build_keys, keys.null_equal, kind.side,
+                                     with_residual ? residual : std::vector<plan::ExprPtr>{}),
+                     traits.outputs_right ? 6 : 3);
+          // A build on the left, and a FULL join's unmatched build rows, come in an order of the
+          // operator's own.
+          const bool sorted = kind.side == BuildSide::kLeft || kind.kind == plan::JoinKind::kFull;
+          std::string key_label;
+          for (std::size_t k = 0; k < keys.columns.size(); ++k) {
+            key_label += std::format("{}{}", k == 0 ? "" : ", ", keys.columns[k]) +
+                         (keys.null_equal[k] ? " NULL-equal" : " =");
+          }
+          // Batches of 1 and 64 rows on one thread, of 3 on four: every case meets both a batch
+          // boundary inside a key's matches and the pool's part order, at a cost CI's ASan affords.
+          for (const auto& [executor, batch_size] :
+               {std::pair<arrow::internal::Executor*, int64_t>{nullptr, 1},
+                std::pair<arrow::internal::Executor*, int64_t>{nullptr, 64},
+                std::pair<arrow::internal::Executor*, int64_t>{pool.get(), 3}}) {
+            SCOPED_TRACE(std::format("{} building {} on [{}] over {}{}, batch size {}, {}",
+                                     plan::ToString(kind.kind),
+                                     kind.side == BuildSide::kLeft ? "left" : "right", key_label,
+                                     build.label, with_residual ? ", with a residual" : "",
+                                     batch_size, executor == nullptr ? "one thread" : "pool"));
+            auto result = RunPlan(plan, ContextOf(executor, batch_size));
+            ASSERT_TRUE(result.ok()) << result.status().ToString();
+            if (sorted) {
+              EXPECT_EQ(Sorted(RowsOf(**result)), Sorted(expected));
+            } else {
+              EXPECT_EQ(RowsOf(**result), expected);
+            }
+          }
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(null_matched);
+}
+
+// A build whose NULL-equal key holds a NULL is hashed, whatever its span: the bytes under a NULL
+// are no value to index. One whose NULL-equal key holds none is the build of an `=` key, direct
+// where that one is; so is one whose NULL is in an `=` key, which leaves the row out.
+TEST_F(HashJoinPlanTest, ANullEqualBuildHoldingANullIsHashed) {
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  const auto probe = MixedTable("p", 2, 10, ProbeKey);
+  const Rows probe_rows = RowsOf(*probe);
+  for (const bool null_in_build : {false, true}) {
+    // Keys 0 to 7, dense; the fourth NULL when asked.
+    const auto build = MixedTable("b", 1, 8, [null_in_build](int64_t i) -> std::optional<int64_t> {
+      if (null_in_build && i == 3) {
+        return std::nullopt;
+      }
+      return i;
+    });
+    const Rows build_rows = RowsOf(*build);
+    for (const bool null_equal : {false, true}) {
+      SCOPED_TRACE(std::format("{} key, {} NULL in the build",
+                               null_equal ? "a NULL-equal" : "an =", null_in_build ? "a" : "no"));
+      ProfileNode profile;
+      auto result = RunPlan(
+          PlanOf(NullEqualJoinOf(plan::JoinKind::kInner, ScanOf(probe, "p"), ScanOf(build, "b"),
+                                 {pk}, {bk}, {null_equal}, BuildSide::kRight),
+                 6),
+          ContextOf(nullptr), &profile);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(DirectBuildsIn(profile), null_equal && null_in_build ? 0 : 1);
+      EXPECT_EQ(RowsOf(**result), ReferenceOf(plan::JoinKind::kInner, probe_rows, build_rows, {0},
+                                              {0}, 3, {}, {null_equal}));
+    }
+  }
+}
+
+// ADR 0029's dynamic filters over a NULL-equal key. A build holding a NULL there puts the NULL hash
+// in its row filter (D1), so a probe row with a NULL key passes it and meets its match; and it
+// publishes no key values (D2), so a part whose keys are all NULL is scanned. A build without a
+// NULL there filters and prunes as an `=` key does.
+TEST_F(HashJoinPlanTest, DynamicFiltersKeepTheNullsANullEqualBuildMatches) {
+  const auto pool = MakeThreadPool();
+  const auto pk = MixedColumn("p", 0);
+  const auto bk = MixedColumn("b", 0);
+  // Parts 0 and 2 hold keys 0..79 and 160..239; part 1's keys are all NULL.
+  const auto probe_keys = [](int64_t i) -> std::optional<int64_t> {
+    return (i / 80) == 1 ? std::optional<int64_t>{} : std::optional<int64_t>(i);
+  };
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    for (const bool null_in_build : {false, true}) {
+      SCOPED_TRACE(std::format("{}, {} NULL in the build",
+                               executor == nullptr ? "one thread" : "pool",
+                               null_in_build ? "a" : "no"));
+      // 0, 60, 120, 180 (hashed: a span of 180 over 4 or 5 rows), then a NULL when asked.
+      const auto build =
+          MixedTable("b", 1, null_in_build ? 5 : 4, [](int64_t i) -> std::optional<int64_t> {
+            if (i == 4) {
+              return std::nullopt;
+            }
+            return i * 60;
+          });
+      const auto one = MixedTable("p", 3, 80, probe_keys);
+      ProfileNode profile;
+      auto got =
+          RunPlan(PlanOf(NullEqualJoinOf(plan::JoinKind::kInner, ScanOf(one, "p"),
+                                         ScanOf(build, "b"), {pk}, {bk}, {true}, BuildSide::kRight),
+                         6),
+                  ContextOf(executor), &profile);
+      ASSERT_TRUE(got.ok()) << got.status().ToString();
+      EXPECT_EQ(DirectBuildsIn(profile), 0) << "the build must be hashed for D1 to apply";
+      EXPECT_EQ(KeyFiltersIn(profile), 1);
+      EXPECT_EQ(one->scanned_parts(),
+                null_in_build ? (std::vector<int64_t>{0, 1, 2}) : (std::vector<int64_t>{0, 2}));
+      const Rows expected = ReferenceOf(plan::JoinKind::kInner, RowsOf(*one), RowsOf(*build), {0},
+                                        {0}, 3, {}, {true});
+      EXPECT_EQ(RowsOf(**got), expected);
+      // Part 1's 80 NULLs each meet the build's NULL.
+      EXPECT_EQ(expected.size(), null_in_build ? 83U : 3U);
+    }
+  }
+}
+
+// NOT IN's NULL rules are those of `=`, so a null-aware anti join takes no NULL-equal key: the
+// physical planner and the operator both refuse one as a planner bug.
+TEST_F(HashJoinTest, ANullAwareAntiJoinTakesNoNullEqualKey) {
+  const auto probe = MixedTable("p", 1, 4, ProbeKey);
+  const auto build = MixedTable("b", 1, 4, ProbeKey);
+  auto planned = RunPlan(PlanOf(NullEqualJoinOf(plan::JoinKind::kNullAwareAnti, ScanOf(probe, "p"),
+                                                ScanOf(build, "b"), {MixedColumn("p", 0)},
+                                                {MixedColumn("b", 0)}, {true}, BuildSide::kRight),
+                                3),
+                         ContextOf(nullptr));
+  ASSERT_TRUE(planned.status().IsInvalid()) << planned.status().ToString();
+  EXPECT_NE(planned.status().message().find("NULL-equal"), std::string::npos)
+      << planned.status().ToString();
+  auto spec = JoinBuildSpec::Make(build->schema(), {MixedColumn("b", 0)},
+                                  /*keep_null_keys=*/false, /*retain=*/{}, /*null_equal=*/{true});
+  ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+  auto join = HashJoinOperator::Make(
+      std::make_unique<TableScanOperator>(probe, AllFields(*probe), 0),
+      std::make_shared<JoinBuild>(*spec, ScanPipeline(build), build->num_parts(),
+                                  std::vector<std::shared_ptr<JoinBuild>>{}, nullptr,
+                                  plan::JoinKind::kNullAwareAnti),
+      {0}, BuildSide::kRight, {}, /*prepares=*/true);
+  ASSERT_TRUE(join.status().IsInvalid()) << join.status().ToString();
+  EXPECT_NE(join.status().message().find("NULL-equal"), std::string::npos)
+      << join.status().ToString();
 }
 
 }  // namespace

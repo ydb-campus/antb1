@@ -492,10 +492,14 @@ struct RowCountNode {
 // smaller side always. Below 100 is invalid.
 inline constexpr int64_t kBuildSideRatio = 400;
 
-// One key of a join: a column of the left input and one of the right input, of one type.
+// One key of a join: a column of the left input and one of the right input, of one type. A key
+// compares `=` (a NULL on either side matches nothing) unless `null_equal`, where it compares IS
+// NOT DISTINCT FROM: a NULL matches a NULL (ADR 0037's OJ5). A null-aware anti join takes no
+// NULL-equal key.
 struct JoinKey {
   BoundColumn left;   // of the left input
   BoundColumn right;  // of the right input
+  bool null_equal = false;
 };
 
 // A join of two inputs, its rows and columns as its kind's traits say (join_kind.h): the left

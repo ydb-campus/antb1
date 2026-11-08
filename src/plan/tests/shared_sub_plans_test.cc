@@ -1,5 +1,6 @@
 #include "antb1/plan/shared_sub_plans.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -7,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -388,6 +390,28 @@ TEST(SharedSubPlansTest, TwoAggregationsCountsAreNotOneColumn) {
                          kCounts, kCounts));
   ASSERT_EQ(groups.size(), 1U);
   EXPECT_EQ(groups[0].substr(0, groups[0].find(' ')), "Join") << groups[0];
+}
+
+// A join on a NULL-equal key matches NULL to NULL, which the same join on an `=` key does not
+// (ADR 0037's OJ5): the two compute different rows and are not one sub-plan, while the scans under
+// them still are. The control: two joins whose keys agree are one group, headed by the join.
+TEST(SharedSubPlansTest, AJoinOnANullEqualKeyIsNotOneWithTheJoinOnAnEqualOne) {
+  const auto joined = [](std::uint32_t first, bool null_equal) {
+    JoinNode join = std::get<JoinNode>(*JoinedOnFirst(ScanOf("t", first), ScanOf("u", first + 1)));
+    join.keys.front().null_equal = null_equal;
+    return Node(std::move(join));
+  };
+  for (const bool first : {false, true}) {
+    for (const bool second : {false, true}) {
+      SCOPED_TRACE(std::format("NULL-equal: {} and {}", first, second));
+      const std::vector<std::string> groups =
+          GroupsOf(PlanOf(JoinedOnFirst(joined(10, first), joined(20, second))));
+      ASSERT_FALSE(groups.empty());
+      const bool joins = std::ranges::any_of(
+          groups, [](const std::string& group) { return group.starts_with("Join "); });
+      EXPECT_EQ(joins, first == second) << groups.front();
+    }
+  }
 }
 
 // The same plan gives the same groups in the same order, which EXPLAIN's goldens depend on.

@@ -175,7 +175,8 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md); its OJ4a update) | | Built |
 | OJ4b | Cross products and joins without an equality key in the binder: keyed parts first, crossed left-deep (ADR 0040; its OJ4b update) | 77 | Built |
 | OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040; its OJ4c update) | | Built |
-| OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |
+| OJ5a | NULL-equal join keys in the executor, no SQL (ADR 0022's OJ5a update) | | Built |
+| OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included | | Planned |
 | **Phase 8** | **Subqueries** | | |
 | SQ1 | Uncorrelated one-row subqueries as values inside conditions | | Planned |
 | SQ2 | The same in select lists and CASE | 9 | Planned |
@@ -758,6 +759,15 @@ items outside OJ4: filters on GROUP BY keys pushed below the grouping, and a dom
 Update (2026-11-08, OJ4c): built, and with it OJ4: a LEFT or FULL JOIN without an equality key is a nested loop of its
 unit (ADR 0040's OJ4c update). No query of the 99 changes, so the ratchet stays at 75. OJ5 (NULL-equal keys, IS [NOT]
 DISTINCT FROM) is phase 7's last item.
+
+Update (2026-11-08, OJ5): the maintainer split OJ5 in two and scoped it. OJ5a puts NULL-equal keys in the executor, with
+no SQL. OJ5b adds `IS [NOT] DISTINCT FROM` and the keys it makes: inner, LEFT and FULL joins, and correlated
+subqueries through ADR 0023's Path 1 and Path 2. DOUBLE and BOOLEAN keys stay out: such a comparison is a predicate,
+and between two relations a residual. No ADR of its own: the design is recorded in dated updates of ADR 0022 and, with
+OJ5b, ADR 0023.
+
+Update (2026-11-08, OJ5a): built (ADR 0022's OJ5a update). No SQL reaches the keys yet, so no query changes and the
+ratchet stays at 75.
 
 ## Alternatives considered
 

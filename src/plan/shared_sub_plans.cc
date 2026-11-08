@@ -379,7 +379,8 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
         } else if constexpr (std::is_same_v<T, JoinNode>) {
           std::string key = std::format("join({},", static_cast<int>(n.kind));
           for (const JoinKey& k : n.keys) {
-            key += std::format("{}={},", origins.Key(k.left, node), origins.Key(k.right, node));
+            key += std::format("{}{}{},", origins.Key(k.left, node), k.null_equal ? "<=>" : "=",
+                               origins.Key(k.right, node));
           }
           key += ';';
           for (const ExprPtr& expr : n.residual) {

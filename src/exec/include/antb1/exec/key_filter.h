@@ -114,9 +114,10 @@ class KeyFilter {
   // Publishes the build's key *values*, which answer a coarser question than the bits do: not "can
   // this row match" but "can this part of the probe's scan hold anything that matches", asked
   // before a part is read at all (D2). `keys` must hold no NULL -- a NULL key matches nothing, so
-  // the join drops such a row anyway -- and need not be sorted; empty with a `min` and `max` says
-  // there were more than kMaxPublishedKeys of them and leaves the interval as the whole of what is
-  // published.
+  // the join drops such a row anyway, and a build whose NULL-equal key holds one, where it does
+  // match, publishes no values (JoinTableBuilder::MakeKeyFilter) -- and need not be sorted; empty
+  // with a `min` and `max` says there were more than kMaxPublishedKeys of them and leaves the
+  // interval as the whole of what is published.
   //
   // The values are charged to the same reservation as the bits, to exactly what `keys` needs. The
   // charge is absolute, so a ReserveKeys of the same count beforehand costs nothing again here, and

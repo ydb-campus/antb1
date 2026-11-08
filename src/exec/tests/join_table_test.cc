@@ -217,19 +217,27 @@ bool Selected(const std::shared_ptr<arrow::BooleanArray>& selection, int64_t row
   return selection == nullptr || (selection->IsValid(row) && selection->Value(row));
 }
 
-bool AnyNull(std::span<const std::shared_ptr<arrow::Array>> keys, int64_t row) {
-  return std::ranges::any_of(keys, [row](const auto& key) { return key->IsNull(row); });
+// Whether a key of `keys` that compares `=` (not marked in `null_equal`) is NULL in row `row`.
+bool AnyNull(std::span<const std::shared_ptr<arrow::Array>> keys, int64_t row,
+             const std::vector<bool>& null_equal = {}) {
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    if (!(k < null_equal.size() && null_equal[k]) && keys[k]->IsNull(row)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The matches by nested loops with SQL's equality: a selected probe row whose keys are not NULL
 // matches every selected build row whose keys are not NULL and equal its keys, in part, batch and
-// row order.
-Ids Reference(const BuildData& data, const Probe& probe) {
+// row order. A key `null_equal` marks compares IS NOT DISTINCT FROM instead, a NULL equal to a NULL
+// (Arrow's RangeEquals already says so).
+Ids Reference(const BuildData& data, const Probe& probe, const std::vector<bool>& null_equal = {}) {
   const int64_t length = probe.keys.front()->length();
   const std::size_t num_keys = probe.keys.size();
   Ids out(static_cast<std::size_t>(length));
   for (int64_t i = 0; i < length; ++i) {
-    if (!Selected(probe.selection, i) || AnyNull(probe.keys, i)) {
+    if (!Selected(probe.selection, i) || AnyNull(probe.keys, i, null_equal)) {
       continue;
     }
     for (const std::vector<Batch>& part : data.parts()) {
@@ -240,7 +248,7 @@ Ids Reference(const BuildData& data, const Probe& probe) {
         const auto& ids =
             static_cast<const arrow::Int64Array&>(*batch.data->column(static_cast<int>(num_keys)));
         for (int64_t j = 0; j < batch.data->num_rows(); ++j) {
-          if (!Selected(batch.selection, j) || AnyNull(keys, j)) {
+          if (!Selected(batch.selection, j) || AnyNull(keys, j, null_equal)) {
             continue;
           }
           bool equal = true;
@@ -1552,6 +1560,9 @@ TEST_F(JoinTableTest, RejectsWhatThePlannerMustNotSend) {
   expect_invalid(JoinBuildSpec::Make(arrow::schema({arrow::field("b", arrow::boolean())}),
                                      {Column(0, "b", LogicalType::kBoolean)})
                      .status());
+  // NULL-equal flags of another count than the keys.
+  expect_invalid(JoinBuildSpec::Make(schema, data.keys(), false, {}, {true}).status());
+  expect_invalid(JoinBuildSpec::Make(schema, {bigint}, false, {}, {true, false}).status());
   auto spec = JoinBuildSpec::Make(schema, data.keys());
   ASSERT_TRUE(spec.ok()) << spec.status().ToString();
   EXPECT_FALSE((*spec)->direct_candidate());
@@ -2014,6 +2025,129 @@ TEST_F(JoinTableTest, AMergeFailureOnTheExecutorFailsEveryLaterCall) {
     parts->clear();
   }
   EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+// ---- NULL-equal keys (ADR 0037's OJ5) ----
+
+// A NULL-equal key compares IS NOT DISTINCT FROM: its NULLs are inserted and hashed, and a probe's
+// NULL finds them, while a NULL in a key that compares `=` still matches nothing and is counted as
+// before. A BIGINT key on both layouts' spans, a VARCHAR key, and two keys of which either or both
+// are NULL-equal, with NULLs across parts, in sliced batches (validity at an offset) and under a
+// selection, against the nested loops, on one thread and on the pool. A build holding a NULL in a
+// NULL-equal key is hashed whatever its span; flags otherwise read as for `=` keys.
+TEST_F(JoinTableTest, NullEqualKeysMatchANullToANull) {
+  const auto pool = MakeThreadPool();
+  const std::optional<int64_t> null;
+  const std::optional<std::string> no_text;
+  for (arrow::internal::Executor* executor : Executors(pool.get())) {
+    SCOPED_TRACE(executor == nullptr ? "serial" : "pool");
+    for (const int64_t step : {1, 1000003}) {  // direct without a NULL, then hashed
+      SCOPED_TRACE(step);
+      for (const bool nulls : {true, false}) {
+        SCOPED_TRACE(nulls ? "NULL keys" : "no NULL key");
+        const std::optional<int64_t> maybe_null = nulls ? null : std::optional<int64_t>(5 * step);
+        BuildData data({LogicalType::kBigInt});
+        data.Add(0, {Int64s({0, maybe_null, step, maybe_null})})
+            .Add(1, {Int64s({7, 2 * step, maybe_null, step, 9})}, nullptr, /*slice=*/1)
+            .Add(1, {Int64s({maybe_null, 3 * step})}, Bools({true, true}));
+        auto spec = JoinBuildSpec::Make(data.schema(), data.keys(), false, {}, {true});
+        ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+        EXPECT_TRUE((*spec)->any_null_equal());
+        EXPECT_TRUE((*spec)->null_equal(0));
+        auto parts = MakeParts(data, *spec);
+        ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+        auto table = Assemble(*spec, *parts, executor);
+        ASSERT_TRUE(table.ok()) << table.status().ToString();
+        const auto probe_array = Int64s({null, 0, step, 4, null, 2 * step, 3 * step, 5 * step});
+        const Probe probe{.keys = {probe_array->Slice(1)}, .selection = nullptr};
+        EXPECT_EQ(Matches(**table, probe), Reference(data, probe, {true}));
+        const Probe selected{.keys = {probe_array},
+                             .selection = Bools({false, true, true, true, true, true, true, true})};
+        EXPECT_EQ(Matches(**table, selected), Reference(data, selected, {true}));
+        EXPECT_EQ(Matches(**table, selected)[4].size(), nulls ? 4U : 0U);
+        EXPECT_FALSE((*table)->has_null());
+        EXPECT_EQ((*table)->null_key_rows(), 0);
+        EXPECT_EQ((*table)->num_rows(), 9);
+        EXPECT_FALSE((*table)->unique());  // NULL four times, or 5 * step four times
+        EXPECT_EQ((*table)->layout(),
+                  step == 1 && !nulls ? JoinTable::Layout::kDirect : JoinTable::Layout::kHashed);
+      }
+    }
+    // The bytes under a NULL are no value: Arrow leaves them to whoever made the array, so NULLs
+    // over different bytes are one key, and a NULL over a value's bytes is not that value.
+    {
+      const auto hidden = [](const std::vector<int64_t>& values, const std::vector<bool>& valid) {
+        arrow::Int64Builder builder;
+        EXPECT_TRUE(builder.AppendValues(values, valid).ok());
+        auto array = builder.Finish();
+        EXPECT_TRUE(array.ok());
+        // AppendValues zeroes nothing under a NULL; the values are copied as given.
+        return *array;
+      };
+      BuildData garbage({LogicalType::kBigInt});
+      garbage.Add(0, {hidden({1, 99, 2, 98}, {true, false, true, false})})
+          .Add(1, {hidden({97, 3}, {false, true})});
+      auto garbage_spec = JoinBuildSpec::Make(garbage.schema(), garbage.keys(), false, {}, {true});
+      ASSERT_TRUE(garbage_spec.ok()) << garbage_spec.status().ToString();
+      auto garbage_parts = MakeParts(garbage, *garbage_spec);
+      ASSERT_TRUE(garbage_parts.ok()) << garbage_parts.status().ToString();
+      auto garbage_table = Assemble(*garbage_spec, *garbage_parts, executor);
+      ASSERT_TRUE(garbage_table.ok()) << garbage_table.status().ToString();
+      const Probe probe{.keys = {hidden({5, 77, 99, 1}, {false, false, true, true})},
+                        .selection = nullptr};
+      EXPECT_EQ(Matches(**garbage_table, probe), Reference(garbage, probe, {true}));
+      EXPECT_EQ(Matches(**garbage_table, probe)[0].size(), 3U);  // every NULL, whatever its bytes
+      EXPECT_TRUE(Matches(**garbage_table, probe)[2].empty());   // 99 is no NULL's value
+      EXPECT_FALSE((*garbage_table)->unique());
+    }
+    // One NULL: unique, since a NULL repeats only with another.
+    BuildData single({LogicalType::kBigInt});
+    single.Add(0, {Int64s({1, null, 2})});
+    auto spec = JoinBuildSpec::Make(single.schema(), single.keys(), false, {}, {true});
+    ASSERT_TRUE(spec.ok()) << spec.status().ToString();
+    auto parts = MakeParts(single, *spec);
+    ASSERT_TRUE(parts.ok()) << parts.status().ToString();
+    auto table = Assemble(*spec, *parts, executor);
+    ASSERT_TRUE(table.ok()) << table.status().ToString();
+    EXPECT_TRUE((*table)->unique());
+    EXPECT_EQ((*table)->num_rows(), 3);
+
+    // Two keys: a BIGINT and a VARCHAR, each `=` or NULL-equal.
+    for (const std::vector<bool>& null_equal :
+         {std::vector<bool>{true, true}, std::vector<bool>{false, true},
+          std::vector<bool>{true, false}, std::vector<bool>{false, false}}) {
+      SCOPED_TRACE(std::format("NULL-equal: {}, {}", null_equal[0], null_equal[1]));
+      BuildData two({LogicalType::kBigInt, LogicalType::kVarchar});
+      two.Add(0, {Int64s({1, null, 1, null, 2}), Strings({"a", "a", no_text, no_text, ""})})
+          .Add(1, {Int64s({0, null, 1, null, 9}), Strings({"z", "a", no_text, no_text, "z"})},
+               nullptr, /*slice=*/1);
+      auto two_spec = JoinBuildSpec::Make(two.schema(), two.keys(), false, {}, null_equal);
+      ASSERT_TRUE(two_spec.ok()) << two_spec.status().ToString();
+      auto two_parts = MakeParts(two, *two_spec);
+      ASSERT_TRUE(two_parts.ok()) << two_parts.status().ToString();
+      auto two_table = Assemble(*two_spec, *two_parts, executor);
+      ASSERT_TRUE(two_table.ok()) << two_table.status().ToString();
+      const Probe both{.keys = {Int64s({1, null, 1, null, 2, null}),
+                                Strings({"a", "a", no_text, no_text, "", "b"})},
+                       .selection = nullptr};
+      EXPECT_EQ(Matches(**two_table, both), Reference(two, both, null_equal));
+      // The rows with a NULL in a key that compares `=` are left out and counted, as before.
+      int64_t strict_nulls = 0;
+      for (const auto& [number, text] : std::vector<std::pair<bool, bool>>{{false, false},
+                                                                           {true, false},
+                                                                           {false, true},
+                                                                           {true, true},
+                                                                           {false, false},
+                                                                           {true, false},
+                                                                           {false, true},
+                                                                           {true, true}}) {
+        strict_nulls += ((number && !null_equal[0]) || (text && !null_equal[1])) ? 1 : 0;
+      }
+      EXPECT_EQ((*two_table)->null_key_rows(), strict_nulls);
+      EXPECT_EQ((*two_table)->has_null(), strict_nulls > 0);
+      EXPECT_EQ((*two_table)->num_rows(), 8 - strict_nulls);
+    }
+  }
 }
 
 }  // namespace
