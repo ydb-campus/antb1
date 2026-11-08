@@ -221,7 +221,7 @@ bool Selected(const std::shared_ptr<arrow::BooleanArray>& selection, int64_t row
 bool AnyNull(std::span<const std::shared_ptr<arrow::Array>> keys, int64_t row,
              const std::vector<bool>& null_equal = {}) {
   for (std::size_t k = 0; k < keys.size(); ++k) {
-    if (!(k < null_equal.size() && null_equal[k]) && keys[k]->IsNull(row)) {
+    if ((k >= null_equal.size() || !null_equal[k]) && keys[k]->IsNull(row)) {
       return true;
     }
   }

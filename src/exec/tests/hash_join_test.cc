@@ -6002,23 +6002,27 @@ TEST_F(HashJoinPlanTest, NullEqualKeysMatchTheNestedLoopReference) {
     std::shared_ptr<MemoryTable> table;
   };
   const std::vector<BuildCase> builds = {
-      {"unique keys and NULLs", MixedTable("b", 2, 6,
-                                           [](int64_t i) -> std::optional<int64_t> {
-                                             if (i % 4 == 3) {
-                                               return std::nullopt;
-                                             }
-                                             return i;
-                                           })},
-      {"repeated keys and NULLs", MixedTable("b", 3, 5,
-                                             [](int64_t i) -> std::optional<int64_t> {
-                                               if (i % 5 == 2) {
-                                                 return std::nullopt;
-                                               }
-                                               return i % 3;
-                                             })},
-      {"no NULL key", MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })},
-      {"NULL keys only",
-       MixedTable("b", 2, 3, [](int64_t /*i*/) -> std::optional<int64_t> { return std::nullopt; })},
+      {.label = "unique keys and NULLs",
+       .table = MixedTable("b", 2, 6,
+                           [](int64_t i) -> std::optional<int64_t> {
+                             if (i % 4 == 3) {
+                               return std::nullopt;
+                             }
+                             return i;
+                           })},
+      {.label = "repeated keys and NULLs",
+       .table = MixedTable("b", 3, 5,
+                           [](int64_t i) -> std::optional<int64_t> {
+                             if (i % 5 == 2) {
+                               return std::nullopt;
+                             }
+                             return i % 3;
+                           })},
+      {.label = "no NULL key",
+       .table = MixedTable("b", 2, 6, [](int64_t i) -> std::optional<int64_t> { return i; })},
+      {.label = "NULL keys only",
+       .table = MixedTable("b", 2, 3,
+                           [](int64_t /*i*/) -> std::optional<int64_t> { return std::nullopt; })},
   };
   struct KeyCase {
     std::vector<int> columns;
@@ -6041,11 +6045,14 @@ TEST_F(HashJoinPlanTest, NullEqualKeysMatchTheNestedLoopReference) {
     plan::JoinKind kind;
     BuildSide side;
   };
-  const std::vector<KindCase> kinds = {
-      {plan::JoinKind::kInner, BuildSide::kRight}, {plan::JoinKind::kInner, BuildSide::kLeft},
-      {plan::JoinKind::kSemi, BuildSide::kRight},  {plan::JoinKind::kSemi, BuildSide::kLeft},
-      {plan::JoinKind::kAnti, BuildSide::kRight},  {plan::JoinKind::kAnti, BuildSide::kLeft},
-      {plan::JoinKind::kLeft, BuildSide::kRight},  {plan::JoinKind::kFull, BuildSide::kRight}};
+  const std::vector<KindCase> kinds = {{.kind = plan::JoinKind::kInner, .side = BuildSide::kRight},
+                                       {.kind = plan::JoinKind::kInner, .side = BuildSide::kLeft},
+                                       {.kind = plan::JoinKind::kSemi, .side = BuildSide::kRight},
+                                       {.kind = plan::JoinKind::kSemi, .side = BuildSide::kLeft},
+                                       {.kind = plan::JoinKind::kAnti, .side = BuildSide::kRight},
+                                       {.kind = plan::JoinKind::kAnti, .side = BuildSide::kLeft},
+                                       {.kind = plan::JoinKind::kLeft, .side = BuildSide::kRight},
+                                       {.kind = plan::JoinKind::kFull, .side = BuildSide::kRight}};
   // Whether some run met a NULL-to-NULL match that `=` keys would not have, so that the case is
   // not passing for want of one.
   bool null_matched = false;
@@ -6203,7 +6210,10 @@ TEST_F(HashJoinTest, ANullAwareAntiJoinTakesNoNullEqualKey) {
                                 3),
                          ContextOf(nullptr));
   ASSERT_TRUE(planned.status().IsInvalid()) << planned.status().ToString();
-  EXPECT_NE(planned.status().message().find("NULL-equal"), std::string::npos)
+  // The physical planner's own refusal (ShapeOf), before any operator is made: the operator's reads
+  // "hash join".
+  EXPECT_NE(planned.status().message().find("NULL-AWARE ANTI join with a NULL-equal key"),
+            std::string::npos)
       << planned.status().ToString();
   auto spec = JoinBuildSpec::Make(build->schema(), {MixedColumn("b", 0)},
                                   /*keep_null_keys=*/false, /*retain=*/{}, /*null_equal=*/{true});
@@ -6215,7 +6225,8 @@ TEST_F(HashJoinTest, ANullAwareAntiJoinTakesNoNullEqualKey) {
                                   plan::JoinKind::kNullAwareAnti),
       {0}, BuildSide::kRight, {}, /*prepares=*/true);
   ASSERT_TRUE(join.status().IsInvalid()) << join.status().ToString();
-  EXPECT_NE(join.status().message().find("NULL-equal"), std::string::npos)
+  EXPECT_NE(join.status().message().find("NULL-AWARE ANTI hash join with a NULL-equal key"),
+            std::string::npos)
       << join.status().ToString();
 }
 

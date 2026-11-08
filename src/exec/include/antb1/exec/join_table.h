@@ -224,7 +224,8 @@ class JoinBuildPart {
   // without hashes, and without a copy when every row of the batch is selected.
   arrow::Status AppendKeyless(const Batch& batch, const RowMask& mask, int64_t kept,
                               arrow::MemoryPool* pool);
-  // The rows of `batch` that are selected and have a NULL key, appended to null_pieces_; nothing
+  // The rows of `batch` that are selected and have a NULL in a key that compares `=`, appended to
+  // null_pieces_; nothing
   // when there is none. `remaining` is how many there are (the selected rows less the kept ones),
   // which is known before the rows are found.
   arrow::Status AppendNullKeys(const Batch& batch, int64_t remaining, arrow::MemoryPool* pool);

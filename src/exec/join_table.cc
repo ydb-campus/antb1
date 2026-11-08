@@ -1262,7 +1262,7 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
   MemoryReservation scratch;  // a probe's own: counted, not charged
   ARROW_ASSIGN_OR_RAISE(const RowHashes hashed, HashRows(keys, mask, kept, pool, scratch));
   const std::vector<KeyView> views = ViewsOf(keys);
-  const auto probe = [&]<bool kValidity>() {
+  const auto probe = [&]<bool kValidity> {
     ForEachRowHash(mask, hashed, [&](int64_t row, std::uint64_t hash) {
       const Directory& directory = directories_[hash % kJoinPartitions];
       if (directory.slots.empty()) {
