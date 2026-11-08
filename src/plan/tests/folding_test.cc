@@ -111,6 +111,8 @@ bool Accepts(const FoldedComparison& folded, Int128 v) {
     case Predicate::Kind::kNotLike:
     case Predicate::Kind::kIsNull:
     case Predicate::Kind::kCompareColumns:
+    case Predicate::Kind::kIsDistinct:
+    case Predicate::Kind::kIsNotDistinct:
     case Predicate::Kind::kIn:
     case Predicate::Kind::kNotIn:
     case Predicate::Kind::kIsTrue:

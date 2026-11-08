@@ -260,7 +260,7 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
       ARROW_ASSIGN_OR_RAISE(const arrow::Datum both_null,
                             arrow::compute::CallFunction("and", {left_null, right_null}, &kernels));
       ARROW_ASSIGN_OR_RAISE(
-          const arrow::Datum not_distinct,
+          arrow::Datum not_distinct,
           arrow::compute::CallFunction("if_else", {any_null, both_null, equal}, &kernels));
       if (p.kind == plan::Predicate::Kind::kIsNotDistinct) {
         return not_distinct;
