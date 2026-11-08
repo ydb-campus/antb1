@@ -751,6 +751,11 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   if (traits.null_aware && spec.keys().size() != 1) {
     return arrow::Status::Invalid("a ", kind_name, " hash join of ", spec.keys().size(), " keys");
   }
+  if (traits.null_aware && spec.any_null_equal()) {
+    // NOT IN's NULL rules are of `=`: a NULL in the set suppresses every row, which a key on which
+    // a NULL matches a NULL would contradict.
+    return arrow::Status::Invalid("a ", kind_name, " hash join with a NULL-equal key");
+  }
   if (!traits.residuals && !residual.empty()) {
     return arrow::Status::Invalid("a ", kind_name, " hash join with residuals");
   }

@@ -20,6 +20,7 @@
 #include <arrow/api.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
+#include <arrow/util/bit_util.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
@@ -271,22 +272,31 @@ void ForEachRowHash(const RowMask& mask, const RowHashes& hashed, const Visit& v
 
 JoinBuildSpec::JoinBuildSpec(std::shared_ptr<arrow::Schema> schema,
                              std::vector<plan::BoundColumn> keys, bool direct_candidate,
-                             bool keep_null_keys, std::vector<bool> retain)
+                             bool keep_null_keys, std::vector<bool> retain,
+                             std::vector<bool> null_equal)
     : schema_(std::move(schema)),
       keys_(std::move(keys)),
       retain_(std::move(retain)),
+      null_equal_(std::move(null_equal)),
       direct_candidate_(direct_candidate),
       keep_null_keys_(keep_null_keys) {}
 
 arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
     std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys, bool keep_null_keys,
-    std::vector<bool> retain) {
+    std::vector<bool> retain, std::vector<bool> null_equal) {
   return NoBadAlloc("a join build", [&] -> arrow::Result<std::shared_ptr<const JoinBuildSpec>> {
     if (schema == nullptr) {
       return arrow::Status::Invalid("a join build without a schema");
     }
     if (keys.empty()) {
       return arrow::Status::Invalid("a join build without keys");
+    }
+    if (!null_equal.empty() && null_equal.size() != keys.size()) {
+      return arrow::Status::Invalid("a join build of ", keys.size(), " keys with ",
+                                    null_equal.size(), " NULL-equal flags");
+    }
+    if (std::ranges::none_of(null_equal, std::identity{})) {
+      null_equal.clear();  // every key compares `=`: the build every join took before
     }
     for (const plan::BoundColumn& key : keys) {
       if (key.index < 0 || key.index >= schema->num_fields()) {
@@ -332,8 +342,9 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Make(
           break;
       }
     }
-    return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(
-        std::move(schema), std::move(keys), direct, keep_null_keys, std::move(retain)));
+    return std::shared_ptr<const JoinBuildSpec>(
+        new JoinBuildSpec(std::move(schema), std::move(keys), direct, keep_null_keys,
+                          std::move(retain), std::move(null_equal)));
   });
 }
 
@@ -350,7 +361,8 @@ arrow::Result<std::shared_ptr<const JoinBuildSpec>> JoinBuildSpec::Keyless(
     return std::shared_ptr<const JoinBuildSpec>(new JoinBuildSpec(std::move(schema), {},
                                                                   /*direct_candidate=*/false,
                                                                   /*keep_null_keys=*/false,
-                                                                  std::move(retain)));
+                                                                  std::move(retain),
+                                                                  /*null_equal=*/{}));
   });
 }
 
@@ -413,9 +425,10 @@ arrow::Status JoinBuildPart::AppendNullKeys(const Batch& batch, int64_t remainin
   int64_t found = 0;
   selected.ForEachRun([&](int64_t position, int64_t count) {
     for (int64_t row = position; row < position + count && found < remaining; ++row) {
-      const bool null_key = std::ranges::any_of(spec_->keys(), [&](const plan::BoundColumn& key) {
-        return data.column(key.index)->IsNull(row);
-      });
+      bool null_key = false;
+      for (std::size_t k = 0; k < spec_->keys().size() && !null_key; ++k) {
+        null_key = !spec_->null_equal(k) && data.column(spec_->keys()[k].index)->IsNull(row);
+      }
       if (null_key) {
         indices[static_cast<std::size_t>(found)] = Narrow<std::uint32_t>(row);
         ++found;
@@ -493,9 +506,11 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
   std::vector<const arrow::Array*> key_arrays;
   keys.reserve(spec_->keys().size());
   key_arrays.reserve(spec_->keys().size());
-  for (const plan::BoundColumn& key : spec_->keys()) {
-    keys.push_back(data.column(key.index));
-    key_arrays.push_back(keys.back().get());
+  for (std::size_t k = 0; k < spec_->keys().size(); ++k) {
+    keys.push_back(data.column(spec_->keys()[k].index));
+    if (!spec_->null_equal(k)) {  // a NULL in a NULL-equal key is a value of it: the row is kept
+      key_arrays.push_back(keys.back().get());
+    }
   }
   ARROW_ASSIGN_OR_RAISE(const RowMask mask,
                         RowMask::Make(key_arrays, batch.selection.get(), length, pool));
@@ -577,10 +592,18 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
     piece.rows = taken.record_batch();
   }
 
-  // The smallest and largest key of a direct candidate (every kept key is a value).
-  int64_t lowest = 0;
-  int64_t highest = 0;
-  if (spec_->direct_candidate()) {
+  // Whether a kept row has a NULL in a NULL-equal key: then the table is hashed (JoinTable::Build).
+  bool null_equal_nulls = false;
+  for (std::size_t k = 0; k < spec_->keys().size(); ++k) {
+    null_equal_nulls =
+        null_equal_nulls ||
+        (spec_->null_equal(k) && piece.rows->column(spec_->keys()[k].index)->null_count() > 0);
+  }
+  // The smallest and largest key of a direct candidate (every kept key is a value), unless it holds
+  // a NULL, whose bytes are no value: a table with one is not direct.
+  int64_t lowest = min_key_;
+  int64_t highest = max_key_;
+  if (spec_->direct_candidate() && !null_equal_nulls) {
     const plan::BoundColumn& key = spec_->keys().front();
     const arrow::ArrayData& values = *piece.rows->column_data(key.index);
     VisitDirectType(key.type, [&]<class T>(T /*type*/) {
@@ -596,6 +619,7 @@ arrow::Status JoinBuildPart::AppendRows(const Batch& batch, arrow::MemoryPool* p
   }
   min_key_ = lowest;
   max_key_ = highest;
+  holds_null_equal_nulls_ = holds_null_equal_nulls_ || null_equal_nulls;
   pieces_.push_back(std::move(piece));
   hash_bytes_ += hash_bytes;
   input_rows_ += selected;
@@ -712,13 +736,26 @@ JoinTable::JoinTable(std::shared_ptr<const JoinBuildSpec> spec, MemoryBudget* bu
 
 JoinTable::~JoinTable() = default;
 
-JoinTable::KeyView JoinTable::ViewOf(const arrow::ArrayData& data, int width) {
-  if (width > 0) {
-    return KeyView{.values = data.GetValues<std::uint8_t>(1, data.offset * width),
-                   .offsets = nullptr};
+JoinTable::KeyView JoinTable::ViewOf(const arrow::ArrayData& data, int width, bool with_validity) {
+  KeyView view = width > 0 ? KeyView{.values = data.GetValues<std::uint8_t>(1, data.offset * width)}
+                           : KeyView{.values = data.GetValues<std::uint8_t>(2, 0),
+                                     .offsets = data.GetValues<std::int32_t>(1)};
+  if (with_validity && data.MayHaveNulls()) {
+    view.validity = data.buffers[0]->data();
+    view.validity_offset = data.offset;
   }
-  return KeyView{.values = data.GetValues<std::uint8_t>(2, 0),
-                 .offsets = data.GetValues<std::int32_t>(1)};
+  return view;
+}
+
+std::vector<JoinTable::KeyView> JoinTable::ViewsOf(
+    std::span<const std::shared_ptr<arrow::Array>> keys) const {
+  std::vector<KeyView> views;
+  views.reserve(keys.size());
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    views.push_back(
+        ViewOf(*keys[k]->data(), widths_[k], null_equal_nulls_ && spec_->null_equal(k)));
+  }
+  return views;
 }
 
 std::span<const JoinTable::KeyView> JoinTable::ChunkKeys(std::uint32_t chunk) const {
@@ -729,13 +766,30 @@ std::span<const JoinTable::KeyView> JoinTable::ChunkKeys(std::uint32_t chunk) co
 // Equal means equal bytes, so every row of a key's range holds its probe rows' key bytes: a semi or
 // anti join whose deterministic residuals read no build column but the keys meets one candidate per
 // probe row (hash_join.h's candidates_alike_). An equality that normalized or collated would end
-// that.
+// that. A NULL of a NULL-equal key equals a NULL and no value, so a NULL key's range holds NULLs
+// only, which keeps the same promise.
+template <bool kValidity>
 bool JoinTable::KeysEqual(std::span<const KeyView> keys, int64_t row, JoinRowRef ref) const {
   const std::span<const KeyView> build = ChunkKeys(ref.chunk);
   const int64_t build_row = ref.row;
   for (std::size_t k = 0; k < keys.size(); ++k) {
     const KeyView& a = keys[k];
     const KeyView& b = build[k];
+    if constexpr (kValidity) {
+      // The bytes under a NULL are no value, so validity decides before they are read.
+      const bool a_valid =
+          a.validity == nullptr ||
+          arrow::bit_util::GetBit(a.validity, Narrow<std::uint64_t>(a.validity_offset + row));
+      const bool b_valid =
+          b.validity == nullptr ||
+          arrow::bit_util::GetBit(b.validity, Narrow<std::uint64_t>(b.validity_offset + build_row));
+      if (!a_valid || !b_valid) {
+        if (a_valid != b_valid) {
+          return false;
+        }
+        continue;  // both NULL
+      }
+    }
     const int width = widths_[k];
     if (width > 0) {  // the same type on both sides: equal values have equal bytes
       if (std::memcmp(a.values + (row * width), b.values + (build_row * width),
@@ -785,7 +839,7 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
   const std::uint64_t span =
       static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
   // The second clause only multiplies and adds inside the first's bound, so neither overflows.
-  const bool direct = spec_->direct_candidate() && num_rows > 0 &&
+  const bool direct = spec_->direct_candidate() && num_rows > 0 && !null_equal_nulls_ &&
                       (span < kDirectSlotsPerRow * num_rows ||
                        (span < kSparseDirectSlotsPerRow * num_rows &&
                         Affordable(budget_, Narrow<int64_t>((span + 3) * sizeof(std::uint32_t)))));
@@ -810,7 +864,8 @@ arrow::Status JoinTable::Build(std::span<const std::shared_ptr<const JoinBuildPa
     for (const JoinBuildPart::Piece& piece : part->pieces_) {
       chunks_.push_back(piece.rows);  // already narrowed when the piece was taken
       for (std::size_t k = 0; k < keys.size(); ++k) {
-        chunk_keys_.push_back(ViewOf(*piece.rows->column_data(keys[k].index), widths_[k]));
+        chunk_keys_.push_back(ViewOf(*piece.rows->column_data(keys[k].index), widths_[k],
+                                     null_equal_nulls_ && spec_->null_equal(k)));
       }
     }
     // In the same part-ordered walk, so that the rows a tail emits from them are the same rows in
@@ -1029,7 +1084,9 @@ arrow::Status JoinTable::BuildDirectory(std::size_t partition, std::span<const S
       const JoinRowRef key = rows_[first + at];
       std::uint32_t stop = at + 1;
       while (stop < end && hashes[stop] == hashes[at] &&
-             KeysEqual(ChunkKeys(key.chunk), key.row, rows_[first + stop])) {
+             (null_equal_nulls_
+                  ? KeysEqual<true>(ChunkKeys(key.chunk), key.row, rows_[first + stop])
+                  : KeysEqual<false>(ChunkKeys(key.chunk), key.row, rows_[first + stop]))) {
         ++stop;
       }
       if (stop - at > 1) {
@@ -1053,7 +1110,9 @@ arrow::Result<std::size_t> JoinTable::GroupBucket(std::uint32_t first,
                                                   MemoryReservation& scratch) {
   const std::span<JoinRowRef> rows = std::span(rows_).subspan(first, hashes.size());
   const auto same = [&](std::size_t a, std::size_t b) {
-    return hashes[a] == hashes[b] && KeysEqual(ChunkKeys(rows[a].chunk), rows[a].row, rows[b]);
+    return hashes[a] == hashes[b] &&
+           (null_equal_nulls_ ? KeysEqual<true>(ChunkKeys(rows[a].chunk), rows[a].row, rows[b])
+                              : KeysEqual<false>(ChunkKeys(rows[a].chunk), rows[a].row, rows[b]));
   };
   // The key of entry i among the keys seen before it (heads: their first entries, in the order
   // they appear), starting with the key of the entry before it; nullopt for a new key.
@@ -1167,10 +1226,15 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
   if (length == 0 || rows_.empty()) {
     return arrow::Status::OK();
   }
+  // A NULL in a key that compares `=` matches nothing, and neither does one in a NULL-equal key of
+  // a table that holds no NULL there: such a row is masked out. Only a table that holds one probes
+  // a NULL, as the NULL hash, and compares validity.
   std::vector<const arrow::Array*> arrays;
   arrays.reserve(keys.size());
-  for (const std::shared_ptr<arrow::Array>& key : keys) {
-    arrays.push_back(key.get());
+  for (std::size_t k = 0; k < keys.size(); ++k) {
+    if (!null_equal_nulls_ || !spec_->null_equal(k)) {
+      arrays.push_back(keys[k].get());
+    }
   }
   ARROW_ASSIGN_OR_RAISE(const RowMask mask, RowMask::Make(arrays, selection, length, pool));
   if (layout_ == Layout::kDirect) {
@@ -1197,25 +1261,29 @@ arrow::Status JoinTable::DoFind(std::span<const std::shared_ptr<arrow::Array>> k
   }
   MemoryReservation scratch;  // a probe's own: counted, not charged
   ARROW_ASSIGN_OR_RAISE(const RowHashes hashed, HashRows(keys, mask, kept, pool, scratch));
-  std::vector<KeyView> views;
-  views.reserve(keys.size());
-  for (std::size_t k = 0; k < keys.size(); ++k) {
-    views.push_back(ViewOf(*keys[k]->data(), widths_[k]));
-  }
-  ForEachRowHash(mask, hashed, [&](int64_t row, std::uint64_t hash) {
-    const Directory& directory = directories_[hash % kJoinPartitions];
-    if (directory.slots.empty()) {
-      return;
-    }
-    const std::uint64_t bucket = (hash >> kPartitionBits) & directory.mask;
-    for (std::uint32_t s = directory.buckets[bucket]; s < directory.buckets[bucket + 1]; ++s) {
-      const KeySlot& slot = directory.slots[s];
-      if (slot.hash == hash && KeysEqual(views, row, rows_[slot.begin])) {
-        matches[static_cast<std::size_t>(row)] = JoinMatches{.begin = slot.begin, .end = slot.end};
+  const std::vector<KeyView> views = ViewsOf(keys);
+  const auto probe = [&]<bool kValidity> {
+    ForEachRowHash(mask, hashed, [&](int64_t row, std::uint64_t hash) {
+      const Directory& directory = directories_[hash % kJoinPartitions];
+      if (directory.slots.empty()) {
         return;
       }
-    }
-  });
+      const std::uint64_t bucket = (hash >> kPartitionBits) & directory.mask;
+      for (std::uint32_t s = directory.buckets[bucket]; s < directory.buckets[bucket + 1]; ++s) {
+        const KeySlot& slot = directory.slots[s];
+        if (slot.hash == hash && KeysEqual<kValidity>(views, row, rows_[slot.begin])) {
+          matches[static_cast<std::size_t>(row)] =
+              JoinMatches{.begin = slot.begin, .end = slot.end};
+          return;
+        }
+      }
+    });
+  };
+  if (null_equal_nulls_) {
+    probe.operator()<true>();
+  } else {
+    probe.operator()<false>();
+  }
   return arrow::Status::OK();
 }
 
@@ -1347,6 +1415,7 @@ arrow::Status JoinTableBuilder::Release(int64_t part) {
   num_rows_ = num_rows;
   input_rows_ += rows->input_rows_;
   null_key_rows_ += rows->null_key_rows_;
+  holds_null_equal_nulls_ = holds_null_equal_nulls_ || rows->holds_null_equal_nulls_;
   num_chunks_ += rows->pieces_.size();
   if (!merge) {
     return arrow::Status::OK();
@@ -1442,6 +1511,9 @@ arrow::Result<std::shared_ptr<const KeyFilter>> JoinTableBuilder::MakeKeyFilter(
     if (part == nullptr) {
       continue;
     }
+    // A NULL of a NULL-equal key is in the bits, as the NULL hash a probe's NULL has, but it is no
+    // value to publish: a part of NULLs, or of values outside the others, may hold a match.
+    integer_keys = integer_keys && !part->holds_null_equal_nulls_;
     for (const JoinBuildPart::Piece& piece : part->pieces_) {
       filter->Add(piece.hashes);
       if (!integer_keys || piece.rows == nullptr || key_column < 0 ||
@@ -1476,6 +1548,7 @@ arrow::Result<std::shared_ptr<const JoinTable>> JoinTableBuilder::Finish() {
         std::shared_ptr<JoinTable> built(new JoinTable(spec_, budget_));
         built->input_rows_ = input_rows_;
         built->null_key_rows_ = null_key_rows_;
+        built->null_equal_nulls_ = holds_null_equal_nulls_;
         ARROW_RETURN_NOT_OK(built->Build(parts_, segments_, min_key_, max_key_, executor_));
         return built;
       });

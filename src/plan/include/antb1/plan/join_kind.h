@@ -8,7 +8,8 @@
 namespace antb1::plan {
 
 // The kinds of joins (ADR 0022). A match is a pair of a left and a right row with equal keys whose
-// residual is true; a NULL key never matches. A join without keys (`nested_loop`, ADR 0040) pairs
+// residual is true; a NULL key never matches, except under a NULL-equal key (JoinKey::null_equal,
+// ADR 0037's OJ5), where it matches a NULL. A join without keys (`nested_loop`, ADR 0040) pairs
 // every left row with every right row, and its residuals alone decide the matches.
 enum class JoinKind : std::uint8_t {
   kInner,          // every match
@@ -149,8 +150,8 @@ constexpr bool EmitsProbeAndBuildRows(JoinKind kind, BuildSide side) {
 
 // Whether such a join emits the build rows that did *not* match, rather than only those that did:
 // a left build that pads its unmatched rows or keeps them (an anti join), a right build that pads
-// them. Those need the build to retain the rows whose keys are NULL
-// (JoinBuildSpec::keep_null_keys), since a NULL key never matches. One function for the same reason
+// them. Those need the build to retain the rows with a NULL in a key that compares `=`
+// (JoinBuildSpec::keep_null_keys), since such a row never matches. One function for the same reason
 // as EmitsBuildRows: the planner sets the flag from it, the probe refuses a build without one, and
 // the sink reads the marks by it.
 constexpr bool EmitsUnmatchedBuildRows(JoinKind kind, BuildSide side) {

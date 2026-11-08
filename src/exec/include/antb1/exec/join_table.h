@@ -42,10 +42,17 @@
 //   hash and the range of their rows.
 //
 // Rows are kept as the parts appended them (the chunks), without a copy, and referenced as (chunk,
-// row); a build of more than 4294967295 rows is OutOfMemory. NULL keys are never inserted, so they
-// never match; the table counts them for the null-aware anti join, and with
-// JoinBuildSpec::keep_null_keys it also retains their rows in null_chunks(), apart from everything
-// a JoinRowRef addresses, for the join that must emit the build rows which did not match.
+// row); a build of more than 4294967295 rows is OutOfMemory. A row with a NULL in a key that
+// compares `=` is never inserted, so it never matches; the table counts such rows for the
+// null-aware anti join, and with JoinBuildSpec::keep_null_keys it also retains them in
+// null_chunks(), apart from everything a JoinRowRef addresses, for the join that must emit the
+// build rows which did not match.
+//
+// NULL-equal keys (JoinBuildSpec's `null_equal`, ADR 0037's OJ5) compare IS NOT DISTINCT FROM: a
+// row with a NULL in one is inserted, hashed as KeyHashes hashes a NULL, and matches a probe row
+// with a NULL there. A table whose NULL-equal keys hold no NULL is the table of `=` keys, layout
+// and probe included; one that holds a NULL in them is hashed, and its key comparison reads
+// validity.
 //
 // A keyless build (JoinBuildSpec::Keyless: a one-row join's, or a nested loop's, ADR 0040) holds
 // every selected row as rows of one key, in (part, row) order, so unique() means at most one row.
@@ -86,12 +93,14 @@ struct JoinMatches {
 class JoinBuildSpec {
  public:
   // Invalid (a planner bug, never NotImplemented) without a schema or keys, for a key outside the
-  // schema, for a DOUBLE or BOOLEAN key, or for a key whose column is not of its type
-  // (plan::ToArrow).
-  // With `keep_null_keys`, the build also retains the selected rows whose keys are NULL, apart from
-  // the table it indexes (JoinTable::null_chunks): a join that emits the build rows which did not
-  // match needs them, since a NULL key never matches (ADR 0026's C2c). Every other join leaves them
-  // behind, so it costs nothing unless it is asked for.
+  // schema, for a DOUBLE or BOOLEAN key, for a key whose column is not of its type
+  // (plan::ToArrow), or for a `null_equal` neither empty nor of one entry per key.
+  // `null_equal` says, per key, whether it compares IS NOT DISTINCT FROM
+  // (plan::JoinKey::null_equal); empty: every key compares `=`. With `keep_null_keys`, the build
+  // also retains the selected rows with a NULL in a key that compares `=`, apart from the table it
+  // indexes (JoinTable::null_chunks): a join that emits the build rows which did not match needs
+  // them, since such a row never matches (ADR 0026's C2c); a NULL in a NULL-equal key is inserted
+  // like a value. Every other join leaves them behind, so it costs nothing unless it is asked for.
   //
   // `retain` says, per field of `schema`, whether the build keeps that column's data: a field the
   // join's output carries but nothing above the join reads is held for the build's whole life for
@@ -112,7 +121,8 @@ class JoinBuildSpec {
   // read as a typed one. Both read NULL, which is the property that matters to a caller.
   static arrow::Result<std::shared_ptr<const JoinBuildSpec>> Make(
       std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-      bool keep_null_keys = false, std::vector<bool> retain = {});
+      bool keep_null_keys = false, std::vector<bool> retain = {},
+      std::vector<bool> null_equal = {});
   // The spec of a build without keys: a one-row join's, which keeps every column (an empty
   // `retain`), or a nested loop's (ADR 0040), which keeps those `retain` says as Make's does. It
   // keeps no NULL-key rows, having no keys. Invalid without a schema.
@@ -127,6 +137,12 @@ class JoinBuildSpec {
   [[nodiscard]] bool direct_candidate() const { return direct_candidate_; }
   // Whether the build retains the rows whose keys are NULL (JoinTable::null_chunks).
   [[nodiscard]] bool keep_null_keys() const { return keep_null_keys_; }
+  // Whether key `key` compares IS NOT DISTINCT FROM, a NULL matching a NULL.
+  [[nodiscard]] bool null_equal(std::size_t key) const {
+    return key < null_equal_.size() && null_equal_[key];
+  }
+  // Whether some key compares IS NOT DISTINCT FROM.
+  [[nodiscard]] bool any_null_equal() const { return !null_equal_.empty(); }
   // Whether the build keeps field `field`'s data. True for every key and for every field when the
   // caller gave no set.
   [[nodiscard]] bool retains(int field) const {
@@ -142,11 +158,13 @@ class JoinBuildSpec {
 
  private:
   JoinBuildSpec(std::shared_ptr<arrow::Schema> schema, std::vector<plan::BoundColumn> keys,
-                bool direct_candidate, bool keep_null_keys, std::vector<bool> retain);
+                bool direct_candidate, bool keep_null_keys, std::vector<bool> retain,
+                std::vector<bool> null_equal);
 
   std::shared_ptr<arrow::Schema> schema_;
   std::vector<plan::BoundColumn> keys_;
-  std::vector<bool> retain_;  // empty: every field
+  std::vector<bool> retain_;      // empty: every field
+  std::vector<bool> null_equal_;  // per key; empty: no key is NULL-equal
   bool direct_candidate_ = false;
   bool keep_null_keys_ = false;
 };
@@ -172,18 +190,20 @@ class JoinBuildPart {
   JoinBuildPart& operator=(JoinBuildPart&&) = delete;
   ~JoinBuildPart();
 
-  // Keeps the selected rows of `batch` whose keys are not NULL, every column, partitioned (Arrow
-  // buffers from `pool`); with JoinBuildSpec::keep_null_keys, the selected rows whose keys are NULL
-  // are kept too, in their own batches that no partition indexes. Invalid for an end batch, another
-  // schema or a selection of another length. On failure the part is unchanged.
+  // Keeps the selected rows of `batch` without a NULL in a key that compares `=`, every column,
+  // partitioned (Arrow buffers from `pool`); with JoinBuildSpec::keep_null_keys, the selected rows
+  // with one are kept too, in their own batches that no partition indexes. Invalid for an end
+  // batch, another schema or a selection of another length. On failure the part is unchanged.
   arrow::Status Append(const Batch& batch, arrow::MemoryPool* pool);
 
   [[nodiscard]] const std::shared_ptr<const JoinBuildSpec>& spec() const { return spec_; }
   // The selected rows appended, NULL keys included.
   [[nodiscard]] int64_t input_rows() const { return input_rows_; }
-  // The selected rows with a NULL in some key (never indexed; retained only with
+  // The selected rows with a NULL in some key that compares `=` (never indexed; retained only with
   // JoinBuildSpec::keep_null_keys).
   [[nodiscard]] int64_t null_key_rows() const { return null_key_rows_; }
+  // Whether a kept row has a NULL in a NULL-equal key.
+  [[nodiscard]] bool holds_null_equal_nulls() const { return holds_null_equal_nulls_; }
   // The rows kept.
   [[nodiscard]] int64_t num_rows() const { return num_rows_; }
 
@@ -204,7 +224,8 @@ class JoinBuildPart {
   // without hashes, and without a copy when every row of the batch is selected.
   arrow::Status AppendKeyless(const Batch& batch, const RowMask& mask, int64_t kept,
                               arrow::MemoryPool* pool);
-  // The rows of `batch` that are selected and have a NULL key, appended to null_pieces_; nothing
+  // The rows of `batch` that are selected and have a NULL in a key that compares `=`, appended to
+  // null_pieces_; nothing
   // when there is none. `remaining` is how many there are (the selected rows less the kept ones),
   // which is known before the rows are found.
   arrow::Status AppendNullKeys(const Batch& batch, int64_t remaining, arrow::MemoryPool* pool);
@@ -225,6 +246,7 @@ class JoinBuildPart {
   int64_t num_rows_ = 0;
   int64_t min_key_ = 0;  // a direct candidate with rows: its smallest and largest key
   int64_t max_key_ = 0;
+  bool holds_null_equal_nulls_ = false;
   int64_t hash_bytes_ = 0;    // the capacity of the pieces' hashes, in bytes
   MemoryReservation memory_;  // pieces_, null_pieces_ and the hashes
 };
@@ -284,12 +306,13 @@ class JoinTable {
   ~JoinTable();
 
   // The matches of every probe row: out[i] for row i of `keys` (one array per build key, of its
-  // type, all of one length), the build rows whose keys equal row i's, in (part, row) order. A row
-  // that is not selected (`selection`: nullptr for every row), has a NULL key or matches nothing
-  // gets an empty range ({0, 0}). Probe buffers come from `pool` (a NULL bitmap and, when at most a
-  // quarter of the rows are kept, their positions and a copy of their keys), except the hashed
-  // layout's hashes: a temporary std::vector that no budget sees. Invalid for a keyless build, keys
-  // of another count, type or length, a selection of another length or a short `out`.
+  // type, all of one length), the build rows whose keys equal row i's, in (part, row) order (a NULL
+  // equal to a NULL in a NULL-equal key). A row that is not selected (`selection`: nullptr for
+  // every row), has a NULL in a key that compares `=` or matches nothing gets an empty range ({0,
+  // 0}). Probe buffers come from `pool` (a NULL bitmap and, when at most a quarter of the rows are
+  // kept, their positions and a copy of their keys), except the hashed layout's hashes: a temporary
+  // std::vector that no budget sees. Invalid for a keyless build, keys of another count, type or
+  // length, a selection of another length or a short `out`.
   arrow::Status Find(std::span<const std::shared_ptr<arrow::Array>> keys,
                      const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                      std::span<JoinMatches> out) const;
@@ -306,11 +329,11 @@ class JoinTable {
   [[nodiscard]] const std::vector<std::shared_ptr<arrow::RecordBatch>>& chunks() const {
     return chunks_;
   }
-  // The retained rows whose keys are NULL, in part order; empty unless
+  // The retained rows with a NULL in a key that compares `=`, in part order; empty unless
   // JoinBuildSpec::keep_null_keys asked for them. They are in no key's range, Find never returns
   // one, and no JoinRowRef addresses them -- a ref's `chunk` indexes chunks() and nothing else,
   // which is what keeps the two stores apart. The join that emits the build rows which did not
-  // match emits these whole (ADR 0026's C2c), since a NULL key matches nothing.
+  // match emits these whole (ADR 0026's C2c), since such a row matches nothing.
   [[nodiscard]] const std::vector<std::shared_ptr<arrow::RecordBatch>>& null_chunks() const {
     return null_chunks_;
   }
@@ -328,7 +351,7 @@ class JoinTable {
   [[nodiscard]] int64_t num_rows() const { return static_cast<int64_t>(rows_.size()); }
   // The selected rows of the build input, NULL keys included.
   [[nodiscard]] int64_t input_rows() const { return input_rows_; }
-  // The selected rows with a NULL in some key (never inserted).
+  // The selected rows with a NULL in some key that compares `=` (never inserted).
   [[nodiscard]] bool has_null() const { return null_key_rows_ > 0; }
   [[nodiscard]] int64_t null_key_rows() const { return null_key_rows_; }
   // No key value repeats among the inserted rows (true when none is inserted).
@@ -340,10 +363,15 @@ class JoinTable {
   friend class JoinTableBuilder;
 
   // One key column of a batch, addressed by the batch's row: a fixed-width value is `width` bytes
-  // at values + row * width; a VARCHAR value is values[offsets[row], offsets[row + 1]).
+  // at values + row * width; a VARCHAR value is values[offsets[row], offsets[row + 1]). A
+  // NULL-equal key of a table that holds NULLs in one also has its validity: row `row` is NULL
+  // where bit `validity_offset + row` of `validity` is clear; nullptr for no NULL (and for every
+  // other key).
   struct KeyView {
     const std::uint8_t* values = nullptr;   // fixed width: row 0's value; VARCHAR: the data buffer
     const std::int32_t* offsets = nullptr;  // VARCHAR only: row 0's offset
+    const std::uint8_t* validity = nullptr;
+    int64_t validity_offset = 0;
   };
   // A distinct key of a partition: its hash and its rows, rows()[begin, end).
   struct KeySlot {
@@ -387,14 +415,20 @@ class JoinTable {
   arrow::Result<std::size_t> GroupBucket(std::uint32_t first, std::span<std::uint64_t> hashes,
                                          std::vector<std::uint32_t>& heads,
                                          MemoryReservation& scratch);
-  // The view of a key column of `width` bytes (0: VARCHAR), whatever its offset.
-  static KeyView ViewOf(const arrow::ArrayData& data, int width);
+  // The view of a key column of `width` bytes (0: VARCHAR), whatever its offset; with its validity
+  // when `with_validity` and the column may hold a NULL.
+  static KeyView ViewOf(const arrow::ArrayData& data, int width, bool with_validity);
+  // The views of probe or build `keys` (one array per key) for KeysEqual.
+  [[nodiscard]] std::vector<KeyView> ViewsOf(
+      std::span<const std::shared_ptr<arrow::Array>> keys) const;
   [[nodiscard]] arrow::Status DoFind(std::span<const std::shared_ptr<arrow::Array>> keys,
                                      const arrow::BooleanArray* selection, arrow::MemoryPool* pool,
                                      std::span<JoinMatches> out) const;
   // The views of chunk `chunk`'s keys.
   [[nodiscard]] std::span<const KeyView> ChunkKeys(std::uint32_t chunk) const;
-  // Whether the keys of row `row` of `keys` (one view per key) equal those of build row `ref`.
+  // Whether the keys of row `row` of `keys` (one view per key) equal those of build row `ref`;
+  // `kValidity` reads the views' validity, which only a table with null_equal_nulls_ sets.
+  template <bool kValidity>
   [[nodiscard]] bool KeysEqual(std::span<const KeyView> keys, int64_t row, JoinRowRef ref) const;
   [[nodiscard]] int64_t MemoryUsage() const;
 
@@ -408,6 +442,9 @@ class JoinTable {
   Layout layout_ = Layout::kHashed;
   int64_t input_rows_ = 0;
   int64_t null_key_rows_ = 0;
+  // Some inserted row has a NULL in a NULL-equal key: the table is hashed, a probe masks only the
+  // keys that compare `=`, and KeysEqual reads validity.
+  bool null_equal_nulls_ = false;
   bool unique_ = true;
   // Direct: key min_key_ + i has the rows rows_[offsets_[i], offsets_[i + 1]), for i <= span_.
   int64_t min_key_ = 0;
@@ -456,7 +493,9 @@ class JoinTableBuilder {
   //
   // Must be called **before** Finish, which frees the parts: the per-row hashes live in them and
   // nowhere else, and the table keeps none for the direct layout at all. Rows whose key is NULL are
-  // not in it, which is right -- a NULL key matches nothing on either side.
+  // not in it, which is right -- a NULL key matches nothing on either side -- except under a
+  // NULL-equal key, where they are, as the NULL hash, and no key values are published (D2): a part
+  // of NULLs, or one outside the values, may hold a match.
   arrow::Result<std::shared_ptr<const KeyFilter>> MakeKeyFilter() const;
 
  private:
@@ -478,7 +517,8 @@ class JoinTableBuilder {
   std::uint64_t num_rows_ = 0;
   int64_t input_rows_ = 0;
   int64_t null_key_rows_ = 0;
-  int64_t min_key_ = 0;  // over the released parts with rows (a direct candidate)
+  bool holds_null_equal_nulls_ = false;  // some released part's
+  int64_t min_key_ = 0;                  // over the released parts with rows (a direct candidate)
   int64_t max_key_ = 0;
   bool finished_ = false;
   arrow::Status failed_;  // the build's failure: the merges', else a failed release's

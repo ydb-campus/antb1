@@ -169,7 +169,10 @@ struct NodeLine {
         "Join {} build={} keys=[{}]", ToString(node.kind), ToString(node.build),
         Join(
             node.keys,
-            [](const JoinKey& key) { return ColumnName(key.left) + " = " + ColumnName(key.right); },
+            [](const JoinKey& key) {
+              return ColumnName(key.left) + (key.null_equal ? " IS NOT DISTINCT FROM " : " = ") +
+                     ColumnName(key.right);
+            },
             ", "));
     if (!node.residual.empty()) {
       line += " residual=[" +

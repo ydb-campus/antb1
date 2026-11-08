@@ -201,7 +201,8 @@ ExprPtr Condition(std::string name) {
                                            .name = std::move(name)});
 }
 
-// One line per join, then its left input and its right input one level deeper.
+// One line per join, then its left input and its right input one level deeper. A NULL-equal key
+// reads IS NOT DISTINCT FROM (ADR 0037's OJ5).
 TEST(ExplainTest, JoinsShowBothInputs) {
   const LogicalNodePtr semi = Node(JoinNode{
       .kind = JoinKind::kSemi,
@@ -216,7 +217,9 @@ TEST(ExplainTest, JoinsShowBothInputs) {
                     .left = ScanOf("t", {0, 1, 2}),
                     .right = semi,
                     .keys = {JoinKey{.left = Qualified("t", "i32"), .right = Qualified("u", "i32")},
-                             JoinKey{.left = Qualified("t", "i64"), .right = Qualified("", "i64")}},
+                             JoinKey{.left = Qualified("t", "i64"),
+                                     .right = Qualified("", "i64"),
+                                     .null_equal = true}},
                     .residual = {Condition("(t.i16 < u.i16)"), Condition("(t.s <> 'it''s\n')")},
                     .build = BuildSide::kLeft,
                     .span = {}});
@@ -231,7 +234,7 @@ TEST(ExplainTest, JoinsShowBothInputs) {
   EXPECT_EQ(Explain(plan),
             "Output: i16:SMALLINT i64:BIGINT\n"
             "Project t.i16, i64\n"
-            "  Join INNER build=left keys=[t.i32 = u.i32, t.i64 = i64] "
+            "  Join INNER build=left keys=[t.i32 = u.i32, t.i64 IS NOT DISTINCT FROM i64] "
             "residual=[(t.i16 < u.i16), (t.s <> 'it''s\\x0A')]\n"
             "    Scan table=t source=fake columns=[i16, i32, i64]\n"
             "    Join SEMI build=right keys=[u.i32 = \"x y\".\"Mixed Case\"]\n"

@@ -1255,6 +1255,9 @@ class Resolver {
       // columns (FULL, ADR 0037's OJ2), whose build-emitting sink runs on a right build only.
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
     }
+    if (traits.null_aware && std::ranges::any_of(join.keys, &JoinKey::null_equal)) {
+      Fail(std::format("Join: {} join with a NULL-equal key", ToString(join.kind)));
+    }
     JoinNode out = join;
     bool changed = left.node != join.left || right.node != join.right;
     out.left = left.node;

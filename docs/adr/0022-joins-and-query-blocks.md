@@ -898,6 +898,25 @@ docs/sql-subset.md sections it changes.
     is never padded, each is answered as before.
   - `RIGHT [OUTER] JOIN` stays exit code 4.
 
+- Update (2026-11-08, ADR 0037's OJ5a): **NULL-equal keys in the executor.** A key may compare IS NOT DISTINCT FROM
+  (`plan::JoinKey::null_equal`): a NULL in it matches a NULL on the other side and no value. "NULL keys never match"
+  above now holds for the keys that compare `=`. Every kind with keys takes such a key but the null-aware anti join,
+  whose NOT IN rules are those of `=`; `ResolvePositions`, the physical planner and the operator refuse it there. EXPLAIN
+  shows the key as `a IS NOT DISTINCT FROM b`, and a NULL-equal join is never one shared sub-plan with an `=` join
+  (ADR 0030). No SQL makes such a key before OJ5b. The design:
+  - **The build** inserts a row whose NULLs are in NULL-equal keys only, hashed as KeyHashes hashes a NULL (GROUP BY's
+    rule). A row with a NULL in an `=` key is left out, counted and retained as before.
+  - **A table whose NULL-equal keys hold no NULL is the table of `=` keys**: the same layout, a probe that masks out a
+    NULL in any key, and the byte comparison. Only a table that holds such a NULL changes: it is hashed whatever its
+    span, a probe masks only its `=` keys, and its key comparison reads validity first, since Arrow gives the bytes
+    under a NULL no value. A join of `=` keys runs the code it ran before.
+  - **Dynamic filters (ADR 0029).** The row filter (D1) and the aggregate filter (D5) take the NULL hash with the build's
+    other hashes, so a probe row with a NULL key passes them where the build holds a NULL. A build holding a NULL in a
+    NULL-equal key publishes no key values (D2): a part of NULLs, or of values outside the build's, may hold a match.
+  - **Kept as they are:** a semi or anti join's alike candidates (a NULL key's range holds NULLs only), the marks of a
+    build that emits its unmatched rows, and aggregate placement below a join (pre-grouping makes NULL one group, which
+    the key then matches).
+
 ## Alternatives considered
 
 - **Arrow's Acero hash join:** a complete join, but not installed, so linking it needs a new package, a new module
