@@ -1418,8 +1418,8 @@ std::vector<Relation> AllRelations() {
                  .probes = {Q(std::string(kTopN)),
                             Q(std::format("SELECT tr_row, tr_fare FROM ({}) AS s", kTopN))},
                  .check = AllEqual()});
-    // A CTE is bound once per reference (rule 8), so two references are two derived tables. The
-    // equality is what keeps the FROM graph connected: a cross product exits 4 for good.
+    // A CTE is bound once per reference (rule 8), so two references are two derived tables, joined
+    // on the equality (without it, they would be a cross product).
     r.push_back(
         {.name = "cte_referenced_twice_is_two_derived_tables",
          .features = SetWith(with_cte, kTableAlias, kQualifiedName, kCompareColumns, kCommaJoin),
@@ -1712,6 +1712,51 @@ std::vector<Relation> AllRelations() {
         {.name = "full_join_chain_batch_size_invariance",
          .features = full,
          .probes = {Q(std::string(kChain), 1), Q(std::string(kChain), 7), Q(std::string(kChain))},
+         .check = AllEqual()});
+  }
+
+  // ---- cross products and joins without an equality key (ADR 0040) ----
+  // A cross product's rows are its inputs' rows multiplied (6 x 9); an inequality, its negation and
+  // the NULL cases partition a product; swapping the two sides changes nothing; a nested loop on
+  // `<=` and `>=` gives the hash join's rows on `=`; and neither the batch size nor the threads
+  // change a nested loop's rows.
+  {
+    const slt::FeatureSet cross = {kColumns,        kMultipleItems, kCountStar,
+                                   kIntegerColumns, kTableName,     kCommaJoin,
+                                   kCrossJoin,      kWhere,         kCompareColumns};
+    r.push_back({.name = "cross_product_counts_multiply",
+                 .features = SetWith(cross, kDerivedTable, kTableAlias, kQualifiedName, kArithmetic,
+                                     kVarcharColumns, kDoubleColumns, kDecimalColumns),
+                 .probes = {Q("SELECT COUNT(*) FROM cities, tariffs"),
+                            Q("SELECT a.n * b.m FROM (SELECT COUNT(*) AS n FROM cities) AS a, "
+                              "(SELECT COUNT(*) AS m FROM tariffs) AS b")},
+                 .check = AllEqual()});
+    r.push_back({.name = "an_inequality_partitions_a_cross_product",
+                 .features = SetWith(cross, kBooleanExpressions),
+                 .probes = {Q("SELECT COUNT(*) FROM zones, cities"),
+                            Q("SELECT COUNT(*) FROM zones, cities WHERE zn_city < ct_id"),
+                            Q("SELECT COUNT(*) FROM zones, cities WHERE zn_city >= ct_id"),
+                            Q("SELECT COUNT(*) FROM zones, cities "
+                              "WHERE zn_city IS NULL OR ct_id IS NULL")},
+                 .check = FirstEqualsSumOfRest()});
+    r.push_back(
+        {.name = "a_nested_loop_is_symmetric",
+         .features = SetWith(cross, kDecimalColumns, kDoubleColumns),
+         .probes = {Q("SELECT zn_id, tf_code FROM zones, tariffs WHERE tf_rate < zn_radius"),
+                    Q("SELECT zn_id, tf_code FROM tariffs, zones WHERE tf_rate < zn_radius")},
+         .check = AllEqual()});
+    r.push_back({.name = "a_nested_loop_on_two_inequalities_equals_the_hash_join",
+                 .features = SetWith(cross, kJoinOn, kWhereAnd),
+                 .probes = {Q("SELECT tr_row, zn_id FROM trips JOIN zones ON tr_pickup = zn_id"),
+                            Q("SELECT tr_row, zn_id FROM trips, zones "
+                              "WHERE tr_pickup <= zn_id AND tr_pickup >= zn_id")},
+                 .check = AllEqual()});
+    constexpr std::string_view kLoop =
+        "SELECT dv_id, ct_id FROM drivers, cities WHERE dv_city BETWEEN ct_id - 1 AND ct_id + 1";
+    r.push_back(
+        {.name = "nested_loop_batch_size_invariance",
+         .features = SetWith(cross, kBetween, kArithmetic, kIntegerLiteral),
+         .probes = {Q(std::string(kLoop), 1), Q(std::string(kLoop), 7), Q(std::string(kLoop))},
          .check = AllEqual()});
   }
 

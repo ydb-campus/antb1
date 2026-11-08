@@ -1,0 +1,154 @@
+# Cross products and joins without an equality key over the star schema (ADR 0040): plain products, inequality,
+# `<>`, OR and BETWEEN conditions between the two sides, NULLs in them, empty inputs, a cross of parts that keys
+# join inside, conditions across the parts, grouped derived tables and CTEs, and products under a LEFT and a FULL
+# JOIN. A join with no equality key is a nested loop, its conditions the residuals on its pairs.
+
+# ---- plain products ----
+
+query I nosort
+SELECT COUNT(*) FROM cities, tariffs
+----
+BIGINT
+54
+
+query I nosort
+SELECT COUNT(*) FROM cities CROSS JOIN tariffs CROSS JOIN zones
+----
+BIGINT
+2160
+
+query IT rowsort
+SELECT ct_id, tf_code FROM cities, tariffs WHERE ct_pop > 40000 AND tf_rate > 2
+----
+SMALLINT	VARCHAR
+1	(empty)
+1	XL\x20
+2	(empty)
+2	XL\x20
+
+# An empty input empties the product, on either side.
+query I nosort
+SELECT COUNT(*) FROM trips, promos
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM promos, trips
+----
+BIGINT
+0
+
+# ---- conditions between the two sides ----
+
+# Each pair of zones once.
+query I nosort
+SELECT COUNT(*) FROM zones AS a, zones AS b WHERE a.zn_id < b.zn_id
+----
+BIGINT
+780
+
+# A NULL population never compares: city 4 is in no pair.
+query II rowsort
+SELECT a.ct_id, COUNT(*) FROM cities AS a JOIN cities AS b ON a.ct_pop < b.ct_pop GROUP BY a.ct_id
+----
+SMALLINT	BIGINT
+2	1
+3	2
+5	3
+6	4
+
+query I nosort
+SELECT COUNT(*) FROM zones JOIN cities ON zn_city <> ct_id
+----
+BIGINT
+196
+
+query I nosort
+SELECT COUNT(*) FROM zones, cities WHERE zn_city = ct_id OR zn_radius > ct_id
+----
+BIGINT
+75
+
+query I nosort
+SELECT COUNT(*) FROM drivers, cities WHERE dv_city BETWEEN ct_id - 1 AND ct_id + 1
+----
+BIGINT
+244
+
+# Two conditions, one of them over a DECIMAL and a DOUBLE.
+query I nosort
+SELECT COUNT(*) FROM tariffs, zones WHERE tf_rate < zn_radius AND tf_label <> label
+----
+BIGINT
+128
+
+# ---- parts that keys join inside, crossed ----
+
+# Trips with their zones, crossed with cities: the condition across the parts decides the pairs.
+query II nosort
+SELECT COUNT(*), COUNT(DISTINCT ct_id) FROM trips JOIN zones ON tr_pickup = zn_id, cities WHERE zn_radius > ct_id
+----
+BIGINT	BIGINT
+3212	3
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id, drivers JOIN cities ON dv_city = ct_id WHERE tr_driver < dv_id AND zn_city = 1
+----
+BIGINT
+22731
+
+# Two grouped derived tables: one row per city on each side.
+query III rowsort
+SELECT a.zn_city, b.dv_city, a.n * b.m FROM (SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city) AS a, (SELECT dv_city, COUNT(*) AS m FROM drivers GROUP BY dv_city) AS b WHERE a.zn_city IS NOT NULL AND b.dv_city IS NOT NULL AND a.zn_city <= 2
+----
+SMALLINT	SMALLINT	BIGINT
+1	1	184
+1	2	176
+1	3	176
+1	4	176
+2	1	184
+2	2	176
+2	3	176
+2	4	176
+
+query II rowsort
+WITH a AS (SELECT ct_id, ct_pop FROM cities WHERE ct_pop IS NOT NULL) SELECT x.ct_id, COUNT(*) FROM a AS x, a AS y WHERE x.ct_pop >= y.ct_pop GROUP BY x.ct_id
+----
+SMALLINT	BIGINT
+1	5
+2	4
+3	3
+5	2
+6	1
+
+query I nosort
+SELECT SUM(n) FROM (SELECT COUNT(*) AS n FROM zones, cities WHERE zn_city < ct_id GROUP BY zn_id) AS g
+----
+HUGEINT
+115
+
+# ---- products under outer joins ----
+
+query III nosort
+SELECT COUNT(*), COUNT(dv_row), COUNT(DISTINCT ct_id) FROM zones CROSS JOIN cities LEFT JOIN drivers ON dv_city = ct_id AND dv_id < 1200 WHERE zn_id <= 3
+----
+BIGINT	BIGINT	BIGINT
+24	18	6
+
+query III nosort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones CROSS JOIN tariffs FULL JOIN cities ON zn_city = ct_id WHERE tf_rate > 2 OR tf_rate IS NULL
+----
+BIGINT	BIGINT	BIGINT
+121	120	115
+
+# ---- ordered and limited ----
+
+query II nosort
+SELECT a.ct_id, b.ct_id FROM cities AS a, cities AS b WHERE a.ct_id < b.ct_id ORDER BY a.ct_id DESC, b.ct_id LIMIT 4
+----
+SMALLINT	SMALLINT
+5	6
+4	5
+4	6
+3	4

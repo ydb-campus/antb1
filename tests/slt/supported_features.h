@@ -65,6 +65,7 @@ enum class Feature : std::uint8_t {
   kJoinOn,         // FROM a [INNER] JOIN b ON ...
   kLeftJoin,       // FROM a LEFT [OUTER] JOIN b ON ...
   kFullJoin,       // FROM a FULL [OUTER] JOIN b ON ...
+  kCrossJoin,      // FROM a, b with no join key between them: a nested loop (ADR 0040)
   kTableAlias,     // FROM t [AS] a
   kQualifiedName,  // t.x
   // WHERE
@@ -216,6 +217,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "left_join";
     case Feature::kFullJoin:
       return "full_join";
+    case Feature::kCrossJoin:
+      return "cross_join";
     case Feature::kTableAlias:
       return "table_alias";
     case Feature::kQualifiedName:
@@ -422,6 +425,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kJoinOn,
     Feature::kLeftJoin,
     Feature::kFullJoin,
+    Feature::kCrossJoin,
     Feature::kTableAlias,
     Feature::kQualifiedName,
     Feature::kWhere,

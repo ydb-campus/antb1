@@ -741,45 +741,8 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     FromLists, BindErrorTest,
     ::testing::Values(
-        // No join key connects the relations: a cross product, at the item that is not connected.
-        // The select list binds first, so these name no column both relations have.
-        ErrorCase{"SELECT COUNT(*) FROM t, u", kUnsupported, "u",
-                  "a cross product is not supported: no join key connects 'u' to 't'"},
-        ErrorCase{"SELECT COUNT(*) FROM t CROSS JOIN u", kUnsupported, "u",
-                  "a cross product is not supported: no join key connects 'u' to 't'"},
-        ErrorCase{"SELECT COUNT(*) FROM t JOIN u ON t.i16 > u.i16", kUnsupported, "u",
-                  "a cross product is not supported"},  // a residual is no key
-        ErrorCase{"SELECT COUNT(*) FROM t AS a CROSS JOIN u", kUnsupported, "u",
-                  "a cross product is not supported: no join key connects 'u' to 'a'"},
-        // A relation of exactly one row joins as one row only where nothing else reads it: a
-        // condition could leave it with no row, and a residual has no join to stand on; and one
-        // that may have no row or many (HAVING, LIMIT, GROUP BY, a UNION ALL of aggregates) is no
-        // one-row relation.
-        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m > 5",
-                  kUnsupported, "(SELECT MAX(i32) AS m FROM u) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE t.i32 < b.m",
-                  kUnsupported, "(SELECT MAX(i32) AS m FROM u) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u HAVING MAX(i32) > 0) AS b",
-                  kUnsupported, "(SELECT MAX(i32) AS m FROM u HAVING MAX(i32) > 0) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u LIMIT 1) AS b", kUnsupported,
-                  "(SELECT MAX(i32) AS m FROM u LIMIT 1) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
-        ErrorCase{"SELECT t.i16 FROM t, (SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
-                  kUnsupported, "(SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
-        // A one-row relation first in FROM: the others must connect to the first that is not.
-        ErrorCase{"SELECT t.i16 FROM (SELECT MAX(i32) AS m FROM u) AS b, t, ok", kUnsupported, "ok",
-                  "a cross product is not supported: no join key connects 'ok' to 't'"},
-        ErrorCase{"SELECT i16 FROM t, (SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM "
-                  "u) AS b",
-                  kUnsupported,
-                  "(SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM u) AS b",
-                  "a cross product is not supported: no join key connects 'b' to 't'"},
         // A column both relations have is ambiguous in the select list, which binds before the
-        // connectivity check (rule 3, and the documented error order).
+        // join order (rule 3, and the documented error order).
         ErrorCase{"SELECT i16 FROM t, u", kBind, "i16",
                   "column name 'i16' is ambiguous: it matches t.i16 and u.i16"},
         // Every item's table is resolved, in FROM order, before any conjunct binds.
@@ -815,11 +778,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "a FULL JOIN without a join key between its two inputs is not supported"},
         ErrorCase{"SELECT u.i16 FROM t, u FULL JOIN ok ON ok.i16 = u.i16 AND t.i32 > 1",
                   kUnsupported, "t.i32", "a FULL JOIN's ON must read its own two inputs only"},
-        // A WHERE equality over a FULL JOIN's left input stays above the join, which pads that
-        // input, so it is no key there, where a LEFT JOIN's left input takes it as one.
-        ErrorCase{"SELECT t.i16 FROM t CROSS JOIN u FULL JOIN ok ON t.i16 = ok.i16 "
-                  "WHERE t.i32 = u.i32",
-                  kUnsupported, "u", "a cross product is not supported"},
         // An inner join's ON inside a FULL JOIN's left input binds inside that input, which the
         // FULL JOIN pads, so a conjunct of it that would bind above every join of the block -- a
         // subquery, a column of an enclosing block, a comma sibling before the join group -- would
@@ -878,7 +836,6 @@ INSTANTIATE_TEST_SUITE_P(
         // Query order.
         ErrorCase{"SELECT md5(s), t.i16 FROM t, u", kUnsupported, "md5",
                   "function md5() is not supported"},
-        ErrorCase{"SELECT t.i16 FROM t, u", kUnsupported, "u", "a cross product is not supported"},
         ErrorCase{"SELECT nope FROM t, u WHERE md5(s) = 'x'", kUnsupported, "md5",
                   "function md5() is not supported"},
         // The select list beats the connectivity check, and an alias names the binding in it.
@@ -935,12 +892,6 @@ INSTANTIATE_TEST_SUITE_P(
         // A call with the wrong number of arguments is a bind error once the FROM list binds.
         ErrorCase{"SELECT strlen(s, 1) FROM (SELECT s FROM t)", kBind, "strlen(s, 1)",
                   "strlen() takes 1 argument, not 2"},
-        // Two sub-plans with no key between them are a cross product like any other pair, named by
-        // their bindings: the connectivity check reads no table reference, so it does not abort.
-        ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t) AS g, (SELECT s FROM u)", kUnsupported,
-                  "(SELECT s FROM u)",
-                  "a cross product is not supported: no join key connects 'unnamed_subquery' "
-                  "to 'g'"},
         // Rule 1's counter numbers the unaliased derived tables only, so an aliased one beside an
         // unaliased one leaves the latter `unnamed_subquery`, with no `unnamed_subquery2`.
         ErrorCase{"SELECT unnamed_subquery2.s FROM (SELECT i16 FROM t) AS g, (SELECT s FROM u) "
@@ -1365,6 +1316,70 @@ TEST(BinderTest, TheRelationLimitCountsAChainBehindASubquery) {
   EXPECT_EQ(SpanText(sql, plan.status()), "IN") << plan.status().ToString();
   EXPECT_NE(plan.status().message().find("relations is not supported"), std::string::npos)
       << plan.status().message();
+}
+
+// A join graph that no key connects is a cross product (ADR 0040): its parts join in cross steps,
+// inner joins without keys -- nested loops -- that a residual between them decides where there is
+// one. A relation of one row that something reads, or one that may have no row or many, joins so
+// too, and one that nothing reads still joins as one row, above the rest.
+TEST(BinderTest, CrossProductsJoinAsNestedLoops) {
+  const Catalog catalog = MakeCatalog();
+  const auto explain = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  const auto count = [](const std::string& text, std::string_view what) {
+    std::size_t n = 0;
+    for (std::size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) {
+      ++n;
+    }
+    return n;
+  };
+  for (const std::string_view sql : {
+           "SELECT COUNT(*) FROM t, u",
+           "SELECT COUNT(*) FROM t CROSS JOIN u",
+           "SELECT COUNT(*) FROM t AS a CROSS JOIN u",
+           "SELECT t.i16 FROM t, (SELECT MAX(i32) AS m FROM u HAVING MAX(i32) > 0) AS b",
+           "SELECT t.i16 FROM t, (SELECT MAX(i32) AS m FROM u LIMIT 1) AS b",
+           "SELECT t.i16 FROM t, (SELECT i16, COUNT(*) AS n FROM u GROUP BY i16) AS b",
+           "SELECT t.i16 FROM t, (SELECT MAX(i32) AS m FROM u UNION ALL SELECT MIN(i32) FROM u) b",
+           "SELECT COUNT(*) FROM (SELECT i16 FROM t) AS g, (SELECT s FROM u)",
+       }) {
+    const std::string text = explain(sql);
+    EXPECT_EQ(count(text, "keys=[]"), 1U) << sql << "\n" << text;
+    EXPECT_EQ(count(text, "Join ONE-ROW"), 0U) << sql << "\n" << text;
+    EXPECT_EQ(count(text, "residual="), 0U) << sql << "\n" << text;
+  }
+  // A condition between the two sides is the nested loop's residual: an inequality, a comparison
+  // with a one-row relation's value, a filter of that relation on its own branch.
+  for (const std::string_view sql : {
+           "SELECT COUNT(*) FROM t JOIN u ON t.i16 > u.i16",
+           "SELECT t.i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE t.i32 < b.m",
+       }) {
+    const std::string text = explain(sql);
+    EXPECT_EQ(count(text, "Join INNER build="), 1U) << sql << "\n" << text;
+    EXPECT_EQ(count(text, "keys=[] residual=["), 1U) << sql << "\n" << text;
+  }
+  const std::string filtered =
+      explain("SELECT t.i16 FROM t, (SELECT MAX(i32) AS m FROM u) AS b WHERE b.m > 5");
+  EXPECT_EQ(count(filtered, "keys=[]"), 1U) << filtered;
+  EXPECT_EQ(count(filtered, "Join ONE-ROW"), 0U) << "a condition reads it\n" << filtered;
+  // A one-row relation that nothing reads still joins as one row, above the cross of the others.
+  const std::string first = explain("SELECT t.i16 FROM (SELECT MAX(i32) AS m FROM u) AS b, t, ok");
+  EXPECT_EQ(count(first, "Join ONE-ROW"), 1U) << first;
+  EXPECT_EQ(count(first, "Join INNER build="), 1U) << first;
+  EXPECT_LT(first.find("Join ONE-ROW"), first.find("Join INNER")) << first;
+  // Three relations, one keyed pair: one cross step and one keyed join.
+  const std::string three = explain("SELECT COUNT(*) FROM t, ok, dec WHERE t.i16 = ok.i16");
+  EXPECT_EQ(count(three, "Join INNER"), 2U) << three;
+  EXPECT_EQ(count(three, "keys=[]"), 1U) << three;
+  // A CROSS JOIN inside a FULL JOIN's left input, whose WHERE equality stays above the FULL JOIN:
+  // the left input is a cross product, answered.
+  const std::string full = explain(
+      "SELECT t.i16 FROM t CROSS JOIN u FULL JOIN ok ON t.i16 = ok.i16 WHERE t.i32 = u.i32");
+  EXPECT_LT(full.find("Join FULL"), full.find("keys=[]")) << "the cross below\n" << full;
+  EXPECT_LT(full.find("Filter"), full.find("Join FULL")) << "the equality above\n" << full;
 }
 
 // A relation no join key connects joins as one row when it is a derived table or a CTE reference
@@ -4188,11 +4203,14 @@ TEST(BinderTest, JoinKeyCastsAndResiduals) {
   ASSERT_NE(deduped, nullptr);
   EXPECT_EQ(deduped->keys.size(), 1U);
   EXPECT_TRUE(deduped->residual.empty());
-  // A DOUBLE equality has no key type, so it is a residual, and then nothing connects the graph.
+  // A DOUBLE equality has no key type, so it is a residual, and with no key the join is a nested
+  // loop (ADR 0040) that the residual decides.
   auto doubles = BindSql("SELECT COUNT(*) FROM t JOIN u ON t.d = u.d", catalog);
-  ASSERT_FALSE(doubles.ok());
-  EXPECT_NE(doubles.status().message().find("a cross product is not supported"), std::string::npos)
-      << doubles.status().ToString();
+  ASSERT_TRUE(doubles.ok()) << doubles.status().ToString();
+  const JoinNode* loop = testing::FirstJoin(*doubles);
+  ASSERT_NE(loop, nullptr);
+  EXPECT_TRUE(loop->keys.empty());
+  EXPECT_EQ(loop->residual.size(), 1U);
 }
 
 // Each relation keeps the conjuncts that read it alone, on its own branch below the join, and a
@@ -4271,14 +4289,16 @@ TEST(BinderTest, FactorsConjunctsSharedByEveryOrBranch) {
       << "the dropped OR is bound for its errors only, and reaches no node\n"
       << Explain(*absorbed);
   // Matching is structural, so the same equality written the other way round shares nothing: with
-  // no key left the join is a cross product, which stays unsupported.
+  // no key left the join is a nested loop (ADR 0040), the whole OR its residual.
   auto reversed = BindSql(
       "SELECT COUNT(*) FROM t, ok WHERE t.i16 = ok.i16 AND ok.s = 'x' OR "
       "ok.i16 = t.i16 AND ok.s = 'y'",
       catalog);
-  ASSERT_FALSE(reversed.ok());
-  EXPECT_NE(reversed.status().message().find("a cross product is not supported"), std::string::npos)
-      << reversed.status().ToString();
+  ASSERT_TRUE(reversed.ok()) << reversed.status().ToString();
+  const JoinNode* unkeyed = testing::FirstJoin(*reversed);
+  ASSERT_NE(unkeyed, nullptr);
+  EXPECT_TRUE(unkeyed->keys.empty());
+  EXPECT_EQ(unkeyed->residual.size(), 1U);
   // One relation, no join: the shared conjunct reaches the Scan, where the OR could not -- and so
   // does the IN list the remainder implies (ADR 0026's "filters implied by ORs"), which is the
   // whole point of deriving it.

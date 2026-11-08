@@ -5823,9 +5823,9 @@ bool ExactlyOneRow(const LogicalNode& node) {
   return false;
 }
 
-// The order the relations of every block join in: each block's relations must be connected to its
-// first by an edge (ADR 0022's connectivity check), and OrderJoins then picks the order from footer
-// statistics (its cost search, or the greedy left-deep rule beyond kSearchRelations). A unit's
+// The order the relations of every block join in: OrderJoins picks it from footer statistics (its
+// cost search, or the greedy left-deep rule beyond kSearchRelations), crossing the relations no key
+// connects (ADR 0040), and those of exactly one row join above as one-row joins. A unit's
 // inputs are ordered before the block that holds the unit, since its estimate stands in for the
 // unit's rows there.
 arrow::Status Binder::OrderRelations() { return OrderBlock(0); }
@@ -5873,9 +5873,10 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
         OrderJoins(block.stats, block.edges, options_.build_side_ratio, options_.join_order);
     return arrow::Status::OK();
   }
-  // A cross product, answered only where every relation no key connects joins as one row
-  // (JoinsAsOneRow). The core is what the keys connect to the first relation that does not, or to
-  // the first relation when they all do; the others join above the core, in FROM order.
+  // A cross product (ADR 0040). A relation no key connects that joins as one row (JoinsAsOneRow)
+  // joins above the core, in FROM order, as a one-row join; every other relation is in the core,
+  // which OrderJoins orders with cross steps where no key connects its parts. The seed is the first
+  // relation that does not join as one row, or the first relation when they all do.
   const std::size_t n = block.relations.size();
   std::vector<bool> one_row(n);
   for (std::size_t i = 0; i < n; ++i) {
@@ -5900,16 +5901,11 @@ arrow::Status Binder::OrderBlock(std::size_t b) {
     if (reached[i]) {
       continue;
     }
-    if (!one_row[i]) {
-      // The message names the binding, so a sub-plan needs no table reference here.
-      const std::size_t missing = FirstBindingOf(block.relations[i]);
-      const std::size_t first = FirstBindingOf(block.relations[seed]);
-      return UnsupportedError(
-          std::format("a cross product is not supported: no join key connects '{}' to '{}'",
-                      scope_.bindings()[missing].name(), scope_.bindings()[first].name()),
-          stmt_.from[missing].span);
+    if (one_row[i]) {
+      block.one_row.push_back(i);
+    } else {
+      reached[i] = true;  // a cross step of the core joins it
     }
-    block.one_row.push_back(i);
   }
   // The core alone goes to OrderJoins, renumbered, and its steps come back in the block's numbers.
   // Every edge is the core's: a relation outside it joins as one row, which no edge touches.

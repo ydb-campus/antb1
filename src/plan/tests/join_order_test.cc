@@ -900,9 +900,58 @@ TEST(JoinOrderDeathTest, EdgesJoinTwoRelationsOfTheBlock) {
   EXPECT_DEATH((void)FirstUnconnected(2, std::vector{Edge(3, 0)}), "edge.a < relations");
 }
 
-// OrderJoins needs connected relations: the binder checks connectivity first.
-TEST(JoinOrderDeathTest, TheRelationsMustBeConnected) {
-  EXPECT_DEATH((void)GreedyOrder(Relations({1, 2, 3}), std::vector{Edge(1, 2)}), "next.has_value");
+// Relations no edge connects are a cross product (ADR 0040): each part the edges connect is
+// ordered on its own, keyed joins only, and the parts are crossed left-deep -- the part of the
+// most rows (an unknown count as the most) first, the others from the fewest rows up, each the
+// right input and the build of a cross step whose edges are empty and whose estimate is the
+// product. The same with either search.
+TEST(JoinOrderTest, DisconnectedPartsCrossLeftDeep) {
+  for (const JoinOrderSearch search : {JoinOrderSearch::kCost, JoinOrderSearch::kGreedy}) {
+    SCOPED_TRACE(search == JoinOrderSearch::kCost ? "cost" : "greedy");
+    // A keyed pair and a relation apart: the pair joins first, then the cross.
+    const auto pair_and_one = OrderJoins(Relations({1000, 10, 5}), std::vector{Edge(0, 1, 10, 10)},
+                                         kBuildSideRatio, search);
+    ASSERT_EQ(pair_and_one.size(), 2U);
+    EXPECT_EQ(pair_and_one[0].edges, (std::vector<std::size_t>{0}));
+    EXPECT_TRUE(pair_and_one[1].edges.empty());
+    EXPECT_TRUE(pair_and_one[1].left.step);
+    EXPECT_EQ(pair_and_one[1].left.index, 0U);
+    EXPECT_FALSE(pair_and_one[1].right.step);
+    EXPECT_EQ(pair_and_one[1].right.index, 2U);
+    EXPECT_EQ(pair_and_one[1].build, BuildSide::kRight);
+    EXPECT_EQ(pair_and_one[1].estimate, 5000);
+    // No edge at all: the unknown relation first, then the others from the fewest rows up.
+    const auto loose = OrderJoins(Relations({7, std::nullopt, 3, 50}), {}, kBuildSideRatio, search);
+    EXPECT_EQ(Order(loose), (std::vector<std::size_t>{1, 2, 0, 3}));
+    for (const JoinStep& step : loose) {
+      EXPECT_TRUE(step.edges.empty());
+      EXPECT_EQ(step.build, BuildSide::kRight) << "each cross builds one part";
+    }
+    // Two keyed parts: the larger is the probe, the smaller one's root the build of the cross.
+    const auto two_parts =
+        OrderJoins(Relations({100, 10, 1000, 20}),
+                   std::vector{Edge(0, 1, 10, 10), Edge(2, 3, 20, 20)}, kBuildSideRatio, search);
+    ASSERT_EQ(two_parts.size(), 3U);
+    const JoinStep& cross = two_parts.back();
+    EXPECT_TRUE(cross.edges.empty());
+    ASSERT_TRUE(cross.left.step);
+    ASSERT_TRUE(cross.right.step);
+    EXPECT_EQ(two_parts[cross.left.index].edges, (std::vector<std::size_t>{1})) << "2-3 first";
+    EXPECT_EQ(two_parts[cross.right.index].edges, (std::vector<std::size_t>{0}));
+    EXPECT_EQ(cross.estimate, 1000 * 100);
+  }
+}
+
+// A connected graph never crosses, however a cross would estimate (ADR 0040's OJ4b update): two
+// small relations that an edge joins to a large one each join it on their own keys.
+TEST(JoinOrderTest, AConnectedGraphNeverCrosses) {
+  const std::vector<JoinRelation> star = Relations({1'000'000, 10, 10});
+  const std::vector<JoinEdge> edges = {Edge(0, 1, 10, 10), Edge(0, 2, 10, 10)};
+  for (const JoinOrderSearch search : {JoinOrderSearch::kCost, JoinOrderSearch::kGreedy}) {
+    for (const JoinStep& step : OrderJoins(star, edges, kBuildSideRatio, search)) {
+      EXPECT_FALSE(step.edges.empty());
+    }
+  }
 }
 
 }  // namespace

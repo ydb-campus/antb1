@@ -214,11 +214,10 @@ SELECT COUNT(*) FROM edge WHERE i16 + 1 > 40000 AND id = 6 OR i16 + 1 > 40000 AN
 BIGINT
 0
 
-# ---- DuckDB only: what the factoring does not reach ----
+# ---- what the factoring does not reach: a nested loop, the whole OR its residual (ADR 0040) ----
 
 # Matching is structural, not commutative (docs/sql-subset.md): `zn_id = tr_pickup` is not the conjunct
-# `tr_pickup = zn_id`, so these branches share nothing, no key connects the graph and antb1 exits 4.
-onlyif duckdb
+# `tr_pickup = zn_id`, so these branches share nothing and no key connects the graph.
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND zn_radius > 1 OR zn_id = tr_pickup AND zn_city = 2
 ----
@@ -227,7 +226,6 @@ BIGINT
 
 # Every branch must share it: two of these three write the equality and the third does not, so nothing is hoisted
 # and the graph stays disconnected -- even though the third branch alone can never be true here.
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips, zones
 WHERE tr_pickup = zn_id AND zn_city = 2 OR tr_pickup = zn_id AND zn_city = 3 OR zn_radius > 99
