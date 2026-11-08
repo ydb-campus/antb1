@@ -22,7 +22,7 @@ namespace antb1::plan {
 // one name sharing a column name, a `t.*` that names no FROM item of its own block or two of them,
 // aggregates mixed with columns, SUM/AVG of a non-number, a literal of the wrong type),
 // kUnsupported for a column of an unsupported type, FROM 'path' without a path opener, more than
-// 256 relations, a join graph no key connects (a cross product, but of one-row inputs), a `t.*`
+// 256 relations, a LEFT or FULL JOIN without an equality key between its inputs, a `t.*`
 // over a STRUCT column, an ORDER BY position over an EXISTS block's star, and an ORDER BY name
 // only the select list makes unambiguous.
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog,

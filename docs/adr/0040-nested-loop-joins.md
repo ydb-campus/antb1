@@ -222,3 +222,12 @@ It is accepted when OJ4c is built.
   dominates, and the performance item the Consequences name follows, outside OJ4. It would run the inner join's
   residuals over candidate pairs that carry only their columns, as the semi, anti, LEFT and FULL paths do
   (`PairBatch`), and gather the output for the pairs that pass.
+
+  One cost is known. A correlated subquery's block whose relations only outer columns connect, such as
+  `EXISTS (SELECT * FROM a, b WHERE a.x = o.k AND b.y = o.k)`, exited 4 before. It is now a cross product of `a` and
+  `b`, keyed on the outer columns only by the semi join (or Path 2's join) above it. That is correct, but quadratic
+  in the subquery's tables, where a decorrelation that joins `a` and `b` on the class of `o.k` would not be. That
+  rewrite belongs to ADR 0023's unnesting, outside OJ4. The subqueries over a cross product, these included, are in
+  `cases/joins/cross.slt`. The reviewer found one with a wrong answer: Path 2 dropped the equality between two inner
+  columns equal to one outer column, a bug on main that a keyed join reached too. It is fixed in its own PR before
+  OJ4b.

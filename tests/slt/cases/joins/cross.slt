@@ -142,6 +142,42 @@ SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones CROSS JOIN tariffs FULL
 BIGINT	BIGINT	BIGINT
 121	120	115
 
+# ---- subqueries over a cross product ----
+
+# A correlated block whose relations only the outer columns connect: a cross product of them, keyed on the outer
+# columns by the semi join or the join above it. Two inner columns equal to one outer column must also equal each
+# other (ADR 0023's Path 2).
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM zones, drivers WHERE zn_city = c.ct_id AND dv_city = c.ct_id AND dv_id < 1100)
+----
+BIGINT
+3
+
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE NOT EXISTS (SELECT * FROM zones, drivers WHERE zn_city = c.ct_id AND dv_city = c.ct_id AND dv_id < 1100)
+----
+BIGINT
+3
+
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE ct_id < (SELECT SUM(zn_id) FROM zones, drivers WHERE zn_city = c.ct_id AND dv_city = c.ct_id AND dv_id < 1100)
+----
+BIGINT
+3
+
+# An uncorrelated IN and NOT IN over a cross product with a condition between its sides.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones, cities WHERE zn_city < ct_id AND ct_pop > 40000)
+----
+BIGINT
+559
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones, cities WHERE zn_city < ct_id AND ct_pop > 40000)
+----
+BIGINT
+2441
+
 # ---- ordered and limited ----
 
 query II nosort

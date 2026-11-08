@@ -939,6 +939,33 @@ TEST(JoinOrderTest, DisconnectedPartsCrossLeftDeep) {
     EXPECT_EQ(two_parts[cross.left.index].edges, (std::vector<std::size_t>{1})) << "2-3 first";
     EXPECT_EQ(two_parts[cross.right.index].edges, (std::vector<std::size_t>{0}));
     EXPECT_EQ(cross.estimate, 1000 * 100);
+    // A part of three relations after a part of two: its own steps come after the first part's,
+    // so its operands are renumbered by that offset and its edges back to the block's.
+    const auto three =
+        OrderJoins(Relations({10, 20, 1000, 50, 5}),
+                   std::vector{Edge(0, 1, 10, 10), Edge(2, 3, 50, 50), Edge(3, 4, 5, 5)},
+                   kBuildSideRatio, search);
+    ASSERT_EQ(three.size(), 4U);
+    std::vector<std::size_t> seen_edges;
+    for (std::size_t k = 0; k < three.size(); ++k) {
+      for (const JoinOperand& operand : {three[k].left, three[k].right}) {
+        if (operand.step) {
+          EXPECT_LT(operand.index, k) << "step " << k << " reads a later step";
+        } else {
+          EXPECT_LT(operand.index, 5U);
+        }
+      }
+      seen_edges.insert(seen_edges.end(), three[k].edges.begin(), three[k].edges.end());
+    }
+    std::ranges::sort(seen_edges);
+    EXPECT_EQ(seen_edges, (std::vector<std::size_t>{0, 1, 2}))
+        << "every edge, in the block's numbers";
+    EXPECT_EQ(three[0].edges, (std::vector<std::size_t>{0})) << "the first part, first in FROM";
+    const JoinStep& second = three[2];  // the three-relation part's second step
+    EXPECT_TRUE((second.left.step && second.left.index == 1) ||
+                (second.right.step && second.right.index == 1))
+        << "it joins the part's first step, step 1 after the offset";
+    EXPECT_TRUE(three[3].edges.empty());
   }
 }
 

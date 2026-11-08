@@ -5220,7 +5220,7 @@ arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
     }
   }
   if (units_[u].keys.empty()) {
-    // As a disconnected inner graph is rejected: E1's table and E2's candidate pairs need a key.
+    // A nested loop without a key is ADR 0040's OJ4c: until then a LEFT or FULL JOIN needs a key.
     return UnsupportedError(
         std::format("a {} JOIN without a join key between its two inputs is not "
                     "supported",
@@ -5789,7 +5789,8 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
     // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
     // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
     // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
-    // therefore disconnected, and exits 4 as ADR 0022 says.
+    // therefore disconnected: a cross product of them (ADR 0040), which the semi join or the join
+    // the unnesting pass makes above it then keys on the outer columns.
     if (outer) {
       ARROW_RETURN_NOT_OK(BindCorrelatedConjunct(*conjunct.expr));
       continue;

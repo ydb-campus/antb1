@@ -132,10 +132,12 @@ work: mark and single dependent-join kinds, and lifting those rejections.
   not compiler-checked the way a node is, since exec dispatches on it through `default:` arms, so each site a new kind
   reaches has to be found by hand. U1 itself adds no join kind.
 - **Correlated conjuncts at the top of their block.** A WHERE conjunct of the subquery's block that reads an outer
-  column becomes neither a key nor an edge of the block's join graph, so a block whose relations connect only through
-  an outer column is disconnected and exits 4 (ADR 0022). The binder keeps all such conjuncts in one filter at the top
-  of the block, above all of its joins, subquery joins included, where the unnesting pass finds them. Conjuncts on
-  inner columns only are classified as usual, so pushdown and part pruning apply to the subquery's scans.
+  column becomes neither a key nor an edge of the block's join graph, so a block whose relations connect only through an
+  outer column is disconnected and exits 4 (ADR 0022; update 2026-11-08: since ADR 0040's OJ4b it is a cross product of
+  them, keyed on the outer columns only by the join above it, see ADR 0040's OJ4b update). The binder keeps all such
+  conjuncts in one filter at the top of the block, above all of its joins, subquery joins included, where the unnesting
+  pass finds them. Conjuncts on inner columns only are classified as usual, so pushdown and part pruning apply to the
+  subquery's scans.
 - **Placement.** A correlated subquery is accepted as a top-level WHERE conjunct: `EXISTS (query)`,
   `NOT EXISTS (query)`, or `x <op> (query)` in either order. A conjunct of an inner join's ON counts as WHERE
   (ADR 0022). In HAVING a correlated subquery exits 4: its outer references would read the outer block's groups, not
