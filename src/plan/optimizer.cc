@@ -1060,6 +1060,14 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   // of one type feeds a class; anything else is a conjunct that has to keep reading what it reads.
   Classes classes;
   std::vector<const Expr*> kept;
+  // The equalities that fed a class, with their two columns: each is dropped below only where the
+  // substitution makes it c = c, and kept as an inner condition otherwise.
+  struct Equality {
+    const Expr* expr = nullptr;
+    ColumnId a = kNoColumnId;
+    ColumnId b = kNoColumnId;
+  };
+  std::vector<Equality> equalities;
   // The name and type of each column a correlated conjunct names: BindBool's column_of stores them
   // in the PredicateExpr's own predicate, positionally, while the ids live in the operands. It is
   // the only place the pass can learn what to call a column.
@@ -1098,7 +1106,8 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
       describe(a->id, compare->predicate.column, compare->operands[0]->type);
       describe(b->id, compare->predicate.other, compare->operands[1]->type);
       classes.Merge(a->id, b->id);
-      continue;  // becomes c = c after the substitution and is dropped
+      equalities.push_back(Equality{.expr = &expr, .a = a->id, .b = b->id});
+      continue;
     }
     kept.push_back(&expr);
   }
@@ -1122,6 +1131,19 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   }
   if (equivalent.empty()) {
     return refuse("that reads no column of its enclosing block");
+  }
+  // An equality the substitution turns into c = c says no more than the key that replaces it: it is
+  // dropped. Any other one is a condition between inner columns -- two inner columns equal to one
+  // outer column, of which only the first is its equivalent, must still equal each other -- and is
+  // kept, substituted like every kept conjunct.
+  const auto substituted = [&equivalent](ColumnId id) {
+    const auto it = equivalent.find(id);
+    return it == equivalent.end() ? id : it->second;
+  };
+  for (const Equality& equality : equalities) {
+    if (substituted(equality.a) != substituted(equality.b)) {
+      kept.push_back(equality.expr);
+    }
   }
 
   // The aggregation groups by the inner equivalents, each output as a new column that the join's
