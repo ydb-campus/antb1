@@ -484,6 +484,19 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   why the sentence above waits on S5 alone: nothing in Q4, Q21 or Q22 is refused today but `substring`, and S4b took
   the `EXISTS` keyword out of the parser's rejected-word table. That last identification is an inference from what no
   longer refuses, not a record of the decision.
+- Update (2026-11-08, ADR 0037's OJ5b): **a correlation may be `IS NOT DISTINCT FROM`,** with ADR 0022's NULL-equal
+  keys (its OJ5a update). "No key needs IS NOT DISTINCT FROM" under Consequences still holds of every key an `=` makes;
+  the keys below are the query's own `IS NOT DISTINCT FROM`, which this ADR deferred with the general domain join and
+  which still waits for a query (the domain D is not built: these keys come from conjuncts, not from D).
+  - **Path 1** keys a semi or anti join on such a conjunct between an inner and an outer column as on an equality,
+    NULL-equal: an outer row whose column is NULL has the inner rows whose column is NULL.
+  - **Path 2** keeps its classes of `=` alone, since their members are equal values and a NULL-equal pair is not.
+    An outer column that no class gives an inner equivalent takes the inner column of an `outer IS NOT DISTINCT FROM
+    inner` conjunct instead (one type on both sides, as for an equality); the aggregation groups by it, NULL one group,
+    and the join back keys on it NULL-equal, so an outer NULL reads the NULL group. The substitution stays exact: it
+    replaces a NULL by a NULL and a value by the same value. Every other such conjunct is kept, substituted, as an
+    inner condition. The semi-join reduction keys as the join back does.
+  - **Unchanged:** an uncorrelated `NOT IN` keeps `=`'s NULL rules, and a null-aware anti join takes no NULL-equal key.
 
 ## Alternatives considered
 

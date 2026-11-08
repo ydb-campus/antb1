@@ -345,6 +345,26 @@ std::string InName(const sql::InExpr& in, bool negated) {
   return std::format("({} {}IN ({}))", ExprName(*in.operand), negated ? "NOT " : "", values);
 }
 
+// `distinct` named as DuckDB names it, IS NOT DISTINCT FROM where `negated`.
+std::string DistinctFromName(const sql::DistinctFromExpr& distinct, bool negated) {
+  return std::format("({} IS {}DISTINCT FROM {})", ExprName(*distinct.left), negated ? "NOT " : "",
+                     ExprName(*distinct.right));
+}
+
+// The IS [NOT] DISTINCT FROM under the NOTs of `expr`, DuckDB folding each NOT into it: `flipped`
+// toggles once per NOT. nullptr when there is none.
+const sql::DistinctFromExpr* DistinctUnderNots(const sql::Expr& expr, bool& flipped) {
+  if (const auto* distinct = std::get_if<sql::DistinctFromExpr>(&expr)) {
+    return distinct;
+  }
+  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+    flipped = !flipped;
+    return DistinctUnderNots(*unary->operand, flipped);
+  }
+  return nullptr;
+}
+
 // The comparison `expr` is once DuckDB folds its NOTs in (each NOT flips it), or std::nullopt when
 // no comparison is under the NOTs.
 struct ComparisonUnderNots {
@@ -376,6 +396,10 @@ std::string NotName(const sql::Expr& operand) {
   }
   if (const auto* in = std::get_if<sql::InExpr>(&operand); in != nullptr && !in->negated) {
     return InName(*in, /*negated=*/true);
+  }
+  bool flipped = true;  // the NOT being named
+  if (const sql::DistinctFromExpr* distinct = DistinctUnderNots(operand, flipped)) {
+    return DistinctFromName(*distinct, distinct->negated != flipped);
   }
   return "(NOT " + ExprName(operand) + ")";
 }
@@ -542,6 +566,9 @@ struct ExprNameOf {
   }
   std::string operator()(const sql::IsNullExpr& is_null) const {
     return std::format("({} IS {}NULL)", ExprName(*is_null.operand), is_null.negated ? "NOT " : "");
+  }
+  std::string operator()(const sql::DistinctFromExpr& distinct) const {
+    return DistinctFromName(distinct, distinct.negated);
   }
   std::string operator()(const sql::FunctionCall& call) const {
     std::string args;
@@ -847,6 +874,9 @@ struct ReadsColumnOf {
   bool operator()(const sql::IsNullExpr& is_null) const {
     return ReadsColumn(*is_null.operand, aggregates);
   }
+  bool operator()(const sql::DistinctFromExpr& distinct) const {
+    return ReadsColumn(*distinct.left, aggregates) || ReadsColumn(*distinct.right, aggregates);
+  }
   bool operator()(const sql::FunctionCall& call) const {
     return std::ranges::any_of(call.args,
                                [this](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
@@ -910,6 +940,10 @@ struct CollectRefsOf {
     CollectRefs(*between.high, out);
   }
   void operator()(const sql::IsNullExpr& is_null) const { CollectRefs(*is_null.operand, out); }
+  void operator()(const sql::DistinctFromExpr& distinct) const {
+    CollectRefs(*distinct.left, out);
+    CollectRefs(*distinct.right, out);
+  }
   void operator()(const sql::FunctionCall& call) const {
     for (const sql::Expr& arg : call.args) {
       CollectRefs(arg, out);
@@ -1043,6 +1077,18 @@ struct FirstUnsupportedOf {
     return Rejection{
         .span = is_null.op_span,
         .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
+  }
+  std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
+    if (auto r = FirstUnsupported(*distinct.left)) {
+      return r;
+    }
+    if (auto r = FirstUnsupported(*distinct.right)) {
+      return r;
+    }
+    return Rejection{
+        .span = distinct.op_span,
+        .message = std::string(distinct.negated ? "IS NOT DISTINCT FROM" : "IS DISTINCT FROM") +
+                   kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     if (IsCoalesce(call)) {
@@ -1229,6 +1275,44 @@ bool IsConstantInteger(const sql::Expr& expr);
 // that a comparison, a bound or an IN list folds into the literal of its value (FoldConstant).
 bool IsFoldableConstant(const sql::Expr& expr);
 
+// IS [NOT] DISTINCT FROM with a constant side (ADR 0037's OJ5b) as the conditions it means, each
+// never NULL as it is: against NULL, IS [NOT] NULL; against a value c, `x = c AND x IS NOT NULL` or
+// `x <> c OR x IS NULL`. std::nullopt when neither side is a literal or a folded constant
+// (RejectCondition refuses both being one).
+std::optional<sql::Expr> LoweredDistinctFrom(const sql::DistinctFromExpr& distinct) {
+  const auto constant = [](const sql::Expr& side) {
+    return std::holds_alternative<sql::Literal>(side) || IsFoldableConstant(side);
+  };
+  const bool right_constant = constant(*distinct.right);
+  if (!right_constant && !constant(*distinct.left)) {
+    return std::nullopt;
+  }
+  const sql::Expr& operand = right_constant ? *distinct.left : *distinct.right;
+  const sql::Expr& value = right_constant ? *distinct.right : *distinct.left;
+  const auto is_null = [&](bool negated) {
+    return sql::Expr(sql::IsNullExpr{.operand = sql::Box<sql::Expr>(operand),
+                                     .negated = negated,
+                                     .op_span = distinct.op_span,
+                                     .span = distinct.span});
+  };
+  const auto* literal = std::get_if<sql::Literal>(&value);
+  if (literal != nullptr && literal->kind == sql::Literal::Kind::kNull) {
+    return is_null(/*negated=*/!distinct.negated);
+  }
+  const sql::Expr compared(
+      sql::BinaryExpr{.op = distinct.negated ? sql::BinaryOp::kEq : sql::BinaryOp::kNe,
+                      .left = sql::Box<sql::Expr>(right_constant ? operand : value),
+                      .right = sql::Box<sql::Expr>(right_constant ? value : operand),
+                      .op_span = distinct.op_span,
+                      .span = distinct.span});
+  return sql::Expr(
+      sql::BinaryExpr{.op = distinct.negated ? sql::BinaryOp::kAnd : sql::BinaryOp::kOr,
+                      .left = sql::Box<sql::Expr>(compared),
+                      .right = sql::Box<sql::Expr>(is_null(distinct.negated)),
+                      .op_span = distinct.op_span,
+                      .span = distinct.span});
+}
+
 // Whether `stmt` aggregates every row it reads rather than projecting them (Shape::kGlobal when it
 // also has no GROUP BY).
 bool IsAggregateQuery(const sql::SelectStatement& stmt);
@@ -1263,6 +1347,32 @@ struct RejectConditionOf {
   // An operand reads a column (in HAVING, or calls an aggregate); the other side of a comparison
   // is then an operand too, or a literal.
   bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having); }
+
+  // The sides of a comparison: each supported, one reading a column, and the other a column's
+  // value too, a literal or a constant the binder folds.
+  std::optional<Rejection> ComparisonSides(const sql::Expr& left, const sql::Expr& right) const {
+    if (auto r = FirstUnsupported(left)) {
+      return r;
+    }
+    if (auto r = FirstUnsupported(right)) {
+      return r;
+    }
+    if (!IsOperand(left) && !IsOperand(right)) {
+      return Rejection{.span = right.span(),
+                       .message = "comparisons between two literals are not supported"};
+    }
+    for (const sql::Expr* side : {&left, &right}) {
+      if (!IsOperand(*side) && !std::holds_alternative<sql::Literal>(*side) &&
+          !IsFoldableConstant(*side)) {
+        return Rejection{.span = side->span(),
+                         .message =
+                             "a constant expression in a comparison is not supported "
+                             "(only integer literals under +, - and * and a quotient of "
+                             "two numbers are folded)"};
+      }
+    }
+    return std::nullopt;
+  }
   std::string_view OperandKind() const { return having ? "a column or an aggregate" : "a column"; }
 
   // `expr` is no condition the binder answers: the first construct in it that is not supported
@@ -1302,31 +1412,8 @@ struct RejectConditionOf {
       case sql::BinaryOp::kLt:
       case sql::BinaryOp::kLe:
       case sql::BinaryOp::kGt:
-      case sql::BinaryOp::kGe: {
-        if (auto r = FirstUnsupported(*binary.left)) {
-          return r;
-        }
-        if (auto r = FirstUnsupported(*binary.right)) {
-          return r;
-        }
-        const bool left = IsOperand(*binary.left);
-        const bool right = IsOperand(*binary.right);
-        if (!left && !right) {
-          return Rejection{.span = binary.right->span(),
-                           .message = "comparisons between two literals are not supported"};
-        }
-        for (const sql::Expr* side : {&*binary.left, &*binary.right}) {
-          if (!IsOperand(*side) && !std::holds_alternative<sql::Literal>(*side) &&
-              !IsFoldableConstant(*side)) {
-            return Rejection{.span = side->span(),
-                             .message =
-                                 "a constant expression in a comparison is not supported "
-                                 "(only integer literals under +, - and * and a quotient of "
-                                 "two numbers are folded)"};
-          }
-        }
-        return std::nullopt;
-      }
+      case sql::BinaryOp::kGe:
+        return ComparisonSides(*binary.left, *binary.right);
       default:  // arithmetic
         break;
     }
@@ -1399,6 +1486,10 @@ struct RejectConditionOf {
   // Of any value: a condition as the operand is refused as a value is ((a = 1) IS NULL).
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
     return FirstUnsupported(*is_null.operand);
+  }
+  // As a comparison's sides (ADR 0037's OJ5b): one reads a column; the other may be NULL too.
+  std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
+    return ComparisonSides(*distinct.left, *distinct.right);
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& /*call*/) const {
     return NotACondition(kThisCondition);
@@ -2064,6 +2155,9 @@ struct ContainsAggregateOf {
   }
   bool operator()(const sql::IsNullExpr& is_null) const {
     return ContainsAggregate(*is_null.operand);
+  }
+  bool operator()(const sql::DistinctFromExpr& distinct) const {
+    return ContainsAggregate(*distinct.left) || ContainsAggregate(*distinct.right);
   }
   bool operator()(const sql::FunctionCall& call) const {
     return std::ranges::any_of(call.args, ContainsAggregate);
@@ -2925,6 +3019,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::IsNullExpr& /*is_null*/) const {
       ConditionAsOperand();
     }
+    arrow::Result<Typed> operator()(const sql::DistinctFromExpr& /*distinct*/) const {
+      ConditionAsOperand();
+    }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
       if (IsGroupingCall(call)) {
         // A row's set exists only above the aggregation: in WHERE, an aggregate's argument or a
@@ -3400,6 +3497,9 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::IsNullExpr& /*is_null*/) const {
       ConditionAsOperand();
     }
+    arrow::Result<Typed> operator()(const sql::DistinctFromExpr& /*distinct*/) const {
+      ConditionAsOperand();
+    }
     arrow::Result<Typed> operator()(const sql::FunctionCall& call) const {
       if (IsGroupingCall(call)) {
         return binder.GroupingOutput(call);
@@ -3779,6 +3879,7 @@ class Binder {
   struct EdgeKey {
     std::size_t relation = 0;  // a relation of the edge's own block, by its index there
     BoundColumn column;
+    bool null_equal = false;  // IS NOT DISTINCT FROM (JoinKey::null_equal); the same on both sides
   };
   // A conjunct over two or more relations of one block that is no key: the join that first has all
   // of them evaluates it (JoinNode::residual).
@@ -4233,27 +4334,7 @@ struct Binder::BindConditionOf {
     }
     ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*binary.left));
     ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*binary.right));
-    const auto temporal = [](LogicalType t) {
-      return t == LogicalType::kDate || t == LogicalType::kTimestamp;
-    };
-    if (left.expr->type != right.expr->type && temporal(left.expr->type) &&
-        temporal(right.expr->type)) {
-      return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", binary.op_span);
-    }
-    // A DECIMAL compares with a DECIMAL of any precision and scale and with an integer exactly by
-    // value, and with a DOUBLE in DOUBLE after DuckDB's conversion (ADR 0021 rule 11; the
-    // executor's comparison of the two columns).
-    if (!Comparable(left.expr->type, right.expr->type)) {
-      return BindError(
-          std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
-          binary.op_span);
-    }
-    if (left.stored_as_float || right.stored_as_float) {
-      return UnsupportedError(
-          "comparing a FLOAT column with another expression is not supported (antb1 reads FLOAT as "
-          "DOUBLE, divergence D11)",
-          binary.op_span);
-    }
+    ARROW_RETURN_NOT_OK(CheckComparable(left, right, binary.op_span));
     return Predicate{.kind = Predicate::Kind::kCompareColumns,
                      .column = column_of(left),
                      .other = column_of(right),
@@ -4261,6 +4342,60 @@ struct Binder::BindConditionOf {
                      .constant = {},
                      .values = {},
                      .span = binary.span};
+  }
+  // Two values compared as two columns are: a DECIMAL with a DECIMAL of any precision and scale and
+  // with an integer exactly by value, and with a DOUBLE in DOUBLE after DuckDB's conversion (ADR
+  // 0021 rule 11; the executor's comparison of the two columns).
+  static arrow::Status CheckComparable(const Typed& left, const Typed& right, SourceSpan op_span) {
+    const auto temporal = [](LogicalType t) {
+      return t == LogicalType::kDate || t == LogicalType::kTimestamp;
+    };
+    if (left.expr->type != right.expr->type && temporal(left.expr->type) &&
+        temporal(right.expr->type)) {
+      return UnsupportedError("comparing a DATE with a TIMESTAMP is not supported", op_span);
+    }
+    if (!Comparable(left.expr->type, right.expr->type)) {
+      return BindError(
+          std::format("cannot compare {} with {}", DescribeOperand(left), DescribeOperand(right)),
+          op_span);
+    }
+    if (left.stored_as_float || right.stored_as_float) {
+      return UnsupportedError(
+          "comparing a FLOAT column with another expression is not supported (antb1 reads FLOAT as "
+          "DOUBLE, divergence D11)",
+          op_span);
+    }
+    return arrow::Status::OK();
+  }
+  // left IS [NOT] DISTINCT FROM right (ADR 0037's OJ5b). Two values compare as kCompareColumns
+  // does, as kIsDistinct or kIsNotDistinct. With a constant side, a conjunct: against NULL, IS
+  // [NOT] NULL; IS NOT DISTINCT FROM a value keeps the rows `=` keeps, a NULL failing both. The
+  // rest (IS DISTINCT FROM a value, an OR, and any nested one) BindBool binds lowered.
+  arrow::Result<Predicate> operator()(const sql::DistinctFromExpr& distinct) const {
+    if (const std::optional<sql::Expr> lowered = LoweredDistinctFrom(distinct)) {
+      if (nested) {
+        return arrow::Status::Invalid("a nested IS [NOT] DISTINCT FROM a constant binds lowered");
+      }
+      if (std::holds_alternative<sql::IsNullExpr>(*lowered)) {
+        return (*this)(std::get<sql::IsNullExpr>(*lowered));
+      }
+      const auto& both = std::get<sql::BinaryExpr>(*lowered);
+      if (both.op != sql::BinaryOp::kAnd) {
+        return arrow::Status::Invalid("IS DISTINCT FROM a value binds as a compound condition");
+      }
+      return (*this)(std::get<sql::BinaryExpr>(*both.left));
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*distinct.left));
+    ARROW_ASSIGN_OR_RAISE(const Typed right, bind(*distinct.right));
+    ARROW_RETURN_NOT_OK(CheckComparable(left, right, distinct.op_span));
+    return Predicate{
+        .kind = distinct.negated ? Predicate::Kind::kIsNotDistinct : Predicate::Kind::kIsDistinct,
+        .column = column_of(left),
+        .other = column_of(right),
+        .op = CompareOp::kEq,
+        .constant = {},
+        .values = {},
+        .span = distinct.span};
   }
   arrow::Result<Predicate> operator()(const sql::ColumnRef& /*ref*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::Literal& /*lit*/) const { NotAConditionLeaf(); }
@@ -4444,6 +4579,15 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
     return Leaf(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(inner)}},
                      .type = LogicalType::kBoolean,
                      .name = ExprName(expr)});
+  }
+  if (const auto* distinct = std::get_if<sql::DistinctFromExpr>(&expr)) {
+    // With a constant side, the conditions it means (LoweredDistinctFrom), named as written.
+    if (const std::optional<sql::Expr> lowered = LoweredDistinctFrom(*distinct)) {
+      ARROW_ASSIGN_OR_RAISE(const Typed bound, BindBool(*lowered, bind, input));
+      Expr named = *bound.expr;
+      named.name = ExprName(expr);
+      return Leaf(std::move(named));
+    }
   }
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNot) {
@@ -4971,15 +5115,31 @@ arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& b
 
 namespace {
 
+// A predicate two relations can join on: an equality, or IS NOT DISTINCT FROM, which makes a
+// NULL-equal key (ADR 0037's OJ5b). Its two operands must still each read one relation.
+bool IsKeyPredicate(const Predicate& predicate) {
+  return (predicate.kind == Predicate::Kind::kCompareColumns && predicate.op == CompareOp::kEq) ||
+         predicate.kind == Predicate::Kind::kIsNotDistinct;
+}
+
 // A conjunct that is no single predicate (OR, NOT): computed as a BOOLEAN column.
 bool IsCompound(const sql::Expr& conjunct) {
   const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct);
   const auto* unary = std::get_if<sql::UnaryExpr>(&conjunct);
   // A plain BETWEEN is two conjuncts (its comparisons), a NOT BETWEEN one compound condition.
   const auto* between = std::get_if<sql::BetweenExpr>(&conjunct);
+  // IS DISTINCT FROM a value is `x <> c OR x IS NULL` (LoweredDistinctFrom, ADR 0037's OJ5b).
+  const auto* distinct = std::get_if<sql::DistinctFromExpr>(&conjunct);
+  std::optional<sql::Expr> lowered;
+  if (distinct != nullptr) {
+    lowered = LoweredDistinctFrom(*distinct);
+  }
+  const auto* lowered_binary =
+      lowered.has_value() ? std::get_if<sql::BinaryExpr>(&*lowered) : nullptr;
   return (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
          (unary != nullptr && unary->op == sql::UnaryOp::kNot) ||
-         (between != nullptr && between->negated);
+         (between != nullptr && between->negated) ||
+         (lowered_binary != nullptr && lowered_binary->op == sql::BinaryOp::kOr);
 }
 
 Predicate IsTrue(BoundColumn column, SourceSpan span) {
@@ -5272,8 +5432,8 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
       const Typed bound,
       BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
   const auto* predicate = std::get_if<PredicateExpr>(&bound.expr->node);
-  if (predicate != nullptr && predicate->predicate.kind == Predicate::Kind::kCompareColumns &&
-      predicate->predicate.op == CompareOp::kEq && predicate->operands.size() == 2) {
+  if (predicate != nullptr && IsKeyPredicate(predicate->predicate) &&
+      predicate->operands.size() == 2) {
     // Each side must read exactly one relation of one input, and the two sides different inputs.
     // One relation, not one input: a side is computed on that relation's own branch, below the
     // unit's join, which only has the columns of that relation. A side over two relations of one
@@ -5317,7 +5477,10 @@ arrow::Status Binder::BindUnitConjunct(std::size_t u, const sql::Expr& conjunct,
           JoinKeyColumn(on_left.relation, predicate->operands[first_left ? 0 : 1], *type);
       BoundColumn key_right =
           JoinKeyColumn(on_right.relation, predicate->operands[first_left ? 1 : 0], *type);
-      units_[u].keys.push_back(JoinKey{.left = std::move(key_left), .right = std::move(key_right)});
+      units_[u].keys.push_back(
+          JoinKey{.left = std::move(key_left),
+                  .right = std::move(key_right),
+                  .null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct});
       units_[u].divisor =
           std::max({units_[u].divisor, KeyDomainOf(*predicate->operands[0]).value_or(0),
                     KeyDomainOf(*predicate->operands[1]).value_or(0)});
@@ -5387,8 +5550,8 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
       const Typed bound,
       BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
   const auto* predicate = std::get_if<PredicateExpr>(&bound.expr->node);
-  if (predicate != nullptr && predicate->predicate.kind == Predicate::Kind::kCompareColumns &&
-      predicate->predicate.op == CompareOp::kEq && predicate->operands.size() == 2) {
+  if (predicate != nullptr && IsKeyPredicate(predicate->predicate) &&
+      predicate->operands.size() == 2) {
     const std::vector<std::size_t> left = RelationsOf(*predicate->operands[0]);
     const std::vector<std::size_t> right = RelationsOf(*predicate->operands[1]);
     const std::optional<LogicalType> type =
@@ -5397,27 +5560,34 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
             : std::nullopt;
     if (type.has_value() && IsExactWidening(predicate->operands[0]->type, *type) &&
         IsExactWidening(predicate->operands[1]->type, *type)) {
+      const bool null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct;
       const auto side = [&](std::size_t i) {
         const std::size_t binding = i == 0 ? left.front() : right.front();
         return EdgeKey{.relation = *LocalOf(block_, binding),
-                       .column = JoinKeyColumn(binding, predicate->operands[i], *type)};
+                       .column = JoinKeyColumn(binding, predicate->operands[i], *type),
+                       .null_equal = null_equal};
       };
       const EdgeKey a = side(0);
       const EdgeKey b = side(1);
       JoinBlock& block = blocks_[block_];
       // One equality spelled in both an ON and WHERE is one key, not two of the same join. The
       // containers are the block's own, so an equality that an outer join unit already keys on is a
-      // conjunct of its own block again: it filters the unit's rows, padded ones included.
+      // conjunct of its own block again: it filters the unit's rows, padded ones included. An `=`
+      // and an IS NOT DISTINCT FROM of the same pair are the `=` key: it implies the other.
       const auto same = [&](const std::pair<EdgeKey, EdgeKey>& keys) {
         return (keys.first.column.id == a.column.id && keys.second.column.id == b.column.id) ||
                (keys.first.column.id == b.column.id && keys.second.column.id == a.column.id);
       };
-      if (std::ranges::none_of(block.edge_keys, same)) {
+      const auto found = std::ranges::find_if(block.edge_keys, same);
+      if (found == block.edge_keys.end()) {
         block.edges.push_back(JoinEdge{.a = a.relation,
                                        .b = b.relation,
                                        .a_domain = KeyDomainOf(*predicate->operands[0]),
                                        .b_domain = KeyDomainOf(*predicate->operands[1])});
         block.edge_keys.emplace_back(a, b);
+      } else if (!null_equal) {
+        found->first.null_equal = false;
+        found->second.null_equal = false;
       }
       return arrow::Status::OK();
     }
@@ -6604,7 +6774,8 @@ LogicalNodePtr Binder::CoreTree(std::size_t b) {
       const auto& [a, b_key] = block.edge_keys[e];
       const bool a_left = left_below.test(a.relation);
       keys.push_back(JoinKey{.left = a_left ? a.column : b_key.column,
-                             .right = a_left ? b_key.column : a.column});
+                             .right = a_left ? b_key.column : a.column,
+                             .null_equal = a.null_equal});
     }
     below[k] = left_below | below_of(step.right);
     lowest[k] = std::min(lowest_of(step.left), lowest_of(step.right));
@@ -6954,6 +7125,10 @@ struct FoldDateCastsOf {
     FoldDateCasts(*between.high);
   }
   void operator()(sql::IsNullExpr& is_null) const { FoldDateCasts(*is_null.operand); }
+  void operator()(sql::DistinctFromExpr& distinct) const {
+    FoldDateCasts(*distinct.left);
+    FoldDateCasts(*distinct.right);
+  }
   // Into its block too, although CheckSupported refuses the form right after: an unfolded cast
   // inside a block is a programming error for whoever answers it, so J5 inherits none.
   void operator()(sql::SubqueryExpr& s) const {

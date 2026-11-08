@@ -712,6 +712,12 @@ constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
 constexpr unsigned kKeylessPercent = 25;
 // Salt of the random stream which every draw that only such a keyless outer join needs takes.
 constexpr uint64_t kKeylessStreamSalt = 0x6B65796C6573732DULL;
+// Share of the inner joins whose keys compare IS NOT DISTINCT FROM, a NULL matching a NULL, and of
+// the correlated subqueries whose correlation does (ADR 0037's OJ5b).
+constexpr unsigned kNullEqualPercent = 20;
+// Salt of the random stream which every draw that only a NULL-equal key needs takes, so that a
+// query without one is the query this seed generated before the NULL-equal PR.
+constexpr uint64_t kNullEqualStreamSalt = 0x6E756C6C2D657121ULL;
 // Share of the joins of two keyed items that cross a third, unkeyed one (ADR 0040's OJ4b).
 constexpr unsigned kCrossPercent = 20;
 // Salt of the random stream which every draw that only a cross product needs takes, so that a
@@ -1006,6 +1012,7 @@ struct FromList {
   std::vector<std::string> shared;  // lower-case names of several bindings: always qualified
   std::size_t qualify = 0;          // the other references: 0 bare, 1 qualified, 2 by a draw each
   bool crossed = false;             // an item no key joins: a cross product (ADR 0040), kCrossJoin
+  bool null_equal = false;          // every key compares IS NOT DISTINCT FROM (ADR 0037's OJ5b)
 };
 
 // The FROM position the join group of item `item` starts at (rule 10 of ADR 0022): the last comma
@@ -1026,7 +1033,8 @@ class Builder {
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
-          Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, FeatureSet allowed)
+          Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1045,6 +1053,7 @@ class Builder {
         full_rng_(full_rng),
         cross_rng_(cross_rng),
         keyless_rng_(keyless_rng),
+        null_equal_rng_(null_equal_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1501,6 +1510,38 @@ class Builder {
         }
       }
     }
+    // Now and then every key compares IS NOT DISTINCT FROM (ADR 0037's OJ5b), in an inner join that
+    // crosses nothing: a key's rows with a NULL in it then match each other too. The bound replays
+    // the walk with them counted, each step's NULL rows a key value of their own: the first adds
+    // the pairs of the two sides' NULL rows, a later one multiplies by the larger of the added
+    // side's multiplicity and its NULL rows. A closing edge only removes rows, as an `=` key does.
+    if (allowed_.Has(Feature::kNullEqualKeys) && !crossed &&
+        std::ranges::none_of(from.bindings, [](const Binding& b) {
+          return b.connector == FromConnector::kLeft || b.connector == FromConnector::kFull;
+        })) {
+      int64_t bound = first.rows;
+      for (std::size_t i = 0; i < taken.size(); ++i) {
+        const Step& step = taken[i];
+        const Edge& edge = edges_[step.edge];
+        const auto nulls = [this](std::size_t table, const GenKeyStats& stats) {
+          return std::max<int64_t>(0, tables_[table].rows - stats.non_null);
+        };
+        if (i == 0) {
+          bound = SaturatingSum(JoinRowBound(edge.child_stats, edge.parent_stats),
+                                SaturatingProduct(nulls(edge.child, edge.child_stats),
+                                                  nulls(edge.parent, edge.parent_stats)));
+        } else {
+          const bool forward = step.forward;
+          const int64_t added = nulls(forward ? edge.parent : edge.child,
+                                      forward ? edge.parent_stats : edge.child_stats);
+          bound = SaturatingProduct(bound, std::max(step.multiplicity, added));
+        }
+      }
+      if (bound <= RowLimit(planned) && null_equal_rng_.Percent(kNullEqualPercent)) {
+        from.null_equal = true;
+        from.rows = bound;
+      }
+    }
     // Distinct names: an alias for a table read again or under another name, now and then for
     // any item.
     std::vector<std::string> names;  // the bindings' names so far, lower case
@@ -1894,7 +1935,7 @@ class Builder {
     }
     Keyword("FROM");
     EmitFrom(from);
-    Where(from.where_keys);
+    Where(from.where_keys, from.null_equal);
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
@@ -2573,7 +2614,7 @@ class Builder {
     return out;
   }
 
-  void Where(const std::vector<KeyPair>& keys) {
+  void Where(const std::vector<KeyPair>& keys, bool null_equal = false) {
     const bool conditions =
         allowed_.Has(Feature::kWhere) && !comparable_.empty() && rng_.Percent(45);
     // An uncorrelated subquery as one more top-level AND conjunct (ADR 0022's T2b), appended after
@@ -2601,7 +2642,7 @@ class Builder {
       }
     }
     Keyword("WHERE");
-    Keys(keys);
+    Keys(keys, /*unkeyed=*/false, null_equal);
     for (std::size_t i = 0; i < terms; ++i) {
       if (i > 0 || !keys.empty()) {
         Keyword("AND");
@@ -2659,6 +2700,25 @@ class Builder {
     Symbol(")");
   }
 
+  // IS NOT DISTINCT FROM between two operands (ADR 0037's OJ5b).
+  void NotDistinctFrom() {
+    used_.Add(Feature::kNullEqualKeys);
+    Keyword("IS");
+    Keyword("NOT");
+    Keyword("DISTINCT");
+    Keyword("FROM");
+  }
+
+  // A correlated key's comparison: `=`, or now and then IS NOT DISTINCT FROM, from a stream of its
+  // own so that a query without one is the query this seed gave before.
+  void CorrelatedKeyComparison() {
+    if (allowed_.Has(Feature::kNullEqualKeys) && null_equal_rng_.Percent(kNullEqualPercent)) {
+      NotDistinctFrom();
+    } else {
+      Symbol("=");
+    }
+  }
+
   // `<outer>.<k>`, the outer end of a correlated key. Written directly rather than through
   // Column(), which draws from join_rng_ and qualifies only against the outer bindings.
   void OuterColumn(const CorrelatedCandidate& c) {
@@ -2695,7 +2755,7 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Keyword("WHERE");
     InnerColumn(c, *c.inner_key);
-    Symbol("=");
+    CorrelatedKeyComparison();
     OuterColumn(c);
     // An optional non-equality over the same pair, which only a residual can evaluate: it keeps
     // the key, so the shape stays inside Path 1.
@@ -2768,7 +2828,7 @@ class Builder {
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
     Keyword("WHERE");
     InnerColumn(c, *c.inner_key);
-    Symbol("=");
+    CorrelatedKeyComparison();
     OuterColumn(c);
     Symbol(")");
     if (!literal_first) {
@@ -2873,8 +2933,9 @@ class Builder {
   }
 
   // The equalities of key pairs, joined by AND, each in a drawn order: never kCompareColumns, and
-  // never under OR or NOT, so that they connect the join graph (ADR 0022).
-  void Keys(const std::vector<KeyPair>& keys, bool unkeyed = false) {
+  // never under OR or NOT, so that they connect the join graph (ADR 0022). `null_equal`: each an IS
+  // NOT DISTINCT FROM, a NULL-equal key (ADR 0037's OJ5b).
+  void Keys(const std::vector<KeyPair>& keys, bool unkeyed = false, bool null_equal = false) {
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (i > 0) {
         Keyword("AND");
@@ -2887,6 +2948,8 @@ class Builder {
         static constexpr std::array<std::string_view, 5> kInequalities = {"<", "<=", ">",
                                                                           ">=", "<>"};
         Symbol(keyless_rng_.Pick(kInequalities));
+      } else if (null_equal) {
+        NotDistinctFrom();
       } else {
         Symbol("=");
       }
@@ -3059,7 +3122,7 @@ class Builder {
         used_.Add(Feature::kCompareColumns);
         used_.Add(Feature::kWhere);
       }
-      Keys(b.on, b.unkeyed);
+      Keys(b.on, b.unkeyed, from.null_equal);
       if (allowed_.Has(Feature::kWhere) && join_rng_.Percent(20)) {
         std::vector<const GenColumn*> all = comparable_;
         std::erase_if(comparable_, [&](const GenColumn* c) {
@@ -4242,6 +4305,7 @@ class Builder {
   Rng& full_rng_;                // the draws that only a FULL JOIN needs
   Rng& cross_rng_;               // the draws that only a cross product needs
   Rng& keyless_rng_;             // the draws that only a keyless LEFT or FULL JOIN needs
+  Rng& null_equal_rng_;          // the draws that only a NULL-equal key needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4461,9 +4525,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng full_rng(Mix(seed ^ kFullStreamSalt));
   Rng cross_rng(Mix(seed ^ kCrossStreamSalt));
   Rng keyless_rng(Mix(seed ^ kKeylessStreamSalt));
+  Rng null_equal_rng(Mix(seed ^ kNullEqualStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-               full_rng, cross_rng, keyless_rng, options.supported)
+               full_rng, cross_rng, keyless_rng, null_equal_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4494,14 +4559,16 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng full_rng(Mix(state ^ kFullStreamSalt));
   Rng cross_rng(Mix(state ^ kCrossStreamSalt));
   Rng keyless_rng(Mix(state ^ kKeylessStreamSalt));
+  Rng null_equal_rng(Mix(state ^ kNullEqualStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
-                             setop_rng, operator_rng, full_rng, cross_rng, keyless_rng, allowed)
-                         .Build()
-                         .value_or(GeneratedQuery{});
+  GeneratedQuery q =
+      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
+              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
+              full_rng, cross_rng, keyless_rng, null_equal_rng, allowed)
+          .Build()
+          .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

@@ -129,7 +129,8 @@ condition   = sum , cmp_op , sum
             | sum , [ "NOT" ] , "IN" , "(" , query , ")"
             | "EXISTS" , "(" , query , ")"
             | sum , [ "NOT" ] , "BETWEEN" , sum , "AND" , sum
-            | sum , "IS" , [ "NOT" ] , "NULL" ;
+            | sum , "IS" , [ "NOT" ] , "NULL"
+            | ( sum | "NULL" ) , "IS" , [ "NOT" ] , "DISTINCT" , "FROM" , ( sum | "NULL" ) ;
 sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
 unary       = "-" , unary | postfix ;
@@ -150,8 +151,9 @@ literal     = [ "-" ] , integer | [ "-" ] , decimal | string_literal | "DATE" , 
             | "TIMESTAMP" , string_literal ;
 ```
 
-Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE`, `IN`, `BETWEEN` and `IS
-[NOT] NULL` (which do not chain: `a = b = c`, `a = b IS NULL` and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds
+Operators bind from loosest to tightest: `OR`, `AND`, `NOT`, the comparisons with `LIKE`, `IN`, `BETWEEN`, `IS
+[NOT] NULL` and `IS [NOT] DISTINCT FROM` (which do not chain: `a = b = c`, `a = b IS NULL`, `a = b IS DISTINCT FROM c`
+and `a BETWEEN 1 AND 2 = b` are unsupported; the bounds
 of `BETWEEN` bind like the operand of
 `+`, so its `AND` is its own and `a BETWEEN 1 AND 2 AND b = 3` is two conjuncts), `+` and `-`, `*`, `/`, `//` and `%`,
 unary `-`, `::`; binary operators are left-associative, and parentheses group. An expression may be at most 256 levels
@@ -293,7 +295,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   including one that reads only the preserved side, since a left row that fails it is padded and not dropped. A `WHERE`
   conjunct over the null-supplying side stays above the join. An equality is a key only when each of its sides reads one
   relation of one input, since a side that is an expression is computed on that relation's own branch; a side over two
-  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is a nested loop
+  of them is a residual, as in an inner `ON`; `IS NOT DISTINCT FROM` is a key on the same terms, a NULL-equal one, on
+  which a NULL matches a NULL ([ADR 0037](adr/0037-tpcds-roadmap.md)'s OJ5b). A `LEFT JOIN` with no equality key
+  between its two inputs is a nested loop
   (ADR 0040's OJ4c): every `ON` conjunct over both inputs a residual, and rule 11 as with a key. A `FULL JOIN` (ADR
   0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct over either input alone is a residual, since
   a row of either that fails it is padded and not dropped; a `WHERE` conjunct over either input stays above the join;
@@ -393,9 +397,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   block an aggregate query. A column count other than one is a bind error. A **correlated** subquery -- one that reads a
   column of the block enclosing it -- is answered where it is a top-level `WHERE` conjunct: the binder plans it as a
   dependent join, which the optimizer's unnesting pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)).
-  `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through, over a block of
+  `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through (or on an `IS NOT
+  DISTINCT FROM`, a NULL-equal key: an outer NULL has the inner NULLs, OJ5b), over a block of
   `FROM` and `WHERE` alone; a scalar `SUM`, `AVG`, `MIN` or `MAX` under a comparison becomes a `GROUP BY` of the inner
-  equivalent and an inner join, where the select item combines the aggregate with literals and arithmetic alone --
+  equivalent and an inner join (an outer column correlated only through `IS NOT DISTINCT FROM` has that inner column as
+  its equivalent, and the join keys on it NULL-equal, so an outer NULL reads the NULL group), where the select item
+  combines the aggregate with literals and arithmetic alone --
   `COUNT` is exit code 4 there, since it is 0 over no rows and the rewrite gives an outer row with no group no row at
   all (divergences D23 and D24). Every other correlated shape is exit code 4: an uncorrelated `EXISTS`, a block with
   `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a
@@ -458,8 +465,9 @@ star's modifiers (`* EXCLUDE (...)`, `REPLACE`, `RENAME`, and `LIKE`, `ILIKE`, `
 `SIMILAR TO` also after `NOT`, before a string, also one in parentheses, after any `*` or `t.*`), an alias after a star
 (`* AS x`, `t.* x`, `* AS ''`, which DuckDB gives every column of the star; only before `,` or `FROM`, else a syntax
 error as in DuckDB), `t.*` inside an expression, `DISTINCT ON`, `ILIKE`, `GLOB`, `LIKE ... ESCAPE`, `NULL` literals (but
-a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, and a whole select item of a `UNION ALL` block), `IS` but `IS [NOT]
-NULL` (`IS DISTINCT FROM`, `IS TRUE`), `ISNULL`, `NOTNULL`, a condition as a select item (`SELECT a IS NULL`), `AT TIME
+a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, a whole select item of a `UNION ALL` block, and a side of `IS [NOT]
+DISTINCT FROM`), `IS` but `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM` (`IS TRUE`), `ISNULL`, `NOTNULL`, a condition as
+a select item (`SELECT a IS NULL`), `AT TIME
 ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
 (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
 than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
@@ -901,7 +909,8 @@ it in its rows' order.
 
 - An inner join keeps each row's matches in the build input's order; its residual conditions are evaluated in order,
   each on the rows the ones before it kept.
-- A semi join keeps each row with a match, once; an anti join each row without one (a NULL key never matches); a
+- A semi join keeps each row with a match, once; an anti join each row without one (a NULL key never matches, but on a
+  NULL-equal key, `IS NOT DISTINCT FROM`, where it matches a NULL); a
   null-aware anti join (SQL's `NOT IN`) each row without one whose key is not NULL, every row when its build input is
   empty, and none when its build input has a NULL key, though it still reads the other input to its end.
 - A left join keeps each row with each of its matches, in the build input's order, and pads a row without one once
@@ -1000,7 +1009,8 @@ Project RegionID, c
 ```
 
 A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI`, `ONE-ROW` or `FULL`), the input it builds
-on, its key pairs (`keys=[]` for a nested loop, ADR 0040, which then has its residuals alone) and, when it has any,
+on, its key pairs (`a.k = b.k`, or `a.k IS NOT DISTINCT FROM b.k` for a NULL-equal one, OJ5b; `keys=[]` for a
+nested loop, ADR 0040, which then has its residuals alone) and, when it has any,
 its residual conditions; its left input follows, then its right input, both
 indented. A column whose binding the plan records is shown qualified, as `a.k`. It ends with `carries N of M unread
 above` where the join's output holds columns no node above it reads -- its own keys and residual columns, usually,
@@ -1126,8 +1136,8 @@ only with `--analyze`); its errors and exit codes are those of `antb1 query`.
     (after the pipeline's lines), or a `HashJoin` over its input (after that input's line). Its input follows it,
     per part when it is a part pipeline. Its `rows` and `batches` are the rows its table holds and the table's
     chunks, and its time includes that of the builds its input probes, which come first. The rows it holds are those
-    without a NULL key, except for a join that emits the build rows which did not match (below), whose build keeps
-    the rows with one too.
+    without a NULL in a key that compares `=` (a NULL-equal key's NULLs are held, as values), except for a join that
+    emits the build rows which did not match (below), whose build keeps the rows with one too.
   - In the JSON, a `HashBuild` is one more entry of the `inputs` of the operator that prepares it.
 - Metrics:
   - `parts`, `skipped` (by statistics);
@@ -1241,6 +1251,15 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   NULL`. Above a `LEFT JOIN`, `IS NULL` on a column of the null-supplying side keeps the rows the join pads, and
   above a `FULL JOIN` on a column of either side. A
   condition as the operand (`(a = 1) IS NULL`, a chained comparison) is unsupported.
+  `x IS DISTINCT FROM y` and `x IS NOT DISTINCT FROM y` ([ADR 0037](adr/0037-tpcds-roadmap.md)'s OJ5b) are never NULL
+  either: NULL is not distinct from NULL and is distinct from every value, and two values compare as `=` compares them
+  (a DECIMAL with a DECIMAL of another scale or an integer by value, with a DOUBLE in DOUBLE), except that a DOUBLE NaN
+  is not distinct from NaN and `-0.0` not from `0.0`, as in DuckDB (divergence D10 is `=`'s). Either side may be an
+  expression or the `NULL` literal, but not both constants. Against `NULL` it is `IS [NOT] NULL`; against a value `c`,
+  `x IS NOT DISTINCT FROM c` is `x = c AND x IS NOT NULL` and `x IS DISTINCT FROM c` is `x <> c OR x IS NULL`, so a
+  `WHERE` conjunct `x IS NOT DISTINCT FROM c` filters, and is pushed to the scan, as `x = c` is. They are named as
+  DuckDB names them, NOT folded in (`NOT (a IS DISTINCT FROM b)` is `(a IS NOT DISTINCT FROM b)`); EXPLAIN shows two
+  columns' `a IS DISTINCT FROM b`. The type pairs `=` refuses are refused alike (DATE with TIMESTAMP, a FLOAT column).
 - BETWEEN: `a BETWEEN lo AND hi` is `lo <= a AND a <= hi` in three-valued logic, both bounds inclusive: a range with
   `lo > hi` matches nothing, and a NULL operand (or a NULL bound column) makes it NULL, which rejects the row;
   `a NOT BETWEEN lo AND hi` is its negation, so it rejects that row too.
@@ -1500,7 +1519,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -1534,7 +1553,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or a decimal of more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded to the nearest double, a decimal literal too, and an integer outside -2^127 to 2^128 - 1 does not make the list DOUBLE | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807`; in a DOUBLE `IN` list a decimal literal converts as its DECIMAL (`9007199254740993.5` becomes 2^53), and an integer outside -2^127 to 2^128 - 1 is DOUBLE as well | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` and `plan.BinderTest.In` pin antb1's folding; the generator writes no exponents for integer columns |
 | D8 | Result names | an aggregate's argument is quoted when it is not a plain identifier or is a reserved word | also quotes non-reserved keywords (`sum("year")`) | the tests compare values and types, not names |
 | D9 | HUGEINT range | HUGEINT is decimal128(38, 0): a `SUM`, or arithmetic on a `SUM`, outside -(10^38 - 1) to 10^38 - 1 is an execution error (exit code 1). An integer SUM over BIGINT or smaller types cannot reach it | HUGEINT holds -(2^127 - 1) to 2^127 - 1 | no column is HUGEINT (a DECIMAL(38, 0) column is DECIMAL); `exec.AggregateStateTest.HugeIntSumIsCheckedAgainstTheRange` checks the error |
-| D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
+| D10 | NaN | MIN and MAX ignore NaN like Arrow's `min_max`, whatever the batch and file boundaries: they return NaN only when every selected non-NULL value is NaN (so only MAX over NaN and other values differs from DuckDB). Arrow's comparison kernels follow IEEE 754: NaN compares unequal to everything, so `d > 1` and `d >= 1` are false for NaN, and `d IN (...)` never matches it; `IS [NOT] DISTINCT FROM` follows DuckDB instead (NaN is not distinct from NaN) | orders NaN above every other value and equal to itself: MIN and MAX return NaN when it is the extreme, `d > 1` is true for NaN | the fixtures contain no NaN (fixturegen builds doubles from integer ratios); `exec.AggregateStateTest.MinMaxOfDoublesIgnoreNaNInEveryBatchSplit` and `engine.SessionTest.MinMaxIgnoreNaNAcrossBatchesAndFiles` pin antb1's MIN and MAX |
 | D11 | FLOAT columns | read as DOUBLE (widened exactly): results of FLOAT columns are DOUBLE and print with double precision; `WHERE` compares like DuckDB (see Binding); arithmetic on them, and comparing them with other expressions, is unsupported (exit code 4); in a `UNION ALL`, FLOAT with FLOAT values stays FLOAT and FLOAT with DOUBLE values is DOUBLE, while FLOAT with integer or DECIMAL values is unsupported | keeps FLOAT (`MIN`, `MAX` and projections return FLOAT); a `UNION ALL` of FLOAT and integer or DECIMAL values is FLOAT | the random generator never references a FLOAT column (`ColumnOf` in `tests/slt/runner/query_gen.cc`, `harness.LoadGenTables.SkipsFloatColumns`); `tests/slt/cases/where/float.slt` selects only other columns, and `engine.SessionTest.FloatColumnsCompareLikeDuckDb` pins that results stay DOUBLE; `tests/slt/cases/having/having.slt` writes its FLOAT result twice, `onlyif duckdb` (FLOAT) and `onlyif antb1` (DOUBLE), since a record's type names must match, under a label shared with a record both engines answer as DOUBLE; `tests/slt/cases/setops/union_all.slt` counts the rows of FLOAT unions under `x = 0.1` |
 | D12 | HUGEINT literals against DOUBLE | an integer literal beyond BIGINT compared with a DOUBLE column is the correctly rounded nearest double (a decimal literal converts as DuckDB converts a DECIMAL, [ADR 0021](adr/0021-decimal-semantics.md) rule 8: `9007199254740993.5` is 2^53 in both engines) | converts a HUGEINT literal through its 128-bit formula (lower + upper × 2^64), which can be one ulp off | the generator writes DOUBLE columns only their own sample values and short decimals (`DoubleText` and `ExactDecimalDouble` in `tests/slt/runner/query_gen.cc`); `plan.BinderTest` pins the decimal conversion and `tests/slt/cases/types/decimal_literals.slt` compares it with DuckDB |
 | D13 | Decimals with many digits against integer and DECIMAL values | compared exactly, and a literal beyond the operand's type folds to a constant | compares in a DECIMAL whose width is capped at 38 digits: when the column type's digits plus the literal's decimals exceed 38, a column value with too many integer digits fails the query with a conversion error (`i16 = 1.0000000000000000000000000000000000001` over the value -32768); likewise an integer `SUM` (HUGEINT, 38 digits) in `HAVING` against any decimal fails once the sum has more digits than 38 minus the literal's decimals, and a DECIMAL(p,s) column against a literal with more than s decimals or more than p - s integer digits once their total exceeds 38 (`d38_10 > 0.00000000001` over a value of 28 integer digits). Two operands that are no literals fail the same way, in comparisons, `IN` lists and `BETWEEN`: a DECIMAL against a DECIMAL of another scale or an integer, once a value of the side with the smaller scale has more integer digits than 38 minus the larger scale (`d9_2 < d38_0` over d38_0's extremes, a DECIMAL(38,2) against a DECIMAL(38,12) past 26 integer digits). An integer literal of more than 38 - s digits against a DECIMAL(p,s) (`p < 1000000000000000000000000000000000000` on DECIMAL(15,2)), and one of 2^127 to 2^128 - 1 (UHUGEINT) against a SMALLINT, INTEGER or BIGINT operand, fails to cast on any input that reaches it | the `.slt` records and the generator keep literals short enough (`DecimalText` in `tests/slt/runner/query_gen.cc`) and compare two columns only while their common type stays within 38 digits (`ColumnComparison`, columns of two FROM items of a join included), and join two DECIMAL keys only then (`UsableEdges`); `tests/slt/cases/types/decimal.slt` and `decimal_comparisons.slt` pin both answers; `plan.Binder/FoldThroughBinderTest.*` and `plan.Binder/FoldDecimalTest.*` cover the exact folding, `exec.DecimalTest.CompareExactIsExactAcrossScalesAndIntegers` the exact comparison |

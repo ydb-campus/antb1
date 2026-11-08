@@ -1413,7 +1413,7 @@ class Parser {
       return kAndPrecedence;
     }
     if (keyword == "LIKE" || keyword == "IN" || keyword == "BETWEEN" ||
-        (keyword == "IS" && StartsIsNull())) {
+        (keyword == "IS" && (StartsIsNull() || StartsDistinctFrom(0)))) {
       return kComparisonPrecedence;
     }
     if (keyword == "NOT") {
@@ -1525,9 +1525,21 @@ class Parser {
                                       (PeekAt(1).IsKeyword("NOT") && PeekAt(2).IsKeyword("NULL")));
   }
 
+  // Whether the tokens from `offset` on are IS DISTINCT FROM or IS NOT DISTINCT FROM.
+  bool StartsDistinctFrom(std::size_t offset) {
+    if (!PeekAt(offset).IsKeyword("IS")) {
+      return false;
+    }
+    const std::size_t distinct = PeekAt(offset + 1).IsKeyword("NOT") ? offset + 2 : offset + 1;
+    return PeekAt(distinct).IsKeyword("DISTINCT") && PeekAt(distinct + 1).IsKeyword("FROM");
+  }
+
   // The operator at the next token applied to `lhs`.
   Expected<Expr> ParseInfix(Context context, Expr lhs, int precedence) {
     const std::string keyword = KeywordOf(Peek());
+    if (keyword == "IS" && StartsDistinctFrom(0)) {
+      return ParseDistinctFrom(context, std::move(lhs), precedence);
+    }
     if (keyword == "IS") {
       // operand IS [NOT] NULL (ADR 0037's NL4), at the comparisons' level as in DuckDB.
       const SourceSpan first = Take().span;
@@ -1579,6 +1591,36 @@ class Parser {
                            .right = Box<Expr>(*std::move(rhs)),
                            .op_span = op.span,
                            .span = span});
+  }
+
+  // left IS [NOT] DISTINCT FROM right (ADR 0037's OJ5b), positioned at the IS: a comparison, at
+  // the comparisons' level as in DuckDB, whose right operand may be the NULL literal unless an
+  // operator that binds tighter follows it (NULL + 1, which stays refused).
+  Expected<Expr> ParseDistinctFrom(Context context, Expr lhs, int precedence) {
+    const SourceSpan first = Take().span;  // IS
+    const bool negated = Peek().IsKeyword("NOT");
+    if (negated) {
+      Take();
+    }
+    Take();                                                // DISTINCT
+    const SourceSpan op_span = Cover(first, Take().span);  // .. FROM
+    const bool null = Peek().IsKeyword("NULL");
+    const SourceSpan null_span = Peek().span;
+    Expected<Expr> rhs =
+        null ? Expected<Expr>(Expr(Literal{.kind = Literal::Kind::kNull, .span = Take().span}))
+             : ParseExpr(context, precedence + 1);
+    if (null && InfixPrecedence() > precedence) {  // NULL + 1: NULL is the sum's operand
+      return Unsupported(null_span, "NULL literals are not supported");
+    }
+    if (!rhs) {
+      return rhs;
+    }
+    const SourceSpan span = Cover(lhs.span(), rhs->span());
+    return Expr(DistinctFromExpr{.left = Box<Expr>(std::move(lhs)),
+                                 .right = Box<Expr>(*std::move(rhs)),
+                                 .negated = negated,
+                                 .op_span = op_span,
+                                 .span = span});
   }
 
   // low AND high, positioned after [NOT] BETWEEN. The bounds bind tighter than comparisons (as the
@@ -1658,6 +1700,12 @@ class Parser {
   // NOT expr, - expr, or a primary expression, in a frame that binds at `min_precedence`.
   Expected<Expr> ParsePrefix(Context context, int min_precedence) {
     const Token& token = Peek();
+    // NULL as the left operand of IS [NOT] DISTINCT FROM (ADR 0037's OJ5b), where it is DuckDB's
+    // NULL literal; not as an operand of anything that binds tighter, where it is still refused.
+    if (token.IsKeyword("NULL") && min_precedence <= kComparisonPrecedence &&
+        StartsDistinctFrom(1)) {
+      return Expr(Literal{.kind = Literal::Kind::kNull, .span = Take().span});
+    }
     if (token.IsKeyword("NOT")) {
       const SourceSpan op = Take().span;
       // Where NOT binds tighter than NOT does (the right operand of a comparison or of arithmetic,
@@ -2413,8 +2461,8 @@ class Parser {
       return UnsupportedError(token.span, "AT TIME ZONE is not supported");
     }
     if (keyword == "IS") {
-      if (StartsIsNull()) {
-        return std::nullopt;  // IS [NOT] NULL, a comparison (ParseInfix)
+      if (StartsIsNull() || StartsDistinctFrom(0)) {
+        return std::nullopt;  // IS [NOT] NULL or IS [NOT] DISTINCT FROM, a comparison (ParseInfix)
       }
       return UnsupportedError(token.span, "IS is not supported");
     }

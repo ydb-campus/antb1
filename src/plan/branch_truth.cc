@@ -175,8 +175,31 @@ std::string_view ToString(BranchTruth truth) {
 
 BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>& column_value,
                       const std::optional<Constant>& other_value) {
-  // A NULL value makes no predicate but IS NULL true: a comparison, IN and NOT IN, LIKE and IS TRUE
-  // are NULL, and IS NOT NULL false. FALSE reads no column.
+  // A NULL value makes no predicate but IS NULL and the DISTINCT FROM pair true: a comparison, IN
+  // and NOT IN, LIKE and IS TRUE are NULL, and IS NOT NULL false. FALSE reads no column.
+  if (predicate.kind == Predicate::Kind::kIsDistinct ||
+      predicate.kind == Predicate::Kind::kIsNotDistinct) {
+    // NULL is not distinct from NULL and distinct from every value; never NULL (ADR 0037's OJ5b).
+    const bool not_distinct = predicate.kind == Predicate::Kind::kIsNotDistinct;
+    const auto decided = [not_distinct](bool equal) {
+      return equal == not_distinct ? BranchTruth::kAlways : BranchTruth::kNever;
+    };
+    const bool null = IsNull(column_value);
+    const bool other_null = IsNull(other_value);
+    const Constant* value = OfItsType(predicate.column, column_value);
+    const Constant* other = OfItsType(predicate.other, other_value);
+    if (null && other_null) {
+      return decided(true);
+    }
+    if ((null && other != nullptr) || (other_null && value != nullptr)) {
+      return decided(false);
+    }
+    if (value == nullptr || other == nullptr) {
+      return BranchTruth::kUnknown;
+    }
+    const std::optional<int> order = Order(*value, *other);
+    return order.has_value() ? decided(*order == 0) : BranchTruth::kUnknown;
+  }
   if (predicate.kind == Predicate::Kind::kIsNull) {
     if (IsNull(column_value)) {
       return BranchTruth::kAlways;
@@ -221,7 +244,9 @@ BranchTruth TruthOver(const Predicate& predicate, const std::optional<Constant>&
                                                                   : BranchTruth::kUnknown;
     case Predicate::Kind::kFalse:
       return BranchTruth::kNever;
-    case Predicate::Kind::kIsNull:  // decided above
+    case Predicate::Kind::kIsNull:  // decided above, as are the DISTINCT FROM pair
+    case Predicate::Kind::kIsDistinct:
+    case Predicate::Kind::kIsNotDistinct:
     case Predicate::Kind::kLike:
     case Predicate::Kind::kNotLike:
     case Predicate::Kind::kIsTrue:

@@ -1570,6 +1570,86 @@ TEST(BinderTest, IsNullAndIsNotNull) {
   }
 }
 
+// IS [NOT] DISTINCT FROM (ADR 0037's OJ5b). Two values bind as kIsDistinct or kIsNotDistinct; a
+// constant side lowers: against NULL to IS [NOT] NULL, IS NOT DISTINCT FROM a value as a conjunct
+// to
+// `=`, IS DISTINCT FROM a value to a computed condition. Between two relations IS NOT DISTINCT FROM
+// is a NULL-equal key where `=` would be a key, and `=` wins over it for one pair; IS DISTINCT FROM
+// and a DOUBLE pair are residuals. DuckDB's names, NOT folded in. A condition as a value, two
+// constants and the pairs `=` refuses are refused alike.
+TEST(BinderTest, IsDistinctFrom) {
+  const Catalog catalog = MakeCatalog();
+  const auto explain = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  for (const auto& [sql, line] :
+       std::initializer_list<std::pair<std::string_view, std::string_view>>{
+           {"SELECT i16 FROM t WHERE i16 IS DISTINCT FROM i32", "Filter i16 IS DISTINCT FROM i32"},
+           {"SELECT i16 FROM t WHERE i16 IS NOT DISTINCT FROM i32",
+            "Filter i16 IS NOT DISTINCT FROM i32"},
+           {"SELECT i16 FROM t WHERE i32 + 1 IS NOT DISTINCT FROM i64",
+            "Filter \"(i32 + 1)\" IS NOT DISTINCT FROM i64"},
+           {"SELECT i16 FROM t WHERE s IS NOT DISTINCT FROM NULL", "Filter s IS NULL"},
+           {"SELECT i16 FROM t WHERE NULL IS DISTINCT FROM s", "Filter s IS NOT NULL"},
+           {"SELECT i16 FROM t WHERE i16 IS NOT DISTINCT FROM 3", "Filter i16 = 3"},
+           {"SELECT i16 FROM t WHERE 1 + 2 IS NOT DISTINCT FROM i16", "Filter i16 = 3"},
+           {"SELECT i16 FROM t WHERE i16 IS DISTINCT FROM 3", "(i16 IS DISTINCT FROM 3)"},
+           {"SELECT i16 FROM t WHERE NOT (i16 IS DISTINCT FROM i32)",
+            "(i16 IS NOT DISTINCT FROM i32)"},
+           {"SELECT COUNT(*) FROM t JOIN u ON t.i16 IS NOT DISTINCT FROM u.i16",
+            "keys=[u.i16 IS NOT DISTINCT FROM t.i16]"},
+           {"SELECT COUNT(*) FROM t, u WHERE t.s IS NOT DISTINCT FROM u.s",
+            "keys=[u.s IS NOT DISTINCT FROM t.s]"},
+           {"SELECT COUNT(*) FROM t JOIN u ON t.i16 IS NOT DISTINCT FROM u.i16 AND t.i16 = u.i16",
+            "keys=[u.i16 = t.i16]"},
+           {"SELECT COUNT(*) FROM t, u WHERE t.i16 = u.i16 AND u.i16 IS NOT DISTINCT FROM t.i16",
+            "keys=[u.i16 = t.i16]"},
+           {"SELECT COUNT(*) FROM t LEFT JOIN u ON t.i32 IS NOT DISTINCT FROM u.i16",
+            "keys=[t.i32 IS NOT DISTINCT FROM \"CAST(u.i16 AS INTEGER)\"]"},
+           {"SELECT COUNT(*) FROM t FULL JOIN u ON t.dt IS NOT DISTINCT FROM u.dt",
+            "Join FULL build=right keys=[t.dt IS NOT DISTINCT FROM u.dt]"},
+           {"SELECT COUNT(*) FROM t JOIN u ON t.i16 IS DISTINCT FROM u.i16",
+            "keys=[] residual=[(t.i16 IS DISTINCT FROM u.i16)]"},
+           {"SELECT COUNT(*) FROM t JOIN u ON t.d IS NOT DISTINCT FROM u.d",
+            "keys=[] residual=[(t.d IS NOT DISTINCT FROM u.d)]"},
+       }) {
+    const std::string text = explain(sql);
+    EXPECT_TRUE(text.contains(line)) << sql << "\n" << text;
+  }
+
+  auto named = BindSql(
+      "SELECT CASE WHEN NOT (i16 IS DISTINCT FROM i32) THEN 1 ELSE 0 END AS a, "
+      "SUM(CASE WHEN NOT NOT (s IS NOT DISTINCT FROM NULL) THEN 1 END), "
+      "SUM(CASE WHEN NULL IS DISTINCT FROM i64 + 1 THEN 1 END) FROM t GROUP BY 1",
+      catalog);
+  ASSERT_TRUE(named.ok()) << named.status().ToString();
+  EXPECT_EQ(named->output[1].name,
+            "sum(CASE  WHEN ((s IS NOT DISTINCT FROM NULL)) THEN (1) ELSE NULL END)");
+  EXPECT_EQ(named->output[2].name,
+            "sum(CASE  WHEN ((NULL IS DISTINCT FROM (i64 + 1))) THEN (1) ELSE NULL END)");
+
+  for (const auto& [sql, kind] :
+       std::initializer_list<std::pair<std::string_view, SqlErrorDetail::Kind>>{
+           {"SELECT i16 IS DISTINCT FROM i32 FROM t", SqlErrorDetail::Kind::kUnsupported},
+           {"SELECT i16 FROM t WHERE (i16 = 1) IS DISTINCT FROM (i32 = 1)",
+            SqlErrorDetail::Kind::kUnsupported},
+           {"SELECT i16 FROM t WHERE 1 IS DISTINCT FROM 2", SqlErrorDetail::Kind::kUnsupported},
+           {"SELECT i16 FROM t WHERE NULL IS NOT DISTINCT FROM NULL",
+            SqlErrorDetail::Kind::kUnsupported},
+           {"SELECT i16 FROM t WHERE dt IS DISTINCT FROM CAST(dt AS TIMESTAMP)",
+            SqlErrorDetail::Kind::kUnsupported},
+           {"SELECT i16 FROM t WHERE s IS DISTINCT FROM i16", SqlErrorDetail::Kind::kBind},
+       }) {
+    const auto plan = BindSql(sql, catalog);
+    ASSERT_FALSE(plan.ok()) << sql;
+    const auto detail = GetSqlError(plan.status());
+    ASSERT_NE(detail, nullptr) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(detail->kind(), kind) << sql << ": " << plan.status().ToString();
+  }
+}
+
 // COALESCE (ADR 0037's NL5) types its arguments as CASE's values, folded from the first through
 // the rest in written order, as DuckDB does: an integer literal takes the others' integer type when
 // it fits, and with a DECIMAL the order of the arguments can change the type. DuckDB names it in

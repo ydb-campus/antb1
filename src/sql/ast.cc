@@ -115,6 +115,10 @@ bool Eq(const IsNullExpr& a, const IsNullExpr& b) {
   return a.negated == b.negated && Eq(*a.operand, *b.operand);
 }
 
+bool Eq(const DistinctFromExpr& a, const DistinctFromExpr& b) {
+  return a.negated == b.negated && Eq(*a.left, *b.left) && Eq(*a.right, *b.right);
+}
+
 bool Eq(const BetweenExpr& a, const BetweenExpr& b) {
   return a.negated == b.negated && Eq(*a.operand, *b.operand) && Eq(*a.low, *b.low) &&
          Eq(*a.high, *b.high);
@@ -710,6 +714,9 @@ struct DepthOf {
     return 1 + deepest;
   }
   std::size_t operator()(const IsNullExpr& i) const { return 1 + Of(*i.operand); }
+  std::size_t operator()(const DistinctFromExpr& d) const {
+    return 1 + std::max(Of(*d.left), Of(*d.right));
+  }
   std::size_t operator()(const BetweenExpr& b) const {
     return 1 + std::max({Of(*b.operand), Of(*b.low), Of(*b.high)});
   }

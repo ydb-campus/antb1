@@ -917,6 +917,12 @@ docs/sql-subset.md sections it changes.
     build that emits its unmatched rows, and aggregate placement below a join (pre-grouping makes NULL one group, which
     the key then matches).
 
+- Update (2026-11-08, ADR 0037's OJ5b): **NULL-equal keys from SQL.** `a IS NOT DISTINCT FROM b` between two relations
+  is a key wherever an `=` of the same two sides would be one (an inner block's WHERE or ON, a LEFT or FULL JOIN's ON),
+  NULL-equal. One pair compared both ways is the `=` key, which implies the other. A NULL-equal edge estimates as an
+  `=` edge does, its NULL pairs uncounted. `IS DISTINCT FROM`, and `IS NOT DISTINCT FROM` of a pair no key type holds
+  (DOUBLE, BOOLEAN), are residuals: alone, a nested loop (ADR 0040). ADR 0023's OJ5b update gives the correlated keys.
+
 ## Alternatives considered
 
 - **Arrow's Acero hash join:** a complete join, but not installed, so linking it needs a new package, a new module

@@ -1,0 +1,206 @@
+# IS [NOT] DISTINCT FROM (ADR 0037's OJ5b, docs/sql-subset.md): true or false, never NULL; NULL is not distinct from
+# NULL and distinct from every value. Two columns, a column and a constant, either side NULL, expressions on either side,
+# DECIMALs of two scales, DOUBLE against an integer, VARCHAR and DATE; under NOT, OR and CASE WHEN, and in HAVING.
+
+# ---- two columns ----
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent IS DISTINCT FROM zn_city
+----
+BIGINT
+8
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent IS NOT DISTINCT FROM zn_city
+----
+BIGINT
+32
+
+query II rowsort
+SELECT zn_id, zn_parent FROM zones WHERE zn_parent IS NOT DISTINCT FROM zn_id - 5 OR zn_parent IS NOT DISTINCT FROM NULL
+----
+INTEGER	INTEGER
+1	NULL
+10	5
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	1
+7	2
+8	3
+9	4
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent + 1 IS DISTINCT FROM zn_id
+----
+BIGINT
+40
+
+# DECIMALs of two scales compare by value, a DOUBLE with an integer in DOUBLE.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rate IS NOT DISTINCT FROM tr_fare / 10
+----
+BIGINT
+30
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_radius IS NOT DISTINCT FROM zn_city
+----
+BIGINT
+2
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_distance IS DISTINCT FROM tr_pickup / 8
+----
+BIGINT
+2980
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_tariff IS NOT DISTINCT FROM tr_tariff
+----
+BIGINT
+3000
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day IS DISTINCT FROM tr_day
+----
+BIGINT
+0
+
+# ---- a constant side ----
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_city IS DISTINCT FROM 1
+----
+BIGINT
+32
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_city IS NOT DISTINCT FROM 1
+----
+BIGINT
+8
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE 2 IS DISTINCT FROM zn_city
+----
+BIGINT
+32
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_city IS NOT DISTINCT FROM 1 + 1
+----
+BIGINT
+8
+
+query I nosort
+SELECT COUNT(*) FROM tariffs WHERE tf_code IS DISTINCT FROM 'STD'
+----
+BIGINT
+8
+
+query I nosort
+SELECT COUNT(*) FROM tariffs WHERE tf_rate IS NOT DISTINCT FROM 1.5
+----
+BIGINT
+1
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day IS DISTINCT FROM DATE '2026-03-05'
+----
+BIGINT
+2906
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_radius IS DISTINCT FROM 1.5
+----
+BIGINT
+37
+
+# Against NULL, IS [NOT] NULL, on either side.
+query I rowsort
+SELECT zn_id FROM zones WHERE zn_parent IS NOT DISTINCT FROM NULL
+----
+INTEGER
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NULL IS DISTINCT FROM zn_parent
+----
+BIGINT
+35
+
+query I nosort
+SELECT COUNT(*) FROM tariffs WHERE tf_code IS NOT DISTINCT FROM NULL
+----
+BIGINT
+1
+
+# ---- nested ----
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT (zn_parent IS DISTINCT FROM zn_city)
+----
+BIGINT
+32
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT (NOT (zn_city IS NOT DISTINCT FROM 1))
+----
+BIGINT
+8
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_parent IS NOT DISTINCT FROM NULL OR zn_city IS DISTINCT FROM 1
+----
+BIGINT
+33
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_city IS DISTINCT FROM 1 AND zn_parent IS DISTINCT FROM zn_city
+----
+BIGINT
+7
+
+query II rowsort
+SELECT CASE WHEN zn_city IS DISTINCT FROM 1 THEN 1 ELSE 0 END AS d, COUNT(*) FROM zones GROUP BY 1
+----
+INTEGER	BIGINT
+0	8
+1	32
+
+query III nosort
+SELECT SUM(CASE WHEN zn_parent IS DISTINCT FROM zn_city THEN 1 ELSE 0 END), SUM(CASE WHEN zn_parent IS NOT DISTINCT FROM NULL THEN 1 ELSE 0 END), SUM(CASE WHEN NOT (zn_city IS DISTINCT FROM 9) THEN 1 ELSE 0 END) FROM zones
+----
+HUGEINT	HUGEINT	HUGEINT
+8	5	1
+
+query II nosort
+SELECT SUM(CASE WHEN tr_rate IS DISTINCT FROM 1.25 THEN 1 ELSE 0 END), SUM(CASE WHEN tr_tariff IS NOT DISTINCT FROM 'STD' THEN 1 ELSE 0 END) FROM trips
+----
+HUGEINT	HUGEINT
+2650	284
+
+# ---- HAVING ----
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING zn_city IS DISTINCT FROM 1
+----
+SMALLINT	BIGINT
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II rowsort
+SELECT zn_city, MIN(zn_parent) FROM zones GROUP BY zn_city HAVING MIN(zn_parent) IS NOT DISTINCT FROM NULL OR zn_city IS NOT DISTINCT FROM NULL
+----
+SMALLINT	INTEGER
+NULL	3

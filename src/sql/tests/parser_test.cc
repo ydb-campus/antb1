@@ -1943,6 +1943,49 @@ TEST(ParserTest, IsNullIsAComparison) {
   }
 }
 
+// IS [NOT] DISTINCT FROM (ADR 0037's OJ5b) binds at the comparisons' level, as in DuckDB: over
+// arithmetic operands, under NOT, with NULL on either side, case-insensitively, and written back in
+// the same place.
+TEST(ParserTest, IsDistinctFromIsAComparison) {
+  const auto where = [](std::string_view condition) {
+    auto stmt = Parse("SELECT a FROM t WHERE " + std::string(condition));
+    EXPECT_TRUE(stmt.has_value()) << condition << ": " << stmt.error().message;
+    return stmt.has_value() ? stmt->where.at(0) : Expr(ColumnRef{});
+  };
+  const Expr plain = where("a IS DISTINCT FROM b");
+  const auto& distinct = std::get<DistinctFromExpr>(plain);
+  EXPECT_FALSE(distinct.negated);
+  EXPECT_EQ(std::get<ColumnRef>(*distinct.left).name, "a");
+  EXPECT_EQ(std::get<ColumnRef>(*distinct.right).name, "b");
+  EXPECT_TRUE(std::get<DistinctFromExpr>(where("a is not distinct from b")).negated);
+  const Expr arithmetic = where("a + 1 IS DISTINCT FROM b * 2");
+  EXPECT_TRUE(std::holds_alternative<BinaryExpr>(*std::get<DistinctFromExpr>(arithmetic).left));
+  EXPECT_TRUE(std::holds_alternative<BinaryExpr>(*std::get<DistinctFromExpr>(arithmetic).right));
+  const Expr negated = where("NOT a IS NOT DISTINCT FROM b");
+  EXPECT_TRUE(std::holds_alternative<DistinctFromExpr>(*std::get<UnaryExpr>(negated).operand));
+  const Expr null_right = where("a IS DISTINCT FROM NULL");
+  EXPECT_EQ(std::get<Literal>(*std::get<DistinctFromExpr>(null_right).right).kind,
+            Literal::Kind::kNull);
+  const Expr null_left = where("NULL IS NOT DISTINCT FROM a");
+  EXPECT_EQ(std::get<Literal>(*std::get<DistinctFromExpr>(null_left).left).kind,
+            Literal::Kind::kNull);
+  // A conjunction after a NULL right side is the WHERE's own AND.
+  EXPECT_EQ(Parse("SELECT a FROM t WHERE a IS DISTINCT FROM NULL AND b = 1")->where.size(), 2U);
+  for (const std::string_view sql : {
+           "SELECT a FROM t WHERE a IS DISTINCT FROM b AND b IS NOT DISTINCT FROM 1 OR c + 1 IS "
+           "DISTINCT FROM d",
+           "SELECT CASE WHEN a IS NOT DISTINCT FROM NULL THEN 1 END FROM t",
+           "SELECT a FROM t WHERE NOT (a IS DISTINCT FROM b) AND NULL IS DISTINCT FROM c",
+           "SELECT a FROM t AS x JOIN u AS y ON x.a IS NOT DISTINCT FROM y.a",
+       }) {
+    auto stmt = Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    auto again = Parse(ToSql(*stmt));
+    ASSERT_TRUE(again.has_value()) << ToSql(*stmt) << ": " << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again)) << ToSql(*stmt);
+  }
+}
+
 // A minus is not folded into a number that '::' follows: -1::INTEGER is -(CAST(1 AS INTEGER)), as
 // in DuckDB, while (-1)::INTEGER and CAST(-1 AS INTEGER) cast the negative literal.
 TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
@@ -3482,11 +3525,24 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "chained comparisons (a = b = c) are not supported"},
         RejectCase{"BetweenAfterComparison", "SELECT a FROM events WHERE a = b ^BETWEEN 1 AND 2",
                    kUnsupported, 7, "chained comparisons (a = b = c) are not supported"},
-        // IS [NOT] NULL is a comparison (ADR 0037's NL4): it does not chain, and every other IS is
-        // unsupported.
+        // IS [NOT] NULL (ADR 0037's NL4) and IS [NOT] DISTINCT FROM (OJ5b) are comparisons: they
+        // do not chain, and every other IS is unsupported. NULL is an operand of DISTINCT FROM
+        // only, not of anything that binds tighter.
         RejectCase{"IsNullAfterComparison", "SELECT a FROM events WHERE a = b ^IS NULL",
                    kUnsupported, 2, "chained comparisons (a = b = c) are not supported"},
-        RejectCase{"IsDistinctFrom", "SELECT a FROM events WHERE a ^IS DISTINCT FROM b",
+        RejectCase{"IsDistinctFromAfterComparison",
+                   "SELECT a FROM events WHERE a = b ^IS DISTINCT FROM c", kUnsupported, 2,
+                   "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"ComparisonAfterIsNotDistinctFrom",
+                   "SELECT a FROM events WHERE a IS NOT DISTINCT FROM b ^= c", kUnsupported, 1,
+                   "chained comparisons (a = b = c) are not supported"},
+        RejectCase{"NullPlusOneIsDistinctFrom",
+                   "SELECT a FROM events WHERE a IS DISTINCT FROM ^NULL + 1", kUnsupported, 4,
+                   "NULL literals are not supported"},
+        RejectCase{"OnePlusNullIsDistinctFrom",
+                   "SELECT a FROM events WHERE 1 + ^NULL IS DISTINCT FROM a", kUnsupported, 4,
+                   "NULL literals are not supported"},
+        RejectCase{"IsDistinctWithoutFrom", "SELECT a FROM events WHERE a ^IS DISTINCT b",
                    kUnsupported, 2, "IS is not supported"},
         RejectCase{"IsTrue", "SELECT a FROM events WHERE a ^IS TRUE", kUnsupported, 2,
                    "IS is not supported"},

@@ -1253,19 +1253,25 @@ LogicalNodePtr CorrelatedBlock(std::vector<ExprPtr> conjuncts, std::uint32_t fir
 
 // `left <op> right` as the binder writes a correlated conjunct: a PredicateExpr whose operands
 // carry the ids and whose own column is operand-local.
-ExprPtr Compare(const BoundColumn& left, const BoundColumn& right, CompareOp op) {
+ExprPtr Compare(const BoundColumn& left, const BoundColumn& right, CompareOp op,
+                Predicate::Kind kind = Predicate::Kind::kCompareColumns) {
   const auto leaf = [](const BoundColumn& c) {
     return std::make_shared<const Expr>(
         Expr{.node = ColumnExpr{.id = c.id}, .type = c.type, .name = c.name});
   };
   return std::make_shared<const Expr>(
-      Expr{.node = PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kCompareColumns,
+      Expr{.node = PredicateExpr{.predicate = Predicate{.kind = kind,
                                                         .column = BoundColumn{},
                                                         .other = BoundColumn{},
                                                         .op = op},
                                  .operands = {leaf(left), leaf(right)}},
            .type = LogicalType::kBoolean,
            .name = "cmp"});
+}
+
+// left IS NOT DISTINCT FROM right, as the binder binds it between two columns (ADR 0037's OJ5b).
+ExprPtr NotDistinct(const BoundColumn& left, const BoundColumn& right) {
+  return Compare(left, right, CompareOp::kEq, Predicate::Kind::kIsNotDistinct);
 }
 
 // ADR 0026's C2b and C3: a semi join may build on the side it preserves, the outer one, when the
@@ -1379,6 +1385,33 @@ TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
     EXPECT_TRUE(join->residual.empty()) << Explain(plan);
     // The block's filter and compute are gone; its scan is the join's right input.
     EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->right)) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+}
+
+// A correlated IS NOT DISTINCT FROM is a key too, NULL-equal (ADR 0037's OJ5b): an outer row whose
+// column is NULL has the inner rows whose column is NULL. Next to an `=` correlation each key keeps
+// its own comparison; IS DISTINCT FROM is a residual.
+TEST(OptimizerTest, Path1KeysANullEqualCorrelationNullEqual) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+        .kind = kind,
+        .left = FourFields(1),
+        .right = CorrelatedBlock(
+            {NotDistinct(FieldOf(11, 1), FieldOf(1, 1)),
+             Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq),
+             Compare(FieldOf(11, 0), FieldOf(1, 0), CompareOp::kEq, Predicate::Kind::kIsDistinct)},
+            50),
+        .span = {}})));
+    const auto* join = std::get_if<JoinNode>(plan.root.get());
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->keys.size(), 2U) << Explain(plan);
+    EXPECT_EQ(join->keys[0].left.id, FieldOf(1, 1).id);
+    EXPECT_TRUE(join->keys[0].null_equal) << Explain(plan);
+    EXPECT_EQ(join->keys[1].left.id, FieldOf(1, 2).id);
+    EXPECT_FALSE(join->keys[1].null_equal) << Explain(plan);
+    EXPECT_EQ(join->residual.size(), 1U) << "IS DISTINCT FROM: " << Explain(plan);
+    EXPECT_TRUE(Explain(plan).contains("IS NOT DISTINCT FROM")) << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
   }
 }
@@ -1939,6 +1972,71 @@ TEST(OptimizerTest, Path2RefusesACountAndAnyNonStrictCombination) {
     EXPECT_EQ(status.message(),
               "a correlated scalar subquery whose aggregate is not SUM, AVG, MIN or MAX is not "
               "supported");
+  }
+}
+
+// A correlated IS NOT DISTINCT FROM gives its outer column an inner equivalent where no `=` does
+// (ADR 0037's OJ5b): the aggregation groups by it, NULL one group, and the join back keys on it
+// NULL-equal, so an outer NULL reads the NULL group. Where an `=` gives the column its equivalent,
+// the key is the `=`'s and the IS NOT DISTINCT FROM stays an inner condition, substituted. The
+// semi-join reduction keys as the join back does.
+TEST(OptimizerTest, Path2KeysANullEqualCorrelationNullEqual) {
+  {
+    const LogicalPlan plan = Optimized(PlanOverJoin(
+        Node(DependentJoinNode{
+            .kind = JoinKind::kOneRow,
+            .left = FourFields(1),
+            .right = ScalarBlock({NotDistinct(FieldOf(11, 1), FieldOf(1, 1))}, AggKind::kMin, 50),
+            .span = {}}),
+        1));
+    const auto* join = JoinUnder(plan);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
+    EXPECT_EQ(join->keys[0].left.id, FieldOf(1, 1).id);
+    EXPECT_TRUE(join->keys[0].null_equal) << Explain(plan);
+    const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+    ASSERT_NE(grouped, nullptr) << Explain(plan);
+    EXPECT_EQ(grouped->keys[0].id, FieldOf(11, 1).id) << "the inner equivalent";
+    EXPECT_TRUE(std::holds_alternative<ScanNode>(*grouped->input))
+        << "the correlated filter is gone: " << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+  {
+    const LogicalPlan plan = Optimized(PlanOverJoin(
+        Node(DependentJoinNode{
+            .kind = JoinKind::kOneRow,
+            .left = FourFields(1),
+            .right = ScalarBlock({NotDistinct(FieldOf(11, 2), FieldOf(1, 1)),
+                                  Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)},
+                                 AggKind::kMin, 50),
+            .span = {}}),
+        1));
+    const auto* join = JoinUnder(plan);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
+    EXPECT_FALSE(join->keys[0].null_equal) << "the `=` gives the equivalent: " << Explain(plan);
+    const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+    ASSERT_NE(grouped, nullptr) << Explain(plan);
+    EXPECT_EQ(grouped->keys[0].id, FieldOf(11, 1).id);
+    EXPECT_TRUE(std::holds_alternative<FilterNode>(*grouped->input))
+        << "IS NOT DISTINCT FROM between the two inner columns is kept: " << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+  {
+    const LogicalPlan plan = Path2Plan({NotDistinct(FieldOf(11, 1), FieldOf(1, 1)),
+                                        Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
+                                       10, 1000);
+    const auto* join = JoinUnder(plan);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    ASSERT_EQ(join->keys.size(), 2U) << Explain(plan);
+    EXPECT_TRUE(join->keys[0].null_equal) << Explain(plan);
+    EXPECT_FALSE(join->keys[1].null_equal) << Explain(plan);
+    const auto* restriction = RestrictionUnder(plan);
+    ASSERT_NE(restriction, nullptr) << Explain(plan);
+    ASSERT_EQ(restriction->keys.size(), 2U) << Explain(plan);
+    EXPECT_TRUE(restriction->keys[0].null_equal) << "a NULL group is read: " << Explain(plan);
+    EXPECT_FALSE(restriction->keys[1].null_equal) << Explain(plan);
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
   }
 }
 

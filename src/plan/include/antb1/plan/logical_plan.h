@@ -164,11 +164,15 @@ struct Predicate {
     kIsNull,          // column IS NULL: true for NULL, false otherwise, never NULL (NL4)
     kFalse,           // folded: true for no row (inside an expression: NULL for a NULL column)
     kIsTrue,          // a BOOLEAN column (a computed condition) is true
+    kIsDistinct,      // column IS DISTINCT FROM other: they differ, a NULL equal to a NULL and to
+                      // no value; never NULL. Compared as kCompareColumns compares (DuckDB's
+                      // rules), but NaN equals NaN, as in DuckDB (ADR 0037's OJ5b)
+    kIsNotDistinct,   // column IS NOT DISTINCT FROM other: NOT kIsDistinct
   };
 
   Kind kind = Kind::kCompare;
   std::optional<BoundColumn> column;  // empty for kFalse
-  std::optional<BoundColumn> other;   // kCompareColumns only
+  std::optional<BoundColumn> other;   // kCompareColumns, kIsDistinct and kIsNotDistinct
   CompareOp op = CompareOp::kEq;      // kCompare and kCompareColumns
   // kCompare, kLike and kNotLike: typed as the column, or DOUBLE on a DECIMAL column, which then
   // compares in DOUBLE with its values converted as DuckDB converts them (ADR 0021 rule 11).

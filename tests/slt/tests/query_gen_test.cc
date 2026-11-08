@@ -787,9 +787,12 @@ TEST(QueryGenerator, NestingChangesOnlyNestedQueries) {
 // bound also decides whether SELECT * needs a LIMIT, but its bound never shrinks: a LEFT JOIN
 // yields max(1, its matches) rows per left row, so at least the rows the inner join yields.
 TEST(QueryGenerator, LeftJoinsChangeOnlyLeftJoinQueries) {
-  // Without kFullJoin, whose draws turn some of the promoted queries into FULL JOIN ones.
+  // Without kFullJoin, whose draws turn some of the promoted queries into FULL JOIN ones, and
+  // without kNullEqualKeys, whose draws turn some of the inner joins a promotion leaves alone into
+  // NULL-equal ones (ADR 0037's OJ5b).
   const FeatureSet with_left =
-      Union(kSupportedFeatures.Minus({Feature::kFullJoin}), {Feature::kLeftJoin});
+      Union(kSupportedFeatures.Minus({Feature::kFullJoin, Feature::kNullEqualKeys}),
+            {Feature::kLeftJoin});
   // target_percent 0: every query draws from `supported`, not from the whole grammar.
   const auto with = MakeOver(JoinTables(), 43, {.supported = with_left, .target_percent = 0});
   const auto without = MakeOver(
@@ -878,6 +881,44 @@ TEST(QueryGenerator, CrossJoinsChangeOnlyTheirQueries) {
     EXPECT_EQ(q.features, plain.features) << i;
   }
   EXPECT_GT(crossed, 20) << "cross products: " << crossed;
+  EXPECT_GT(same, 1000);
+}
+
+// Every draw a NULL-equal key needs comes from a stream of its own (null_equal_rng_), so allowing
+// kNullEqualKeys changes the queries whose join keys or correlation compare IS NOT DISTINCT FROM,
+// and no others (ADR 0037's OJ5b). Such a join's bound counts the pairs of NULL keys, so it is
+// never below the `=` join's, and a query may differ beyond its keys, as its bound decides whether
+// SELECT * needs a LIMIT.
+TEST(QueryGenerator, NullEqualKeysChangeOnlyTheirQueries) {
+  const FeatureSet with = Union(kSupportedFeatures, {Feature::kNullEqualKeys});
+  const auto gen = MakeOver(JoinTables(), 43, {.supported = with, .target_percent = 0});
+  const auto plain_gen = MakeOver(
+      JoinTables(), 43, {.supported = with.Minus({Feature::kNullEqualKeys}), .target_percent = 0});
+  int null_equal = 0;
+  int correlated = 0;
+  int wider = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = gen.Generate(i);
+    const auto plain = plain_gen.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kNullEqualKeys)) << plain.sql;
+    if (q.features.Has(Feature::kNullEqualKeys)) {
+      ++null_equal;
+      correlated += q.features.Has(Feature::kCorrelatedExists) ||
+                            q.features.Has(Feature::kCorrelatedAggregate)
+                        ? 1
+                        : 0;
+      EXPECT_GE(q.row_bound, plain.row_bound) << q.sql;
+      wider += q.row_bound > plain.row_bound ? 1 : 0;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(null_equal, 20) << "NULL-equal keys: " << null_equal;
+  EXPECT_GT(correlated, 5) << "NULL-equal correlations: " << correlated;
+  EXPECT_GT(wider, 5) << "bounds that NULL pairs widen: " << wider;
   EXPECT_GT(same, 1000);
 }
 
@@ -998,7 +1039,8 @@ void ForEachNode(const sql::Expr& e, const F& f) {
         } else if constexpr (std::is_same_v<Node, sql::UnaryExpr> ||
                              std::is_same_v<Node, sql::CastExpr>) {
           ForEachNode(*node.operand, f);
-        } else if constexpr (std::is_same_v<Node, sql::BinaryExpr>) {
+        } else if constexpr (std::is_same_v<Node, sql::BinaryExpr> ||
+                             std::is_same_v<Node, sql::DistinctFromExpr>) {
           ForEachNode(*node.left, f);
           ForEachNode(*node.right, f);
         } else if constexpr (std::is_same_v<Node, sql::LikeExpr>) {
@@ -1096,6 +1138,7 @@ struct JoinCoverage {
   int unkeyed_outer = 0;       // a LEFT or FULL JOIN without an equality key (ADR 0040's OJ4c)
   int full_outer = 0;          // spelled FULL OUTER JOIN
   int full_three_item = 0;     // a FULL JOIN in a FROM list of three items
+  int null_equal = 0;          // keys of IS NOT DISTINCT FROM (ADR 0037's OJ5b)
 };
 
 // Checks a generated join over JoinTables() against the algorithm, on its AST: 2 or 3 inner FROM
@@ -1233,13 +1276,21 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   // key column).
   const std::vector<JoinRef> refs = UsableJoinRefs();
   std::vector<std::array<std::size_t, 4>> halves;
+  // A key's IS NOT DISTINCT FROM (ADR 0037's OJ5b): every key of the join is one, or none is.
+  int null_equal_halves = 0;
+  int equal_halves = 0;
   const auto key_half = [&](const sql::Expr& e) {
     const auto* eq = std::get_if<sql::BinaryExpr>(&static_cast<const sql::ExprNode&>(e));
-    if (eq == nullptr || eq->op != sql::BinaryOp::kEq) {
+    const auto* not_distinct =
+        std::get_if<sql::DistinctFromExpr>(&static_cast<const sql::ExprNode&>(e));
+    if (not_distinct != nullptr && !not_distinct->negated) {
+      not_distinct = nullptr;
+    }
+    if ((eq == nullptr || eq->op != sql::BinaryOp::kEq) && not_distinct == nullptr) {
       return false;
     }
-    const sql::ColumnRef* l = AsColumn(*eq->left);
-    const sql::ColumnRef* r = AsColumn(*eq->right);
+    const sql::ColumnRef* l = AsColumn(eq != nullptr ? *eq->left : *not_distinct->left);
+    const sql::ColumnRef* r = AsColumn(eq != nullptr ? *eq->right : *not_distinct->right);
     if (l == nullptr || r == nullptr) {
       return false;
     }
@@ -1265,6 +1316,9 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
           found = true;
         }
       }
+    }
+    if (found) {
+      (not_distinct != nullptr ? null_equal_halves : equal_halves) += 1;
     }
     return found;
   };
@@ -1380,7 +1434,12 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
           return r.table == refs[n].parent && r.columns == refs[n].columns;
         });
         if (ref != child.refs.end()) {
-          const int64_t matched = JoinRowBound(ref->stats, ref->ref_stats);
+          // NULL-equal keys also pair the two sides' rows with a NULL in the key.
+          const int64_t null_pairs = null_equal_halves > 0
+                                         ? (child.rows - ref->stats.non_null) *
+                                               (items[pi].table->rows - ref->ref_stats.non_null)
+                                         : 0;
+          const int64_t matched = JoinRowBound(ref->stats, ref->ref_stats) + null_pairs;
           bounds.push_back(matched);
           // The same edge read as `items[0] LEFT JOIN items[1]`: the walk promotes the item it
           // added last, so the left input is the item at FROM position 0 and the padding is by
@@ -1426,6 +1485,13 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
   } else {
     EXPECT_EQ(roots.size(), 1U) << "a FROM item is not connected by keys";
   }
+  if (null_equal_halves > 0) {
+    ++cov.null_equal;
+    EXPECT_EQ(equal_halves, 0) << "every key NULL-equal, or none";
+    EXPECT_FALSE(left || q.features.Has(Feature::kCrossJoin))
+        << "NULL-equal keys only in an inner join that crosses nothing";
+  }
+  EXPECT_TRUE(null_equal_halves == 0 || q.features.Has(Feature::kNullEqualKeys));
   cov.closing_edge += edges > items.size() - 1 ? 1 : 0;
   cov.unconnected_start += first_two ? 0 : 1;
   EXPECT_LE(q.row_bound, 10'000);
@@ -1556,6 +1622,7 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
   EXPECT_GT(cov.full, 0) << "a FULL JOIN";
   EXPECT_GT(cov.crossed, 0) << "a cross product";
   EXPECT_GT(cov.unkeyed_outer, 0) << "a LEFT or FULL JOIN without an equality key";
+  EXPECT_GT(cov.null_equal, 0) << "keys of IS NOT DISTINCT FROM";
   EXPECT_GT(cov.full_outer, 0) << "spelled FULL OUTER JOIN";
   EXPECT_GT(cov.full_three_item, 0) << "a FULL JOIN among three FROM items";
 }
@@ -2453,11 +2520,12 @@ TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
     const std::string before = q.sql.substr(0, begin);
     EXPECT_TRUE(before.ends_with("AND ") || before.ends_with("WHERE "))
         << "a top-level conjunct: " << q.sql;
-    // Exactly one key equality, and a residual is a second comparison over the same pair.
+    // Exactly one key equality, an IS NOT DISTINCT FROM now and then (ADR 0037's OJ5b), and a
+    // residual is a second comparison over the same pair.
     const std::size_t where = q.sql.find(" WHERE ", at);
     ASSERT_NE(where, std::string::npos) << q.sql;
     const std::string block = q.sql.substr(where, q.sql.find(')', where) - where);
-    EXPECT_NE(block.find('='), std::string::npos) << q.sql;
+    EXPECT_TRUE(block.contains('=') || block.contains(" IS NOT DISTINCT FROM ")) << q.sql;
     EXPECT_GE(std::ranges::count(block, '.'), 2) << "both ends qualified: " << q.sql;
     if (block.contains(" AND ")) {
       ++residual;
