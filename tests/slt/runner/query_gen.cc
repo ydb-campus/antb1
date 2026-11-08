@@ -707,6 +707,11 @@ constexpr unsigned kLeftPercent = 25;
 // Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
 // query without one is the query this seed generated before the left-join PR.
 constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
+// Share of the joins of two keyed items that cross a third, unkeyed one (ADR 0040's OJ4b).
+constexpr unsigned kCrossPercent = 20;
+// Salt of the random stream which every draw that only a cross product needs takes, so that a
+// query without one is the query this seed generated before the cross-product PR.
+constexpr uint64_t kCrossStreamSalt = 0x63726F73732D726EULL;
 // Share of the LEFT JOIN promotions that a FULL JOIN replaces (ADR 0037's OJ3).
 constexpr unsigned kFullPercent = 40;
 // Salt of the random stream which every draw that only a FULL JOIN needs takes, so that a query
@@ -992,6 +997,7 @@ struct FromList {
   bool other_columns = false;
   std::vector<std::string> shared;  // lower-case names of several bindings: always qualified
   std::size_t qualify = 0;          // the other references: 0 bare, 1 qualified, 2 by a draw each
+  bool crossed = false;             // an item no key joins: a cross product (ADR 0040), kCrossJoin
 };
 
 // The FROM position the join group of item `item` starts at (rule 10 of ADR 0022): the last comma
@@ -1012,7 +1018,7 @@ class Builder {
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
-          Rng& operator_rng, Rng& full_rng, FeatureSet allowed)
+          Rng& operator_rng, Rng& full_rng, Rng& cross_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1029,6 +1035,7 @@ class Builder {
         setop_rng_(setop_rng),
         operator_rng_(operator_rng),
         full_rng_(full_rng),
+        cross_rng_(cross_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1353,6 +1360,27 @@ class Builder {
         }
       }
     }
+    // Now and then a third item that no key joins (ADR 0040's cross product), after a walk of two:
+    // a table that keeps the product of the bounds within the join's row limit, named by an alias
+    // where it stands twice, its shared names qualified. It takes no LEFT or FULL promotion, whose
+    // bounds do not count a product.
+    const std::size_t walked = planned.size();
+    bool crossed = false;
+    if (walked == 2 && allowed_.Has(Feature::kCrossJoin) && allowed_.Has(Feature::kCommaJoin) &&
+        allowed_.Has(Feature::kTableAlias) && allowed_.Has(Feature::kQualifiedName)) {
+      std::vector<std::size_t> candidates;
+      for (std::size_t t = 0; t < tables_.size(); ++t) {
+        if (SaturatingProduct(rows, tables_[t].rows) <= RowLimit(planned)) {
+          candidates.push_back(t);
+        }
+      }
+      if (!candidates.empty() && cross_rng_.Percent(kCrossPercent)) {
+        const std::size_t table = candidates[cross_rng_.Below(candidates.size())];
+        planned.push_back(Planned{.table = table, .by_path = false});
+        rows = SaturatingProduct(rows, tables_[table].rows);
+        crossed = true;
+      }
+    }
     // The FROM order: the walk's, or now and then a shuffle (with commas), which can start with
     // two tables that share no key.
     std::vector<std::size_t> order(planned.size());  // FROM position -> planned binding
@@ -1418,7 +1446,7 @@ class Builder {
         const int64_t matched = rows;
         const int64_t left_rows = rows_before_last;
         const int64_t bound = LeftJoinRowBound(matched, left_rows, last_multiplicity);
-        if (allowed_.Has(Feature::kLeftJoin) && order[k] + 1 == planned.size() &&
+        if (allowed_.Has(Feature::kLeftJoin) && !crossed && order[k] + 1 == walked &&
             std::ranges::all_of(keys, reaches_back) && bound <= RowLimit(planned) &&
             left_rng_.Percent(kLeftPercent)) {
           b.connector = FromConnector::kLeft;
@@ -1498,6 +1526,7 @@ class Builder {
       }
     }
     from.qualify = join_rng_.Below(3);
+    from.crossed = crossed;
     return TryFrom(from);
   }
 
@@ -2928,6 +2957,9 @@ class Builder {
   }
 
   void EmitFrom(const FromList& from) {
+    if (from.crossed) {
+      used_.Add(Feature::kCrossJoin);
+    }
     for (std::size_t k = 0; k < from.bindings.size(); ++k) {
       const Binding& b = from.bindings[k];
       switch (b.connector) {
@@ -4173,6 +4205,7 @@ class Builder {
   Rng& setop_rng_;               // the draws that only a set operation's form needs
   Rng& operator_rng_;            // the draws that only a set operator other than UNION ALL needs
   Rng& full_rng_;                // the draws that only a FULL JOIN needs
+  Rng& cross_rng_;               // the draws that only a cross product needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4390,9 +4423,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng setop_rng(Mix(seed ^ kSetOpStreamSalt));
   Rng operator_rng(Mix(seed ^ kSetOperatorStreamSalt));
   Rng full_rng(Mix(seed ^ kFullStreamSalt));
+  Rng cross_rng(Mix(seed ^ kCrossStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-               full_rng, options.supported)
+               full_rng, cross_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4421,12 +4455,13 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng setop_rng(Mix(state ^ kSetOpStreamSalt));
   Rng operator_rng(Mix(state ^ kSetOperatorStreamSalt));
   Rng full_rng(Mix(state ^ kFullStreamSalt));
+  Rng cross_rng(Mix(state ^ kCrossStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
                              corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
-                             setop_rng, operator_rng, full_rng, allowed)
+                             setop_rng, operator_rng, full_rng, cross_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

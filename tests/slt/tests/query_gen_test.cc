@@ -852,6 +852,33 @@ TEST(QueryGenerator, FullJoinsChangeOnlyTheirQueries) {
   EXPECT_GT(wider, 5) << "bounds that the right input's padding widens: " << wider;
 }
 
+// Every draw a cross product needs comes from a stream of its own (cross_rng_), so allowing
+// kCrossJoin changes the queries that cross a third item and no others (ADR 0040's OJ4b). Such a
+// query may differ beyond its FROM list, since its bound is the product (0 over an empty table).
+TEST(QueryGenerator, CrossJoinsChangeOnlyTheirQueries) {
+  const FeatureSet with_cross = Union(kSupportedFeatures, {Feature::kCrossJoin});
+  const auto with = MakeOver(JoinTables(), 43, {.supported = with_cross, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 43,
+               {.supported = with_cross.Minus({Feature::kCrossJoin}), .target_percent = 0});
+  int crossed = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kCrossJoin)) << plain.sql;
+    if (q.features.Has(Feature::kCrossJoin)) {
+      ++crossed;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(crossed, 20) << "cross products: " << crossed;
+  EXPECT_GT(same, 1000);
+}
+
 // What a nested query's text holds: the block names the table and projects its columns under their
 // own names, which is why the outer block can read them and why the property tests above, whose
 // guards are regexes over column names, still see them. With kUnionAll each copy of a compound is
@@ -1063,6 +1090,7 @@ struct JoinCoverage {
   int left_sibling_group = 0;  // a comma sibling before its join group (its ON may not read one)
   int left_cross_group = 0;    // a CROSS JOIN inside its left input
   int full = 0;                // of the LEFT JOIN items, FULL JOIN ones (ADR 0037's OJ3)
+  int crossed = 0;             // a third item no key joins (ADR 0040)
   int full_outer = 0;          // spelled FULL OUTER JOIN
   int full_three_item = 0;     // a FULL JOIN in a FROM list of three items
 };
@@ -1365,8 +1393,21 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
       }
     }
   }
+  // Every item is connected by keys, but for a cross product's (ADR 0040): then the keys connect
+  // two items, and the third, anywhere in FROM, is joined by none.
+  std::vector<std::size_t> roots;
   for (std::size_t k = 0; k < items.size(); ++k) {
-    EXPECT_EQ(root(k), root(0)) << "FROM item " << k << " is not connected by keys";
+    if (!std::ranges::contains(roots, root(k))) {
+      roots.push_back(root(k));
+    }
+  }
+  if (q.features.Has(Feature::kCrossJoin)) {
+    ++cov.crossed;
+    EXPECT_EQ(items.size(), 3U);
+    EXPECT_EQ(roots.size(), 2U) << "a cross product of a keyed pair and one item";
+    EXPECT_FALSE(left) << "a cross product takes no outer join";
+  } else {
+    EXPECT_EQ(roots.size(), 1U) << "a FROM item is not connected by keys";
   }
   cov.closing_edge += edges > items.size() - 1 ? 1 : 0;
   cov.unconnected_start += first_two ? 0 : 1;
@@ -1490,6 +1531,7 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
   EXPECT_GT(cov.left_sibling_group, 0) << "a comma sibling before a LEFT JOIN's group";
   EXPECT_GT(cov.left_cross_group, 0) << "a CROSS JOIN inside a LEFT JOIN's left input";
   EXPECT_GT(cov.full, 0) << "a FULL JOIN";
+  EXPECT_GT(cov.crossed, 0) << "a cross product";
   EXPECT_GT(cov.full_outer, 0) << "spelled FULL OUTER JOIN";
   EXPECT_GT(cov.full_three_item, 0) << "a FULL JOIN among three FROM items";
 }

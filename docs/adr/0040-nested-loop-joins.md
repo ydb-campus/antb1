@@ -185,3 +185,49 @@ It is accepted when OJ4c is built.
 
   No SQL reaches a nested loop yet: OJ4b's binder does. The measurement of a selective inequality join moves to
   OJ4b, where SQL reaches the operator and `explain --analyze` splits the gather time from the residual time.
+
+- Update (2026-11-08, OJ4b, the maintainer's decision): **decisions 7 and 8 are replaced. A cross product never comes
+  inside a part that keys connect.** OJ4b first built decision 7 as written, and the plans it changed were measured
+  on the queries derived from TPC-DS at SF 1. Q74 then ran out of its 2 GiB limit, where it had passed. Its four
+  references to one grouped CTE join on one key, and the search crossed two of them below a join on both keys. That
+  is decision 7's typical case, and the cross's product became that join's build.
+
+  The estimates could not tell the two apart. A sub-plan's output columns have no domain, so every keyed join among
+  the references divides by 1 and is estimated at the full product, as a cross is (35,775² for each pair). The
+  bushy plan with the cross skips the chain's larger intermediate, so it looked cheaper. In fact each keyed join is
+  about 1:1, while the cross is about 10⁹ rows.
+
+  So, like PostgreSQL and DuckDB, antb1 crosses only where no key connects:
+  - Each part that the edges connect is ordered on its own, by the cost search or the greedy rule, with keyed joins
+    only. The plans of connected blocks are those of main, unchanged.
+  - Then the parts are crossed, left-deep. The part with the most rows comes first, as the probe that streams (an
+    unknown count counts as the most). The others follow from the fewest rows up, each the right input and the build
+    of its cross step.
+  - No build is ever a product of parts, so the join order itself never materializes a cross's output. A sort, or a
+    union's part buffers, above the join still may (decision 11).
+  - A residual between parts joins at the first cross step that has all its relations.
+
+  Of the 99, only Q77 plans a cross step, and it passes.
+
+  Two estimate items follow from Q74, outside OJ4. Each is measured on the TPC suites before it lands:
+  - Push a filter on a GROUP BY key below the grouping (Q74's year filter, which stays above its grouping today).
+  - Give a sub-plan's GROUP BY keys a domain, the group estimate, so that keyed joins over them estimate near 1:1.
+
+  With both in place, crossing inside a connected part could be considered again. The Alternatives' "Cross the
+  key-connected components only at the top of the block" is now the decision, with the left-deep rule added.
+
+  The measurement OJ4a moved here (Consequences): a self-cross of our own star schema's trips, 9,000,000 candidate
+  pairs of which an inequality passes 45. In the Debug build on one thread, `explain --analyze` gives the join 749 ms:
+  611 ms gathering and 6 ms in the residual. So the inner path's gathering every output column before its residuals
+  dominates, and the performance item the Consequences name follows, outside OJ4. It would run the inner join's
+  residuals over candidate pairs that carry only their columns, as the semi, anti, LEFT and FULL paths do
+  (`PairBatch`), and gather the output for the pairs that pass.
+
+  One cost is known. A correlated subquery's block whose relations only outer columns connect, such as
+  `EXISTS (SELECT * FROM a, b WHERE a.x = o.k AND b.y = o.k)`, exited 4 before. It is now a cross product of `a` and
+  `b`, keyed on the outer columns only by the semi join (or Path 2's join) above it. That is correct, but quadratic
+  in the subquery's tables, where a decorrelation that joins `a` and `b` on the class of `o.k` would not be. That
+  rewrite belongs to ADR 0023's unnesting, outside OJ4. The subqueries over a cross product, these included, are in
+  `cases/joins/cross.slt`. The reviewer found one with a wrong answer: Path 2 dropped the equality between two inner
+  columns equal to one outer column, a bug on main that a keyed join reached too. It is fixed in its own PR before
+  OJ4b.

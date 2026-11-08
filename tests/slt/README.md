@@ -109,13 +109,14 @@ feature removes:
 
 `cases/joins/` and `cases/subqueries/` hold the pending corpus of the join and subquery PRs of ADRs 0022 and 0023, over
 the star schema. Its pending records stay inside what those PRs answer: every query joins all its tables through
-equalities whose common type is not DOUBLE (a disconnected join graph exits 4), and none has a `NULL` literal, `IS
-NULL`, `SELECT DISTINCT` or `COALESCE`, which exited 4 as well when it was written (the NULLs come from the data, and
-`COUNT(col)` counts them). `fact_pair.slt` is the exception: its pending records wait on the roadmap's IS NULL (`NL4`)
-and DATE arithmetic (`CT5`). Results of several rows use `rowsort`, and no string `MIN` or `MAX` runs under `GROUP BY`,
-where DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a build key without repeats,
-because DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file starts with unguarded records
-over one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any guard goes.
+equalities whose common type is not DOUBLE (a disconnected join graph exited 4 when they were written), and none has a
+`NULL` literal, `IS NULL`, `SELECT DISTINCT` or `COALESCE`, which exited 4 as well when it was written (the NULLs come
+from the data, and `COUNT(col)` counts them). `fact_pair.slt` is the exception: its pending records wait on the
+roadmap's IS NULL (`NL4`) and DATE arithmetic (`CT5`). Results of several rows use `rowsort`, and no string `MIN` or
+`MAX` runs under `GROUP BY`, where DuckDB 1.5.5 leaks. The DuckDB-only ASOF records join columns without NULLs on a
+build key without repeats, because DuckDB 1.5.5 and 1.5.6 count a NULL inequality value as an ASOF match. Each file
+starts with unguarded records over one table that pin its inputs, so its `slt.*` and `parallel.*` tests run before any
+guard goes.
 
 ## Canonical values
 
@@ -230,13 +231,16 @@ Its bound is `LeftJoinRowBound`, which adds the left rows a padded row stands fo
 and its draws come from a fourth random stream, so a query that joins inner is the query the seed gave before the
 feature. With the feature `full_join` 40% of those items become a `FULL [OUTER] JOIN` instead (ADR 0037's OJ3), bounded
 by `FullJoinRowBound`, which adds the right input's rows, from a random stream of its own, so a query whose `LEFT JOIN`
-stays is the query the seed gave before. The bound stands in for the table's rows wherever the generator needs a row
-count (a select list with a star above 50 rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT` literals in
-`HAVING`). Every draw that only a join needs comes from a second random stream of the seed and the query index, so a
-query that joins nothing is the query the same tables give without refs: `diff.random`, `diff.decimal` and `diff.tpch`
-keep their queries, and only the join queries of `diff.star` are new. The join features are declared supported, so every
-generated join is compared against DuckDB like any other query. The generated joins never use single-table aliases, and
-never meet a bind error or an exit code 4 of the join rules: `.slt` files cover those.
+stays is the query the seed gave before. With the feature `cross_join` 20% of the joins of two keyed items cross a third
+that no key joins (ADR 0040's cross product), a table that keeps the product of the bounds within the row limit, from a
+random stream of its own, so a query without one is the query the seed gave before; such a query takes no outer join.
+The bound stands in for the table's rows wherever the generator needs a row count (a select list with a star above 50
+rows gets a `LIMIT`, DECIMAL sums stay within 38 digits, `COUNT` literals in `HAVING`). Every draw that only a join
+needs comes from a second random stream of the seed and the query index, so a query that joins nothing is the query the
+same tables give without refs: `diff.random`, `diff.decimal` and `diff.tpch` keep their queries, and only the join
+queries of `diff.star` are new. The join features are declared supported, so every generated join is compared against
+DuckDB like any other query. The generated joins never use single-table aliases, and never meet a bind error or an exit
+code 4 of the join rules: `.slt` files cover those.
 
 The refs also carry the uncorrelated subqueries (ADR 0022's T2b, feature `in_subquery` or `scalar_subquery`): a
 query with a usable probe takes one as a further top-level `AND` conjunct of `WHERE` 25% of the time, which may be

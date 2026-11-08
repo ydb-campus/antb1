@@ -62,8 +62,9 @@ struct JoinOperand {
 struct JoinStep {
   JoinOperand left;
   JoinOperand right;
-  // The edges between the two inputs, ascending: the keys of this join. Never empty -- a step
-  // joins two inputs that an edge connects, and the binder passes only relations the edges connect.
+  // The edges between the two inputs, ascending: the keys of this join. Empty only for a cross step
+  // between two parts no edge connects: a nested loop (ADR 0040), its residuals its only
+  // conditions.
   std::vector<std::size_t> edges;
   // The side this join builds on: its right input, unless that input's estimate exceeds its left
   // input's by more than `build_side_ratio` (ADR 0026). An unknown estimate on either side keeps
@@ -73,17 +74,25 @@ struct JoinStep {
 };
 
 // The first relation, in FROM order, that the edges do not connect to relation 0, or std::nullopt
-// when they connect every relation. A disconnected graph is a cross product: the binder refuses it
-// unless every relation left out joins as one row, and then orders only the connected rest.
-// Every edge must join two relations below `relations`.
+// when they connect every relation. A disconnected graph is a cross product (ADR 0040): the binder
+// appends the relations left out that join as one row above the rest, and OrderJoins crosses the
+// rest's parts. Every edge must join two relations below `relations`.
 std::optional<std::size_t> FirstUnconnected(std::size_t relations, std::span<const JoinEdge> edges);
 
 // The most relations a block may have before `kCost` gives way to `kGreedy`: beyond it the search's
 // own work is no longer bounded for every shape a query may have.
 inline constexpr std::size_t kSearchRelations = 12;
 
-// The join order of connected relations (FirstUnconnected gives std::nullopt), one step per join,
-// so relations.size() - 1 of them, in dependency order (none for a single relation).
+// The join order of the relations, one step per join, so relations.size() - 1 of them, in
+// dependency order (none for a single relation).
+//
+// Relations the edges do not connect are a cross product (ADR 0040). Each part the edges connect
+// is ordered on its own, by the rules below, with keyed joins only; then the parts are crossed,
+// left-deep: the part of the most rows first (an unknown count as the most), the probe that
+// streams, then the others from the fewest rows up, each the right input and the build of its
+// cross step, whose edges are empty and whose estimate is the product. A cross never comes inside
+// a part, where the estimates could not tell it from a keyed join, and no build is a product of
+// parts. Ties go to the part first in FROM. The rest of this comment is about one connected part.
 //
 // With `JoinOrderSearch::kCost` and at most kSearchRelations relations, dynamic programming over
 // connected subsets chooses the order: of all the trees the edges allow, including those that are
@@ -108,8 +117,8 @@ inline constexpr std::size_t kSearchRelations = 12;
 //   5. Each step builds on its right input, unless that input's rows exceed its left input's
 //      estimate by more than `build_side_ratio` hundredths, when it builds on the left instead
 //      (JoinStep::build).
-// Edges that do not join two different relations below relations.size(), relations that are not
-// connected, or a ratio below 100, are a programming error.
+// Edges that do not join two different relations below relations.size(), or a ratio below 100, are
+// a programming error.
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  std::span<const JoinEdge> edges,
                                  int64_t build_side_ratio = kBuildSideRatio,

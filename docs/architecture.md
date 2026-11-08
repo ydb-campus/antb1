@@ -118,60 +118,55 @@ steps (only step 7 uses more than one thread):
    below it) count against the depth limit too. Syntax outside the
    grammar is a `kUnsupported` error with the span of the offending token. The engine converts a parse error with
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
-4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an
-   `IN` subquery anywhere but as a top-level conjunct of `WHERE`, of an inner `ON` or of `HAVING`, a lateral
-   reference, more than 256 relations counting every sub-plan and every subquery, a compound's own `ORDER BY`,
-   `LIMIT` or `OFFSET` and a subquery over one (ADR 0036's X5 and X6), many expressions) is `kUnsupported` before
-   any name resolves, over every block
-   the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
-   each CTE something references; then each
-   FROM item resolves, in FROM order, one binding per item in the block's scope (`src/plan/scope.h`: its rule-1
-   name — its alias, else a CTE's name as written, else a table's name as written, else a path's file name, else
-   `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT flags). A derived
-   table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id source, and
-   a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*` names a
-   FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT column
-   instead, whose fields DuckDB expands). A compound of `UNION`, `INTERSECT` and `EXCEPT`, `ALL` or not, binds each leaf
-   of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of one
-   operator is spliced into the run around it), in its own CTE frame and scope, checking a run's column counts in
+4. Bind (`plan::Bind`): what the binder does not answer yet (a scalar subquery or `EXISTS` in an expression, an `IN`
+   subquery anywhere but as a top-level conjunct of `WHERE`, of an inner `ON` or of `HAVING`, a lateral reference, more
+   than 256 relations counting every sub-plan and every subquery, a compound's own `ORDER BY`, `LIMIT` or `OFFSET` and a
+   subquery over one (ADR 0036's X5 and X6), many expressions) is `kUnsupported` before any name resolves, over every
+   block the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
+   each CTE something references; then each FROM item resolves, in FROM order, one binding per item in the block's scope
+   (`src/plan/scope.h`: its rule-1 name — its alias, else a CTE's name as written, else a table's name as written, else
+   a path's file name, else `unnamed_subquery` for a derived table without one — and its columns' ids, types and FLOAT
+   flags). A derived table and a CTE reference are each bound as a sub-plan of their own, recursively, from the one id
+   source, and a CTE is bound once per reference; a name only an enclosing block has exits 4 (rule 9), while a `t.*`
+   names a FROM item of its own block only and is a bind error otherwise, as in DuckDB (exit 4 when it names a STRUCT
+   column instead, whose fields DuckDB expands). A compound of `UNION`, `INTERSECT` and `EXCEPT`, `ALL` or not, binds
+   each leaf of its tree so (a block, or a parenthesized query with its own `WITH` list or tail; a parenthesized run of
+   one operator is spliced into the run around it), in its own CTE frame and scope, checking a run's column counts in
    DuckDB's order, then folds their types along the tree (a run of `INTERSECT` or `EXCEPT` as binary nodes) and casts
    each leaf of another type once, straight to the root's type: a run of `UNION ALL` becomes a `UnionAll` node and each
    maximal region of the other operators one `SetOperation` node (`SetOperationBinder`, [ADR
-   0036](adr/0036-union-all.md), [ADR 0039](adr/0039-set-operations.md)).
-   Columns resolve there,
-   an `ON` seeing only its
-   own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types
-   are checked, and every `WHERE` literal is folded exactly into its column's type
-   ([Binding](sql-subset.md#binding)). Each element of `WHERE` and of an inner `ON` first gives up the conjuncts
-   every branch of a top-level `OR` shares, `(A AND X) OR (A AND Y)` becoming `A AND (X OR Y)` one level deep
-   (`src/plan/or_factoring.h`), so that an `OR` can connect a join graph. Each conjunct then goes to the relations it
-   reads: one relation filters that relation's own branch, a cross-relation equality whose sides share one key type
-   (each side cast to it on its own branch where it must be) becomes a join key, and anything else over two or more
-   relations becomes a join's residual. An accepted `IN` subquery conjunct takes neither route: its query is a
-   sub-plan of its own and the conjunct becomes a semi or null-aware anti join above the block's inner joins, in the
-   order the conjuncts are written -- or, for a `WHERE` semi join whose key reads one relation, on that relation's
-   own branch below them (ADR 0029's D0). A join graph no key connects is a cross product, `kUnsupported`, unless
-   every relation the keys leave out is a sub-plan of exactly one row (an aggregate without groups) that no key, no
-   residual and no conjunct of its own branch reads: each of those then joins above the others as a one-row join. The
-   relations the keys connect join in the tree a cost search chooses from the footer row counts, integer ranges and
-   distinct-count hints (`src/plan/join_order.h`; left-deep and greedy beyond 12 relations), each join building on its
-   right input unless the estimates make that side decisively the larger. `HAVING` binds the same way
-   against the aggregation's output and becomes a `Filter` above it, with any subquery conjunct of it a join above
-   the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable
-   nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
+   0036](adr/0036-union-all.md), [ADR 0039](adr/0039-set-operations.md)). Columns resolve there, an `ON` seeing only its
+   own join group and the comma siblings before it ([ADR 0022](adr/0022-joins-and-query-blocks.md) rule 10); types are
+   checked, and every `WHERE` literal is folded exactly into its column's type ([Binding](sql-subset.md#binding)). Each
+   element of `WHERE` and of an inner `ON` first gives up the conjuncts every branch of a top-level `OR` shares, `(A AND
+   X) OR (A AND Y)` becoming `A AND (X OR Y)` one level deep (`src/plan/or_factoring.h`), so that an `OR` can connect a
+   join graph. Each conjunct then goes to the relations it reads: one relation filters that relation's own branch, a
+   cross-relation equality whose sides share one key type (each side cast to it on its own branch where it must be)
+   becomes a join key, and anything else over two or more relations becomes a join's residual. An accepted `IN` subquery
+   conjunct takes neither route: its query is a sub-plan of its own and the conjunct becomes a semi or null-aware anti
+   join above the block's inner joins, in the order the conjuncts are written -- or, for a `WHERE` semi join whose key
+   reads one relation, on that relation's own branch below them (ADR 0029's D0). A join graph no key connects is a cross
+   product ([ADR 0040](adr/0040-nested-loop-joins.md)): a relation the keys leave out that is a sub-plan of exactly one
+   row (an aggregate without groups) that no key, no residual and no conjunct of its own branch reads joins above the
+   others as a one-row join, and the parts the keys connect are crossed left-deep, each the build of an inner join
+   without keys (a nested loop), the largest part the probe. The relations of a part join in the tree a cost search
+   chooses from the footer row counts, integer ranges and distinct-count hints (`src/plan/join_order.h`; left-deep and
+   greedy beyond 12 relations), each join building on its right input unless the estimates make that side decisively the
+   larger. `HAVING` binds the same way against the aggregation's output and becomes a `Filter` above it, with any
+   subquery conjunct of it a join above the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable nodes
+   in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
    `RowCount`, `Join`, `DependentJoin`, `UnionAll`, `GroupingSets`, `SetOperation`) plus the output columns.
-   `GroupingSets` (ROLLUP, CUBE and GROUPING SETS, [ADR 0038](adr/0038-grouping-sets.md)) holds the distinct keys,
-   the sets as lists of key indices, the calls and the GROUPING calls; no SQL binds to it before ADR 0037's RU3. A
-   correlated subquery binds to a
-   `DependentJoin`, whose right input reads columns of its left input as free variables (`plan::FreeVariables`). A
-   `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new columns of one type each
-   ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one. `SetOperation` answers one tree of UNION,
-   INTERSECT and EXCEPT, ALL or not, over one or more inputs: new columns of one type each, every one of them a key,
-   and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); the binder makes one
-   per maximal region of `UNION`, `INTERSECT` [`ALL`] and `EXCEPT` [`ALL`] since ADR 0037's X4b to X4d.
-    Every column gets a `plan::ColumnId` where it is created (a field, a computed
-   expression, an aggregate call or key, a select item), and a column reference names the column it reads by id and
-   by its position in the input ([ADR 0022](adr/0022-joins-and-query-blocks.md)).
+   `GroupingSets` (ROLLUP, CUBE and GROUPING SETS, [ADR 0038](adr/0038-grouping-sets.md)) holds the distinct keys, the
+   sets as lists of key indices, the calls and the GROUPING calls; no SQL binds to it before ADR 0037's RU3. A
+   correlated subquery binds to a `DependentJoin`, whose right input reads columns of its left input as free variables
+   (`plan::FreeVariables`). A `UnionAll` concatenates two or more inputs, each the plan of a block of its own, into new
+   columns of one type each ([ADR 0036](adr/0036-union-all.md)); the optimizer may leave it one. `SetOperation` answers
+   one tree of UNION, INTERSECT and EXCEPT, ALL or not, over one or more inputs: new columns of one type each, every one
+   of them a key, and the tree as a postfix formula over the inputs ([ADR 0039](adr/0039-set-operations.md)); the binder
+   makes one per maximal region of `UNION`, `INTERSECT` [`ALL`] and `EXCEPT` [`ALL`] since ADR 0037's X4b to X4d. Every
+   column gets a `plan::ColumnId` where it is created (a field, a computed expression, an aggregate call or key, a
+   select item), and a column reference names the column it reads by id and by its position in the input ([ADR
+   0022](adr/0022-joins-and-query-blocks.md)).
 5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass, which replaces every `DependentJoin` with
    ordinary joins or rejects the query with exit code 4, so no later rule and no operator meets one (ADR 0023); then
    the conditions of a `Filter` over a `UnionAll` go on top of each of its inputs, and an input whose constants make

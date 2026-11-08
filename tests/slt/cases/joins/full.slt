@@ -318,9 +318,8 @@ BIGINT
 90
 
 # A WHERE equality over the FULL JOIN's left input stays above the join, where it also drops the rows padded on the
-# left, so it is no key of that input: drivers CROSS JOIN trips is a cross product, which exits 4 on antb1 (where
-# a LEFT JOIN takes the same equality as its left input's key).
-onlyif duckdb
+# left, so it is no key of that input: drivers CROSS JOIN trips is a cross product (ADR 0040), the equality a
+# filter above the FULL JOIN (where a LEFT JOIN takes it as its left input's key).
 query I nosort
 SELECT COUNT(*) FROM drivers CROSS JOIN trips FULL JOIN zones ON tr_pickup = zn_id WHERE tr_driver = dv_id
 ----

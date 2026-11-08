@@ -173,7 +173,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ2 | A FULL join kind and its operator (the OJ2 update below) | | Built |
 | OJ3 | FULL OUTER JOIN (the OJ3 update below) | 97 | Built |
 | OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md); its OJ4a update) | | Built |
-| OJ4b | Cross products and joins without an equality key in the binder and the join-order cost search (ADR 0040) | 77 | Planned |
+| OJ4b | Cross products and joins without an equality key in the binder: keyed parts first, crossed left-deep (ADR 0040; its OJ4b update) | 77 | Built |
 | OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040) | | Planned |
 | OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |
 | **Phase 8** | **Subqueries** | | |
@@ -746,6 +746,14 @@ Update (2026-11-07, OJ4): [ADR 0040](0040-nested-loop-joins.md) designs it. The 
 product to every join without an equality key, inner, LEFT and FULL, run as a nested loop whose conditions are
 residuals. The join-order cost search places cross products. OJ4 splits into OJ4a (the executor), OJ4b (inner joins
 in the binder and the join order; Q77) and OJ4c (LEFT and FULL JOINs).
+
+Update (2026-11-08, OJ4b): built. A join graph no key connects is answered: each key-connected part is ordered as before,
+keyed joins only, and the parts are crossed left-deep, each cross step an inner join without keys (OJ4a's nested loop),
+its residuals the conditions between the parts. Q77 passes, so the ratchet is at 75. At SF 1 it takes 0.83 s in the
+Debug build and 2.2 s under ASan, peaks at 5.1 MiB, and its ASan shard (3 of 8) takes 37 s. Crossing inside the cost
+search, as ADR 0040 first had it, made Q74 run out of memory at SF 1, because the estimates of its CTE references
+cannot tell a keyed join from a cross. ADR 0040's OJ4b update records the rule that replaced it, and two estimate
+items outside OJ4: filters on GROUP BY keys pushed below the grouping, and a domain for a sub-plan's GROUP BY keys.
 
 ## Alternatives considered
 

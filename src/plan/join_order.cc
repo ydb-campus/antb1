@@ -724,7 +724,111 @@ int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinE
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  std::span<const JoinEdge> edges, int64_t build_side_ratio,
                                  JoinOrderSearch search) {
-  return Orderer(relations, edges, build_side_ratio, search).Order();
+  const std::size_t n = relations.size();
+  if (n < 2 || !FirstUnconnected(n, edges).has_value()) {
+    return Orderer(relations, edges, build_side_ratio, search).Order();
+  }
+  // A cross product (ADR 0040): the parts the edges connect, each ordered on its own exactly as a
+  // connected block is, then crossed -- never inside a part, where the keys' estimates could not
+  // tell a keyed join from a cross (ADR 0040's OJ4b update).
+  std::vector<std::size_t> part_of(n, n);
+  std::vector<std::vector<std::size_t>> parts;  // each part's relations, ascending
+  for (std::size_t r = 0; r < n; ++r) {
+    if (part_of[r] != n) {
+      continue;
+    }
+    part_of[r] = parts.size();
+    std::vector<std::size_t> members = {r};
+    for (std::size_t at = 0; at < members.size(); ++at) {
+      for (const JoinEdge& edge : edges) {
+        for (const auto& [from, to] : {std::pair(edge.a, edge.b), std::pair(edge.b, edge.a)}) {
+          if (from == members[at] && part_of[to] == n) {
+            part_of[to] = parts.size();
+            members.push_back(to);
+          }
+        }
+      }
+    }
+    std::ranges::sort(members);
+    parts.push_back(std::move(members));
+  }
+  struct Part {
+    JoinOperand root;
+    int64_t rows = 0;  // unknown counts as the most
+    std::size_t first = 0;
+  };
+  std::vector<JoinStep> steps;
+  std::vector<Part> ordered;
+  ordered.reserve(parts.size());
+  for (const std::vector<std::size_t>& members : parts) {
+    if (members.size() == 1) {
+      ordered.push_back(
+          Part{.root = JoinOperand{.step = false, .index = members.front()},
+               .rows = std::max<int64_t>(relations[members.front()].rows.value_or(kLargest), 0),
+               .first = members.front()});
+      continue;
+    }
+    std::vector<std::size_t> index_in_part(n, 0);
+    std::vector<JoinRelation> part_relations;
+    part_relations.reserve(members.size());
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      index_in_part[members[i]] = i;
+      part_relations.push_back(relations[members[i]]);
+    }
+    std::vector<JoinEdge> part_edges;
+    for (const JoinEdge& edge : edges) {
+      if (part_of[edge.a] == part_of[members.front()]) {
+        JoinEdge renumbered = edge;
+        renumbered.a = index_in_part[edge.a];
+        renumbered.b = index_in_part[edge.b];
+        part_edges.push_back(renumbered);
+      }
+    }
+    // The part's steps, in its own numbering, back in the block's: its relations through
+    // `members`, its steps after those already emitted. The edges keep their indices, which are
+    // the block's: part_edges lists them in the order `edges` does.
+    std::vector<std::size_t> edge_index;
+    for (std::size_t e = 0; e < edges.size(); ++e) {
+      if (part_of[edges[e].a] == part_of[members.front()]) {
+        edge_index.push_back(e);
+      }
+    }
+    const std::size_t offset = steps.size();
+    for (JoinStep step : Orderer(part_relations, part_edges, build_side_ratio, search).Order()) {
+      for (JoinOperand* operand : {&step.left, &step.right}) {
+        operand->index = operand->step ? offset + operand->index : members[operand->index];
+      }
+      for (std::size_t& e : step.edges) {
+        e = edge_index[e];
+      }
+      steps.push_back(std::move(step));
+    }
+    ordered.push_back(Part{.root = JoinOperand{.step = true, .index = steps.size() - 1},
+                           .rows = steps.back().estimate,
+                           .first = members.front()});
+  }
+  // Left-deep, the part with the most rows first, as the probe that streams, then the others from
+  // the fewest rows up, each the build of its cross step: no build is ever a product of parts, and
+  // the products before the last one are as small as they can be. Ties go to the first in FROM.
+  const auto largest = std::ranges::max_element(ordered, [](const Part& x, const Part& y) {
+    return x.rows != y.rows ? x.rows < y.rows : x.first > y.first;
+  });
+  std::ranges::rotate(ordered.begin(), largest, largest + 1);
+  std::ranges::stable_sort(ordered.begin() + 1, ordered.end(),
+                           [](const Part& x, const Part& y) { return x.rows < y.rows; });
+  JoinOperand left = ordered.front().root;
+  int64_t left_rows = ordered.front().rows;
+  for (std::size_t p = 1; p < ordered.size(); ++p) {
+    const int64_t rows = JoinRowsOf(edges, left_rows, ordered[p].rows, {});
+    steps.push_back(JoinStep{.left = left,
+                             .right = ordered[p].root,
+                             .edges = {},
+                             .build = BuildSide::kRight,
+                             .estimate = rows});
+    left = JoinOperand{.step = true, .index = steps.size() - 1};
+    left_rows = rows;
+  }
+  return steps;
 }
 
 BuildSide ChooseBuildSide(const std::optional<int64_t>& left, const std::optional<int64_t>& right,

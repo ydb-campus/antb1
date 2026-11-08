@@ -151,39 +151,34 @@ SELECT COUNT(*) FROM (SELECT * FROM zones WHERE zn_id < 0) AS z, (SELECT COUNT(*
 BIGINT
 0
 
-# ---- DuckDB only until general cross products get a PR (ADR 0022) ----
+# ---- cross products (ADR 0040) ----
 # A one-row input that a condition reads, or that may have no row, a union of one-row blocks, and a cross
-# product of tables.
+# product of tables: no ONE-ROW join, but a nested loop, its condition the residual where it has one.
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities) AS a WHERE a.m > 5
 ----
 BIGINT
 40
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones AS z, (SELECT MAX(zn_id) AS m FROM zones) AS a WHERE z.zn_id < a.m
 ----
 BIGINT
 39
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities HAVING MAX(ct_pop) > 0) AS a
 ----
 BIGINT
 40
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, (SELECT MAX(ct_pop) AS m FROM cities UNION ALL SELECT MIN(ct_pop) FROM cities) AS a
 ----
 BIGINT
 80
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones, cities
 ----

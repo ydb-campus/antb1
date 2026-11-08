@@ -49,12 +49,12 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
 - SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS TRUE`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
   `CROSS JOIN`, `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON` or `FULL [OUTER] JOIN ... ON`, with aliases and
-  qualified names, is answered as long as a join key connects every relation — so a comma list or a `CROSS JOIN`
-  needs an equality between its relations, in the list's `ON` or in `WHERE`, and a `LEFT JOIN` or a `FULL JOIN` needs
-  one between its own two inputs, in its `ON` —
-  or the relation is a derived table or a CTE reference of exactly one row (an aggregate without `GROUP BY`,
-  `HAVING`, `LIMIT` or `OFFSET`) that no condition but a subquery conjunct reads; such a relation joins the others
-  as one row.
+  qualified names, is answered. Relations that no join key connects are a cross product
+  ([ADR 0040](adr/0040-nested-loop-joins.md)), answered as a nested loop whose conditions between them (an inequality,
+  `<>`, OR, or none) decide its pairs; a derived table or a CTE reference of exactly one row (an aggregate without
+  `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`) that no condition but a subquery conjunct reads joins the others as one
+  row. A `LEFT JOIN` or a `FULL JOIN` still needs an equality between its own two inputs, in its `ON` (exit code 4
+  until ADR 0037's OJ4c).
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
   an expression, `x [NOT] IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order are answered as a
   top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
@@ -67,8 +67,7 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   is no direct operand among them, and so does a subquery column count
   other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level `WHERE`
   conjunct and nowhere else; `TRY_CAST`, a lateral reference, more than 256
-  relations counting every sub-plan and every subquery, and a join graph that no join key connects (a cross
-  product, but of one-row inputs as above): exit code 4 as well. A query in parentheses that starts with neither
+  relations counting every sub-plan and every subquery: exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
   `SUMMARIZE` and `DESCRIBE` family are names there (divergence D21), so `VALUES(1)` is a call and
@@ -294,16 +293,17 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   including one that reads only the preserved side, since a left row that fails it is padded and not dropped. A `WHERE`
   conjunct over the null-supplying side stays above the join. An equality is a key only when each of its sides reads one
   relation of one input, since a side that is an expression is computed on that relation's own branch; a side over two
-  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is exit code 4,
-  as a cross product is. A `FULL JOIN` (ADR 0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct
+  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is exit code 4
+  (until ADR 0037's OJ4c). A `FULL JOIN` (ADR 0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct
   over either input alone is a residual, since a row of either that fails it is padded and not dropped; a `WHERE`
   conjunct over either input stays above the join; the `ON` of an inner join before it in FROM order still binds inside
   its left input, which that join is part of, while a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN
-  b FULL JOIN c ON ... WHERE a.k = b.k` is a cross product, exit code 4), and a conjunct of that inner `ON` that would
-  bind above every join of the block (a subquery conjunct, a column of an enclosing block, a comma sibling before the
-  join group) is exit code 4, since it would drop the rows the `FULL JOIN` pads on the left; and the same `ON` rules and
-  exit code 4 hold as for a `LEFT JOIN`. More than 256 relations, counting a derived table, a CTE reference and a
-  subquery in an expression as one plus the relations of their body, is exit code 4 too, before the per-item checks;
+  b FULL JOIN c ON ... WHERE a.k = b.k` crosses `a` and `b` below the `FULL JOIN`, the equality a filter above it), and
+  a conjunct of that inner `ON` that would bind above every join of the block (a subquery conjunct, a column of an
+  enclosing block, a comma sibling before the join group) is exit code 4, since it would drop the rows the `FULL JOIN`
+  pads on the left; and the same `ON` rules and exit code 4 hold as for a `LEFT JOIN`. More than 256 relations, counting
+  a derived table, a CTE reference and a subquery in an expression as one plus the relations of their body, is exit code
+  4 too, before the per-item checks;
 - `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
   answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
   ([Binding](#binding)); a branch in parentheses, a block with its own `ORDER BY`, `LIMIT` and `OFFSET` or a query
@@ -879,11 +879,15 @@ below) and sends every conjunct that leaves it to the relations it reads, so one
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
 cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
-cross product: exit code 4, naming the item nothing connects -- but for a relation of exactly one row, a derived table
-or a CTE reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no
-residual and no conjunct of its own branch reads (one could leave it with no row). The keys connect the others to the
-first relation that is not one of those, or to the first relation when all are, and the one-row relations then each join
-above them, in FROM order, as a `ONE-ROW` join that appends its row to every row. A subquery conjunct that reads one
+cross product ([ADR 0040](adr/0040-nested-loop-joins.md)). A relation of exactly one row, a derived table or a CTE
+reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no residual and no
+conjunct of its own branch reads (one could leave it with no row), joins above the others, in FROM order, as a
+`ONE-ROW` join that appends its row to every row. The others form parts that keys connect; each part joins on its own,
+as below, keyed joins only, and the parts are then crossed left-deep: the part with the most rows first (an unknown
+count as the most), the probe that streams, then the others from the fewest rows up, each the build of its cross step,
+an inner `Join` without keys (a nested loop: every build row is a candidate of every probe row, and the residuals
+decide). A residual between parts joins at the first cross step that has all its relations. A cross never comes inside
+a part, where the estimates cannot tell it from a keyed join. A subquery conjunct that reads one
 joins above that join, as above every join of its block. The relations then join in the order and tree shape a cost
 search chooses from footer metadata only (row counts, and each key's domain from the parts' integer ranges capped at
 their non-NULL rows, else their distinct-count hints; "Join order and build sides" under Semantics): every edge between
@@ -996,7 +1000,8 @@ Project RegionID, c
 ```
 
 A `Join` line shows its kind (`INNER`, `LEFT`, `SEMI`, `ANTI`, `NULL-AWARE ANTI`, `ONE-ROW` or `FULL`), the input it builds
-on, its key pairs and, when it has any, its residual conditions; its left input follows, then its right input, both
+on, its key pairs (`keys=[]` for a nested loop, ADR 0040, which then has its residuals alone) and, when it has any,
+its residual conditions; its left input follows, then its right input, both
 indented. A column whose binding the plan records is shown qualified, as `a.k`. It ends with `carries N of M unread
 above` where the join's output holds columns no node above it reads -- its own keys and residual columns, usually,
 which its inputs must carry to it and no further (ADR 0026's C8a, and the `cols_dropped` metric below is what a build
@@ -1495,7 +1500,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a, b` with no join key between them (a cross product); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a LEFT JOIN b ON a.x < b.y` (no equality key, until OJ4c); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
@@ -1746,7 +1751,7 @@ phase 9 instead, whose PRs the window ADR will number.
 | Q74 | pass | `UNION ALL` (ADR 0036) |
 | Q75 | pass | `UNION` (X4b) |
 | Q76 | pass | IS NULL (NL4) |
-| Q77 | unsupported | needs a cross product of multi-row relations (OJ4b, [ADR 0040](adr/0040-nested-loop-joins.md)) |
+| Q77 | pass | a cross product of two multi-row relations (OJ4b, [ADR 0040](adr/0040-nested-loop-joins.md)) |
 | Q78 | pass | round of a DOUBLE (FN2) |
 | Q79 | pass | constant integer expressions in IN lists |
 | Q80 | pass | ROLLUP (RU3) |

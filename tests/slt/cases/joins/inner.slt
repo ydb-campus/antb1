@@ -418,16 +418,14 @@ basic	885
 gold	882
 plus	889
 
-# ---- DuckDB only until DOUBLE join keys get a PR (ADR 0022: a graph connected only through one exits 4) ----
+# ---- DOUBLE equalities: no key type, so a nested loop's residual (ADR 0040) until DOUBLE join keys get a PR ----
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips, zones WHERE tr_distance = zn_radius
 ----
 BIGINT
 828
 
-onlyif duckdb
 query RI rowsort
 SELECT zn_radius, COUNT(*) FROM trips JOIN zones ON tr_distance = zn_radius WHERE zn_radius > 3 GROUP BY zn_radius
 ----
