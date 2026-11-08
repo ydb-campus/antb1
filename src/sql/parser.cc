@@ -1609,7 +1609,8 @@ class Parser {
     Expected<Expr> rhs =
         null ? Expected<Expr>(Expr(Literal{.kind = Literal::Kind::kNull, .span = Take().span}))
              : ParseExpr(context, precedence + 1);
-    if (null && InfixPrecedence() > precedence) {  // NULL + 1: NULL is the sum's operand
+    // NULL + 1 and NULL::INTEGER: NULL is the operand of the sum or the cast.
+    if (null && (InfixPrecedence() > precedence || Peek().kind == TokenKind::kDoubleColon)) {
       return Unsupported(null_span, "NULL literals are not supported");
     }
     if (!rhs) {
