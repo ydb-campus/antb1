@@ -412,7 +412,7 @@ int64_t SortBuffer::memory_usage() const {
 
 int64_t SortBuffer::sort_memory() const {
   // Sort's entries (a 64-bit prefix, a row reference and a group, padded) and the new order.
-  constexpr auto kPerRow = static_cast<int64_t>((3 * sizeof(std::uint64_t)) + sizeof(RowRef));
+  constexpr int64_t kPerRow = (3 * int64_t{sizeof(std::uint64_t)}) + int64_t{sizeof(RowRef)};
   return rows_ * kPerRow;
 }
 

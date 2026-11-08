@@ -37,6 +37,7 @@
 #include "antb1/exec/join_table.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 
 #include "../hash_join.h"
@@ -107,6 +108,9 @@ void* AllocateOrNull(std::size_t size) noexcept {
 
 // The replaceable allocation and deallocation functions ([new.delete]) but the aligned ones, which
 // keep the library's (or the sanitizer's) own pairs.
+// libc++ names the parameters of its declarations of these with reserved identifiers (__sz, __p),
+// which no definition outside it may use; libstdc++ leaves them unnamed.
+// NOLINTBEGIN(readability-inconsistent-declaration-parameter-name)
 void* operator new(std::size_t size) { return antb1::exec::Allocate(size); }
 void* operator new[](std::size_t size) { return antb1::exec::Allocate(size); }
 void* operator new(std::size_t size, const std::nothrow_t& /*tag*/) noexcept {
@@ -121,6 +125,7 @@ void operator delete(void* memory, std::size_t /*size*/) noexcept { std::free(me
 void operator delete[](void* memory, std::size_t /*size*/) noexcept { std::free(memory); }
 void operator delete(void* memory, const std::nothrow_t& /*tag*/) noexcept { std::free(memory); }
 void operator delete[](void* memory, const std::nothrow_t& /*tag*/) noexcept { std::free(memory); }
+// NOLINTEND(readability-inconsistent-declaration-parameter-name)
 
 namespace antb1::exec {
 namespace {
@@ -264,6 +269,30 @@ class FailingExecutor final : public arrow::internal::Executor {
   int spawns_ = 0;  // Submit is called from one thread
 };
 
+// A profile never ends a query: a timer's destructor records its time with AddNoThrow, which drops
+// a metric it cannot allocate and counts it, rather than throwing out of a destructor. Once the
+// allocations succeed again the node records as before.
+TEST(ProfileBadAllocTest, ATimerThatCannotRecordDropsItsMetric) {
+  ProfileNode node;
+  node.Add("kept", MetricUnit::kCount, 1);
+  {
+    const FailAllocations fail(/*skip=*/0, /*count=*/1000);
+    node.AddNoThrow("added", MetricUnit::kCount, 5);  // a new metric: the vector grows, and fails
+    {
+      const ProfileTimer timer(&node, "timed");
+    }  // its destructor records a new metric too
+  }
+  EXPECT_EQ(node.lost(), 2);
+  std::vector<std::string> names;
+  for (const ProfileMetric& metric : node.metrics()) {
+    names.push_back(metric.name);
+  }
+  EXPECT_EQ(names, std::vector<std::string>{"kept"});
+  node.AddNoThrow("added", MetricUnit::kCount, 5);
+  EXPECT_EQ(node.lost(), 2);
+  EXPECT_EQ(node.metrics().size(), 2U);
+}
+
 // A task that cannot be submitted (Submit throws std::bad_alloc), and then no memory for its
 // OutOfMemory either: the std::bad_alloc leaves ForEach only once every task submitted has ended,
 // as they use its frame and `fn`; the later tasks never run. The tasks start their work only when
@@ -376,19 +405,22 @@ TEST(PartitionLanesBadAllocTest, ALaneThatCannotQueueAPartStillMergesThePartsBef
   std::mutex mu;
   std::condition_variable cv;
   bool open = false;
-  const std::function<void()> open_gate = [&] {
+  const auto open_lanes = [&] {
     {
       const std::scoped_lock lock(mu);
       open = true;
     }
     cv.notify_all();
   };
+  const std::function<void()> open_gate = open_lanes;
   PartitionLanes lanes(1, &spawns, kMaxParts);
-  struct OpenAtExit {  // so that no lane waits when a check ends the test early
-    const std::function<void()>& open;
+  // So that no lane waits when a check ends the test early. It calls the lambda itself, not the
+  // std::function, whose call could throw (an empty one): nothing escapes the destructor.
+  struct OpenAtExit {
+    const decltype(open_lanes)& open;
     ~OpenAtExit() { open(); }
   };
-  const OpenAtExit open_at_exit{open_gate};
+  const OpenAtExit open_at_exit{open_lanes};
   ASSERT_TRUE(lanes
                   .Add(0,
                        [&](std::size_t) {

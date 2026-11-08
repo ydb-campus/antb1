@@ -1818,9 +1818,10 @@ arrow::Result<std::shared_ptr<arrow::Table>> RunTwoLevel(
     const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
     arrow::internal::Executor* executor) {
   const std::vector<int> fields = {0, 1, 2, 3, 4, 5};
-  PartPipeline pipeline = [table,
-                           fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
-    return std::make_unique<TableScanOperator>(table, fields, part);
+  // `columns = fields`: a non-const copy, so that moving the closure moves it rather than copying.
+  PartPipeline pipeline =
+      [table, columns = fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, columns, part);
   };
   std::shared_ptr<arrow::Schema> schema;
   if (keys.empty()) {
@@ -2393,9 +2394,9 @@ TEST_F(PartOperatorsTest, LateTopNChecksItsColumns) {
       TableScanOperator(table, fields, 0,
                         LateScan{.late = {false, true, true, true, true}, .row_id = 1})
           .output_schema();
-  const PartPipeline pipeline = [table,
-                                 fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
-    return std::make_unique<TableScanOperator>(table, fields, part);
+  const PartPipeline pipeline =
+      [table, columns = fields](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, columns, part);
   };
   const LateColumns good{
       .table = table,

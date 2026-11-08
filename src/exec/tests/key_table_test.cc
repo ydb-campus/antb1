@@ -25,6 +25,7 @@
 #include <arrow/compute/exec.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
@@ -486,8 +487,8 @@ TEST_P(KeyTableTest, AGroupByGivesTheSameRowsWithEveryKind) {
       k.reserve(kBatchRows);
       v.reserve(kBatchRows);
       for (int r = 0; r < kBatchRows; ++r) {
-        const auto row = static_cast<std::int64_t>((p * 2 * kBatchRows) +
-                                                   static_cast<std::size_t>((b * kBatchRows) + r));
+        const std::int64_t row =
+            (Narrow<std::int64_t>(p) * 2 * kBatchRows) + (std::int64_t{b} * kBatchRows) + r;
         const std::optional<std::int64_t> key =
             row % 11 == 0 ? std::nullopt : std::optional<std::int64_t>((row * 13) % 97);
         k.push_back(key);

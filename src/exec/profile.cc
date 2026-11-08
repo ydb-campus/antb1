@@ -34,6 +34,14 @@ void ProfileNode::Add(std::string_view name, MetricUnit unit, int64_t value) {
   Find(name, unit).value += value;
 }
 
+void ProfileNode::AddNoThrow(std::string_view name, MetricUnit unit, int64_t value) noexcept {
+  try {
+    Add(name, unit, value);
+  } catch (...) {  // std::bad_alloc, or std::system_error from the lock
+    lost_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void ProfileNode::Max(std::string_view name, MetricUnit unit, int64_t value) {
   const std::scoped_lock lock(mutex_);
   ProfileMetric& metric = Find(name, unit);

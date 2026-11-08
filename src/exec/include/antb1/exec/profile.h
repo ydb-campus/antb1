@@ -59,6 +59,10 @@ class ProfileNode {
   void AddInstance() { instances_.fetch_add(1, std::memory_order_relaxed); }
   // Adds `value` to metric `name` (created with this unit at its first use).
   void Add(std::string_view name, MetricUnit unit, int64_t value);
+  // Add, for a destructor (ProfileTimer's): it never throws. A metric it cannot record, because an
+  // allocation or the lock failed, is dropped and counted in lost(); a profile describes a query,
+  // so it never ends one.
+  void AddNoThrow(std::string_view name, MetricUnit unit, int64_t value) noexcept;
   // Keeps the largest `value` of metric `name`.
   void Max(std::string_view name, MetricUnit unit, int64_t value);
 
@@ -68,6 +72,8 @@ class ProfileNode {
   [[nodiscard]] bool per_part() const { return per_part_; }
   [[nodiscard]] int64_t rows() const { return rows_.load(std::memory_order_relaxed); }
   [[nodiscard]] int64_t batches() const { return batches_.load(std::memory_order_relaxed); }
+  // The metrics AddNoThrow dropped.
+  [[nodiscard]] int64_t lost() const { return lost_.load(std::memory_order_relaxed); }
   [[nodiscard]] std::chrono::nanoseconds time() const {
     return std::chrono::nanoseconds(time_ns_.load(std::memory_order_relaxed));
   }
@@ -86,6 +92,7 @@ class ProfileNode {
   std::atomic<int64_t> batches_{0};
   std::atomic<int64_t> time_ns_{0};
   std::atomic<int64_t> instances_{0};
+  std::atomic<int64_t> lost_{0};
   mutable std::mutex mutex_;
   std::vector<ProfileMetric> metrics_;
   std::vector<std::unique_ptr<ProfileNode>> children_;
@@ -106,10 +113,10 @@ class ProfileTimer {
   ProfileTimer& operator=(ProfileTimer&&) = delete;
   ~ProfileTimer() {
     if (node_ != nullptr) {
-      node_->Add(name_, MetricUnit::kNanos,
-                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::steady_clock::now() - start_)
-                     .count());
+      node_->AddNoThrow(name_, MetricUnit::kNanos,
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start_)
+                            .count());
     }
   }
 
