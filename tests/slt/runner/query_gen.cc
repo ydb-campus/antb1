@@ -707,6 +707,11 @@ constexpr unsigned kLeftPercent = 25;
 // Salt of the fourth random stream, which every draw that only a left join needs takes, so that a
 // query without one is the query this seed generated before the left-join PR.
 constexpr uint64_t kLeftStreamSalt = 0x6C6566742D726E67ULL;
+// Share of the LEFT JOIN promotions whose ON writes its keys as inequalities: a LEFT or FULL JOIN
+// without an equality key (ADR 0040's OJ4c).
+constexpr unsigned kKeylessPercent = 25;
+// Salt of the random stream which every draw that only such a keyless outer join needs takes.
+constexpr uint64_t kKeylessStreamSalt = 0x6B65796C6573732DULL;
 // Share of the joins of two keyed items that cross a third, unkeyed one (ADR 0040's OJ4b).
 constexpr unsigned kCrossPercent = 20;
 // Salt of the random stream which every draw that only a cross product needs takes, so that a
@@ -933,6 +938,9 @@ struct Binding {
   // no-op.
   std::size_t on_scope_start = 0;
   std::vector<KeyPair> on;  // kJoin, kLeft and kFull: the keys of its ON (at least one)
+  // kLeft and kFull: its ON writes `on` with inequalities, not equalities -- a nested loop without
+  // a key (ADR 0040's OJ4c).
+  bool unkeyed = false;
   // A join's copy of the table's columns, so that every binding's columns have their own
   // addresses (a table may stand twice); `columns` views it, or the table's columns when the
   // query reads one table.
@@ -1018,7 +1026,7 @@ class Builder {
   Builder(const std::vector<GenTable>& tables, Rng& rng, Rng& join_rng, Rng& block_rng,
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
-          Rng& operator_rng, Rng& full_rng, Rng& cross_rng, FeatureSet allowed)
+          Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1036,6 +1044,7 @@ class Builder {
         operator_rng_(operator_rng),
         full_rng_(full_rng),
         cross_rng_(cross_rng),
+        keyless_rng_(keyless_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1453,6 +1462,18 @@ class Builder {
           b.outer_keyword = left_rng_.Percent(50);
           b.on_scope_start = group;
           from.rows = bound;
+          // Now and then without a key (ADR 0040's OJ4c): its keys written as inequalities, a
+          // nested loop whose residuals decide. Every left row then meets every right row or is
+          // padded once, which bounds it, and a FULL JOIN pads every right row once more (below).
+          const int64_t right_rows = b.table->rows;
+          const int64_t unkeyed_left =
+              SaturatingProduct(left_rows, std::max<int64_t>(1, right_rows));
+          if (allowed_.Has(Feature::kCrossJoin) && allowed_.Has(Feature::kCompareColumns) &&
+              allowed_.Has(Feature::kWhere) && unkeyed_left <= RowLimit(planned) &&
+              keyless_rng_.Percent(kKeylessPercent)) {
+            b.unkeyed = true;
+            from.rows = unkeyed_left;
+          }
           // Now and then a FULL JOIN instead (ADR 0037's OJ3), from a stream of its own, so a
           // query that stays LEFT is the query this seed gave before. Its ON obeys the same scope.
           // It pads its left input, so nothing that joins that input may stand above it: no key
@@ -1466,7 +1487,8 @@ class Builder {
             return at < group || at >= k || IsJoin(from.bindings[at].connector) != from_sibling;
           };
           const int64_t full =
-              FullJoinRowBound(matched, left_rows, last_multiplicity, b.table->rows);
+              b.unkeyed ? SaturatingSum(unkeyed_left, right_rows)
+                        : FullJoinRowBound(matched, left_rows, last_multiplicity, b.table->rows);
           if (allowed_.Has(Feature::kFullJoin) && full <= RowLimit(planned) &&
               std::ranges::all_of(keys, stays_inside) && full_rng_.Percent(kFullPercent)) {
             b.connector = FromConnector::kFull;
@@ -2852,14 +2874,22 @@ class Builder {
 
   // The equalities of key pairs, joined by AND, each in a drawn order: never kCompareColumns, and
   // never under OR or NOT, so that they connect the join graph (ADR 0022).
-  void Keys(const std::vector<KeyPair>& keys) {
+  void Keys(const std::vector<KeyPair>& keys, bool unkeyed = false) {
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (i > 0) {
         Keyword("AND");
       }
       const bool flip = join_rng_.Percent(50);
       Column(flip ? *keys[i].right : *keys[i].left);
-      Symbol("=");
+      // A keyless outer join's pairs compare otherwise (ADR 0040's OJ4c): the columns share a
+      // kind, as keys do, so the comparison is DuckDB's too.
+      if (unkeyed) {
+        static constexpr std::array<std::string_view, 5> kInequalities = {"<", "<=", ">",
+                                                                          ">=", "<>"};
+        Symbol(keyless_rng_.Pick(kInequalities));
+      } else {
+        Symbol("=");
+      }
       Column(flip ? *keys[i].left : *keys[i].right);
     }
   }
@@ -3024,7 +3054,12 @@ class Builder {
         continue;
       }
       Keyword("ON");
-      Keys(b.on);
+      if (b.unkeyed) {  // conditions of WHERE's forms, comparing columns, and no key
+        used_.Add(Feature::kCrossJoin);
+        used_.Add(Feature::kCompareColumns);
+        used_.Add(Feature::kWhere);
+      }
+      Keys(b.on, b.unkeyed);
       if (allowed_.Has(Feature::kWhere) && join_rng_.Percent(20)) {
         std::vector<const GenColumn*> all = comparable_;
         std::erase_if(comparable_, [&](const GenColumn* c) {
@@ -4206,6 +4241,7 @@ class Builder {
   Rng& operator_rng_;            // the draws that only a set operator other than UNION ALL needs
   Rng& full_rng_;                // the draws that only a FULL JOIN needs
   Rng& cross_rng_;               // the draws that only a cross product needs
+  Rng& keyless_rng_;             // the draws that only a keyless LEFT or FULL JOIN needs
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4424,9 +4460,10 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng operator_rng(Mix(seed ^ kSetOperatorStreamSalt));
   Rng full_rng(Mix(seed ^ kFullStreamSalt));
   Rng cross_rng(Mix(seed ^ kCrossStreamSalt));
+  Rng keyless_rng(Mix(seed ^ kKeylessStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-               full_rng, cross_rng, options.supported)
+               full_rng, cross_rng, keyless_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4456,12 +4493,13 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng operator_rng(Mix(state ^ kSetOperatorStreamSalt));
   Rng full_rng(Mix(state ^ kFullStreamSalt));
   Rng cross_rng(Mix(state ^ kCrossStreamSalt));
+  Rng keyless_rng(Mix(state ^ kKeylessStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
                              corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
-                             setop_rng, operator_rng, full_rng, cross_rng, allowed)
+                             setop_rng, operator_rng, full_rng, cross_rng, keyless_rng, allowed)
                          .Build()
                          .value_or(GeneratedQuery{});
   q.index = index;

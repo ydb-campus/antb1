@@ -231,3 +231,10 @@ It is accepted when OJ4c is built.
   `cases/joins/cross.slt`. The reviewer found one with a wrong answer: Path 2 dropped the equality between two inner
   columns equal to one outer column, a bug on main that a keyed join reached too. It is fixed in its own PR before
   OJ4b.
+
+- Update (2026-11-08, OJ4c): built, and with it OJ4. A LEFT or FULL JOIN whose `ON` has no equality key between its two
+  inputs is a nested loop of its unit (`keys=[]`), built on its right input. Every `ON` conjunct over both inputs is
+  a residual: an inequality, a DOUBLE equality, or a key side that reads two relations of one input. Rule 11 still
+  filters a LEFT JOIN's right input by a conjunct over it alone. The unit's estimate is the product, padded as with a
+  key (`PaddedJoinRows`). The binder needed only to stop refusing: OJ4a's operator already ran keyless LEFT and FULL
+  joins. A semi or anti join without a key stays exit 4 (decision 3). No query of the 99 changes.

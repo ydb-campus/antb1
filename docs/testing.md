@@ -571,7 +571,8 @@ the same with or without refs, and the join generation changes only the join que
 (`diff.star`, `diff.tpcds`). Stars among the select items and qualified stars draw from a ninth stream: they changed
 the star queries of every seed and no other query ([tests/slt/README.md](../tests/slt/README.md)). FULL JOINs draw
 from a stream of their own too: they changed only the queries whose `LEFT JOIN` became a `FULL JOIN`. So do cross
-products (ADR 0040): they changed only the queries that cross a third item.
+products (ADR 0040): they changed only the queries that cross a third item, or that write a LEFT or FULL JOIN's keys
+as inequalities (OJ4c).
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as this
 implementation does not comply with all requirements of the TPC-H Benchmark.

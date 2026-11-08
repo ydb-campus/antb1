@@ -852,8 +852,10 @@ TEST(QueryGenerator, FullJoinsChangeOnlyTheirQueries) {
   EXPECT_GT(wider, 5) << "bounds that the right input's padding widens: " << wider;
 }
 
-// Every draw a cross product needs comes from a stream of its own (cross_rng_), so allowing
-// kCrossJoin changes the queries that cross a third item and no others (ADR 0040's OJ4b). Such a
+// Every draw a cross product needs comes from a stream of its own (cross_rng_), and every draw a
+// keyless LEFT or FULL JOIN needs from another (keyless_rng_), so allowing kCrossJoin, which both
+// record, changes the queries that cross a third item or write an outer join's keys as
+// inequalities, and no others (ADR 0040's OJ4b and OJ4c). Such a
 // query may differ beyond its FROM list, since its bound is the product (0 over an empty table).
 TEST(QueryGenerator, CrossJoinsChangeOnlyTheirQueries) {
   const FeatureSet with_cross = Union(kSupportedFeatures, {Feature::kCrossJoin});
@@ -1091,6 +1093,7 @@ struct JoinCoverage {
   int left_cross_group = 0;    // a CROSS JOIN inside its left input
   int full = 0;                // of the LEFT JOIN items, FULL JOIN ones (ADR 0037's OJ3)
   int crossed = 0;             // a third item no key joins (ADR 0040)
+  int unkeyed_outer = 0;       // a LEFT or FULL JOIN without an equality key (ADR 0040's OJ4c)
   int full_outer = 0;          // spelled FULL OUTER JOIN
   int full_three_item = 0;     // a FULL JOIN in a FROM list of three items
 };
@@ -1401,18 +1404,30 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
       roots.push_back(root(k));
     }
   }
-  if (q.features.Has(Feature::kCrossJoin)) {
+  // A keyless LEFT or FULL JOIN (ADR 0040's OJ4c) writes its keys as inequalities, so its item is
+  // one no key joins, the others keyed; a cross product is a keyed pair and one unkeyed item, and
+  // takes no outer join.
+  const bool unkeyed_outer = left && q.features.Has(Feature::kCrossJoin);
+  if (unkeyed_outer) {
+    ++cov.unkeyed_outer;
+    EXPECT_LE(roots.size(), 2U);
+  } else if (q.features.Has(Feature::kCrossJoin)) {
     ++cov.crossed;
     EXPECT_EQ(items.size(), 3U);
     EXPECT_EQ(roots.size(), 2U) << "a cross product of a keyed pair and one item";
-    EXPECT_FALSE(left) << "a cross product takes no outer join";
   } else {
     EXPECT_EQ(roots.size(), 1U) << "a FROM item is not connected by keys";
   }
   cov.closing_edge += edges > items.size() - 1 ? 1 : 0;
   cov.unconnected_start += first_two ? 0 : 1;
   EXPECT_LE(q.row_bound, 10'000);
-  if (items.size() == 2) {
+  if (items.size() == 2 && unkeyed_outer) {
+    // Every left row with every right row, or padded once; a FULL JOIN every right row once more.
+    const int64_t left_rows = items[0].table->rows;
+    const int64_t right_rows = items[1].table->rows;
+    EXPECT_EQ(q.row_bound,
+              (left_rows * std::max<int64_t>(1, right_rows)) + (full ? right_rows : 0));
+  } else if (items.size() == 2) {
     const std::vector<int64_t>* expected = &bounds;
     if (full) {
       expected = &full_bounds;
@@ -1532,6 +1547,7 @@ TEST(QueryGenerator, JoinQueriesFollowTheRefs) {
   EXPECT_GT(cov.left_cross_group, 0) << "a CROSS JOIN inside a LEFT JOIN's left input";
   EXPECT_GT(cov.full, 0) << "a FULL JOIN";
   EXPECT_GT(cov.crossed, 0) << "a cross product";
+  EXPECT_GT(cov.unkeyed_outer, 0) << "a LEFT or FULL JOIN without an equality key";
   EXPECT_GT(cov.full_outer, 0) << "spelled FULL OUTER JOIN";
   EXPECT_GT(cov.full_three_item, 0) << "a FULL JOIN among three FROM items";
 }
