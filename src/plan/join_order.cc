@@ -741,7 +741,7 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
     std::vector<std::size_t> members = {r};
     for (std::size_t at = 0; at < members.size(); ++at) {
       for (const JoinEdge& edge : edges) {
-        for (const auto [from, to] : {std::pair(edge.a, edge.b), std::pair(edge.b, edge.a)}) {
+        for (const auto& [from, to] : {std::pair(edge.a, edge.b), std::pair(edge.b, edge.a)}) {
           if (from == members[at] && part_of[to] == n) {
             part_of[to] = parts.size();
             members.push_back(to);
