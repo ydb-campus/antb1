@@ -4,14 +4,15 @@ Date: 2026-11-07
 
 ## Status
 
-Proposed (2026-11-07). This is a design ADR the maintainer asked for ahead of the code (the ADR README's exception).
+Accepted (2026-11-08), by the maintainer, once OJ4c was built. Proposed (2026-11-07) as a design ADR the maintainer
+asked for ahead of the code (the ADR README's exception).
 Its items are [ADR 0037](0037-tpcds-roadmap.md)'s OJ4, split three ways:
 
 - OJ4a: the executor;
 - OJ4b: inner cross products and joins without an equality key, in the binder and the join order;
 - OJ4c: LEFT and FULL JOINs without an equality key.
 
-It is accepted when OJ4c is built.
+It was to be accepted when OJ4c was built, and it was. Decisions 7 and 8 were replaced on the way (the OJ4b update).
 
 ## Context
 
