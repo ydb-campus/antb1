@@ -135,6 +135,9 @@ enum class Feature : std::uint8_t {
   // kMultipleItems, a qualified star kStar.
   kStarItems,      // a star next to another select item, or a second star: SELECT a, *
   kQualifiedStar,  // SELECT t.*
+  // IS NOT DISTINCT FROM as a join's keys, or as a correlated subquery's key (ADR 0037's OJ5b): a
+  // NULL-equal key, on which a NULL matches a NULL.
+  kNullEqualKeys,  // FROM a JOIN b ON a.k IS NOT DISTINCT FROM b.k
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -301,6 +304,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "star_items";
     case Feature::kQualifiedStar:
       return "qualified_star";
+    case Feature::kNullEqualKeys:
+      return "null_equal_keys";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -426,6 +431,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kLeftJoin,
     Feature::kFullJoin,
     Feature::kCrossJoin,
+    Feature::kNullEqualKeys,
     Feature::kTableAlias,
     Feature::kQualifiedName,
     Feature::kWhere,

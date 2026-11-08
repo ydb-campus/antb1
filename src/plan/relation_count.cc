@@ -101,6 +101,10 @@ struct SubqueryWalk {
   void operator()(const sql::ExtractExpr& e) const { Of(*e.source); }
   void operator()(const sql::CastExpr& c) const { Of(*c.operand); }
   void operator()(const sql::IsNullExpr& i) const { Of(*i.operand); }
+  void operator()(const sql::DistinctFromExpr& d) const {
+    Of(*d.left);
+    Of(*d.right);
+  }
   // The IN operand first: its text precedes the operator this node is reported at.
   void operator()(const sql::SubqueryExpr& s) const {
     Of(s.operand);

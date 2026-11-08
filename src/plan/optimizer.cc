@@ -529,8 +529,9 @@ struct Conjunct {
 };
 
 // A key of the rewritten join, where the conjunct is an equality of a pure-inner and a pure-outer
-// side whose common type is not DOUBLE (ADR 0023's Path 1). Both sides must be plain columns: an
-// equality over an expression stays a residual, which is always correct and never wrong.
+// side whose common type is not DOUBLE (ADR 0023's Path 1), or an IS NOT DISTINCT FROM of them,
+// whose key is NULL-equal (ADR 0037's OJ5b). Both sides must be plain columns: an equality over an
+// expression stays a residual, which is always correct and never wrong.
 struct KeyParts {
   ColumnExpr inner;
   ColumnExpr outer;
@@ -542,12 +543,17 @@ struct KeyParts {
   // built without them reads `keys=[outer = inner]`.
   std::string inner_name;
   std::string outer_name;
+  bool null_equal = false;  // IS NOT DISTINCT FROM: a NULL matches a NULL
 };
 
 std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_ids) {
   const auto* predicate = std::get_if<PredicateExpr>(&expr.node);
-  if (predicate == nullptr || predicate->predicate.kind != Predicate::Kind::kCompareColumns ||
-      predicate->predicate.op != CompareOp::kEq || predicate->operands.size() != 2) {
+  if (predicate == nullptr || predicate->operands.size() != 2) {
+    return std::nullopt;
+  }
+  const bool null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct;
+  if (!null_equal && (predicate->predicate.kind != Predicate::Kind::kCompareColumns ||
+                      predicate->predicate.op != CompareOp::kEq)) {
     return std::nullopt;
   }
   const auto* a = std::get_if<ColumnExpr>(&predicate->operands[0]->node);
@@ -577,7 +583,8 @@ std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_
                   .outer_type = outer_expr.type,
                   .key_type = *key,
                   .inner_name = name_of(a_outer ? second : first, inner_expr),
-                  .outer_name = name_of(a_outer ? first : second, outer_expr)};
+                  .outer_name = name_of(a_outer ? first : second, outer_expr),
+                  .null_equal = null_equal};
 }
 
 // ---- ADR 0023's Path 2: equivalence substitution (scalar aggregates, U3) ----
@@ -755,7 +762,8 @@ arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& las
       keys.push_back(JoinKey{.left = side(key->outer, key->outer_type, key->key_type, outer_casts,
                                           outer_cast_ids, key->outer_name),
                              .right = side(key->inner, key->inner_type, key->key_type, inner_casts,
-                                           inner_cast_ids, key->inner_name)});
+                                           inner_cast_ids, key->inner_name),
+                             .null_equal = key->null_equal});
       continue;
     }
     residual.push_back(expr);  // reads both sides and is no key: a residual over candidate pairs
@@ -925,6 +933,7 @@ bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
 // join above matches each outer row to at most one group, so no row count above it moves either.
 LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinNode& join,
                                       const std::map<ColumnId, ColumnId>& equivalent,
+                                      const std::set<ColumnId>& null_equal,
                                       const std::map<ColumnId, BoundColumn>& described,
                                       ColumnId& last_id) {
   // **One correlated column over a bare scan is ADR 0029's D5 to restrict, not this.** D5 publishes
@@ -1001,7 +1010,11 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
     }
     BoundColumn key = outer->second;
     key.id = domain_ids[Narrow<std::size_t>(at - outer_ids.begin())];
-    keys.push_back(JoinKey{.left = inner->second, .right = std::move(key)});
+    // The key the join above takes, NULL-equal where that one is: a NULL group is read by an outer
+    // row whose column is NULL, so it must not be restricted away.
+    keys.push_back(JoinKey{.left = inner->second,
+                           .right = std::move(key),
+                           .null_equal = null_equal.contains(outer_id)});
   }
   if (keys.empty()) {
     return input;
@@ -1068,6 +1081,17 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     ColumnId b = kNoColumnId;
   };
   std::vector<Equality> equalities;
+  // The correlated IS NOT DISTINCT FROM conjuncts between an outer and an inner column of one type
+  // (ADR 0037's OJ5b). They feed no class, since the classes' members are equal values and these
+  // also match NULL to NULL; an outer column with no equivalent in a class takes its inner column
+  // from one instead, and its key is then NULL-equal. The substitution stays exact: a NULL is
+  // replaced by a NULL, and a value by the same value.
+  struct NullEqualLink {
+    const Expr* expr = nullptr;
+    ColumnId outer = kNoColumnId;
+    ColumnId inner = kNoColumnId;
+  };
+  std::vector<NullEqualLink> links;
   // The name and type of each column a correlated conjunct names: BindBool's column_of stores them
   // in the PredicateExpr's own predicate, positionally, while the ids live in the operands. It is
   // the only place the pass can learn what to call a column.
@@ -1090,10 +1114,13 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     const bool equality = b != nullptr &&
                           compare->predicate.kind == Predicate::Kind::kCompareColumns &&
                           compare->predicate.op == CompareOp::kEq;
+    const bool not_distinct = b != nullptr &&
+                              compare->predicate.kind == Predicate::Kind::kIsNotDistinct &&
+                              outer.contains(a->id) != outer.contains(b->id);
     // One type on both ends, which KeyType answers for: it is the same question, and it excludes
     // DOUBLE, whose comparison is not exact.
     const bool one_type =
-        equality && compare->operands[0]->type == compare->operands[1]->type &&
+        (equality || not_distinct) && compare->operands[0]->type == compare->operands[1]->type &&
         KeyType(compare->operands[0]->type, compare->operands[1]->type).has_value();
     if (one_type) {
       const auto describe = [&described](ColumnId id, const std::optional<BoundColumn>& from,
@@ -1105,6 +1132,12 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
       };
       describe(a->id, compare->predicate.column, compare->operands[0]->type);
       describe(b->id, compare->predicate.other, compare->operands[1]->type);
+      if (not_distinct) {
+        const bool a_outer = outer.contains(a->id);
+        links.push_back(NullEqualLink{
+            .expr = &expr, .outer = a_outer ? a->id : b->id, .inner = a_outer ? b->id : a->id});
+        continue;
+      }
       classes.Merge(a->id, b->id);
       equalities.push_back(Equality{.expr = &expr, .a = a->id, .b = b->id});
       continue;
@@ -1116,12 +1149,28 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   // per class would drop a second outer column's constraint and keep rows SQL rejects.
   const std::vector<ColumnId> free = FreeVariables(*join.right);
   std::map<ColumnId, ColumnId> equivalent;  // outer id -> the inner column it is replaced by
+  std::set<ColumnId> null_equal;            // the outer ids whose key is NULL-equal
+  std::set<const NullEqualLink*> used_links;
   for (const ColumnId id : free) {
     ColumnId found = kNoColumnId;
     for (const ColumnId candidate : inner_ids) {
       if (classes.Same(id, candidate)) {
         found = candidate;
         break;
+      }
+    }
+    if (found == kNoColumnId) {
+      const NullEqualLink* used = nullptr;
+      for (const NullEqualLink& link : links) {
+        if (link.outer == id && inner.contains(link.inner)) {
+          used = &link;
+          break;
+        }
+      }
+      if (used != nullptr) {
+        found = used->inner;
+        null_equal.insert(id);
+        used_links.insert(used);
       }
     }
     if (found == kNoColumnId) {
@@ -1143,6 +1192,13 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   for (const Equality& equality : equalities) {
     if (substituted(equality.a) != substituted(equality.b)) {
       kept.push_back(equality.expr);
+    }
+  }
+  // A link that gave its outer column the equivalent says no more than the NULL-equal key that
+  // replaces it; any other is a condition between inner columns once substituted, and is kept.
+  for (const NullEqualLink& link : links) {
+    if (!used_links.contains(&link)) {
+      kept.push_back(link.expr);
     }
   }
 
@@ -1211,7 +1267,8 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   }
   // The keys as the join will name them, taken before `grouped` is moved into its node.
   const std::vector<BoundColumn> group_keys = grouped.keys;
-  grouped.input = RestrictToTheOuterKeys(std::move(right), join, equivalent, described, last_id);
+  grouped.input =
+      RestrictToTheOuterKeys(std::move(right), join, equivalent, null_equal, described, last_id);
   right = Make(std::move(grouped));
   // The select item over the aggregate, and the select list, rebuilt above it. A Compute passes
   // its input's columns through, but a Project outputs only its own, so the group's key columns
@@ -1251,7 +1308,9 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     if (key.type != group_key.type) {
       return refuse("whose correlated key has two types");
     }
-    keys.push_back(JoinKey{.left = std::move(key), .right = std::move(group_key)});
+    keys.push_back(JoinKey{.left = std::move(key),
+                           .right = std::move(group_key),
+                           .null_equal = null_equal.contains(id)});
   }
   // Path 2's join is an inner join, so either side may build: the aggregate it puts on the right
   // is often far larger than the outer rows that probe it (ADR 0026). Its estimate is its left

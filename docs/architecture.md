@@ -302,10 +302,12 @@ minus the smallest key; every other key the hashed layout: per partition, `bit_c
 above the partition's, each listing its distinct keys with their hash and range of rows. The rows stay in the parts'
 taken batches (`JoinTable::chunks`, referenced as `JoinRowRef{chunk, row}`, at most 2^32 - 1 rows), each key's rows
 together and in (part, row) order. The table keeps whether any key repeats (`unique`), whether the input had a NULL key
-(`has_null`) and whether it was empty. A keyless build (`JoinBuildSpec::Keyless`: a one-row join's, or a nested loop's,
-ADR 0040, which keeps only the columns read above) holds every row as the rows of one key, without hashes or a
-directory, and has nothing to probe: `JoinTable::FindEvery` gives each selected probe row every row as its candidates,
-with no hash and no lookup. `JoinTable::Find` gives every probe row the range of its matches, from any number of threads
+(`has_null`) and whether it was empty. A NULL-equal key (`IS NOT DISTINCT FROM`, ADR 0022's OJ5a update) holds its
+NULLs as a value, so a table that holds one is hashed and compares validity first. A keyless build
+(`JoinBuildSpec::Keyless`: a one-row join's, or a nested loop's, ADR 0040, which keeps only the columns read above)
+holds every row as the rows of one key, without hashes or a directory, and has nothing to probe:
+`JoinTable::FindEvery` gives each selected probe row every row as its candidates, with no hash and no lookup.
+`JoinTable::Find` gives every probe row the range of its matches, from any number of threads
 at once and without a lock; neither the thread count nor the order in which parts arrive changes the table, nor the
 failure of a build that fails: the failure of its earliest part, as in the serial order (a merge's before a later part's
 failed release). The hash joins' operators (`src/exec/hash_join.h`) use it. An `exec::JoinBuild` builds a table for a

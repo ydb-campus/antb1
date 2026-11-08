@@ -73,6 +73,11 @@ std::string PredicateText(const Predicate& p) {
     case Predicate::Kind::kCompareColumns:
       return std::format("{} {} {}", column, ToString(p.op),
                          p.other.has_value() ? ColumnName(*p.other) : "?");
+    case Predicate::Kind::kIsDistinct:
+    case Predicate::Kind::kIsNotDistinct:
+      return std::format("{} IS {}DISTINCT FROM {}", column,
+                         p.kind == Predicate::Kind::kIsNotDistinct ? "NOT " : "",
+                         p.other.has_value() ? ColumnName(*p.other) : "?");
     case Predicate::Kind::kLike:
       return std::format("{} LIKE {}", column, ToString(p.constant));
     case Predicate::Kind::kNotLike:

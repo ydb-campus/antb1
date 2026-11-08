@@ -671,7 +671,7 @@ antb1_add_cli_golden(
   unsupported_where
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS DISTINCT FROM 0" --table "${_t}"
+  ARGS query --threads 1 -c "SELECT COUNT(*) FROM t\nWHERE IsMobile = 1 OR IsRefresh IS TRUE" --table "${_t}"
 )
 # A UNION ALL's own ORDER BY, LIMIT and OFFSET exit 4 at their first clause until ADR 0036's X5;
 # values with no exact common type exit 4 at the first item that does not widen; a column count

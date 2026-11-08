@@ -176,7 +176,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ4b | Cross products and joins without an equality key in the binder: keyed parts first, crossed left-deep (ADR 0040; its OJ4b update) | 77 | Built |
 | OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040; its OJ4c update) | | Built |
 | OJ5a | NULL-equal join keys in the executor, no SQL (ADR 0022's OJ5a update) | | Built |
-| OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included | | Planned |
+| OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included (the OJ5b update below) | | Built |
 | **Phase 8** | **Subqueries** | | |
 | SQ1 | Uncorrelated one-row subqueries as values inside conditions | | Planned |
 | SQ2 | The same in select lists and CASE | 9 | Planned |
@@ -768,6 +768,13 @@ OJ5b, ADR 0023.
 
 Update (2026-11-08, OJ5a): built (ADR 0022's OJ5a update). No SQL reaches the keys yet, so no query changes and the
 ratchet stays at 75.
+
+Update (2026-11-08, OJ5b): built, and with it OJ5 and phase 7. `x IS [NOT] DISTINCT FROM y` parses at the comparisons'
+level, either side an expression or `NULL`, and is never NULL; NaN is not distinct from NaN, as in DuckDB. A constant
+side lowers to `IS [NOT] NULL` or to `=` or `<>` with an `IS NULL`; two values bind as two new predicate kinds, which
+the filter evaluates. Between two relations `IS NOT DISTINCT FROM` is a NULL-equal key (ADR 0022's OJ5b update), and a
+correlation through it decorrelates in both of ADR 0023's paths (its OJ5b update). No query of the 99 changes, so the
+ratchet stays at 75. Phase 9's window ADR may now weigh whole-partition aggregates joined back on NULL-equal keys.
 
 ## Alternatives considered
 

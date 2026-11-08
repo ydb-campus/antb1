@@ -1041,6 +1041,8 @@ int64_t PredicateRows(int64_t rows, const Predicate& predicate, const ColumnRang
     case Predicate::Kind::kNotLike:
       return scaled(kDefaultScale - kLikeDefault, kDefaultScale);
     case Predicate::Kind::kCompareColumns:
+    case Predicate::Kind::kIsDistinct:
+    case Predicate::Kind::kIsNotDistinct:
     case Predicate::Kind::kIsTrue:
       return scaled(kOtherDefault, kDefaultScale);
   }

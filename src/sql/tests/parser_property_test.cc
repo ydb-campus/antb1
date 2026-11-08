@@ -177,6 +177,10 @@ struct CountOf {
   }
   // BETWEEN's own AND is an AND token.
   void operator()(const IsNullExpr& is_null) const { Count(*is_null.operand, sql, c); }
+  void operator()(const DistinctFromExpr& distinct) const {
+    Count(*distinct.left, sql, c);
+    Count(*distinct.right, sql, c);
+  }
   void operator()(const BetweenExpr& between) const {
     ++c.and_count;
     Count(*between.operand, sql, c);
@@ -419,6 +423,10 @@ void CheckSpans(const Expr& expr, const std::string& sql) {
     for (const Expr& value : in->list) {
       CheckSpans(value, sql);
     }
+  } else if (const auto* distinct = std::get_if<DistinctFromExpr>(&expr)) {
+    ASSERT_TRUE(SpanInside(distinct->op_span, sql));
+    CheckSpans(*distinct->left, sql);
+    CheckSpans(*distinct->right, sql);
   } else if (const auto* between = std::get_if<BetweenExpr>(&expr)) {
     ASSERT_TRUE(SpanInside(between->op_span, sql));
     CheckSpans(*between->operand, sql);
@@ -1220,6 +1228,13 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
                             .op_span = {},
                             .span = {}});
     case 7:
+      if (rng.Percent(20)) {  // ADR 0037's OJ5b
+        return Expr(DistinctFromExpr{.left = sub(aggregates),
+                                     .right = sub(aggregates),
+                                     .negated = rng.Percent(50),
+                                     .op_span = {},
+                                     .span = {}});
+      }
       if (rng.Percent(30)) {
         return Expr(BetweenExpr{.operand = sub(aggregates),
                                 .low = sub(aggregates),

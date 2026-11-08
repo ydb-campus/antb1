@@ -1,0 +1,203 @@
+# Joins on IS NOT DISTINCT FROM (ADR 0037's OJ5b): a NULL-equal key, on which a NULL matches a NULL and no value, over
+# the star schema's NULL keys. Inner joins in ON and WHERE, LEFT and FULL JOINs, keys of every key type mixed with `=`
+# keys, an `=` and an IS NOT DISTINCT FROM of one pair, IS DISTINCT FROM as a nested loop, a DOUBLE comparison as a
+# residual, aggregations over the join, and correlated EXISTS, NOT EXISTS and scalar subqueries on such a correlation.
+
+# ---- the keys, NULLs included ----
+
+query II rowsort
+SELECT dv_city, COUNT(*) FROM drivers GROUP BY dv_city
+----
+SMALLINT	BIGINT
+1	23
+2	22
+3	22
+4	22
+NULL	8
+
+query II rowsort
+SELECT rd_city, COUNT(*) FROM riders GROUP BY rd_city
+----
+SMALLINT	BIGINT
+1	77
+2	77
+3	78
+NULL	8
+
+# ---- inner joins ----
+
+query II nosort
+SELECT COUNT(*), COUNT(rd_city) FROM riders JOIN drivers ON rd_city IS NOT DISTINCT FROM dv_city
+----
+BIGINT	BIGINT
+5245	5181
+
+query II nosort
+SELECT COUNT(*), COUNT(rd_city) FROM riders, drivers WHERE rd_city IS NOT DISTINCT FROM dv_city
+----
+BIGINT	BIGINT
+5245	5181
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_driver) FROM trips JOIN drivers ON tr_driver IS NOT DISTINCT FROM dv_id
+----
+BIGINT	BIGINT
+2681	2577
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_tariff) FROM trips JOIN tariffs ON tr_tariff IS NOT DISTINCT FROM tf_code
+----
+BIGINT	BIGINT
+2432	2274
+
+query II nosort
+SELECT COUNT(*), COUNT(tr_rate) FROM trips JOIN tariffs ON tr_rate IS NOT DISTINCT FROM tf_rate
+----
+BIGINT	BIGINT
+2314	2083
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN tariffs ON tr_tariff IS NOT DISTINCT FROM tf_code AND tr_rate IS NOT DISTINCT FROM tf_rate
+----
+BIGINT
+211
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN tariffs ON tr_tariff IS NOT DISTINCT FROM tf_code AND tr_rate = tf_rate
+----
+BIGINT
+199
+
+# One pair compared both ways is the `=` key.
+query I nosort
+SELECT COUNT(*) FROM riders JOIN drivers ON rd_city = dv_city AND rd_city IS NOT DISTINCT FROM dv_city
+----
+BIGINT
+5181
+
+query I nosort
+SELECT COUNT(*) FROM riders, drivers WHERE rd_city IS NOT DISTINCT FROM dv_city AND dv_city = rd_city
+----
+BIGINT
+5181
+
+# A chain of three relations, one NULL-equal key and one `=` key.
+query III nosort
+SELECT COUNT(*), COUNT(DISTINCT dv_id), COUNT(ct_id) FROM riders JOIN drivers ON rd_city IS NOT DISTINCT FROM dv_city JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+5181	66	5181
+
+query TI rowsort
+SELECT tf_code, COUNT(*) FROM trips JOIN tariffs ON tr_tariff IS NOT DISTINCT FROM tf_code GROUP BY tf_code
+----
+VARCHAR	BIGINT
+(empty)	284
+AIRPORT	285
+NIGHT	284
+NULL	158
+POOL	284
+STD	284
+Std	284
+XL\x20	285
+Ж-1	284
+
+query II rowsort
+SELECT dv_city, COUNT(*) FROM riders JOIN drivers ON rd_city IS NOT DISTINCT FROM dv_city WHERE rd_id < 40 GROUP BY dv_city
+----
+SMALLINT	BIGINT
+1	299
+2	264
+3	286
+NULL	8
+
+# ---- LEFT and FULL JOINs ----
+
+query III nosort
+SELECT COUNT(*), COUNT(dv_id), COUNT(DISTINCT zn_id) FROM zones LEFT JOIN drivers ON zn_city IS NOT DISTINCT FROM dv_city
+----
+BIGINT	BIGINT	BIGINT
+685	669	40
+
+query III nosort
+SELECT COUNT(*), COUNT(zn_id), COUNT(dv_id) FROM zones FULL JOIN drivers ON zn_city IS NOT DISTINCT FROM dv_city AND dv_id < 1300
+----
+BIGINT	BIGINT	BIGINT
+166	78	155
+
+query III nosort
+SELECT COUNT(*), COUNT(tf_code), COUNT(tr_row) FROM tariffs FULL JOIN trips ON tf_code IS NOT DISTINCT FROM tr_tariff AND tr_row < 50
+----
+BIGINT	BIGINT	BIGINT
+3000	38	3000
+
+# ---- not keys ----
+
+# IS DISTINCT FROM pairs every row with every row it differs from: a nested loop.
+query II nosort
+SELECT COUNT(*), COUNT(zn_city) FROM zones JOIN cities ON zn_city IS DISTINCT FROM ct_id
+----
+BIGINT	BIGINT
+202	196
+
+# DOUBLE is no key type: a residual of the pickup key's join, and alone a nested loop.
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND tr_distance IS NOT DISTINCT FROM zn_radius
+----
+BIGINT
+24
+
+query I nosort
+SELECT COUNT(*) FROM trips, zones WHERE tr_distance IS NOT DISTINCT FROM zn_radius
+----
+BIGINT
+1047
+
+# ---- correlated subqueries ----
+
+query I nosort
+SELECT COUNT(*) FROM riders AS r WHERE EXISTS (SELECT * FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city)
+----
+BIGINT
+240
+
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE NOT EXISTS (SELECT * FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM z.zn_city)
+----
+BIGINT
+9
+
+query I nosort
+SELECT COUNT(*) FROM riders AS r WHERE EXISTS (SELECT * FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city AND d.dv_id > r.rd_id * 5)
+----
+BIGINT
+240
+
+query I nosort
+SELECT COUNT(*) FROM riders AS r WHERE r.rd_id * 5 < (SELECT MAX(dv_id) FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city)
+----
+BIGINT
+240
+
+query II rowsort
+SELECT z.zn_city, COUNT(*) FROM zones AS z WHERE z.zn_id <= (SELECT MIN(dv_id) - 1000 FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM z.zn_city) GROUP BY z.zn_city
+----
+SMALLINT	BIGINT
+2	8
+3	7
+4	7
+NULL	1
+
+# Two correlations, one `=` and one NULL-equal.
+query I nosort
+SELECT COUNT(*) FROM riders AS r WHERE r.rd_id * 2 < (SELECT MAX(q.rd_id) FROM riders AS q WHERE q.rd_tier = r.rd_tier AND q.rd_city IS NOT DISTINCT FROM r.rd_city)
+----
+BIGINT
+117
+
+# NOT IN keeps `=`'s NULL rules: a NULL in the set leaves no row.
+query I nosort
+SELECT COUNT(*) FROM riders WHERE rd_city NOT IN (SELECT dv_city FROM drivers)
+----
+BIGINT
+0

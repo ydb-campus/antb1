@@ -34,19 +34,31 @@ class PredicateEvaluator {
   enum class Mode : std::uint8_t {
     kArrow,           // Arrow's comparison kernels on the values as they are
     kColumnToDouble,  // kCompare, kIn, kNotIn: the DECIMAL column converted to DOUBLE
-    kInDouble,        // kCompareColumns: the side that is not DOUBLE converted to DOUBLE
-    kExact,           // kCompareColumns: a DECIMAL with another type of number, by value
+    kInDouble,  // kCompareColumns and the DISTINCT FROM pair: the side that is not DOUBLE converted
+                // to DOUBLE
+    kExact,     // kCompareColumns and the DISTINCT FROM pair: a DECIMAL with another type of
+                // number, by value
     // A narrow DECIMAL against the same type: compared as the BIGINT it already is, both sides
     // viewed rather than converted (ADR 0021's decimal64 item).
     kNarrowAsInteger,
   };
 
+  // A comparison of the two columns as kCompareColumns makes it, and the operands it compared:
+  // in DOUBLE where it compared in DOUBLE, as they are by value (kExact).
+  struct ColumnComparison {
+    arrow::Datum left;
+    arrow::Datum right;
+    arrow::Datum result;
+  };
+  arrow::Result<ColumnComparison> CompareColumns(const arrow::RecordBatch& batch,
+                                                 plan::CompareOp op, arrow::MemoryPool* pool) const;
+
   plan::Predicate predicate_;
   Mode mode_ = Mode::kArrow;
-  int column_ = -1;                                     // -1: none (kFalse without a column)
-  int other_ = -1;                                      // kCompareColumns only
-  std::shared_ptr<arrow::Scalar> constant_;             // kCompare only
-  std::optional<LikePattern> pattern_;                  // kLike and kNotLike only
+  int column_ = -1;                          // -1: none (kFalse without a column)
+  int other_ = -1;                           // kCompareColumns and the DISTINCT FROM pair only
+  std::shared_ptr<arrow::Scalar> constant_;  // kCompare only
+  std::optional<LikePattern> pattern_;       // kLike and kNotLike only
   std::vector<std::shared_ptr<arrow::Scalar>> values_;  // kIn and kNotIn only
 };
 

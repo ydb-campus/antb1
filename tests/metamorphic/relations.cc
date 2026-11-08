@@ -1807,6 +1807,59 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- NULL-equal keys and IS [NOT] DISTINCT FROM (ADR 0037's OJ5b) ----
+  // IS NOT DISTINCT FROM is `=` or both NULL: a join on it is the `=` join and the pairs of NULL
+  // keys, and a filter on it the `=` rows and the rows NULL on both sides; IS DISTINCT FROM and IS
+  // NOT DISTINCT FROM are never NULL, so they partition a cross product; a correlated EXISTS on it
+  // and its NOT EXISTS partition the outer rows; and the batch size changes no NULL-equal join.
+  {
+    const slt::FeatureSet null_equal = {kColumns,        kMultipleItems, kCountStar,
+                                        kIntegerColumns, kTableName,     kNullEqualKeys};
+    r.push_back(
+        {.name = "a_null_equal_join_is_the_equal_join_and_the_null_pairs",
+         .features = SetWith(null_equal, kJoinOn, kCommaJoin, kCrossJoin, kWhere, kWhereAnd),
+         .probes = {Q("SELECT rd_id, dv_id FROM riders JOIN drivers "
+                      "ON rd_city IS NOT DISTINCT FROM dv_city"),
+                    Q("SELECT rd_id, dv_id FROM riders JOIN drivers ON rd_city = dv_city"),
+                    Q("SELECT rd_id, dv_id FROM riders, drivers "
+                      "WHERE rd_city IS NULL AND dv_city IS NULL")},
+         .check = FirstIsUnionOfRest()});
+    r.push_back({.name = "not_distinct_from_is_equal_or_both_null",
+                 .features = SetWith(null_equal, kWhere, kWhereAnd, kCompareColumns),
+                 .probes = {Q("SELECT COUNT(*) FROM zones WHERE zn_parent IS NOT DISTINCT FROM "
+                              "zn_city"),
+                            Q("SELECT COUNT(*) FROM zones WHERE zn_parent = zn_city"),
+                            Q("SELECT COUNT(*) FROM zones WHERE zn_parent IS NULL AND zn_city IS "
+                              "NULL")},
+                 .check = FirstEqualsSumOfRest()});
+    r.push_back({.name = "distinct_from_partitions_a_cross_product",
+                 .features = SetWith(null_equal, kCommaJoin, kCrossJoin, kWhere),
+                 .probes = {Q("SELECT COUNT(*) FROM zones, cities"),
+                            Q("SELECT COUNT(*) FROM zones, cities WHERE zn_city IS DISTINCT FROM "
+                              "ct_id"),
+                            Q("SELECT COUNT(*) FROM zones, cities WHERE zn_city IS NOT DISTINCT "
+                              "FROM ct_id")},
+                 .check = FirstEqualsSumOfRest()});
+    r.push_back({.name = "null_equal_correlated_exists_partitions_the_outer_rows",
+                 .features = SetWith(null_equal, kQualifiedName, kWhere, kWhereAnd,
+                                     kCorrelatedExists, kCompareColumns, kIntegerLiteral),
+                 .probes = {Q("SELECT rd_id FROM riders"),
+                            Q("SELECT rd_id FROM riders WHERE EXISTS (SELECT * FROM drivers "
+                              "WHERE drivers.dv_city IS NOT DISTINCT FROM riders.rd_city AND "
+                              "drivers.dv_id < 1100)"),
+                            Q("SELECT rd_id FROM riders WHERE NOT EXISTS (SELECT * FROM drivers "
+                              "WHERE drivers.dv_city IS NOT DISTINCT FROM riders.rd_city AND "
+                              "drivers.dv_id < 1100)")},
+                 .check = FirstIsUnionOfRest()});
+    constexpr std::string_view kJoin =
+        "SELECT tr_row, tf_code FROM trips JOIN tariffs ON tr_tariff IS NOT DISTINCT FROM tf_code";
+    r.push_back(
+        {.name = "null_equal_join_batch_size_invariance",
+         .features = SetWith(null_equal, kJoinOn, kVarcharColumns),
+         .probes = {Q(std::string(kJoin), 1), Q(std::string(kJoin), 7), Q(std::string(kJoin))},
+         .check = AllEqual()});
+  }
+
   // ---- correlated subqueries (ADR 0023; pending until U2 and U3 declare their feature) ----
   // Each carries only its own Feature, so U2 activates the EXISTS family and U3 the aggregate one
   // without waiting for the other: the two PRs run side by side.

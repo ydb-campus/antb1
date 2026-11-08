@@ -77,7 +77,9 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
   }
   out.column_ = p.column->index;
   const arrow::DataType& column_type = *schema.field(out.column_)->type();
-  if (p.kind == plan::Predicate::Kind::kCompareColumns) {
+  if (p.kind == plan::Predicate::Kind::kCompareColumns ||
+      p.kind == plan::Predicate::Kind::kIsDistinct ||
+      p.kind == plan::Predicate::Kind::kIsNotDistinct) {
     if (!p.other.has_value() || !in_range(p.other->index)) {
       return arrow::Status::Invalid("filter compares a column outside its input");
     }
@@ -158,6 +160,47 @@ arrow::Result<PredicateEvaluator> PredicateEvaluator::Make(const plan::Predicate
   return out;
 }
 
+arrow::Result<PredicateEvaluator::ColumnComparison> PredicateEvaluator::CompareColumns(
+    const arrow::RecordBatch& batch, plan::CompareOp op, arrow::MemoryPool* pool) const {
+  arrow::compute::ExecContext kernels(pool);
+  if (mode_ == Mode::kExact) {
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr result,
+                          CompareExact(*batch.column(column_), *batch.column(other_), op, pool));
+    return ColumnComparison{.left = arrow::Datum(batch.column(column_)),
+                            .right = arrow::Datum(batch.column(other_)),
+                            .result = arrow::Datum(result)};
+  }
+  arrow::Datum left(batch.column(column_));
+  arrow::Datum right(batch.column(other_));
+  if (mode_ == Mode::kNarrowAsInteger) {  // both views: see Evaluate
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr left_integers,
+                          batch.column(column_)->View(arrow::int64()));
+    ARROW_ASSIGN_OR_RAISE(const ArrayPtr right_integers,
+                          batch.column(other_)->View(arrow::int64()));
+    left = arrow::Datum(left_integers);
+    right = arrow::Datum(right_integers);
+  }
+  if (mode_ == Mode::kInDouble) {
+    // With a DOUBLE both compare in DOUBLE, as in DuckDB: a DECIMAL (a HUGEINT too) converts as
+    // DuckDB converts it (ADR 0021 rule 8), an integer rounds to the nearest double with Arrow's
+    // cast (a BIGINT beyond 2^53 too, which Arrow's implicit cast refuses).
+    arrow::Datum& other = left.type()->id() == arrow::Type::DOUBLE ? right : left;
+    if (IsDecimalType(*other.type())) {
+      ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted, DecimalToDouble(*other.make_array(), pool));
+      other = arrow::Datum(converted);
+    } else {
+      arrow::compute::CastOptions to_double = arrow::compute::CastOptions::Safe(arrow::float64());
+      to_double.allow_float_truncate = true;
+      ARROW_ASSIGN_OR_RAISE(other, arrow::compute::Cast(other, to_double, &kernels));
+    }
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      arrow::Datum result,
+      arrow::compute::CallFunction(std::string(KernelName(op)), {left, right}, &kernels));
+  return ColumnComparison{
+      .left = std::move(left), .right = std::move(right), .result = std::move(result)};
+}
+
 arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatch& batch,
                                                          arrow::MemoryPool* pool,
                                                          bool kleene) const {
@@ -185,35 +228,44 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
       return arrow::compute::CallFunction(std::string(KernelName(p.op)), {column, constant_},
                                           &kernels);
     case plan::Predicate::Kind::kCompareColumns: {
-      if (mode_ == Mode::kExact) {
-        ARROW_ASSIGN_OR_RAISE(
-            const ArrayPtr result,
-            CompareExact(*batch.column(column_), *batch.column(other_), p.op, pool));
-        return arrow::Datum(result);
+      ARROW_ASSIGN_OR_RAISE(const ColumnComparison compared, CompareColumns(batch, p.op, pool));
+      return compared.result;
+    }
+    case plan::Predicate::Kind::kIsDistinct:
+    case plan::Predicate::Kind::kIsNotDistinct: {
+      // Equal, NaN equal to NaN as in DuckDB (a DOUBLE comparison is IEEE's: NaN equals nothing),
+      // where neither side is NULL; else whether both are. Never NULL (ADR 0037's OJ5b).
+      ARROW_ASSIGN_OR_RAISE(const ColumnComparison compared,
+                            CompareColumns(batch, plan::CompareOp::kEq, pool));
+      arrow::Datum equal = compared.result;
+      if (compared.left.type()->id() == arrow::Type::DOUBLE &&
+          compared.right.type()->id() == arrow::Type::DOUBLE) {
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum left_nan,
+                              arrow::compute::CallFunction("is_nan", {compared.left}, &kernels));
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum right_nan,
+                              arrow::compute::CallFunction("is_nan", {compared.right}, &kernels));
+        ARROW_ASSIGN_OR_RAISE(const arrow::Datum both_nan,
+                              arrow::compute::CallFunction("and", {left_nan, right_nan}, &kernels));
+        ARROW_ASSIGN_OR_RAISE(equal,
+                              arrow::compute::CallFunction("or", {equal, both_nan}, &kernels));
       }
-      arrow::Datum left = column;
-      arrow::Datum right(batch.column(other_));
-      if (mode_ == Mode::kNarrowAsInteger) {  // `left` is already the view; `right` needs its own
-        ARROW_ASSIGN_OR_RAISE(const ArrayPtr integers, batch.column(other_)->View(arrow::int64()));
-        right = arrow::Datum(integers);
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum left_null,
+          arrow::compute::CallFunction("is_null", {batch.column(column_)}, &kernels));
+      ARROW_ASSIGN_OR_RAISE(
+          const arrow::Datum right_null,
+          arrow::compute::CallFunction("is_null", {batch.column(other_)}, &kernels));
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum any_null,
+                            arrow::compute::CallFunction("or", {left_null, right_null}, &kernels));
+      ARROW_ASSIGN_OR_RAISE(const arrow::Datum both_null,
+                            arrow::compute::CallFunction("and", {left_null, right_null}, &kernels));
+      ARROW_ASSIGN_OR_RAISE(
+          arrow::Datum not_distinct,
+          arrow::compute::CallFunction("if_else", {any_null, both_null, equal}, &kernels));
+      if (p.kind == plan::Predicate::Kind::kIsNotDistinct) {
+        return not_distinct;
       }
-      if (mode_ == Mode::kInDouble) {
-        // With a DOUBLE both compare in DOUBLE, as in DuckDB: a DECIMAL (a HUGEINT too) converts as
-        // DuckDB converts it (ADR 0021 rule 8), an integer rounds to the nearest double with
-        // Arrow's cast (a BIGINT beyond 2^53 too, which Arrow's implicit cast refuses).
-        arrow::Datum& other = left.type()->id() == arrow::Type::DOUBLE ? right : left;
-        if (IsDecimalType(*other.type())) {
-          ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted,
-                                DecimalToDouble(*other.make_array(), pool));
-          other = arrow::Datum(converted);
-        } else {
-          arrow::compute::CastOptions to_double =
-              arrow::compute::CastOptions::Safe(arrow::float64());
-          to_double.allow_float_truncate = true;
-          ARROW_ASSIGN_OR_RAISE(other, arrow::compute::Cast(other, to_double, &kernels));
-        }
-      }
-      return arrow::compute::CallFunction(std::string(KernelName(p.op)), {left, right}, &kernels);
+      return arrow::compute::CallFunction("invert", {not_distinct}, &kernels);
     }
     case plan::Predicate::Kind::kLike:
     case plan::Predicate::Kind::kNotLike: {

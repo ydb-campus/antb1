@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/api.h>
@@ -236,6 +237,97 @@ TEST_F(BranchTruthAgreesWithTheFilter, ComparisonsOfTwoColumns) {
     }
   }
   EXPECT_EQ(decided, cases) << "every comparison of two numbers, dates, timestamps or texts";
+}
+
+// column IS [NOT] DISTINCT FROM other (ADR 0037's OJ5b) for every pair of values of a type and its
+// NULL, as two columns of that type, and for numbers of different types or scales with their NULLs:
+// every pair is decided, NULL against NULL as not distinct and against a value as distinct.
+TEST_F(BranchTruthAgreesWithTheFilter, DistinctFromOfTwoColumns) {
+  std::vector<std::pair<std::vector<Constant>, std::vector<Constant>>> pairs;
+  for (std::vector<Constant> values : ValuesOfEveryType()) {
+    values.push_back(Constant{.type = values.front().type, .value = std::monostate{}});
+    pairs.emplace_back(values, values);
+  }
+  const auto of = [](LogicalType type, const std::vector<Int128>& values) {
+    std::vector<Constant> out;
+    out.reserve(values.size() + 1);
+    for (const Int128 v : values) {
+      out.push_back(Of(type, v));
+    }
+    out.push_back(Constant{.type = type, .value = std::monostate{}});
+    return out;
+  };
+  pairs.emplace_back(of(LogicalType::kInteger, {-1, 1, 2}),
+                     of(LogicalType::Decimal(12, 2), {-100, 100, 150, 200}));
+  pairs.emplace_back(of(LogicalType::Decimal(3, 2), {149, 150, 151}),
+                     of(LogicalType::Decimal(2, 1), {14, 15, 16}));
+  pairs.emplace_back(of(LogicalType::kSmallInt, {-32'768, -1, 0, 7, 32'767}),
+                     of(LogicalType::kUSmallInt, {0, 7, 65'535}));
+  int cases = 0;
+  int decided = 0;
+  for (const auto& [lefts, rights] : pairs) {
+    SCOPED_TRACE(plan::ToString(lefts.front().type) + " against " +
+                 plan::ToString(rights.front().type));
+    for (const Constant& left : lefts) {
+      for (const Constant& right : rights) {
+        for (const Predicate::Kind kind :
+             {Predicate::Kind::kIsDistinct, Predicate::Kind::kIsNotDistinct}) {
+          const Predicate predicate{
+              .kind = kind, .column = Col(0, left.type), .other = Col(1, right.type)};
+          ++cases;
+          decided += Agrees(predicate, {left, right}) ? 1 : 0;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(decided, cases) << "every pair of values and NULLs";
+}
+
+// DOUBLE is compared by the filter alone (TruthOver decides none): NaN is not distinct from NaN
+// and -0.0 not from 0.0, as in DuckDB, where `=` follows IEEE (divergence D10); a DOUBLE with an
+// integer or a DECIMAL compares in DOUBLE; NULL is not distinct from NULL only. Never NULL.
+TEST_F(BranchTruthAgreesWithTheFilter, DistinctFromOfDoubles) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const auto dbl = [](double v) { return Constant{.type = LogicalType::kDouble, .value = v}; };
+  const Constant null_double{.type = LogicalType::kDouble, .value = std::monostate{}};
+  struct Case {
+    Constant left;
+    Constant right;
+    bool not_distinct;
+  };
+  const std::vector<Case> cases = {
+      {.left = dbl(nan), .right = dbl(nan), .not_distinct = true},
+      {.left = dbl(-0.0), .right = dbl(0.0), .not_distinct = true},
+      {.left = dbl(1.5), .right = dbl(1.5), .not_distinct = true},
+      {.left = dbl(nan), .right = dbl(1.5), .not_distinct = false},
+      {.left = dbl(nan), .right = null_double, .not_distinct = false},
+      {.left = null_double, .right = null_double, .not_distinct = true},
+      {.left = dbl(2.0), .right = Of(LogicalType::kInteger, 2), .not_distinct = true},
+      {.left = Of(LogicalType::kBigInt, 3), .right = dbl(2.0), .not_distinct = false},
+      {.left = dbl(1.5), .right = Of(LogicalType::Decimal(9, 2), 150), .not_distinct = true},
+      {.left = Of(LogicalType::Decimal(9, 2), 151), .right = dbl(1.5), .not_distinct = false},
+      {.left = Of(LogicalType::kInteger, 2),
+       .right = Constant{.type = LogicalType::kDouble, .value = std::monostate{}},
+       .not_distinct = false},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(plan::ToString(c.left) + " and " + plan::ToString(c.right));
+    const std::shared_ptr<arrow::RecordBatch> batch = OneRow({c.left, c.right});
+    ASSERT_NE(batch, nullptr);
+    for (const Predicate::Kind kind :
+         {Predicate::Kind::kIsDistinct, Predicate::Kind::kIsNotDistinct}) {
+      const Predicate predicate{
+          .kind = kind, .column = Col(0, c.left.type), .other = Col(1, c.right.type)};
+      EXPECT_EQ(Kept(predicate, *batch),
+                c.not_distinct == (kind == Predicate::Kind::kIsNotDistinct));
+      // Never NULL, inside an expression too.
+      auto evaluator = PredicateEvaluator::Make(predicate, *batch->schema());
+      ASSERT_TRUE(evaluator.ok()) << evaluator.status().ToString();
+      auto result = evaluator->Evaluate(*batch, arrow::default_memory_pool(), /*kleene=*/true);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(result->make_array()->null_count(), 0);
+    }
+  }
 }
 
 }  // namespace
