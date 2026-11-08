@@ -1760,6 +1760,53 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
+  // ---- LEFT and FULL JOINs without an equality key (ADR 0040's OJ4c) ----
+  // A keyless LEFT JOIN keeps every left row and matches the inner join's pairs; a keyless FULL
+  // JOIN is symmetric and adds to the LEFT JOIN's rows the right rows that match none; neither
+  // depends on the batch size.
+  {
+    const slt::FeatureSet keyless = {kColumns,   kMultipleItems,  kCountStar,      kCountColumn,
+                                     kTableName, kCompareColumns, kIntegerColumns, kCrossJoin};
+    constexpr std::string_view kOn = "ON zn_city < ct_id";
+    r.push_back(
+        {.name = "keyless_left_join_keeps_every_left_row",
+         .features = SetWith(keyless, kLeftJoin, kCountDistinct),
+         .probes = {Q("SELECT COUNT(*) FROM zones"),
+                    Q(std::format("SELECT COUNT(DISTINCT zn_id) FROM zones LEFT JOIN cities {}",
+                                  kOn))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "keyless_left_join_matches_equal_the_inner_join",
+         .features = SetWith(keyless, kLeftJoin, kJoinOn),
+         .probes = {Q(std::format("SELECT COUNT(ct_id) FROM zones LEFT JOIN cities {}", kOn)),
+                    Q(std::format("SELECT COUNT(*) FROM zones JOIN cities {}", kOn))},
+         .check = AllEqual()});
+    r.push_back(
+        {.name = "keyless_full_join_is_symmetric",
+         .features = SetWith(keyless, kFullJoin),
+         .probes = {Q("SELECT zn_id, ct_id FROM zones FULL JOIN cities ON zn_city > ct_id"),
+                    Q("SELECT zn_id, ct_id FROM cities FULL JOIN zones ON zn_city > ct_id")},
+         .check = AllEqual()});
+    r.push_back({.name = "keyless_full_join_is_left_join_and_unmatched_right_rows",
+                 .features = SetWith(keyless, kLeftJoin, kFullJoin, kWhere),
+                 .probes = {Q("SELECT zn_id, ct_id FROM zones FULL JOIN cities ON zn_city > ct_id"),
+                            Q("SELECT zn_id, ct_id FROM zones LEFT JOIN cities ON zn_city > ct_id"),
+                            Q("SELECT zn_id, ct_id FROM cities LEFT JOIN zones ON zn_city > ct_id "
+                              "WHERE zn_id IS NULL")},
+                 .check = FirstIsUnionOfRest()});
+    for (const std::string_view kind : {"LEFT", "FULL"}) {
+      const std::string loop = std::format(
+          "SELECT zn_id, ct_id FROM zones {} JOIN cities ON zn_city < ct_id AND ct_pop > 1000",
+          kind);
+      r.push_back({.name = std::format("keyless_{}_join_batch_size_invariance",
+                                       kind == "LEFT" ? "left" : "full"),
+                   .features = SetWith(keyless, kind == "LEFT" ? kLeftJoin : kFullJoin, kWhere,
+                                       kIntegerLiteral),
+                   .probes = {Q(loop, 1), Q(loop, 7), Q(loop)},
+                   .check = AllEqual()});
+    }
+  }
+
   // ---- correlated subqueries (ADR 0023; pending until U2 and U3 declare their feature) ----
   // Each carries only its own Feature, so U2 activates the EXISTS family and U3 the aggregate one
   // without waiting for the other: the two PRs run side by side.

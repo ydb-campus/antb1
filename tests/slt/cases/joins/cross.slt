@@ -178,6 +178,67 @@ SELECT COUNT(*) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones, citi
 BIGINT
 2441
 
+# ---- LEFT and FULL JOINs without an equality key (ADR 0040's OJ4c) ----
+
+# Each zone with every city of a larger id, or once padded: the zones of the last city and of a NULL city match none.
+query III nosort
+SELECT COUNT(*), COUNT(ct_id), COUNT(DISTINCT zn_id) FROM zones LEFT JOIN cities ON zn_city < ct_id
+----
+BIGINT	BIGINT	BIGINT
+117	115	40
+
+# A conjunct over the right input alone filters it (rule 11); one over the left input pads the rows that fail it.
+query III nosort
+SELECT COUNT(*), COUNT(ct_id), COUNT(DISTINCT zn_id) FROM zones LEFT JOIN cities ON zn_city < ct_id AND ct_pop > 40000
+----
+BIGINT	BIGINT	BIGINT
+40	8	40
+
+query III nosort
+SELECT COUNT(*), COUNT(ct_id), COUNT(DISTINCT zn_id) FROM zones LEFT JOIN cities ON zn_city < ct_id AND zn_radius > 2
+----
+BIGINT	BIGINT	BIGINT
+70	45	40
+
+# An empty right input pads every left row.
+query II nosort
+SELECT COUNT(*), COUNT(pm_id) FROM cities LEFT JOIN promos ON ct_id <> pm_id
+----
+BIGINT	BIGINT
+6	0
+
+# A FULL JOIN pads both sides: the cities no zone is below, and the zones no city is above.
+query III nosort
+SELECT COUNT(*), COUNT(zn_id), COUNT(ct_id) FROM zones FULL JOIN cities ON zn_city > ct_id AND zn_radius > 2
+----
+BIGINT	BIGINT	BIGINT
+60	58	32
+
+query II rowsort
+SELECT ct_id, COUNT(zn_id) FROM zones FULL JOIN cities ON zn_city > ct_id GROUP BY ct_id
+----
+SMALLINT	BIGINT
+1	31
+2	23
+3	16
+4	9
+5	1
+6	1
+NULL	9
+
+# OR and <> conditions, and a keyless LEFT JOIN of a keyed pair.
+query II nosort
+SELECT COUNT(*), COUNT(tf_code) FROM cities LEFT JOIN tariffs ON ct_pop > 40000 OR tf_rate > 2
+----
+BIGINT	BIGINT
+26	24
+
+query II nosort
+SELECT COUNT(*), COUNT(ct_id) FROM trips JOIN zones ON tr_pickup = zn_id LEFT JOIN cities ON zn_city <> ct_id AND ct_pop > 40000 WHERE tr_row < 100
+----
+BIGINT	BIGINT
+148	146
+
 # ---- ordered and limited ----
 
 query II nosort

@@ -308,9 +308,8 @@ NULL	39
 1	6
 1	11
 
-# ---- DuckDB only: a FULL JOIN without a key, which exits 4 on antb1 (ADR 0022) ----
+# ---- a FULL JOIN without a key: a nested loop (ADR 0040's OJ4c) ----
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM cities FULL JOIN zones ON ct_id < zn_city
 ----

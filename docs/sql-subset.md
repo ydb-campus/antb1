@@ -53,8 +53,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   ([ADR 0040](adr/0040-nested-loop-joins.md)), answered as a nested loop whose conditions between them (an inequality,
   `<>`, OR, or none) decide its pairs; a derived table or a CTE reference of exactly one row (an aggregate without
   `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`) that no condition but a subquery conjunct reads joins the others as one
-  row. A `LEFT JOIN` or a `FULL JOIN` still needs an equality between its own two inputs, in its `ON` (exit code 4
-  until ADR 0037's OJ4c).
+  row. A `LEFT JOIN` or a `FULL JOIN` whose `ON` has no equality key between its own two inputs is a nested loop too,
+  padding the rows no pair passes (ADR 0040's OJ4c).
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
   an expression, `x [NOT] IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order are answered as a
   top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
@@ -293,17 +293,17 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   including one that reads only the preserved side, since a left row that fails it is padded and not dropped. A `WHERE`
   conjunct over the null-supplying side stays above the join. An equality is a key only when each of its sides reads one
   relation of one input, since a side that is an expression is computed on that relation's own branch; a side over two
-  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is exit code 4
-  (until ADR 0037's OJ4c). A `FULL JOIN` (ADR 0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct
-  over either input alone is a residual, since a row of either that fails it is padded and not dropped; a `WHERE`
-  conjunct over either input stays above the join; the `ON` of an inner join before it in FROM order still binds inside
-  its left input, which that join is part of, while a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN
-  b FULL JOIN c ON ... WHERE a.k = b.k` crosses `a` and `b` below the `FULL JOIN`, the equality a filter above it), and
-  a conjunct of that inner `ON` that would bind above every join of the block (a subquery conjunct, a column of an
-  enclosing block, a comma sibling before the join group) is exit code 4, since it would drop the rows the `FULL JOIN`
-  pads on the left; and the same `ON` rules and exit code 4 hold as for a `LEFT JOIN`. More than 256 relations, counting
-  a derived table, a CTE reference and a subquery in an expression as one plus the relations of their body, is exit code
-  4 too, before the per-item checks;
+  of them is a residual, as in an inner `ON`. A `LEFT JOIN` with no equality key between its two inputs is a nested loop
+  (ADR 0040's OJ4c): every `ON` conjunct over both inputs a residual, and rule 11 as with a key. A `FULL JOIN` (ADR
+  0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct over either input alone is a residual, since
+  a row of either that fails it is padded and not dropped; a `WHERE` conjunct over either input stays above the join;
+  the `ON` of an inner join before it in FROM order still binds inside its left input, which that join is part of, while
+  a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN b FULL JOIN c ON ... WHERE a.k = b.k` crosses `a`
+  and `b` below the `FULL JOIN`, the equality a filter above it), and a conjunct of that inner `ON` that would bind
+  above every join of the block (a subquery conjunct, a column of an enclosing block, a comma sibling before the join
+  group) is exit code 4, since it would drop the rows the `FULL JOIN` pads on the left; and the same `ON` rules hold as
+  for a `LEFT JOIN`, without a key too. More than 256 relations, counting a derived table, a CTE reference and a
+  subquery in an expression as one plus the relations of their body, is exit code 4 too, before the per-item checks;
 - `UNION ALL` of two or more blocks as the whole statement, a derived table's query and a CTE's query, each block
   answered as any block is, with the first block's names and DuckDB's types where every block widens exactly to them
   ([Binding](#binding)); a branch in parentheses, a block with its own `ORDER BY`, `LIMIT` and `OFFSET` or a query
@@ -1500,7 +1500,7 @@ formatter:
 | 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a LEFT JOIN b ON a.k > b.k` (no equality key); `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; `FROM a LEFT JOIN b ON a.x < b.y` (no equality key, until OJ4c); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS DISTINCT FROM`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

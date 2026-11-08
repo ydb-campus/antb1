@@ -5219,14 +5219,8 @@ arrow::Status Binder::BindUnitOn(std::size_t u, const sql::FromItem& item) {
       ARROW_RETURN_NOT_OK(BindUnitConjunct(u, *conjunct, element.span()));
     }
   }
-  if (units_[u].keys.empty()) {
-    // A nested loop without a key is ADR 0040's OJ4c: until then a LEFT or FULL JOIN needs a key.
-    return UnsupportedError(
-        std::format("a {} JOIN without a join key between its two inputs is not "
-                    "supported",
-                    ToString(units_[u].kind)),
-        units_[u].span);
-  }
+  // A unit without a key is a nested loop (ADR 0040's OJ4c): every right row is a candidate of
+  // every left row, and the ON's residuals decide which pairs match; the unmatched rows pad.
   return arrow::Status::OK();
 }
 

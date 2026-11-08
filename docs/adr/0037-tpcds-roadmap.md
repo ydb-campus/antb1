@@ -174,7 +174,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ3 | FULL OUTER JOIN (the OJ3 update below) | 97 | Built |
 | OJ4a | Nested-loop joins in the executor: keyless inner, LEFT and FULL joins, no SQL ([ADR 0040](0040-nested-loop-joins.md); its OJ4a update) | | Built |
 | OJ4b | Cross products and joins without an equality key in the binder: keyed parts first, crossed left-deep (ADR 0040; its OJ4b update) | 77 | Built |
-| OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040) | | Planned |
+| OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040; its OJ4c update) | | Built |
 | OJ5 | NULL-equal join keys, and IS [NOT] DISTINCT FROM | | Planned |
 | **Phase 8** | **Subqueries** | | |
 | SQ1 | Uncorrelated one-row subqueries as values inside conditions | | Planned |
@@ -754,6 +754,10 @@ Debug build and 2.2 s under ASan, peaks at 5.1 MiB, and its ASan shard (3 of 8) 
 search, as ADR 0040 first had it, made Q74 run out of memory at SF 1, because the estimates of its CTE references
 cannot tell a keyed join from a cross. ADR 0040's OJ4b update records the rule that replaced it, and two estimate
 items outside OJ4: filters on GROUP BY keys pushed below the grouping, and a domain for a sub-plan's GROUP BY keys.
+
+Update (2026-11-08, OJ4c): built, and with it OJ4: a LEFT or FULL JOIN without an equality key is a nested loop of its
+unit (ADR 0040's OJ4c update). No query of the 99 changes, so the ratchet stays at 75. OJ5 (NULL-equal keys, IS [NOT]
+DISTINCT FROM) is phase 7's last item.
 
 ## Alternatives considered
 

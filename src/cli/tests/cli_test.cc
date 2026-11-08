@@ -169,17 +169,17 @@ TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("SUM(DISTINCT ...) is not supported"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^^^^^"), std::string::npos) << r.err;
-  // A LEFT JOIN is answered, but one without a join key between its two inputs exits 4 at its
-  // connector, which is what added the join: the whole rendering, caret included.
-  r = Invoke({"query", "-c", "SELECT COUNT(*) FROM t LEFT JOIN t AS u ON t.EventDate > u.EventDate",
-              "--table", "t=" + path_});
+  // A LEFT JOIN is answered, with a key or without (ADR 0040), but a RIGHT JOIN exits 4 at its
+  // connector: the whole rendering, caret included.
+  r = Invoke({"query", "-c",
+              "SELECT COUNT(*) FROM t RIGHT JOIN t AS u ON t.EventDate = u.EventDate", "--table",
+              "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_EQ(r.err,
-            "antb1: unsupported error: a LEFT JOIN without a join key between its two inputs is "
-            "not supported\n"
+            "antb1: unsupported error: RIGHT JOIN is not supported; see docs/sql-subset.md\n"
             "  at line 1, column 24\n"
-            "  SELECT COUNT(*) FROM t LEFT JOIN t AS u ON t.EventDate > u.EventDate\n"
-            "                         ^^^^^^^^^\n");
+            "  SELECT COUNT(*) FROM t RIGHT JOIN t AS u ON t.EventDate = u.EventDate\n"
+            "                         ^^^^^\n");
   // An inner join binds, so its tables are resolved: a missing one is a bind error, exit code 1.
   r = Invoke({"query", "-c", "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k"});
   EXPECT_EQ(r.code, kExitQueryError);
