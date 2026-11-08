@@ -155,6 +155,20 @@ BIGINT
 
 # ---- correlated subqueries ----
 
+# An equality over outer columns that only NULL-equal links correlate is kept: for a NULL city it is NULL, so the
+# subquery sees no zone, and an outer row of NULL cities must not read the NULL group (the zone with no city).
+query I nosort
+SELECT COUNT(*) FROM riders AS r, drivers AS d WHERE r.rd_id <= 40 AND d.dv_id < 2000 AND r.rd_id < (SELECT SUM(z.zn_id) FROM zones AS z WHERE z.zn_city IS NOT DISTINCT FROM r.rd_city AND z.zn_city IS NOT DISTINCT FROM d.dv_city AND r.rd_city = d.dv_city)
+----
+BIGINT
+248
+
+query I nosort
+SELECT COUNT(*) FROM riders AS r WHERE r.rd_id < (SELECT SUM(z.zn_id) FROM zones AS z WHERE z.zn_city IS NOT DISTINCT FROM r.rd_city AND r.rd_city = r.rd_city)
+----
+BIGINT
+137
+
 query I nosort
 SELECT COUNT(*) FROM riders AS r WHERE EXISTS (SELECT * FROM drivers AS d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city)
 ----

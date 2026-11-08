@@ -1190,9 +1190,9 @@ TEST(OptimizerTest, EmptyPlanStaysEmpty) {
   EXPECT_TRUE(plan.output.empty());
 }
 
-// The unnesting pass, the first and only fallible step (ADR 0023). U1 has no rewrite, so it rejects
-// every dependent join: kUnsupported at the subquery's span, which the CLI turns into exit code 4,
-// never a bind error (1) or an internal error (70). No other rule runs on a rejected plan.
+// The unnesting pass, the first and only fallible step (ADR 0023). It rejects every dependent join
+// that neither path fits: kUnsupported at the subquery's span, which the CLI turns into exit code
+// 4, never a bind error (1) or an internal error (70). No other rule runs on a rejected plan.
 TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
   const SourceSpan span{.offset = 13, .length = 5};
   // Path 2 takes a one-row dependent join, and declines a right input that is not the ungrouped
@@ -2038,6 +2038,44 @@ TEST(OptimizerTest, Path2KeysANullEqualCorrelationNullEqual) {
     EXPECT_FALSE(restriction->keys[1].null_equal) << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
   }
+}
+
+// The substitution turns an equality over outer columns into c = c, which is dropped where every
+// key on c is `=`: such a key never matches the NULL group. A NULL-equal key does, so over an outer
+// column that only IS NOT DISTINCT FROM gives an equivalent the equality is kept, as c = c, which
+// leaves c's NULL rows out of the aggregation: in SQL `o.x = o.x` is NULL for a NULL o.x, and the
+// subquery sees no row there (NK15 p. 395 drops the selection only for a column that cannot be
+// NULL).
+TEST(OptimizerTest, Path2KeepsAnEqualityOverAnOuterColumnKeyedNullEqual) {
+  const auto plan_with = [](ExprPtr key) {
+    return Optimized(PlanOverJoin(
+        Node(DependentJoinNode{
+            .kind = JoinKind::kOneRow,
+            .left = FourFields(1),
+            .right =
+                ScalarBlock({std::move(key), Compare(FieldOf(1, 1), FieldOf(1, 1), CompareOp::kEq)},
+                            AggKind::kMin, 50),
+            .span = {}}),
+        1));
+  };
+  const LogicalPlan linked = plan_with(NotDistinct(FieldOf(11, 1), FieldOf(1, 1)));
+  const auto* join = JoinUnder(linked);
+  ASSERT_NE(join, nullptr) << Explain(linked);
+  ASSERT_EQ(join->keys.size(), 1U) << Explain(linked);
+  EXPECT_TRUE(join->keys[0].null_equal) << Explain(linked);
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  ASSERT_NE(grouped, nullptr) << Explain(linked);
+  EXPECT_TRUE(std::holds_alternative<FilterNode>(*grouped->input))
+      << "the equality is kept below the aggregation: " << Explain(linked);
+  EXPECT_EQ(PositionMismatch(linked), std::nullopt) << Explain(linked);
+
+  // Beside an `=` key it says nothing the key does not, and is dropped.
+  const LogicalPlan equal = plan_with(Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq));
+  const auto* equal_join = JoinUnder(equal);
+  ASSERT_NE(equal_join, nullptr) << Explain(equal);
+  const auto* equal_grouped = std::get_if<GroupAggregateNode>(equal_join->right.get());
+  ASSERT_NE(equal_grouped, nullptr) << Explain(equal);
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(*equal_grouped->input)) << Explain(equal);
 }
 
 // Without an inner equivalent for every outer column the substitution cannot run.

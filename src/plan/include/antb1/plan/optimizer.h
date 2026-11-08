@@ -9,11 +9,11 @@ namespace antb1::plan {
 
 // Rule-based rewrites of a bound plan, applied in this order (docs/architecture.md). The unnesting
 // pass runs first and is the only one that can fail:
-//  0. Unnesting (ADR 0023): every DependentJoin becomes ordinary joins, or the query is rejected
-//     with kUnsupported (exit code 4) at the subquery's span. Roadmap id U1 has no rewrite yet, so
-//     every correlated subquery is rejected here. A dependent join left in the plan afterwards is a
-//     bug in the pass, and fails with no SqlErrorDetail (exit code 70), so that it can never pass
-//     for a refusal (ADR 0005).
+//  0. Unnesting (ADR 0023): every DependentJoin becomes ordinary joins -- a semi or anti join
+//     (Path 1) or a grouped inner join (Path 2) -- or the query is rejected with kUnsupported
+//     (exit code 4) at the subquery's span. A dependent join left in the plan afterwards is a bug
+//     in the pass, and fails with no SqlErrorDetail (exit code 70), so that it can never pass for a
+//     refusal (ADR 0005).
 //  1. WHERE conditions into a union's branches (ADR 0036's X7a): the conditions of a Filter
 //     directly over a UnionAll go on top of each branch, in that branch's columns. A condition the
 //     branch's constants (a literal select item, through the binder's widening casts) make never

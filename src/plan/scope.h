@@ -166,8 +166,12 @@ class Scope {
   // `outer` is the scope of the enclosing block (nullptr: none), which must outlive this one.
   // `Resolve` consults the whole chain of them for rule 9 of ADR 0022: a name this block lacks that
   // an enclosing one has is a correlation, which exits 4 until ADR 0023's PRs answer it and never
-  // reports "does not exist". A Visibility limits this block's bindings only.
-  explicit Scope(std::vector<Binding> bindings, const Scope* outer = nullptr);
+  // reports "does not exist". A Visibility limits this block's bindings only; `outer_visible` is
+  // the enclosing block's, where this block is written: an ON's (rule 10) for the block of a
+  // subquery in an inner join's ON, which sees the FROM items up to that JOIN as a name in the ON
+  // itself does, and never a later one; every binding for any other block.
+  explicit Scope(std::vector<Binding> bindings, const Scope* outer = nullptr,
+                 Visibility outer_visible = {});
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
   Scope(Scope&&) = delete;
@@ -185,8 +189,9 @@ class Scope {
 
   // Where `ref` resolves in an enclosing block: the nearest one that has it, with `distance` 1 for
   // the block that directly encloses this one -- the only distance ADR 0023 answers -- and that
-  // scope's own LookUp, so an outer name that is ambiguous there stays ambiguous. None when no
-  // enclosing block has the name.
+  // scope's own LookUp, in the visibility where the block inside it is written (`outer_visible`,
+  // level by level), so an outer name that is ambiguous there stays ambiguous and a FROM item an ON
+  // does not see is no candidate. None when no enclosing block has the name.
   //
   // Asked only once this block's own resolution has failed, its select-list aliases included: an
   // alias of this block that happens to name a column of an enclosing one is this block's alias,
@@ -196,6 +201,7 @@ class Scope {
     std::size_t distance = 0;      // blocks out: 1 is the directly enclosing block
     const Scope* scope = nullptr;  // the scope that has the name; outlives this one
     Lookup lookup;                 // where in that scope
+    Visibility visible;            // of that scope, in which `lookup` was made
   };
   [[nodiscard]] std::optional<OuterLookup> LookUpOuter(const sql::ColumnRef& ref) const;
 
@@ -262,6 +268,7 @@ class Scope {
  private:
   std::vector<Binding> bindings_;
   const Scope* outer_ = nullptr;
+  Visibility outer_visible_;  // of `outer_`, where this block is written
 };
 
 }  // namespace antb1::plan

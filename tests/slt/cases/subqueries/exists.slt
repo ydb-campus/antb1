@@ -136,6 +136,31 @@ SMALLINT
 1
 4
 
+# A subquery in an ON sees its block as the ON does (rule 10): x is a later FROM item, so no outer reference reaches it.
+statement error
+SELECT COUNT(*) FROM zones JOIN cities ON zn_city = ct_id AND EXISTS (SELECT * FROM drivers WHERE dv_city = x.ct_id) JOIN cities AS x ON x.ct_id = zn_city
+
+# ... and the later cities' label does not make zones' label ambiguous.
+query I nosort
+SELECT COUNT(*) FROM zones JOIN drivers ON zn_city = dv_city AND EXISTS (SELECT * FROM tariffs WHERE tf_label = label) JOIN cities ON ct_id = zn_city
+----
+BIGINT
+178
+
+# An ON in a comma list sees its join group first, then the comma siblings before it: label is the group's cities',
+# although the comma sibling zones has one too, and zn_id, which only zones has, is zones'.
+query I nosort
+SELECT COUNT(*) FROM zones AS a, drivers JOIN cities ON ct_id = dv_city AND EXISTS (SELECT * FROM tariffs WHERE tf_label = label)
+----
+BIGINT
+1800
+
+query I nosort
+SELECT COUNT(*) FROM zones AS a, drivers JOIN cities ON ct_id = dv_city AND EXISTS (SELECT * FROM fleet WHERE fl_zone = zn_id)
+----
+BIGINT
+267
+
 # Inside EXISTS, * is checked: two bindings named z that share label.
 statement error
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM zones AS z, cities AS z WHERE z.zn_id = tr_pickup AND z.zn_city = z.ct_id)
@@ -477,6 +502,16 @@ INTEGER
 30
 35
 40
+
+# ---- DuckDB only until references further out than the enclosing block get a PR (ADR 0023) ----
+
+# The innermost x is the outermost block's: the middle block's x is a FROM item after the ON the subquery is in.
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM cities AS x WHERE EXISTS (SELECT * FROM zones JOIN drivers ON zn_city = dv_city AND EXISTS (SELECT * FROM riders WHERE rd_city = x.ct_id) JOIN cities AS x ON x.ct_id = zn_city WHERE zn_id < 10)
+----
+BIGINT
+3
 
 # ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
 

@@ -871,6 +871,46 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
   });
 }
 
+// Whether every column of `values` -- what the subquery outputs, which the comparison above the
+// dependent join reads -- is NULL when the aggregation has no row to aggregate: an aggregate call
+// (each SUM, AVG, MIN or MAX, StrictAggregates), or a strict combination (IsStrict) that reads at
+// least one such column, through the Computes and Projects above the aggregation. The inner join
+// gives an outer row with no group no row, which is SQL's answer only where the subquery's value is
+// NULL there, so that the comparison rejects the row. IsStrict alone does not say it: a constant is
+// strict and reads no call, and so is the select item of `SELECT 1 ... ORDER BY COUNT(*)`, whose
+// aggregation is left with no call at all -- 1 over no rows, not NULL.
+bool NullOverNoRows(const ScalarBlock& block, const std::vector<ColumnId>& values) {
+  std::set<ColumnId> nulls;
+  for (const AggregateCall& call : block.aggregate->aggregates) {
+    nulls.insert(call.id);
+  }
+  for (const LogicalNodePtr& node : std::ranges::reverse_view(block.above)) {
+    if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+      for (std::size_t i = 0; i < compute->exprs.size(); ++i) {
+        std::vector<ColumnId> reads;
+        CollectColumnIds(*compute->exprs[i], reads);
+        if (IsStrict(*compute->exprs[i]) &&
+            std::ranges::any_of(reads, [&nulls](ColumnId id) { return nulls.contains(id); })) {
+          nulls.insert(compute->ids[i]);
+        }
+      }
+      continue;
+    }
+    const auto* project = std::get_if<ProjectNode>(node.get());
+    if (project == nullptr) {
+      return false;  // ScalarBlockOf admits Computes and Projects only
+    }
+    for (std::size_t i = 0; i < project->columns.size() && i < project->ids.size(); ++i) {
+      const bool constant = i < project->constants.size() && project->constants[i].has_value();
+      if (!constant && nulls.contains(project->columns[i].id)) {
+        nulls.insert(project->ids[i]);
+      }
+    }
+  }
+  return !values.empty() &&
+         std::ranges::all_of(values, [&nulls](ColumnId id) { return nulls.contains(id); });
+}
+
 // How many times the aggregation's own input must exceed the outer side before restricting it to
 // the keys that side binds is worth a build and a probe (RestrictToTheOuterKeys below).
 //
@@ -1064,6 +1104,9 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
       return refuse("whose select item does not combine its aggregate strictly");
     }
   }
+  if (!NullOverNoRows(*block, OutputIds(*join.right))) {
+    return refuse("whose select item does not combine its aggregate strictly");
+  }
   const std::vector<ColumnId> left_ids = OutputIds(*join.left);
   const std::set<ColumnId> outer(left_ids.begin(), left_ids.end());
   const std::vector<ColumnId> inner_ids = OutputIds(*block->below);
@@ -1185,12 +1228,20 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   // dropped. Any other one is a condition between inner columns -- two inner columns equal to one
   // outer column, of which only the first is its equivalent, must still equal each other -- and is
   // kept, substituted like every kept conjunct.
+  //
+  // So is one over an outer column whose key is NULL-equal. Dropping c = c is right only where c
+  // cannot be NULL in a group an outer row reads (NK15 p. 395), which an `=` key ensures: it never
+  // matches a NULL. A NULL-equal key does match the NULL group, so `o.x = o.y` (or `o.x = o.x`)
+  // over two outer columns that only IS NOT DISTINCT FROM links to an inner column would let an
+  // outer row whose columns are NULL read that group, where the equality is NULL in SQL and the
+  // subquery sees no row. Kept, `c = c` leaves the NULL rows out of the aggregation.
   const auto substituted = [&equivalent](ColumnId id) {
     const auto it = equivalent.find(id);
     return it == equivalent.end() ? id : it->second;
   };
   for (const Equality& equality : equalities) {
-    if (substituted(equality.a) != substituted(equality.b)) {
+    if (substituted(equality.a) != substituted(equality.b) || null_equal.contains(equality.a) ||
+        null_equal.contains(equality.b)) {
       kept.push_back(equality.expr);
     }
   }
