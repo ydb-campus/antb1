@@ -265,6 +265,30 @@ SMALLINT
 2
 4
 
+# Two inner columns equal to one outer column: grouping by the first, the second must still equal it. Path 2 kept only
+# the first one's equality, so the subquery summed the trips of zones and drivers of different cities.
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE 500000 < (SELECT SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id JOIN drivers ON tr_driver = dv_id WHERE zn_city = c.ct_id AND dv_city = c.ct_id)
+----
+BIGINT
+0
+
+query II rowsort
+SELECT ct_id, ct_pop FROM cities WHERE 20000 < (SELECT SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id JOIN drivers ON tr_driver = dv_id WHERE zn_city = ct_id AND dv_city = ct_id AND tr_fare > 10)
+----
+SMALLINT	INTEGER
+1	120000
+2	45000
+3	30000
+4	NULL
+
+# The same with the outer column on the left of one equality and two outer columns of one row.
+query I nosort
+SELECT COUNT(*) FROM zones AS z WHERE 0 < (SELECT SUM(tr_row) FROM trips JOIN drivers ON tr_driver = dv_id WHERE z.zn_city = dv_city AND tr_pickup = z.zn_id AND tr_dropoff = z.zn_id)
+----
+BIGINT
+7
+
 # ---- DuckDB only until correlated COUNT gets a PR (ADR 0023: the COUNT bug) ----
 
 # COUNT over no rows is 0, so the riders without a trip pass: an inner join on the grouped trips would drop them.
