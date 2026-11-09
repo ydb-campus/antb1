@@ -1348,7 +1348,10 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   comparison (`WHERE`, `HAVING`, `CASE WHEN`; `x` a column, a key, an aggregate or an alias), `x + c <op> k`,
   `x - c <op> k`, `c - x <op> k` and `x * c <op> k` (a signed integer `x`, integer constants, `c` dividing `k` for
   `*`) compare `x` with a moved constant, repeatedly, while `k` and the new constant fit the type.
-  The arithmetic is then never computed. Divergence D14 lists what still differs.
+  The arithmetic is then never computed. A constant `c` is integer literals under `+`, `-`, `*` and unary minus, folded
+  in DuckDB's types (`2147483647 + 1` adds two INTEGERs); one that overflows its type is no constant, since DuckDB
+  leaves it unfolded, so neither rewrite applies and the expression is computed, failing on the first row that computes
+  it, as in DuckDB. Divergences D14 and D16 list what still differs.
 - Timestamps: microseconds since 1970-01-01 00:00:00, without a time zone, printed as DuckDB prints them
   (`2013-07-15 14:00:00`, a fraction without trailing zeros, `0001-12-31 (BC) 23:59:59` before year 1).
   `toDateTime` fails the query when `t * 1000` overflows its type or the time is outside DuckDB's TIMESTAMP range,

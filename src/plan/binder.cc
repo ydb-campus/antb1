@@ -2202,59 +2202,8 @@ Typed ColumnLeaf(ColumnId id, LogicalType type, std::string name, bool stored_as
               stored_as_float);
 }
 
-// The rank of an integer type among the signed ones (USMALLINT: none).
-
-// The type DuckDB computes two integer operands in (neither of them a literal that fits the
-
 bool IsSignedInteger(LogicalType t) {
   return t == LogicalType::kSmallInt || t == LogicalType::kInteger || t == LogicalType::kBigInt;
-}
-
-// The value of a constant integer expression (integer literals under + - * and unary -), as DuckDB
-// folds it; std::nullopt for anything else or on an overflow.
-std::optional<Int128> ConstantValue(const sql::Expr& expr) {
-  if (const auto* lit = std::get_if<sql::Literal>(&expr)) {
-    if (lit->kind != sql::Literal::Kind::kInteger || IsApproximateNumber(lit->text)) {
-      return std::nullopt;
-    }
-    const auto exact = ParseExactNumber(lit->text, lit->negative);
-    if (!exact.has_value() || exact->huge) {
-      return std::nullopt;
-    }
-    return exact->negative ? -exact->magnitude : exact->magnitude;
-  }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
-      unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
-    const auto v = ConstantValue(*unary->operand);
-    Int128 out = 0;
-    return v.has_value() && !__builtin_sub_overflow(Int128{0}, *v, &out) ? std::optional(out)
-                                                                         : std::nullopt;
-  }
-  const auto* binary = std::get_if<sql::BinaryExpr>(&expr);
-  if (binary == nullptr) {
-    return std::nullopt;
-  }
-  const auto l = ConstantValue(*binary->left);
-  const auto r = ConstantValue(*binary->right);
-  if (!l.has_value() || !r.has_value()) {
-    return std::nullopt;
-  }
-  Int128 out = 0;
-  bool overflow = true;
-  switch (binary->op) {
-    case sql::BinaryOp::kAdd:
-      overflow = __builtin_add_overflow(*l, *r, &out);
-      break;
-    case sql::BinaryOp::kSubtract:
-      overflow = __builtin_sub_overflow(*l, *r, &out);
-      break;
-    case sql::BinaryOp::kMultiply:
-      overflow = __builtin_mul_overflow(*l, *r, &out);
-      break;
-    default:
-      break;
-  }
-  return overflow ? std::nullopt : std::optional(out);
 }
 
 // A constant integer expression (integer literals under unary -, +, - and *) folded as DuckDB
@@ -2386,6 +2335,20 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
 
 bool IsConstantInteger(const sql::Expr& expr) {
   return !std::holds_alternative<sql::Literal>(expr) && FoldTyped(expr).has_value();
+}
+
+// The value of a constant integer expression (integer literals under + - * and unary -) as DuckDB
+// folds it, in its types (FoldTyped); std::nullopt for anything else, and for one that overflows
+// its type, which DuckDB leaves unfolded (or a HUGEINT beyond antb1's 38 digits, which no rewrite
+// takes): a rewrite that needs a constant (RewritableSum, MoveConstants) then leaves the expression
+// alone, and it is computed, failing on the first row that computes it, as in DuckDB -- which may
+// decide a row by another condition first (divergence D16) -- and answering over no rows.
+std::optional<Int128> ConstantValue(const sql::Expr& expr) {
+  const std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(expr);
+  if (!folded.has_value() || !folded->ok()) {
+    return std::nullopt;
+  }
+  return (*folded)->value;
 }
 
 // The double DuckDB divides when `expr` is a number it converts for a DOUBLE division: a constant
@@ -3301,7 +3264,8 @@ class Binder {
   };
 
   // DuckDB's sum rewriter, in a query without GROUP BY: SUM(other + c) (either order), c an integer
-  // constant (literals folded) and the sum and `other` of a signed integer type, is
+  // constant (literals folded in their types, ConstantValue: one that overflows is none) and the
+  // sum and `other` of a signed integer type, is
   // SUM(other) + c * COUNT(other), in HUGEINT: the addition is never computed, so it never
   // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
   // without its `+ constant` layers (they add no NULL), as DuckDB does. Not in a correlated block,
@@ -4148,7 +4112,8 @@ arrow::Status Binder::BindSelectList() {
 
 // DuckDB's constant moving in a comparison `operand <op> k` (WHERE, HAVING, CASE WHEN, in any
 // scope), k an integer literal: for a
-// signed integer operand x + c, c + x or x - c (c an integer constant, literals folded) the
+// signed integer operand x + c, c + x or x - c (c an integer constant, literals folded in their
+// types, ConstantValue: one that overflows is none) the
 // comparison becomes x <op> k - c (or k + c), for c - x it becomes x <mirrored op> c - k, and for
 // x * c (c not 0) x <op> k / c when c divides k (the op mirrored for a negative c), where a
 // non-dividing k makes = FALSE and <> IS NOT NULL. It repeats on x, and stops where k or the new
