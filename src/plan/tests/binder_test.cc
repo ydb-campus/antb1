@@ -3657,6 +3657,24 @@ TEST(BinderTest, SumOfAnIntegerPlusAConstantIsRewritten) {
   EXPECT_EQ(input.exprs[1]->name, "(d + 1)");
 }
 
+// The constant of the sum rewrite is folded in DuckDB's types: 2147483647 + 1 and 65536 * 32768
+// overflow INTEGER, which DuckDB leaves unfolded, so they are no constants, the SUM is not
+// rewritten and its addition is computed, failing on a row as in DuckDB. 2147483646 + 1 fits, and
+// is.
+TEST(BinderTest, AConstantThatOverflowsItsTypeIsNoneToTheSumRewrite) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view sql :
+       {"SELECT SUM(i32 + (2147483647 + 1)) FROM t", "SELECT SUM((2147483647 + 1) + i32) FROM t",
+        "SELECT SUM(i32 + 65536 * 32768) FROM t", "SELECT SUM(i32 + -(-2147483647 - 1)) FROM t"}) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_FALSE(Explain(*plan).contains("COUNT(")) << sql << "\n" << Explain(*plan);
+  }
+  auto fits = BindSql("SELECT SUM(i32 + (2147483646 + 1)) FROM t", catalog);
+  ASSERT_TRUE(fits.ok()) << fits.status().ToString();
+  EXPECT_TRUE(Explain(*fits).contains("COUNT(")) << Explain(*fits);
+}
+
 // GROUP BY an expression computes it below the aggregation; a select or ORDER BY expression equal
 // to a key is that key, others over keys and aggregates are computed above the aggregation, as are
 // HAVING and ORDER BY expressions.
@@ -4490,6 +4508,12 @@ TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
            Case{.where = "i16 + i32 > 0", .filter = "Filter \"(i16 + i32)\" > 0"},
            Case{.where = "i16 + 1 > 1e0", .filter = "Filter \"(i16 + 1)\" > 1"},
            Case{.where = "i16 * 2 <= 4", .filter = "Filter i16 <= 2"},
+           // A constant folded in DuckDB's types moves; one that overflows its type is none.
+           Case{.where = "i32 + (2147483646 + 1) > 5", .filter = "Filter i32 > -2147483642"},
+           Case{.where = "i32 + (2147483647 + 1) > 5",
+                .filter = "Filter \"(i32 + (2147483647 + 1))\" > 5"},
+           Case{.where = "i32 + 65536 * 32768 > 5",
+                .filter = "Filter \"(i32 + (65536 * 32768))\" > 5"},
        }) {
     const std::string sql = "SELECT COUNT(*) FROM t WHERE " + std::string(c.where);
     auto plan = BindSql(sql, catalog);
@@ -4599,6 +4623,12 @@ TEST(BinderTest, HavingMovesConstantsLikeDuckDb) {
         << "no addition computed: " << c.sql << "\n"
         << explain;
   }
+  // A constant that overflows its type is none (ConstantValue), so the operand is computed.
+  auto overflowing =
+      BindSql("SELECT i16 FROM t GROUP BY i16 HAVING i16 + (2147483647 + 1) > 5", catalog);
+  ASSERT_TRUE(overflowing.ok()) << overflowing.status().ToString();
+  EXPECT_TRUE(Explain(*overflowing).contains("Filter \"(i16 + (2147483647 + 1))\" > 5\n"))
+      << Explain(*overflowing);
 }
 
 // The sum rewrite follows DuckDB: only without GROUP BY, for SUM(other + c) whatever `other` is

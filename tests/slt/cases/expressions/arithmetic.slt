@@ -124,6 +124,60 @@ SELECT SUM(i32 + 2147483647) FROM edge
 HUGEINT
 21474890790
 
+# The constant is folded in DuckDB's types: 2147483646 + 1 fits INTEGER, so the SUM is rewritten as above, while
+# 2147483647 + 1 and 65536 * 32768 overflow it and are left unfolded, so they are computed and fail, as in DuckDB,
+# and the rewrites of SUM and of a comparison do not apply. Over no rows nothing is computed.
+query I nosort
+SELECT SUM(i32 + (2147483646 + 1)) FROM edge
+----
+HUGEINT
+21474890790
+
+statement error Overflow in addition
+SELECT SUM(i32 + (2147483647 + 1)) FROM edge
+
+statement error Overflow in multiplication
+SELECT SUM(i32 + 65536 * 32768) FROM edge
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + (2147483646 + 1) > 5
+----
+BIGINT
+9
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + (2147483647 + 1) > 5
+
+statement error Overflow in addition
+SELECT SUM(CASE WHEN i32 + (2147483647 + 1) > 5 THEN 1 ELSE 0 END) FROM edge
+
+statement error Overflow in addition
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 + (2147483647 + 1) > 5
+
+statement error Overflow in addition
+SELECT i16 FROM edge GROUP BY i16 HAVING MIN(i32) + (2147483647 + 1) > 5
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i64 + (9223372036854775807 + 1) > 5
+
+statement error Overflow in subtraction
+SELECT SUM(i32 + (-2147483647 - 2)) FROM edge
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE (2147483647 + 1) - i32 > 5
+
+query I nosort
+SELECT COUNT(*) FROM empty WHERE RegionID + (2147483647 + 1) > 5
+----
+BIGINT
+0
+
+query I nosort
+SELECT SUM(RegionID + (2147483647 + 1)) FROM empty
+----
+HUGEINT
+NULL
+
 # Expressions in WHERE, GROUP BY, HAVING and ORDER BY.
 query II rowsort
 SELECT id, i16 FROM edge WHERE i16 + 1 > 5 AND i16 < 32767
