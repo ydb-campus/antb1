@@ -63,7 +63,9 @@ struct Literal {
   // kNull: NULL, only as a whole CASE value (THEN NULL; ELSE NULL END is a CASE without ELSE).
   enum class Kind : std::uint8_t { kInteger, kDecimal, kString, kDate, kTimestamp, kNull };
   Kind kind = Kind::kInteger;
-  bool negative = false;  // leading '-' (integers/decimals only)
+  // Integers and decimals: the number is negated, by a '-' before it or by the unary minuses over
+  // it, through parentheses, which the parser folds into it as DuckDB's parser does (-(-(1)) is 1).
+  bool negative = false;
   std::string
       text;  // number as written without the sign / unescaped string, date or timestamp text
   SourceSpan span;

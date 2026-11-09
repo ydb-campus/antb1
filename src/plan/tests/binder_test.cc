@@ -85,6 +85,23 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t ORDER BY 2", kBind, "2",
                   "ORDER BY position 2 is not between 1 and 1"},
         ErrorCase{"SELECT i16 FROM t ORDER BY -1", kBind, "-1", "ORDER BY position -1"},
+        // A minus over a number is part of the literal, as DuckDB's parser folds it: each is the
+        // error of the literal spelling, and one at the number spans from the minus to the number,
+        // as a negation's did.
+        ErrorCase{"SELECT i16 FROM t ORDER BY -(1)", kBind, "-(1",
+                  "ORDER BY position -1 is not between 1 and 1"},
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY -(-2)", kBind, "-(-2",
+                  "GROUP BY cannot refer to the aggregate at position 2"},
+        ErrorCase{"SELECT -(1e3) FROM t", kUnsupported, "-(1e3",
+                  "a number with an exponent or more than 38 digits as a constant"},
+        ErrorCase{"SELECT CAST(-(1e3) AS INTEGER) FROM t", kUnsupported, "CAST(-(1e3) AS INTEGER)",
+                  "CAST of the number -1e3 to INTEGER is not supported"},
+        ErrorCase{"SELECT CAST(- -1e3 AS INTEGER) FROM t", kUnsupported, "CAST(- -1e3 AS INTEGER)",
+                  "CAST of the number 1e3 to INTEGER is not supported"},
+        ErrorCase{"SELECT SUM(-(1)) FROM t", kUnsupported, "-(1",
+                  "constant aggregate arguments are not supported"},
+        ErrorCase{"SELECT -(1) AS k, COUNT(*) FROM t GROUP BY i16 HAVING k < 0", kUnsupported, "k",
+                  "HAVING on a constant select item is not supported"},
         ErrorCase{"SELECT i16 FROM t ORDER BY 'x'", kBind, "'x'",
                   "ORDER BY a non-integer literal orders nothing"},
         ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY 0", kBind, "0",
@@ -1837,6 +1854,12 @@ TEST(BinderTest, QuotientsOfNumbersFoldIntoDoubles) {
            // BIGINT converts as a HUGEINT.
            {"SELECT i32 FROM t WHERE d = -(9223372036854776833) / 1",
             "Filter d = -9223372036854775808"},
+           // A minus over a decimal is part of the literal, converted with its sign: DuckDB's
+           // formula for a DECIMAL of more than 18 digits is not symmetric in it.
+           {"SELECT i32 FROM t WHERE d > -(000009007199254740994.) / 1",
+            "Filter d > -9007199254740992"},
+           {"SELECT i32 FROM t WHERE d > 000009007199254740994. / 1",
+            "Filter d > 9007199254740994"},
            {"SELECT i32 FROM t WHERE d = (-18014398509481987 + 0 * 100000000000000000000) / 1",
             "Filter d = -18014398509481984"},
        })) {
@@ -3261,6 +3284,17 @@ TEST(BinderTest, ArithmeticTypesAndNamesLikeDuckDb) {
            Case{.expr = "-(i16 + 1) * 2",
                 .type = LogicalType::kSmallInt,
                 .name = "(-((i16 + 1)) * 2)"},
+           // A minus over a number is part of the literal, which takes the other operand's type; a
+           // cast binds tighter, so a minus over one is an operation of the cast's type.
+           Case{.expr = "i16 + -(1)", .type = LogicalType::kSmallInt, .name = "(i16 + -1)"},
+           Case{.expr = "i16 * - -2", .type = LogicalType::kSmallInt, .name = "(i16 * 2)"},
+           Case{.expr = "i16 - -(-(3))", .type = LogicalType::kSmallInt, .name = "(i16 - 3)"},
+           Case{.expr = "i16 + -(1)::INTEGER",
+                .type = LogicalType::kInteger,
+                .name = "(i16 + -(CAST(1 AS INTEGER)))"},
+           Case{.expr = "-(-(1))::SMALLINT",
+                .type = LogicalType::kSmallInt,
+                .name = "-(CAST(-1 AS SMALLINT))"},
            Case{.expr = "1 + 2", .type = LogicalType::kInteger, .name = "(1 + 2)"},
            Case{.expr = "SUM(i16) + 1", .type = LogicalType::kHugeInt, .name = "(sum(i16) + 1)"},
            Case{.expr = "\"Mixed Case\" + 007",
@@ -3361,7 +3395,7 @@ TEST(BinderTest, DecimalLiteralsAndDivisionTypesLikeDuckDb) {
            Case{.expr = "b * 1.5", .type = dec(21, 1), .name = "(b * 1.5)"},
            Case{.expr = "1.5 + 2", .type = dec(12, 1), .name = "(1.5 + 2)"},
            Case{.expr = "1.5 * 2.25", .type = dec(5, 3), .name = "(1.5 * 2.25)"},
-           Case{.expr = "-(1.5)", .type = dec(2, 1), .name = "-(1.5)"},
+           Case{.expr = "-(1.5)", .type = dec(2, 1), .name = "-1.5"},
            Case{.expr = "p + 0.5", .type = dec(16, 2), .name = "(p + 0.5)"},
            Case{.expr = "p * 1.5", .type = dec(17, 3), .name = "(p * 1.5)"},
            Case{.expr = "e + 0.00005", .type = dec(18, 8), .name = "(e + 0.00005)"},
@@ -3537,7 +3571,7 @@ TEST(BinderTest, DecimalCaseValuesFoldLikeDuckDb) {
 // Without a DECIMAL value antb1 types the CASE as before (divergence D20): the values that are no
 // literals first, then each integer literal takes their type when it fits; DuckDB folds from the
 // ELSE through the THENs, where a literal next to NULL (the first THEN without an ELSE) or another
-// literal becomes its own type, `-(7)` is a literal, and such a string literal is VARCHAR.
+// literal becomes its own type, and such a string literal is VARCHAR.
 TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
   const Catalog catalog = MakeCatalog();
   struct Case {
@@ -3545,17 +3579,19 @@ TEST(BinderTest, CaseTypesWithoutADecimalAreAntb1s) {
     LogicalType type;
   };
   for (const Case& c : {
-           // DuckDB: INTEGER, INTEGER, SMALLINT and a bind error (VARCHAR and DATE).
+           // DuckDB: INTEGER, INTEGER and a bind error (VARCHAR and DATE).
            Case{.expr = "CASE WHEN i32 = 1 THEN 7 WHEN i32 = 2 THEN i16 END",
                 .type = LogicalType::kSmallInt},
            Case{.expr = "CASE WHEN i32 = 1 THEN 8 WHEN i32 = 2 THEN i16 ELSE 7 END",
                 .type = LogicalType::kSmallInt},
-           Case{.expr = "CASE WHEN i32 = 1 THEN -(7) ELSE i16 END", .type = LogicalType::kInteger},
            Case{.expr = "CASE WHEN i32 = 1 THEN '2020-01-01' WHEN i32 = 2 THEN dt END",
                 .type = LogicalType::kDate},
            // DuckDB: INTEGER, its 7 next to the THEN NULL.
            Case{.expr = "CASE WHEN i32 = 1 THEN NULL WHEN i32 = 2 THEN i16 ELSE 7 END",
                 .type = LogicalType::kSmallInt},
+           // As DuckDB: -(7) is the literal -7 (the parser folds the minus into it), which takes
+           // the type of i16.
+           Case{.expr = "CASE WHEN i32 = 1 THEN -(7) ELSE i16 END", .type = LogicalType::kSmallInt},
        }) {
     const std::string sql = "SELECT " + std::string(c.expr) + " FROM t";
     auto plan = BindSql(sql, catalog);
@@ -5495,6 +5531,30 @@ TEST(BinderTest, ConstantsAndPositions) {
   EXPECT_EQ(out[5].name, "0");
   EXPECT_EQ(out[5].type, LogicalType::kInteger);
 
+  // A minus over a number is part of the literal, through parentheses and other minuses, as
+  // DuckDB's parser folds it: named and typed by the literal's value.
+  auto folded = BindSql(
+      "SELECT -(1), - -1, -(-(1)), -(-9223372036854775808), - -2147483648, -(1.5), -(0) "
+      "FROM t",
+      catalog);
+  ASSERT_TRUE(folded.ok()) << folded.status().ToString();
+  const auto& negated = folded->output;
+  ASSERT_EQ(negated.size(), 7U);
+  for (std::size_t i = 0;
+       const auto& [name, type] : std::to_array<std::pair<std::string_view, LogicalType>>({
+           {"-1", LogicalType::kInteger},
+           {"1", LogicalType::kInteger},
+           {"1", LogicalType::kInteger},
+           {"9223372036854775808", LogicalType::kHugeInt},
+           {"2147483648", LogicalType::kBigInt},
+           {"-1.5", LogicalType::Decimal(2, 1)},
+           {"0", LogicalType::kInteger},
+       })) {
+    EXPECT_EQ(negated[i].name, name) << i;
+    EXPECT_EQ(negated[i].type, type) << i;
+    ++i;
+  }
+
   auto grouped = BindSql("SELECT 7, s, COUNT(*) FROM t GROUP BY 1, 2 ORDER BY 3 DESC", catalog);
   ASSERT_TRUE(grouped.ok()) << grouped.status().ToString();
   const auto& group = std::get<GroupAggregateNode>(Nth(*grouped, 2));
@@ -5514,6 +5574,46 @@ TEST(BinderTest, ConstantsAndPositions) {
   ASSERT_TRUE(ordered_global.ok()) << ordered_global.status().ToString();
   EXPECT_TRUE(std::holds_alternative<AggregateNode>(Nth(*ordered_global, 1)))
       << "an ORDER BY aggregate makes one row";
+}
+
+// A minus over a number is part of the literal (the parser folds it, as DuckDB's parser does,
+// through parentheses and other minuses): a query binds to the plan, names and types of the same
+// query with the literal written, in every clause.
+TEST(BinderTest, AMinusOverANumberBindsAsTheLiteral) {
+  const Catalog catalog = MakeCatalog();
+  for (const auto& [folded, literal] :
+       std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"SELECT -(1), - -1, -(-(1)), -((2)), -(1.5), -(-9223372036854775808) FROM t",
+            "SELECT -1, 1, 1, -2, -1.5, 9223372036854775808 FROM t"},
+           {"SELECT i16 + -(1), i16 * - -2, i32 - -(-(3)), i64 // -(2), -(1.5) / 3 FROM t",
+            "SELECT i16 + -1, i16 * 2, i32 - 3, i64 // -2, -1.5 / 3 FROM t"},
+           {"SELECT CASE WHEN i32 = 1 THEN -(7) WHEN i32 = 2 THEN - -8 ELSE i16 END FROM t",
+            "SELECT CASE WHEN i32 = 1 THEN -7 WHEN i32 = 2 THEN 8 ELSE i16 END FROM t"},
+           {"SELECT i32 FROM t WHERE i16 + -(1) > -(-(2)) AND i64 BETWEEN -(5) AND - -5 "
+            "AND i32 IN (-(1), - -2) AND d < -(1.5) / 3",
+            "SELECT i32 FROM t WHERE i16 + -1 > 2 AND i64 BETWEEN -5 AND 5 AND i32 IN (-1, 2) "
+            "AND d < -1.5 / 3"},
+           {"SELECT COUNT(*) FROM dec WHERE p > -(1.5) AND p IN (-(2.5), 3.0)",
+            "SELECT COUNT(*) FROM dec WHERE p > -1.5 AND p IN (-2.5, 3.0)"},
+           {"SELECT i16, s, COUNT(*) FROM t GROUP BY -(-1), - -2 HAVING COUNT(*) > -(-(1)) "
+            "ORDER BY -(-3) DESC, - -1",
+            "SELECT i16, s, COUNT(*) FROM t GROUP BY 1, 2 HAVING COUNT(*) > 1 ORDER BY 3 DESC, 1"},
+           {"SELECT SUM(i32 + -(1)), SUM(i16 * - -2) FROM t",
+            "SELECT SUM(i32 + -1), SUM(i16 * 2) FROM t"},
+           {"SELECT COUNT(*) FROM t JOIN ok ON t.i16 = ok.i16 + -(1) WHERE t.i32 > - -3",
+            "SELECT COUNT(*) FROM t JOIN ok ON t.i16 = ok.i16 + -1 WHERE t.i32 > 3"},
+       })) {
+    auto a = BindSql(folded, catalog);
+    auto b = BindSql(literal, catalog);
+    ASSERT_TRUE(a.ok()) << folded << ": " << a.status().ToString();
+    ASSERT_TRUE(b.ok()) << literal << ": " << b.status().ToString();
+    EXPECT_EQ(Explain(*a), Explain(*b)) << folded;
+    ASSERT_EQ(a->output.size(), b->output.size()) << folded;
+    for (std::size_t i = 0; i < a->output.size(); ++i) {
+      EXPECT_EQ(a->output[i].name, b->output[i].name) << folded;
+      EXPECT_EQ(a->output[i].type, b->output[i].type) << folded;
+    }
+  }
 }
 
 // CAST('YYYY-MM-DD' AS DATE) and 'YYYY-MM-DD'::DATE are the DATE literal, as in DuckDB, which names

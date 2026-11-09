@@ -101,6 +101,29 @@ INTEGER	BIGINT
 -2	32767
 0	1
 
+# A minus over a number is part of the literal, through parentheses and other minuses, as DuckDB's parser folds it, so
+# it takes the other operand's type: i16 + -(1) is SMALLINT, and overflows where i16 + -1 does. A cast makes a value of
+# its type: i16 + -(1)::INTEGER is an INTEGER addition, which does not overflow there.
+query IIIII rowsort
+SELECT id, i16 + -(1), i16 * - -2, i16 - -(-(3)), i16 + -(1)::INTEGER FROM edge WHERE id IN (2, 3, 4, 6, 7, 11)
+----
+INTEGER	SMALLINT	SMALLINT	SMALLINT	INTEGER
+11	6	14	4	6
+2	-1	0	-3	-1
+3	-2	-2	-4	-2
+4	0	2	-2	0
+6	99	200	97	99
+7	-101	-200	-103	-101
+
+statement error
+SELECT i16 + -(1) FROM edge WHERE id = 0
+
+query I nosort
+SELECT i16 + -(1)::INTEGER FROM edge WHERE id = 0
+----
+INTEGER
+-32769
+
 # Overflows are errors in both engines.
 statement error
 SELECT i16 + 1 FROM edge

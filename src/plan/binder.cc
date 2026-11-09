@@ -2273,24 +2273,9 @@ std::optional<arrow::Result<TypedConstant>> FoldTyped(const sql::Expr& expr) {
   };
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
-    // DuckDB folds the minuses of a literal into the literal while parsing, so
-    // -(-9223372036854775808) is the HUGEINT literal 9223372036854775808, not an overflowing
-    // negation, and -(-(-9223372036854775808)) is a BIGINT.
-    bool flip = true;
-    const sql::Expr* operand = &*unary->operand;
-    for (const auto* inner = std::get_if<sql::UnaryExpr>(operand);
-         inner != nullptr && inner->op == sql::UnaryOp::kNegate;
-         inner = std::get_if<sql::UnaryExpr>(operand)) {
-      flip = !flip;
-      operand = &*inner->operand;
-    }
-    if (const auto* lit = std::get_if<sql::Literal>(operand);
-        lit != nullptr && lit->kind == sql::Literal::Kind::kInteger) {
-      sql::Literal negated = *lit;
-      negated.negative = flip != lit->negative;
-      negated.span = unary->span;
-      return FoldTyped(sql::Expr(std::move(negated)));
-    }
+    // A minus over an operation, -(1 + 2). One over a number is part of the literal (the parser
+    // folds it, as DuckDB's parser does), so -(-9223372036854775808) is the HUGEINT literal
+    // 9223372036854775808, not an overflowing negation.
     auto inner = FoldTyped(*unary->operand);
     if (!inner.has_value() || !inner->ok()) {
       return inner;
@@ -2358,8 +2343,9 @@ std::optional<Int128> IntegerConstant(const Expr& expr) {
 // The double DuckDB divides when `expr` is a number it converts for a DOUBLE division: a constant
 // integer expression (a literal, negated or not, included) converted by the type DuckDB gives it --
 // an INTEGER or a BIGINT to the nearest double, a HUGEINT by DuckDB's two's-complement formula
-// (DuckDbHugeintToDouble) -- or a decimal or exponent literal, negated or not, as DuckDbDoubleOf
-// converts it (symmetric in its sign). std::nullopt for anything else.
+// (DuckDbHugeintToDouble) -- or a decimal or exponent literal, its sign included, as DuckDbDoubleOf
+// converts it: a DECIMAL of more than 18 digits by that formula, which is not symmetric in the
+// sign (-(000009007199254740994.) is -9007199254740992). std::nullopt for anything else.
 std::optional<double> DivisionOperand(const sql::Expr& expr) {
   if (std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(expr); folded.has_value()) {
     if (!folded->ok()) {
@@ -2375,12 +2361,6 @@ std::optional<double> DivisionOperand(const sql::Expr& expr) {
       lit != nullptr &&
       (lit->kind == sql::Literal::Kind::kInteger || lit->kind == sql::Literal::Kind::kDecimal)) {
     return DuckDbDoubleOf(lit->text, lit->negative);
-  }
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
-      unary != nullptr && unary->op == sql::UnaryOp::kNegate) {
-    if (const std::optional<double> inner = DivisionOperand(*unary->operand)) {
-      return -*inner;
-    }
   }
   return std::nullopt;
 }
@@ -4247,15 +4227,12 @@ MoveStep MoveStepOf(ArithOp arith, Int128 c, bool constant_right, Int128 k, sql:
   return MoveStep{.kind = MoveStep::Kind::kMove, .k = moved, .op = next};
 }
 
-// Whether `expr` is an integer literal as DuckDB's parser writes one: a literal, or a minus over
-// one, through parentheses -- its parser folds -(1) into the literal -1.
+// Whether `expr` is an integer literal, the minuses over it included: the parser folds -(1) into
+// the literal -1, as DuckDB's parser does.
 bool IsIntegerLiteral(const sql::Expr& expr) {
-  if (const auto* literal = std::get_if<sql::Literal>(&expr)) {
-    return literal->kind == sql::Literal::Kind::kInteger && !IsApproximateNumber(literal->text);
-  }
-  const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
-  return unary != nullptr && unary->op == sql::UnaryOp::kNegate &&
-         IsIntegerLiteral(*unary->operand);
+  const auto* literal = std::get_if<sql::Literal>(&expr);
+  return literal != nullptr && literal->kind == sql::Literal::Kind::kInteger &&
+         !IsApproximateNumber(literal->text);
 }
 
 // Whether DuckDB's comparison simplification drops the cast from `from` to `to` of a comparison
@@ -4376,10 +4353,10 @@ std::optional<LogicalType> BetweenType(const sql::BetweenExpr& between, const Bi
 // compare in a wider type: that of a constant expression (`2147483648 - 1`, a BIGINT, against an
 // INTEGER chain), or the one a BETWEEN compares all three values in, for both its comparisons
 // (`folded_type`). Constants then move off the chain as written, for as long as the one met is a
-// literal of its operation's own type -- an INTEGER literal in an INTEGER chain, a minus over one
-// included; a literal of another type, a cast or a constant expression is one DuckDB has not folded
-// yet -- and stop at a GROUP BY key, an aggregate or an alias, a column of the output scope. The
-// passes follow: so x + 2147483647 + 1 > 2147483648 - 1 is x > -1.
+// literal of its operation's own type -- an INTEGER literal in an INTEGER chain, -(1) included,
+// which is a literal; a literal of another type, a cast or a constant expression is one DuckDB has
+// not folded yet -- and stop at a GROUP BY key, an aggregate or an alias, a column of the output
+// scope. The passes follow: so x + 2147483647 + 1 > 2147483648 - 1 is x > -1.
 //
 // std::nullopt: nothing to change, the operand as it is written; otherwise the bound operand to
 // compare with the new k, or the outcome that decides the comparison over it.
@@ -4688,9 +4665,8 @@ struct Binder::BindConditionOf {
       }
     }
     // A constant integer expression on a side (1 + 2) as the literal of its value, which then
-    // folds as any literal; one that overflows its type is a bind error. One that is no literal
-    // (a minus over one is, as DuckDB's parser writes it) is of its own type, which DuckDB casts
-    // the operand to (MoveConstants).
+    // folds as any literal; one that overflows its type is a bind error. Being no literal, it is
+    // of its own type, which DuckDB casts the operand to (MoveConstants).
     for (const bool left : {true, false}) {
       const sql::Expr& side = left ? *binary.left : *binary.right;
       if (std::holds_alternative<sql::Literal>(side) || !IsFoldableConstant(side)) {
@@ -4700,8 +4676,7 @@ struct Binder::BindConditionOf {
       sql::BinaryExpr literal = binary;
       (left ? literal.left : literal.right) = sql::Box<sql::Expr>(sql::Expr(std::move(folded)));
       BindConditionOf typed = *this;
-      if (const auto constant = FoldTyped(side);
-          !IsIntegerLiteral(side) && constant.has_value() && constant->ok()) {
+      if (const auto constant = FoldTyped(side); constant.has_value() && constant->ok()) {
         typed.folded_type = CommonValueType(typed.folded_type, (*constant)->type);
       }
       return typed(literal);
@@ -5156,19 +5131,10 @@ bool IsStringLiteral(const sql::Expr& expr) {
   return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
 }
 
-// An integer literal as DuckDB's CASE typing sees one: plain, parenthesized or under unary minus
-// (DuckDB folds every minus of a literal into it), with its value and its type by value (INTEGER,
-// BIGINT or HUGEINT); `1 + 1` and `7 + 0` are none.
+// An integer literal as DuckDB's CASE typing sees one (IsIntegerLiteral: -(7) is one), with its
+// value and its type by value (INTEGER, BIGINT or HUGEINT); `1 + 1` and `7 + 0` are none.
 std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
-  const sql::Expr* inner = &expr;
-  for (const auto* unary = std::get_if<sql::UnaryExpr>(inner);
-       unary != nullptr && unary->op == sql::UnaryOp::kNegate;
-       unary = std::get_if<sql::UnaryExpr>(inner)) {
-    inner = &*unary->operand;
-  }
-  const auto* lit = std::get_if<sql::Literal>(inner);
-  if (lit == nullptr || lit->kind != sql::Literal::Kind::kInteger ||
-      IsApproximateNumber(lit->text)) {
+  if (!IsIntegerLiteral(expr)) {
     return std::nullopt;
   }
   auto folded = FoldTyped(expr);

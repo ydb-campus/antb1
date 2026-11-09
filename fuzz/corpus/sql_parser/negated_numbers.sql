@@ -1,0 +1,1 @@
+SELECT -(1), - -2.5, -(-(1e3)), -((7))::INT, -(a), -(1 + 2) FROM t WHERE b > -(-(-1)) AND c IN (-(1), 2) AND d BETWEEN -(5) AND - -5 ORDER BY -(-1)

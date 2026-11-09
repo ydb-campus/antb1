@@ -190,3 +190,27 @@ HUGEINT
 
 statement error
 SELECT CAST(d9_2 AS SMALLINT) FROM decimals
+
+# Casts of numbers written with minuses, in the cast's type.
+query IIID nosort
+SELECT CAST(-(1.5) AS INTEGER), -(2.5)::INTEGER, CAST(- -2 AS BIGINT), CAST(-(2.50) AS DECIMAL(9, 2)) FROM edge WHERE id = 0
+----
+INTEGER	INTEGER	BIGINT	DECIMAL(9,2)
+-2	-3	2	-2.50
+
+# A cast binds tighter than a minus: -(0)::DOUBLE negates CAST(0 AS DOUBLE), the DOUBLE -0, which a division tells
+# from CAST(-(0) AS DOUBLE), the cast of the literal -0 (the integer 0), by the sign of its infinities. Two records:
+# DuckDB 1.5.6 computes d / -0.0 and d / 0.0 of one select list once, as if they were one expression.
+query IR rowsort
+SELECT id, d / -(0)::DOUBLE FROM edge WHERE id IN (1, 7)
+----
+INTEGER	DOUBLE
+1	-inf
+7	inf
+
+query IR rowsort
+SELECT id, d / CAST(-(0) AS DOUBLE) FROM edge WHERE id IN (1, 7)
+----
+INTEGER	DOUBLE
+1	inf
+7	-inf

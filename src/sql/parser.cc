@@ -54,10 +54,13 @@
 //   agg_call    := COUNT '(' '*' ')' | COUNT '(' DISTINCT expr ')'
 //                | (COUNT | SUM | AVG | MIN | MAX) '(' expr ')'
 //   literal     := ['-'] integer | ['-'] decimal | string_literal | (DATE | TIMESTAMP)
-//                  string_literal          ('-' joins the number only when no '::' follows it)
+//                  string_literal          ('-' joins the number only when no '::' follows it; a
+//                  unary minus over a number, through parentheses and other minuses, joins it too:
+//                  -(1) is the literal -1, as in DuckDB's parser)
 //   type        := name ['(' integer (',' integer)* ')']
 //
-// The parser keeps expressions as written; what the engine answers is the binder's decision. The
+// The parser keeps expressions as written (but a minus over a number, which it folds into the
+// literal, as DuckDB's parser does); what the engine answers is the binder's decision. The
 // FROM list is flat (ADR 0022): each item records its connector to the items before it, and the
 // list is collected in a loop, and so are a compound's blocks (ADR 0036), whose ORDER BY, LIMIT and
 // OFFSET follow the last block and are the compound's own. The ON, WHERE and HAVING predicates are
@@ -66,8 +69,10 @@
 // aggregate-placement contexts, built on the heap; it ends at its ')'. Recursion is bounded: every
 // level of an expression tree (but that chain) counts against kMaxDepth, and so do the levels that
 // the canonical form of a cast, a unary minus or a NOT operand adds (ToSql writes x::T as CAST(x AS
-// T), -x as -(x) and a = NOT b as a = (NOT b)), and every nested query, one level below the clauses
-// around it; a predicate with a top-level OR is written bare, so it reads back as it was parsed.
+// T), -x as -(x) and a = NOT b as a = (NOT b); a minus folded into a number adds no such level, but
+// its operand is parsed one level down, as a parenthesized one is), and every nested query, one
+// level below the clauses around it; a predicate with a top-level OR is written bare, so it reads
+// back as it was parsed.
 // Tokens are pulled lazily from the lexer (at most three tokens of lookahead), so work and memory
 // stop at the first error whatever the input. Recognized SQL outside the grammar yields
 // kUnsupported at its first offending token and names the construct; anything else yields kSyntax.
@@ -1751,6 +1756,19 @@ class Parser {
       auto operand = ParseExpr(context, kUnaryPrecedence);
       minus_operand_ = false;
       if (!operand) {
+        return operand;
+      }
+      // A minus over a number is part of it, as in DuckDB's parser (PostgreSQL's doNegate),
+      // through parentheses and other minuses: -(1) is the literal -1, - -1 and -(-(1)) the literal
+      // 1. Its canonical form is the literal, so ToSql adds no level for it: only the level its
+      // operand was parsed at counts, as a parenthesis does. It spans from this minus to the
+      // number, as the negation did. A cast binds tighter, so -(1)::INT stays a negation of it.
+      if (auto* number = std::get_if<Literal>(&*operand);
+          number != nullptr &&
+          (number->kind == Literal::Kind::kInteger || number->kind == Literal::Kind::kDecimal)) {
+        number->negative = !number->negative;
+        number->span = Cover(op, number->span);
+        peak_ = std::max(outer_peak, peak_);
         return operand;
       }
       // ToSql writes -(operand): one level more, unless the operand is written in parentheses

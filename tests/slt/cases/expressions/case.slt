@@ -31,6 +31,19 @@ SMALLINT	SMALLINT
 32767	0
 7	2100
 
+# -(7) is the literal -7 (a minus over a number is part of it, as DuckDB's parser folds it), which takes the type of the
+# other values as any integer literal does.
+query II rowsort
+SELECT id, CASE WHEN id < 3 THEN -(7) WHEN id < 4 THEN - -8 ELSE i16 END FROM edge WHERE id < 6
+----
+INTEGER	SMALLINT
+0	-7
+1	-7
+2	-7
+3	8
+4	1
+5	NULL
+
 query II rowsort
 SELECT i16, CASE WHEN i16 >= -100 AND i16 <= 100 THEN 1 END FROM edge
 ----

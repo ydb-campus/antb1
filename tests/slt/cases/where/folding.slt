@@ -380,3 +380,18 @@ SELECT COUNT(*) FROM decimals WHERE d18_4 < -(10) / 4.0
 ----
 BIGINT
 11
+
+# A minus over a decimal is part of the literal, which DuckDB converts with its sign: a DECIMAL of more than 18 digits by
+# a formula that is not symmetric in it, so -(000009007199254740994.) / 1 is -9007199254740992.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE d > -(000009007199254740994.) / 1
+----
+BIGINT
+9
+
+# A minus over a number is part of the literal (DuckDB's parser folds it), which then folds as any literal.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i16 < -(-32767) AND i16 > -(32768.5) AND i16 <> - -12345
+----
+BIGINT
+8

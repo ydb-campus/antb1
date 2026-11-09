@@ -85,6 +85,9 @@ struct Counts {
   std::size_t numbers = 0;
   std::size_t casts = 0;  // CAST( / TRY_CAST( or '::'
   std::size_t dots = 0;   // '.' of a qualified name
+  // The integer and decimal literals, whose minuses -- one before the number, or any the parser
+  // folded into it through parentheses -- are counted from the tokens of their spans.
+  std::vector<const Literal*> number_literals;
 };
 
 std::size_t Separators(std::size_t n) { return n == 0 ? 0U : n - 1; }
@@ -118,8 +121,10 @@ struct CountOf {
     if (lit.kind == Literal::Kind::kNull) {
       return;  // THEN NULL: a keyword, which counts nothing
     }
-    c.minuses += lit.negative ? 1U : 0U;
     const bool numeric = lit.kind == Literal::Kind::kInteger || lit.kind == Literal::Kind::kDecimal;
+    if (numeric) {
+      c.number_literals.push_back(&lit);
+    }
     (numeric ? c.numbers : c.strings) += 1;
   }
   void operator()(const AggregateCall& agg) const {
@@ -291,6 +296,11 @@ void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts&
   }
 }
 
+// Whether `inner` lies within `outer`.
+bool Within(SourceSpan inner, SourceSpan outer) {
+  return inner.offset >= outer.offset && inner.offset + inner.length <= outer.offset + outer.length;
+}
+
 // Token counts of an accepted query must match what its AST explains; a token the parser skipped
 // (a silent misparse such as an operator read as an alias) breaks one of the equalities.
 // Parentheses that only group are not in the AST: they come in pairs, on top of the explained ones.
@@ -375,6 +385,29 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
   Counts want;
   CountStatement(stmt, sql, want);
   const std::string context = testing::PrintToString(sql);
+  // A number's minuses are the '-' tokens of its span, before the number, among only '(': as many
+  // as flip it to its sign.
+  for (const Literal* number : want.number_literals) {
+    std::vector<const Token*> inside;
+    for (const Token& token : *tokens) {
+      if (token.kind != TokenKind::kEnd && Within(token.span, number->span)) {
+        inside.push_back(&token);
+      }
+    }
+    ASSERT_FALSE(inside.empty()) << context;
+    const Token& digits = *inside.back();
+    ASSERT_TRUE(digits.kind == TokenKind::kInteger || digits.kind == TokenKind::kDecimal)
+        << context;
+    EXPECT_EQ(digits.text, number->text) << context;
+    std::size_t minuses = 0;
+    for (std::size_t i = 0; i + 1 < inside.size(); ++i) {
+      ASSERT_TRUE(inside[i]->kind == TokenKind::kMinus || inside[i]->kind == TokenKind::kLeftParen)
+          << context;
+      minuses += inside[i]->kind == TokenKind::kMinus ? 1U : 0U;
+    }
+    EXPECT_EQ(minuses % 2 == 1, number->negative) << context;
+    want.minuses += minuses;
+  }
   EXPECT_EQ(seen.commas, want.commas) << context;
   EXPECT_EQ(seen.and_count, want.and_count) << context;
   EXPECT_EQ(seen.or_count, want.or_count) << context;
@@ -482,11 +515,6 @@ std::string UpperText(const std::string& sql, SourceSpan span) {
 // Whether `span` is a non-empty span in parentheses: its first byte '(' and its last ')'.
 bool Parenthesized(const std::string& sql, SourceSpan span) {
   return span.length >= 2 && sql[span.offset] == '(' && sql[span.offset + span.length - 1] == ')';
-}
-
-// Whether `inner` lies within `outer`.
-bool Within(SourceSpan inner, SourceSpan outer) {
-  return inner.offset >= outer.offset && inner.offset + inner.length <= outer.offset + outer.length;
 }
 
 // The invariants of one parsed query and of the queries nested in it (fatal gtest failures on a
@@ -1008,6 +1036,7 @@ constexpr auto kCorpus = std::to_array<std::string_view>({
     "select count(user_id) from events where user_id != 7 -- trailing\n",
     "SELECT CAST(amount AS DECIMAL(15, 2)) FROM sales WHERE day >= '2024-01-31'::date AND "
     "-1::INTEGER < amount",
+    "SELECT -(1), - -2.5, -(-(1e3)) FROM t WHERE a > -(-(-1)) AND b IN (-(1), 2) ORDER BY -(-1)",
     "SELECT s.region, SUM(e.amount) FROM sales AS s JOIN events e ON s.id = e.sale_id AND "
     "e.amount > 0 GROUP BY s.region",
     R"(SELECT COUNT(*) FROM a, "B" b CROSS JOIN 'c.parquet' AS 'c' LEFT OUTER JOIN d ON a.k = )"
@@ -1071,13 +1100,26 @@ TEST(ParserPropertyTest, MutatedQueriesNeverBreakTheParser) {
   for (const std::string_view sql : kCorpus) {
     ASSERT_TRUE(Parse(sql).has_value()) << sql;
   }
+  std::size_t folded = 0;  // accepted queries with a minus folded into a number through '('
   for (const std::uint64_t seed : kSeeds) {
     Rng rng(seed);
     for (int i = 0; i < 2000; ++i) {
       const std::string sql = Mutate(rng, std::string(rng.Pick(kCorpus)));
       ASSERT_NO_FATAL_FAILURE(CheckParse(sql)) << "seed " << seed << " iteration " << i;
+      if (const auto stmt = Parse(sql); stmt.has_value()) {
+        Counts counts;
+        CountStatement(*stmt, sql, counts);
+        folded += std::ranges::any_of(
+                      counts.number_literals,
+                      [&sql](const Literal* number) {
+                        return sql.substr(number->span.offset, number->span.length).contains('(');
+                      })
+                      ? 1U
+                      : 0U;
+      }
     }
   }
+  EXPECT_GT(folded, 10U);  // mutations of the corpus reach minuses folded into numbers too
 }
 
 // ---- random valid ASTs -------------------------------------------------------------------------
@@ -1222,11 +1264,20 @@ Expr RandomExpr(Rng& rng, std::size_t depth, bool aggregates) {
                              .right = sub(aggregates),
                              .op_span = {},
                              .span = {}});
-    case 6:
-      return Expr(UnaryExpr{.op = rng.Percent(50) ? UnaryOp::kNegate : UnaryOp::kNot,
-                            .operand = sub(aggregates),
-                            .op_span = {},
-                            .span = {}});
+    case 6: {
+      // A minus over a number is part of the number, as the parser folds it (-(1) is the literal
+      // -1); the draws keep their order.
+      const UnaryOp op = rng.Percent(50) ? UnaryOp::kNegate : UnaryOp::kNot;
+      Expr operand = RandomExpr(rng, depth - 1, aggregates);
+      if (auto* number = std::get_if<Literal>(&operand);
+          op == UnaryOp::kNegate && number != nullptr &&
+          (number->kind == Literal::Kind::kInteger || number->kind == Literal::Kind::kDecimal)) {
+        number->negative = !number->negative;
+        return operand;
+      }
+      return Expr(
+          UnaryExpr{.op = op, .operand = Box<Expr>(std::move(operand)), .op_span = {}, .span = {}});
+    }
     case 7:
       if (rng.Percent(20)) {  // ADR 0037's OJ5b
         return Expr(DistinctFromExpr{.left = sub(aggregates),

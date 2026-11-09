@@ -25,3 +25,15 @@ SELECT id FROM edge ORDER BY 2
 onlyif antb1
 statement error ^bind: GROUP BY cannot refer to the aggregate at position 1$
 SELECT COUNT(*) FROM edge GROUP BY 1
+
+# A minus over a number is part of the literal: -(1) is the position -1, and -(-2) the position 2.
+statement error
+SELECT id FROM edge ORDER BY -(1)
+
+onlyif antb1
+statement error ^bind: ORDER BY position -1 is not between 1 and 1$
+SELECT id FROM edge ORDER BY -(1)
+
+onlyif antb1
+statement error ^bind: GROUP BY cannot refer to the aggregate at position 2$
+SELECT id, COUNT(*) FROM edge GROUP BY -(-2)

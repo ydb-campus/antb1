@@ -162,7 +162,8 @@ struct SqlOf {
     if (unary.op == UnaryOp::kNot) {
       return "NOT " + Sql(*unary.operand, kNot);
     }
-    // Always parenthesized: "-5" would read back as a negative literal, "- -a" as a comment.
+    // Always parenthesized, so that "- -a" does not read back as a comment. The parser builds no
+    // negation of a number (it folds the minus into the literal), and -(5) would read back as one.
     return "-(" + Sql(*unary.operand, kOr) + ")";
   }
   std::string operator()(const BinaryExpr& binary) const {
