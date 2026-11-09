@@ -175,7 +175,10 @@ steps (only step 7 uses more than one thread):
    (not DOUBLE) keys is dropped from the `GroupAggregate` and computed once per group above it, unless a `Limit`
    without a `Sort` reads it (ADR 0018);
    `Limit` below `Project`; a grouped aggregate computed as partials on one input of its join, where the gate admits
-   it (ADR 0032's G2b); and projection pruning (a `Scan` reads only the fields used above it; a `Join` asks both
+   it (ADR 0032's G2b); integer arithmetic in every `Compute` and join residual as DuckDB's expression rewriter
+   computes it (the constants of a `+` or `*` chain first and folded, `x + 0` as `x`: docs/sql-subset.md; the binder
+   reads the same rewrite before it moves a comparison's constants or rewrites a `SUM`); and projection pruning (a
+   `Scan` reads only the fields used above it; a `Join` asks both
    inputs for what is used above it plus its keys and residuals; a `Project`, a `UnionAll` and a `SetOperation`
    keep every output, each asking its inputs for the columns it maps). Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and

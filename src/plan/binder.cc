@@ -38,6 +38,7 @@
 #include "antb1/sql/parser.h"
 #include "antb1/sql/unparse.h"
 
+#include "arithmetic_rewrite.h"
 #include "join_order.h"
 #include "key_type.h"
 #include "or_factoring.h"
@@ -1326,6 +1327,12 @@ bool HasGroupBy(const sql::SelectStatement& stmt) {
   return !stmt.group_by.empty() || !stmt.grouping.empty();
 }
 
+// Whether the query groups by any key: a GROUP BY of empty grouping sets alone (GROUP BY (),
+// GROUPING SETS ((), ())) groups by none.
+bool HasGroupingKeys(const sql::SelectStatement& stmt) {
+  return !stmt.group_by.empty() || !sql::GroupingExprs(stmt.grouping).empty();
+}
+
 // `expr` as a scalar subquery -- `(query)` used as a value -- or nullptr when it is anything else.
 const sql::SubqueryExpr* AsScalarSubquery(const sql::Expr& expr) {
   const auto* subquery = std::get_if<sql::SubqueryExpr>(&expr);
@@ -2337,18 +2344,15 @@ bool IsConstantInteger(const sql::Expr& expr) {
   return !std::holds_alternative<sql::Literal>(expr) && FoldTyped(expr).has_value();
 }
 
-// The value of a constant integer expression (integer literals under + - * and unary -) as DuckDB
-// folds it, in its types (FoldTyped); std::nullopt for anything else, and for one that overflows
-// its type, which DuckDB leaves unfolded (or a HUGEINT beyond antb1's 38 digits, which no rewrite
-// takes): a rewrite that needs a constant (RewritableSum, MoveConstants) then leaves the expression
-// alone, and it is computed, failing on the first row that computes it, as in DuckDB -- which may
-// decide a row by another condition first (divergence D16) -- and answering over no rows.
-std::optional<Int128> ConstantValue(const sql::Expr& expr) {
-  const std::optional<arrow::Result<TypedConstant>> folded = FoldTyped(expr);
-  if (!folded.has_value() || !folded->ok()) {
-    return std::nullopt;
-  }
-  return (*folded)->value;
+// The value of an integer constant of a bound expression, or std::nullopt for anything else: an
+// operation of constants included, which is what DuckDB's constant folding leaves of one that
+// overflows its type (RewriteArithmetic), so that a rewrite needing a constant does not apply.
+std::optional<Int128> IntegerConstant(const Expr& expr) {
+  const auto* constant = std::get_if<ConstantExpr>(&expr.node);
+  const auto* value = constant == nullptr || !IsInteger(expr.type)
+                          ? nullptr
+                          : std::get_if<Int128>(&constant->value.value);
+  return value == nullptr ? std::nullopt : std::optional(*value);
 }
 
 // The double DuckDB divides when `expr` is a number it converts for a DOUBLE division: a constant
@@ -3258,52 +3262,47 @@ class Binder {
   // ---- the output scope: the aggregation's keys and aggregates ----
 
   struct SumRewrite {
-    const sql::Expr* other = nullptr;    // SUM(other + constant)
-    const sql::Expr* counted = nullptr;  // `other` without its `+ constant` layers
+    Typed other;  // SUM(other + constant): the argument without its constant, bound
     Int128 constant = 0;
   };
 
-  // DuckDB's sum rewriter, in a query without GROUP BY: SUM(other + c) (either order), c an integer
-  // constant (literals folded in their types, ConstantValue: one that overflows is none) and the
-  // sum and `other` of a signed integer type, is
+  // DuckDB's sum rewriter, in a query that groups by no key (no GROUP BY, or one of empty grouping
+  // sets alone), over the argument as DuckDB's expression rewriter leaves it, which it runs first
+  // (RewriteArithmetic: a chain's constants first and folded, x + 0 as x): SUM(other + c) (either
+  // order), c a constant antb1 folds -- one that overflows its type is none, since it stays
+  // unfolded, nor is a function of constants (divergence D33) -- and the sum of a signed integer
+  // type, is
   // SUM(other) + c * COUNT(other), in HUGEINT: the addition is never computed, so it never
-  // overflows. SUM(other) is rewritten again if it has that shape, and COUNT(other) counts `other`
-  // without its `+ constant` layers (they add no NULL), as DuckDB does. Not in a correlated block,
-  // whose aggregation DuckDB has given groups by the time its rewriter runs: there the addition is
-  // computed, as in DuckDB, and the SUM stays one that ADR 0023's Path 2 answers.
+  // overflows. So SUM(x + 1 + 2) is SUM(x) + 3 * COUNT(x), and SUM(x + 2147483647 + 1) computes
+  // (2147483647 + 1) + x and fails, as in DuckDB. Not in a correlated block, whose aggregation
+  // DuckDB has given groups by the time its rewriter runs: there the addition is computed, as in
+  // DuckDB, and the SUM stays one that ADR 0023's Path 2 answers.
   arrow::Result<std::optional<SumRewrite>> RewritableSum(const sql::AggregateCall& call) {
-    if (HasGroupBy(stmt_) || call.kind != sql::AggKind::kSum || call.distinct ||
+    if (HasGroupingKeys(stmt_) || call.kind != sql::AggKind::kSum || call.distinct ||
         !call.arg.has_value() || Correlated()) {
       return std::nullopt;
     }
-    const auto split =
-        [](const sql::Expr& e) -> std::optional<std::pair<const sql::Expr*, Int128>> {
-      const auto* add = std::get_if<sql::BinaryExpr>(&e);
-      if (add == nullptr || add->op != sql::BinaryOp::kAdd) {
-        return std::nullopt;
-      }
-      if (const auto c = ConstantValue(*add->right); c.has_value() && ReadsColumn(*add->left)) {
-        return std::pair(&*add->left, *c);
-      }
-      if (const auto c = ConstantValue(*add->left); c.has_value() && ReadsColumn(*add->right)) {
-        return std::pair(&*add->right, *c);
-      }
-      return std::nullopt;
-    };
-    const auto top = split(**call.arg);
-    if (!top.has_value()) {
-      return std::nullopt;
-    }
-    SumRewrite rewrite{.other = top->first, .counted = top->first, .constant = top->second};
-    while (const auto inner = split(*rewrite.counted)) {
-      rewrite.counted = inner->first;
-    }
     ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(**call.arg));
-    ARROW_ASSIGN_OR_RAISE(const Typed other, BindInput(*rewrite.other));
-    if (!IsSignedInteger(whole.expr->type) || !IsSignedInteger(other.expr->type)) {
+    return SumRewriteOf(RewriteArithmetic(whole.expr));
+  }
+
+  // The sum rewrite of SUM(arg) for a bound and rewritten `arg`, or std::nullopt.
+  static std::optional<SumRewrite> SumRewriteOf(const ExprPtr& arg) {
+    const auto* add = std::get_if<ArithExpr>(&arg->node);
+    if (add == nullptr || add->op != ArithOp::kAdd || !IsSignedInteger(arg->type)) {
       return std::nullopt;
     }
-    return rewrite;
+    const std::optional<Int128> right = IntegerConstant(*add->right);
+    const std::optional<Int128> left = IntegerConstant(*add->left);
+    if (right.has_value() == left.has_value()) {
+      return std::nullopt;  // no constant, or two that DuckDB leaves unfolded
+    }
+    // `other` of any integer type: DuckDB reads one narrower than the sum through a cast.
+    const ExprPtr& other = right.has_value() ? add->left : add->right;
+    if (!IsInteger(other->type)) {
+      return std::nullopt;
+    }
+    return SumRewrite{.other = Typed{.expr = other}, .constant = right.value_or(left.value_or(0))};
   }
 
   // The aggregate as an output column (added as a hidden aggregate when the select list lacks it);
@@ -3311,33 +3310,61 @@ class Binder {
   arrow::Result<Typed> AggregateOutput(const sql::AggregateCall& call) {
     ARROW_ASSIGN_OR_RAISE(const auto rewrite, RewritableSum(call));
     if (rewrite.has_value()) {
-      sql::AggregateCall sum{
-          .kind = sql::AggKind::kSum, .arg = {}, .distinct = false, .span = call.span};
-      sum.arg.emplace(*rewrite->other);
-      sql::AggregateCall count{
-          .kind = sql::AggKind::kCount, .arg = {}, .distinct = false, .span = call.span};
-      count.arg.emplace(*rewrite->counted);
-      ARROW_ASSIGN_OR_RAISE(Typed sum_column, AggregateOutput(sum));
-      ARROW_ASSIGN_OR_RAISE(Typed count_column, AggregateOutput(count));
-      const std::string constant_name = Int128ToString(rewrite->constant);
-      auto constant = std::make_shared<const Expr>(
-          Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kHugeInt,
-                                                      .value = rewrite->constant}},
-               .type = LogicalType::kHugeInt,
-               .name = constant_name});
-      auto product = std::make_shared<const Expr>(
-          Expr{.node = ArithExpr{.op = ArithOp::kMultiply,
-                                 .left = std::move(constant),
-                                 .right = std::move(count_column.expr)},
-               .type = LogicalType::kHugeInt,
-               .name = std::format("({} * {})", constant_name, ResultName(count))});
-      return Leaf(Expr{.node = ArithExpr{.op = ArithOp::kAdd,
-                                         .left = std::move(sum_column.expr),
-                                         .right = std::move(product)},
-                       .type = LogicalType::kHugeInt,
-                       .name = ResultName(call)});
+      return RewrittenSum(*rewrite, call.span, ResultName(call));
     }
     ARROW_ASSIGN_OR_RAISE(AggregateCall bound, BindAggregate(call));
+    return HiddenAggregate(std::move(bound), ResultName(call));
+  }
+
+  // SUM(other) + c * COUNT(other) in HUGEINT, named `name`. SUM(other) is rewritten again where it
+  // has the shape, as DuckDB applies its rule again through the aggregate it adds, and COUNT counts
+  // `other` as it is: SUM(1 + (2 + x)), whose constants lead and so stay apart, is
+  // SUM(x) + 2 * COUNT(x) + 1 * COUNT(2 + x), which computes 2 + x, as DuckDB does.
+  arrow::Result<Typed> RewrittenSum(const SumRewrite& rewrite, SourceSpan span, std::string name) {
+    const std::string& other = rewrite.other.expr->name;
+    Typed sum_column;
+    if (const auto again = SumRewriteOf(rewrite.other.expr)) {
+      ARROW_ASSIGN_OR_RAISE(sum_column, RewrittenSum(*again, span, std::format("sum({})", other)));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(sum_column, BoundAggregate(sql::AggKind::kSum, rewrite.other, span,
+                                                       std::format("sum({})", other)));
+    }
+    const std::string count_name = std::format("count({})", other);
+    ARROW_ASSIGN_OR_RAISE(Typed count_column,
+                          BoundAggregate(sql::AggKind::kCount, rewrite.other, span, count_name));
+    const std::string constant_name = Int128ToString(rewrite.constant);
+    auto constant = std::make_shared<const Expr>(
+        Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kHugeInt,
+                                                    .value = rewrite.constant}},
+             .type = LogicalType::kHugeInt,
+             .name = constant_name});
+    auto product = std::make_shared<const Expr>(
+        Expr{.node = ArithExpr{.op = ArithOp::kMultiply,
+                               .left = std::move(constant),
+                               .right = std::move(count_column.expr)},
+             .type = LogicalType::kHugeInt,
+             .name = std::format("({} * {})", constant_name, count_name)});
+    return Leaf(Expr{.node = ArithExpr{.op = ArithOp::kAdd,
+                                       .left = std::move(sum_column.expr),
+                                       .right = std::move(product)},
+                     .type = LogicalType::kHugeInt,
+                     .name = std::move(name)});
+  }
+
+  // A SUM or a COUNT of a bound argument, as an output column named `name`.
+  arrow::Result<Typed> BoundAggregate(sql::AggKind kind, const Typed& arg, SourceSpan span,
+                                      std::string name) {
+    const sql::AggregateCall call{.kind = kind, .arg = {}, .distinct = false, .span = span};
+    AggregateCall bound{.kind = ToPlan(kind), .span = span};
+    BoundColumn column = InputColumn(arg);
+    ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(call, column));
+    bound.arg = std::move(column);
+    return HiddenAggregate(std::move(bound), std::move(name));
+  }
+
+  // A bound aggregate as an output column named `name`: the select list's or a hidden one's of the
+  // same call, added as a hidden aggregate when there is none.
+  Typed HiddenAggregate(AggregateCall bound, std::string name) {
     const auto same = std::ranges::find_if(
         select_.aggregates, [&](const AggregateCall& a) { return SameCall(a, bound); });
     const auto index = Narrow<std::size_t>(same - select_.aggregates.begin());
@@ -3346,7 +3373,7 @@ class Binder {
       select_.aggregates.push_back(std::move(bound));
     }
     const AggregateCall& agg = select_.aggregates[index];
-    return ColumnLeaf(agg.id, agg.type, ResultName(call), FloatResult(agg));
+    return ColumnLeaf(agg.id, agg.type, std::move(name), FloatResult(agg));
   }
 
   // GROUPING(k1, ..., kn) as an output column of the grouping-sets node (added when new): a BIGINT,
@@ -3657,17 +3684,62 @@ class Binder {
   arrow::Result<Typed> BindCast(const sql::CastExpr& cast, const BindFn& bind);
   struct Moved {
     enum class Outcome : std::uint8_t { kCompare, kFalse, kNotNull };
-    const sql::Expr* operand = nullptr;
+    ExprPtr operand;  // bound
     sql::CompareOp op = sql::CompareOp::kEq;
     Int128 k = 0;
     Outcome outcome = Outcome::kCompare;
   };
-  // `bind` binds the operand in its scope; `aggregates`: an aggregate call is an operand too (the
-  // output scope of HAVING and of conditions over the aggregation).
+  // `bind` binds the operand in its scope; `folded_type`: the type of the constant expression the
+  // literal was folded from, if it was, or of a bound of the BETWEEN the comparison is written for;
+  // `distinct`: the comparison stands for an IS [NOT] DISTINCT FROM.
   template <class BindFn>
   arrow::Result<std::optional<Moved>> MoveConstants(const sql::Expr& operand, sql::CompareOp op,
                                                     const sql::Literal& literal, const BindFn& bind,
-                                                    bool aggregates);
+                                                    std::optional<LogicalType> folded_type,
+                                                    bool distinct);
+  // What a comparison the binder writes itself (BetweenComparisons, LoweredDistinctFrom) means that
+  // the comparison alone does not say, for MoveConstants, by the comparison's address while it
+  // binds: the type a BETWEEN compares all three values in (BetweenType), which DuckDB casts the
+  // operand to for both comparisons; whether it stands for an IS [NOT] DISTINCT
+  // FROM; and, out, the operand constant moving leaves, which the null test of the IS DISTINCT FROM
+  // it is written for then reads in place of the operand as written.
+  struct WrittenComparison {
+    std::optional<LogicalType> folded_type;
+    bool distinct = false;
+    ExprPtr moved;
+  };
+  // While it lives, `comparison` is one the binder wrote, as `what` says.
+  class WrittenScope {
+   public:
+    WrittenScope(Binder& binder, const sql::Expr& comparison, const WrittenComparison& what)
+        : binder_(binder), key_(std::get_if<sql::BinaryExpr>(&comparison)) {
+      // An outer scope's entry for the comparison stays: its writer knows more (a BETWEEN's type
+      // when one of its comparisons binds again on one relation).
+      if (key_ != nullptr) {
+        owner_ = binder_.written_comparisons_.try_emplace(key_, what).second;
+      }
+    }
+    ~WrittenScope() {
+      if (owner_) {
+        binder_.written_comparisons_.erase(key_);
+      }
+    }
+    WrittenScope(const WrittenScope&) = delete;
+    WrittenScope& operator=(const WrittenScope&) = delete;
+    WrittenScope(WrittenScope&&) = delete;
+    WrittenScope& operator=(WrittenScope&&) = delete;
+    // The operand constant moving left of the comparison, nullptr where it moved nothing.
+    [[nodiscard]] ExprPtr moved() const {
+      const auto entry = key_ == nullptr ? binder_.written_comparisons_.end()
+                                         : binder_.written_comparisons_.find(key_);
+      return entry == binder_.written_comparisons_.end() ? nullptr : entry->second.moved;
+    }
+
+   private:
+    Binder& binder_;
+    const sql::BinaryExpr* key_;
+    bool owner_ = false;  // the entry is this scope's own
+  };
   arrow::Result<std::optional<Typed>> ResolveHavingName(const sql::ColumnRef& ref);
   arrow::Status BindHaving();
   arrow::Status BindOrderBy();
@@ -3813,6 +3885,7 @@ class Binder {
 
   const sql::SelectStatement& stmt_;
   Scope scope_;
+  std::map<const sql::BinaryExpr*, WrittenComparison> written_comparisons_;
   Visibility visible_;  // the clause being bound (the default: every binding, in one level)
   mutable std::optional<bool> correlated_;  // Correlated(), once asked
   // Which clause is binding, for ADR 0023's rule that an outer reference is answered only in a
@@ -4110,101 +4183,414 @@ arrow::Status Binder::BindSelectList() {
   return arrow::Status::OK();
 }
 
-// DuckDB's constant moving in a comparison `operand <op> k` (WHERE, HAVING, CASE WHEN, in any
-// scope), k an integer literal: for a
-// signed integer operand x + c, c + x or x - c (c an integer constant, literals folded in their
-// types, ConstantValue: one that overflows is none) the
-// comparison becomes x <op> k - c (or k + c), for c - x it becomes x <mirrored op> c - k, and for
-// x * c (c not 0) x <op> k / c when c divides k (the op mirrored for a negative c), where a
-// non-dividing k makes = FALSE and <> IS NOT NULL. It repeats on x, and stops where k or the new
-// constant is outside the operand's type. So the arithmetic is never computed and never
-// overflows, as in DuckDB. std::nullopt: nothing moved.
-template <class BindFn>
-arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(const sql::Expr& operand,
-                                                                  sql::CompareOp op,
-                                                                  const sql::Literal& literal,
-                                                                  const BindFn& bind,
-                                                                  bool aggregates) {
-  if (literal.kind != sql::Literal::Kind::kInteger || IsApproximateNumber(literal.text)) {
-    return std::nullopt;
-  }
-  const auto exact = ParseExactNumber(literal.text, literal.negative);
-  if (!exact.has_value() || exact->huge) {
-    return std::nullopt;
-  }
-  Moved cur{.operand = &operand,
-            .op = op,
-            .k = exact->negative ? -exact->magnitude : exact->magnitude,
-            .outcome = Moved::Outcome::kCompare};
-  bool moved = false;
-  const bool ordered = op != sql::CompareOp::kEq && op != sql::CompareOp::kNe;
-  while (const auto* binary = std::get_if<sql::BinaryExpr>(cur.operand)) {
-    ARROW_ASSIGN_OR_RAISE(const Typed whole, bind(*cur.operand));
-    const LogicalType type = whole.expr->type;
-    if (!IsSignedInteger(type)) {
+namespace {
+
+// One step of DuckDB's MoveConstantsRule (move_constants.cpp) at `<operand> <op> k`, for an operand
+// x + c, c + x, x - c, c - x or x * c of an integer type of range `range`: kMove with the new k
+// and op; kDecide with the outcome where DuckDB replaces the comparison by a constant_or_null over
+// x -- FALSE for an = whose new k is outside the type or whose c does not divide k, TRUE for a <>
+// whose c does not divide k, NULL for a NULL x either way; or kStop. An IS [NOT] DISTINCT FROM
+// (`distinct`) is never decided, as DuckDB decides only an = and a <>. DuckDB's FALSE for any
+// other comparison whose quotient leaves the type (x * -1 against the type's minimum) is a wrong
+// answer of its own, and this stops there instead.
+struct MoveStep {
+  enum class Kind : std::uint8_t { kMove, kDecide, kStop };
+  Kind kind = Kind::kStop;
+  Int128 k = 0;
+  sql::CompareOp op = sql::CompareOp::kEq;
+  bool truth = false;  // of a kDecide: TRUE (a <>) or FALSE (an =)
+};
+
+MoveStep MoveStepOf(ArithOp arith, Int128 c, bool constant_right, Int128 k, sql::CompareOp op,
+                    IntegerRange range, bool distinct) {
+  const auto fits = [&range](Int128 v) { return v >= range.min && v <= range.max; };
+  const bool equal = op == sql::CompareOp::kEq && !distinct;
+  const bool not_equal = op == sql::CompareOp::kNe && !distinct;
+  const MoveStep stop{};
+  const MoveStep never{.kind = MoveStep::Kind::kDecide, .truth = false};
+  Int128 moved = 0;
+  sql::CompareOp next = op;
+  switch (arith) {
+    case ArithOp::kAdd:
+      if (__builtin_sub_overflow(k, c, &moved)) {
+        return stop;
+      }
       break;
+    case ArithOp::kSubtract:
+      if (constant_right ? __builtin_add_overflow(k, c, &moved)
+                         : __builtin_sub_overflow(c, k, &moved)) {
+        return stop;
+      }
+      if (!constant_right) {
+        next = Mirror(op);
+      }
+      break;
+    case ArithOp::kMultiply:
+      if (c == 0) {
+        return stop;  // DuckDB leaves x * 0 to its ArithmeticSimplification (and k % 0 is none)
+      }
+      if (k % c != 0) {
+        if (equal || not_equal) {
+          return MoveStep{.kind = MoveStep::Kind::kDecide, .truth = not_equal};
+        }
+        return stop;
+      }
+      moved = k / c;
+      next = c < 0 ? Mirror(op) : op;
+      break;
+    default:
+      return stop;
+  }
+  if (!fits(moved)) {
+    return equal ? never : stop;
+  }
+  return MoveStep{.kind = MoveStep::Kind::kMove, .k = moved, .op = next};
+}
+
+// Whether `expr` is an integer literal as DuckDB's parser writes one: a literal, or a minus over
+// one, through parentheses -- its parser folds -(1) into the literal -1.
+bool IsIntegerLiteral(const sql::Expr& expr) {
+  if (const auto* literal = std::get_if<sql::Literal>(&expr)) {
+    return literal->kind == sql::Literal::Kind::kInteger && !IsApproximateNumber(literal->text);
+  }
+  const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
+  return unary != nullptr && unary->op == sql::UnaryOp::kNegate &&
+         IsIntegerLiteral(*unary->operand);
+}
+
+// Whether DuckDB's comparison simplification drops the cast from `from` to `to` of a comparison
+// with the constant k, CAST(x AS to) <op> k becoming x <op> k: where its CastIsInvertible holds
+// both ways -- two integer types of one signedness, narrowing ones too (so never USMALLINT with a
+// signed type), or an integer type or a DECIMAL and a DECIMAL of the same scale (an integer type's
+// being 0) -- and k converts exactly into both types. A k that `to` does not hold DuckDB compares
+// in a wider type, behind a cast to it that it cannot drop, so the cast to `to` is computed. The
+// cast may be written, or one DuckDB's binder writes where antb1 has an operation read an operand
+// of another type (which its executor casts).
+bool DropsCast(LogicalType from, LogicalType to, Int128 k) {
+  const auto scale = [](LogicalType type) -> std::optional<int> {
+    if (IsInteger(type)) {
+      return 0;
+    }
+    return type == LogicalType::kDecimal ? std::optional<int>(type.scale()) : std::nullopt;
+  };
+  const std::optional<int> from_scale = scale(from);
+  const std::optional<int> to_scale = scale(to);
+  if (!from_scale.has_value() || !to_scale.has_value() || *from_scale != *to_scale) {
+    return false;
+  }
+  if (IsInteger(from) && IsInteger(to) &&
+      (from == LogicalType::kUSmallInt) != (to == LogicalType::kUSmallInt)) {
+    return false;
+  }
+  // An integer k in an integer type's range, or within a DECIMAL(p, s)'s p - s integer digits.
+  const auto holds = [k](LogicalType type) {
+    if (IsInteger(type)) {
+      const IntegerRange range = RangeOf(type);
+      return k >= range.min && k <= range.max;
+    }
+    const Int128 limit = PowerOfTen(type.width() - type.scale());
+    return k > -limit && k < limit;
+  };
+  return holds(from) && holds(to);
+}
+
+// The type DuckDB's binder gives a BETWEEN, casting its operand and both bounds to it, so that both
+// its comparisons compare in it (bind_between_expression.cpp): its comparison typing of the operand
+// with the low bound, and of that with the high one, where an integer literal (IsIntegerLiteral)
+// takes the other value's type if it fits it and any two other values take their common type
+// (CommonValueType). std::nullopt where a value does not bind or is no number (a string literal,
+// which takes the other's type, or a date): the comparisons then move as they would alone.
+template <class BindFn>
+std::optional<LogicalType> BetweenType(const sql::BetweenExpr& between, const BindFn& bind) {
+  struct Value {
+    LogicalType type;
+    std::optional<Int128> literal;  // an integer literal's value, of its own type
+  };
+  const auto value_of = [&bind](const sql::Expr& expr) -> std::optional<Value> {
+    if (IsIntegerLiteral(expr)) {
+      const auto literal = FoldTyped(expr);
+      if (!literal.has_value() || !literal->ok()) {
+        return std::nullopt;
+      }
+      return Value{.type = (*literal)->type, .literal = (*literal)->value};
+    }
+    const arrow::Result<Typed> typed = bind(expr);
+    if (!typed.ok() ||
+        (!IsNumeric(typed->expr->type) && typed->expr->type != LogicalType::kDecimal)) {
+      return std::nullopt;
+    }
+    return Value{.type = typed->expr->type, .literal = std::nullopt};
+  };
+  const auto fits = [](Int128 value, LogicalType type) {
+    if (!IsInteger(type)) {
+      return false;
     }
     const IntegerRange range = RangeOf(type);
-    const auto fits = [&](Int128 v) { return v >= range.min && v <= range.max; };
-    if (!fits(cur.k)) {
-      break;
+    return value >= range.min && value <= range.max;
+  };
+  const auto compared = [&fits](const Value& a, const Value& b) {
+    if (a.literal.has_value() && !b.literal.has_value() && fits(*a.literal, b.type)) {
+      return b.type;
     }
-    const auto right = ConstantValue(*binary->right);
-    const auto left = ConstantValue(*binary->left);
-    const bool constant_right = right.has_value() && ReadsColumn(*binary->left, aggregates);
-    const bool constant_left = left.has_value() && ReadsColumn(*binary->right, aggregates);
-    if (!constant_right && !constant_left) {
-      break;
+    if (b.literal.has_value() && !a.literal.has_value() && fits(*b.literal, a.type)) {
+      return a.type;
     }
-    const sql::Expr* x = constant_right ? &*binary->left : &*binary->right;
-    const Int128 c = constant_right ? *right : *left;
-    Int128 k = 0;
-    sql::CompareOp next = cur.op;
-    bool overflow = false;
-    switch (binary->op) {
-      case sql::BinaryOp::kAdd:
-        overflow = __builtin_sub_overflow(cur.k, c, &k);
-        break;
-      case sql::BinaryOp::kSubtract:
-        if (constant_right) {
-          overflow = __builtin_add_overflow(cur.k, c, &k);
-        } else {
-          overflow = __builtin_sub_overflow(c, cur.k, &k);
-          next = Mirror(cur.op);
-        }
-        break;
-      case sql::BinaryOp::kMultiply:
-        if (c == 0) {
-          overflow = true;  // no move
-        } else if (cur.k % c != 0) {
-          if (ordered) {
-            overflow = true;
-          } else {
-            return Moved{.operand = x,
-                         .op = cur.op,
-                         .k = 0,
-                         .outcome = cur.op == sql::CompareOp::kEq ? Moved::Outcome::kFalse
-                                                                  : Moved::Outcome::kNotNull};
-          }
-        } else {
-          k = cur.k / c;
-          next = c < 0 ? Mirror(cur.op) : cur.op;
-        }
-        break;
-      default:
-        overflow = true;
-        break;
-    }
-    if (overflow || !fits(k)) {
-      break;
-    }
-    cur = Moved{.operand = x, .op = next, .k = k, .outcome = Moved::Outcome::kCompare};
-    moved = true;
-  }
-  if (!moved) {
+    return CommonValueType(a.type, b.type).value_or(a.type);
+  };
+  const std::optional<Value> operand = value_of(*between.operand);
+  const std::optional<Value> low = value_of(*between.low);
+  const std::optional<Value> high = value_of(*between.high);
+  if (!operand.has_value() || !low.has_value() || !high.has_value()) {
     return std::nullopt;
   }
-  return cur;
+  return compared(Value{.type = compared(*operand, *low), .literal = std::nullopt}, *high);
+}
+
+}  // namespace
+
+// DuckDB's constant moving in a comparison `operand <op> k` (WHERE, HAVING, CASE WHEN, in any
+// scope), k an integer literal (or a decimal one of scale 0, an integer DuckDB compares in a
+// DECIMAL), in the order DuckDB's rewriter gives it. Its MoveConstants changes
+// the comparison in place, which ends the rewriter's pass before the operand is visited; and in the
+// first pass k is still the cast its binder wrote (CAST(5 AS INTEGER)), which MoveConstants cannot
+// read. So the operand is rewritten by one pass of the expression rewriter (RewriteArithmeticPass:
+// a chain's constants first and folded, x + 0 as x), then constants move off it for as long as
+// they can, then another pass, and so on until neither changes anything. A move takes, for an
+// integer operand x + c, c + x or x - c (c a constant: one that overflows its type is none, since
+// it stays unfolded), k - c (or k + c), for c - x c - k with the op mirrored, and for x * c (c not
+// 0) k / c when c divides k (the op mirrored for a negative c). A cast of x -- written, or the one
+// DuckDB's binder writes where antb1 has an operation read an operand of another type -- is
+// dropped where DuckDB's comparison simplification drops it (DropsCast) and otherwise kept, so
+// that x is computed behind it; a cast to x's own type is none, as DuckDB's binder writes none,
+// and one to a type such as DOUBLE leaves nothing to move. An = whose new k leaves the type, or
+// whose c does not divide k,
+// is FALSE (NULL for a NULL x, which is still computed), and a <> whose c does not divide k TRUE
+// (MoveStepOf); NOT (x = k) comes here as x <> k, as DuckDB's parser writes it (BindBool). So
+// x + 1 + 2 > 5 is x > 2, and x + 2147483647 + 1 > 5 computes (2147483647 + 1) + x and fails, as
+// in DuckDB; but (x + 2147483647) * 1 + 1 > 5 moves 1, the * 1 the first pass removed and then
+// 2147483647, before any pass regroups what is left.
+//
+// The other order DuckDB keeps: its comparison simplification reads k from the first pass on, and
+// so drops a cast at the top of the operand before the operand's first pass -- a written one that
+// changes the type, under any casts to the value's own type, or the one its binder writes to
+// compare in a wider type: that of a constant expression (`2147483648 - 1`, a BIGINT, against an
+// INTEGER chain), or the one a BETWEEN compares all three values in, for both its comparisons
+// (`folded_type`). Constants then move off the chain as written, for as long as the one met is a
+// literal of its operation's own type -- an INTEGER literal in an INTEGER chain, a minus over one
+// included; a literal of another type, a cast or a constant expression is one DuckDB has not folded
+// yet -- and stop at a GROUP BY key, an aggregate or an alias, a column of the output scope. The
+// passes follow: so x + 2147483647 + 1 > 2147483648 - 1 is x > -1.
+//
+// std::nullopt: nothing to change, the operand as it is written; otherwise the bound operand to
+// compare with the new k, or the outcome that decides the comparison over it.
+template <class BindFn>
+arrow::Result<std::optional<Binder::Moved>> Binder::MoveConstants(
+    const sql::Expr& operand, sql::CompareOp op, const sql::Literal& literal, const BindFn& bind,
+    std::optional<LogicalType> folded_type, bool distinct) {
+  if (IsApproximateNumber(literal.text)) {
+    return std::nullopt;
+  }
+  Int128 k = 0;
+  if (literal.kind == sql::Literal::Kind::kDecimal) {
+    // A decimal of scale 0 (`5.`, DECIMAL(1,0) to DuckDB) is an integer k compared in a DECIMAL,
+    // behind a cast DuckDB drops where k fits the operand's type (DropsCast).
+    const std::optional<DecimalLiteral> decimal =
+        ParseDecimalLiteral(literal.text, literal.negative);
+    if (!decimal.has_value() || decimal->type.scale() != 0) {
+      return std::nullopt;
+    }
+    k = decimal->unscaled;
+    folded_type = CommonValueType(folded_type, decimal->type);
+  } else if (literal.kind == sql::Literal::Kind::kInteger) {
+    const auto exact = ParseExactNumber(literal.text, literal.negative);
+    if (!exact.has_value() || exact->huge) {
+      return std::nullopt;
+    }
+    k = exact->negative ? -exact->magnitude : exact->magnitude;
+  } else {
+    return std::nullopt;
+  }
+  sql::CompareOp current = op;
+  bool changed = false;
+  const auto decided = [&current](ExprPtr x, const MoveStep& step) {
+    return Moved{.operand = std::move(x),
+                 .op = current,
+                 .k = 0,
+                 .outcome = step.truth ? Moved::Outcome::kNotNull : Moved::Outcome::kFalse};
+  };
+  // The type k is compared in: the operand's, or the one DuckDB's binder casts the operand to, of
+  // a constant expression k was folded from or of a BETWEEN (BetweenType) where wider; then that
+  // of each operand a dropped cast reaches.
+  const sql::Expr* written = &operand;
+  ARROW_ASSIGN_OR_RAISE(const Typed whole, bind(operand));
+  LogicalType compared = CommonValueType(whole.expr->type, folded_type).value_or(whole.expr->type);
+  bool cast_at_top = compared != whole.expr->type;
+  if (cast_at_top && !IsInteger(compared) && !DropsCast(whole.expr->type, compared, k)) {
+    // Compared in a type such as DOUBLE behind a cast DuckDB keeps: nothing moves, and the
+    // operand is computed as its rewrite leaves it (the optimizer's, RewriteArithmetic).
+    return std::nullopt;
+  }
+  // A written cast that changes the type, under any casts to the value's own type, which are none
+  // to DuckDB: its binder returns the value itself.
+  for (const sql::Expr* top = &operand; !cast_at_top;) {
+    const auto* cast = std::get_if<sql::CastExpr>(top);
+    if (cast == nullptr) {
+      break;
+    }
+    // Read where the cast binds as one: not where it is a GROUP BY key, an alias or an aggregate
+    // of the output scope, whose operand is no value there, or a constant it folded into.
+    ARROW_ASSIGN_OR_RAISE(const Typed layer, bind(*top));
+    const auto* bound = std::get_if<CastExpr>(&layer.expr->node);
+    if (bound == nullptr) {
+      break;
+    }
+    cast_at_top = bound->operand->type != whole.expr->type;
+    top = &*cast->operand;
+  }
+  // The as-written order. DuckDB's comparison simplification reads a cast at the top of the
+  // operand from its rewriter's first pass on, k being foldable from the start, where its constant
+  // moving cannot read k yet. Where it drops the cast, before the operand's first pass, constants
+  // move off the chain as written, each of a literal of its operation's type.
+  if (cast_at_top) {
+    for (;;) {
+      // Each layer as bound, which the walk steps into only where it is the node the SQL spells: a
+      // GROUP BY key, an aggregate or an alias binds as a column of the output scope, whose
+      // operands are no values of that scope.
+      ARROW_ASSIGN_OR_RAISE(const Typed layer, bind(*written));
+      const LogicalType type = layer.expr->type;
+      if (type != compared) {
+        if (!DropsCast(type, compared, k)) {
+          break;
+        }
+        compared = type;
+      }
+      if (const auto* cast = std::get_if<sql::CastExpr>(written)) {
+        const auto* bound = std::get_if<CastExpr>(&layer.expr->node);
+        if (bound == nullptr || !DropsCast(bound->operand->type, type, k)) {
+          break;  // a constant the cast folded into, or a cast DuckDB keeps
+        }
+        written = &*cast->operand;
+        compared = bound->operand->type;
+        changed = true;
+        continue;
+      }
+      if (!IsInteger(type)) {
+        break;
+      }
+      const IntegerRange range = RangeOf(type);
+      if (k < range.min || k > range.max) {
+        break;
+      }
+      const auto* binary = std::get_if<sql::BinaryExpr>(written);
+      const std::optional<ArithOp> arith = binary == nullptr ? std::nullopt : ArithOpOf(binary->op);
+      if (!arith.has_value() || !std::holds_alternative<ArithExpr>(layer.expr->node)) {
+        break;
+      }
+      const auto own = [type](const sql::Expr& side) -> std::optional<Int128> {
+        if (!IsIntegerLiteral(side)) {
+          return std::nullopt;
+        }
+        const auto folded = FoldTyped(side);
+        if (!folded.has_value() || !folded->ok() || (*folded)->type != type) {
+          return std::nullopt;
+        }
+        return (*folded)->value;
+      };
+      const std::optional<Int128> right = own(*binary->right);
+      const std::optional<Int128> left = own(*binary->left);
+      if (right.has_value() == left.has_value()) {
+        break;
+      }
+      const sql::Expr& x = right.has_value() ? *binary->left : *binary->right;
+      const MoveStep step = MoveStepOf(*arith, right.value_or(left.value_or(0)), right.has_value(),
+                                       k, current, range, distinct);
+      if (step.kind == MoveStep::Kind::kDecide) {
+        ARROW_ASSIGN_OR_RAISE(const Typed bound, bind(x));
+        return decided(bound.expr, step);
+      }
+      if (step.kind == MoveStep::Kind::kStop) {
+        break;
+      }
+      written = &x;
+      k = step.k;
+      current = step.op;
+      changed = true;
+    }
+  }
+  ExprPtr x = whole.expr;
+  if (written != &operand) {
+    ARROW_ASSIGN_OR_RAISE(const Typed rest, bind(*written));
+    x = rest.expr;
+  }
+  // The passes, each followed by the moves it allows (a pass reads no cast of a value to its own
+  // type, which DuckDB's binder never writes).
+  for (;;) {
+    ExprPtr passed = RewriteArithmeticPass(x);
+    bool stepped = passed != x;
+    x = std::move(passed);
+    for (;;) {
+      if (x->type != compared) {
+        if (!DropsCast(x->type, compared, k)) {
+          break;
+        }
+        compared = x->type;
+        stepped = true;
+      }
+      const LogicalType type = x->type;
+      if (const auto* cast = std::get_if<CastExpr>(&x->node)) {
+        if (!DropsCast(cast->operand->type, type, k)) {
+          break;
+        }
+        x = cast->operand;
+        compared = x->type;
+        stepped = true;
+        continue;
+      }
+      if (!IsInteger(type)) {
+        break;
+      }
+      const IntegerRange range = RangeOf(type);
+      if (k < range.min || k > range.max) {
+        break;
+      }
+      const auto* arith = std::get_if<ArithExpr>(&x->node);
+      if (arith == nullptr) {
+        break;
+      }
+      const std::optional<Int128> right = IntegerConstant(*arith->right);
+      const std::optional<Int128> left = IntegerConstant(*arith->left);
+      if (right.has_value() == left.has_value()) {
+        break;  // no constant, or two that DuckDB leaves unfolded
+      }
+      const ExprPtr& rest = right.has_value() ? arith->left : arith->right;
+      const MoveStep step = MoveStepOf(arith->op, right.value_or(left.value_or(0)),
+                                       right.has_value(), k, current, range, distinct);
+      if (step.kind == MoveStep::Kind::kDecide) {
+        return decided(rest, step);
+      }
+      if (step.kind == MoveStep::Kind::kStop) {
+        break;
+      }
+      x = rest;
+      k = step.k;
+      current = step.op;
+      stepped = true;
+    }
+    if (!stepped) {
+      break;
+    }
+    changed = true;
+  }
+  // An operand of a narrower type left behind a cast DuckDB keeps: compared through it.
+  if (x->type != compared) {
+    std::string name = std::format("CAST({} AS {})", x->name, ToString(compared));
+    x = std::make_shared<const Expr>(
+        Expr{.node = CastExpr{.operand = x}, .type = compared, .name = std::move(name)});
+  }
+  if (!changed) {
+    return std::nullopt;
+  }
+  return Moved{.operand = std::move(x), .op = current, .k = k, .outcome = Moved::Outcome::kCompare};
 }
 
 // A condition of WHERE (the input scope) or HAVING (the output scope, `having`): an operand
@@ -4239,6 +4625,11 @@ struct Binder::BindConditionOf {
   const ColumnOf& column_of;
   bool input = false;
   bool nested = false;
+  // The type of the constant expression a literal side was folded from, or of a BETWEEN's values
+  // (MoveConstants), and what the binder wrote the comparison for (written_comparisons_).
+  std::optional<LogicalType> folded_type = std::nullopt;
+  bool distinct_from = false;
+  WrittenComparison* written_for = nullptr;
 
   // `operand <op> literal` (and the LIKE and IN forms) through the column binders.
   arrow::Result<Predicate> WithLiteral(const sql::Expr& operand_expr, sql::CompareOp op,
@@ -4246,10 +4637,16 @@ struct Binder::BindConditionOf {
                                        const std::vector<sql::Literal>& list,
                                        SourceSpan span) const {
     ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(operand_expr));
+    return WithBound(operand, operand_expr.span(), op, literal, list, span);
+  }
+  // The same over a bound operand, written at `operand_span`.
+  arrow::Result<Predicate> WithBound(const Typed& operand, SourceSpan operand_span,
+                                     sql::CompareOp op, const sql::Literal& literal,
+                                     const std::vector<sql::Literal>& list, SourceSpan span) const {
     const BoundColumn column = column_of(operand);
     // The comparison binders read the operand's name and span from a column reference.
     const sql::Comparison cmp{
-        .column = sql::ColumnRef{.name = column.name, .quoted = false, .span = operand_expr.span()},
+        .column = sql::ColumnRef{.name = column.name, .quoted = false, .span = operand_span},
         .op = op,
         .literal = literal,
         .list = list,
@@ -4280,8 +4677,20 @@ struct Binder::BindConditionOf {
                        sql::Literal{}, list, in.span);
   }
   arrow::Result<Predicate> operator()(const sql::BinaryExpr& binary) const {
+    if (written_for == nullptr) {
+      if (const auto entry = binder.written_comparisons_.find(&binary);
+          entry != binder.written_comparisons_.end()) {
+        BindConditionOf with = *this;
+        with.written_for = &entry->second;
+        with.distinct_from = entry->second.distinct;
+        with.folded_type = entry->second.folded_type;
+        return with(binary);
+      }
+    }
     // A constant integer expression on a side (1 + 2) as the literal of its value, which then
-    // folds as any literal; one that overflows its type is a bind error.
+    // folds as any literal; one that overflows its type is a bind error. One that is no literal
+    // (a minus over one is, as DuckDB's parser writes it) is of its own type, which DuckDB casts
+    // the operand to (MoveConstants).
     for (const bool left : {true, false}) {
       const sql::Expr& side = left ? *binary.left : *binary.right;
       if (std::holds_alternative<sql::Literal>(side) || !IsFoldableConstant(side)) {
@@ -4290,7 +4699,12 @@ struct Binder::BindConditionOf {
       ARROW_ASSIGN_OR_RAISE(sql::Literal folded, FoldConstant(side));
       sql::BinaryExpr literal = binary;
       (left ? literal.left : literal.right) = sql::Box<sql::Expr>(sql::Expr(std::move(folded)));
-      return (*this)(literal);
+      BindConditionOf typed = *this;
+      if (const auto constant = FoldTyped(side);
+          !IsIntegerLiteral(side) && constant.has_value() && constant->ok()) {
+        typed.folded_type = CommonValueType(typed.folded_type, (*constant)->type);
+      }
+      return typed(literal);
     }
     const sql::CompareOp op = SqlCompareOp(binary.op);
     const auto* left_literal = std::get_if<sql::Literal>(&*binary.left);
@@ -4301,10 +4715,14 @@ struct Binder::BindConditionOf {
       const sql::CompareOp oriented = right_literal != nullptr ? op : Mirror(op);
       {
         ARROW_ASSIGN_OR_RAISE(const auto moved,
-                              binder.MoveConstants(operand_expr, oriented, literal, bind, !input));
+                              binder.MoveConstants(operand_expr, oriented, literal, bind,
+                                                   folded_type, distinct_from));
         if (moved.has_value()) {
+          const Typed operand{.expr = moved->operand};
+          if (written_for != nullptr) {
+            written_for->moved = moved->operand;
+          }
           if (moved->outcome != Moved::Outcome::kCompare) {
-            ARROW_ASSIGN_OR_RAISE(const Typed operand, bind(*moved->operand));
             // A top-level FALSE reads nothing; inside an expression it is NULL for a NULL operand.
             const bool never = moved->outcome == Moved::Outcome::kFalse;
             return Predicate{
@@ -4319,7 +4737,7 @@ struct Binder::BindConditionOf {
                                .negative = moved->k < 0,
                                .text = Int128ToString(moved->k < 0 ? -moved->k : moved->k),
                                .span = literal.span};
-          return WithLiteral(*moved->operand, moved->op, k, {}, binary.span);
+          return WithBound(operand, operand_expr.span(), moved->op, k, {}, binary.span);
         }
       }
       return WithLiteral(operand_expr, oriented, literal, {}, binary.span);
@@ -4375,6 +4793,7 @@ struct Binder::BindConditionOf {
       if (both.op != sql::BinaryOp::kAnd) {
         return arrow::Status::Invalid("IS DISTINCT FROM a value binds as a compound condition");
       }
+      const WrittenScope written(binder, *both.left, WrittenComparison{.distinct = true});
       return (*this)(std::get<sql::BinaryExpr>(*both.left));
     }
     ARROW_ASSIGN_OR_RAISE(const Typed left, bind(*distinct.left));
@@ -4558,7 +4977,9 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
     // operand >= low AND operand <= high, under a NOT when negated; named as DuckDB names it.
     ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
     BoolExpr both{.op = BoolOp::kAnd, .args = {}};
+    const std::optional<LogicalType> folded = BetweenType(*between, bind);
     for (const sql::Expr& comparison : BetweenComparisons(*between)) {
+      const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
       ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(comparison, bind, input));
       both.args.push_back(std::move(arg.expr));
     }
@@ -4573,16 +4994,72 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
                      .name = ExprName(expr)});
   }
   if (const auto* distinct = std::get_if<sql::DistinctFromExpr>(&expr)) {
-    // With a constant side, the conditions it means (LoweredDistinctFrom), named as written.
+    // With a constant side, the conditions it means (LoweredDistinctFrom), named as written. DuckDB
+    // keeps one comparison, whose constants it moves as for = and <> (MoveConstants, `distinct`):
+    // so the null test reads the operand they leave, which is NULL exactly where the operand as
+    // written is, and computes nothing that comparison does not.
     if (const std::optional<sql::Expr> lowered = LoweredDistinctFrom(*distinct)) {
-      ARROW_ASSIGN_OR_RAISE(const Typed bound, BindBool(*lowered, bind, input));
-      Expr named = *bound.expr;
-      named.name = ExprName(expr);
-      return Leaf(std::move(named));
+      const auto* both = std::get_if<sql::BinaryExpr>(&*lowered);
+      if (both == nullptr) {
+        ARROW_ASSIGN_OR_RAISE(const Typed bound, BindBool(*lowered, bind, input));
+        Expr named = *bound.expr;
+        named.name = ExprName(expr);
+        return Leaf(std::move(named));
+      }
+      const WrittenScope written(*this, *both->left, WrittenComparison{.distinct = true});
+      ARROW_ASSIGN_OR_RAISE(const Typed compared, BindBool(*both->left, bind, input));
+      ExprPtr null_test;
+      if (const ExprPtr moved = written.moved(); moved != nullptr) {
+        const auto& is_null = std::get<sql::IsNullExpr>(*both->right);
+        sql::IsNullExpr positive = is_null;
+        positive.negated = false;
+        null_test = std::make_shared<const Expr>(Expr{
+            .node = PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kIsNull,
+                                                         .column = BoundColumn{.index = 0,
+                                                                               .name = moved->name,
+                                                                               .type = moved->type},
+                                                         .span = is_null.span},
+                                  .operands = {moved}},
+            .type = LogicalType::kBoolean,
+            .name = ExprName(sql::Expr(std::move(positive)))});
+        if (is_null.negated) {
+          // IS NOT NULL inside an expression is NOT (IS NULL), as below (ADR 0037's NL4).
+          null_test = std::make_shared<const Expr>(
+              Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(null_test)}},
+                   .type = LogicalType::kBoolean,
+                   .name = ExprName(*both->right)});
+        }
+      } else {
+        ARROW_ASSIGN_OR_RAISE(const Typed bound, BindBool(*both->right, bind, input));
+        null_test = bound.expr;
+      }
+      return Leaf(
+          Expr{.node = BoolExpr{.op = both->op == sql::BinaryOp::kAnd ? BoolOp::kAnd : BoolOp::kOr,
+                                .args = {compared.expr, std::move(null_test)}},
+               .type = LogicalType::kBoolean,
+               .name = ExprName(expr)});
     }
   }
   if (const auto* unary = std::get_if<sql::UnaryExpr>(&expr);
       unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+    // An = or <> under NOTs is the comparison they flip it to (FoldNots), as DuckDB's parser
+    // writes it before its optimizer reads it: its constant moving then sees NOT (x = k) as
+    // x <> k, which it never decides FALSE (MoveConstants). Named as the NOT is. An ordered
+    // comparison keeps its NOT: its moves are the same either way, and under antb1's IEEE
+    // comparison of DOUBLE values (divergence D10) NOT (d < 1) and d >= 1 differ for NaN.
+    if (const auto folded = FoldNots(expr);
+        folded.has_value() &&
+        (folded->op == sql::BinaryOp::kEq || folded->op == sql::BinaryOp::kNe)) {
+      const sql::Expr flipped(sql::BinaryExpr{.op = folded->op,
+                                              .left = sql::Box<sql::Expr>(*folded->left),
+                                              .right = sql::Box<sql::Expr>(*folded->right),
+                                              .op_span = unary->op_span,
+                                              .span = unary->span});
+      ARROW_ASSIGN_OR_RAISE(const Typed comparison, BindBool(flipped, bind, input));
+      Expr named = *comparison.expr;
+      named.name = ExprName(expr);
+      return Leaf(std::move(named));
+    }
     ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(*unary->operand, bind, input));
     return Leaf(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(arg.expr)}},
                      .type = LogicalType::kBoolean,
@@ -4986,7 +5463,8 @@ namespace {
 // literal in a DECIMAL's p digits, rounded half away from zero where the scale shrinks as DuckDB
 // casts (CT2), or in an integer type's range rounded the same way (CT3); a string literal as
 // VARCHAR or TIMESTAMP. std::nullopt for anything else, which is cast as a value or refused, as is
-// a constant DuckDB would fail to convert.
+// a constant DuckDB would fail to convert; and for arithmetic of integer literals that overflows
+// its type, which is cast as a value: computed, as DuckDB leaves it unfolded.
 std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, LogicalType to) {
   const auto in_decimal = [&to](Int128 unscaled, int scale) -> std::optional<Constant> {
     const std::optional<Int128> scaled = Rescale(unscaled, scale, to.scale());
@@ -5045,6 +5523,11 @@ std::optional<arrow::Result<Constant>> CastConstant(const sql::Expr& expr, Logic
     return std::nullopt;
   }
   if (!folded->ok()) {
+    // One that overflows stays unfolded, as DuckDB's constant folding leaves it: it is computed,
+    // failing on the first row that computes it. A HUGEINT out of antb1's range is refused.
+    if (folded->status().IsInvalid()) {
+      return std::nullopt;
+    }
     return folded->status();
   }
   const Int128 value = (**folded).value;
@@ -5083,7 +5566,18 @@ arrow::Result<Typed> Binder::BindCast(const sql::CastExpr& cast, const BindFn& b
   }
   const LogicalType to = target->type;
   std::string name = std::format("CAST({} AS {})", ExprName(*cast.operand), target->name);
-  if (std::optional<arrow::Result<Constant>> constant = CastConstant(*cast.operand, to)) {
+  // An integer constant expression already of T's type is no cast to DuckDB, whose binder returns
+  // the expression itself: its constants stay in the chain around it (RewriteArithmetic) rather
+  // than fold into one here. A literal is a cast DuckDB folds.
+  const bool own_type = [&cast, to] {
+    if (!IsInteger(to) || IsIntegerLiteral(*cast.operand)) {
+      return false;
+    }
+    const auto folded = FoldTyped(*cast.operand);
+    return folded.has_value() && folded->ok() && (*folded)->type == to;
+  }();
+  if (std::optional<arrow::Result<Constant>> constant =
+          own_type ? std::nullopt : CastConstant(*cast.operand, to)) {
     ARROW_ASSIGN_OR_RAISE(Constant value, *std::move(constant));
     return Leaf(Expr{.node = ConstantExpr{.value = std::move(value)}, .type = to, .name = name});
   }
@@ -5353,7 +5847,10 @@ arrow::Status Binder::ClassifyConjunct(const sql::Expr& conjunct, SourceSpan ele
   if (comparisons.empty()) {
     return BindAcrossRelations(conjunct, bindings);
   }
+  const std::optional<LogicalType> folded = BetweenType(
+      std::get<sql::BetweenExpr>(conjunct), [this](const sql::Expr& e) { return BindInput(e); });
   for (const sql::Expr* part : {&comparisons.front(), &comparisons.back()}) {
+    const WrittenScope written(*this, *part, WrittenComparison{.folded_type = folded});
     ARROW_RETURN_NOT_OK(BindConjunct(*part, element));
   }
   return arrow::Status::OK();
@@ -5520,7 +6017,12 @@ arrow::Status Binder::BindOnOneRelation(const sql::Expr& conjunct, SourceSpan el
       comparisons.empty()
           ? std::vector<const sql::Expr*>{&conjunct}
           : std::vector<const sql::Expr*>{&comparisons.front(), &comparisons.back()};
+  const std::optional<LogicalType> folded =
+      comparisons.empty() ? std::nullopt
+                          : BetweenType(std::get<sql::BetweenExpr>(conjunct),
+                                        [this](const sql::Expr& e) { return BindInput(e); });
   for (const sql::Expr* part : parts) {
+    const WrittenScope written(*this, *part, WrittenComparison{.folded_type = folded});
     ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(*part, /*having=*/false));
     // A unit has no Scan below it, only its join: its conjuncts filter the unit's rows, padded
     // ones included, so they never claim the scan layer that ADR 0020's pushdown reads.
@@ -6510,7 +7012,9 @@ arrow::Status Binder::BindHaving() {
     }
     if (const auto* between = std::get_if<sql::BetweenExpr>(conjunct)) {
       ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
+      const std::optional<LogicalType> folded = BetweenType(*between, bind);
       for (const sql::Expr& comparison : BetweenComparisons(*between)) {
+        const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
         ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
         having_.push_back(std::move(predicate));
       }

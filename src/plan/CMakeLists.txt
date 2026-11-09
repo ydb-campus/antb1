@@ -11,6 +11,7 @@ antb1_add_module(
     join_order.cc
     or_factoring.cc
     aggregate_placement.cc
+    arithmetic_rewrite.cc
     relation_count.cc
     binder.cc
     logical_plan.cc
@@ -35,6 +36,7 @@ if(ANTB1_BUILD_TESTS)
       tests/join_order_test.cc
       tests/or_factoring_test.cc
       tests/aggregate_placement_test.cc
+      tests/arithmetic_rewrite_test.cc
       tests/relation_count_test.cc
       tests/column_ids_test.cc
       tests/grouping_sets_node_test.cc

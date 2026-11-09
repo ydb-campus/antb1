@@ -21,6 +21,7 @@
 #include "antb1/plan/sql_status.h"
 
 #include "aggregate_placement.h"
+#include "arithmetic_rewrite.h"
 #include "join_order.h"
 #include "key_type.h"
 #include "union_branches.h"
@@ -1444,6 +1445,32 @@ LogicalNodePtr Prune(const LogicalNodePtr& node, Needed needed) {
   return std::visit(Pruner{.node = node, .needed = needed}, *node);
 }
 
+// Rule 6: every expression a Compute or a join's residual computes, rewritten by
+// RewriteArithmetic (arithmetic_rewrite.h). Reads no column id and adds none.
+LogicalNodePtr RewriteArithmeticIn(const LogicalNodePtr& node) {
+  LogicalNodePtr out = MapInputs(node, RewriteArithmeticIn);
+  const auto rewrite = [](std::vector<ExprPtr>& exprs) {
+    bool changed = false;
+    for (ExprPtr& expr : exprs) {
+      ExprPtr rewritten = RewriteArithmetic(expr);
+      if (rewritten != expr) {
+        expr = std::move(rewritten);
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  if (const auto* compute = std::get_if<ComputeNode>(out.get())) {
+    ComputeNode rewritten = *compute;
+    return rewrite(rewritten.exprs) ? Make(std::move(rewritten)) : out;
+  }
+  if (const auto* join = std::get_if<JoinNode>(out.get())) {
+    JoinNode rewritten = *join;
+    return rewrite(rewritten.residual) ? Make(std::move(rewritten)) : out;
+  }
+  return out;
+}
+
 }  // namespace
 
 arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& options) {
@@ -1461,6 +1488,10 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // the aggregated side no longer has to carry.
   ColumnId last_exchanged = MaxColumnId(*root);
   root = ExchangeAggregates(root, last_exchanged);
+  // Integer arithmetic as DuckDB computes it (rule 6): after every rule that reads expressions, so
+  // that none meets a rewritten one, and before Prune, which then drops a column that a rewritten
+  // expression no longer reads.
+  root = RewriteArithmeticIn(root);
   const std::vector<ColumnId> output = OutputIds(*root);
   root = Prune(root, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
