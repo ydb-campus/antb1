@@ -117,6 +117,20 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   execution error (exit code 1), as in DuckDB. A `Compute` evaluates only the rows its input selected.
 - **DuckDB's sum rewriter is reproduced in the binder**, so `SUM(x + c)` never fails where DuckDB answers: the SUM
   becomes an expression over a hidden `SUM(x)` and `COUNT(x)` in HUGEINT.
+  Update (2026-11-09): **so are the three rules of DuckDB's expression rewriter that run before it.** In every
+  expression, before its sum rewriter and its constant moving read one, DuckDB moves the constants of a `+` or `*` chain
+  of one integer type to its front and folds them in that type (ConstantOrderNormalization, ConstantFolding: one that
+  overflows stays unfolded and is computed), drops `+ 0`, `* 1` and `// 1`, and makes `x * 0` its
+  `constant_or_null(0, x)` (ArithmeticSimplification). So `x + 2147483647 + 1` fails there on every row and `x + 1 + -1`
+  never does, where antb1 peeled one constant at a time off the top and did the opposite. The rules are reproduced on
+  bound expressions (`src/plan/arithmetic_rewrite.h`), which read no cast of a value to its own type, as DuckDB's binder
+  writes none: an optimizer pass rewrites every expression a plan computes, keeping its name and type, and the sum
+  rewrite and constant moving read the same rewrite of their operand while the binder binds it -- constant moving in
+  DuckDB's order of one pass of the rewriter, then every move it allows, then another pass, since DuckDB's moves end
+  each pass of its rewriter before the operand is visited. A GROUP BY key is still matched as written, as DuckDB matches
+  it before its optimizer. One order of DuckDB's is kept besides: below a cast its comparison simplification drops
+  before the first pass -- a written one that changes the type, or the one its binder writes to compare in a wider type
+  -- constant moving reads the chain as written first (docs/sql-subset.md).
 - **What stays unsupported:** DECIMAL arithmetic (a decimal literal with an integer; antb1 has no DECIMAL type),
   DATE arithmetic, negating a USMALLINT (DuckDB wraps it), `//` and `%` in HUGEINT, and arithmetic on FLOAT columns
   (antb1 reads FLOAT as DOUBLE, divergence D11).

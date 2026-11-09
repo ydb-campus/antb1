@@ -28,11 +28,17 @@ namespace antb1::plan {
 //  4. Limit below Project and Compute, so that it sits right above a Sort (top-N).
 //  5. Aggregate placement (docs/adr/0032-aggregate-placement.md's G2b): a grouped aggregate is
 //     computed on one input of the join it reads, as partials, where the gate admits it.
-//  6. Projection pruning: every Scan reads only the fields that the nodes above it reference
+//  6. Integer arithmetic as DuckDB computes it: every expression a Compute or a join's residual
+//     computes goes through the three rules of DuckDB's expression rewriter that decide which
+//     integer additions and multiplications run (arithmetic_rewrite.h): the constants of a + or *
+//     chain first and folded, x + 0, x * 1 and x // 1 as x. Its name, type and values stay; only
+//     the rows an overflow fails on change, to DuckDB's. Last of the rules that read expressions,
+//     so that none of them meets a rewritten one.
+//  7. Projection pruning: every Scan reads only the fields that the nodes above it reference
 //     (possibly none), and Computes keep only the expressions used. A Project and a UnionAll keep
 //     every output, so a derived table's or a union's branch computes its columns whether or not
 //     anything above reads them.
-// Rules 1 to 6 find columns by their ids and ignore the input's indices; last,
+// Rules 1 to 7 find columns by their ids and ignore the input's indices; last,
 // plan::ResolvePositions sets every index from the ids (ADR 0022). A plan it returns has the same
 // output columns (and column ids) and the same answer as the input plan, and holds no dependent
 // join, so no later pass and no operator meets one.

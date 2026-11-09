@@ -704,8 +704,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "CAST of the number 1e3 to DOUBLE is not supported"},
         ErrorCase{"SELECT CAST('2020-1-2' AS TIMESTAMP) FROM t", kBind, "'2020-1-2'",
                   "invalid timestamp '2020-1-2'"},
-        ErrorCase{"SELECT CAST(2147483647 + 1 AS BIGINT) FROM t", kBind, "2147483647 + 1",
-                  "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT CAST(d AS HUGEINT) FROM t", kUnsupported, "CAST(d AS HUGEINT)",
                   "CAST of DOUBLE values to HUGEINT is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(s AS INT) > 1", kUnsupported, "CAST(s AS INT)",
@@ -4473,9 +4471,9 @@ TEST(BinderTest, RelationLayersAndTheirSpans) {
   EXPECT_EQ(project.columns[0].qualifier, "");
 }
 
-// DuckDB's constant moving in WHERE: x + c <op> k is x <op> k - c for a signed integer x (and
-// likewise x - c, c + x, c - x, x * c when c divides k), so the arithmetic is never computed;
-// it stops where k or the new constant leaves the type, and never applies to USMALLINT.
+// DuckDB's constant moving in WHERE: x + c <op> k is x <op> k - c for an integer x (and likewise
+// x - c, c + x, c - x, x * c when c divides k), so the arithmetic is never computed; it stops where
+// k or the new constant leaves the type, where an = is FALSE instead.
 TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
   const Catalog catalog = MakeCatalog();
   struct Case {
@@ -4514,6 +4512,91 @@ TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
                 .filter = "Filter \"(i32 + (2147483647 + 1))\" > 5"},
            Case{.where = "i32 + 65536 * 32768 > 5",
                 .filter = "Filter \"(i32 + (65536 * 32768))\" > 5"},
+           // The operand as DuckDB's expression rewriter leaves it (RewriteArithmetic): a chain's
+           // constants first and folded, then moved; the regrouped constant that overflows is no
+           // constant; x * 1 and x + 0 are x; with two columns the chain moves nothing.
+           Case{.where = "i32 + 1 + 2 > 5", .filter = "Filter i32 > 2"},
+           Case{.where = "1 + i32 + 2 = 7", .filter = "Filter i32 = 4"},
+           Case{.where = "1 + (2 + i32) = 10", .filter = "Filter i32 = 7"},
+           Case{.where = "i32 * 2 * 3 = 12", .filter = "Filter i32 = 2"},
+           Case{.where = "i32 * 2 * 3 = 13", .filter = "Filter FALSE"},
+           Case{.where = "i32 * 2 * 3 > 13", .filter = "Filter \"((i32 * 2) * 3)\" > 13"},
+           Case{.where = "i32 + 1 + -1 >= 2147483647", .filter = "Filter i32 >= 2147483647"},
+           Case{.where = "i32 * 1 > 5", .filter = "Filter i32 > 5"},
+           Case{.where = "i32 + 2147483647 + 1 > 5",
+                .filter = "Filter \"((i32 + 2147483647) + 1)\" > 5"},
+           Case{.where = "i32 + 1 + i32 + 2 > 5",
+                .filter = "Filter \"(((i32 + 1) + i32) + 2)\" > 5"},
+           // Against a constant expression of a wider type, DuckDB moves the constants of the
+           // operation's own type off the chain as written first; a SMALLINT chain's INTEGER
+           // literals are none.
+           Case{.where = "i32 + 2147483647 + 1 > 2147483648 - 1", .filter = "Filter i32 > -1"},
+           Case{.where = "i16 + 32767 + 1 > 2147483648 - 2147483643",
+                .filter = "Filter \"((i16 + 32767) + 1)\" > 5"},
+           Case{.where = "i32 + 2147483647 + 1 BETWEEN 4 AND 2147483648 - 1",
+                .filter = "Filter i32 >= -2147483644 AND i32 <= -1"},
+           // In DuckDB's order: one pass of the rewrite, then the moves it allows, then another
+           // pass: the * 1 the first pass removes lets 2147483647 move before a pass regroups it.
+           Case{.where = "(i32 + 2147483647) * 1 + 1 > 5", .filter = "Filter i32 > -2147483643"},
+           // An = whose moved constant leaves the type is FALSE.
+           Case{.where = "i32 + 1 + -1 - 0 = 2147483648 - 1", .filter = "Filter FALSE"},
+           // A widening cast is moved through where k fits its operand's type, and kept where
+           // it does not, so that the operand is computed.
+           Case{.where = "CAST(i16 AS INTEGER) + 1 > 5", .filter = "Filter i16 > 4"},
+           Case{.where = "i16 + 30000 + 70000 < 5",
+                .filter = "Filter \"CAST((i16 + 30000) AS INTEGER)\" < -69995"},
+           // A cast at the top of the operand is dropped before its first pass, so its constants
+           // move as written; a USMALLINT operand is compared behind its cast, which DuckDB keeps.
+           Case{.where = "CAST(i32 + 2147483647 + 1 AS BIGINT) > 2147483647",
+                .filter = "Filter i32 > -1"},
+           Case{.where = "u16 + 0 + 1 = 1 + 1",
+                .filter = "Filter \"CAST(((u16 + 0) + 1) AS INTEGER)\" = 2"},
+           // Every integer type, USMALLINT too, and constants of // and %.
+           Case{.where = "u16 + 1 > 5", .filter = "Filter u16 > 4"},
+           Case{.where = "i32 + (4 // 2) + 1 > 5", .filter = "Filter i32 > 2"},
+           // A cast to a value's own type is none, as DuckDB's binder writes none: the chain
+           // regroups in the first pass and overflows.
+           Case{.where = "CAST(i32 + 2147483647 + 1 AS INTEGER) > 5",
+                .filter = "Filter \"CAST(((i32 + 2147483647) + 1) AS INTEGER)\" > 5"},
+           // DuckDB drops a narrowing cast and one to a DECIMAL of scale 0 too, but none to a
+           // DECIMAL of another scale and none between USMALLINT and a signed type.
+           Case{.where = "CAST(i64 + 1 AS INTEGER) > 5", .filter = "Filter i64 > 4"},
+           Case{.where = "CAST(i32 + 1 AS DECIMAL(12,0)) > 5", .filter = "Filter i32 > 4"},
+           Case{.where = "CAST(i32 + 1 AS DECIMAL(12,2)) > 5",
+                .filter = "Filter \"CAST((i32 + 1) AS DECIMAL(12, 2))\" > 5.00"},
+           Case{.where = "CAST(u16 + 1 AS INTEGER) > 5",
+                .filter = "Filter \"CAST((u16 + 1) AS INTEGER)\" > 5"},
+           // x * 0 moves nothing, as written or once a pass has regrouped it.
+           Case{.where = "i32 * 0 > 2147483648 - 1", .filter = "Filter \"(i32 * 0)\" > 2147483647"},
+           Case{.where = "i32 * 2 * 0 > 5", .filter = "Filter \"((i32 * 2) * 0)\" > 5"},
+           // A BETWEEN compares in the type of all three values: a literal or a column that does
+           // not fit the operand's widens it for both comparisons; a decimal literal such as 3.5
+           // moves nothing.
+           Case{.where = "i32 + 2147483647 + 1 BETWEEN -3000000000 AND 5",
+                .filter = "Filter i32 <= -2147483643"},
+           Case{.where = "i32 + 2147483647 + 1 BETWEEN i64 AND 5",
+                .filter = "Filter i32 <= -2147483643"},
+           // A k the cast's own type does not hold is compared behind it, so it is computed (or,
+           // as a whole conjunct, folds as D14 says).
+           Case{.where = "CAST(i32 AS SMALLINT) > 40000", .filter = "Filter FALSE"},
+           Case{.where = "CAST(i32 + 1 AS SMALLINT) + 0 < 40000",
+                .filter = "Filter \"(CAST((i32 + 1) AS SMALLINT) + 0)\" IS NOT NULL"},
+           Case{.where = "CAST(h AS SMALLINT) <> 40000",
+                .filter = "Filter \"CAST(h AS SMALLINT)\" IS NOT NULL"},
+           // A DECIMAL of scale 0 casts as an integer type does, and under a cast to a value's own
+           // type the cast below is still the one at the top.
+           Case{.where = "CAST(h AS BIGINT) > 5", .filter = "Filter h > 5"},
+           Case{.where = "CAST(CAST(i32 + 2147483647 + 1 AS BIGINT) AS BIGINT) > 5",
+                .filter = "Filter i32 > -2147483643"},
+           // A decimal k of scale 0 is an integer compared in a DECIMAL, as written first; one of
+           // another scale moves nothing.
+           Case{.where = "i32 + 2147483647 + 1 <= 5.", .filter = "Filter i32 <= -2147483643"},
+           Case{.where = "i32 + 2147483647 + 1 <= 5.0",
+                .filter = "Filter \"((i32 + 2147483647) + 1)\" <= 5"},
+           // A literal operand of a BETWEEN takes the type of a bound it fits.
+           Case{.where = "5 BETWEEN u16 + 1 AND u16 + 10", .filter = "Filter u16 <= 4"},
+           Case{.where = "i32 - 1 BETWEEN 0 AND 3.5",
+                .filter = "Filter \"(i32 - 1)\" >= 0 AND \"(i32 - 1)\" <= 3"},
        }) {
     const std::string sql = "SELECT COUNT(*) FROM t WHERE " + std::string(c.where);
     auto plan = BindSql(sql, catalog);
@@ -4521,6 +4604,91 @@ TEST(BinderTest, WhereMovesConstantsLikeDuckDb) {
     const std::string explain = Explain(*plan);
     EXPECT_NE(explain.find(std::string(c.filter) + "\n"), std::string::npos) << sql << "\n"
                                                                              << explain;
+  }
+}
+
+// A BETWEEN whose values read two relations, and one of whose comparisons reads only one, still
+// compares both in the type of all three: a comparison bound again on its own relation keeps what
+// the BETWEEN wrote for it.
+TEST(BinderTest, ABetweenOverTwoRelationsKeepsItsType) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT COUNT(*) FROM t AS a JOIN u AS b ON a.i16 = b.i16 "
+      "WHERE a.i32 + 2147483647 + 1 BETWEEN b.i64 AND 5",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string explain = Explain(*plan);
+  EXPECT_TRUE(explain.contains("Filter a.i32 <= -2147483643\n")) << explain;
+}
+
+// NOT over an = or a <> binds as the comparison it flips (through any NOTs), as DuckDB's parser
+// writes it before its optimizer moves constants: NOT (x = k) is x <> k, which no moved constant
+// that leaves the type decides, so its operand is computed as far as the moves reach. An ordered
+// comparison keeps its NOT: its moves are the same either way, and NaN tells NOT (d < 1) from
+// d >= 1 in antb1's IEEE comparison of DOUBLE values (divergence D10).
+TEST(BinderTest, NotOverAnEqualityIsTheComparisonItFlips) {
+  const Catalog catalog = MakeCatalog();
+  struct Case {
+    std::string_view where;
+    bool flipped;  // else a NOT over the comparison
+    CompareOp op;
+    std::string_view constant;
+    bool column;            // the moves reach the column; else an addition is left to compute
+    std::string_view name;  // DuckDB's
+  };
+  for (const Case& c : {
+           Case{.where = "NOT (i32 + 1 + -1 - 0 = 2147483648 - 1)",
+                .flipped = true,
+                .op = CompareOp::kNe,
+                .constant = "2147483647",
+                .column = true,
+                .name = "((((i32 + 1) + -1) - 0) != (2147483648 - 1))"},
+           Case{.where = "NOT (2 + (30000 + i16) = 2999997233 - 3000000000)",
+                .flipped = true,
+                .op = CompareOp::kNe,
+                .constant = "-2769",
+                .column = false,
+                .name = "((2 + (30000 + i16)) != (2999997233 - 3000000000))"},
+           Case{.where = "NOT (i16 + 1 <> 5)",
+                .flipped = true,
+                .op = CompareOp::kEq,
+                .constant = "4",
+                .column = true,
+                .name = "((i16 + 1) = 5)"},
+           Case{.where = "NOT NOT NOT (i16 + 1 = 5)",
+                .flipped = true,
+                .op = CompareOp::kNe,
+                .constant = "4",
+                .column = true,
+                .name = "((i16 + 1) != 5)"},
+           Case{.where = "NOT (i16 + 1 > 5)",
+                .flipped = false,
+                .op = CompareOp::kGt,
+                .constant = "4",
+                .column = true,
+                .name = "((i16 + 1) <= 5)"},
+       }) {
+    const std::string sql = "SELECT COUNT(*) FROM t WHERE " + std::string(c.where);
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const auto& compute = std::get<ComputeNode>(Nth(*plan, 2));
+    ASSERT_EQ(compute.exprs.size(), 1U) << sql;
+    EXPECT_EQ(compute.exprs[0]->name, c.name) << sql;
+    const Expr* compared = compute.exprs[0].get();
+    if (!c.flipped) {
+      const auto* negated = std::get_if<BoolExpr>(&compared->node);
+      ASSERT_NE(negated, nullptr) << sql << ": a NOT is left";
+      EXPECT_EQ(negated->op, BoolOp::kNot) << sql;
+      ASSERT_EQ(negated->args.size(), 1U) << sql;
+      compared = negated->args[0].get();
+    }
+    const auto* predicate = std::get_if<PredicateExpr>(&compared->node);
+    ASSERT_NE(predicate, nullptr) << sql;
+    EXPECT_EQ(predicate->predicate.kind, Predicate::Kind::kCompare) << sql;
+    EXPECT_EQ(predicate->predicate.op, c.op) << sql;
+    EXPECT_EQ(ToString(predicate->predicate.constant), c.constant) << sql;
+    ASSERT_EQ(predicate->operands.size(), 1U) << sql;
+    EXPECT_EQ(std::holds_alternative<ColumnExpr>(predicate->operands[0]->node), c.column) << sql;
   }
 }
 
@@ -4614,6 +4782,17 @@ TEST(BinderTest, HavingMovesConstantsLikeDuckDb) {
                 .text = "Filter i16 > 10000\n"},
            Case{.sql = "SELECT i16, CASE WHEN i16 + 30000 > 5 THEN 1 END FROM t GROUP BY i16",
                 .text = "Compute CASE  WHEN (((i16 + 30000) > 5)) THEN (1) ELSE NULL END"},
+           // The constants of a chain first and folded, then moved, as DuckDB moves them.
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING i16 + 1 + 2 > 5",
+                .text = "Filter i16 > 2\n"},
+           // A cast GROUP BY key is one value, under a cast to its own type too: its operand,
+           // no value of the output scope, is never bound alone.
+           Case{.sql = "SELECT CAST(i16 AS INTEGER) AS k FROM t GROUP BY CAST(i16 AS INTEGER) "
+                       "HAVING CAST(CAST(i16 AS INTEGER) AS INTEGER) > 1",
+                .text = "Filter \"CAST(CAST(i16 AS INTEGER) AS INTEGER)\" > 1\n"},
+           Case{.sql = "SELECT CAST(i16 AS INTEGER) AS k, CASE WHEN CAST(i16 AS INTEGER) = 7 THEN "
+                       "1 END FROM t GROUP BY CAST(i16 AS INTEGER)",
+                .text = "Compute CASE  WHEN ((CAST(i16 AS INTEGER) = 7)) THEN (1) ELSE NULL END"},
        }) {
     auto plan = BindSql(c.sql, catalog);
     ASSERT_TRUE(plan.ok()) << c.sql << ": " << plan.status().ToString();
@@ -4623,7 +4802,8 @@ TEST(BinderTest, HavingMovesConstantsLikeDuckDb) {
         << "no addition computed: " << c.sql << "\n"
         << explain;
   }
-  // A constant that overflows its type is none (ConstantValue), so the operand is computed.
+  // A constant that overflows its type is none (RewriteArithmetic leaves it unfolded), so the
+  // operand is computed.
   auto overflowing =
       BindSql("SELECT i16 FROM t GROUP BY i16 HAVING i16 + (2147483647 + 1) > 5", catalog);
   ASSERT_TRUE(overflowing.ok()) << overflowing.status().ToString();
@@ -4650,6 +4830,55 @@ TEST(BinderTest, SumRewriteScopeLikeDuckDb) {
   EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*having, 0)))
       << "the HAVING column is projected away\n"
       << Explain(*having);
+}
+
+// The sum rewrite reads the argument as DuckDB's expression rewriter leaves it, as DuckDB's sum
+// rewriter does: a chain's constants first and folded, so one rewrite with their sum; a regrouped
+// constant that overflows is none, so no rewrite; and constants that lead a chain stay apart, each
+// a rewrite of its own whose COUNT counts what it adds to, as DuckDB counts it.
+TEST(BinderTest, TheSumRewriteReadsTheArgumentAsDuckDbRewritesIt) {
+  const Catalog catalog = MakeCatalog();
+  const auto aggregates = [&catalog](std::string_view sql) {
+    std::vector<std::string> out;
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return out;
+    }
+    for (const LogicalNode* node = plan->root.get(); node != nullptr;) {
+      if (const auto* aggregate = std::get_if<AggregateNode>(node)) {
+        for (const AggregateCall& call : aggregate->aggregates) {
+          out.push_back(std::format("{}({})", call.kind == AggKind::kSum ? "SUM" : "COUNT",
+                                    call.arg.value_or(BoundColumn{}).name));
+        }
+        return out;
+      }
+      const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+      node = inputs.size() == 1 ? inputs.front().get() : nullptr;
+    }
+    ADD_FAILURE() << sql << ": no aggregation";
+    return out;
+  };
+  EXPECT_EQ(aggregates("SELECT SUM(i32 + 1 + 2) FROM t"),
+            (std::vector<std::string>{"SUM(i32)", "COUNT(i32)"}));
+  EXPECT_EQ(aggregates("SELECT SUM(i32 + 2147483647 + 1) FROM t"),
+            (std::vector<std::string>{"SUM(((i32 + 2147483647) + 1))"}));
+  EXPECT_EQ(aggregates("SELECT SUM(i32 + 1 + -1) FROM t"),
+            (std::vector<std::string>{"SUM(((i32 + 1) + -1))"}))
+      << "x + 0 is x: nothing to rewrite, and the argument computes nothing";
+  EXPECT_EQ(aggregates("SELECT SUM(1 + (2 + i32)) FROM t"),
+            (std::vector<std::string>{"SUM(i32)", "COUNT(i32)", "COUNT((2 + i32))"}));
+  // A USMALLINT operand of an INTEGER sum, which DuckDB reads through a cast.
+  EXPECT_EQ(aggregates("SELECT SUM(u16 + 2147483647) FROM t"),
+            (std::vector<std::string>{"SUM(u16)", "COUNT(u16)"}));
+  // SUM(i32) + 3 * COUNT(i32): the constants folded, one rewrite.
+  auto plan = BindSql("SELECT SUM(i32 + 1 + 2) FROM t", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto& post = std::get<ComputeNode>(Nth(*plan, 1));
+  ASSERT_EQ(post.exprs.size(), 1U);
+  const auto& sum = std::get<ArithExpr>(post.exprs[0]->node);
+  const auto& product = std::get<ArithExpr>(sum.right->node);
+  EXPECT_EQ(std::get<Int128>(std::get<ConstantExpr>(product.left->node).value.value), Int128{3});
 }
 
 // Inside ORDER BY and HAVING expressions a select alias is the fallback for a name that is no table
@@ -4722,12 +4951,11 @@ TEST(BinderTest, BooleanConditions) {
   ASSERT_EQ(compute.exprs.size(), 1U);
   const auto& any = std::get<BoolExpr>(compute.exprs[0]->node);
   ASSERT_EQ(any.args.size(), 2U);
-  const auto& negated = std::get<BoolExpr>(any.args[0]->node);
-  EXPECT_EQ(negated.op, BoolOp::kNot);
-  const auto& never = std::get<PredicateExpr>(negated.args[0]->node);
-  EXPECT_EQ(never.predicate.kind, Predicate::Kind::kFalse);
-  ASSERT_TRUE(never.predicate.column.has_value()) << "NULL for a NULL i16, not FALSE";
-  EXPECT_EQ(never.operands.size(), 1U);
+  // NOT (i16 = 1.5) is i16 <> 1.5, as DuckDB's parser flips it: true for every i16 but NULL.
+  const auto& always = std::get<PredicateExpr>(any.args[0]->node);
+  EXPECT_EQ(always.predicate.kind, Predicate::Kind::kIsNotNull);
+  ASSERT_TRUE(always.predicate.column.has_value()) << "NULL for a NULL i16, not TRUE";
+  EXPECT_EQ(always.operands.size(), 1U);
   const auto& moved = std::get<PredicateExpr>(any.args[1]->node);
   EXPECT_EQ(moved.predicate.kind, Predicate::Kind::kCompare);
   EXPECT_EQ(ToString(moved.predicate.constant), "9") << "i16 > 9";

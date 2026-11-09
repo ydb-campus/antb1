@@ -203,6 +203,12 @@ This amends ADR 0012's list of unsupported constructs and three points of ADR 00
     stay for signed integers, because DuckDB applies neither to DECIMAL: `SUM(price * qty + 7)` adds 7 on every row,
     and `price * qty + 7 > 12` computes the addition, both in DECIMAL(18,4), so an overflow of that addition fails in
     both engines (unless rule 11 folds the comparison to a constant, divergence D14).
+    Update (2026-11-09): the binder now reproduces three rules of DuckDB's expression rewriter too, which regroup and
+    fold the constants of integer `+` and `*` chains before either rewrite reads them, and constant moving covers every
+    integer type, USMALLINT included (docs/sql-subset.md). None of the three applies to DECIMAL arithmetic either. The
+    DECIMAL casts constant moving reads through are those DuckDB's comparison simplification drops, between an integer
+    type or a DECIMAL and a DECIMAL of the same scale, where the constant fits both: so the integer constants under a
+    cast to DECIMAL(p,0), or compared with a decimal literal of scale 0 such as `5.`, move.
 
 **Storage:**
 

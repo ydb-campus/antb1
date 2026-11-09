@@ -172,6 +172,732 @@ SELECT COUNT(*) FROM empty WHERE RegionID + (2147483647 + 1) > 5
 BIGINT
 0
 
+# DuckDB's optimizer moves the constants of a + or * chain of one integer type to its front and folds them, in that
+# type, before anything else reads the chain: x + 1 + -1 computes nothing and x * 2 * 0 is 0, so neither overflows at
+# INT_MAX, while i16 + 30000 + 30000 and x + 2147483647 + 1 add their constants first, which fails on every row.
+query I rowsort
+SELECT i32 + 1 + -1 FROM edge
+----
+INTEGER
+-1
+-100000
+-2147483648
+-7
+0
+1
+100000
+2147483647
+54321
+7
+NULL
+NULL
+
+query I rowsort
+SELECT i32 * 2 * 0 FROM edge
+----
+INTEGER
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+NULL
+NULL
+
+query I nosort
+SELECT i16 + 1 + 2 FROM edge WHERE id = 0
+----
+SMALLINT
+-32765
+
+query I rowsort
+SELECT u16 + 70000 + -70000 FROM edge
+----
+INTEGER
+0
+1
+12
+15887
+15917
+2
+32768
+40000
+65535
+7
+NULL
+NULL
+
+statement error Overflow in addition
+SELECT i16 + 30000 + 30000 FROM edge
+
+statement error Overflow in addition
+SELECT i32 + 2147483647 + 1 FROM edge WHERE id = 5
+
+# The same wherever an expression is: GROUP BY, ORDER BY, CASE, a join's ON.
+query II rowsort
+SELECT i32 + 1 + -1, COUNT(*) FROM edge GROUP BY i32 + 1 + -1
+----
+INTEGER	BIGINT
+-1	1
+-100000	1
+-2147483648	1
+-7	1
+0	1
+1	1
+100000	1
+2147483647	1
+54321	1
+7	1
+NULL	2
+
+query I nosort
+SELECT id FROM edge ORDER BY i32 + 1 + -1, id
+----
+INTEGER
+0
+7
+11
+3
+2
+4
+8
+10
+6
+1
+5
+9
+
+query I rowsort
+SELECT CASE WHEN id > 0 THEN i32 * 2 * 0 END FROM edge
+----
+INTEGER
+0
+0
+0
+0
+0
+0
+0
+0
+0
+NULL
+NULL
+NULL
+
+query I rowsort
+SELECT e.id FROM edge AS e JOIN edge AS f ON e.i32 + 1 + -1 = f.i32
+----
+INTEGER
+0
+1
+10
+11
+2
+3
+4
+6
+7
+8
+
+# The sum rewrite and constant moving read the chain as DuckDB's optimizer leaves it: SUM(x + 1 + 2) is one rewrite,
+# with 3; x + 2147483647 + 1 is computed; constants that lead a chain stay apart, so SUM(1 + (2 + x)) counts 2 + x.
+query I nosort
+SELECT SUM(i32 + 1 + 2) FROM edge
+----
+HUGEINT
+54350
+
+statement error Overflow in addition
+SELECT SUM(i32 + 2147483647 + 1) FROM edge
+
+statement error Overflow in addition
+SELECT SUM(1 + (2 + i32)) FROM edge
+
+query I nosort
+SELECT SUM(1 + (2 + i32)) FROM edge WHERE id <> 1
+----
+HUGEINT
+-2147429300
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + 2 > 5
+----
+BIGINT
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + -1 >= 2147483647
+----
+BIGINT
+1
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 > 5
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + 2 IN (4, 13)
+
+# Against a constant expression of a wider type (2147483648 - 1 is a BIGINT) DuckDB moves the constants off the chain
+# as written first, as long as each is of the chain's own type: an INTEGER literal in an INTEGER chain, but not in a
+# SMALLINT one.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 > 2147483648 - 1
+----
+BIGINT
+6
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i16 + 32767 + 1 > 2147483648 - 2147483643
+
+query II rowsort
+SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING i16 + 1 + 2 > 5
+----
+SMALLINT	BIGINT
+100	1
+12345	1
+32767	1
+7	1
+
+statement error Overflow in addition
+SELECT i16 FROM edge GROUP BY i16 HAVING i16 + 30000 + 30000 > 5
+
+# Over no rows nothing is computed, except the one row an aggregate without GROUP BY makes.
+query I nosort
+SELECT SUM(RegionID + 2147483647 + 1) FROM empty
+----
+HUGEINT
+NULL
+
+statement error Overflow in addition
+SELECT MAX(RegionID) + 2147483647 + 1 FROM empty
+
+# Constants move in the order DuckDB's rewriter gives them: one pass over the operand, then the moves it allows, then
+# another pass. The * 1 the first pass removes lets 2147483647 move before a pass could regroup it with the 1.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE (i32 + 2147483647) * 1 + 1 > 5
+----
+BIGINT
+9
+
+query I nosort
+SELECT SUM(CASE WHEN (i32 + 2147483647) * 1 + 1 > 5 THEN 1 ELSE 0 END) FROM edge
+----
+HUGEINT
+9
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE (i64 + 3) * 1 + 9223372036854775807 <= 5
+----
+BIGINT
+1
+
+# An = whose moved constant leaves the type is FALSE, NULL for a NULL operand, which is still computed: in CASE WHEN
+# that computes i32 + 1, and fails at the maximum.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + -1 - 0 = 2147483648 - 1
+----
+BIGINT
+0
+
+statement error Overflow in addition
+SELECT SUM(CASE WHEN i32 + 1 + -1 - 0 = 2147483648 - 1 THEN 1 ELSE 0 END) FROM edge
+
+# Against a BETWEEN bound of a wider type both comparisons move as written: NOT BETWEEN too, over a join and in HAVING.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 BETWEEN 4 AND 2147483648 - 1
+----
+BIGINT
+3
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 NOT BETWEEN 4 AND 2147483648 - 1
+----
+BIGINT
+7
+
+query I nosort
+SELECT COUNT(*) FROM edge AS a JOIN edge AS b ON a.id = b.id WHERE a.i32 - b.i32 + 2147483647 + 1 BETWEEN 4 AND 2147483648 - 1
+----
+BIGINT
+0
+
+# A BETWEEN over two relations whose one comparison reads one of them still compares both in the type of all three.
+query I nosort
+SELECT COUNT(*) FROM edge AS a JOIN edge AS b ON a.id = b.id WHERE a.i32 <> -2147483648 AND a.i32 + 2147483647 + 1 BETWEEN b.i64 AND 5
+----
+BIGINT
+0
+
+query I rowsort
+SELECT i32 FROM edge GROUP BY i32 HAVING i32 + 2147483647 + 1 BETWEEN 4 AND 2147483648 - 1
+----
+INTEGER
+-1
+-100000
+-7
+
+# DuckDB compares a BETWEEN in the type of all three values: a literal or a column bound the operand's type does not
+# hold widens it for both comparisons, and a decimal literal such as 3.5 moves nothing, so i32 - 1 is computed.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 <> -2147483648 AND i32 + 2147483647 + 1 BETWEEN -3000000000 AND 5
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 <> -2147483648 AND i32 + 2147483647 + 1 BETWEEN i64 AND 5
+----
+BIGINT
+0
+
+statement error Overflow in subtraction
+SELECT COUNT(*) FROM edge WHERE i32 - 1 BETWEEN 0 AND 3.5
+
+# Behind such a cast the operand is still computed as its rewrite leaves it: i32 + 1 + -1 is i32.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + -1 BETWEEN 0 AND 3e0
+----
+BIGINT
+2
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 1 + -1 BETWEEN 0 AND 3.5
+----
+BIGINT
+2
+
+# A cast at the top of the operand is dropped before the operand's first pass, so its constants move as written; a
+# USMALLINT chain against a wider constant expression stays computed behind its cast, which DuckDB never drops.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(i32 + 2147483647 + 1 AS BIGINT) > 2147483647
+----
+BIGINT
+6
+
+statement error Overflow in addition
+SELECT SUM(CASE WHEN u16 + 0 + 1 = 1 + 1 THEN 1 ELSE 0 END) FROM edge
+
+# A cast to a value's own type is none, as DuckDB's binder writes none: the chain regroups in the first pass and
+# overflows. DuckDB drops a narrowing cast and one to a DECIMAL of scale 0 too, so their constants move.
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE CAST(i32 + 2147483647 + 1 AS INTEGER) > 5
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(i64 + 1 AS INTEGER) > 5
+----
+BIGINT
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(i32 + 1 AS SMALLINT) > 5
+----
+BIGINT
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(i32 + 1 AS DECIMAL(12,0)) > 5
+----
+BIGINT
+4
+
+# A cast is dropped only where k fits the cast's own type too: otherwise DuckDB compares in a wider type, behind a
+# cast it cannot drop, and computes the cast. A DECIMAL of scale 0 casts as an integer type does; under a cast to a
+# value's own type the cast below is still the one at the top.
+statement error can't be cast
+SELECT COUNT(*) FROM edge WHERE CAST(i32 AS SMALLINT) <> 50000
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE CAST(i32 + 1 AS SMALLINT) + 0 < 40000
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(CAST(i32 + 2147483647 + 1 AS BIGINT) AS BIGINT) > 5
+----
+BIGINT
+9
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE CAST(d38_0 AS BIGINT) > 5
+----
+BIGINT
+14
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE CAST(d9_2 AS DECIMAL(5,2)) > 2
+----
+BIGINT
+11
+
+statement error Failed to cast decimal value
+SELECT COUNT(*) FROM decimals WHERE CAST(d38_0 AS SMALLINT) <> 40000
+
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE CAST(b + 1 AS DECIMAL(19,0)) > 5
+----
+BIGINT
+15
+
+# A decimal k of scale 0 (5.) is an integer compared in a DECIMAL, so its constants move as written first; one of
+# another scale (5.0) moves nothing. A literal operand of a BETWEEN takes the type of a bound it fits.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 <= 5.
+----
+BIGINT
+1
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 BETWEEN 0 AND 5.
+----
+BIGINT
+1
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 <= 5.0
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE 5 BETWEEN u16 + 1 AND u16 + 10
+----
+BIGINT
+3
+
+# The rewrite reads through a cast to a value's own type, around a column or a constant expression alike.
+query II rowsort
+SELECT id, CAST(i32 + 1 AS INTEGER) + -1 FROM edge
+----
+INTEGER	INTEGER
+0	-2147483648
+1	2147483647
+10	54321
+11	-7
+2	0
+3	-1
+4	1
+5	NULL
+6	100000
+7	-100000
+8	7
+9	NULL
+
+query I nosort
+SELECT SUM(CAST(i32 + 1 AS INTEGER)) FROM edge
+----
+HUGEINT
+54330
+
+statement error Overflow in addition
+SELECT i32 + 2147483647 + CAST(1 + -1 AS INTEGER) FROM edge
+
+# A constant that overflows under a cast stays unfolded too: computed, it fails on the first row, and only there.
+statement error Overflow in addition
+SELECT CAST(2147483647 + 1 AS BIGINT) FROM edge
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT CAST(2147483647 + 1 AS BIGINT) AS c FROM empty) AS e
+----
+BIGINT
+0
+
+query II rowsort
+SELECT id, CASE WHEN id > 100 THEN CAST(2147483647 + 1 AS INTEGER) ELSE 0 END FROM edge WHERE id < 3
+----
+INTEGER	INTEGER
+0	0
+1	0
+2	0
+
+# IS DISTINCT FROM moves as <> does, and tests the operand the moves leave for NULL.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 IS DISTINCT FROM 2147483648 - 1
+----
+BIGINT
+11
+
+# Where an = would be decided FALSE (the moved constant leaves the type) or a <> TRUE (the constant does not divide),
+# IS [NOT] DISTINCT FROM is not: the operand is computed.
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + 1 IS NOT DISTINCT FROM -2147483648
+
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM edge WHERE i32 * 2 IS DISTINCT FROM 3
+
+# Inside an expression IS NOT DISTINCT FROM tests the operand the moves leave for NULL, under a NOT.
+query I nosort
+SELECT SUM(CASE WHEN i32 + 2147483647 + 1 IS NOT DISTINCT FROM 2147483648 - 1 THEN 1 ELSE 0 END) FROM edge
+----
+HUGEINT
+1
+
+# NOT over a comparison is the comparison it flips, as DuckDB's parser writes it: NOT (x = k) is x <> k, which a moved
+# constant that leaves the type never decides. So 30000 + i16 is computed here, and in the CASE the chain regroups to
+# i32, where the = alone computes i32 + 1.
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE NOT (2 + (30000 + i16) = 2999997233 - 3000000000)
+
+query I nosort
+SELECT SUM(CASE WHEN NOT (i32 + 1 + -1 - 0 = 2147483648 - 1) THEN 1 ELSE 0 END) FROM edge
+----
+HUGEINT
+9
+
+# An ordered comparison keeps its NOT: NaN (d % 0) makes d < 1 false, and so NOT (d < 1) true, in both engines.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE NOT (d % 0 < 1)
+----
+BIGINT
+10
+
+# A widening cast is moved through where the constant fits its operand's type; and a SMALLINT operand widened by a
+# constant that is no literal, (1 - 1), moves on into it.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE CAST(i16 AS INTEGER) + 1 > 5
+----
+BIGINT
+4
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE (i16 + 30000) + (1 - 1) > 5
+----
+BIGINT
+9
+
+# Where the moved constant does not fit the narrower type, the operand is compared behind its cast, and computed.
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i16 + 30000 + 70000 < 5
+
+# Every integer type moves, USMALLINT too, and constants of // and % fold first.
+query I nosort
+SELECT COUNT(*) FROM edge WHERE u16 + 1 > 5
+----
+BIGINT
+7
+
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + (4 // 2) + 1 > 5
+----
+BIGINT
+4
+
+query I nosort
+SELECT SUM(i32 + (4 // 2) + 1) FROM edge
+----
+HUGEINT
+54350
+
+# The sum rewrite reads a USMALLINT operand of an INTEGER sum through a cast, as DuckDB does: u16 + 2147483647 is never
+# computed.
+query I nosort
+SELECT SUM(u16 + 2147483647) FROM edge
+----
+HUGEINT
+21475006599
+
+# GROUP BY () and empty grouping sets group by no key, so the sum rewrite applies there too.
+query I nosort
+SELECT SUM(i32 + 1) FROM edge GROUP BY ()
+----
+HUGEINT
+54330
+
+query I rowsort
+SELECT SUM(i32 + 1) FROM edge GROUP BY GROUPING SETS ((), ())
+----
+HUGEINT
+54330
+54330
+
+# A compound GROUP BY key is one value in HAVING and in a grouped select item, behind a cast too.
+query I rowsort
+SELECT id + 2 AS g FROM edge GROUP BY id + 2 HAVING CAST(id + 2 AS BIGINT) > 5
+----
+INTEGER
+10
+11
+12
+13
+6
+7
+8
+9
+
+query II rowsort
+SELECT CASE WHEN CAST(id + 2 AS BIGINT) > 5 THEN 1 ELSE 0 END AS c, COUNT(*) AS n FROM edge GROUP BY id + 2
+----
+INTEGER	BIGINT
+0	1
+0	1
+0	1
+0	1
+1	1
+1	1
+1	1
+1	1
+1	1
+1	1
+1	1
+1	1
+
+# A cast GROUP BY key is one value too, in HAVING and in a grouped CASE WHEN, under a cast to its own type alike.
+query II rowsort
+SELECT CAST(i32 AS BIGINT) AS k, COUNT(*) FROM edge GROUP BY CAST(i32 AS BIGINT) HAVING CAST(i32 AS BIGINT) > 5
+----
+BIGINT	BIGINT
+100000	1
+2147483647	1
+54321	1
+7	1
+
+query II rowsort
+SELECT CAST(i32 AS BIGINT) AS k, COUNT(*) FROM edge GROUP BY CAST(i32 AS BIGINT) HAVING CAST(CAST(i32 AS BIGINT) AS BIGINT) <> 40000
+----
+BIGINT	BIGINT
+-1	1
+-100000	1
+-2147483648	1
+-7	1
+0	1
+1	1
+100000	1
+2147483647	1
+54321	1
+7	1
+
+query II rowsort
+SELECT CAST(i32 AS BIGINT) AS k, COUNT(*) FROM edge GROUP BY CAST(i32 AS BIGINT) HAVING CAST(i32 AS BIGINT) BETWEEN 1 AND 100000
+----
+BIGINT	BIGINT
+1	1
+100000	1
+54321	1
+7	1
+
+query II rowsort
+SELECT CAST(i16 AS INTEGER) AS g, CASE WHEN CAST(i16 AS INTEGER) = 7 THEN 1 ELSE 0 END AS c FROM edge GROUP BY CAST(i16 AS INTEGER)
+----
+INTEGER	INTEGER
+-1	0
+-100	0
+-12345	0
+-32768	0
+0	0
+1	0
+100	0
+12345	0
+32767	0
+7	1
+NULL	0
+
+query DI rowsort
+SELECT CAST(d9_2 AS DECIMAL(12,0)) AS k, COUNT(*) FROM decimals GROUP BY CAST(d9_2 AS DECIMAL(12,0)) HAVING CAST(d9_2 AS DECIMAL(12,0)) > 5.
+----
+DECIMAL(12,0)	BIGINT
+10000000	1
+6	3
+
+# Constants of // and % with a zero divisor are NULL; the minimum's remainder by -1 overflows. The optimizer's rewrite
+# reaches chains under abs, a cast, a minus and a condition.
+query III nosort
+SELECT 7 // 0, 7 % 0, i32 + (2 // 0) FROM edge WHERE id = 2
+----
+INTEGER	INTEGER	INTEGER
+NULL	NULL	NULL
+
+statement error Overflow in division
+SELECT i32 + ((-2147483647 - 1) % -1) FROM edge WHERE id = 2
+
+query IIII rowsort
+SELECT abs(i32 + 1 + -1), CAST(i32 + 1 + -1 AS BIGINT), -(i32 + 1 + -1), CASE WHEN i32 + 1 + -1 > i64 OR id = 3 THEN 1 ELSE 0 END FROM edge WHERE id <> 0
+----
+INTEGER	BIGINT	INTEGER	INTEGER
+0	0	0	0
+1	-1	1	1
+1	1	-1	0
+100000	-100000	100000	1
+100000	100000	-100000	0
+2147483647	2147483647	-2147483647	0
+54321	54321	-54321	1
+7	-7	7	0
+7	7	-7	0
+NULL	NULL	NULL	0
+NULL	NULL	NULL	0
+
+# x * 0 is DuckDB's constant_or_null(0, x), which computes x: here an overflowing product, which no later pass
+# regroups away.
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM edge WHERE (i32 * 2147483640 + 0) * 0 < 5
+
+# Divergence D32: a derived table's select item nothing reads is computed, so its overflow fails the query; DuckDB
+# removes it. A query that reads it fails in both.
+onlyif antb1
+statement error Overflow in addition
+SELECT id FROM (SELECT id, i32 + 2147483647 + 1 AS v FROM edge) AS d
+
+onlyif duckdb
+query I rowsort
+SELECT id FROM (SELECT id, i32 + 2147483647 + 1 AS v FROM edge) AS d
+----
+INTEGER
+0
+1
+10
+11
+2
+3
+4
+5
+6
+7
+8
+9
+
+statement error Overflow in addition
+SELECT id, v FROM (SELECT id, i32 + 2147483647 + 1 AS v FROM edge) AS d
+
+# Divergence D33: a constant antb1 does not fold, such as COALESCE(1, 2), is computed, so it moves nothing and the
+# addition overflows; DuckDB folds it first and answers.
+onlyif antb1
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + COALESCE(1, 2) > 5
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + COALESCE(1, 2) > 5
+----
+BIGINT
+4
+
+# Divergence D16: in a CASE WHEN, DuckDB computes an AND's later argument only for the rows its earlier ones make
+# true; antb1 computes it for a NULL i32 too, where the addition overflows.
+onlyif antb1
+statement error Overflow in addition
+SELECT SUM(CASE WHEN i32 > 2147483647 AND i32 + 2147483647 + 1 > 0 THEN 1 ELSE 0 END) FROM edge
+
+onlyif duckdb
+query I nosort
+SELECT SUM(CASE WHEN i32 > 2147483647 AND i32 + 2147483647 + 1 > 0 THEN 1 ELSE 0 END) FROM edge
+----
+HUGEINT
+0
+
+# Divergence D34: DuckDB's filter combiner finds that no row passes an empty BETWEEN in WHERE and computes nothing;
+# antb1 computes the regrouped chain and overflows. In a CASE WHEN both engines compute it.
+onlyif antb1
+statement error Overflow in addition
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 BETWEEN 10 AND 5
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM edge WHERE i32 + 2147483647 + 1 BETWEEN 10 AND 5
+----
+BIGINT
+0
+
+statement error Overflow in addition
+SELECT SUM(CASE WHEN i32 + 2147483647 + 1 BETWEEN 10 AND 5 THEN 1 ELSE 0 END) FROM edge
+
 query I nosort
 SELECT SUM(RegionID + (2147483647 + 1)) FROM empty
 ----
