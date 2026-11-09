@@ -2013,6 +2013,93 @@ TEST(ParserTest, MinusBeforeCastIsNotFoldedIntoTheNumber) {
   EXPECT_EQ(ToSql(where->where.at(0)), "a <= -(CAST(1 AS INT))");
 }
 
+// A unary minus over a number is part of the number, as DuckDB's parser folds it (PostgreSQL's
+// doNegate), through parentheses, comments and other minuses: -(1) is the literal -1, - -1 the
+// literal 1. Its span runs from the first minus to the number. A minus over anything else stays a
+// negation, a cast too, which binds tighter: -(1)::INT negates CAST(1 AS INT).
+TEST(ParserTest, MinusFoldsIntoTheNumberItNegates) {
+  using enum Literal::Kind;
+  const auto item = [](const std::string& sql) {
+    auto stmt = Parse(sql);
+    EXPECT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+    return stmt.has_value() ? *stmt->items.at(0).expr() : Expr(ColumnRef{});
+  };
+  struct Case {
+    std::string_view written;
+    Literal::Kind kind;
+    bool negative;
+    std::string_view text;
+    std::string_view sql;  // ToSql
+  };
+  for (const Case& c : {
+           Case{.written = "-(1)", .kind = kInteger, .negative = true, .text = "1", .sql = "-1"},
+           Case{.written = "- -1", .kind = kInteger, .negative = false, .text = "1", .sql = "1"},
+           Case{.written = "-(-(1))", .kind = kInteger, .negative = false, .text = "1", .sql = "1"},
+           Case{.written = "- - -1", .kind = kInteger, .negative = true, .text = "1", .sql = "-1"},
+           Case{.written = "-((7))", .kind = kInteger, .negative = true, .text = "7", .sql = "-7"},
+           Case{.written = "-/* c */( 1 )",
+                .kind = kInteger,
+                .negative = true,
+                .text = "1",
+                .sql = "-1"},
+           Case{.written = "-(1.5)",
+                .kind = kDecimal,
+                .negative = true,
+                .text = "1.5",
+                .sql = "-1.5"},
+           Case{.written = "-(1e3)",
+                .kind = kDecimal,
+                .negative = true,
+                .text = "1e3",
+                .sql = "-1e3"},
+           Case{.written = "-(-2.5E-3)",
+                .kind = kDecimal,
+                .negative = false,
+                .text = "2.5E-3",
+                .sql = "2.5E-3"},
+           Case{.written = "-(0)", .kind = kInteger, .negative = true, .text = "0", .sql = "-0"},
+           Case{.written = "-(-9223372036854775808)",
+                .kind = kInteger,
+                .negative = false,
+                .text = "9223372036854775808",
+                .sql = "9223372036854775808"},
+       }) {
+    const std::string sql = "SELECT " + std::string(c.written) + " FROM t";
+    const Expr expr = item(sql);
+    const auto* number = std::get_if<Literal>(&expr);
+    ASSERT_NE(number, nullptr) << c.written;
+    EXPECT_EQ(number->kind, c.kind) << c.written;
+    EXPECT_EQ(number->negative, c.negative) << c.written;
+    EXPECT_EQ(number->text, c.text) << c.written;
+    // From the first minus to the number; parentheses around it close outside the span.
+    const std::string_view spanned = At(sql, number->span);
+    EXPECT_TRUE(spanned.starts_with('-')) << c.written << ": " << spanned;
+    EXPECT_TRUE(spanned.ends_with(c.text)) << c.written << ": " << spanned;
+    EXPECT_EQ(ToSql(expr), c.sql) << c.written;
+  }
+  for (const std::string_view written :
+       {"-(1 + 2)", "-a", "-1::INT", "-(1)::INT", "-(-1)::INT", "-'1'", "- -a", "-(NOT a)"}) {
+    const Expr expr = item("SELECT " + std::string(written) + " FROM t");
+    const auto* negation = std::get_if<UnaryExpr>(&expr);
+    ASSERT_NE(negation, nullptr) << written;
+    EXPECT_EQ(negation->op, UnaryOp::kNegate) << written;
+  }
+  EXPECT_EQ(ToSql(item("SELECT -(-1)::INT FROM t")), "-(CAST(-1 AS INT))");
+  // In conditions, lists, bounds, calls, casts and positions alike.
+  auto where = Parse(
+      "SELECT f(-(-(1))), CAST(-(1) AS INT), -(1) + 2, 2 - -(1) FROM t WHERE a > -(-(1)) AND b IN "
+      "(-(1), - -2.5) AND c BETWEEN -(5) AND - -5 ORDER BY -(-1)");
+  ASSERT_TRUE(where.has_value()) << where.error().message;
+  EXPECT_EQ(
+      ToSql(*where),
+      "SELECT f(1), CAST(-1 AS INT), -1 + 2, 2 - -1 FROM t WHERE a > 1 AND b IN (-1, 2.5) AND "
+      "c BETWEEN -5 AND 5 ORDER BY 1");
+  // Folded, a number is one level deep however many minuses and parentheses were around it.
+  auto deep = Parse("SELECT -(-(-(1))) FROM t");
+  ASSERT_TRUE(deep.has_value()) << deep.error().message;
+  EXPECT_EQ(Depth(*deep->items.at(0).expr()), 1U);
+}
+
 // WHERE and HAVING split their top-level AND chain; a parenthesized AND, or an OR at the top,
 // makes one conjunct.
 TEST(ParserTest, PredicatesSplitAtTheirTopLevelAndChain) {
@@ -2264,6 +2351,15 @@ TEST(ParserTest, CanonicalFormStaysWithinTheDepthLimit) {
     EXPECT_NE(bare, 0U) << f.name;
     EXPECT_EQ(bare, FirstTooDeep(f.parenthesized)) << f.name;
   }
+  // A minus folded into a number counts one level, as a parenthesis does, and none for ToSql's
+  // -(x), the canonical form being the literal: - -1 counts as (1) does and -(1) as ((1)).
+  const auto calls = [](std::string inner) {
+    return [number = std::move(inner)](std::size_t n) {
+      return "SELECT " + Repeat("f(", n) + number + std::string(n, ')') + " FROM t";
+    };
+  };
+  EXPECT_EQ(FirstTooDeep(calls("- -1")), FirstTooDeep(calls("(1)")));
+  EXPECT_EQ(FirstTooDeep(calls("-(1)")), FirstTooDeep(calls("((1))")));
 }
 
 // Grouping elements (ADR 0038) count a level each, as a parenthesis does: the deepest accepted

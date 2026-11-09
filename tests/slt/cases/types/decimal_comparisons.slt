@@ -102,6 +102,27 @@ INTEGER
 37
 39
 
+# A minus over a number is part of the literal, as DuckDB's parser folds it: a negated decimal compares as the literal.
+query I nosort
+SELECT COUNT(*) FROM decimals WHERE p > -(19.99) AND d9_2 < - -5.00
+----
+BIGINT
+10
+
+query I rowsort
+SELECT id FROM decimals WHERE p IN (-(19.99), - -59.97, -(-(-99.95)))
+----
+INTEGER
+0
+1
+12
+13
+2
+22
+23
+33
+35
+
 # Equal as doubles, not exactly: row 12's d38_10 (2^53 + 0.5) and b (2^53 + 1), row 13's d18_4 and d38_10.
 query I rowsort
 SELECT id FROM decimals WHERE d38_10 < b AND id IN (12, 13)

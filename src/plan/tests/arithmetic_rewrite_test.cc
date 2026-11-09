@@ -158,7 +158,10 @@ TEST(ArithmeticRewriteTest, IntegerChainsAsDuckDbComputesThem) {
            // // and % of constants fold, with a divisor that is no zero.
            Case{.item = "i32 + (4 // 2) + 1", .shape = "(3 + i32)"},
            Case{.item = "i32 + (7 % 4) + 1", .shape = "(4 + i32)"},
-           // Negation and abs of constants are constants.
+           // Negation and abs of constants are constants, a negation of a cast (-1::INTEGER) or of
+           // an operation included; -(1) is the literal -1.
+           Case{.item = "i32 + -1::INTEGER + 2", .shape = "(1 + i32)"},
+           Case{.item = "i32 + -(2 * 1) + 3", .shape = "(1 + i32)"},
            Case{.item = "i32 + -(1) + 2", .shape = "(1 + i32)"},
            Case{.item = "i32 + abs(-1) + 2", .shape = "(3 + i32)"},
            // A whole constant folds.

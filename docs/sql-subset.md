@@ -163,9 +163,11 @@ deep, counted along its deepest path through operators and parentheses (the top-
 operator pushes everything before it one level down, so `f(f(...)) + 1 + 1` counts the calls and the operators together.
 A `::` and a unary `-` count one level more, as they do in the canonical form `CAST(x AS T)` and `-(x)` (a `-` before a
 parenthesized operand does not), and so does a `NOT` that is the right operand of a comparison or of arithmetic, a
-`LIKE` pattern or a `BETWEEN` bound (`a = NOT b` is `a = (NOT b)`). The canonical form writes an `ON`, `WHERE` or
-`HAVING` predicate with a top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed
-in the select list, `HAVING` and `ORDER BY`, and cannot be nested; one in `ON`, `WHERE` or `GROUP BY` is a syntax error.
+`LIKE` pattern or a `BETWEEN` bound (`a = NOT b` is `a = (NOT b)`). A `-` that is part of a number (see the lexical
+rules) counts one level, as a parenthesis does, unless it stands directly before the digits: `-1` is as deep as `1`,
+`- -1` as `(1)` and `-(1)` as `((1))`. The canonical form writes an `ON`, `WHERE` or `HAVING` predicate with a
+top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed in the select list,
+`HAVING` and `ORDER BY`, and cannot be nested; one in `ON`, `WHERE` or `GROUP BY` is a syntax error.
 A nested call is unsupported rather than a syntax error when `OVER` follows the outer call (`SUM(SUM(a)) OVER ()`,
 a window function over an aggregate, as DuckDB takes it).
 
@@ -226,8 +228,11 @@ is.
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
 sequence of digits; a `decimal` is a number with a decimal point, an exponent or both (`1.5`, `.5`, `5.`, `1e3`).
-Keywords are not reserved by the lexer. A `-` directly before a number makes a negative literal, except when `::`
-follows the number: `-1::INTEGER` is `-(CAST(1 AS INTEGER))`, as in DuckDB. The `identifier` of a `type` and the field
+Keywords are not reserved by the lexer. A `-` before a number is part of the literal, through parentheses and other
+minuses, as DuckDB's parser folds it: `-1` and `-(1)` are the literal -1, `- -1` and `-(-(1))` the literal 1 and
+`-(1.5)` the DECIMAL -1.5, each named and typed as the literal. A cast binds tighter, so a `-` before a number that `::`
+follows negates the cast: `-1::INTEGER` and `-(1)::INTEGER` are `-(CAST(1 AS INTEGER))`, as in DuckDB. A `-` over
+anything else (`-(1 + 2)`, `-a`) is an operator. The `identifier` of a `type` and the field
 of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's parameters are integers (`DECIMAL(15, 2)`).
 `CAST(x AS T)` and `x::T` are the same expression.
 
@@ -373,9 +378,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   `HUGEINT` value (a column, a literal or a folded constant of that type), a `FLOAT` column, a decimal literal and
   an integer value, or a DECIMAL value that antb1 would compare exactly (a DECIMAL operand with a bound that is not
   `DOUBLE`, or a DECIMAL column or expression as a bound: `price BETWEEN 1e0 AND 5`) is unsupported; one that mixes
-  a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind error, as in DuckDB. As in DuckDB, every unary minus
-  directly over an integer literal (through any nesting) belongs to the literal, so `-(-9223372036854775808)` is a
-  `HUGEINT`, not an overflow, and `-(-(-9223372036854775808))` a `BIGINT`. A plain `BETWEEN` in the `AND` chain of
+  a `VARCHAR` value with a `DATE` or `TIMESTAMP` value is a bind error, as in DuckDB. Every unary minus over an
+  integer literal is part of it (the lexical rules above), so `-(-9223372036854775808)` is a `HUGEINT`, not an
+  overflow, and `-(-(-9223372036854775808))` a `BIGINT`. A plain `BETWEEN` in the `AND` chain of
   `WHERE` or `HAVING` is its two comparisons, each folded and, over a table column, pushed into the scan like any
   comparison; `NOT BETWEEN`, `NOT (a BETWEEN ...)` and `BETWEEN` under `OR` or in `CASE` are compound conditions.
   DuckDB's names apply: `(a BETWEEN 1 AND 2)`, and both negations `(NOT (a BETWEEN 1 AND 2))`;
@@ -482,7 +487,7 @@ also next to a `LIMIT`, which DuckDB answers; `LIMIT 5 ROWS` is a syntax error, 
 a`, `LIMIT t.a`) and a call or a typed literal of a longer name (`LIMIT a.b.c.d(1)`) are syntax errors, and DuckDB
 refuses them too, and so are an operator after a star (`* + 1`, `t.* = 1`, `* ISNULL`) and a star with no FROM (`SELECT
 1, *`). Known gaps, among others: a star in parentheses (`(*)`), `ORDER BY *` and `GROUP BY *` are syntax errors, which
-DuckDB answers; `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a unary minus (`LIMIT -(-5)`) and
+DuckDB answers; `LIMIT` and `OFFSET` expressions that start with `CASE`, `NOT` or a minus (`LIMIT -(-5)`) and
 conditions (`LIMIT 5 = 5`, `LIMIT 5 AND 3`) are syntax errors (exit code 1), although DuckDB answers them, and so are a
 trailing comma in an `IN` list (`a IN (1,)`), `IN` before a list or a list column (`a IN [1, 2]`, `a IN b`), `BETWEEN
 ASYMMETRIC` (`asymmetric` is a name, divergence D21), `MAP {...}`, a prefix alias (`SELECT x: 1`, `FROM x: t`), an
@@ -1387,10 +1392,8 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   comparisons, and a literal operand takes a bound's type it fits (a DOUBLE bound, or a DECIMAL one of a nonzero scale,
   whose cast DuckDB keeps, moves nothing) -- it drops it before the operand's first pass, and constants move off the
   chain as written first, for as long as each is a literal of its operation's own type -- an INTEGER literal in an
-  INTEGER chain, a minus over one included; not a cast, a constant expression or a literal of another type -- so
-  `x + 2147483647 + 1 > 2147483648 - 1` is `x > -1`. A minus over a literal in parentheses is an INTEGER expression to
-  antb1's typing, where DuckDB's parser makes `-(1)` the literal -1 (as in divergence D20), so a constant written with
-  one is computed in the type antb1 gives it. Divergences D14, D16, D32, D33 and D34 list what else differs.
+  INTEGER chain, `-(1)` included; not a cast, a constant expression or a literal of another type -- so
+  `x + 2147483647 + 1 > 2147483648 - 1` is `x > -1`. Divergences D14, D16, D32, D33 and D34 list what else differs.
 - Timestamps: microseconds since 1970-01-01 00:00:00, without a time zone, printed as DuckDB prints them
   (`2013-07-15 14:00:00`, a fraction without trailing zeros, `0001-12-31 (BC) 23:59:59` before year 1).
   `toDateTime` fails the query when `t * 1000` overflows its type or the time is outside DuckDB's TIMESTAMP range,
@@ -1612,7 +1615,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D17 | Overflows in constant expressions | a constant integer expression on a side of a comparison, a `BETWEEN` bound or a value of an `IN` list that overflows its type (`a > 2147483647 + 1`) is a bind error, whatever the table holds | raises the overflow only when a row computes it: an empty table, or one whose rows another conjunct rejects first, answers | `plan.Expressions/BindErrorTest` pins the errors; `tests/slt/cases/where/between.slt` has the error on a table both engines fail on and, `onlyif antb1`, on the empty table, and `tests/slt/cases/in/in.slt` the same for an `IN` list |
 | D18 | DECIMAL SUM beyond 38 digits | a `SUM` of a DECIMAL(p,s) whose result has more than 38 digits is an execution error (`SUM overflow: the result is outside the range of DECIMAL(38,s) (38 decimal digits)`), as for HUGEINT (D9) | returns up to 39 digits until its 128-bit sum overflows | `tests/slt/cases/types/decimal_arithmetic.slt` pins both answers; the generator sums only DECIMAL columns whose sum over every row fits 38 digits |
 | D19 | Which failing row an error names | the overflow and cast errors of DECIMAL arithmetic, and the cast errors of DECIMAL `CASE` values, print the values of the first failing row of a 64Ki-row batch (each operand, then the operation); a dependent `GROUP BY` key (ADR 0018) is computed per group, in group order; a failed cast names the column it casts (`when casting from source column b`) only for a column reference, an aggregate's output and a key included | evaluates 2048-row vectors, and every key per row: with several failing rows the message can show another row's values; it also names the column of an expression its optimizer reduces to one (`b + 0`); the exit code and whether a query fails are the same | the `.slt` records match the error text without the values; `exec.ComputeTest.DecimalOperandsInDuckDbOrder` pins the operand order, `exec.ComputeTest.DecimalCaseValuesCastToTheCaseType` the named columns |
-| D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, a negated literal in parentheses (`-(7)`) counts as an INTEGER expression, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`, or a `THEN NULL`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type; `-(7)` is a literal (SMALLINT next to `s16`), and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
+| D20 | CASE types without a DECIMAL value | types the values that are no literals first, then lets each integer literal take their integer type when it fits and each string literal any type: `CASE WHEN c THEN 7 WHEN c2 THEN s16 END` and `CASE WHEN c THEN 8 WHEN c2 THEN s16 ELSE 7 END` are SMALLINT, and a string literal before a DATE value is that DATE (`THEN '2020-01-01' WHEN c2 THEN dt END`) and before a number unsupported | folds from the `ELSE` value (NULL without one) through the `THEN` values in order, where a literal next to NULL (the first `THEN` value without an `ELSE`, or a `THEN NULL`) or next to another literal becomes its own type (both CASEs are INTEGER), while an `ELSE` literal takes the next value's type, and a string literal next to NULL is VARCHAR (a bind error next to the DATE or the number) | `plan.BinderTest.CaseTypesWithoutADecimalAreAntb1s` pins antb1's types; the random generator writes the column first among its `CASE` values, where both agree; with a DECIMAL value antb1 folds as DuckDB does ([ADR 0021](adr/0021-decimal-semantics.md) rule 10) |
 | D21 | Keywords as names | the 49 words that are never table aliases ([Grammar](#grammar)) are unquoted column, table and function names, qualifiers and select aliases, with or without `AS` (without `AS`, `glob`, `isnull` and `notnull` continue the expression: unsupported), so `SELECT default FROM t` answers with a column named `default`; `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` are reserved: no unquoted column or table names (an error) or qualifiers (unsupported), but table aliases, as in DuckDB; a name right after a star and before `,` or `FROM` is an alias there (unsupported), also a word DuckDB keeps as a keyword | refuses all 49 words as unquoted column names (`default` is its `DEFAULT` keyword, an error wherever a query uses it: `SELECT default FROM t` is a binder error), table names, qualifiers and select aliases without `AS` (after an expression `isnull` and `notnull` are its operators `IS NULL` and `IS NOT NULL`, not aliases); accepts them after `AS` and after a dot, and 14 of them as function names (`unpack(...)` is its `UNPACK` operator, the other 34 are syntax errors); accepts `BETWEEN`, `EXISTS`, `INTERVAL` and `OVER` as column and table names and as qualifiers; a keyword right after a star is a syntax error | the fixtures, the `.slt` records and the random generator use none of these words as an unquoted name; `sql.ParserTest.WordsThatCannotBeImplicitAliases`, `sql.ParserTest.EveryReservedWordAfterAsInFrom` and `sql.ParserTest.ReservedWordsThatQualifyNamesInFrom` and the reject case `KeywordAliasAfterAStar` pin antb1's rules, and `harness.TableAliasOracle.*` compares every DuckDB keyword as a table alias and as a qualifier in FROM with DuckDB itself |
 | D22 | `IN` over a doubly parenthesized query | reads `x [NOT] IN ((query))` as an `IN` list holding one scalar subquery, because a `(` opens a nested query only before a reserved query word (divergence D21), and a list of one subquery is unsupported: exit code 4 at the inner `(` | reads an `IN` subquery and answers it exactly as the single-paren form | `plan.SubqueryPlacements/BindErrorTest` pins the refusal and its span, and `tests/slt/cases/subqueries/in.slt` compares the form with DuckDB's own answer under `onlyif duckdb` |
 | D23 | A correlated `EXISTS`'s conjuncts over different rows | unnests it into a semi or anti join (ADR 0023's Path 1), so a conjunct that reads both blocks is a residual, computed only over the candidate pairs a key matches, and a conjunct that reads only the outer block is a residual too, computed over those same pairs rather than over every outer row | plans a delim join and computes the subquery's conjuncts for the bindings of the outer side, so an overflow in such a conjunct can fail in one engine and not the other | the random generator writes no arithmetic that can overflow (as for divergences D14 and D16), and `tests/slt/cases/subqueries/exists.slt` compares every shape Path 1 answers with DuckDB's own answer |

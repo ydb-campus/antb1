@@ -17,6 +17,23 @@ NULL	2
 12345	1
 32767	1
 
+# A minus over a number is part of the literal, as DuckDB's parser folds it: -(-1) and - -2 are positions.
+query II nosort
+SELECT i16, COUNT(*) FROM edge GROUP BY -(-1) ORDER BY - -2 DESC, -(-(1)) NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	2
+-32768	1
+-12345	1
+-100	1
+-1	1
+0	1
+1	1
+7	1
+100	1
+12345	1
+32767	1
+
 query IIII nosort
 SELECT 1, OS, IsMobile, COUNT(*) AS c FROM hits_like GROUP BY 1, 2, IsMobile ORDER BY c DESC, 2, 3 LIMIT 5
 ----

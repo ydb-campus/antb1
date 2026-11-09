@@ -225,6 +225,15 @@ SELECT i16, COUNT(*) FROM edge GROUP BY i16 HAVING COUNT(*) IN (1 + 1) ORDER BY 
 SMALLINT	BIGINT
 NULL	2
 
+# A minus over a number is part of the literal, as DuckDB's parser folds it: -(-9223372036854775808) is the HUGEINT
+# 9223372036854775808, which no BIGINT equals, not a negation that overflows BIGINT.
+query I rowsort
+SELECT id FROM edge WHERE i64 IN (-(-9223372036854775808), - -42, -(-(7)))
+----
+INTEGER
+11
+9
+
 # An overflowing constant expression is the comparison's bind error in both engines.
 
 statement error Overflow

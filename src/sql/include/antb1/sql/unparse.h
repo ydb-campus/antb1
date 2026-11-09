@@ -10,7 +10,8 @@ namespace antb1::sql {
 // qualifiers quoted only when they were quoted in the source, aliases always quoted after AS (a
 // table alias too, so it never reads back as a keyword), and so are the names of a WITH list and of
 // a column alias list (WITH "c"("x") AS (...), FROM (...) AS "s"("x")), JOIN as INNER JOIN and
-// LEFT OUTER JOIN as LEFT JOIN, numbers as written, expressions in the order written with only the
+// LEFT OUTER JOIN as LEFT JOIN, numbers as written but signed by the minuses the parser folded into
+// them (-(-(1)) as 1), expressions in the order written with only the
 // parentheses that the operator precedence needs (a unary minus always takes them), casts as
 // CAST(x AS T) (also x::T), a star where it stands among the select items (`*`, or `t.*` with its
 // qualifier quoted only when it was), a compound's blocks joined by UNION ALL with its ORDER BY,

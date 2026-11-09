@@ -10,10 +10,11 @@
 namespace antb1::sql {
 
 // The deepest expression tree Parse accepts: nodes on the longest path from a root to a leaf,
-// counted together with the parentheses of the input, the levels its canonical form (ToSql) adds
-// and the queries it is nested in (a derived table's or a WITH list's query is one level below its
-// statement, and each branch of a compound one level below the compound), so that the
-// canonical form of an accepted statement parses too.
+// counted together with the parentheses of the input, the minuses folded into a number (each but
+// one directly before its digits counts as a parenthesis does), the levels its canonical form
+// (ToSql) adds and the queries it is nested in (a derived table's or a WITH list's query is one
+// level below its statement, and each branch of a compound one level below the compound), so that
+// the canonical form of an accepted statement parses too.
 inline constexpr std::size_t kMaxExpressionDepth = 256;
 
 // Parses one statement of the grammar in docs/sql-subset.md; an optional trailing ';' is allowed.

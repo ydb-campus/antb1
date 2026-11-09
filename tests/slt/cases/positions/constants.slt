@@ -15,6 +15,14 @@ SELECT 3000000000, -2147483648, -99999999999999999999999999999999999999, 007, -2
 BIGINT	BIGINT	HUGEINT	INTEGER	INTEGER	BIGINT
 3000000000	-2147483648	-99999999999999999999999999999999999999	7	-2147483647	-9223372036854775808
 
+# A minus over a number is part of the literal, through parentheses and other minuses, as DuckDB's parser folds it:
+# typed by the literal's value, so -(-9223372036854775808) is a HUGEINT, no overflowing negation.
+query IIIIIDI nosort
+SELECT -(1), - -1, -(-(1)), -(-9223372036854775808), - -2147483648, -(1.5), -(0) FROM edge WHERE id = 0
+----
+INTEGER	INTEGER	INTEGER	HUGEINT	BIGINT	DECIMAL(2,1)	INTEGER
+-1	1	1	9223372036854775808	2147483648	-1.5	0
+
 # Next to aggregates (no GROUP BY needed), and with an ORDER BY aggregate: one row.
 
 query ITI nosort

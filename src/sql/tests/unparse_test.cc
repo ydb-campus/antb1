@@ -151,6 +151,12 @@ TEST(UnparseTest, CanonicalForms) {
                              R"(AS "over" ON z = c)"},
            Case{.input = "with recursive as (select a from t) select a from recursive",
                 .canonical = R"(WITH "recursive" AS (SELECT a FROM t) SELECT a FROM recursive)"},
+           // A minus over a number is part of the literal, through parentheses and other minuses;
+           // one over a cast of a number stays an operator.
+           Case{.input =
+                    "select -(1), - -1, -(-(1)), -(1.5), -((2)), a - -(1), a * -(-2), -(1)::int "
+                    "from t",
+                .canonical = "SELECT -1, 1, 1, -1.5, -2, a - -1, a * 2, -(CAST(1 AS INT)) FROM t"},
            Case{.input = "SELECT a FROM (SELECT a, -b FROM t ORDER BY a LIMIT 1 OFFSET 2) x ORDER "
                          "BY a",
                 .canonical = R"(SELECT a FROM (SELECT a, -(b) FROM t ORDER BY a LIMIT 1 OFFSET 2) )"
@@ -688,6 +694,34 @@ TEST(AstTest, BoxCopiesDeeply) {
   const Box<Expr>& self = b;
   b = self;
   EXPECT_EQ(std::get<ColumnRef>(*b).name, "a");
+}
+
+// A minus over a number is part of the literal, so its spellings are equal; a minus over anything
+// else, a cast of a number included, is an operator.
+TEST(EqualIgnoringSpansTest, AMinusOverANumberIsTheLiteral) {
+  const auto item = [](std::string_view expr) {
+    auto stmt = Parse("SELECT " + std::string(expr) + " FROM t");
+    EXPECT_TRUE(stmt.has_value()) << expr;
+    return stmt.has_value() ? *stmt->items[0].expr() : Expr(Literal{});
+  };
+  for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"-(1)", "-1"},
+           {"-(-(1))", "1"},
+           {"- - -1.5", "-1.5"},
+           {"-((1e3))", "-1e3"},
+           {"-1::INT", "-(1)::INT"},
+       })) {
+    EXPECT_TRUE(EqualIgnoringSpans(item(a), item(b))) << a << " / " << b;
+  }
+  for (const auto& [a, b] : std::to_array<std::pair<std::string_view, std::string_view>>({
+           {"-(1)", "1"},
+           {"-(1 + 2)", "-3"},
+           {"-(1)::INT", "-1"},
+           {"-(-1)::INT", "1::INT"},
+           {"- -a", "a"},
+       })) {
+    EXPECT_FALSE(EqualIgnoringSpans(item(a), item(b))) << a << " / " << b;
+  }
 }
 
 // EqualIgnoringSpans tells apart every part of a CASE and of the other expression nodes.
