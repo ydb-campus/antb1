@@ -50,16 +50,72 @@ std::vector<ExprPtr*> ChildrenOf(Expr& expr) {
   return out;
 }
 
+// f(child) for each of ChildrenOf's slots of `expr`, in its order (a null one included), without
+// copying the node or listing its children.
+template <class F>
+void ForEachChild(const Expr& expr, const F& f) {
+  const auto all = [&f](const std::vector<ExprPtr>& exprs) {
+    for (const ExprPtr& e : exprs) {
+      f(e);
+    }
+  };
+  if (const auto* arith = std::get_if<ArithExpr>(&expr.node)) {
+    f(arith->left);
+    f(arith->right);
+  } else if (const auto* negate = std::get_if<NegateExpr>(&expr.node)) {
+    f(negate->operand);
+  } else if (const auto* function = std::get_if<FunctionExpr>(&expr.node)) {
+    all(function->args);
+  } else if (const auto* predicate = std::get_if<PredicateExpr>(&expr.node)) {
+    all(predicate->operands);
+  } else if (const auto* boolean = std::get_if<BoolExpr>(&expr.node)) {
+    all(boolean->args);
+  } else if (const auto* c = std::get_if<CaseExpr>(&expr.node)) {
+    all(c->whens);
+    all(c->thens);
+    f(c->otherwise);
+  } else if (const auto* cast = std::get_if<CastExpr>(&expr.node)) {
+    f(cast->operand);
+  }
+}
+
+// `expr` with each child c (a null one left as it is) replaced by map(c): copied where a child
+// changes, the same pointer where none does, so that a walk that changes nothing copies nothing.
+template <class F>
+ExprPtr MapChildren(const ExprPtr& expr, const F& map) {
+  std::vector<std::pair<std::size_t, ExprPtr>> changed;  // allocated only on a change
+  std::size_t index = 0;
+  ForEachChild(*expr, [&](const ExprPtr& child) {
+    if (child != nullptr) {
+      ExprPtr out = map(child);
+      if (out != child) {
+        changed.emplace_back(index, std::move(out));
+      }
+    }
+    ++index;
+  });
+  if (changed.empty()) {
+    return expr;
+  }
+  Expr copy = *expr;
+  const std::vector<ExprPtr*> children = ChildrenOf(copy);
+  for (auto& [slot, out] : changed) {
+    *children[slot] = std::move(out);
+  }
+  return Share(std::move(copy));
+}
+
 // Whether `expr` reads no column: DuckDB's IsFoldable, for antb1's expressions, whose aggregates
 // and subqueries are columns by the time an expression reads them.
 bool Foldable(const Expr& expr) {
   if (std::holds_alternative<ColumnExpr>(expr.node)) {
     return false;
   }
-  Expr copy = expr;  // ChildrenOf takes a mutable node; the copy shares the children
-  return std::ranges::all_of(ChildrenOf(copy), [](const ExprPtr* child) {
-    return *child == nullptr || Foldable(**child);
+  bool foldable = true;
+  ForEachChild(expr, [&foldable](const ExprPtr& child) {
+    foldable = foldable && (child == nullptr || Foldable(*child));
   });
+  return foldable;
 }
 
 // The value of an integer expression that reads no column, in its type, as DuckDB's
@@ -138,15 +194,40 @@ void ChainOperands(const ExprPtr& expr, ArithOp op, LogicalType type, std::vecto
   out.push_back(expr);
 }
 
+// What decides whether rule 1 applies to the chain `expr` heads (ChainOperands), gathered without
+// listing its operands: how many there are, how many of them are constants, and whether a constant
+// follows an operand that is none.
+struct ChainShape {
+  std::size_t operands = 0;
+  std::size_t constants = 0;
+  bool variable = false;  // an operand that is no constant seen so far
+  bool constant_after_variable = false;
+};
+
+void ShapeOf(const ExprPtr& expr, ArithOp op, LogicalType type, ChainShape& shape) {
+  if (const auto* arith = std::get_if<ArithExpr>(&expr->node);
+      arith != nullptr && arith->op == op && expr->type == type) {
+    ShapeOf(arith->left, op, type, shape);
+    ShapeOf(arith->right, op, type, shape);
+    return;
+  }
+  ++shape.operands;
+  if (Foldable(*expr)) {
+    ++shape.constants;
+    shape.constant_after_variable = shape.constant_after_variable || shape.variable;
+  } else {
+    shape.variable = true;
+  }
+}
+
 // The levels of `expr`'s tree, 1 for a leaf.
 std::size_t Depth(const Expr& expr) {
-  Expr copy = expr;  // ChildrenOf takes a mutable node; the copy shares the children
   std::size_t deepest = 0;
-  for (const ExprPtr* child : ChildrenOf(copy)) {
-    if (*child != nullptr) {
-      deepest = std::max(deepest, Depth(**child));
+  ForEachChild(expr, [&deepest](const ExprPtr& child) {
+    if (child != nullptr) {
+      deepest = std::max(deepest, Depth(*child));
     }
-  }
+  });
   return deepest + 1;
 }
 
@@ -161,17 +242,15 @@ ExprPtr OrderConstants(const ExprPtr& expr, std::size_t level) {
       !IsInteger(expr->type)) {
     return nullptr;
   }
+  // Decided first without listing the operands, as most chains at most passes are left as they are.
+  ChainShape shape;
+  ShapeOf(expr, arith->op, expr->type, shape);
+  if (shape.constants < 2 || !shape.constant_after_variable ||
+      level - 1 + shape.operands > sql::kMaxExpressionDepth) {
+    return nullptr;
+  }
   std::vector<ExprPtr> operands;
   ChainOperands(expr, arith->op, expr->type, operands);
-  const auto constant = [](const ExprPtr& e) { return Foldable(*e); };
-  const auto variable = std::ranges::find_if_not(operands, constant);
-  if (std::ranges::count_if(operands, constant) < 2 ||
-      std::find_if(variable, operands.end(), constant) == operands.end()) {
-    return nullptr;
-  }
-  if (level - 1 + operands.size() > sql::kMaxExpressionDepth) {
-    return nullptr;
-  }
   std::size_t deepest = 0;
   for (const ExprPtr& operand : operands) {
     deepest = std::max(deepest, Depth(*operand));
@@ -179,7 +258,7 @@ ExprPtr OrderConstants(const ExprPtr& expr, std::size_t level) {
   if (level - 1 + operands.size() - 1 + deepest > sql::kMaxExpressionDepth) {
     return nullptr;
   }
-  std::ranges::stable_partition(operands, constant);
+  std::ranges::stable_partition(operands, [](const ExprPtr& e) { return Foldable(*e); });
   ExprPtr out = operands.front();
   for (std::size_t i = 1; i < operands.size(); ++i) {
     std::string name = std::format("({} {} {})", out->name, ToString(arith->op), operands[i]->name);
@@ -297,19 +376,8 @@ ExprPtr Pass(ExprPtr expr, bool& changed, std::size_t level) {
     expr = std::move(next);
     changed = true;
   }
-  Expr copy = *expr;
-  bool rebuilt = false;
-  for (ExprPtr* child : ChildrenOf(copy)) {
-    if (*child == nullptr) {
-      continue;
-    }
-    ExprPtr rewritten = Pass(*child, changed, level + 1);
-    if (rewritten != *child) {
-      *child = std::move(rewritten);
-      rebuilt = true;
-    }
-  }
-  return rebuilt ? Share(std::move(copy)) : expr;
+  return MapChildren(
+      expr, [&changed, level](const ExprPtr& child) { return Pass(child, changed, level + 1); });
 }
 
 // `expr` without its casts of an integer value to the value's own type, which DuckDB's binder never
@@ -320,19 +388,7 @@ ExprPtr StripIdentityCasts(const ExprPtr& expr) {
       cast != nullptr && IsInteger(expr->type) && cast->operand->type == expr->type) {
     return StripIdentityCasts(cast->operand);
   }
-  Expr copy = *expr;
-  bool rebuilt = false;
-  for (ExprPtr* child : ChildrenOf(copy)) {
-    if (*child == nullptr) {
-      continue;
-    }
-    ExprPtr stripped = StripIdentityCasts(*child);
-    if (stripped != *child) {
-      *child = std::move(stripped);
-      rebuilt = true;
-    }
-  }
-  return rebuilt ? Share(std::move(copy)) : expr;
+  return MapChildren(expr, [](const ExprPtr& child) { return StripIdentityCasts(child); });
 }
 
 // `out`, a rewrite of `expr`, named as `expr` is.
