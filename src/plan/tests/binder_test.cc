@@ -3825,8 +3825,8 @@ TEST(BinderTest, AConstantThatOverflowsItsTypeIsNoneToTheSumRewrite) {
 }
 
 // GROUP BY an expression computes it below the aggregation; a select or ORDER BY expression equal
-// to a key is that key, others over keys and aggregates are computed above the aggregation, as are
-// HAVING and ORDER BY expressions.
+// to a key is that key, others over keys and aggregates are computed above the aggregation, and
+// HAVING's below them, under its filter: DuckDB filters HAVING before it computes the select list.
 TEST(BinderTest, ExpressionsBelowAndAboveTheAggregation) {
   const Catalog catalog = MakeCatalog();
   auto plan = BindSql(
@@ -3837,35 +3837,40 @@ TEST(BinderTest, ExpressionsBelowAndAboveTheAggregation) {
   EXPECT_EQ(plan->output[0].type, LogicalType::kInteger);
   EXPECT_EQ(plan->output[1].name, "((i32 - 1) * 2)");
   EXPECT_EQ(plan->output[2].type, LogicalType::kHugeInt);
-  // Limit <- Project <- Sort <- Filter (HAVING) <- Compute <- GroupAggregate <- Compute (the key)
-  // <- Filter (WHERE) <- Compute (its operand) <- Scan.
+  // Limit <- Project <- Sort <- Compute (select and ORDER BY) <- Filter (HAVING) <- Compute (its
+  // operand) <- GroupAggregate <- Compute (the key) <- Filter (WHERE) <- Compute (its operand) <-
+  // Scan.
   EXPECT_TRUE(std::holds_alternative<LimitNode>(Nth(*plan, 0)));
   EXPECT_TRUE(std::holds_alternative<ProjectNode>(Nth(*plan, 1)));
   const auto& sort = std::get<SortNode>(Nth(*plan, 2));
   ASSERT_EQ(sort.keys.size(), 2U);
-  const auto& having = std::get<FilterNode>(Nth(*plan, 3));
+  const auto names = [](const ComputeNode& compute) {
+    std::vector<std::string> out;
+    out.reserve(compute.exprs.size());
+    for (const auto& e : compute.exprs) {
+      out.push_back(e->name);
+    }
+    return out;
+  };
+  EXPECT_EQ(names(std::get<ComputeNode>(Nth(*plan, 3))),
+            (std::vector<std::string>{"((i32 - 1) * 2)", "(sum(i16) * 2)", "-((i32 - 1))"}));
+  const auto& having = std::get<FilterNode>(Nth(*plan, 4));
   ASSERT_EQ(having.predicates.size(), 1U);
   EXPECT_EQ(having.predicates[0].kind, Predicate::Kind::kCompareColumns);
-  const auto& post = std::get<ComputeNode>(Nth(*plan, 4));
-  std::vector<std::string> names;
-  names.reserve(post.exprs.size());
-  for (const auto& e : post.exprs) {
-    names.push_back(e->name);
-  }
-  EXPECT_EQ(names, (std::vector<std::string>{"((i32 - 1) * 2)", "(sum(i16) * 2)", "(sum(i16) + 1)",
-                                             "-((i32 - 1))"}));
-  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 5));
+  EXPECT_EQ(names(std::get<ComputeNode>(Nth(*plan, 5))),
+            (std::vector<std::string>{"(sum(i16) + 1)"}));
+  const auto& group = std::get<GroupAggregateNode>(Nth(*plan, 6));
   ASSERT_EQ(group.keys.size(), 1U);
   EXPECT_EQ(group.keys[0].name, "(i32 - 1)");
-  const auto& keys = std::get<ComputeNode>(Nth(*plan, 6));
+  const auto& keys = std::get<ComputeNode>(Nth(*plan, 7));
   ASSERT_EQ(keys.exprs.size(), 1U);
   EXPECT_EQ(keys.exprs[0]->name, "(i32 - 1)");
-  const auto& where = std::get<FilterNode>(Nth(*plan, 7));
+  const auto& where = std::get<FilterNode>(Nth(*plan, 8));
   EXPECT_EQ(where.predicates[0].column.value_or(BoundColumn{}).name, "(i16 // 2)");
-  const auto& operand = std::get<ComputeNode>(Nth(*plan, 8));
+  const auto& operand = std::get<ComputeNode>(Nth(*plan, 9));
   ASSERT_EQ(operand.exprs.size(), 1U);
   EXPECT_EQ(operand.exprs[0]->name, "(i16 // 2)");
-  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 9)));
+  EXPECT_TRUE(std::holds_alternative<ScanNode>(Nth(*plan, 10)));
 
   // A select item over a non-key column is not grouped.
   auto ungrouped = BindSql("SELECT i16 + 1, COUNT(*) FROM t GROUP BY i32", catalog);
@@ -6508,7 +6513,7 @@ TEST(BinderTest, AggregatesOfAFieldAndOfAnExpressionDiffer) {
 }
 
 // In a HAVING condition with OR, the alias of an item computed over the aggregation is the item's
-// expression, computed again inside the condition: a Compute's expressions read only its input.
+// expression, computed again inside the condition: HAVING's Compute stands below the select list's.
 TEST(BinderTest, HavingAliasOfAComputedItemInsideOr) {
   const Catalog catalog = MakeCatalog();
   auto plan = BindSql(
@@ -6516,15 +6521,60 @@ TEST(BinderTest, HavingAliasOfAComputedItemInsideOr) {
       "HAVING size = 'many' OR size = 'few'",
       catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
-  const auto& compute = std::get<ComputeNode>(Nth(*plan, 2));
-  ASSERT_EQ(compute.exprs.size(), 2U);  // the CASE item and the condition
-  const auto& condition = std::get<BoolExpr>(compute.exprs[1]->node);
+  const auto& select = std::get<ComputeNode>(Nth(*plan, 1));
+  ASSERT_EQ(select.exprs.size(), 1U);  // the CASE item
+  EXPECT_TRUE(std::holds_alternative<CaseExpr>(select.exprs[0]->node));
+  EXPECT_TRUE(std::holds_alternative<FilterNode>(Nth(*plan, 2)));
+  const auto& compute = std::get<ComputeNode>(Nth(*plan, 3));
+  ASSERT_EQ(compute.exprs.size(), 1U);  // the condition
+  const auto& condition = std::get<BoolExpr>(compute.exprs[0]->node);
   ASSERT_EQ(condition.args.size(), 2U);
   for (const ExprPtr& arg : condition.args) {
     const auto& predicate = std::get<PredicateExpr>(arg->node);
     ASSERT_EQ(predicate.operands.size(), 1U);
     EXPECT_TRUE(std::holds_alternative<CaseExpr>(predicate.operands[0]->node));
   }
+}
+
+// HAVING computes what its conditions read and filters the groups before the select list and ORDER
+// BY are computed, as DuckDB does: their expressions run only over the groups that pass. The alias
+// of a computed item is its expression there, in a comparison, a compound condition and a global
+// aggregate's HAVING alike.
+TEST(BinderTest, HavingFiltersBeforeTheSelectListIsComputed) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i32, SUM(i16) + 1 AS s FROM t GROUP BY i32 HAVING s > 5 ORDER BY s"),
+            "Output: i32:INTEGER s:HUGEINT\n"
+            "Project i32, s\n"
+            "  Sort s ASC NULLS LAST\n"
+            "    Compute (sum(i16) + 1)\n"
+            "      Filter \"sum(i16)\" > 4\n"
+            "        GroupAggregate keys=[i32] SUM(i16)\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n");
+  EXPECT_EQ(
+      optimized("SELECT i32, SUM(i16) + 1 AS s FROM t GROUP BY i32 HAVING s > 5 OR i32 * 2 < 0"),
+      "Output: i32:INTEGER s:HUGEINT\n"
+      "Project i32, s\n"
+      "  Compute (sum(i16) + 1)\n"
+      "    Filter \"((s > 5) OR ((i32 * 2) < 0))\"\n"
+      "      Compute ((s > 5) OR ((i32 * 2) < 0))\n"
+      "        GroupAggregate keys=[i32] SUM(i16)\n"
+      "          Scan table=t source=fake columns=[i16, i32]\n");
+  EXPECT_EQ(optimized("SELECT MAX(i32) * 2 FROM t HAVING MAX(i32) < 0"),
+            "Output: (max(i32) * 2):INTEGER\n"
+            "Project \"(max(i32) * 2)\"\n"
+            "  Compute (max(i32) * 2)\n"
+            "    Filter \"max(i32)\" < 0\n"
+            "      Aggregate MAX(i32)\n"
+            "        Scan table=t source=fake columns=[i32]\n");
 }
 
 // Every column a bound plan creates has its own id, and Bind resolves every position from the ids
@@ -6888,10 +6938,10 @@ TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
 
 // A BETWEEN with a subquery bound is its two comparisons (ADR 0041's decision 6), each a conjunct
 // of its clause: a subquery's a one-row join with the comparison above it, the other an ordinary
-// conjunct -- a filter below the joins in WHERE. Both compare in the type DuckDB gives all three
-// values, a subquery bound's being its column's: with a DOUBLE bound, the plain half keeps
-// `i32 + 1` as written (DuckDB keeps the cast to DOUBLE above it), where an INTEGER bound lets the
-// constant move.
+// conjunct -- a filter below the joins, in WHERE and HAVING alike. Both compare in the type DuckDB
+// gives all three values, a subquery bound's being its column's: with a DOUBLE bound, the plain
+// half keeps `i32 + 1` as written (DuckDB keeps the cast to DOUBLE above it), where an INTEGER
+// bound lets the constant move.
 TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
   const Catalog catalog = MakeCatalog();
   const auto optimized = [&catalog](std::string_view sql) -> std::string {
@@ -6953,13 +7003,13 @@ TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
                       "MIN(i16) FROM u) AND 10"),
             "Output: i16:SMALLINT count_star():BIGINT\n"
             "Project i16, \"count_star()\"\n"
-            "  Filter \"count_star()\" <= 10\n"
-            "    Filter \"count_star()\" >= \"min(i16)\"\n"
-            "      Join ONE-ROW build=right keys=[]\n"
+            "  Filter \"count_star()\" >= \"min(i16)\"\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Filter \"count_star()\" <= 10\n"
             "        GroupAggregate keys=[i16] COUNT(*)\n"
             "          Scan table=t source=fake columns=[i16]\n"
-            "        Aggregate MIN(i16)\n"
-            "          Scan table=u source=fake columns=[i16]\n");
+            "      Aggregate MIN(i16)\n"
+            "        Scan table=u source=fake columns=[i16]\n");
 }
 
 // A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass

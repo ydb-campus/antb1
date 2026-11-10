@@ -1,0 +1,8 @@
+Output: tr_pickup:INTEGER d:DOUBLE
+Project tr_pickup, d
+  Sort d DESC NULLS LAST, tr_pickup ASC NULLS LAST
+    Compute (sum(tr_distance) * 2)
+      Filter "count_star()" > 1 AND "(max(tr_row) - min(tr_row))" > 10
+        Compute (max(tr_row) - min(tr_row))
+          GroupAggregate keys=[tr_pickup] SUM(tr_distance), COUNT(*), MAX(tr_row), MIN(tr_row)
+            Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup, tr_distance]

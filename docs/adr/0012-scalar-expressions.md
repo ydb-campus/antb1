@@ -110,6 +110,9 @@ Accepted (with the maintainer-approved plan for scalar expressions)
   select or `ORDER BY` expression equal to a `GROUP BY` expression is that key. A `WHERE` condition over table columns
   filters before the `Compute`, one over computed columns after it; two columns compare with a new
   `column <op> column` predicate.
+  Update (2026-11-10): over the aggregation there are now two: one of what `HAVING`'s conditions read, below their
+  `Filter`, and one of the select and `ORDER BY` expressions above it and above `HAVING`'s subquery joins, as DuckDB
+  filters `HAVING` before it computes the select list ([docs/sql-subset.md](../sql-subset.md), D16).
 - **Evaluation with Arrow's kernels where they match DuckDB** (`add_checked`, `subtract_checked`,
   `multiply_checked`, `negate_checked` in the result type, `divide` in DOUBLE, the comparison kernels), and with own
   loops where they do not: `//` and `%` (DuckDB truncates, returns NULL for a zero divisor and fails on the minimum

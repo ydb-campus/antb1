@@ -501,8 +501,8 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
-# The same form in HAVING: its join sits above the aggregation and above the columns HAVING
-# computes, over the groups rather than over the rows.
+# The same form in HAVING: its join sits above the aggregation and the filter of HAVING's other
+# conjuncts, below the select list's computed columns, over the groups rather than over the rows.
 antb1_add_cli_golden(
   explain_in_subquery_having
   ARGS
@@ -515,6 +515,20 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
     --table
     "zones=${_f}/star/zones.parquet"
+)
+# HAVING computes what its conditions read and filters directly above the aggregation, before the
+# select list and ORDER BY are computed, as DuckDB does: their expressions run only over the groups
+# that pass.
+antb1_add_cli_golden(
+  explain_having_before_select_list
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_pickup, SUM(tr_distance) * 2 AS d FROM trips GROUP BY tr_pickup HAVING COUNT(*) > 1 AND MAX(tr_row) - MIN(tr_row) > 10 ORDER BY d DESC, tr_pickup"
+    --table
+    "trips=${_f}/star/trips.parquet"
 )
 # A scalar subquery as a keyless one-row join (ADR 0022's J5): its build is the aggregate's single
 # row, which the join appends to every probe row, and the comparison is a Filter directly above it.
