@@ -3084,6 +3084,8 @@ TEST(QueryGenerator, ConditionValuesAreAtMostOneRowAndReadOnlyTheirTable) {
   int betweens = 0;
   int exists = 0;
   int pairs = 0;
+  int compared = 0;     // two values, one on each side of a comparison
+  int case_exists = 0;  // a CASE over an EXISTS
   for (uint64_t i = 0; i < 12000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kConditionValue)) {
@@ -3133,6 +3135,16 @@ TEST(QueryGenerator, ConditionValuesAreAtMostOneRowAndReadOnlyTheirTable) {
       if (const auto* binary = std::get_if<sql::BinaryExpr>(e)) {
         ors += binary->op == sql::BinaryOp::kOr ? 1 : 0;
         cases += std::holds_alternative<sql::CaseExpr>(*binary->left) ? 1 : 0;
+        case_exists += std::holds_alternative<sql::CaseExpr>(*binary->left) &&
+                               sql::ToSql(*binary->left).contains("EXISTS")
+                           ? 1
+                           : 0;
+        const bool comparison =
+            binary->op >= sql::BinaryOp::kEq && binary->op <= sql::BinaryOp::kGe;
+        compared += comparison && sql::ToSql(*binary->left).contains("SELECT") &&
+                            sql::ToSql(*binary->right).contains("SELECT")
+                        ? 1
+                        : 0;
         const auto* sum = std::get_if<sql::BinaryExpr>(&*binary->right);
         plus += sum != nullptr && sum->op == sql::BinaryOp::kAdd ? 1 : 0;
       }
@@ -3150,6 +3162,8 @@ TEST(QueryGenerator, ConditionValuesAreAtMostOneRowAndReadOnlyTheirTable) {
   EXPECT_GT(betweens, 60);
   EXPECT_GT(exists, 150);
   EXPECT_GT(pairs, 200) << "IN lists, BETWEEN and two values compared";
+  EXPECT_GT(compared, 50) << "two values compared";
+  EXPECT_GT(case_exists, 50) << "a CASE over an EXISTS";
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {
