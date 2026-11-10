@@ -325,10 +325,10 @@ SELECT COUNT(*) FROM drivers CROSS JOIN trips FULL JOIN zones ON tr_pickup = zn_
 BIGINT
 2577
 
-# A subquery conjunct in the ON of an inner join inside the FULL JOIN's left input would bind above every join of the
-# block, where it would drop the rows the FULL JOIN pads on the left (zones and drivers of city 1 meet the 5 other
-# cities padded), so it exits 4 on antb1. Under a LEFT JOIN, which never pads its left input, it is answered.
-onlyif duckdb
+# A subquery conjunct in the ON of an inner join inside the FULL JOIN's left input filters that input before the FULL
+# JOIN pads it (ADR 0041's SQ1): zones and drivers of city 1 meet the 5 other cities padded. Under a LEFT JOIN, which
+# never pads its left input, it is answered as well.
+pending SQ1a
 query III nosort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT ct_id FROM cities WHERE ct_id = 1) FULL JOIN cities ON dv_city = ct_id
 ----
