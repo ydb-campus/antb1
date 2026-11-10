@@ -1305,6 +1305,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "SUM(u.i32) IN (SELECT ok.i16 FROM ok))",
                   kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
+                  "SUM(u.i32 + t.i32) IN (SELECT ok.i16 FROM ok))",
+                  kBind, "SUM(u.i32 + t.i32)", "WHERE clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
+                  "SUM(t.i32) IN (SELECT ok.i16 FROM ok))",
+                  kUnsupported, "SUM(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
                   "u.i32 < (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(u.i32)))",
                   kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
         // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand

@@ -450,7 +450,7 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   0041's decision 23). One of an enclosing block whose subquery stands in that block's `HAVING` is an outer aggregate,
   exit code 4 until ADR 0041's SQ13 answers it, as DuckDB does; any other -- of the subquery's own columns, of no
   column, a mix, or owned through a `WHERE` or `ON` -- is a bind error, `WHERE clause cannot contain aggregates!`
-  (DuckDB's text depends on where the subquery stands). In a derived table's or a CTE's `WHERE` or `ON` inside such a
+  (DuckDB's text depends on where the subquery stands). Anywhere inside a derived table or a CTE body within such a
   subquery it is exit code 4; under a subquery in the select list or `ORDER BY` the parse error stays where DuckDB
   answers an outer aggregate (SQ2). A column count other than one is a bind error. A **correlated** subquery -- one
   that reads a

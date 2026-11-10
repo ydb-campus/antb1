@@ -7004,6 +7004,12 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
   const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct);
   const bool in = form.has_value() && !form->scalar() && !form->exists();
   const bool outer = ReadsOuterColumn(conjunct, visible_);
+  // An aggregate in an IN's probe, which the parser admits only inside a subquery in HAVING:
+  // binding the probe reaches it, and AggregateInCondition judges it by the block it belongs to
+  // (ADR 0041's decision 23), before the rule below would read its outer columns as the probe's.
+  if (in && ContainsAggregate(*form->other)) {
+    ARROW_RETURN_NOT_OK(BindInput(*form->other).status());
+  }
   // An IN whose probe reads a column of an enclosing block: its semi join would stand above this
   // block's joins with the probe's free variable on its outer side, which neither unnesting path of
   // ADR 0023 takes.
