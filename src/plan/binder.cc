@@ -1729,7 +1729,7 @@ std::optional<Rejection> RejectCompoundSubquery(const SubqueryConjunct& form) {
 // (RejectCompoundSubquery). CheckConjunct passes IN forms alone: a scalar or EXISTS form is a
 // condition with values like any other.
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
-  ANTB1_CHECK(!form.scalar() && !form.exists());
+  ANTB1_CHECK(form.subquery->kind == sql::SubqueryExpr::Kind::kIn);
   if (auto r = FirstUnsupported(*form.other)) {
     return r;
   }
