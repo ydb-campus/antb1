@@ -594,7 +594,7 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
     - the uncorrelated EXISTS: SQ4a, built (2026-11-10). A correlated EXISTS keeps this ADR's refusals and their
       messages, which no longer come from the static check of its shape: a gate refuses its block at the EXISTS once
       its FROM list is bound, before any other clause of it binds, so what the enclosing block binds first (its FROM
-      list and inner ONs, earlier WHERE conjuncts, its select list, and for a HAVING EXISTS its grouping) reports its
+      list and every ON, earlier WHERE conjuncts, its select list, and for a HAVING EXISTS its grouping) reports its
       bind errors first (ADR 0041's SQ4a update);
     - IS NOT DISTINCT FROM keys: built with OJ5b (its update above).
 

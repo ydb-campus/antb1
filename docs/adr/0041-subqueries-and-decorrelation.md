@@ -704,8 +704,9 @@ Defects the design discussion found, to which no item is assigned:
   is bound, not from the static check of its shape. A correlated EXISTS keeps its refusals and their messages through
   a gate that runs once the block's FROM list is bound and before any other clause of it binds, so those clauses'
   bind errors still never show; it asks every clause, grouping-set keys included, whether it reads an enclosing
-  column, a name that a written select alias has being that alias. A compound's arms all bind before a correlated arm
-  is refused. What the enclosing block binds before the subquery now comes first: its FROM list and inner ONs, the
+  column, a name that a written select alias has being that alias where the binder takes one (a bare GROUP BY key,
+  and HAVING and ORDER BY outside an aggregate's argument). A compound's arms all bind before a correlated arm
+  is refused. What the enclosing block binds before the subquery now comes first: its FROM list and every ON, the
   WHERE conjuncts written before it, its select list (which binds before its WHERE), and its grouping for a HAVING
   subquery; a conjunct written after it is never reached. A correlated scalar subquery's own bind errors come first
   too. Each is exit 1 where antb1 exited 4; DuckDB, which answers these subqueries, binds WHERE before the select list,

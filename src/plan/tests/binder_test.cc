@@ -6697,13 +6697,24 @@ TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
     EXPECT_TRUE(FreeVariables(*bound->root).empty()) << sql;
   }
-  // A name only the enclosing block has stays an enclosing column: correlated, and refused.
-  const auto correlated =
-      BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)", catalog);
-  ASSERT_FALSE(correlated.ok());
-  EXPECT_TRUE(correlated.status().message().starts_with(
-      "EXISTS over a subquery with LIMIT is not supported"))
-      << correlated.status().message();
+  // A name only the enclosing block has stays an enclosing column, and so does an alias's name
+  // where the binder takes no alias -- WHERE, an ON, an aggregate's argument -- as DuckDB reads it
+  // there: correlated, and refused at the EXISTS.
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok WHERE ok.i16 = i32 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT ok.s AS i64 FROM ok JOIN dec ON dec.b = i64 "
+           "LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING MAX(i32) > 0 "
+           "LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32 + 1, s LIMIT 1)",
+       }) {
+    const auto correlated = BindSql(sql, catalog);
+    ASSERT_FALSE(correlated.ok()) << sql;
+    EXPECT_TRUE(correlated.status().IsNotImplemented()) << sql << ": " << correlated.status();
+    EXPECT_TRUE(correlated.status().message().starts_with("EXISTS over a subquery with"))
+        << sql << ": " << correlated.status().message();
+  }
 }
 
 // The single value keeps its column's FLOAT flag (divergence D11): a literal it is compared with

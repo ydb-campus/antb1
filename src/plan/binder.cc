@@ -909,71 +909,87 @@ bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
 
 void CollectRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out);
 
-// Every column reference of an expression, in query order; nothing is resolved or bound.
+// Every column reference of an expression, in query order; nothing is resolved or bound. With
+// `aggregate_args_only`, only those inside an aggregate call's argument.
 struct CollectRefsOf {
   std::vector<const sql::ColumnRef*>& out;
+  bool aggregate_args_only = false;
 
-  void operator()(const sql::ColumnRef& column) const { out.push_back(&column); }
+  void Recurse(const sql::Expr& e) const {
+    std::visit(*this, static_cast<const sql::ExprNode&>(e));
+  }
+
+  void operator()(const sql::ColumnRef& column) const {
+    if (!aggregate_args_only) {
+      out.push_back(&column);
+    }
+  }
   void operator()(const sql::Literal& /*lit*/) const {}
   void operator()(const sql::AggregateCall& call) const {
     if (call.arg.has_value()) {
-      CollectRefs(**call.arg, out);
+      CollectRefs(**call.arg, out);  // every reference of the argument
     }
   }
-  void operator()(const sql::UnaryExpr& unary) const { CollectRefs(*unary.operand, out); }
+  void operator()(const sql::UnaryExpr& unary) const { Recurse(*unary.operand); }
   void operator()(const sql::BinaryExpr& binary) const {
-    CollectRefs(*binary.left, out);
-    CollectRefs(*binary.right, out);
+    Recurse(*binary.left);
+    Recurse(*binary.right);
   }
   void operator()(const sql::LikeExpr& like) const {
-    CollectRefs(*like.operand, out);
-    CollectRefs(*like.pattern, out);
+    Recurse(*like.operand);
+    Recurse(*like.pattern);
   }
   void operator()(const sql::InExpr& in) const {
-    CollectRefs(*in.operand, out);
+    Recurse(*in.operand);
     for (const sql::Expr& value : in.list) {
-      CollectRefs(value, out);
+      Recurse(value);
     }
   }
   void operator()(const sql::BetweenExpr& between) const {
-    CollectRefs(*between.operand, out);
-    CollectRefs(*between.low, out);
-    CollectRefs(*between.high, out);
+    Recurse(*between.operand);
+    Recurse(*between.low);
+    Recurse(*between.high);
   }
-  void operator()(const sql::IsNullExpr& is_null) const { CollectRefs(*is_null.operand, out); }
+  void operator()(const sql::IsNullExpr& is_null) const { Recurse(*is_null.operand); }
   void operator()(const sql::DistinctFromExpr& distinct) const {
-    CollectRefs(*distinct.left, out);
-    CollectRefs(*distinct.right, out);
+    Recurse(*distinct.left);
+    Recurse(*distinct.right);
   }
   void operator()(const sql::FunctionCall& call) const {
     for (const sql::Expr& arg : call.args) {
-      CollectRefs(arg, out);
+      Recurse(arg);
     }
   }
   void operator()(const sql::CaseExpr& c) const {
     if (c.operand.has_value()) {
-      CollectRefs(**c.operand, out);
+      Recurse(**c.operand);
     }
     for (const sql::CaseBranch& branch : c.branches) {
-      CollectRefs(*branch.when, out);
-      CollectRefs(*branch.then, out);
+      Recurse(*branch.when);
+      Recurse(*branch.then);
     }
     if (c.otherwise.has_value()) {
-      CollectRefs(**c.otherwise, out);
+      Recurse(**c.otherwise);
     }
   }
-  void operator()(const sql::ExtractExpr& e) const { CollectRefs(*e.source, out); }
-  void operator()(const sql::CastExpr& cast) const { CollectRefs(*cast.operand, out); }
+  void operator()(const sql::ExtractExpr& e) const { Recurse(*e.source); }
+  void operator()(const sql::CastExpr& cast) const { Recurse(*cast.operand); }
   // Only its IN operand: the refs inside its block resolve in that block's own scope.
   void operator()(const sql::SubqueryExpr& s) const {
     if (s.operand.has_value()) {
-      CollectRefs(**s.operand, out);
+      Recurse(**s.operand);
     }
   }
 };
 
 void CollectRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out) {
   std::visit(CollectRefsOf{.out = out}, static_cast<const sql::ExprNode&>(expr));
+}
+
+// The column references inside the arguments of an expression's aggregate calls.
+void CollectAggregateArgRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out) {
+  std::visit(CollectRefsOf{.out = out, .aggregate_args_only = true},
+             static_cast<const sql::ExprNode&>(expr));
 }
 
 std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
@@ -3846,12 +3862,13 @@ class Binder {
   // relations it reads (ADR 0023). A name a select alias of this block also has is that alias, as
   // in Resolve.
   [[nodiscard]] bool ReadsOuterColumn(const sql::Expr& expr, Visibility visible) const {
-    return ReadsOuterColumnWith(expr, visible, [this](std::string_view name) {
-      return FindAlias(select_, name).has_value();
+    return ReadsOuterColumnWith(expr, visible, [this](const sql::ColumnRef& ref) {
+      return FindAlias(select_, ref.name).has_value();
     });
   }
-  // ReadsOuterColumn, with `is_alias` telling whether an unqualified name is a select alias of this
-  // block: the bound list's, or before the list binds its written aliases (GateCorrelatedExists).
+  // ReadsOuterColumn, with `is_alias` telling whether an unqualified reference names a select
+  // alias of this block rather than an enclosing column: Resolve's rule over the bound list, or
+  // the gate's before the list binds (GateCorrelatedExists).
   template <class IsAlias>
   [[nodiscard]] bool ReadsOuterColumnWith(const sql::Expr& expr, Visibility visible,
                                           const IsAlias& is_alias) const {
@@ -3862,8 +3879,7 @@ class Binder {
     CollectRefs(expr, refs);
     return std::ranges::any_of(refs, [&](const sql::ColumnRef* ref) {
       return scope_.LookUp(*ref, visible).outcome == Lookup::Outcome::kMissing &&
-             !(ref->qualifier.empty() && is_alias(ref->name)) &&
-             scope_.LookUpOuter(*ref).has_value();
+             !(ref->qualifier.empty() && is_alias(*ref)) && scope_.LookUpOuter(*ref).has_value();
     });
   }
 
@@ -3896,7 +3912,7 @@ class Binder {
   // binding is refused at the EXISTS, as is a correlated EXISTS in HAVING. An uncorrelated EXISTS
   // reads any block (decision 5). "Correlated" asks every clause of the block, grouping-set keys
   // included, whether it reads an enclosing column (ReadsOuterColumn) before the select list
-  // binds, so a name that a written select alias has is that alias, as Resolve takes it later.
+  // binds, so it reads a written select alias as the alias only where the binder will.
   [[nodiscard]] arrow::Status GateCorrelatedExists() const;
 
   // One WHERE conjunct of this block that reads an outer column: bound as a condition over the
@@ -7396,34 +7412,50 @@ arrow::Status Binder::GateCorrelatedExists() const {
   if (exists_ == nullptr) {
     return arrow::Status::OK();
   }
-  // The select list is not bound yet, so a name that a written alias has is that alias, as Resolve
-  // takes it once the list is bound.
-  const auto written_alias = [this](std::string_view name) {
-    const std::string wanted = AsciiLower(name);
+  // The select list is not bound yet, so the gate tells a written alias from an enclosing column
+  // where the binder will: a bare GROUP BY key (a grouping set's too) and a name of HAVING or ORDER
+  // BY outside an aggregate's argument are the alias (Resolve, AliasFallback). Anywhere else --
+  // WHERE, an ON, a select item, a GROUP BY expression, an aggregate's argument -- the name is the
+  // enclosing column, as DuckDB reads it there (the block's binder would make it a bind error).
+  const auto written_alias = [this](const sql::ColumnRef& ref) {
+    const std::string wanted = AsciiLower(ref.name);
     return std::ranges::any_of(stmt_.items, [&wanted](const sql::SelectItem& item) {
       return item.alias.has_value() && AsciiLower(*item.alias) == wanted;
     });
   };
+  const auto never_alias = [](const sql::ColumnRef& /*ref*/) { return false; };
   const auto reads = [&](const sql::Expr& e, Visibility visible) {
-    return ReadsOuterColumnWith(e, visible, written_alias);
+    return ReadsOuterColumnWith(e, visible, never_alias);
   };
-  const auto any_reads = [&](const std::vector<sql::Expr>& exprs, Visibility visible) {
-    return std::ranges::any_of(exprs, [&](const sql::Expr& e) { return reads(e, visible); });
+  const auto reads_key = [&](const sql::Expr& key) {
+    const auto* bare = std::get_if<sql::ColumnRef>(&key);
+    return bare != nullptr ? ReadsOuterColumnWith(key, Visibility{}, written_alias)
+                           : reads(key, Visibility{});
   };
-  bool correlated = any_reads(stmt_.where, Visibility{}) ||
-                    any_reads(stmt_.group_by, Visibility{}) ||
-                    any_reads(stmt_.having, Visibility{});
+  const auto reads_output = [&](const sql::Expr& e) {
+    std::vector<const sql::ColumnRef*> in_aggregates;
+    CollectAggregateArgRefs(e, in_aggregates);
+    return ReadsOuterColumnWith(e, Visibility{}, [&](const sql::ColumnRef& ref) {
+      return written_alias(ref) && !std::ranges::contains(in_aggregates, &ref);
+    });
+  };
+  bool correlated = std::ranges::any_of(
+                        stmt_.where, [&](const sql::Expr& e) { return reads(e, Visibility{}); }) ||
+                    std::ranges::any_of(stmt_.group_by, reads_key) ||
+                    std::ranges::any_of(stmt_.having, reads_output);
   for (const sql::Expr* key : sql::GroupingExprs(stmt_.grouping)) {
-    correlated = correlated || reads(*key, Visibility{});  // ROLLUP, CUBE, GROUPING SETS keys
+    correlated = correlated || reads_key(*key);  // ROLLUP, CUBE, GROUPING SETS keys
   }
   for (std::size_t i = 0; i < stmt_.from.size() && !correlated; ++i) {
-    correlated = any_reads(stmt_.from[i].on, OnVisibility(stmt_.from, i));
+    const Visibility on = OnVisibility(stmt_.from, i);
+    correlated =
+        std::ranges::any_of(stmt_.from[i].on, [&](const sql::Expr& e) { return reads(e, on); });
   }
   for (const sql::SelectItem& item : stmt_.items) {
     correlated = correlated || (item.expr() != nullptr && reads(*item.expr(), Visibility{}));
   }
   for (const sql::OrderItem& item : stmt_.order_by) {
-    correlated = correlated || reads(item.expr, Visibility{});
+    correlated = correlated || reads_output(item.expr);
   }
   if (!correlated) {
     return arrow::Status::OK();
