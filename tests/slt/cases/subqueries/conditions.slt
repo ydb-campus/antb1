@@ -2251,8 +2251,9 @@ SMALLINT
 
 # ---- DuckDB only until subqueries in a LEFT JOIN's ON get a PR (ADR 0041's decision 3: DuckDB coverage) ----
 
-# A value (a COUNT over no row: 0) and an IN whose set holds a NULL, in a LEFT JOIN's ON: a city whose zone fails them
-# is padded.
+# DuckDB answers a subquery in a LEFT JOIN's ON in a conjunct that reads the right input alone: a value (a COUNT over
+# no row: 0), an IN whose set holds a NULL, and an EXISTS under OR with a column of that input. A city whose zone fails
+# them is padded.
 onlyif duckdb
 query II nosort
 SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id
@@ -2277,10 +2278,24 @@ SMALLINT	INTEGER
 5	5
 6	NULL
 
-# ---- DuckDB only, for good: DuckDB refuses subqueries in a FULL JOIN's ON and EXISTS in a LEFT JOIN's ON ----
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND (zn_city > 3 OR EXISTS (SELECT 1 FROM promos)) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	4
+5	5
+6	NULL
 
-# antb1 refuses them too (exit code 4), and an Unsupported answer passes no record. A value directly compared, the same
-# value in arithmetic, and an uncorrelated EXISTS.
+# ---- DuckDB only, for good: DuckDB's refusals of subqueries in a FULL JOIN's or a LEFT JOIN's ON ----
+
+# DuckDB refuses any subquery in a FULL JOIN's ON, and one in a LEFT JOIN's ON whose conjunct reads the left input or
+# no column. antb1 refuses them too (exit code 4), and an Unsupported answer passes no record. In a FULL JOIN's ON a
+# value directly compared and the same value in arithmetic; in a LEFT JOIN's ON an uncorrelated EXISTS alone and a
+# value compared with a column of the left input.
 onlyif duckdb
 statement error ^Not implemented Error: Cannot perform non-inner join on subquery
 SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id, zn_id
@@ -2292,3 +2307,7 @@ SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >
 onlyif duckdb
 statement error ^Not implemented Error: Cannot perform non-inner join on subquery
 SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND EXISTS (SELECT * FROM promos) ORDER BY ct_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND ct_pop >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id

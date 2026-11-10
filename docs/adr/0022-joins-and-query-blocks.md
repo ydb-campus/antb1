@@ -980,9 +980,10 @@ docs/sql-subset.md sections it changes.
       features that no item plans yet (ADR 0041's open decisions).
     - Update (2026-11-10, SQ1a): built for WHERE and the inner ONs (ADR 0041's SQ1a update), and with a third slot:
       the left input of a unit that pads it, below the unit, which answers the subquery conditions in an inner ON
-      inside a FULL JOIN's left input that the OJ3 update refuses. A subquery in a FULL JOIN's own ON, and EXISTS in
-      a LEFT JOIN's ON, are DuckDB's own refusals, so they stay exit 4 for good; a value in a LEFT JOIN's ON stays
-      the coverage item.
+      inside a FULL JOIN's left input that the OJ3 update refuses. DuckDB refuses a subquery in a FULL JOIN's own
+      ON, and one in a LEFT JOIN's ON whose conjunct reads the left input or no column, so those stay exit 4 for
+      good; a LEFT JOIN's ON conjunct that reads the right input alone (a value, an IN or an EXISTS) stays the
+      coverage item.
   - **IN and NOT IN under OR, NOT or CASE (SQ7).** A top-level conjunct keeps its semi or null-aware anti join.
     Elsewhere in a condition, IN becomes a null-aware mark join, a new kind that keeps each left row once and appends
     a BOOLEAN: TRUE on a match; else FALSE for an empty set, even for a NULL probe; else NULL where the probe is NULL

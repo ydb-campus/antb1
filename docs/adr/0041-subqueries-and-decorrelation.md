@@ -764,12 +764,15 @@ completes, and the ratchet stays at 78.
   DISTINCT FROM's lowering, CASE x WHEN's equalities, the copy a folded or moved comparison makes, an IN list's
   equalities) and a subquery written twice in WHERE and the inner ONs all read one join. With an IN that turns out
   empty written between two occurrences, the first-occurrence placement hides the value's error (D35). OR
-  factoring's dropped branch binds as a dry run, which binds each subquery's block for its bind errors, plants
-  nothing and refuses no correlation, so a correlated conjunct every branch of an OR shares is answered through ADR
+  factoring's dropped branch binds as a dry run, which binds each subquery's block for its bind errors and its own
+  refusals (a correlated scalar subquery that is no aggregate over every row, say), plants nothing, and refuses no
+  correlated subquery for where it stands; a correlated conjunct every branch of an OR shares is answered through ADR
   0023's paths.
-- **Decision 3 is corrected:** a subquery in a FULL JOIN's own ON, and EXISTS in a LEFT JOIN's ON, are DuckDB's own
-  refusals ("Cannot perform non-inner join on subquery!"), so no coverage item answers them; a value in a LEFT JOIN's
-  ON, which DuckDB answers, stays one.
+- **Decision 3 is corrected:** DuckDB answers a subquery in a LEFT JOIN's ON only in a conjunct that reads the
+  right input alone -- a value, an IN or an EXISTS, one correlated to that input too -- and refuses every other with
+  "Cannot perform non-inner join on subquery!": any in a FULL JOIN's own ON, and in a LEFT JOIN's ON one whose
+  conjunct reads the left input or no column at all. Those refusals are DuckDB's own, so no coverage item answers
+  them; the conjuncts over the right input alone stay decision 3's coverage item.
 - **Decision 20, a note for SQ5:** a conjunct's other value joins stand between a correlated value's join and the
   conjunct's filter, so the consumer proof's walk must pass uncorrelated one-row joins, or SQ5 plants a conjunct's
   correlated join last.
