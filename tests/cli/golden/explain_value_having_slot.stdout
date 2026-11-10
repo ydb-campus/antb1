@@ -1,0 +1,12 @@
+Output: tr_pickup:INTEGER s:DECIMAL(38,2)
+Project tr_pickup, s
+  Sort tr_pickup ASC NULLS LAST
+    Compute (sum(tr_fare) * 2)
+      Filter "sum(tr_fare)" > "(avg(tr_fare) * 70)"
+        Compute (avg(tr_fare) * 70)
+          Join ONE-ROW build=right keys=[] carries 1 of 4 unread above
+            Filter "count_star()" > 50
+              GroupAggregate keys=[tr_pickup] SUM(tr_fare), COUNT(*)
+                Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_pickup, tr_fare]  [shared #1 of 2, 2 fields]
+            Aggregate AVG(tr_fare)
+              Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_fare]  [shared #1 of 2, 2 fields]

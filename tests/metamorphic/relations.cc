@@ -2100,6 +2100,44 @@ std::vector<Relation> AllRelations() {
                       "ON t.tr_pickup = z.zn_id AND z.zn_city < 3 FULL JOIN drivers d ON "
                       "t.tr_driver = d.dv_id")},
          .check = AllEqual()});
+    // In HAVING (ADR 0041's SQ1b): a value equals the literal it holds, under OR, in a CASE and in
+    // an IN list; under OR it keeps the groups of its branches; of no row it is NULL, so the OR
+    // keeps its other branch's groups.
+    const slt::FeatureSet in_having =
+        SetWith(in_conditions, kColumns, kGroupBy, kHaving, kHavingValue);
+    for (const auto& [name, with_value, with_literal] :
+         {std::tuple{"or", "COUNT(*) > 70 OR tr_pickup = ({})", "COUNT(*) > 70 OR tr_pickup = 5"},
+          std::tuple{"case", "CASE WHEN tr_pickup = ({}) THEN 1 ELSE 0 END = 1",
+                     "CASE WHEN tr_pickup = 5 THEN 1 ELSE 0 END = 1"},
+          std::tuple{"in_list", "COUNT(*) IN (75, ({}) * 15)", "COUNT(*) IN (75, 75)"}}) {
+      r.push_back(
+          {.name = std::format("having_value_equals_its_literal_{}", name),
+           .features = SetWith(in_having, kCase, kIn, kArithmetic),
+           .probes = {Q(std::format("SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup "
+                                    "HAVING {}",
+                                    std::vformat(with_value, std::make_format_args(kOneRow)))),
+                      Q(std::format("SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup "
+                                    "HAVING {}",
+                                    with_literal))},
+           .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "having_value_under_or_is_the_union_of_its_branches",
+         .features = SetWith(in_having, kArithmetic, kWhereAnd),
+         .probes = {Q("SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING COUNT(*) < 70 OR "
+                      "COUNT(*) > (SELECT COUNT(*) FROM cities) * 13"),
+                    Q("SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING COUNT(*) < 70"),
+                    Q("SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING NOT (COUNT(*) < 70) "
+                      "AND COUNT(*) > (SELECT COUNT(*) FROM cities) * 13")},
+         .check = FirstIsUnionOfRest()});
+    r.push_back({.name = "having_value_of_no_row_keeps_the_other_branch",
+                 .features = in_having,
+                 .probes = {Q(std::format("SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING "
+                                          "COUNT(*) > 70 OR tr_pickup = ({})",
+                                          kNoRow)),
+                            Q("SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING COUNT(*) > "
+                              "70")},
+                 .check = AllEqual()});
     // NOT BETWEEN two values is the OR of the two comparisons it negates.
     r.push_back({.name = "not_between_values_is_two_comparisons",
                  .features = SetWith(in_conditions, kBetween, kMin, kMax),

@@ -672,6 +672,20 @@ antb1_add_cli_golden(
     --table
     "drivers=${_f}/star/drivers.parquet"
 )
+# A HAVING conjunct with a value stands in HAVING's slot (ADR 0041's SQ1b): above the aggregation and
+# the filter of HAVING's other conjuncts, its value's join and then what it computes and its filter,
+# below the select list's computed column.
+antb1_add_cli_golden(
+  explain_value_having_slot
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_pickup, SUM(tr_fare) * 2 AS s FROM trips GROUP BY tr_pickup HAVING COUNT(*) > 50 AND SUM(tr_fare) > (SELECT AVG(tr_fare) FROM trips) * 70 ORDER BY tr_pickup"
+    --table
+    "trips=${_f}/star/trips.parquet"
+)
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
