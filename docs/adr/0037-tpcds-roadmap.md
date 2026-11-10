@@ -187,7 +187,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included (the OJ5b update below) | | Built |
 | **Phase 8** | **Subqueries ([ADR 0041](0041-subqueries-and-decorrelation.md); the phase 8 update below)** | | |
 | SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Built |
-| SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Planned |
+| SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | SQ1a built (WHERE and an inner ON); SQ1b planned (HAVING) |
 | SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Planned |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Planned |
 | SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Planned |
@@ -859,7 +859,17 @@ of the latest nightly `asan-tpc-sf1` run to the local times of its shards (about
 43% of the timeout. At the slowest ratio seen (5.9x, a PR leg that ran eight jobs on four cores), it would be 557 s,
 above the gate's 60% (522 s): shard 2 is the one to watch, and CL1's rebalancing is the remedy if a nightly run crosses
 the gate. `pixi run asan-tpc-sf1` stops at test discovery on macOS, so the shards ran from its build tree directly
-here, and the task's first run is the nightly's.
+here, and the task's first run is the nightly's. That run (2026-11-10) took 376 s for shard 2, 43% of the timeout,
+and 93 s for Q14 itself.
+
+Update (2026-11-10, SQ1a): SQ1 is two PRs at the maintainer's request (ADR 0041's SQ1a update), after a fix that makes
+HAVING filter before the select list is computed (#345). SQ1a, built, answers uncorrelated values anywhere in the
+conditions of WHERE and of an inner ON, and with them the OJ3 update's candidate: uncorrelated IN, NOT IN and EXISTS
+conditions and values in an inner ON inside a FULL JOIN's left input, which filter that input in a slot of its own.
+No query completes, and the ratchet stays at 78; of the queries that wait on phase 8, Q6 now exits 4 at its correlated
+value inside arithmetic (SQ5), and Q10 and Q35 at their correlated EXISTS under OR (SQ8). One passing query's plan
+changes, Q54's, whose BETWEEN bounds now both join before their two comparisons filter. PF16 stays a guard: SQ4a's
+shapes keep their counters. SQ1b, values in HAVING with decision 23's outer aggregates, follows.
 
 ## Alternatives considered
 

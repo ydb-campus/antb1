@@ -6904,6 +6904,24 @@ TEST(BinderTest, ASubqueryIsBoundOncePerSlot) {
       "            Scan table=t source=fake columns=[i16, i32, i64]\n"
       "          Aggregate MIN(i16)\n"
       "            Scan table=ok source=fake columns=[i16]\n");
+  // Top-level comparisons and EXISTS conjuncts written alike read one join each, too.
+  EXPECT_EQ(
+      optimized("SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) AND i16 < (SELECT "
+                "MIN(i16) FROM u) AND EXISTS (SELECT 1 FROM ok) AND EXISTS (SELECT 1 FROM ok)"),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "  Filter \"count_star()\" = 1\n"
+      "    Filter \"count_star()\" = 1\n"
+      "      Join ONE-ROW build=right keys=[] carries 2 of 4 unread above\n"
+      "        Filter i16 < \"min(i16)\"\n"
+      "          Filter i32 > \"min(i16)\"\n"
+      "            Join ONE-ROW build=right keys=[]\n"
+      "              Scan table=t source=fake columns=[i16, i32]\n"
+      "              Aggregate MIN(i16)\n"
+      "                Scan table=u source=fake columns=[i16]\n"
+      "        Aggregate COUNT(*)\n"
+      "          Limit 1\n"
+      "            Scan table=ok source=fake columns=[]\n");
 }
 
 // OR factoring's dropped branch binds as a dry run (ADR 0041's decision 10): its subquery plants no

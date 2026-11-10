@@ -3734,6 +3734,9 @@ class Binder {
   arrow::Result<Typed> SubqueryValue(const sql::SubqueryExpr& s, bool group);
   // An uncorrelated block's one-row join, planted in its slot, and its value remembered there.
   Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
+  // The value of a subquery written alike in the same slot before, or nullptr.
+  struct BoundValue;
+  [[nodiscard]] const BoundValue* FindValue(const sql::SubqueryExpr& s, bool group) const;
   // A WHERE or inner-ON conjunct that holds a value: a filter of its own at the end of its slot.
   arrow::Status BindValueConjunct(const sql::Expr& conjunct, SourceSpan element);
   // Inside a FULL JOIN's left input, a conjunct of that input's slot reads that input's relations
@@ -6895,12 +6898,17 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
-arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
+const Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) const {
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
-  for (const BoundValue& bound : values_) {
-    if (bound.block == block && SameSubquery(bound.written, s)) {
-      return bound.value;
-    }
+  const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
+    return bound.block == block && SameSubquery(bound.written, s);
+  });
+  return found == values_.end() ? nullptr : &*found;
+}
+
+arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
+  if (const BoundValue* known = FindValue(s, group)) {
+    return known->value;
   }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING alone, and
   // OR factoring's dry run binds one of those.
@@ -7020,6 +7028,20 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
                                 [this](const sql::Expr& e) { return BindInput(e); });
   }
   if (form.has_value()) {
+    // A subquery written alike before in this slot is that value (ADR 0041's decision 10): only
+    // uncorrelated ones are remembered.
+    if (const BoundValue* known = FindValue(*form->subquery, /*group=*/false)) {
+      if (form->exists()) {
+        ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+        RowSlot().push_back(
+            SlotFilter{.exprs = {},
+                       .ids = {},
+                       .filter = {CountTest(known->value, form->negated, form->subquery->span)},
+                       .span = conjunct.span()});
+        return arrow::Status::OK();
+      }
+      return BindValueConjunct(conjunct, element);
+    }
     // A correlated EXISTS or scalar comparison is ADR 0023's dependent join; an uncorrelated one is
     // a value in the slot (ADR 0041's decisions 4 and 5), the conjunct a filter reading it.
     ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/false));

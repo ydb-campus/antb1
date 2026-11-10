@@ -293,6 +293,16 @@ value block. Every block names one table and reads only its columns, unqualified
 the outer query alone; its aggregates and set operators record theirs, as in the outer grammar, and its aggregates
 wait for a select list that settles the query's row shape, as the uncorrelated form's do.
 
+Uncorrelated values go **inside conditions** too (ADR 0041's SQ1, feature `condition_value`), from a random stream of
+their own and only where no subquery conjunct above fired, over the same candidates: 30% of the queries that have one
+take a top-level `AND` conjunct of `WHERE` that holds values -- `probe <op> literal OR probe <op> (value)` in either
+order, `NOT (probe <op> (value))`, a `CASE` whose `WHEN` compares the probe with a value, `probe <op> (value) + 1`
+where the files' statistics show that neither the value nor the probe can overflow, `probe [NOT] IN ((value),
+(value))` and `probe [NOT] BETWEEN (value) AND (value)` over integers, strings or dates, two values compared, or
+`[NOT] EXISTS (block)` under `OR` or in a `CASE`. Its value and `EXISTS` blocks are the uncorrelated value's, written
+from its own stream, so they keep every rule above: no generated query meets the row error or an error the order of
+evaluation could hide (divergences D16 and D35).
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count
