@@ -21,6 +21,7 @@ accepted when X4d is built.
   - No compound mixes two operators, none writes ALL with INTERSECT or EXCEPT, and no parenthesized branch has a WITH
     or a tail of its own. Only Q87 parenthesizes its branches.
   - Phase 6 completes Q75, Q8, Q38 and Q87. Q14 also needs SQ3, and Q36 and Q49 need window functions (phase 9).
+    Update (2026-11-10): [ADR 0041](0041-subqueries-and-decorrelation.md) absorbs SQ3 into SQ4a, which Q14 now needs.
 - **DuckDB 1.5.6**, checked on synthetic data:
   - INTERSECT binds tighter than UNION and EXCEPT, which share a level and associate to the left. Each operator has
     its own quantifier, DISTINCT by default.

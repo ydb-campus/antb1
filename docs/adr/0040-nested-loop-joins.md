@@ -239,3 +239,18 @@ It was to be accepted when OJ4c was built, and it was. Decisions 7 and 8 were re
   filters a LEFT JOIN's right input by a conjunct over it alone. The unit's estimate is the product, padded as with a
   key (`PaddedJoinRows`). The binder needed only to stop refusing: OJ4a's operator already ran keyless LEFT and FULL
   joins. A semi or anti join without a key stays exit 4 (decision 3). No query of the 99 changes.
+
+- Update (2026-11-10, [ADR 0041](0041-subqueries-and-decorrelation.md)): **decision 3 holds through ADR 0037's phase
+  8, and covers its mark joins.** Phase 8 adds two mark kinds, each a join that keeps every left row and appends a
+  BOOLEAN: `kNullAwareMark` for an uncorrelated IN, NOT IN, `= ANY` or `<> ALL` under OR, NOT or CASE (SQ7), and
+  `kMark` for a correlated EXISTS there (SQ8). Both are keyed, as the semi, anti and null-aware anti joins are, and so
+  are SQ8's correlated IN and NOT IN as conjuncts, a semi and an anti join keyed on their correlation.
+
+  Keyless semi, anti and mark joins are planned in ADR 0037's new phase 10, full decorrelation, as SQ11, which amends
+  this decision: a correlated EXISTS, NOT EXISTS, IN or NOT IN whose correlation has no equality becomes a keyless
+  join, which decision 1 runs as a nested loop, and needs no domain D, since its correlated conjuncts move into the
+  join as ADR 0023's Path 1 moves them today.
+
+  The other exit-4 cases of the Consequences have items too: a correlated scalar aggregate whose correlation has no
+  equality needs D (SQ9, phase 10); SQ7 makes an uncorrelated IN of VARCHAR against INTEGER or DATE DuckDB's bind
+  error (exit code 1); and DOUBLE keys, with a rule for NaN, are among the DuckDB coverage items that follow phase 10.

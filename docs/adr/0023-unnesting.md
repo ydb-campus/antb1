@@ -91,6 +91,9 @@ Accepted (decision C14, once all 22 queries derived from TPC-H passed)
   - A comparison with a NULL operand is NULL, and a WHERE conjunct that is NULL rejects its row.
   - `x IN (query)` is NULL when it finds no match and the set holds a NULL, and `x NOT IN (query)` is true for an
     empty set: for a correlated IN, the set, its NULLs and its emptiness change with every binding.
+    Correction (2026-11-10, [ADR 0041](0041-subqueries-and-decorrelation.md)): as a top-level conjunct, a correlated
+    IN or NOT IN needs no flags for that, since the candidate pairs of an outer row's binding decide that row; it
+    needs them only under OR, NOT or CASE (the Plan's update of 2026-11-10).
 
 ## Decision
 
@@ -304,7 +307,10 @@ errors, as in ADR 0022:
   and arithmetic: COUNT, count(DISTINCT), CASE, COALESCE, AND, OR, functions and explicit casts;
 - a correlated subquery under OR, in CASE or in a select list (these need mark or single joins), or in HAVING;
 - an outer reference outside the WHERE conjuncts of its subquery's block, and one that skips a block;
-- correlated IN and NOT IN, whose NULL semantics need the set's NULL and empty flags for each binding;
+- correlated IN and NOT IN, whose NULL semantics need the set's NULL and empty flags for each binding (correction
+  2026-11-10, [ADR 0041](0041-subqueries-and-decorrelation.md): only under OR, NOT or CASE, which phase 10's SQ12
+  answers; as top-level conjuncts they need no flags, and ADR 0037's SQ8 answers them, see the Plan's update of
+  2026-11-10);
 - an aggregate, GROUP BY, HAVING, LIMIT or OFFSET inside a correlated EXISTS or NOT EXISTS;
 - a correlated EXISTS or NOT EXISTS without a key, and a correlated scalar subquery with an outer column that has no
   inner equivalent.
@@ -524,6 +530,68 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   - **Two statements above are stale, the behaviour being right:** explicit casts no longer exit 4 (ADR 0037's CT1
     binds an exact widening to a cast, which is strict), and a join kind is compiler-checked since ADR 0037's OJ1
     (`Traits(JoinKind)`, an exhaustive switch), where Binding (U1) says it is not.
+- Update (2026-11-10, [ADR 0041](0041-subqueries-and-decorrelation.md)): **ADR 0037's phase 8 builds on this ADR's
+  pass, and a new phase 10 builds the general algorithm it deferred.** ADR 0041 designs phase 8 ahead of the code, and
+  a phase 10, after the window functions of phase 9, in which Neumann's top-down unnesting is built in full. Every
+  phase 8 item is designed as a subset of it, so that phase 10 adds rules, join kinds and a second terminal step and
+  reworks nothing.
+  - **One rule table in place of Path 1 and Path 2 (SQ0).** The block-top filter of Binding (U1) is the 2015 paper's
+    pull-up (its §3.1) done at bind time, so the unnesting work lies between a dependent join and that filter, and in
+    nested blocks. SQ0 replaces `BlockOf`, `ScalarBlockOf` and the choice of a path with the 2025 paper's top-down
+    algorithm: per dependent join its outer references; per subtree the equivalence classes and the representatives
+    of the outer columns; and a rule per node type, in an exhaustive visitor that reads joins through
+    `JoinKindTraits`. It keeps the classes, `AsKey`, `MapColumns`, the semi-join reduction, the choice of build side
+    and the check of Lemma 3.1 after each rewrite. Substitution (the formalization's Lemma 4.2), which Path 2 is, stays
+    phase 8's only terminal step. SQ0 changes no answer and no plan of a shape answered today: every correlated query
+    of both ratchets is planned again, and the EXPLAIN of every correlated `.slt` record is compared before and after.
+    Each later item adds a rule, not a path, and the list under "Exit code 4 for everything else" shrinks item by
+    item.
+  - **The consumer proof (SQ0).** Path 2's INNER join back is exact only because the binder puts a comparison that
+    rejects NULL directly above the dependent join, and the pass never looks above it. SQ0 moves that argument into
+    the optimizer, which proves it from the plan: the join back is INNER only where every reader of the subquery's
+    value rejects the subquery's empty value, what its block computes over no rows (NULL for a strict combination of
+    SUM, AVG, MIN and MAX, 0 for COUNT(*)). Every shape answered today passes the proof, so SQ0 changes no answer;
+    from SQ5 and SQ6 on it decides (from SQ6 if they split, since SQ6 lands first). Where it fails, SQ6 joins back
+    LEFT with the empty values, a COUNT read through `COALESCE(c, 0)`: the left join and the value for every outer row
+    that "Why nothing else: the COUNT bug" asks for, under substitution and without the domain.
+  - **Correlated IN and NOT IN need no per-binding flags as conjuncts** (the corrections in the Context and in the
+    exit-4 list). As a top-level conjunct, `x IN (q)` is a semi join keyed on the correlation and on the IN pair, and
+    `x NOT IN (q)` an anti join keyed on the correlation with the residual `x = s OR x IS NULL OR s IS NULL` for q's
+    item `s`: a NULL in the set and an empty set decide only the outer row at hand, through its binding's candidate
+    pairs. SQ8 answers both. The flags are needed only under OR, NOT or CASE, where phase 10's SQ12 answers the two
+    with correlated marks that keep the flags per binding.
+  - **The domain D, designed now as the second terminal step (SQ9, phase 10).** It serves the correlations that
+    substitution cannot express: non-equality or OR correlations below an aggregate, an outer column inside an
+    aggregate's argument, a reference two blocks out that the middle block does not equate, relational division, and
+    the input that reads no outer column of a join that must be unnested on both inputs. A join whose two inputs both
+    read outer columns is unnested on both by substitution, their representatives equated NULL-equal (with a COALESCE
+    of each pair above a FULL join), with no D (SQ10). COUNT takes SQ6's LEFT join back and a subquery under OR takes
+    a mark, so neither needs D. Its design:
+    - a GroupAggregate without calls, keyed by the free variables, over a clone of the left input that keeps the base
+      relations that provide them and every operator that can add a value to one (a join that pads the input it comes
+      from, a grouping set that rolls it up, a Compute that defines it), and leaves out only operators that restrict
+      (filters, inner and semi joins): D then stays a duplicate-free superset of the bindings, which Theorem 4.1
+      requires, and the clone stays small, where a clone of the whole left input grows as 2^k ("Within the relation
+      limit");
+    - the left input unnested first, so that the clone holds no dependent join;
+    - D meeting the leaves through keyed joins first;
+    - a NULL-equal join back (`JoinKey::null_equal`, ADR 0022's OJ5a update), since D may hold NULL.
+
+    The rules under Execution hold: there is no shared build, so the outer side's relations are computed twice.
+    Whether a keyless D is refused above some size is an open decision of ADR 0041.
+  - **The shapes the Consequences deferred,** by the items that answer them:
+    - the general domain join: SQ9;
+    - mark joins: SQ7 for uncorrelated IN, NOT IN, `= ANY` and `<> ALL` under OR, NOT or CASE, SQ8 for correlated
+      EXISTS and SQ12 for correlated IN and NOT IN; IN and EXISTS as select items are BOOLEAN values, a DuckDB
+      coverage item after phase 10;
+    - single joins: SQ4b, for correlated scalar subqueries that are not aggregates; SQ4a answers uncorrelated ones
+      with a single-value aggregate instead;
+    - correlated aggregates as values, in any expression and in a select list: SQ5, and above an aggregation SQ13;
+    - correlated IN and NOT IN: SQ8 as conjuncts, SQ12 under OR, NOT or CASE;
+    - correlated COUNT, and CASE or COALESCE over aggregates: SQ6 and SQ5;
+    - per-binding top-N: SQ14, after phase 9's windows;
+    - the uncorrelated EXISTS: SQ4a;
+    - IS NOT DISTINCT FROM keys: built with OJ5b (its update above).
 
 ## Alternatives considered
 

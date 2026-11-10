@@ -49,3 +49,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0038](0038-grouping-sets.md) | Grouping sets: ROLLUP, CUBE and GROUPING SETS in two levels | Accepted |
 | [0039](0039-set-operations.md) | Set operations: UNION, INTERSECT and EXCEPT in one n-ary node | Proposed |
 | [0040](0040-nested-loop-joins.md) | Nested-loop joins and cross products | Accepted |
+| [0041](0041-subqueries-and-decorrelation.md) | Subqueries and full decorrelation | Proposed |

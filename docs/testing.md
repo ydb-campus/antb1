@@ -198,6 +198,44 @@ ADRs 0022 and 0023 this way; its rules are in [tests/slt/README.md](../tests/slt
 `onlyif antb1` is for antb1's own error texts and for registered divergences
 ([sql-subset.md](sql-subset.md#divergences-from-duckdb)).
 
+### Wrong answers of DuckDB 1.5.6
+
+`slt-complete` writes DuckDB's answers into the records, and the oracle and differential tests take them as right, so
+a shape that DuckDB 1.5.6 answers wrongly is kept out of both: no record is written over it (a record tests the same
+rule over a shape DuckDB answers right, or splits it), and the random generator never writes it. These are DuckDB's
+wrong answers, not divergences: antb1 answers them right, or refuses them (exit code 4). The known ones:
+
+- **Correlated subqueries for an outer row that matches no inner row: one family.** A correlated block that aggregates
+  without `GROUP BY`, or with a grouping set `()`, returns one row over no input, its aggregates at their empty values.
+  DuckDB does not compute that row. Where every aggregate call of the block, and every select item over the calls,
+  turns a NULL into NULL (a constant passes, and a `HAVING` is not read), it joins the outer rows' distinct bindings
+  (its domain D) to the groups INNER, so the subquery is NULL for an outer row whose binding has no group; otherwise it
+  joins D to them LEFT and computes the items over a NULL-padded row, where only `COUNT` gets its empty value, 0, and
+  `GROUPING()` is NULL. DuckDB is known to answer three shapes wrongly:
+  - a constant item over `ORDER BY MAX(x)`: `(SELECT 42 FROM i WHERE i.k = o.a ORDER BY MAX(i.x))` is 42 for every
+    outer row, but NULL in DuckDB for one whose `a` no `i.k` matches; over `ORDER BY COUNT(*)` DuckDB answers 42, the
+    form `tests/slt/cases/subqueries/scalar.slt` uses;
+  - a constant item under `HAVING SUM(x) IS NULL OR SUM(x) > 0`: the constant, since the row over no input passes the
+    `HAVING`, but NULL in DuckDB;
+  - `GROUPING()` in a correlated block with grouping sets: 1 in the `()` set's row over no input, but NULL in DuckDB.
+
+  The PR of each [ADR 0041](adr/0041-subqueries-and-decorrelation.md) item whose generator Feature could write a member
+  of this family adds it to the generator's list of shapes it never writes.
+- **A correlated scalar subquery in an `ON` that also reads a comma sibling** (`FROM a, b JOIN c ON ...`, the `ON`
+  reading `a` as well): DuckDB can drop every row there, or fail with an internal error, where antb1 answers, so no
+  record of `tests/slt/cases/subqueries/scalar.slt` has that shape.
+- **`x * -1 > -2147483648`** over an INTEGER `x` is false on every row in DuckDB; it holds for every `x` whose product
+  does not overflow.
+- **`d / -0.0` next to `d / 0.0` in one select list**, the DOUBLE -0.0 and 0.0 (`d / -(0)::DOUBLE` and
+  `d / CAST(-(0) AS DOUBLE)`): DuckDB's elimination of common subexpressions computes them once, as one expression, so
+  the second column repeats the first (with `SET disabled_optimizers = 'common_subexpressions'` it answers right);
+  `tests/slt/cases/types/casts.slt` writes them in two records.
+
+A self-check that needs no DuckDB covers the correlated shapes above in antb1 from ADR 0041's SQ4a on (its decision
+28): for each binding of a small outer table, a correlated subquery's value equals the uncorrelated subquery with the
+binding written as literals, which holds where DuckDB's decorrelation is wrong. The oracle's other traps (internal
+errors, a leak of DuckDB 1.5.5, ASOF matches of NULL) are noted in [tests/slt/README.md](../tests/slt/README.md).
+
 ## Random differential tests
 
 `antb1-slt diff` generates queries over the tables of `tests/slt/tables.txt`, runs each on antb1 and on DuckDB and

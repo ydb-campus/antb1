@@ -466,7 +466,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
   - They are allowed only as a top-level conjunct of WHERE or HAVING: `x IN (query)`, `x NOT IN (query)`,
     `NOT (x IN (query))` and `x <op> (query)` in either order. A subquery conjunct of an inner join's ON counts as a
     WHERE conjunct; one in a LEFT JOIN's ON exits 4. Any other placement exits 4, and so does an uncorrelated
-    `EXISTS`, which no query of the workload has.
+    `EXISTS`, which no query of the workload has. Update (2026-11-10,
+    [ADR 0041](0041-subqueries-and-decorrelation.md)): ADR 0037's phase 8 answers them in conditions and as values,
+    the uncorrelated EXISTS included; the Plan's update of 2026-11-10 lists what stays exit 4, a LEFT or FULL JOIN's
+    ON among it.
   - Each subquery is a sub-plan with its own scope, resolved innermost first (rule 9); a name found only in an
     enclosing block exits 4 until ADR 0023's PRs. An IN subquery may have GROUP BY and HAVING: nothing is pulled out
     of it. Aggregate detection never descends into a subquery, so an aggregate inside one does not make the outer
@@ -487,6 +490,9 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
       exactly one row: any other count is `Invalid` from its `Prepare`, before any probe part runs, a planner bug
       that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than
       `batch_size` when its VARCHAR values are long.
+    - Update (2026-11-10, ADR 0041): ADR 0037's SQ4a answers any uncorrelated scalar subquery through a single-value
+      aggregate under this one-row join, which stays exact, and makes the check above an internal error, exit code 70
+      (the Plan's update of 2026-11-10).
   - A subquery's join sits above the inner joins of its block (WHERE) or above the aggregation (HAVING), in the
     order the conjuncts are written. Update (2026-10-18): a WHERE semi join whose key reads one relation of the
     block runs on that relation's own branch instead, below those joins; see the "Build sides" exception above and
@@ -922,6 +928,79 @@ docs/sql-subset.md sections it changes.
   NULL-equal. One pair compared both ways is the `=` key, which implies the other. A NULL-equal edge estimates as an
   `=` edge does, its NULL pairs uncounted. `IS DISTINCT FROM`, and `IS NOT DISTINCT FROM` of a pair no key type holds
   (DOUBLE, BOOLEAN), are residuals: alone, a nested loop (ADR 0040). ADR 0023's OJ5b update gives the correlated keys.
+
+- Update (2026-11-10, [ADR 0041](0041-subqueries-and-decorrelation.md)): **uncorrelated subqueries of any shape, in
+  every clause.** ADR 0041 designs them ahead of the code, as ADR 0037's phase 8 items SQ4a, SQ1, SQ2 and SQ7. J5's
+  rules change as follows:
+  - **The single-value aggregate under the one-row join (SQ4a).** The rule that a scalar subquery be an ungrouped
+    aggregate without HAVING, LIMIT or OFFSET goes. Any uncorrelated scalar subquery's plan is wrapped in a new
+    aggregate: NULL over no row, that row's value over one, and over two or more an `ExecutionError` (exit code 1)
+    whose message begins with DuckDB's first sentence, "More than one row returned by a subquery used as an
+    expression". A NULL counts as a row.
+    - The one-row join above it stays exact, since one-row FROM items share it (the update of 2026-10-31 under
+      "Connected join graphs only"), and for them no row is an empty product, not a NULL.
+    - `ExactlyOneRow` skips the wrapper over a plan of exactly one row, so every scalar subquery answered today keeps
+      its plan and its EXPLAIN goldens.
+    - The aggregate is on the build side, and builds come first (the J1b update), so the error fires over an empty
+      outer side, as in DuckDB. No `LIMIT 2` goes below it: DuckDB reads every row.
+    - The column count is checked first, so a scalar subquery of two columns is DuckDB's bind error (exit code 1)
+      whatever its shape, where today one that is not an aggregate exits 4.
+  - **The one-row join's own check exits 70 (SQ4a).** The E2a update's `Invalid` from `Prepare`, for a build of
+    other than one row, exits 1 today, like a query's error (`src/cli/cli.cc`). Once a subquery has a row error of
+    its own, a planner bug must not pass for one, so the check becomes an internal error, exit code 70
+    ([ADR 0005](0005-error-boundary.md)).
+  - **The uncorrelated EXISTS is a one-row value (SQ4a).** `EXISTS (q)` is COUNT(*) over `LIMIT 1` of q under the
+    one-row join, compared with 1, and NOT EXISTS compares it with 0. That is DuckDB's plan, and never a mark, which
+    would keep every probe row for a value that is the same for every row. SQ4a answers it as a top-level conjunct of
+    WHERE, an inner ON and HAVING; SQ1 under OR, NOT or CASE in a condition, and SQ2 in a CASE of the select list.
+  - **Values in every clause (SQ1, SQ2).** SQ1 answers uncorrelated subqueries in conditions: WHERE, an inner ON
+    (also inside a FULL JOIN's left input, which the OJ3 update above refuses) and HAVING, under AND, OR, NOT and CASE
+    and inside expressions. SQ2 answers them as values: select items (CASE included), ORDER BY, GROUP BY keys,
+    aggregate arguments and the list of a SELECT DISTINCT. Where DuckDB raises a bind error in a newly opened place,
+    so does antb1 (exit code 1).
+    - **Slots.** Each block gets two places for these joins: per row, between the block's joins and its input
+      Compute, and after the aggregation, directly above it, which generalize J5's places for WHERE and HAVING
+      subqueries. Within a slot the joins stack in written order, as today.
+    - **Eager values.** A slot's join computes its value for every row before an AND, OR or CASE above it decides,
+      as in DuckDB. D16's lazy AND and OR apply to the expression over the appended column, which SQ1 records in
+      D16.
+    - **Bound once.** The binder binds some expressions more than once (a select item bound speculatively, an alias
+      bound again, BETWEEN's operand and bounds, a folded comparison's copy), and each binding would plant a join. A
+      memo keyed by block scope, binding mode and structure binds each subquery once per scope and mode, and merges
+      subqueries written alike. OR factoring's bind-then-drop (the J3 update) binds as a dry run that registers no
+      join.
+    - **Names.** Rule 13 stays under divergence D8, which SQ2 extends to unaliased subquery items. A deparser in
+      DuckDB's style is a coverage item after phase 10.
+    - **Still exit 4:** a subquery in the ON of a LEFT or FULL JOIN, a coverage item after phase 10, and a subquery
+      in a ROLLUP, CUBE or GROUPING SETS element, refused as a constant there is (ADR 0037's RU3 and RU5 updates).
+      LIMIT or OFFSET given by a subquery and a subquery as the whole of an aggregate's argument wait for general
+      features that no item plans yet (ADR 0041's open decisions).
+  - **IN and NOT IN under OR, NOT or CASE (SQ7).** A top-level conjunct keeps its semi or null-aware anti join.
+    Elsewhere in a condition, IN becomes a null-aware mark join, a new kind that keeps each left row once and appends
+    a BOOLEAN: TRUE on a match; else FALSE for an empty set, even for a NULL probe; else NULL where the probe is NULL
+    or the set holds a NULL; else FALSE. NOT IN is a NOT over the mark. The build's two flags, a NULL key and an empty
+    input, decide it, as they decide the null-aware anti join. `= ANY`, `= SOME` and `<> ALL` become the parser's
+    aliases of IN and NOT IN. OR factoring runs before a subquery under OR is classified, so that one every branch
+    shares is hoisted rather than made a mark. SQ7 also answers NOT over NOT IN and NOT NOT over IN, which the J5a
+    update leaves at exit 4, and makes an IN of VARCHAR against INTEGER or DATE DuckDB's bind error (exit code 1),
+    where it exits 4 today.
+  - **An aggregate whose arguments are only the enclosing block's columns** is the enclosing block's aggregate,
+    anywhere in a subquery. Where the subquery stands in the enclosing WHERE, ON or GROUP BY, DuckDB raises a bind
+    error; where it stands in the enclosing HAVING or select list, DuckDB answers it. In the subquery's WHERE it is a
+    parse error today (exit code 1), and in its select list or HAVING it exits 4. SQ1 moves the parse check to the
+    binder, which knows whose columns an aggregate reads and which clause holds the subquery: the form in the
+    subquery's WHERE then exits 4 in the enclosing HAVING or select list, until phase 10's SQ13 answers it, and stays
+    exit code 1 elsewhere, as an aggregate of inner columns in WHERE does. In the enclosing WHERE, ON or GROUP BY,
+    phase 10 makes the other two forms DuckDB's bind error: SQ10 the select list's, SQ13 the HAVING's.
+  - **Errors next to a join that turns out empty.** The J1b order stands, and no join is reordered for errors. antb1
+    reports the errors of the builds it prepares, outermost first, and stops at a build that empties its join. DuckDB
+    prepares every build, whatever turns out empty: an empty file, a filter outside a column's range and join keys
+    outside the other side's range delete nothing. Its optimizer deletes a failing subquery only where its filter
+    combiner proves a condition never true in the block the subquery is written in (a contradiction pair such as
+    `a = 1 AND a = 2`, an empty BETWEEN, a constant false; also inside an IN subquery there), where an IN subquery
+    there has `LIMIT 0`, or where nothing reads the derived-table or CTE column that holds it. So a subquery's error
+    (an overflow today, and SQ4a's row error) can fire in one engine and not the other, in both directions. ADR 0041
+    registers the family once, as divergence D35 of docs/sql-subset.md.
 
 ## Alternatives considered
 
