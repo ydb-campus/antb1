@@ -1445,6 +1445,50 @@ INSTANTIATE_TEST_SUITE_P(
                   "SELECT i16 FROM t WHERE i32 IN (SELECT a FROM c)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"}));
 
+// ADR 0041's SQ2a answers an uncorrelated value in the select items and ORDER BY of a block that
+// does not aggregate. What it leaves refused, each with a message: a value's own bind errors, which
+// come as DuckDB's, an EXISTS block's dropped list included; and the placements other PRs answer.
+INSTANTIATE_TEST_SUITE_P(
+    SelectValues, BindErrorTest,
+    ::testing::Values(
+        // One column, as in DuckDB, which reports a bind error for two.
+        ErrorCase{"SELECT (SELECT i16, i32 FROM u) FROM t", kBind, "(",
+                  "a scalar subquery must have one column, not 2"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT i16, i32 FROM u)", kBind, "(",
+                  "a scalar subquery must have one column, not 2"},
+        // An EXISTS block's list is dropped, but bound: its bind errors and refusals stay, a
+        // correlated value's shape that ADR 0023's Path 2 does not take among them.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT nope FROM u) FROM u)", kBind,
+                  "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT ok.i16 FROM ok WHERE ok.i16 = "
+                  "u.i32) FROM u)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        // A correlated value or EXISTS outside a condition (ADR 0041's SQ5 and SQ13).
+        ErrorCase{"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) FROM t", kUnsupported, "(",
+                  "a correlated scalar subquery"},
+        ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
+                  kUnsupported, "(", "a correlated scalar subquery"},
+        ErrorCase{"SELECT CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END "
+                  "FROM t",
+                  kUnsupported, "EXISTS", "a correlated EXISTS"},
+        // An IN subquery outside a condition (SQ7).
+        ErrorCase{"SELECT i16 IN (SELECT i16 FROM u) FROM t", kUnsupported, "IN",
+                  "IN (subquery) is not supported"},
+        ErrorCase{"SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
+                  kUnsupported, "IN", "IN (subquery) is not supported"},
+        // A block that aggregates, its EXISTS blocks' included (SQ2b).
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) "
+                  "FROM u)",
+                  kUnsupported, "(",
+                  "a subquery's value in a query block that aggregates is not supported"},
+        ErrorCase{"SELECT DISTINCT i16, (SELECT MIN(i16) FROM u) FROM t GROUP BY i16", kUnsupported,
+                  "(", "a subquery's value in a query block that aggregates is not supported"},
+        // A compound's own ORDER BY (ADR 0039's X5).
+        ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY (SELECT MIN(i16) FROM "
+                  "ok)",
+                  kUnsupported, "ORDER BY (SELECT MIN(i16) FROM ok)",
+                  "ORDER BY on a UNION ALL is not supported"}));
+
 // The relation limit comes before every other check (ADR 0022), and it counts a subquery's query
 // too: the doubling chain of CTEs referenced only from a subquery in WHERE would otherwise expand
 // to 2^11 relations from eleven lines of SQL. A subquery has no FROM item of the outer block to
@@ -7031,6 +7075,129 @@ TEST(BinderTest, TheMemoKeepsWhereAndHavingApart) {
   EXPECT_EQ(joins("SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MIN(u.i32) FROM u) "
                   "AND MAX(i32) < (SELECT MIN(u.i32) FROM u) + 10"),
             1U);
+}
+
+// ADR 0041's SQ2a: a value in a select item or an ORDER BY item of a block that does not aggregate
+// binds and resolves in every form and block it may stand in.
+TEST(BinderTest, SelectValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16, (SELECT MIN(i16) FROM u) FROM t",
+           "SELECT i16 * (SELECT MIN(i16) FROM u) + 1 AS v FROM t",
+           "SELECT *, (SELECT COUNT(*) FROM u) FROM ok",
+           "SELECT COALESCE((SELECT MIN(i32) FROM u), i32), CAST((SELECT MIN(i16) FROM u) AS "
+           "BIGINT) FROM t",
+           "SELECT CASE WHEN EXISTS (SELECT 1 FROM u) THEN (SELECT MIN(i16) FROM u) ELSE "
+           "(SELECT MAX(i16) FROM u) END FROM t",
+           "SELECT CASE (SELECT MIN(i16) FROM u) WHEN 1 THEN i32 ELSE 0 END FROM t",
+           "SELECT CASE WHEN i16 IN (1, (SELECT MIN(i16) FROM u)) OR i32 BETWEEN (SELECT "
+           "MIN(i32) FROM u) AND 10 THEN 1 ELSE 0 END FROM t",
+           "SELECT DISTINCT i16, (SELECT MIN(i16) FROM u) AS m FROM t ORDER BY m, i16",
+           "SELECT i16 FROM t ORDER BY i32 * (SELECT MIN(i16) FROM u) DESC NULLS FIRST, i16 LIMIT "
+           "3 OFFSET 1",
+           "SELECT i16, (SELECT MIN(i16) FROM u) AS m FROM t ORDER BY m, 1",
+           // Divergence D37: an ORDER BY expression over a value item's alias.
+           "SELECT i16, (SELECT COUNT(*) FROM u) AS n FROM t ORDER BY n - i16",
+           // Inside the blocks a value may be in: IN's, a value's, a derived table's, a CTE's and
+           // a compound's arms.
+           "SELECT i16 FROM t WHERE i32 IN (SELECT i16 + (SELECT MIN(i16) FROM ok) FROM u)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT i16 + 0 FROM u ORDER BY (SELECT MIN(i16) FROM "
+           "ok), i16 LIMIT 1)",
+           "SELECT (SELECT (SELECT MIN(i16) FROM ok) FROM u LIMIT 1) FROM t",
+           "SELECT d.v FROM (SELECT i16 + (SELECT MIN(i16) FROM u) AS v FROM t) AS d",
+           "WITH c AS (SELECT i16, (SELECT MIN(i16) FROM u) AS m FROM t) SELECT i16, m FROM c",
+           "SELECT x FROM (SELECT i16 + (SELECT MIN(i16) FROM ok) AS x FROM t UNION ALL SELECT "
+           "(SELECT MAX(i16) FROM ok) FROM u) AS d ORDER BY x",
+           "SELECT t.i16, (SELECT MIN(i16) FROM ok) FROM t LEFT JOIN u ON t.i16 = u.i16",
+           "SELECT t.i16, u.i32 + (SELECT MIN(i16) FROM ok) FROM t FULL JOIN u ON t.i16 = u.i16",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
+}
+
+// Decision 9's per-row slot: a select item's or an ORDER BY item's value joins in block 0's slot,
+// below the computed items, the sort, DISTINCT and the projection (EXPLAIN writes a node before its
+// inputs); one subquery written in the list and in ORDER BY is one join (decision 10).
+TEST(BinderTest, AProjectionValueJoinsInTheRowSlot) {
+  const Catalog catalog = MakeCatalog();
+  const auto count = [](const std::string& text, std::string_view what) {
+    std::size_t n = 0;
+    for (std::size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) {
+      ++n;
+    }
+    return n;
+  };
+  for (const char* sql : {
+           "SELECT i16, i32 * (SELECT MIN(i16) FROM u) AS v FROM t ORDER BY i32 * (SELECT "
+           "MIN(i16) FROM u), i16",
+           "SELECT DISTINCT i16 + (SELECT MIN(i16) FROM u) AS v FROM t ORDER BY v",
+           "SELECT CASE WHEN EXISTS (SELECT 1 FROM u) THEN i16 ELSE 0 END FROM t WHERE i32 > 0 "
+           "ORDER BY 1",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(*plan);
+    EXPECT_EQ(count(text, "Join ONE-ROW"), 1U) << sql << "\n" << text;
+    for (const std::string_view above : {"Compute", "Sort", "Project"}) {
+      if (text.contains(above)) {
+        EXPECT_LT(text.find(above), text.find("Join ONE-ROW")) << sql << "\n" << text;
+      }
+    }
+    EXPECT_LT(text.find("Join ONE-ROW"), text.find("Scan table=t")) << sql << "\n" << text;
+  }
+}
+
+// An EXISTS block's select list is dropped (DuckDB too): a value in it that no other clause of the
+// block reads binds as a dry run and plants no join (an uncorrelated EXISTS is one join itself, of
+// its count), correlated EXISTS or not, while one that its ORDER BY reads -- by position, by alias,
+// or inside an expression -- is planted. The placeholder of a dropped item keeps the items after it
+// at their positions (critique P1-4's c26).
+TEST(BinderTest, AnExistsSelectListPlantsNothing) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok) FROM u)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok), u.i16 FROM u WHERE u.i64 "
+           "= t.i64)",
+           // A correlated value of a shape Path 2 takes, dropped with the list (DuckDB answers).
+           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = "
+           "u.i32) FROM u)",
+           "SELECT i16 FROM t WHERE i32 = 1 OR NOT EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) "
+           "FROM u)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
+           "b, i16 * 3 AS c FROM u ORDER BY 2 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
+           "b, i16 * 3 AS c FROM u ORDER BY 3 LIMIT 1)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(*plan);
+    EXPECT_FALSE(text.contains("table=ok")) << sql << "\n" << text;
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << text;
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
+}
+
+TEST(BinderTest, AnExistsOrderByThatReadsAnItemPlantsIt) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a FROM u "
+           "ORDER BY 1 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a FROM u "
+           "ORDER BY a LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a FROM u "
+           "ORDER BY a * 2 LIMIT 1)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(*plan);
+    EXPECT_TRUE(text.contains("Join ONE-ROW")) << sql << "\n" << text;
+    EXPECT_TRUE(text.contains("table=ok")) << sql << "\n" << text;
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << text;
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
 }
 
 // ADR 0041's decision 10: a subquery binds once per slot, keyed by what is written, so the copies

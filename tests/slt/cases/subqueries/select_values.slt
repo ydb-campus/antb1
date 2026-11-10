@@ -2286,6 +2286,22 @@ SELECT id, u16 + (SELECT MAX(u16) FROM edge) AS v FROM edge WHERE id IN (1, 2) O
 statement error Overflow in (addition|subtraction|multiplication) of
 SELECT id, d38_10 + (SELECT MAX(d38_10) FROM decimals) AS v FROM decimals WHERE id IN (6, 7) ORDER BY id
 
+# ---- a correlated value in an EXISTS block's dropped select list ----
+
+# The list is dropped, so a value there that reads the EXISTS block's columns answers where it is an aggregate over
+# every row, in an uncorrelated EXISTS and in a correlated one; another shape stays refused.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT (SELECT MIN(z2.zn_id) FROM zones z2 WHERE z2.zn_city = z.zn_city) FROM zones z)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT (SELECT MIN(z2.zn_id) FROM zones z2 WHERE z2.zn_city = z.zn_city) FROM zones z WHERE z.zn_city = cities.ct_id)
+----
+BIGINT
+5
+
 # ---- divergence D37: an ORDER BY expression over the alias of a value item ----
 
 # antb1 binds the item's expression again, which reads the same value; DuckDB refuses an alias whose item holds a
