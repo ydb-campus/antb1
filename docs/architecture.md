@@ -148,7 +148,11 @@ steps (only step 7 uses more than one thread):
    becomes a join key, and anything else over two or more relations becomes a join's residual. An accepted `IN` subquery
    conjunct takes neither route: its query is a sub-plan of its own and the conjunct becomes a semi or null-aware anti
    join above the block's inner joins, in the order the conjuncts are written -- or, for a `WHERE` semi join whose key
-   reads one relation, on that relation's own branch below them (ADR 0029's D0). A join graph no key connects is a cross
+   reads one relation, on that relation's own branch below them (ADR 0029's D0). Nor does a conjunct that holds an
+   uncorrelated subquery's value or `EXISTS` ([ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s SQ1): the value
+   is a one-row join in the block's slot above its inner joins (a padded unit's left input has a slot of its own),
+   bound once per slot, so a subquery written alike twice reads one join, and the conjunct is a `Compute` of what it
+   computes and a `Filter` after that join, in the order written. A join graph no key connects is a cross
    product ([ADR 0040](adr/0040-nested-loop-joins.md)): a relation the keys leave out that is a sub-plan of exactly one
    row (an aggregate without groups) that no key, no residual and no conjunct of its own branch reads joins above the
    others as a one-row join, and the parts the keys connect are crossed left-deep, each the build of an inner join

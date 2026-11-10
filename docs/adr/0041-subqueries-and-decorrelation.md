@@ -748,9 +748,13 @@ completes, and the ratchet stays at 78.
   its equalities after DuckDB's one-type check of the list; a value may be LIKE's operand, not its pattern. A value
   as an IN subquery's probe, and an IN every branch of an OR shares, stay SQ7's (decision 14), as does any IN under
   OR, NOT or CASE. A conjunct of a correlated block that reads the enclosing block and holds a value is a residual
-  of Path 1 or Path 2, whole, a BETWEEN included; an IN whose probe reads the enclosing block stays exit 4. Path 2
-  refuses a correlation whose inner side is a value, "an outer column that has no inner equivalent". Of decision 8's
-  three bind-error examples, two wait on X5 and on LIMIT expressions, which no PR of this phase opens.
+  of Path 1 or Path 2, whole, a BETWEEN included; an IN whose probe reads the enclosing block stays exit 4, and so
+  does a correlated subquery in a conjunct that reads the enclosing block itself. A correlated comparison whose other
+  side holds a value, or is one, is ADR 0023's dependent join with the value's join below it; two correlated
+  subqueries compared wait on SQ5. A value of the outer column's type that a correlation equates with it keys the
+  block, as Path 1's semi key or Path 2's inner equivalent; one that needs a cast, or an expression over a value, has
+  no inner equivalent, and Path 2 refuses it. Of decision 8's three bind-error examples, two wait on X5 and on LIMIT
+  expressions, which no PR of this phase opens.
 - **Decision 9, as built.** Each block has a per-row slot above its joins and below the filter of its correlated
   conjuncts, which Path 1 and Path 2 take with the block; the left input of a unit that pads it (a FULL JOIN) has one
   of its own, below the unit, which answers ADR 0037's OJ3 candidate (uncorrelated IN, NOT IN and EXISTS conjuncts
