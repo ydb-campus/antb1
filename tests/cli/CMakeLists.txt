@@ -531,9 +531,9 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
 )
 # A scalar subquery as a keyless one-row join (ADR 0022's J5): its build is the aggregate's single
-# row, which the join appends to every probe row, and the comparison is a Filter directly above it.
-# The outer side is an expression, so it is computed in the join's own layer below it -- the same
-# layer an IN probe's cast uses.
+# row, which the join appends to every probe row. The conjunct is a filter of the block's slot
+# (ADR 0041's decision 9): what it computes, the outer side, stands above the join, and its
+# comparison above that.
 antb1_add_cli_golden(
   explain_scalar_subquery_one_row_join
   ARGS

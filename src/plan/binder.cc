@@ -591,7 +591,20 @@ struct ExprNameOf {
     }
     return std::format("CAST({} AS {})", ExprName(*cast.operand), type);
   }
-  std::string operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+  // DuckDB names a subquery by a deparse of it (ADR 0041's decision 11); antb1 by its own unparse,
+  // which shows in EXPLAIN and in messages only (divergence D8).
+  std::string operator()(const sql::SubqueryExpr& s) const {
+    const std::string query = "(" + sql::ToSql(*s.query) + ")";
+    switch (s.kind) {
+      case sql::SubqueryExpr::Kind::kScalar:
+        return query;
+      case sql::SubqueryExpr::Kind::kExists:
+        return (s.negated ? "NOT EXISTS " : "EXISTS ") + query;
+      case sql::SubqueryExpr::Kind::kIn:
+        break;
+    }
+    return ExprName(**s.operand) + (s.negated ? " NOT IN " : " IN ") + query;
+  }
 };
 
 std::string ExprName(const sql::Expr& expr) {
@@ -1613,6 +1626,15 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
   ANTB1_CHECK(subquery->operand.has_value());  // the parser writes no kIn node without one
   return SubqueryConjunct{
       .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
+}
+
+// Whether two subquery expressions are written alike, whatever their spans: the key of ADR 0041's
+// decision 10, by which a subquery binds once per slot.
+bool SameSubquery(const sql::SubqueryExpr& a, const sql::SubqueryExpr& b) {
+  return a.kind == b.kind && a.negated == b.negated &&
+         a.operand.has_value() == b.operand.has_value() &&
+         (!a.operand.has_value() || sql::EqualIgnoringSpans(**a.operand, **b.operand)) &&
+         sql::EqualIgnoringSpans(*a.query, *b.query);
 }
 
 // An operator as messages name it: UNION, UNION ALL, INTERSECT ALL and so on.
@@ -3032,7 +3054,14 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
       return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindInput(e); });
     }
-    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+    // A scalar subquery's value, in the per-row slot (ADR 0041's decision 9); the gate admits no
+    // other kind of subquery as a value.
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& s) const {
+      if (s.kind != sql::SubqueryExpr::Kind::kScalar) {
+        RejectedSubquery();
+      }
+      return binder.SubqueryValue(s, /*group=*/false);
+    }
   };
 
   arrow::Result<Typed> BindInput(const sql::Expr& expr) {
@@ -3239,6 +3268,10 @@ class Binder {
           .name = location.has_value() ? scope_.column(*location).name : t.expr->name,
           .type = t.expr->type,
           .qualifier = location.has_value() ? scope_.Qualifier(location->binding) : std::string()};
+    }
+    // A conjunct that holds a value computes in its own filter's layer, above the slot's joins.
+    if (in_slot_ != nullptr) {
+      return ComputedColumn(t, in_slot_->exprs, in_slot_->ids);
     }
     Relation& relation = relations_[conjunct_relation_];
     // A correlated conjunct sits above this block's joins (ADR 0023), so what it computes cannot
@@ -3532,7 +3565,13 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
       return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindOutput(e); });
     }
-    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+    // A scalar subquery's value, in HAVING's slot (ADR 0041's decision 9).
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& s) const {
+      if (s.kind != sql::SubqueryExpr::Kind::kScalar) {
+        RejectedSubquery();
+      }
+      return binder.SubqueryValue(s, /*group=*/true);
+    }
   };
 
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
@@ -3653,6 +3692,20 @@ class Binder {
     bool correlated = false;
   };
   arrow::Result<SubqueryBlock> BindSubqueryBlock(const SubqueryConjunct& form, bool having);
+  // A subquery's value in a condition (ADR 0041's decisions 9 and 10), in HAVING's slot (`group`)
+  // or else the per-row slot of the conjunct being bound: its block bound once per slot, the first
+  // binding planting its one-row join there, and its column read as one of the scope.
+  arrow::Result<Typed> SubqueryValue(const sql::SubqueryExpr& s, bool group);
+  // An uncorrelated block's one-row join, planted in its slot, and its value remembered there.
+  Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
+  // A WHERE or inner-ON conjunct that holds a value: a filter of its own at the end of its slot.
+  arrow::Status BindValueConjunct(const sql::Expr& conjunct, SourceSpan element);
+  // Inside a FULL JOIN's left input, a conjunct of that input's slot reads that input's relations
+  // only (or none), as any conjunct of that ON does (BindConjunct): the slot stands below the unit.
+  [[nodiscard]] arrow::Status CheckInsidePaddedLeft(const sql::Expr& conjunct,
+                                                    SourceSpan element) const;
+  // One conjunct of a WHERE or inner-ON element, routed by what it reads and what it holds.
+  arrow::Status BindRowConjunct(const sql::Expr& conjunct, SourceSpan element);
   // One subquery conjunct, intercepted before any conjunct classification: its block bound
   // against this block's scope (BindSubqueryBlock), then its join (JoinSubquery). `bind` binds the
   // outer side in the scope of the clause it is written in, and `conjunct` is the whole conjunct,
@@ -4077,9 +4130,10 @@ class Binder {
   std::optional<std::size_t> padded_unit_;
   // The per-row slot of the conjunct being bound: block 0's, or that of the left input of the unit
   // that pads it.
-  std::vector<SlotEntry>& RowSlot() {
-    return blocks_[padded_unit_.has_value() ? units_[*padded_unit_].left : 0].slot;
+  [[nodiscard]] std::size_t RowBlock() const {
+    return padded_unit_.has_value() ? units_[*padded_unit_].left : 0;
   }
+  std::vector<SlotEntry>& RowSlot() { return blocks_[RowBlock()].slot; }
 
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
@@ -4105,6 +4159,18 @@ class Binder {
   // HAVING's slot (ADR 0041's decision 9), directly above the filter of HAVING's other conjuncts
   // and below the select list's computed columns.
   std::vector<SlotEntry> group_slot_;
+  // ADR 0041's decision 10: each subquery value is bound once per slot. The first binding plants
+  // its one-row join in the slot, and a later binding of a subquery written alike reads its column.
+  struct BoundValue {
+    std::optional<std::size_t> block;  // the block whose per-row slot holds it; none: HAVING's
+    sql::SubqueryExpr written;         // a copy: the first binding is often of a temporary
+    Typed value;
+  };
+  std::vector<BoundValue> values_;
+  // OR factoring's bind-only path: subquery values are bound for their errors, and plant nothing.
+  bool dry_run_ = false;
+  // The filter of the conjunct being bound that holds a value: where its operands are computed.
+  SlotFilter* in_slot_ = nullptr;
 };
 
 arrow::Status Binder::BindSelectList() {
@@ -4926,7 +4992,22 @@ struct Binder::BindConditionOf {
   arrow::Result<Predicate> operator()(const sql::CaseExpr& /*c*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::ExtractExpr& /*e*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
-  arrow::Result<Predicate> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+  // EXISTS as a condition (ADR 0041's decision 5): the count of at most one row of its block, a
+  // value in the slot of the scope, compared with 1, or with 0 for NOT EXISTS. The gate admits no
+  // other subquery as a condition.
+  arrow::Result<Predicate> operator()(const sql::SubqueryExpr& s) const {
+    if (s.kind != sql::SubqueryExpr::Kind::kExists) {
+      RejectedSubquery();
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed count, binder.SubqueryValue(s, /*group=*/!input));
+    return Predicate{
+        .kind = Predicate::Kind::kCompare,
+        .column = column_of(count),
+        .op = CompareOp::kEq,
+        .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{s.negated ? 0 : 1}},
+        .values = {},
+        .span = s.span};
+  }
 };
 
 template <class BindFn, class ColumnOf>
@@ -5706,6 +5787,19 @@ bool IsCompound(const sql::Expr& conjunct) {
          (unary != nullptr && unary->op == sql::UnaryOp::kNot) ||
          (between != nullptr && between->negated) ||
          (lowered_binary != nullptr && lowered_binary->op == sql::BinaryOp::kOr);
+}
+
+// An EXISTS's test of its count of at most one row (ADR 0041's decision 5): 1, or 0 when negated.
+Predicate CountTest(const Typed& count, bool negated, SourceSpan span) {
+  return Predicate{
+      .kind = Predicate::Kind::kCompare,
+      .column = BoundColumn{.id = std::get<ColumnExpr>(count.expr->node).id,
+                            .name = count.expr->name,
+                            .type = LogicalType::kBigInt},
+      .op = CompareOp::kEq,
+      .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{negated ? 0 : 1}},
+      .values = {},
+      .span = span};
 }
 
 Predicate IsTrue(BoundColumn column, SourceSpan span) {
@@ -6712,8 +6806,172 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
+arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
+  const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
+  for (const BoundValue& bound : values_) {
+    if (bound.block == block && SameSubquery(bound.written, s)) {
+      return bound.value;
+    }
+  }
+  // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING alone, and
+  // OR factoring's dry run binds one of those.
+  ANTB1_CHECK(dry_run_ || clause_ == Clause::kWhere || clause_ == Clause::kInnerOn ||
+              clause_ == Clause::kHaving);
+  const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
+  ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
+  if (dry_run_) {
+    // A branch OR factoring drops: its block's bind errors stand, and nothing is planted, whether
+    // the block reads an enclosing one or not.
+    return ColumnLeaf(bound.column.id, bound.type, bound.column.name, bound.column.stored_as_float);
+  }
+  if (bound.correlated) {
+    // A correlated value needs the consumer proof of ADR 0041's SQ5, a correlated EXISTS a mark
+    // (SQ8): until then ADR 0023 answers each as a top-level conjunct only.
+    return Reject(Rejection{
+        .span = s.op_span,
+        .message = s.kind == sql::SubqueryExpr::Kind::kExists
+                       ? "a correlated EXISTS is supported only as a top-level conjunct of WHERE "
+                         "or an inner ON"
+                       : "a correlated scalar subquery is supported only as a direct operand of "
+                         "a comparison in a top-level conjunct of WHERE or an inner ON"});
+  }
+  return PlantValue(s, std::move(bound), group);
+}
+
+Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group) {
+  Typed value =
+      ColumnLeaf(block.column.id, block.type, block.column.name, block.column.stored_as_float);
+  (group ? group_slot_ : RowSlot())
+      .push_back(SubqueryJoin{.kind = JoinKind::kOneRow,
+                              .dependent = false,
+                              .right = std::move(block.right),
+                              .left_key = {},
+                              .right_key = {},
+                              .exprs = {},
+                              .ids = {},
+                              .filter = {},
+                              .span = s.op_span});
+  values_.push_back(BoundValue{
+      .block = group ? std::nullopt : std::optional(RowBlock()), .written = s, .value = value});
+  return value;
+}
+
+arrow::Status Binder::CheckInsidePaddedLeft(const sql::Expr& conjunct, SourceSpan element) const {
+  if (!padded_unit_.has_value() || std::ranges::all_of(RelationsRead(conjunct), [&](std::size_t b) {
+        return BlockHolds(units_[*padded_unit_].left, b);
+      })) {
+    return arrow::Status::OK();
+  }
+  return UnsupportedError(
+      std::format("the ON of a join inside a {} JOIN's left input must read that input only, "
+                  "and this reads a FROM item outside it",
+                  ToString(units_[*padded_unit_].kind)),
+      element);
+}
+
+arrow::Status Binder::BindValueConjunct(const sql::Expr& conjunct, SourceSpan element) {
+  // Inside a FULL JOIN's left input the filter stands in that input's slot, below the unit.
+  ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+  SlotFilter filter{.exprs = {}, .ids = {}, .filter = {}, .span = conjunct.span()};
+  in_slot_ = &filter;
+  const arrow::Status status = [&]() -> arrow::Status {
+    if (IsCompound(conjunct)) {
+      ARROW_ASSIGN_OR_RAISE(
+          const Typed condition,
+          BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      filter.filter.push_back(IsTrue(InputColumn(condition, /*where=*/true), conjunct.span()));
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(conjunct, /*having=*/false));
+    filter.filter.push_back(std::move(predicate));
+    return arrow::Status::OK();
+  }();
+  in_slot_ = nullptr;  // restored on the error path too, before the status propagates
+  ARROW_RETURN_NOT_OK(status);
+  RowSlot().push_back(std::move(filter));
+  return arrow::Status::OK();
+}
+
+arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan element) {
+  const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct);
+  const bool in = form.has_value() && !form->scalar() && !form->exists();
+  const bool outer = ReadsOuterColumn(conjunct, visible_);
+  // An IN whose probe reads a column of an enclosing block: its semi join would stand above this
+  // block's joins with the probe's free variable on its outer side, which neither unnesting path of
+  // ADR 0023 takes.
+  if (in && outer) {
+    return Reject(Rejection{
+        .span = form->subquery->op_span,
+        .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
+                   "not supported"});
+  }
+  // A conjunct that reads the enclosing block goes above every join of the block, which a unit
+  // that pads its join (an inner join inside a FULL JOIN's left input) must not have above it.
+  if (outer && padded_unit_.has_value()) {
+    return Reject(Rejection{
+        .span = conjunct.span(),
+        .message = std::format("a column of an enclosing block in the ON of a join inside a {} "
+                               "JOIN's left input is not supported",
+                               ToString(units_[*padded_unit_].kind))});
+  }
+  // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
+  // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
+  // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
+  // therefore disconnected: a cross product of them (ADR 0040), which the semi join or the join
+  // the unnesting pass makes above it then keys on the outer columns. The values it holds plant
+  // their joins in the block's slot, below that filter, which reads them as a Path 1 or Path 2
+  // residual does (ADR 0041's decision 8), whole: a BETWEEN with a subquery bound is not split.
+  if (outer) {
+    return BindCorrelatedConjunct(conjunct);
+  }
+  // An IN subquery conjunct becomes a semi or null-aware anti join in the per-row slot.
+  if (in) {
+    ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+    return BindSubqueryConjunct(conjunct, *form, /*having=*/false,
+                                [this](const sql::Expr& e) { return BindInput(e); });
+  }
+  if (form.has_value()) {
+    // A correlated EXISTS or scalar comparison is ADR 0023's dependent join; an uncorrelated one is
+    // a value in the slot (ADR 0041's decisions 4 and 5), the conjunct a filter reading it.
+    ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/false));
+    if (block.correlated) {
+      if (padded_unit_.has_value()) {
+        return Reject(
+            Rejection{.span = form->subquery->op_span,
+                      .message = std::format("a correlated subquery in the ON of a join inside a "
+                                             "{} JOIN's left input is not supported",
+                                             ToString(units_[*padded_unit_].kind))});
+      }
+      return JoinSubquery(
+          conjunct, *form, /*having=*/false, [this](const sql::Expr& e) { return BindInput(e); },
+          std::move(block));
+    }
+    if (form->exists()) {
+      // EXISTS or NOT EXISTS itself, in either spelling: its count compared with 1 or 0.
+      ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+      const SourceSpan span = form->subquery->span;
+      const Typed count = PlantValue(*form->subquery, std::move(block), /*group=*/false);
+      RowSlot().push_back(SlotFilter{.exprs = {},
+                                     .ids = {},
+                                     .filter = {CountTest(count, form->negated, span)},
+                                     .span = conjunct.span()});
+      return arrow::Status::OK();
+    }
+    PlantValue(*form->subquery, std::move(block), /*group=*/false);
+    return BindValueConjunct(conjunct, element);
+  }
+  if (const sql::BetweenExpr* between = SubqueryBetween(conjunct)) {
+    return BindSubqueryBetween(conjunct, *between, /*having=*/false, element,
+                               [this](const sql::Expr& e) { return BindInput(e); });
+  }
+  if (HoldsSubquery(conjunct)) {
+    return BindValueConjunct(conjunct, element);
+  }
+  return BindConjunct(conjunct, element);
+}
+
 // One element of WHERE or of an inner ON: its conjuncts, with what every branch of a top-level OR
-// shares factored out first (ADR 0022's OR factoring), each then classified as any conjunct is.
+// shares factored out first (ADR 0022's OR factoring), each then routed by BindRowConjunct.
 arrow::Status Binder::BindElement(const sql::Expr& element,
                                   const std::vector<const sql::Expr*>& siblings) {
   std::vector<sql::Box<sql::Expr>> owned;  // keeps the rewrite's expressions alive
@@ -6724,59 +6982,19 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
   for (const FactoredConjunct& conjunct : conjuncts) {
     if (conjunct.bind_only) {
       // An OR its shared conjuncts imply contributes nothing to the plan, but it is still bound, so
-      // that a bind error inside a dropped branch is still that error (ADR 0022). BindBool resolves
-      // and types every operand and mints no column id, so the result goes without a trace.
-      ARROW_RETURN_NOT_OK(BindBool(
-          *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      // that a bind error inside a dropped branch is still that error (ADR 0022): as a dry run,
+      // which binds each subquery's block for its errors and plants nothing (ADR 0041's decision
+      // 10). BindBool resolves and types every operand, and the result goes without a trace (the
+      // sub-blocks mint ids that nothing uses).
+      dry_run_ = true;
+      const arrow::Result<Typed> dropped = BindBool(
+          *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); },
+          /*input=*/true);
+      dry_run_ = false;  // restored on the error path too, before the status propagates
+      ARROW_RETURN_NOT_OK(dropped.status());
       continue;
     }
-    if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct.expr)) {
-      ARROW_RETURN_NOT_OK(BindSubqueryBetween(*conjunct.expr, *between, /*having=*/false,
-                                              element.span(),
-                                              [this](const sql::Expr& e) { return BindInput(e); }));
-      continue;
-    }
-    const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(*conjunct.expr);
-    const bool outer = ReadsOuterColumn(*conjunct.expr, visible_);
-    // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
-    // neither route can take it. The subquery route binds the conjunct's other side as an ordinary
-    // expression, and the correlated route binds the whole conjunct as a condition, whose every
-    // expression visitor aborts on a subquery. Neither unnesting path of ADR 0023 handles a block
-    // that is correlated and holds a subquery of its own, so it exits 4 at the subquery.
-    if (form.has_value() && outer) {
-      return Reject(Rejection{
-          .span = form->subquery->op_span,
-          .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
-                     "not supported"});
-    }
-    // Both routes below put the conjunct above every join of the block, which a unit that pads
-    // the conjunct's join (an inner join inside a FULL JOIN's left input) must not have above it.
-    if (padded_unit_.has_value() && (outer || form.has_value())) {
-      return Reject(Rejection{
-          .span = form.has_value() ? form->subquery->op_span : conjunct.expr->span(),
-          .message = std::format("{} in the ON of a join inside a {} JOIN's left input is not "
-                                 "supported",
-                                 form.has_value() ? "a subquery" : "a column of an enclosing block",
-                                 ToString(units_[*padded_unit_].kind))});
-    }
-    // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
-    // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
-    // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
-    // therefore disconnected: a cross product of them (ADR 0040), which the semi join or the join
-    // the unnesting pass makes above it then keys on the outer columns.
-    if (outer) {
-      ARROW_RETURN_NOT_OK(BindCorrelatedConjunct(*conjunct.expr));
-      continue;
-    }
-    // A subquery conjunct becomes a join above this block's inner joins, so it is neither
-    // classified by the relations it reads (it reads none of them) nor pushed into a relation.
-    if (form.has_value()) {
-      ARROW_RETURN_NOT_OK(
-          BindSubqueryConjunct(*conjunct.expr, *form, /*having=*/false,
-                               [this](const sql::Expr& e) { return BindInput(e); }));
-      continue;
-    }
-    ARROW_RETURN_NOT_OK(BindConjunct(*conjunct.expr, element.span()));
+    ARROW_RETURN_NOT_OK(BindRowConjunct(*conjunct.expr, element.span()));
   }
   return arrow::Status::OK();
 }

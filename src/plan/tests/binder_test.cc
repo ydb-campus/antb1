@@ -777,14 +777,16 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "t.i32", "a FULL JOIN's ON must read its own two inputs only"},
         // An inner join's ON inside a FULL JOIN's left input binds inside that input, which the
         // FULL JOIN pads, so a conjunct of it that would bind above every join of the block -- a
-        // subquery, a column of an enclosing block, a comma sibling before the join group -- would
-        // drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left input, those
-        // are answered.
+        // correlated subquery, a column of an enclosing block, a comma sibling before the join
+        // group -- would drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left
+        // input, those are answered; an uncorrelated subquery stands in that input's own slot
+        // (ADR 0041's SQ1).
         ErrorCase{
-            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM "
-            "dec) FULL JOIN ok ON u.i16 = ok.i16",
-            kUnsupported, "IN",
-            "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
+            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND EXISTS (SELECT 1 FROM dec WHERE "
+            "dec.i = t.i32) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "EXISTS",
+            "a correlated subquery in the ON of a join inside a FULL JOIN's left input is not "
+            "supported"},
         ErrorCase{"SELECT t.i16 FROM t WHERE EXISTS (SELECT * FROM u JOIN dec ON u.i32 = dec.i AND "
                   "dec.b = t.i64 FULL JOIN ok ON u.i16 = ok.i16)",
                   kUnsupported, "dec.b = t.i64",
@@ -1248,25 +1250,16 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i32 FROM t GROUP BY i32 HAVING MIN(i16) = "
                   "(SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
                   kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
-        // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
-        // the subquery route binds the other side as an ordinary expression and the correlated
-        // route binds the whole conjunct as a condition, whose expression visitors abort on a
-        // subquery, so neither can take it.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
-                  "t.i64 = (SELECT MIN(ok.i16) FROM ok))",
-                  kUnsupported, "(",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
+        // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
+        // above this block's joins with the probe's free variable on its outer side, which neither
+        // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
+        // decision 8, ValuePlacements).
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
                   "t.i64 IN (SELECT ok.i16 FROM ok))",
                   kUnsupported, "IN",
                   "a subquery whose conjunct also reads a column of an enclosing query block"},
-        // A BETWEEN with a subquery bound keeps both placement rules of a subquery conjunct, at its
-        // first subquery (ADR 0041's SQ4a): an operand that reads an enclosing block's column...
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 "
-                  "BETWEEN (SELECT MIN(ok.i16) FROM ok) AND 100)",
-                  kUnsupported, "(",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
-        // ... and an inner ON inside a FULL JOIN's left input, which the FULL JOIN pads.
+        // A BETWEEN with a subquery bound in an inner ON inside a FULL JOIN's left input, which the
+        // FULL JOIN pads.
         ErrorCase{
             "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 BETWEEN 1 AND (SELECT "
             "MAX(dec.i) FROM dec) FULL JOIN ok ON u.i16 = ok.i16",
@@ -6805,6 +6798,33 @@ TEST(BinderTest, TheSingleValueOfAFloatColumnIsAFloat) {
     EXPECT_TRUE(refused.status().IsNotImplemented()) << sql << ": " << refused.status().ToString();
     EXPECT_TRUE(refused.status().message().contains("divergence D11"))
         << refused.status().message();
+  }
+}
+
+// Every shape of ADR 0041's SQ1 places its values (decision 9) without an abort: bound, resolved
+// and optimized, a correlated block's residual included, which ADR 0023's unnesting then takes.
+TEST(BinderTest, ValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           // Decision 8: a conjunct of a correlated EXISTS that reads the enclosing block and holds
+           // a value is a residual of Path 1, a BETWEEN with a subquery bound whole among them...
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i64 > "
+           "(SELECT MIN(ok.i16) FROM ok))",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 BETWEEN "
+           "(SELECT MIN(ok.i16) FROM ok) AND 100)",
+           // ... and a value conjunct of a correlated aggregate's block stands in its slot, which
+           // Path 2 takes with the block.
+           "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64 AND "
+           "u.i32 > (SELECT MIN(ok.i16) FROM ok))",
+           // An IN in an inner ON inside a FULL JOIN's left input: that input's own slot.
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM dec) FULL "
+           "JOIN ok ON u.i16 = ok.i16",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_NE(optimized.root, nullptr) << sql;
   }
 }
 

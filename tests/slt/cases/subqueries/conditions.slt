@@ -1225,14 +1225,12 @@ INTEGER	INTEGER
 # The conjunct filters the left input before the FULL JOIN pads, so every driver without a kept trip still comes
 # out: direct comparisons (one with COUNT(*) over no row, which is 0), arithmetic, and a value of no row, which
 # empties the input (every driver padded).
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id
 ----
 BIGINT	BIGINT	BIGINT
 1126	1118	966
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_parent > (SELECT COUNT(*) FROM promos) FULL JOIN drivers ON tr_driver = dv_id
 ----
@@ -1246,7 +1244,6 @@ SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup 
 BIGINT	BIGINT	BIGINT
 1124	1116	966
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city < (SELECT ct_id FROM cities WHERE ct_id > 6) FULL JOIN drivers ON tr_driver = dv_id
 ----
@@ -1262,35 +1259,30 @@ SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup 
 
 # IN over one row and over none; NOT IN over rows, over rows with a NULL (never true: every city padded) and over
 # none (always true).
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT ct_id FROM cities WHERE label = 'harbor') FULL JOIN cities ON dv_city = ct_id
 ----
 BIGINT	BIGINT	BIGINT
 27	22	27
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT pm_id FROM promos) FULL JOIN cities ON dv_city = ct_id
 ----
 BIGINT	BIGINT	BIGINT
 6	0	6
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT ct_id FROM cities WHERE ct_id > 1) FULL JOIN cities ON dv_city = ct_id
 ----
 BIGINT	BIGINT	BIGINT
 581	579	581
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT zn_parent FROM zones WHERE zn_city = 1) FULL JOIN cities ON dv_city = ct_id
 ----
 BIGINT	BIGINT	BIGINT
 6	0	6
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT pm_id FROM promos) FULL JOIN cities ON dv_city = ct_id
 ----
@@ -1298,14 +1290,12 @@ BIGINT	BIGINT	BIGINT
 670	668	670
 
 # EXISTS that is false empties the left input, every driver padded; NOT EXISTS over an empty table keeps it whole.
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND EXISTS (SELECT 1 FROM cities WHERE ct_pop > 1000000) FULL JOIN drivers d ON t.tr_driver = d.dv_id
 ----
 BIGINT	BIGINT	BIGINT
 97	0	96
 
-pending SQ1a
 query III rowsort
 SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND NOT EXISTS (SELECT 1 FROM promos) FULL JOIN drivers ON tr_driver = dv_id
 ----
@@ -1316,7 +1306,6 @@ BIGINT	BIGINT	BIGINT
 
 # A conjunct of a correlated EXISTS that reads the enclosing block and holds a value; NOT EXISTS keeps the other
 # cities.
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT MIN(zn_city) FROM zones)) ORDER BY ct_id
 ----
@@ -1326,7 +1315,6 @@ SMALLINT
 4
 5
 
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT MIN(zn_city) FROM zones)) ORDER BY ct_id
 ----
@@ -1336,7 +1324,6 @@ SMALLINT
 
 # The value over the enclosing block's table: city 4's NULL population never passes. Over no row the conjunct is
 # never true, so NOT EXISTS keeps every city.
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_pop > (SELECT MIN(ct_pop) FROM cities)) ORDER BY ct_id
 ----
@@ -1346,7 +1333,6 @@ SMALLINT
 3
 5
 
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_pop > (SELECT ct_pop FROM cities WHERE ct_id > 6)) ORDER BY ct_id
 ----
@@ -1391,7 +1377,6 @@ SELECT COUNT(*) FROM zones WHERE zn_city * 2 < (SELECT MAX(tr_dropoff) FROM trip
 BIGINT
 30
 
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zn_id) * 300 FROM zones WHERE zn_city = ct_id AND zn_id + ct_id > (SELECT MAX(zn_city) FROM zones)) ORDER BY ct_id
 ----
@@ -1410,7 +1395,6 @@ SMALLINT
 4
 5
 
-pending SQ1a
 query I nosort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id BETWEEN (SELECT MIN(zn_city) FROM zones WHERE zn_city > 2) AND 5) ORDER BY ct_id
 ----
@@ -1428,7 +1412,6 @@ SMALLINT
 5
 
 # A value of two rows fails inside the correlated block too.
-pending SQ1a
 statement error More than one row returned by a subquery used as an expression
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT zn_city FROM zones WHERE zn_id < 3)) ORDER BY ct_id
 
