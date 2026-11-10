@@ -1670,8 +1670,6 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
       .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
 }
 
-// Whether two subquery expressions are written alike, whatever their spans: the key of ADR 0041's
-// decision 10, by which a subquery binds once per slot.
 // A comparison of two scalar subqueries, each a direct operand: `(q1) <op> (q2)` (ADR 0041's SQ1).
 std::optional<std::pair<const sql::SubqueryExpr*, const sql::SubqueryExpr*>> AsSubqueryPair(
     const sql::Expr& conjunct) {
@@ -1687,6 +1685,8 @@ std::optional<std::pair<const sql::SubqueryExpr*, const sql::SubqueryExpr*>> AsS
   return std::pair{left, right};
 }
 
+// Whether two subquery expressions are written alike, whatever their spans: the key of ADR 0041's
+// decision 10, by which a subquery binds once per slot.
 bool SameSubquery(const sql::SubqueryExpr& a, const sql::SubqueryExpr& b) {
   return a.kind == b.kind && a.negated == b.negated &&
          a.operand.has_value() == b.operand.has_value() &&
@@ -6695,11 +6695,9 @@ arrow::Status Binder::BindSubqueryBetween(const sql::BetweenExpr& between, const
       const SubqueryConjunct form{.subquery = AsScalarSubquery(*bounds[i]),
                                   .other = &*between.operand};
       ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(form, /*having=*/true));
-      if (block.correlated) {
-        // A correlated bound keeps the refusal it had, as a scalar subquery in a condition (SQ5).
-        return Reject(Rejection{.span = form.subquery->op_span,
-                                .message = "a scalar subquery is not supported"});
-      }
+      // A block in HAVING that reads an enclosing one is refused while it binds ("a correlated
+      // subquery in HAVING"), so none arrives here.
+      ANTB1_CHECK(!block.correlated);
       blocks[i] = std::move(block);
     }
     return &*blocks[i];

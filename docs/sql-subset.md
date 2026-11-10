@@ -468,8 +468,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   stands in the block's slot, below the filter of its correlated conjuncts, and the conjunct is a residual of the
   unnesting (ADR 0041's decision 8). A correlated scalar subquery compared with an uncorrelated one, directly or in
   an expression, is answered too, the uncorrelated one a value whose join stands below the dependent join. A
-  correlated value anywhere but a direct operand of a top-level comparison, two correlated subqueries in one
-  comparison, a correlated subquery in a conjunct that reads the enclosing block itself, and a correlated `EXISTS`
+  correlated value anywhere but a direct operand of a top-level comparison, two different correlated subqueries in
+  one comparison, a correlated subquery in a conjunct that reads the enclosing block itself, and a correlated `EXISTS`
   anywhere but a top-level conjunct exit 4 once their blocks bind (SQ5 and SQ8 answer them). A top-level correlated
   `EXISTS` whose block has a shape the unnesting does not take is refused at the `EXISTS` once its block's FROM list
   is bound and before any other clause of the block binds, so the bind errors of those clauses never show (a

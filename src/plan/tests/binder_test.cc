@@ -1303,6 +1303,17 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "(",
                   "a correlated subquery in the ON of a join inside a FULL JOIN's left input is "
                   "not supported"},
+        // The same for a correlated subquery compared directly with a value there, and the second
+        // of two subqueries compared binds before the pair is refused, so its bind error wins, as
+        // in DuckDB.
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (SELECT MIN(ok.i16) FROM ok) < "
+                  "(SELECT MIN(dec.i) FROM dec WHERE dec.i = u.i32) FULL JOIN ok ON u.i16 = ok.i16",
+                  kUnsupported, "(",
+                  "a correlated subquery in the ON of a join inside a FULL JOIN's left input is "
+                  "not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < "
+                  "(SELECT MAX(nope) FROM ok WHERE ok.i16 = t.i16)",
+                  kBind, "nope", "column 'nope' does not exist"},
         // A name this block has twice keeps its own bind error: an enclosing block that happens to
         // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
         // binds, make it read the outer column).

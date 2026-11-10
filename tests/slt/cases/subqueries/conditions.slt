@@ -1730,6 +1730,19 @@ SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup 
 BIGINT	BIGINT	BIGINT
 847	839	726
 
+# Two values compared there: true keeps the inner join's rows, false empties the input, every model padded.
+query III rowsort
+SELECT COUNT(*), COUNT(c.ct_id), COUNT(m.md_id) FROM cities c JOIN zones z ON z.zn_id = c.ct_id AND (SELECT COUNT(*) FROM cities) > (SELECT MIN(zn_city) FROM zones) FULL JOIN models m ON m.md_id = z.zn_id
+----
+BIGINT	BIGINT	BIGINT
+26	6	26
+
+query III rowsort
+SELECT COUNT(*), COUNT(c.ct_id), COUNT(m.md_id) FROM cities c JOIN zones z ON z.zn_id = c.ct_id AND (SELECT COUNT(*) FROM cities) < (SELECT MIN(zn_city) FROM zones) FULL JOIN models m ON m.md_id = z.zn_id
+----
+BIGINT	BIGINT	BIGINT
+26	0	26
+
 # ---- more forms in an inner ON: BETWEEN, an IN list, COALESCE, a CASE, a second join over three relations ----
 
 query I rowsort

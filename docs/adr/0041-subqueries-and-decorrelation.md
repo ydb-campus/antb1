@@ -750,7 +750,7 @@ completes, and the ratchet stays at 78.
   OR, NOT or CASE. A conjunct of a correlated block that reads the enclosing block and holds a value is a residual
   of Path 1 or Path 2, whole, a BETWEEN included; an IN whose probe reads the enclosing block stays exit 4, and so
   does a correlated subquery in a conjunct that reads the enclosing block itself. A correlated comparison whose other
-  side holds a value, or is one, is ADR 0023's dependent join with the value's join below it; two correlated
+  side holds a value, or is one, is ADR 0023's dependent join with the value's join below it; two different correlated
   subqueries compared wait on SQ5. A value of the outer column's type that a correlation equates with it keys the
   block, as Path 1's semi key or Path 2's inner equivalent; one that needs a cast, or an expression over a value, has
   no inner equivalent, and Path 2 refuses it. Of decision 8's three bind-error examples, two wait on X5 and on LIMIT
