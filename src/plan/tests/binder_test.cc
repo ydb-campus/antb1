@@ -796,6 +796,23 @@ INSTANTIATE_TEST_SUITE_P(
                   "ON u.i16 = ok.i16",
                   kUnsupported, "dec.i = t.i32",
                   "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        // So must a conjunct with a subquery, which filters in that input's own slot (ADR 0041's
+        // SQ1): an IN, a value and an EXISTS under OR, each beside a comma sibling's column.
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND dec.i IN (SELECT ok.i16 FROM "
+            "ok) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i IN (SELECT ok.i16 FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND dec.i > (SELECT MIN(ok.i16) "
+            "FROM ok) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i > (SELECT MIN(ok.i16) FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND (dec.i > 0 OR EXISTS (SELECT "
+            "1 FROM ok)) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i > 0 OR EXISTS (SELECT 1 FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
         // The missing tables are still missing, and that bind error comes first, as in DuckDB.
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kBind, "nope",
                   "table 'nope' does not exist"},
