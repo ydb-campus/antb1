@@ -3064,8 +3064,8 @@ class Builder {
   // aggregate, no GROUP BY) whose query holds no other subquery: the value alone, or `CASE WHEN
   // <condition> THEN 1 ELSE 0 END` over one of ConditionValueForm's conditions. It is written after
   // WHERE, which tells whether another subquery fired, and moved to `at`, the end of the select
-  // list. It is no ORDER BY item: a value is the same on every row. Its value blocks are ValueBody's
-  // and its EXISTS blocks ExistsBody's, so no generated query meets the row error.
+  // list. It is no ORDER BY item. Its value blocks are ValueBody's and its EXISTS blocks
+  // ExistsBody's, so no generated query meets the row error.
   // `lone_star`: the list is Shape::kStar's, so the item makes it a star among items.
   void ItemValue(std::size_t at, bool lone_star) {
     const bool other_subquery =
@@ -3073,7 +3073,8 @@ class Builder {
         used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
         used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue);
     if (other_subquery || !allowed_.Has(Feature::kItemValue) ||
-        !allowed_.Has(Feature::kMultipleItems) || (lone_star && !allowed_.Has(Feature::kStarItems))) {
+        !allowed_.Has(Feature::kMultipleItems) ||
+        (lone_star && !allowed_.Has(Feature::kStarItems))) {
       return;
     }
     const std::vector<SubqueryCandidate> values = ItemValueCandidates();
@@ -4913,7 +4914,7 @@ class Builder {
   Rng& value_rng_;            // the draws that only an uncorrelated value needs
   Rng& condition_value_rng_;  // the draws that only a value inside a condition needs
   Rng& having_value_rng_;     // the draws that only a value inside a HAVING condition needs
-  Rng& item_value_rng_;     // the draws that only a value in a select item needs
+  Rng& item_value_rng_;       // the draws that only a value in a select item needs
   // The stream and the feature of the value form being written (ConditionValue, HavingValue,
   // ItemValue).
   Rng* form_rng_ = nullptr;

@@ -2217,8 +2217,9 @@ std::vector<Relation> AllRelations() {
           std::tuple{"arithmetic", "tr_pickup * ({}) - 1", "tr_pickup * 5 - 1"},
           std::tuple{"case", "CASE WHEN tr_pickup = ({}) THEN 10 ELSE tr_row END",
                      "CASE WHEN tr_pickup = 5 THEN 10 ELSE tr_row END"}}) {
-      const std::string value = std::format("SELECT tr_row, {} FROM trips WHERE tr_row < 200",
-                                            std::vformat(with_value, std::make_format_args(kOneRow)));
+      const std::string value =
+          std::format("SELECT tr_row, {} FROM trips WHERE tr_row < 200",
+                      std::vformat(with_value, std::make_format_args(kOneRow)));
       r.push_back({.name = std::format("item_value_equals_its_literal_{}", name),
                    .features = SetWith(in_items, kArithmetic, kCase),
                    .probes = {Q(value),
@@ -2229,11 +2230,12 @@ std::vector<Relation> AllRelations() {
     }
     r.push_back(
         {.name = "item_value_in_a_derived_table_equals_its_literal",
-         .features = SetWith(in_items, kSum, kCountColumn, kArithmetic, kDerivedTable, kAlias,
-                             kTableAlias),
-         .probes = {Q(std::format("SELECT SUM(v), COUNT(v) FROM (SELECT tr_dropoff + ({}) AS v FROM "
-                                  "trips) AS d",
-                                  kOneRow)),
+         .features =
+             SetWith(in_items, kSum, kCountColumn, kArithmetic, kDerivedTable, kAlias, kTableAlias),
+         .probes = {Q(std::format(
+                        "SELECT SUM(v), COUNT(v) FROM (SELECT tr_dropoff + ({}) AS v FROM "
+                        "trips) AS d",
+                        kOneRow)),
                     Q("SELECT SUM(v), COUNT(v) FROM (SELECT tr_dropoff + 5 AS v FROM trips) AS d")},
          .check = AllEqual()});
     r.push_back({.name = "item_value_of_one_row_is_a_cross_join",

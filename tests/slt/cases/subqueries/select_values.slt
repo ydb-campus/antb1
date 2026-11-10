@@ -513,8 +513,8 @@ SMALLINT	BIGINT
 6	2023
 
 # CASE: EXISTS and NOT EXISTS in a WHEN (alone and under AND), a value in a WHEN, THEN and ELSE, a simple CASE over a
-# value and with values in its WHENs, IN lists and BETWEEN with values, IS NULL of a value; a DECIMAL value against
-# a DECIMAL or an integer column, and a CASE without ELSE.
+# value and with values in its WHEN clauses, IN lists and BETWEEN with values, IS NULL of a value; a DECIMAL value
+# against a DECIMAL or an integer column, and a CASE without ELSE.
 
 query II nosort
 SELECT ct_id, CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_city = 6) THEN 1 ELSE 0 END AS e FROM cities ORDER BY ct_id
@@ -1787,13 +1787,13 @@ SMALLINT	VARCHAR
 6	NORTH-outskirts-xl |
 
 query ITIT nosort
-SELECT ct_id, substring((SELECT label FROM zones WHERE zn_id = 7), ct_id, 3) AS s, strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 7))) AS n, regexp_replace((SELECT label FROM cities WHERE ct_id = 5), ' ', '_') AS r FROM cities ORDER BY ct_id
+SELECT ct_id, substring((SELECT label FROM zones WHERE zn_id = 7), ct_id, 2) AS s, strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 7))) AS n, regexp_replace((SELECT label FROM cities WHERE ct_id = 5), ' ', '_') AS r FROM cities ORDER BY ct_id
 ----
 SMALLINT	VARCHAR	BIGINT	VARCHAR
-1	mar	12	old_town
-2	ark	12	old_town
-3	rke	11	old_town
-4	ket	13	old_town
+1	ma	12	old_town
+2	ar	12	old_town
+3	rk	11	old_town
+4	ke	13	old_town
 5	et	14	old_town
 6	t	15	old_town
 
@@ -1849,19 +1849,19 @@ INTEGER	DECIMAL(6,3)
 # column, a FULL JOIN of two derived tables whose select items are values; and a failing value over a LEFT JOIN whose
 # right side is empty.
 
-query IIT nosort
-SELECT c.ct_id, z.zn_id, COALESCE(z.label, (SELECT label FROM cities WHERE ct_id = 6)) AS l FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30 ORDER BY c.ct_id, z.zn_id
+query ITI nosort
+SELECT c.ct_id, COALESCE(z.label, (SELECT label FROM cities WHERE ct_id = 6)) AS l, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30 ORDER BY c.ct_id, z.zn_id
 ----
-SMALLINT	INTEGER	VARCHAR
-1	31	market
-1	36	airport
-2	32	outskirts
-2	37	docks
-3	33	center
-4	34	north
-5	35	south
-5	40	outskirts
-6	NULL	outskirts
+SMALLINT	VARCHAR	INTEGER
+1	market	31
+1	airport	36
+2	outskirts	32
+2	docks	37
+3	center	33
+4	north	34
+5	south	35
+5	outskirts	40
+6	outskirts	NULL
 
 query III nosort
 SELECT c.ct_id, z.zn_id, CASE WHEN z.zn_id IS NULL THEN -(SELECT COUNT(*) FROM zones) ELSE z.zn_id * (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) END AS v FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 33 ORDER BY 1, 2
@@ -2175,28 +2175,28 @@ SMALLINT	VARCHAR
 5	below
 6	below
 
-query IIT nosort
-SELECT zn_id, zn_city, CASE WHEN zn_id > (SELECT MAX(zn_id) FROM zones) - zn_city * 4 THEN 'top' ELSE 'rest' END AS t FROM zones WHERE zn_id > 22 ORDER BY zn_id
+query ITI nosort
+SELECT zn_id, CASE WHEN zn_id > (SELECT MAX(zn_id) FROM zones) - zn_city * 4 THEN 'top' ELSE 'rest' END AS t, zn_city FROM zones WHERE zn_id > 22 ORDER BY zn_id
 ----
-INTEGER	SMALLINT	VARCHAR
-23	3	rest
-24	4	rest
-25	5	top
-26	1	rest
-27	2	rest
-28	3	rest
-29	4	top
-30	5	top
-31	1	rest
-32	2	rest
-33	3	top
-34	4	top
-35	5	top
-36	1	rest
-37	2	top
-38	NULL	rest
-39	9	top
-40	5	top
+INTEGER	VARCHAR	SMALLINT
+23	rest	3
+24	rest	4
+25	top	5
+26	rest	1
+27	rest	2
+28	rest	3
+29	top	4
+30	top	5
+31	rest	1
+32	rest	2
+33	top	3
+34	top	4
+35	top	5
+36	rest	1
+37	top	2
+38	rest	NULL
+39	top	9
+40	top	5
 
 query IT nosort
 SELECT tr_row, CASE WHEN tr_fare > tr_distance * (SELECT MAX(tf_rate) FROM tariffs) * 4 THEN 'high' WHEN tr_fare > (SELECT MIN(tr_fare) FROM trips) * tr_rate * 3 THEN 'mid' ELSE 'low' END AS f FROM trips WHERE tr_row < 12 ORDER BY tr_row
@@ -2247,22 +2247,22 @@ INTEGER	DECIMAL(10,2)
 11	12.50
 12	7.50
 
-query IIT nosort
-SELECT zn_id, zn_city, CASE zn_city WHEN (SELECT MIN(zn_city) FROM zones) THEN 'first' WHEN (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - zn_id % 5 THEN 'shifted' ELSE 'other' END AS k FROM zones WHERE zn_id < 13 ORDER BY zn_id
+query ITI nosort
+SELECT zn_id, CASE zn_city WHEN (SELECT MIN(zn_city) FROM zones) THEN 'first' WHEN (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - zn_id % 5 THEN 'shifted' ELSE 'other' END AS k, zn_city FROM zones WHERE zn_id < 13 ORDER BY zn_id
 ----
-INTEGER	SMALLINT	VARCHAR
-1	1	first
-2	2	other
-3	3	other
-4	4	other
-5	5	shifted
-6	1	first
-7	2	other
-8	3	other
-9	4	other
-10	5	shifted
-11	1	first
-12	2	other
+INTEGER	VARCHAR	SMALLINT
+1	first	1
+2	other	2
+3	other	3
+4	other	4
+5	shifted	5
+6	first	1
+7	other	2
+8	other	3
+9	other	4
+10	shifted	5
+11	first	1
+12	other	2
 
 query TT nosort
 SELECT label, CASE WHEN label < (SELECT label FROM zones WHERE zn_id = 4) THEN 'before' WHEN label = (SELECT label FROM zones WHERE zn_id = 4) THEN 'same' ELSE 'after' END AS o FROM cities ORDER BY label

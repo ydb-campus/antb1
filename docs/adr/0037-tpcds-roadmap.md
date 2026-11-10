@@ -188,7 +188,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | **Phase 8** | **Subqueries ([ADR 0041](0041-subqueries-and-decorrelation.md); the phase 8 update below)** | | |
 | SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Built |
 | SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Built (SQ1a: WHERE and an inner ON; SQ1b: HAVING) |
-| SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Planned |
+| SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | SQ2a built (blocks that do not aggregate); SQ2b planned (blocks that aggregate) |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Planned |
 | SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Planned |
 | SQ5, SQ6 | One PR or two. SQ6: correlated static aggregates of any kind, COUNT included, joined back LEFT with their empty values where the consumer proof fails; SQ5: correlated aggregates as values in the per-row slots, under the proof. Split, SQ6 lands first, since SQ5's correlated aggregates of any kind with any select item need its LEFT join back; SQ6 completes 41 and SQ5 6 | 6, 41 | Planned |
@@ -874,6 +874,15 @@ shapes keep their counters. SQ1b, values in HAVING with decision 23's outer aggr
 Update (2026-11-10, SQ1b): SQ1b, built, answers uncorrelated values anywhere in a HAVING condition and makes decision
 23's SQ1 row (ADR 0041's SQ1b update), which completes SQ1. No query completes, the ratchet stays at 78, and no TPC-H
 or TPC-DS plan changes. SQ2, values in the select list (Q9), is next.
+
+Update (2026-11-11, SQ2a): SQ2 is two PRs at the maintainer's request (ADR 0041's SQ2a update). SQ2a, built, answers
+uncorrelated values in the select items and ORDER BY of a block that neither groups nor aggregates, and completes Q9:
+the ratchet is at 79. No other TPC-H or TPC-DS plan changes. On Apple silicon antb1 answers Q9 at SF 1 in 3.4 s in the
+release build, 4.8 s in the Debug build and 9.5 s under AddressSanitizer, and it peaks at 9.8 MiB, far inside the
+budget, so PF4 stays conditional although Q9's values are fifteen scans of one table. Shard 8 of 8, which holds Q9,
+took 87 s under AddressSanitizer here: about 340 s at the 3.9x ratio of the nightly run to local times, 39% of the
+870-second inner timeout, and 513 s at the slowest ratio seen (5.9x), below the gate's 522 s. PF16 stays a guard (ADR
+0041's SQ2a update). SQ2b, values in the blocks that aggregate with decision 23's select-list half, follows.
 
 ## Alternatives considered
 

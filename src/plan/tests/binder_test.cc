@@ -7157,20 +7157,21 @@ TEST(BinderTest, AProjectionValueJoinsInTheRowSlot) {
 // at their positions (critique P1-4's c26).
 TEST(BinderTest, AnExistsSelectListPlantsNothing) {
   const Catalog catalog = MakeCatalog();
-  for (const char* sql : {
-           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok) FROM u)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok), u.i16 FROM u WHERE u.i64 "
-           "= t.i64)",
-           // A correlated value of a shape Path 2 takes, dropped with the list (DuckDB answers).
-           "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = "
-           "u.i32) FROM u)",
-           "SELECT i16 FROM t WHERE i32 = 1 OR NOT EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) "
-           "FROM u)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
-           "b, i16 * 3 AS c FROM u ORDER BY 2 LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
-           "b, i16 * 3 AS c FROM u ORDER BY 3 LIMIT 1)",
-       }) {
+  for (
+      const char* sql : {
+          "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok) FROM u)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT i16 FROM ok), u.i16 FROM u WHERE u.i64 "
+          "= t.i64)",
+          // A correlated value of a shape Path 2 takes, dropped with the list (DuckDB answers).
+          "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = "
+          "u.i32) FROM u)",
+          "SELECT i16 FROM t WHERE i32 = 1 OR NOT EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) "
+          "FROM u)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
+          "b, i16 * 3 AS c FROM u ORDER BY 2 LIMIT 1)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
+          "b, i16 * 3 AS c FROM u ORDER BY 3 LIMIT 1)",
+      }) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     const std::string text = Explain(*plan);

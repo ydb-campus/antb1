@@ -3227,9 +3227,9 @@ TEST(QueryGenerator, HavingValuesChangeOnlyTheirQueries) {
 TEST(QueryGenerator, ItemValuesChangeOnlyTheirQueries) {
   const auto with =
       MakeOver(JoinTables(), 83, {.supported = kSupportedFeatures, .target_percent = 0});
-  const auto without = MakeOver(
-      JoinTables(), 83,
-      {.supported = kSupportedFeatures.Minus({Feature::kItemValue}), .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 83,
+               {.supported = kSupportedFeatures.Minus({Feature::kItemValue}), .target_percent = 0});
   const std::vector<GenTable> tables = JoinTables();
   int took = 0;
   int same = 0;
