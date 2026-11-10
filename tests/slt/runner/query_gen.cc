@@ -748,6 +748,11 @@ constexpr uint64_t kConditionValueStreamSalt = 0x636F6E642D76616CULL;
 // a query without one is the query this seed generated before the SQ1b PR.
 constexpr unsigned kHavingValuePercent = 70;
 constexpr uint64_t kHavingValueStreamSalt = 0x686176672D76616CULL;
+// Share of the projections without another subquery that take one more select item holding a
+// value (ADR 0041's SQ2a), and the salt of the stream of all its draws, so that a query without one
+// is the query this seed generated before the SQ2a PR.
+constexpr unsigned kItemValuePercent = 50;
+constexpr uint64_t kItemValueStreamSalt = 0x6974656D2D76616CULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1052,7 +1057,8 @@ class Builder {
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
-          Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, FeatureSet allowed)
+          Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1075,6 +1081,7 @@ class Builder {
         value_rng_(value_rng),
         condition_value_rng_(condition_value_rng),
         having_value_rng_(having_value_rng),
+        item_value_rng_(item_value_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1954,9 +1961,13 @@ class Builder {
       }
       Symbol(")");
     }
+    const std::size_t select_end = tokens_.size();
     Keyword("FROM");
     EmitFrom(from);
     Where(from.where_keys, from.null_equal);
+    if (shape != Shape::kAggregates) {
+      ItemValue(select_end, /*lone_star=*/shape == Shape::kStar);
+    }
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
         shape == Shape::kAggregates && keys.empty() && allowed_.Has(Feature::kGroupBy) &&
@@ -3046,6 +3057,68 @@ class Builder {
     std::erase_if(out, [&keys](const SubqueryCandidate& c) {
       return c.column == nullptr || std::ranges::find(keys, c.probe) == keys.end();
     });
+    return out;
+  }
+
+  // One more select item holding an uncorrelated value (ADR 0041's SQ2a), in a projection (no
+  // aggregate, no GROUP BY) whose query holds no other subquery: the value alone, or `CASE WHEN
+  // <condition> THEN 1 ELSE 0 END` over one of ConditionValueForm's conditions. It is written after
+  // WHERE, which tells whether another subquery fired, and moved to `at`, the end of the select
+  // list. It is no ORDER BY item: a value is the same on every row. Its value blocks are ValueBody's
+  // and its EXISTS blocks ExistsBody's, so no generated query meets the row error.
+  // `lone_star`: the list is Shape::kStar's, so the item makes it a star among items.
+  void ItemValue(std::size_t at, bool lone_star) {
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue);
+    if (other_subquery || !allowed_.Has(Feature::kItemValue) ||
+        !allowed_.Has(Feature::kMultipleItems) || (lone_star && !allowed_.Has(Feature::kStarItems))) {
+      return;
+    }
+    const std::vector<SubqueryCandidate> values = ItemValueCandidates();
+    if (values.empty() || !item_value_rng_.Percent(kItemValuePercent)) {
+      return;
+    }
+    const SubqueryCandidate& c = values[item_value_rng_.Below(values.size())];
+    const std::size_t end = tokens_.size();
+    block_draws_ = &item_value_rng_;
+    form_rng_ = &item_value_rng_;
+    form_feature_ = Feature::kItemValue;
+    used_.Add(Feature::kItemValue);
+    used_.Add(Feature::kMultipleItems);
+    if (lone_star) {
+      used_.Add(Feature::kStarItems);
+    }
+    Symbol(",");
+    if (allowed_.Has(Feature::kCase) && allowed_.Has(Feature::kIntegerLiteral) &&
+        item_value_rng_.Percent(50)) {
+      used_.Add(Feature::kCase);
+      used_.Add(Feature::kIntegerLiteral);
+      Keyword("CASE");
+      Keyword("WHEN");
+      ConditionValueForm(c);
+      Keyword("THEN");
+      ValueNumber(1);
+      Keyword("ELSE");
+      ValueNumber(0);
+      Keyword("END");
+    } else {
+      ValueBlock(c);
+    }
+    block_draws_ = nullptr;
+    std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at),
+                tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+  }
+
+  // The candidates of a value in a select item: those of a value inside a condition (pure: no
+  // draw).
+  [[nodiscard]] std::vector<SubqueryCandidate> ItemValueCandidates() const {
+    if (!allowed_.Has(Feature::kItemValue)) {
+      return {};
+    }
+    std::vector<SubqueryCandidate> out = SubqueryCandidates();
+    std::erase_if(out, [](const SubqueryCandidate& c) { return c.column == nullptr; });
     return out;
   }
 
@@ -4840,7 +4913,9 @@ class Builder {
   Rng& value_rng_;            // the draws that only an uncorrelated value needs
   Rng& condition_value_rng_;  // the draws that only a value inside a condition needs
   Rng& having_value_rng_;     // the draws that only a value inside a HAVING condition needs
-  // The stream and the feature of the value form being written (ConditionValue, HavingValue).
+  Rng& item_value_rng_;     // the draws that only a value in a select item needs
+  // The stream and the feature of the value form being written (ConditionValue, HavingValue,
+  // ItemValue).
   Rng* form_rng_ = nullptr;
   Feature form_feature_ = Feature::kConditionValue;
   // While ConditionValue writes, the stream its value and EXISTS blocks draw from (BlockRng).
@@ -5071,10 +5146,11 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng value_rng(Mix(seed ^ kValueStreamSalt));
   Rng condition_value_rng(Mix(seed ^ kConditionValueStreamSalt));
   Rng having_value_rng(Mix(seed ^ kHavingValueStreamSalt));
+  Rng item_value_rng(Mix(seed ^ kItemValueStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-               having_value_rng, options.supported)
+               having_value_rng, item_value_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -5109,6 +5185,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng value_rng(Mix(state ^ kValueStreamSalt));
   Rng condition_value_rng(Mix(state ^ kConditionValueStreamSalt));
   Rng having_value_rng(Mix(state ^ kHavingValueStreamSalt));
+  Rng item_value_rng(Mix(state ^ kItemValueStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
@@ -5116,7 +5193,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
       Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-              having_value_rng, allowed)
+              having_value_rng, item_value_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;
