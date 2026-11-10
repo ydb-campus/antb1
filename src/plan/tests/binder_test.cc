@@ -6853,6 +6853,162 @@ TEST(BinderTest, ValuePlacements) {
   }
 }
 
+// ADR 0041's decision 10: a subquery binds once per slot, keyed by what is written, so the copies
+// the binder makes of a conjunct -- a BETWEEN's two comparisons, IS DISTINCT FROM's lowering, CASE
+// x WHEN's equalities, a comparison whose constant moves -- and a subquery written twice, in an ON
+// and in WHERE alike, read one join.
+TEST(BinderTest, ASubqueryIsBoundOncePerSlot) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u) AND (SELECT "
+                      "MIN(i16) FROM u) + 10"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 <= \"(min(i16) + 10)\"\n"
+            "    Compute (min(i16) + 10)\n"
+            "      Filter i32 >= \"min(i16)\"\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i16 IS DISTINCT FROM (SELECT MIN(i16) FROM u) AND "
+                      "CASE (SELECT MIN(i16) FROM u) WHEN 1 THEN i32 ELSE 0 END > 0"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\" > 0\n"
+            "    Compute CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\n"
+            "      Filter i16 IS DISTINCT FROM \"min(i16)\"\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(
+      optimized("SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 > (SELECT MIN(i16) FROM "
+                "ok) WHERE u.i32 + 1 > (SELECT MIN(i16) FROM ok) OR t.i64 < 0"),
+      "Output: i16:SMALLINT\n"
+      "Project t.i16\n"
+      "  Filter \"(((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\"\n"
+      "    Compute (((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\n"
+      "      Filter t.i32 > \"min(i16)\"\n"
+      "        Join ONE-ROW build=right keys=[] carries 1 of 6 unread above\n"
+      "          Join INNER build=right keys=[u.i16 = t.i16] carries 1 of 5 unread above\n"
+      "            Scan table=u source=fake columns=[i16, i32]\n"
+      "            Scan table=t source=fake columns=[i16, i32, i64]\n"
+      "          Aggregate MIN(i16)\n"
+      "            Scan table=ok source=fake columns=[i16]\n");
+}
+
+// OR factoring's dropped branch binds as a dry run (ADR 0041's decision 10): its subquery plants no
+// join, so a value of two rows there never fails, but a bind error in it is still that error.
+TEST(BinderTest, ADroppedOrBranchPlansNoJoinButKeepsItsBindErrors) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT i16 FROM u)) OR i32 = 2"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 = 2\n"
+            "    Scan table=t source=fake columns=[i16, i32]\n");
+  auto error = BindSql(
+      "SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT nope FROM u)) OR i32 = 2", catalog);
+  ASSERT_FALSE(error.ok());
+  EXPECT_EQ(SpanText("SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT nope FROM u)) OR i32 = 2",
+                     error.status()),
+            "nope");
+}
+
+// A block's per-row slot stands above its joins and below the filter of its correlated conjuncts
+// (ADR 0041's decision 9), which a value that such a conjunct holds is then read by: ADR 0023's
+// Path 1 takes the slot with the block, and the conjunct as a residual of its semi join (decision
+// 8).
+TEST(BinderTest, TheSlotsStandWhereDecisionNinePutsThem) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i64 > (SELECT "
+      "MIN(ok.i16) FROM ok) AND u.i32 > (SELECT MAX(ok.i16) FROM ok) + 1)";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(
+      Explain(*plan),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "  DependentJoin SEMI\n"
+      "    Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", "
+      "from]\n"
+      "    Project 1\n"
+      "      Filter \"(u.i16 = t.i16)\" AND \"(t.i64 > (SELECT MIN(ok.i16) FROM ok))\"\n"
+      "        Compute (u.i16 = t.i16), (t.i64 > (SELECT MIN(ok.i16) FROM ok))\n"
+      "          Filter i32 > \"(max(ok.i16) + 1)\"\n"
+      "            Compute (max(ok.i16) + 1)\n"
+      "              Join ONE-ROW build=right keys=[]\n"
+      "                Join ONE-ROW build=right keys=[]\n"
+      "                  Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+      "\"Mixed Case\", from]\n"
+      "                  Aggregate MIN(i16)\n"
+      "                    Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n"
+      "                Aggregate MAX(i16)\n"
+      "                  Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n");
+  EXPECT_EQ(Explain(Optimized(*plan)),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"t.i16\" = \"u.i16\"] residual=[(t.i64 > (SELECT "
+            "MIN(ok.i16) FROM ok))] carries 1 of 2 unread above\n"
+            "    Scan table=t source=fake columns=[i16, i64]\n"
+            "    Filter i32 > \"(max(ok.i16) + 1)\"\n"
+            "      Compute (max(ok.i16) + 1)\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Join ONE-ROW build=right keys=[]\n"
+            "            Scan table=u source=fake columns=[i16, i32]\n"
+            "            Aggregate MIN(i16)\n"
+            "              Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+            "          Aggregate MAX(i16)\n"
+            "            Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
+}
+
+// An inner ON inside a FULL JOIN's left input has that input's own slot, below the FULL JOIN, which
+// then pads what its filters keep (ADR 0041's SQ1; ADR 0037's OJ3 left it to this phase).
+TEST(BinderTest, AFullJoinsLeftInputHasASlotOfItsOwn) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT COUNT(*) FROM t JOIN u ON t.i16 = u.i16 AND t.i32 < (SELECT MIN(i16) "
+                      "FROM ok) + 2 FULL JOIN dec ON u.i32 = dec.i"),
+            "Output: count_star():BIGINT\n"
+            "Aggregate COUNT(*)\n"
+            "  Join FULL build=right keys=[u.i32 = dec.i]\n"
+            "    Filter t.i32 < \"(min(i16) + 2)\"\n"
+            "      Compute (min(i16) + 2)\n"
+            "        Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
+            "          Join INNER build=right keys=[u.i16 = t.i16] carries 2 of 4 unread above\n"
+            "            Scan table=u source=fake columns=[i16, i32]\n"
+            "            Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=ok source=fake columns=[i16]\n"
+            "    Scan table=dec source=fake columns=[i]\n");
+}
+
 // An uncorrelated EXISTS is COUNT(*) over LIMIT 1 of its block under a one-row join, compared with
 // 1, or with 0 for NOT EXISTS (ADR 0041's decision 5), DuckDB's own plan. Its select list -- the
 // Projects among the Limits and Sorts at the top of its plan -- is dropped, as DuckDB drops it, so
