@@ -1682,6 +1682,43 @@ SMALLINT	BIGINT
 5	8
 9	1
 
+# ---- an aggregate of a computed argument beside a value ----
+
+# The aggregate's argument is computed below the aggregation, while the conjunct's own operands are computed in its
+# filter, above the value's join: directly, under OR, and with the aggregate in the select list too.
+query II nosort
+SELECT zn_city, MAX(zn_id * 2) FROM zones GROUP BY zn_city HAVING MAX(zn_id * 2) > (SELECT MIN(ct_id) FROM cities) + 60 ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	72
+2	74
+3	66
+4	68
+5	80
+9	78
+NULL	76
+
+query I nosort
+SELECT zn_city FROM zones GROUP BY zn_city HAVING MAX(zn_id * 2) > (SELECT MIN(ct_id) FROM cities) + 60 OR COUNT(*) < 3 ORDER BY zn_city
+----
+SMALLINT
+1
+2
+3
+4
+5
+9
+NULL
+
+query II nosort
+SELECT zn_city, SUM(zn_id + zn_parent) FROM zones GROUP BY zn_city HAVING SUM(zn_id + zn_parent) * (SELECT COUNT(*) FROM cities) > 900 ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	154
+2	168
+4	153
+5	282
+
 # ---- aggregates of an enclosing block inside a subquery's WHERE or inner ON (decision 23's SQ1 row) ----
 
 # An aggregate in a subquery's WHERE or inner ON parses where some subquery around it stands in HAVING, and the
