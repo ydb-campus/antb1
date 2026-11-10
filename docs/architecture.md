@@ -142,10 +142,11 @@ steps (only step 7 uses more than one thread):
    element of `WHERE` and of an inner `ON` first gives up the conjuncts every branch of a top-level `OR` shares, `(A AND
    X) OR (A AND Y)` becoming `A AND (X OR Y)` one level deep (`src/plan/or_factoring.h`), so that an `OR` can connect a
    join graph. Each conjunct then goes to the relations it reads: one relation filters that relation's own branch, a
-   cross-relation equality whose sides share one key type (each side cast to it on its own branch where it must be)
-   becomes a join key, and anything else over two or more relations becomes a join's residual. An accepted `IN` subquery
-   conjunct takes neither route: its query is a sub-plan of its own and the conjunct becomes a semi or null-aware anti
-   join above the block's inner joins, in the order the conjuncts are written -- or, for a `WHERE` semi join whose key
+   cross-relation equality whose sides share one key type (each side computed and cast to it on its own branch where
+   it must be, or above the outer join unit that pads it) becomes a join key, and anything else over two or more
+   relations becomes a join's residual. An accepted `IN` subquery conjunct takes neither route: its query is a
+   sub-plan of its own and the conjunct becomes a semi or null-aware anti join above the block's inner joins, in the
+   order the conjuncts are written -- or, for a `WHERE` semi join whose key
    reads one relation, on that relation's own branch below them (ADR 0029's D0). A join graph no key connects is a cross
    product ([ADR 0040](adr/0040-nested-loop-joins.md)): a relation the keys leave out that is a sub-plan of exactly one
    row (an aggregate without groups) that no key, no residual and no conjunct of its own branch reads joins above the

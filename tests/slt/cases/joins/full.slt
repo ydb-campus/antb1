@@ -334,3 +334,27 @@ SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city
 ----
 BIGINT	BIGINT	BIGINT
 28	23	28
+
+# ---- a key over a FULL JOIN's padded sides, for a later join ----
+
+# COALESCE over the left side's column keys the zones the FULL JOIN pads on 6, and over the right side's the cities it
+# pads on 1: both are computed above the FULL JOIN.
+query II rowsort
+SELECT COUNT(*), COUNT(z.zn_id) FROM cities c0 FULL JOIN zones z ON c0.ct_id = z.zn_id + 3 JOIN cities c ON c.ct_id = COALESCE(c0.ct_id, 6)
+----
+BIGINT	BIGINT
+43	40
+
+query II rowsort
+SELECT COUNT(*), COUNT(c0.ct_id) FROM cities c0 FULL JOIN zones z ON c0.ct_id = z.zn_id + 3 JOIN cities c ON c.ct_id = COALESCE(z.zn_city, 1)
+----
+BIGINT	BIGINT
+42	6
+
+# Through a LEFT JOIN nested in the FULL JOIN's left input: the key over its padded side is computed above the
+# outermost unit that holds it.
+query IIII rowsort
+SELECT COUNT(*), COUNT(z.zn_id), COUNT(c.ct_id), SUM(d.dv_row) FROM cities c0 LEFT JOIN zones z ON c0.ct_id = z.zn_id + 3 FULL JOIN drivers d ON d.dv_city = c0.ct_id + 1 JOIN cities c ON c.ct_id = COALESCE(z.zn_city, 1)
+----
+BIGINT	BIGINT	BIGINT	HUGEINT
+100	3	100	4656
