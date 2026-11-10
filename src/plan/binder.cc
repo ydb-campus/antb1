@@ -6109,10 +6109,16 @@ arrow::Status Binder::BindAcrossRelations(const sql::Expr& conjunct,
     if (type.has_value() && IsExactWidening(predicate->operands[0]->type, *type) &&
         IsExactWidening(predicate->operands[1]->type, *type)) {
       const bool null_equal = predicate->predicate.kind == Predicate::Kind::kIsNotDistinct;
+      // A side is computed on the block's relation that holds its binding: the binding's own
+      // branch, or, for a binding inside an outer join unit, the unit's, above its join -- where a
+      // padded row's side is what the expression makes of its NULLs (COALESCE(z.x, 1) is 1), not
+      // the NULL the branch below the padding would leave.
       const auto side = [&](std::size_t i) {
         const std::size_t binding = i == 0 ? left.front() : right.front();
-        return EdgeKey{.relation = *LocalOf(block_, binding),
-                       .column = JoinKeyColumn(binding, predicate->operands[i], *type),
+        const std::size_t local = *LocalOf(block_, binding);
+        return EdgeKey{.relation = local,
+                       .column = JoinKeyColumn(blocks_[block_].relations[local],
+                                               predicate->operands[i], *type),
                        .null_equal = null_equal};
       };
       const EdgeKey a = side(0);
