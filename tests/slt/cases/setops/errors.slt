@@ -139,10 +139,10 @@ BIGINT
 6
 
 query I nosort
-SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(ct_pop) FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_id < 0)
+SELECT COUNT(*) FROM trips WHERE tr_row < (SELECT MAX(ct_pop) FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_id < 0)
 ----
 BIGINT
-0
+3000
 
 # ---- DuckDB only, for good: values with no exact common type (ADR 0036) ----
 # DuckDB casts every type mix, a cast that fails failing per row; antb1 casts only exact widenings and exits 4.

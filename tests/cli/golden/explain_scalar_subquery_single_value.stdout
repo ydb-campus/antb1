@@ -6,5 +6,5 @@ Aggregate COUNT(*)
       Aggregate SINGLE_VALUE(zn_id)
         Project zn_id
           Limit 1
-            Sort zn_radius DESC NULLS LAST
+            Sort zn_radius DESC NULLS LAST, zn_id ASC NULLS LAST
               Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_radius]

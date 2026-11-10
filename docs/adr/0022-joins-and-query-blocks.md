@@ -492,9 +492,10 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
       `batch_size` when its VARCHAR values are long.
     - Update (2026-11-10, ADR 0041): ADR 0037's SQ4a answers any uncorrelated scalar subquery through a single-value
       aggregate under this one-row join, which stays exact, and makes the check above an internal error, exit code 70
-      (the Plan's update of 2026-11-10). Update (2026-11-10, SQ4a): built. The check is a bare `NotImplemented`, the
-      planner-bug convention, and an uncorrelated EXISTS takes the same join: COUNT(*) over `LIMIT 1` of its block,
-      compared with 1, or 0 for NOT EXISTS, above it (ADR 0041's SQ4a update).
+      (the Plan's update of 2026-11-10). Update (2026-11-10, SQ4a): built. The check is a bare `NotImplemented`, so it
+      exits 70 (ADR 0041's decision 23); the exec module's other planner-bug checks still return `Invalid`. An
+      uncorrelated EXISTS takes the same join: COUNT(*) over `LIMIT 1` of its block, compared with 1, or 0 for NOT
+      EXISTS, above it (ADR 0041's SQ4a update).
   - A subquery's join sits above the inner joins of its block (WHERE) or above the aggregation (HAVING), in the
     order the conjuncts are written. Update (2026-10-18): a WHERE semi join whose key reads one relation of the
     block runs on that relation's own branch instead, below those joins; see the "Build sides" exception above and

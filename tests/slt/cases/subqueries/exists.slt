@@ -724,8 +724,70 @@ SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT id FROM edge ORDER BY i32 + 214
 statement error Overflow in addition
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT i32 + 2147483647 FROM edge)
 
-# Divergence D32: an aggregate of a grouped block that nothing reads is computed, so its overflow fails the query;
-# DuckDB removes it. An aggregate HAVING reads fails in both.
+# A DISTINCT star's rows are those of every column it names: past the first of them an OFFSET still leaves rows.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT * FROM zones OFFSET 1)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE NOT EXISTS (SELECT DISTINCT * FROM zones OFFSET 1)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT zn_city, * FROM zones OFFSET 7)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT a.* FROM (SELECT zn_city, label FROM zones) AS a OFFSET 1)
+----
+BIGINT
+6
+
+# A select alias named like an enclosing column is the alias, in ORDER BY, GROUP BY and HAVING: the block is
+# uncorrelated.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE EXISTS (SELECT ct_id AS zn_city FROM cities ORDER BY zn_city LIMIT 1)
+----
+BIGINT
+40
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE NOT EXISTS (SELECT label AS zn_radius FROM cities GROUP BY zn_radius HAVING COUNT(*) > 1)
+----
+BIGINT
+40
+
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING EXISTS (SELECT ct_id AS zn_city FROM cities ORDER BY zn_city LIMIT 1) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+# Divergence D32: an aggregate of an EXISTS block that nothing reads is computed, grouped or not, so its overflow
+# fails the query; DuckDB removes it. An aggregate HAVING reads fails in both.
+onlyif antb1
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT MAX(i32 * i32) FROM edge)
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT MAX(i32 * i32) FROM edge)
+----
+BIGINT
+6
+
 onlyif antb1
 statement error Overflow in addition
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i16, SUM(i32 + 2147483647) FROM edge GROUP BY i16)
@@ -750,6 +812,19 @@ SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones GROUP BY zn_city)
 
 statement error
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT *, COUNT(*) FROM zones)
+
+# Divergence D32: a block that aggregates without GROUP BY has one row, which antb1 never sorts, so it never computes
+# its ORDER BY keys; DuckDB computes them and fails.
+onlyif antb1
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT MAX(i32) FROM edge ORDER BY MAX(i32) + 1)
+----
+BIGINT
+6
+
+onlyif duckdb
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT MAX(i32) FROM edge ORDER BY MAX(i32) + 1)
 
 # Divergence D32: a correlated EXISTS's ORDER BY is dropped (ADR 0023's Path 1 takes its FROM and WHERE alone), so its
 # keys are never computed; DuckDB computes them and fails.

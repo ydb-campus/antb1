@@ -140,9 +140,9 @@ enum class Feature : std::uint8_t {
   kNullEqualKeys,  // FROM a JOIN b ON a.k IS NOT DISTINCT FROM b.k
   // An uncorrelated subquery of any shape as a top-level conjunct of WHERE (ADR 0041's SQ4a): a
   // scalar subquery of at most one row as a comparison's operand or as both bounds of a BETWEEN,
-  // and [NOT] EXISTS over a block of any shape. The block's own clauses (ORDER BY, LIMIT, OFFSET,
-  // GROUP BY, HAVING, a set operator) belong to this feature and record none of their own; its
-  // aggregates, its inner table and its operators of the outer block's grammar record theirs.
+  // and [NOT] EXISTS over a block of any shape. The block's ORDER BY, LIMIT, OFFSET, GROUP BY and
+  // HAVING belong to this feature and record none of their own; its aggregates, its inner table and
+  // its set operators record theirs, as in the outer grammar (every compound kUnionAll).
   kUncorrelatedValue,  // x < (SELECT c FROM t ORDER BY c LIMIT 1), EXISTS (SELECT * FROM t)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path

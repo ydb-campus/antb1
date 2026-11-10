@@ -592,10 +592,10 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
     - correlated COUNT, and CASE or COALESCE over aggregates: SQ6 and SQ5;
     - per-binding top-N: SQ14, after phase 9's windows;
     - the uncorrelated EXISTS: SQ4a, built (2026-11-10). A correlated EXISTS keeps this ADR's refusals and their
-      messages, which no longer come from the static check of its shape: a gate refuses its block at the EXISTS when
-      the block is bound, before any clause of it binds, so the enclosing block's select list (and, for a HAVING
-      EXISTS, its grouping) binds first and its bind errors come first, as DuckDB, which answers the EXISTS, reports
-      them (ADR 0041's SQ4a update);
+      messages, which no longer come from the static check of its shape: a gate refuses its block at the EXISTS once
+      its FROM list is bound, before any other clause of it binds, so what the enclosing block binds first (its FROM
+      list and inner ONs, earlier WHERE conjuncts, its select list, and for a HAVING EXISTS its grouping) reports its
+      bind errors first (ADR 0041's SQ4a update);
     - IS NOT DISTINCT FROM keys: built with OJ5b (its update above).
 
 ## Alternatives considered

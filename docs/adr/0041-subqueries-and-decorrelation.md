@@ -684,11 +684,15 @@ Defects the design discussion found, to which no item is assigned:
   included, so Q14's subqueries over a CTE's aggregates need no wrapper.
 - **The EXISTS block (decision 5).** Probed against DuckDB, its select list goes even under a LIMIT, while its ORDER BY
   keys are computed (a top-N under the LIMIT 1). So the Projects among the Limits and Sorts at the top of the block's
-  plan go and the Sorts stay; a DISTINCT's list stays, being its rows. Two cases still differ, both registered under
-  divergence D32 with records of both engines: the aggregates of a grouped EXISTS block that nothing reads, which
-  antb1 computes and DuckDB removes, and a correlated EXISTS's ORDER BY, which ADR 0023's Path 1 drops and DuckDB
-  computes. A star in the block stays unexpanded, but its columns go through the grouping checks, so a grouped or
-  aggregate block's star is DuckDB's bind error (decision 23's row).
+  plan go and the Sorts stay; a DISTINCT's list stays, being its rows, and so do the block's aggregates. Three cases
+  still differ, registered under divergence D32 with records of both engines: the aggregates of an EXISTS block that
+  nothing reads, grouped or not, which antb1 computes and DuckDB removes (so over an ungrouped aggregate an EXISTS is
+  always true only where the aggregate cannot fail); the ORDER BY of a block that aggregates without GROUP BY, whose
+  one row antb1 never sorts, as it never sorts a query's (ADR 0011), while DuckDB computes its keys; and a correlated
+  EXISTS's ORDER BY, which ADR 0023's Path 1 drops and DuckDB computes. A star in the block stays unexpanded, but its
+  columns go through the grouping checks, so a grouped or aggregate block's star is DuckDB's bind error (decision 23's
+  row), and a GROUP BY position that falls in it exits 4, as an ORDER BY one does; under a DISTINCT, whose rows its
+  columns are, it expands, and so it does in every arm of a set operation.
 - **The BETWEEN split (decision 6)** takes one subquery bound or two. DuckDB's typing of the three values runs with
   each subquery bound standing for its block's column, and both comparisons compare in that type, which decides, as
   in DuckDB, whether a constant moves off the operand: with a DOUBLE bound, `i + 1 <= 100` keeps its sum (and an
@@ -697,15 +701,21 @@ Defects the design discussion found, to which no item is assigned:
   blocks, so an arm that reads an enclosing block makes the compound correlated, refused at the subquery as "a
   correlated subquery over a UNION ALL is not supported" (the compound's root operator named); SQ15 answers it.
 - **The order of errors (decision 23).** The refusals that depend on correlation now come when the subquery's block
-  is bound, not from the static check of its shape. A correlated EXISTS's refusals keep their messages and their
-  place before the block's own bind errors: a gate refuses the block at the EXISTS before any of its clauses binds.
-  The enclosing block's select list binds before its WHERE, and its grouping before its HAVING, so their bind errors
-  now come first, as do a correlated scalar subquery's own bind errors: exit 1 where antb1 exited 4, DuckDB's first
-  error in each case. Decision 23's SQ4a rows are built: the row error exits 1, the one-row join's own check 70, a
-  scalar subquery of two columns 1 in any shape, and an uncorrelated EXISTS block's ungrouped select column 1, its
-  star's columns included.
+  is bound, not from the static check of its shape. A correlated EXISTS keeps its refusals and their messages through
+  a gate that runs once the block's FROM list is bound and before any other clause of it binds, so those clauses'
+  bind errors still never show; it asks every clause, grouping-set keys included, whether it reads an enclosing
+  column, a name that a written select alias has being that alias. A compound's arms all bind before a correlated arm
+  is refused. What the enclosing block binds before the subquery now comes first: its FROM list and inner ONs, the
+  WHERE conjuncts written before it, its select list (which binds before its WHERE), and its grouping for a HAVING
+  subquery; a conjunct written after it is never reached. A correlated scalar subquery's own bind errors come first
+  too. Each is exit 1 where antb1 exited 4; DuckDB, which answers these subqueries, binds WHERE before the select list,
+  so the first error each engine names can differ. Decision 23's SQ4a rows are built: the row error exits 1, the
+  one-row join's own check 70, a scalar subquery of two columns 1 in any shape, and an uncorrelated EXISTS block's
+  ungrouped select column 1, its star's columns included.
 - **Error visibility (decision 24).** `tests/slt/cases/subqueries/values.slt` pins D35 for the row error in both
-  engines: an IN written after the failing subquery, a contradiction pair, and a WHERE subquery under a HAVING IN. An
+  engines: an IN written after the failing subquery, a contradiction pair, a HAVING conjunct antb1 folds to false
+  (D14), whose filter ends the plan above the subquery's join, a `LIMIT 0` derived table in the block's FROM (which
+  DuckDB's optimizer also deletes), and a WHERE subquery under a HAVING IN; D35's text gains the two new cases. An
   uncorrelated EXISTS that is false empties no join, its count being a row, so it hides no error.
 - **Tests (decision 28).** The guards the table lists for SQ4a are lifted, and `setops/errors.slt`'s X6 records wait
   on SQ7 (IN) and SQ15 (a correlated arm). The generator's Feature `uncorrelated_value` draws from a stream of its

@@ -879,6 +879,19 @@ INTEGER
 statement error Overflow in addition
 SELECT id, v FROM (SELECT id, i32 + 2147483647 + 1 AS v FROM edge) AS d
 
+# Divergence D32: a query that aggregates without GROUP BY has one row, which antb1 never sorts, so it never computes
+# its ORDER BY keys; DuckDB computes them and fails.
+onlyif antb1
+query I nosort
+SELECT MAX(i32) FROM edge ORDER BY MAX(i32) + 1
+----
+INTEGER
+2147483647
+
+onlyif duckdb
+statement error Overflow in addition
+SELECT MAX(i32) FROM edge ORDER BY MAX(i32) + 1
+
 # Divergence D33: a constant antb1 does not fold, such as COALESCE(1, 2), is computed, so it moves nothing and the
 # addition overflows; DuckDB folds it first and answers.
 onlyif antb1

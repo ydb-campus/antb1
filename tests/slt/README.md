@@ -288,9 +288,10 @@ COUNT(*)` that holds or not, or an `INTERSECT` or `EXCEPT`, `ALL` or not, of two
 whose rows add up. So no generated query meets the row error, and since no block computes anything that can fail,
 none meets an error the order of its joins could hide (divergence D35). An `EXISTS` block may have any row count: a
 star, the column, the groups a `HAVING COUNT(*)` keeps, a `UNION [ALL]` or `EXCEPT` of the column with itself, or a
-value block. Every block names one table, reads only its columns, unqualified, and records no feature for its own
-clauses (they are `uncorrelated_value`'s), so the row-shape rules read the outer query alone; its aggregates record
-theirs, and wait for a select list that settles the query's row shape, as the uncorrelated form's do.
+value block. Every block names one table and reads only its columns, unqualified. Its `ORDER BY`, `LIMIT`, `OFFSET`,
+`GROUP BY` and `HAVING` record no feature of their own (they are `uncorrelated_value`'s), so the row-shape rules read
+the outer query alone; its aggregates and set operators record theirs, as in the outer grammar, and its aggregates
+wait for a select list that settles the query's row shape, as the uncorrelated form's do.
 
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave

@@ -2872,8 +2872,31 @@ void CheckOwnColumns(const sql::SelectStatement& block, const std::vector<GenTab
   }
 }
 
+// The row-shape rules over the recorded features (as QueriesRespectTheSemanticsBothEnginesShare
+// derives them): a value's block records none of its own clauses, and its aggregates only where
+// the select list settled the shape already, so the rules read the outer query alone.
+void CheckRowShape(const GeneratedQuery& q) {
+  const bool aggregate = std::ranges::any_of(
+      std::to_array({Feature::kCountStar, Feature::kCountColumn, Feature::kSum, Feature::kAvg,
+                     Feature::kMin, Feature::kMax, Feature::kCountDistinct, Feature::kVariance}),
+      [&](Feature f) { return q.features.Has(f); });
+  const bool rows = q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
+                    q.features.Has(Feature::kGroupBy) ||
+                    ((q.features.Has(Feature::kConstant) || q.features.Has(Feature::kArithmetic) ||
+                      q.features.Has(Feature::kStringFunctions) || q.features.Has(Feature::kCase) ||
+                      q.features.Has(Feature::kTimestamps)) &&
+                     !aggregate);
+  const bool ordered = q.features.Has(Feature::kOrderBy);
+  EXPECT_EQ(q.sort, rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort) << q.sql;
+  EXPECT_EQ(
+      q.unordered_limit,
+      rows && !ordered && (q.features.Has(Feature::kLimit) || q.features.Has(Feature::kOffset)))
+      << q.sql;
+}
+
 void CheckValue(const GeneratedQuery& q, const std::vector<GenTable>& tables, ValueCoverage& cov) {
   SCOPED_TRACE(q.sql);
+  CheckRowShape(q);
   const auto parsed = sql::Parse(q.sql);
   ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
   const sql::SelectStatement& stmt = *parsed;

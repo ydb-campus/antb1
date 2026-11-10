@@ -85,7 +85,7 @@ TEST(QueryGenOracle, DuckDbReadsEveryGeneratedJoinAndItsCanonicalFormAlike) {
                                         {.supported = kSupportedFeatures, .target_percent = 100});
   ASSERT_TRUE(gen.has_value()) << gen.error();
   int joins = 0;
-  int unions = 0;  // of them compounds (ADR 0036), always a nested block's query
+  int unions = 0;  // of them compounds (ADR 0036): a nested block's query or a subquery's
   for (uint64_t i = 0; joins < 1500 && i < 10'000; ++i) {
     const GeneratedQuery q = gen->Generate(i);
     if (!q.features.Has(Feature::kCommaJoin) && !q.features.Has(Feature::kJoinOn) &&

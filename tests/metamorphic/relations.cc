@@ -1975,20 +1975,21 @@ std::vector<Relation> AllRelations() {
                                     block))},
            .check = AllEqual()});
     }
-    // The single value and the EXISTS count are the same at any batch size, a part's rows and its
-    // first value merged in part order.
+    // The single value and the EXISTS count are the same at any batch size. The single value's
+    // one row lies somewhere among trips' parts and batches, which no scan filter can skip (a
+    // modulus), so the state counts the selected rows of every batch and keeps the one value.
     for (const auto& [name, sql] :
          {std::pair{"single_value",
-                    "SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT tr_fare FROM trips ORDER "
-                    "BY tr_fare DESC LIMIT 1 OFFSET 100)"},
+                    "SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT tr_fare FROM trips WHERE "
+                    "tr_row % 3000 = 2500)"},
           std::pair{"exists",
                     "SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT tr_rider FROM trips GROUP BY "
                     "tr_rider HAVING COUNT(*) > 30)"}}) {
-      r.push_back({.name = std::format("{}_batch_size_invariance", name),
-                   .features = SetWith(value, kDecimalColumns, kColumns, kOrderBy, kLimit, kOffset,
-                                       kGroupBy, kHaving),
-                   .probes = {Q(sql, 1), Q(sql, 7), Q(sql)},
-                   .check = AllEqual()});
+      r.push_back(
+          {.name = std::format("{}_batch_size_invariance", name),
+           .features = SetWith(value, kDecimalColumns, kColumns, kArithmetic, kGroupBy, kHaving),
+           .probes = {Q(sql, 1), Q(sql, 7), Q(sql)},
+           .check = AllEqual()});
     }
     // The self-check of ADR 0041's decision 28, which needs no DuckDB: a correlated subquery's
     // rows are those of the uncorrelated subquery with each binding of the outer table written as

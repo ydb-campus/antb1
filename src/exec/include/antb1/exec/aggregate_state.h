@@ -47,7 +47,7 @@ class AggregateState {
 
   // Adds the selected, non-NULL values of the argument column. selection: nullptr for every row;
   // otherwise a boolean array of values.length() where NULL counts as false. COUNT(*) counts the
-  // selected rows of `values`.
+  // selected rows of `values`, and SINGLE_VALUE every selected row, a NULL value too.
   virtual arrow::Status Consume(const arrow::Array& values,
                                 const arrow::BooleanArray* selection) = 0;
   // Adds rows without values; only COUNT(*) has no argument and accepts it.

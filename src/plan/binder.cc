@@ -2024,9 +2024,10 @@ struct ImplicitName {
   bool alias = false;  // a reference spelled otherwise: an alias
 };
 
-// Where a star of an EXISTS block stands, which ADR 0023 checks but does not expand: its first
-// column's position as DuckDB counts them (0-based, every such star at its full width), and its
-// width, which ORDER BY positions still count (PositionOf).
+// Where a star of an EXISTS block stands, which ADR 0023 checks but does not expand (but under a
+// DISTINCT, whose rows its columns are): its first column's position as DuckDB counts them
+// (0-based, every such star at its full width), and its width, which ORDER BY positions still
+// count (PositionOf).
 struct UnexpandedStar {
   std::size_t position = 0;
   std::size_t width = 0;
@@ -2847,18 +2848,20 @@ enum class Clause : std::uint8_t {
 // The clauses whose outer references ADR 0023 answers.
 bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == Clause::kInnerOn; }
 
-// Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
-// seen in the given visibility: the clause the subquery is written in (rule 10's for an ON).
-// A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
-// before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
 // The EXISTS conjunct a block is bound for: its operator, at which a refusal of the block points,
-// and whether it is a HAVING conjunct. Such a block's select list is checked but not expanded (ADR
-// 0023's Path 1 drops it, and so does ADR 0041's uncorrelated EXISTS), and when the block is
-// correlated it must be one Path 1 takes (Binder::GateCorrelatedExists).
+// and whether it is a HAVING conjunct. Such a block's select list is checked but its stars are not
+// expanded (ADR 0023's Path 1 drops the list, and so does ADR 0041's uncorrelated EXISTS, but
+// under a DISTINCT), and when the block is correlated it must be one Path 1 takes
+// (Binder::GateCorrelatedExists).
 struct ExistsConjunct {
   SourceSpan op_span;
   bool having = false;
 };
+
+// Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
+// seen in the given visibility: the clause the subquery is written in (rule 10's for an ON).
+// A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
+// before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
 // `exists` is null except for the block of an EXISTS conjunct.
 using BindBlockFn = std::function<arrow::Result<BoundBlock>(
     const sql::SelectStatement&, const Scope*, Visibility, const ExistsConjunct* exists)>;
@@ -2905,7 +2908,6 @@ class Binder {
       : stmt_(stmt),
         scope_(std::move(bindings), outer, outer_visible),
         outer_encloses_(outer_encloses),
-        inside_exists_(exists != nullptr),
         exists_(exists),
         ids_(ids),
         options_(options),
@@ -3844,14 +3846,23 @@ class Binder {
   // relations it reads (ADR 0023). A name a select alias of this block also has is that alias, as
   // in Resolve.
   [[nodiscard]] bool ReadsOuterColumn(const sql::Expr& expr, Visibility visible) const {
+    return ReadsOuterColumnWith(expr, visible, [this](std::string_view name) {
+      return FindAlias(select_, name).has_value();
+    });
+  }
+  // ReadsOuterColumn, with `is_alias` telling whether an unqualified name is a select alias of this
+  // block: the bound list's, or before the list binds its written aliases (GateCorrelatedExists).
+  template <class IsAlias>
+  [[nodiscard]] bool ReadsOuterColumnWith(const sql::Expr& expr, Visibility visible,
+                                          const IsAlias& is_alias) const {
     if (!outer_encloses_) {
       return false;  // a lateral reference is refused where it resolves, never routed
     }
     std::vector<const sql::ColumnRef*> refs;
     CollectRefs(expr, refs);
-    return std::ranges::any_of(refs, [this, visible](const sql::ColumnRef* ref) {
+    return std::ranges::any_of(refs, [&](const sql::ColumnRef* ref) {
       return scope_.LookUp(*ref, visible).outcome == Lookup::Outcome::kMissing &&
-             !(ref->qualifier.empty() && FindAlias(select_, ref->name).has_value()) &&
+             !(ref->qualifier.empty() && is_alias(ref->name)) &&
              scope_.LookUpOuter(*ref).has_value();
     });
   }
@@ -3879,13 +3890,13 @@ class Binder {
   }
 
   // The block of a correlated EXISTS must be one ADR 0023's Path 1 takes, a plain FROM and WHERE
-  // (ADR 0041's decision 23 keeps that until SQ8): before any clause of the block binds, so that
-  // its error is this refusal and not a bind error of a clause the unnesting could not answer
-  // anyway, every clause that would have to act per binding is refused at the EXISTS, as is a
-  // correlated EXISTS in HAVING. An uncorrelated EXISTS reads any block (decision 5). "Correlated"
-  // asks every clause of the block whether it reads an enclosing column, before the select list
-  // binds, so no select alias stands for a name yet: a name both an alias and an enclosing column
-  // counts as the enclosing column, which can only keep a refusal ADR 0023 gave.
+  // (ADR 0041's decision 23 keeps that until SQ8): before any clause of the block binds (its FROM
+  // list is bound already, by BindBlock), so that its error is this refusal and not a bind error
+  // of a clause the unnesting could not answer anyway, every clause that would have to act per
+  // binding is refused at the EXISTS, as is a correlated EXISTS in HAVING. An uncorrelated EXISTS
+  // reads any block (decision 5). "Correlated" asks every clause of the block, grouping-set keys
+  // included, whether it reads an enclosing column (ReadsOuterColumn) before the select list
+  // binds, so a name that a written select alias has is that alias, as Resolve takes it later.
   [[nodiscard]] arrow::Status GateCorrelatedExists() const;
 
   // One WHERE conjunct of this block that reads an outer column: bound as a condition over the
@@ -3909,13 +3920,14 @@ class Binder {
   // subquery expression's block has. A derived table's and a CTE's enclosing scope is a sibling or
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
-  // The block of an EXISTS conjunct. ADR 0023's Path 1 drops its select list, so a star here, `*`
-  // or `t.*`, is checked by name (ADR 0022's rule 5, or its one FROM item) and then neither
-  // expanded into columns nor type-checked: a table with a column antb1 cannot read still works
-  // inside EXISTS, as it does in DuckDB. The other select items bind as usual.
-  bool inside_exists_ = false;
-  const ExistsConjunct* exists_ = nullptr;  // the EXISTS conjunct this block is bound for, if any
-  bool in_correlated_ = false;              // a correlated conjunct is binding: see InputColumn
+  bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
+  // The EXISTS conjunct this block is bound for, if any. ADR 0023's Path 1 and ADR 0041's
+  // uncorrelated EXISTS drop its select list, so a star here, `*` or `t.*`, is checked by name (ADR
+  // 0022's rule 5, or its one FROM item) and against the block's grouping (CheckGrouped), but
+  // neither expanded into columns nor type-checked, except under a DISTINCT: a table with a column
+  // antb1 cannot read still works inside EXISTS, as it does in DuckDB. The other select items bind
+  // as usual.
+  const ExistsConjunct* exists_ = nullptr;
   ColumnIdSource& ids_;
   const BindOptions& options_;  // one per query, and the caller outlives the binder
   const BindBlockFn* bind_block_ = nullptr;
@@ -4074,10 +4086,14 @@ arrow::Status Binder::BindSelectList() {
     const sql::SelectItem& item = stmt_.items[i];
     if (const sql::SelectStar* star = item.star()) {
       const auto [first, last] = expands[i];
-      if (inside_exists_) {
-        // Checked, not expanded (ADR 0023): the semi or anti join reads none of these columns, and
-        // the expansion below is where a column's engine type is checked. ORDER BY positions still
-        // count its columns (PositionOf).
+      if (exists_ != nullptr && !stmt_.distinct) {
+        // Checked, not expanded (ADR 0023, ADR 0041's decision 5): neither the semi or anti join
+        // nor the count of an uncorrelated EXISTS reads these columns, and the expansion below is
+        // where a column's engine type is checked. GROUP BY and ORDER BY positions still count its
+        // columns (PositionOf), and the grouping checks read them (CheckGrouped). A DISTINCT's list
+        // is its rows, which an uncorrelated EXISTS counts (WithoutSelectList keeps it), so its
+        // stars expand as any block's do; a correlated EXISTS over a DISTINCT is refused before
+        // this (GateCorrelatedExists).
         UnexpandedStar unexpanded_star{.position = list.items.size() + unexpanded,
                                        .width = 0,
                                        .ids = {},
@@ -6121,10 +6137,11 @@ BoundColumn Binder::SubqueryColumn(SubqueryJoin& join, const Typed& t) {
 bool ExactlyOneRow(const LogicalNode& node);
 
 // The plan of an EXISTS block without its select list, as DuckDB plans an EXISTS: the Projects
-// among the Limits and Sorts at the top of the plan go, so a select item that nothing else reads is
-// never computed, under a LIMIT too, while the rows stay those the block returns. Its ORDER BY
-// stays, whose keys DuckDB computes as well (a top-N under the EXISTS's LIMIT 1). A Project under a
-// Sort that reads it -- a DISTINCT's, whose Sort reads its keys -- stays with everything below it.
+// among the Limits and Sorts at the top of the plan go, so a select item that is no aggregate and
+// that nothing else reads is never computed, under a LIMIT too, while the rows stay those the block
+// returns (its aggregates stay: divergence D32). Its ORDER BY stays, whose keys DuckDB computes as
+// well (a top-N under the EXISTS's LIMIT 1). A Project under a Sort that reads it -- a DISTINCT's,
+// whose Sort reads its keys -- stays with everything below it.
 LogicalNodePtr WithoutSelectList(const LogicalNodePtr& node, bool under_sort = false) {
   if (const auto* project = std::get_if<ProjectNode>(node.get());
       project != nullptr && !under_sort) {
@@ -7379,21 +7396,34 @@ arrow::Status Binder::GateCorrelatedExists() const {
   if (exists_ == nullptr) {
     return arrow::Status::OK();
   }
-  const auto reads = [this](const std::vector<sql::Expr>& exprs, Visibility visible) {
-    return std::ranges::any_of(exprs,
-                               [&](const sql::Expr& e) { return ReadsOuterColumn(e, visible); });
+  // The select list is not bound yet, so a name that a written alias has is that alias, as Resolve
+  // takes it once the list is bound.
+  const auto written_alias = [this](std::string_view name) {
+    const std::string wanted = AsciiLower(name);
+    return std::ranges::any_of(stmt_.items, [&wanted](const sql::SelectItem& item) {
+      return item.alias.has_value() && AsciiLower(*item.alias) == wanted;
+    });
   };
-  bool correlated = reads(stmt_.where, Visibility{}) || reads(stmt_.group_by, Visibility{}) ||
-                    reads(stmt_.having, Visibility{});
+  const auto reads = [&](const sql::Expr& e, Visibility visible) {
+    return ReadsOuterColumnWith(e, visible, written_alias);
+  };
+  const auto any_reads = [&](const std::vector<sql::Expr>& exprs, Visibility visible) {
+    return std::ranges::any_of(exprs, [&](const sql::Expr& e) { return reads(e, visible); });
+  };
+  bool correlated = any_reads(stmt_.where, Visibility{}) ||
+                    any_reads(stmt_.group_by, Visibility{}) ||
+                    any_reads(stmt_.having, Visibility{});
+  for (const sql::Expr* key : sql::GroupingExprs(stmt_.grouping)) {
+    correlated = correlated || reads(*key, Visibility{});  // ROLLUP, CUBE, GROUPING SETS keys
+  }
   for (std::size_t i = 0; i < stmt_.from.size() && !correlated; ++i) {
-    correlated = reads(stmt_.from[i].on, OnVisibility(stmt_.from, i));
+    correlated = any_reads(stmt_.from[i].on, OnVisibility(stmt_.from, i));
   }
   for (const sql::SelectItem& item : stmt_.items) {
-    correlated =
-        correlated || (item.expr() != nullptr && ReadsOuterColumn(*item.expr(), Visibility{}));
+    correlated = correlated || (item.expr() != nullptr && reads(*item.expr(), Visibility{}));
   }
   for (const sql::OrderItem& item : stmt_.order_by) {
-    correlated = correlated || ReadsOuterColumn(item.expr, Visibility{});
+    correlated = correlated || reads(item.expr, Visibility{});
   }
   if (!correlated) {
     return arrow::Status::OK();
@@ -8007,17 +8037,8 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
   return stmt;
 }
 
-// The FROM list the binder answers: tables and paths, joined by commas, CROSS JOIN or JOIN ... ON,
-// each with an alias or without. What it does not answer parses (ADR 0022) and is answered from J4
-// and J6 on. The relation limit comes first, like the parser's depth limit, since every walk of a
-// plan is recursive per node; then each item in query order, where its connector precedes its
-// source, which precedes its ON.
-// A conjunct list of a clause that answers subquery conjuncts: WHERE, an inner join's ON and
-// HAVING. Each top-level conjunct in written order, a subquery form by its own rule and everything
-// else by RejectCondition's -- which is where every other placement of a subquery keeps the
-// refusal FirstUnsupportedOf gives it, an OR branch included, since Conjuncts flattens AND alone.
-// The conjuncts are the binder's own (plan::Conjuncts, and FactorSharedConjuncts over it), so what
-// this accepts is what the binder intercepts.
+// One top-level conjunct of CheckConjuncts: a subquery form by its own rule, anything else by
+// RejectCondition's.
 arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
   if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct)) {
     if (auto r = RejectSubqueryConjunct(*form, having)) {
@@ -8031,6 +8052,12 @@ arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
   return arrow::Status::OK();
 }
 
+// A conjunct list of a clause that answers subquery conjuncts: WHERE, an inner join's ON and
+// HAVING. Each top-level conjunct in written order, a subquery form by its own rule and everything
+// else by RejectCondition's -- which is where every other placement of a subquery keeps the
+// refusal FirstUnsupportedOf gives it, an OR branch included, since Conjuncts flattens AND alone.
+// The conjuncts are the binder's own (plan::Conjuncts, and FactorSharedConjuncts over it), so what
+// this accepts is what the binder intercepts.
 arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool having) {
   for (const sql::Expr* conjunct : Conjuncts(predicate)) {
     // A BETWEEN with a subquery bound is checked as its two comparisons, as the binder binds it.
@@ -8045,6 +8072,11 @@ arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool havin
   return arrow::Status::OK();
 }
 
+// The FROM list the binder answers: tables and paths, joined by commas, CROSS JOIN or JOIN ... ON,
+// each with an alias or without. What it does not answer parses (ADR 0022) and is answered from J4
+// and J6 on. The relation limit comes first, like the parser's depth limit, since every walk of a
+// plan is recursive per node; then each item in query order, where its connector precedes its
+// source, which precedes its ON.
 arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
   // The parser makes no block without a FROM item; a compound has none of its own, and CheckBlock
   // never passes one here.

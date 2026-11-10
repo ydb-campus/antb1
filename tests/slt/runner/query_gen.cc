@@ -733,8 +733,9 @@ constexpr unsigned kSubqueryPercent = 25;
 // Share of the queries with a usable probe and neither subquery conjunct that take an uncorrelated
 // value of any shape (ADR 0041's SQ4a).
 constexpr unsigned kValuePercent = 30;
-// Salt of the random stream which every draw that only an uncorrelated value needs takes, so that a
-// query without one is the query this seed generated before the SQ4a PR.
+// Salt of the random stream which every draw of an uncorrelated value's own shape takes, so that a
+// query without one is the query this seed generated before the SQ4a PR. Its probe is a column
+// like any other, qualified by the join stream's draw (Column).
 constexpr uint64_t kValueStreamSalt = 0x76616C75652D726EULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
@@ -3021,8 +3022,10 @@ class Builder {
   //   - MIN or MAX under a HAVING COUNT(*) that holds or not: one row or none;
   //   - an INTERSECT or EXCEPT, ALL or not, of two such aggregates without HAVING, one row each --
   //     never a UNION, whose rows add up.
-  // Its clauses record no feature of their own: they are kUncorrelatedValue's. A shape that the
-  // allowed features rule out is the first value instead, with no draw of its own.
+  // Its ORDER BY, LIMIT, OFFSET, GROUP BY and HAVING record no feature of their own: they are
+  // kUncorrelatedValue's. Its aggregates and its set operator record theirs, as in the outer
+  // grammar (every compound kUnionAll). A shape that the allowed features rule out is the first
+  // value instead, with no draw of its own.
   void ValueBody(const SubqueryCandidate& c) {
     const GenColumn& column = *c.column;
     uint64_t shape = value_rng_.Below(6);

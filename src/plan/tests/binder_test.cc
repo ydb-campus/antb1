@@ -1176,6 +1176,20 @@ INSTANTIATE_TEST_SUITE_P(
                   "column 's' must appear in the GROUP BY clause"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT *, COUNT(*) FROM u)", kBind, "*",
                   "column 'i16' must be inside an aggregate function"},
+        // A GROUP BY position that falls in such a star exits 4, as an ORDER BY one does.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT * FROM ok GROUP BY 1, 2)", kUnsupported,
+                  "1", "GROUP BY position 1 over a '*' of an EXISTS subquery is not supported"},
+        // What binds before the gate: the EXISTS block's FROM list, and the enclosing conjuncts
+        // written before the EXISTS; a later conjunct's bind error comes after its refusal.
+        ErrorCase{
+            "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM nope WHERE nope.x = t.i16 LIMIT 1)",
+            kBind, "nope", "table 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE nope = 1 AND EXISTS (SELECT 1 FROM u WHERE u.i16 = "
+                  "t.i16 LIMIT 1)",
+                  kBind, "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 LIMIT 1) "
+                  "AND nope = 1",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
         // A DOUBLE has no join key, by decision (ADR 0022), and a DECIMAL(38,0) with a
         // DECIMAL(38,10) would need 48 digits: a semi join needs one type for its key, so neither
         // exits past 4.
@@ -1246,6 +1260,18 @@ INSTANTIATE_TEST_SUITE_P(
                   "t.i64 IN (SELECT ok.i16 FROM ok))",
                   kUnsupported, "IN",
                   "a subquery whose conjunct also reads a column of an enclosing query block"},
+        // A BETWEEN with a subquery bound keeps both placement rules of a subquery conjunct, at its
+        // first subquery (ADR 0041's SQ4a): an operand that reads an enclosing block's column...
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 "
+                  "BETWEEN (SELECT MIN(ok.i16) FROM ok) AND 100)",
+                  kUnsupported, "(",
+                  "a subquery whose conjunct also reads a column of an enclosing query block"},
+        // ... and an inner ON inside a FULL JOIN's left input, which the FULL JOIN pads.
+        ErrorCase{
+            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 BETWEEN 1 AND (SELECT "
+            "MAX(dec.i) FROM dec) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "(",
+            "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
         // A name this block has twice keeps its own bind error: an enclosing block that happens to
         // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
         // binds, make it read the outer column).
@@ -2921,6 +2947,20 @@ TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
     ASSERT_FALSE(bound.ok()) << rollup;
     EXPECT_EQ(bound.status().message(), expected.status().message()) << rollup;
     EXPECT_EQ(SpanText(rollup, bound.status()), SpanText(plain, expected.status())) << rollup;
+  }
+  // Correlated through the grouping keys alone, every spelling of them is correlated alike: the
+  // gate reads a grouping set's keys as it reads a GROUP BY list's.
+  for (const std::string_view keys :
+       {"t.i32", "ROLLUP (t.i32)", "CUBE (t.i32)", "GROUPING SETS ((t.i32), ())"}) {
+    const std::string sql =
+        std::vformat("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 > 0 GROUP BY {})",
+                     std::make_format_args(keys));
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    EXPECT_TRUE(bound.status().message().starts_with(
+        "EXISTS over a subquery with GROUP BY is not supported"))
+        << sql << ": " << bound.status().message();
+    EXPECT_EQ(SpanText(sql, bound.status()), "EXISTS") << sql;
   }
   // Uncorrelated, any block is answered (ADR 0041's SQ4a), a grouping set's as a GROUP BY's.
   for (const std::string_view outer : {
@@ -6640,6 +6680,32 @@ TEST(BinderTest, AnUncorrelatedScalarSubqueryOfAnyShapeIsItsSingleValue) {
             "          Scan table=u source=fake columns=[i32]\n");
 }
 
+// An uncorrelated EXISTS whose block names a select alias that an enclosing column shares, in its
+// ORDER BY, GROUP BY or HAVING, is answered: the name is the alias, as the block's binder and
+// DuckDB take it, so the gate does not count it as an enclosing column.
+TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok ORDER BY i32 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32)",
+           "SELECT i16 FROM t WHERE NOT EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING i32 > "
+           "'a')",
+           "SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT s AS i32 FROM ok ORDER "
+           "BY i32 LIMIT 1)",
+       }) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    EXPECT_TRUE(FreeVariables(*bound->root).empty()) << sql;
+  }
+  // A name only the enclosing block has stays an enclosing column: correlated, and refused.
+  const auto correlated =
+      BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)", catalog);
+  ASSERT_FALSE(correlated.ok());
+  EXPECT_TRUE(correlated.status().message().starts_with(
+      "EXISTS over a subquery with LIMIT is not supported"))
+      << correlated.status().message();
+}
+
 // The single value keeps its column's FLOAT flag (divergence D11): a literal it is compared with
 // folds at FLOAT precision, and another column is refused, as next to the column itself.
 TEST(BinderTest, TheSingleValueOfAFloatColumnIsAFloat) {
@@ -6715,6 +6781,27 @@ TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
             "            Sort i32 ASC NULLS LAST\n"
             "              Scan table=u source=fake columns=[i32]\n");
   // Under a DISTINCT the select list is the rows: it stays, and so does the Project its Sort reads.
+  // A DISTINCT star expands, its columns being the rows: over every column of `ok`, and a column of
+  // no engine type is then refused, as in any select list.
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT * FROM ok OFFSET 1)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Limit ALL OFFSET 1\n"
+            "            GroupAggregate keys=[i16, s]\n"
+            "              Project i16, s\n"
+            "                Scan table=ok source=fake columns=[i16, s]\n");
+  {
+    const auto refused =
+        BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT * FROM u)", catalog);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_TRUE(refused.status().IsNotImplemented()) << refused.status().ToString();
+    EXPECT_TRUE(BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT * FROM u)", catalog).ok());
+  }
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT i32 + 1 AS x FROM u ORDER "
                       "BY x)"),
             "Output: i16:SMALLINT\n"

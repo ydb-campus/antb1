@@ -115,9 +115,10 @@ BIGINT
 statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MIN(zn_id) FROM zones GROUP BY zn_city)
 
-# ORDER BY with LIMIT 1, with an OFFSET, an OFFSET past the end, and LIMIT 0; LIMIT 2 is two rows.
+# ORDER BY with LIMIT 1 (a key that ends with a unique column: zones tie on zn_radius), with an OFFSET, an OFFSET
+# past the end, and LIMIT 0; LIMIT 2 is two rows.
 query I nosort
-SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC LIMIT 1)
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC, zn_id LIMIT 1)
 ----
 BIGINT
 70
@@ -433,6 +434,34 @@ SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND ct_id = (SELECT zn
 onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND ct_id = (SELECT zn_city FROM zones)
+----
+BIGINT
+0
+
+# A HAVING conjunct antb1 folds to false (a literal outside its operand's type, D14) ends the plan above the subquery's
+# join, which never builds: its error is never reported, where DuckDB computes the comparison and fails. Over a scan
+# the builds come first, and both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 40000 AND ct_id > (SELECT zn_city FROM zones)
+
+# A LIMIT 0 derived table among the block's FROM items: DuckDB's optimizer removes the block's plan; antb1 fails.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips, (SELECT ct_id FROM cities LIMIT 0) AS c WHERE tr_row = (SELECT zn_id FROM zones)
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips, (SELECT ct_id FROM cities LIMIT 0) AS c WHERE tr_row = (SELECT zn_id FROM zones)
 ----
 BIGINT
 0

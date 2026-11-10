@@ -556,7 +556,7 @@ antb1_add_cli_golden(
     --threads
     1
     -c
-    "SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC LIMIT 1)"
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC, zn_id LIMIT 1)"
     --table
     "trips=${_f}/star/trips.parquet"
     --table
