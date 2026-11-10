@@ -6680,14 +6680,17 @@ TEST(BinderTest, AnUncorrelatedScalarSubqueryOfAnyShapeIsItsSingleValue) {
             "          Scan table=u source=fake columns=[i32]\n");
 }
 
-// An uncorrelated EXISTS whose block names a select alias that an enclosing column shares, in its
-// ORDER BY, GROUP BY or HAVING, is answered: the name is the alias, as the block's binder and
-// DuckDB take it, so the gate does not count it as an enclosing column.
+// The correlated-EXISTS gate reads a name that a select alias of the block and a column of the
+// enclosing block share as DuckDB reads it: the alias in ORDER BY, HAVING, a bare GROUP BY key,
+// WHERE and the select list, outside the argument of an aggregate or of GROUPING(); the enclosing
+// column in an ON, a GROUP BY expression and such an argument.
 TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
   const Catalog catalog = MakeCatalog();
+  // The alias, where the block's binder takes it too: an uncorrelated EXISTS, answered.
   for (const char* sql : {
            "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok ORDER BY i32 LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY ROLLUP (i32))",
            "SELECT i16 FROM t WHERE NOT EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING i32 > "
            "'a')",
            "SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT s AS i32 FROM ok ORDER "
@@ -6697,17 +6700,29 @@ TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
     EXPECT_TRUE(FreeVariables(*bound->root).empty()) << sql;
   }
-  // A name only the enclosing block has stays an enclosing column, and so does an alias's name
-  // where the binder takes no alias -- WHERE, an ON, an aggregate's argument -- as DuckDB reads it
-  // there: correlated, and refused at the EXISTS.
+  // The alias where the block's binder takes none: its bind error, as for a name that is neither
+  // a column nor the alias of an item before it (DuckDB fails in the select list, and answers in
+  // WHERE, where it takes the alias), never the gate's refusal of a correlated block.
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok WHERE ok.i16 = i32 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i32 + 1, s AS i32 FROM ok LIMIT 1)",
+       }) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    EXPECT_TRUE(bound.status().IsInvalid()) << sql << ": " << bound.status();
+  }
+  // A name only the enclosing block has stays an enclosing column, and so does an alias's name in
+  // an ON, a GROUP BY expression and the argument of an aggregate or of GROUPING(): correlated, and
+  // refused at the EXISTS.
   for (const char* sql : {
            "SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok WHERE ok.i16 = i32 LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT ok.s AS i64 FROM ok JOIN dec ON dec.b = i64 "
            "LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING MAX(i32) > 0 "
            "LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32 + 1, s LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY ROLLUP (s) HAVING "
+           "GROUPING(i32) = 0)",
        }) {
     const auto correlated = BindSql(sql, catalog);
     ASSERT_FALSE(correlated.ok()) << sql;

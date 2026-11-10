@@ -814,7 +814,7 @@ statement error
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT *, COUNT(*) FROM zones)
 
 # A derived table right under the dropped select list loses its select list too, as in DuckDB. Under the block's WHERE
-# it keeps it, so antb1 computes its unread item (divergence D32).
+# (or anything but a LIMIT or an OFFSET) it keeps it, so antb1 computes its unread item (divergence D32).
 query I nosort
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM (SELECT id, i32 + 2147483647 + 1 AS v FROM edge) AS d)
 ----

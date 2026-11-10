@@ -909,8 +909,11 @@ bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
 
 void CollectRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out);
 
+bool IsGroupingCall(const sql::FunctionCall& call);
+
 // Every column reference of an expression, in query order; nothing is resolved or bound. With
-// `aggregate_args_only`, only those inside an aggregate call's argument.
+// `aggregate_args_only`, only those inside the argument of an aggregate call or of GROUPING(),
+// which DuckDB reads in the block's scope and never as a select alias.
 struct CollectRefsOf {
   std::vector<const sql::ColumnRef*>& out;
   bool aggregate_args_only = false;
@@ -957,7 +960,11 @@ struct CollectRefsOf {
   }
   void operator()(const sql::FunctionCall& call) const {
     for (const sql::Expr& arg : call.args) {
-      Recurse(arg);
+      if (aggregate_args_only && IsGroupingCall(call)) {
+        CollectRefs(arg, out);  // every reference of the argument, as an aggregate's
+      } else {
+        Recurse(arg);
+      }
     }
   }
   void operator()(const sql::CaseExpr& c) const {
@@ -986,7 +993,7 @@ void CollectRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out)
   std::visit(CollectRefsOf{.out = out}, static_cast<const sql::ExprNode&>(expr));
 }
 
-// The column references inside the arguments of an expression's aggregate calls.
+// The column references inside the arguments of an expression's aggregate and GROUPING() calls.
 void CollectAggregateArgRefs(const sql::Expr& expr, std::vector<const sql::ColumnRef*>& out) {
   std::visit(CollectRefsOf{.out = out, .aggregate_args_only = true},
              static_cast<const sql::ExprNode&>(expr));
@@ -3912,7 +3919,7 @@ class Binder {
   // binding is refused at the EXISTS, as is a correlated EXISTS in HAVING. An uncorrelated EXISTS
   // reads any block (decision 5). "Correlated" asks every clause of the block, grouping-set keys
   // included, whether it reads an enclosing column (ReadsOuterColumn) before the select list
-  // binds, so it reads a written select alias as the alias only where the binder will.
+  // binds, so it reads a name that a written select alias has as DuckDB reads it there.
   [[nodiscard]] arrow::Status GateCorrelatedExists() const;
 
   // One WHERE conjunct of this block that reads an outer column: bound as a condition over the
@@ -7412,11 +7419,13 @@ arrow::Status Binder::GateCorrelatedExists() const {
   if (exists_ == nullptr) {
     return arrow::Status::OK();
   }
-  // The select list is not bound yet, so the gate tells a written alias from an enclosing column
-  // where the binder will: a bare GROUP BY key (a grouping set's too) and a name of HAVING or ORDER
-  // BY outside an aggregate's argument are the alias (Resolve, AliasFallback). Anywhere else --
-  // WHERE, an ON, a select item, a GROUP BY expression, an aggregate's argument -- the name is the
-  // enclosing column, as DuckDB reads it there (the block's binder would make it a bind error).
+  // The select list is not bound yet, so the gate reads a name that a written select alias has as
+  // DuckDB reads it: the alias in WHERE, the select list, HAVING and ORDER BY outside the argument
+  // of an aggregate or of GROUPING(), and as a bare GROUP BY key (a grouping set's too); the
+  // enclosing column in an ON, a GROUP BY expression and such an argument. Where the gate takes the
+  // alias, the block's binder takes it too (HAVING, ORDER BY, a bare key: Resolve, AliasFallback)
+  // or makes the name a bind error (WHERE and the select list, where DuckDB answers with the alias
+  // or, before the alias's item, fails too).
   const auto written_alias = [this](const sql::ColumnRef& ref) {
     const std::string wanted = AsciiLower(ref.name);
     return std::ranges::any_of(stmt_.items, [&wanted](const sql::SelectItem& item) {
@@ -7432,17 +7441,16 @@ arrow::Status Binder::GateCorrelatedExists() const {
     return bare != nullptr ? ReadsOuterColumnWith(key, Visibility{}, written_alias)
                            : reads(key, Visibility{});
   };
-  const auto reads_output = [&](const sql::Expr& e) {
+  const auto reads_aliased = [&](const sql::Expr& e) {
     std::vector<const sql::ColumnRef*> in_aggregates;
     CollectAggregateArgRefs(e, in_aggregates);
     return ReadsOuterColumnWith(e, Visibility{}, [&](const sql::ColumnRef& ref) {
       return written_alias(ref) && !std::ranges::contains(in_aggregates, &ref);
     });
   };
-  bool correlated = std::ranges::any_of(
-                        stmt_.where, [&](const sql::Expr& e) { return reads(e, Visibility{}); }) ||
+  bool correlated = std::ranges::any_of(stmt_.where, reads_aliased) ||
                     std::ranges::any_of(stmt_.group_by, reads_key) ||
-                    std::ranges::any_of(stmt_.having, reads_output);
+                    std::ranges::any_of(stmt_.having, reads_aliased);
   for (const sql::Expr* key : sql::GroupingExprs(stmt_.grouping)) {
     correlated = correlated || reads_key(*key);  // ROLLUP, CUBE, GROUPING SETS keys
   }
@@ -7452,10 +7460,10 @@ arrow::Status Binder::GateCorrelatedExists() const {
         std::ranges::any_of(stmt_.from[i].on, [&](const sql::Expr& e) { return reads(e, on); });
   }
   for (const sql::SelectItem& item : stmt_.items) {
-    correlated = correlated || (item.expr() != nullptr && reads(*item.expr(), Visibility{}));
+    correlated = correlated || (item.expr() != nullptr && reads_aliased(*item.expr()));
   }
   for (const sql::OrderItem& item : stmt_.order_by) {
-    correlated = correlated || reads_output(item.expr);
+    correlated = correlated || reads_aliased(item.expr);
   }
   if (!correlated) {
     return arrow::Status::OK();
