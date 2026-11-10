@@ -4396,6 +4396,30 @@ TEST(BinderTest, AFullJoinKeepsOneSidedConditionsAtTheJoin) {
   }
 }
 
+// A key over an outer join unit's padded side, for a later join or a WHERE equality, is computed
+// above the unit, not on its relation's branch below the padding: a padded row's side is then
+// what the expression makes of its NULLs (COALESCE(u.i16, 1) is 1), as in DuckDB.
+TEST(BinderTest, AKeyOverAPaddedSideIsComputedAboveTheUnit) {
+  const Catalog catalog = MakeCatalog();
+  for (
+      const std::string_view sql : {
+          "SELECT t.i16 FROM t LEFT JOIN u ON t.i16 = u.i16 JOIN ok ON ok.i16 = COALESCE(u.i16, 1)",
+          "SELECT t.i16 FROM t LEFT JOIN u ON t.i16 = u.i16, ok WHERE COALESCE(u.i16, 1) = ok.i16",
+          "SELECT t.i16 FROM t FULL JOIN u ON t.i16 = u.i16 JOIN ok ON ok.i16 = COALESCE(t.i16, 1)",
+      }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    // EXPLAIN writes a node before its inputs: the key's Compute comes before the unit's join.
+    const std::string text = Explain(*plan);
+    const std::size_t key = text.find("Compute COALESCE(");
+    const std::size_t unit = text.find(sql.contains("FULL") ? "Join FULL" : "Join LEFT");
+    ASSERT_NE(key, std::string::npos) << sql << "\n" << text;
+    ASSERT_NE(unit, std::string::npos) << sql << "\n" << text;
+    EXPECT_LT(key, unit) << sql << "\n" << text;
+  }
+}
+
 TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
   const Catalog catalog = MakeCatalog();
   // Every join of a plan, both inputs of each, however deeply nested.

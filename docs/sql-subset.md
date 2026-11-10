@@ -308,13 +308,14 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   each a sub-plan of its own. A `LEFT JOIN` is one fixed unit: it is never reordered, its `ON` reads its own two inputs
   only, an `ON` conjunct over the right input alone filters that input, and every other one is a residual of the join —
   including one that reads only the preserved side, since a left row that fails it is padded and not dropped. A `WHERE`
-  conjunct over the null-supplying side stays above the join. An equality is a key only when each of its sides reads one
-  relation of one input, since a side that is an expression is computed on that relation's own branch; a side over two
-  of them is a residual, as in an inner `ON`; `IS NOT DISTINCT FROM` is a key on the same terms, a NULL-equal one, on
-  which a NULL matches a NULL ([ADR 0037](adr/0037-tpcds-roadmap.md)'s OJ5b). A `LEFT JOIN` with no equality key
-  between its two inputs is a nested loop
-  (ADR 0040's OJ4c): every `ON` conjunct over both inputs a residual, and rule 11 as with a key. A `FULL JOIN` (ADR
-  0037's OJ3) is such a unit too, which pads both inputs: an `ON` conjunct over either input alone is a residual, since
+  conjunct over the null-supplying side stays above the join, and so does an expression over it that keys a later join
+  or a `WHERE` equality: `COALESCE(z.x, 1)` keys a padded row on 1, as in DuckDB. An equality is a key only when each
+  of its sides reads one relation of one input, since a side that is an expression is computed on that relation's own
+  branch; a side over two of them is a residual, as in an inner `ON`; `IS NOT DISTINCT FROM` is a key on the same
+  terms, a NULL-equal one, on which a NULL matches a NULL ([ADR 0037](adr/0037-tpcds-roadmap.md)'s OJ5b). A
+  `LEFT JOIN` with no equality key between its two inputs is a nested loop (ADR 0040's OJ4c): every `ON` conjunct over
+  both inputs a residual, and rule 11 as with a key. A `FULL JOIN` (ADR 0037's OJ3) is such a unit too, which pads both
+  inputs: an `ON` conjunct over either input alone is a residual, since
   a row of either that fails it is padded and not dropped; a `WHERE` conjunct over either input stays above the join;
   the `ON` of an inner join before it in FROM order still binds inside its left input, which that join is part of, while
   a `WHERE` equality there is no key of that input (`FROM a CROSS JOIN b FULL JOIN c ON ... WHERE a.k = b.k` crosses `a`
@@ -959,7 +960,8 @@ EXPLAIN prints its formula with the tree's precedence (`SetOperation inputs=3 fo
 columns=[a]`). A query produces inner `Join`s: the binder factors each element of `WHERE` and of an inner `ON` (below,
 below) and sends every conjunct that leaves it to the relations it reads, so one relation's conjuncts filter that
 relation's own branch, a cross-relation equality whose two sides share one key type is a key of their join (each side
-cast to that type on its own branch, an exact widening, and an equality spelled twice is one key), and anything else
+cast to that type on its own branch, an exact widening, or above the outer join that pads it, where a padded row's side
+is what the expression makes of its NULLs; and an equality spelled twice is one key), and anything else
 over two or more relations is the residual of the first join that has all of them. A join graph no key connects is a
 cross product ([ADR 0040](adr/0040-nested-loop-joins.md)). A relation of exactly one row, a derived table or a CTE
 reference whose query is an aggregate without `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, that no key, no residual and no
