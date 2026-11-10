@@ -743,7 +743,8 @@ SMALLINT
 5
 6
 
-# IS NULL of a FLOAT value and of edge.s, a binary column both engines read as VARCHAR: a row with a value, and a NULL row.
+# IS NULL of a FLOAT value and of edge.s, a binary column both engines read as VARCHAR: a row with a value, and a
+# NULL row.
 query I nosort
 SELECT ct_id FROM cities WHERE (SELECT f FROM floats WHERE id = 2) IS NULL OR ct_id = 1 ORDER BY ct_id
 ----
@@ -1147,6 +1148,20 @@ BIGINT	BIGINT	BIGINT
 statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT zn_city FROM zones WHERE zn_id < 3) + 0 FULL JOIN drivers ON tr_driver = dv_id
 
+# The inner ON's conjunct zn_city < (SELECT MIN(ct_id) + 2 FROM cities) moved to WHERE filters above the FULL JOIN, so
+# the drivers it pads go too; with 3, the value, in its place the inner ON keeps what the value keeps.
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id FULL JOIN drivers d ON t.tr_driver = d.dv_id WHERE z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities)
+----
+BIGINT	BIGINT	BIGINT
+1118	1118	959
+
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < 3 FULL JOIN drivers d ON t.tr_driver = d.dv_id
+----
+BIGINT	BIGINT	BIGINT
+1126	1118	966
+
 # ---- IN, NOT IN and EXISTS in an inner ON inside a FULL JOIN's left input ----
 
 # IN over one row and over none; NOT IN over rows, over rows with a NULL (never true: every city padded) and over
@@ -1442,7 +1457,7 @@ statement error Overflow in multiplication of
 SELECT COUNT(*) FROM cities WHERE (SELECT zn_id FROM zones WHERE zn_id > 100) * 1000000000 * 3 > 0
 
 # An overflowing OR branch written first fails in both engines, whatever the other branch decides; so does an
-# overflowing WHERE conjunct, which antb1 computes for every row in any order (D16).
+# overflowing WHERE conjunct written first: conjuncts that hold values filter in the order written.
 statement error Overflow in addition of
 SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT i64 FROM edge WHERE id = 1) + 1 OR strlen(concat(label, 'x')) > 0
 
@@ -1597,7 +1612,7 @@ SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup 
 BIGINT	BIGINT	BIGINT
 847	839	726
 
-# ---- more forms in an inner ON: BETWEEN, an IN list, COALESCE, a CASE THEN of no row, a second join over three relations ----
+# ---- more forms in an inner ON: BETWEEN, an IN list, COALESCE, a CASE, a second join over three relations ----
 
 query I rowsort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city NOT BETWEEN (SELECT MIN(ct_id) FROM cities) + 1 AND 3
@@ -1636,8 +1651,9 @@ SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_cit
 BIGINT
 1266
 
-# ---- values under OR inside correlated blocks: a conjunct of the block alone, one that reads the enclosing block, and a correlated aggregate ----
+# ---- values under OR inside correlated blocks ----
 
+# A conjunct of the block alone, one that reads the enclosing block, and one in a correlated aggregate's block.
 query I nosort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city = ct_id AND (zn_radius > (SELECT MAX(zn_radius) FROM zones) - 0.1 OR zn_id = 3)) ORDER BY ct_id
 ----
@@ -1663,7 +1679,7 @@ SMALLINT
 2
 3
 
-# ---- next to the other subquery joins of one WHERE: an IN semi join, a correlated EXISTS and a correlated scalar comparison ----
+# ---- next to an IN semi join, a correlated EXISTS and a correlated scalar comparison ----
 
 query I nosort
 SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_radius > 3) AND (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5) ORDER BY ct_id
@@ -1781,7 +1797,7 @@ SMALLINT
 5
 6
 
-# ---- one subquery written twice: across WHERE and an inner ON, and under one OR; an inner alias that shadows an outer one ----
+# ---- a subquery written twice (across WHERE and an ON, under one OR); an inner alias over an outer one ----
 
 query I rowsort
 SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT MIN(ct_id) FROM cities) WHERE tr_dropoff > (SELECT MIN(ct_id) FROM cities) + 30 OR tr_fare > 25
@@ -1830,8 +1846,10 @@ SMALLINT	BIGINT
 4	3
 5	3
 
-# ---- the row error in the new placements: under OR above a LEFT JOIN, inside a correlated EXISTS, an IN subquery's block, a FULL JOIN's left input and a derived table ----
+# ---- the row error in the new placements ----
 
+# Under OR above a LEFT JOIN, inside a correlated EXISTS, in an IN subquery's block, in a FULL JOIN's left input and
+# in a derived table.
 statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*) FROM cities LEFT JOIN zones ON zn_city = ct_id AND zn_radius > 3 WHERE zn_id IS NULL OR zn_id > (SELECT zn_id FROM zones WHERE zn_city = 2)
 
@@ -1863,3 +1881,405 @@ SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR label = (SELECT MIN(zn_id) FROM z
 
 statement error
 SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_id > (SELECT MIN(nope) FROM zones WHERE zn_city = ct_id)
+
+# ---- divergence D16: an expression over a value, computed per row in antb1 and at DuckDB's join build ----
+
+# DuckDB makes a comparison with a value the condition of the join that appends the value and, with the value as that
+# join's build side, computes the value's side of it (here + 1, past BIGINT's maximum) once at the build, whatever the
+# conjunct before it decides; antb1 computes it per row, only for the rows that conjunct keeps, and here it keeps none:
+# no id is below 0, and a string with 'x' appended is never empty. An aggregate's value, a value of one row, and a
+# first conjunct that no statistics decide.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE id < 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE id < 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE id < 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE id < 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE strlen(concat(u, 'x')) = 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE strlen(concat(u, 'x')) = 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+
+# Where rows reach the sum, both fail.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE id >= 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+
+# ---- divergence D16: an OR argument DuckDB's statistics prove true ----
+
+# DuckDB drops an OR whose argument its footer statistics prove true for every row (no id is below 0), and the value's
+# sum with it; antb1 computes an OR's arguments in the order written, the first for every row, and overflows. Where no
+# statistics decide the other argument, DuckDB computes the sum too, and both fail; written the other way round, with
+# id >= 0 first, the OR answers in both.
+onlyif antb1
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR id >= 0
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR id >= 0
+----
+BIGINT
+12
+
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR strlen(concat(u, 'x')) > 0
+
+# ---- divergence D35: one join for a subquery written twice, at its first occurrence ----
+
+# A subquery written again reads the join of its first occurrence (ADR 0041's decision 10), as a direct operand of a
+# comparison or inside an expression, which stands below an IN written between the two: antb1 prepares the IN's build
+# first, finds it empty and never builds the value's; DuckDB builds every join first and fails. With the IN written
+# first, the value's join stands above it: both fail.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) + 0
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) + 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) AND ct_id > (SELECT zn_city FROM zones) + 0
+
+# ---- divergence D35: a value only an OR branch that OR factoring drops holds ----
+
+# The OR is implied by the conjunct its branches share, a comparison with a value of one row, so OR factoring drops it:
+# the value of two rows that only the dropped branch holds is bound for its bind errors and never planted, and antb1
+# answers; DuckDB keeps the OR as written, computes that value and fails. With a value of one row there, both answer.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+----
+BIGINT
+5
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones WHERE zn_id = 1)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+----
+BIGINT
+5
+
+# ---- divergence D35: a value under OR or CASE next to an IN that turns out empty ----
+
+# The IN written after the failing value: under OR (in either branch) and in a CASE branch never taken. antb1 prepares
+# the IN's build first, finds it empty and never builds the value's; DuckDB builds every join first and fails. With
+# the IN written first, both fail.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1) AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1) AND ct_id IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id = 1 OR ct_id > (SELECT zn_city FROM zones)) AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_id = 1 OR ct_id > (SELECT zn_city FROM zones)) AND ct_id IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id < 0 THEN (SELECT zn_city FROM zones) ELSE ct_id END > 0 AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id < 0 THEN (SELECT zn_city FROM zones) ELSE ct_id END > 0 AND ct_id IN (SELECT pm_id FROM promos)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT pm_id FROM promos) AND (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1)
+
+# ---- divergence D35: a WHERE value under OR below a HAVING IN that turns out empty ----
+
+# The HAVING IN's build is prepared first and turns out empty, so the aggregation below it never reads its input and
+# the WHERE value's build never runs; DuckDB builds it and fails. With a HAVING IN whose set is not empty, both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) + 0 OR ct_id = 1 GROUP BY ct_id HAVING MAX(ct_pop) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) + 0 OR ct_id = 1 GROUP BY ct_id HAVING MAX(ct_pop) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT zn_city FROM zones) ORDER BY ct_id
+
+# ---- divergence D35: a value under OR next to a condition that never holds ----
+
+# DuckDB's filter combiner proves ct_id = 1 AND ct_id = 2 never true and removes the block's plan, the value with it;
+# antb1 has no filter combiner (D34) and fails. A condition that never holds by the data alone removes nothing in
+# either engine: both fail.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+----
+BIGINT
+0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_pop = 45000 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+
+# ---- divergence D14: a comparison over a value folded to never-true ----
+
+# A value's SMALLINT sum against a literal outside SMALLINT's range is a whole conjunct that antb1 folds to never-true
+# at bind time, so it computes no sum; DuckDB computes 32767 + 1 in SMALLINT and fails. The value's join still builds
+# below the folded filter, so a value of two rows fails in both.
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 ORDER BY id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id <= 2) + 1 > 40000 ORDER BY id
+
+# ---- pending: values in select lists and aggregate arguments (ADR 0041; roadmap PR SQ2 removes these guards) ----
+
+# A value in the select list, added to a column on every row: NULL where the column is NULL.
+pending SQ2
+query II nosort
+SELECT ct_id, (SELECT zn_parent FROM zones WHERE zn_id = 10) + ct_pop FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	120005
+2	45005
+3	30005
+4	NULL
+5	8005
+6	2505
+
+# A value in an aggregate's argument, in a block whose WHERE holds a value of its own: one in an IN list, which SQ1
+# answers.
+pending SQ2
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT zn_parent FROM zones WHERE zn_id = 10)) FROM zones WHERE zn_city IN (1, (SELECT ct_id FROM cities WHERE label = 'harbor')) GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	740
+2	780
+
+# ---- pending: IN, NOT IN, = ANY and <> ALL in any condition (ADR 0041; roadmap PR SQ7 removes these guards) ----
+
+# The set holds 1, 2, 5, 9 and a NULL, so IN is true for cities 1, 2 and 5 and NULL for the others, and NOT IN is
+# never true: IN under OR, NOT NOT over IN, IN in a CASE WHEN (whose ELSE takes the NULLs), NOT IN under OR.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+6
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (NOT (ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35))) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) THEN 1 ELSE 0 END = 0 ORDER BY ct_id
+----
+SMALLINT
+3
+4
+6
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id NOT IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+6
+
+# = ANY is IN, and <> ALL over the same set without its NULL is NOT IN.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = ANY (SELECT zn_city FROM zones WHERE zn_id > 35) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id <> ALL (SELECT zn_city FROM zones WHERE zn_id > 35 AND zn_city IS NOT NULL) ORDER BY ct_id
+----
+SMALLINT
+3
+4
+6
+
+# An IN that every branch of an OR shares, which OR factoring would make a conjunct; city 6's IN is NULL.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_pop > 40000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) OR (ct_pop < 10000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+# A probe that reads no column: a value (zone 7's city, 2) and a literal.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_city FROM zones WHERE zn_id = 7) IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id < 3 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE 2 IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+# ---- pending: a correlated value outside a top-level comparison (ADR 0041; roadmap PR SQ5 removes these guards) ----
+
+# A correlated MAX in arithmetic; under OR, where city 5 passes by its comparison and city 6, which has no zone and so a
+# NULL MAX, by the other branch; and in a COALESCE, which turns city 6's NULL into 0 and keeps the row.
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id) * 1000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id < (SELECT MAX(zn_parent) FROM zones WHERE zn_city = ct_id) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE((SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id), 0) < ct_id * 10 ORDER BY ct_id
+----
+SMALLINT
+4
+5
+6
+
+# ---- DuckDB only until subqueries in a LEFT JOIN's ON get a PR (ADR 0041's decision 3: DuckDB coverage) ----
+
+# A value (a COUNT over no row: 0) and an IN whose set holds a NULL, in a LEFT JOIN's ON: a city whose zone fails them
+# is padded.
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	6
+
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND zn_city IN (SELECT zn_city FROM zones WHERE zn_id > 36) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	2
+3	NULL
+4	NULL
+5	5
+6	NULL
+
+# ---- DuckDB only, for good: DuckDB refuses subqueries in a FULL JOIN's ON and EXISTS in a LEFT JOIN's ON ----
+
+# antb1 refuses them too (exit code 4), and an Unsupported answer passes no record. A value directly compared, the same
+# value in arithmetic, and an uncorrelated EXISTS.
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id, zn_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) + 1 ORDER BY ct_id, zn_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND EXISTS (SELECT * FROM promos) ORDER BY ct_id
