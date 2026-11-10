@@ -1,0 +1,2353 @@
+# Uncorrelated subqueries as values in a query block that does not aggregate (ADR 0041's SQ2, its first PR): a
+# select item -- alone, in arithmetic, functions, COALESCE, casts and CASE (EXISTS in its WHEN) -- an ORDER BY item and
+# a SELECT DISTINCT's list, through the value's single row, joined before any row is read; and the select lists of
+# EXISTS (dropped, as DuckDB drops it), IN, scalar, derived-table, CTE and set-operation blocks.
+
+# ---- SQ2a: select items and DISTINCT of a block that does not aggregate ----
+
+# A value as a select item of a block that does not aggregate: computed once, before any row is read, and the same
+# on every row. Its type is the subquery's column: one row's value, NULL over no row or a NULL row, VARCHAR, DECIMAL,
+# DATE, HUGEINT of an integer SUM, DOUBLE of an AVG.
+
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM zones) AS n FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones WHERE zn_id > 100) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+
+query II nosort
+SELECT ct_id, (SELECT ct_pop FROM cities WHERE ct_id = 4) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+
+query IT nosort
+SELECT ct_id, (SELECT label FROM cities WHERE ct_id = 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	center
+2	center
+3	center
+4	center
+5	center
+6	center
+
+query ID nosort
+SELECT ct_id, (SELECT MAX(tf_rate) FROM tariffs) AS r FROM cities ORDER BY ct_id
+----
+SMALLINT	DECIMAL(5,3)
+1	2.500
+2	2.500
+3	2.500
+4	2.500
+5	2.500
+6	2.500
+
+query IT nosort
+SELECT ct_id, (SELECT MAX(dy_day) FROM days) AS d FROM cities ORDER BY ct_id
+----
+SMALLINT	DATE
+1	2029-12-23
+2	2029-12-23
+3	2029-12-23
+4	2029-12-23
+5	2029-12-23
+6	2029-12-23
+
+query II nosort
+SELECT ct_id, (SELECT i64 FROM edge WHERE id = 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	9223372036854775807
+2	9223372036854775807
+3	9223372036854775807
+4	9223372036854775807
+5	9223372036854775807
+6	9223372036854775807
+
+query II nosort
+SELECT ct_id, (SELECT SUM(zn_id) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	HUGEINT
+1	820
+2	820
+3	820
+4	820
+5	820
+6	820
+
+query IR nosort
+SELECT ct_id, (SELECT AVG(zn_city) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE
+1	3.128205128205128
+2	3.128205128205128
+3	3.128205128205128
+4	3.128205128205128
+5	3.128205128205128
+6	3.128205128205128
+
+query IT nosort
+SELECT tr_row, (SELECT MIN(label) FROM zones) AS v FROM trips ORDER BY tr_row LIMIT 3
+----
+INTEGER	VARCHAR
+0	airport
+1	airport
+2	airport
+
+query I nosort
+SELECT (SELECT MAX(zn_id) FROM zones) AS m FROM cities WHERE ct_id = 1
+----
+INTEGER
+40
+
+# The value block in other shapes: a top-1 by ORDER BY and LIMIT, an OFFSET, INTERSECT, UNION ALL with an empty arm,
+# EXCEPT, a CTE's aggregate (alone and in arithmetic), a join inside the block.
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones ORDER BY zn_id DESC LIMIT 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 1 OFFSET 5) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	6
+2	6
+3	6
+4	6
+5	6
+6	6
+
+query II nosort
+SELECT ct_id, (SELECT MIN(zn_id) FROM zones INTERSECT SELECT MIN(zn_id) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones UNION ALL SELECT pm_id FROM promos) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones EXCEPT SELECT ct_id FROM cities) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query II nosort
+WITH t AS (SELECT MAX(zn_id) AS m FROM zones) SELECT ct_id, (SELECT m FROM t) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query II nosort
+WITH t AS (SELECT MAX(zn_id) AS m FROM zones) SELECT ct_id, ct_id * (SELECT m FROM t) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	80
+3	120
+4	160
+5	200
+6	240
+
+query II nosort
+SELECT ct_id, (SELECT MAX(z.zn_id) FROM zones z JOIN cities c ON z.zn_city = c.ct_id WHERE c.label = 'hills') AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	33
+2	33
+3	33
+4	33
+5	33
+6	33
+
+# A value in arithmetic with columns: integer widths (SMALLINT, INTEGER, BIGINT), DECIMAL scales, DOUBLE division (a
+# zero divisor gives inf), integer division and modulo, unary minus, a DATE plus a column; a value of no row makes the
+# item NULL.
+
+query II nosort
+SELECT ct_id, ct_id * (SELECT MAX(zn_id) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	80
+3	120
+4	160
+5	200
+6	240
+
+query II nosort
+SELECT ct_id, ct_pop - (SELECT MIN(ct_pop) FROM cities) AS d FROM cities ORDER BY ct_id DESC LIMIT 3
+----
+SMALLINT	INTEGER
+6	0
+5	5500
+4	NULL
+
+query II nosort
+SELECT id, i16 + (SELECT i16 FROM edge WHERE id = 4) AS v FROM edge WHERE id IN (0, 2, 3, 6) ORDER BY id
+----
+INTEGER	SMALLINT
+0	-32767
+2	1
+3	0
+6	101
+
+query II nosort
+SELECT id, i64 - (SELECT i64 FROM edge WHERE id = 10) AS v FROM edge WHERE id IN (2, 3, 6, 7) ORDER BY id
+----
+INTEGER	BIGINT
+2	42
+3	41
+6	1000000000000042
+7	-999999999999958
+
+query ID nosort
+SELECT tr_row, tr_fare * (SELECT MAX(tf_rate) FROM tariffs) AS v FROM trips ORDER BY tr_row LIMIT 3
+----
+INTEGER	DECIMAL(14,5)
+0	8.75000
+1	26.87500
+2	45.00000
+
+query ID nosort
+SELECT id, d9_2 + (SELECT d18_4 FROM decimals WHERE id = 1) AS v FROM decimals WHERE id < 4 ORDER BY id
+----
+INTEGER	DECIMAL(18,4)
+0	-7.2501
+1	9999998.9899
+2	-10000000.9901
+3	NULL
+
+query ID nosort
+SELECT id, p * (SELECT q FROM decimals WHERE id = 5) AS v FROM decimals WHERE id < 5 ORDER BY id
+----
+INTEGER	DECIMAL(18,4)
+0	-11988.0030
+1	-2397.6006
+2	7192.8018
+3	-9590.4024
+4	NULL
+
+query ID nosort
+SELECT tr_row, tr_rate - (SELECT MIN(tf_rate) FROM tariffs) AS v FROM trips ORDER BY tr_row LIMIT 4
+----
+INTEGER	DECIMAL(6,3)
+0	0.125
+1	0.125
+2	0.125
+3	0.125
+
+query IR nosort
+SELECT ct_id, ct_pop / (SELECT COUNT(*) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE
+1	3000
+2	1125
+3	750
+4	NULL
+5	200
+6	62.5
+
+query IR nosort
+SELECT ct_id, ct_id / (SELECT i32 FROM edge WHERE id = 2) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE
+1	inf
+2	inf
+3	inf
+4	inf
+5	inf
+6	inf
+
+query II nosort
+SELECT ct_id, -(SELECT MAX(zn_id) FROM zones) + ct_id // 2 AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	-40
+2	-39
+3	-39
+4	-38
+5	-38
+6	-37
+
+query ITT nosort
+SELECT tr_row, tr_day, (SELECT MIN(dy_day) FROM days) + tr_row AS d FROM trips ORDER BY tr_row LIMIT 3
+----
+INTEGER	DATE	DATE
+0	2026-03-01	2025-12-29
+1	2026-03-02	2025-12-30
+2	2026-03-03	2025-12-31
+
+query II nosort
+SELECT ct_id, ct_id + (SELECT zn_id FROM zones WHERE zn_id > 99) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+
+# Two values in one item, the same value twice, values over an empty table, and a value next to a star.
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) - (SELECT MIN(zn_id) FROM zones) + ct_id AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	40
+2	41
+3	42
+4	43
+5	44
+6	45
+
+query III nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) AS a, (SELECT MAX(zn_id) FROM zones) + 1 AS b FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER	INTEGER
+1	40	41
+2	40	41
+3	40	41
+4	40	41
+5	40	41
+6	40	41
+
+query IIII nosort
+SELECT ct_id, ct_id + (SELECT COUNT(*) FROM promos) AS v, (SELECT MAX(pm_id) FROM promos) AS m, ct_id % (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) AS r FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT	INTEGER	SMALLINT
+1	1	NULL	1
+2	2	NULL	2
+3	3	NULL	3
+4	4	NULL	4
+5	5	NULL	0
+6	6	NULL	1
+
+query IITII nosort
+SELECT *, (SELECT COUNT(*) FROM zones) AS n FROM cities ORDER BY ct_id
+----
+INTEGER	SMALLINT	VARCHAR	INTEGER	BIGINT
+0	1	center	120000	40
+1	2	harbor	45000	40
+2	3	hills	30000	40
+3	4	airport	NULL	40
+4	5	old town	8000	40
+5	6	outskirts	2500	40
+
+query IITIR nosort
+SELECT c.*, c.ct_pop / 1000 * (SELECT MIN(ct_id) FROM cities) AS k FROM cities c ORDER BY ct_id
+----
+INTEGER	SMALLINT	VARCHAR	INTEGER	DOUBLE
+0	1	center	120000	120
+1	2	harbor	45000	45
+2	3	hills	30000	30
+3	4	airport	NULL	NULL
+4	5	old town	8000	8
+5	6	outskirts	2500	2.5
+
+# A value as a function's argument: ABS, COALESCE (a value as its first, middle or last argument), CAST, upper,
+# strlen, concat, substring and EXTRACT.
+
+query IRI nosort
+SELECT ct_id, ABS(ct_id - (SELECT AVG(zn_city) FROM zones)) AS a, COALESCE(ct_pop, (SELECT MIN(ct_pop) FROM cities)) AS p FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE	INTEGER
+1	2.128205128205128	120000
+2	1.1282051282051282	45000
+3	0.1282051282051282	30000
+4	0.8717948717948718	2500
+5	1.8717948717948718	8000
+6	2.871794871794872	2500
+
+query II nosort
+SELECT ct_id, COALESCE((SELECT zn_id FROM zones WHERE zn_id > 100), -ct_id) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	-1
+2	-2
+3	-3
+4	-4
+5	-5
+6	-6
+
+query II nosort
+SELECT ct_id, COALESCE(ct_pop, (SELECT ct_pop FROM cities WHERE ct_id = 4), (SELECT MAX(zn_id) FROM zones)) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	120000
+2	45000
+3	30000
+4	40
+5	8000
+6	2500
+
+query III nosort
+SELECT ct_id, CAST((SELECT MAX(zn_id) FROM zones) AS BIGINT) * ct_id AS b, CAST((SELECT MIN(zn_id) FROM zones) AS SMALLINT) + ct_id AS s FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT	SMALLINT
+1	40	2
+2	80	3
+3	120	4
+4	160	5
+5	200	6
+6	240	7
+
+query IR nosort
+SELECT ct_id, CAST((SELECT MAX(zn_id) FROM zones) AS DECIMAL(10,2)) / 4 AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE
+1	10
+2	10
+3	10
+4	10
+5	10
+6	10
+
+query II nosort
+SELECT ct_id, CAST((SELECT AVG(zn_city) FROM zones) * 10 AS INTEGER) + ct_id AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	32
+2	33
+3	34
+4	35
+5	36
+6	37
+
+query ITI nosort
+SELECT ct_id, upper((SELECT label FROM cities WHERE ct_id = 2)) AS u, strlen((SELECT label FROM cities WHERE ct_id = 5)) + ct_id AS n FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR	BIGINT
+1	HARBOR	9
+2	HARBOR	10
+3	HARBOR	11
+4	HARBOR	12
+5	HARBOR	13
+6	HARBOR	14
+
+query IT nosort
+SELECT ct_id, concat(label, '/', (SELECT label FROM cities WHERE ct_id = 6)) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	center/outskirts
+2	harbor/outskirts
+3	hills/outskirts
+4	airport/outskirts
+5	old town/outskirts
+6	outskirts/outskirts
+
+query IT nosort
+SELECT ct_id, substring((SELECT MIN(label) FROM zones), 1, ct_id) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	a
+2	ai
+3	air
+4	airp
+5	airpo
+6	airpor
+
+query II nosort
+SELECT ct_id, EXTRACT(year FROM (SELECT MAX(dy_day) FROM days)) - ct_id AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	2028
+2	2027
+3	2026
+4	2025
+5	2024
+6	2023
+
+# CASE: EXISTS and NOT EXISTS in a WHEN (alone and under AND), a value in a WHEN, THEN and ELSE, a simple CASE over a
+# value and with values in its WHENs, IN lists and BETWEEN with values, IS NULL of a value; a DECIMAL value against
+# a DECIMAL or an integer column, and a CASE without ELSE.
+
+query II nosort
+SELECT ct_id, CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_city = 6) THEN 1 ELSE 0 END AS e FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+
+query II nosort
+SELECT ct_id, CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN ct_id ELSE 0 END AS e FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+
+query IT nosort
+SELECT ct_id, CASE WHEN ct_id > 3 AND EXISTS (SELECT 1 FROM zones WHERE zn_city = 9) THEN 'yes' ELSE 'no' END AS e FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	no
+2	no
+3	no
+4	yes
+5	yes
+6	yes
+
+query IT nosort
+SELECT ct_id, CASE WHEN ct_id * 10 > (SELECT MAX(zn_id) FROM zones) THEN 'big' ELSE 'small' END AS s FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	small
+2	small
+3	small
+4	small
+5	big
+6	big
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id < 3 THEN (SELECT MIN(zn_id) FROM zones) ELSE (SELECT MAX(zn_id) FROM zones) END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	1
+2	1
+3	40
+4	40
+5	40
+6	40
+
+query IT nosort
+SELECT ct_id, CASE (SELECT COUNT(*) FROM cities) WHEN ct_id THEN 'last' ELSE 'other' END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	other
+2	other
+3	other
+4	other
+5	other
+6	last
+
+query IT nosort
+SELECT ct_id, CASE ct_id WHEN (SELECT MIN(ct_id) FROM cities) THEN 'first' WHEN (SELECT MAX(ct_id) FROM cities) THEN 'last' ELSE 'mid' END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	first
+2	mid
+3	mid
+4	mid
+5	mid
+6	last
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id IN ((SELECT MIN(ct_id) FROM cities), 3) THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	1
+2	0
+3	1
+4	0
+5	0
+6	0
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id NOT IN ((SELECT MAX(ct_id) FROM cities), (SELECT MIN(ct_id) FROM cities) + 1) THEN ct_id ELSE -1 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	1
+2	-1
+3	3
+4	4
+5	5
+6	-1
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id BETWEEN (SELECT MIN(ct_id) FROM cities) + 1 AND (SELECT MAX(ct_id) FROM cities) - 1 THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	0
+2	1
+3	1
+4	1
+5	1
+6	0
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_pop NOT BETWEEN 5000 AND (SELECT MAX(ct_pop) FROM cities WHERE ct_id > 1) THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	1
+2	0
+3	0
+4	0
+5	0
+6	1
+
+query II nosort
+SELECT ct_id, CASE WHEN (SELECT zn_id FROM zones WHERE zn_id > 100) IS NULL THEN ct_id ELSE 0 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+
+query ID nosort
+SELECT tr_row, CASE WHEN tr_row % 2 = 0 THEN tr_fare ELSE (SELECT MAX(tf_rate) FROM tariffs) END AS v FROM trips ORDER BY tr_row LIMIT 3
+----
+INTEGER	DECIMAL(10,3)
+0	3.500
+1	2.500
+2	18.000
+
+query ID nosort
+SELECT ct_id, CASE WHEN ct_id > 3 THEN (SELECT MAX(tf_rate) FROM tariffs) ELSE ct_id END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	DECIMAL(8,3)
+1	1.000
+2	2.000
+3	3.000
+4	2.500
+5	2.500
+6	2.500
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id > 4 THEN ct_id + (SELECT COUNT(*) FROM zones) END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	45
+6	46
+
+query IT nosort
+SELECT ct_id, CASE WHEN ct_pop IS NULL THEN (SELECT label FROM cities WHERE ct_id = 3) ELSE label END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	center
+2	harbor
+3	hills
+4	hills
+5	old town
+6	outskirts
+
+# Over joins and with WHERE: a LEFT JOIN's padded rows, a FULL JOIN's, a comma join, an inner join, a WHERE with a
+# value of its own (the same value as the select item's, and another), a LEFT JOIN under a WHERE.
+
+query II nosort
+SELECT c.ct_id, COALESCE(z.zn_id, 0) + (SELECT MAX(ct_id) FROM cities) AS v FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 35 ORDER BY c.ct_id, v
+----
+SMALLINT	INTEGER
+1	42
+2	43
+3	6
+4	6
+5	46
+6	6
+
+query III nosort
+SELECT c.ct_id, z.zn_id, (SELECT COUNT(*) FROM promos) AS n FROM cities c FULL JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 38 ORDER BY 1 NULLS LAST, 2 NULLS LAST
+----
+SMALLINT	INTEGER	BIGINT
+1	NULL	0
+2	NULL	0
+3	NULL	0
+4	NULL	0
+5	40	0
+6	NULL	0
+NULL	1	0
+NULL	2	0
+NULL	3	0
+NULL	4	0
+NULL	5	0
+NULL	6	0
+NULL	7	0
+NULL	8	0
+NULL	9	0
+NULL	10	0
+NULL	11	0
+NULL	12	0
+NULL	13	0
+NULL	14	0
+NULL	15	0
+NULL	16	0
+NULL	17	0
+NULL	18	0
+NULL	19	0
+NULL	20	0
+NULL	21	0
+NULL	22	0
+NULL	23	0
+NULL	24	0
+NULL	25	0
+NULL	26	0
+NULL	27	0
+NULL	28	0
+NULL	29	0
+NULL	30	0
+NULL	31	0
+NULL	32	0
+NULL	33	0
+NULL	34	0
+NULL	35	0
+NULL	36	0
+NULL	37	0
+NULL	38	0
+NULL	39	0
+
+query III nosort
+SELECT c.ct_id, z.zn_id, (SELECT MAX(zn_id) FROM zones) - z.zn_id AS v FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 37 WHERE c.ct_id > 3 ORDER BY c.ct_id, z.zn_id
+----
+SMALLINT	INTEGER	INTEGER
+4	NULL	NULL
+5	40	0
+6	NULL	NULL
+
+query III nosort
+SELECT c.ct_id, z.zn_id, z.zn_id - (SELECT MIN(zn_id) FROM zones) AS v FROM cities c, zones z WHERE z.zn_city = c.ct_id AND z.zn_id > 34 ORDER BY z.zn_id
+----
+SMALLINT	INTEGER	INTEGER
+5	35	34
+1	36	35
+2	37	36
+5	40	39
+
+query II nosort
+SELECT c.ct_id, c.ct_id * (SELECT MAX(zn_city) FROM zones) AS v FROM cities c JOIN zones z ON z.zn_city = c.ct_id WHERE z.zn_id = 7
+----
+SMALLINT	SMALLINT
+2	18
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) - ct_id AS v FROM cities WHERE ct_pop > (SELECT MIN(ct_pop) FROM cities) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	39
+2	38
+3	37
+5	35
+
+query II nosort
+SELECT ct_id, (SELECT MIN(ct_pop) FROM cities) AS v FROM cities WHERE ct_pop > (SELECT MIN(ct_pop) FROM cities) * 10 ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	2500
+2	2500
+3	2500
+
+# SELECT DISTINCT with value items: a value next to a column, a value alone (one row), arithmetic over a value, ORDER
+# BY over the DISTINCT list (alias, the same expression, position), with LIMIT and OFFSET, a value of no row, a
+# VARCHAR value, a CASE over a value.
+
+query II nosort
+SELECT DISTINCT zn_city, (SELECT MAX(ct_id) FROM cities) AS m FROM zones ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	6
+NULL	6
+
+query I nosort
+SELECT DISTINCT (SELECT MAX(ct_id) FROM cities) AS m FROM zones
+----
+SMALLINT
+6
+
+query I nosort
+SELECT DISTINCT zn_city * (SELECT MAX(ct_id) FROM cities) AS v FROM zones ORDER BY v
+----
+SMALLINT
+6
+12
+18
+24
+30
+54
+NULL
+
+query I nosort
+SELECT DISTINCT zn_city * (SELECT MAX(ct_id) FROM cities) AS v FROM zones ORDER BY zn_city * (SELECT MAX(ct_id) FROM cities)
+----
+SMALLINT
+6
+12
+18
+24
+30
+54
+NULL
+
+query I nosort
+SELECT DISTINCT zn_city - (SELECT MAX(ct_id) FROM cities) AS v FROM zones ORDER BY v DESC
+----
+SMALLINT
+3
+-1
+-2
+-3
+-4
+-5
+NULL
+
+query I nosort
+SELECT DISTINCT zn_city % 2 + (SELECT MIN(ct_id) FROM cities) AS p FROM zones WHERE zn_city IS NOT NULL ORDER BY p
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT DISTINCT zn_city * (SELECT MAX(ct_id) FROM cities) AS v FROM zones WHERE zn_city IS NOT NULL ORDER BY v DESC LIMIT 2
+----
+SMALLINT
+54
+30
+
+query I nosort
+SELECT DISTINCT zn_city + (SELECT MIN(ct_id) FROM cities) AS v FROM zones ORDER BY 1 DESC LIMIT 3
+----
+SMALLINT
+10
+6
+5
+
+query IT nosort
+SELECT DISTINCT zn_city, CASE WHEN zn_city > (SELECT AVG(ct_id) FROM cities) THEN 'high' ELSE 'low' END AS h FROM zones ORDER BY 1 LIMIT 3 OFFSET 1
+----
+SMALLINT	VARCHAR
+2	low
+3	low
+4	high
+
+query II nosort
+SELECT DISTINCT zn_city, (SELECT pm_id FROM promos) AS v FROM zones ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+9	NULL
+NULL	NULL
+
+query TT nosort
+SELECT DISTINCT rd_tier, (SELECT label FROM cities WHERE ct_id = 3) AS v FROM riders ORDER BY rd_tier
+----
+VARCHAR	VARCHAR
+basic	hills
+gold	hills
+plus	hills
+
+query IT nosort
+SELECT DISTINCT zn_city, (SELECT label FROM cities WHERE ct_id = 1) AS v FROM zones ORDER BY zn_city DESC NULLS LAST
+----
+SMALLINT	VARCHAR
+9	center
+5	center
+4	center
+3	center
+2	center
+1	center
+NULL	center
+
+# A value of two rows fails, in both engines, even where no row reads it: its join is built before any row is read,
+# so over an empty table, a WHERE (or an IN of an empty subquery, or an outer join's WHERE) that keeps no row, an
+# untaken CASE branch, a COALESCE whose first argument is never NULL, a value multiplied by zero, LIMIT 1, DISTINCT,
+# and a UNION ALL of two one-row arms.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_id FROM zones WHERE zn_id < 3) AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT pm_id, (SELECT zn_id FROM zones) AS v FROM promos
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities WHERE ct_id > 100
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities WHERE ct_id IN (SELECT pm_id FROM promos)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT c.ct_id, (SELECT tf_label FROM tariffs WHERE tf_rate > 2) AS v FROM cities c LEFT JOIN promos p ON p.pm_id = c.ct_id WHERE p.pm_id IS NOT NULL
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, CASE WHEN ct_id > 100 THEN (SELECT zn_id FROM zones) ELSE 0 END AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, CASE WHEN NOT EXISTS (SELECT 1 FROM zones) THEN (SELECT ct_id FROM cities) END AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, COALESCE(ct_id, (SELECT zn_id FROM zones)) AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT tf_rate FROM tariffs WHERE tf_rate > 2) * 0 AS v FROM cities WHERE ct_id = 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, ABS((SELECT zn_city FROM zones WHERE zn_id > 38)) AS v FROM cities ORDER BY ct_id LIMIT 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT DISTINCT zn_city, (SELECT ct_id FROM cities WHERE ct_id < 3) AS v FROM zones ORDER BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones UNION ALL SELECT MIN(zn_id) FROM zones) AS v FROM cities ORDER BY ct_id
+
+# Overflow of a value in arithmetic with a column, as both engines raise it: INTEGER multiplication, SMALLINT
+# addition, BIGINT subtraction, DECIMAL addition, under DISTINCT too; a WHERE that drops the row that would overflow
+# answers.
+
+statement error Overflow in multiplication of
+SELECT ct_id, ct_pop * (SELECT MAX(i32) FROM edge) AS v FROM cities ORDER BY ct_id
+
+statement error Overflow in addition of
+SELECT id, i16 + (SELECT i16 FROM edge WHERE id = 4) AS v FROM edge WHERE id IN (1, 2) ORDER BY id
+
+statement error Overflow in subtraction of
+SELECT id, i64 - (SELECT i64 FROM edge WHERE id = 4) AS v FROM edge WHERE id IN (0, 2) ORDER BY id
+
+statement error Overflow in addition of
+SELECT id, d9_2 + (SELECT MAX(d18_4) FROM decimals) AS v FROM decimals WHERE id < 4 ORDER BY id
+
+statement error Overflow in addition of
+SELECT DISTINCT i32 + (SELECT MAX(i32) FROM edge) AS v FROM edge WHERE id IN (1, 2, 4)
+
+query II nosort
+SELECT id, i32 + (SELECT MAX(i32) FROM edge) AS v FROM edge WHERE id IN (0, 2, 3) ORDER BY id
+----
+INTEGER	INTEGER
+0	-1
+2	2147483647
+3	2147483646
+
+# ---- ORDER BY ----
+
+# A value as an ORDER BY key: alone (the same for every row, so the next key decides), times a column, in arithmetic
+# with a column, ascending and descending.
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id * ((SELECT MIN(zn_id) FROM zones) - 2), ct_id
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY (SELECT MAX(zn_id) FROM zones), ct_id DESC
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY (SELECT MIN(zn_id) FROM zones), ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id - (SELECT MAX(ct_id) FROM cities) DESC, ct_id
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id * (SELECT MIN(zn_id) FROM zones) + (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) * -2, ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query ID nosort
+SELECT tf_row, tf_rate FROM tariffs ORDER BY tf_rate * (SELECT MAX(tf_rate) FROM tariffs) DESC NULLS LAST, tf_row
+----
+INTEGER	DECIMAL(5,3)
+5	2.500
+4	2.125
+2	2.000
+6	1.750
+1	1.500
+3	1.250
+0	1.000
+8	0.875
+7	NULL
+
+query IT nosort
+SELECT ct_id, label FROM cities ORDER BY CASE WHEN label < (SELECT label FROM cities WHERE ct_id = 3) THEN 0 ELSE 1 END, ct_id DESC
+----
+SMALLINT	VARCHAR
+4	airport
+2	harbor
+1	center
+6	outskirts
+5	old town
+3	hills
+
+# NULLS FIRST and NULLS LAST: a value of no row is NULL for every row; a column times a value is NULL where the
+# column is.
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY (SELECT ct_id FROM cities WHERE ct_id > 99) NULLS FIRST, ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id + (SELECT zn_id FROM zones WHERE zn_id > 99) NULLS LAST, ct_id DESC
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+query II nosort
+SELECT ct_id, ct_pop FROM cities ORDER BY ct_pop * (SELECT MIN(zn_id) FROM zones) NULLS FIRST, ct_id
+----
+SMALLINT	INTEGER
+4	NULL
+6	2500
+5	8000
+3	30000
+2	45000
+1	120000
+
+query II nosort
+SELECT ct_id, ct_pop FROM cities ORDER BY ct_pop * (SELECT MIN(zn_id) FROM zones) DESC NULLS LAST, ct_id
+----
+SMALLINT	INTEGER
+1	120000
+2	45000
+3	30000
+5	8000
+6	2500
+4	NULL
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY COALESCE((SELECT zn_id FROM zones WHERE zn_id > 99), ct_id) DESC, ct_id
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+# With LIMIT and OFFSET: the keys end with a unique column, so the rows cut are the same in both engines.
+
+query I nosort
+SELECT zn_id FROM zones ORDER BY ABS(zn_id - (SELECT AVG(zn_id) FROM zones)), zn_id LIMIT 4
+----
+INTEGER
+20
+21
+19
+22
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id % (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9), ct_id LIMIT 3 OFFSET 1
+----
+SMALLINT
+1
+6
+2
+
+query II nosort
+SELECT tr_row, tr_pickup FROM trips ORDER BY tr_pickup * (SELECT MIN(ct_id) - 2 FROM cities) NULLS FIRST, tr_row LIMIT 5
+----
+INTEGER	INTEGER
+42	43
+85	43
+128	43
+171	43
+214	43
+
+query I nosort
+SELECT tr_row FROM trips WHERE tr_row < 40 ORDER BY tr_row % (SELECT COUNT(*) FROM cities), tr_row DESC LIMIT 6 OFFSET 3
+----
+INTEGER
+18
+12
+6
+0
+37
+31
+
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id ORDER BY z.zn_id % (SELECT COUNT(*) FROM cities), z.zn_id LIMIT 8 OFFSET 2
+----
+SMALLINT	INTEGER
+3	18
+4	24
+5	30
+1	36
+1	1
+2	7
+3	13
+4	19
+
+# A value item named by its alias or by its position as a whole ORDER BY key.
+
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM cities) - ct_id AS r FROM cities ORDER BY r, ct_id
+----
+SMALLINT	BIGINT
+6	0
+5	1
+4	2
+3	3
+2	4
+1	5
+
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM cities) - ct_id AS r FROM cities ORDER BY 2, 1
+----
+SMALLINT	BIGINT
+6	0
+5	1
+4	2
+3	3
+2	4
+1	5
+
+query II nosort
+SELECT ct_id, ct_id * (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) AS v FROM cities ORDER BY 2 DESC, 1 LIMIT 3
+----
+SMALLINT	SMALLINT
+6	30
+5	25
+4	20
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) - ct_id * 5 AS r FROM cities ORDER BY r DESC, ct_id LIMIT 2 OFFSET 1
+----
+SMALLINT	INTEGER
+2	30
+3	25
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones WHERE zn_id > 99) AS v FROM cities ORDER BY v NULLS FIRST, ct_id DESC
+----
+SMALLINT	INTEGER
+6	NULL
+5	NULL
+4	NULL
+3	NULL
+2	NULL
+1	NULL
+
+# CASE over EXISTS and NOT EXISTS, over a value's BETWEEN, as an ORDER BY key.
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_city = 9) THEN -ct_id ELSE ct_id END, ct_id
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN ct_id % 2 ELSE 0 END, ct_id DESC
+----
+SMALLINT
+6
+4
+2
+5
+3
+1
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_city = 99) THEN -ct_id ELSE ct_id END, ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN ct_id BETWEEN (SELECT MIN(zn_city) FROM zones) + 1 AND (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - 1 THEN 0 ELSE 1 END, ct_id DESC
+----
+SMALLINT
+4
+3
+2
+6
+5
+1
+
+# ORDER BY a value over LEFT and FULL joins and a comma join below.
+
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 35 ORDER BY c.ct_id * ((SELECT MIN(zn_id) FROM zones) - 2), z.zn_id NULLS FIRST
+----
+SMALLINT	INTEGER
+6	NULL
+5	40
+4	NULL
+3	NULL
+2	37
+1	36
+
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c FULL JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 35 ORDER BY COALESCE(z.zn_id, 0) * (SELECT MIN(zn_id) FROM zones), c.ct_id NULLS FIRST LIMIT 6
+----
+SMALLINT	INTEGER
+3	NULL
+4	NULL
+6	NULL
+NULL	1
+NULL	2
+NULL	3
+
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c, zones z WHERE z.zn_city = c.ct_id AND z.zn_id > 28 ORDER BY z.zn_id % (SELECT COUNT(*) FROM cities) DESC, z.zn_id
+----
+SMALLINT	INTEGER
+4	29
+5	35
+4	34
+5	40
+3	33
+2	32
+1	31
+2	37
+5	30
+1	36
+
+# ---- Other blocks ----
+
+# The select list of an EXISTS block, uncorrelated and correlated with an equality key, under NOT EXISTS and with
+# LIMIT. DuckDB drops the list, so a value of two rows there answers too.
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT MAX(zn_id) FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT MAX(zn_id) FROM zones) FROM zones WHERE zn_city = 9) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT (SELECT MAX(zn_id) FROM zones) FROM zones WHERE zn_city = 99) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities c WHERE NOT EXISTS (SELECT z.zn_id * (SELECT MAX(zn_id) FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT zn_id + (SELECT MIN(ct_id) FROM cities) FROM zones LIMIT 1) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities c WHERE NOT EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones LIMIT 1) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# The select list of an IN subquery's block: a value in arithmetic with the block's column, alone, under NOT IN.
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city - (SELECT MIN(zn_city) FROM zones) + 2 FROM zones) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT (SELECT MAX(ct_id) FROM cities) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id NOT IN (SELECT zn_city * (SELECT MIN(ct_id) FROM cities) FROM zones WHERE zn_city IS NOT NULL) ORDER BY ct_id
+----
+SMALLINT
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT (SELECT zn_id FROM zones WHERE zn_id > 99) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+
+# The select list of a scalar subquery's block: a value of a value, two levels deep, a value under a value's
+# WHERE, and a value in its ORDER BY under LIMIT 1.
+
+query II nosort
+SELECT ct_id, (SELECT (SELECT MAX(zn_id) FROM zones) + 1 FROM cities WHERE ct_id = 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	41
+2	41
+3	41
+4	41
+5	41
+6	41
+
+query II nosort
+SELECT ct_id, (SELECT (SELECT (SELECT MAX(zn_id) FROM zones) * 2 FROM cities WHERE ct_id = 1) + 1 FROM cities WHERE ct_id = 2) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	81
+2	81
+3	81
+4	81
+5	81
+6	81
+
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM zones WHERE zn_id > (SELECT MAX(ct_id) FROM cities)) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	34
+2	34
+3	34
+4	34
+5	34
+6	34
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones ORDER BY ABS(zn_id - (SELECT AVG(zn_id) FROM zones)), zn_id LIMIT 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	20
+2	20
+3	20
+4	20
+5	20
+6	20
+
+query II nosort
+SELECT ct_id, (SELECT (SELECT zn_id FROM zones WHERE zn_id > 99) FROM cities WHERE ct_id = 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+
+# The select list of derived tables and CTEs, a CTE referenced once and twice; the outer block filters, joins and
+# orders on the computed column.
+
+query II nosort
+SELECT * FROM (SELECT ct_id, (SELECT COUNT(*) FROM zones) AS n FROM cities) d ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	40
+2	40
+3	40
+4	40
+5	40
+6	40
+
+query I nosort
+SELECT ct_id FROM (SELECT ct_id, ct_id * (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) AS v FROM cities) d WHERE v > 12 ORDER BY ct_id
+----
+SMALLINT
+3
+4
+5
+6
+
+query I nosort
+SELECT d.v FROM (SELECT ct_id + (SELECT MIN(zn_id) FROM zones) AS v FROM cities) d ORDER BY 1
+----
+INTEGER
+2
+3
+4
+5
+6
+7
+
+query III nosort
+SELECT d.ct_id, d.n, z.zn_id FROM (SELECT ct_id, (SELECT COUNT(*) FROM promos) AS n FROM cities) d FULL JOIN zones z ON z.zn_city = d.ct_id AND z.zn_id > 38 ORDER BY 1 NULLS LAST, 3 NULLS LAST LIMIT 7
+----
+SMALLINT	BIGINT	INTEGER
+1	0	NULL
+2	0	NULL
+3	0	NULL
+4	0	NULL
+5	0	40
+6	0	NULL
+NULL	NULL	1
+
+query II nosort
+WITH c AS (SELECT ct_id, (SELECT COUNT(*) FROM zones) AS n FROM cities) SELECT ct_id, n FROM c WHERE ct_id > 3 ORDER BY ct_id
+----
+SMALLINT	BIGINT
+4	40
+5	40
+6	40
+
+query II nosort
+WITH c AS (SELECT ct_id, (SELECT COUNT(*) FROM zones) AS n FROM cities) SELECT a.ct_id, a.n + b.n AS s FROM c a JOIN c b ON a.ct_id = b.ct_id ORDER BY a.ct_id
+----
+SMALLINT	BIGINT
+1	80
+2	80
+3	80
+4	80
+5	80
+6	80
+
+query II nosort
+WITH c AS (SELECT ct_id, ct_id - (SELECT MIN(zn_id) FROM zones) AS k FROM cities) SELECT a.ct_id, b.ct_id FROM c a LEFT JOIN c b ON b.k = a.ct_id ORDER BY a.ct_id
+----
+SMALLINT	SMALLINT
+1	2
+2	3
+3	4
+4	5
+5	6
+6	NULL
+
+query II nosort
+SELECT z.zn_id, d.v FROM zones z JOIN (SELECT ct_id, (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - ct_id AS v FROM cities) d ON d.ct_id = z.zn_city WHERE z.zn_id > 34 ORDER BY z.zn_id
+----
+INTEGER	SMALLINT
+35	0
+36	4
+37	3
+40	0
+
+# Values in UNION ALL, UNION, INTERSECT and EXCEPT arms, the compound wrapped in a derived table ordered outside.
+
+query I nosort
+SELECT u.v FROM (SELECT ct_id + (SELECT MIN(zn_id) FROM zones) AS v FROM cities UNION ALL SELECT zn_id + 10 FROM zones WHERE zn_id < 3) u ORDER BY 1
+----
+INTEGER
+2
+3
+4
+5
+6
+7
+11
+12
+
+query II nosort
+SELECT * FROM (SELECT ct_id % 2 AS p, (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) AS v FROM cities UNION SELECT zn_id % 2, (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - 1 FROM zones) u ORDER BY 1, 2
+----
+INTEGER	SMALLINT
+0	4
+0	5
+1	4
+1	5
+
+query I nosort
+SELECT * FROM (SELECT ct_id * (SELECT MIN(ct_id) FROM cities) AS v FROM cities INTERSECT SELECT zn_city FROM zones) u ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT * FROM (SELECT ct_id FROM cities EXCEPT SELECT zn_city * (SELECT MIN(ct_id) FROM cities) + 1 FROM zones) u ORDER BY 1
+----
+SMALLINT
+1
+
+query II nosort
+SELECT * FROM (SELECT ct_id, (SELECT zn_id FROM zones WHERE zn_id > 99) AS v FROM cities WHERE ct_id < 3 UNION ALL SELECT zn_id, (SELECT MIN(zn_id) FROM zones) FROM zones WHERE zn_id > 38) u ORDER BY 1
+----
+INTEGER	INTEGER
+1	NULL
+2	NULL
+39	1
+40	1
+
+# ---- Row errors ----
+
+# A value of two rows fails in a select item over every row, over an empty table, behind a WHERE that keeps no row,
+# in an untaken CASE branch and as COALESCE's never-read argument: its join is built before any row is read.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT (SELECT zn_id FROM zones) AS v FROM cities
+
+statement error More than one row returned by a subquery used as an expression
+SELECT tr_row, (SELECT zn_id FROM zones) AS c FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id < 0)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT CASE WHEN ct_id > 100 THEN (SELECT zn_id FROM zones) ELSE 0 END AS v FROM cities
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, CASE WHEN ct_id > 100 AND EXISTS (SELECT zn_id FROM zones ORDER BY (SELECT zn_id FROM zones)) THEN 1 ELSE 0 END AS e FROM cities ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities ORDER BY (SELECT zn_id FROM zones WHERE zn_id < 3), ct_id
+
+# A value of two rows in another block fails too: an IN subquery's select list, a derived table's column read
+# outside, an EXISTS block's ORDER BY keys (under LIMIT, correlated, or by an item's alias) and an EXISTS block's
+# DISTINCT list.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT (SELECT zn_id FROM zones) FROM zones) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, v FROM (SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities) d ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones ORDER BY zn_id + (SELECT ct_id FROM cities) LIMIT 1) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT zn_id FROM zones ORDER BY zn_id + (SELECT zn_id FROM zones)) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT zn_id FROM zones z WHERE z.zn_city = c.ct_id ORDER BY zn_id + (SELECT zn_id FROM zones)) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT DISTINCT (SELECT zn_id FROM zones) FROM zones) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS v FROM zones ORDER BY v) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS v FROM zones z WHERE z.zn_city = c.ct_id ORDER BY v) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT DISTINCT (SELECT zn_id FROM zones) FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT zn_id FROM zones ORDER BY zn_id + (SELECT zn_id FROM zones) LIMIT 1)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT zn_id FROM zones WHERE zn_id = tr_pickup ORDER BY zn_id + (SELECT zn_id FROM zones))
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS v FROM zones ORDER BY v LIMIT 1)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT * FROM (SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities UNION ALL SELECT zn_id, zn_city FROM zones) u ORDER BY 1
+
+# A column times a value that overflows its type.
+
+statement error Overflow in (addition|subtraction|multiplication) of
+SELECT ct_id FROM cities ORDER BY (SELECT MAX(i64) FROM edge) + ct_id, ct_id
+
+# ---- Bind errors ----
+
+# A value of two columns is a bind error wherever it stands: a select item, an ORDER BY key, an EXISTS block's or an
+# IN subquery's select list, a derived table's column. So is a column the value's block does not have.
+
+statement error
+SELECT ct_id, (SELECT zn_id, zn_city FROM zones LIMIT 1) AS v FROM cities
+
+statement error
+SELECT ct_id, (SELECT zn_id, zn_city FROM zones LIMIT 1) FROM cities ORDER BY ct_id
+
+statement error
+SELECT (SELECT zn_id, zn_city FROM zones LIMIT 1) AS v FROM cities
+
+statement error
+SELECT ct_id FROM cities ORDER BY (SELECT zn_id, zn_city FROM zones LIMIT 1), ct_id
+
+statement error
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id, zn_city FROM zones) FROM zones) ORDER BY 1
+
+statement error
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT zn_id, zn_city FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
+
+statement error
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT (SELECT zn_id, zn_city FROM zones LIMIT 1) FROM zones) ORDER BY 1
+
+statement error
+SELECT * FROM (SELECT ct_id, (SELECT zn_id, zn_city FROM zones LIMIT 1) AS v FROM cities) d ORDER BY 1
+
+statement error
+SELECT ct_id, (SELECT nope FROM zones) AS v FROM cities ORDER BY ct_id
+
+# A later select item cannot read a value item's alias.
+
+statement error
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) AS n, n + ct_id AS m FROM cities ORDER BY ct_id
+
+statement error
+SELECT (SELECT MIN(zn_id) FROM zones) AS m, m + ct_id AS k FROM cities ORDER BY 2
+
+# ---- SQ2a: column types, outer joins, WHERE values, value blocks, nesting, EXISTS lists, wide lists, CASE ----
+
+# A value of each fixture column type, through the functions antb1 has: DATE plus and minus an integer, DATE_TRUNC
+# and EXTRACT of a DATE value; VARCHAR values through CONCAT, UPPER, LOWER, SUBSTRING, STRLEN and REGEXP_REPLACE (a
+# trailing space kept); DECIMAL rounded by a CAST to a smaller scale and by ROUND of a DOUBLE quotient; DECIMAL(38,10)
+# and DECIMAL(38,0) values; USMALLINT, BIGINT and DOUBLE values; HUGEINT, an integer SUM, times a BIGINT column; a
+# DECIMAL value over the empty promos table.
+
+query ITT nosort
+SELECT tr_row, tr_day, (SELECT MAX(sh_day) FROM shifts) - tr_row AS d FROM trips ORDER BY tr_row LIMIT 4
+----
+INTEGER	DATE	DATE
+0	2026-03-01	2026-03-30
+1	2026-03-02	2026-03-29
+2	2026-03-03	2026-03-28
+3	2026-03-04	2026-03-27
+
+query ITI nosort
+SELECT ct_id, date_trunc('month', (SELECT MAX(dy_day) FROM days)) AS m, EXTRACT(month FROM (SELECT MIN(dy_day) FROM days)) + ct_id AS k FROM cities ORDER BY ct_id
+----
+SMALLINT	TIMESTAMP	BIGINT
+1	2029-12-01 00:00:00	13
+2	2029-12-01 00:00:00	14
+3	2029-12-01 00:00:00	15
+4	2029-12-01 00:00:00	16
+5	2029-12-01 00:00:00	17
+6	2029-12-01 00:00:00	18
+
+query ITT nosort
+SELECT tr_row, tr_day, CASE WHEN tr_day >= (SELECT MAX(tr_day) FROM trips) - 2 THEN 'end' WHEN tr_day < (SELECT MIN(tr_day) FROM trips) + 3 THEN 'start' ELSE 'mid' END AS p FROM trips WHERE tr_row BETWEEN 26 AND 34 ORDER BY tr_row
+----
+INTEGER	DATE	VARCHAR
+26	2026-03-27	mid
+27	2026-03-28	mid
+28	2026-03-29	end
+29	2026-03-30	end
+30	2026-03-31	end
+31	2026-03-01	start
+32	2026-03-02	start
+33	2026-03-03	start
+34	2026-03-04	mid
+
+query IT nosort
+SELECT ct_id, concat(upper((SELECT label FROM zones WHERE zn_id = 2)), '-', label, '-', lower((SELECT tf_code FROM tariffs WHERE tf_row = 5)), '|') AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	NORTH-center-xl |
+2	NORTH-harbor-xl |
+3	NORTH-hills-xl |
+4	NORTH-airport-xl |
+5	NORTH-old town-xl |
+6	NORTH-outskirts-xl |
+
+query ITIT nosort
+SELECT ct_id, substring((SELECT label FROM zones WHERE zn_id = 7), ct_id, 3) AS s, strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 7))) AS n, regexp_replace((SELECT label FROM cities WHERE ct_id = 5), ' ', '_') AS r FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR	BIGINT	VARCHAR
+1	mar	12	old_town
+2	ark	12	old_town
+3	rke	11	old_town
+4	ket	13	old_town
+5	et	14	old_town
+6	t	15	old_town
+
+query IDR nosort
+SELECT tf_row, CAST(tf_rate * (SELECT MAX(sh_hours) FROM shifts) AS DECIMAL(8,1)) AS r, ROUND(tf_rate / (SELECT COUNT(*) FROM cities), 3) AS q FROM tariffs ORDER BY tf_row
+----
+INTEGER	DECIMAL(8,1)	DOUBLE
+0	12.0	0.167
+1	18.0	0.25
+2	24.0	0.333
+3	15.0	0.208
+4	25.5	0.354
+5	30.0	0.417
+6	21.0	0.292
+7	NULL	NULL
+8	10.5	0.146
+
+query IDD nosort
+SELECT id, d38_10 + (SELECT d38_10 FROM decimals WHERE id = 18) AS a, d38_0 - (SELECT MIN(d38_0) FROM decimals WHERE id < 4) AS b FROM decimals WHERE id < 6 ORDER BY id
+----
+INTEGER	DECIMAL(38,10)	DECIMAL(38,0)
+0	-4.0000000004	NULL
+1	0.0000000000	300000000000000000000
+2	NULL	700000000000000000000
+3	-3.0000000003	0
+4	1.0000000001	400000000000000000000
+5	5.0000000005	800000000000000000000
+
+query IIIR nosort
+SELECT id, u16 + (SELECT u16 FROM edge WHERE id = 10) AS a, i64 // (SELECT i32 FROM edge WHERE id = 6) AS b, d * (SELECT d FROM edge WHERE id = 3) AS c FROM edge WHERE id IN (2, 3, 4, 6, 7) ORDER BY id
+----
+INTEGER	USMALLINT	BIGINT	DOUBLE
+2	13	0	0
+3	32780	0	0.4444444444444444
+4	15899	0	0.06666666666666667
+6	15929	10000000000	82304526.08333333
+7	40012	-10000000000	-6004799503160661
+
+query II nosort
+SELECT rd_row, rd_id * (SELECT SUM(tr_rider) FROM trips) AS v FROM riders ORDER BY rd_row LIMIT 3
+----
+INTEGER	HUGEINT
+0	363684
+1	727368
+2	1091052
+
+query ID nosort
+SELECT pm_id, pm_discount + (SELECT MAX(tf_rate) FROM tariffs) AS v FROM promos ORDER BY pm_id
+----
+INTEGER	DECIMAL(6,3)
+
+# Values over the padded side of an outer join: COALESCE and CASE over a NULL-padded column, a value times a padded
+# column, a FULL JOIN of two derived tables whose select items are values; and a failing value over a LEFT JOIN whose
+# right side is empty.
+
+query IIT nosort
+SELECT c.ct_id, z.zn_id, COALESCE(z.label, (SELECT label FROM cities WHERE ct_id = 6)) AS l FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30 ORDER BY c.ct_id, z.zn_id
+----
+SMALLINT	INTEGER	VARCHAR
+1	31	market
+1	36	airport
+2	32	outskirts
+2	37	docks
+3	33	center
+4	34	north
+5	35	south
+5	40	outskirts
+6	NULL	outskirts
+
+query III nosort
+SELECT c.ct_id, z.zn_id, CASE WHEN z.zn_id IS NULL THEN -(SELECT COUNT(*) FROM zones) ELSE z.zn_id * (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) END AS v FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 33 ORDER BY 1, 2
+----
+SMALLINT	INTEGER	BIGINT
+1	36	180
+2	37	185
+3	NULL	-40
+4	34	170
+5	35	175
+5	40	200
+6	NULL	-40
+
+query IIIR nosort
+SELECT c.ct_id, z.zn_id, c.ct_pop + (SELECT MIN(ct_pop) FROM cities) AS p, z.zn_radius * (SELECT MAX(zn_radius) FROM zones) AS r FROM cities c FULL JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 4 WHERE z.zn_id IS NULL OR z.zn_id < 8 ORDER BY 2 NULLS FIRST, 1
+----
+SMALLINT	INTEGER	INTEGER	DOUBLE
+4	NULL	NULL	NULL
+5	NULL	10500	NULL
+6	NULL	5000	NULL
+1	1	122500	1.625
+2	2	47500	2.4375
+3	3	32500	3.25
+NULL	4	NULL	4.0625
+NULL	5	NULL	4.875
+NULL	6	NULL	5.6875
+NULL	7	NULL	6.5
+
+query IIDD nosort
+SELECT d.dv_id, s.sh_row, s.sh_hours, COALESCE(s.sh_hours, 0) + (SELECT MIN(sh_hours) FROM shifts) AS h FROM drivers d LEFT JOIN shifts s ON s.sh_driver = d.dv_id AND s.sh_day = DATE '2026-03-29' ORDER BY d.dv_id, s.sh_row LIMIT 8
+----
+BIGINT	INTEGER	DECIMAL(4,1)	DECIMAL(12,1)
+1000	NULL	NULL	4.0
+1037	NULL	NULL	4.0
+1074	362	6.8	10.8
+1111	NULL	NULL	4.0
+1148	4	6.0	10.0
+1148	499	10.5	14.5
+1185	NULL	NULL	4.0
+1222	NULL	NULL	4.0
+
+query III nosort
+SELECT a.k, b.k, COALESCE(a.v, b.v) AS v FROM (SELECT ct_id AS k, (SELECT MAX(zn_id) FROM zones) AS v FROM cities WHERE ct_id < 4) a FULL JOIN (SELECT zn_id AS k, (SELECT MIN(zn_id) FROM zones) - zn_id AS v FROM zones WHERE zn_id BETWEEN 3 AND 5) b ON a.k = b.k ORDER BY 1 NULLS LAST, 2
+----
+SMALLINT	INTEGER	INTEGER
+1	NULL	40
+2	NULL	40
+3	3	40
+NULL	4	-3
+NULL	5	-4
+
+statement error More than one row returned by a subquery used as an expression
+SELECT c.ct_id, COALESCE(p.pm_id, (SELECT zn_id FROM zones WHERE zn_id < 3)) AS v FROM cities c LEFT JOIN promos p ON p.pm_id = c.ct_id ORDER BY 1
+
+# Select-list values next to values in WHERE: a value and an uncorrelated EXISTS in one condition, a compound value
+# and a top-1 value, NOT EXISTS over the empty table, the same value in both lists, a value over a derived table; and a
+# failing select-list value behind a WHERE value that keeps no row.
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones) - ct_id AS v FROM cities WHERE ct_id < (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) AND EXISTS (SELECT 1 FROM zones WHERE zn_city = 9) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	39
+2	38
+3	37
+4	36
+
+query II nosort
+SELECT ct_id, (SELECT zn_id FROM zones ORDER BY zn_id DESC LIMIT 1 OFFSET 1) AS v FROM cities WHERE ct_id > (SELECT MIN(zn_id) FROM zones UNION ALL SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+2	39
+3	39
+4	39
+5	39
+6	39
+
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM promos) + ct_id AS n FROM cities WHERE NOT EXISTS (SELECT 1 FROM promos) AND ct_id > 4 ORDER BY ct_id
+----
+SMALLINT	BIGINT
+5	5
+6	6
+
+query IR nosort
+SELECT zn_id, zn_id - (SELECT AVG(zn_id) FROM zones) AS dev FROM zones WHERE zn_id > (SELECT AVG(zn_id) FROM zones) + 15 ORDER BY zn_id
+----
+INTEGER	DOUBLE
+36	15.5
+37	16.5
+38	17.5
+39	18.5
+40	19.5
+
+query III nosort
+SELECT ct_id, ct_pop, ct_pop - (SELECT MAX(ct_pop) FROM (SELECT ct_pop FROM cities WHERE ct_id > 1) t) AS gap FROM cities WHERE ct_pop > (SELECT AVG(ct_pop) FROM (SELECT ct_pop FROM cities WHERE ct_id > 2) t) ORDER BY ct_id
+----
+SMALLINT	INTEGER	INTEGER
+1	120000	75000
+2	45000	0
+3	30000	-15000
+
+query IT nosort
+SELECT ct_id, CASE WHEN EXISTS (SELECT 1 FROM promos) THEN 'promo' ELSE (SELECT label FROM zones WHERE zn_id = 4) END AS v FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id > (SELECT MAX(zn_id) FROM zones) - 4) ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+2	airport
+5	airport
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities WHERE ct_id > (SELECT MAX(zn_id) FROM zones)
+
+# The value's own block groups, filters groups, orders, limits or deduplicates: one group, no group (NULL), the top
+# group by count, a DISTINCT of one value, a derived table of groups, a VARCHAR top-1 with OFFSET; two groups or two
+# distinct values fail.
+
+query II nosort
+SELECT ct_id, (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) = 1 AND zn_city IS NOT NULL) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	9
+2	9
+3	9
+4	9
+5	9
+6	9
+
+query II nosort
+SELECT ct_id, (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) > 100) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	NULL
+
+query II nosort
+SELECT ct_id, ct_id * (SELECT COUNT(*) FROM zones GROUP BY zn_city ORDER BY COUNT(*) DESC, zn_city LIMIT 1) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	8
+2	16
+3	24
+4	32
+5	40
+6	48
+
+query II nosort
+SELECT ct_id, (SELECT DISTINCT zn_city FROM zones WHERE zn_parent = 2) + ct_id AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	SMALLINT
+1	3
+2	4
+3	5
+4	6
+5	7
+6	8
+
+query II nosort
+SELECT ct_id, (SELECT MAX(n) FROM (SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city) g) - ct_id AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	7
+2	6
+3	5
+4	4
+5	3
+6	2
+
+query IT nosort
+SELECT ct_id, (SELECT label FROM zones WHERE zn_radius IS NOT NULL ORDER BY zn_radius DESC, zn_id LIMIT 1 OFFSET 2) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	airport
+2	airport
+3	airport
+4	airport
+5	airport
+6	airport
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) = 8) AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT DISTINCT zn_city FROM zones WHERE zn_id < 3) AS v FROM cities ORDER BY ct_id
+
+# Three levels of values: in ORDER BY, in the value block's WHERE, through a derived table in the value block; the
+# innermost value fails.
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY ct_id % (SELECT (SELECT (SELECT COUNT(*) FROM promos) + 3 FROM zones WHERE zn_id = 1) FROM cities WHERE ct_id = 1), ct_id DESC
+----
+SMALLINT
+6
+3
+4
+1
+5
+2
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) FROM zones WHERE zn_city = (SELECT MIN(ct_id) FROM cities WHERE ct_pop < (SELECT AVG(ct_pop) FROM cities))) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	33
+2	33
+3	33
+4	33
+5	33
+6	33
+
+query II nosort
+SELECT * FROM (SELECT ct_id, (SELECT v + 1 FROM (SELECT (SELECT MAX(zn_id) FROM zones) AS v FROM cities WHERE ct_id = 1) t) AS w FROM cities) d WHERE w > ct_id * 7 ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	41
+2	41
+3	41
+4	41
+5	41
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT (SELECT (SELECT zn_id FROM zones) FROM cities WHERE ct_id = 1) FROM cities WHERE ct_id = 2) AS v FROM cities
+
+# Values in an EXISTS block's select list and its ORDER BY by position. A select list that only feeds EXISTS is
+# dropped, so a failing value there answers; ordering by its position computes it and fails, correlated or not.
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT MAX(zn_id) FROM zones) - z.zn_id FROM zones z WHERE z.zn_city = c.ct_id ORDER BY 1) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT z.zn_id, (SELECT zn_id FROM zones) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+query IT nosort
+SELECT ct_id, CASE WHEN EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones WHERE zn_city = 9) THEN label ELSE 'none' END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	center
+2	harbor
+3	hills
+4	airport
+5	old town
+6	outskirts
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones ORDER BY 1) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT (SELECT zn_id FROM zones WHERE zn_id < 3) FROM zones z WHERE z.zn_city = c.ct_id ORDER BY 1) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT zn_id, (SELECT zn_id FROM zones) FROM zones WHERE zn_city = 99 ORDER BY 2) ORDER BY ct_id
+
+# Wide select lists, a report row of eight or more values: one city's row of facts over other tables, a row per city
+# mixing values with its columns, and trips rows with eight value items (a NULL value among them).
+
+query ITIITTDDIDI nosort
+SELECT ct_id, label, (SELECT COUNT(*) FROM trips) AS trips, (SELECT COUNT(DISTINCT tr_rider) FROM trips) AS riders, (SELECT MIN(tr_day) FROM trips) AS first_day, (SELECT MAX(tr_day) FROM trips) AS last_day, (SELECT SUM(tr_fare) FROM trips) AS fares, (SELECT MAX(tr_fare) FROM trips) AS top_fare, (SELECT COUNT(*) FROM trips WHERE tr_promo IS NOT NULL) AS promo_trips, (SELECT MAX(tf_rate) FROM tariffs) AS top_rate, (SELECT COUNT(*) FROM drivers) AS drivers FROM cities WHERE ct_id = 1
+----
+SMALLINT	VARCHAR	BIGINT	BIGINT	DATE	DATE	DECIMAL(38,2)	DECIMAL(9,2)	BIGINT	DECIMAL(5,3)	BIGINT
+1	center	3000	243	2026-03-01	2026-03-31	44992.50	27.50	60	2.500	97
+
+query IRIIIIITTD nosort
+SELECT ct_id, ROUND(ct_pop * 100 / (SELECT SUM(ct_pop) FROM cities), 2) AS share, (SELECT MAX(ct_pop) FROM cities) - ct_pop AS gap, ct_pop - (SELECT MIN(ct_pop) FROM cities) AS over_min, (SELECT COUNT(*) FROM zones) AS zones, (SELECT COUNT(*) FROM riders) AS riders, (SELECT COUNT(*) FROM drivers) AS drivers, (SELECT MIN(dv_since) FROM drivers) AS since, (SELECT MAX(md_name) FROM models) AS model, (SELECT MAX(sh_hours) FROM shifts) AS hours FROM cities ORDER BY ct_id
+----
+SMALLINT	DOUBLE	INTEGER	INTEGER	BIGINT	BIGINT	BIGINT	DATE	VARCHAR	DECIMAL(4,1)
+1	58.39	0	117500	40	240	97	2025-01-01	zelkova	12.0
+2	21.9	75000	42500	40	240	97	2025-01-01	zelkova	12.0
+3	14.6	90000	27500	40	240	97	2025-01-01	zelkova	12.0
+4	NULL	NULL	NULL	40	240	97	2025-01-01	zelkova	12.0
+5	3.89	112000	5500	40	240	97	2025-01-01	zelkova	12.0
+6	1.22	117500	0	40	240	97	2025-01-01	zelkova	12.0
+
+query IDDRITTTI nosort
+SELECT tr_row, tr_fare - (SELECT MIN(tr_fare) FROM trips) AS a, (SELECT MAX(tr_fare) FROM trips) - tr_fare AS b, tr_distance * (SELECT MAX(zn_radius) FROM zones) AS c, (SELECT pm_id FROM promos) AS d, tr_day - (SELECT MIN(zn_city) FROM zones) AS e, (SELECT MIN(tr_day) FROM trips) + tr_row AS f, CASE WHEN tr_pickup > (SELECT AVG(zn_id) FROM zones) THEN 'far' ELSE 'near' END AS g, COALESCE(tr_promo, (SELECT MIN(pm_id) FROM promos), -1) AS h FROM trips ORDER BY tr_row LIMIT 5
+----
+INTEGER	DECIMAL(10,2)	DECIMAL(10,2)	DOUBLE	INTEGER	DATE	DATE	VARCHAR	INTEGER
+0	0.00	24.00	0.40625	NULL	2026-02-28	2026-03-01	near	1
+1	7.25	16.75	2.4375	NULL	2026-03-01	2026-03-02	near	-1
+2	14.50	9.50	4.46875	NULL	2026-03-02	2026-03-03	near	-1
+3	21.75	2.25	6.5	NULL	2026-03-03	2026-03-04	near	-1
+4	4.75	19.25	8.53125	NULL	2026-03-04	2026-03-05	near	-1
+
+# Values as CASE thresholds that depend on the row: bands around an average, a cutoff that moves with a column, a fare
+# against a distance times a rate, an integer range shifted by the row id, DECIMAL branches; a failing threshold.
+
+query IT nosort
+SELECT ct_id, CASE WHEN ct_pop >= (SELECT AVG(ct_pop) FROM cities) THEN 'above' WHEN ct_pop * 4 >= (SELECT AVG(ct_pop) FROM cities) THEN 'near' WHEN ct_pop IS NULL THEN 'unknown' ELSE 'below' END AS band FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	above
+2	above
+3	near
+4	unknown
+5	below
+6	below
+
+query IIT nosort
+SELECT zn_id, zn_city, CASE WHEN zn_id > (SELECT MAX(zn_id) FROM zones) - zn_city * 4 THEN 'top' ELSE 'rest' END AS t FROM zones WHERE zn_id > 22 ORDER BY zn_id
+----
+INTEGER	SMALLINT	VARCHAR
+23	3	rest
+24	4	rest
+25	5	top
+26	1	rest
+27	2	rest
+28	3	rest
+29	4	top
+30	5	top
+31	1	rest
+32	2	rest
+33	3	top
+34	4	top
+35	5	top
+36	1	rest
+37	2	top
+38	NULL	rest
+39	9	top
+40	5	top
+
+query IT nosort
+SELECT tr_row, CASE WHEN tr_fare > tr_distance * (SELECT MAX(tf_rate) FROM tariffs) * 4 THEN 'high' WHEN tr_fare > (SELECT MIN(tr_fare) FROM trips) * tr_rate * 3 THEN 'mid' ELSE 'low' END AS f FROM trips WHERE tr_row < 12 ORDER BY tr_row
+----
+INTEGER	VARCHAR
+0	high
+1	high
+2	high
+3	high
+4	low
+5	mid
+6	low
+7	low
+8	low
+9	mid
+10	mid
+11	low
+
+query II nosort
+SELECT id, CASE WHEN i32 > (SELECT i32 FROM edge WHERE id = 6) - id * 20000 THEN 1 WHEN i32 IS NULL THEN -1 ELSE 0 END AS b FROM edge ORDER BY id
+----
+INTEGER	INTEGER
+0	0
+1	1
+2	0
+3	0
+4	0
+5	-1
+6	1
+7	0
+8	1
+9	-1
+10	1
+11	1
+
+query ID nosort
+SELECT id, CASE WHEN d9_2 > (SELECT MIN(d9_2) FROM decimals WHERE id > 2) + id THEN d9_2 - (SELECT MIN(d9_2) FROM decimals WHERE id > 2) ELSE (SELECT MAX(d9_2) FROM decimals WHERE id > 2) - d9_2 END AS v FROM decimals WHERE id BETWEEN 3 AND 12 ORDER BY id
+----
+INTEGER	DECIMAL(10,2)
+3	NULL
+4	6.25
+5	11.25
+6	10.00
+7	7.50
+8	12.50
+9	8.75
+10	NULL
+11	12.50
+12	7.50
+
+query IIT nosort
+SELECT zn_id, zn_city, CASE zn_city WHEN (SELECT MIN(zn_city) FROM zones) THEN 'first' WHEN (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) - zn_id % 5 THEN 'shifted' ELSE 'other' END AS k FROM zones WHERE zn_id < 13 ORDER BY zn_id
+----
+INTEGER	SMALLINT	VARCHAR
+1	1	first
+2	2	other
+3	3	other
+4	4	other
+5	5	shifted
+6	1	first
+7	2	other
+8	3	other
+9	4	other
+10	5	shifted
+11	1	first
+12	2	other
+
+query TT nosort
+SELECT label, CASE WHEN label < (SELECT label FROM zones WHERE zn_id = 4) THEN 'before' WHEN label = (SELECT label FROM zones WHERE zn_id = 4) THEN 'same' ELSE 'after' END AS o FROM cities ORDER BY label
+----
+VARCHAR	VARCHAR
+airport	same
+center	after
+harbor	after
+hills	after
+old town	after
+outskirts	after
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, CASE WHEN ct_pop > (SELECT ct_pop FROM cities WHERE ct_pop > 10000) + ct_id THEN 'big' ELSE 'small' END AS s FROM cities ORDER BY ct_id
+
+# Overflow of a value over a column type the other sections do not use: a USMALLINT sum and a DECIMAL(38,10) sum.
+
+statement error Overflow in (addition|subtraction|multiplication) of
+SELECT id, u16 + (SELECT MAX(u16) FROM edge) AS v FROM edge WHERE id IN (1, 2) ORDER BY id
+
+statement error Overflow in (addition|subtraction|multiplication) of
+SELECT id, d38_10 + (SELECT MAX(d38_10) FROM decimals) AS v FROM decimals WHERE id IN (6, 7) ORDER BY id
+
+# ---- divergence D37: an ORDER BY expression over the alias of a value item ----
+
+# antb1 binds the item's expression again, which reads the same value; DuckDB refuses an alias whose item holds a
+# subquery inside an ORDER BY expression. ORDER BY the alias alone, or the item's position, answers in both.
+onlyif antb1
+query II nosort
+SELECT ct_id, (SELECT COUNT(*) FROM cities) AS n FROM cities ORDER BY n - ct_id
+----
+SMALLINT	BIGINT
+6	6
+5	6
+4	6
+3	6
+2	6
+1	6
+
+onlyif duckdb
+statement error Alias "n" referenced in a SELECT clause - but the expression has a subquery
+SELECT ct_id, (SELECT COUNT(*) FROM cities) AS n FROM cities ORDER BY n - ct_id
+
+onlyif antb1
+query II nosort
+SELECT ct_id, CASE WHEN ct_id > 3 THEN 1 ELSE 0 END + (SELECT MIN(zn_id) FROM zones) AS m FROM cities ORDER BY -m, ct_id
+----
+SMALLINT	INTEGER
+4	2
+5	2
+6	2
+1	1
+2	1
+3	1
+
+onlyif duckdb
+statement error Alias "m" referenced in a SELECT clause - but the expression has a subquery
+SELECT ct_id, CASE WHEN ct_id > 3 THEN 1 ELSE 0 END + (SELECT MIN(zn_id) FROM zones) AS m FROM cities ORDER BY -m, ct_id
+
+# ---- divergences D35 and D32: a failing value that DuckDB's optimizer deletes ----
+
+# DuckDB's filter combiner proves ct_id = 1 AND ct_id = 2 never true and drops the block's plan, the value with it;
+# and it drops a derived table's column that nothing reads, its value with it. antb1 builds the value and fails.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities WHERE ct_id = 1 AND ct_id = 2
+
+onlyif duckdb
+query II rowsort
+SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities WHERE ct_id = 1 AND ct_id = 2
+----
+SMALLINT	INTEGER
+
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM (SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities) d ORDER BY ct_id
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM (SELECT ct_id, (SELECT zn_id FROM zones) AS v FROM cities) d ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
