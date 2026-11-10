@@ -276,6 +276,23 @@ subquery silently uncorrelated), and the outer binding is never read by a path (
 `AVG` is written only over a `DECIMAL` argument, where ADR 0021 rule 13 makes the engines agree bit for bit.
 U2 and U3 declare both forms, so they are compared like any other.
 
+The refs carry **uncorrelated values of any shape** as well (ADR 0041's SQ4a, feature `uncorrelated_value`), from a
+random stream of their own and only where neither subquery form above fired, so a query holds at most one subquery
+conjunct and a seed that took another is untouched. Over the same candidates as the uncorrelated `IN` (a column of
+the block's table), 30% of the queries that have one take a further top-level `AND` conjunct of `WHERE`:
+`[NOT] EXISTS (block)`, `probe BETWEEN (value) AND (value)` over integers, strings or dates (whose three values then
+need no `DOUBLE` or `DECIMAL` rule of a `BETWEEN`), or `probe <op> (value)` and its mirror. A value block returns at
+most one row whatever the data: the first value of the column in either order or the first of its groups (`ORDER BY`
+the column, `LIMIT 1`, now and then an `OFFSET`, past the end too), `LIMIT 0`, `MIN` or `MAX` under a `HAVING
+COUNT(*)` that holds or not, or an `INTERSECT` or `EXCEPT`, `ALL` or not, of two such aggregates -- never a `UNION`,
+whose rows add up. So no generated query meets the row error, and since no block computes anything that can fail,
+none meets an error the order of its joins could hide (divergence D35). An `EXISTS` block may have any row count: a
+star, the column, the groups a `HAVING COUNT(*)` keeps, a `UNION [ALL]` or `EXCEPT` of the column with itself, or a
+value block. Every block names one table and reads only its columns, unqualified. Its `ORDER BY`, `LIMIT`, `OFFSET`,
+`GROUP BY` and `HAVING` record no feature of their own (they are `uncorrelated_value`'s), so the row-shape rules read
+the outer query alone; its aggregates and set operators record theirs, as in the outer grammar, and its aggregates
+wait for a select list that settles the query's row shape, as the uncorrelated form's do.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

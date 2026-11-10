@@ -186,7 +186,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ5a | NULL-equal join keys in the executor, no SQL (ADR 0022's OJ5a update) | | Built |
 | OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included (the OJ5b update below) | | Built |
 | **Phase 8** | **Subqueries ([ADR 0041](0041-subqueries-and-decorrelation.md); the phase 8 update below)** | | |
-| SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Planned |
+| SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Built |
 | SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Planned |
 | SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Planned |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Planned |
@@ -847,6 +847,19 @@ functions. Phase 8's rows are planned again, and the ids change:
   before SQ4a (Q14) and SQ2 (Q9) merge, the two of the nine likeliest to press on the budget.
 - **Open** (ADR 0041's open decisions): phase 10's build order, and whether the closing items CL1 and CL2, and with
   CL2 this ADR's acceptance, wait for phase 10.
+
+Update (2026-11-10, SQ4a): built, and with it phase 8 begins (ADR 0041's SQ4a update). Uncorrelated scalar subqueries of
+any shape are values through the single-value aggregate, an uncorrelated EXISTS is COUNT(*) over `LIMIT 1` of its block,
+a BETWEEN with a subquery bound is its two comparisons, and a set operation is the query of either; correlated
+subqueries are answered as before. Q14, Q54 and Q58 pass, so the ratchet is at 78. They stay far inside the SF 1
+budget, so PF7 and PF16 stay guards. On Apple silicon, antb1 answers them at SF 1 in 7.0 s, 0.58 s and 0.67 s in the
+Debug build and in 20.8 s, 1.4 s and 1.8 s under AddressSanitizer, and they peak at 10.2, 3.9 and 7.8 MiB. Their shards
+(2, 5 and 6 of 8) take 94 s, 58 s and 45 s under AddressSanitizer here, against an inner timeout of 870 s. At the ratio
+of the latest nightly `asan-tpc-sf1` run to the local times of its shards (about 3.9x), shard 2 comes to about 370 s,
+43% of the timeout. At the slowest ratio seen (5.9x, a PR leg that ran eight jobs on four cores), it would be 557 s,
+above the gate's 60% (522 s): shard 2 is the one to watch, and CL1's rebalancing is the remedy if a nightly run crosses
+the gate. `pixi run asan-tpc-sf1` stops at test discovery on macOS, so the shards ran from its build tree directly
+here, and the task's first run is the nightly's.
 
 ## Alternatives considered
 

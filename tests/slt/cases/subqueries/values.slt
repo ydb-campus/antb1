@@ -1,0 +1,482 @@
+# Uncorrelated scalar subqueries of any shape as values (ADR 0041's SQ4a): a direct operand of a comparison in a
+# top-level conjunct of WHERE, an inner join's ON or HAVING, through its single value -- NULL over no row, the row's
+# value over one (a NULL value counts as a row), DuckDB's error over two or more. Also a BETWEEN with subquery bounds,
+# a set operation as the subquery's query, and the error-visibility divergence D35 of docs/sql-subset.md.
+
+# ---- the inputs, one table at a time ----
+
+query ITI nosort
+SELECT ct_id, label, ct_pop FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR	INTEGER
+1	center	120000
+2	harbor	45000
+3	hills	30000
+4	airport	NULL
+5	old town	8000
+6	outskirts	2500
+
+query ITR nosort
+SELECT zn_id, label, zn_radius FROM zones WHERE zn_id <= 12 ORDER BY zn_id
+----
+INTEGER	VARCHAR	DOUBLE
+1	center	0.5
+2	north	0.75
+3	south	1
+4	airport	1.25
+5	docks	1.5
+6	park	1.75
+7	market	2
+8	NULL	2.25
+9	center	2.5
+10	north	2.75
+11	south	3
+12	airport	3.25
+
+query I nosort
+SELECT COUNT(*) FROM promos
+----
+BIGINT
+0
+
+# ---- one row, no row, a NULL row ----
+
+# A subquery of exactly one row that is no aggregate: its value.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_parent FROM zones WHERE zn_id = 10)
+----
+BIGINT
+70
+
+# No row: NULL, which the comparison rejects, on either side of it.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones WHERE zn_id > 1000)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE (SELECT pm_id FROM promos) = ct_id
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE (SELECT pm_id FROM promos) <> ct_id
+----
+BIGINT
+0
+
+# One row whose value is NULL: a row, so no error, and NULL rejects every row.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE label = 'airport')
+----
+BIGINT
+0
+
+# ---- two rows or more: DuckDB's error ----
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_city FROM zones WHERE zn_id < 3)
+
+# Two NULL values are two rows, and so are a NULL value and another.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_parent FROM zones WHERE zn_id < 3)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_parent FROM zones WHERE zn_id IN (1, 6))
+
+# The subquery runs even where the other side has no row.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM promos WHERE pm_id = (SELECT zn_id FROM zones)
+
+# Inside a derived table, and inside another subquery.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM (SELECT tr_pickup FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones WHERE zn_city = 3)) AS d
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MAX(zn_id) FROM zones WHERE zn_city = (SELECT zn_city FROM zones WHERE zn_id > 38))
+
+# ---- shapes: grouped, LIMIT and OFFSET, DISTINCT, HAVING, a CTE, a nested subquery ----
+
+# A grouped subquery of one group, of none, and of several.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MIN(zn_id) FROM zones WHERE zn_city = 2 GROUP BY zn_city)
+----
+BIGINT
+70
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MIN(zn_id) FROM zones WHERE zn_city > 100 GROUP BY zn_city)
+----
+BIGINT
+0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MIN(zn_id) FROM zones GROUP BY zn_city)
+
+# ORDER BY with LIMIT 1 (a key that ends with a unique column: zones tie on zn_radius), with an OFFSET, an OFFSET
+# past the end, and LIMIT 0; LIMIT 2 is two rows.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC, zn_id LIMIT 1)
+----
+BIGINT
+70
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 1 OFFSET 4)
+----
+BIGINT
+70
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 1 OFFSET 40)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup <> (SELECT zn_id FROM zones LIMIT 0)
+----
+BIGINT
+0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 2)
+
+# DISTINCT of one value, and of two.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_city = (SELECT DISTINCT zn_city FROM zones WHERE zn_id IN (2, 7, 12))
+----
+BIGINT
+8
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM zones WHERE zn_city = (SELECT DISTINCT zn_city FROM zones WHERE zn_id IN (2, 3))
+
+# An aggregate with HAVING: one row where it holds, none where it does not.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MAX(tr_fare) - 10 FROM trips HAVING COUNT(*) > 100)
+----
+BIGINT
+1197
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT MAX(tr_fare) FROM trips HAVING COUNT(*) > 100000)
+----
+BIGINT
+0
+
+# A CTE's column, its aggregate in WHERE and one group of it in HAVING.
+query I nosort
+WITH per_pickup AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup) SELECT COUNT(*) FROM per_pickup WHERE n = (SELECT MAX(n) FROM per_pickup)
+----
+BIGINT
+33
+
+query II rowsort
+WITH per_pickup AS (SELECT tr_pickup AS zone, COUNT(*) AS n FROM trips GROUP BY tr_pickup) SELECT tr_dropoff, COUNT(*) FROM trips GROUP BY tr_dropoff HAVING COUNT(*) > (SELECT n FROM per_pickup WHERE zone = 7)
+----
+INTEGER	BIGINT
+1	71
+10	71
+12	71
+14	71
+16	71
+18	71
+2	71
+20	71
+21	71
+22	71
+23	71
+25	71
+27	71
+29	71
+3	71
+31	71
+33	71
+35	71
+37	71
+39	71
+4	71
+40	71
+6	71
+8	71
+NULL	176
+
+# A subquery inside the subquery: a value, and an IN.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones WHERE zn_id = (SELECT MAX(ct_id) FROM cities))
+----
+BIGINT
+70
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones WHERE zn_id IN (SELECT ct_id FROM cities WHERE label = 'hills'))
+----
+BIGINT
+70
+
+# Two of them, each its own value.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_parent FROM zones WHERE zn_id = 10) AND tr_dropoff = (SELECT zn_parent FROM zones WHERE zn_id = 6)
+----
+BIGINT
+2
+
+# ---- placements: an inner join's ON, HAVING ----
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city = (SELECT ct_id FROM cities WHERE label = 'harbor')
+----
+BIGINT
+559
+
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING COUNT(*) > (SELECT COUNT(*) FROM zones WHERE zn_city = 3 GROUP BY zn_city) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+5	8
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING COUNT(*) > (SELECT COUNT(*) FROM zones GROUP BY zn_city)
+
+# ---- types: VARCHAR, DATE and DECIMAL values ----
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_tariff = (SELECT tf_code FROM tariffs WHERE tf_rate = 1.5)
+----
+BIGINT
+284
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day >= (SELECT MAX(sh_day) FROM shifts GROUP BY sh_driver ORDER BY sh_driver LIMIT 1)
+----
+BIGINT
+842
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_rate < (SELECT tf_rate FROM tariffs ORDER BY tf_rate DESC NULLS LAST LIMIT 1)
+----
+BIGINT
+2427
+
+# ---- one column ----
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id, zn_city FROM zones LIMIT 1)
+
+onlyif antb1
+statement error ^bind: a subquery of a comparison must have one column, not 2$
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id, zn_city FROM zones LIMIT 1)
+
+# ---- a set operation as the query (ADR 0036's X6) ----
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_id = (SELECT zn_id FROM zones WHERE zn_city = 1 INTERSECT SELECT zn_id FROM zones WHERE zn_radius > 2.9 AND zn_radius < 3.1)
+----
+BIGINT
+1
+
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_id = (SELECT ct_id FROM cities EXCEPT SELECT zn_id FROM zones WHERE zn_id < 6)
+----
+BIGINT
+1
+
+# A UNION that keeps one row, and a UNION ALL of two one-row arms, which is two rows.
+query I nosort
+SELECT COUNT(*) FROM zones WHERE zn_id = (SELECT MIN(zn_id) FROM zones UNION SELECT MIN(ct_id) FROM cities)
+----
+BIGINT
+1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM zones WHERE zn_id = (SELECT MIN(zn_id) FROM zones UNION ALL SELECT MAX(zn_id) FROM zones)
+
+# ---- BETWEEN with subquery bounds (ADR 0041's decision 6): its two comparisons ----
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_fare BETWEEN (SELECT MIN(tr_fare) + 5 FROM trips) AND (SELECT MAX(tr_fare) - 5 FROM trips)
+----
+BIGINT
+1706
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN 3 AND (SELECT zn_parent FROM zones WHERE zn_id = 10)
+----
+BIGINT
+210
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN (SELECT zn_parent FROM zones WHERE zn_id = 10) AND 20
+----
+BIGINT
+1120
+
+# A NULL bound rejects every row; a literal operand; a bound of two rows.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN (SELECT pm_id FROM promos) AND 20
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE 3 BETWEEN (SELECT MIN(zn_city) FROM zones) AND ct_id
+----
+BIGINT
+4
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN (SELECT zn_id FROM zones WHERE zn_city = 1) AND 20
+
+# DATE and VARCHAR values, the literal typed as the subquery's column.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_day BETWEEN (SELECT MIN(sh_day) FROM shifts) AND '2026-03-10'
+----
+BIGINT
+944
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_tariff BETWEEN (SELECT MIN(tf_code) FROM tariffs) AND 'P'
+----
+BIGINT
+853
+
+# In HAVING, and in an inner join's ON.
+query II nosort
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING COUNT(*) BETWEEN (SELECT MAX(zn_id) + 30 FROM zones) AND 80 ORDER BY tr_pickup
+----
+INTEGER	BIGINT
+1	70
+2	70
+3	70
+4	70
+5	70
+6	70
+7	70
+8	70
+9	70
+10	70
+11	70
+12	70
+13	70
+14	70
+15	70
+16	70
+17	70
+18	70
+19	70
+20	70
+21	70
+22	70
+23	70
+24	70
+25	70
+26	70
+27	70
+28	70
+29	70
+30	70
+31	70
+32	70
+33	70
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_radius BETWEEN (SELECT MIN(zn_radius) FROM zones WHERE zn_city = 2) AND 5
+----
+BIGINT
+2584
+
+# All three values compare in DuckDB's common type: with a DOUBLE bound the operand's sum is computed as written (DuckDB
+# keeps its cast to DOUBLE) and overflows; with an INTEGER bound the constant moves and nothing overflows.
+statement error Overflow in addition
+SELECT id FROM edge WHERE i32 + 1 BETWEEN (SELECT MIN(d) FROM edge) AND 100
+
+query I nosort
+SELECT id FROM edge WHERE i32 + 1 BETWEEN (SELECT MIN(i32) FROM edge) AND 100 ORDER BY id
+----
+INTEGER
+0
+2
+3
+4
+7
+8
+11
+
+# ---- divergence D35: errors of subqueries next to a join that turns out empty ----
+
+# The IN written after the failing subquery: antb1 prepares the IN's build first, finds it empty and never builds the
+# subquery's; DuckDB builds both.
+onlyif antb1
+query I nosort
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos)
+
+# The IN written first: both fail.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT pm_id FROM promos) AND ct_id = (SELECT zn_city FROM zones)
+
+# A condition that never holds: DuckDB's filter combiner removes the block's plan, the subquery with it; antb1 fails.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND ct_id = (SELECT zn_city FROM zones)
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND ct_id = (SELECT zn_city FROM zones)
+----
+BIGINT
+0
+
+# A HAVING conjunct antb1 folds to false (a literal outside its operand's type, D14) ends the plan above the subquery's
+# join, which never builds: its error is never reported, where DuckDB computes the comparison and fails. Over a scan
+# the builds come first, and both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 40000 AND ct_id > (SELECT zn_city FROM zones)
+
+# A LIMIT 0 derived table among the block's FROM items: DuckDB's optimizer removes the block's plan; antb1 fails.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips, (SELECT ct_id FROM cities LIMIT 0) AS c WHERE tr_row = (SELECT zn_id FROM zones)
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM trips, (SELECT ct_id FROM cities LIMIT 0) AS c WHERE tr_row = (SELECT zn_id FROM zones)
+----
+BIGINT
+0
+
+# A WHERE subquery under a HAVING IN that turns out empty.
+onlyif antb1
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones WHERE zn_id = (SELECT zn_id FROM zones WHERE zn_city = 1) GROUP BY zn_city HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) FROM zones WHERE zn_id = (SELECT zn_id FROM zones WHERE zn_city = 1) GROUP BY zn_city HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY zn_city
+
+# An uncorrelated EXISTS that is false empties no join (its count is one row), so both fail.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = (SELECT zn_city FROM zones) AND EXISTS (SELECT * FROM promos)

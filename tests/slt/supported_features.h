@@ -138,6 +138,12 @@ enum class Feature : std::uint8_t {
   // IS NOT DISTINCT FROM as a join's keys, or as a correlated subquery's key (ADR 0037's OJ5b): a
   // NULL-equal key, on which a NULL matches a NULL.
   kNullEqualKeys,  // FROM a JOIN b ON a.k IS NOT DISTINCT FROM b.k
+  // An uncorrelated subquery of any shape as a top-level conjunct of WHERE (ADR 0041's SQ4a): a
+  // scalar subquery of at most one row as a comparison's operand or as both bounds of a BETWEEN,
+  // and [NOT] EXISTS over a block of any shape. The block's ORDER BY, LIMIT, OFFSET, GROUP BY and
+  // HAVING belong to this feature and record none of their own; its aggregates, its inner table and
+  // its set operators record theirs, as in the outer grammar (every compound kUnionAll).
+  kUncorrelatedValue,  // x < (SELECT c FROM t ORDER BY c LIMIT 1), EXISTS (SELECT * FROM t)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -306,6 +312,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "qualified_star";
     case Feature::kNullEqualKeys:
       return "null_equal_keys";
+    case Feature::kUncorrelatedValue:
+      return "uncorrelated_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -465,6 +473,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kScalarSubquery,
     Feature::kCorrelatedExists,
     Feature::kCorrelatedAggregate,
+    Feature::kUncorrelatedValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

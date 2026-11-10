@@ -122,26 +122,27 @@ INTEGER
 
 # ---- a subquery over a UNION ALL (ADR 0036's X6) ----
 
-pending X6
+# An IN's set operation waits for ADR 0041's SQ7, a set operation with a correlated arm for SQ15; a scalar's and an
+# EXISTS's with uncorrelated arms are answered (SQ4a; more in cases/subqueries/values.slt and exists.slt).
+pending SQ7
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id < 3 UNION ALL SELECT ct_id FROM cities)
 ----
 BIGINT
 420
 
-pending X6
+pending SQ15
 query I nosort
 SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM zones AS z WHERE z.zn_city = c.ct_id UNION ALL SELECT * FROM zones AS z WHERE z.zn_id = c.ct_id)
 ----
 BIGINT
 6
 
-pending X6
 query I nosort
-SELECT COUNT(*) FROM trips WHERE tr_row > (SELECT MAX(ct_pop) FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_id < 0)
+SELECT COUNT(*) FROM trips WHERE tr_row < (SELECT MAX(ct_pop) FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_id < 0)
 ----
 BIGINT
-0
+3000
 
 # ---- DuckDB only, for good: values with no exact common type (ADR 0036) ----
 # DuckDB casts every type mix, a cast that fails failing per row; antb1 casts only exact widenings and exits 4.

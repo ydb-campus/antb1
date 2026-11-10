@@ -45,6 +45,7 @@ bool MergesExactly(const plan::AggregateCall& call) {
     case plan::AggKind::kStddevPop:
     case plan::AggKind::kVarSamp:
     case plan::AggKind::kVarPop:
+    case plan::AggKind::kSingleValue:  // never grouped: it has no grouped state to merge
       return false;
   }
   return false;

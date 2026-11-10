@@ -80,8 +80,9 @@ struct JoinColumns {
 // Thread safety: Prepare and Release on the consumer thread only; table(), columns() and values()
 // from any thread between a successful Prepare and the next Release.
 //
-// A one-row join's build (a keyless spec) must hold exactly one row: any other count is Invalid,
-// from Prepare, before any probe part runs (a planner bug: SQL never sees it). Its values are then
+// A one-row join's build (a keyless spec) must hold exactly one row: any other count is a bare
+// NotImplemented, an internal error (exit 70), from Prepare, before any probe part runs (a planner
+// bug: SQL never sees it). Its values are then
 // made once (OneRowValues), from ExecContext::pool. A nested loop's keyless build (ADR 0040) may
 // hold any number of rows.
 //
@@ -107,7 +108,8 @@ class JoinBuild {
 
   // Builds the table, releasing the one it holds first. Errors: the input's (in the serial order
   // above), OutOfMemory past the memory limit, Invalid for what a correct physical plan never sends
-  // (JoinTableBuilder's checks, a one-row join's build of another row count than one).
+  // (JoinTableBuilder's checks), NotImplemented for a one-row join's build of another row count
+  // than one.
   arrow::Status Prepare(ExecContext& ctx);
   // Releases the table, a one-row join's values and the tables of the builds its input probes.
   void Release();

@@ -399,10 +399,12 @@ arrow::Status JoinBuild::BuildTable(ExecContext& ctx) {
     ARROW_ASSIGN_OR_RAISE(table_, builder->Finish());
     ARROW_ASSIGN_OR_RAISE(columns_, MakeJoinColumns(table_, ctx.budget));
     if (plan::Traits(kind_).one_row) {
-      // A planner bug, never an answer: SQL plans only an aggregate without groups here.
+      // A planner bug, never an answer: SQL plans only an aggregate without groups here, a scalar
+      // subquery's single value included, which raises its own error first. A bare NotImplemented
+      // carries no SqlErrorDetail, so it exits 70, an internal error (ADR 0041's decision 23).
       if (table_->num_rows() != 1) {
-        return arrow::Status::Invalid("a one-row join's right input returned ", table_->num_rows(),
-                                      " rows");
+        return arrow::Status::NotImplemented("a one-row join's right input returned ",
+                                             table_->num_rows(), " rows");
       }
       ARROW_ASSIGN_OR_RAISE(values_, OneRowValuesOf(*table_, ctx));
     }

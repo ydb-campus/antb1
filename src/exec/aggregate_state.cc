@@ -663,6 +663,65 @@ class MinMaxState final : public AggregateState {
   std::shared_ptr<arrow::Scalar> best_;
 };
 
+// ---- the single value of a scalar subquery ----
+
+// DuckDB 1.5.6's first sentence; the rest of its message names a setting antb1 does not offer.
+constexpr std::string_view kMoreThanOneRow =
+    "More than one row returned by a subquery used as an expression - scalar subqueries can only "
+    "return a single row";
+
+// The value of an uncorrelated scalar subquery (ADR 0041's decision 4): the selected rows, NULL
+// values counted as rows, and a copy of the first one, so that no batch stays pinned. Over no row
+// it is NULL, over one row that row's value; over more it fails, at Finalize only, so that an
+// error of the subquery's own input comes first in part order and the answer does not depend on
+// how the rows split into parts.
+class SingleValueState final : public AggregateState {
+ public:
+  SingleValueState(std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
+      : type_(std::move(type)), pool_(pool) {}
+
+  arrow::Status Consume(const arrow::Array& values, const arrow::BooleanArray* selection) override {
+    ARROW_RETURN_NOT_OK(CheckInput(values, selection, *type_));
+    const int64_t rows = selection == nullptr ? values.length() : selection->true_count();
+    if (first_ == nullptr && rows > 0) {
+      int64_t row = 0;
+      while (selection != nullptr && !(selection->IsValid(row) && selection->Value(row))) {
+        ++row;
+      }
+      ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,
+                            arrow::MakeBuilder(type_, pool_));
+      ARROW_RETURN_NOT_OK(builder->AppendArraySlice(arrow::ArraySpan(*values.data()), row, 1));
+      ARROW_ASSIGN_OR_RAISE(first_, builder->Finish());
+    }
+    rows_ += rows;
+    return arrow::Status::OK();
+  }
+  arrow::Status Merge(const AggregateState& other) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<SingleValueState>(other));
+    if (!same->type_->Equals(*type_)) {
+      return arrow::Status::Invalid("cannot merge states of different aggregates");
+    }
+    if (first_ == nullptr) {
+      first_ = same->first_;
+    }
+    rows_ += same->rows_;
+    return arrow::Status::OK();
+  }
+  [[nodiscard]] arrow::Result<std::shared_ptr<arrow::Array>> Finalize(
+      arrow::MemoryPool* pool) const override {
+    if (rows_ > 1) {
+      return arrow::Status::ExecutionError(kMoreThanOneRow);
+    }
+    return rows_ == 0 ? arrow::MakeArrayOfNull(type_, 1, pool) : first_;
+  }
+
+ private:
+  std::shared_ptr<arrow::DataType> type_;
+  arrow::MemoryPool* pool_;
+  std::shared_ptr<arrow::Array> first_;  // one element: the first selected row's value
+  int64_t rows_ = 0;
+};
+
 arrow::Result<std::unique_ptr<AggregateState>> SumState(bool average, plan::LogicalType input,
                                                         arrow::MemoryPool* pool) {
   switch (input.id()) {
@@ -766,6 +825,11 @@ arrow::Result<std::unique_ptr<AggregateState>> MakeAggregateState(
         return invalid();
       }
       return std::make_unique<VarianceState>(kind, pool);
+    case plan::AggKind::kSingleValue:
+      if (result != *input) {
+        return invalid();
+      }
+      return std::make_unique<SingleValueState>(plan::ToArrow(*input), pool);
   }
   return invalid();
 }

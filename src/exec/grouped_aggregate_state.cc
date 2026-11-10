@@ -1205,6 +1205,10 @@ arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
         return invalid();
       }
       return std::make_unique<GroupedVariance>(kind, pool);
+    case plan::AggKind::kSingleValue:
+      // The value of a scalar subquery is one aggregate over its whole plan, never grouped (ADR
+      // 0041's decision 22: a check per group would see the wrong rows).
+      break;
   }
   return invalid();
 }

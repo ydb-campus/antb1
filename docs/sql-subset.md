@@ -21,7 +21,7 @@ functions `strlen`, `regexp_replace` and `substring`, the timestamp functions `t
 `CASE` and `COALESCE` in every clause, dates written as casts or literals (`CAST('2013-07-01' AS DATE)`,
 `'2013-07-01'::DATE`,
 `DATE '2013-07-01'`), `LIMIT` and `OFFSET`, over one table of Parquet files or several joined by inner or left
-outer joins, with uncorrelated `IN` subqueries, scalar subqueries correlated or not, correlated `EXISTS` subqueries,
+outer joins, with uncorrelated `IN` subqueries, scalar and `EXISTS` subqueries correlated or not,
 and `UNION ALL`, `UNION`, `INTERSECT` and `EXCEPT`
 of two or more blocks. This covers all 43 ClickBench queries (see
 [ClickBench status](#clickbench-status)). All 22 queries derived from TPC-H pass
@@ -61,13 +61,15 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   top-level `AND` conjunct of `WHERE`, of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or
   an expression over one; in `HAVING`, an aggregate too; for a comparison, a literal or a constant integer
   expression as well) and the query has exactly one column. An `IN` key needs a type that holds both sides (so no
-  `DOUBLE`), and a comparison's query must be an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or
-  `OFFSET`, each of which could leave no row — since that is the one shape returning exactly one row however the
-  data falls. Every other placement
+  `DOUBLE`). A comparison's query that reads no enclosing block may have any shape: its value is NULL over no row,
+  the row's over one, and over two or more the query fails with DuckDB's error (exit code 1); a correlated one must be
+  an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of which could leave no row. A
+  `BETWEEN` whose bound is such a subquery (one or both) is answered as its two comparisons. Every other placement
   exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, two subqueries in one comparison and a subquery that
   is no direct operand among them, and so does a subquery column count
   other than one — a bind error, as in DuckDB. `EXISTS (query)` is answered as a top-level conjunct of `WHERE` or of
-  an inner join's `ON` and nowhere else; `TRY_CAST`, a lateral reference, more than 256
+  an inner join's `ON`, and one that reads no enclosing block of `HAVING` too, and nowhere else; `TRY_CAST`, a
+  lateral reference, more than 256
   relations counting every sub-plan and every subquery: exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
   words are reserved, while `(VALUES (1))` and `(PIVOT ...)` are not — `VALUES` and the `PIVOT`, `SHOW`,
@@ -220,11 +222,11 @@ compound of `UNION`, `INTERSECT` and `EXCEPT`, `ALL` or not, in any nesting and 
 whole statement, a derived table's query and a CTE's query ([Binding](#binding)). A compound's own `ORDER BY`, `LIMIT`
 and `OFFSET` -- the outermost compound's, or a parenthesized one's -- are unsupported (exit code 4) at the first of
 them, after any construct in its branches that is unsupported anyway, until ADR 0036's X5; a parenthesized block's own
-are answered. So is a compound as the query of an `IN`, `EXISTS` or scalar subquery unsupported, at the subquery's `IN`,
-`EXISTS` or `(` once the other side of its conjunct is checked, until X6, which
-[ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s SQ4a and SQ7 build for arms that read no enclosing block -- a
-compound in the FROM list of a subquery's query is answered. A compound in a CTE that nothing references is never
-checked or bound, tail included, as no such CTE is.
+are answered. A compound as the query of a scalar or `EXISTS` subquery is answered where no arm reads an enclosing
+block (X6, [ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s SQ4a); one with such an arm is unsupported at the
+subquery's `EXISTS` or `(`, until SQ15, and so is a compound as the query of an `IN` subquery, at its `IN` once the
+other side of its conjunct is checked, until SQ7. A compound in the FROM list of a subquery's query is answered. A
+compound in a CTE that nothing references is never checked or bound, tail included, as no such CTE is.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
 (`""` escapes a quote); a `string_literal` is text in single quotes (`''` escapes a quote); an `integer` is a
@@ -391,12 +393,30 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   with one column, and the two share a join key type (an exact widening from each, so never a `DOUBLE`). `IN` is a semi
   join, which keeps a row once when it has a match, so it is exact with NULLs too; `NOT IN` is a null-aware anti join,
   which keeps every row of an empty set, a NULL `x` included, and otherwise only a row whose `x` is not NULL, has no
-  match, and faces a set with no NULL in it. And a comparison `x <op> (query)` in either order, where the query is an
-  aggregate over every row and so returns exactly one row: it becomes a keyless one-row join that appends that row's
-  column, with the comparison directly above it, which then follows every rule a comparison of two operands does — the
-  `DECIMAL` and `DATE` pairs it admits, its folding of a literal side, and its refusal of a `FLOAT` column (divergence
-  D11), which the column carries across the block boundary. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which
-  the comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. The join sits above its
+  match, and faces a set with no NULL in it. And a comparison `x <op> (query)` in either order, whose query may have
+  any shape: it becomes a keyless one-row join that appends the query's value, with the comparison directly above it,
+  which then follows every rule a comparison of two operands does — the `DECIMAL` and `DATE` pairs it admits, its
+  folding of a literal side, and its refusal of a `FLOAT` column (divergence D11), which the column carries across the
+  block boundary. A query that is an aggregate over every row, under projections and computed columns alone (a CTE's
+  too), returns exactly one row and is its own value. Any other query is wrapped in a single value (`Aggregate
+  SINGLE_VALUE` in `EXPLAIN`; [ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s decision 4). It is NULL over no row
+  and the row's value over one, a NULL value counting as a row. Over two or more the query fails with DuckDB's error,
+  `More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row`
+  (exit code 1), once every row of the subquery is counted. Over no row `SUM`, `AVG`, `MIN` and `MAX` are NULL, which
+  the comparison rejects, and `COUNT` is 0, which it compares as usual; both as in DuckDB. A `BETWEEN` whose bound is
+  such a subquery, one or both, is answered as its two comparisons, each a conjunct of its own: a subquery's a
+  one-row join, the other an ordinary conjunct (pushed into the scan in `WHERE`). All three values are typed by the
+  rules of a `BETWEEN` above, a subquery bound as its column, and both comparisons compare in that type. `NOT
+  BETWEEN`, a subquery inside a bound's arithmetic and a subquery as the operand stay exit code 4. `EXISTS` and `NOT
+  EXISTS` over any block are `COUNT(*)` over `LIMIT 1` of the block under a one-row join, compared with 1 or with 0
+  above it, as DuckDB plans them. The block's select list is dropped, so a select item that is no aggregate and that
+  nothing else reads is never computed, under a `LIMIT` too; its aggregates are computed, grouped or not (divergence
+  D32), and a `DISTINCT`'s list, being its rows, stays. Its `ORDER BY` keys are computed, as DuckDB computes them,
+  but in a block that aggregates without `GROUP BY`, whose one row antb1 never sorts (D32). A star in it is checked
+  by name and against the block's `GROUP BY` and aggregates, a bind error as in DuckDB, and expanded only under a
+  `DISTINCT`, whose rows its columns are; a `GROUP BY` or `ORDER BY` position that falls in it exits 4. A compound of
+  `UNION`, `INTERSECT` and `EXCEPT` is answered as the query of either form where no arm reads an enclosing block;
+  each arm expands its stars, so a column of a type antb1 cannot read exits 4 there. The join sits above its
   block's inner joins, or above the aggregation for a `HAVING` conjunct, in the order the conjuncts are written --
   except that a `WHERE` semi join whose key reads one relation of the block runs on that relation's own branch, below
   those joins, which answers the same and carries fewer rows through them (ADR 0029's D0). Where a subquery's join
@@ -416,20 +436,28 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   all (divergences D23 and D24), and so is a select item that reads no aggregate, which is not NULL over no rows either
   (`SELECT 1` of a block that aggregates only in its `ORDER BY`). An equality of outer columns stays in the subquery
   when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not true), and a correlated `SUM(x + c)`
-  keeps its form, as in DuckDB (no `COUNT`, below). Every other correlated shape is exit code 4: an uncorrelated
-  `EXISTS`, a block with `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a
-  correlated `EXISTS` without a key, a correlated scalar subquery whose outer column has no inner equivalent, and at the
-  `IN` a correlated `IN` or `NOT IN`; at the subquery for one in `HAVING`, whose outer references would read the outer
-  block's groups and not its rows; and at the subquery for a conjunct that is both a subquery conjunct and a reader of
-  an enclosing block's column, which neither unnesting path handles.
+  keeps its form, as in DuckDB (no `COUNT`, below). Every other correlated shape is exit code 4: a block with
+  `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a correlated `EXISTS` without a
+  key, a correlated scalar subquery that is no aggregate over every row or whose outer column has no inner equivalent,
+  a compound with an arm that reads an enclosing block, and at the `IN` a correlated `IN` or `NOT IN`; at the subquery
+  for one in `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the
+  subquery for a conjunct that is both a subquery conjunct and a reader of an enclosing block's column, which neither
+  unnesting path handles. A correlated `EXISTS` is refused at the `EXISTS` once its block's FROM list is bound and
+  before any other clause of the block binds, so their bind errors never show (a compound's arms all bind before a
+  correlated arm is refused). What the enclosing block binds before the subquery comes first: its FROM list and every
+  `ON`, the `WHERE` conjuncts written before it, its select list, and for one in `HAVING` its grouping; a conjunct
+  written after it is never reached. A scalar subquery's shape is checked once its block is bound, so the block's own
+  bind errors come first. DuckDB, which answers these subqueries, binds a block's `WHERE` before its select list and
+  reports the first bind error it meets, so where a refused subquery hides one, it exits 1 where antb1 exits 4.
   [ADR 0041](adr/0041-subqueries-and-decorrelation.md) assigns these shapes to items of ADR 0037's phases 8 and 10.
   A subquery in an inner join's `ON` sees its block's FROM items as that `ON` does (rule 10 of
   [ADR 0022](adr/0022-joins-and-query-blocks.md)): an outer name there never resolves to a later item, as in DuckDB. An
   outer reference is read only in a `WHERE` conjunct of the subquery's own block, an inner join's `ON` included, and
   only one block out; in a select list, `GROUP BY`, `ORDER BY`, `HAVING` or a `LEFT JOIN`'s or a `FULL JOIN`'s `ON`,
   further out, or in a derived table or a CTE (a lateral reference) it is exit code 4 at the reference, each with its
-  own message. A star in an `EXISTS` block is checked by name but not expanded: an `ORDER BY` position there counts its
-  columns, and one that names a column of it is exit code 4 (one out of range is a bind error, as in DuckDB);
+  own message. A star in an `EXISTS` block is checked by name but not expanded (but under an uncorrelated block's
+  `DISTINCT`): a `GROUP BY` or `ORDER BY` position there counts its columns, and one that names a column of it is exit
+  code 4 (one out of range is a bind error, as in DuckDB);
 - any of these in parentheses (`(a)`, `SUM((a))`, `WHERE (a = 1 AND b = 2)`), which group without changing
   anything.
 
@@ -880,7 +908,8 @@ A bound query is a tree of logical nodes: `Scan` (reads fields of the table), `F
 above the aggregation the `HAVING` one), `Compute` (appends one computed column per expression: over the table for
 `WHERE` operands, aggregate arguments and `GROUP BY` expressions, and over the aggregation for select, `HAVING` and
 `ORDER BY` expressions), `Project` (the select list's columns, every star expanded where it stands), `Aggregate` (the
-aggregates, one output row) or `GroupAggregate` (`GROUP BY`: the keys, then the aggregates, one row per group; a
+aggregates, one output row; `SINGLE_VALUE`, which no query writes, is a scalar subquery's single value) or
+`GroupAggregate` (`GROUP BY`: the keys, then the aggregates, one row per group; a
 `Project` above it restores the select order), `Sort` (`ORDER BY`, below the `Project`, so it can use columns and
 aggregates the query does not return) and `Limit` (with its offset). A `Join` has two inputs ([ADR
 0022](adr/0022-joins-and-query-blocks.md)): its kind (inner, left, semi, anti, null-aware anti, one-row or full), key
@@ -941,7 +970,8 @@ it in its rows' order.
   keeps it, a left join pads it. A left join pads a row none of whose candidates passes right after its last
   candidate.
 - A one-row join appends the single row of its right input, an aggregate without groups, to every row; any other row
-  count is a planner bug, reported as an error (exit code 1).
+  count is a planner bug, an internal error (exit code 70; [ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s
+  decision 23).
 - When an inner or a semi join's build holds no row, the other input is never read.
 
 OR factoring, before that classification: in each element of `WHERE` and of an inner `ON`, a conjunct whose root is
@@ -1572,11 +1602,11 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
-| 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)`, `EXISTS (SELECT ...)` and `(SELECT ...)` as a value (outside a top-level `AND` conjunct); more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context; a one-row join whose right input is not one row |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported
 (`SqlErrorDetail` kind `kUnsupported`). Any other `NotImplemented` or type error from Arrow maps to 70, so a
@@ -1631,10 +1661,10 @@ compare against DuckDB, so an unregistered difference is a bug.
 | D29 | Which of `-0.0` and `0.0`, or which NaN, a deduplication keeps | a `GROUP BY` key, a `SELECT DISTINCT` row and a `UNION`, `INTERSECT` or `EXCEPT` row show the value their group saw first, in input order and then part order (a set operation's blocks in written order, among those that can bring a row in: an `INTERSECT`'s or `EXCEPT`'s left operand, even a block whose own row an `EXCEPT` then removed), the same on any number of threads, and a condition above the deduplication tests that kept value; an `INTERSECT ALL` or `EXCEPT ALL` root shows the normalized value | shows a value that depends on its plan and threads, and can change between runs: `SELECT DISTINCT` over a `UNION ALL` of an empty block, a block holding `0.0` and one holding `-0.0` shows `-0.0` at one thread (D30's order), where antb1 shows `0.0`, and so does a `UNION` of the same three blocks; it passes an `INTERSECT ALL`'s rows on normalized, so `(N INTERSECT ALL N) UNION E`, with N holding `-0.0` and E empty, shows `0.0` where antb1 shows `-0.0`; `(B EXCEPT C) UNION A`, with B holding `-0.0` and C and A `0.0`, shows `0.0` where antb1 shows `-0.0`; it drops an `EXCEPT ALL` whose later operands a `LIMIT 0` or a constant condition empties, so `N EXCEPT ALL (P LIMIT 0)` shows `-0.0` where antb1 shows `0.0`; and it moves a condition on the value below the deduplication, so one that tells `-0.0` from `0.0` tests every row's own value: over `0.0`, `-0.0` and `3.0`, `SELECT DISTINCT` and then `WHERE 1 / d < 0` gives `-0.0` in DuckDB and no row in antb1 | the fixtures' DOUBLE columns hold no `-0.0` and no NaN, and the one FLOAT `-0.0` (`floats.parquet`) is compared only through counts (`tests/slt/cases/groupby/keys.slt`); the random generator groups by no DOUBLE key, writes no set operator but `UNION ALL` over a DOUBLE column and never reads a FLOAT column (D11); `tests/slt/cases/setops/union.slt`, `intersect.slt` and `except.slt` pin the set operations' cases with both engines' answers ([ADR 0039](adr/0039-set-operations.md)) |
 | D30 | Which error a query reports when several blocks of a `UNION ALL` or a set operation fail | the first failing block in written order, since a union runs its blocks one after another ([ADR 0036](adr/0036-union-all.md)) | follows its pipeline order: at one thread, under an aggregate, a sort or a join's build side, it runs the first block and then the others from the last back, so `COUNT(*)` over three blocks whose second and third fail reports the third's error, as does a `UNION`, whose own deduplication is such a sink; it builds an `INTERSECT`'s or `EXCEPT`'s right operand before it reads the left one, so with both failing it reports the right one's error, and it skips the other operand where a `LIMIT 0` or a constant empties an `INTERSECT`'s operand or an `EXCEPT`'s first one, which antb1 still reads; streamed to the client it runs them in written order; above one thread its choice varies between runs | the answers agree where at most one block fails; the random generator writes no arithmetic that can overflow (as for divergences D14, D16 and D23 to D27), and each error record of `tests/slt/cases/setops/errors.slt` has one failing block; `union.slt`, `intersect.slt` and `except.slt` pin the set operations' cases with both engines' errors ([ADR 0039](adr/0039-set-operations.md)) |
 | D31 | An `INTERSECT` whose right operand turns out empty | reads the left operand in full, so an error anywhere in it -- an overflow, say -- fails the query | stops each pipeline that streams into the join after the first vector of 2,048 rows that reaches it with a row, and returns no rows; below an aggregate, a `DISTINCT`, a sort, a join's build side or another set operation it reads the left operand in full too; an `INTERSECT ALL`, an `EXCEPT` and an `EXCEPT ALL` read it in full in both engines ([ADR 0039](adr/0039-set-operations.md)) | the answers agree where no left row fails; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/setops/intersect.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's empty answer under `onlyif duckdb` |
-| D32 | Expressions nothing reads, and a join's probe keys over an empty build | computes every select item of a derived table, a CTE or a `UNION ALL` branch and every aggregate of a derived table, whether or not a query above reads it (a `Project` and a `UnionAll` keep every output), and the probe keys of a `LEFT JOIN`, an anti join or a `NOT IN` whose build side turns out empty, so an error there -- an overflow, say -- fails the query; the constants DuckDB's own order regroups (`x + 2147483647 + 1`) fail it on every row | removes the columns and the aggregates nothing reads, and computes no probe key over an empty hash table, so it answers | the answers agree where nothing fails; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/expressions/arithmetic.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb`, and a control that reads the column and fails in both |
+| D32 | Expressions nothing reads, and a join's probe keys over an empty build | computes every select item of a derived table, a CTE or a `UNION ALL` branch and every aggregate of a derived table or of an `EXISTS` block, whether or not a query above reads it (a `Project` and a `UnionAll` keep every output; an `EXISTS` block's select list is dropped, and with it that of a derived table or a CTE right under it, where nothing but a `LIMIT` or an `OFFSET` of the block stands between them, but not its aggregates, grouped or not), and the probe keys of a `LEFT JOIN`, an anti join or a `NOT IN` whose build side turns out empty, so an error there -- an overflow, say -- fails the query; the constants DuckDB's own order regroups (`x + 2147483647 + 1`) fail it on every row. The other way round, it computes no `ORDER BY` key of a query or a block that aggregates without `GROUP BY`, whose one row it never sorts, nor of a correlated `EXISTS` (ADR 0023's Path 1 takes its `FROM` and `WHERE` alone), so an error in them never shows | removes the columns and the aggregates nothing reads, and computes no probe key over an empty hash table, so it answers; it computes every `ORDER BY` key, also of one row or of an `EXISTS` block, correlated or not, so it fails | the answers agree where nothing fails; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/expressions/arithmetic.slt` and `tests/slt/cases/subqueries/exists.slt` pin it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb` (and the reverse for the `ORDER BY` keys), and a control that reads the column and fails in both |
 | D33 | Constants antb1 does not evaluate | folds only integer literals and `+ - * // %`, negation, casts and `abs` over them; any other constant -- a function of constants such as `strlen('a')`, a `CASE` or a `COALESCE` of them -- is computed, to the same value, so the rewrites that need a constant's value do not apply to it: `x * 1`, `x + 0` and `x // 1` stay operations, a comparison moves no constant across it and `SUM(x + c)` is no sum rewrite, so `i32 + COALESCE(1, 2) > 5` computes the addition and fails at the type's maximum | folds every constant expression before these rewrites, so it answers | the answers agree where nothing overflows; the random generator writes no such constant, and `tests/slt/cases/expressions/arithmetic.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb` |
 | D34 | Comparisons of one value in a filter that contradict each other | computes the value they compare, so an overflow there fails the query: `WHERE i32 + 2147483647 + 1 BETWEEN 10 AND 5` computes `(2147483647 + 1) + i32` and fails on every row | its filter combiner finds that no row passes a `WHERE`, a `HAVING` or an inner join's `ON` whose comparisons of one value contradict each other (an empty `BETWEEN`, or `x > 10 AND x < 5`) and computes nothing, so it answers; in a `CASE WHEN` it computes the value as antb1 does | the answers agree where nothing overflows; the random generator writes no arithmetic that can overflow, and `tests/slt/cases/expressions/arithmetic.slt` pins it: antb1's error under `onlyif antb1`, DuckDB's answer under `onlyif duckdb` |
-| D35 | Errors of subqueries next to a join that turns out empty or a condition that can never hold | prepares the builds of a pipeline's joins before its probe reads a row, outermost join first (a build whose input probes builds of its own prepares those first), and stops at the first build that empties its join, an inner or semi join whose build holds no row, such as an `IN` or a correlated `EXISTS` whose set turns out empty: the builds below it never run and its probe never opens its input, so their errors -- an overflow, say -- are never reported (`PrepareBuilds` in `src/exec/hash_join.cc`; [ADR 0022](adr/0022-joins-and-query-blocks.md)'s J1b update). A block's subquery joins stack above its own joins in the order their conjuncts are written, the last outermost (an `IN` that ADR 0029's D0 moves onto one relation's branch stands below them all). So over a `u` whose `k` values are 1 and 3 and whose INTEGER `x` values include 2, `WHERE t.b < (SELECT MAX(u.x * 2147483647) FROM u) AND t.a IN (SELECT u.k FROM u WHERE u.k = 2)` answers, and with the `IN` written first it fails. Across blocks too, a failing subquery never runs inside a derived table, a CTE body or a `UNION ALL` branch that probes a join whose build turns out empty, inside an `IN` subquery whose join stands below one that empties, or in a `WHERE` under a `HAVING` `IN` that turns out empty. A condition that can never hold empties nothing before the builds run: `t.a = 1 AND t.a = 2` next to the failing subquery fails the query (antb1 has no filter combiner, D34) | prepares every build before any probe, whatever turns out empty, so the example fails in either order; an empty file, a filter outside a column's range and join keys outside the other side's range remove no build either. It answers only where its optimizer deletes the failing subquery before running: a condition its filter combiner proves never true (`a = 1 AND a = 2`, `a > 5 AND a < 3`, an empty `BETWEEN`) in the block the failing subquery is written in (its `WHERE`, an inner `ON` or its `HAVING`), or such a condition or a `LIMIT 0` in an `IN` subquery there, empties the block's plan, the subquery's join included; and a derived-table or CTE column that nothing reads goes with its subquery (D32) | the answers agree where no subquery fails; the random generator writes no arithmetic that can overflow, so no generated subquery fails, and no record pins it yet. ADR 0041's SQ4a adds its row error to this family, with records of both engines and generator rules (its decisions 24 and 28) |
+| D35 | Errors of subqueries next to a join that turns out empty or a condition that can never hold | prepares the builds of a pipeline's joins before its probe reads a row, outermost join first (a build whose input probes builds of its own prepares those first), and stops at the first build that empties its join, an inner or semi join whose build holds no row, such as an `IN` or a correlated `EXISTS` whose set turns out empty: the builds below it never run and its probe never opens its input, so their errors -- an overflow, say -- are never reported (`PrepareBuilds` in `src/exec/hash_join.cc`; [ADR 0022](adr/0022-joins-and-query-blocks.md)'s J1b update). A block's subquery joins stack above its own joins in the order their conjuncts are written, the last outermost (an `IN` that ADR 0029's D0 moves onto one relation's branch stands below them all). So over a `u` whose `k` values are 1 and 3 and whose INTEGER `x` values include 2, `WHERE t.b < (SELECT MAX(u.x * 2147483647) FROM u) AND t.a IN (SELECT u.k FROM u WHERE u.k = 2)` answers, and with the `IN` written first it fails. Across blocks too, a failing subquery never runs inside a derived table, a CTE body or a `UNION ALL` branch that probes a join whose build turns out empty, inside an `IN` subquery whose join stands below one that empties, or in a `WHERE` under a `HAVING` `IN` that turns out empty. A condition that can never hold empties nothing before the builds run: `t.a = 1 AND t.a = 2` next to the failing subquery fails the query (antb1 has no filter combiner, D34). A conjunct antb1 folds to false, though -- a comparison with a literal outside its operand's type (D14), which DuckDB computes -- ends the plan where its filter stands, so the joins below it never build unless their probe is a scan, whose builds run first: a `HAVING` subquery's error under such a `HAVING` conjunct is never reported, nor a subquery's whose own comparison folds so over a set operation, while over a scan the query fails | prepares every build before any probe, whatever turns out empty, so the example fails in either order; an empty file, a filter outside a column's range and join keys outside the other side's range remove no build either. It answers only where its optimizer deletes the failing subquery before running: a condition its filter combiner proves never true (`a = 1 AND a = 2`, `a > 5 AND a < 3`, an empty `BETWEEN`) in the block the failing subquery is written in (its `WHERE`, an inner `ON` or its `HAVING`), or such a condition or a `LIMIT 0` in an `IN` subquery there or in a derived table among its FROM items, empties the block's plan, the subquery's join included; and a derived-table or CTE column that nothing reads goes with its subquery (D32) | the answers agree where no subquery fails; the random generator writes no arithmetic that can overflow and no scalar subquery of more than one row (ADR 0041's decision 28), so no generated subquery fails. A scalar subquery's error over two or more rows (ADR 0041's SQ4a) is the family's most common member, and `tests/slt/cases/subqueries/values.slt` pins it: each engine's outcome under `onlyif`, for an `IN` written after the failing subquery, a condition that never holds, a conjunct folded to false above an aggregation, a `LIMIT 0` derived table and a `HAVING` `IN`, and controls that fail in both |
 
 ## ClickBench status
 
@@ -1769,7 +1799,7 @@ follows.
 | Q11 | pass | `UNION ALL` (ADR 0036) |
 | Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q13 | pass | answered when the ratchet was added |
-| Q14 | unsupported | needs scalar subqueries that select a CTE's column (SQ4a) |
+| Q14 | pass | scalar subqueries that select a CTE's column (SQ4a) |
 | Q15 | pass | answered when the ratchet was added |
 | Q16 | pass | answered when the ratchet was added |
 | Q17 | pass | stddev_samp (AG2) |
@@ -1809,11 +1839,11 @@ follows.
 | Q51 | unsupported | needs running window aggregates and windows over aggregates (phase 9); its `FULL OUTER JOIN` is answered (OJ3) |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
-| Q54 | unsupported | needs scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |
+| Q54 | pass | scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | pass | `UNION ALL` (ADR 0036) |
 | Q57 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
-| Q58 | unsupported | needs scalar subqueries that are not aggregates (SQ4a) |
+| Q58 | pass | scalar subqueries that are not aggregates (SQ4a) |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | pass | CAST to DECIMAL(p,s) (CT2) |

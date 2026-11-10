@@ -375,18 +375,16 @@ SELECT COUNT(*) FROM drivers WHERE 450 < (SELECT SUM(tr_fare) FROM trips WHERE t
 BIGINT
 13
 
-# ---- DuckDB only until single joins get a PR (ADR 0023: a scalar subquery that is no aggregate exits 4) ----
+# ---- uncorrelated scalar subqueries that are no aggregate (ADR 0041's SQ4a; more in values.slt) ----
 
 # Zero rows give NULL; several rows are an error.
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_promo = (SELECT pm_id FROM promos)
 ----
 BIGINT
 0
 
-onlyif duckdb
-statement error
+statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)
 
 # ---- DuckDB only, for good: DuckDB's error texts ----

@@ -866,6 +866,10 @@ bool StrictAggregates(const std::vector<AggregateCall>& calls) {
       case AggKind::kStddevPop:
       case AggKind::kVarSamp:
       case AggKind::kVarPop:
+      // The binder wraps only an uncorrelated subquery in it, so no dependent join holds one; and
+      // its check of the row count belongs to each binding, which grouping by the correlated keys
+      // would lose (ADR 0041's decision 22).
+      case AggKind::kSingleValue:
         return false;
     }
     return false;

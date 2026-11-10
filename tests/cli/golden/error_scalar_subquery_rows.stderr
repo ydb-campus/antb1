@@ -1,0 +1,1 @@
+antb1: execution error: More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row

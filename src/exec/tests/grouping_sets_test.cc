@@ -118,6 +118,7 @@ TEST(GroupingSetsShapeTest, OnlyOrderIndependentCallsMergeExactly) {
            call(AggKind::kMin, LogicalType::kDouble, LogicalType::kDouble),
            call(AggKind::kCountDistinct, LogicalType::kBigInt, LogicalType::kBigInt),
            call(AggKind::kStddevSamp, LogicalType::kDouble, LogicalType::kDouble),
+           call(AggKind::kSingleValue, LogicalType::kBigInt, LogicalType::kBigInt),
        }) {
     EXPECT_FALSE(MergesExactly({key}, {inexact})) << plan::ToString(inexact.kind);
   }

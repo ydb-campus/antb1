@@ -460,6 +460,60 @@ TEST_F(PartOperatorsTest, AggregatesAreTheSameOnAnyNumberOfThreads) {
   }
 }
 
+// SINGLE_VALUE (ADR 0041's decision 4) counts the selected rows of every part and keeps the first
+// part's value: the same on any number of threads. Its error over two rows is raised once every
+// part is merged, so a failing part comes first, in part order, as any part's error does.
+TEST_F(PartOperatorsTest, SingleValueIsTheSameOnAnyNumberOfThreads) {
+  const auto pool = Pool();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto single_value = [&x](const std::shared_ptr<MemoryTable>& table,
+                                 const std::vector<std::pair<plan::CompareOp, int64_t>>& bounds) {
+    std::vector<plan::Predicate> filter;
+    filter.reserve(bounds.size());
+    for (const auto& [op, k] : bounds) {
+      filter.push_back(testing::Compare(x, op, BigInt(k)));
+    }
+    return PlanOf(
+        Node(plan::AggregateNode{
+            .input = Node(plan::FilterNode{.input = Scan(table), .predicates = std::move(filter)}),
+            .aggregates = {{.kind = plan::AggKind::kSingleValue,
+                            .arg = Column(2, "y", LogicalType::kBigInt),
+                            .type = LogicalType::kBigInt}}}),
+        1);
+  };
+  using enum plan::CompareOp;
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    // One row, in part 11: its value.
+    const auto one = Run(single_value(Table(), {{kEq, 78}}), executor);
+    ASSERT_TRUE(one.ok()) << one.status().ToString();
+    EXPECT_EQ(Int64Column(**one), (std::vector<std::optional<int64_t>>{78}));
+    // One row whose value is NULL (y is NULL where x is a multiple of 5), and no row: NULL.
+    for (const auto& bounds : {std::vector<std::pair<plan::CompareOp, int64_t>>{{kEq, 75}},
+                               std::vector<std::pair<plan::CompareOp, int64_t>>{{kGt, 1000}}}) {
+      const auto null = Run(single_value(Table(), bounds), executor);
+      ASSERT_TRUE(null.ok()) << null.status().ToString();
+      EXPECT_EQ(Int64Column(**null), (std::vector<std::optional<int64_t>>{std::nullopt}));
+    }
+    // Two rows, one in part 0 and one in part 1, and every row: DuckDB's error.
+    for (const auto& bounds : {std::vector<std::pair<plan::CompareOp, int64_t>>{{kGe, 6}, {kLe, 7}},
+                               std::vector<std::pair<plan::CompareOp, int64_t>>{{kGe, 0}}}) {
+      const auto two = Run(single_value(Table(), bounds), executor);
+      EXPECT_TRUE(two.status().IsExecutionError()) << two.status().ToString();
+      EXPECT_TRUE(two.status().message().starts_with(
+          "More than one row returned by a subquery used as an expression"))
+          << two.status().ToString();
+    }
+    // Parts 0 to 2 hold 21 rows, but part 3's error comes first.
+    const auto table = Table();
+    table->FailPart(3);
+    const auto failed = Run(single_value(table, {{kGe, 0}}), executor);
+    EXPECT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
+    EXPECT_EQ(failed.status().message(), "part 3 is broken");
+  }
+}
+
 // DOUBLE SUM and AVG add per part, then the part sums in part order: the same on any number of
 // threads, and possibly other than one running sum by rounding.
 TEST_F(PartOperatorsTest, DoubleSumsAddPerPartThenInOrder) {

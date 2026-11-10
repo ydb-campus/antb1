@@ -233,7 +233,10 @@ wrong answers, not divergences: antb1 answers them right, or refuses them (exit 
 
 A self-check that needs no DuckDB covers the correlated shapes above in antb1 from ADR 0041's SQ4a on (its decision
 28): for each binding of a small outer table, a correlated subquery's value equals the uncorrelated subquery with the
-binding written as literals, which holds where DuckDB's decorrelation is wrong. The oracle's other traps (internal
+binding written as literals, which holds where DuckDB's decorrelation is wrong. The metamorphic relations
+`correlated_exists_is_its_bindings_as_literals`, `correlated_not_exists_is_its_bindings_as_literals` and
+`correlated_aggregate_is_its_bindings_as_literals` (`tests/metamorphic/relations.cc`) hold it over the six cities of
+the star schema; each item that answers a correlated shape adds its own. The oracle's other traps (internal
 errors, a leak of DuckDB 1.5.5, ASOF matches of NULL) are noted in [tests/slt/README.md](../tests/slt/README.md).
 
 ## Random differential tests

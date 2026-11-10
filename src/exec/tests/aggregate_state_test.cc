@@ -1,6 +1,7 @@
 #include "antb1/exec/aggregate_state.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -615,6 +616,67 @@ TEST_F(AggregateStateTest, MinMaxOfDoublesIgnoreNaNInEveryBatchSplit) {
   }
 }
 
+// SINGLE_VALUE, an uncorrelated scalar subquery's value (ADR 0041's decision 4): NULL over no
+// selected row, the row's value over one, a NULL value counted as a row, and DuckDB's error over
+// two or more, raised at Finalize only. Partial states merge by adding their rows, so whichever
+// part holds the one row, the value is the same.
+TEST_F(AggregateStateTest, SingleValueIsNullTheOneRowOrAnError) {
+  const auto single = [](LogicalType type) { return Make(AggKind::kSingleValue, type, type); };
+  auto none = single(LogicalType::kBigInt);
+  EXPECT_EQ(Text(*none), "NULL");
+  ASSERT_TRUE(none->Consume(*Int64s({1, 2}), Bools({false, std::nullopt}).get()).ok());
+  EXPECT_EQ(Text(*none), "NULL") << "no selected row";
+  auto one = single(LogicalType::kBigInt);
+  ASSERT_TRUE(one->Consume(*Int64s({5, 7, 9}), Bools({false, true, false}).get()).ok());
+  ASSERT_TRUE(one->Consume(*Int64s({}), nullptr).ok());
+  EXPECT_EQ(Text(*one), "7");
+  auto null_row = single(LogicalType::kBigInt);
+  ASSERT_TRUE(null_row->Consume(*Int64s({std::nullopt}), nullptr).ok());
+  EXPECT_EQ(Text(*null_row), "NULL") << "one row whose value is NULL";
+  // Two rows or more, NULL ones included: no error until Finalize.
+  for (const auto& values :
+       {Int64s({1, 2}), Int64s({std::nullopt, std::nullopt}), Int64s({std::nullopt, 3})}) {
+    auto two = single(LogicalType::kBigInt);
+    ASSERT_TRUE(two->Consume(*values, nullptr).ok());
+    const auto result = two->Finalize(arrow::default_memory_pool());
+    ASSERT_TRUE(result.status().IsExecutionError()) << result.status().ToString();
+    EXPECT_EQ(result.status().message(),
+              "More than one row returned by a subquery used as an expression - scalar "
+              "subqueries can only return a single row");
+  }
+  // Merged: one row in either part is the value; one in each is the error.
+  for (const bool left_holds : {true, false}) {
+    auto left = single(LogicalType::kBigInt);
+    auto right = single(LogicalType::kBigInt);
+    ASSERT_TRUE((left_holds ? left : right)->Consume(*Int64s({42}), nullptr).ok());
+    ASSERT_TRUE(left->Merge(*right).ok());
+    EXPECT_EQ(Text(*left), "42");
+    ASSERT_TRUE(right->Consume(*Int64s({std::nullopt}), nullptr).ok());
+    ASSERT_TRUE(left->Merge(*right).ok()) << "merging never fails";
+    EXPECT_TRUE(left->Finalize(arrow::default_memory_pool()).status().IsExecutionError());
+  }
+  // Every type keeps its own: VARCHAR, a narrow DECIMAL, a DOUBLE's sign.
+  auto text = single(LogicalType::kVarchar);
+  ASSERT_TRUE(text->Consume(*Strings({"a", "bc"}), Bools({false, true}).get()).ok());
+  EXPECT_EQ(Text(*text), "bc");
+  const LogicalType decimal = LogicalType::Decimal(9, 2);
+  auto narrow = single(decimal);
+  ASSERT_TRUE(narrow->Consume(*testing::Decimals(decimal, {"-1250"}), nullptr).ok());
+  EXPECT_EQ(Text(*narrow), "-1250");
+  EXPECT_TRUE(Result(*narrow)->type()->Equals(*plan::ToArrow(decimal)));
+  auto real = single(LogicalType::kDouble);
+  ASSERT_TRUE(
+      real->Consume(*testing::ArrayOf<arrow::DoubleBuilder, double>(arrow::float64(), {-0.0}),
+                    nullptr)
+          .ok());
+  EXPECT_TRUE(std::signbit(static_cast<const arrow::DoubleArray&>(*Result(*real)).Value(0)));
+  // The other state of a merge must be a single value of the same type.
+  EXPECT_TRUE(single(LogicalType::kBigInt)->Merge(*single(LogicalType::kVarchar)).IsInvalid());
+  EXPECT_TRUE(single(LogicalType::kBigInt)
+                  ->Merge(*Make(AggKind::kMax, LogicalType::kBigInt, LogicalType::kBigInt))
+                  .IsInvalid());
+}
+
 TEST_F(AggregateStateTest, MergeCombinesPartialStates) {
   const auto first = Int64s({4, std::nullopt, 10});
   const auto second = Int64s({-2, 8});
@@ -682,6 +744,9 @@ TEST_F(AggregateStateTest, InputsAreChecked) {
   EXPECT_TRUE(Make(AggKind::kSum, LogicalType::kHugeInt, LogicalType::kHugeInt)
                   ->Consume(*Int64s({1}), nullptr)
                   .IsInvalid());
+  auto single = Make(AggKind::kSingleValue, LogicalType::kBigInt, LogicalType::kBigInt);
+  EXPECT_TRUE(single->Consume(*Int16s({1}), nullptr).IsInvalid()) << "another input type";
+  EXPECT_TRUE(single->ConsumeRows(1, nullptr).IsInvalid()) << "SINGLE_VALUE needs its argument";
 }
 
 TEST_F(AggregateStateTest, OnlyTheBindersCombinationsExist) {
@@ -704,6 +769,9 @@ TEST_F(AggregateStateTest, OnlyTheBindersCombinationsExist) {
   EXPECT_TRUE(invalid(AggKind::kCountDistinct, std::nullopt, LogicalType::kBigInt));
   EXPECT_TRUE(invalid(AggKind::kCountDistinct, LogicalType::kDate, LogicalType::kDate));
   EXPECT_FALSE(invalid(AggKind::kMax, LogicalType::kVarchar, LogicalType::kVarchar));
+  EXPECT_FALSE(invalid(AggKind::kSingleValue, LogicalType::kDate, LogicalType::kDate));
+  EXPECT_TRUE(invalid(AggKind::kSingleValue, LogicalType::kInteger, LogicalType::kBigInt));
+  EXPECT_TRUE(invalid(AggKind::kSingleValue, std::nullopt, LogicalType::kBigInt));
 }
 
 }  // namespace

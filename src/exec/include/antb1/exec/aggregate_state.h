@@ -27,8 +27,12 @@
 //   MIN/MAX(c) Arrow's min_max over the selected values (VARCHAR byte-wise, DATE chronologically);
 //              NaN is ignored, in every batch split: NaN only when every value is NaN. The
 //              column's type, NULL over no values
+//   SINGLE_VALUE(c)  an uncorrelated scalar subquery's value (ADR 0041's decision 4): NULL over no
+//              rows, the row's value over one, and DuckDB's ExecutionError over two or more,
+//              raised at Finalize. The column's type
 //
-// NULL values are skipped. Arrow's integer "sum" kernel is never used: it wraps at 64 bits.
+// NULL values are skipped, except by SINGLE_VALUE, which counts a NULL value as a row. Arrow's
+// integer "sum" kernel is never used: it wraps at 64 bits.
 
 namespace antb1::exec {
 
@@ -43,7 +47,7 @@ class AggregateState {
 
   // Adds the selected, non-NULL values of the argument column. selection: nullptr for every row;
   // otherwise a boolean array of values.length() where NULL counts as false. COUNT(*) counts the
-  // selected rows of `values`.
+  // selected rows of `values`, and SINGLE_VALUE every selected row, a NULL value too.
   virtual arrow::Status Consume(const arrow::Array& values,
                                 const arrow::BooleanArray* selection) = 0;
   // Adds rows without values; only COUNT(*) has no argument and accepts it.
