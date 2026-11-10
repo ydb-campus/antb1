@@ -1,0 +1,5 @@
+ct_id | (SELECT MIN(zn_id) FROM zones) | (ct_id + (SELECT COUNT(*) FROM cities))
+----- | ------------------------------ | ---------------------------------------
+1     | 1                              | 7
+2     | 1                              | 8
+(2 rows)
