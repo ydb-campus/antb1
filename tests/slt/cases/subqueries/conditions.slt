@@ -2273,7 +2273,6 @@ SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id <= 2) + 1 > 40000 ORDER
 # ---- pending: values in select lists and aggregate arguments (ADR 0041; roadmap PR SQ2 removes these guards) ----
 
 # A value in the select list, added to a column on every row: NULL where the column is NULL.
-pending SQ2
 query II nosort
 SELECT ct_id, (SELECT zn_parent FROM zones WHERE zn_id = 10) + ct_pop FROM cities ORDER BY ct_id
 ----

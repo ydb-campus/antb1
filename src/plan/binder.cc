@@ -1316,9 +1316,10 @@ arrow::Status Reject(const Rejection& r) {
 }
 
 // A value expression (a select, GROUP BY or ORDER BY item, an aggregate argument): kUnsupported
-// unless it is a column, a literal or an aggregate of a column.
-arrow::Status CheckValue(const sql::Expr& expr) {
-  if (auto r = FirstUnsupported(expr)) {
+// unless it is a column, a literal or an aggregate of a column -- or, in values mode, an
+// uncorrelated subquery's value among them (ADR 0041's SQ2).
+arrow::Status CheckValue(const sql::Expr& expr, bool values = false) {
+  if (auto r = FirstUnsupported(expr, values)) {
     return Reject(*r);
   }
   return arrow::Status::OK();
@@ -3811,6 +3812,10 @@ class Binder {
   arrow::Status BindGroupBy();
   arrow::Status CheckGrouped();
   arrow::Status BindSelectExpressions();
+  // Whether select item `i` is read by a clause other than the select list: a GROUP BY or ORDER BY
+  // position, or its alias named unqualified in GROUP BY, HAVING or ORDER BY (an expression there
+  // included). An EXISTS block's item that holds a subquery is bound for real only then.
+  [[nodiscard]] bool ReadOutsideItems(std::size_t i) const;
   // A WHERE or HAVING conjunct as a predicate over the scope's columns.
   arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
   // BindCondition with the scope's operand binder `bind` and `column_of`, which gives an operand's
@@ -6483,9 +6488,12 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   }
   // The column count first, whatever the shape: a subquery of two columns is DuckDB's bind error.
   if (bound.columns.size() != 1) {
-    return BindError(std::format("a subquery of {} must have one column, not {}",
-                                 form.scalar() ? "a comparison" : "IN", bound.columns.size()),
-                     form.subquery->op_span);
+    return BindError(
+        form.scalar() && form.other == nullptr
+            ? std::format("a scalar subquery must have one column, not {}", bound.columns.size())
+            : std::format("a subquery of {} must have one column, not {}",
+                          form.scalar() ? "a comparison" : "IN", bound.columns.size()),
+        form.subquery->op_span);
   }
   BindingColumn column = bound.columns.front();
   if (!column.type.has_value()) {
@@ -6858,11 +6866,10 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   if (const BoundValue* known = FindValue(s, group)) {
     return known->value;
   }
-  // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`)
-  // alone, and OR factoring's dry run binds one of those.
-  const bool condition =
-      clause_ == Clause::kWhere || clause_ == Clause::kInnerOn || clause_ == Clause::kHaving;
-  ANTB1_CHECK(dry_run_ || condition);
+  // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
+  // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
+  // (decision 3); OR factoring's dry run binds one of those.
+  ANTB1_CHECK(dry_run_ || clause_ != Clause::kLeftOn);
   const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
   if (dry_run_) {
@@ -7649,6 +7656,28 @@ arrow::Status Binder::CheckGrouped() {
   return check_stars(select_.items.size());
 }
 
+bool Binder::ReadOutsideItems(std::size_t i) const {
+  const std::string position = std::to_string(i + 1);
+  const auto names_item = [&](const sql::Expr& e) {
+    if (const auto* lit = std::get_if<sql::Literal>(&e);
+        lit != nullptr && lit->kind == sql::Literal::Kind::kInteger && lit->text == position) {
+      return true;
+    }
+    if (!select_.aliases[i].has_value()) {
+      return false;
+    }
+    std::vector<const sql::ColumnRef*> refs;
+    CollectRefs(e, refs);
+    return std::ranges::any_of(refs, [&](const sql::ColumnRef* ref) {
+      return ref->qualifier.empty() && AsciiLower(ref->name) == AsciiLower(*select_.aliases[i]);
+    });
+  };
+  return std::ranges::any_of(stmt_.group_by, names_item) ||
+         std::ranges::any_of(stmt_.having, names_item) ||
+         std::ranges::any_of(stmt_.order_by,
+                             [&](const sql::OrderItem& item) { return names_item(item.expr); });
+}
+
 // The select items that are neither columns, aggregates nor constants, in the query's scope; each
 // gets its column (computed unless it is one already).
 arrow::Status Binder::BindSelectExpressions() {
@@ -7658,11 +7687,36 @@ arrow::Status Binder::BindSelectExpressions() {
     if (kind != ItemKind::kExpression) {
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(*select_.exprs[index]));
+    const sql::Expr& written = *select_.exprs[index];
+    // An EXISTS block's select list is dropped, as DuckDB drops it (ADR 0041's SQ2a): an item that
+    // holds a subquery and that no other clause reads binds as a dry run, for its bind errors, and
+    // plants nothing; a computed 0 keeps its place, which nothing reads.
+    if (exists_ != nullptr && !stmt_.distinct && HoldsSubquery(written) && !ReadOutsideItems(i)) {
+      dry_run_ = true;
+      const arrow::Result<Typed> dropped = BindScoped(written);
+      dry_run_ = false;  // restored on the error path too, before the status propagates
+      ARROW_RETURN_NOT_OK(dropped.status());
+      const Typed zero =
+          Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = LogicalType::kInteger,
+                                                           .value = Int128{0}}},
+                    .type = LogicalType::kInteger,
+                    .name = ExprName(written)});
+      BoundColumn column = ScopedColumn(zero);
+      select_.output[i].type = LogicalType::kInteger;
+      if (!select_.aliases[i].has_value()) {
+        select_.output[i].name = zero.expr->name;
+      }
+      column.name = select_.output[i].name;
+      select_.expr_columns.push_back(std::move(column));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(written));
     BoundColumn column = ScopedColumn(t);
     select_.output[i].type = t.expr->type;
     if (!select_.aliases[i].has_value()) {
-      select_.output[i].name = t.expr->name;
+      // An item that holds a subquery is named by what is written (ADR 0041's decision 11; DuckDB
+      // by a deparse of its own, divergence D8), its value's leaf by its block's column.
+      select_.output[i].name = HoldsSubquery(written) ? ExprName(written) : t.expr->name;
     }
     column.name = select_.output[i].name;
     select_.expr_columns.push_back(std::move(column));
@@ -8733,9 +8787,22 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
     }
     return arrow::Status::OK();
   }
+  // A select item or an ORDER BY item may hold a subquery's value (ADR 0041's SQ2a) in a block that
+  // does not aggregate; in one that does, that waits for SQ2b.
+  const bool aggregates = HasGroupBy(stmt) || IsAggregateQuery(stmt);
+  const auto check_item = [aggregates](const sql::Expr& expr) -> arrow::Status {
+    ARROW_RETURN_NOT_OK(CheckValue(expr, /*values=*/true));
+    if (const std::optional<SourceSpan> subquery = FirstSubquerySpan(expr);
+        aggregates && subquery.has_value()) {
+      return Reject(Rejection{
+          .span = *subquery,
+          .message = "a subquery's value in a query block that aggregates is not supported"});
+    }
+    return arrow::Status::OK();
+  };
   for (const sql::SelectItem& item : stmt.items) {
     if (const sql::SelectExpr* expr = item.expr()) {  // a star's names bind later (BindSelectList)
-      ARROW_RETURN_NOT_OK(CheckValue(*expr));
+      ARROW_RETURN_NOT_OK(check_item(*expr));
     }
   }
   ARROW_RETURN_NOT_OK(CheckFromList(stmt.from));
@@ -8748,7 +8815,7 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
   }
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true));
   for (const sql::OrderItem& item : stmt.order_by) {
-    ARROW_RETURN_NOT_OK(CheckValue(item.expr));
+    ARROW_RETURN_NOT_OK(check_item(item.expr));
   }
   return arrow::Status::OK();
 }

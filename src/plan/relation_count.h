@@ -60,4 +60,8 @@ std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatem
 // block, which is a block of its own.
 bool HoldsSubquery(const sql::Expr& expr);
 
+// The span (its opening parenthesis, or EXISTS) of the first subquery expression `expr` holds, as
+// HoldsSubquery finds them; std::nullopt when it holds none.
+std::optional<SourceSpan> FirstSubquerySpan(const sql::Expr& expr);
+
 }  // namespace antb1::plan

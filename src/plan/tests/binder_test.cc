@@ -1090,8 +1090,10 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
+        // A select or ORDER BY item's value is answered in a block that does not aggregate (ADR
+        // 0041's SQ2a); in one that does it waits for SQ2b.
+        ErrorCase{"SELECT COUNT(*) + (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
+                  "a subquery's value in a query block that aggregates is not supported"},
         // An uncorrelated scalar subquery of any shape is its single value (ADR 0041's SQ4a). A
         // correlated one is ADR 0023's Path 2 only over an aggregate over every row; any other
         // shape needs the single join (SQ4b).
@@ -1375,8 +1377,8 @@ INSTANTIATE_TEST_SUITE_P(
         // Clauses that are no conjunct list.
         ErrorCase{"SELECT i16 FROM t GROUP BY (SELECT COUNT(*) FROM u)", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT COUNT(*) FROM u)", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY (SELECT COUNT(*) FROM u)", kUnsupported,
+                  "(", "a subquery's value in a query block that aggregates is not supported"},
         ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported, "(",
                   "a scalar subquery is not supported"},
         // A BETWEEN's subquery bound is a value (ADR 0041's SQ1); a correlated one waits for SQ5.
@@ -1396,8 +1398,10 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "(", "a scalar subquery is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE s LIKE (SELECT s FROM u)", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        ErrorCase{"SELECT CASE WHEN (SELECT COUNT(*) FROM u) > 0 THEN 1 ELSE 0 END FROM t",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16, CASE WHEN (SELECT COUNT(*) FROM u) > 0 THEN 1 ELSE 0 END FROM t "
+                  "GROUP BY i16",
+                  kUnsupported, "(",
+                  "a subquery's value in a query block that aggregates is not supported"},
         // An IN list's values read no column: a subquery's value among literals (ADR 0041's SQ1),
         // typed as DuckDB types the list, all its values in one type.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT COUNT(*) FROM u), i16)", kUnsupported,

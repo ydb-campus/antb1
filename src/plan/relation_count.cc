@@ -126,6 +126,17 @@ bool HoldsSubquery(const sql::Expr& expr) {
   return holds;
 }
 
+std::optional<SourceSpan> FirstSubquerySpan(const sql::Expr& expr) {
+  std::optional<SourceSpan> first;
+  const auto found = [&first](const sql::SubqueryExpr& s) {
+    if (!first.has_value()) {
+      first = s.op_span;
+    }
+  };
+  EachSubqueryOf(expr, found);
+  return first;
+}
+
 namespace {
 
 // Every subquery expression of `block`'s own expressions, in query order: the select items, each
