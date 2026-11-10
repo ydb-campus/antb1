@@ -58,7 +58,10 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    typing before COALESCE, ROLLUP's NULL keys and FULL JOIN padding; one cast framework before every feature that
    casts. Phases 0 to 8 are completed before window functions start; no phase runs in parallel with another.
 4. **Window functions come last** (phase 9). Their scope and design are decided then, in an ADR of their own, which
-   also replaces `kWindowFunctions` as the permanent canary. Until then they stay out of scope.
+   also replaces `kWindowFunctions` as the permanent canary. Until then they stay out of scope. Update (2026-11-10,
+   phase 8): last among the phases that complete queries. Phase 10, full decorrelation
+   ([ADR 0041](0041-subqueries-and-decorrelation.md)), follows them and completes none of the 99 (the phase 8 update
+   below).
 5. **Every PR of the Plan** builds one feature, with:
    - `.slt` records completed from DuckDB, with result type names where a type is decided (HC2). Update
      (2026-11-01, HC2): every query record carries the type names of its result, so any change of a result type
@@ -98,6 +101,9 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    take two before any PR writes such a guard. Update (2026-11-01, HC8): it does, so `pending NL2` and the like parse.
    Update (2026-11-06, phase 6): X4s and X4p join the X4 ids; X4s is an item of phase 6, and X4p and PF12 to PF15
    are guards ([ADR 0039](0039-set-operations.md)).
+   Update (2026-11-10, phase 8): SQ3 goes, absorbed into SQ4a; SQ4 becomes SQ4a in phase 8 and SQ4b in phase 10; SQ0
+   is new; SQ9 to SQ17 name phase 10's items; and PF16 is a guard
+   ([ADR 0041](0041-subqueries-and-decorrelation.md)).
 
 ## Consequences
 
@@ -105,7 +111,9 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
   semantics first rather than the most queries first, so phase 2 completes three queries and phase 8 nine.
 - Each feature lands as a general capability, so a PR is larger than what its queries alone need, and other queries
   benefit.
-- The 15 window queries wait for the last phase, Q12, Q20 and Q98 included, which need nothing else.
+- The 15 window queries wait for the last phase, Q12, Q20 and Q98 included, which need nothing else. Update
+  (2026-11-10, phase 8): they wait for phase 9, the last phase that completes queries; phase 10 follows it (decision
+  4's update).
 - docs/sql-subset.md's table now lists every construct each failing query needs and the Plan id that completes it.
 - The designs the survey suggested are inputs for their PRs, not decisions of this ADR: ROLLUP as one grouping-sets
   operator with a hidden set id, set operations as UNION ALL plus a grouped marker (ADR 0036's X4), and mark joins for
@@ -177,24 +185,34 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ4c | LEFT and FULL JOINs without an equality key (ADR 0040; its OJ4c update) | | Built |
 | OJ5a | NULL-equal join keys in the executor, no SQL (ADR 0022's OJ5a update) | | Built |
 | OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included (the OJ5b update below) | | Built |
-| **Phase 8** | **Subqueries** | | |
-| SQ1 | Uncorrelated one-row subqueries as values inside conditions | | Planned |
-| SQ2 | The same in select lists and CASE | 9 | Planned |
-| SQ3 | The one-row proof through CTE and derived-table references | 14 | Planned |
-| SQ4 | Scalar subqueries that are not aggregates (a single join, with DuckDB's row check) | 54, 58 | Planned |
-| SQ5 | Correlated aggregates inside arithmetic | 6 | Planned |
-| SQ6 | Correlated COUNT subqueries | 41 | Planned |
-| SQ7 | Mark joins, and IN subqueries under OR | 45 | Planned |
-| SQ8 | Correlated EXISTS under OR | 10, 35 | Planned |
+| **Phase 8** | **Subqueries ([ADR 0041](0041-subqueries-and-decorrelation.md); the phase 8 update below)** | | |
+| SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Planned |
+| SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Planned |
+| SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Planned |
+| SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Planned |
+| SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Planned |
+| SQ5, SQ6 | One PR or two. SQ6: correlated static aggregates of any kind, COUNT included, joined back LEFT with their empty values where the consumer proof fails; SQ5: correlated aggregates as values in the per-row slots, under the proof. Split, SQ6 lands first, since SQ5's correlated aggregates of any kind with any select item need its LEFT join back; SQ6 completes 41 and SQ5 6 | 6, 41 | Planned |
+| SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Planned |
 | **Phase 9** | **Window functions** | | |
 | W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
+| **Phase 10** | **Full decorrelation ([ADR 0041](0041-subqueries-and-decorrelation.md)), of which phase 8 is a subset; the ids name items, not yet an order (the phase 8 update below)** | | |
+| SQ4b | The single join, `kSingle`: correlated scalar subqueries that are not aggregates, grouped ones included, checked per probe row (needs SQ0 and SQ8) | | Planned |
+| SQ9 | The domain D, the unnesting's second terminal step, for correlations that substitution cannot express: relational division (a double NOT EXISTS, or NOT EXISTS over an EXCEPT whose left arm is uncorrelated), non-equality and OR correlations below an aggregate, outer columns inside an aggregate's argument, references two blocks out that the middle block does not equate, and the input that reads no outer column of a join that must be unnested on both inputs (needs SQ0) | | Planned |
+| SQ10 | Correlation forms that need no D: keys over computed expressions; widened keys of two types; an outer-only conjunct of a scalar aggregate, lifted out under the consumer proof and otherwise kept as a CASE above the join; substitution through a middle block's classes; a correlation inside a derived table or CTE body nested in the subquery; a join whose two inputs both read outer columns, unnested on both by substitution with their representatives equated NULL-equal; maps in select items; SQL's rule that an aggregate whose arguments are only outer columns is the outer block's, with DuckDB's bind error for one in a subquery's select list where the subquery stands in the enclosing WHERE, ON or GROUP BY (needs SQ0 and SQ6) | | Planned |
+| SQ11 | Keyless semi, anti and mark joins, amending [ADR 0040](0040-nested-loop-joins.md)'s decision 3: correlated EXISTS, NOT EXISTS, IN and NOT IN whose correlation has no equality (needs SQ8) | | Planned |
+| SQ12 | Correlated marks: correlated IN, NOT IN, `= ANY` and `<> ALL` under OR, NOT or CASE, three-valued, with per-binding NULL and empty flags (needs SQ8) | | Planned |
+| SQ13 | Correlation above an aggregation: free variables remapped to the GROUP BY or grouping-sets output, NULL where rolled up; correlated subqueries in HAVING and in a grouped block's select list; an aggregate of the enclosing block inside a subquery that stands in the enclosing HAVING or select list; DuckDB's bind error for one in a subquery's HAVING where the subquery stands in the enclosing WHERE, ON or GROUP BY (needs SQ0 and SQ5) | | Planned |
+| SQ14 | Per-binding LIMIT and OFFSET, a ROW_NUMBER partitioned by the representatives (needs phase 9, and SQ9 for an ORDER BY over an outer column without an equivalent) | | Planned |
+| SQ15 | Set operations with correlated arms: an uncorrelated right arm of EXCEPT or INTERSECT without D, a UNION arm through D or a decomposition (needs SQ9) | | Planned |
+| SQ16 | Grouping sets that mix `()` with other sets inside a correlated block, with GROUPING()'s empty value (needs SQ4b and SQ6) | | Planned |
+| SQ17 | Correlated values in an aggregate's FILTER clause and in window arguments (needs phase 9, and FILTER itself) | | Planned |
 | **Guards** | **Pulled in front of the PR they protect when the budget gate or their own trigger (the updates below) fires** | | |
 | PF2 | Filters into derived tables and CTE references: through their Projects, GROUP BY keys and inner joins to the scan of the relation that defines the column | | Conditional |
 | PF3 | LEFT JOIN as INNER or anti join where WHERE rejects the padded rows | | Conditional |
-| PF4 | One aggregation for one-row subqueries over the same rows | | Conditional |
+| PF4 | One aggregation for one-row subqueries over the same rows, measured in SQ2 on Q9 (ADR 0041) | | Conditional |
 | PF5 | ADR 0036's X7, its sharing part: a shared result past `MaterializedTable`'s cap first falls back to recomputation, then CTE references topped by a union or set operation are shared; the fallback lands before the first PR that makes such a result shareable, which no X4 item does (the X7a update below and its phase 6 note) | | Conditional |
 | PF6 | A partial aggregate below the join under a grouping-sets node: grouped by its join keys and every column of its side that any set groups by (ADR 0032's condition 3 over the union of the sets), with AVG as a (SUM, COUNT) partial (the phase 5 update below) | | Conditional |
-| PF7 | One-row and single joins on the branch of the relation they read | | Conditional |
+| PF7 | One-row, single and mark joins on the branch of the relation they read: ADR 0029's D0 rule generalized to marks, never into a padded input (ADR 0041) | | Conditional |
 | PF8 | Hash-set membership for long IN lists | | Conditional |
 | PF9 | One candidate per probe row for semi and anti residuals that read no build column but its keys (ADR 0022's E2c) | | Built |
 | PF10 | A derived table's or CTE reference's row estimate after its conditions, without the union branches they rule out, for the join order and the build sides | | Conditional |
@@ -204,7 +222,8 @@ Queries are those a PR completes when the PRs merge in this order.
 | PF13 | The smallest input as the starter of a region of INTERSECT and INTERSECT ALL alone, with no DOUBLE or FLOAT column under a DISTINCT root (ADR 0039) | | Conditional |
 | PF14 | Set-operation inputs that a constant column makes pairwise disjoint, each deduplicated on its own and freed before the next (ADR 0039) | | Conditional |
 | PF15 | Conditions above a set operation moved into every input, an input they rule out dropped and the formula simplified (ADR 0039) | | Conditional |
-| **Closing** | | | |
+| PF16 | One-row values as run-time constants of the probe pipeline: late materialization and top-N part pruning kept under a one-row join, and a comparison of a scan column with the value as a dynamic scan filter; measured in SQ1 and SQ2 (ADR 0041) | | Conditional |
+| **Closing** | **Whether CL1 and CL2 wait for phase 10 is open (the phase 8 update below)** | | |
 | CL1 | SF 1 shards rebalanced with all 99 passing | | Planned |
 | CL2 | This ADR and the feature ADRs accepted | | Planned |
 
@@ -776,6 +795,59 @@ the filter evaluates. Between two relations `IS NOT DISTINCT FROM` is a NULL-equ
 correlation through it decorrelates in both of ADR 0023's paths (its OJ5b update). No query of the 99 changes, so the
 ratchet stays at 75. Phase 9's window ADR may now weigh whole-partition aggregates joined back on NULL-equal keys.
 
+Update (2026-11-10, phase 8): the maintainer's decisions, with [ADR 0041](0041-subqueries-and-decorrelation.md), which
+designs the subqueries ahead of the code, extends ADR 0022 and ADR 0023, and adds a phase 10 after the window
+functions. Phase 8's rows are planned again, and the ids change:
+
+- **The order.** SQ4a, SQ1, SQ2, SQ7, SQ0, SQ5 and SQ6, then SQ8. The uncorrelated items come first: they are
+  independent, carry little risk and complete five queries before the riskiest change. SQ7's mark needs neither
+  correlation nor the unnesting framework, and its audit of the join-kind traits then serves SQ8. SQ0 comes before any
+  correlated widening, so that its consumer proof exists before a correlated value reaches a new placement.
+- **The ids.**
+  - SQ3 goes, absorbed into SQ4a: its one-row proof through CTE and derived-table references would have answered Q14
+    only, and Q58's subqueries are not aggregates. Q14, which the X4c update left needing only SQ3, waits for SQ4a.
+  - SQ4 splits. SQ4a answers uncorrelated scalar subqueries that are not aggregates through a single-value aggregate
+    under the one-row join, not through a single join; the single join, for correlated ones, is phase 10's SQ4b.
+  - SQ0 is new: a refactor of ADR 0023's unnesting into one rule table, which changes no answer and no plan of a
+    shape answered today.
+  - SQ1 and SQ2 widen to every clause in which DuckDB answers an uncorrelated value, conditions in SQ1 and values in
+    SQ2, except a LEFT or FULL JOIN's ON and a grouping-set element (ADR 0041's decision 8). LIMIT and OFFSET given
+    by a subquery, and a subquery as the whole of an aggregate's argument, wait for general features that no item
+    plans yet (ADR 0041's open decisions). SQ1 takes the OJ3 update's candidate, a subquery condition in an inner ON
+    inside a FULL JOIN's left input.
+  - SQ5 and SQ6 may be one PR or two. If they split, SQ6 lands first, since SQ5's correlated aggregates of any kind
+    with any select item need its LEFT join back.
+- **The queries.** SQ4a completes Q58, Q14 and Q54, and the ratchet goes from 75 to 78; Q54 because the bounds of its
+  BETWEEN are the subqueries themselves, which SQ4a's split of a BETWEEN answers. SQ1 completes none. SQ2 completes Q9
+  (79), SQ7 Q45 (80), SQ0 none, SQ5 and SQ6 Q6 and Q41 (82), and SQ8 Q10 and Q35 (84), the figure the Consequences
+  give for the end of phase 8. None of the nine needs a single join, the domain D or a keyless join (ADR 0041's
+  context).
+- **Phase 10, full decorrelation.** Neumann's top-down unnesting is built in full, as a phase of its own after phase 9.
+  Every phase 8 item is designed as a subset of it, with the same rule table, join kinds, traits and empty values, so
+  that phase 10 adds rules, kinds and a second terminal step, the domain D, and reworks nothing. Its ids are SQ4b and
+  SQ9 to SQ17. They name items, not a build order, which is set when phase 10 is planned. It completes none of the
+  99: its measure is DuckDB's answers to general SQL, and the windows stay the last phase that completes queries
+  (decision 4's update).
+- **Full DuckDB coverage follows phase 10.** Its items have no ids until they are planned, and their shapes exit 4
+  until then: subqueries in the ON of a LEFT or FULL JOIN, the quantified comparisons other than `= ANY`, `= SOME`
+  and `<> ALL`, LATERAL, BOOLEAN values (IN and EXISTS as select items included), a deparser in DuckDB's style for
+  the names of subquery items, DOUBLE join keys with a rule for NaN, row values, LIST types and recursive CTEs inside
+  subqueries.
+- **The guards** (ADR 0041's decision 26).
+  - PF16 is new. Today a one-row join switches off late materialization and top-N part pruning in its probe
+    pipeline. Its value is known before the probe starts, since builds come first, so a constant would keep both and
+    could become a dynamic scan filter. SQ1 and SQ2 put values into every condition and select list, so they measure
+    it.
+  - PF4 is measured in SQ2 on Q9 and pulled in only if the budget gate fires.
+  - PF7 now covers mark joins: ADR 0029's D0 rule generalizes to them, since a mark acts on each left row alone, but
+    never into a padded input.
+  - PF3 stays a guard: SQ0's consumer proof is its analysis restricted to the joins the unnesting makes, so
+    user-written LEFT JOINs keep their plans.
+- **The budget.** Each PR that completes a query gives its SF 1 numbers (decision 5), and `pixi run asan-tpc-sf1` runs
+  before SQ4a (Q14) and SQ2 (Q9) merge, the two of the nine likeliest to press on the budget.
+- **Open** (ADR 0041's open decisions): phase 10's build order, and whether the closing items CL1 and CL2, and with
+  CL2 this ADR's acceptance, wait for phase 10.
+
 ## Alternatives considered
 
 - **The features that complete the most queries first.** Rejected by the maintainer: the aim is all 99, and a layer
@@ -785,6 +857,8 @@ ratchet stays at 75. Phase 9's window ADR may now weigh whole-partition aggregat
 - **One ADR per phase.** Rejected: the ids need one home, while each feature's design belongs to the ADR that
   deferred it (0004, 0012, 0021, 0022, 0023, 0036) or to a new one for grouping sets and for windows. Update
   (2026-11-06, phase 6): set operations other than UNION ALL got a new one too, [ADR 0039](0039-set-operations.md).
+  Update (2026-11-10, phase 8): so did subqueries, [ADR 0041](0041-subqueries-and-decorrelation.md), which extends
+  ADR 0022 and ADR 0023 and also plans phase 10.
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
 this implementation does not comply with all requirements of the TPC-DS Benchmark.
