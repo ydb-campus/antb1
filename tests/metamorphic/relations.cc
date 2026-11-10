@@ -2031,6 +2031,146 @@ std::vector<Relation> AllRelations() {
          .check = FirstIsUnionOfRest()});
   }
 
+  // ---- values inside conditions (ADR 0041's SQ1) ----
+  {
+    const slt::FeatureSet in_conditions = {kCountStar,     kIntegerColumns, kTableName,
+                                           kWhere,         kIntegerLiteral, kBooleanExpressions,
+                                           kConditionValue};
+    // Zone 10's parent is zone 5, and zone 1 has none (tools/fixturegen/star.h).
+    constexpr std::string_view kOneRow = "SELECT zn_parent FROM zones WHERE zn_id = 10";
+    constexpr std::string_view kNoRow = "SELECT zn_parent FROM zones WHERE zn_id > 1000";
+
+    // `p OR EXISTS (q)` keeps p's rows and, of the others, those EXISTS keeps: over a block with a
+    // row (all of them) and one without (none).
+    for (const auto& [name, block] : {std::pair{"rows", kOneRow}, std::pair{"no_row", kNoRow}}) {
+      r.push_back(
+          {.name = std::format("or_exists_is_its_disjoint_branches_over_{}", name),
+           .features = SetWith(in_conditions, kColumns, kWhereAnd),
+           .probes = {Q(std::format("SELECT tr_row FROM trips WHERE tr_row < 10 OR EXISTS ({})",
+                                    block)),
+                      Q("SELECT tr_row FROM trips WHERE tr_row < 10"),
+                      Q(std::format("SELECT tr_row FROM trips WHERE NOT (tr_row < 10) AND EXISTS "
+                                    "({})",
+                                    block))},
+           .check = FirstIsUnionOfRest()});
+    }
+    // A value of one row under OR equals a cross join with it as a one-row derived table; a value
+    // of no row is NULL, whose comparison keeps nothing, so the OR keeps its other branch's rows.
+    r.push_back({.name = "value_of_one_row_under_or_is_a_cross_join",
+                 .features = SetWith(in_conditions, kDerivedTable, kCommaJoin, kAlias, kTableAlias,
+                                     kQualifiedName, kColumns),
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_row < 10 OR "
+                                          "tr_pickup = ({})",
+                                          kOneRow)),
+                            Q("SELECT COUNT(*) FROM trips, (SELECT zn_parent AS v FROM zones WHERE "
+                              "zn_id = 10) AS s WHERE tr_row < 10 OR tr_pickup = s.v")},
+                 .check = AllEqual()});
+    r.push_back({.name = "value_of_no_row_under_or_keeps_the_other_branch",
+                 .features = in_conditions,
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_row < 10 OR "
+                                          "tr_pickup = ({})",
+                                          kNoRow)),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_row < 10")},
+                 .check = AllEqual()});
+    // A value equals the literal it holds, under OR, in a CASE, in an IN list (lowered to the OR of
+    // its equalities, against BindIn's list) and in an inner ON inside a FULL JOIN's left input,
+    // which filters that input before the FULL JOIN pads it.
+    for (const auto& [name, with_value, with_literal] :
+         {std::tuple{"or", "tr_row < 10 OR tr_pickup = ({})", "tr_row < 10 OR tr_pickup = 5"},
+          std::tuple{"case", "CASE WHEN tr_pickup = ({}) THEN 1 ELSE 0 END = 1",
+                     "CASE WHEN tr_pickup = 5 THEN 1 ELSE 0 END = 1"},
+          std::tuple{"in_list", "tr_pickup IN (1, ({}))", "tr_pickup IN (1, 5)"},
+          std::tuple{"not_in_list", "tr_pickup NOT IN (1, ({}))", "tr_pickup NOT IN (1, 5)"}}) {
+      r.push_back(
+          {.name = std::format("value_equals_its_literal_{}", name),
+           .features = SetWith(in_conditions, kCase, kIn),
+           .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE {}",
+                                    std::vformat(with_value, std::make_format_args(kOneRow)))),
+                      Q(std::format("SELECT COUNT(*) FROM trips WHERE {}", with_literal))},
+           .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "value_equals_its_literal_in_a_full_joins_left_input",
+         .features = SetWith(in_conditions, kCountColumn, kJoinOn, kFullJoin, kTableAlias,
+                             kQualifiedName, kMultipleItems, kMin, kArithmetic),
+         .probes = {Q("SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z "
+                      "ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM "
+                      "cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id"),
+                    Q("SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z "
+                      "ON t.tr_pickup = z.zn_id AND z.zn_city < 3 FULL JOIN drivers d ON "
+                      "t.tr_driver = d.dv_id")},
+         .check = AllEqual()});
+    // NOT BETWEEN two values is the OR of the two comparisons it negates.
+    r.push_back({.name = "not_between_values_is_two_comparisons",
+                 .features = SetWith(in_conditions, kBetween, kMin, kMax),
+                 .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_pickup NOT BETWEEN (SELECT "
+                              "MIN(zn_id) FROM zones WHERE zn_city = 2) AND (SELECT MAX(zn_id) "
+                              "FROM zones WHERE zn_city = 2)"),
+                            Q("SELECT COUNT(*) FROM trips WHERE tr_pickup < (SELECT MIN(zn_id) "
+                              "FROM zones WHERE zn_city = 2) OR tr_pickup > (SELECT MAX(zn_id) "
+                              "FROM zones WHERE zn_city = 2)")},
+                 .check = AllEqual()});
+    // Above, below and NULL partition the rows: the column's NULLs (zones 1 to 5 have no parent)
+    // and a value's NULL fall to the third part only.
+    for (const auto& [name, value] :
+         {std::pair{"one_row", std::string_view("SELECT MIN(zn_city) FROM zones")},
+          std::pair{"no_row", kNoRow}}) {
+      r.push_back(
+          {.name = std::format("value_conditions_partition_rows_{}", name),
+           .features = SetWith(in_conditions, kMin),
+           .probes = {Q("SELECT COUNT(*) FROM zones"),
+                      Q(std::format("SELECT COUNT(*) FROM zones WHERE zn_parent > ({})", value)),
+                      Q(std::format("SELECT COUNT(*) FROM zones WHERE zn_parent <= ({})", value)),
+                      Q(std::format("SELECT COUNT(*) FROM zones WHERE zn_parent IS NULL OR ({}) IS "
+                                    "NULL",
+                                    value))},
+           .check = FirstEqualsSumOfRest()});
+    }
+    // One subquery written twice is one value: the cross join with it once.
+    r.push_back({.name = "subquery_written_twice_is_one_value",
+                 .features = SetWith(in_conditions, kDerivedTable, kCommaJoin, kAlias, kTableAlias,
+                                     kQualifiedName, kColumns),
+                 .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_pickup = ({}) OR "
+                                          "tr_dropoff = ({})",
+                                          kOneRow, kOneRow)),
+                            Q("SELECT COUNT(*) FROM trips, (SELECT zn_parent AS v FROM zones WHERE "
+                              "zn_id = 10) AS s WHERE tr_pickup = s.v OR tr_dropoff = s.v")},
+                 .check = AllEqual()});
+    // ADR 0041's self-check for decision 8's residual: a correlated EXISTS whose conjunct reads the
+    // enclosing block and holds a value is the uncorrelated EXISTS with each binding written as a
+    // literal, one query per binding (cities holds the ids 1 to 6).
+    {
+      std::vector<Probe> probes = {
+          Q("SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM zones WHERE zones.zn_city = "
+            "cities.ct_id AND cities.ct_id > (SELECT MIN(zn_city) FROM zones))")};
+      for (int id = 1; id <= 6; ++id) {
+        probes.push_back(Q(std::format(
+            "SELECT ct_id FROM cities WHERE ct_id = {} AND EXISTS (SELECT * FROM zones WHERE "
+            "zones.zn_city = {} AND {} > (SELECT MIN(zn_city) FROM zones))",
+            id, id, id)));
+      }
+      r.push_back({.name = "correlated_exists_with_a_value_is_its_bindings_as_literals",
+                   .features = SetWith(in_conditions, kColumns, kQualifiedName, kWhereAnd,
+                                       kCorrelatedExists, kMin, kLiteralFirst),
+                   .probes = std::move(probes),
+                   .check = FirstIsUnionOfRest()});
+    }
+    // A value under OR and in a CASE is the same at any batch size.
+    for (const auto& [name, sql] :
+         {std::pair{"or",
+                    "SELECT COUNT(*) FROM trips WHERE tr_row % 7 = 0 OR tr_fare > (SELECT "
+                    "tr_fare FROM trips WHERE tr_row % 3000 = 2500)"},
+          std::pair{"case",
+                    "SELECT COUNT(*) FROM trips WHERE CASE WHEN tr_fare > (SELECT tr_fare "
+                    "FROM trips WHERE tr_row % 3000 = 2500) THEN 1 ELSE 0 END = 1"}}) {
+      r.push_back(
+          {.name = std::format("value_under_{}_batch_size_invariance", name),
+           .features = SetWith(in_conditions, kDecimalColumns, kColumns, kArithmetic, kCase),
+           .probes = {Q(sql, 1), Q(sql, 7), Q(sql)},
+           .check = AllEqual()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.
