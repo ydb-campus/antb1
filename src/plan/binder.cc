@@ -629,15 +629,18 @@ struct Rejection {
 };
 
 // The first construct of a value expression, in source order, that is not a column, a literal
-// or (where allowed) an aggregate of a column.
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
+// or (where allowed) an aggregate of a column. `values`: inside a condition of WHERE or of an inner
+// ON, where a scalar subquery is a value (ADR 0041's decision 8).
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values = false);
 
 // Why a condition (WHERE, HAVING, CASE WHEN) is not one the binder answers, or std::nullopt.
-std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
+// `values`: one of WHERE or of an inner ON, where a scalar subquery is a value and EXISTS a
+// condition (ADR 0041's decision 8).
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, bool values = false);
 
-// Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
-// neither is a constant.
-bool ReadsColumn(const sql::Expr& expr, bool aggregates = false);
+// Whether the expression reads a column (or, `aggregates`, calls an aggregate; or, `subqueries`,
+// holds a scalar subquery's value): one that does none of these is a constant.
+bool ReadsColumn(const sql::Expr& expr, bool aggregates = false, bool subqueries = false);
 
 // What an argument of a scalar function takes (ADR 0012's function table).
 enum class ArgKind : std::uint8_t {
@@ -867,56 +870,69 @@ std::string FunctionNameOpening(const sql::FunctionCall& call) {
 
 struct ReadsColumnOf {
   bool aggregates = false;
+  bool subqueries = false;
 
   bool operator()(const sql::ColumnRef& /*column*/) const { return true; }
   bool operator()(const sql::Literal& /*lit*/) const { return false; }
   bool operator()(const sql::AggregateCall& /*call*/) const { return aggregates; }
   bool operator()(const sql::UnaryExpr& unary) const {
-    return ReadsColumn(*unary.operand, aggregates);
+    return ReadsColumn(*unary.operand, aggregates, subqueries);
   }
   bool operator()(const sql::BinaryExpr& binary) const {
-    return ReadsColumn(*binary.left, aggregates) || ReadsColumn(*binary.right, aggregates);
+    return ReadsColumn(*binary.left, aggregates, subqueries) ||
+           ReadsColumn(*binary.right, aggregates, subqueries);
   }
   bool operator()(const sql::LikeExpr& like) const {
-    return ReadsColumn(*like.operand, aggregates) || ReadsColumn(*like.pattern, aggregates);
+    return ReadsColumn(*like.operand, aggregates, subqueries) ||
+           ReadsColumn(*like.pattern, aggregates, subqueries);
   }
-  bool operator()(const sql::InExpr& in) const { return ReadsColumn(*in.operand, aggregates); }
+  bool operator()(const sql::InExpr& in) const {
+    return ReadsColumn(*in.operand, aggregates, subqueries);
+  }
   bool operator()(const sql::BetweenExpr& between) const {
-    return ReadsColumn(*between.operand, aggregates) || ReadsColumn(*between.low, aggregates) ||
-           ReadsColumn(*between.high, aggregates);
+    return ReadsColumn(*between.operand, aggregates, subqueries) ||
+           ReadsColumn(*between.low, aggregates, subqueries) ||
+           ReadsColumn(*between.high, aggregates, subqueries);
   }
   bool operator()(const sql::IsNullExpr& is_null) const {
-    return ReadsColumn(*is_null.operand, aggregates);
+    return ReadsColumn(*is_null.operand, aggregates, subqueries);
   }
   bool operator()(const sql::DistinctFromExpr& distinct) const {
-    return ReadsColumn(*distinct.left, aggregates) || ReadsColumn(*distinct.right, aggregates);
+    return ReadsColumn(*distinct.left, aggregates, subqueries) ||
+           ReadsColumn(*distinct.right, aggregates, subqueries);
   }
   bool operator()(const sql::FunctionCall& call) const {
-    return std::ranges::any_of(call.args,
-                               [this](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
+    return std::ranges::any_of(
+        call.args, [this](const sql::Expr& a) { return ReadsColumn(a, aggregates, subqueries); });
   }
   bool operator()(const sql::CaseExpr& c) const {
-    const auto reads = [this](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
+    const auto reads = [this](const sql::Expr& e) {
+      return ReadsColumn(e, aggregates, subqueries);
+    };
     return (c.operand.has_value() && reads(**c.operand)) ||
            (c.otherwise.has_value() && reads(**c.otherwise)) ||
            std::ranges::any_of(c.branches, [&](const sql::CaseBranch& b) {
              return reads(*b.when) || reads(*b.then);
            });
   }
-  bool operator()(const sql::ExtractExpr& e) const { return ReadsColumn(*e.source, aggregates); }
+  bool operator()(const sql::ExtractExpr& e) const {
+    return ReadsColumn(*e.source, aggregates, subqueries);
+  }
   bool operator()(const sql::CastExpr& cast) const {
-    return ReadsColumn(*cast.operand, aggregates);
+    return ReadsColumn(*cast.operand, aggregates, subqueries);
   }
   // A subquery's own block reads its own columns, which are no columns of this one; a correlated
   // reference would be, and ADR 0023's U-series revisits this when it answers one. Its IN operand
-  // belongs to this block, though.
+  // belongs to this block, though, and a scalar subquery's value is an operand where `subqueries`
+  // (ADR 0041's decision 9: `(q) > 5` is no comparison of two literals).
   bool operator()(const sql::SubqueryExpr& s) const {
-    return s.operand.has_value() && ReadsColumn(**s.operand, aggregates);
+    return (subqueries && s.kind == sql::SubqueryExpr::Kind::kScalar) ||
+           (s.operand.has_value() && ReadsColumn(**s.operand, aggregates, subqueries));
   }
 };
 
-bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
-  return std::visit(ReadsColumnOf{.aggregates = aggregates},
+bool ReadsColumn(const sql::Expr& expr, bool aggregates, bool subqueries) {
+  return std::visit(ReadsColumnOf{.aggregates = aggregates, .subqueries = subqueries},
                     static_cast<const sql::ExprNode&>(expr));
 }
 
@@ -1014,9 +1030,10 @@ void CollectAggregateArgRefs(const sql::Expr& expr, std::vector<const sql::Colum
              static_cast<const sql::ExprNode&>(expr));
 }
 
-std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
+std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs,
+                                            bool values = false) {
   for (const sql::Expr& e : exprs) {
-    if (auto r = FirstUnsupported(e)) {
+    if (auto r = FirstUnsupported(e, values)) {
       return r;
     }
   }
@@ -1036,6 +1053,8 @@ bool IsGroupingCall(const sql::FunctionCall& call) {
 }
 
 struct FirstUnsupportedOf {
+  bool values = false;  // see FirstUnsupported
+
   // A qualified name is no rejection: the scope resolves it among the bindings it names, and says
   // so when none does (rules 1 to 3 of ADR 0022).
   std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
@@ -1050,6 +1069,7 @@ struct FirstUnsupportedOf {
       return (*this)(*column);
     }
     const sql::Expr& arg = **call.arg;
+    // A subquery in an aggregate's argument waits for ADR 0041's SQ2, wherever the aggregate is.
     if (auto r = FirstUnsupported(arg)) {
       return r;
     }
@@ -1062,12 +1082,12 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
     if (unary.op == sql::UnaryOp::kNegate) {
-      return FirstUnsupported(*unary.operand);
+      return FirstUnsupported(*unary.operand, values);
     }
     return Rejection{.span = unary.op_span, .message = std::string("NOT") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
-    if (auto r = FirstUnsupported(*binary.left)) {
+    if (auto r = FirstUnsupported(*binary.left, values)) {
       return r;
     }
     std::string message;
@@ -1078,7 +1098,7 @@ struct FirstUnsupportedOf {
       case sql::BinaryOp::kDivide:
       case sql::BinaryOp::kIntegerDivide:
       case sql::BinaryOp::kModulo:
-        return FirstUnsupported(*binary.right);
+        return FirstUnsupported(*binary.right, values);
       case sql::BinaryOp::kAnd:
         message = std::string("AND") + kConditionsOnly;
         break;
@@ -1092,25 +1112,25 @@ struct FirstUnsupportedOf {
     return Rejection{.span = binary.op_span, .message = std::move(message)};
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand)) {
+    if (auto r = FirstUnsupported(*like.operand, values)) {
       return r;
     }
     return Rejection{.span = like.op_span, .message = std::string("LIKE") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand)) {
+    if (auto r = FirstUnsupported(*in.operand, values)) {
       return r;
     }
     return Rejection{.span = in.op_span, .message = std::string("IN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BetweenExpr& between) const {
-    if (auto r = FirstUnsupported(*between.operand)) {
+    if (auto r = FirstUnsupported(*between.operand, values)) {
       return r;
     }
     return Rejection{.span = between.op_span, .message = std::string("BETWEEN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    if (auto r = FirstUnsupported(*is_null.operand)) {
+    if (auto r = FirstUnsupported(*is_null.operand, values)) {
       return r;
     }
     return Rejection{
@@ -1118,10 +1138,10 @@ struct FirstUnsupportedOf {
         .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
-    if (auto r = FirstUnsupported(*distinct.left)) {
+    if (auto r = FirstUnsupported(*distinct.left, values)) {
       return r;
     }
-    if (auto r = FirstUnsupported(*distinct.right)) {
+    if (auto r = FirstUnsupported(*distinct.right, values)) {
       return r;
     }
     return Rejection{
@@ -1131,10 +1151,10 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     if (IsCoalesce(call)) {
-      return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
+      return FirstUnsupportedIn(call.args, values);  // any values (ADR 0037's NL5)
     }
     if (IsGroupingCall(call)) {
-      return FirstUnsupportedIn(call.args);  // the keys it reads (ADR 0038)
+      return FirstUnsupportedIn(call.args, values);  // the keys it reads (ADR 0038)
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
@@ -1197,7 +1217,7 @@ struct FirstUnsupportedOf {
           ++j;  // the escaped character
         }
       }
-      if (auto r = FirstUnsupported(call.args[i])) {
+      if (auto r = FirstUnsupported(call.args[i], values)) {
         return r;
       }
     }
@@ -1207,7 +1227,7 @@ struct FirstUnsupportedOf {
   // operand; the binder rejects it where the scope has none); CASE x WHEN v as x = v.
   std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
     if (c.operand.has_value()) {
-      if (auto r = FirstUnsupported(**c.operand)) {
+      if (auto r = FirstUnsupported(**c.operand, values)) {
         return r;
       }
     }
@@ -1218,18 +1238,18 @@ struct FirstUnsupportedOf {
                                               .right = sql::Box<sql::Expr>(*branch.when),
                                               .op_span = branch.when->span(),
                                               .span = branch.when->span()});
-        if (auto r = RejectCondition(equal, /*having=*/true)) {
+        if (auto r = RejectCondition(equal, /*having=*/true, values)) {
           return r;
         }
-      } else if (auto r = RejectCondition(*branch.when, /*having=*/true)) {
+      } else if (auto r = RejectCondition(*branch.when, /*having=*/true, values)) {
         return r;
       }
-      if (auto r = FirstUnsupported(*branch.then)) {
+      if (auto r = FirstUnsupported(*branch.then, values)) {
         return r;
       }
     }
     if (c.otherwise.has_value()) {
-      return FirstUnsupported(**c.otherwise);
+      return FirstUnsupported(**c.otherwise, values);
     }
     return std::nullopt;
   }
@@ -1240,7 +1260,7 @@ struct FirstUnsupportedOf {
                                               "lists the fields)",
                                               Clip(e.field))};
     }
-    return FirstUnsupported(*e.source);
+    return FirstUnsupported(*e.source, values);
   }
   // Every cast that FoldDateCasts left (all but CAST('YYYY-MM-DD' AS DATE)): to a type antb1 has
   // (ADR 0037's CT1), whose operands the binder then checks.
@@ -1248,7 +1268,7 @@ struct FirstUnsupportedOf {
     if (cast.try_cast) {
       return Rejection{.span = cast.op_span, .message = "TRY_CAST is not supported"};
     }
-    if (auto r = FirstUnsupported(*cast.operand)) {
+    if (auto r = FirstUnsupported(*cast.operand, values)) {
       return r;
     }
     if (!KnownCastTarget(cast)) {
@@ -1266,6 +1286,10 @@ struct FirstUnsupportedOf {
   std::optional<Rejection> operator()(const sql::SubqueryExpr& s) const {
     switch (s.kind) {
       case sql::SubqueryExpr::Kind::kScalar:
+        if (values) {
+          return std::nullopt;  // a value in a condition (ADR 0041's SQ1); its block is checked as
+                                // a block
+        }
         return Rejection{.span = s.op_span, .message = "a scalar subquery is not supported"};
       case sql::SubqueryExpr::Kind::kIn:
         return Rejection{.span = s.op_span, .message = "IN (subquery) is not supported"};
@@ -1279,8 +1303,8 @@ struct FirstUnsupportedOf {
   }
 };
 
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr) {
-  return std::visit(FirstUnsupportedOf{}, static_cast<const sql::ExprNode&>(expr));
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values) {
+  return std::visit(FirstUnsupportedOf{.values = values}, static_cast<const sql::ExprNode&>(expr));
 }
 
 arrow::Status Reject(const Rejection& r) {
@@ -1391,18 +1415,19 @@ constexpr std::string_view kThisCondition = "this condition is not supported";
 struct RejectConditionOf {
   const sql::Expr& expr;  // the condition
   bool having = false;
+  bool values = false;  // see RejectCondition
 
   // An operand reads a column (in HAVING, or calls an aggregate); the other side of a comparison
   // is then an operand too, or a literal.
-  bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having); }
+  bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having, values); }
 
   // The sides of a comparison: each supported, one reading a column, and the other a column's
   // value too, a literal or a constant the binder folds.
   std::optional<Rejection> ComparisonSides(const sql::Expr& left, const sql::Expr& right) const {
-    if (auto r = FirstUnsupported(left)) {
+    if (auto r = FirstUnsupported(left, values)) {
       return r;
     }
-    if (auto r = FirstUnsupported(right)) {
+    if (auto r = FirstUnsupported(right, values)) {
       return r;
     }
     if (!IsOperand(left) && !IsOperand(right)) {
@@ -1426,7 +1451,7 @@ struct RejectConditionOf {
   // `expr` is no condition the binder answers: the first construct in it that is not supported
   // anywhere, else `message`, at the whole of `expr`.
   std::optional<Rejection> NotACondition(std::string_view message) const {
-    if (auto r = FirstUnsupported(expr)) {
+    if (auto r = FirstUnsupported(expr, values)) {
       return r;
     }
     return Rejection{.span = expr.span(), .message = std::string(message)};
@@ -1443,7 +1468,7 @@ struct RejectConditionOf {
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
     if (unary.op == sql::UnaryOp::kNot) {
-      return RejectCondition(*unary.operand, having);
+      return RejectCondition(*unary.operand, having, values);
     }
     return NotACondition(kOtherConditions);
   }
@@ -1451,10 +1476,10 @@ struct RejectConditionOf {
     switch (binary.op) {
       case sql::BinaryOp::kAnd:
       case sql::BinaryOp::kOr:
-        if (auto r = RejectCondition(*binary.left, having)) {
+        if (auto r = RejectCondition(*binary.left, having, values)) {
           return r;
         }
-        return RejectCondition(*binary.right, having);
+        return RejectCondition(*binary.right, having, values);
       case sql::BinaryOp::kEq:
       case sql::BinaryOp::kNe:
       case sql::BinaryOp::kLt:
@@ -1468,7 +1493,7 @@ struct RejectConditionOf {
     return NotACondition(kOtherConditions);
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand)) {
+    if (auto r = FirstUnsupported(*like.operand, values)) {
       return r;
     }
     if (!IsOperand(*like.operand)) {
@@ -1487,7 +1512,7 @@ struct RejectConditionOf {
                          "supported"};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand)) {
+    if (auto r = FirstUnsupported(*in.operand, values)) {
       return r;
     }
     if (!IsOperand(*in.operand)) {
@@ -1508,10 +1533,15 @@ struct RejectConditionOf {
                              "subquery without the second pair of parentheses)"};
       }
     }
-    if (auto r = FirstUnsupportedIn(in.list)) {
+    if (auto r = FirstUnsupportedIn(in.list, values)) {
       return r;
     }
     for (const sql::Expr& value : in.list) {
+      // A value that reads no column of the block, a subquery's (ADR 0041's SQ1): the list is then
+      // an OR of its equalities.
+      if (values && !ReadsColumn(value) && HoldsSubquery(value)) {
+        continue;
+      }
       if (!std::holds_alternative<sql::Literal>(value) && !IsFoldableConstant(value)) {
         return Rejection{
             .span = value.span(),
@@ -1525,7 +1555,7 @@ struct RejectConditionOf {
   // As the two comparisons it means: operand >= low AND operand <= high.
   std::optional<Rejection> operator()(const sql::BetweenExpr& between) const {
     for (const sql::Expr& comparison : BetweenComparisons(between)) {
-      if (auto r = RejectCondition(comparison, having)) {
+      if (auto r = RejectCondition(comparison, having, values)) {
         return r;
       }
     }
@@ -1533,7 +1563,7 @@ struct RejectConditionOf {
   }
   // Of any value: a condition as the operand is refused as a value is ((a = 1) IS NULL).
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    return FirstUnsupported(*is_null.operand);
+    return FirstUnsupported(*is_null.operand, values);
   }
   // As a comparison's sides (ADR 0037's OJ5b): one reads a column; the other may be NULL too.
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
@@ -1552,14 +1582,19 @@ struct RejectConditionOf {
     return NotACondition(kThisCondition);
   }
   // A subquery is a condition DuckDB answers, so NotACondition's FirstUnsupported gives the
-  // message: the form itself is what is unsupported, not its use as a condition.
-  std::optional<Rejection> operator()(const sql::SubqueryExpr& /*s*/) const {
+  // message: the form itself is what is unsupported, not its use as a condition. EXISTS is a
+  // condition in a WHERE or inner-ON condition under AND, OR, NOT and CASE WHEN (ADR 0041's SQ1);
+  // a scalar subquery there is a value, which is no condition.
+  std::optional<Rejection> operator()(const sql::SubqueryExpr& s) const {
+    if (values && s.kind == sql::SubqueryExpr::Kind::kExists) {
+      return std::nullopt;
+    }
     return NotACondition(kThisCondition);
   }
 };
 
-std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
-  return std::visit(RejectConditionOf{.expr = expr, .having = having},
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, bool values) {
+  return std::visit(RejectConditionOf{.expr = expr, .having = having, .values = values},
                     static_cast<const sql::ExprNode&>(expr));
 }
 
@@ -5022,17 +5057,19 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
 
 namespace {
 
-// DuckDB compares x BETWEEN lo AND hi with one common type of the three values, while antb1
-// compares x >= lo and x <= hi each in its own. They differ only when that type is DOUBLE (a
-// DOUBLE column or an approximate literal, which an exponent or more than 38 digits makes) and a
-// pair that antb1 does not compare in DOUBLE would compare otherwise in DOUBLE: a BIGINT or
-// HUGEINT value (a column, or a constant of that type), a FLOAT column, a decimal literal against
-// an integer value, and a DECIMAL (ADR 0021): a DECIMAL operand against any bound that is not
-// DOUBLE (an integer or decimal literal, a constant, a column), or a DECIMAL column or expression
-// as a bound. Such a BETWEEN is unsupported, unless the operand is DOUBLE: then both comparisons
-// are in DOUBLE already.
+// DuckDB compares x BETWEEN lo AND hi with one common type of the three values, and x IN (v1, ...)
+// with one of all of them (an IN list that holds a subquery's value, ADR 0041's SQ1), while antb1
+// compares x >= lo and x <= hi, or x = v for each v, each in its own. They differ only when that
+// type is DOUBLE (a DOUBLE column or an approximate literal, which an exponent or more than 38
+// digits makes) and a pair that antb1 does not compare in DOUBLE would compare otherwise in DOUBLE:
+// a BIGINT or HUGEINT value (a column, or a constant of that type), a FLOAT column, a decimal
+// literal against an integer value, and a DECIMAL (ADR 0021): a DECIMAL operand against any value
+// that is not DOUBLE (an integer or decimal literal, a constant, a column), or a DECIMAL column or
+// expression as another value. Such a BETWEEN or IN is unsupported, unless the operand is DOUBLE:
+// then every comparison is in DOUBLE already. `values` starts with the operand.
 template <class BindFn>
-arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
+arrow::Status CheckCommonType(std::span<const sql::Expr* const> values, const BindFn& bind,
+                              SourceSpan op_span, std::string_view clause, std::string_view all) {
   bool any_double = false;
   bool any_wide = false;
   bool any_float = false;
@@ -5047,8 +5084,8 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
   const auto wide = [](LogicalType t) {
     return t == LogicalType::kBigInt || t == LogicalType::kHugeInt;
   };
-  for (const sql::Expr* value : {&*between.operand, &*between.low, &*between.high}) {
-    const bool is_operand = value == &*between.operand;
+  for (const sql::Expr* value : values) {
+    const bool is_operand = value == values.front();
     bool is_double = false;
     bool is_decimal = false;
     if (const auto* lit = std::get_if<sql::Literal>(value)) {
@@ -5098,20 +5135,37 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
   // Pairwise, a string literal compares with a VARCHAR value and a DATE value alike; DuckDB
   // rejects the mix.
   if (any_varchar && temporal.has_value()) {
-    return BindError(std::format("Cannot mix values of type VARCHAR and {} in BETWEEN clause",
-                                 ToString(*temporal)),
-                     between.op_span);
+    return BindError(std::format("Cannot mix values of type VARCHAR and {} in {} clause",
+                                 ToString(*temporal), clause),
+                     op_span);
   }
   const bool decimal_pair = (operand_decimal && any_exact_bound) || any_decimal_bound;
   if (any_double && !operand_double &&
       (any_wide || any_float || (any_decimal && any_integer) || decimal_pair)) {
     return UnsupportedError(
-        "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value, or of a DOUBLE "
-        "value, a decimal literal and an integer value, is not supported (DuckDB compares all "
-        "three in DOUBLE)",
-        between.op_span);
+        std::format(
+            "{} of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value, or of a "
+            "DOUBLE value, a decimal literal and an integer value, is not supported (DuckDB "
+            "compares {} in DOUBLE)",
+            clause, all),
+        op_span);
   }
   return arrow::Status::OK();
+}
+
+template <class BindFn>
+arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
+  const std::array<const sql::Expr*, 3> values = {&*between.operand, &*between.low, &*between.high};
+  return CheckCommonType(values, bind, between.op_span, "BETWEEN", "all three");
+}
+
+template <class BindFn>
+arrow::Status CheckInListTypes(const sql::InExpr& in, const BindFn& bind) {
+  std::vector<const sql::Expr*> values{&*in.operand};
+  for (const sql::Expr& value : in.list) {
+    values.push_back(&value);
+  }
+  return CheckCommonType(values, bind, in.op_span, "IN", "all of them");
 }
 
 }  // namespace
@@ -5142,6 +5196,36 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
     }
     return Leaf(
         Expr{.node = std::move(node), .type = LogicalType::kBoolean, .name = ExprName(expr)});
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr);
+      in != nullptr &&
+      std::ranges::any_of(in->list, [](const sql::Expr& v) { return HoldsSubquery(v); })) {
+    // An IN list that holds a subquery's value (ADR 0041's SQ1): the OR of its equalities, which
+    // is IN exactly in three-valued logic, under a NOT for NOT IN; checked against DuckDB's typing
+    // of the list in one type first (CheckInListTypes).
+    ARROW_RETURN_NOT_OK(CheckInListTypes(*in, bind));
+    BoolExpr any{.op = BoolOp::kOr, .args = {}};
+    for (const sql::Expr& value : in->list) {
+      const sql::Expr equal(sql::BinaryExpr{.op = sql::BinaryOp::kEq,
+                                            .left = sql::Box<sql::Expr>(*in->operand),
+                                            .right = sql::Box<sql::Expr>(value),
+                                            .op_span = in->op_span,
+                                            .span = in->span});
+      ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(equal, bind, input));
+      any.args.push_back(std::move(arg.expr));
+    }
+    ExprPtr list =
+        any.args.size() == 1
+            ? any.args.front()
+            : std::make_shared<const Expr>(Expr{
+                  .node = std::move(any), .type = LogicalType::kBoolean, .name = ExprName(expr)});
+    if (in->negated) {
+      list = std::make_shared<const Expr>(
+          Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(list)}},
+               .type = LogicalType::kBoolean,
+               .name = ExprName(expr)});
+    }
+    return Typed{.expr = std::move(list)};
   }
   if (const auto* between = std::get_if<sql::BetweenExpr>(&expr)) {
     // operand >= low AND operand <= high, under a NOT when negated; named as DuckDB names it.
@@ -5783,7 +5867,11 @@ bool IsCompound(const sql::Expr& conjunct) {
   }
   const auto* lowered_binary =
       lowered.has_value() ? std::get_if<sql::BinaryExpr>(&*lowered) : nullptr;
-  return (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
+  // An IN list that holds a subquery's value is the OR of its equalities (ADR 0041's SQ1).
+  const auto* in = std::get_if<sql::InExpr>(&conjunct);
+  return (in != nullptr &&
+          std::ranges::any_of(in->list, [](const sql::Expr& v) { return HoldsSubquery(v); })) ||
+         (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
          (unary != nullptr && unary->op == sql::UnaryOp::kNot) ||
          (between != nullptr && between->negated) ||
          (lowered_binary != nullptr && lowered_binary->op == sql::BinaryOp::kOr);
@@ -6960,11 +7048,22 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
     PlantValue(*form->subquery, std::move(block), /*group=*/false);
     return BindValueConjunct(conjunct, element);
   }
-  if (const sql::BetweenExpr* between = SubqueryBetween(conjunct)) {
-    return BindSubqueryBetween(conjunct, *between, /*having=*/false, element,
-                               [this](const sql::Expr& e) { return BindInput(e); });
-  }
   if (HoldsSubquery(conjunct)) {
+    // A plain BETWEEN is its two comparisons, typed as DuckDB types all three values (each value
+    // bound once, ADR 0041's decision 10), each then bound on its own: a half without a value goes
+    // where any conjunct goes, onto a scan, say.
+    if (const auto* between = std::get_if<sql::BetweenExpr>(&conjunct);
+        between != nullptr && !between->negated) {
+      const auto bind = [this](const sql::Expr& e) { return BindInput(e); };
+      ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
+      const std::optional<LogicalType> folded = BetweenType(*between, bind);
+      for (const sql::Expr& comparison : BetweenComparisons(*between)) {
+        const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
+        ARROW_RETURN_NOT_OK(HoldsSubquery(comparison) ? BindValueConjunct(comparison, element)
+                                                      : BindConjunct(comparison, element));
+      }
+      return arrow::Status::OK();
+    }
     return BindValueConjunct(conjunct, element);
   }
   return BindConjunct(conjunct, element);
@@ -8377,15 +8476,17 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
 }
 
 // One top-level conjunct of CheckConjuncts: a subquery form by its own rule, anything else by
-// RejectCondition's.
-arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
-  if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct)) {
+// RejectCondition's. Where a condition takes values (`values`), only IN keeps a rule of its own:
+// EXISTS is a condition there, and a comparison with a subquery one of two values.
+arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having, bool values) {
+  if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct);
+      form.has_value() && (!values || (!form->scalar() && !form->exists()))) {
     if (auto r = RejectSubqueryConjunct(*form, having)) {
       return Reject(*r);
     }
     return arrow::Status::OK();
   }
-  if (auto r = RejectCondition(conjunct, having)) {
+  if (auto r = RejectCondition(conjunct, having, values)) {
     return Reject(*r);
   }
   return arrow::Status::OK();
@@ -8397,16 +8498,17 @@ arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
 // refusal FirstUnsupportedOf gives it, an OR branch included, since Conjuncts flattens AND alone.
 // The conjuncts are the binder's own (plan::Conjuncts, and FactorSharedConjuncts over it), so what
 // this accepts is what the binder intercepts.
-arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool having) {
+arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool having, bool values) {
   for (const sql::Expr* conjunct : Conjuncts(predicate)) {
-    // A BETWEEN with a subquery bound is checked as its two comparisons, as the binder binds it.
-    if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct)) {
+    // A BETWEEN with a subquery bound is checked as its two comparisons, as the binder binds it in
+    // HAVING (where a condition takes values, RejectCondition checks a BETWEEN's two anyway).
+    if (const sql::BetweenExpr* between = values ? nullptr : SubqueryBetween(*conjunct)) {
       for (const sql::Expr& comparison : BetweenComparisons(*between)) {
-        ARROW_RETURN_NOT_OK(CheckConjunct(comparison, having));
+        ARROW_RETURN_NOT_OK(CheckConjunct(comparison, having, values));
       }
       continue;
     }
-    ARROW_RETURN_NOT_OK(CheckConjunct(*conjunct, having));
+    ARROW_RETURN_NOT_OK(CheckConjunct(*conjunct, having, values));
   }
   return arrow::Status::OK();
 }
@@ -8426,7 +8528,7 @@ arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
     // the join's rows, which a semi join cannot stand for: a subquery there is refused as it is
     // in any other placement.
     if (item.connector == sql::Connector::kInner) {
-      ARROW_RETURN_NOT_OK(CheckConjuncts(item.on, /*having=*/false));
+      ARROW_RETURN_NOT_OK(CheckConjuncts(item.on, /*having=*/false, /*values=*/true));
       continue;
     }
     for (const sql::Expr& conjunct : item.on) {
@@ -8519,14 +8621,15 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
     }
   }
   ARROW_RETURN_NOT_OK(CheckFromList(stmt.from));
-  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false));
+  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false, /*values=*/true));
   for (const sql::Expr& expr : stmt.group_by) {
     ARROW_RETURN_NOT_OK(CheckValue(expr));
   }
   for (const sql::GroupingElement& element : stmt.grouping) {
     ARROW_RETURN_NOT_OK(CheckGroupingElement(element));
   }
-  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true));
+  // HAVING takes the subquery forms of ADR 0041's SQ4a alone until SQ1's second PR.
+  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true, /*values=*/false));
   for (const sql::OrderItem& item : stmt.order_by) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
   }
