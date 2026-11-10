@@ -2921,6 +2921,21 @@ struct SubqueryJoin {
   [[nodiscard]] bool AddsColumns() const { return !exprs.empty() || Traits(kind).outputs_right; }
 };
 
+// A conjunct of WHERE, an inner ON or HAVING that holds a subquery's value (ADR 0041's decision 9):
+// what it computes and its predicates, over the entries of its slot bound before it -- never on one
+// relation's branch, since it reads a value that no relation has.
+struct SlotFilter {
+  std::vector<ExprPtr> exprs;
+  std::vector<ColumnId> ids;  // per expression: its column
+  std::vector<Predicate> filter;
+  SourceSpan span;  // the conjunct
+};
+
+// One entry of a slot (ADR 0041's decision 9): a subquery's join -- a value's one-row join, an IN's
+// semi or anti join, a correlated subquery's dependent join -- or the filter of a conjunct that
+// holds a value, in the order they were bound.
+using SlotEntry = std::variant<SubqueryJoin, SlotFilter>;
+
 class Binder {
  public:
   // `bindings`: the FROM items, in order. `ids` minted their columns' ids and mints the binder's.
@@ -4022,6 +4037,11 @@ class Binder {
     std::vector<JoinStep> steps;
     std::size_t root = 0;
     std::vector<std::size_t> one_row;
+    // Its slot (ADR 0041's decision 9), above its joins: the joins of its conjuncts' subqueries and
+    // the filters of its conjuncts that hold a value, in the order they were bound. Block 0's holds
+    // those of WHERE and of the inner ONs; the left input of a unit that pads it (a FULL JOIN)
+    // those of the inner ONs inside it.
+    std::vector<SlotEntry> slot;
   };
   // An outer join unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
   // reordered and always built on its right input, whose two inputs are inner blocks of their own.
@@ -4055,6 +4075,11 @@ class Binder {
   // innermost such unit: every conjunct of that ON must stay inside its left input, since above
   // the unit it would drop the rows the unit pads on the left (CheckInsidePaddedLeft).
   std::optional<std::size_t> padded_unit_;
+  // The per-row slot of the conjunct being bound: block 0's, or that of the left input of the unit
+  // that pads it.
+  std::vector<SlotEntry>& RowSlot() {
+    return blocks_[padded_unit_.has_value() ? units_[*padded_unit_].left : 0].slot;
+  }
 
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
@@ -4077,8 +4102,9 @@ class Binder {
   // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
   // sort reads above the dedup instead.
   std::vector<std::size_t> sort_items_;
-  std::vector<SubqueryJoin> where_subqueries_;
-  std::vector<SubqueryJoin> having_subqueries_;
+  // HAVING's slot (ADR 0041's decision 9), directly above the filter of HAVING's other conjuncts
+  // and below the select list's computed columns.
+  std::vector<SlotEntry> group_slot_;
 };
 
 arrow::Status Binder::BindSelectList() {
@@ -6331,16 +6357,15 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                    bool having, const BindFn& bind, SubqueryBlock block) {
   if (form.exists()) {
     if (block.correlated) {
-      where_subqueries_.push_back(
-          SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
-                       .dependent = true,
-                       .right = std::move(block.right),
-                       .left_key = {},
-                       .right_key = {},
-                       .exprs = {},
-                       .ids = {},
-                       .filter = {},
-                       .span = form.subquery->op_span});
+      RowSlot().push_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
+                                       .dependent = true,
+                                       .right = std::move(block.right),
+                                       .left_key = {},
+                                       .right_key = {},
+                                       .exprs = {},
+                                       .ids = {},
+                                       .filter = {},
+                                       .span = form.subquery->op_span});
       return arrow::Status::OK();
     }
     // The count of at most one row, compared with 1 for EXISTS and with 0 for NOT EXISTS above
@@ -6363,7 +6388,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                       .filter = {},
                       .span = form.subquery->op_span};
     join.filter.push_back(std::move(test));
-    (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).push_back(std::move(join));
     return arrow::Status::OK();
   }
   const BindingColumn& column = block.column;
@@ -6400,7 +6425,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                           BindConditionWith(conjunct, /*input=*/!having, bind_side, column_of,
                                             /*nested=*/false));
     join.filter.push_back(std::move(predicate));
-    (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).push_back(std::move(join));
     return arrow::Status::OK();
   }
   ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(*form.other));
@@ -6446,7 +6471,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                   .span = form.subquery->span});
     join.right_key = BoundColumn{.id = id, .name = widened->name, .type = *type};
   }
-  (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+  (having ? group_slot_ : RowSlot()).push_back(std::move(join));
   return arrow::Status::OK();
 }
 
@@ -6522,49 +6547,78 @@ arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
   return arrow::Status::OK();
 }
 
+// One subquery conjunct's join over `node`.
+LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join) {
+  if (!join.exprs.empty()) {
+    node = Make(ComputeNode{.input = std::move(node),
+                            .exprs = std::move(join.exprs),
+                            .ids = std::move(join.ids),
+                            .span = join.span});
+  }
+  // A one-row join is keyless: its build holds the single row of an ungrouped aggregate, which it
+  // appends to every row of its probe (ADR 0022's E2a note). The keys are a named local rather
+  // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
+  // outlive the statement.
+  std::vector<JoinKey> keys;
+  if (!join.dependent && !Traits(join.kind).one_row) {
+    keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
+  }
+  if (join.dependent) {
+    node = Make(DependentJoinNode{.kind = join.kind,
+                                  .left = std::move(node),
+                                  .right = std::move(join.right),
+                                  .mark = kNoColumnId,
+                                  .span = join.span});
+  } else {
+    // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
+    // rows with the subquery's single row, so the left input's estimate is an upper bound for
+    // every kind this builds -- the same bound ADR 0023's Path 1 keeps on the joins it makes.
+    // Without it every pass above reads this join's rows as unknown, which is what kept ADR
+    // 0023's semi-join reduction from seeing the one query it gains most on.
+    const std::optional<int64_t> left_rows = EstimateRows(*node);
+    node = Make(JoinNode{
+        .kind = join.kind,
+        .left = std::move(node),
+        .right = std::move(join.right),
+        .keys = std::move(keys),
+        .residual = {},
+        .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
+        .estimate = left_rows,
+        .span = join.span});
+  }
+  if (!join.filter.empty()) {
+    node = Make(FilterNode{
+        .input = std::move(node), .predicates = std::move(join.filter), .span = join.span});
+  }
+  return node;
+}
+
 // The subquery conjuncts' joins over `node`, in the order they were written.
 LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins) {
   for (SubqueryJoin& join : joins) {
-    if (!join.exprs.empty()) {
+    node = SubqueryJoinNode(std::move(node), join);
+  }
+  return node;
+}
+
+// A slot's entries over `node`, in the order they were bound: each join, and each filter as what
+// it computes, then its predicates.
+LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot) {
+  for (SlotEntry& entry : slot) {
+    if (auto* join = std::get_if<SubqueryJoin>(&entry)) {
+      node = SubqueryJoinNode(std::move(node), *join);
+      continue;
+    }
+    auto& filter = std::get<SlotFilter>(entry);
+    if (!filter.exprs.empty()) {
       node = Make(ComputeNode{.input = std::move(node),
-                              .exprs = std::move(join.exprs),
-                              .ids = std::move(join.ids),
-                              .span = join.span});
+                              .exprs = std::move(filter.exprs),
+                              .ids = std::move(filter.ids),
+                              .span = filter.span});
     }
-    // A one-row join is keyless: its build holds the single row of an ungrouped aggregate, which it
-    // appends to every row of its probe (ADR 0022's E2a note). The keys are a named local rather
-    // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
-    // outlive the statement.
-    std::vector<JoinKey> keys;
-    if (!join.dependent && !Traits(join.kind).one_row) {
-      keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
-    }
-    if (join.dependent) {
-      node = Make(DependentJoinNode{.kind = join.kind,
-                                    .left = std::move(node),
-                                    .right = std::move(join.right),
-                                    .mark = kNoColumnId,
-                                    .span = join.span});
-    } else {
-      // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
-      // rows with the subquery's single row, so the left input's estimate is an upper bound for
-      // every kind this builds -- the same bound ADR 0023's Path 1 keeps on the joins it makes.
-      // Without it every pass above reads this join's rows as unknown, which is what kept ADR
-      // 0023's semi-join reduction from seeing the one query it gains most on.
-      const std::optional<int64_t> left_rows = EstimateRows(*node);
-      node = Make(JoinNode{
-          .kind = join.kind,
-          .left = std::move(node),
-          .right = std::move(join.right),
-          .keys = std::move(keys),
-          .residual = {},
-          .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
-          .estimate = left_rows,
-          .span = join.span});
-    }
-    if (!join.filter.empty()) {
+    if (!filter.filter.empty()) {
       node = Make(FilterNode{
-          .input = std::move(node), .predicates = std::move(join.filter), .span = join.span});
+          .input = std::move(node), .predicates = std::move(filter.filter), .span = filter.span});
     }
   }
   return node;
@@ -7575,8 +7629,10 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
 // input, which is what the executor requires of an outer join (ADR 0022, "Build sides").
 LogicalNodePtr Binder::UnitNode(std::size_t u) {
   Unit& unit = units_[u];
+  // Its left input's slot inside that input, below the unit, which pads what the slot's filters
+  // keep (ADR 0041's decision 9).
   return Make(JoinNode{.kind = unit.kind,
-                       .left = JoinTree(unit.left),
+                       .left = SlotNodes(JoinTree(unit.left), blocks_[unit.left].slot),
                        .right = JoinTree(unit.right),
                        .keys = std::move(unit.keys),
                        .residual = std::move(unit.residual),
@@ -7748,15 +7804,17 @@ void Binder::PushSemiJoinsDown() {
   if (blocks_.empty() || blocks_.front().relations.size() < 2) {
     return;  // one relation: its branch and its tree are the same node, so this would only churn
   }
-  std::vector<SubqueryJoin> kept;
-  for (SubqueryJoin& join : where_subqueries_) {
-    if (const std::optional<std::size_t> relation = PushableSemiJoin(join)) {
-      relations_[*relation].semi_joins.push_back(std::move(join));
+  std::vector<SlotEntry> kept;
+  for (SlotEntry& entry : blocks_.front().slot) {
+    const auto* join = std::get_if<SubqueryJoin>(&entry);
+    if (const std::optional<std::size_t> relation =
+            join != nullptr ? PushableSemiJoin(*join) : std::nullopt) {
+      relations_[*relation].semi_joins.push_back(std::get<SubqueryJoin>(std::move(entry)));
     } else {
-      kept.push_back(std::move(join));
+      kept.push_back(std::move(entry));
     }
   }
-  where_subqueries_ = std::move(kept);
+  blocks_.front().slot = std::move(kept);
 }
 
 LogicalPlan Binder::Assemble() {
@@ -7765,7 +7823,7 @@ LogicalPlan Binder::Assemble() {
   const bool distinct = stmt_.distinct && shape_ != Shape::kGlobal;
   PushSemiJoinsDown();
   LogicalNodePtr node = JoinTree(0);
-  node = SubqueryJoins(std::move(node), where_subqueries_);
+  node = SlotNodes(std::move(node), blocks_.front().slot);
   // The correlated conjuncts of this block, above all of its joins and below its aggregation, in
   // one filter (ADR 0023): where the unnesting pass finds them, and where the free variables they
   // read are bound by the dependent join this block's plan becomes the right input of.
@@ -7787,8 +7845,10 @@ LogicalPlan Binder::Assemble() {
   // select list -- a probe's cast to the key type, or the row a one-row join appends -- and a
   // global aggregate's Project below is what restores the list. Noted before `above` runs, since
   // that is where the joins are built.
-  const bool having_join_columns = std::ranges::any_of(
-      having_subqueries_, [](const SubqueryJoin& join) { return join.AddsColumns(); });
+  const bool having_join_columns = std::ranges::any_of(group_slot_, [](const SlotEntry& entry) {
+    const auto* join = std::get_if<SubqueryJoin>(&entry);
+    return join != nullptr ? join->AddsColumns() : !std::get<SlotFilter>(entry).exprs.empty();
+  });
   // Over the aggregation: what HAVING's conditions compute and their filter, then HAVING's
   // subquery joins, as DuckDB filters HAVING before it computes the select list; the select list's
   // and ORDER BY's computed columns; the Sort; then a Project restores the select order.
@@ -7804,7 +7864,7 @@ LogicalPlan Binder::Assemble() {
     }
     // HAVING's subquery conjuncts after its others, as in DuckDB: each join computes what it reads
     // in a layer of its own, from the aggregation's columns.
-    node = SubqueryJoins(std::move(node), having_subqueries_);
+    node = SlotNodes(std::move(node), group_slot_);
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});
