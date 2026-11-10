@@ -2207,6 +2207,73 @@ std::vector<Relation> AllRelations() {
            .probes = {Q(sql, 1), Q(sql, 7), Q(sql)},
            .check = AllEqual()});
     }
+    // In select items and ORDER BY (ADR 0041's SQ2a): a value equals the literal it holds, alone,
+    // in arithmetic and in a CASE, at any batch size, and inside a derived table an outer aggregate
+    // reads; of one row it equals the cross join with it, of no row it is NULL; an ORDER BY over it
+    // orders as over its literal.
+    const slt::FeatureSet in_items = SetWith(in_conditions, kColumns, kMultipleItems, kItemValue);
+    for (const auto& [name, with_value, with_literal] :
+         {std::tuple{"alone", "({})", "5"},
+          std::tuple{"arithmetic", "tr_pickup * ({}) - 1", "tr_pickup * 5 - 1"},
+          std::tuple{"case", "CASE WHEN tr_pickup = ({}) THEN 10 ELSE tr_row END",
+                     "CASE WHEN tr_pickup = 5 THEN 10 ELSE tr_row END"}}) {
+      const std::string value = std::format("SELECT tr_row, {} FROM trips WHERE tr_row < 200",
+                                            std::vformat(with_value, std::make_format_args(kOneRow)));
+      r.push_back({.name = std::format("item_value_equals_its_literal_{}", name),
+                   .features = SetWith(in_items, kArithmetic, kCase),
+                   .probes = {Q(value),
+                              Q(std::format("SELECT tr_row, {} FROM trips WHERE tr_row < 200",
+                                            with_literal)),
+                              Q(value, 1), Q(value, 7)},
+                   .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "item_value_in_a_derived_table_equals_its_literal",
+         .features = SetWith(in_items, kSum, kCountColumn, kArithmetic, kDerivedTable, kAlias,
+                             kTableAlias),
+         .probes = {Q(std::format("SELECT SUM(v), COUNT(v) FROM (SELECT tr_dropoff + ({}) AS v FROM "
+                                  "trips) AS d",
+                                  kOneRow)),
+                    Q("SELECT SUM(v), COUNT(v) FROM (SELECT tr_dropoff + 5 AS v FROM trips) AS d")},
+         .check = AllEqual()});
+    r.push_back({.name = "item_value_of_one_row_is_a_cross_join",
+                 .features = SetWith(in_items, kArithmetic, kDerivedTable, kCommaJoin, kAlias,
+                                     kTableAlias, kQualifiedName),
+                 .probes = {Q(std::format("SELECT tr_row, tr_dropoff - ({}) FROM trips", kOneRow)),
+                            Q("SELECT tr_row, tr_dropoff - s.v FROM trips, (SELECT zn_parent AS v "
+                              "FROM zones WHERE zn_id = 10) AS s")},
+                 .check = AllEqual()});
+    r.push_back(
+        {.name = "item_value_of_no_row_is_null",
+         .features = SetWith(in_items, kArithmetic, kDerivedTable, kAlias, kTableAlias),
+         .probes = {Q(std::format("SELECT COUNT(*) FROM (SELECT tr_row, tr_pickup + ({}) AS v FROM "
+                                  "trips) AS d WHERE v IS NULL",
+                                  kNoRow)),
+                    Q("SELECT COUNT(*) FROM trips")},
+         .check = AllEqual()});
+    r.push_back({.name = "order_by_value_orders_as_its_literal",
+                 .features = SetWith(in_items, kArithmetic, kOrderBy, kLimit),
+                 .probes = {Q(std::format("SELECT tr_row, tr_pickup FROM trips WHERE tr_row < 300 "
+                                          "ORDER BY tr_pickup * ({}) DESC, tr_row LIMIT 40",
+                                          kOneRow)),
+                            Q("SELECT tr_row, tr_pickup FROM trips WHERE tr_row < 300 ORDER BY "
+                              "tr_pickup * 5 DESC, tr_row LIMIT 40")},
+                 .check = AllEqualInOrder()});
+    // An EXISTS block's select list is dropped, correlated or not: a value there that would fail
+    // with more than one row (zones has 40) changes nothing.
+    for (const auto& [name, block, star] :
+         {std::tuple{"uncorrelated", "SELECT (SELECT zn_id FROM zones) FROM cities",
+                     "SELECT * FROM cities"},
+          std::tuple{"correlated",
+                     "SELECT (SELECT zn_id FROM zones), zn_city FROM zones WHERE zones.zn_id = "
+                     "trips.tr_pickup",
+                     "SELECT * FROM zones WHERE zones.zn_id = trips.tr_pickup"}}) {
+      r.push_back({.name = std::format("exists_drops_its_item_values_{}", name),
+                   .features = SetWith(in_items, kStar, kQualifiedName, kCorrelatedExists),
+                   .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE EXISTS ({})", block)),
+                              Q(std::format("SELECT COUNT(*) FROM trips WHERE EXISTS ({})", star))},
+                   .check = AllEqual()});
+    }
   }
 
   // ---- UNION ALL (ADR 0036) ----
