@@ -168,6 +168,23 @@ TEST(ParserTest, VarianceFamily) {
 
 // SELECT DISTINCT (ADR 0037's AG3): the flag and its keyword's span, unparsed and parsed again;
 // DISTINCT ON is unsupported.
+// ADR 0041's decision 23: an aggregate in a WHERE or ON inside a subquery that some HAVING encloses
+// parses, also under a subquery nested in that one: it may be an enclosing block's aggregate, which
+// DuckDB answers, and the binder judges it by the block it belongs to.
+TEST(ParserTest, AnAggregateInASubqueryUnderHavingParses) {
+  for (const char* sql : {
+           "SELECT a FROM events GROUP BY a HAVING (SELECT COUNT(*) FROM events e WHERE e.a < "
+           "SUM(events.a)) > 3",
+           "SELECT a FROM events GROUP BY a HAVING EXISTS (SELECT 1 FROM events e JOIN users u ON "
+           "e.a = u.a AND e.a < SUM(events.a))",
+           "SELECT a FROM events GROUP BY a HAVING COUNT(*) IN (SELECT e.a FROM events e WHERE e.a "
+           "< (SELECT MAX(u.a) FROM users u WHERE u.a > SUM(events.a)))",
+       }) {
+    const auto stmt = Parse(sql);
+    EXPECT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
+  }
+}
+
 TEST(ParserTest, SelectDistinct) {
   constexpr std::string_view kSql = "select Distinct a, b + 1 FROM t ORDER BY 1";
   auto stmt = Parse(kSql);
@@ -4189,6 +4206,26 @@ INSTANTIATE_TEST_SUITE_P(
                    "aggregate function calls cannot be nested"},
         RejectCase{"AggregateInWhere", "SELECT a FROM events WHERE ^COUNT(*) > 1", kSyntax, 5,
                    "aggregate functions are not allowed in WHERE"},
+        // Inside subqueries that no HAVING encloses, and inside a derived table or a CTE body,
+        // whatever encloses them, an aggregate in WHERE or ON keeps the parse error (ADR 0041's
+        // decision 23 admits one only under a HAVING subquery).
+        RejectCase{"AggregateInWhereSubquery",
+                   "SELECT a FROM events WHERE a < (SELECT COUNT(*) FROM events e WHERE e.a < "
+                   "^SUM(a))",
+                   kSyntax, 3, "aggregate functions are not allowed in WHERE"},
+        RejectCase{
+            "AggregateInSelectSubquery",
+            "SELECT (SELECT COUNT(*) FROM events e JOIN users u ON e.a = u.a AND ^SUM(e.a) > "
+            "1) FROM events",
+            kSyntax, 3, "aggregate functions are not allowed in ON"},
+        RejectCase{"AggregateInDerivedTableUnderHaving",
+                   "SELECT a FROM events GROUP BY a HAVING (SELECT COUNT(*) FROM (SELECT b FROM "
+                   "events WHERE ^SUM(b) > 1) AS d) > 0",
+                   kSyntax, 3, "aggregate functions are not allowed in WHERE"},
+        RejectCase{"AggregateInCteUnderHaving",
+                   "SELECT a FROM events GROUP BY a HAVING (WITH c AS (SELECT b FROM events WHERE "
+                   "^SUM(b) > 1) SELECT COUNT(*) FROM c) > 0",
+                   kSyntax, 3, "aggregate functions are not allowed in WHERE"},
         RejectCase{"EmptyWhere", "SELECT a FROM events WHERE^", kSyntax, 0,
                    "expected an expression, found end of input"},
         RejectCase{"ReservedInWhere", "SELECT a FROM events WHERE ^LIMIT 5", kSyntax, 5,

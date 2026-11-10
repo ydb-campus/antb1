@@ -1278,6 +1278,32 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i32 FROM t GROUP BY i32 HAVING MIN(i16) = "
                   "(SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
                   kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
+        // ADR 0041's decision 23: an aggregate in a WHERE or ON inside a subquery that a HAVING
+        // encloses belongs to the nearest block whose columns it reads. The enclosing block's,
+        // through its HAVING, is an outer aggregate (SQ13); one of the subquery's own columns, of
+        // no column, a mix, or one owned through a WHERE nearer in, is DuckDB's bind error.
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "SUM(t.i32)) > 3",
+                  kUnsupported, "SUM(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(t.i32))) > 3",
+                  kUnsupported, "SUM(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "SUM(u.i32)) > 3",
+                  kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "SUM(u.i32 + t.i32)) > 3",
+                  kBind, "SUM(u.i32 + t.i32)", "WHERE clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "COUNT(*)) > 3",
+                  kBind, "COUNT(*)", "WHERE clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
+                  "u.i32 < (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(u.i32)))",
+                  kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
         // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
         // above this block's joins with the probe's free variable on its outer side, which neither
         // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
@@ -6933,6 +6959,63 @@ TEST(BinderTest, ValuePlacements) {
     const LogicalPlan optimized = Optimized(*plan);
     EXPECT_NE(optimized.root, nullptr) << sql;
   }
+}
+
+// ADR 0041's SQ1b: a HAVING conjunct that holds a value is a filter of HAVING's slot, above the
+// aggregation, so the value's join is a one-row join over the groups, never a per-row one below
+// them (EXPLAIN writes a node before its inputs), and an aggregate's computed argument stays below
+// the aggregation, in every form a condition takes there.
+TEST(BinderTest, AHavingValueJoinsAboveTheAggregation) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16, SUM(i32 * 2) FROM t GROUP BY i16 HAVING SUM(i32 * 2) > (SELECT MIN(u.i32) "
+           "FROM u) + 1",
+           "SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u) OR MAX(i32) "
+           "< 0",
+           "SELECT i16 FROM t GROUP BY i16 HAVING i16 IN (1, (SELECT MIN(u.i16) FROM u))",
+           "SELECT i16 FROM t GROUP BY i16 HAVING EXISTS (SELECT 1 FROM u) OR COUNT(*) > 1",
+           "SELECT i16 FROM t GROUP BY i16 HAVING NOT EXISTS (SELECT 1 FROM u)",
+           "SELECT i16 FROM t GROUP BY i16 HAVING MAX(i32) BETWEEN (SELECT MIN(u.i32) FROM u) AND "
+           "(SELECT MAX(u.i32) FROM u) + 1",
+           "SELECT i16, SUM(i32) + 1 AS s FROM t GROUP BY i16 HAVING s > (SELECT MIN(u.i32) FROM "
+           "u) + 1",
+           "SELECT COUNT(*) FROM t HAVING COUNT(*) > (SELECT COUNT(*) FROM u) + 0",
+           "SELECT i16 FROM t GROUP BY ROLLUP (i16) HAVING GROUPING(i16) = 0 AND COUNT(*) > "
+           "(SELECT COUNT(*) FROM u) - 1",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const std::string text = Explain(*plan);
+    EXPECT_LT(text.find("Join ONE-ROW"), text.find("Aggregate")) << sql << "\n" << text;
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
+}
+
+// The same subquery in WHERE and in HAVING is two values, one per slot -- a per-row join below the
+// aggregation and one over the groups above it -- while written twice in HAVING it is one.
+TEST(BinderTest, TheMemoKeepsWhereAndHavingApart) {
+  const Catalog catalog = MakeCatalog();
+  const auto joins = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return std::size_t{0};
+    }
+    const std::string text = Explain(*plan);
+    std::size_t n = 0;
+    for (std::size_t at = text.find("Join ONE-ROW"); at != std::string::npos;
+         at = text.find("Join ONE-ROW", at + 1)) {
+      ++n;
+    }
+    return n;
+  };
+  EXPECT_EQ(joins("SELECT i16 FROM t WHERE i32 > (SELECT MIN(u.i32) FROM u) GROUP BY i16 HAVING "
+                  "COUNT(*) > (SELECT MIN(u.i32) FROM u)"),
+            2U);
+  EXPECT_EQ(joins("SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MIN(u.i32) FROM u) "
+                  "AND MAX(i32) < (SELECT MIN(u.i32) FROM u) + 10"),
+            1U);
 }
 
 // ADR 0041's decision 10: a subquery binds once per slot, keyed by what is written, so the copies
