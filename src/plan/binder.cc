@@ -594,16 +594,18 @@ struct ExprNameOf {
   // DuckDB names a subquery by a deparse of it (ADR 0041's decision 11); antb1 by its own unparse,
   // which shows in EXPLAIN and in messages only (divergence D8).
   std::string operator()(const sql::SubqueryExpr& s) const {
-    const std::string query = "(" + sql::ToSql(*s.query) + ")";
+    std::string query = "(" + sql::ToSql(*s.query) + ")";
     switch (s.kind) {
       case sql::SubqueryExpr::Kind::kScalar:
-        return query;
+        break;
       case sql::SubqueryExpr::Kind::kExists:
         return (s.negated ? "NOT EXISTS " : "EXISTS ") + query;
       case sql::SubqueryExpr::Kind::kIn:
-        break;
+        // The parser gives every IN its operand.
+        return (s.operand.has_value() ? ExprName(**s.operand) : std::string()) +
+               (s.negated ? " NOT IN " : " IN ") + query;
     }
-    return ExprName(**s.operand) + (s.negated ? " NOT IN " : " IN ") + query;
+    return query;
   }
 };
 
@@ -6543,15 +6545,15 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                    bool having, const BindFn& bind, SubqueryBlock block) {
   if (form.exists()) {
     if (block.correlated) {
-      RowSlot().push_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
-                                       .dependent = true,
-                                       .right = std::move(block.right),
-                                       .left_key = {},
-                                       .right_key = {},
-                                       .exprs = {},
-                                       .ids = {},
-                                       .filter = {},
-                                       .span = form.subquery->op_span});
+      RowSlot().emplace_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
+                                          .dependent = true,
+                                          .right = std::move(block.right),
+                                          .left_key = {},
+                                          .right_key = {},
+                                          .exprs = {},
+                                          .ids = {},
+                                          .filter = {},
+                                          .span = form.subquery->op_span});
       return arrow::Status::OK();
     }
     // The count of at most one row, compared with 1 for EXISTS and with 0 for NOT EXISTS above
@@ -6574,7 +6576,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                       .filter = {},
                       .span = form.subquery->op_span};
     join.filter.push_back(std::move(test));
-    (having ? group_slot_ : RowSlot()).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
   const BindingColumn& column = block.column;
@@ -6611,7 +6613,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                           BindConditionWith(conjunct, /*input=*/!having, bind_side, column_of,
                                             /*nested=*/false));
     join.filter.push_back(std::move(predicate));
-    (having ? group_slot_ : RowSlot()).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
   ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(*form.other));
@@ -6657,7 +6659,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                   .span = form.subquery->span});
     join.right_key = BoundColumn{.id = id, .name = widened->name, .type = *type};
   }
-  (having ? group_slot_ : RowSlot()).push_back(std::move(join));
+  (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
   return arrow::Status::OK();
 }
 
@@ -6912,8 +6914,9 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING alone, and
   // OR factoring's dry run binds one of those.
-  ANTB1_CHECK(dry_run_ || clause_ == Clause::kWhere || clause_ == Clause::kInnerOn ||
-              clause_ == Clause::kHaving);
+  const bool condition =
+      clause_ == Clause::kWhere || clause_ == Clause::kInnerOn || clause_ == Clause::kHaving;
+  ANTB1_CHECK(dry_run_ || condition);
   const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
   if (dry_run_) {
@@ -6939,15 +6942,15 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
   Typed value =
       ColumnLeaf(block.column.id, block.type, block.column.name, block.column.stored_as_float);
   (group ? group_slot_ : RowSlot())
-      .push_back(SubqueryJoin{.kind = JoinKind::kOneRow,
-                              .dependent = false,
-                              .right = std::move(block.right),
-                              .left_key = {},
-                              .right_key = {},
-                              .exprs = {},
-                              .ids = {},
-                              .filter = {},
-                              .span = s.op_span});
+      .emplace_back(SubqueryJoin{.kind = JoinKind::kOneRow,
+                                 .dependent = false,
+                                 .right = std::move(block.right),
+                                 .left_key = {},
+                                 .right_key = {},
+                                 .exprs = {},
+                                 .ids = {},
+                                 .filter = {},
+                                 .span = s.op_span});
   values_.push_back(BoundValue{
       .block = group ? std::nullopt : std::optional(RowBlock()), .written = s, .value = value});
   return value;
@@ -6971,7 +6974,7 @@ arrow::Status Binder::BindValueConjunct(const sql::Expr& conjunct, SourceSpan el
   ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
   SlotFilter filter{.exprs = {}, .ids = {}, .filter = {}, .span = conjunct.span()};
   in_slot_ = &filter;
-  const arrow::Status status = [&]() -> arrow::Status {
+  const arrow::Status status = [&] -> arrow::Status {
     if (IsCompound(conjunct)) {
       ARROW_ASSIGN_OR_RAISE(
           const Typed condition,
@@ -6985,7 +6988,7 @@ arrow::Status Binder::BindValueConjunct(const sql::Expr& conjunct, SourceSpan el
   }();
   in_slot_ = nullptr;  // restored on the error path too, before the status propagates
   ARROW_RETURN_NOT_OK(status);
-  RowSlot().push_back(std::move(filter));
+  RowSlot().emplace_back(std::move(filter));
   return arrow::Status::OK();
 }
 
@@ -7033,7 +7036,7 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
     if (const BoundValue* known = FindValue(*form->subquery, /*group=*/false)) {
       if (form->exists()) {
         ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
-        RowSlot().push_back(
+        RowSlot().emplace_back(
             SlotFilter{.exprs = {},
                        .ids = {},
                        .filter = {CountTest(known->value, form->negated, form->subquery->span)},
@@ -7062,10 +7065,10 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
       ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
       const SourceSpan span = form->subquery->span;
       const Typed count = PlantValue(*form->subquery, std::move(block), /*group=*/false);
-      RowSlot().push_back(SlotFilter{.exprs = {},
-                                     .ids = {},
-                                     .filter = {CountTest(count, form->negated, span)},
-                                     .span = conjunct.span()});
+      RowSlot().emplace_back(SlotFilter{.exprs = {},
+                                        .ids = {},
+                                        .filter = {CountTest(count, form->negated, span)},
+                                        .span = conjunct.span()});
       return arrow::Status::OK();
     }
     PlantValue(*form->subquery, std::move(block), /*group=*/false);
