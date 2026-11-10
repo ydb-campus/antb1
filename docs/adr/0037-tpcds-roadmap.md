@@ -187,7 +187,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | OJ5b | IS [NOT] DISTINCT FROM, and NULL-equal keys from it, correlated ones included (the OJ5b update below) | | Built |
 | **Phase 8** | **Subqueries ([ADR 0041](0041-subqueries-and-decorrelation.md); the phase 8 update below)** | | |
 | SQ4a | Uncorrelated scalar subqueries of any shape as direct comparison operands, through a single-value aggregate under the exact one-row join (NULL over no row, DuckDB's row error over two or more); uncorrelated EXISTS as a conjunct, COUNT(*) over `LIMIT 1`; a BETWEEN whose bounds are subqueries split into two comparisons; a set operation as the query of a scalar subquery or an EXISTS (ADR 0036's X6); the column count checked first, and the one-row join's own check at exit code 70. It absorbs SQ3 | 14, 54, 58 | Built |
-| SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | SQ1a built (WHERE and an inner ON); SQ1b planned (HAVING) |
+| SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Built (SQ1a: WHERE and an inner ON; SQ1b: HAVING) |
 | SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Planned |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Planned |
 | SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Planned |
@@ -870,6 +870,10 @@ No query completes, and the ratchet stays at 78; of the queries that wait on pha
 value inside arithmetic (SQ5), and Q10 and Q35 at their correlated EXISTS under OR (SQ8). One passing query's plan
 changes, Q54's, whose BETWEEN bounds now both join before their two comparisons filter. PF16 stays a guard: SQ4a's
 shapes keep their counters. SQ1b, values in HAVING with decision 23's outer aggregates, follows.
+
+Update (2026-11-10, SQ1b): SQ1b, built, answers uncorrelated values anywhere in a HAVING condition and makes decision
+23's SQ1 row (ADR 0041's SQ1b update), which completes SQ1. No query completes, the ratchet stays at 78, and no TPC-H
+or TPC-DS plan changes. SQ2, values in the select list (Q9), is next.
 
 ## Alternatives considered
 
