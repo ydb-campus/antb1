@@ -706,7 +706,10 @@ Defects the design discussion found, to which no item is assigned:
   bind errors still never show; it asks every clause, grouping-set keys included, whether it reads an enclosing
   column, and it reads a name that a written select alias also has as DuckDB reads it: the alias in WHERE, the select
   list, HAVING, ORDER BY and a bare GROUP BY key, outside the argument of an aggregate or of GROUPING(); the
-  enclosing column in an ON, a GROUP BY expression and such an argument. A compound's arms all bind before a
+  enclosing column in an ON, a GROUP BY expression and such an argument (DuckDB reads a GROUPING() argument as the
+  alias where the block groups by it, a GROUPING() of an alias, which antb1 refuses in any case). Where DuckDB takes
+  the alias in WHERE or the select list, the block's binder refuses the name, as it does in any block. A compound's
+  arms all bind before a
   correlated arm
   is refused. What the enclosing block binds before the subquery now comes first: its FROM list and every ON, the
   WHERE conjuncts written before it, its select list (which binds before its WHERE), and its grouping for a HAVING

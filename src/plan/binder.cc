@@ -913,7 +913,9 @@ bool IsGroupingCall(const sql::FunctionCall& call);
 
 // Every column reference of an expression, in query order; nothing is resolved or bound. With
 // `aggregate_args_only`, only those inside the argument of an aggregate call or of GROUPING(),
-// which DuckDB reads in the block's scope and never as a select alias.
+// which DuckDB reads in the block's scope: an aggregate's never as a select alias, GROUPING()'s as
+// one only where the block groups by that alias as a bare key (a GROUPING() of an alias, which
+// antb1 refuses in any case).
 struct CollectRefsOf {
   std::vector<const sql::ColumnRef*>& out;
   bool aggregate_args_only = false;
@@ -7422,10 +7424,12 @@ arrow::Status Binder::GateCorrelatedExists() const {
   // The select list is not bound yet, so the gate reads a name that a written select alias has as
   // DuckDB reads it: the alias in WHERE, the select list, HAVING and ORDER BY outside the argument
   // of an aggregate or of GROUPING(), and as a bare GROUP BY key (a grouping set's too); the
-  // enclosing column in an ON, a GROUP BY expression and such an argument. Where the gate takes the
-  // alias, the block's binder takes it too (HAVING, ORDER BY, a bare key: Resolve, AliasFallback)
-  // or makes the name a bind error (WHERE and the select list, where DuckDB answers with the alias
-  // or, before the alias's item, fails too).
+  // enclosing column in an ON, a GROUP BY expression and such an argument (but a GROUPING() of an
+  // alias the block groups by, which antb1 refuses in any case: CollectRefsOf). Where the gate
+  // takes the alias, the block's binder takes it too (HAVING, ORDER BY, a bare key: Resolve,
+  // AliasFallback) or refuses the name: a bind error in WHERE and in a select expression, and a
+  // plain select item before its alias reads the enclosing column, refused there (DuckDB answers
+  // with the alias in WHERE, and fails in the select list).
   const auto written_alias = [this](const sql::ColumnRef& ref) {
     const std::string wanted = AsciiLower(ref.name);
     return std::ranges::any_of(stmt_.items, [&wanted](const sql::SelectItem& item) {

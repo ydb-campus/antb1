@@ -6683,7 +6683,8 @@ TEST(BinderTest, AnUncorrelatedScalarSubqueryOfAnyShapeIsItsSingleValue) {
 // The correlated-EXISTS gate reads a name that a select alias of the block and a column of the
 // enclosing block share as DuckDB reads it: the alias in ORDER BY, HAVING, a bare GROUP BY key,
 // WHERE and the select list, outside the argument of an aggregate or of GROUPING(); the enclosing
-// column in an ON, a GROUP BY expression and such an argument.
+// column in an ON, a GROUP BY expression and such an argument (DuckDB reads a GROUPING() argument
+// as the alias where the block groups by it, a GROUPING() of an alias, which antb1 refuses anyway).
 TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
   const Catalog catalog = MakeCatalog();
   // The alias, where the block's binder takes it too: an uncorrelated EXISTS, answered.
@@ -6700,9 +6701,10 @@ TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
     ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
     EXPECT_TRUE(FreeVariables(*bound->root).empty()) << sql;
   }
-  // The alias where the block's binder takes none: its bind error, as for a name that is neither
-  // a column nor the alias of an item before it (DuckDB fails in the select list, and answers in
-  // WHERE, where it takes the alias), never the gate's refusal of a correlated block.
+  // The alias where the block's binder takes none: its bind error in WHERE and in a select
+  // expression, as for a name that is neither a column nor the alias of an item before it (DuckDB
+  // answers in WHERE, where it takes the alias, and fails in the select list), never the gate's
+  // refusal of a correlated block.
   for (const char* sql : {
            "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok WHERE ok.i16 = i32 LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT i32 + 1, s AS i32 FROM ok LIMIT 1)",
