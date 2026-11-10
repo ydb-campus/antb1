@@ -672,6 +672,49 @@ Defects the design discussion found, to which no item is assigned:
   keys.
 - **D4's text** does not name a DATE column against a VARCHAR operand, which a scalar subquery reaches.
 
+## Update (2026-11-10, SQ4a): uncorrelated values, built
+
+- **Built as decided** (decisions 4 to 7): Q14, Q54 and Q58 pass, and the ratchet is at 78 (ADR 0037's SQ4a update
+  gives their SF 1 figures). Correlated subqueries are answered and refused as before.
+- **The single value (decision 4)** is `AggKind::kSingleValue`, `SINGLE_VALUE` in EXPLAIN. Its state counts the
+  selected rows, NULL ones included, and keeps a one-row copy of the first selected value, so no batch stays pinned;
+  merging adds the counts. It raises the row error in Finalize only, after every part is merged, so a part that fails
+  reports its own error first, in part order, on any number of threads. The factory takes only a result type equal
+  to the argument's. `ExactlyOneRow` sees through Projects and Computes to an ungrouped aggregate, a CTE's root
+  included, so Q14's subqueries over a CTE's aggregates need no wrapper.
+- **The EXISTS block (decision 5).** Probed against DuckDB, its select list goes even under a LIMIT, while its ORDER BY
+  keys are computed (a top-N under the LIMIT 1). So the Projects among the Limits and Sorts at the top of the block's
+  plan go and the Sorts stay; a DISTINCT's list stays, being its rows. Two cases still differ, both registered under
+  divergence D32 with records of both engines: the aggregates of a grouped EXISTS block that nothing reads, which
+  antb1 computes and DuckDB removes, and a correlated EXISTS's ORDER BY, which ADR 0023's Path 1 drops and DuckDB
+  computes. A star in the block stays unexpanded, but its columns go through the grouping checks, so a grouped or
+  aggregate block's star is DuckDB's bind error (decision 23's row).
+- **The BETWEEN split (decision 6)** takes one subquery bound or two. DuckDB's typing of the three values runs with
+  each subquery bound standing for its block's column, and both comparisons compare in that type, which decides, as
+  in DuckDB, whether a constant moves off the operand: with a DOUBLE bound, `i + 1 <= 100` keeps its sum (and an
+  overflow in it) as DuckDB keeps the cast to DOUBLE above it.
+- **Set operations (decision 7).** The arms of a scalar subquery's or an EXISTS's compound bind as the subquery's
+  blocks, so an arm that reads an enclosing block makes the compound correlated, refused at the subquery as "a
+  correlated subquery over a UNION ALL is not supported" (the compound's root operator named); SQ15 answers it.
+- **The order of errors (decision 23).** The refusals that depend on correlation now come when the subquery's block
+  is bound, not from the static check of its shape. A correlated EXISTS's refusals keep their messages and their
+  place before the block's own bind errors: a gate refuses the block at the EXISTS before any of its clauses binds.
+  The enclosing block's select list binds before its WHERE, and its grouping before its HAVING, so their bind errors
+  now come first, as do a correlated scalar subquery's own bind errors: exit 1 where antb1 exited 4, DuckDB's first
+  error in each case. Decision 23's SQ4a rows are built: the row error exits 1, the one-row join's own check 70, a
+  scalar subquery of two columns 1 in any shape, and an uncorrelated EXISTS block's ungrouped select column 1, its
+  star's columns included.
+- **Error visibility (decision 24).** `tests/slt/cases/subqueries/values.slt` pins D35 for the row error in both
+  engines: an IN written after the failing subquery, a contradiction pair, and a WHERE subquery under a HAVING IN. An
+  uncorrelated EXISTS that is false empties no join, its count being a row, so it hides no error.
+- **Tests (decision 28).** The guards the table lists for SQ4a are lifted, and `setops/errors.slt`'s X6 records wait
+  on SQ7 (IN) and SQ15 (a correlated arm). The generator's Feature `uncorrelated_value` draws from a stream of its
+  own: value blocks of at most one row (the first value in either order or of its groups, an OFFSET, LIMIT 0, an
+  aggregate under HAVING COUNT(*), INTERSECT or EXCEPT of two aggregates; never a UNION) under a comparison or as a
+  BETWEEN's bounds, and EXISTS over blocks of any row count, compounds included. No block computes anything that can
+  fail, so no generated query meets the row error or D35. The metamorphic relations of decision 28 hold, the
+  self-check among them, over the six cities of the star schema for a correlated EXISTS, NOT EXISTS and aggregate.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

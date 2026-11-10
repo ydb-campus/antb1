@@ -915,17 +915,22 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM u UNION ALL SELECT i16 "
                   "FROM t)",
                   kUnsupported, "NOT IN", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u UNION ALL SELECT "
-                  "MAX(i16) FROM t)",
-                  kUnsupported, "(", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-                  kUnsupported, "EXISTS", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 "
-                  "FROM t)",
-                  kUnsupported, "EXISTS", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MAX(i16) FROM u UNION "
+        // A scalar's or an EXISTS's UNION ALL is answered where no arm reads an enclosing column
+        // (ADR 0041's SQ4a); a correlated arm is SQ15's, refused at the subquery.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u WHERE u.i32 = t.i32 UNION "
                   "ALL SELECT MAX(i16) FROM t)",
-                  kUnsupported, "(", "a subquery over a UNION ALL is not supported"},
+                  kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u WHERE u.i32 = t.i32 UNION ALL "
+                  "SELECT i16 FROM t)",
+                  kUnsupported, "EXISTS",
+                  "a correlated subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u UNION ALL SELECT i16 "
+                  "FROM u WHERE u.i32 = t.i32)",
+                  kUnsupported, "EXISTS",
+                  "a correlated subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MAX(i16) FROM u WHERE "
+                  "u.i16 = t.i16 UNION ALL SELECT MAX(i16) FROM t)",
+                  kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT i32 FROM u "
                   "UNION ALL SELECT i32 FROM t)",
                   kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
@@ -940,7 +945,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 // Every set operator is answered (ADR 0039's X4b to X4d); what stays refused is a compound's own
 // tail, which X5 keeps at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a
-// update) -- and a subquery over a compound (X6). Both name the compound by its root operator.
+// update) -- an IN over a compound (X6, answered with ADR 0041's SQ7) and a scalar's or an EXISTS's
+// compound with a correlated arm (SQ15). Each names the compound by its root operator.
 INSTANTIATE_TEST_SUITE_P(
     SetOperatorRefusals, BindErrorTest,
     ::testing::Values(
@@ -952,8 +958,9 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "OFFSET 1", "OFFSET on a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t)",
                   kUnsupported, "IN", "a subquery over a UNION is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u EXCEPT SELECT i16 FROM t)",
-                  kUnsupported, "EXISTS", "a subquery over an EXCEPT is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u WHERE u.i16 = t.i16 EXCEPT "
+                  "SELECT i16 FROM t)",
+                  kUnsupported, "EXISTS", "a correlated subquery over an EXCEPT is not supported"},
         ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u LIMIT 1", kUnsupported, "LIMIT 1",
                   "LIMIT on an INTERSECT is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u INTERSECT ALL SELECT i16 "
@@ -1066,17 +1073,22 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         ErrorCase{"SELECT (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        // Only an aggregate over every row returns exactly one row however the data falls, so
-        // every other shape of a scalar subquery exits 4 rather than check a row count at run time.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16 FROM u)", kUnsupported, "(",
-                  "other than an aggregate over every row"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u LIMIT 1)", kUnsupported,
-                  "(", "other than an aggregate over every row"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u OFFSET 1)", kUnsupported,
-                  "(", "other than an aggregate over every row"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u GROUP BY i16)",
+        // An uncorrelated scalar subquery of any shape is its single value (ADR 0041's SQ4a). A
+        // correlated one is ADR 0023's Path 2 only over an aggregate over every row; any other
+        // shape needs the single join (SQ4b).
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16 FROM u WHERE u.i64 = t.i64)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u HAVING COUNT(*) > 1)",
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "LIMIT 1)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "OFFSET 1)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "GROUP BY i16)",
+                  kUnsupported, "(", "other than an aggregate over every row"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) > 1)",
                   kUnsupported, "(", "other than an aggregate over every row"},
         // Two of them would be two stacked one-row joins, and one that is no direct operand of the
         // comparison would need the join below an expression: both keep the form's own refusal.
@@ -1095,22 +1107,25 @@ INSTANTIATE_TEST_SUITE_P(
                   "2147483647 + 1", "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u, v)", kBind, "v",
                   "table 'v' does not exist"},
-        // One column, as in DuckDB, which reports a bind error for two.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16, i32 FROM u)", kUnsupported, "(",
-                  "other than an aggregate over every row"},
+        // One column, as in DuckDB, which reports a bind error for two, whatever the shape, a
+        // correlated one's too: the column count is checked first.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16, i32 FROM u)", kBind, "(",
+                  "a subquery of a comparison must have one column, not 2"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16, i32 FROM u WHERE u.i64 = t.i64)",
+                  kBind, "(", "a subquery of a comparison must have one column, not 2"},
+        // A scalar subquery's refusals that depend on its shape come once its block is bound: the
+        // enclosing select list's and the block's own bind errors come first, as in DuckDB, which
+        // answers the subquery.
+        ErrorCase{"SELECT nope FROM t WHERE i32 = (SELECT i16 FROM u WHERE u.i64 = t.i64)", kBind,
+                  "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT nope FROM u WHERE u.i64 = t.i64 GROUP BY "
+                  "i16)",
+                  kBind, "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(i16), MAX(i32) FROM u)", kBind, "(",
                   "a subquery of a comparison must have one column, not 2"},
-        // A top-level conjunct is the one placement ADR 0023's U2 answers, and only correlated:
-        // an uncorrelated EXISTS waits for its own PR, since a semi join needs a key and there is
-        // no correlation to make one from.
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
-                  "an uncorrelated EXISTS is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
-                  "an uncorrelated EXISTS is not supported"},
-        // Inside a sub-plan, which CheckSupported's walk of the reachable blocks reaches.
-        ErrorCase{"SELECT COUNT(*) FROM (SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u)) AS s",
-                  kUnsupported, "EXISTS", "an uncorrelated EXISTS is not supported"},
-        // Every other placement keeps the static refusal, before any name resolves.
+        // A top-level conjunct is the one placement EXISTS is answered in, correlated (ADR 0023's
+        // U2) or not (ADR 0041's SQ4a); every other placement keeps the static refusal, before any
+        // name resolves.
         ErrorCase{"SELECT EXISTS (SELECT i16 FROM u) FROM t", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE "
@@ -1119,7 +1134,14 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         // Path 1 takes a plain block only: every clause that would have to act per binding is
-        // refused where the shape is visible, before a name resolves.
+        // refused at the EXISTS before any clause of its block binds (the binder's gate), even one
+        // that would be a bind error; an uncorrelated EXISTS reads any block.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i32 FROM u WHERE u.i32 = t.i32 "
+                  "GROUP BY u.i16)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
+        ErrorCase{"SELECT nope FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
+                  "GROUP BY u.i16)",
+                  kBind, "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
                   "GROUP BY u.i16)",
                   kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
@@ -1132,6 +1154,28 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i32, COUNT(*) FROM t GROUP BY i32 HAVING EXISTS "
                   "(SELECT u.i16 FROM u WHERE u.i32 = t.i32)",
                   kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
+        // The gate comes before the block's own bind errors, which binding it would meet first...
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT nope FROM u WHERE u.i32 = t.i32 "
+                  "GROUP BY u.i16)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
+        // ... and after the enclosing block's grouping errors, which come before its HAVING binds,
+        // as DuckDB, which answers the EXISTS, reports them.
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i32 HAVING EXISTS "
+                  "(SELECT u.i16 FROM u WHERE u.i32 = t.i32)",
+                  kBind, "i16", "column 'i16' must appear in the GROUP BY clause"},
+        // An uncorrelated EXISTS reads any block (ADR 0041's SQ4a), and the stars of its select
+        // list are checked, not expanded: a grouped or aggregate block's star is DuckDB's bind
+        // error, for the star's first ungrouped column, in select order.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT * FROM u GROUP BY i16)", kBind, "*",
+                  "column 'i32' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT ok.* FROM ok GROUP BY ok.i16)", kBind,
+                  "ok.*", "column 's' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT s, * FROM ok GROUP BY i16)", kBind, "s",
+                  "column 's' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT *, s FROM ok GROUP BY i16)", kBind, "*",
+                  "column 's' must appear in the GROUP BY clause"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT *, COUNT(*) FROM u)", kBind, "*",
+                  "column 'i16' must be inside an aggregate function"},
         // A DOUBLE has no join key, by decision (ADR 0022), and a DECIMAL(38,0) with a
         // DECIMAL(38,10) would need 48 digits: a semi join needs one type for its key, so neither
         // exits past 4.
@@ -1237,7 +1281,26 @@ INSTANTIATE_TEST_SUITE_P(
                   "a scalar subquery is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE CAST((SELECT COUNT(*) FROM u) AS BIGINT) > 0",
                   kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u) AND 10",
+        // A BETWEEN is answered as its two comparisons when a bound is itself an uncorrelated
+        // subquery (ADR 0041's SQ4a); a correlated bound, a NOT BETWEEN (an OR), a bound with the
+        // subquery inside arithmetic and a subquery as the operand keep the refusal.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u WHERE u.i64 = "
+                  "t.i64) AND 10",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT BETWEEN (SELECT MIN(i16) FROM u) AND 10",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN 1 AND (SELECT MIN(i16) FROM u) + 1",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) BETWEEN i32 AND 10",
+                  kUnsupported, "(", "a scalar subquery is not supported"},
+        // A subquery bound is typed as its column, with DuckDB's rules for the three values.
+        ErrorCase{"SELECT i16 FROM t WHERE i64 BETWEEN (SELECT MIN(d) FROM u) AND 5", kUnsupported,
+                  "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT"},
+        ErrorCase{"SELECT i16 FROM t WHERE dt BETWEEN (SELECT s FROM ok LIMIT 1) AND dt", kBind,
+                  "BETWEEN", "Cannot mix values of type VARCHAR and DATE in BETWEEN clause"},
+        // An outer join's ON keeps every subquery refused (ADR 0041's follow-ups).
+        ErrorCase{"SELECT t.i16 FROM t LEFT JOIN ok ON t.i16 = ok.i16 AND ok.i16 BETWEEN (SELECT "
+                  "MIN(i16) FROM u) AND 5",
                   kUnsupported, "(", "a scalar subquery is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE s LIKE (SELECT s FROM u)", kUnsupported, "(",
                   "a scalar subquery is not supported"},
@@ -2841,22 +2904,34 @@ TEST(BinderTest, GroupingCallsAreColumnsOfTheNode) {
 }
 
 // A block with a GROUP BY in grouping-set syntax is a grouped block wherever the binder asks
-// (HasGroupBy): an EXISTS or a scalar subquery over one is refused as over a plain GROUP BY, with
-// the same message at the same span.
+// (HasGroupBy): a correlated EXISTS or scalar subquery over one is refused as over a plain GROUP
+// BY, with the same message at the same span, and an uncorrelated one is answered alike.
 TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
   const Catalog catalog = MakeCatalog();
+  // Correlated, a grouped block stays refused, with the same message at the same place.
   for (const std::string_view outer : {
-           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM t GROUP BY {})",
-           "SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM t GROUP BY {})",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 GROUP BY {})",
+           "SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 GROUP BY {})",
        }) {
-    const std::string plain = std::vformat(outer, std::make_format_args("i16"));
-    const std::string rollup = std::vformat(outer, std::make_format_args("ROLLUP (i16)"));
+    const std::string plain = std::vformat(outer, std::make_format_args("u.i32"));
+    const std::string rollup = std::vformat(outer, std::make_format_args("ROLLUP (u.i32)"));
     const auto expected = BindSql(plain, catalog);
     const auto bound = BindSql(rollup, catalog);
     ASSERT_FALSE(expected.ok()) << plain;
     ASSERT_FALSE(bound.ok()) << rollup;
     EXPECT_EQ(bound.status().message(), expected.status().message()) << rollup;
     EXPECT_EQ(SpanText(rollup, bound.status()), SpanText(plain, expected.status())) << rollup;
+  }
+  // Uncorrelated, any block is answered (ADR 0041's SQ4a), a grouping set's as a GROUP BY's.
+  for (const std::string_view outer : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM t GROUP BY {})",
+           "SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM t GROUP BY {})",
+       }) {
+    for (const std::string_view keys : {"i16", "ROLLUP (i16)"}) {
+      const std::string sql = std::vformat(outer, std::make_format_args(keys));
+      const auto bound = BindSql(sql, catalog);
+      EXPECT_TRUE(bound.ok()) << sql << ": " << bound.status().ToString();
+    }
   }
 }
 
@@ -6466,6 +6541,310 @@ TEST(BinderTest, AStarInsideExistsIsCheckedButNotExpanded) {
   auto conflict = BindSql(
       "SELECT i16 FROM u WHERE EXISTS (SELECT * FROM t, t AS t WHERE t.i64 = u.i64)", catalog);
   EXPECT_FALSE(conflict.ok());
+}
+
+// An uncorrelated scalar subquery of any shape is its single value (ADR 0041's decision 4): the
+// one-row join's right input is a SINGLE_VALUE aggregate over the subquery's plan, of the
+// subquery's column's type, which exec makes NULL over no row and an error over two. A plan that is
+// exactly one row, an aggregate over every row under Projects and Computes (a CTE's too), gets
+// none, so every scalar subquery answered before keeps its plan.
+TEST(BinderTest, AnUncorrelatedScalarSubqueryOfAnyShapeIsItsSingleValue) {
+  const Catalog catalog = MakeCatalog();
+  // The right input of the plan's outermost join, which must be a one-row join.
+  const auto one_row_right = [&catalog](std::string_view sql) -> LogicalNodePtr {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return nullptr;
+    }
+    // The comparison above the join reads the single value's column, which only the join defines.
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_TRUE(Optimize(*plan).ok()) << sql;
+    const JoinNode* join = testing::FirstJoin(*plan);
+    if (join == nullptr || join->kind != JoinKind::kOneRow) {
+      ADD_FAILURE() << sql << ": no one-row join\n" << Explain(*plan);
+      return nullptr;
+    }
+    return join->right;
+  };
+  const auto single_value = [](const LogicalNode& node) -> const AggregateCall* {
+    const auto* aggregate = std::get_if<AggregateNode>(&node);
+    if (aggregate == nullptr || aggregate->aggregates.size() != 1 ||
+        aggregate->aggregates.front().kind != AggKind::kSingleValue) {
+      return nullptr;
+    }
+    return &aggregate->aggregates.front();
+  };
+  for (const auto& [sql, type] : {
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT i32 FROM u)", "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT MAX(i32) FROM u GROUP BY i16)",
+                     "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT i32 FROM u ORDER BY i32 LIMIT 1 "
+                     "OFFSET 2)",
+                     "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT MAX(i32) FROM u HAVING COUNT(*) > 1)",
+                     "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT DISTINCT i32 FROM u)", "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE i16 = (SELECT i16 FROM u INTERSECT SELECT i16 FROM "
+                     "ok)",
+                     "SMALLINT"},
+           std::pair{"SELECT i16 FROM t WHERE i32 = (SELECT i16 FROM u EXCEPT ALL SELECT i32 FROM "
+                     "u)",
+                     "INTEGER"},
+           std::pair{
+               "WITH c AS (SELECT MAX(i32) AS m FROM u) SELECT i16 FROM t WHERE i32 = (SELECT "
+               "m FROM c WHERE m > 0)",
+               "INTEGER"},
+           std::pair{"SELECT i16 FROM t WHERE s = (SELECT s FROM ok LIMIT 1)", "VARCHAR"},
+           std::pair{"SELECT i16 FROM t WHERE dt > (SELECT MAX(dt) FROM u GROUP BY i16)", "DATE"},
+           std::pair{"SELECT i16 FROM t WHERE h < (SELECT h FROM u ORDER BY h LIMIT 1)",
+                     "DECIMAL(38,0)"},
+           std::pair{"SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND ok.i16 = (SELECT i16 FROM "
+                     "u LIMIT 1)",
+                     "SMALLINT"},
+           std::pair{"SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT i64 FROM "
+                     "u LIMIT 1)",
+                     "BIGINT"},
+       }) {
+    const LogicalNodePtr right = one_row_right(sql);
+    ASSERT_NE(right, nullptr) << sql;
+    const AggregateCall* call = single_value(*right);
+    ASSERT_NE(call, nullptr) << sql << ": no single value at the join's right input";
+    EXPECT_EQ(ToString(call->type), type) << sql;
+    if (const std::optional<BoundColumn>& arg = call->arg; arg.has_value()) {
+      EXPECT_EQ(arg->type, call->type) << sql << ": the value keeps its column's type";
+    } else {
+      ADD_FAILURE() << sql << ": the single value has no argument";
+    }
+  }
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE i32 = (SELECT MAX(i32) FROM u)",
+           "SELECT i16 FROM t WHERE i32 = (SELECT MAX(i32) + 1 FROM u)",
+           "WITH c AS (SELECT MAX(i32) AS m FROM u) SELECT i16 FROM t WHERE i32 = (SELECT m FROM "
+           "c)",
+       }) {
+    const LogicalNodePtr right = one_row_right(sql);
+    ASSERT_NE(right, nullptr) << sql;
+    EXPECT_EQ(single_value(*right), nullptr) << sql << ": a plan of exactly one row is its value";
+  }
+  auto plan = BindSql("SELECT i16 FROM t WHERE i32 = (SELECT i32 FROM u)", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(Explain(Optimized(*plan)),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 = i32\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16, i32]\n"
+            "      Aggregate SINGLE_VALUE(i32)\n"
+            "        Project i32\n"
+            "          Scan table=u source=fake columns=[i32]\n");
+}
+
+// The single value keeps its column's FLOAT flag (divergence D11): a literal it is compared with
+// folds at FLOAT precision, and another column is refused, as next to the column itself.
+TEST(BinderTest, TheSingleValueOfAFloatColumnIsAFloat) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32()),
+                                                     arrow::field("k", arrow::int32())}),
+                                      10, std::vector<int>{0}))
+                  .ok());
+  auto folded = BindSql("SELECT COUNT(*) FROM tf WHERE 0.1 = (SELECT f FROM tf LIMIT 1)", catalog);
+  ASSERT_TRUE(folded.ok()) << folded.status().ToString();
+  EXPECT_EQ(FilterConstants(*folded), std::vector<double>{static_cast<double>(0.1F)});
+  for (const char* sql : {"SELECT COUNT(*) FROM tf WHERE k = (SELECT f FROM tf LIMIT 1)",
+                          "SELECT COUNT(*) FROM tf WHERE f BETWEEN (SELECT f FROM tf LIMIT 1) AND "
+                          "0.1"}) {
+    const auto refused = BindSql(sql, catalog);
+    ASSERT_FALSE(refused.ok()) << sql;
+    EXPECT_TRUE(refused.status().IsNotImplemented()) << sql << ": " << refused.status().ToString();
+    EXPECT_TRUE(refused.status().message().contains("divergence D11"))
+        << refused.status().message();
+  }
+}
+
+// An uncorrelated EXISTS is COUNT(*) over LIMIT 1 of its block under a one-row join, compared with
+// 1, or with 0 for NOT EXISTS (ADR 0041's decision 5), DuckDB's own plan. Its select list -- the
+// Projects among the Limits and Sorts at the top of its plan -- is dropped, as DuckDB drops it, so
+// nothing computes a select item that nothing else reads, also under a LIMIT; its ORDER BY stays,
+// whose keys DuckDB computes too (a top-N under the LIMIT 1). Its join stands where a scalar
+// subquery's would: above the block's joins, and above the aggregation for a HAVING one.
+TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT i32, s FROM u WHERE i64 > 0 ORDER "
+                      "BY s)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Sort s ASC NULLS LAST\n"
+            "            Filter i64 > 0\n"
+            "              Scan table=u source=fake columns=[i64, s]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE NOT EXISTS (SELECT * FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 0\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Scan table=u source=fake columns=[]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT i32 + 1, s FROM u ORDER BY i32 "
+                      "LIMIT 2 OFFSET 3)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Limit 2 OFFSET 3\n"
+            "            Sort i32 ASC NULLS LAST\n"
+            "              Scan table=u source=fake columns=[i32]\n");
+  // Under a DISTINCT the select list is the rows: it stays, and so does the Project its Sort reads.
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT i32 + 1 AS x FROM u ORDER "
+                      "BY x)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Sort x ASC NULLS LAST\n"
+            "            GroupAggregate keys=[x]\n"
+            "              Project x\n"
+            "                Compute (i32 + 1)\n"
+            "                  Scan table=u source=fake columns=[i32]\n");
+  EXPECT_EQ(optimized("SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT i16 FROM u "
+                      "GROUP BY i16 HAVING COUNT(*) > 1)"),
+            "Output: i16:SMALLINT count_star():BIGINT\n"
+            "Project i16, \"count_star()\"\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      GroupAggregate keys=[i16] COUNT(*)\n"
+            "        Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Filter \"count_star()\" > 1\n"
+            "            GroupAggregate keys=[i16] COUNT(*)\n"
+            "              Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(optimized("SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT EXISTS (SELECT 1 "
+                      "FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project t.i16\n"
+            "  Filter \"count_star()\" = 0\n"
+            "    Join ONE-ROW build=right keys=[] carries 1 of 3 unread above\n"
+            "      Join INNER build=right keys=[t.i16 = ok.i16] carries 1 of 2 unread above\n"
+            "        Scan table=t source=fake columns=[i16]\n"
+            "        Scan table=ok source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          Scan table=u source=fake columns=[]\n");
+  // A set operation as its query (ADR 0036's X6): its arms bound and typed as any set operation's.
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u UNION SELECT i32 FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"count_star()\" = 1\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "      Aggregate COUNT(*)\n"
+            "        Limit 1\n"
+            "          SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
+            "            Compute CAST(i16 AS INTEGER)\n"
+            "              Project i16\n"
+            "                Scan table=u source=fake columns=[i16]\n"
+            "            Project i32\n"
+            "              Scan table=u source=fake columns=[i32]\n");
+}
+
+// A BETWEEN with a subquery bound is its two comparisons (ADR 0041's decision 6), each a conjunct
+// of its clause: a subquery's a one-row join with the comparison above it, the other an ordinary
+// conjunct -- a filter below the joins in WHERE. Both compare in the type DuckDB gives all three
+// values, a subquery bound's being its column's: with a DOUBLE bound, the plain half keeps
+// `i32 + 1` as written (DuckDB keeps the cast to DOUBLE above it), where an INTEGER bound lets the
+// constant move.
+TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i32) FROM u) AND (SELECT "
+                      "i32 FROM u LIMIT 1)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 <= i32\n"
+            "    Join ONE-ROW build=right keys=[] carries 1 of 4 unread above\n"
+            "      Filter i32 >= \"min(i32)\"\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i32)\n"
+            "            Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n"
+            "      Aggregate SINGLE_VALUE(i32)\n"
+            "        Project i32\n"
+            "          Limit 1\n"
+            "            Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE dt BETWEEN (SELECT MIN(dt) FROM u) AND "
+                      "'2020-01-01'"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter dt >= \"min(dt)\"\n"
+            "    Join ONE-ROW build=right keys=[]\n"
+            "      Filter dt <= DATE '2020-01-01'\n"
+            "        Scan table=t source=fake columns=[i16, dt]\n"
+            "      Aggregate MIN(dt)\n"
+            "        Scan table=u source=fake columns=[dt]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 + 1 BETWEEN (SELECT MIN(d) FROM u) AND 100"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"(i32 + 1)\" >= \"min(d)\"\n"
+            "    Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
+            "      Compute (i32 + 1)\n"
+            "        Filter \"(i32 + 1)\" <= 100\n"
+            "          Compute (i32 + 1)\n"
+            "            Scan table=t source=fake columns=[i16, i32]\n"
+            "      Aggregate MIN(d)\n"
+            "        Scan table=u source=fake columns=[d]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 + 1 BETWEEN (SELECT MIN(i32) FROM u) AND 100"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"(i32 + 1)\" >= \"min(i32)\"\n"
+            "    Join ONE-ROW build=right keys=[] carries 1 of 4 unread above\n"
+            "      Compute (i32 + 1)\n"
+            "        Filter i32 <= 99\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "      Aggregate MIN(i32)\n"
+            "        Scan table=u source=fake columns=[i32]\n");
+  EXPECT_EQ(optimized("SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) BETWEEN (SELECT "
+                      "MIN(i16) FROM u) AND 10"),
+            "Output: i16:SMALLINT count_star():BIGINT\n"
+            "Project i16, \"count_star()\"\n"
+            "  Filter \"count_star()\" <= 10\n"
+            "    Filter \"count_star()\" >= \"min(i16)\"\n"
+            "      Join ONE-ROW build=right keys=[]\n"
+            "        GroupAggregate keys=[i16] COUNT(*)\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "        Aggregate MIN(i16)\n"
+            "          Scan table=u source=fake columns=[i16]\n");
 }
 
 // A correlated scalar subquery binds to a DependentJoin (ADR 0023's U1), which the unnesting pass

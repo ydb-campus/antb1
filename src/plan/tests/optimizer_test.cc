@@ -1958,7 +1958,10 @@ TEST(OptimizerTest, Path2KeysEveryOuterColumn) {
 // outer row with no group would pass a comparison the inner join drops it from. It must refuse,
 // not answer -- this was a live wrong answer before the strictness classifier existed.
 TEST(OptimizerTest, Path2RefusesACountAndAnyNonStrictCombination) {
-  for (const AggKind kind : {AggKind::kCountStar, AggKind::kCount, AggKind::kCountDistinct}) {
+  // A scalar subquery's single value (ADR 0041's decision 4) never reaches Path 2, which the binder
+  // keeps from it; if it did, its row check would be lost per binding, so it is refused too.
+  for (const AggKind kind :
+       {AggKind::kCountStar, AggKind::kCount, AggKind::kCountDistinct, AggKind::kSingleValue}) {
     const auto status =
         Optimize(PlanOver(Node(DependentJoinNode{
                      .kind = JoinKind::kOneRow,

@@ -680,6 +680,8 @@ TEST_F(GroupedAggregateTest, InvalidCallsAndInputs) {
   EXPECT_TRUE(invalid(AggKind::kSum, LogicalType::kDate, LogicalType::kDouble));
   EXPECT_TRUE(invalid(AggKind::kSum, LogicalType::kBigInt, LogicalType::kDouble));
   EXPECT_TRUE(invalid(AggKind::kMin, LogicalType::kBigInt, LogicalType::kHugeInt));
+  // A scalar subquery's single value is one aggregate over its whole plan, never grouped.
+  EXPECT_TRUE(invalid(AggKind::kSingleValue, LogicalType::kBigInt, LogicalType::kBigInt));
   constexpr auto kIds = std::to_array<std::uint32_t>({0});
   for (const LogicalType type : kTypes) {
     for (const Call& call : CallsOver(type)) {

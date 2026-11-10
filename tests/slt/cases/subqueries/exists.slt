@@ -513,14 +513,256 @@ SELECT COUNT(*) FROM cities AS x WHERE EXISTS (SELECT * FROM zones JOIN drivers 
 BIGINT
 3
 
-# ---- DuckDB only until the uncorrelated EXISTS gets a PR (ADR 0023) ----
+# ---- uncorrelated EXISTS and NOT EXISTS (ADR 0041's SQ4a): COUNT(*) over LIMIT 1 of any block ----
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM promos)
 ----
 BIGINT
 0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE NOT EXISTS (SELECT * FROM promos)
+----
+BIGINT
+6
+
+# An aggregate over every row is one row, even over no row.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT MAX(pm_id) FROM promos)
+----
+BIGINT
+6
+
+# LIMIT 0, and an OFFSET past the end and just before it.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones LIMIT 0)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE NOT EXISTS (SELECT * FROM zones LIMIT 0)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 5 OFFSET 40)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT zn_id FROM zones ORDER BY zn_id LIMIT 5 OFFSET 39)
+----
+BIGINT
+6
+
+# GROUP BY with a HAVING that some group passes, and one that none does; DISTINCT.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) > 7)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) > 100)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT zn_city FROM zones)
+----
+BIGINT
+6
+
+# A join, a cross join, a CTE and a derived table inside it.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones JOIN cities AS c2 ON zn_city = c2.ct_id WHERE c2.ct_pop > 100000)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones, tariffs)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (WITH z AS (SELECT * FROM zones) SELECT * FROM z WHERE zn_id > 39)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM (SELECT zn_city FROM zones WHERE zn_id > 100) AS s)
+----
+BIGINT
+0
+
+# A set operation as the query (ADR 0036's X6).
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT ct_id FROM cities EXCEPT SELECT zn_city FROM zones)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE NOT EXISTS (SELECT ct_id FROM cities EXCEPT SELECT zn_city FROM zones)
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT ct_id FROM cities INTERSECT SELECT zn_city FROM zones)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT pm_id FROM promos UNION ALL SELECT ct_id FROM cities WHERE ct_id > 10)
+----
+BIGINT
+0
+
+# In HAVING, next to another conjunct, and in an inner join's ON.
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING EXISTS (SELECT * FROM promos) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING NOT EXISTS (SELECT * FROM promos) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING COUNT(*) > 6 AND EXISTS (SELECT * FROM cities WHERE ct_pop > 100000) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND EXISTS (SELECT * FROM cities WHERE ct_pop > 100000)
+----
+BIGINT
+2793
+
+query I nosort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND NOT EXISTS (SELECT * FROM cities WHERE ct_pop > 100000)
+----
+BIGINT
+0
+
+# Inside a scalar subquery, an IN subquery and a correlated EXISTS, and next to a correlated one.
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MAX(zn_id) FROM zones WHERE EXISTS (SELECT * FROM promos))
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT MAX(zn_id) FROM zones WHERE NOT EXISTS (SELECT * FROM promos))
+----
+BIGINT
+69
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE NOT EXISTS (SELECT * FROM promos))
+----
+BIGINT
+5
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones WHERE zn_city = ct_id AND EXISTS (SELECT * FROM promos))
+----
+BIGINT
+0
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones WHERE zn_city = ct_id AND NOT EXISTS (SELECT * FROM promos))
+----
+BIGINT
+5
+
+query I nosort
+SELECT COUNT(*) FROM cities AS c WHERE EXISTS (SELECT * FROM zones) AND EXISTS (SELECT * FROM zones AS z WHERE z.zn_city = c.ct_id)
+----
+BIGINT
+5
+
+# Its select list is never computed, under a LIMIT too, as in DuckDB; its ORDER BY and a DISTINCT's list are.
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i32 + 2147483647 FROM edge)
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i32 + 2147483647 FROM edge ORDER BY id LIMIT 5)
+----
+BIGINT
+6
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT id FROM edge ORDER BY i32 + 2147483647)
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT DISTINCT i32 + 2147483647 FROM edge)
+
+# Divergence D32: an aggregate of a grouped block that nothing reads is computed, so its overflow fails the query;
+# DuckDB removes it. An aggregate HAVING reads fails in both.
+onlyif antb1
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i16, SUM(i32 + 2147483647) FROM edge GROUP BY i16)
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i16, SUM(i32 + 2147483647) FROM edge GROUP BY i16)
+----
+BIGINT
+6
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT i16 FROM edge GROUP BY i16 HAVING SUM(i32 + 2147483647) > 0)
+
+# Its star is checked: a grouped or aggregate block's star is a bind error in both.
+statement error
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones GROUP BY zn_city)
+
+onlyif antb1
+statement error ^bind: column 'zn_row' must appear in the GROUP BY clause or be inside an aggregate function$
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM zones GROUP BY zn_city)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT *, COUNT(*) FROM zones)
+
+# Divergence D32: a correlated EXISTS's ORDER BY is dropped (ADR 0023's Path 1 takes its FROM and WHERE alone), so its
+# keys are never computed; DuckDB computes them and fails.
+onlyif antb1
+query I nosort
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM edge WHERE id = ct_id ORDER BY i32 + 2147483647)
+----
+BIGINT
+6
+
+onlyif duckdb
+statement error Overflow in addition
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM edge WHERE id = ct_id ORDER BY i32 + 2147483647)
 
 # ---- DuckDB only until mark joins get a PR (ADR 0023: EXISTS under OR exits 4) ----
 

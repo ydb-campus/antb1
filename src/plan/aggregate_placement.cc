@@ -156,6 +156,9 @@ bool Decomposable(AggKind kind) {
     case AggKind::kStddevPop:
     case AggKind::kVarSamp:
     case AggKind::kVarPop:
+    // A partial below a join would collapse or multiply the very rows it must count; and it is
+    // never grouped anyway.
+    case AggKind::kSingleValue:
       return false;
   }
   return false;

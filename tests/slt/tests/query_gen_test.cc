@@ -115,7 +115,8 @@ bool Joins(const GeneratedQuery& q) {
 bool HasSubquery(const GeneratedQuery& q) {
   return q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery) ||
          q.features.Has(Feature::kCorrelatedExists) ||
-         q.features.Has(Feature::kCorrelatedAggregate);
+         q.features.Has(Feature::kCorrelatedAggregate) ||
+         q.features.Has(Feature::kUncorrelatedValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -2742,6 +2743,263 @@ TEST(QueryGenerator, SubqueriesChangeOnlySubqueryQueries) {
   }
   EXPECT_GT(took, 300) << "took: " << took;
   EXPECT_GT(same, 2000);
+}
+
+// An uncorrelated value's draws come from a stream of its own (ADR 0041's SQ4a), and it fires only
+// where neither subquery form above it did, so declaring it changes the queries that take one and
+// no others.
+TEST(QueryGenerator, UncorrelatedValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 61, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 61,
+      {.supported = kSupportedFeatures.Minus({Feature::kUncorrelatedValue}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kUncorrelatedValue)) << plain.sql;
+    if (q.features.Has(Feature::kUncorrelatedValue)) {
+      ++took;
+      // It never displaces another subquery conjunct, and it only removes rows.
+      for (const Feature other : {Feature::kInSubquery, Feature::kScalarSubquery,
+                                  Feature::kCorrelatedExists, Feature::kCorrelatedAggregate}) {
+        EXPECT_FALSE(q.features.Has(other)) << q.sql;
+      }
+      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  // Measured: 538 of the 4000 take one, and the other 3462 are byte-identical.
+  EXPECT_GT(took, 300) << "took: " << took;
+  EXPECT_GT(same, 3000) << "same: " << same;
+}
+
+struct ValueCoverage {
+  int queries = 0;
+  int comparison = 0;
+  int block_first = 0;  // (SELECT ...) <op> probe
+  int between = 0;
+  int exists = 0;
+  int not_exists = 0;
+  int first_value = 0;  // ORDER BY ... LIMIT 1
+  int descending = 0;
+  int offset = 0;
+  int grouped = 0;  // GROUP BY ... ORDER BY ... LIMIT 1
+  int limit_zero = 0;
+  int having = 0;
+  int intersect = 0;
+  int except = 0;
+  int set_all = 0;
+  int exists_star = 0;
+  int exists_rows = 0;  // EXISTS over a block without LIMIT, HAVING or an aggregate
+  int exists_union = 0;
+  int joined = 0;
+};
+
+// Whether a value block returns at most one row whatever the data: LIMIT 0 or 1 at its top, an
+// aggregate without GROUP BY (a HAVING may drop its one row), or an INTERSECT or EXCEPT of such
+// blocks -- never a UNION, whose rows add up.
+bool AtMostOneRow(const sql::SelectStatement& block) {
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  if (!block.set_operation.empty()) {
+    for (std::size_t i = 0; i < block.set_operation.size(); ++i) {
+      const sql::SetBranch& branch = block.set_operation[i];
+      if ((i > 0 && branch.op == sql::SetOp::kUnion) || !AtMostOneRow(*branch.query)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (block.limit.has_value()) {
+    return *block.limit <= 1;
+  }
+  return block.group_by.empty() && block.grouping.empty() && !block.distinct &&
+         !block.items.empty() && std::ranges::all_of(block.items, [](const sql::SelectItem& item) {
+           return item.expr() != nullptr &&
+                  std::holds_alternative<sql::AggregateCall>(*item.expr());
+         });
+}
+
+// Every column a block names, in each of its branches: unqualified, of its one table, which it
+// names (never a path), so that the block reads nothing of the enclosing query.
+void CheckOwnColumns(const sql::SelectStatement& block, const std::vector<GenTable>& tables) {
+  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  if (!block.set_operation.empty()) {
+    for (const sql::SetBranch& branch : block.set_operation) {
+      CheckOwnColumns(*branch.query, tables);
+    }
+    return;
+  }
+  EXPECT_TRUE(block.with.empty());
+  EXPECT_TRUE(block.where.empty());
+  ASSERT_EQ(block.from.size(), 1U);
+  const sql::TableRef* ref = block.from.front().table();
+  ASSERT_NE(ref, nullptr) << "the block reads a table, never a derived one";
+  EXPECT_EQ(ref->kind, sql::TableRef::Kind::kName);
+  EXPECT_FALSE(block.from.front().alias.has_value());
+  const auto table = std::ranges::find_if(
+      tables, [&](const GenTable& t) { return Lower(t.name) == Lower(ref->name); });
+  ASSERT_NE(table, tables.end()) << ref->name;
+  const auto check = [&](const sql::Expr& e) {
+    ForEachNode(e, [&](const sql::Expr& node) {
+      if (const auto* column = std::get_if<sql::ColumnRef>(&node)) {
+        EXPECT_TRUE(column->qualifier.empty()) << column->name;
+        EXPECT_TRUE(std::ranges::any_of(
+            table->columns,
+            [&](const GenColumn& c) { return Lower(c.name) == Lower(column->name); }))
+            << column->name << " is no column of " << table->name;
+      }
+    });
+  };
+  for (const sql::SelectItem& item : block.items) {
+    if (item.expr() != nullptr) {
+      check(*item.expr());
+    }
+  }
+  for (const sql::Expr& e : block.group_by) {
+    check(e);
+  }
+  for (const sql::Expr& e : block.having) {
+    check(e);
+  }
+  for (const sql::OrderItem& item : block.order_by) {
+    check(item.expr);
+  }
+}
+
+void CheckValue(const GeneratedQuery& q, const std::vector<GenTable>& tables, ValueCoverage& cov) {
+  SCOPED_TRACE(q.sql);
+  const auto parsed = sql::Parse(q.sql);
+  ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+  const sql::SelectStatement& stmt = *parsed;
+  ++cov.queries;
+  cov.joined += stmt.from.size() > 1 ? 1 : 0;
+  std::vector<const sql::SubqueryExpr*> all;
+  DeepSubqueries(stmt, all);
+  // Where its subqueries may sit: one top-level conjunct of WHERE holds them all -- EXISTS under
+  // its own NOT, the bounds of a BETWEEN, or one operand of a comparison.
+  std::vector<const sql::SubqueryExpr*> values;
+  const sql::SubqueryExpr* exists = nullptr;
+  std::size_t conjuncts = 0;
+  for (const sql::Expr& conjunct : stmt.where) {
+    const sql::Expr* e = &conjunct;
+    bool negated = false;
+    if (const auto* unary = std::get_if<sql::UnaryExpr>(e);
+        unary != nullptr && unary->op == sql::UnaryOp::kNot) {
+      e = &*unary->operand;
+      negated = true;
+    }
+    const auto scalar = [](const sql::Expr& side) -> const sql::SubqueryExpr* {
+      const auto* sub = std::get_if<sql::SubqueryExpr>(&side);
+      return sub != nullptr && sub->kind == sql::SubqueryExpr::Kind::kScalar ? sub : nullptr;
+    };
+    if (const auto* sub = std::get_if<sql::SubqueryExpr>(e);
+        sub != nullptr && sub->kind == sql::SubqueryExpr::Kind::kExists) {
+      ++conjuncts;
+      exists = sub;
+      ++cov.exists;
+      cov.not_exists += negated ? 1 : 0;
+    } else if (const auto* between = std::get_if<sql::BetweenExpr>(e);
+               between != nullptr && !negated && scalar(*between->low) != nullptr &&
+               scalar(*between->high) != nullptr) {
+      ++conjuncts;
+      ++cov.between;
+      values = {scalar(*between->low), scalar(*between->high)};
+    } else if (const auto* binary = std::get_if<sql::BinaryExpr>(e);
+               binary != nullptr && !negated && binary->op >= sql::BinaryOp::kEq &&
+               binary->op <= sql::BinaryOp::kGe &&
+               (scalar(*binary->left) != nullptr || scalar(*binary->right) != nullptr)) {
+      ++conjuncts;
+      ++cov.comparison;
+      cov.block_first += scalar(*binary->left) != nullptr ? 1 : 0;
+      values = {scalar(*binary->left) != nullptr ? scalar(*binary->left) : scalar(*binary->right)};
+    }
+  }
+  ASSERT_EQ(conjuncts, 1U) << "one top-level conjunct of WHERE holds the value";
+  ASSERT_EQ(all.size(), exists != nullptr ? 1U : values.size())
+      << "no subquery elsewhere, and none inside a block";
+  if (exists != nullptr) {
+    CheckOwnColumns(*exists->query, tables);
+    const sql::SelectStatement& block = *exists->query;
+    if (!block.set_operation.empty()) {
+      cov.exists_union +=
+          std::ranges::any_of(block.set_operation,
+                              [](const sql::SetBranch& b) { return b.op == sql::SetOp::kUnion; })
+              ? 1
+              : 0;
+    } else {
+      cov.exists_star += block.items.size() == 1 && block.items[0].star() != nullptr ? 1 : 0;
+      cov.exists_rows += AtMostOneRow(block) ? 0 : 1;
+    }
+    return;
+  }
+  for (const sql::SubqueryExpr* value : values) {
+    const sql::SelectStatement& block = *value->query;
+    CheckOwnColumns(block, tables);
+    EXPECT_TRUE(AtMostOneRow(block)) << "a value block of at most one row";
+    for (const sql::SetBranch& branch : block.set_operation) {
+      cov.intersect += branch.op == sql::SetOp::kIntersect ? 1 : 0;
+      cov.except += branch.op == sql::SetOp::kExcept ? 1 : 0;
+      cov.set_all += branch.all ? 1 : 0;
+    }
+    if (!block.set_operation.empty()) {
+      continue;
+    }
+    EXPECT_FALSE(block.items.empty());
+    EXPECT_EQ(block.items.at(0).star(), nullptr);
+    cov.limit_zero += block.limit == 0 ? 1 : 0;
+    cov.having += block.having.empty() ? 0 : 1;
+    if (block.limit == 1) {
+      ++cov.first_value;
+      EXPECT_EQ(block.order_by.size(), 1U) << "LIMIT 1 under an ORDER BY, so it reads one value";
+      cov.descending += !block.order_by.empty() && block.order_by[0].descending ? 1 : 0;
+      cov.offset += block.offset.has_value() ? 1 : 0;
+      cov.grouped += block.group_by.empty() ? 0 : 1;
+    }
+  }
+}
+
+// What an uncorrelated value writes (ADR 0041's SQ4a): one top-level conjunct, its blocks over one
+// named table each, unqualified, value blocks of at most one row whatever the data, and every form
+// and shape.
+TEST(QueryGenerator, UncorrelatedValuesAreAtMostOneRowAndReadOnlyTheirTable) {
+  ValueCoverage cov;
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 67, {.supported = kSupportedFeatures, .target_percent = 0});
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = gen.Generate(i);
+    if (q.features.Has(Feature::kUncorrelatedValue)) {
+      ASSERT_NO_FATAL_FAILURE(CheckValue(q, tables, cov)) << i;
+    }
+  }
+  // Measured: 1623 values, 908 comparisons (259 block first), 257 BETWEEN forms and 458 EXISTS
+  // (193 NOT); value blocks 787 first values (317 descending, 220 after an OFFSET, 247 grouped),
+  // 234 LIMIT 0, 218 HAVING, 78 INTERSECT, 105 EXCEPT, 58 ALL; EXISTS blocks 56 stars, 190 of any
+  // row count, 97 with a UNION; 1088 beside a join.
+  EXPECT_GT(cov.queries, 1000) << "values: " << cov.queries;
+  EXPECT_GT(cov.comparison, 600);
+  EXPECT_GT(cov.block_first, 150) << "(SELECT ...) <op> probe";
+  EXPECT_GT(cov.between, 150);
+  EXPECT_GT(cov.exists, 300);
+  EXPECT_GT(cov.not_exists, 100);
+  EXPECT_GT(cov.first_value, 500);
+  EXPECT_GT(cov.descending, 200);
+  EXPECT_GT(cov.offset, 120);
+  EXPECT_GT(cov.grouped, 150);
+  EXPECT_GT(cov.limit_zero, 150);
+  EXPECT_GT(cov.having, 120);
+  EXPECT_GT(cov.intersect, 40);
+  EXPECT_GT(cov.except, 50);
+  EXPECT_GT(cov.set_all, 30);
+  EXPECT_GT(cov.exists_star, 30);
+  EXPECT_GT(cov.exists_rows, 100);
+  EXPECT_GT(cov.exists_union, 50);
+  EXPECT_GT(cov.joined, 600) << "a value beside a join";
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

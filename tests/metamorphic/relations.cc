@@ -1904,6 +1904,132 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
+  // ---- uncorrelated values of any shape (ADR 0041's SQ4a) ----
+  {
+    const slt::FeatureSet value = {kCountStar, kIntegerColumns, kTableName,
+                                   kWhere,     kIntegerLiteral, kUncorrelatedValue};
+
+    // A value of one row equals a cross join with it as a one-row derived table, and a value of no
+    // row does too: its NULL rejects every row, as the empty derived table leaves none. Zone 10's
+    // parent is zone 5 (tools/fixturegen/star.h).
+    for (const auto& [name, where] :
+         {std::pair{"one_row", "zn_id = 10"}, std::pair{"no_row", "zn_id > 1000"}}) {
+      r.push_back(
+          {.name = std::format("uncorrelated_value_of_{}_is_a_cross_join", name),
+           .features = SetWith(value, kDerivedTable, kCommaJoin, kAlias, kTableAlias,
+                               kQualifiedName, kColumns),
+           .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_pickup = "
+                                    "(SELECT zn_parent FROM zones WHERE {})",
+                                    where)),
+                      Q(std::format("SELECT COUNT(*) FROM trips, (SELECT zn_parent AS v FROM zones "
+                                    "WHERE {}) AS s WHERE tr_pickup = s.v",
+                                    where))},
+           .check = AllEqual()});
+    }
+    // A subquery of at most one row equals its MIN() form: MIN of one row is its value, and of no
+    // row NULL, as the value is then. The first value in order is the MIN of the non-NULL ones,
+    // NULL sorting last.
+    for (const auto& [name, parent] : {std::pair{"one_row", 5}, std::pair{"no_row", 100}}) {
+      r.push_back({.name = std::format("value_of_at_most_{}_is_its_min", name),
+                   .features = SetWith(value, kMin, kOrderBy, kLimit),
+                   .probes = {Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT "
+                                            "zn_id FROM zones WHERE zn_parent = {} ORDER BY zn_id "
+                                            "LIMIT 1)",
+                                            parent)),
+                              Q(std::format("SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT "
+                                            "MIN(zn_id) FROM zones WHERE zn_parent = {})",
+                                            parent))},
+                   .check = AllEqual()});
+    }
+    // A BETWEEN with subquery bounds is its two comparisons, a subquery each.
+    r.push_back(
+        {.name = "between_subquery_bounds_are_two_comparisons",
+         .features = SetWith(value, kBetween, kWhereAnd, kMin, kOrderBy, kLimit),
+         .probes = {Q("SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN (SELECT MIN(zn_id) "
+                      "FROM zones WHERE zn_city = 2) AND (SELECT zn_id FROM zones WHERE "
+                      "zn_city = 2 ORDER BY zn_id DESC LIMIT 1)"),
+                    Q("SELECT COUNT(*) FROM trips WHERE tr_pickup >= (SELECT MIN(zn_id) "
+                      "FROM zones WHERE zn_city = 2) AND tr_pickup <= (SELECT zn_id FROM "
+                      "zones WHERE zn_city = 2 ORDER BY zn_id DESC LIMIT 1)")},
+         .check = AllEqual()});
+    // EXISTS and NOT EXISTS partition the rows, the one true for all and the other for none, and
+    // EXISTS is `0 < COUNT(*)` of its block: over a block with a row (some zone groups hold more
+    // than 7 zones) and one without (none holds 100).
+    for (const auto& [name, count] : {std::pair{"rows", 7}, std::pair{"no_row", 100}}) {
+      const std::string block =
+          std::format("SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) > {}", count);
+      r.push_back(
+          {.name = std::format("exists_and_not_exists_partition_over_{}", name),
+           .features = SetWith(value, kColumns, kGroupBy, kHaving),
+           .probes = {Q("SELECT COUNT(*) FROM cities"),
+                      Q(std::format("SELECT COUNT(*) FROM cities WHERE EXISTS ({})", block)),
+                      Q(std::format("SELECT COUNT(*) FROM cities WHERE NOT EXISTS ({})", block))},
+           .check = FirstEqualsSumOfRest()});
+      r.push_back(
+          {.name = std::format("exists_is_a_positive_count_over_{}", name),
+           .features = SetWith(value, kColumns, kGroupBy, kHaving, kDerivedTable, kTableAlias,
+                               kLiteralFirst),
+           .probes = {Q(std::format("SELECT COUNT(*) FROM cities WHERE EXISTS ({})", block)),
+                      Q(std::format("SELECT COUNT(*) FROM cities WHERE 0 < (SELECT "
+                                    "COUNT(*) FROM ({}) AS g)",
+                                    block))},
+           .check = AllEqual()});
+    }
+    // The single value and the EXISTS count are the same at any batch size, a part's rows and its
+    // first value merged in part order.
+    for (const auto& [name, sql] :
+         {std::pair{"single_value",
+                    "SELECT COUNT(*) FROM trips WHERE tr_fare > (SELECT tr_fare FROM trips ORDER "
+                    "BY tr_fare DESC LIMIT 1 OFFSET 100)"},
+          std::pair{"exists",
+                    "SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT tr_rider FROM trips GROUP BY "
+                    "tr_rider HAVING COUNT(*) > 30)"}}) {
+      r.push_back({.name = std::format("{}_batch_size_invariance", name),
+                   .features = SetWith(value, kDecimalColumns, kColumns, kOrderBy, kLimit, kOffset,
+                                       kGroupBy, kHaving),
+                   .probes = {Q(sql, 1), Q(sql, 7), Q(sql)},
+                   .check = AllEqual()});
+    }
+    // The self-check of ADR 0041's decision 28, which needs no DuckDB: a correlated subquery's
+    // rows are those of the uncorrelated subquery with each binding of the outer table written as
+    // a literal, one query per binding (cities holds the ids 1 to 6, none NULL).
+    const auto per_binding = [](std::string_view correlated, std::string_view literal) {
+      std::vector<Probe> probes = {Q(std::string(correlated))};
+      for (int id = 1; id <= 6; ++id) {
+        probes.push_back(Q(std::vformat(literal, std::make_format_args(id, id))));
+      }
+      return probes;
+    };
+    r.push_back(
+        {.name = "correlated_exists_is_its_bindings_as_literals",
+         .features = SetWith(value, kColumns, kQualifiedName, kWhereAnd, kCorrelatedExists),
+         .probes = per_binding(
+             "SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM zones WHERE zones.zn_city = "
+             "cities.ct_id AND zones.zn_id > 20)",
+             "SELECT ct_id FROM cities WHERE ct_id = {} AND EXISTS (SELECT * FROM zones WHERE "
+             "zones.zn_city = {} AND zones.zn_id > 20)"),
+         .check = FirstIsUnionOfRest()});
+    r.push_back(
+        {.name = "correlated_not_exists_is_its_bindings_as_literals",
+         .features = SetWith(value, kColumns, kQualifiedName, kWhereAnd, kCorrelatedExists),
+         .probes = per_binding(
+             "SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT * FROM zones WHERE zones.zn_city = "
+             "cities.ct_id AND zones.zn_id > 20)",
+             "SELECT ct_id FROM cities WHERE ct_id = {} AND NOT EXISTS (SELECT * FROM zones WHERE "
+             "zones.zn_city = {} AND zones.zn_id > 20)"),
+         .check = FirstIsUnionOfRest()});
+    r.push_back(
+        {.name = "correlated_aggregate_is_its_bindings_as_literals",
+         .features = SetWith(value, kColumns, kQualifiedName, kWhereAnd, kCorrelatedAggregate, kSum,
+                             kArithmetic),
+         .probes = per_binding(
+             "SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zones.zn_id) * 300 FROM zones "
+             "WHERE zones.zn_city = cities.ct_id)",
+             "SELECT ct_id FROM cities WHERE ct_id = {} AND ct_pop > (SELECT SUM(zones.zn_id) * "
+             "300 FROM zones WHERE zones.zn_city = {})"),
+         .check = FirstIsUnionOfRest()});
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

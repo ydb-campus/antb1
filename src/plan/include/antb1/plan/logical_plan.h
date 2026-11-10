@@ -100,10 +100,15 @@ enum class AggKind : std::uint8_t {
   kStddevPop,
   kVarSamp,
   kVarPop,
+  // The value of an uncorrelated scalar subquery of any shape (ADR 0041's decision 4), which no
+  // query can write either: the binder wraps the subquery's plan in it. Over no row it is NULL,
+  // over one row that row's value, and over two rows or more it fails with DuckDB's error. It is
+  // the one aggregate that counts NULL values as rows; it is never grouped.
+  kSingleValue,
 };
 
 // "COUNT", "SUM", "AVG", "MIN", "MAX" (COUNT for COUNT(*), COUNT(col) and COUNT(DISTINCT col)),
-// "STDDEV_SAMP", "STDDEV_POP", "VAR_SAMP", "VAR_POP".
+// "STDDEV_SAMP", "STDDEV_POP", "VAR_SAMP", "VAR_POP", "SINGLE_VALUE".
 std::string_view ToString(AggKind kind);
 
 // A constant of a column's logical type, folded exactly from a SQL literal by the binder.

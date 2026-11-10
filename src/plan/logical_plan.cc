@@ -491,6 +491,8 @@ std::string_view ToString(AggKind kind) {
       return "VAR_SAMP";
     case AggKind::kVarPop:
       return "VAR_POP";
+    case AggKind::kSingleValue:
+      return "SINGLE_VALUE";
   }
   return "?";
 }

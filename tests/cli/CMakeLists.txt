@@ -546,6 +546,67 @@ antb1_add_cli_golden(
     --table
     "drivers=${_f}/star/drivers.parquet"
 )
+# A scalar subquery of any other shape (ADR 0041's SQ4a): its single value, an aggregate over the
+# subquery's plan under the same one-row join -- NULL over no row, the row's over one, and over two
+# or more DuckDB's error, which the query below reports at exit code 1.
+antb1_add_cli_golden(
+  explain_scalar_subquery_single_value
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones ORDER BY zn_radius DESC LIMIT 1)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+antb1_add_cli_golden(
+  error_scalar_subquery_rows
+  EXIT_CODE 1
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup = (SELECT zn_id FROM zones)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# An uncorrelated EXISTS: COUNT(*) over LIMIT 1 of its block, its select list dropped, under the
+# one-row join, compared with 1 (NOT EXISTS: 0); in HAVING above the aggregation.
+antb1_add_cli_golden(
+  explain_exists_uncorrelated_having
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING NOT EXISTS (SELECT tr_rider FROM trips WHERE tr_fare > 1000)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# A BETWEEN whose bound is a subquery: its two comparisons, the subquery's above its one-row join
+# and the other one pushed into the scan.
+antb1_add_cli_golden(
+  explain_between_subquery_bound
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN 3 AND (SELECT zn_id FROM zones ORDER BY zn_id DESC LIMIT 1)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):

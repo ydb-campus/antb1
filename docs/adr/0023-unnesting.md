@@ -315,7 +315,8 @@ errors, as in ADR 0022:
 - a correlated EXISTS or NOT EXISTS without a key, and a correlated scalar subquery with an outer column that has no
   inner equivalent.
 
-The rest of ADR 0022's list stands, the uncorrelated EXISTS included. The physical planner rejects a `DependentJoin`
+The rest of ADR 0022's list stands, the uncorrelated EXISTS included (update 2026-11-10: ADR 0041's SQ4a answers it).
+The physical planner rejects a `DependentJoin`
 with `kUnsupported` too, never with `NotImplemented`: its visitor must handle every node, and plans that tests build by
 hand reach it without Optimize, as ADR 0022's join kinds do before E2.
 
@@ -590,7 +591,11 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
     - correlated IN and NOT IN: SQ8 as conjuncts, SQ12 under OR, NOT or CASE;
     - correlated COUNT, and CASE or COALESCE over aggregates: SQ6 and SQ5;
     - per-binding top-N: SQ14, after phase 9's windows;
-    - the uncorrelated EXISTS: SQ4a;
+    - the uncorrelated EXISTS: SQ4a, built (2026-11-10). A correlated EXISTS keeps this ADR's refusals and their
+      messages, which no longer come from the static check of its shape: a gate refuses its block at the EXISTS when
+      the block is bound, before any clause of it binds, so the enclosing block's select list (and, for a HAVING
+      EXISTS, its grouping) binds first and its bind errors come first, as DuckDB, which answers the EXISTS, reports
+      them (ADR 0041's SQ4a update);
     - IS NOT DISTINCT FROM keys: built with OJ5b (its update above).
 
 ## Alternatives considered

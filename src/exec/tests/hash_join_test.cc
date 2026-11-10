@@ -44,6 +44,7 @@
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/sql_status.h"
 #include "antb1/plan/table.h"
 
 #include "../gather.h"
@@ -2410,10 +2411,11 @@ TEST_F(HashJoinTest, OneRowJoinAppendsAnAggregateOverEmptyInput) {
   }
 }
 
-// A one-row join's build of no row or of two rows is Invalid, a planner bug (SQL plans only an
-// aggregate without groups there), from Prepare: before any probe part runs or any probe input
-// opens, for a drained build input and one of parts. The build then holds nothing.
-TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
+// A one-row join's build of no row or of two rows is a bare NotImplemented, a planner bug (SQL
+// plans only an aggregate without groups there) that exits 70 as an internal error, with no
+// SqlErrorDetail, from Prepare: before any probe part runs or any probe input opens, for a drained
+// build input and one of parts. The build then holds nothing.
+TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsAnInternalError) {
   const auto schema = Int64Schema({"x", "y"});
   const auto row = [](int64_t i) -> std::optional<int64_t> { return i; };
   for (const int64_t rows : {0, 2}) {
@@ -2429,7 +2431,8 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
                                       std::make_unique<ScriptedSource>(schema, batches), {});
     auto result = RunUnion(ProbePipeline(probe_table, drained, {}), probe_table->num_parts(),
                            {drained}, ContextOf(nullptr));
-    EXPECT_TRUE(result.status().IsInvalid()) << result.status().ToString();
+    EXPECT_TRUE(result.status().IsNotImplemented()) << result.status().ToString();
+    EXPECT_EQ(plan::GetSqlError(result.status()), nullptr);
     EXPECT_TRUE(probe_table->scanned_parts().empty());
     EXPECT_EQ(drained->table(), nullptr);
     EXPECT_EQ(drained->columns(), nullptr);
@@ -2442,7 +2445,7 @@ TEST_F(HashJoinTest, OneRowBuildOfAnotherCountIsInvalid) {
     ASSERT_NE(join, nullptr);
     ExecContext ctx = ContextOf(nullptr);
     auto serial = Drain(*join, ctx);
-    EXPECT_TRUE(serial.status().IsInvalid()) << serial.status().ToString();
+    EXPECT_TRUE(serial.status().IsNotImplemented()) << serial.status().ToString();
     EXPECT_EQ(probed.opens(), 0);
     EXPECT_EQ(scanned->table(), nullptr);
     EXPECT_EQ(scanned->columns(), nullptr);

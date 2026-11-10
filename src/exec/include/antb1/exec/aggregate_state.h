@@ -27,8 +27,12 @@
 //   MIN/MAX(c) Arrow's min_max over the selected values (VARCHAR byte-wise, DATE chronologically);
 //              NaN is ignored, in every batch split: NaN only when every value is NaN. The
 //              column's type, NULL over no values
+//   SINGLE_VALUE(c)  an uncorrelated scalar subquery's value (ADR 0041's decision 4): NULL over no
+//              rows, the row's value over one, and DuckDB's ExecutionError over two or more,
+//              raised at Finalize. The column's type
 //
-// NULL values are skipped. Arrow's integer "sum" kernel is never used: it wraps at 64 bits.
+// NULL values are skipped, except by SINGLE_VALUE, which counts a NULL value as a row. Arrow's
+// integer "sum" kernel is never used: it wraps at 64 bits.
 
 namespace antb1::exec {
 
