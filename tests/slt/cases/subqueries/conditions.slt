@@ -1325,6 +1325,115 @@ SMALLINT
 statement error More than one row returned by a subquery used as an expression
 SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT zn_city FROM zones WHERE zn_id < 3)) ORDER BY ct_id
 
+# ---- a correlated comparison with a value on its other side, and a value as a correlated block's key ----
+
+# A correlated aggregate compared with an expression over a value, in WHERE and in an inner ON, and with a CASE over an
+# EXISTS: the value's join stands below Path 2's join.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_pop / 1000 + (SELECT COUNT(*) FROM cities) > (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+query I rowsort
+SELECT COUNT(*) FROM cities JOIN days ON dy_week = ct_id AND ct_pop + (SELECT MIN(md_id) - 1 FROM models) > (SELECT SUM(zn_id) * 500 FROM zones WHERE zn_city = ct_id)
+----
+BIGINT
+7
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM promos) THEN 0 ELSE ct_pop END > (SELECT SUM(zn_id) * 500 FROM zones WHERE zn_city = ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+# A correlated aggregate compared directly with a value, in either order and in an inner ON; with a value bound before
+# in WHERE (one join), a value of no row (NULL: no row passes), a value of two rows (the row error), and the same
+# correlated subquery on both sides (one join, its column on both).
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) < (SELECT COUNT(*) * 6 FROM cities) ORDER BY 1
+----
+SMALLINT
+3
+4
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) * 6 FROM cities) > (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+3
+4
+
+query I rowsort
+SELECT COUNT(*) FROM cities c JOIN drivers d ON d.dv_city = c.ct_id AND (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) < (SELECT COUNT(*) * 6 FROM cities)
+----
+BIGINT
+44
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_id > (SELECT MIN(zn_city) FROM zones) AND (SELECT MAX(zn_id) FROM zones z WHERE z.zn_city = c.ct_id) > (SELECT MIN(zn_city) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) < (SELECT ct_id FROM cities WHERE ct_id > 100) ORDER BY ct_id
+----
+SMALLINT
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) < (SELECT zn_city FROM zones) ORDER BY ct_id
+
+query I nosort
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) = (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+# A value equal to the outer column keys the correlated block: Path 2's inner equivalent (SUM, AVG, a value of a NULL
+# row, which binds no city), and Path 1's semi and anti key.
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop / 100 > (SELECT AVG(zn_id) FROM zones z WHERE (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+5
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT zn_city FROM zones WHERE zn_id = 38) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
 # ---- nesting, and UNION ALL ----
 
 # A value inside another subquery's WHERE; with a value of no row there, the inner MAX is NULL and no city passes.
@@ -1953,6 +2062,43 @@ BIGINT
 statement error Overflow in addition of
 SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR strlen(concat(u, 'x')) > 0
 
+# ---- divergence D16: an IN list that holds a value is the OR of its equalities ----
+
+# antb1 computes a later element of such a list only for the rows the earlier ones leave undecided; DuckDB computes
+# every element of an IN list for every row that reaches it. Here every row matches the first element, so the
+# overflowing second one fails in DuckDB alone, in IN and NOT IN. Written as that OR, both answer; with the failing
+# element first, both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+----
+SMALLINT
+1
+
+onlyif duckdb
+statement error Overflow in multiplication of
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id NOT IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id NOT IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000)
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 AND (ct_id = 1 OR ct_id = (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+----
+SMALLINT
+1
+
+statement error Overflow in multiplication of
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN ((SELECT MAX(zn_id) FROM zones) * 1000000000, 1) ORDER BY ct_id
+
 # ---- divergence D35: one join for a subquery written twice, at its first occurrence ----
 
 # A subquery written again reads the join of its first occurrence (ADR 0041's decision 10), as a direct operand of a
@@ -2248,6 +2394,34 @@ SMALLINT
 4
 5
 6
+
+# Two correlated aggregates compared: one dependent join each.
+pending SQ5
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) > (SELECT MIN(d.dv_city) * 10 FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
+
+# A value keys a correlated block as an inner equivalent only where it is the outer column's type: an INTEGER value
+# against the SMALLINT ct_id, and an expression over a value, have none.
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_id) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) + 0 = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
 
 # ---- DuckDB only until subqueries in a LEFT JOIN's ON get a PR (ADR 0041's decision 3: DuckDB coverage) ----
 

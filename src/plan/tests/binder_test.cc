@@ -303,8 +303,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
                   "LIKE is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
@@ -396,11 +396,11 @@ INSTANTIATE_TEST_SUITE_P(
         // The same in an IN list: a constant that does not fold stays unsupported, an overflow
         // is the comparison's bind error (D17) and a HUGEINT past 38 digits is unsupported.
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 1 // 1)", kUnsupported, "1 // 1",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 NOT IN (2 * 1.5, 1)", kUnsupported, "2 * 1.5",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 2147483647 + 1)", kBind, "2147483647 + 1",
                   "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT i32 FROM t WHERE h IN (99999999999999999999999999999999999999 + 1)",
@@ -707,8 +707,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
                   "CAST(i16 AS VARCHAR)", "CAST of SMALLINT values to VARCHAR is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "2::INT",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported,
                   "'x%'::VARCHAR", "LIKE with a column or an aggregate as the pattern"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kBind, "i16",
@@ -838,8 +838,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         // A call with the wrong number of arguments stays a bind error whatever its arguments
         // (CheckSupported does not look into them, and the binder reports the arity before it
         // binds one).
@@ -1285,7 +1285,24 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
                   "t.i64 IN (SELECT ok.i16 FROM ok))",
                   kUnsupported, "IN",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
+                  "an IN subquery whose probe reads a column of an enclosing query block"},
+        // A correlated subquery in a conjunct that reads the enclosing block itself (decision 8
+        // answers an uncorrelated value there), two correlated subqueries compared (SQ5), and a
+        // correlated value inside a FULL JOIN's left input, each named for what refuses it.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 > "
+                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
+                  kUnsupported, "(",
+                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
+                  "query block is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < "
+                  "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)",
+                  kUnsupported, "(",
+                  "a comparison of two correlated scalar subqueries is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND u.i32 > (SELECT MIN(dec.i) FROM "
+                  "dec WHERE dec.i = u.i32) + 1 FULL JOIN ok ON u.i16 = ok.i16",
+                  kUnsupported, "(",
+                  "a correlated subquery in the ON of a join inside a FULL JOIN's left input is "
+                  "not supported"},
         // A name this block has twice keeps its own bind error: an enclosing block that happens to
         // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
         // binds, make it read the outer column).
@@ -1337,8 +1354,8 @@ INSTANTIATE_TEST_SUITE_P(
         // typed as DuckDB types the list, all its values in one type.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT COUNT(*) FROM u), i16)", kUnsupported,
                   "i16",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i16 FROM t WHERE i64 IN (1.5e0, (SELECT MIN(i64) FROM u))", kUnsupported,
                   "IN", "IN of a DOUBLE value and a BIGINT"},
         // Under an OR, which is no top-level conjunct: or_factoring flattens AND only, so the
@@ -6861,6 +6878,19 @@ TEST(BinderTest, ValuePlacements) {
            // One subquery written twice, in one slot: one join.
            "SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) OR i16 < (SELECT MIN(i16) FROM "
            "u)",
+           // A correlated comparison whose other side holds a value, or is one, in either order:
+           // the value's join stands below Path 2's.
+           "SELECT i16 FROM t WHERE i32 + (SELECT COUNT(*) FROM ok) > (SELECT MIN(u.i16) FROM u "
+           "WHERE u.i64 = t.i64)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < (SELECT "
+           "COUNT(*) FROM ok)",
+           "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM ok) > (SELECT MIN(u.i16) FROM u WHERE "
+           "u.i64 = t.i64)",
+           // A value that keys a correlated block: Path 1's semi key, Path 2's inner equivalent.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (SELECT MIN(ok.i16) FROM ok) = "
+           "t.i16)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) FROM u WHERE (SELECT MIN(ok.i16) FROM "
+           "ok) = t.i16)",
        }) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
@@ -6921,6 +6951,19 @@ TEST(BinderTest, ASubqueryIsBoundOncePerSlot) {
       "            Scan table=t source=fake columns=[i16, i32, i64]\n"
       "          Aggregate MIN(i16)\n"
       "            Scan table=ok source=fake columns=[i16]\n");
+  // IS DISTINCT FROM's lowering, which a constant side makes (x <> 5 OR x IS NULL), and a
+  // comparison whose constant moves across the value both read the one join.
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IS DISTINCT FROM 5 AND "
+                      "(SELECT MIN(i16) FROM u) + 1 > 5"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"min(i16)\" > 4\n"
+            "    Filter \"((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\"\n"
+            "      Compute ((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
   // Top-level comparisons and EXISTS conjuncts written alike read one join each, too.
   EXPECT_EQ(
       optimized("SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) AND i16 < (SELECT "
