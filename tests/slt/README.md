@@ -303,6 +303,10 @@ where the files' statistics show that neither the value nor the probe can overfl
 from its own stream, so they keep every rule above: no generated query meets the row error or an error the order of
 evaluation could hide (divergences D16 and D35).
 
+`HAVING` takes them as well (ADR 0041's SQ1b, feature `having_value`): where a `HAVING` was written, the query holds no
+other subquery and a `GROUP BY` key can be a probe, 70% of the time one more `AND` conjunct holds the same forms over
+that key, from a stream of its own, so a query without one is the query its seed gave before.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

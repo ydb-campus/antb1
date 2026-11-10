@@ -796,6 +796,36 @@ completes, and the ratchet stays at 78.
   `condition_value` writes values inside WHERE conditions from a stream of its own, over SQ4a's blocks; the
   metamorphic relations include the self-check for decision 8's residual.
 
+## Update (2026-11-10, SQ1b): values in HAVING conditions and decision 23's row, built
+
+SQ1's second PR. With it SQ1 is built; no query completes, and no TPC-H or TPC-DS plan changes.
+
+- **Decision 8 in HAVING.** An uncorrelated scalar subquery is a value anywhere in a HAVING condition, and an
+  uncorrelated EXISTS a condition there, as SQ1a made them in WHERE. HAVING's slot (decision 9) stands above the
+  aggregation and the filter of HAVING's conjuncts without one, below the select list's computed columns: a conjunct
+  that holds a value is a filter of the slot after its value's join, computing what it reads over the groups there.
+  SQ4a's scalar and EXISTS forms in HAVING read the memo too, so a subquery written twice in HAVING is one join; an IN
+  keeps its semi or anti join in the slot; a BETWEEN that holds a value is its two comparisons, as in WHERE. A
+  subquery in WHERE and the same text in HAVING are two values, one per slot.
+- **No per-row join for a HAVING operand.** The binder's speculative binding of a HAVING operand as a GROUP BY key
+  skips one that holds a value, which would plant its join per row, below the aggregation; an aggregate's computed
+  argument in such a conjunct stays below the aggregation.
+- **Decision 23's SQ1 row, as built.** The parser admits an aggregate in a WHERE or ON inside a subquery only where some
+  subquery expression around it stands in HAVING (a derived table's or a CTE's query starts afresh); elsewhere its
+  parse error stays, exit 1 as DuckDB's bind error. The binder judges such an aggregate by the block it belongs to, the
+  nearest whose columns its argument reads, each block noting whether it binds a WHERE or ON condition while a
+  subquery's block in it binds. An enclosing block's whose subquery stands in its HAVING is exit 4 until SQ13; any
+  other -- of the subquery's own columns, of no column, a mix, or one owned through a WHERE or ON -- is a bind error,
+  "WHERE clause cannot contain aggregates!" (DuckDB's text depends on where the subquery stands). A constant argument
+  (`SUM(1)`) keeps the gate's refusal, exit 4, where DuckDB raises a bind error of its own; the parser refuses an
+  aggregate anywhere inside a derived table or a CTE body within such a subquery (exit 4), which DuckDB may answer.
+  The row's select-list half moves to SQ2, as the SQ1 plan put it: under a subquery in the select list or ORDER BY the
+  parse error stays, where DuckDB answers an outer aggregate.
+- **Decision 28.** `tests/slt/cases/subqueries/having_conditions.slt` holds about 200 records of HAVING values, each
+  Unsupported before and checked against DuckDB, and decision 23's row, its outer aggregates pending SQ13; the
+  generator's Feature `having_value` adds a HAVING conjunct with a value from a stream of its own; three metamorphic
+  relations cover HAVING values.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

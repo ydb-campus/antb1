@@ -117,7 +117,8 @@ bool HasSubquery(const GeneratedQuery& q) {
   return q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery) ||
          q.features.Has(Feature::kCorrelatedExists) ||
          q.features.Has(Feature::kCorrelatedAggregate) ||
-         q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue);
+         q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
+         q.features.Has(Feature::kHavingValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -3164,6 +3165,59 @@ TEST(QueryGenerator, ConditionValuesAreAtMostOneRowAndReadOnlyTheirTable) {
   EXPECT_GT(pairs, 200) << "IN lists, BETWEEN and two values compared";
   EXPECT_GT(compared, 50) << "two values compared";
   EXPECT_GT(case_exists, 50) << "a CASE over an EXISTS";
+}
+
+// A value inside a HAVING condition (ADR 0041's SQ1b) draws from a stream of its own and fires only
+// where the query holds no other subquery, so declaring it changes the queries that take one and no
+// others; each is one more HAVING conjunct over a GROUP BY key, whose value blocks return at most
+// one row and read only their own table.
+TEST(QueryGenerator, HavingValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 79, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 79,
+      {.supported = kSupportedFeatures.Minus({Feature::kHavingValue}), .target_percent = 0});
+  const std::vector<GenTable> tables = JoinTables();
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kHavingValue)) << plain.sql;
+    if (!q.features.Has(Feature::kHavingValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_TRUE(q.features.Has(Feature::kHaving));
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue}) {
+      EXPECT_FALSE(q.features.Has(other));
+    }
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_FALSE(parsed->having.empty());
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_FALSE(all.empty());
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_NE(sub->kind, sql::SubqueryExpr::Kind::kIn) << "an IN subquery is SQ7's";
+      CheckOwnColumns(*sub->query, tables);
+      if (sub->kind == sql::SubqueryExpr::Kind::kScalar) {
+        EXPECT_TRUE(AtMostOneRow(*sub->query)) << "a value block of at most one row";
+      }
+    }
+    // Every subquery is in HAVING: the query's WHERE holds none.
+    for (const sql::Expr& e : parsed->where) {
+      EXPECT_FALSE(sql::ToSql(e).contains("SELECT")) << "no subquery in WHERE";
+    }
+  }
+  EXPECT_GT(took, 50) << "values in HAVING: " << took;
+  EXPECT_GT(same, 6000);
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

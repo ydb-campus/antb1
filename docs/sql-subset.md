@@ -61,10 +61,10 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   an expression, `x [NOT] IN (query)` and `NOT (x IN (query))` are answered as a top-level `AND` conjunct of `WHERE`,
   of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or an expression over one; in `HAVING`,
   an aggregate too) and the query has exactly one column; an `IN` key needs a type that holds both sides (so no
-  `DOUBLE`). A scalar subquery that reads no enclosing block is a value anywhere inside a condition of `WHERE` or of
-  an inner join's `ON` (one inside a `FULL JOIN`'s left input too): under `AND`, `OR`, `NOT` and `CASE`, in
-  arithmetic, functions, `COALESCE` and casts, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, an `IN` list, `LIKE`'s
-  operand and `BETWEEN`; in `HAVING`, as a direct operand of a top-level comparison or a `BETWEEN`'s bound. Its query
+  `DOUBLE`). A scalar subquery that reads no enclosing block is a value anywhere inside a condition of `WHERE`, of an
+  inner join's `ON` (one inside a `FULL JOIN`'s left input too) or of `HAVING`: under `AND`, `OR`, `NOT` and `CASE`,
+  in arithmetic (over aggregates and `GROUP BY` keys in `HAVING`), functions, `COALESCE` and casts, `IS [NOT] NULL`,
+  `IS [NOT] DISTINCT FROM`, an `IN` list, `LIKE`'s operand and `BETWEEN`. Its query
   may have any shape: its value is NULL over no row, the row's over one, and over two or more the query fails with
   DuckDB's error (exit code 1). A correlated one must be a direct operand of a top-level comparison of `WHERE` or of
   an inner `ON`, and an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of which could
@@ -72,9 +72,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   under `OR`, `NOT` or `CASE`, and a value in an `IN` subquery's probe (`x + (query) IN (query)`, ADR 0041's SQ7)
   among them; a subquery column count other than one is a bind error, as in DuckDB. `EXISTS (query)` that reads no
   enclosing block is a condition anywhere
-  inside a condition of `WHERE` or of an inner `ON` (under `AND`, `OR`, `NOT` and `CASE WHEN`) and a top-level
-  conjunct of `HAVING`; a correlated one is answered as a top-level conjunct of `WHERE` or of an inner `ON`, and
-  nowhere else; `TRY_CAST`, a
+  inside a condition of `WHERE`, of an inner `ON` or of `HAVING` (under `AND`, `OR`, `NOT` and `CASE WHEN`); a
+  correlated one is answered as a top-level conjunct of `WHERE` or of an inner `ON`, and nowhere else; `TRY_CAST`, a
   lateral reference, more than 256
   relations counting every sub-plan and every subquery: exit code 4 as well. A query in parentheses that starts with neither
   `SELECT` nor `WITH` is refused at its first token: in an expression `(FROM t)` and `(TABLE t)` are, since those
@@ -446,7 +445,15 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   turns out empty, the order of these joins decides which builds run and which errors are reported (divergence D35).
   An `IN` query may have its
   own `GROUP BY` and `HAVING`, and nothing is pulled out of it; an aggregate inside any subquery does not make the outer
-  block an aggregate query. A column count other than one is a bind error. A **correlated** subquery -- one that reads a
+  block an aggregate query. An aggregate in a subquery's `WHERE` or `ON` is a parse error (exit code 1) unless a
+  subquery around it stands in `HAVING`; there it belongs to the nearest block whose columns its argument reads (ADR
+  0041's decision 23). One of an enclosing block whose subquery stands in that block's `HAVING` is an outer aggregate,
+  exit code 4 until ADR 0041's SQ13 answers it, as DuckDB does; any other -- of the subquery's own columns, of no
+  column, a mix, or owned through a `WHERE` or `ON` -- is a bind error, `WHERE clause cannot contain aggregates!`
+  (DuckDB's text depends on where the subquery stands). Anywhere inside a derived table or a CTE body within such a
+  subquery it is exit code 4; under a subquery in the select list or `ORDER BY` the parse error stays where DuckDB
+  answers an outer aggregate (SQ2). A column count other than one is a bind error. A **correlated** subquery -- one
+  that reads a
   column of the block enclosing it -- is answered where it is a top-level `WHERE` conjunct: the binder plans it as a
   dependent join, which the optimizer's unnesting pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)).
   `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through (or on an `IS NOT
@@ -1640,10 +1647,10 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; an aggregate in a subquery's `WHERE` that belongs to the subquery's own block (`WHERE clause cannot contain aggregates!`), and one under a subquery in the select list or `ORDER BY`; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
-| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)` outside a top-level `AND` conjunct; `EXISTS (SELECT ...)` and `(SELECT ...)` outside a condition of `WHERE` or of an inner `ON` (in `HAVING`, anything but a top-level `EXISTS` or a direct operand of a top-level comparison or a `BETWEEN` bound); a correlated `(SELECT ...)` other than a direct operand of a top-level comparison, and a correlated `EXISTS` other than a top-level conjunct; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
+| 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)` outside a top-level `AND` conjunct; `EXISTS (SELECT ...)` and `(SELECT ...)` outside a condition of `WHERE`, of an inner `ON` or of `HAVING`; a correlated `(SELECT ...)` other than a direct operand of a top-level comparison, and a correlated `EXISTS` other than a top-level conjunct; an aggregate of an enclosing block's columns inside a subquery in that block's `HAVING`; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context; a one-row join whose right input is not one row |
 
 Exit code 4 is used only for errors that the parser, the binder or the physical planner marks as unsupported

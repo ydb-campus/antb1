@@ -149,6 +149,8 @@ enum class Feature : std::uint8_t {
   // list or of a BETWEEN, or compared with another; and [NOT] EXISTS under OR or in a CASE. Its
   // blocks record their features as kUncorrelatedValue's do.
   kConditionValue,  // x = 1 OR x > (SELECT ...), x IN ((SELECT ...), (SELECT ...))
+  // The same forms in HAVING (ADR 0041's SQ1b), over a GROUP BY key, as one more AND conjunct.
+  kHavingValue,  // HAVING k = 1 OR k > (SELECT ...)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -321,6 +323,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "uncorrelated_value";
     case Feature::kConditionValue:
       return "condition_value";
+    case Feature::kHavingValue:
+      return "having_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -482,6 +486,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedAggregate,
     Feature::kUncorrelatedValue,
     Feature::kConditionValue,
+    Feature::kHavingValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,
