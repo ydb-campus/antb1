@@ -226,10 +226,9 @@ wrong answers, not divergences: antb1 answers them right, or refuses them (exit 
   record of `tests/slt/cases/subqueries/scalar.slt` has that shape.
 - **`x * -1 > -2147483648`** over an INTEGER `x` is false on every row in DuckDB; it holds for every `x` whose product
   does not overflow.
-- **An aggregate of an enclosing block's columns mixed with the subquery's own**, in a subquery's `WHERE` that stands
-  in the select list (`SELECT (SELECT COUNT(*) FROM u WHERE u.x < SUM(t.a + u.k)) FROM t`): DuckDB fails with an
-  internal error (`unordered_map::at: key not found`), so no record writes it; in a subquery in `WHERE` or `HAVING`
-  both engines fail with exit code 1 (ADR 0041's decision 23).
+- **An aggregate of an enclosing block's columns mixed with the subquery's own**, in the `WHERE` of a subquery that
+  stands in the select list or in `HAVING` (`SELECT (SELECT COUNT(*) FROM u WHERE u.x < SUM(t.a + u.k)) FROM t`):
+  DuckDB fails with an internal error (`unordered_map::at: key not found`), so no record writes it.
 - **`d / -0.0` next to `d / 0.0` in one select list**, the DOUBLE -0.0 and 0.0 (`d / -(0)::DOUBLE` and
   `d / CAST(-(0) AS DOUBLE)`): DuckDB's elimination of common subexpressions computes them once, as one expression, so
   the second column repeats the first (with `SET disabled_optimizers = 'common_subexpressions'` it answers right);

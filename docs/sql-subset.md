@@ -449,8 +449,11 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   subquery around it stands in `HAVING`; there it belongs to the nearest block whose columns its argument reads (ADR
   0041's decision 23). One of an enclosing block whose subquery stands in that block's `HAVING` is an outer aggregate,
   exit code 4 until ADR 0041's SQ13 answers it, as DuckDB does; any other -- of the subquery's own columns, of no
-  column, a mix, or owned through a `WHERE` or `ON` -- is DuckDB's bind error, `WHERE clause cannot contain
-  aggregates!`. A column count other than one is a bind error. A **correlated** subquery -- one that reads a
+  column, a mix, or owned through a `WHERE` or `ON` -- is a bind error, `WHERE clause cannot contain aggregates!`
+  (DuckDB's text depends on where the subquery stands). In a derived table's or a CTE's `WHERE` or `ON` inside such a
+  subquery it is exit code 4; under a subquery in the select list or `ORDER BY` the parse error stays where DuckDB
+  answers an outer aggregate (SQ2). A column count other than one is a bind error. A **correlated** subquery -- one
+  that reads a
   column of the block enclosing it -- is answered where it is a top-level `WHERE` conjunct: the binder plans it as a
   dependent join, which the optimizer's unnesting pass turns into ordinary joins ([ADR 0023](adr/0023-unnesting.md)).
   `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through (or on an `IS NOT
@@ -1644,7 +1647,7 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; an aggregate in a subquery's `WHERE` that belongs to the subquery's own block (`WHERE clause cannot contain aggregates!`); a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; an aggregate in a subquery's `WHERE` that belongs to the subquery's own block (`WHERE clause cannot contain aggregates!`), and one under a subquery in the select list or `ORDER BY`; a query that needs more memory than `--memory-limit` |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
 | 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
 | 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)` outside a top-level `AND` conjunct; `EXISTS (SELECT ...)` and `(SELECT ...)` outside a condition of `WHERE`, of an inner `ON` or of `HAVING`; a correlated `(SELECT ...)` other than a direct operand of a top-level comparison, and a correlated `EXISTS` other than a top-level conjunct; an aggregate of an enclosing block's columns inside a subquery in that block's `HAVING`; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |

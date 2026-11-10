@@ -1723,36 +1723,22 @@ std::optional<Rejection> RejectCompoundSubquery(const SubqueryConjunct& form) {
 //
 // The IN form's probe is checked exactly as the left-hand side of an IN list is -- a construct that
 // is unsupported anywhere comes first, a nested subquery among them, then its kind -- so
-// `x IN (query)` and `x IN (1, 2)` take the same left-hand sides. The scalar form's other side is
-// checked as the other side of any comparison is, so a column, an aggregate in HAVING, a literal
-// and a constant integer expression all stand. Its query may have any shape (ADR 0041's decision
-// 4): an uncorrelated one is wrapped in the single value, which is NULL over no row and fails over
-// two; a correlated one must still be an aggregate over every row, and EXISTS of either kind is
-// checked where its block binds. A set operation as the query: answered for a scalar and an
-// EXISTS (decision 7), refused for IN until SQ7 (RejectCompoundSubquery).
+// `x IN (query)` and `x IN (1, 2)` take the same left-hand sides; an aggregate counts as reading a
+// column, in a WHERE too, where the parser admits one only inside a subquery in HAVING and the
+// binder judges it (ADR 0041's decision 23). A set operation as the query is refused until SQ7
+// (RejectCompoundSubquery). CheckConjunct passes IN forms alone: a scalar or EXISTS form is a
+// condition with values like any other.
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
-  if (form.exists()) {
-    return std::nullopt;  // the conjunct is the subquery itself: there is no other side to check
-  }
+  ANTB1_CHECK(!form.scalar() && !form.exists());
   if (auto r = FirstUnsupported(*form.other)) {
     return r;
   }
-  if (!form.scalar()) {
-    if (!ReadsColumn(*form.other, having)) {
-      return Rejection{.span = form.other->span(),
-                       .message = std::format("IN needs {} on the left",
-                                              having ? "a column or an aggregate" : "a column")};
-    }
-    return RejectCompoundSubquery(form);
-  }
-  if (!ReadsColumn(*form.other, having) && !std::holds_alternative<sql::Literal>(*form.other) &&
-      !IsConstantInteger(*form.other)) {
+  if (!ReadsColumn(*form.other, /*aggregates=*/true)) {
     return Rejection{.span = form.other->span(),
-                     .message = std::format("a comparison with a subquery needs {} or a literal "
-                                            "on the other side",
+                     .message = std::format("IN needs {} on the left",
                                             having ? "a column or an aggregate" : "a column")};
   }
-  return std::nullopt;
+  return RejectCompoundSubquery(form);
 }
 
 // Whether a correlated scalar subquery's query is the one shape ADR 0023's Path 2 takes, an
@@ -3762,7 +3748,8 @@ class Binder {
   // The value of a subquery written alike in the same slot before, or nullptr.
   struct BoundValue;
   [[nodiscard]] const BoundValue* FindValue(const sql::SubqueryExpr& s, bool group) const;
-  // A WHERE or inner-ON conjunct that holds a value: a filter of its own at the end of its slot.
+  // A WHERE, inner-ON or (`group`) HAVING conjunct that holds a value: a filter of its own at the
+  // end of its slot.
   arrow::Status BindValueConjunct(const sql::Expr& conjunct, SourceSpan element,
                                   bool group = false);
   // An aggregate met while binding an input operand, which the parser admits only in a WHERE or ON

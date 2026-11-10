@@ -815,9 +815,12 @@ SQ1's second PR. With it SQ1 is built; no query completes, and no TPC-H or TPC-D
   parse error stays, exit 1 as DuckDB's bind error. The binder judges such an aggregate by the block it belongs to, the
   nearest whose columns its argument reads, each block noting whether it binds a WHERE or ON condition while a
   subquery's block in it binds. An enclosing block's whose subquery stands in its HAVING is exit 4 until SQ13; any
-  other -- of the subquery's own columns, of no column, a mix, or one owned through a WHERE or ON -- is DuckDB's bind
-  error, "WHERE clause cannot contain aggregates!". A constant argument (`SUM(1)`) keeps the gate's refusal, exit 4,
-  where DuckDB raises a bind error of its own.
+  other -- of the subquery's own columns, of no column, a mix, or one owned through a WHERE or ON -- is a bind error,
+  "WHERE clause cannot contain aggregates!" (DuckDB's text depends on where the subquery stands). A constant argument
+  (`SUM(1)`) keeps the gate's refusal, exit 4, where DuckDB raises a bind error of its own, and so does an aggregate in
+  the WHERE or ON of a derived table or a CTE inside such a subquery, which DuckDB may answer. The row's select-list
+  half moves to SQ2, as the SQ1 plan put it: under a subquery in the select list or ORDER BY the parse error stays,
+  where DuckDB answers an outer aggregate.
 - **Decision 28.** `tests/slt/cases/subqueries/having_conditions.slt` holds about 200 records of HAVING values, each
   Unsupported before and checked against DuckDB, and decision 23's row, its outer aggregates pending SQ13; the
   generator's Feature `having_value` adds a HAVING conjunct with a value from a stream of its own; three metamorphic

@@ -1030,9 +1030,12 @@ class Parser {
       return Syntax(Peek().span, "expected ( after AS in the WITH list, found " + Describe(Peek()));
     }
     // A CTE's query is no subquery expression's, whatever encloses its WITH (decision 23).
+    const bool having = std::ranges::contains(subquery_contexts_, Context::kHaving);
+    having_outside_ += having ? 1 : 0;
     std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
     auto query = ParseNestedQuery();
     subquery_contexts_ = std::move(enclosing);
+    having_outside_ -= having ? 1 : 0;
     if (!query) {
       return std::unexpected(std::move(query.error()));
     }
@@ -1976,6 +1979,14 @@ class Parser {
             if (std::ranges::contains(subquery_contexts_, Context::kHaving)) {
               break;
             }
+            // Inside a derived table or a CTE body under such a subquery, DuckDB may answer it as
+            // the enclosing block's aggregate too, which no binder path reads: unsupported.
+            if (having_outside_ > 0) {
+              return Unsupported(
+                  token.span,
+                  "an aggregate in the WHERE or ON of a derived table or a CTE inside "
+                  "a subquery in HAVING");
+            }
             return Syntax(token.span, context == Context::kOn
                                           ? "aggregate functions are not allowed in ON"
                                           : "aggregate functions are not allowed in WHERE");
@@ -2910,9 +2921,12 @@ class Parser {
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next)) ||
             StartsOtherQuery(1)) {
           // A derived table's query is no subquery expression's (decision 23).
+          const bool having = std::ranges::contains(subquery_contexts_, Context::kHaving);
+          having_outside_ += having ? 1 : 0;
           std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
           auto derived = ParseNestedQuery();
           subquery_contexts_ = std::move(enclosing);
+          having_outside_ -= having ? 1 : 0;
           if (!derived) {
             return std::unexpected(std::move(derived.error()));
           }
@@ -3644,6 +3658,8 @@ class Parser {
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
   // The clause each open subquery expression stands in, outermost first (ADR 0041's decision 23).
   std::vector<Context> subquery_contexts_;
+  // How many derived tables and CTE bodies being parsed stand inside a subquery in HAVING.
+  std::size_t having_outside_ = 0;
   bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps
   BlockEnd block_end_ = BlockEnd::kStatement;  // where the block being parsed ends
 };

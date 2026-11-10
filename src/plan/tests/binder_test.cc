@@ -1302,6 +1302,9 @@ INSTANTIATE_TEST_SUITE_P(
                   "COUNT(*)) > 3",
                   kBind, "COUNT(*)", "WHERE clause cannot contain aggregates!"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
+                  "SUM(u.i32) IN (SELECT ok.i16 FROM ok))",
+                  kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
                   "u.i32 < (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(u.i32)))",
                   kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
         // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
