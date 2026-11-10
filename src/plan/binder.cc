@@ -3759,13 +3759,13 @@ class Binder {
   template <class BindFn>
   arrow::Status JoinSubquery(const sql::Expr& conjunct, const SubqueryConjunct& form, bool having,
                              const BindFn& bind, SubqueryBlock block);
-  // A BETWEEN with a subquery bound (SubqueryBetween) as its two comparisons (ADR 0041's decision
-  // 6): DuckDB's typing of all three values, with each subquery bound standing as its block's
-  // column, then each comparison under that type, a subquery's as its join and the other as any
-  // conjunct of the clause. `conjunct` is the BETWEEN, `element` the WHERE or ON element it is in.
+  // A HAVING BETWEEN with a subquery bound (SubqueryBetween) as its two comparisons (ADR 0041's
+  // decision 6): DuckDB's typing of all three values, with each subquery bound standing as its
+  // block's column, then each comparison under that type, a subquery's as its join and the other
+  // as a conjunct of HAVING. WHERE and an inner ON split such a BETWEEN in BindRowConjunct, and
+  // SQ1b gives HAVING the same split.
   template <class BindFn>
-  arrow::Status BindSubqueryBetween(const sql::Expr& conjunct, const sql::BetweenExpr& between,
-                                    bool having, SourceSpan element, const BindFn& bind);
+  arrow::Status BindSubqueryBetween(const sql::BetweenExpr& between, const BindFn& bind);
   // The column of a subquery join's own side: a column of the tree below as is, anything else
   // computed in that join's layer directly below it.
   BoundColumn SubqueryColumn(SubqueryJoin& join, const Typed& t);
@@ -6664,29 +6664,8 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
 }
 
 template <class BindFn>
-arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
-                                          const sql::BetweenExpr& between, bool having,
-                                          SourceSpan element, const BindFn& bind) {
+arrow::Status Binder::BindSubqueryBetween(const sql::BetweenExpr& between, const BindFn& bind) {
   const std::array<const sql::Expr*, 2> bounds = {&*between.low, &*between.high};
-  const sql::SubqueryExpr* first = AsScalarSubquery(*between.low) != nullptr
-                                       ? AsScalarSubquery(*between.low)
-                                       : AsScalarSubquery(*between.high);
-  if (!having) {
-    // BindElement's placement rules of a subquery conjunct, for the BETWEEN as a whole.
-    if (ReadsOuterColumn(conjunct, visible_)) {
-      return Reject(Rejection{
-          .span = first->op_span,
-          .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
-                     "not supported"});
-    }
-    if (padded_unit_.has_value()) {
-      return Reject(Rejection{
-          .span = first->op_span,
-          .message = std::format("a subquery in the ON of a join inside a {} JOIN's left input is "
-                                 "not supported",
-                                 ToString(units_[*padded_unit_].kind))});
-    }
-  }
   // Each subquery bound's block, bound once, when the typing below first reads it: the operand
   // first, so that its errors come first, as DuckDB binds the three values.
   std::array<std::optional<SubqueryBlock>, 2> blocks;
@@ -6694,7 +6673,7 @@ arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
     if (!blocks[i].has_value()) {
       const SubqueryConjunct form{.subquery = AsScalarSubquery(*bounds[i]),
                                   .other = &*between.operand};
-      ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(form, having));
+      ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(form, /*having=*/true));
       if (block.correlated) {
         // A correlated bound keeps the refusal it had, as a scalar subquery in a condition (SQ5).
         return Reject(Rejection{.span = form.subquery->op_span,
@@ -6722,15 +6701,11 @@ arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
     const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
     if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(comparison)) {
       ARROW_ASSIGN_OR_RAISE(const SubqueryBlock* block, block_of(i));
-      ARROW_RETURN_NOT_OK(JoinSubquery(comparison, *form, having, bind, *block));
+      ARROW_RETURN_NOT_OK(JoinSubquery(comparison, *form, /*having=*/true, bind, *block));
       continue;
     }
-    if (having) {
-      ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
-      having_.push_back(std::move(predicate));
-      continue;
-    }
-    ARROW_RETURN_NOT_OK(BindConjunct(comparison, element));
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
+    having_.push_back(std::move(predicate));
   }
   return arrow::Status::OK();
 }
@@ -7687,8 +7662,7 @@ arrow::Status Binder::BindHaving() {
   };
   for (const sql::Expr* conjunct : Conjuncts(stmt_.having)) {
     if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct)) {
-      ARROW_RETURN_NOT_OK(
-          BindSubqueryBetween(*conjunct, *between, /*having=*/true, conjunct->span(), bind));
+      ARROW_RETURN_NOT_OK(BindSubqueryBetween(*between, bind));
       continue;
     }
     // A subquery conjunct of HAVING becomes a join above the aggregation, over the groups.
