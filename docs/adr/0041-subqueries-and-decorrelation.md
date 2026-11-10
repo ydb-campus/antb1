@@ -722,7 +722,11 @@ Defects the design discussion found, to which no item is assigned:
   engines: an IN written after the failing subquery, a contradiction pair, a HAVING conjunct antb1 folds to false
   (D14), whose filter ends the plan above the subquery's join, a `LIMIT 0` derived table in the block's FROM (which
   DuckDB's optimizer also deletes), and a WHERE subquery under a HAVING IN; D35's text gains the two new cases. An
-  uncorrelated EXISTS that is false empties no join, its count being a row, so it hides no error.
+  uncorrelated EXISTS that is false empties no join, its count being a row, so it hides no error. Update
+  (2026-11-10): HAVING now filters right above the aggregation, then joins its subquery conjuncts, before the select
+  list is computed, as DuckDB does, so a HAVING subquery's join stands above a plain conjunct folded to false and its
+  build runs: that record fails in both engines, and pins a WHERE subquery under such a conjunct instead (D35's text
+  gives the other cases).
 - **Tests (decision 28).** The guards the table lists for SQ4a are lifted, and `setops/errors.slt`'s X6 records wait
   on SQ7 (IN) and SQ15 (a correlated arm). The generator's Feature `uncorrelated_value` draws from a stream of its
   own: value blocks of at most one row (the first value in either order or of its groups, an OFFSET, LIMIT 0, an

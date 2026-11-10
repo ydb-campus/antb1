@@ -2892,10 +2892,11 @@ using BindBlockFn = std::function<arrow::Result<BoundBlock>(
     const sql::SelectStatement&, const Scope*, Visibility, const ExistsConjunct* exists)>;
 
 // One subquery conjunct's join (ADR 0022's J5): above its block's inner joins for a WHERE or
-// inner-ON conjunct, above its aggregation for a HAVING one, in the order the conjuncts are
-// written. `exprs` is a layer of its own directly below the join -- an IN probe's cast to the key
-// type, or whatever a scalar subquery's comparison computes on the outer side -- so a select-list
-// expression that can overflow is still computed over the rows the join keeps (divergence D16).
+// inner-ON conjunct, above its aggregation and the filter of HAVING's other conjuncts for a HAVING
+// one, in the order the conjuncts are written. `exprs` is a layer of its own directly below the
+// join -- an IN probe's cast to the key type, or whatever a scalar subquery's comparison computes
+// on the outer side -- so a select-list expression that can overflow is still computed over the
+// rows the join keeps only (divergence D16).
 // The IN forms key on `left_key` and `right_key` and need no filter; the one-row join of a scalar
 // subquery is keyless and appends its row's column, which `filter` then compares.
 struct SubqueryJoin {
@@ -3538,7 +3539,11 @@ class Binder {
 
   // The column of an output-scope expression: an output column as is, anything else computed
   // above the aggregation (once).
-  BoundColumn OutputColumn(const Typed& t) {
+  BoundColumn OutputColumn(const Typed& t) { return ComputedColumn(t, post_exprs_, post_ids_); }
+  // The same for an operand of a HAVING condition, computed below HAVING's filter.
+  BoundColumn HavingColumn(const Typed& t) { return ComputedColumn(t, having_exprs_, having_ids_); }
+  BoundColumn ComputedColumn(const Typed& t, std::vector<ExprPtr>& exprs,
+                             std::vector<ColumnId>& ids) {
     if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
       return BoundColumn{.id = column->id,
                          .name = t.expr->name,
@@ -3546,13 +3551,13 @@ class Binder {
                          .qualifier = QualifierOf(column->id)};
     }
     const auto same =
-        std::ranges::find_if(post_exprs_, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
-    const auto k = Narrow<std::size_t>(same - post_exprs_.begin());
-    if (same == post_exprs_.end()) {
-      post_exprs_.push_back(t.expr);
-      post_ids_.push_back(ids_.Next());
+        std::ranges::find_if(exprs, [&](const ExprPtr& e) { return SameExpr(*e, *t.expr); });
+    const auto k = Narrow<std::size_t>(same - exprs.begin());
+    if (same == exprs.end()) {
+      exprs.push_back(t.expr);
+      ids.push_back(ids_.Next());
     }
-    return BoundColumn{.id = post_ids_[k], .name = t.expr->name, .type = t.expr->type};
+    return BoundColumn{.id = ids[k], .name = t.expr->name, .type = t.expr->type};
   }
 
   // An expression of the select list, HAVING or ORDER BY in the query's scope: the input scope of a
@@ -4063,6 +4068,10 @@ class Binder {
   bool constant_group_item_ = false;          // a plain GROUP BY item that is a constant (no key)
   std::vector<ExprPtr> post_exprs_;           // computed over the aggregation's output
   std::vector<ColumnId> post_ids_;            // per post expression: its column
+  // What HAVING's conditions compute, below their filter and so below post_exprs_: DuckDB filters
+  // HAVING before it computes the select list.
+  std::vector<ExprPtr> having_exprs_;
+  std::vector<ColumnId> having_ids_;  // per HAVING expression: its column
   std::vector<Predicate> having_;
   std::vector<SortKey> sort_keys_;
   // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
@@ -4667,7 +4676,7 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
     return BindInput(e);
   };
   const auto column_of = [&](const Typed& t) {
-    return having ? OutputColumn(t) : InputColumn(t, /*where=*/true);
+    return having ? HavingColumn(t) : InputColumn(t, /*where=*/true);
   };
   return BindConditionWith(conjunct, /*input=*/!having, bind, column_of, /*nested=*/false);
 }
@@ -7252,6 +7261,15 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
     // DuckDB's MIN and MAX of a FLOAT column are FLOAT.
     item->stored_as_float = FloatResult(select_.aggregates[select_.items[*alias].second]);
   }
+  // The alias of an item computed over the aggregation is the item's expression: HAVING computes
+  // what it reads below its filter, so before the select list is computed.
+  if (item.has_value()) {
+    if (const auto* column = std::get_if<ColumnExpr>(&item->expr->node); column != nullptr) {
+      if (const auto post = std::ranges::find(post_ids_, column->id); post != post_ids_.end()) {
+        item->expr = post_exprs_.at(Narrow<std::size_t>(post - post_ids_.begin()));
+      }
+    }
+  }
   return item;
 }
 
@@ -7259,18 +7277,12 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
 arrow::Status Binder::BindHaving() {
   clause_ = Clause::kHaving;
   alias_fallback_ = true;
-  // A name binds as in BindCondition: a key or a select alias first. The alias of an expression
-  // item is its expression: the condition is computed next to it, over the aggregation.
+  // A name binds as in BindCondition: a key or a select alias first, the alias of an expression
+  // item as its expression.
   const auto bind = [&](const sql::Expr& e) -> arrow::Result<Typed> {
     if (const auto* ref = std::get_if<sql::ColumnRef>(&e)) {
       ARROW_ASSIGN_OR_RAISE(auto resolved, ResolveHavingName(*ref));
       if (resolved.has_value()) {
-        const auto* column = std::get_if<ColumnExpr>(&resolved->expr->node);
-        const auto post =
-            column == nullptr ? post_ids_.end() : std::ranges::find(post_ids_, column->id);
-        if (post != post_ids_.end()) {
-          resolved->expr = post_exprs_.at(Narrow<std::size_t>(post - post_ids_.begin()));
-        }
         return *std::move(resolved);
       }
     }
@@ -7289,7 +7301,7 @@ arrow::Status Binder::BindHaving() {
     }
     if (IsCompound(*conjunct)) {
       ARROW_ASSIGN_OR_RAISE(const Typed condition, BindBool(*conjunct, bind, /*input=*/false));
-      having_.push_back(IsTrue(OutputColumn(condition), conjunct->span()));
+      having_.push_back(IsTrue(HavingColumn(condition), conjunct->span()));
       continue;
     }
     if (const auto* between = std::get_if<sql::BetweenExpr>(conjunct)) {
@@ -7777,20 +7789,25 @@ LogicalPlan Binder::Assemble() {
   // that is where the joins are built.
   const bool having_join_columns = std::ranges::any_of(
       having_subqueries_, [](const SubqueryJoin& join) { return join.AddsColumns(); });
-  // Over the aggregation: computed columns, HAVING, the Sort, then a Project restores the select
-  // order.
+  // Over the aggregation: what HAVING's conditions compute and their filter, then HAVING's
+  // subquery joins, as DuckDB filters HAVING before it computes the select list; the select list's
+  // and ORDER BY's computed columns; the Sort; then a Project restores the select order.
   const auto above = [&] {
+    if (!having_.empty()) {
+      const SourceSpan span = Cover(stmt_.having.front().span(), stmt_.having.back().span());
+      if (!having_exprs_.empty()) {
+        node = Make(ComputeNode{
+            .input = std::move(node), .exprs = having_exprs_, .ids = having_ids_, .span = span});
+      }
+      node = Make(
+          FilterNode{.input = std::move(node), .predicates = std::move(having_), .span = span});
+    }
+    // HAVING's subquery conjuncts after its others, as in DuckDB: each join computes what it reads
+    // in a layer of its own, from the aggregation's columns.
+    node = SubqueryJoins(std::move(node), having_subqueries_);
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});
-    }
-    // Above the aggregation and the columns HAVING computes, which a probe may read.
-    node = SubqueryJoins(std::move(node), having_subqueries_);
-    if (!having_.empty()) {
-      node =
-          Make(FilterNode{.input = std::move(node),
-                          .predicates = std::move(having_),
-                          .span = Cover(stmt_.having.front().span(), stmt_.having.back().span())});
     }
     if (!sort_keys_.empty() && !distinct) {
       node = Make(SortNode{
@@ -7882,7 +7899,7 @@ LogicalPlan Binder::Assemble() {
       // expressions, hidden aggregates, or columns computed for HAVING -- its own, or a subquery
       // conjunct's probe cast).
       if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty() ||
-          having_join_columns) {
+          !having_exprs_.empty() || having_join_columns) {
         project([](ColumnId column) { return column; });
       } else {
         for (std::size_t i = 0; i < select_.items.size(); ++i) {

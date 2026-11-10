@@ -153,10 +153,12 @@ steps (only step 7 uses more than one thread):
    without keys (a nested loop), the largest part the probe. The relations of a part join in the tree a cost search
    chooses from the footer row counts, integer ranges and distinct-count hints (`src/plan/join_order.h`; left-deep and
    greedy beyond 12 relations), each join building on its right input unless the estimates make that side decisively the
-   larger. `HAVING` binds the same way against the aggregation's output and becomes a `Filter` above it, with any
-   subquery conjunct of it a join above the aggregation. The result is a `plan::LogicalPlan`: a tree of immutable nodes
-   in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`, `Aggregate`, `GroupAggregate`, `Sort`, `Limit`,
-   `RowCount`, `Join`, `DependentJoin`, `UnionAll`, `GroupingSets`, `SetOperation`) plus the output columns.
+   larger. `HAVING` binds the same way against the aggregation's output and becomes a `Compute` of its operands and a
+   `Filter` directly above it, then a join for each subquery conjunct of it, all below the `Compute` of the select list
+   and `ORDER BY` (DuckDB filters `HAVING` before it computes the select list). The result is a
+   `plan::LogicalPlan`: a tree of immutable nodes in a `std::variant` (`Scan`, `Filter`, `Compute`, `Project`,
+   `Aggregate`, `GroupAggregate`, `Sort`, `Limit`, `RowCount`, `Join`, `DependentJoin`, `UnionAll`, `GroupingSets`,
+   `SetOperation`) plus the output columns.
    `GroupingSets` (ROLLUP, CUBE and GROUPING SETS, [ADR 0038](adr/0038-grouping-sets.md)) holds the distinct keys, the
    sets as lists of key indices, the calls and the GROUPING calls; no SQL binds to it before ADR 0037's RU3. A
    correlated subquery binds to a `DependentJoin`, whose right input reads columns of its left input as free variables

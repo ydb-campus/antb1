@@ -438,21 +438,49 @@ SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND ct_id = (SELECT zn
 BIGINT
 0
 
-# A HAVING conjunct antb1 folds to false (a literal outside its operand's type, D14) ends the plan above the subquery's
-# join, which never builds: its error is never reported, where DuckDB computes the comparison and fails. Over a scan
-# the builds come first, and both fail.
+# A HAVING conjunct antb1 folds to false (a literal outside its operand's type, D14) ends the plan where its filter
+# stands, right above the aggregation: a WHERE subquery's join below it never builds, so its error is never reported,
+# where DuckDB computes the comparison and fails. A HAVING subquery's join stands above that filter and builds first,
+# as the builds over a scan do: both engines fail.
 onlyif antb1
 query I nosort
-SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
+SELECT ct_id FROM cities WHERE ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING ct_id = 40000
 ----
 SMALLINT
 
 onlyif duckdb
 statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING ct_id = 40000
+
+statement error More than one row returned by a subquery used as an expression
 SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND COUNT(*) > (SELECT zn_city FROM zones)
 
 statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*) FROM cities WHERE ct_id = 40000 AND ct_id > (SELECT zn_city FROM zones)
+
+# HAVING's conjuncts without a subquery filter below its subquery joins, so the failing build runs even where
+# DuckDB's filter combiner proves those conjuncts never true and removes the plan.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND ct_id = 40001 AND COUNT(*) > (SELECT zn_city FROM zones)
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities GROUP BY ct_id HAVING ct_id = 40000 AND ct_id = 40001 AND COUNT(*) > (SELECT zn_city FROM zones)
+----
+SMALLINT
+
+# A later HAVING conjunct that compares a subquery's value and folds to false ends the plan above the joins written
+# before it, so their errors are never reported; DuckDB computes the comparison and fails.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities GROUP BY ct_id HAVING COUNT(*) > (SELECT zn_city FROM zones) AND (SELECT zn_city FROM zones WHERE zn_id = 1) = 40000
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities GROUP BY ct_id HAVING COUNT(*) > (SELECT zn_city FROM zones) AND (SELECT zn_city FROM zones WHERE zn_id = 1) = 40000
 
 # A LIMIT 0 derived table among the block's FROM items: DuckDB's optimizer removes the block's plan; antb1 fails.
 onlyif antb1
