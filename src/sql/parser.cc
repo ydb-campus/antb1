@@ -1029,7 +1029,10 @@ class Parser {
     if (Peek().kind != TokenKind::kLeftParen) {
       return Syntax(Peek().span, "expected ( after AS in the WITH list, found " + Describe(Peek()));
     }
+    // A CTE's query is no subquery expression's, whatever encloses its WITH (decision 23).
+    std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
     auto query = ParseNestedQuery();
+    subquery_contexts_ = std::move(enclosing);
     if (!query) {
       return std::unexpected(std::move(query.error()));
     }
@@ -1659,7 +1662,7 @@ class Parser {
       return Syntax(Peek().span, "expected ( after IN, found " + Describe(Peek()));
     }
     if (OpensNestedQuery(0)) {
-      auto sub = ParseSubquery(SubqueryExpr::Kind::kIn);
+      auto sub = ParseSubquery(SubqueryExpr::Kind::kIn, context);
       if (!sub) {
         return std::unexpected(std::move(sub.error()));
       }
@@ -1856,7 +1859,7 @@ class Parser {
       }
       case TokenKind::kLeftParen: {
         if (OpensNestedQuery(0)) {
-          auto sub = ParseSubquery(SubqueryExpr::Kind::kScalar);
+          auto sub = ParseSubquery(SubqueryExpr::Kind::kScalar, context);
           if (!sub) {
             return std::unexpected(std::move(sub.error()));
           }
@@ -1915,7 +1918,7 @@ class Parser {
       // copied out before the keyword goes: the nested query takes many tokens after it.
       const SourceSpan exists = token.span;
       Take();  // EXISTS
-      auto sub = ParseSubquery(SubqueryExpr::Kind::kExists);
+      auto sub = ParseSubquery(SubqueryExpr::Kind::kExists, context);
       if (!sub) {
         return std::unexpected(std::move(sub.error()));
       }
@@ -1966,9 +1969,16 @@ class Parser {
       if (auto agg_kind = AggregateOf(token); agg_kind.has_value()) {
         switch (context) {
           case Context::kOn:
-            return Syntax(token.span, "aggregate functions are not allowed in ON");
           case Context::kWhere:
-            return Syntax(token.span, "aggregate functions are not allowed in WHERE");
+            // Inside a subquery that some HAVING encloses, the aggregate may be an enclosing
+            // block's, which DuckDB answers: the binder judges it by the block it belongs to (ADR
+            // 0041's decision 23).
+            if (std::ranges::contains(subquery_contexts_, Context::kHaving)) {
+              break;
+            }
+            return Syntax(token.span, context == Context::kOn
+                                          ? "aggregate functions are not allowed in ON"
+                                          : "aggregate functions are not allowed in WHERE");
           case Context::kGroupBy:
             return Syntax(token.span, "aggregate functions are not allowed in GROUP BY");
           case Context::kAggregateArg:
@@ -2810,9 +2820,11 @@ class Parser {
   }
 
   // A nested query in an expression, positioned at its '(': the node every subquery form holds.
-  Expected<SubqueryExpr> ParseSubquery(SubqueryExpr::Kind kind) {
+  Expected<SubqueryExpr> ParseSubquery(SubqueryExpr::Kind kind, Context context) {
     const SourceSpan open = Peek().span;
+    subquery_contexts_.push_back(context);
     auto nested = ParseNestedQuery();
+    subquery_contexts_.pop_back();
     if (!nested) {
       return std::unexpected(std::move(nested.error()));
     }
@@ -2897,7 +2909,10 @@ class Parser {
         }
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next)) ||
             StartsOtherQuery(1)) {
+          // A derived table's query is no subquery expression's (decision 23).
+          std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
           auto derived = ParseNestedQuery();
+          subquery_contexts_ = std::move(enclosing);
           if (!derived) {
             return std::unexpected(std::move(derived.error()));
           }
@@ -3627,6 +3642,8 @@ class Parser {
   std::optional<bool> over_after_aggregate_;  // OverAfterAggregate() of that call, once known
   std::size_t depth_ = 0;  // levels of the nested queries and the expression being parsed
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
+  // The clause each open subquery expression stands in, outermost first (ADR 0041's decision 23).
+  std::vector<Context> subquery_contexts_;
   bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps
   BlockEnd block_end_ = BlockEnd::kStatement;  // where the block being parsed ends
 };

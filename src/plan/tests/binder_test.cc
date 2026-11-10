@@ -290,8 +290,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING MIN(s) LIKE MAX(s)", kUnsupported, "MAX(s)",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING a IN (1, COUNT(*))", kUnsupported, "COUNT(*)",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 'x' LIKE 'y'", kUnsupported, "'x'",
                   "LIKE needs a column or an aggregate on the left"},
         ErrorCase{"SELECT a FROM t GROUP BY a HAVING 1 IN (1)", kUnsupported, "1",

@@ -265,8 +265,16 @@ class Scope {
   // Whether column `id` is a binding's column stored as FLOAT (false for a computed column).
   [[nodiscard]] bool StoredAsFloat(ColumnId id) const;
 
+  // Whether this block is binding a condition of WHERE or an inner ON while a subquery's block in
+  // it binds (its binder sets it first). An aggregate of this block's columns written inside that
+  // subquery is then in this block's WHERE, which DuckDB refuses, where one inside a HAVING
+  // subquery is an outer aggregate it answers (ADR 0041's decision 23).
+  void set_binding_condition(bool condition) { binding_condition_ = condition; }
+  [[nodiscard]] bool binding_condition() const { return binding_condition_; }
+
  private:
   std::vector<Binding> bindings_;
+  bool binding_condition_ = false;
   const Scope* outer_ = nullptr;
   Visibility outer_visible_;  // of `outer_`, where this block is written
 };
