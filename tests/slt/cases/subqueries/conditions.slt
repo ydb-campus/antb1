@@ -1162,6 +1162,15 @@ SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.
 BIGINT	BIGINT	BIGINT
 1126	1118	966
 
+# One subquery written in that inner ON and in WHERE is two values, one per slot (ADR 0041's decision 10). The WHERE's
+# stands above the FULL JOIN, so its comparison holds for the drivers the FULL JOIN pads too; read from the inner ON's
+# slot, the value would be NULL on those rows and drop them.
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id WHERE d.dv_id > (SELECT MIN(ct_id) + 2 FROM cities) - 100
+----
+BIGINT	BIGINT	BIGINT
+966	959	966
+
 # ---- IN, NOT IN and EXISTS in an inner ON inside a FULL JOIN's left input ----
 
 # IN over one row and over none; NOT IN over rows, over rows with a NULL (never true: every city padded) and over
