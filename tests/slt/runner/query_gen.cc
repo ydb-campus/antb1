@@ -743,6 +743,11 @@ constexpr unsigned kConditionValuePercent = 30;
 // Salt of the random stream which every draw of a value inside a condition takes, so that a query
 // without one is the query this seed generated before the SQ1 PR.
 constexpr uint64_t kConditionValueStreamSalt = 0x636F6E642D76616CULL;
+// Share of the HAVING clauses with a GROUP BY key a value can be compared with that take one more
+// conjunct holding a value (ADR 0041's SQ1b), and the salt of the stream of all its draws, so that
+// a query without one is the query this seed generated before the SQ1b PR.
+constexpr unsigned kHavingValuePercent = 70;
+constexpr uint64_t kHavingValueStreamSalt = 0x686176672D76616CULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1047,7 +1052,7 @@ class Builder {
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
-          Rng& value_rng, Rng& condition_value_rng, FeatureSet allowed)
+          Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1069,6 +1074,7 @@ class Builder {
         null_equal_rng_(null_equal_rng),
         value_rng_(value_rng),
         condition_value_rng_(condition_value_rng),
+        having_value_rng_(having_value_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2539,6 +2545,16 @@ class Builder {
       }
       Compound(leaf);
     }
+    // Only where the query holds no other subquery, as a value inside a WHERE condition.
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue);
+    if (const std::vector<SubqueryCandidate> values = HavingValueCandidates(keys);
+        !other_subquery && !values.empty() && having_value_rng_.Percent(kHavingValuePercent)) {
+      Keyword("AND");
+      HavingValue(values[having_value_rng_.Below(values.size())]);
+    }
     return true;
   }
 
@@ -3004,12 +3020,37 @@ class Builder {
   // allowed features rule out is the plain comparison instead, with no draw of its own.
   void ConditionValue(const SubqueryCandidate& c) {
     block_draws_ = &condition_value_rng_;
+    form_rng_ = &condition_value_rng_;
+    form_feature_ = Feature::kConditionValue;
     ConditionValueForm(c);
     block_draws_ = nullptr;
   }
 
+  // The same forms as one more conjunct of HAVING (ADR 0041's SQ1b), whose probe is a GROUP BY key.
+  void HavingValue(const SubqueryCandidate& c) {
+    block_draws_ = &having_value_rng_;
+    form_rng_ = &having_value_rng_;
+    form_feature_ = Feature::kHavingValue;
+    ConditionValueForm(c);
+    block_draws_ = nullptr;
+  }
+
+  // The candidates of a value in HAVING: those of a value inside a condition whose probe is a
+  // GROUP BY key (pure: no draw).
+  [[nodiscard]] std::vector<SubqueryCandidate> HavingValueCandidates(
+      const std::vector<const GenColumn*>& keys) const {
+    if (!allowed_.Has(Feature::kHavingValue)) {
+      return {};
+    }
+    std::vector<SubqueryCandidate> out = SubqueryCandidates();
+    std::erase_if(out, [&keys](const SubqueryCandidate& c) {
+      return c.column == nullptr || std::ranges::find(keys, c.probe) == keys.end();
+    });
+    return out;
+  }
+
   void ConditionValueForm(const SubqueryCandidate& c) {
-    used_.Add(Feature::kConditionValue);
+    used_.Add(form_feature_);
     const GenColumn& probe = *c.probe;
     const GenColumn& column = *c.column;
     // IN and BETWEEN compare all their values in one type in DuckDB: integers, strings or dates
@@ -3018,11 +3059,11 @@ class Builder {
                           column.kind == ValueKind::kVarchar || column.kind == ValueKind::kDate;
     const bool booleans = allowed_.Has(Feature::kBooleanExpressions);
     const bool cases = allowed_.Has(Feature::kCase) && allowed_.Has(Feature::kIntegerLiteral);
-    switch (condition_value_rng_.Below(9)) {
+    switch (form_rng_->Below(9)) {
       case 0:
         if (booleans) {
           used_.Add(Feature::kBooleanExpressions);
-          const bool value_first = condition_value_rng_.Percent(50);
+          const bool value_first = form_rng_->Percent(50);
           Symbol("(");
           if (value_first) {
             ConditionComparison(c);
@@ -3063,7 +3104,7 @@ class Builder {
           used_.Add(Feature::kArithmetic);
           used_.Add(Feature::kIntegerLiteral);
           Column(probe);
-          Symbol(condition_value_rng_.Pick(kOps));
+          Symbol(form_rng_->Pick(kOps));
           ValueBlock(c);
           Symbol("+");
           ValueNumber(1);
@@ -3074,7 +3115,7 @@ class Builder {
         if (one_type && allowed_.Has(Feature::kIn)) {
           used_.Add(Feature::kIn);
           Column(probe);
-          if (condition_value_rng_.Percent(30)) {
+          if (form_rng_->Percent(30)) {
             Keyword("NOT");
           }
           Keyword("IN");
@@ -3090,7 +3131,7 @@ class Builder {
         if (one_type && allowed_.Has(Feature::kBetween)) {
           used_.Add(Feature::kBetween);
           Column(probe);
-          if (condition_value_rng_.Percent(30)) {
+          if (form_rng_->Percent(30)) {
             Keyword("NOT");
           }
           Keyword("BETWEEN");
@@ -3102,7 +3143,7 @@ class Builder {
         break;
       case 6:
         ValueBlock(c);
-        Symbol(condition_value_rng_.Pick(kOps));
+        Symbol(form_rng_->Pick(kOps));
         ValueBlock(c);
         return;
       case 7:
@@ -3129,7 +3170,7 @@ class Builder {
   // `probe <op> (value)`.
   void ConditionComparison(const SubqueryCandidate& c) {
     Column(*c.probe);
-    Symbol(condition_value_rng_.Pick(kOps));
+    Symbol(form_rng_->Pick(kOps));
     ValueBlock(c);
   }
 
@@ -3140,16 +3181,16 @@ class Builder {
       ConditionComparison(c);
       return;
     }
-    Literal lit = MakeLiteral(condition_value_rng_, *c.probe);
+    Literal lit = MakeLiteral(*form_rng_, *c.probe);
     used_.Add(lit.features);
     Column(*c.probe);
-    Symbol(condition_value_rng_.Pick(kOps));
+    Symbol(form_rng_->Pick(kOps));
     tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
   }
 
   // `[NOT] EXISTS (block)` over the candidate's inner table.
   void ConditionExists(const SubqueryCandidate& c) {
-    if (condition_value_rng_.Percent(kNotExistsPercent)) {
+    if (form_rng_->Percent(kNotExistsPercent)) {
       Keyword("NOT");
     }
     Keyword("EXISTS");
@@ -4798,6 +4839,10 @@ class Builder {
   Rng& null_equal_rng_;       // the draws that only a NULL-equal key needs
   Rng& value_rng_;            // the draws that only an uncorrelated value needs
   Rng& condition_value_rng_;  // the draws that only a value inside a condition needs
+  Rng& having_value_rng_;     // the draws that only a value inside a HAVING condition needs
+  // The stream and the feature of the value form being written (ConditionValue, HavingValue).
+  Rng* form_rng_ = nullptr;
+  Feature form_feature_ = Feature::kConditionValue;
   // While ConditionValue writes, the stream its value and EXISTS blocks draw from (BlockRng).
   Rng* block_draws_ = nullptr;
   // The stream a value block's or an EXISTS block's shape draws from: an uncorrelated value's own,
@@ -5025,10 +5070,11 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng null_equal_rng(Mix(seed ^ kNullEqualStreamSalt));
   Rng value_rng(Mix(seed ^ kValueStreamSalt));
   Rng condition_value_rng(Mix(seed ^ kConditionValueStreamSalt));
+  Rng having_value_rng(Mix(seed ^ kHavingValueStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-               options.supported)
+               having_value_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -5062,15 +5108,17 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng null_equal_rng(Mix(state ^ kNullEqualStreamSalt));
   Rng value_rng(Mix(state ^ kValueStreamSalt));
   Rng condition_value_rng(Mix(state ^ kConditionValueStreamSalt));
+  Rng having_value_rng(Mix(state ^ kHavingValueStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
-                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
-                             setop_rng, operator_rng, full_rng, cross_rng, keyless_rng,
-                             null_equal_rng, value_rng, condition_value_rng, allowed)
-                         .Build()
-                         .value_or(GeneratedQuery{});
+  GeneratedQuery q =
+      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
+              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
+              full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
+              having_value_rng, allowed)
+          .Build()
+          .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;
