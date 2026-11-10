@@ -256,6 +256,13 @@ SELECT COUNT(*) FROM cities c0 LEFT JOIN zones z ON c0.ct_id = z.zn_id + 3 JOIN 
 BIGINT
 6
 
+# The same key below a later LEFT JOIN, whose left input holds it.
+query II rowsort
+SELECT COUNT(*), COUNT(d.dv_id) FROM cities c0 LEFT JOIN zones z ON c0.ct_id = z.zn_id + 3 JOIN cities c ON c.ct_id = COALESCE(z.zn_city, 1) LEFT JOIN drivers d ON d.dv_city = c.ct_id
+----
+BIGINT	BIGINT
+136	135
+
 query I rowsort
 SELECT COUNT(*) FROM cities c0 LEFT JOIN zones z ON c0.ct_id = z.zn_id + 3 JOIN cities c ON c.ct_id = z.zn_city + 0
 ----

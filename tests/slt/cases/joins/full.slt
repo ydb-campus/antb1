@@ -350,3 +350,11 @@ SELECT COUNT(*), COUNT(c0.ct_id) FROM cities c0 FULL JOIN zones z ON c0.ct_id = 
 ----
 BIGINT	BIGINT
 42	6
+
+# Through a LEFT JOIN nested in the FULL JOIN's left input: the key over its padded side is computed above the
+# outermost unit that holds it.
+query IIII rowsort
+SELECT COUNT(*), COUNT(z.zn_id), COUNT(c.ct_id), SUM(d.dv_row) FROM cities c0 LEFT JOIN zones z ON c0.ct_id = z.zn_id + 3 FULL JOIN drivers d ON d.dv_city = c0.ct_id + 1 JOIN cities c ON c.ct_id = COALESCE(z.zn_city, 1)
+----
+BIGINT	BIGINT	BIGINT	HUGEINT
+100	3	100	4656
