@@ -30,6 +30,7 @@
 #include "antb1/plan/catalog.h"
 #include "antb1/sql/ast.h"
 #include "antb1/sql/parser.h"
+#include "antb1/sql/unparse.h"
 
 #include "canonical.h"
 #include "join_tables.h"
@@ -116,7 +117,7 @@ bool HasSubquery(const GeneratedQuery& q) {
   return q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery) ||
          q.features.Has(Feature::kCorrelatedExists) ||
          q.features.Has(Feature::kCorrelatedAggregate) ||
-         q.features.Has(Feature::kUncorrelatedValue);
+         q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -3023,6 +3024,132 @@ TEST(QueryGenerator, UncorrelatedValuesAreAtMostOneRowAndReadOnlyTheirTable) {
   EXPECT_GT(cov.exists_rows, 100);
   EXPECT_GT(cov.exists_union, 50);
   EXPECT_GT(cov.joined, 600) << "a value beside a join";
+}
+
+// A value inside a condition draws from a stream of its own (ADR 0041's SQ1) and fires only where
+// no subquery conjunct above it did, so declaring it changes the queries that take one and no
+// others.
+TEST(QueryGenerator, ConditionValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 73, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 73,
+      {.supported = kSupportedFeatures.Minus({Feature::kConditionValue}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kConditionValue)) << plain.sql;
+    if (q.features.Has(Feature::kConditionValue)) {
+      ++took;
+      // It never displaces another subquery conjunct, and it only removes rows.
+      for (const Feature other :
+           {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+            Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue}) {
+        EXPECT_FALSE(q.features.Has(other)) << q.sql;
+      }
+      EXPECT_EQ(q.row_bound, plain.row_bound) << q.sql;
+      continue;
+    }
+    ++same;
+    EXPECT_EQ(q.sql, plain.sql) << i;
+    EXPECT_EQ(q.features, plain.features) << i;
+  }
+  EXPECT_GT(took, 200);
+  EXPECT_GT(same, 2000);
+}
+
+// What a value inside a condition writes (ADR 0041's SQ1): its blocks over one named table each,
+// unqualified, value blocks of at most one row whatever the data, no IN subquery, and every form.
+TEST(QueryGenerator, ConditionValuesAreAtMostOneRowAndReadOnlyTheirTable) {
+  std::vector<GenTable> tables = JoinTables();
+  // Data strictly inside every integer column's type, as the files' statistics give it, so that the
+  // value plus 1 form, which needs it, is written too.
+  for (GenTable& table : tables) {
+    for (GenColumn& column : table.columns) {
+      if (column.kind == ValueKind::kInteger) {
+        column.data_min = column.min + 1;
+        column.data_max = column.max - 1;
+      }
+    }
+  }
+  const auto gen = MakeOver(tables, 71, {.supported = kSupportedFeatures, .target_percent = 0});
+  int queries = 0;
+  int ors = 0;
+  int nots = 0;
+  int cases = 0;
+  int plus = 0;
+  int ins = 0;
+  int betweens = 0;
+  int exists = 0;
+  int pairs = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kConditionValue)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_FALSE(all.empty());
+    int scalars = 0;
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_NE(sub->kind, sql::SubqueryExpr::Kind::kIn) << "an IN subquery is SQ7's";
+      CheckOwnColumns(*sub->query, tables);
+      if (sub->kind == sql::SubqueryExpr::Kind::kScalar) {
+        ++scalars;
+        EXPECT_TRUE(AtMostOneRow(*sub->query)) << "a value block of at most one row";
+      } else {
+        ++exists;
+      }
+    }
+    pairs += scalars == 2 ? 1 : 0;
+    // The form, from the conjunct that holds the subqueries: WHERE's top-level AND flattened.
+    std::vector<const sql::Expr*> conjuncts;
+    std::vector<const sql::Expr*> pending;
+    for (const sql::Expr& e : parsed->where) {
+      pending.push_back(&e);
+    }
+    while (!pending.empty()) {
+      const sql::Expr* e = pending.back();
+      pending.pop_back();
+      if (const auto* both = std::get_if<sql::BinaryExpr>(e);
+          both != nullptr && both->op == sql::BinaryOp::kAnd) {
+        pending.push_back(&*both->left);
+        pending.push_back(&*both->right);
+      } else {
+        conjuncts.push_back(e);
+      }
+    }
+    for (const sql::Expr* e : conjuncts) {
+      if (!sql::ToSql(*e).contains("SELECT")) {
+        continue;
+      }
+      if (const auto* binary = std::get_if<sql::BinaryExpr>(e)) {
+        ors += binary->op == sql::BinaryOp::kOr ? 1 : 0;
+        cases += std::holds_alternative<sql::CaseExpr>(*binary->left) ? 1 : 0;
+        const auto* sum = std::get_if<sql::BinaryExpr>(&*binary->right);
+        plus += sum != nullptr && sum->op == sql::BinaryOp::kAdd ? 1 : 0;
+      }
+      nots += std::holds_alternative<sql::UnaryExpr>(*e) ? 1 : 0;
+      ins += std::holds_alternative<sql::InExpr>(*e) ? 1 : 0;
+      betweens += std::holds_alternative<sql::BetweenExpr>(*e) ? 1 : 0;
+    }
+  }
+  EXPECT_GT(queries, 1000) << "values in conditions: " << queries;
+  EXPECT_GT(ors, 150);
+  EXPECT_GT(nots, 80);
+  EXPECT_GT(cases, 150);
+  EXPECT_GT(plus, 30);
+  EXPECT_GT(ins, 60);
+  EXPECT_GT(betweens, 60);
+  EXPECT_GT(exists, 150);
+  EXPECT_GT(pairs, 200) << "IN lists, BETWEEN and two values compared";
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

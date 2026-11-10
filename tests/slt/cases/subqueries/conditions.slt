@@ -340,6 +340,23 @@ SMALLINT
 5
 6
 
+# A CASE over an EXISTS with no column in its branches is a value of each row too, no constant.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_id = 1) THEN 1 ELSE 0 END = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN 0 ELSE 1 END = 1 ORDER BY ct_id
+----
+SMALLINT
+
 # In an inner join's ON: NOT EXISTS under OR, false, so the other branch decides.
 query II nosort
 SELECT ct_id, zn_id FROM cities JOIN zones ON zn_city = ct_id AND (NOT EXISTS (SELECT 1 FROM drivers WHERE dv_city = 1) OR zn_radius > 3) ORDER BY zn_id

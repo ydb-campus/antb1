@@ -737,6 +737,12 @@ constexpr unsigned kValuePercent = 30;
 // query without one is the query this seed generated before the SQ4a PR. Its probe is a column
 // like any other, qualified by the join stream's draw (Column).
 constexpr uint64_t kValueStreamSalt = 0x76616C75652D726EULL;
+// Share of the queries with a usable probe and no subquery conjunct above that take an uncorrelated
+// value inside a condition instead (ADR 0041's SQ1).
+constexpr unsigned kConditionValuePercent = 30;
+// Salt of the random stream which every draw of a value inside a condition takes, so that a query
+// without one is the query this seed generated before the SQ1 PR.
+constexpr uint64_t kConditionValueStreamSalt = 0x636F6E642D76616CULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1041,7 +1047,7 @@ class Builder {
           Rng& left_rng, Rng& sub_rng, Rng& substring_rng, Rng& corr_rng, Rng& union_rng,
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
-          Rng& value_rng, FeatureSet allowed)
+          Rng& value_rng, Rng& condition_value_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1062,6 +1068,7 @@ class Builder {
         keyless_rng_(keyless_rng),
         null_equal_rng_(null_equal_rng),
         value_rng_(value_rng),
+        condition_value_rng_(condition_value_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2643,7 +2650,14 @@ class Builder {
     const std::vector<SubqueryCandidate> values =
         subquery || correlated ? std::vector<SubqueryCandidate>{} : ValueCandidates();
     const bool value = !values.empty() && value_rng_.Percent(kValuePercent);
-    if (keys.empty() && !conditions && !subquery && !correlated && !value) {
+    // A value inside a condition (ADR 0041's SQ1), on the same terms and from a stream of its own,
+    // only where no subquery above fired.
+    const std::vector<SubqueryCandidate> in_conditions = subquery || correlated || value
+                                                             ? std::vector<SubqueryCandidate>{}
+                                                             : ConditionValueCandidates();
+    const bool condition_value =
+        !in_conditions.empty() && condition_value_rng_.Percent(kConditionValuePercent);
+    if (keys.empty() && !conditions && !subquery && !correlated && !value && !condition_value) {
       return;
     }
     std::size_t terms = 0;
@@ -2689,6 +2703,13 @@ class Builder {
       }
       used_.Add(Feature::kWhere);
       ValueConjunct(values[value_rng_.Below(values.size())]);
+    }
+    if (condition_value) {
+      if (terms > 0 || !keys.empty()) {
+        Keyword("AND");
+      }
+      used_.Add(Feature::kWhere);
+      ConditionValue(in_conditions[condition_value_rng_.Below(in_conditions.size())]);
     }
   }
 
@@ -2964,6 +2985,196 @@ class Builder {
     return out;
   }
 
+  // The candidates of a value inside a condition (ADR 0041's SQ1): those of ValueCandidates (pure:
+  // no draw).
+  [[nodiscard]] std::vector<SubqueryCandidate> ConditionValueCandidates() const {
+    if (!allowed_.Has(Feature::kConditionValue) || !allowed_.Has(Feature::kWhere)) {
+      return {};
+    }
+    std::vector<SubqueryCandidate> out = SubqueryCandidates();
+    std::erase_if(out, [](const SubqueryCandidate& c) { return c.column == nullptr; });
+    return out;
+  }
+
+  // One top-level conjunct with an uncorrelated value inside it (ADR 0041's SQ1): under OR or NOT,
+  // in a CASE, plus 1 where neither the value nor the probe can overflow, as both values of an IN
+  // list or a BETWEEN, two values compared, or [NOT] EXISTS under OR or in a CASE. Its value blocks
+  // are ValueBody's and its EXISTS blocks ExistsBody's, so no generated query meets the row error,
+  // nor an error that the order of evaluation could hide (divergences D16 and D35). A form the
+  // allowed features rule out is the plain comparison instead, with no draw of its own.
+  void ConditionValue(const SubqueryCandidate& c) {
+    block_draws_ = &condition_value_rng_;
+    ConditionValueForm(c);
+    block_draws_ = nullptr;
+  }
+
+  void ConditionValueForm(const SubqueryCandidate& c) {
+    used_.Add(Feature::kConditionValue);
+    const GenColumn& probe = *c.probe;
+    const GenColumn& column = *c.column;
+    // IN and BETWEEN compare all their values in one type in DuckDB: integers, strings or dates
+    // only, so that no DOUBLE or DECIMAL mixes in (CheckInListTypes, CheckBetweenTypes).
+    const bool one_type = column.kind == ValueKind::kInteger ||
+                          column.kind == ValueKind::kVarchar || column.kind == ValueKind::kDate;
+    const bool booleans = allowed_.Has(Feature::kBooleanExpressions);
+    const bool cases = allowed_.Has(Feature::kCase) && allowed_.Has(Feature::kIntegerLiteral);
+    switch (condition_value_rng_.Below(9)) {
+      case 0:
+        if (booleans) {
+          used_.Add(Feature::kBooleanExpressions);
+          const bool value_first = condition_value_rng_.Percent(50);
+          Symbol("(");
+          if (value_first) {
+            ConditionComparison(c);
+            Keyword("OR");
+            LiteralComparison(c);
+          } else {
+            LiteralComparison(c);
+            Keyword("OR");
+            ConditionComparison(c);
+          }
+          Symbol(")");
+          return;
+        }
+        break;
+      case 1:
+        if (booleans) {
+          used_.Add(Feature::kBooleanExpressions);
+          Keyword("NOT");
+          Symbol("(");
+          ConditionComparison(c);
+          Symbol(")");
+          return;
+        }
+        break;
+      case 2:
+        if (cases) {
+          CaseOf([&] { ConditionComparison(c); });
+          return;
+        }
+        break;
+      case 3:
+        // The value plus 1, which no value of the column reaches past its type's maximum, against a
+        // probe that 1 below its minimum still holds, in case a constant moves across.
+        if (column.kind == ValueKind::kInteger && probe.kind == ValueKind::kInteger &&
+            column.data_max.has_value() && *column.data_max < column.max &&
+            probe.data_min.has_value() && *probe.data_min > probe.min &&
+            allowed_.Has(Feature::kArithmetic) && allowed_.Has(Feature::kIntegerLiteral)) {
+          used_.Add(Feature::kArithmetic);
+          used_.Add(Feature::kIntegerLiteral);
+          Column(probe);
+          Symbol(condition_value_rng_.Pick(kOps));
+          ValueBlock(c);
+          Symbol("+");
+          ValueNumber(1);
+          return;
+        }
+        break;
+      case 4:
+        if (one_type && allowed_.Has(Feature::kIn)) {
+          used_.Add(Feature::kIn);
+          Column(probe);
+          if (condition_value_rng_.Percent(30)) {
+            Keyword("NOT");
+          }
+          Keyword("IN");
+          Symbol("(");
+          ValueBlock(c);
+          Symbol(",");
+          ValueBlock(c);
+          Symbol(")");
+          return;
+        }
+        break;
+      case 5:
+        if (one_type && allowed_.Has(Feature::kBetween)) {
+          used_.Add(Feature::kBetween);
+          Column(probe);
+          if (condition_value_rng_.Percent(30)) {
+            Keyword("NOT");
+          }
+          Keyword("BETWEEN");
+          ValueBlock(c);
+          Keyword("AND");
+          ValueBlock(c);
+          return;
+        }
+        break;
+      case 6:
+        ValueBlock(c);
+        Symbol(condition_value_rng_.Pick(kOps));
+        ValueBlock(c);
+        return;
+      case 7:
+        if (booleans) {
+          used_.Add(Feature::kBooleanExpressions);
+          Symbol("(");
+          ConditionExists(c);
+          Keyword("OR");
+          LiteralComparison(c);
+          Symbol(")");
+          return;
+        }
+        break;
+      default:
+        if (cases) {
+          CaseOf([&] { ConditionExists(c); });
+          return;
+        }
+        break;
+    }
+    ConditionComparison(c);
+  }
+
+  // `probe <op> (value)`.
+  void ConditionComparison(const SubqueryCandidate& c) {
+    Column(*c.probe);
+    Symbol(condition_value_rng_.Pick(kOps));
+    ValueBlock(c);
+  }
+
+  // `probe <op> literal` where the probe takes literals (WhereLeaf's columns), else a comparison
+  // with the value.
+  void LiteralComparison(const SubqueryCandidate& c) {
+    if (std::ranges::find(comparable_, c.probe) == comparable_.end()) {
+      ConditionComparison(c);
+      return;
+    }
+    Literal lit = MakeLiteral(condition_value_rng_, *c.probe);
+    used_.Add(lit.features);
+    Column(*c.probe);
+    Symbol(condition_value_rng_.Pick(kOps));
+    tokens_.insert(tokens_.end(), lit.tokens.begin(), lit.tokens.end());
+  }
+
+  // `[NOT] EXISTS (block)` over the candidate's inner table.
+  void ConditionExists(const SubqueryCandidate& c) {
+    if (condition_value_rng_.Percent(kNotExistsPercent)) {
+      Keyword("NOT");
+    }
+    Keyword("EXISTS");
+    Symbol("(");
+    ExistsBody(c);
+    Symbol(")");
+  }
+
+  // `CASE WHEN <condition> THEN 1 ELSE 0 END = 1`.
+  template <class Condition>
+  void CaseOf(const Condition& condition) {
+    used_.Add(Feature::kCase);
+    used_.Add(Feature::kIntegerLiteral);
+    Keyword("CASE");
+    Keyword("WHEN");
+    condition();
+    Keyword("THEN");
+    ValueNumber(1);
+    Keyword("ELSE");
+    ValueNumber(0);
+    Keyword("END");
+    Symbol("=");
+    ValueNumber(1);
+  }
+
   // One top-level conjunct holding an uncorrelated value (ADR 0041's SQ4a): `[NOT] EXISTS (block)`
   // over a block of any shape, `probe BETWEEN (value) AND (value)`, or `probe <op> (value)` and its
   // mirror. A value block returns at most one row whatever the data (ValueBody), so no generated
@@ -3028,7 +3239,7 @@ class Builder {
   // value instead, with no draw of its own.
   void ValueBody(const SubqueryCandidate& c) {
     const GenColumn& column = *c.column;
-    uint64_t shape = value_rng_.Below(6);
+    uint64_t shape = BlockRng().Below(6);
     if ((shape == 4 && !(ValueAggregates() && allowed_.Has(Feature::kCountStar))) ||
         (shape == 5 && !(ValueAggregates() && allowed_.Has(Feature::kUnionAll) &&
                          (allowed_.Has(Feature::kIntersect) || allowed_.Has(Feature::kExcept))))) {
@@ -3049,15 +3260,15 @@ class Builder {
         Keyword("ORDER");
         Keyword("BY");
         ValueColumn(column);
-        if (value_rng_.Percent(40)) {
+        if (BlockRng().Percent(40)) {
           Keyword("DESC");
         }
         Keyword("LIMIT");
         ValueNumber(1);
-        if (value_rng_.Percent(30)) {
+        if (BlockRng().Percent(30)) {
           static constexpr auto kOffsets = std::to_array<int64_t>({1, 2});
           Keyword("OFFSET");
-          ValueNumber(value_rng_.Percent(25) ? c.inner->rows : value_rng_.Pick(kOffsets));
+          ValueNumber(BlockRng().Percent(25) ? c.inner->rows : BlockRng().Pick(kOffsets));
         }
         return;
       }
@@ -3076,18 +3287,18 @@ class Builder {
         CountStar();
         Symbol(">");
         // The table's row count, or one less: COUNT(*) passes for the second only.
-        ValueNumber(std::max<int64_t>(c.inner->rows - 1, 0) + (value_rng_.Percent(50) ? 1 : 0));
+        ValueNumber(std::max<int64_t>(c.inner->rows - 1, 0) + (BlockRng().Percent(50) ? 1 : 0));
         return;
       default: {
         const bool intersect = allowed_.Has(Feature::kIntersect) &&
-                               (!allowed_.Has(Feature::kExcept) || value_rng_.Percent(50));
+                               (!allowed_.Has(Feature::kExcept) || BlockRng().Percent(50));
         used_.Add(Feature::kUnionAll);  // every compound records it
         used_.Add(intersect ? Feature::kIntersect : Feature::kExcept);
         Keyword("SELECT");
         ValueAggregate(column);
         ValueFrom(*c.inner);
         Keyword(intersect ? "INTERSECT" : "EXCEPT");
-        if (allowed_.Has(Feature::kSetOpAll) && value_rng_.Percent(30)) {
+        if (allowed_.Has(Feature::kSetOpAll) && BlockRng().Percent(30)) {
           used_.Add(Feature::kSetOpAll);
           Keyword("ALL");
         }
@@ -3106,7 +3317,7 @@ class Builder {
   // column's rows instead, with no draw of its own.
   void ExistsBody(const SubqueryCandidate& c) {
     const GenColumn& column = *c.column;
-    uint64_t shape = value_rng_.Below(7);
+    uint64_t shape = BlockRng().Below(7);
     if ((shape == 2 && !(InnerAggregateFits() && allowed_.Has(Feature::kCountStar))) ||
         (shape == 3 && !allowed_.Has(Feature::kUnionAll))) {
       shape = 1;
@@ -3135,7 +3346,7 @@ class Builder {
         Keyword("HAVING");
         CountStar();
         Symbol(">");
-        ValueNumber(value_rng_.Pick(kCounts));
+        ValueNumber(BlockRng().Pick(kCounts));
         return;
       }
       case 3: {
@@ -3143,7 +3354,7 @@ class Builder {
         Keyword("SELECT");
         ValueColumn(column);
         ValueFrom(*c.inner);
-        const uint64_t op = value_rng_.Below(3);
+        const uint64_t op = BlockRng().Below(3);
         if (op == 1 && allowed_.Has(Feature::kUnion)) {
           used_.Add(Feature::kUnion);
           Keyword("UNION");
@@ -3173,7 +3384,7 @@ class Builder {
   // MIN or MAX of the inner column, whichever is allowed, drawn when both are.
   void ValueAggregate(const GenColumn& column) {
     const Agg agg =
-        !allowed_.Has(Feature::kMax) || (allowed_.Has(Feature::kMin) && value_rng_.Percent(50))
+        !allowed_.Has(Feature::kMax) || (allowed_.Has(Feature::kMin) && BlockRng().Percent(50))
             ? Agg::kMin
             : Agg::kMax;
     used_.Add(AggFeature(agg));
@@ -4568,24 +4779,30 @@ class Builder {
 
   const std::vector<GenTable>& tables_;
   Rng& rng_;
-  Rng& join_rng_;                // the draws that only a join needs
-  Rng& block_rng_;               // the draws that only a nested block needs
-  Rng& left_rng_;                // the draws that only a left join needs
-  Rng& sub_rng_;                 // the draws that only an uncorrelated subquery needs
-  Rng& substring_rng_;           // the draws that only substring needs
-  Rng& corr_rng_;                // the draws that only a correlated subquery needs
-  Rng& union_rng_;               // the draws that only a compound needs
-  Rng& star_rng_;                // the draws that only a star item or a qualified star needs
-  Rng& variance_rng_;            // the draws that only the variance family needs
-  Rng& distinct_rng_;            // the draws that only SELECT DISTINCT needs
-  Rng& rollup_rng_;              // the draws that only grouping sets need
-  Rng& setop_rng_;               // the draws that only a set operation's form needs
-  Rng& operator_rng_;            // the draws that only a set operator other than UNION ALL needs
-  Rng& full_rng_;                // the draws that only a FULL JOIN needs
-  Rng& cross_rng_;               // the draws that only a cross product needs
-  Rng& keyless_rng_;             // the draws that only a keyless LEFT or FULL JOIN needs
-  Rng& null_equal_rng_;          // the draws that only a NULL-equal key needs
-  Rng& value_rng_;               // the draws that only an uncorrelated value needs
+  Rng& join_rng_;             // the draws that only a join needs
+  Rng& block_rng_;            // the draws that only a nested block needs
+  Rng& left_rng_;             // the draws that only a left join needs
+  Rng& sub_rng_;              // the draws that only an uncorrelated subquery needs
+  Rng& substring_rng_;        // the draws that only substring needs
+  Rng& corr_rng_;             // the draws that only a correlated subquery needs
+  Rng& union_rng_;            // the draws that only a compound needs
+  Rng& star_rng_;             // the draws that only a star item or a qualified star needs
+  Rng& variance_rng_;         // the draws that only the variance family needs
+  Rng& distinct_rng_;         // the draws that only SELECT DISTINCT needs
+  Rng& rollup_rng_;           // the draws that only grouping sets need
+  Rng& setop_rng_;            // the draws that only a set operation's form needs
+  Rng& operator_rng_;         // the draws that only a set operator other than UNION ALL needs
+  Rng& full_rng_;             // the draws that only a FULL JOIN needs
+  Rng& cross_rng_;            // the draws that only a cross product needs
+  Rng& keyless_rng_;          // the draws that only a keyless LEFT or FULL JOIN needs
+  Rng& null_equal_rng_;       // the draws that only a NULL-equal key needs
+  Rng& value_rng_;            // the draws that only an uncorrelated value needs
+  Rng& condition_value_rng_;  // the draws that only a value inside a condition needs
+  // While ConditionValue writes, the stream its value and EXISTS blocks draw from (BlockRng).
+  Rng* block_draws_ = nullptr;
+  // The stream a value block's or an EXISTS block's shape draws from: an uncorrelated value's own,
+  // or that of a value inside a condition while one is written.
+  Rng& BlockRng() { return block_draws_ != nullptr ? *block_draws_ : value_rng_; }
   bool distinct_ = false;        // the outer block is SELECT DISTINCT
   bool distinct_items_ = false;  // writing a SELECT DISTINCT's select list
   FeatureSet allowed_;
@@ -4807,9 +5024,11 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng keyless_rng(Mix(seed ^ kKeylessStreamSalt));
   Rng null_equal_rng(Mix(seed ^ kNullEqualStreamSalt));
   Rng value_rng(Mix(seed ^ kValueStreamSalt));
+  Rng condition_value_rng(Mix(seed ^ kConditionValueStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, options.supported)
+               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
+               options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -4842,15 +5061,16 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng keyless_rng(Mix(state ^ kKeylessStreamSalt));
   Rng null_equal_rng(Mix(state ^ kNullEqualStreamSalt));
   Rng value_rng(Mix(state ^ kValueStreamSalt));
+  Rng condition_value_rng(Mix(state ^ kConditionValueStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
-  GeneratedQuery q =
-      Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
-              union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
-              full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, allowed)
-          .Build()
-          .value_or(GeneratedQuery{});
+  GeneratedQuery q = Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng,
+                             corr_rng, union_rng, star_rng, variance_rng, distinct_rng, rollup_rng,
+                             setop_rng, operator_rng, full_rng, cross_rng, keyless_rng,
+                             null_equal_rng, value_rng, condition_value_rng, allowed)
+                         .Build()
+                         .value_or(GeneratedQuery{});
   q.index = index;
   q.target_sample = target;
   return q;

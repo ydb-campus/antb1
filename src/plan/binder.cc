@@ -923,10 +923,11 @@ struct ReadsColumnOf {
   }
   // A subquery's own block reads its own columns, which are no columns of this one; a correlated
   // reference would be, and ADR 0023's U-series revisits this when it answers one. Its IN operand
-  // belongs to this block, though, and a scalar subquery's value is an operand where `subqueries`
-  // (ADR 0041's decision 9: `(q) > 5` is no comparison of two literals).
+  // belongs to this block, though, and a scalar subquery's or an EXISTS's value is an operand where
+  // `subqueries` (ADR 0041's decision 9: `(q) > 5` is no comparison of two literals, nor is a CASE
+  // over an EXISTS).
   bool operator()(const sql::SubqueryExpr& s) const {
-    return (subqueries && s.kind == sql::SubqueryExpr::Kind::kScalar) ||
+    return (subqueries && s.kind != sql::SubqueryExpr::Kind::kIn) ||
            (s.operand.has_value() && ReadsColumn(**s.operand, aggregates, subqueries));
   }
 };
