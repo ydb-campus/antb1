@@ -735,6 +735,67 @@ Defects the design discussion found, to which no item is assigned:
   fail, so no generated query meets the row error or D35. The metamorphic relations of decision 28 hold, the
   self-check among them, over the six cities of the star schema for a correlated EXISTS, NOT EXISTS and aggregate.
 
+## Update (2026-11-10, SQ1a): values in WHERE and inner-ON conditions, built
+
+At the maintainer's request SQ1 is two PRs: SQ1a, values in the conditions of WHERE and of an inner ON, with all the
+machinery; and SQ1b, values in HAVING with decision 23's SQ1 row. A fix PR before them (#345) made HAVING filter
+before the select list is computed, as DuckDB does, so that HAVING's slot can stand between the two. No query
+completes, and the ratchet stays at 78.
+
+- **Decision 8, as built in WHERE and an inner ON** (one inside a FULL JOIN's left input too): an uncorrelated
+  scalar subquery is a value anywhere in a condition, and an uncorrelated EXISTS a condition there, under AND, OR, NOT
+  and CASE. An IN list's values may be subqueries among literals, each reading no column, and the list is the OR of
+  its equalities after DuckDB's one-type check of the list; a value may be LIKE's operand, not its pattern. A value
+  as an IN subquery's probe, and an IN every branch of an OR shares, stay SQ7's (decision 14), as does any IN under
+  OR, NOT or CASE. A conjunct of a correlated block that reads the enclosing block and holds a value is a residual
+  of Path 1 or Path 2, whole, a BETWEEN included; an IN whose probe reads the enclosing block stays exit 4, and so
+  does a correlated subquery in a conjunct that reads the enclosing block itself. A correlated comparison whose other
+  side holds a value, or is one, is ADR 0023's dependent join with the value's join below it; two different correlated
+  subqueries compared wait on SQ5. A value of the outer column's type that a correlation equates with it keys the
+  block, as Path 1's semi key or Path 2's inner equivalent; one that needs a cast, or an expression over a value, has
+  no inner equivalent, and Path 2 refuses it. Of decision 8's three bind-error examples, two wait on X5 and on LIMIT
+  expressions, which no PR of this phase opens.
+- **Decision 9, as built.** Each block has a per-row slot above its joins and below the filter of its correlated
+  conjuncts, which Path 1 and Path 2 take with the block; the left input of a unit that pads it (a FULL JOIN) has one
+  of its own, below the unit, which answers ADR 0037's OJ3 candidate (uncorrelated IN, NOT IN and EXISTS conjuncts
+  there, and values); and HAVING's slot stands above the filter of HAVING's other conjuncts, below the select list's
+  computed columns. "Filtered above its slot" is read as each conjunct that holds a value being a filter of its own
+  after the joins of its values, in the order bound -- what it computes, then its predicate -- while a plain conjunct
+  still goes onto its relation, as DuckDB's filter pushdown puts it below the values. One filter for the whole slot
+  above all of its joins would compute later conjuncts' operands over rows that earlier ones drop.
+- **Decision 10, as built.** A value is bound once per slot, keyed by the slot and the subquery's structure, its first
+  binding planting its one-row join: the copies the binder makes of a conjunct (a BETWEEN's two comparisons, IS
+  DISTINCT FROM's lowering, CASE x WHEN's equalities, the copy a folded or moved comparison makes, an IN list's
+  equalities) and a subquery written twice in WHERE and the inner ONs all read one join. With an IN that turns out
+  empty written between two occurrences, the first-occurrence placement hides the value's error (D35). OR
+  factoring's dropped branch binds as a dry run, which binds each subquery's block for its bind errors and its own
+  refusals (a correlated scalar subquery that is no aggregate over every row, say), plants nothing, and refuses no
+  correlated subquery for where it stands; a correlated conjunct every branch of an OR shares is answered through ADR
+  0023's paths.
+- **Decision 3 is corrected:** DuckDB answers a subquery in a LEFT JOIN's ON only in a conjunct that reads the
+  right input alone -- a value, an IN or an EXISTS, one correlated to that input too -- and refuses every other with
+  "Cannot perform non-inner join on subquery!": any in a FULL JOIN's own ON, and in a LEFT JOIN's ON one whose
+  conjunct reads the left input or no column at all. Those refusals are DuckDB's own, so no coverage item answers
+  them; the conjuncts over the right input alone stay decision 3's coverage item.
+- **Decision 20, a note for SQ5:** a conjunct's other value joins stand between a correlated value's join and the
+  conjunct's filter, so the consumer proof's walk must pass uncorrelated one-row joins, or SQ5 plants a conjunct's
+  correlated join last.
+- **Decisions 23 and 25.** A correlated value outside a direct top-level comparison, and a correlated EXISTS outside
+  a top-level conjunct, exit 4 once their blocks bind, after their own bind errors, with messages that name what
+  answers them. D16 now says that a value is computed before an AND, OR or CASE decides, and an expression over it per
+  row, where DuckDB computes a subquery's side of a comparison at its join's build and folds by statistics; D35 gains
+  the first-occurrence placement and the dropped branch; D14 notes that a value's join still builds under a folded
+  comparison; D22's lists of values are answered; D36 registers which error several failing subqueries report, live
+  since SQ4a.
+- **Decision 26, PF16.** On a synthetic file of 400,000 rows in 98 parts, SQ4a's shapes keep their counters (a top-N
+  with a value reads 98 parts where the literal form prunes 97); a value under OR costs the top-N its late
+  materialization; and a comparison with a value is no scan filter (400,000 rows leave the scan, 376,000 with the
+  literal). No TPC query's plan regresses, so PF16 stays a guard, and these figures are SQ2's baseline.
+- **Decision 28.** `tests/slt/cases/subqueries/conditions.slt` holds the forms, written first under `pending SQ1a`
+  and checked against DuckDB, with the divergence pins and the DuckDB-only boundaries; the generator's Feature
+  `condition_value` writes values inside WHERE conditions from a stream of its own, over SQ4a's blocks; the
+  metamorphic relations include the self-check for decision 8's residual.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

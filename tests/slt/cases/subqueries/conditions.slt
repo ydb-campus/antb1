@@ -1,0 +1,2500 @@
+# Uncorrelated subqueries as values in conditions (ADR 0041's SQ1, its first PR): a scalar subquery or an EXISTS
+# anywhere inside a condition of WHERE or of an inner join's ON, one inside a FULL JOIN's left input included -- under
+# AND, OR, NOT and CASE, in arithmetic, functions, COALESCE, casts, IS [NOT] NULL, IS [NOT] DISTINCT FROM, IN lists,
+# LIKE's operand and BETWEEN -- through its single value (NULL over no row, DuckDB's error over two or more), which is
+# computed before any row is read (decision 9); a conjunct of a correlated block that reads the enclosing block and
+# holds such a value; and a correlated conjunct every branch of an OR shares.
+
+# ---- the inputs, one table at a time ----
+
+query ITI nosort
+SELECT ct_id, label, ct_pop FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR	INTEGER
+1	center	120000
+2	harbor	45000
+3	hills	30000
+4	airport	NULL
+5	old town	8000
+6	outskirts	2500
+
+query III nosort
+SELECT zn_id, zn_city, zn_parent FROM zones WHERE zn_id <= 12 ORDER BY zn_id
+----
+INTEGER	SMALLINT	INTEGER
+1	1	NULL
+2	2	NULL
+3	3	NULL
+4	4	NULL
+5	5	NULL
+6	1	1
+7	2	2
+8	3	3
+9	4	4
+10	5	5
+11	1	1
+12	2	2
+
+query I nosort
+SELECT COUNT(*) FROM promos
+----
+BIGINT
+0
+
+query IIII nosort
+SELECT id, i16, i32, i64 FROM edge ORDER BY id
+----
+INTEGER	SMALLINT	INTEGER	BIGINT
+0	-32768	-2147483648	-9223372036854775808
+1	32767	2147483647	9223372036854775807
+2	0	0	0
+3	-1	-1	-1
+4	1	1	1
+5	NULL	NULL	NULL
+6	100	100000	1000000000000000
+7	-100	-100000	-1000000000000000
+8	NULL	7	NULL
+9	12345	NULL	42
+10	-12345	54321	-42
+11	7	-7	7
+
+# ---- under OR: a value of one row, of no row, of a NULL row ----
+
+# A value under OR, decided per row: one row's value; no row and a NULL row are NULL, so only the other branch keeps a
+# row. City 4's population is NULL: its comparison is NULL, and so is its OR.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE ct_id > 100) OR ct_id = 5 ORDER BY ct_id
+----
+SMALLINT
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE label = 'airport') OR ct_id = 5 ORDER BY ct_id
+----
+SMALLINT
+5
+
+# An aggregate's value, and the same aggregate over no row: one row, whose value is NULL.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id > (SELECT MIN(zn_city) FROM zones) OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id > (SELECT MIN(zn_city) FROM zones WHERE zn_id > 1000) OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+# Arithmetic over the value that would overflow, in an OR whose first branch holds for every row: no error.
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE id >= 0 OR i32 > (SELECT MAX(i64) FROM edge) + 1
+----
+BIGINT
+12
+
+# ---- under NOT ----
+
+# NOT over a comparison with a value: NOT NULL is NULL, so a value of no row or of a NULL row keeps nothing.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills')) ORDER BY ct_id
+----
+SMALLINT
+3
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id > 100)) ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'airport')) ORDER BY ct_id
+----
+SMALLINT
+
+# NOT over an OR: a row whose comparison is NULL and whose other branch is false stays NULL.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5) ORDER BY ct_id
+----
+SMALLINT
+3
+6
+
+# NOT over IS NULL of a value that reads no column of the block: every row, or none for a NULL row.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT ((SELECT zn_parent FROM zones WHERE zn_id = 10) IS NULL) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT ((SELECT zn_parent FROM zones WHERE zn_id = 1) IS NULL) ORDER BY ct_id
+----
+SMALLINT
+
+# ---- CASE ----
+
+# A value in a WHEN condition: one row, an aggregate, and no row, whose NULL condition sends every row to the ELSE.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') THEN 1 ELSE 0 END = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id > (SELECT MIN(zn_city) FROM zones) THEN 1 ELSE 0 END = 1 ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_pop > (SELECT ct_pop FROM cities WHERE ct_id > 100) THEN 1 ELSE 0 END = 0 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# CASE x WHEN: a value as the operand that every WHEN compares (a NULL row matches none: the ELSE), and as a WHEN.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE (SELECT zn_parent FROM zones WHERE zn_id = 10) WHEN 5 THEN ct_pop ELSE ct_id END > 20000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE (SELECT zn_parent FROM zones WHERE zn_id = 1) WHEN 5 THEN ct_pop ELSE ct_id END > 4 ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE (SELECT MIN(zn_city) FROM zones) WHEN 1 THEN ct_id WHEN 2 THEN 0 END > 2 ORDER BY ct_id
+----
+SMALLINT
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE ct_id WHEN (SELECT zn_parent FROM zones WHERE zn_id = 10) THEN 1 ELSE 0 END = 1 ORDER BY ct_id
+----
+SMALLINT
+5
+
+# Values as THEN and ELSE, and a THEN of no row: NULL for the rows that take it.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id > 3 THEN (SELECT zn_parent FROM zones WHERE zn_id = 9) ELSE (SELECT MAX(zn_city) FROM zones WHERE zn_id < 3) END < ct_id ORDER BY ct_id
+----
+SMALLINT
+3
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id > 3 THEN (SELECT zn_parent FROM zones WHERE zn_id > 1000) ELSE ct_id END > 1 ORDER BY ct_id
+----
+SMALLINT
+2
+3
+
+# Arithmetic that would overflow over a value of one row and over an aggregate, in an ELSE no row takes: no error.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id > 0 THEN 0 ELSE (SELECT i64 FROM edge WHERE id = 1) + 1 END = 0 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE CASE WHEN id >= 0 THEN 0 ELSE (SELECT MAX(i64) FROM edge) + 1 END = 0
+----
+BIGINT
+12
+
+# ---- EXISTS and NOT EXISTS under OR, NOT and CASE ----
+
+# Under OR: EXISTS over no row is false, over two rows true (it reads no value, so no error), over LIMIT 0 false, over
+# an ungrouped aggregate of an empty table true (one row), over a grouped one false.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city > 100) OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT zn_id FROM zones WHERE zn_city = 2) OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones LIMIT 0) OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT MAX(pm_id) FROM promos) OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT MAX(pm_id) FROM promos GROUP BY pm_code) OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+2
+
+# NOT EXISTS under OR.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT 1 FROM zones WHERE zn_city = 2) OR ct_id = 3 ORDER BY ct_id
+----
+SMALLINT
+3
+
+# NOT over NOT EXISTS, of one row and of none.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (NOT EXISTS (SELECT 1 FROM zones WHERE zn_id = 1)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT NOT EXISTS (SELECT 1 FROM zones WHERE zn_id > 1000) ORDER BY ct_id
+----
+SMALLINT
+
+# CASE WHEN EXISTS, true and false, and CASE WHEN NOT EXISTS over an empty table.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_id = 1) THEN ct_pop ELSE ct_id END > 40000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_id > 1000) THEN 0 ELSE ct_id END > 4 ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN ct_id ELSE 0 END > 3 ORDER BY ct_id
+----
+SMALLINT
+4
+5
+6
+
+# A CASE over an EXISTS with no column in its branches is a value of each row too, no constant.
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_id = 1) THEN 1 ELSE 0 END = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN 0 ELSE 1 END = 1 ORDER BY ct_id
+----
+SMALLINT
+
+# In an inner join's ON: NOT EXISTS under OR, false, so the other branch decides.
+query II nosort
+SELECT ct_id, zn_id FROM cities JOIN zones ON zn_city = ct_id AND (NOT EXISTS (SELECT 1 FROM drivers WHERE dv_city = 1) OR zn_radius > 3) ORDER BY zn_id
+----
+SMALLINT	INTEGER
+2	12
+4	24
+1	36
+
+# The EXISTS block's own value has two rows: the error is raised, although the other branch holds for a row.
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 OR EXISTS (SELECT 1 FROM zones WHERE zn_id > (SELECT zn_id FROM zones WHERE zn_city = 2))
+
+# ---- OR factoring ----
+
+# A conjunct every branch shares leaves the OR as a conjunct of its own: a value, an uncorrelated EXISTS.
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_id = 1 AND ct_pop <= (SELECT ct_pop FROM cities WHERE label = 'harbor')) OR (ct_id = 3 AND ct_pop <= (SELECT ct_pop FROM cities WHERE label = 'harbor')) ORDER BY ct_id
+----
+SMALLINT
+3
+
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_id = 1 AND EXISTS (SELECT 1 FROM zones WHERE zn_city = 9)) OR (ct_id = 3 AND EXISTS (SELECT 1 FROM zones WHERE zn_city = 9)) ORDER BY ct_id
+----
+SMALLINT
+1
+3
+
+# An OR its shared conjunct implies is dropped, and the shared conjunct alone decides. A value only the dropped branch
+# holds is never computed, so its two rows raise no error (as in DuckDB).
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_id = 1 AND ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills')) OR ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id = 2 AND ct_id > (SELECT zn_city FROM zones)) OR ct_id = 2
+----
+BIGINT
+1
+
+# The same value compared with another literal in each branch.
+query I nosort
+SELECT ct_id FROM cities WHERE ((SELECT MIN(zn_city) FROM zones) = 1 AND ct_id = 2) OR ((SELECT MIN(zn_city) FROM zones) = 2 AND ct_id = 3) ORDER BY ct_id
+----
+SMALLINT
+2
+
+# A correlated conjunct every branch shares: EXISTS, NOT EXISTS and a scalar value.
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE (tr_fare > 25 AND EXISTS (SELECT 1 FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')) OR (tr_fare < 5 AND EXISTS (SELECT 1 FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold'))
+----
+BIGINT
+147
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE (tr_fare > 25 AND NOT EXISTS (SELECT 1 FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')) OR (tr_fare < 5 AND NOT EXISTS (SELECT 1 FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold'))
+----
+BIGINT
+332
+
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_id < 3 AND ct_pop > (SELECT SUM(zn_id) * 200 FROM zones WHERE zn_city = ct_id)) OR (ct_id > 4 AND ct_pop > (SELECT SUM(zn_id) * 200 FROM zones WHERE zn_city = ct_id)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+# A dropped branch that holds a correlated value: the shared correlated conjunct alone decides.
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_pop > (SELECT SUM(zn_id) * 200 FROM zones WHERE zn_city = ct_id) AND ct_id = 1) OR ct_pop > (SELECT SUM(zn_id) * 200 FROM zones WHERE zn_city = ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+# ---- arithmetic, functions, COALESCE and casts over a value ----
+
+# A value plus a literal against a column; over no row or a NULL row the sum is NULL, and NOT keeps it NULL.
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE tr_pickup > (SELECT zn_parent FROM zones WHERE zn_id = 10) + 1
+----
+BIGINT
+2580
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE tr_pickup > (SELECT pm_id FROM promos) + 1
+----
+BIGINT
+0
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE NOT (tr_pickup > (SELECT zn_parent FROM zones WHERE zn_id = 1) + 1)
+----
+BIGINT
+0
+
+# No column on either side: the value is an operand, so the comparison holds for every row or for none.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) + 5 > 9 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 1) + 5 > 9 ORDER BY ct_id
+----
+SMALLINT
+
+# A constant moves across a value as it does across a column, so nothing overflows: BIGINT's maximum plus 1 (and
+# minus 1 plus 2) against 0, and an INTEGER product times 1000000000 against 0.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT i64 FROM edge WHERE id = 1) + 1 > 0 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT i64 FROM edge WHERE id = 1) - 1 + 2 > 0 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop * (SELECT zn_parent FROM zones WHERE zn_id = 10) * 1000000000 > 0 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+5
+6
+
+# The value keeps its column's type: INTEGER plus a literal beyond INTEGER is BIGINT, INTEGER's maximum plus a BIGINT
+# value does not overflow, and a SUM below BIGINT's minimum is a HUGEINT.
+query I nosort
+SELECT id FROM edge WHERE (SELECT i32 FROM edge WHERE id = 6) + 3000000000 > i32 + 3000000000 ORDER BY id
+----
+INTEGER
+0
+2
+3
+4
+7
+8
+10
+11
+
+query I nosort
+SELECT id FROM edge WHERE i32 + (SELECT i64 FROM edge WHERE id = 4) > 15 ORDER BY id
+----
+INTEGER
+1
+6
+10
+
+query I nosort
+SELECT id FROM edge WHERE i64 > (SELECT SUM(i64) FROM edge WHERE id IN (0, 3)) + 1 ORDER BY id
+----
+INTEGER
+1
+2
+3
+4
+6
+7
+9
+10
+11
+
+# DECIMAL values: plus a literal of another scale, a sum and a product compared exactly (5.00 * 4.5 is not above
+# 22.5), and a quotient, which is DOUBLE (a zero divisor gives infinity).
+query I nosort
+SELECT id FROM decimals WHERE d9_2 > (SELECT sh_hours FROM shifts WHERE sh_row = 0) + 0.05 ORDER BY id
+----
+INTEGER
+1
+5
+8
+16
+19
+27
+30
+
+query I nosort
+SELECT id FROM decimals WHERE d9_2 + (SELECT sh_hours FROM shifts WHERE sh_row = 0) = 9.00 ORDER BY id
+----
+INTEGER
+5
+16
+27
+
+query I nosort
+SELECT id FROM decimals WHERE d9_2 * (SELECT sh_hours FROM shifts WHERE sh_row = 1) > 22.5 ORDER BY id
+----
+INTEGER
+1
+8
+19
+30
+
+query I nosort
+SELECT id FROM decimals WHERE (SELECT sh_hours FROM shifts WHERE sh_row = 0) / d9_2 > 1 ORDER BY id
+----
+INTEGER
+4
+7
+13
+15
+18
+21
+26
+29
+32
+35
+37
+
+# Functions and a cast over a value: round half away from zero, substring's start, date_trunc, abs (NULL over no
+# row) and CAST.
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE round((SELECT zn_radius FROM zones WHERE zn_id = 1) + zn_radius, 0) > 2
+----
+BIGINT
+18
+
+query I nosort
+SELECT ct_id FROM cities WHERE substring(label, (SELECT zn_parent FROM zones WHERE zn_id = 7), 2) = 'ar' ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I nosort
+SELECT dv_row FROM drivers WHERE date_trunc('month', (SELECT dv_since FROM drivers WHERE dv_row = 1)) = date_trunc('month', dv_since) ORDER BY dv_row
+----
+INTEGER
+0
+1
+2
+34
+35
+67
+68
+69
+
+query I nosort
+SELECT ct_id FROM cities WHERE abs((SELECT MIN(zn_city) FROM zones)) < ct_id ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE abs((SELECT pm_id FROM promos)) < ct_id OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id > CAST((SELECT MIN(zn_city) FROM zones) AS BIGINT) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+# COALESCE: no row and a NULL row (an aggregate over no row too) take the next argument, one row keeps its value; a
+# value fills a NULL column, and no row leaves it NULL.
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE((SELECT pm_id FROM promos), 30000) < ct_pop ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE((SELECT zn_parent FROM zones WHERE zn_id = 1), 30000) < ct_pop ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id > COALESCE((SELECT MIN(zn_city) FROM zones WHERE zn_id < 0), 3) ORDER BY ct_id
+----
+SMALLINT
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE((SELECT zn_parent FROM zones WHERE zn_id = 7), 30000) < ct_pop ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE(ct_pop, (SELECT ct_pop FROM cities WHERE ct_id = 2)) > 30000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+4
+
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE(ct_pop, (SELECT pm_id FROM promos)) > 30000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+# ---- IS [NOT] NULL and IS [NOT] DISTINCT FROM ----
+
+# No row and a NULL row are NULL, one row is not; COUNT over no row is 0, MAX over no row NULL.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT pm_id FROM promos) IS NULL AND ct_id < 3 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) IS NULL OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 1) IS NOT NULL ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 1) IS NULL ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT COUNT(*) FROM zones WHERE zn_id > 1000) IS NULL ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_id > 1000) IS NULL ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# IS NULL of a FLOAT value and of edge.s, a binary column both engines read as VARCHAR: a row with a value, and a
+# NULL row.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT f FROM floats WHERE id = 2) IS NULL OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT f FROM floats WHERE id = 17) IS NULL OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT s FROM edge WHERE id = 1) IS NULL AND ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT s FROM edge WHERE id = 5) IS NULL AND ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+# IS [NOT] DISTINCT FROM is NULL-safe: a column against one row, NOT of it, a NULL row and no row; a value against a
+# literal under OR, equal to it and NULL.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop IS DISTINCT FROM (SELECT ct_pop FROM cities WHERE ct_id = 2) ORDER BY ct_id
+----
+SMALLINT
+1
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (ct_pop IS DISTINCT FROM (SELECT ct_pop FROM cities WHERE ct_id = 2)) ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop IS NOT DISTINCT FROM (SELECT zn_parent FROM zones WHERE zn_id = 1) ORDER BY ct_id
+----
+SMALLINT
+4
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT pm_id FROM promos) IS NOT DISTINCT FROM ct_pop ORDER BY ct_id
+----
+SMALLINT
+4
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) IS DISTINCT FROM 5 OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 1) IS DISTINCT FROM 5 OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# ---- IN lists ----
+
+# A value as an element of the list: one row, no row (a NULL element matches nothing), and two values.
+query I nosort
+SELECT zn_id FROM zones WHERE zn_id IN (1, (SELECT zn_parent FROM zones WHERE zn_id = 10)) ORDER BY zn_id
+----
+INTEGER
+1
+5
+
+query I nosort
+SELECT zn_id FROM zones WHERE zn_id IN (1, (SELECT pm_id FROM promos)) ORDER BY zn_id
+----
+INTEGER
+1
+
+query I nosort
+SELECT zn_id FROM zones WHERE zn_id IN ((SELECT zn_parent FROM zones WHERE zn_id = 10), (SELECT MAX(ct_id) FROM cities)) ORDER BY zn_id
+----
+INTEGER
+5
+6
+
+# NOT IN a list that holds a NULL row is never true; with one row it is.
+query I nosort
+SELECT zn_id FROM zones WHERE zn_id NOT IN (1, (SELECT zn_parent FROM zones WHERE zn_id = 1)) ORDER BY zn_id
+----
+INTEGER
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE zn_id NOT IN (1, (SELECT zn_parent FROM zones WHERE zn_id = 10))
+----
+BIGINT
+38
+
+# A value as the operand: one row IN literals, and no row NOT IN them.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) IN (1, 5, 9) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT pm_id FROM promos) NOT IN (1, 5) ORDER BY ct_id
+----
+SMALLINT
+
+# The list's type: a DECIMAL value next to an INTEGER literal, a DATE value next to a string literal.
+query I nosort
+SELECT id FROM decimals WHERE d9_2 IN ((SELECT sh_hours FROM shifts WHERE sh_row = 2), 0) ORDER BY id
+----
+INTEGER
+4
+5
+15
+16
+26
+27
+37
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE tr_day IN ((SELECT sh_day FROM shifts WHERE sh_row = 0), '2026-03-10')
+----
+BIGINT
+189
+
+# An element of two rows or more fails, whatever the other elements match.
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_id FROM zones WHERE zn_id IN (1, (SELECT zn_city FROM zones WHERE zn_id < 3))
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_id FROM zones WHERE zn_id IN ((SELECT ct_id FROM cities), 50)
+
+# ---- LIKE ----
+
+# A value as LIKE's operand (never its pattern): LIKE, NOT LIKE, and a NULL row.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT label FROM zones WHERE zn_id = 2) LIKE 'no%' AND ct_id < 3 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT label FROM zones WHERE zn_id = 2) NOT LIKE 'no%' OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT label FROM zones WHERE zn_id = 8) LIKE 'no%' OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+# ---- BETWEEN ----
+
+# NOT BETWEEN value bounds, arithmetic on a bound, a value between two columns, and value bounds under OR.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop NOT BETWEEN (SELECT ct_pop FROM cities WHERE ct_id = 3) AND (SELECT MAX(ct_pop) FROM cities WHERE ct_id > 1) ORDER BY ct_id
+----
+SMALLINT
+1
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop BETWEEN (SELECT ct_pop FROM cities WHERE ct_id = 3) + 1 AND 100000 ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) BETWEEN tr_pickup AND tr_dropoff
+----
+BIGINT
+297
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop BETWEEN (SELECT ct_pop FROM cities WHERE ct_id = 3) AND (SELECT MAX(ct_pop) FROM cities WHERE ct_id > 1) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+2
+3
+6
+
+# NOT BETWEEN a bound of no row is NULL where the other comparison holds, and true where it does not.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop NOT BETWEEN (SELECT pm_id FROM promos) AND 30000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop NOT BETWEEN 10000 AND (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+# A value of two rows as the operand fails.
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE (SELECT zn_city FROM zones WHERE zn_id < 3) BETWEEN 0 AND 100
+
+# ---- two values in one comparison ----
+
+# One row each and two aggregates; no row each: NULL = NULL is NULL, while IS NOT DISTINCT FROM holds.
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 10) = (SELECT MIN(ct_id) FROM cities WHERE ct_pop < 10000) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT MIN(zn_city) FROM zones) < (SELECT MAX(zn_city) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT pm_id FROM promos) = (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT pm_id FROM promos) IS NOT DISTINCT FROM (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# ---- one subquery written twice ----
+
+# The same subquery in a direct comparison and in arithmetic, and as both bounds of a BETWEEN.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id > (SELECT zn_city FROM zones WHERE zn_id = 3) AND ct_pop > (SELECT zn_city FROM zones WHERE zn_id = 3) + 5000 ORDER BY ct_id
+----
+SMALLINT
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop BETWEEN (SELECT ct_pop FROM cities WHERE ct_id = 3) AND (SELECT ct_pop FROM cities WHERE ct_id = 3) + 15000 ORDER BY ct_id
+----
+SMALLINT
+2
+3
+
+# ---- an inner join's ON ----
+
+# Arithmetic over a value; over a NULL row the difference is NULL and the ON never holds.
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT MIN(ct_id) FROM cities) + 2
+----
+BIGINT
+1116
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT ct_pop FROM cities WHERE ct_id = 4) - 2
+----
+BIGINT
+0
+
+# Under OR the other branch keeps its rows where the value's comparison is NULL too: for city 4, which has no
+# population, and for every row when the value has no row. NOT keeps the cities at or under the value, not city 4.
+query I rowsort
+SELECT zn_id FROM cities JOIN zones ON ct_id = zn_city AND (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 2) OR zn_parent IS NULL)
+----
+INTEGER
+1
+11
+16
+2
+21
+26
+3
+31
+36
+4
+5
+6
+
+query I rowsort
+SELECT zn_id FROM cities JOIN zones ON ct_id = zn_city AND (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 7) OR zn_parent IS NULL)
+----
+INTEGER
+1
+2
+3
+4
+5
+
+query II nosort
+SELECT ct_id, COUNT(*) FROM cities JOIN zones ON ct_id = zn_city AND NOT (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 2)) GROUP BY ct_id ORDER BY ct_id
+----
+SMALLINT	BIGINT
+2	8
+3	7
+5	8
+
+# A value inside the equality's key expression; over no row the key is NULL and no pair matches.
+query II nosort
+SELECT ct_id, zn_id FROM cities JOIN zones ON ct_id = zn_id - (SELECT MIN(zn_city) FROM zones WHERE zn_city > 1) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	3
+2	4
+3	5
+4	6
+5	7
+6	8
+
+query I rowsort
+SELECT COUNT(*) FROM cities JOIN zones ON ct_id = zn_id - (SELECT zn_city FROM zones WHERE zn_id > 40)
+----
+BIGINT
+0
+
+# A value under OR in an inner ON, then a LEFT JOIN over its rows.
+query II nosort
+SELECT z.zn_id, p.zn_id FROM zones AS z JOIN cities ON z.zn_city = ct_id AND (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 2) OR z.zn_parent IS NULL) LEFT JOIN zones AS p ON p.zn_id = z.zn_parent ORDER BY z.zn_id
+----
+INTEGER	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	1
+11	1
+16	1
+21	1
+26	1
+31	1
+36	1
+
+# ---- an inner ON inside a FULL JOIN's left input ----
+
+# The conjunct filters the left input before the FULL JOIN pads, so every driver without a kept trip still comes
+# out: direct comparisons (one with COUNT(*) over no row, which is 0), arithmetic, and a value of no row, which
+# empties the input (every driver padded).
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id
+----
+BIGINT	BIGINT	BIGINT
+1126	1118	966
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_parent > (SELECT COUNT(*) FROM promos) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+2451	2443	2107
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city * 2 > (SELECT COUNT(*) FROM promos) + 7 FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+1124	1116	966
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city < (SELECT ct_id FROM cities WHERE ct_id > 6) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+97	0	96
+
+# A value of two rows fails there too.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT zn_city FROM zones WHERE zn_id < 3) + 0 FULL JOIN drivers ON tr_driver = dv_id
+
+# The inner ON's conjunct zn_city < (SELECT MIN(ct_id) + 2 FROM cities) moved to WHERE filters above the FULL JOIN, so
+# the drivers it pads go too; with 3, the value, in its place the inner ON keeps what the value keeps.
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id FULL JOIN drivers d ON t.tr_driver = d.dv_id WHERE z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities)
+----
+BIGINT	BIGINT	BIGINT
+1118	1118	959
+
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < 3 FULL JOIN drivers d ON t.tr_driver = d.dv_id
+----
+BIGINT	BIGINT	BIGINT
+1126	1118	966
+
+# One subquery written in that inner ON and in WHERE is two values, one per slot (ADR 0041's decision 10). The WHERE's
+# stands above the FULL JOIN, so its comparison holds for the drivers the FULL JOIN pads too; read from the inner ON's
+# slot, the value would be NULL on those rows and drop them.
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id WHERE d.dv_id > (SELECT MIN(ct_id) + 2 FROM cities) - 100
+----
+BIGINT	BIGINT	BIGINT
+966	959	966
+
+# ---- IN, NOT IN and EXISTS in an inner ON inside a FULL JOIN's left input ----
+
+# IN over one row and over none; NOT IN over rows, over rows with a NULL (never true: every city padded) and over
+# none (always true).
+query III rowsort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT ct_id FROM cities WHERE label = 'harbor') FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+27	22	27
+
+query III rowsort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id IN (SELECT pm_id FROM promos) FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+6	0	6
+
+query III rowsort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT ct_id FROM cities WHERE ct_id > 1) FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+581	579	581
+
+query III rowsort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT zn_parent FROM zones WHERE zn_city = 1) FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+6	0	6
+
+query III rowsort
+SELECT COUNT(*), COUNT(zn_row), COUNT(ct_row) FROM zones JOIN drivers ON zn_city = dv_city AND zn_id NOT IN (SELECT pm_id FROM promos) FULL JOIN cities ON dv_city = ct_id
+----
+BIGINT	BIGINT	BIGINT
+670	668	670
+
+# EXISTS that is false empties the left input, every driver padded; NOT EXISTS over an empty table keeps it whole.
+query III rowsort
+SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND EXISTS (SELECT 1 FROM cities WHERE ct_pop > 1000000) FULL JOIN drivers d ON t.tr_driver = d.dv_id
+----
+BIGINT	BIGINT	BIGINT
+97	0	96
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND NOT EXISTS (SELECT 1 FROM promos) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+2801	2793	2405
+
+# ---- values inside correlated blocks ----
+
+# A conjunct of a correlated EXISTS that reads the enclosing block and holds a value; NOT EXISTS keeps the other
+# cities.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT MIN(zn_city) FROM zones)) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT MIN(zn_city) FROM zones)) ORDER BY ct_id
+----
+SMALLINT
+1
+6
+
+# The value over the enclosing block's table: city 4's NULL population never passes. Over no row the conjunct is
+# never true, so NOT EXISTS keeps every city.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_pop > (SELECT MIN(ct_pop) FROM cities)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_pop > (SELECT ct_pop FROM cities WHERE ct_id > 6)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# Arithmetic over columns of both blocks against arithmetic over a value: INTEGER, and DECIMAL with a SMALLINT.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND zones.zn_id + cities.ct_id > (SELECT MAX(zn_id) FROM zones) - 2) ORDER BY ct_id
+----
+SMALLINT
+2
+5
+
+query I rowsort
+SELECT COUNT(*) FROM drivers WHERE EXISTS (SELECT 1 FROM trips WHERE tr_driver = dv_id AND tr_fare + dv_city > (SELECT MAX(tr_fare) FROM trips) - 1)
+----
+BIGINT
+81
+
+# A correlated scalar aggregate whose block holds a value in arithmetic (SUM, MAX), and one whose conjunct reads the
+# enclosing block and holds a value.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zones.zn_id) * 300 FROM zones WHERE zones.zn_city = cities.ct_id AND zones.zn_id > (SELECT MIN(zn_id) FROM zones) + 10) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE zn_city * 2 < (SELECT MAX(tr_dropoff) FROM trips WHERE tr_pickup = zn_id AND tr_dropoff < (SELECT MIN(tr_dropoff) FROM trips) + 10)
+----
+BIGINT
+30
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zn_id) * 300 FROM zones WHERE zn_city = ct_id AND zn_id + ct_id > (SELECT MAX(zn_city) FROM zones)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+# BETWEEN over an enclosing column with a value bound: arithmetic on the bound, the bound alone, and NOT BETWEEN.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id BETWEEN (SELECT MIN(zn_city) FROM zones) + 1 AND 5) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id BETWEEN (SELECT MIN(zn_city) FROM zones WHERE zn_city > 2) AND 5) ORDER BY ct_id
+----
+SMALLINT
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id NOT BETWEEN (SELECT MIN(zn_city) FROM zones) + 1 AND 4) ORDER BY ct_id
+----
+SMALLINT
+1
+5
+
+# A value of two rows fails inside the correlated block too.
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = cities.ct_id AND cities.ct_id > (SELECT zn_city FROM zones WHERE zn_id < 3)) ORDER BY ct_id
+
+# ---- a correlated comparison with a value on its other side, and a value as a correlated block's key ----
+
+# A correlated aggregate compared with an expression over a value, in WHERE and in an inner ON, and with a CASE over an
+# EXISTS: the value's join stands below Path 2's join.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_pop / 1000 + (SELECT COUNT(*) FROM cities) > (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+query I rowsort
+SELECT COUNT(*) FROM cities JOIN days ON dy_week = ct_id AND ct_pop + (SELECT MIN(md_id) - 1 FROM models) > (SELECT SUM(zn_id) * 500 FROM zones WHERE zn_city = ct_id)
+----
+BIGINT
+7
+
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN EXISTS (SELECT 1 FROM promos) THEN 0 ELSE ct_pop END > (SELECT SUM(zn_id) * 500 FROM zones WHERE zn_city = ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+# A correlated aggregate compared directly with a value, in either order and in an inner ON; with a value bound before
+# in WHERE (one join), a value of no row (NULL: no row passes), a value of two rows (the row error), and the same
+# correlated subquery on both sides (one join, its column on both).
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) < (SELECT COUNT(*) * 6 FROM cities) ORDER BY 1
+----
+SMALLINT
+3
+4
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) * 6 FROM cities) > (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+3
+4
+
+query I rowsort
+SELECT COUNT(*) FROM cities c JOIN drivers d ON d.dv_city = c.ct_id AND (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) < (SELECT COUNT(*) * 6 FROM cities)
+----
+BIGINT
+44
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_id > (SELECT MIN(zn_city) FROM zones) AND (SELECT MAX(zn_id) FROM zones z WHERE z.zn_city = c.ct_id) > (SELECT MIN(zn_city) FROM zones) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+
+query I nosort
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) < (SELECT ct_id FROM cities WHERE ct_id > 100) ORDER BY ct_id
+----
+SMALLINT
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) < (SELECT zn_city FROM zones) ORDER BY ct_id
+
+query I nosort
+SELECT ct_id FROM cities c WHERE (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) = (SELECT MAX(zn_id) FROM zones WHERE zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+# A value equal to the outer column keys the correlated block: Path 2's inner equivalent (SUM, AVG, a value of a NULL
+# row, which binds no city), and Path 1's semi and anti key.
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop / 100 > (SELECT AVG(zn_id) FROM zones z WHERE (SELECT MAX(zn_city) FROM zones WHERE zn_city < 9) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+5
+
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT zn_city FROM zones WHERE zn_id = 38) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+# ---- nesting, and UNION ALL ----
+
+# A value inside another subquery's WHERE; with a value of no row there, the inner MAX is NULL and no city passes.
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(ct_pop) FROM cities WHERE ct_pop < (SELECT MIN(ct_pop) FROM cities) * 10) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(ct_pop) FROM cities WHERE ct_pop < (SELECT ct_pop FROM cities WHERE ct_id = 7) * 10) ORDER BY ct_id
+----
+SMALLINT
+
+# Values in both arms of a UNION ALL, under OR and under NOT; with a NULL row only the OR's other branch keeps a row.
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 3) OR ct_id = 6 UNION ALL SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 3))
+----
+SMALLINT
+1
+2
+3
+5
+6
+6
+
+query I rowsort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 4) OR ct_id = 6 UNION ALL SELECT ct_id FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 4))
+----
+SMALLINT
+6
+
+# A value of two rows fails wherever it stands: in another subquery's WHERE under an OR whose other branch holds,
+# and under NOT in one arm of a UNION ALL.
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(zn_id) FROM zones WHERE zn_id > (SELECT zn_city FROM zones WHERE zn_id < 3) + 0) OR ct_id = 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 UNION ALL SELECT ct_id FROM cities WHERE NOT (ct_id > (SELECT zn_city FROM zones WHERE zn_id < 3))
+
+# ---- the value's own errors: its join builds before any row is read ----
+
+# Two rows fail the query wherever the value stands, even where no row needs it: under OR beside a branch that holds
+# for one row or for every row, and under NOT over that OR.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM edge WHERE id = 1 OR i32 > (SELECT i64 FROM edge WHERE id < 3)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > 0 OR ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE NOT (ct_id > 0 OR ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2))
+
+# In a CASE branch never taken: after a literal THEN, after a WHEN that holds for every row, and after one the column's
+# range proves true. As COALESCE's second argument, needed by one row (the NULL population) or by none.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM edge WHERE CASE WHEN id >= 0 THEN 0 ELSE (SELECT i64 FROM edge WHERE id < 3) END = 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE CASE WHEN label <> 'nowhere' THEN ct_pop ELSE (SELECT zn_id FROM zones WHERE zn_id <= 2) END > 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id > 0 THEN ct_pop ELSE (SELECT zn_id FROM zones WHERE zn_id <= 2) END > 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE COALESCE(ct_pop, (SELECT zn_id FROM zones WHERE zn_id <= 2)) > 15
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE COALESCE(ct_id, (SELECT zn_city FROM zones WHERE zn_id <= 2)) > 0
+
+# Under AND beside a side no row passes (by its values, or outside the column's range), and over an empty table.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE label = 'nowhere' AND ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2) + 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > 100 AND ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2) + 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM promos WHERE pm_id > (SELECT zn_id FROM zones WHERE zn_id <= 2) OR pm_id = 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM promos WHERE pm_id > (SELECT zn_id FROM zones WHERE zn_id <= 2) + 1
+
+# Under OR in an inner join's ON.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_id = 1 OR zn_city > (SELECT zn_city FROM zones WHERE zn_id <= 2))
+
+# An overflow inside the value's query is its own error too: it fails in a CASE branch never taken and beside an OR
+# branch true for every row. Over a NULL row the same query computes no overflow, and the query answers.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id > 0 THEN 0 ELSE (SELECT i64 + 1 FROM edge WHERE id = 1) END = 0
+
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE ct_id > 0 OR ct_pop > (SELECT i64 + 1 FROM edge WHERE id = 1)
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id > 0 THEN 0 ELSE (SELECT i64 + 1 FROM edge WHERE id = 5) END = 0
+----
+BIGINT
+6
+
+# ---- expressions over the value: computed for the rows that reach them ----
+
+# Arithmetic over the value in its column's type (a SMALLINT times 2 stays SMALLINT, an INTEGER times 2147483647
+# stays INTEGER) overflows where rows reach it: against a column, under NOT, and in an inner join's ON. Over no row
+# the value is NULL, and nothing overflows.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT i64 FROM edge WHERE id = 1) + 1
+
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT i16 FROM edge WHERE id = 1) * 2
+
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE (SELECT zn_id FROM zones WHERE zn_id = 20) * 2147483647 > ct_pop
+
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE NOT ((SELECT zn_id FROM zones WHERE zn_id = 20) * 2147483647 > ct_pop)
+
+statement error Overflow in addition of
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_id > (SELECT i64 FROM edge WHERE id = 1) + 1
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT i64 FROM edge WHERE id > 100) + 1
+----
+BIGINT
+0
+
+# Constants regroup around the value as around a column: 1000000000 * 3 is computed in INTEGER and overflows, also
+# when the value is NULL.
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE (SELECT zn_id FROM zones WHERE zn_id = 20) * 1000000000 * 3 > 0
+
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE (SELECT zn_id FROM zones WHERE zn_id > 100) * 1000000000 * 3 > 0
+
+# An overflowing OR branch written first fails in both engines, whatever the other branch decides; so does an
+# overflowing WHERE conjunct written first: conjuncts that hold values filter in the order written.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT i64 FROM edge WHERE id = 1) + 1 OR strlen(concat(label, 'x')) > 0
+
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE ct_pop + (SELECT i64 FROM edge WHERE id = 1) > 0 AND strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 1))) = 0
+
+# A comparison with a literal outside the value's type still computes its operand under OR, so the SMALLINT sum
+# overflows; over a NULL row the operand is NULL and the other branch decides.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 OR ct_id = 1
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (SELECT i16 FROM edge WHERE id = 5) + 1 > 40000 OR ct_id = 1
+----
+BIGINT
+1
+
+# ---- bind errors around values ----
+
+# The subquery's own block: two columns (under OR, in a CASE branch, in arithmetic, under OR in an inner join's ON),
+# an unknown column (under OR, under NOT, in arithmetic, and in an OR branch its shared conjunct makes redundant), an
+# ungrouped column (a value under OR, EXISTS and NOT EXISTS under OR).
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_id, zn_city FROM zones)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id > 1 THEN (SELECT zn_id, zn_city FROM zones) ELSE 0 END > 0
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT zn_id, zn_city FROM zones WHERE zn_id = 1) + 1
+
+statement error
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_id = 1 OR zn_city > (SELECT zn_city, zn_id FROM zones))
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_id > (SELECT MIN(nope) FROM zones)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE NOT (ct_id = 1 OR ct_id > (SELECT MIN(nope) FROM zones))
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT nope FROM zones) + 1
+
+statement error
+SELECT COUNT(*) FROM cities WHERE (ct_id = 2 AND ct_id > (SELECT nosuch FROM zones)) OR ct_id = 2
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_id FROM zones GROUP BY zn_city)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR EXISTS (SELECT zn_id FROM zones GROUP BY zn_city)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR NOT EXISTS (SELECT zn_id FROM zones GROUP BY zn_city)
+
+# A value of a type its place does not take: a VARCHAR value beside an INTEGER in CASE, an INTEGER value as the operand
+# of LIKE and NOT LIKE, a VARCHAR value in arithmetic, a DATE compared with a COALESCE of a VARCHAR value (a NULL row).
+statement error
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id > 1 THEN (SELECT MIN(label) FROM zones) ELSE 1 END = 1
+
+statement error
+SELECT COUNT(*) FROM cities WHERE (SELECT MIN(zn_id) FROM zones) LIKE '1%'
+
+statement error
+SELECT COUNT(*) FROM cities WHERE (SELECT MIN(zn_id) FROM zones) NOT LIKE '1%'
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id + (SELECT MIN(label) FROM zones) > 1
+
+statement error
+SELECT COUNT(*) FROM drivers WHERE dv_since > COALESCE((SELECT label FROM zones WHERE zn_id = 8), '2025-06-01')
+
+# A bind error outside the subquery: in a conjunct after an OR that holds a value, in a conjunct before a value
+# conjunct, and in the select list.
+statement error
+SELECT COUNT(*) FROM cities WHERE (ct_id = 1 OR ct_id > (SELECT zn_id FROM zones)) AND nope = 1
+
+statement error
+SELECT COUNT(*) FROM cities WHERE nope > 1 AND ct_pop > (SELECT zn_id FROM zones WHERE zn_id = 1) + 1
+
+statement error
+SELECT nope FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_id FROM zones)
+
+# ---- values in a WHERE over joins: above an inner join, a comma join and a LEFT JOIN (whose padded rows are NULL) ----
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id WHERE zn_city > (SELECT MIN(ct_id) FROM cities) + 2 OR tr_fare > 25
+----
+BIGINT
+1288
+
+query I rowsort
+SELECT COUNT(*) FROM trips, zones WHERE tr_pickup = zn_id AND (zn_city > (SELECT MIN(ct_id) FROM cities) + 2 OR tr_fare > 25)
+----
+BIGINT
+1288
+
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_city = ct_id AND zn_radius > 3 WHERE zn_id IS NULL OR zn_id > (SELECT MIN(zn_id) FROM zones) + 20 ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	36
+3	NULL
+4	24
+5	NULL
+6	NULL
+
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_city = ct_id AND zn_radius > 3 WHERE zn_id IS NULL OR zn_id > (SELECT zn_id FROM zones WHERE zn_id > 1000) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+3	NULL
+5	NULL
+6	NULL
+
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_city = ct_id AND zn_radius > 3 WHERE NOT (zn_id < (SELECT MIN(zn_id) FROM zones) + 20) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	36
+4	24
+
+# ---- in an inner ON inside a FULL JOIN's left input: under OR, of no row, under NOT, an EXISTS under OR, a CASE ----
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city < (SELECT MIN(ct_id) FROM cities) + 1 OR zn_parent IS NULL) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+847	839	726
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city < (SELECT ct_id FROM cities WHERE ct_id > 6) OR zn_parent IS NULL) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+360	350	307
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND NOT (zn_city > (SELECT MIN(ct_id) FROM cities)) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+567	559	487
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND (EXISTS (SELECT 1 FROM promos) OR zn_city = 1) FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+567	559	487
+
+query III rowsort
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND CASE WHEN zn_parent IS NULL THEN (SELECT MIN(ct_id) FROM cities) ELSE zn_city END = 1 FULL JOIN drivers ON tr_driver = dv_id
+----
+BIGINT	BIGINT	BIGINT
+847	839	726
+
+# Two values compared there: true keeps the inner join's rows, false empties the input, every model padded.
+query III rowsort
+SELECT COUNT(*), COUNT(c.ct_id), COUNT(m.md_id) FROM cities c JOIN zones z ON z.zn_id = c.ct_id AND (SELECT COUNT(*) FROM cities) > (SELECT MIN(zn_city) FROM zones) FULL JOIN models m ON m.md_id = z.zn_id
+----
+BIGINT	BIGINT	BIGINT
+26	6	26
+
+query III rowsort
+SELECT COUNT(*), COUNT(c.ct_id), COUNT(m.md_id) FROM cities c JOIN zones z ON z.zn_id = c.ct_id AND (SELECT COUNT(*) FROM cities) < (SELECT MIN(zn_city) FROM zones) FULL JOIN models m ON m.md_id = z.zn_id
+----
+BIGINT	BIGINT	BIGINT
+26	0	26
+
+# ---- more forms in an inner ON: BETWEEN, an IN list, COALESCE, a CASE, a second join over three relations ----
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city NOT BETWEEN (SELECT MIN(ct_id) FROM cities) + 1 AND 3
+----
+BIGINT
+1675
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city IN (1, (SELECT zn_parent FROM zones WHERE zn_id = 10))
+----
+BIGINT
+1117
+
+query I rowsort
+SELECT COUNT(*) FROM cities JOIN zones ON zn_city = ct_id AND COALESCE(zn_parent, (SELECT MAX(zn_city) FROM zones WHERE zn_id < 3)) = ct_id
+----
+BIGINT
+33
+
+query II nosort
+SELECT ct_id, zn_id FROM cities JOIN zones ON zn_city = ct_id AND CASE WHEN zn_parent IS NULL THEN (SELECT zn_id FROM zones WHERE zn_id > 1000) ELSE zn_id END > 30 ORDER BY zn_id
+----
+SMALLINT	INTEGER
+1	31
+2	32
+3	33
+4	34
+5	35
+1	36
+2	37
+5	40
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id JOIN cities ON zn_city = ct_id AND (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR tr_fare > 25)
+----
+BIGINT
+1266
+
+# ---- values under OR inside correlated blocks ----
+
+# A conjunct of the block alone, one that reads the enclosing block, and one in a correlated aggregate's block.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city = ct_id AND (zn_radius > (SELECT MAX(zn_radius) FROM zones) - 0.1 OR zn_id = 3)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city = ct_id AND (ct_pop > (SELECT ct_pop FROM cities WHERE ct_id = 3) OR zn_radius > 3)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+4
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zn_id) * 240 FROM zones WHERE zn_city = ct_id AND (zn_id > (SELECT MIN(zn_id) FROM zones) + 2 OR zn_parent > 1)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+# ---- next to an IN semi join, a correlated EXISTS and a correlated scalar comparison ----
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_radius > 3) AND (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city = ct_id AND zn_radius > 3) AND (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT SUM(zn_id) * 200 FROM zones WHERE zn_city = ct_id) AND (ct_id < (SELECT MAX(zn_city) FROM zones WHERE zn_id < 3) OR label = 'hills') ORDER BY ct_id
+----
+SMALLINT
+1
+3
+
+# ---- in other blocks' WHERE: a derived table, a CTE body and an IN subquery ----
+
+query I rowsort
+SELECT COUNT(*) FROM (SELECT ct_id FROM cities WHERE ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills') OR ct_id = 5) AS d
+----
+BIGINT
+3
+
+query I nosort
+WITH c AS (SELECT ct_id, ct_pop FROM cities WHERE NOT (ct_pop > (SELECT ct_pop FROM cities WHERE label = 'hills'))) SELECT ct_id FROM c ORDER BY ct_id
+----
+SMALLINT
+3
+5
+6
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_radius > (SELECT MAX(zn_radius) FROM zones) - 0.5 OR zn_parent IS NULL)
+----
+BIGINT
+768
+
+# ---- VARCHAR and DATE values ----
+
+query I nosort
+SELECT ct_id FROM cities WHERE strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 2))) > 10 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE strlen(concat(label, (SELECT label FROM zones WHERE zn_id = 8))) > 8 ORDER BY ct_id
+----
+SMALLINT
+6
+
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE tr_day < (SELECT sh_day FROM shifts WHERE sh_row = 0) + 7
+----
+BIGINT
+660
+
+query I nosort
+SELECT ct_id FROM cities WHERE label = (SELECT label FROM zones WHERE zn_id = 4) OR ct_pop < 3000 ORDER BY ct_id
+----
+SMALLINT
+4
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE label IN ((SELECT label FROM zones WHERE zn_id = 1), 'hills') ORDER BY ct_id
+----
+SMALLINT
+1
+3
+
+# ---- a zero value as a divisor, a DECIMAL value in a CASE, two values next to a column ----
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop / (SELECT COUNT(*) FROM promos) > 0 OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+5
+6
+
+query I nosort
+SELECT id FROM decimals WHERE CASE WHEN id > 20 THEN (SELECT sh_hours FROM shifts WHERE sh_row = 1) ELSE 1.25 END < d9_2 ORDER BY id
+----
+INTEGER
+1
+5
+8
+13
+16
+19
+27
+30
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id + (SELECT MIN(zn_city) FROM zones) > (SELECT MAX(zn_city) FROM zones WHERE zn_id < 3) ORDER BY ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+# ---- a subquery written twice (across WHERE and an ON, under one OR); an inner alias over an outer one ----
+
+query I rowsort
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city > (SELECT MIN(ct_id) FROM cities) WHERE tr_dropoff > (SELECT MIN(ct_id) FROM cities) + 30 OR tr_fare > 25
+----
+BIGINT
+623
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id < (SELECT MIN(zn_city) FROM zones) + 1 OR ct_id > (SELECT MIN(zn_city) FROM zones) + 4 ORDER BY ct_id
+----
+SMALLINT
+1
+6
+
+query I nosort
+SELECT c.ct_id FROM cities AS c WHERE c.ct_pop > (SELECT c.ct_pop FROM cities AS c WHERE c.ct_id = 3) OR c.ct_id = 6 ORDER BY c.ct_id
+----
+SMALLINT
+1
+2
+6
+
+# ---- a lazy OR and a lazy CASE whose first branch no statistics decide ----
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE strlen(concat(label, 'x')) > 0 OR ct_pop > (SELECT i64 FROM edge WHERE id = 1) + 1
+----
+BIGINT
+6
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE CASE WHEN strlen(concat(label, 'x')) > 0 THEN 0 ELSE (SELECT i64 FROM edge WHERE id = 1) + 1 END = 0
+----
+BIGINT
+6
+
+# ---- a WHERE value under OR in a grouped block ----
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones WHERE zn_radius > (SELECT MIN(zn_radius) FROM zones) + 2 OR zn_parent IS NULL GROUP BY zn_city
+----
+SMALLINT	BIGINT
+1	3
+2	3
+3	2
+4	3
+5	3
+
+# ---- the row error in the new placements ----
+
+# Under OR above a LEFT JOIN, inside a correlated EXISTS, in an IN subquery's block, in a FULL JOIN's left input and
+# in a derived table.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities LEFT JOIN zones ON zn_city = ct_id AND zn_radius > 3 WHERE zn_id IS NULL OR zn_id > (SELECT zn_id FROM zones WHERE zn_city = 2)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones WHERE zn_city = ct_id AND (zn_radius > (SELECT zn_radius FROM zones WHERE zn_city = 2) OR zn_id = 3))
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_radius > (SELECT zn_radius FROM zones WHERE zn_city = 2) OR zn_parent IS NULL)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), COUNT(tr_row), COUNT(dv_id) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city > (SELECT zn_city FROM zones WHERE zn_id < 3) OR zn_parent IS NULL) FULL JOIN drivers ON tr_driver = dv_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM (SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_pop > (SELECT zn_id FROM zones WHERE zn_id <= 2)) AS d
+
+# ---- bind errors in both engines ----
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR label > (SELECT MIN(zn_id) FROM zones)
+
+statement error
+SELECT COUNT(*) FROM cities WHERE COALESCE((SELECT MIN(label) FROM zones), 1) > 0
+
+statement error
+SELECT COUNT(*) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city > (SELECT MIN(ct_id) FROM cities) OR ct_pop > 1) JOIN cities ON ct_id = zn_city
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR label = (SELECT MIN(zn_id) FROM zones) + 0
+
+statement error
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 OR ct_id > (SELECT MIN(nope) FROM zones WHERE zn_city = ct_id)
+
+# ---- divergence D16: an expression over a value, computed per row in antb1 and at DuckDB's join build ----
+
+# DuckDB makes a comparison with a value the condition of the join that appends the value and, with the value as that
+# join's build side, computes the value's side of it (here + 1, past BIGINT's maximum) once at the build, whatever the
+# conjunct before it decides; antb1 computes it per row, only for the rows that conjunct keeps, and here it keeps none:
+# no id is below 0, and a string with 'x' appended is never empty. An aggregate's value, a value of one row, and a
+# first conjunct that no statistics decide.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE id < 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE id < 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE id < 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE id < 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE strlen(concat(u, 'x')) = 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE strlen(concat(u, 'x')) = 0 AND i32 > (SELECT i64 FROM edge WHERE id = 1) + 1 ORDER BY id
+
+# Where rows reach the sum, both fail.
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE id >= 0 AND i32 > (SELECT MAX(i64) FROM edge) + 1
+
+# ---- divergence D16: an OR argument DuckDB's statistics prove true ----
+
+# DuckDB drops an OR whose argument its footer statistics prove true for every row (no id is below 0), and the value's
+# sum with it; antb1 computes an OR's arguments in the order written, the first for every row, and overflows. Where no
+# statistics decide the other argument, DuckDB computes the sum too, and both fail; written the other way round, with
+# id >= 0 first, the OR answers in both.
+onlyif antb1
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR id >= 0
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR id >= 0
+----
+BIGINT
+12
+
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE i32 > (SELECT MAX(i64) FROM edge) + 1 OR strlen(concat(u, 'x')) > 0
+
+# ---- divergence D16: an IN list that holds a value is the OR of its equalities ----
+
+# antb1 computes a later element of such a list only for the rows the earlier ones leave undecided; DuckDB computes
+# every element of an IN list for every row that reaches it. Here every row matches the first element, so the
+# overflowing second one fails in DuckDB alone, in IN and NOT IN. Written as that OR, both answer; with the failing
+# element first, both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+----
+SMALLINT
+1
+
+onlyif duckdb
+statement error Overflow in multiplication of
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id NOT IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error Overflow in multiplication of
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id NOT IN (1, (SELECT MAX(zn_id) FROM zones) * 1000000000)
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 AND (ct_id = 1 OR ct_id = (SELECT MAX(zn_id) FROM zones) * 1000000000) ORDER BY ct_id
+----
+SMALLINT
+1
+
+statement error Overflow in multiplication of
+SELECT ct_id FROM cities WHERE ct_id = 1 AND ct_id IN ((SELECT MAX(zn_id) FROM zones) * 1000000000, 1) ORDER BY ct_id
+
+# ---- divergence D35: one join for a subquery written twice, at its first occurrence ----
+
+# A subquery written again reads the join of its first occurrence (ADR 0041's decision 10), as a direct operand of a
+# comparison or inside an expression, which stands below an IN written between the two: antb1 prepares the IN's build
+# first, finds it empty and never builds the value's; DuckDB builds every join first and fails. With the IN written
+# first, the value's join stands above it: both fail.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) + 0
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id > (SELECT zn_city FROM zones) AND ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) + 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT pm_id FROM promos) AND ct_id > (SELECT zn_city FROM zones) AND ct_id > (SELECT zn_city FROM zones) + 0
+
+# ---- divergence D35: a value only an OR branch that OR factoring drops holds ----
+
+# The OR is implied by the conjunct its branches share, a comparison with a value of one row, so OR factoring drops it:
+# the value of two rows that only the dropped branch holds is bound for its bind errors and never planted, and antb1
+# answers; DuckDB keeps the OR as written, computes that value and fails. With a value of one row there, both answer.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+----
+BIGINT
+5
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id > (SELECT MIN(zn_city) FROM zones) AND ct_pop > (SELECT zn_city FROM zones WHERE zn_id = 1)) OR ct_id > (SELECT MIN(zn_city) FROM zones)
+----
+BIGINT
+5
+
+# ---- divergence D35: a value under OR or CASE next to an IN that turns out empty ----
+
+# The IN written after the failing value: under OR (in either branch) and in a CASE branch never taken. antb1 prepares
+# the IN's build first, finds it empty and never builds the value's; DuckDB builds every join first and fails. With
+# the IN written first, both fail.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1) AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1) AND ct_id IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE (ct_id = 1 OR ct_id > (SELECT zn_city FROM zones)) AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE (ct_id = 1 OR ct_id > (SELECT zn_city FROM zones)) AND ct_id IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id < 0 THEN (SELECT zn_city FROM zones) ELSE ct_id END > 0 AND ct_id IN (SELECT pm_id FROM promos)
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE CASE WHEN ct_id < 0 THEN (SELECT zn_city FROM zones) ELSE ct_id END > 0 AND ct_id IN (SELECT pm_id FROM promos)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id IN (SELECT pm_id FROM promos) AND (ct_pop > (SELECT zn_city FROM zones) OR ct_id = 1)
+
+# ---- divergence D35: a WHERE value under OR below a HAVING IN that turns out empty ----
+
+# The HAVING IN's build is prepared first and turns out empty, so the aggregation below it never reads its input and
+# the WHERE value's build never runs; DuckDB builds it and fails. With a HAVING IN whose set is not empty, both fail.
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) + 0 OR ct_id = 1 GROUP BY ct_id HAVING MAX(ct_pop) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) + 0 OR ct_id = 1 GROUP BY ct_id HAVING MAX(ct_pop) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+
+onlyif antb1
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id = 1 OR ct_id > (SELECT zn_city FROM zones) GROUP BY ct_id HAVING COUNT(*) IN (SELECT zn_city FROM zones) ORDER BY ct_id
+
+# ---- divergence D35: a value under OR next to a condition that never holds ----
+
+# DuckDB's filter combiner proves ct_id = 1 AND ct_id = 2 never true and removes the block's plan, the value with it;
+# antb1 has no filter combiner (D34) and fails. A condition that never holds by the data alone removes nothing in
+# either engine: both fail.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_id = 2 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+----
+BIGINT
+0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_id = 1 AND ct_pop = 45000 AND (ct_id = 3 OR ct_id > (SELECT zn_city FROM zones))
+
+# ---- divergence D14: a comparison over a value folded to never-true ----
+
+# A value's SMALLINT sum against a literal outside SMALLINT's range is a whole conjunct that antb1 folds to never-true
+# at bind time, so it computes no sum; DuckDB computes 32767 + 1 in SMALLINT and fails. The value's join still builds
+# below the folded filter, so a value of two rows fails in both.
+onlyif antb1
+query I nosort
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 ORDER BY id
+----
+INTEGER
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 ORDER BY id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id <= 2) + 1 > 40000 ORDER BY id
+
+# ---- pending: values in select lists and aggregate arguments (ADR 0041; roadmap PR SQ2 removes these guards) ----
+
+# A value in the select list, added to a column on every row: NULL where the column is NULL.
+pending SQ2
+query II nosort
+SELECT ct_id, (SELECT zn_parent FROM zones WHERE zn_id = 10) + ct_pop FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	120005
+2	45005
+3	30005
+4	NULL
+5	8005
+6	2505
+
+# A value in an aggregate's argument, in a block whose WHERE holds a value of its own: one in an IN list, which SQ1
+# answers.
+pending SQ2
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT zn_parent FROM zones WHERE zn_id = 10)) FROM zones WHERE zn_city IN (1, (SELECT ct_id FROM cities WHERE label = 'harbor')) GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	740
+2	780
+
+# ---- pending: IN, NOT IN, = ANY and <> ALL in any condition (ADR 0041; roadmap PR SQ7 removes these guards) ----
+
+# The set holds 1, 2, 5, 9 and a NULL, so IN is true for cities 1, 2 and 5 and NULL for the others, and NOT IN is
+# never true: IN under OR, NOT NOT over IN, IN in a CASE WHEN (whose ELSE takes the NULLs), NOT IN under OR.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+6
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (NOT (ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35))) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) THEN 1 ELSE 0 END = 0 ORDER BY ct_id
+----
+SMALLINT
+3
+4
+6
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id NOT IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+6
+
+# = ANY is IN, and <> ALL over the same set without its NULL is NOT IN.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = ANY (SELECT zn_city FROM zones WHERE zn_id > 35) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id <> ALL (SELECT zn_city FROM zones WHERE zn_id > 35 AND zn_city IS NOT NULL) ORDER BY ct_id
+----
+SMALLINT
+3
+4
+6
+
+# An IN that every branch of an OR shares, which OR factoring would make a conjunct; city 6's IN is NULL.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE (ct_pop > 40000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) OR (ct_pop < 10000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+# A probe that reads no column: a value (zone 7's city, 2) and a literal.
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_city FROM zones WHERE zn_id = 7) IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id < 3 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+pending SQ7
+query I nosort
+SELECT ct_id FROM cities WHERE 2 IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+# ---- pending: a correlated value outside a top-level comparison (ADR 0041; roadmap PR SQ5 removes these guards) ----
+
+# A correlated MAX in arithmetic; under OR, where city 5 passes by its comparison and city 6, which has no zone and so a
+# NULL MAX, by the other branch; and in a COALESCE, which turns city 6's NULL into 0 and keeps the row.
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id) * 1000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id < (SELECT MAX(zn_parent) FROM zones WHERE zn_city = ct_id) OR ct_id = 6 ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+pending SQ5
+query I nosort
+SELECT ct_id FROM cities WHERE COALESCE((SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id), 0) < ct_id * 10 ORDER BY ct_id
+----
+SMALLINT
+4
+5
+6
+
+# Two correlated aggregates compared: one dependent join each.
+pending SQ5
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) > (SELECT MIN(d.dv_city) * 10 FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# ---- DuckDB only until the general domain join gets a PR (ADR 0023: a correlation of two types exits 4) ----
+
+# A value keys a correlated block as an inner equivalent only where it is the outer column's type: an INTEGER value
+# against the SMALLINT ct_id, and an expression over a value, have none.
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_id) FROM zones) = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_pop > (SELECT SUM(zn_id) FROM zones z WHERE (SELECT MIN(zn_city) FROM zones) + 0 = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+
+# ---- DuckDB only until subqueries in a LEFT JOIN's ON get a PR (ADR 0041's decision 3: DuckDB coverage) ----
+
+# DuckDB answers a subquery in a LEFT JOIN's ON in a conjunct that reads the right input alone: a value (a COUNT over
+# no row: 0), an IN whose set holds a NULL, and an EXISTS under OR with a column of that input. A city whose zone fails
+# them is padded.
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	6
+
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND zn_city IN (SELECT zn_city FROM zones WHERE zn_id > 36) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	2
+3	NULL
+4	NULL
+5	5
+6	NULL
+
+onlyif duckdb
+query II nosort
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND (zn_city > 3 OR EXISTS (SELECT 1 FROM promos)) ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	4
+5	5
+6	NULL
+
+# ---- DuckDB only, for good: DuckDB's refusals of subqueries in a FULL JOIN's or a LEFT JOIN's ON ----
+
+# DuckDB refuses any subquery in a FULL JOIN's ON, and one in a LEFT JOIN's ON whose conjunct reads the left input or
+# no column. antb1 refuses them too (exit code 4), and an Unsupported answer passes no record. In a FULL JOIN's ON a
+# value directly compared and the same value in arithmetic; in a LEFT JOIN's ON an uncorrelated EXISTS alone and a
+# value compared with a column of the left input.
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id, zn_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities FULL JOIN zones ON zn_id = ct_id AND zn_parent >= (SELECT COUNT(*) FROM promos) + 1 ORDER BY ct_id, zn_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND EXISTS (SELECT * FROM promos) ORDER BY ct_id
+
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT ct_id, zn_id FROM cities LEFT JOIN zones ON zn_id = ct_id AND ct_pop >= (SELECT COUNT(*) FROM promos) ORDER BY ct_id

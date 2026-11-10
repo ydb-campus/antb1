@@ -531,9 +531,9 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
 )
 # A scalar subquery as a keyless one-row join (ADR 0022's J5): its build is the aggregate's single
-# row, which the join appends to every probe row, and the comparison is a Filter directly above it.
-# The outer side is an expression, so it is computed in the join's own layer below it -- the same
-# layer an IN probe's cast uses.
+# row, which the join appends to every probe row. The conjunct is a filter of the block's slot
+# (ADR 0041's decision 9): what it computes, the outer side, stands above the join, and its
+# comparison above that.
 antb1_add_cli_golden(
   explain_scalar_subquery_one_row_join
   ARGS
@@ -620,6 +620,57 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
     --table
     "zones=${_f}/star/zones.parquet"
+)
+# Values inside conditions (ADR 0041's SQ1): each value's one-row join stands in the block's slot,
+# in the order they are bound, and the conjunct that holds it is a filter after them -- what it
+# computes, then its predicate (decision 9). A value under OR with arithmetic next to an EXISTS under
+# NOT, whose count is a value too.
+antb1_add_cli_golden(
+  explain_value_conditions
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_fare * 2 > (SELECT AVG(tr_fare) FROM trips) + 1 OR NOT EXISTS (SELECT 1 FROM promos)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "promos=${_f}/star/promos.parquet"
+)
+# A subquery written twice in one slot is one value, one join (decision 10): here both bounds of a
+# BETWEEN, the second with a constant added.
+antb1_add_cli_golden(
+  explain_value_bound_once
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup BETWEEN (SELECT MIN(zn_id) FROM zones) AND (SELECT MIN(zn_id) FROM zones) + 10"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# An inner ON inside a FULL JOIN's left input has that input's own slot, below the FULL JOIN, which
+# then pads what its filter keeps.
+antb1_add_cli_golden(
+  explain_value_full_join_left_input
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id) FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id AND z.zn_city < (SELECT MIN(ct_id) + 2 FROM cities) FULL JOIN drivers d ON t.tr_driver = d.dv_id"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
 )
 
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----

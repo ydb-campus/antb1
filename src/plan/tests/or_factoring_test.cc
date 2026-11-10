@@ -233,6 +233,20 @@ TEST(OrFactoringTest, DerivesNothingWhereABranchLeavesTheColumnFree) {
             (Texts{"a = 1", "b = 2 OR b = 3", "b IN (2, 3)"}));
 }
 
+// A subquery's value is no column a scan filters on, so no list is derived over one, alone or in
+// an expression (ADR 0041's SQ1); the other columns the branches bound still derive theirs.
+TEST(OrFactoringTest, DerivesNoInListOverASubquery) {
+  const Factored value = Factor(
+      "((SELECT MIN(i16) FROM u) = 1 AND b = 2) OR ((SELECT MIN(i16) FROM u) = 2 AND b = 3)");
+  ASSERT_EQ(value.conjuncts.size(), 2U);
+  EXPECT_EQ(value.conjuncts.back(), "b IN (2, 3)");
+  const Factored sum = Factor(
+      "((SELECT MIN(i16) FROM u) + a = 1 AND b = 2) OR ((SELECT MIN(i16) FROM u) + a = 2 AND b = "
+      "3)");
+  ASSERT_EQ(sum.conjuncts.size(), 2U);
+  EXPECT_EQ(sum.conjuncts.back(), "b IN (2, 3)");
+}
+
 // Factoring is idempotent: its output, re-parsed, factors to itself.
 TEST(OrFactoringTest, IsIdempotent) {
   const Factored once = Factor("(i16 = 1 AND i32 = 2) OR (i16 = 1 AND i32 = 3)");

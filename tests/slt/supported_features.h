@@ -144,6 +144,11 @@ enum class Feature : std::uint8_t {
   // HAVING belong to this feature and record none of their own; its aggregates, its inner table and
   // its set operators record theirs, as in the outer grammar (every compound kUnionAll).
   kUncorrelatedValue,  // x < (SELECT c FROM t ORDER BY c LIMIT 1), EXISTS (SELECT * FROM t)
+  // An uncorrelated value inside a condition of WHERE (ADR 0041's SQ1): a value block of
+  // kUncorrelatedValue's shapes under OR or NOT, in a CASE, in arithmetic, as both values of an IN
+  // list or of a BETWEEN, or compared with another; and [NOT] EXISTS under OR or in a CASE. Its
+  // blocks record their features as kUncorrelatedValue's do.
+  kConditionValue,  // x = 1 OR x > (SELECT ...), x IN ((SELECT ...), (SELECT ...))
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -314,6 +319,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "null_equal_keys";
     case Feature::kUncorrelatedValue:
       return "uncorrelated_value";
+    case Feature::kConditionValue:
+      return "condition_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -474,6 +481,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedExists,
     Feature::kCorrelatedAggregate,
     Feature::kUncorrelatedValue,
+    Feature::kConditionValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

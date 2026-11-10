@@ -56,4 +56,8 @@ std::size_t CountRelations(const sql::SelectStatement& block);
 // matching, like the count, so a check over the result runs before anything resolves.
 std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatement& block);
 
+// Whether `expr` holds a subquery expression, its IN operand included; not inside a nested query's
+// block, which is a block of its own.
+bool HoldsSubquery(const sql::Expr& expr);
+
 }  // namespace antb1::plan

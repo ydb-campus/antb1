@@ -117,6 +117,17 @@ void EachSubqueryOf(const sql::Expr& expr, Fn& fn) {
   std::visit(SubqueryWalk<Fn>{.fn = fn}, static_cast<const sql::ExprNode&>(expr));
 }
 
+}  // namespace
+
+bool HoldsSubquery(const sql::Expr& expr) {
+  bool holds = false;
+  const auto found = [&holds](const sql::SubqueryExpr& /*s*/) { holds = true; };
+  EachSubqueryOf(expr, found);
+  return holds;
+}
+
+namespace {
+
 // Every subquery expression of `block`'s own expressions, in query order: the select items, each
 // FROM item's ON, WHERE, GROUP BY, HAVING, ORDER BY -- the order plan::CheckBlock reports in. Not
 // the WITH list's bodies: a CTE is reached through the references to it, or not at all. Nor a

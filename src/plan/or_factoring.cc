@@ -8,6 +8,8 @@
 
 #include "antb1/sql/ast.h"
 
+#include "relation_count.h"
+
 namespace antb1::plan {
 namespace {
 
@@ -127,7 +129,10 @@ void DeriveImpliedInLists(const std::vector<std::vector<const sql::Expr*>>& per_
     } else if (const auto* in = std::get_if<sql::InExpr>(conjunct); in != nullptr && !in->negated) {
       column = &*in->operand;
     }
-    if (column == nullptr || std::holds_alternative<sql::Literal>(*column)) {
+    // A side that holds a subquery's value derives nothing: no scan filters on it, so its list
+    // would only test again, after the value's join, the rows the OR keeps (ADR 0041's SQ1).
+    if (column == nullptr || std::holds_alternative<sql::Literal>(*column) ||
+        HoldsSubquery(*column)) {
       continue;
     }
     const bool seen = std::ranges::any_of(candidates, [column](const Constrained& c) {

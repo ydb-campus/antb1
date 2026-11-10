@@ -1,0 +1,14 @@
+Output: count_star():BIGINT count(t.tr_row):BIGINT count(d.dv_id):BIGINT
+Aggregate COUNT(*), COUNT(t.tr_row), COUNT(d.dv_id)
+  Join FULL build=right keys=["CAST(t.tr_driver AS BIGINT)" = d.dv_id] carries 6 of 8 unread above
+    Filter z.zn_city < "(min(ct_id) + 2)"
+      Join ONE-ROW build=right keys=[] carries 3 of 7 unread above
+        Join INNER build=right keys=[t.tr_pickup = z.zn_id] carries 3 of 6 unread above
+          Compute CAST(t.tr_driver AS BIGINT)
+            Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_driver, tr_pickup]
+          Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city]
+        Project "(min(ct_id) + 2)"
+          Compute (min(ct_id) + 2)
+            Aggregate MIN(ct_id)
+              Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+    Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id]

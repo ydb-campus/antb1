@@ -591,7 +591,22 @@ struct ExprNameOf {
     }
     return std::format("CAST({} AS {})", ExprName(*cast.operand), type);
   }
-  std::string operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+  // DuckDB names a subquery by a deparse of it (ADR 0041's decision 11); antb1 by its own unparse,
+  // which shows in EXPLAIN and in messages only (divergence D8).
+  std::string operator()(const sql::SubqueryExpr& s) const {
+    std::string query = "(" + sql::ToSql(*s.query) + ")";
+    switch (s.kind) {
+      case sql::SubqueryExpr::Kind::kScalar:
+        break;
+      case sql::SubqueryExpr::Kind::kExists:
+        return (s.negated ? "NOT EXISTS " : "EXISTS ") + query;
+      case sql::SubqueryExpr::Kind::kIn:
+        // The parser gives every IN its operand.
+        return (s.operand.has_value() ? ExprName(**s.operand) : std::string()) +
+               (s.negated ? " NOT IN " : " IN ") + query;
+    }
+    return query;
+  }
 };
 
 std::string ExprName(const sql::Expr& expr) {
@@ -616,15 +631,18 @@ struct Rejection {
 };
 
 // The first construct of a value expression, in source order, that is not a column, a literal
-// or (where allowed) an aggregate of a column.
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr);
+// or (where allowed) an aggregate of a column. `values`: inside a condition of WHERE or of an inner
+// ON, where a scalar subquery is a value (ADR 0041's decision 8).
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values = false);
 
 // Why a condition (WHERE, HAVING, CASE WHEN) is not one the binder answers, or std::nullopt.
-std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having);
+// `values`: one of WHERE or of an inner ON, where a scalar subquery is a value and EXISTS a
+// condition (ADR 0041's decision 8).
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, bool values = false);
 
-// Whether the expression reads a column (or, `aggregates`, calls an aggregate): one that does
-// neither is a constant.
-bool ReadsColumn(const sql::Expr& expr, bool aggregates = false);
+// Whether the expression reads a column (or, `aggregates`, calls an aggregate; or, `subqueries`,
+// holds a scalar subquery's value): one that does none of these is a constant.
+bool ReadsColumn(const sql::Expr& expr, bool aggregates = false, bool subqueries = false);
 
 // What an argument of a scalar function takes (ADR 0012's function table).
 enum class ArgKind : std::uint8_t {
@@ -854,56 +872,70 @@ std::string FunctionNameOpening(const sql::FunctionCall& call) {
 
 struct ReadsColumnOf {
   bool aggregates = false;
+  bool subqueries = false;
 
   bool operator()(const sql::ColumnRef& /*column*/) const { return true; }
   bool operator()(const sql::Literal& /*lit*/) const { return false; }
   bool operator()(const sql::AggregateCall& /*call*/) const { return aggregates; }
   bool operator()(const sql::UnaryExpr& unary) const {
-    return ReadsColumn(*unary.operand, aggregates);
+    return ReadsColumn(*unary.operand, aggregates, subqueries);
   }
   bool operator()(const sql::BinaryExpr& binary) const {
-    return ReadsColumn(*binary.left, aggregates) || ReadsColumn(*binary.right, aggregates);
+    return ReadsColumn(*binary.left, aggregates, subqueries) ||
+           ReadsColumn(*binary.right, aggregates, subqueries);
   }
   bool operator()(const sql::LikeExpr& like) const {
-    return ReadsColumn(*like.operand, aggregates) || ReadsColumn(*like.pattern, aggregates);
+    return ReadsColumn(*like.operand, aggregates, subqueries) ||
+           ReadsColumn(*like.pattern, aggregates, subqueries);
   }
-  bool operator()(const sql::InExpr& in) const { return ReadsColumn(*in.operand, aggregates); }
+  bool operator()(const sql::InExpr& in) const {
+    return ReadsColumn(*in.operand, aggregates, subqueries);
+  }
   bool operator()(const sql::BetweenExpr& between) const {
-    return ReadsColumn(*between.operand, aggregates) || ReadsColumn(*between.low, aggregates) ||
-           ReadsColumn(*between.high, aggregates);
+    return ReadsColumn(*between.operand, aggregates, subqueries) ||
+           ReadsColumn(*between.low, aggregates, subqueries) ||
+           ReadsColumn(*between.high, aggregates, subqueries);
   }
   bool operator()(const sql::IsNullExpr& is_null) const {
-    return ReadsColumn(*is_null.operand, aggregates);
+    return ReadsColumn(*is_null.operand, aggregates, subqueries);
   }
   bool operator()(const sql::DistinctFromExpr& distinct) const {
-    return ReadsColumn(*distinct.left, aggregates) || ReadsColumn(*distinct.right, aggregates);
+    return ReadsColumn(*distinct.left, aggregates, subqueries) ||
+           ReadsColumn(*distinct.right, aggregates, subqueries);
   }
   bool operator()(const sql::FunctionCall& call) const {
-    return std::ranges::any_of(call.args,
-                               [this](const sql::Expr& a) { return ReadsColumn(a, aggregates); });
+    return std::ranges::any_of(
+        call.args, [this](const sql::Expr& a) { return ReadsColumn(a, aggregates, subqueries); });
   }
   bool operator()(const sql::CaseExpr& c) const {
-    const auto reads = [this](const sql::Expr& e) { return ReadsColumn(e, aggregates); };
+    const auto reads = [this](const sql::Expr& e) {
+      return ReadsColumn(e, aggregates, subqueries);
+    };
     return (c.operand.has_value() && reads(**c.operand)) ||
            (c.otherwise.has_value() && reads(**c.otherwise)) ||
            std::ranges::any_of(c.branches, [&](const sql::CaseBranch& b) {
              return reads(*b.when) || reads(*b.then);
            });
   }
-  bool operator()(const sql::ExtractExpr& e) const { return ReadsColumn(*e.source, aggregates); }
+  bool operator()(const sql::ExtractExpr& e) const {
+    return ReadsColumn(*e.source, aggregates, subqueries);
+  }
   bool operator()(const sql::CastExpr& cast) const {
-    return ReadsColumn(*cast.operand, aggregates);
+    return ReadsColumn(*cast.operand, aggregates, subqueries);
   }
   // A subquery's own block reads its own columns, which are no columns of this one; a correlated
   // reference would be, and ADR 0023's U-series revisits this when it answers one. Its IN operand
-  // belongs to this block, though.
+  // belongs to this block, though, and a scalar subquery's or an EXISTS's value is an operand where
+  // `subqueries` (ADR 0041's decision 9: `(q) > 5` is no comparison of two literals, nor is a CASE
+  // over an EXISTS).
   bool operator()(const sql::SubqueryExpr& s) const {
-    return s.operand.has_value() && ReadsColumn(**s.operand, aggregates);
+    return (subqueries && s.kind != sql::SubqueryExpr::Kind::kIn) ||
+           (s.operand.has_value() && ReadsColumn(**s.operand, aggregates, subqueries));
   }
 };
 
-bool ReadsColumn(const sql::Expr& expr, bool aggregates) {
-  return std::visit(ReadsColumnOf{.aggregates = aggregates},
+bool ReadsColumn(const sql::Expr& expr, bool aggregates, bool subqueries) {
+  return std::visit(ReadsColumnOf{.aggregates = aggregates, .subqueries = subqueries},
                     static_cast<const sql::ExprNode&>(expr));
 }
 
@@ -1001,9 +1033,10 @@ void CollectAggregateArgRefs(const sql::Expr& expr, std::vector<const sql::Colum
              static_cast<const sql::ExprNode&>(expr));
 }
 
-std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs) {
+std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs,
+                                            bool values = false) {
   for (const sql::Expr& e : exprs) {
-    if (auto r = FirstUnsupported(e)) {
+    if (auto r = FirstUnsupported(e, values)) {
       return r;
     }
   }
@@ -1023,6 +1056,8 @@ bool IsGroupingCall(const sql::FunctionCall& call) {
 }
 
 struct FirstUnsupportedOf {
+  bool values = false;  // see FirstUnsupported
+
   // A qualified name is no rejection: the scope resolves it among the bindings it names, and says
   // so when none does (rules 1 to 3 of ADR 0022).
   std::optional<Rejection> operator()(const sql::ColumnRef& /*column*/) const {
@@ -1037,6 +1072,7 @@ struct FirstUnsupportedOf {
       return (*this)(*column);
     }
     const sql::Expr& arg = **call.arg;
+    // A subquery in an aggregate's argument waits for ADR 0041's SQ2, wherever the aggregate is.
     if (auto r = FirstUnsupported(arg)) {
       return r;
     }
@@ -1049,12 +1085,12 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
     if (unary.op == sql::UnaryOp::kNegate) {
-      return FirstUnsupported(*unary.operand);
+      return FirstUnsupported(*unary.operand, values);
     }
     return Rejection{.span = unary.op_span, .message = std::string("NOT") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
-    if (auto r = FirstUnsupported(*binary.left)) {
+    if (auto r = FirstUnsupported(*binary.left, values)) {
       return r;
     }
     std::string message;
@@ -1065,7 +1101,7 @@ struct FirstUnsupportedOf {
       case sql::BinaryOp::kDivide:
       case sql::BinaryOp::kIntegerDivide:
       case sql::BinaryOp::kModulo:
-        return FirstUnsupported(*binary.right);
+        return FirstUnsupported(*binary.right, values);
       case sql::BinaryOp::kAnd:
         message = std::string("AND") + kConditionsOnly;
         break;
@@ -1079,25 +1115,25 @@ struct FirstUnsupportedOf {
     return Rejection{.span = binary.op_span, .message = std::move(message)};
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand)) {
+    if (auto r = FirstUnsupported(*like.operand, values)) {
       return r;
     }
     return Rejection{.span = like.op_span, .message = std::string("LIKE") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand)) {
+    if (auto r = FirstUnsupported(*in.operand, values)) {
       return r;
     }
     return Rejection{.span = in.op_span, .message = std::string("IN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BetweenExpr& between) const {
-    if (auto r = FirstUnsupported(*between.operand)) {
+    if (auto r = FirstUnsupported(*between.operand, values)) {
       return r;
     }
     return Rejection{.span = between.op_span, .message = std::string("BETWEEN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    if (auto r = FirstUnsupported(*is_null.operand)) {
+    if (auto r = FirstUnsupported(*is_null.operand, values)) {
       return r;
     }
     return Rejection{
@@ -1105,10 +1141,10 @@ struct FirstUnsupportedOf {
         .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
-    if (auto r = FirstUnsupported(*distinct.left)) {
+    if (auto r = FirstUnsupported(*distinct.left, values)) {
       return r;
     }
-    if (auto r = FirstUnsupported(*distinct.right)) {
+    if (auto r = FirstUnsupported(*distinct.right, values)) {
       return r;
     }
     return Rejection{
@@ -1118,10 +1154,10 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     if (IsCoalesce(call)) {
-      return FirstUnsupportedIn(call.args);  // any values (ADR 0037's NL5)
+      return FirstUnsupportedIn(call.args, values);  // any values (ADR 0037's NL5)
     }
     if (IsGroupingCall(call)) {
-      return FirstUnsupportedIn(call.args);  // the keys it reads (ADR 0038)
+      return FirstUnsupportedIn(call.args, values);  // the keys it reads (ADR 0038)
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
@@ -1184,7 +1220,7 @@ struct FirstUnsupportedOf {
           ++j;  // the escaped character
         }
       }
-      if (auto r = FirstUnsupported(call.args[i])) {
+      if (auto r = FirstUnsupported(call.args[i], values)) {
         return r;
       }
     }
@@ -1194,7 +1230,7 @@ struct FirstUnsupportedOf {
   // operand; the binder rejects it where the scope has none); CASE x WHEN v as x = v.
   std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
     if (c.operand.has_value()) {
-      if (auto r = FirstUnsupported(**c.operand)) {
+      if (auto r = FirstUnsupported(**c.operand, values)) {
         return r;
       }
     }
@@ -1205,18 +1241,18 @@ struct FirstUnsupportedOf {
                                               .right = sql::Box<sql::Expr>(*branch.when),
                                               .op_span = branch.when->span(),
                                               .span = branch.when->span()});
-        if (auto r = RejectCondition(equal, /*having=*/true)) {
+        if (auto r = RejectCondition(equal, /*having=*/true, values)) {
           return r;
         }
-      } else if (auto r = RejectCondition(*branch.when, /*having=*/true)) {
+      } else if (auto r = RejectCondition(*branch.when, /*having=*/true, values)) {
         return r;
       }
-      if (auto r = FirstUnsupported(*branch.then)) {
+      if (auto r = FirstUnsupported(*branch.then, values)) {
         return r;
       }
     }
     if (c.otherwise.has_value()) {
-      return FirstUnsupported(**c.otherwise);
+      return FirstUnsupported(**c.otherwise, values);
     }
     return std::nullopt;
   }
@@ -1227,7 +1263,7 @@ struct FirstUnsupportedOf {
                                               "lists the fields)",
                                               Clip(e.field))};
     }
-    return FirstUnsupported(*e.source);
+    return FirstUnsupported(*e.source, values);
   }
   // Every cast that FoldDateCasts left (all but CAST('YYYY-MM-DD' AS DATE)): to a type antb1 has
   // (ADR 0037's CT1), whose operands the binder then checks.
@@ -1235,7 +1271,7 @@ struct FirstUnsupportedOf {
     if (cast.try_cast) {
       return Rejection{.span = cast.op_span, .message = "TRY_CAST is not supported"};
     }
-    if (auto r = FirstUnsupported(*cast.operand)) {
+    if (auto r = FirstUnsupported(*cast.operand, values)) {
       return r;
     }
     if (!KnownCastTarget(cast)) {
@@ -1246,28 +1282,34 @@ struct FirstUnsupportedOf {
   }
   // Every subquery in an expression, which the grammar parses from roadmap PR S4b on (ADR 0022).
   // This is the one place the forms are refused, so the condition walk and every binder visitor
-  // can rely on never seeing one: roadmap PR J5 answers IN, NOT IN and a scalar subquery, ADR
-  // 0023's U-series a correlated EXISTS and ADR 0041's SQ4a an uncorrelated one, each as a
-  // top-level conjunct (AsSubqueryConjunct), and SQ4a a BETWEEN's subquery bounds as its two
-  // comparisons (SubqueryBetween). The span is the operator, as a FROM item's connector is.
+  // meet only what it admits: the top-level forms AsSubqueryConjunct intercepts (roadmap PR J5's
+  // IN, NOT IN and scalar comparison, ADR 0023's correlated EXISTS, ADR 0041's SQ4a), a BETWEEN's
+  // subquery bounds in HAVING (SubqueryBetween), and, where a condition takes values (`values`,
+  // ADR 0041's SQ1), a scalar subquery as a value and EXISTS as a condition (RejectConditionOf),
+  // which BindInputOf and BindConditionOf bind. The span is the operator, as a FROM item's
+  // connector is.
   std::optional<Rejection> operator()(const sql::SubqueryExpr& s) const {
     switch (s.kind) {
       case sql::SubqueryExpr::Kind::kScalar:
+        if (values) {
+          return std::nullopt;  // a value in a condition (ADR 0041's SQ1); its block is checked as
+                                // a block
+        }
         return Rejection{.span = s.op_span, .message = "a scalar subquery is not supported"};
       case sql::SubqueryExpr::Kind::kIn:
         return Rejection{.span = s.op_span, .message = "IN (subquery) is not supported"};
       case sql::SubqueryExpr::Kind::kExists:
-        // Still every placement but a top-level conjunct of WHERE, of an inner join's ON or of
-        // HAVING, which AsSubqueryConjunct intercepts before this walk runs (ADR 0023's U2, ADR
-        // 0041's SQ4a).
+        // EXISTS as a value: as a condition it never reaches this walk, a top-level conjunct
+        // (AsSubqueryConjunct, ADR 0023's U2 and ADR 0041's SQ4a) and, where a condition takes
+        // values, one under AND, OR, NOT and CASE WHEN (RejectConditionOf) alike.
         return Rejection{.span = s.op_span, .message = "EXISTS (subqueries) is not supported here"};
     }
     return Rejection{.span = s.span, .message = "a subquery is not supported"};
   }
 };
 
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr) {
-  return std::visit(FirstUnsupportedOf{}, static_cast<const sql::ExprNode&>(expr));
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values) {
+  return std::visit(FirstUnsupportedOf{.values = values}, static_cast<const sql::ExprNode&>(expr));
 }
 
 arrow::Status Reject(const Rejection& r) {
@@ -1378,18 +1420,19 @@ constexpr std::string_view kThisCondition = "this condition is not supported";
 struct RejectConditionOf {
   const sql::Expr& expr;  // the condition
   bool having = false;
+  bool values = false;  // see RejectCondition
 
   // An operand reads a column (in HAVING, or calls an aggregate); the other side of a comparison
   // is then an operand too, or a literal.
-  bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having); }
+  bool IsOperand(const sql::Expr& e) const { return ReadsColumn(e, having, values); }
 
   // The sides of a comparison: each supported, one reading a column, and the other a column's
   // value too, a literal or a constant the binder folds.
   std::optional<Rejection> ComparisonSides(const sql::Expr& left, const sql::Expr& right) const {
-    if (auto r = FirstUnsupported(left)) {
+    if (auto r = FirstUnsupported(left, values)) {
       return r;
     }
-    if (auto r = FirstUnsupported(right)) {
+    if (auto r = FirstUnsupported(right, values)) {
       return r;
     }
     if (!IsOperand(left) && !IsOperand(right)) {
@@ -1413,7 +1456,7 @@ struct RejectConditionOf {
   // `expr` is no condition the binder answers: the first construct in it that is not supported
   // anywhere, else `message`, at the whole of `expr`.
   std::optional<Rejection> NotACondition(std::string_view message) const {
-    if (auto r = FirstUnsupported(expr)) {
+    if (auto r = FirstUnsupported(expr, values)) {
       return r;
     }
     return Rejection{.span = expr.span(), .message = std::string(message)};
@@ -1430,7 +1473,7 @@ struct RejectConditionOf {
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
     if (unary.op == sql::UnaryOp::kNot) {
-      return RejectCondition(*unary.operand, having);
+      return RejectCondition(*unary.operand, having, values);
     }
     return NotACondition(kOtherConditions);
   }
@@ -1438,10 +1481,10 @@ struct RejectConditionOf {
     switch (binary.op) {
       case sql::BinaryOp::kAnd:
       case sql::BinaryOp::kOr:
-        if (auto r = RejectCondition(*binary.left, having)) {
+        if (auto r = RejectCondition(*binary.left, having, values)) {
           return r;
         }
-        return RejectCondition(*binary.right, having);
+        return RejectCondition(*binary.right, having, values);
       case sql::BinaryOp::kEq:
       case sql::BinaryOp::kNe:
       case sql::BinaryOp::kLt:
@@ -1455,7 +1498,7 @@ struct RejectConditionOf {
     return NotACondition(kOtherConditions);
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand)) {
+    if (auto r = FirstUnsupported(*like.operand, values)) {
       return r;
     }
     if (!IsOperand(*like.operand)) {
@@ -1474,7 +1517,7 @@ struct RejectConditionOf {
                          "supported"};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand)) {
+    if (auto r = FirstUnsupported(*in.operand, values)) {
       return r;
     }
     if (!IsOperand(*in.operand)) {
@@ -1495,16 +1538,22 @@ struct RejectConditionOf {
                              "subquery without the second pair of parentheses)"};
       }
     }
-    if (auto r = FirstUnsupportedIn(in.list)) {
+    if (auto r = FirstUnsupportedIn(in.list, values)) {
       return r;
     }
     for (const sql::Expr& value : in.list) {
+      // A value that reads no column of the block, a subquery's (ADR 0041's SQ1): the list is then
+      // an OR of its equalities.
+      if (values && !ReadsColumn(value) && HoldsSubquery(value)) {
+        continue;
+      }
       if (!std::holds_alternative<sql::Literal>(value) && !IsFoldableConstant(value)) {
-        return Rejection{
-            .span = value.span(),
-            .message =
-                "only literals, constant integer expressions and quotients of numbers are "
-                "supported in an IN list"};
+        return Rejection{.span = value.span(),
+                         .message = values ? "only literals, constant integer expressions, "
+                                             "quotients of numbers and subquery values that read "
+                                             "no column are supported in an IN list"
+                                           : "only literals, constant integer expressions and "
+                                             "quotients of numbers are supported in an IN list"};
       }
     }
     return std::nullopt;
@@ -1512,7 +1561,7 @@ struct RejectConditionOf {
   // As the two comparisons it means: operand >= low AND operand <= high.
   std::optional<Rejection> operator()(const sql::BetweenExpr& between) const {
     for (const sql::Expr& comparison : BetweenComparisons(between)) {
-      if (auto r = RejectCondition(comparison, having)) {
+      if (auto r = RejectCondition(comparison, having, values)) {
         return r;
       }
     }
@@ -1520,7 +1569,7 @@ struct RejectConditionOf {
   }
   // Of any value: a condition as the operand is refused as a value is ((a = 1) IS NULL).
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    return FirstUnsupported(*is_null.operand);
+    return FirstUnsupported(*is_null.operand, values);
   }
   // As a comparison's sides (ADR 0037's OJ5b): one reads a column; the other may be NULL too.
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
@@ -1539,14 +1588,19 @@ struct RejectConditionOf {
     return NotACondition(kThisCondition);
   }
   // A subquery is a condition DuckDB answers, so NotACondition's FirstUnsupported gives the
-  // message: the form itself is what is unsupported, not its use as a condition.
-  std::optional<Rejection> operator()(const sql::SubqueryExpr& /*s*/) const {
+  // message: the form itself is what is unsupported, not its use as a condition. EXISTS is a
+  // condition in a WHERE or inner-ON condition under AND, OR, NOT and CASE WHEN (ADR 0041's SQ1);
+  // a scalar subquery there is a value, which is no condition.
+  std::optional<Rejection> operator()(const sql::SubqueryExpr& s) const {
+    if (values && s.kind == sql::SubqueryExpr::Kind::kExists) {
+      return std::nullopt;
+    }
     return NotACondition(kThisCondition);
   }
 };
 
-std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
-  return std::visit(RejectConditionOf{.expr = expr, .having = having},
+std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, bool values) {
+  return std::visit(RejectConditionOf{.expr = expr, .having = having, .values = values},
                     static_cast<const sql::ExprNode&>(expr));
 }
 
@@ -1556,11 +1610,12 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having) {
 // `NOT NOT (x IN (query))` -- which both mean IN, where one NOT means NOT IN -- are no match and
 // keep their refusal rather than risking the rows of the other form.
 //
-// Syntactic only, and the single place that decides: CheckConjuncts skips its own rejection for
-// exactly what this accepts and the binder intercepts exactly what this accepts, so the two cannot
-// disagree; both first split a BETWEEN with a subquery bound into its two comparisons alike
-// (SubqueryBetween, BetweenComparisons). That is what keeps FirstUnsupportedOf the one place a
-// subquery is refused, and with it every binder visitor's assumption that it never meets one.
+// Syntactic only, and the single place that decides: CheckConjunct checks exactly what this
+// accepts by the form's own rule (RejectSubqueryConjunct) -- where a condition takes values (ADR
+// 0041's SQ1), an IN form alone, since a scalar or EXISTS form is a condition with values like any
+// other there -- and the binder intercepts exactly what this accepts, so the two cannot disagree.
+// In HAVING both first split a BETWEEN with a subquery bound into its two comparisons alike
+// (SubqueryBetween, BetweenComparisons).
 struct SubqueryConjunct {
   const sql::SubqueryExpr* subquery = nullptr;
   // kIn: its left-hand side. kScalar: the other side of the comparison, which may be a literal or
@@ -1575,8 +1630,8 @@ struct SubqueryConjunct {
 };
 
 std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
-  // A comparison with a scalar subquery on exactly one side, in either order: two of them would
-  // be two stacked one-row joins, which the ADR does not answer.
+  // A comparison with a scalar subquery on exactly one side, in either order. One with a subquery
+  // on both sides is AsSubqueryPair's, which a condition that takes values answers.
   if (const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct);
       binary != nullptr && IsComparison(binary->op)) {
     const auto* left = AsScalarSubquery(*binary->left);
@@ -1613,6 +1668,30 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
   ANTB1_CHECK(subquery->operand.has_value());  // the parser writes no kIn node without one
   return SubqueryConjunct{
       .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
+}
+
+// A comparison of two scalar subqueries, each a direct operand: `(q1) <op> (q2)` (ADR 0041's SQ1).
+std::optional<std::pair<const sql::SubqueryExpr*, const sql::SubqueryExpr*>> AsSubqueryPair(
+    const sql::Expr& conjunct) {
+  const auto* binary = std::get_if<sql::BinaryExpr>(&conjunct);
+  if (binary == nullptr || !IsComparison(binary->op)) {
+    return std::nullopt;
+  }
+  const sql::SubqueryExpr* left = AsScalarSubquery(*binary->left);
+  const sql::SubqueryExpr* right = AsScalarSubquery(*binary->right);
+  if (left == nullptr || right == nullptr) {
+    return std::nullopt;
+  }
+  return std::pair{left, right};
+}
+
+// Whether two subquery expressions are written alike, whatever their spans: the key of ADR 0041's
+// decision 10, by which a subquery binds once per slot.
+bool SameSubquery(const sql::SubqueryExpr& a, const sql::SubqueryExpr& b) {
+  return a.kind == b.kind && a.negated == b.negated &&
+         a.operand.has_value() == b.operand.has_value() &&
+         (!a.operand.has_value() || sql::EqualIgnoringSpans(**a.operand, **b.operand)) &&
+         sql::EqualIgnoringSpans(*a.query, *b.query);
 }
 
 // An operator as messages name it: UNION, UNION ALL, INTERSECT ALL and so on.
@@ -2683,9 +2762,9 @@ bool IsConstantExpr(const Expr& expr) { return std::holds_alternative<ConstantEx
 // - UnfoldedCast: a cast is a value (BindCast, ADR 0037's CT1), never a condition leaf:
 //   RejectCondition refuses a bare cast as a condition.
 [[noreturn]] void UnfoldedCast() { ANTB1_CHECK(false); }
-// - RejectedSubquery: CheckSupported rejects every subquery in an expression before any name
-//   resolves (FirstUnsupportedOf), so nothing that binds one is ever reached. Roadmap PR J5 and
-//   ADR 0023's U-series replace these with the real binding.
+// - RejectedSubquery: CheckSupported admits a subquery in an expression only as a scalar value
+//   and as an EXISTS condition (FirstUnsupportedOf, RejectConditionOf; ADR 0041's SQ1), so the
+//   visitors that bind one never meet another kind.
 [[noreturn]] void RejectedSubquery() { ANTB1_CHECK(false); }
 
 // The comparison of a binary comparison operator (any other operator is no condition leaf).
@@ -2921,6 +3000,21 @@ struct SubqueryJoin {
   [[nodiscard]] bool AddsColumns() const { return !exprs.empty() || Traits(kind).outputs_right; }
 };
 
+// A conjunct of WHERE, an inner ON or HAVING that holds a subquery's value (ADR 0041's decision 9):
+// what it computes and its predicates, over the entries of its slot bound before it -- never on one
+// relation's branch, since it reads a value that no relation has.
+struct SlotFilter {
+  std::vector<ExprPtr> exprs;
+  std::vector<ColumnId> ids;  // per expression: its column
+  std::vector<Predicate> filter;
+  SourceSpan span;  // the conjunct
+};
+
+// One entry of a slot (ADR 0041's decision 9): a subquery's join -- a value's one-row join, an IN's
+// semi or anti join, a correlated subquery's dependent join -- or the filter of a conjunct that
+// holds a value, in the order they were bound.
+using SlotEntry = std::variant<SubqueryJoin, SlotFilter>;
+
 class Binder {
  public:
   // `bindings`: the FROM items, in order. `ids` minted their columns' ids and mints the binder's.
@@ -3017,7 +3111,14 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
       return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindInput(e); });
     }
-    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+    // A scalar subquery's value, in the per-row slot (ADR 0041's decision 9); the gate admits no
+    // other kind of subquery as a value.
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& s) const {
+      if (s.kind != sql::SubqueryExpr::Kind::kScalar) {
+        RejectedSubquery();
+      }
+      return binder.SubqueryValue(s, /*group=*/false);
+    }
   };
 
   arrow::Result<Typed> BindInput(const sql::Expr& expr) {
@@ -3224,6 +3325,10 @@ class Binder {
           .name = location.has_value() ? scope_.column(*location).name : t.expr->name,
           .type = t.expr->type,
           .qualifier = location.has_value() ? scope_.Qualifier(location->binding) : std::string()};
+    }
+    // A conjunct that holds a value computes in its own filter's layer, above the slot's joins.
+    if (in_slot_ != nullptr) {
+      return ComputedColumn(t, in_slot_->exprs, in_slot_->ids);
     }
     Relation& relation = relations_[conjunct_relation_];
     // A correlated conjunct sits above this block's joins (ADR 0023), so what it computes cannot
@@ -3517,7 +3622,14 @@ class Binder {
     arrow::Result<Typed> operator()(const sql::CastExpr& cast) const {
       return binder.BindCast(cast, [this](const sql::Expr& e) { return binder.BindOutput(e); });
     }
-    arrow::Result<Typed> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+    // A scalar subquery's value, in HAVING's slot (ADR 0041's decision 9): SQ1b's, since the gate
+    // admits no value in HAVING before it.
+    arrow::Result<Typed> operator()(const sql::SubqueryExpr& s) const {
+      if (s.kind != sql::SubqueryExpr::Kind::kScalar) {
+        RejectedSubquery();
+      }
+      return binder.SubqueryValue(s, /*group=*/true);
+    }
   };
 
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
@@ -3638,6 +3750,23 @@ class Binder {
     bool correlated = false;
   };
   arrow::Result<SubqueryBlock> BindSubqueryBlock(const SubqueryConjunct& form, bool having);
+  // A subquery's value in a condition (ADR 0041's decisions 9 and 10), in HAVING's slot (`group`)
+  // or else the per-row slot of the conjunct being bound: its block bound once per slot, the first
+  // binding planting its one-row join there, and its column read as one of the scope.
+  arrow::Result<Typed> SubqueryValue(const sql::SubqueryExpr& s, bool group);
+  // An uncorrelated block's one-row join, planted in its slot, and its value remembered there.
+  Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
+  // The value of a subquery written alike in the same slot before, or nullptr.
+  struct BoundValue;
+  [[nodiscard]] const BoundValue* FindValue(const sql::SubqueryExpr& s, bool group) const;
+  // A WHERE or inner-ON conjunct that holds a value: a filter of its own at the end of its slot.
+  arrow::Status BindValueConjunct(const sql::Expr& conjunct, SourceSpan element);
+  // Inside a FULL JOIN's left input, a conjunct of that input's slot reads that input's relations
+  // only (or none), as any conjunct of that ON does (BindConjunct): the slot stands below the unit.
+  [[nodiscard]] arrow::Status CheckInsidePaddedLeft(const sql::Expr& conjunct,
+                                                    SourceSpan element) const;
+  // One conjunct of a WHERE or inner-ON element, routed by what it reads and what it holds.
+  arrow::Status BindRowConjunct(const sql::Expr& conjunct, SourceSpan element);
   // One subquery conjunct, intercepted before any conjunct classification: its block bound
   // against this block's scope (BindSubqueryBlock), then its join (JoinSubquery). `bind` binds the
   // outer side in the scope of the clause it is written in, and `conjunct` is the whole conjunct,
@@ -3650,13 +3779,13 @@ class Binder {
   template <class BindFn>
   arrow::Status JoinSubquery(const sql::Expr& conjunct, const SubqueryConjunct& form, bool having,
                              const BindFn& bind, SubqueryBlock block);
-  // A BETWEEN with a subquery bound (SubqueryBetween) as its two comparisons (ADR 0041's decision
-  // 6): DuckDB's typing of all three values, with each subquery bound standing as its block's
-  // column, then each comparison under that type, a subquery's as its join and the other as any
-  // conjunct of the clause. `conjunct` is the BETWEEN, `element` the WHERE or ON element it is in.
+  // A HAVING BETWEEN with a subquery bound (SubqueryBetween) as its two comparisons (ADR 0041's
+  // decision 6): DuckDB's typing of all three values, with each subquery bound standing as its
+  // block's column, then each comparison under that type, a subquery's as its join and the other
+  // as a conjunct of HAVING. WHERE and an inner ON split such a BETWEEN in BindRowConjunct, and
+  // SQ1b gives HAVING the same split.
   template <class BindFn>
-  arrow::Status BindSubqueryBetween(const sql::Expr& conjunct, const sql::BetweenExpr& between,
-                                    bool having, SourceSpan element, const BindFn& bind);
+  arrow::Status BindSubqueryBetween(const sql::BetweenExpr& between, const BindFn& bind);
   // The column of a subquery join's own side: a column of the tree below as is, anything else
   // computed in that join's layer directly below it.
   BoundColumn SubqueryColumn(SubqueryJoin& join, const Typed& t);
@@ -4022,6 +4151,11 @@ class Binder {
     std::vector<JoinStep> steps;
     std::size_t root = 0;
     std::vector<std::size_t> one_row;
+    // Its slot (ADR 0041's decision 9), above its joins: the joins of its conjuncts' subqueries and
+    // the filters of its conjuncts that hold a value, in the order they were bound. Block 0's holds
+    // those of WHERE and of the inner ONs; the left input of a unit that pads it (a FULL JOIN)
+    // those of the inner ONs inside it.
+    std::vector<SlotEntry> slot;
   };
   // An outer join unit (ADR 0022, "Inner blocks"): one relation of its enclosing block, never
   // reordered and always built on its right input, whose two inputs are inner blocks of their own.
@@ -4055,6 +4189,12 @@ class Binder {
   // innermost such unit: every conjunct of that ON must stay inside its left input, since above
   // the unit it would drop the rows the unit pads on the left (CheckInsidePaddedLeft).
   std::optional<std::size_t> padded_unit_;
+  // The per-row slot of the conjunct being bound: block 0's, or that of the left input of the unit
+  // that pads it.
+  [[nodiscard]] std::size_t RowBlock() const {
+    return padded_unit_.has_value() ? units_[*padded_unit_].left : 0;
+  }
+  std::vector<SlotEntry>& RowSlot() { return blocks_[RowBlock()].slot; }
 
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
@@ -4077,8 +4217,21 @@ class Binder {
   // Under SELECT DISTINCT (ADR 0037's AG3): per sort key, the select item it orders by, which the
   // sort reads above the dedup instead.
   std::vector<std::size_t> sort_items_;
-  std::vector<SubqueryJoin> where_subqueries_;
-  std::vector<SubqueryJoin> having_subqueries_;
+  // HAVING's slot (ADR 0041's decision 9), directly above the filter of HAVING's other conjuncts
+  // and below the select list's computed columns.
+  std::vector<SlotEntry> group_slot_;
+  // ADR 0041's decision 10: each subquery value is bound once per slot. The first binding plants
+  // its one-row join in the slot, and a later binding of a subquery written alike reads its column.
+  struct BoundValue {
+    std::optional<std::size_t> block;  // the block whose per-row slot holds it; none: HAVING's
+    sql::SubqueryExpr written;         // a copy: the first binding is often of a temporary
+    Typed value;
+  };
+  std::vector<BoundValue> values_;
+  // OR factoring's bind-only path: subquery values are bound for their errors, and plant nothing.
+  bool dry_run_ = false;
+  // The filter of the conjunct being bound that holds a value: where its operands are computed.
+  SlotFilter* in_slot_ = nullptr;
 };
 
 arrow::Status Binder::BindSelectList() {
@@ -4900,7 +5053,22 @@ struct Binder::BindConditionOf {
   arrow::Result<Predicate> operator()(const sql::CaseExpr& /*c*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::ExtractExpr& /*e*/) const { NotAConditionLeaf(); }
   arrow::Result<Predicate> operator()(const sql::CastExpr& /*cast*/) const { UnfoldedCast(); }
-  arrow::Result<Predicate> operator()(const sql::SubqueryExpr& /*s*/) const { RejectedSubquery(); }
+  // EXISTS as a condition (ADR 0041's decision 5): the count of at most one row of its block, a
+  // value in the slot of the scope (HAVING's from SQ1b on), compared with 1, or with 0 for NOT
+  // EXISTS. The gate admits no other subquery as a condition.
+  arrow::Result<Predicate> operator()(const sql::SubqueryExpr& s) const {
+    if (s.kind != sql::SubqueryExpr::Kind::kExists) {
+      RejectedSubquery();
+    }
+    ARROW_ASSIGN_OR_RAISE(const Typed count, binder.SubqueryValue(s, /*group=*/!input));
+    return Predicate{
+        .kind = Predicate::Kind::kCompare,
+        .column = column_of(count),
+        .op = CompareOp::kEq,
+        .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{s.negated ? 0 : 1}},
+        .values = {},
+        .span = s.span};
+  }
 };
 
 template <class BindFn, class ColumnOf>
@@ -4915,17 +5083,19 @@ arrow::Result<Predicate> Binder::BindConditionWith(const sql::Expr& conjunct, bo
 
 namespace {
 
-// DuckDB compares x BETWEEN lo AND hi with one common type of the three values, while antb1
-// compares x >= lo and x <= hi each in its own. They differ only when that type is DOUBLE (a
-// DOUBLE column or an approximate literal, which an exponent or more than 38 digits makes) and a
-// pair that antb1 does not compare in DOUBLE would compare otherwise in DOUBLE: a BIGINT or
-// HUGEINT value (a column, or a constant of that type), a FLOAT column, a decimal literal against
-// an integer value, and a DECIMAL (ADR 0021): a DECIMAL operand against any bound that is not
-// DOUBLE (an integer or decimal literal, a constant, a column), or a DECIMAL column or expression
-// as a bound. Such a BETWEEN is unsupported, unless the operand is DOUBLE: then both comparisons
-// are in DOUBLE already.
+// DuckDB compares x BETWEEN lo AND hi with one common type of the three values, and x IN (v1, ...)
+// with one of all of them (an IN list that holds a subquery's value, ADR 0041's SQ1), while antb1
+// compares x >= lo and x <= hi, or x = v for each v, each in its own. They differ only when that
+// type is DOUBLE (a DOUBLE column or an approximate literal, which an exponent or more than 38
+// digits makes) and a pair that antb1 does not compare in DOUBLE would compare otherwise in DOUBLE:
+// a BIGINT or HUGEINT value (a column, or a constant of that type), a FLOAT column, a decimal
+// literal against an integer value, and a DECIMAL (ADR 0021): a DECIMAL operand against any value
+// that is not DOUBLE (an integer or decimal literal, a constant, a column), or a DECIMAL column or
+// expression as another value. Such a BETWEEN or IN is unsupported, unless the operand is DOUBLE:
+// then every comparison is in DOUBLE already. `values` starts with the operand.
 template <class BindFn>
-arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
+arrow::Status CheckCommonType(std::span<const sql::Expr* const> values, const BindFn& bind,
+                              SourceSpan op_span, std::string_view clause, std::string_view all) {
   bool any_double = false;
   bool any_wide = false;
   bool any_float = false;
@@ -4940,8 +5110,8 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
   const auto wide = [](LogicalType t) {
     return t == LogicalType::kBigInt || t == LogicalType::kHugeInt;
   };
-  for (const sql::Expr* value : {&*between.operand, &*between.low, &*between.high}) {
-    const bool is_operand = value == &*between.operand;
+  for (const sql::Expr* value : values) {
+    const bool is_operand = value == values.front();
     bool is_double = false;
     bool is_decimal = false;
     if (const auto* lit = std::get_if<sql::Literal>(value)) {
@@ -4991,20 +5161,37 @@ arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& b
   // Pairwise, a string literal compares with a VARCHAR value and a DATE value alike; DuckDB
   // rejects the mix.
   if (any_varchar && temporal.has_value()) {
-    return BindError(std::format("Cannot mix values of type VARCHAR and {} in BETWEEN clause",
-                                 ToString(*temporal)),
-                     between.op_span);
+    return BindError(std::format("Cannot mix values of type VARCHAR and {} in {} clause",
+                                 ToString(*temporal), clause),
+                     op_span);
   }
   const bool decimal_pair = (operand_decimal && any_exact_bound) || any_decimal_bound;
   if (any_double && !operand_double &&
       (any_wide || any_float || (any_decimal && any_integer) || decimal_pair)) {
     return UnsupportedError(
-        "BETWEEN of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value, or of a DOUBLE "
-        "value, a decimal literal and an integer value, is not supported (DuckDB compares all "
-        "three in DOUBLE)",
-        between.op_span);
+        std::format(
+            "{} of a DOUBLE value and a BIGINT, HUGEINT, FLOAT or DECIMAL value, or of a "
+            "DOUBLE value, a decimal literal and an integer value, is not supported (DuckDB "
+            "compares {} in DOUBLE)",
+            clause, all),
+        op_span);
   }
   return arrow::Status::OK();
+}
+
+template <class BindFn>
+arrow::Status CheckBetweenTypes(const sql::BetweenExpr& between, const BindFn& bind) {
+  const std::array<const sql::Expr*, 3> values = {&*between.operand, &*between.low, &*between.high};
+  return CheckCommonType(values, bind, between.op_span, "BETWEEN", "all three");
+}
+
+template <class BindFn>
+arrow::Status CheckInListTypes(const sql::InExpr& in, const BindFn& bind) {
+  std::vector<const sql::Expr*> values{&*in.operand};
+  for (const sql::Expr& value : in.list) {
+    values.push_back(&value);
+  }
+  return CheckCommonType(values, bind, in.op_span, "IN", "all of them");
 }
 
 }  // namespace
@@ -5035,6 +5222,36 @@ arrow::Result<Typed> Binder::BindBool(const sql::Expr& expr, const BindFn& bind,
     }
     return Leaf(
         Expr{.node = std::move(node), .type = LogicalType::kBoolean, .name = ExprName(expr)});
+  }
+  if (const auto* in = std::get_if<sql::InExpr>(&expr);
+      in != nullptr &&
+      std::ranges::any_of(in->list, [](const sql::Expr& v) { return HoldsSubquery(v); })) {
+    // An IN list that holds a subquery's value (ADR 0041's SQ1): the OR of its equalities, which
+    // is IN exactly in three-valued logic, under a NOT for NOT IN; checked against DuckDB's typing
+    // of the list in one type first (CheckInListTypes).
+    ARROW_RETURN_NOT_OK(CheckInListTypes(*in, bind));
+    BoolExpr any{.op = BoolOp::kOr, .args = {}};
+    for (const sql::Expr& value : in->list) {
+      const sql::Expr equal(sql::BinaryExpr{.op = sql::BinaryOp::kEq,
+                                            .left = sql::Box<sql::Expr>(*in->operand),
+                                            .right = sql::Box<sql::Expr>(value),
+                                            .op_span = in->op_span,
+                                            .span = in->span});
+      ARROW_ASSIGN_OR_RAISE(Typed arg, BindBool(equal, bind, input));
+      any.args.push_back(std::move(arg.expr));
+    }
+    ExprPtr list =
+        any.args.size() == 1
+            ? any.args.front()
+            : std::make_shared<const Expr>(Expr{
+                  .node = std::move(any), .type = LogicalType::kBoolean, .name = ExprName(expr)});
+    if (in->negated) {
+      list = std::make_shared<const Expr>(
+          Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(list)}},
+               .type = LogicalType::kBoolean,
+               .name = ExprName(expr)});
+    }
+    return Typed{.expr = std::move(list)};
   }
   if (const auto* between = std::get_if<sql::BetweenExpr>(&expr)) {
     // operand >= low AND operand <= high, under a NOT when negated; named as DuckDB names it.
@@ -5676,10 +5893,27 @@ bool IsCompound(const sql::Expr& conjunct) {
   }
   const auto* lowered_binary =
       lowered.has_value() ? std::get_if<sql::BinaryExpr>(&*lowered) : nullptr;
-  return (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
+  // An IN list that holds a subquery's value is the OR of its equalities (ADR 0041's SQ1).
+  const auto* in = std::get_if<sql::InExpr>(&conjunct);
+  return (in != nullptr &&
+          std::ranges::any_of(in->list, [](const sql::Expr& v) { return HoldsSubquery(v); })) ||
+         (binary != nullptr && binary->op == sql::BinaryOp::kOr) ||
          (unary != nullptr && unary->op == sql::UnaryOp::kNot) ||
          (between != nullptr && between->negated) ||
          (lowered_binary != nullptr && lowered_binary->op == sql::BinaryOp::kOr);
+}
+
+// An EXISTS's test of its count of at most one row (ADR 0041's decision 5): 1, or 0 when negated.
+Predicate CountTest(const Typed& count, bool negated, SourceSpan span) {
+  return Predicate{
+      .kind = Predicate::Kind::kCompare,
+      .column = BoundColumn{.id = std::get<ColumnExpr>(count.expr->node).id,
+                            .name = count.expr->name,
+                            .type = LogicalType::kBigInt},
+      .op = CompareOp::kEq,
+      .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{negated ? 0 : 1}},
+      .values = {},
+      .span = span};
 }
 
 Predicate IsTrue(BoundColumn column, SourceSpan span) {
@@ -6337,16 +6571,15 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                    bool having, const BindFn& bind, SubqueryBlock block) {
   if (form.exists()) {
     if (block.correlated) {
-      where_subqueries_.push_back(
-          SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
-                       .dependent = true,
-                       .right = std::move(block.right),
-                       .left_key = {},
-                       .right_key = {},
-                       .exprs = {},
-                       .ids = {},
-                       .filter = {},
-                       .span = form.subquery->op_span});
+      RowSlot().emplace_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
+                                          .dependent = true,
+                                          .right = std::move(block.right),
+                                          .left_key = {},
+                                          .right_key = {},
+                                          .exprs = {},
+                                          .ids = {},
+                                          .filter = {},
+                                          .span = form.subquery->op_span});
       return arrow::Status::OK();
     }
     // The count of at most one row, compared with 1 for EXISTS and with 0 for NOT EXISTS above
@@ -6369,7 +6602,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                       .filter = {},
                       .span = form.subquery->op_span};
     join.filter.push_back(std::move(test));
-    (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
   const BindingColumn& column = block.column;
@@ -6389,14 +6622,15 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
     // then applies unchanged: the DECIMAL and DATE pairs it admits, its folding of a literal side,
     // and its refusal of a FLOAT column (divergence D11), which the sub-plan's column carries
     // across the block boundary.
-    // Any scalar subquery this meets is the conjunct's own: AsSubqueryConjunct accepted exactly one
-    // as a direct operand of the comparison, and RejectSubqueryConjunct ran FirstUnsupported over
-    // the other side, which refuses every subquery. Matching by kind rather than by address matters
-    // because BindConditionWith does not promise to hand back the same nodes: folding a constant
-    // integer side copies the whole comparison, and sql::Box deep-copies its pointee, so the
-    // subquery arrives at a new address.
+    // The conjunct's own subquery reads the join's column; any other on the other side, which a
+    // condition that takes values admits (ADR 0041's SQ1), is a value bound through `bind`, its
+    // join planted in the slot before this one. Matching by structure (SameSubquery) rather than
+    // by address matters because BindConditionWith does not promise to hand back the same nodes:
+    // folding a constant integer side copies the whole comparison, and sql::Box deep-copies its
+    // pointee, so the subquery arrives at a new address.
     const auto bind_side = [&](const sql::Expr& e) -> arrow::Result<Typed> {
-      if (AsScalarSubquery(e) != nullptr) {
+      if (const sql::SubqueryExpr* own = AsScalarSubquery(e);
+          own != nullptr && SameSubquery(*own, *form.subquery)) {
         return ColumnLeaf(column.id, block.type, column.name, column.stored_as_float);
       }
       return bind(e);
@@ -6406,7 +6640,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                           BindConditionWith(conjunct, /*input=*/!having, bind_side, column_of,
                                             /*nested=*/false));
     join.filter.push_back(std::move(predicate));
-    (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+    (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
   ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(*form.other));
@@ -6452,34 +6686,13 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                                   .span = form.subquery->span});
     join.right_key = BoundColumn{.id = id, .name = widened->name, .type = *type};
   }
-  (having ? having_subqueries_ : where_subqueries_).push_back(std::move(join));
+  (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
   return arrow::Status::OK();
 }
 
 template <class BindFn>
-arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
-                                          const sql::BetweenExpr& between, bool having,
-                                          SourceSpan element, const BindFn& bind) {
+arrow::Status Binder::BindSubqueryBetween(const sql::BetweenExpr& between, const BindFn& bind) {
   const std::array<const sql::Expr*, 2> bounds = {&*between.low, &*between.high};
-  const sql::SubqueryExpr* first = AsScalarSubquery(*between.low) != nullptr
-                                       ? AsScalarSubquery(*between.low)
-                                       : AsScalarSubquery(*between.high);
-  if (!having) {
-    // BindElement's placement rules of a subquery conjunct, for the BETWEEN as a whole.
-    if (ReadsOuterColumn(conjunct, visible_)) {
-      return Reject(Rejection{
-          .span = first->op_span,
-          .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
-                     "not supported"});
-    }
-    if (padded_unit_.has_value()) {
-      return Reject(Rejection{
-          .span = first->op_span,
-          .message = std::format("a subquery in the ON of a join inside a {} JOIN's left input is "
-                                 "not supported",
-                                 ToString(units_[*padded_unit_].kind))});
-    }
-  }
   // Each subquery bound's block, bound once, when the typing below first reads it: the operand
   // first, so that its errors come first, as DuckDB binds the three values.
   std::array<std::optional<SubqueryBlock>, 2> blocks;
@@ -6487,12 +6700,10 @@ arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
     if (!blocks[i].has_value()) {
       const SubqueryConjunct form{.subquery = AsScalarSubquery(*bounds[i]),
                                   .other = &*between.operand};
-      ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(form, having));
-      if (block.correlated) {
-        // A correlated bound keeps the refusal it had, as a scalar subquery in a condition (SQ5).
-        return Reject(Rejection{.span = form.subquery->op_span,
-                                .message = "a scalar subquery is not supported"});
-      }
+      ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(form, /*having=*/true));
+      // A block in HAVING that reads an enclosing one is refused while it binds ("a correlated
+      // subquery in HAVING"), so none arrives here.
+      ANTB1_CHECK(!block.correlated);
       blocks[i] = std::move(block);
     }
     return &*blocks[i];
@@ -6515,62 +6726,87 @@ arrow::Status Binder::BindSubqueryBetween(const sql::Expr& conjunct,
     const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
     if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(comparison)) {
       ARROW_ASSIGN_OR_RAISE(const SubqueryBlock* block, block_of(i));
-      ARROW_RETURN_NOT_OK(JoinSubquery(comparison, *form, having, bind, *block));
+      ARROW_RETURN_NOT_OK(JoinSubquery(comparison, *form, /*having=*/true, bind, *block));
       continue;
     }
-    if (having) {
-      ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
-      having_.push_back(std::move(predicate));
-      continue;
-    }
-    ARROW_RETURN_NOT_OK(BindConjunct(comparison, element));
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(comparison, /*having=*/true));
+    having_.push_back(std::move(predicate));
   }
   return arrow::Status::OK();
+}
+
+// One subquery conjunct's join over `node`.
+LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join) {
+  if (!join.exprs.empty()) {
+    node = Make(ComputeNode{.input = std::move(node),
+                            .exprs = std::move(join.exprs),
+                            .ids = std::move(join.ids),
+                            .span = join.span});
+  }
+  // A one-row join is keyless: its build holds the single row of an ungrouped aggregate, which it
+  // appends to every row of its probe (ADR 0022's E2a note). The keys are a named local rather
+  // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
+  // outlive the statement.
+  std::vector<JoinKey> keys;
+  if (!join.dependent && !Traits(join.kind).one_row) {
+    keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
+  }
+  if (join.dependent) {
+    node = Make(DependentJoinNode{.kind = join.kind,
+                                  .left = std::move(node),
+                                  .right = std::move(join.right),
+                                  .mark = kNoColumnId,
+                                  .span = join.span});
+  } else {
+    // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
+    // rows with the subquery's single row, so the left input's estimate is an upper bound for
+    // every kind this builds -- the same bound ADR 0023's Path 1 keeps on the joins it makes.
+    // Without it every pass above reads this join's rows as unknown, which is what kept ADR
+    // 0023's semi-join reduction from seeing the one query it gains most on.
+    const std::optional<int64_t> left_rows = EstimateRows(*node);
+    node = Make(JoinNode{
+        .kind = join.kind,
+        .left = std::move(node),
+        .right = std::move(join.right),
+        .keys = std::move(keys),
+        .residual = {},
+        .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
+        .estimate = left_rows,
+        .span = join.span});
+  }
+  if (!join.filter.empty()) {
+    node = Make(FilterNode{
+        .input = std::move(node), .predicates = std::move(join.filter), .span = join.span});
+  }
+  return node;
 }
 
 // The subquery conjuncts' joins over `node`, in the order they were written.
 LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins) {
   for (SubqueryJoin& join : joins) {
-    if (!join.exprs.empty()) {
+    node = SubqueryJoinNode(std::move(node), join);
+  }
+  return node;
+}
+
+// A slot's entries over `node`, in the order they were bound: each join, and each filter as what
+// it computes, then its predicates.
+LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot) {
+  for (SlotEntry& entry : slot) {
+    if (auto* join = std::get_if<SubqueryJoin>(&entry)) {
+      node = SubqueryJoinNode(std::move(node), *join);
+      continue;
+    }
+    auto& filter = std::get<SlotFilter>(entry);
+    if (!filter.exprs.empty()) {
       node = Make(ComputeNode{.input = std::move(node),
-                              .exprs = std::move(join.exprs),
-                              .ids = std::move(join.ids),
-                              .span = join.span});
+                              .exprs = std::move(filter.exprs),
+                              .ids = std::move(filter.ids),
+                              .span = filter.span});
     }
-    // A one-row join is keyless: its build holds the single row of an ungrouped aggregate, which it
-    // appends to every row of its probe (ADR 0022's E2a note). The keys are a named local rather
-    // than a temporary in the initializer, which GCC's -Wdangling-pointer reads as one that may
-    // outlive the statement.
-    std::vector<JoinKey> keys;
-    if (!join.dependent && !Traits(join.kind).one_row) {
-      keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
-    }
-    if (join.dependent) {
-      node = Make(DependentJoinNode{.kind = join.kind,
-                                    .left = std::move(node),
-                                    .right = std::move(join.right),
-                                    .mark = kNoColumnId,
-                                    .span = join.span});
-    } else {
-      // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
-      // rows with the subquery's single row, so the left input's estimate is an upper bound for
-      // every kind this builds -- the same bound ADR 0023's Path 1 keeps on the joins it makes.
-      // Without it every pass above reads this join's rows as unknown, which is what kept ADR
-      // 0023's semi-join reduction from seeing the one query it gains most on.
-      const std::optional<int64_t> left_rows = EstimateRows(*node);
-      node = Make(JoinNode{
-          .kind = join.kind,
-          .left = std::move(node),
-          .right = std::move(join.right),
-          .keys = std::move(keys),
-          .residual = {},
-          .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
-          .estimate = left_rows,
-          .span = join.span});
-    }
-    if (!join.filter.empty()) {
+    if (!filter.filter.empty()) {
       node = Make(FilterNode{
-          .input = std::move(node), .predicates = std::move(join.filter), .span = join.span});
+          .input = std::move(node), .predicates = std::move(filter.filter), .span = filter.span});
     }
   }
   return node;
@@ -6664,8 +6900,266 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
+const Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) const {
+  const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
+  const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
+    return bound.block == block && SameSubquery(bound.written, s);
+  });
+  return found == values_.end() ? nullptr : &*found;
+}
+
+arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
+  if (const BoundValue* known = FindValue(s, group)) {
+    return known->value;
+  }
+  // The gate admits a subquery's value in a condition of WHERE or an inner ON alone (HAVING's,
+  // `group`, from ADR 0041's SQ1b on: nothing reaches those paths before it), and OR factoring's
+  // dry run binds one of those.
+  const bool condition =
+      clause_ == Clause::kWhere || clause_ == Clause::kInnerOn || clause_ == Clause::kHaving;
+  ANTB1_CHECK(dry_run_ || condition);
+  const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
+  ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
+  if (dry_run_) {
+    // A branch OR factoring drops: its block's bind errors stand, and nothing is planted, whether
+    // the block reads an enclosing one or not.
+    return ColumnLeaf(bound.column.id, bound.type, bound.column.name, bound.column.stored_as_float);
+  }
+  if (bound.correlated) {
+    // A correlated value needs the consumer proof of ADR 0041's SQ5, a correlated EXISTS a mark
+    // (SQ8): until then ADR 0023 answers each as a top-level conjunct only, and never inside a
+    // padded unit's left input or in a conjunct that reads an enclosing block itself.
+    std::string message;
+    if (padded_unit_.has_value()) {
+      message = std::format(
+          "a correlated subquery in the ON of a join inside a {} JOIN's left input is not "
+          "supported",
+          ToString(units_[*padded_unit_].kind));
+    } else if (in_correlated_) {
+      message =
+          "a correlated subquery in a conjunct that also reads a column of an enclosing query "
+          "block is not supported";
+    } else if (s.kind == sql::SubqueryExpr::Kind::kExists) {
+      message =
+          "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an inner ON";
+    } else {
+      message =
+          "a correlated scalar subquery is supported only as a direct operand of a comparison in a "
+          "top-level conjunct of WHERE or an inner ON";
+    }
+    return Reject(Rejection{.span = s.op_span, .message = std::move(message)});
+  }
+  return PlantValue(s, std::move(bound), group);
+}
+
+Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group) {
+  Typed value =
+      ColumnLeaf(block.column.id, block.type, block.column.name, block.column.stored_as_float);
+  (group ? group_slot_ : RowSlot())
+      .emplace_back(SubqueryJoin{.kind = JoinKind::kOneRow,
+                                 .dependent = false,
+                                 .right = std::move(block.right),
+                                 .left_key = {},
+                                 .right_key = {},
+                                 .exprs = {},
+                                 .ids = {},
+                                 .filter = {},
+                                 .span = s.op_span});
+  values_.push_back(BoundValue{
+      .block = group ? std::nullopt : std::optional(RowBlock()), .written = s, .value = value});
+  return value;
+}
+
+arrow::Status Binder::CheckInsidePaddedLeft(const sql::Expr& conjunct, SourceSpan element) const {
+  if (!padded_unit_.has_value() || std::ranges::all_of(RelationsRead(conjunct), [&](std::size_t b) {
+        return BlockHolds(units_[*padded_unit_].left, b);
+      })) {
+    return arrow::Status::OK();
+  }
+  return UnsupportedError(
+      std::format("the ON of a join inside a {} JOIN's left input must read that input only, "
+                  "and this reads a FROM item outside it",
+                  ToString(units_[*padded_unit_].kind)),
+      element);
+}
+
+arrow::Status Binder::BindValueConjunct(const sql::Expr& conjunct, SourceSpan element) {
+  // Inside a FULL JOIN's left input the filter stands in that input's slot, below the unit.
+  ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+  SlotFilter filter{.exprs = {}, .ids = {}, .filter = {}, .span = conjunct.span()};
+  in_slot_ = &filter;
+  const arrow::Status status = [&] -> arrow::Status {
+    if (IsCompound(conjunct)) {
+      ARROW_ASSIGN_OR_RAISE(
+          const Typed condition,
+          BindBool(conjunct, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      filter.filter.push_back(IsTrue(InputColumn(condition, /*where=*/true), conjunct.span()));
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(Predicate predicate, BindCondition(conjunct, /*having=*/false));
+    filter.filter.push_back(std::move(predicate));
+    return arrow::Status::OK();
+  }();
+  in_slot_ = nullptr;  // restored on the error path too, before the status propagates
+  ARROW_RETURN_NOT_OK(status);
+  RowSlot().emplace_back(std::move(filter));
+  return arrow::Status::OK();
+}
+
+arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan element) {
+  const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct);
+  const bool in = form.has_value() && !form->scalar() && !form->exists();
+  const bool outer = ReadsOuterColumn(conjunct, visible_);
+  // An IN whose probe reads a column of an enclosing block: its semi join would stand above this
+  // block's joins with the probe's free variable on its outer side, which neither unnesting path of
+  // ADR 0023 takes.
+  if (in && outer) {
+    return Reject(Rejection{
+        .span = form->subquery->op_span,
+        .message = "an IN subquery whose probe reads a column of an enclosing query block is not "
+                   "supported"});
+  }
+  // A conjunct that reads the enclosing block goes above every join of the block, which a unit
+  // that pads its join (an inner join inside a FULL JOIN's left input) must not have above it.
+  if (outer && padded_unit_.has_value()) {
+    return Reject(Rejection{
+        .span = conjunct.span(),
+        .message = std::format("a column of an enclosing block in the ON of a join inside a {} "
+                               "JOIN's left input is not supported",
+                               ToString(units_[*padded_unit_].kind))});
+  }
+  // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
+  // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
+  // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
+  // therefore disconnected: a cross product of them (ADR 0040), which the semi join or the join
+  // the unnesting pass makes above it then keys on the outer columns. The values it holds plant
+  // their joins in the block's slot, below that filter, which reads them as a Path 1 or Path 2
+  // residual does (ADR 0041's decision 8), whole: a BETWEEN with a subquery bound is not split.
+  if (outer) {
+    return BindCorrelatedConjunct(conjunct);
+  }
+  // An IN subquery conjunct becomes a semi or null-aware anti join in the per-row slot.
+  if (in) {
+    ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+    return BindSubqueryConjunct(conjunct, *form, /*having=*/false,
+                                [this](const sql::Expr& e) { return BindInput(e); });
+  }
+  if (form.has_value()) {
+    // A subquery written alike before in this slot is that value (ADR 0041's decision 10): only
+    // uncorrelated ones are remembered.
+    if (const BoundValue* known = FindValue(*form->subquery, /*group=*/false)) {
+      if (form->exists()) {
+        ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+        RowSlot().emplace_back(
+            SlotFilter{.exprs = {},
+                       .ids = {},
+                       .filter = {CountTest(known->value, form->negated, form->subquery->span)},
+                       .span = conjunct.span()});
+        return arrow::Status::OK();
+      }
+      return BindValueConjunct(conjunct, element);
+    }
+    // A correlated EXISTS or scalar comparison is ADR 0023's dependent join; an uncorrelated one is
+    // a value in the slot (ADR 0041's decisions 4 and 5), the conjunct a filter reading it.
+    ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/false));
+    if (block.correlated) {
+      if (padded_unit_.has_value()) {
+        return Reject(
+            Rejection{.span = form->subquery->op_span,
+                      .message = std::format("a correlated subquery in the ON of a join inside a "
+                                             "{} JOIN's left input is not supported",
+                                             ToString(units_[*padded_unit_].kind))});
+      }
+      return JoinSubquery(
+          conjunct, *form, /*having=*/false, [this](const sql::Expr& e) { return BindInput(e); },
+          std::move(block));
+    }
+    if (form->exists()) {
+      // EXISTS or NOT EXISTS itself, in either spelling: its count compared with 1 or 0.
+      ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
+      const SourceSpan span = form->subquery->span;
+      const Typed count = PlantValue(*form->subquery, std::move(block), /*group=*/false);
+      RowSlot().emplace_back(SlotFilter{.exprs = {},
+                                        .ids = {},
+                                        .filter = {CountTest(count, form->negated, span)},
+                                        .span = conjunct.span()});
+      return arrow::Status::OK();
+    }
+    PlantValue(*form->subquery, std::move(block), /*group=*/false);
+    return BindValueConjunct(conjunct, element);
+  }
+  // Two scalar subqueries compared, each a direct operand: their blocks bind in the order written.
+  // An uncorrelated one is a value in the slot (the memo first); with one correlated, the
+  // comparison is that one's dependent join, the other a value below it, as in `corr > (q) + 0`.
+  if (const auto pair = AsSubqueryPair(conjunct)) {
+    const std::array<const sql::SubqueryExpr*, 2> sides = {pair->first, pair->second};
+    struct Dependent {
+      std::size_t side = 0;
+      SubqueryBlock block;
+    };
+    std::optional<Dependent> dependent;  // the correlated side, if one is
+    for (std::size_t i = 0; i < sides.size(); ++i) {
+      if (FindValue(*sides[i], /*group=*/false) != nullptr) {
+        continue;
+      }
+      const SubqueryConjunct side{.subquery = sides[i], .other = nullptr, .negated = false};
+      ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(side, /*having=*/false));
+      if (!block.correlated) {
+        PlantValue(*sides[i], std::move(block), /*group=*/false);
+        continue;
+      }
+      if (dependent.has_value()) {
+        if (SameSubquery(*sides[dependent->side], *sides[i])) {
+          continue;  // one subquery on both sides: its join's column is both
+        }
+        return Reject(Rejection{
+            .span = sides[i]->op_span,
+            .message = "a comparison of two correlated scalar subqueries is not supported"});
+      }
+      dependent = Dependent{.side = i, .block = std::move(block)};
+    }
+    if (!dependent.has_value()) {
+      return BindValueConjunct(conjunct, element);
+    }
+    if (padded_unit_.has_value()) {
+      return Reject(
+          Rejection{.span = sides[dependent->side]->op_span,
+                    .message = std::format("a correlated subquery in the ON of a join inside a "
+                                           "{} JOIN's left input is not supported",
+                                           ToString(units_[*padded_unit_].kind))});
+    }
+    const auto& comparison = std::get<sql::BinaryExpr>(conjunct);
+    const SubqueryConjunct correlated_form{
+        .subquery = sides[dependent->side],
+        .other = dependent->side == 0 ? &*comparison.right : &*comparison.left,
+        .negated = false};
+    return JoinSubquery(
+        conjunct, correlated_form, /*having=*/false,
+        [this](const sql::Expr& e) { return BindInput(e); }, std::move(dependent->block));
+  }
+  if (HoldsSubquery(conjunct)) {
+    // A plain BETWEEN is its two comparisons, typed as DuckDB types all three values (each value
+    // bound once, ADR 0041's decision 10), each then bound on its own: a half without a value goes
+    // where any conjunct goes, onto a scan, say.
+    if (const auto* between = std::get_if<sql::BetweenExpr>(&conjunct);
+        between != nullptr && !between->negated) {
+      const auto bind = [this](const sql::Expr& e) { return BindInput(e); };
+      ARROW_RETURN_NOT_OK(CheckBetweenTypes(*between, bind));
+      const std::optional<LogicalType> folded = BetweenType(*between, bind);
+      for (const sql::Expr& comparison : BetweenComparisons(*between)) {
+        const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
+        ARROW_RETURN_NOT_OK(HoldsSubquery(comparison) ? BindValueConjunct(comparison, element)
+                                                      : BindConjunct(comparison, element));
+      }
+      return arrow::Status::OK();
+    }
+    return BindValueConjunct(conjunct, element);
+  }
+  return BindConjunct(conjunct, element);
+}
+
 // One element of WHERE or of an inner ON: its conjuncts, with what every branch of a top-level OR
-// shares factored out first (ADR 0022's OR factoring), each then classified as any conjunct is.
+// shares factored out first (ADR 0022's OR factoring), each then routed by BindRowConjunct.
 arrow::Status Binder::BindElement(const sql::Expr& element,
                                   const std::vector<const sql::Expr*>& siblings) {
   std::vector<sql::Box<sql::Expr>> owned;  // keeps the rewrite's expressions alive
@@ -6676,59 +7170,19 @@ arrow::Status Binder::BindElement(const sql::Expr& element,
   for (const FactoredConjunct& conjunct : conjuncts) {
     if (conjunct.bind_only) {
       // An OR its shared conjuncts imply contributes nothing to the plan, but it is still bound, so
-      // that a bind error inside a dropped branch is still that error (ADR 0022). BindBool resolves
-      // and types every operand and mints no column id, so the result goes without a trace.
-      ARROW_RETURN_NOT_OK(BindBool(
-          *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); }, /*input=*/true));
+      // that a bind error inside a dropped branch is still that error (ADR 0022): as a dry run,
+      // which binds each subquery's block for its errors and plants nothing (ADR 0041's decision
+      // 10). BindBool resolves and types every operand, and the result goes without a trace (the
+      // sub-blocks mint ids that nothing uses).
+      dry_run_ = true;
+      const arrow::Result<Typed> dropped = BindBool(
+          *conjunct.expr, [this](const sql::Expr& e) { return BindInput(e); },
+          /*input=*/true);
+      dry_run_ = false;  // restored on the error path too, before the status propagates
+      ARROW_RETURN_NOT_OK(dropped.status());
       continue;
     }
-    if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct.expr)) {
-      ARROW_RETURN_NOT_OK(BindSubqueryBetween(*conjunct.expr, *between, /*having=*/false,
-                                              element.span(),
-                                              [this](const sql::Expr& e) { return BindInput(e); }));
-      continue;
-    }
-    const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(*conjunct.expr);
-    const bool outer = ReadsOuterColumn(*conjunct.expr, visible_);
-    // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
-    // neither route can take it. The subquery route binds the conjunct's other side as an ordinary
-    // expression, and the correlated route binds the whole conjunct as a condition, whose every
-    // expression visitor aborts on a subquery. Neither unnesting path of ADR 0023 handles a block
-    // that is correlated and holds a subquery of its own, so it exits 4 at the subquery.
-    if (form.has_value() && outer) {
-      return Reject(Rejection{
-          .span = form->subquery->op_span,
-          .message = "a subquery whose conjunct also reads a column of an enclosing query block is "
-                     "not supported"});
-    }
-    // Both routes below put the conjunct above every join of the block, which a unit that pads
-    // the conjunct's join (an inner join inside a FULL JOIN's left input) must not have above it.
-    if (padded_unit_.has_value() && (outer || form.has_value())) {
-      return Reject(Rejection{
-          .span = form.has_value() ? form->subquery->op_span : conjunct.expr->span(),
-          .message = std::format("{} in the ON of a join inside a {} JOIN's left input is not "
-                                 "supported",
-                                 form.has_value() ? "a subquery" : "a column of an enclosing block",
-                                 ToString(units_[*padded_unit_].kind))});
-    }
-    // A conjunct that reads a column of the enclosing block goes into the block-top filter: it is
-    // neither a key nor an edge of this block's join graph, and the unnesting pass needs it above
-    // the joins (ADR 0023). A block whose relations connect only through such a conjunct is
-    // therefore disconnected: a cross product of them (ADR 0040), which the semi join or the join
-    // the unnesting pass makes above it then keys on the outer columns.
-    if (outer) {
-      ARROW_RETURN_NOT_OK(BindCorrelatedConjunct(*conjunct.expr));
-      continue;
-    }
-    // A subquery conjunct becomes a join above this block's inner joins, so it is neither
-    // classified by the relations it reads (it reads none of them) nor pushed into a relation.
-    if (form.has_value()) {
-      ARROW_RETURN_NOT_OK(
-          BindSubqueryConjunct(*conjunct.expr, *form, /*having=*/false,
-                               [this](const sql::Expr& e) { return BindInput(e); }));
-      continue;
-    }
-    ARROW_RETURN_NOT_OK(BindConjunct(*conjunct.expr, element.span()));
+    ARROW_RETURN_NOT_OK(BindRowConjunct(*conjunct.expr, element.span()));
   }
   return arrow::Status::OK();
 }
@@ -7296,8 +7750,7 @@ arrow::Status Binder::BindHaving() {
   };
   for (const sql::Expr* conjunct : Conjuncts(stmt_.having)) {
     if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct)) {
-      ARROW_RETURN_NOT_OK(
-          BindSubqueryBetween(*conjunct, *between, /*having=*/true, conjunct->span(), bind));
+      ARROW_RETURN_NOT_OK(BindSubqueryBetween(*between, bind));
       continue;
     }
     // A subquery conjunct of HAVING becomes a join above the aggregation, over the groups.
@@ -7581,8 +8034,10 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
 // input, which is what the executor requires of an outer join (ADR 0022, "Build sides").
 LogicalNodePtr Binder::UnitNode(std::size_t u) {
   Unit& unit = units_[u];
+  // Its left input's slot inside that input, below the unit, which pads what the slot's filters
+  // keep (ADR 0041's decision 9).
   return Make(JoinNode{.kind = unit.kind,
-                       .left = JoinTree(unit.left),
+                       .left = SlotNodes(JoinTree(unit.left), blocks_[unit.left].slot),
                        .right = JoinTree(unit.right),
                        .keys = std::move(unit.keys),
                        .residual = std::move(unit.residual),
@@ -7754,15 +8209,17 @@ void Binder::PushSemiJoinsDown() {
   if (blocks_.empty() || blocks_.front().relations.size() < 2) {
     return;  // one relation: its branch and its tree are the same node, so this would only churn
   }
-  std::vector<SubqueryJoin> kept;
-  for (SubqueryJoin& join : where_subqueries_) {
-    if (const std::optional<std::size_t> relation = PushableSemiJoin(join)) {
-      relations_[*relation].semi_joins.push_back(std::move(join));
+  std::vector<SlotEntry> kept;
+  for (SlotEntry& entry : blocks_.front().slot) {
+    const auto* join = std::get_if<SubqueryJoin>(&entry);
+    if (const std::optional<std::size_t> relation =
+            join != nullptr ? PushableSemiJoin(*join) : std::nullopt) {
+      relations_[*relation].semi_joins.push_back(std::get<SubqueryJoin>(std::move(entry)));
     } else {
-      kept.push_back(std::move(join));
+      kept.push_back(std::move(entry));
     }
   }
-  where_subqueries_ = std::move(kept);
+  blocks_.front().slot = std::move(kept);
 }
 
 LogicalPlan Binder::Assemble() {
@@ -7771,7 +8228,7 @@ LogicalPlan Binder::Assemble() {
   const bool distinct = stmt_.distinct && shape_ != Shape::kGlobal;
   PushSemiJoinsDown();
   LogicalNodePtr node = JoinTree(0);
-  node = SubqueryJoins(std::move(node), where_subqueries_);
+  node = SlotNodes(std::move(node), blocks_.front().slot);
   // The correlated conjuncts of this block, above all of its joins and below its aggregation, in
   // one filter (ADR 0023): where the unnesting pass finds them, and where the free variables they
   // read are bound by the dependent join this block's plan becomes the right input of.
@@ -7793,8 +8250,11 @@ LogicalPlan Binder::Assemble() {
   // select list -- a probe's cast to the key type, or the row a one-row join appends -- and a
   // global aggregate's Project below is what restores the list. Noted before `above` runs, since
   // that is where the joins are built.
-  const bool having_join_columns = std::ranges::any_of(
-      having_subqueries_, [](const SubqueryJoin& join) { return join.AddsColumns(); });
+  const bool having_join_columns = std::ranges::any_of(group_slot_, [](const SlotEntry& entry) {
+    const auto* join = std::get_if<SubqueryJoin>(&entry);
+    // A slot filter stands in HAVING's slot from ADR 0041's SQ1b on.
+    return join != nullptr ? join->AddsColumns() : !std::get<SlotFilter>(entry).exprs.empty();
+  });
   // Over the aggregation: what HAVING's conditions compute and their filter, then HAVING's
   // subquery joins, as DuckDB filters HAVING before it computes the select list; the select list's
   // and ORDER BY's computed columns; the Sort; then a Project restores the select order.
@@ -7810,7 +8270,7 @@ LogicalPlan Binder::Assemble() {
     }
     // HAVING's subquery conjuncts after its others, as in DuckDB: each join computes what it reads
     // in a layer of its own, from the aggregation's columns.
-    node = SubqueryJoins(std::move(node), having_subqueries_);
+    node = SlotNodes(std::move(node), group_slot_);
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});
@@ -8105,15 +8565,17 @@ sql::SelectStatement FoldDateCasts(sql::SelectStatement stmt) {
 }
 
 // One top-level conjunct of CheckConjuncts: a subquery form by its own rule, anything else by
-// RejectCondition's.
-arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
-  if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct)) {
+// RejectCondition's. Where a condition takes values (`values`), only IN keeps a rule of its own:
+// EXISTS is a condition there, and a comparison with a subquery one of two values.
+arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having, bool values) {
+  if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct);
+      form.has_value() && (!values || (!form->scalar() && !form->exists()))) {
     if (auto r = RejectSubqueryConjunct(*form, having)) {
       return Reject(*r);
     }
     return arrow::Status::OK();
   }
-  if (auto r = RejectCondition(conjunct, having)) {
+  if (auto r = RejectCondition(conjunct, having, values)) {
     return Reject(*r);
   }
   return arrow::Status::OK();
@@ -8122,19 +8584,21 @@ arrow::Status CheckConjunct(const sql::Expr& conjunct, bool having) {
 // A conjunct list of a clause that answers subquery conjuncts: WHERE, an inner join's ON and
 // HAVING. Each top-level conjunct in written order, a subquery form by its own rule and everything
 // else by RejectCondition's -- which is where every other placement of a subquery keeps the
-// refusal FirstUnsupportedOf gives it, an OR branch included, since Conjuncts flattens AND alone.
+// refusal FirstUnsupportedOf gives it, an OR branch included, since Conjuncts flattens AND alone,
+// but for the values and EXISTS conditions a condition that takes values admits (ADR 0041's SQ1).
 // The conjuncts are the binder's own (plan::Conjuncts, and FactorSharedConjuncts over it), so what
 // this accepts is what the binder intercepts.
-arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool having) {
+arrow::Status CheckConjuncts(const std::vector<sql::Expr>& predicate, bool having, bool values) {
   for (const sql::Expr* conjunct : Conjuncts(predicate)) {
-    // A BETWEEN with a subquery bound is checked as its two comparisons, as the binder binds it.
-    if (const sql::BetweenExpr* between = SubqueryBetween(*conjunct)) {
+    // A BETWEEN with a subquery bound is checked as its two comparisons, as the binder binds it in
+    // HAVING (where a condition takes values, RejectCondition checks a BETWEEN's two anyway).
+    if (const sql::BetweenExpr* between = values ? nullptr : SubqueryBetween(*conjunct)) {
       for (const sql::Expr& comparison : BetweenComparisons(*between)) {
-        ARROW_RETURN_NOT_OK(CheckConjunct(comparison, having));
+        ARROW_RETURN_NOT_OK(CheckConjunct(comparison, having, values));
       }
       continue;
     }
-    ARROW_RETURN_NOT_OK(CheckConjunct(*conjunct, having));
+    ARROW_RETURN_NOT_OK(CheckConjunct(*conjunct, having, values));
   }
   return arrow::Status::OK();
 }
@@ -8154,7 +8618,7 @@ arrow::Status CheckFromList(const std::vector<sql::FromItem>& from) {
     // the join's rows, which a semi join cannot stand for: a subquery there is refused as it is
     // in any other placement.
     if (item.connector == sql::Connector::kInner) {
-      ARROW_RETURN_NOT_OK(CheckConjuncts(item.on, /*having=*/false));
+      ARROW_RETURN_NOT_OK(CheckConjuncts(item.on, /*having=*/false, /*values=*/true));
       continue;
     }
     for (const sql::Expr& conjunct : item.on) {
@@ -8247,14 +8711,15 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
     }
   }
   ARROW_RETURN_NOT_OK(CheckFromList(stmt.from));
-  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false));
+  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false, /*values=*/true));
   for (const sql::Expr& expr : stmt.group_by) {
     ARROW_RETURN_NOT_OK(CheckValue(expr));
   }
   for (const sql::GroupingElement& element : stmt.grouping) {
     ARROW_RETURN_NOT_OK(CheckGroupingElement(element));
   }
-  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true));
+  // HAVING takes the subquery forms of ADR 0041's SQ4a alone until SQ1's second PR.
+  ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true, /*values=*/false));
   for (const sql::OrderItem& item : stmt.order_by) {
     ARROW_RETURN_NOT_OK(CheckValue(item.expr));
   }

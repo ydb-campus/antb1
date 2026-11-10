@@ -303,8 +303,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT url LIKE '%x%' FROM t", kUnsupported, "LIKE",
                   "LIKE is only supported in conditions (WHERE, HAVING and CASE WHEN)"},
         ErrorCase{"SELECT a FROM t WHERE region IN (1, b)", kUnsupported, "b",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT a FROM t WHERE 1 IN (a)", kUnsupported, "1",
                   "IN needs a column on the left"},
         ErrorCase{"SELECT region IN ('a') FROM t", kUnsupported, "IN",
@@ -396,11 +396,11 @@ INSTANTIATE_TEST_SUITE_P(
         // The same in an IN list: a constant that does not fold stays unsupported, an overflow
         // is the comparison's bind error (D17) and a HUGEINT past 38 digits is unsupported.
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 1 // 1)", kUnsupported, "1 // 1",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 NOT IN (2 * 1.5, 1)", kUnsupported, "2 * 1.5",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i32 FROM t WHERE i32 IN (1, 2147483647 + 1)", kBind, "2147483647 + 1",
                   "Overflow in addition of INTEGER"},
         ErrorCase{"SELECT i32 FROM t WHERE h IN (99999999999999999999999999999999999999 + 1)",
@@ -707,8 +707,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE CAST(i16 AS VARCHAR) = '1'", kUnsupported,
                   "CAST(i16 AS VARCHAR)", "CAST of SMALLINT values to VARCHAR is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, 2::INT)", kUnsupported, "2::INT",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE 'x%'::VARCHAR", kUnsupported,
                   "'x%'::VARCHAR", "LIKE with a column or an aggregate as the pattern"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16::INT", kBind, "i16",
@@ -777,14 +777,16 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "t.i32", "a FULL JOIN's ON must read its own two inputs only"},
         // An inner join's ON inside a FULL JOIN's left input binds inside that input, which the
         // FULL JOIN pads, so a conjunct of it that would bind above every join of the block -- a
-        // subquery, a column of an enclosing block, a comma sibling before the join group -- would
-        // drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left input, those
-        // are answered.
+        // correlated subquery, a column of an enclosing block, a comma sibling before the join
+        // group -- would drop the padded rows: exit 4. Under a LEFT JOIN, which never pads its left
+        // input, those are answered; an uncorrelated subquery stands in that input's own slot
+        // (ADR 0041's SQ1).
         ErrorCase{
-            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM "
-            "dec) FULL JOIN ok ON u.i16 = ok.i16",
-            kUnsupported, "IN",
-            "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
+            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND EXISTS (SELECT 1 FROM dec WHERE "
+            "dec.i = t.i32) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "EXISTS",
+            "a correlated subquery in the ON of a join inside a FULL JOIN's left input is not "
+            "supported"},
         ErrorCase{"SELECT t.i16 FROM t WHERE EXISTS (SELECT * FROM u JOIN dec ON u.i32 = dec.i AND "
                   "dec.b = t.i64 FULL JOIN ok ON u.i16 = ok.i16)",
                   kUnsupported, "dec.b = t.i64",
@@ -794,6 +796,23 @@ INSTANTIATE_TEST_SUITE_P(
                   "ON u.i16 = ok.i16",
                   kUnsupported, "dec.i = t.i32",
                   "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        // So must a conjunct with a subquery, which filters in that input's own slot (ADR 0041's
+        // SQ1): an IN, a value and an EXISTS under OR, each beside a comma sibling's column.
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND dec.i IN (SELECT ok.i16 FROM "
+            "ok) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i IN (SELECT ok.i16 FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND dec.i > (SELECT MIN(ok.i16) "
+            "FROM ok) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i > (SELECT MIN(ok.i16) FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
+        ErrorCase{
+            "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND (dec.i > 0 OR EXISTS (SELECT "
+            "1 FROM ok)) FULL JOIN ok ON u.i16 = ok.i16",
+            kUnsupported, "dec.i > 0 OR EXISTS (SELECT 1 FROM ok)",
+            "the ON of a join inside a FULL JOIN's left input must read that input only"},
         // The missing tables are still missing, and that bind error comes first, as in DuckDB.
         ErrorCase{"SELECT i16 FROM nope LEFT JOIN missing ON a = b", kBind, "nope",
                   "table 'nope' does not exist"},
@@ -819,8 +838,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT(*) FROM t WHERE s LIKE t.s", kUnsupported, "t.s",
                   "LIKE with a column or an aggregate as the pattern is not supported"},
         ErrorCase{"SELECT COUNT(*) FROM t WHERE i16 IN (1, t.i16)", kUnsupported, "t.i16",
-                  "only literals, constant integer expressions and quotients of numbers are "
-                  "supported in an IN list"},
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
         // A call with the wrong number of arguments stays a bind error whatever its arguments
         // (CheckSupported does not look into them, and the binder reports the arity before it
         // binds one).
@@ -1090,16 +1109,10 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "HAVING COUNT(*) > 1)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        // Two of them would be two stacked one-row joins, and one that is no direct operand of the
-        // comparison would need the join below an expression: both keep the form's own refusal.
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) < (SELECT MAX(i16) FROM u)",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u) + 1", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
         // The other side is checked as any comparison's is: an operand, a literal, or a constant
         // integer expression.
         ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,
-                  "1 + 2.5", "a comparison with a subquery needs a column or a literal"},
+                  "1 + 2.5", "a constant expression in a comparison is not supported"},
         // A constant integer expression that overflows is a bind error (divergence D17), as it is
         // without a subquery: the fold runs, and the comparison's own side has to survive the copy
         // it makes (sql::Box deep-copies, so the subquery moves).
@@ -1123,14 +1136,31 @@ INSTANTIATE_TEST_SUITE_P(
                   kBind, "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(i16), MAX(i32) FROM u)", kBind, "(",
                   "a subquery of a comparison must have one column, not 2"},
-        // A top-level conjunct is the one placement EXISTS is answered in, correlated (ADR 0023's
-        // U2) or not (ADR 0041's SQ4a); every other placement keeps the static refusal, before any
-        // name resolves.
+        // A top-level conjunct is the one placement a correlated EXISTS is answered in (ADR 0023's
+        // U2), refused elsewhere once its block binds; an uncorrelated one is answered under OR,
+        // NOT and CASE too (ADR 0041's SQ1). Outside a condition every EXISTS keeps the static
+        // refusal, before any name resolves.
         ErrorCase{"SELECT EXISTS (SELECT i16 FROM u) FROM t", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE "
                   "u.i32 = t.i32)",
-                  kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported here"},
+                  kUnsupported, "EXISTS",
+                  "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an "
+                  "inner ON"},
+        ErrorCase{"SELECT i16 FROM t WHERE (EXISTS (SELECT i16 FROM u)) IS NOT NULL", kUnsupported,
+                  "EXISTS", "EXISTS (subqueries) is not supported here"},
+        // A correlated value elsewhere than a direct operand of a top-level comparison waits for
+        // ADR 0041's SQ5, refused once its block binds.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR i32 > (SELECT MIN(u.i16) FROM u WHERE "
+                  "u.i64 = t.i64)",
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only as a direct operand of a "
+                  "comparison"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) "
+                  "+ 1",
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only as a direct operand of a "
+                  "comparison"},
         ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         // Path 1 takes a plain block only: every clause that would have to act per binding is
@@ -1248,30 +1278,42 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i32 FROM t GROUP BY i32 HAVING MIN(i16) = "
                   "(SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
                   kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
-        // A conjunct that is both a subquery conjunct and a reader of an enclosing block's column:
-        // the subquery route binds the other side as an ordinary expression and the correlated
-        // route binds the whole conjunct as a condition, whose expression visitors abort on a
-        // subquery, so neither can take it.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
-                  "t.i64 = (SELECT MIN(ok.i16) FROM ok))",
-                  kUnsupported, "(",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
+        // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
+        // above this block's joins with the probe's free variable on its outer side, which neither
+        // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
+        // decision 8, ValuePlacements).
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
                   "t.i64 IN (SELECT ok.i16 FROM ok))",
                   kUnsupported, "IN",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
-        // A BETWEEN with a subquery bound keeps both placement rules of a subquery conjunct, at its
-        // first subquery (ADR 0041's SQ4a): an operand that reads an enclosing block's column...
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 "
-                  "BETWEEN (SELECT MIN(ok.i16) FROM ok) AND 100)",
+                  "an IN subquery whose probe reads a column of an enclosing query block"},
+        // A correlated subquery in a conjunct that reads the enclosing block itself (decision 8
+        // answers an uncorrelated value there), two correlated subqueries compared (SQ5), and a
+        // correlated value inside a FULL JOIN's left input, each named for what refuses it.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 > "
+                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
                   kUnsupported, "(",
-                  "a subquery whose conjunct also reads a column of an enclosing query block"},
-        // ... and an inner ON inside a FULL JOIN's left input, which the FULL JOIN pads.
-        ErrorCase{
-            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 BETWEEN 1 AND (SELECT "
-            "MAX(dec.i) FROM dec) FULL JOIN ok ON u.i16 = ok.i16",
-            kUnsupported, "(",
-            "a subquery in the ON of a join inside a FULL JOIN's left input is not supported"},
+                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
+                  "query block is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < "
+                  "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)",
+                  kUnsupported, "(",
+                  "a comparison of two correlated scalar subqueries is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND u.i32 > (SELECT MIN(dec.i) FROM "
+                  "dec WHERE dec.i = u.i32) + 1 FULL JOIN ok ON u.i16 = ok.i16",
+                  kUnsupported, "(",
+                  "a correlated subquery in the ON of a join inside a FULL JOIN's left input is "
+                  "not supported"},
+        // The same for a correlated subquery compared directly with a value there, and the second
+        // of two subqueries compared binds before the pair is refused, so its bind error wins, as
+        // in DuckDB.
+        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (SELECT MIN(ok.i16) FROM ok) < "
+                  "(SELECT MIN(dec.i) FROM dec WHERE dec.i = u.i32) FULL JOIN ok ON u.i16 = ok.i16",
+                  kUnsupported, "(",
+                  "a correlated subquery in the ON of a join inside a FULL JOIN's left input is "
+                  "not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < "
+                  "(SELECT MAX(nope) FROM ok WHERE ok.i16 = t.i16)",
+                  kBind, "nope", "column 'nope' does not exist"},
         // A name this block has twice keeps its own bind error: an enclosing block that happens to
         // have it must not turn an ambiguous name into a refusal (nor, once a correlated subquery
         // binds, make it read the outer column).
@@ -1300,25 +1342,12 @@ INSTANTIATE_TEST_SUITE_P(
                   "a scalar subquery is not supported"},
         ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        // Inside an expression rather than as a conjunct of its own.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 + (SELECT COUNT(*) FROM u) > 0", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u) + 1", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE CAST((SELECT COUNT(*) FROM u) AS BIGINT) > 0",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
-        // A BETWEEN is answered as its two comparisons when a bound is itself an uncorrelated
-        // subquery (ADR 0041's SQ4a); a correlated bound, a NOT BETWEEN (an OR), a bound with the
-        // subquery inside arithmetic and a subquery as the operand keep the refusal.
+        // A BETWEEN's subquery bound is a value (ADR 0041's SQ1); a correlated one waits for SQ5.
         ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u WHERE u.i64 = "
                   "t.i64) AND 10",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT BETWEEN (SELECT MIN(i16) FROM u) AND 10",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN 1 AND (SELECT MIN(i16) FROM u) + 1",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) BETWEEN i32 AND 10",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only as a direct operand of a "
+                  "comparison"},
         // A subquery bound is typed as its column, with DuckDB's rules for the three values.
         ErrorCase{"SELECT i16 FROM t WHERE i64 BETWEEN (SELECT MIN(d) FROM u) AND 5", kUnsupported,
                   "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT"},
@@ -1332,11 +1361,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "a scalar subquery is not supported"},
         ErrorCase{"SELECT CASE WHEN (SELECT COUNT(*) FROM u) > 0 THEN 1 ELSE 0 END FROM t",
                   kUnsupported, "(", "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (1, (SELECT COUNT(*) FROM u))", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
-        // Two subqueries in one comparison, which would be two stacked one-row joins.
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) < (SELECT MAX(i16) FROM u)",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
+        // An IN list's values read no column: a subquery's value among literals (ADR 0041's SQ1),
+        // typed as DuckDB types the list, all its values in one type.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT COUNT(*) FROM u), i16)", kUnsupported,
+                  "i16",
+                  "only literals, constant integer expressions, quotients of numbers and "
+                  "subquery values that read no column are supported in an IN list"},
+        ErrorCase{"SELECT i16 FROM t WHERE i64 IN (1.5e0, (SELECT MIN(i64) FROM u))", kUnsupported,
+                  "IN", "IN of a DOUBLE value and a BIGINT"},
         // Under an OR, which is no top-level conjunct: or_factoring flattens AND only, so the
         // conjunct never reaches the acceptance list.
         ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)", kUnsupported,
@@ -6832,6 +6864,264 @@ TEST(BinderTest, TheSingleValueOfAFloatColumnIsAFloat) {
   }
 }
 
+// Every shape of ADR 0041's SQ1 places its values (decision 9) without an abort: bound, resolved
+// and optimized, a correlated block's residual included, which ADR 0023's unnesting then takes.
+TEST(BinderTest, ValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           // Decision 8: a conjunct of a correlated EXISTS that reads the enclosing block and holds
+           // a value is a residual of Path 1, a BETWEEN with a subquery bound whole among them...
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i64 > "
+           "(SELECT MIN(ok.i16) FROM ok))",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 BETWEEN "
+           "(SELECT MIN(ok.i16) FROM ok) AND 100)",
+           // ... and a value conjunct of a correlated aggregate's block stands in its slot, which
+           // Path 2 takes with the block.
+           "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64 AND "
+           "u.i32 > (SELECT MIN(ok.i16) FROM ok))",
+           // An IN in an inner ON inside a FULL JOIN's left input: that input's own slot.
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT dec.i FROM dec) FULL "
+           "JOIN ok ON u.i16 = ok.i16",
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 BETWEEN 1 AND (SELECT "
+           "MAX(dec.i) FROM dec) FULL JOIN ok ON u.i16 = ok.i16",
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 > (SELECT MIN(dec.i) FROM dec) "
+           "OR NOT EXISTS (SELECT 1 FROM dec)) FULL JOIN ok ON u.i16 = ok.i16",
+           // Values inside expressions of WHERE and of an inner ON.
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) < (SELECT MAX(i16) FROM u)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u) + 1",
+           "SELECT i16 FROM t WHERE i32 + (SELECT COUNT(*) FROM u) > 0",
+           "SELECT i16 FROM t WHERE CAST((SELECT COUNT(*) FROM u) AS BIGINT) > 0",
+           "SELECT i16 FROM t WHERE i32 = 1 OR i32 > (SELECT MIN(i16) FROM u)",
+           "SELECT i16 FROM t WHERE NOT (i32 > (SELECT MIN(i16) FROM u))",
+           "SELECT i16 FROM t WHERE CASE WHEN i32 > (SELECT MIN(i16) FROM u) THEN 1 ELSE (SELECT "
+           "MAX(i16) FROM u) END = 1",
+           "SELECT i16 FROM t WHERE COALESCE((SELECT MIN(i16) FROM u), i16) > 0",
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IS NULL",
+           "SELECT i16 FROM t WHERE i16 IS DISTINCT FROM (SELECT MIN(i16) FROM u)",
+           "SELECT i16 FROM t WHERE (SELECT s FROM ok LIMIT 1) LIKE 'a%'",
+           "SELECT i16 FROM t WHERE i32 IN (1, (SELECT COUNT(*) FROM u))",
+           "SELECT i16 FROM t WHERE i32 NOT IN (1, (SELECT COUNT(*) FROM u))",
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IN (1, 2)",
+           "SELECT i16 FROM t WHERE i32 NOT BETWEEN (SELECT MIN(i16) FROM u) AND 10",
+           "SELECT i16 FROM t WHERE i32 BETWEEN 1 AND (SELECT MIN(i16) FROM u) + 1",
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) BETWEEN i32 AND 10",
+           "SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT 1 FROM u)",
+           "SELECT i16 FROM t WHERE CASE WHEN NOT EXISTS (SELECT 1 FROM u) THEN i32 ELSE i16 END > "
+           "0",
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 > (SELECT MIN(i16) FROM ok) OR "
+           "u.i32 < 0)",
+           // One subquery written twice, in one slot: one join.
+           "SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) OR i16 < (SELECT MIN(i16) FROM "
+           "u)",
+           // A correlated comparison whose other side holds a value, or is one, in either order:
+           // the value's join stands below Path 2's.
+           "SELECT i16 FROM t WHERE i32 + (SELECT COUNT(*) FROM ok) > (SELECT MIN(u.i16) FROM u "
+           "WHERE u.i64 = t.i64)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < (SELECT "
+           "COUNT(*) FROM ok)",
+           "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM ok) > (SELECT MIN(u.i16) FROM u WHERE "
+           "u.i64 = t.i64)",
+           // A value that keys a correlated block: Path 1's semi key, Path 2's inner equivalent.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (SELECT MIN(ok.i16) FROM ok) = "
+           "t.i16)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) FROM u WHERE (SELECT MIN(ok.i16) FROM "
+           "ok) = t.i16)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_NE(optimized.root, nullptr) << sql;
+  }
+}
+
+// ADR 0041's decision 10: a subquery binds once per slot, keyed by what is written, so the copies
+// the binder makes of a conjunct -- a BETWEEN's two comparisons, IS DISTINCT FROM's lowering, CASE
+// x WHEN's equalities, a comparison whose constant moves -- and a subquery written twice, in an ON
+// and in WHERE alike, read one join.
+TEST(BinderTest, ASubqueryIsBoundOncePerSlot) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u) AND (SELECT "
+                      "MIN(i16) FROM u) + 10"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 <= \"(min(i16) + 10)\"\n"
+            "    Compute (min(i16) + 10)\n"
+            "      Filter i32 >= \"min(i16)\"\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i16 IS DISTINCT FROM (SELECT MIN(i16) FROM u) AND "
+                      "CASE (SELECT MIN(i16) FROM u) WHEN 1 THEN i32 ELSE 0 END > 0"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\" > 0\n"
+            "    Compute CASE  WHEN (((SELECT MIN(i16) FROM u) = 1)) THEN (i32) ELSE 0 END\n"
+            "      Filter i16 IS DISTINCT FROM \"min(i16)\"\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(
+      optimized("SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 > (SELECT MIN(i16) FROM "
+                "ok) WHERE u.i32 + 1 > (SELECT MIN(i16) FROM ok) OR t.i64 < 0"),
+      "Output: i16:SMALLINT\n"
+      "Project t.i16\n"
+      "  Filter \"(((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\"\n"
+      "    Compute (((u.i32 + 1) > (SELECT MIN(i16) FROM ok)) OR (t.i64 < 0))\n"
+      "      Filter t.i32 > \"min(i16)\"\n"
+      "        Join ONE-ROW build=right keys=[] carries 1 of 6 unread above\n"
+      "          Join INNER build=right keys=[u.i16 = t.i16] carries 1 of 5 unread above\n"
+      "            Scan table=u source=fake columns=[i16, i32]\n"
+      "            Scan table=t source=fake columns=[i16, i32, i64]\n"
+      "          Aggregate MIN(i16)\n"
+      "            Scan table=ok source=fake columns=[i16]\n");
+  // IS DISTINCT FROM's lowering, which a constant side makes (x <> 5 OR x IS NULL), and a
+  // comparison whose constant moves across the value both read the one join.
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IS DISTINCT FROM 5 AND "
+                      "(SELECT MIN(i16) FROM u) + 1 > 5"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"min(i16)\" > 4\n"
+            "    Filter \"((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\"\n"
+            "      Compute ((SELECT MIN(i16) FROM u) IS DISTINCT FROM 5)\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=u source=fake columns=[i16]\n");
+  // Top-level comparisons and EXISTS conjuncts written alike read one join each, too.
+  EXPECT_EQ(
+      optimized("SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u) AND i16 < (SELECT "
+                "MIN(i16) FROM u) AND EXISTS (SELECT 1 FROM ok) AND EXISTS (SELECT 1 FROM ok)"),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "  Filter \"count_star()\" = 1\n"
+      "    Filter \"count_star()\" = 1\n"
+      "      Join ONE-ROW build=right keys=[] carries 2 of 4 unread above\n"
+      "        Filter i16 < \"min(i16)\"\n"
+      "          Filter i32 > \"min(i16)\"\n"
+      "            Join ONE-ROW build=right keys=[]\n"
+      "              Scan table=t source=fake columns=[i16, i32]\n"
+      "              Aggregate MIN(i16)\n"
+      "                Scan table=u source=fake columns=[i16]\n"
+      "        Aggregate COUNT(*)\n"
+      "          Limit 1\n"
+      "            Scan table=ok source=fake columns=[]\n");
+}
+
+// OR factoring's dropped branch binds as a dry run (ADR 0041's decision 10): its subquery plants no
+// join, so a value of two rows there never fails, but a bind error in it is still that error.
+TEST(BinderTest, ADroppedOrBranchPlansNoJoinButKeepsItsBindErrors) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT i16 FROM u)) OR i32 = 2"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i32 = 2\n"
+            "    Scan table=t source=fake columns=[i16, i32]\n");
+  auto error = BindSql(
+      "SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT nope FROM u)) OR i32 = 2", catalog);
+  ASSERT_FALSE(error.ok());
+  EXPECT_EQ(SpanText("SELECT i16 FROM t WHERE (i32 = 2 AND i32 > (SELECT nope FROM u)) OR i32 = 2",
+                     error.status()),
+            "nope");
+}
+
+// A block's per-row slot stands above its joins and below the filter of its correlated conjuncts
+// (ADR 0041's decision 9), which a value that such a conjunct holds is then read by: ADR 0023's
+// Path 1 takes the slot with the block, and the conjunct as a residual of its semi join (decision
+// 8).
+TEST(BinderTest, TheSlotsStandWhereDecisionNinePutsThem) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i64 > (SELECT "
+      "MIN(ok.i16) FROM ok) AND u.i32 > (SELECT MAX(ok.i16) FROM ok) + 1)";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(
+      Explain(*plan),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "  DependentJoin SEMI\n"
+      "    Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", "
+      "from]\n"
+      "    Project 1\n"
+      "      Filter \"(u.i16 = t.i16)\" AND \"(t.i64 > (SELECT MIN(ok.i16) FROM ok))\"\n"
+      "        Compute (u.i16 = t.i16), (t.i64 > (SELECT MIN(ok.i16) FROM ok))\n"
+      "          Filter i32 > \"(max(ok.i16) + 1)\"\n"
+      "            Compute (max(ok.i16) + 1)\n"
+      "              Join ONE-ROW build=right keys=[]\n"
+      "                Join ONE-ROW build=right keys=[]\n"
+      "                  Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+      "\"Mixed Case\", from]\n"
+      "                  Aggregate MIN(i16)\n"
+      "                    Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n"
+      "                Aggregate MAX(i16)\n"
+      "                  Scan table=ok source=fake columns=[i16, s]  [shared #1 of 2, 2 fields]\n");
+  EXPECT_EQ(Explain(Optimized(*plan)),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"t.i16\" = \"u.i16\"] residual=[(t.i64 > (SELECT "
+            "MIN(ok.i16) FROM ok))] carries 1 of 2 unread above\n"
+            "    Scan table=t source=fake columns=[i16, i64]\n"
+            "    Filter i32 > \"(max(ok.i16) + 1)\"\n"
+            "      Compute (max(ok.i16) + 1)\n"
+            "        Join ONE-ROW build=right keys=[]\n"
+            "          Join ONE-ROW build=right keys=[]\n"
+            "            Scan table=u source=fake columns=[i16, i32]\n"
+            "            Aggregate MIN(i16)\n"
+            "              Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
+            "          Aggregate MAX(i16)\n"
+            "            Scan table=ok source=fake columns=[i16]  [shared #1 of 2, 1 field]\n");
+}
+
+// An inner ON inside a FULL JOIN's left input has that input's own slot, below the FULL JOIN, which
+// then pads what its filters keep (ADR 0041's SQ1; ADR 0037's OJ3 left it to this phase).
+TEST(BinderTest, AFullJoinsLeftInputHasASlotOfItsOwn) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT COUNT(*) FROM t JOIN u ON t.i16 = u.i16 AND t.i32 < (SELECT MIN(i16) "
+                      "FROM ok) + 2 FULL JOIN dec ON u.i32 = dec.i"),
+            "Output: count_star():BIGINT\n"
+            "Aggregate COUNT(*)\n"
+            "  Join FULL build=right keys=[u.i32 = dec.i]\n"
+            "    Filter t.i32 < \"(min(i16) + 2)\"\n"
+            "      Compute (min(i16) + 2)\n"
+            "        Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
+            "          Join INNER build=right keys=[u.i16 = t.i16] carries 2 of 4 unread above\n"
+            "            Scan table=u source=fake columns=[i16, i32]\n"
+            "            Scan table=t source=fake columns=[i16, i32]\n"
+            "          Aggregate MIN(i16)\n"
+            "            Scan table=ok source=fake columns=[i16]\n"
+            "    Scan table=dec source=fake columns=[i]\n");
+}
+
 // An uncorrelated EXISTS is COUNT(*) over LIMIT 1 of its block under a one-row join, compared with
 // 1, or with 0 for NOT EXISTS (ADR 0041's decision 5), DuckDB's own plan. Its select list -- the
 // Projects among the Limits and Sorts at the top of its plan -- is dropped, as DuckDB drops it, so
@@ -6961,8 +7251,10 @@ TEST(BinderTest, AnUncorrelatedExistsIsACountOverLimitOne) {
 }
 
 // A BETWEEN with a subquery bound is its two comparisons (ADR 0041's decision 6), each a conjunct
-// of its clause: a subquery's a one-row join with the comparison above it, the other an ordinary
-// conjunct -- a filter below the joins, in WHERE and HAVING alike. Both compare in the type DuckDB
+// of its clause: the bounds' one-row joins come first, planted where the BETWEEN is typed, then a
+// subquery's comparison filters above them (in WHERE a filter of the slot, computing its operand
+// there, ADR 0041's SQ1), and the other is an ordinary conjunct -- a filter below the joins, in
+// WHERE and HAVING alike. Both compare in the type DuckDB
 // gives all three values, a subquery bound's being its column's: with a DOUBLE bound, the plain
 // half keeps `i32 + 1` as written (DuckDB keeps the cast to DOUBLE above it), where an INTEGER
 // bound lets the constant move.
@@ -6982,16 +7274,16 @@ TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
             "Output: i16:SMALLINT\n"
             "Project i16\n"
             "  Filter i32 <= i32\n"
-            "    Join ONE-ROW build=right keys=[] carries 1 of 4 unread above\n"
-            "      Filter i32 >= \"min(i32)\"\n"
+            "    Filter i32 >= \"min(i32)\"\n"
+            "      Join ONE-ROW build=right keys=[]\n"
             "        Join ONE-ROW build=right keys=[]\n"
             "          Scan table=t source=fake columns=[i16, i32]\n"
             "          Aggregate MIN(i32)\n"
             "            Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n"
-            "      Aggregate SINGLE_VALUE(i32)\n"
-            "        Project i32\n"
-            "          Limit 1\n"
-            "            Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n");
+            "        Aggregate SINGLE_VALUE(i32)\n"
+            "          Project i32\n"
+            "            Limit 1\n"
+            "              Scan table=u source=fake columns=[i32]  [shared #1 of 2, 1 field]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE dt BETWEEN (SELECT MIN(dt) FROM u) AND "
                       "'2020-01-01'"),
             "Output: i16:SMALLINT\n"
@@ -7006,23 +7298,23 @@ TEST(BinderTest, ABetweenWithASubqueryBoundIsItsTwoComparisons) {
             "Output: i16:SMALLINT\n"
             "Project i16\n"
             "  Filter \"(i32 + 1)\" >= \"min(d)\"\n"
-            "    Join ONE-ROW build=right keys=[] carries 2 of 5 unread above\n"
-            "      Compute (i32 + 1)\n"
+            "    Compute (i32 + 1)\n"
+            "      Join ONE-ROW build=right keys=[] carries 1 of 4 unread above\n"
             "        Filter \"(i32 + 1)\" <= 100\n"
             "          Compute (i32 + 1)\n"
             "            Scan table=t source=fake columns=[i16, i32]\n"
-            "      Aggregate MIN(d)\n"
-            "        Scan table=u source=fake columns=[d]\n");
+            "        Aggregate MIN(d)\n"
+            "          Scan table=u source=fake columns=[d]\n");
   EXPECT_EQ(optimized("SELECT i16 FROM t WHERE i32 + 1 BETWEEN (SELECT MIN(i32) FROM u) AND 100"),
             "Output: i16:SMALLINT\n"
             "Project i16\n"
             "  Filter \"(i32 + 1)\" >= \"min(i32)\"\n"
-            "    Join ONE-ROW build=right keys=[] carries 1 of 4 unread above\n"
-            "      Compute (i32 + 1)\n"
+            "    Compute (i32 + 1)\n"
+            "      Join ONE-ROW build=right keys=[]\n"
             "        Filter i32 <= 99\n"
             "          Scan table=t source=fake columns=[i16, i32]\n"
-            "      Aggregate MIN(i32)\n"
-            "        Scan table=u source=fake columns=[i32]\n");
+            "        Aggregate MIN(i32)\n"
+            "          Scan table=u source=fake columns=[i32]\n");
   EXPECT_EQ(optimized("SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) BETWEEN (SELECT "
                       "MIN(i16) FROM u) AND 10"),
             "Output: i16:SMALLINT count_star():BIGINT\n"
