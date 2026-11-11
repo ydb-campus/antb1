@@ -2270,7 +2270,7 @@ SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id = 1) + 1 > 40000 ORDER 
 statement error More than one row returned by a subquery used as an expression
 SELECT id FROM edge WHERE (SELECT i16 FROM edge WHERE id <= 2) + 1 > 40000 ORDER BY id
 
-# ---- pending: values in select lists and aggregate arguments (ADR 0041; roadmap PR SQ2 removes these guards) ----
+# ---- values in select lists (ADR 0041's SQ2a); pending: in aggregate arguments (roadmap PR SQ2b) ----
 
 # A value in the select list, added to a column on every row: NULL where the column is NULL.
 query II nosort
@@ -2286,7 +2286,7 @@ SMALLINT	INTEGER
 
 # A value in an aggregate's argument, in a block whose WHERE holds a value of its own: one in an IN list, which SQ1
 # answers.
-pending SQ2
+pending SQ2b
 query II nosort
 SELECT zn_city, SUM(zn_id * (SELECT zn_parent FROM zones WHERE zn_id = 10)) FROM zones WHERE zn_city IN (1, (SELECT ct_id FROM cities WHERE label = 'harbor')) GROUP BY zn_city ORDER BY zn_city
 ----

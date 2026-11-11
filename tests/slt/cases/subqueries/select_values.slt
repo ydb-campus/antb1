@@ -2286,6 +2286,94 @@ SELECT id, u16 + (SELECT MAX(u16) FROM edge) AS v FROM edge WHERE id IN (1, 2) O
 statement error Overflow in (addition|subtraction|multiplication) of
 SELECT id, d38_10 + (SELECT MAX(d38_10) FROM decimals) AS v FROM decimals WHERE id IN (6, 7) ORDER BY id
 
+# ---- what an EXISTS block's ORDER BY reads of its dropped select list ----
+
+# A value item the ORDER BY reads is computed, so its row error fails both engines: by its position, counted after a
+# star's columns or written with a leading zero, and by its alias alone.
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT *, (SELECT zn_id FROM zones) FROM zones ORDER BY 7) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones ORDER BY 01) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS v FROM zones z WHERE z.zn_city = cities.ct_id ORDER BY v)
+
+# A value in a correlated EXISTS block's ORDER BY joins in the block's slot, which the semi join keeps.
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT z.zn_id FROM zones z WHERE z.zn_city = cities.ct_id ORDER BY (SELECT zn_id FROM zones))
+
+# One the ORDER BY does not read stays dropped and answers: a position that falls on another item, a name inside an
+# expression that a column of the block takes before the alias, and a bare name that a later item's alias takes.
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT *, zn_id, zn_id, zn_id, zn_id, zn_id, zn_id, zn_id, (SELECT zn_id FROM zones) FROM zones ORDER BY 8) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS zn_id FROM zones ORDER BY zn_id + 1) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT (SELECT zn_id FROM zones) AS v, zn_id AS v FROM zones ORDER BY v) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# ---- divergences D32 and D35: a value in a derived table's or a CTE's list right under an EXISTS ----
+
+# DuckDB drops that list with the EXISTS block's, the value with it; antb1 drops the list but still joins the value
+# in the derived table's slot, so its row error fails the query.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM (SELECT (SELECT zn_id FROM zones) AS v FROM zones) d) ORDER BY ct_id
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM (SELECT (SELECT zn_id FROM zones) AS v FROM zones) d) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+WITH w AS (SELECT (SELECT zn_id FROM zones) AS v FROM zones) SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM w) ORDER BY ct_id
+
+onlyif duckdb
+query I nosort
+WITH w AS (SELECT (SELECT zn_id FROM zones) AS v FROM zones) SELECT ct_id FROM cities WHERE EXISTS (SELECT * FROM w) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
 # ---- a correlated value in an EXISTS block's dropped select list ----
 
 # The list is dropped, so a value there that reads the EXISTS block's columns answers where it is an aggregate over

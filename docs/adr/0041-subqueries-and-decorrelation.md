@@ -844,12 +844,16 @@ aggregates, and decision 23's select-list half. SQ2a completes Q9, and the ratch
   the sort, DISTINCT and the projection; the assembly of a block does not change. **Decision 10:** the memo covers
   them, so a subquery written in a select item and in ORDER BY is one join.
 - **The select list of an EXISTS block.** DuckDB drops it for an uncorrelated EXISTS too, so an item that holds a
-  value and that no other clause of the block reads -- no GROUP BY or ORDER BY position, and no unqualified name equal
-  to its alias in GROUP BY, HAVING or ORDER BY, inside an ORDER BY expression too -- binds as a dry run, as OR
-  factoring's dropped branch does: its bind errors and refusals stay, it plants nothing, and a computed 0 keeps its
-  place so the items after it keep their positions. A value there that would fail answers, as in DuckDB, and so does a
+  value and that its block's ORDER BY does not read binds as a dry run, as OR factoring's dropped branch does: its bind
+  errors and refusals stay, it plants nothing, and a computed 0 keeps its place so the items after it keep their
+  positions. The ORDER BY reads an item as it binds: by its position, the unexpanded stars' columns counted, by a bare
+  name that the item is the last alias of, or inside an expression by a name that no column of the block has and the
+  item is the last alias of. (A block with GROUP BY or HAVING aggregates, so SQ2b settles theirs; any position or name
+  equal to the alias counts there for now.) A value there that would fail answers, as in DuckDB, and so does a
   correlated value of the shape Path 2 takes, an aggregate over every row; a correlated value of another shape keeps
-  its refusal. Under SELECT DISTINCT the list is the block's rows, and is computed.
+  its refusal. Under SELECT DISTINCT and in a compound the list is the block's rows, and is computed. A value in the
+  list of a derived table or a CTE right under the EXISTS block still joins in that block's slot, although D32 drops
+  the list, so its error fails the query where DuckDB answers (D32 and D35 now say so).
 - **Decision 11, as built.** An unaliased select item that holds a subquery is named by antb1's own text of the item,
   under D8. The column count of a value is DuckDB's class of bind error, "a scalar subquery must have one column, not
   N".

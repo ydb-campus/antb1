@@ -3812,9 +3812,12 @@ class Binder {
   arrow::Status BindGroupBy();
   arrow::Status CheckGrouped();
   arrow::Status BindSelectExpressions();
-  // Whether select item `i` is read by a clause other than the select list: a GROUP BY or ORDER BY
-  // position, or its alias named unqualified in GROUP BY, HAVING or ORDER BY (an expression there
-  // included). An EXISTS block's item that holds a subquery is bound for real only then.
+  // Whether select item `i` is read by a clause other than the select list, as BindOrderBy resolves
+  // an ORDER BY item: its position (the unexpanded stars counted, PositionOf), a bare name the item
+  // is the last alias of (FindOrderAlias), or, inside an expression, a name that no column of the
+  // block has and the item is the last alias of (AliasFallback). In GROUP BY and HAVING, of a block
+  // that aggregates, any position or unqualified name equal to its alias counts. An EXISTS block's
+  // item that holds a subquery is bound for real only then.
   [[nodiscard]] bool ReadOutsideItems(std::size_t i) const;
   // A WHERE or HAVING conjunct as a predicate over the scope's columns.
   arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
@@ -6868,8 +6871,9 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
   // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
-  // (decision 3); OR factoring's dry run binds one of those.
-  ANTB1_CHECK(dry_run_ || clause_ != Clause::kLeftOn);
+  // (decision 3); a dry run (OR factoring's, an EXISTS block's dropped item) binds one of those.
+  const bool admitted = dry_run_ || clause_ != Clause::kLeftOn;
+  ANTB1_CHECK(admitted);
   const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
   if (dry_run_) {
@@ -7657,6 +7661,7 @@ arrow::Status Binder::CheckGrouped() {
 }
 
 bool Binder::ReadOutsideItems(std::size_t i) const {
+  // GROUP BY and HAVING: any position or name that could be the item's.
   const std::string position = std::to_string(i + 1);
   const auto names_item = [&](const sql::Expr& e) {
     if (const auto* lit = std::get_if<sql::Literal>(&e);
@@ -7672,10 +7677,28 @@ bool Binder::ReadOutsideItems(std::size_t i) const {
       return ref->qualifier.empty() && AsciiLower(ref->name) == AsciiLower(*select_.aliases[i]);
     });
   };
+  // ORDER BY: what its item resolves to.
+  const auto orders_by_item = [&](const sql::OrderItem& item) {
+    if (const auto* lit = std::get_if<sql::Literal>(&item.expr)) {
+      const arrow::Result<std::optional<std::size_t>> at = PositionOf(*lit, select_, "ORDER BY");
+      return at.ok() && *at == i;  // an error is BindOrderBy's to report
+    }
+    if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
+        ref != nullptr && ref->qualifier.empty()) {
+      if (const std::optional<std::size_t> alias = FindOrderAlias(select_, ref->name)) {
+        return *alias == i;
+      }
+    }
+    std::vector<const sql::ColumnRef*> refs;
+    CollectRefs(item.expr, refs);
+    return std::ranges::any_of(refs, [&](const sql::ColumnRef* ref) {
+      return ref->qualifier.empty() && scope_.LookUp(*ref).outcome == Lookup::Outcome::kMissing &&
+             FindAlias(select_, ref->name) == i;
+    });
+  };
   return std::ranges::any_of(stmt_.group_by, names_item) ||
          std::ranges::any_of(stmt_.having, names_item) ||
-         std::ranges::any_of(stmt_.order_by,
-                             [&](const sql::OrderItem& item) { return names_item(item.expr); });
+         std::ranges::any_of(stmt_.order_by, orders_by_item);
 }
 
 // The select items that are neither columns, aggregates nor constants, in the query's scope; each

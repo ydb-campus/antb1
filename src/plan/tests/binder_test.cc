@@ -7171,6 +7171,16 @@ TEST(BinderTest, AnExistsSelectListPlantsNothing) {
           "b, i16 * 3 AS c FROM u ORDER BY 2 LIMIT 1)",
           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
           "b, i16 * 3 AS c FROM u ORDER BY 3 LIMIT 1)",
+          // What ORDER BY reads as it binds: a position after a star's eleven columns, a name that
+          // the block's column takes before the alias inside an expression, and a bare name that a
+          // later item's alias takes.
+          "SELECT i16 FROM t WHERE EXISTS (SELECT *, i16, (SELECT MIN(i16) FROM ok) FROM u ORDER "
+          "BY "
+          "12 LIMIT 1)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT MIN(i16) FROM ok) AS i32 FROM u ORDER BY "
+          "i32 + 1 LIMIT 1)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT MIN(i16) FROM ok) AS v, i16 AS v FROM u "
+          "ORDER BY v LIMIT 1)",
       }) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
@@ -7190,6 +7200,13 @@ TEST(BinderTest, AnExistsOrderByThatReadsAnItemPlantsIt) {
            "ORDER BY a LIMIT 1)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a FROM u "
            "ORDER BY a * 2 LIMIT 1)",
+           // A position counts a star's columns, and a leading zero is the same position.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT *, i16 + (SELECT MIN(i16) FROM ok) FROM u ORDER "
+           "BY "
+           "12 LIMIT 1)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) FROM u ORDER BY "
+           "01 "
+           "LIMIT 1)",
        }) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
