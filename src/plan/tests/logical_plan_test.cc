@@ -36,7 +36,8 @@ class FinishingScanState final : public TableScanState {
  public:
   explicit FinishingScanState(std::shared_ptr<ScanFinishRecord> record)
       : record_(std::move(record)) {}
-  arrow::Status Finish(arrow::MemoryPool* pool) override {
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* pool) override {
+    EXPECT_EQ(part, 0);
     ++record_->calls;
     EXPECT_EQ(pool, record_->expected_pool);
     if (record_->fail_allocation) {

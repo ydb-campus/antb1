@@ -848,6 +848,40 @@ TEST_F(ParquetScanTest, ScanContextFinishesOnlyUsedFilesWithTheCurrentPool) {
   EXPECT_EQ(finish_pool.bytes_allocated(), 0);
 }
 
+TEST_F(ParquetScanTest, ScanContextFinishPartsValidateIndividualFiles) {
+  const std::string first = WriteNumbers("a.parquet", 0, 4, 2);
+  const std::string second = WriteNumbers("b.parquet", 4, 4, 2);
+  auto table = ParquetTable::Open({first, second});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_EQ((*table)->num_parts(), 4);
+  auto context = std::make_shared<plan::ScanContext>();
+  {
+    auto reader = (*table)->Scan({}, 2, arrow::default_memory_pool(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 8);
+  }
+  auto state = context->Get(**table);
+  ASSERT_TRUE(state.ok()) << state.status().ToString();
+  ASSERT_NE(*state, nullptr);
+  EXPECT_EQ((*state)->num_finish_parts(), 2);  // Final pieces are files, not row groups.
+  {
+    std::ofstream append(second, std::ios::app | std::ios::binary);
+    append << "changed";
+    ASSERT_TRUE(append.good());
+  }
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  EXPECT_TRUE((*state)->FinishPart(-1, &pool).IsInvalid());
+  EXPECT_TRUE((*state)->FinishPart(2, &pool).IsInvalid());
+  EXPECT_EQ(pool.total_bytes_allocated(), 0);
+  const arrow::Status unchanged = (*state)->FinishPart(0, &pool);
+  EXPECT_TRUE(unchanged.ok()) << unchanged.ToString();
+  EXPECT_GT(pool.total_bytes_allocated(), 0);
+  const arrow::Status changed = (*state)->FinishPart(1, &pool);
+  EXPECT_TRUE(changed.IsIOError()) << changed.ToString();
+  EXPECT_NE(changed.message().find("b.parquet"), std::string::npos) << changed.ToString();
+  EXPECT_EQ(pool.bytes_allocated(), 0);
+}
+
 TEST_F(ParquetScanTest, ScanContextDoesNotRetainQueryPool) {
   auto table = ParquetTable::Open({WriteNumbers("a.parquet", 0, 12, 4)});
   ASSERT_TRUE(table.ok()) << table.status().ToString();

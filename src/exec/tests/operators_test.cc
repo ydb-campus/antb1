@@ -88,7 +88,8 @@ struct ScanFinishTrace {
 class TracedScanState final : public plan::TableScanState {
  public:
   explicit TracedScanState(std::shared_ptr<ScanFinishTrace> trace) : trace_(std::move(trace)) {}
-  arrow::Status Finish(arrow::MemoryPool* /*pool*/) override {
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* /*pool*/) override {
+    EXPECT_EQ(part, 0);
     trace_->events.emplace_back("finish");
     return trace_->finish;
   }

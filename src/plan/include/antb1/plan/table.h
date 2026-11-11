@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -30,10 +31,28 @@ class ScanContext;
 class TableScanState {
  public:
   virtual ~TableScanState() = default;
-  // Called after all readers/workers have closed, before their rows become a successful result.
-  // Tables can perform a final content check here; cheap per-part metadata checks alone need
-  // not detect every rewrite. Retain no allocation made from this pool after the call returns.
-  virtual arrow::Status Finish(arrow::MemoryPool* /*pool*/) { return arrow::Status::OK(); }
+  // Independent final checks, called after all readers/workers have closed and before their rows
+  // become a successful result. Different pieces may run concurrently. Any piece, including an
+  // already successful one, must be safe to repeat after another piece runs out of memory.
+  // Retain no allocation made from the pool after the call returns.
+  virtual int64_t num_finish_parts() const { return 1; }
+  virtual arrow::Status FinishPart(int64_t part, arrow::MemoryPool* /*pool*/) {
+    return part == 0 ? arrow::Status::OK()
+                     : arrow::Status::Invalid("finish of part ", part, " of a scan with 1 part");
+  }
+
+  // Direct callers use serial validation. The executor can schedule the same pieces on its
+  // bounded query executor, including a serial retry when parallel checks run out of memory.
+  arrow::Status Finish(arrow::MemoryPool* pool) {
+    const int64_t parts = num_finish_parts();
+    if (parts < 0) {
+      return arrow::Status::Invalid("negative number of scan finish parts: ", parts);
+    }
+    for (int64_t part = 0; part < parts; ++part) {
+      ARROW_RETURN_NOT_OK(FinishPart(part, pool));
+    }
+    return arrow::Status::OK();
+  }
 };
 
 // What a part's footer says about one integer-valued column (integers, USMALLINT, DATE as days
@@ -258,6 +277,10 @@ class Table {
 // Tables referenced here must outlive the context; their operators already own them during a run.
 class ScanContext {
  public:
+  // A runner must finish/join every task before returning, including on failure. It must preserve
+  // part-order errors and use the supplied pool. An empty runner validates serially.
+  using FinishRunner = std::function<arrow::Status(TableScanState&, arrow::MemoryPool*)>;
+
   arrow::Result<std::shared_ptr<TableScanState>> Get(const Table& table) {
     try {
       const std::scoped_lock lock(mutex_);
@@ -273,14 +296,21 @@ class ScanContext {
     }
   }
 
-  arrow::Status Finish(arrow::MemoryPool* pool) {
+  arrow::Status Finish(arrow::MemoryPool* pool, const FinishRunner& runner = {}) {
     try {
-      const std::scoped_lock lock(mutex_);
-      for (const auto& [table, state] : states_) {
-        static_cast<void>(table);
-        if (state != nullptr) {
-          ARROW_RETURN_NOT_OK(state->Finish(pool));
+      std::vector<std::shared_ptr<TableScanState>> states;
+      {
+        const std::scoped_lock lock(mutex_);
+        states.reserve(states_.size());
+        for (const auto& [table, state] : states_) {
+          static_cast<void>(table);
+          if (state != nullptr) {
+            states.push_back(state);
+          }
         }
+      }
+      for (const auto& state : states) {
+        ARROW_RETURN_NOT_OK(runner ? runner(*state, pool) : state->Finish(pool));
       }
       return arrow::Status::OK();
     } catch (const std::bad_alloc&) {

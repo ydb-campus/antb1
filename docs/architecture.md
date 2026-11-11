@@ -60,13 +60,17 @@ Responsibilities:
   and later parts share that successful validation while the open descriptor's device, inode, size, modification
   time and change time remain equal. A changed fingerprint requires another full comparison. At successful
   completion, after readers close and before results return, the context compares every used file's full footer
-  again: timestamp granularity must not hide a footer rewrite. Every new execution also compares the footer again,
+  again: timestamp granularity must not hide a footer rewrite. Different files are checked on the query's existing
+  executor, with at most its configured thread count in flight; memory pressure reduces concurrency and a check
+  that runs out of memory in parallel is retried alone. The first error in file order is returned after all workers
+  stop. Every new execution also compares the footer again,
   even when these attributes are unchanged. C++ calls to `Table::Scan` or `Table::ScanPart` that omit a context
   validate independently; SQL execution supplies the context automatically. Validation retains no file handle
   or query-pool buffer; parts keep independent readers and their
   column reads run concurrently. Files must remain stable during an execution: these checks detect observed
   changes but do not provide a transactional snapshot against concurrent writers. Callers that supply their own
-  scan context must finish its readers and call `ScanContext::Finish` before accepting the results.
+  scan context must finish its readers and call `ScanContext::Finish` before accepting the results; without an
+  executor runner that call checks files serially.
   The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
   [ADR 0013](adr/0013-parallel-execution.md), are its row groups with rows in file order; scanning them one after
   another gives the rows of `Scan`. Other tables are one part by default. A part's footer statistics are the exact

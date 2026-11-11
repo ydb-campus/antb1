@@ -66,24 +66,29 @@ struct ParquetScanState final : public plan::TableScanState {
     }
   }
 
-  arrow::Status Finish(arrow::MemoryPool* pool) override {
-    for (const Segment& file : files) {
-      const std::scoped_lock lock(file.validation->mutex);
-      if (!file.validation->version.has_value()) {
-        continue;  // Pruned/unused files have not been read and must not be opened here.
+  int64_t num_finish_parts() const override { return Narrow<int64_t>(files.size()); }
+
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* pool) override {
+    if (part < 0 || part >= num_finish_parts()) {
+      return arrow::Status::Invalid("final validation of file ", part, " of a table with ",
+                                    num_finish_parts(), " files");
+    }
+    const Segment& file = files[Narrow<std::size_t>(part)];
+    const std::scoped_lock lock(file.validation->mutex);
+    if (!file.validation->version.has_value()) {
+      return arrow::Status::OK();  // Pruned/unused files must not be opened here.
+    }
+    // Timestamp granularity can hide an in-place rewrite within the execution. Compare the
+    // exact footer again before the result is returned, independently of the cached identity.
+    Segment check = file;
+    check.validation.reset();
+    const auto input = OpenSegmentFile(check, pool);
+    if (!input.ok()) {
+      if (input.status().IsOutOfMemory()) {
+        return input.status();
       }
-      // Timestamp granularity can hide an in-place rewrite within the execution. Compare the
-      // exact footer again before the result is returned, independently of the cached identity.
-      Segment check = file;
-      check.validation.reset();
-      const auto input = OpenSegmentFile(check, pool);
-      if (!input.ok()) {
-        if (input.status().IsOutOfMemory()) {
-          return input.status();
-        }
-        return arrow::Status::IOError("cannot validate Parquet file '", file.path,
-                                      "' at the end of the scan: ", input.status().message());
-      }
+      return arrow::Status::IOError("cannot validate Parquet file '", file.path,
+                                    "' at the end of the scan: ", input.status().message());
     }
     return arrow::Status::OK();
   }

@@ -1,5 +1,7 @@
 #include "antb1/exec/operator.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -10,6 +12,8 @@
 #include <arrow/compute/exec.h>
 
 #include "antb1/plan/table.h"
+
+#include "part_scheduler.h"
 
 namespace antb1::exec {
 
@@ -61,6 +65,38 @@ arrow::Result<arrow::RecordBatchVector> PullAllChecked(Operator& op, arrow::Memo
   }
 }
 
+arrow::Status FinishScanState(plan::TableScanState& state, arrow::MemoryPool* pool,
+                              const ExecContext& ctx) {
+  const int64_t parts = state.num_finish_parts();
+  if (ctx.executor == nullptr || parts <= 1) {
+    return state.Finish(pool);
+  }
+  // A small footer can cost less to validate than to schedule. Use a few ordered batches per
+  // worker rather than allocating a future and result slot for every file. A batch retains only
+  // one footer buffer at a time; retrying it after OutOfMemory repeats harmless content checks.
+  const int64_t threads = std::max(1, ctx.threads);
+  const int64_t batches = std::min(parts, 4 * threads);
+  const int64_t width = parts / batches;
+  const int64_t extra = parts % batches;
+  PartScheduler<int> checks(
+      batches,
+      [&state, pool, width, extra](int64_t batch,
+                                   const std::atomic<bool>& stop) -> arrow::Result<int> {
+        const int64_t begin = (batch * width) + std::min(batch, extra);
+        const int64_t end = begin + width + (batch < extra ? 1 : 0);
+        for (int64_t part = begin; part < end && !stop; ++part) {
+          ARROW_RETURN_NOT_OK(state.FinishPart(part, pool));
+        }
+        return 0;
+      },
+      ctx.executor, threads, ctx.budget);
+  while (!checks.done()) {
+    const auto checked = checks.Next();
+    ARROW_RETURN_NOT_OK(checked.status());
+  }
+  return arrow::Status::OK();
+}
+
 }  // namespace
 
 arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecContext& ctx) {
@@ -75,7 +111,10 @@ arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecConte
   const arrow::Status closed = op.Close();  // also after a failure: release files and readers
   ARROW_RETURN_NOT_OK(batches.status());
   ARROW_RETURN_NOT_OK(closed);
-  ARROW_RETURN_NOT_OK(run.scans->Finish(run.pool));
+  ARROW_RETURN_NOT_OK(
+      run.scans->Finish(run.pool, [&run](plan::TableScanState& state, arrow::MemoryPool* pool) {
+        return FinishScanState(state, pool, run);
+      }));
   return arrow::Table::FromRecordBatches(op.output_schema(), *batches);
 }
 
