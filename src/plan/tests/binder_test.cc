@@ -1323,6 +1323,28 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
                   "u.i32 < (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(u.i32)))",
                   kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
+        // SQ2b: under a subquery in the select list or ORDER BY too, the owner's place deciding:
+        // its select list or ORDER BY an outer aggregate, its GROUP BY or an aggregate's argument
+        // DuckDB's bind error of each.
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < MAX(t.i32)) FROM t", kUnsupported,
+                  "MAX(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "MAX(t.i32))",
+                  kUnsupported, "MAX(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < MAX(t.i32)) AS n FROM t GROUP BY n",
+                  kBind, "MAX(t.i32)", "GROUP BY clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 < "
+                  "MAX(u.i16))) FROM u) FROM t",
+                  kBind, "MAX(u.i16)", "aggregate function calls cannot be nested"},
+        ErrorCase{"SELECT i16, (SELECT MIN(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 < "
+                  "MAX(u.i16))) FROM u) FROM t",
+                  kBind, "MAX(u.i16)", "aggregate function calls cannot be nested"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < SUM(1)) FROM t", kBind, "SUM(1)",
+                  "WHERE clause cannot contain aggregates!"},
         // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
         // above this block's joins with the probe's free variable on its outer side, which neither
         // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
@@ -7301,8 +7323,7 @@ TEST(BinderTest, GroupValuesJoinInTheirSlots) {
 // A GROUP BY key that holds a value binds it per row, and the select item, HAVING and ORDER BY
 // written alike find the key through the value already bound (BindOutput's lookup-only
 // speculation): one join, below the aggregation. A HAVING operand that no key holds still plants no
-// per-row join (SQ1b's rule), also through the alias of an item the speculation binds again (the
-// guard is restored, not reset: critique c27).
+// per-row join (SQ1b's rule), also next to the alias of a key item (the SQ2 critique's c27).
 TEST(BinderTest, AValueKeyIsMatchedWithoutASecondJoin) {
   const Catalog catalog = MakeCatalog();
   const auto joins = [&catalog](std::string_view sql) {

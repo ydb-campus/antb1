@@ -896,7 +896,7 @@ changes.
   key only looks values up in the memo and never binds or plants one, so `k % 2 + (q)` in the select list, HAVING or
   ORDER BY matches the key written alike (or named by alias or position), one join below the aggregation; an
   expression that no key holds plants its value after the aggregation, as SQ1b required. The flag is saved and
-  restored, since an alias bound again nests the speculation (the SQ2 critique's c27).
+  restored, so that a nested speculation could not end it.
 - **Decision 23's select-list half.** The parser admits an aggregate in a subquery's WHERE or ON where some subquery
   around it stands in HAVING, the select list or ORDER BY (a derived table or a CTE body under a select-list or ORDER
   BY subquery keeps the parse error, as DuckDB fails it). The binder judges the aggregate by the place in the owning

@@ -3147,3 +3147,11 @@ SELECT ct_id, (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d
 
 statement error
 SELECT ct_id FROM cities ORDER BY (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d), ct_id
+
+# The owner holds the subquery in an aggregate's argument, or in its GROUP BY: a bind error in both engines (their
+# texts differ).
+statement error
+SELECT ct_id, (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM drivers WHERE dv_city < MAX(z.zn_city))) FROM zones z) AS s FROM cities ORDER BY ct_id
+
+statement error
+SELECT ct_id, (SELECT COUNT(*) FROM zones z GROUP BY z.zn_city, (SELECT COUNT(*) FROM drivers WHERE dv_city < MAX(z.zn_id)) LIMIT 1) AS s FROM cities ORDER BY ct_id

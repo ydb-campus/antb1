@@ -3624,7 +3624,7 @@ class Binder {
   arrow::Result<Typed> BindOutput(const sql::Expr& expr) {
     // A GROUP BY key that holds a subquery's value has bound it per row before (ADR 0041's SQ2b),
     // so the speculation only looks values up: binding one as an input would plant its join per
-    // row, below the aggregation. Restored, not reset: AliasFallback nests a BindOutput here.
+    // row, below the aggregation. Saved and restored, so that a nested speculation cannot end it.
     if (!ContainsAggregate(expr) && !std::holds_alternative<sql::Literal>(expr)) {
       const bool lookup_only = std::exchange(lookup_only_, true);
       auto input = BindInput(expr);
