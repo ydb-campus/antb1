@@ -1,0 +1,2953 @@
+# Uncorrelated subqueries as values in a query block that aggregates (ADR 0041's SQ2, its second PR): a select item
+# or an ORDER BY item over GROUP BY keys and aggregates, in grouped and global blocks, joined after the aggregation; a
+# GROUP BY key and an aggregate's argument, joined per row, a key matched by the same expression, its alias or its
+# position; HAVING over the alias of a value item; and such blocks inside derived tables, CTEs, compounds, IN, scalar
+# and EXISTS subqueries. Every value is computed before any row is read, so its row error fails both engines.
+
+# ---- values over aggregates and keys ----
+
+# A value as a select item of a grouped block: alone, the same on every group; over COUNT, SUM (HUGEINT), AVG and
+# MIN/MAX; two values in one item; in a function, COALESCE and a cast; over a join's groups.
+
+query III nosort
+SELECT zn_city, COUNT(*) AS c, (SELECT COUNT(*) FROM cities) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT	BIGINT
+1	8	6
+2	8	6
+3	7	6
+4	7	6
+5	8	6
+9	1	6
+NULL	1	6
+
+query II nosort
+SELECT ct_id % 2 AS g, (SELECT MIN(zn_id) FROM zones) AS m FROM cities GROUP BY 1 ORDER BY 1
+----
+SMALLINT	INTEGER
+0	1
+1	1
+
+query IR nosort
+SELECT zn_city, COUNT(*) * 100 / (SELECT COUNT(*) FROM zones) AS pct FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	DOUBLE
+1	20
+2	20
+3	17.5
+4	17.5
+5	20
+9	2.5
+NULL	2.5
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	14
+2	14
+3	13
+4	13
+5	14
+9	7
+NULL	7
+
+query II nosort
+SELECT zn_city, SUM(zn_id) * (SELECT MAX(ct_id) FROM cities) AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	888
+2	936
+3	756
+4	798
+5	1080
+9	234
+NULL	228
+
+query IR nosort
+SELECT zn_city, AVG(zn_id) - (SELECT AVG(zn_id) FROM zones) AS d FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	DOUBLE
+1	-2
+2	-1
+3	-2.5
+4	-1.5
+5	2
+9	18.5
+NULL	17.5
+
+query II nosort
+SELECT zn_city, MAX(zn_id) - MIN(zn_id) * (SELECT MIN(ct_id) FROM cities) AS w FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	35
+2	35
+3	30
+4	30
+5	35
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, COUNT(*) * (SELECT MAX(ct_id) FROM cities) - (SELECT MIN(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	47
+2	47
+3	41
+4	41
+5	47
+9	5
+NULL	5
+
+query III nosort
+SELECT zn_city, ABS(COUNT(*) - (SELECT MAX(ct_id) FROM cities) * 2) AS a, COALESCE((SELECT zn_id FROM zones WHERE zn_id > 100), COUNT(*)) AS c FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT	BIGINT
+1	4	8
+2	4	8
+3	5	7
+4	5	7
+5	4	8
+9	11	1
+NULL	11	1
+
+query II nosort
+SELECT zn_city, CAST(SUM(zn_id) - (SELECT MAX(ct_id) FROM cities) AS BIGINT) AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	142
+2	150
+3	120
+4	127
+5	174
+9	33
+NULL	32
+
+query II nosort
+SELECT c.ct_id, COUNT(*) * (SELECT MAX(ct_id) FROM cities) AS v FROM cities c JOIN zones z ON z.zn_city = c.ct_id GROUP BY c.ct_id ORDER BY v DESC, c.ct_id
+----
+SMALLINT	BIGINT
+1	48
+2	48
+5	48
+3	42
+4	42
+
+# The value's own block may group and aggregate; a VARCHAR value, DECIMAL arithmetic of an aggregate and a value, a
+# DATE aggregate plus an integer value.
+
+query IR nosort
+SELECT zn_city, COUNT(*) * 100 / (SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM zones GROUP BY zn_city) t) AS pct FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	DOUBLE
+1	100
+2	100
+3	87.5
+4	87.5
+5	100
+9	12.5
+NULL	12.5
+
+query IT nosort
+SELECT zn_city, (SELECT label FROM cities WHERE ct_id = 1) AS l FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	center
+2	center
+3	center
+4	center
+5	center
+9	center
+NULL	center
+
+query ID nosort
+SELECT tr_promo, SUM(tr_fare) - (SELECT MAX(tf_rate) FROM tariffs) AS f FROM trips GROUP BY tr_promo ORDER BY tr_promo
+----
+INTEGER	DECIMAL(38,3)
+1	228.250
+2	223.750
+3	190.500
+4	244.750
+NULL	44092.750
+
+query ID nosort
+SELECT tr_promo, MIN(tr_rate) * (SELECT MAX(tf_rate) FROM tariffs) AS r FROM trips GROUP BY tr_promo ORDER BY tr_promo
+----
+INTEGER	DECIMAL(9,5)
+1	2.50000
+2	2.20000
+3	2.20000
+4	2.20000
+NULL	2.20000
+
+query IT nosort
+SELECT tr_promo, MAX(tr_day) + (SELECT MIN(ct_id) FROM cities) AS d FROM trips GROUP BY tr_promo ORDER BY tr_promo
+----
+INTEGER	DATE
+1	2026-04-01
+2	2026-04-01
+3	2026-03-31
+4	2026-03-30
+NULL	2026-04-01
+
+# A value of no row is NULL, and so is a value of a NULL row: every group's item is NULL.
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT zn_id FROM zones WHERE zn_id > 100) AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+9	NULL
+NULL	NULL
+
+query II nosort
+SELECT zn_city, SUM(zn_id) * (SELECT ct_pop FROM cities WHERE ct_id = 4) AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+9	NULL
+NULL	NULL
+
+# A value over a GROUP BY key: a key column, a key expression written again, a key of a joined table, a key and an
+# aggregate in one item; the same value in WHERE, HAVING and the select list.
+
+query II nosort
+SELECT zn_city, zn_city + (SELECT MAX(ct_id) FROM cities) AS k FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	7
+2	8
+3	9
+4	10
+5	11
+9	15
+NULL	NULL
+
+query II nosort
+SELECT ct_id % 2 AS g, ct_id % 2 * (SELECT COUNT(*) FROM zones) AS v FROM cities GROUP BY ct_id % 2 ORDER BY 1
+----
+SMALLINT	BIGINT
+0	0
+1	40
+
+query II nosort
+SELECT c.ct_id, c.ct_id * (SELECT MIN(zn_id) FROM zones) + COUNT(*) AS v FROM cities c JOIN zones z ON z.zn_city = c.ct_id GROUP BY c.ct_id ORDER BY c.ct_id
+----
+SMALLINT	BIGINT
+1	9
+2	10
+3	10
+4	11
+5	13
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS v FROM zones WHERE zn_city > (SELECT MIN(ct_id) FROM cities) GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+2	9
+3	8
+4	8
+5	9
+9	2
+
+query II nosort
+SELECT zn_city, COUNT(*) - (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city HAVING COUNT(*) > (SELECT MAX(ct_id) FROM cities) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	2
+2	2
+3	1
+4	1
+5	2
+
+# CASE over a key or an aggregate and a value: the value in WHEN, THEN or ELSE, a simple CASE over a value, over a key
+# or an aggregate with values in its WHENs, a WHEN over a value of no row.
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city > (SELECT AVG(ct_id) FROM cities) THEN COUNT(*) ELSE (SELECT MAX(ct_id) FROM cities) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	6
+2	6
+3	6
+4	7
+5	8
+9	1
+NULL	6
+
+query IT nosort
+SELECT zn_city, CASE WHEN COUNT(*) > (SELECT MAX(ct_id) FROM cities) THEN 'many' ELSE 'few' END AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	many
+2	many
+3	many
+4	many
+5	many
+9	few
+NULL	few
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city < 3 THEN (SELECT MAX(ct_id) FROM cities) ELSE COUNT(*) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	6
+2	6
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, CASE WHEN SUM(zn_id) > 100 THEN SUM(zn_id) ELSE (SELECT MIN(ct_id) FROM cities) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	126
+4	133
+5	180
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, CASE (SELECT MAX(ct_id) FROM cities) WHEN 6 THEN COUNT(*) ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query IT nosort
+SELECT zn_city, CASE zn_city WHEN (SELECT MIN(ct_id) FROM cities) THEN 'first' WHEN (SELECT MAX(ct_id) FROM cities) - 1 THEN 'fifth' ELSE 'other' END AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	first
+2	other
+3	other
+4	other
+5	fifth
+9	other
+NULL	other
+
+query II nosort
+SELECT zn_city, CASE COUNT(*) WHEN (SELECT COUNT(*) FROM zones WHERE zn_city = 1) THEN 1 ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	1
+2	1
+3	0
+4	0
+5	1
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, CASE WHEN COUNT(*) > (SELECT zn_id FROM zones WHERE zn_id > 100) THEN 1 ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	0
+2	0
+3	0
+4	0
+5	0
+9	0
+NULL	0
+
+# EXISTS and NOT EXISTS in a WHEN, alone or beside a condition over an aggregate; IN and NOT IN lists and BETWEEN
+# whose elements or bounds are values, over a key and over an aggregate.
+
+query II nosort
+SELECT zn_city, CASE WHEN EXISTS (SELECT 1 FROM promos) THEN COUNT(*) ELSE -COUNT(*) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	-8
+2	-8
+3	-7
+4	-7
+5	-8
+9	-1
+NULL	-1
+
+query II nosort
+SELECT ct_id % 2 AS g, CASE WHEN EXISTS (SELECT 1 FROM zones WHERE zn_id > 100) THEN COUNT(*) ELSE -1 END AS e FROM cities GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT
+0	-1
+1	-1
+
+query II nosort
+SELECT zn_city, CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN SUM(zn_id) ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	126
+4	133
+5	180
+9	39
+NULL	38
+
+query IT nosort
+SELECT zn_city, CASE WHEN EXISTS (SELECT 1 FROM cities WHERE ct_pop > 100000) AND COUNT(*) > 7 THEN 'big' ELSE 'small' END AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	big
+2	big
+3	small
+4	small
+5	big
+9	small
+NULL	small
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city IN ((SELECT MIN(ct_id) FROM cities), (SELECT MAX(ct_id) FROM cities) - 1) THEN COUNT(*) ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	0
+3	0
+4	0
+5	8
+9	0
+NULL	0
+
+query IT nosort
+SELECT zn_city, CASE WHEN COUNT(*) IN (1, (SELECT MAX(ct_id) FROM cities) + 1) THEN 'odd' ELSE 'even' END AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	even
+2	even
+3	odd
+4	odd
+5	even
+9	odd
+NULL	odd
+
+query II nosort
+SELECT zn_city, CASE WHEN COUNT(*) NOT IN ((SELECT COUNT(*) FROM zones WHERE zn_city = 1), 1) THEN 1 ELSE 0 END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER
+1	0
+2	0
+3	1
+4	1
+5	0
+9	0
+NULL	0
+
+query IT nosort
+SELECT zn_city, CASE WHEN COUNT(*) BETWEEN (SELECT MAX(ct_id) FROM cities) AND (SELECT MAX(ct_id) FROM cities) + 1 THEN 'mid' ELSE 'out' END AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	VARCHAR
+1	out
+2	out
+3	mid
+4	mid
+5	out
+9	out
+NULL	out
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city BETWEEN (SELECT MIN(ct_id) FROM cities) AND 2 THEN SUM(zn_id) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	NULL
+4	NULL
+5	NULL
+9	NULL
+NULL	NULL
+
+# A global aggregate (no GROUP BY) with values in its select items: beside and over aggregates, DOUBLE, HUGEINT,
+# DECIMAL and DATE arithmetic, COUNT(DISTINCT), GROUP BY (), a value inside and outside an aggregate's argument, CASE
+# over a value and over EXISTS.
+
+query II nosort
+SELECT COUNT(*) AS c, (SELECT COUNT(*) FROM cities) AS n FROM zones
+----
+BIGINT	BIGINT
+40	6
+
+query R nosort
+SELECT COUNT(*) * 1.0 / (SELECT COUNT(*) FROM cities) AS r FROM zones
+----
+DOUBLE
+6.666666666666667
+
+query I nosort
+SELECT SUM(zn_id) + (SELECT MAX(ct_id) FROM cities) AS s FROM zones
+----
+HUGEINT
+826
+
+query R nosort
+SELECT AVG(zn_radius) - (SELECT AVG(zn_radius) FROM zones) AS d FROM zones
+----
+DOUBLE
+0
+
+query R nosort
+SELECT SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) / (SELECT MAX(ct_id) FROM cities) AS s FROM zones
+----
+DOUBLE
+820
+
+query DD nosort
+SELECT SUM(tr_fare) - (SELECT MAX(tf_rate) FROM tariffs) AS f, MAX(tr_rate) * (SELECT MAX(tf_rate) FROM tariffs) AS r FROM trips
+----
+DECIMAL(38,3)	DECIMAL(9,5)
+44990.000	6.25000
+
+query TT nosort
+SELECT MAX(tr_day) - (SELECT MAX(ct_id) FROM cities) AS d, MIN(tr_day) + (SELECT MIN(ct_id) FROM cities) AS e FROM trips
+----
+DATE	DATE
+2026-03-25	2026-03-02
+
+query I nosort
+SELECT COUNT(DISTINCT tr_driver) - (SELECT COUNT(*) FROM cities) AS v FROM trips
+----
+BIGINT
+94
+
+query I nosort
+SELECT (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY ()
+----
+SMALLINT
+6
+
+query T nosort
+SELECT CASE WHEN COUNT(*) > (SELECT COUNT(*) FROM cities) THEN 'more' ELSE 'less' END AS s FROM zones
+----
+VARCHAR
+more
+
+query I nosort
+SELECT CASE WHEN EXISTS (SELECT 1 FROM promos) THEN 0 ELSE COUNT(*) END AS v FROM zones
+----
+BIGINT
+40
+
+# A global aggregate over no row is one row: a value beside COUNT(*) of an empty table or of a WHERE that keeps no
+# row, and NULL from a SUM of no row.
+
+query II nosort
+SELECT COUNT(*) AS c, (SELECT MAX(ct_id) FROM cities) AS m FROM promos
+----
+BIGINT	SMALLINT
+0	6
+
+query I nosort
+SELECT COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS v FROM zones WHERE zn_id > 100
+----
+BIGINT
+6
+
+query I nosort
+SELECT SUM(pm_id) + (SELECT MAX(ct_id) FROM cities) AS v FROM promos
+----
+HUGEINT
+NULL
+
+# A global aggregate with a value in HAVING and in its select list.
+
+query I nosort
+SELECT COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS v FROM zones HAVING COUNT(*) > (SELECT MAX(ct_id) FROM cities)
+----
+BIGINT
+41
+
+# The ORDER BY of a global aggregate: a value alone, over an aggregate, a value of no row. The one row is kept.
+
+query I nosort
+SELECT COUNT(*) AS c FROM zones ORDER BY (SELECT MAX(ct_id) FROM cities)
+----
+BIGINT
+40
+
+query I nosort
+SELECT SUM(zn_id) AS s FROM zones ORDER BY SUM(zn_id) * (SELECT MAX(ct_id) FROM cities)
+----
+HUGEINT
+820
+
+query I nosort
+SELECT COUNT(*) AS c FROM zones ORDER BY COUNT(*) + (SELECT zn_id FROM zones WHERE zn_id > 100)
+----
+BIGINT
+40
+
+# ORDER BY items of a grouped block over aggregates and keys with values: DESC, a key times a value, NULLS FIRST and
+# LAST, a value of no row before a key, a value alone, CASE (EXISTS in its WHEN), DECIMAL.
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY COUNT(*) - (SELECT MAX(ct_id) FROM cities) DESC, zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+5	8
+3	7
+4	7
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY zn_city * ((SELECT MIN(ct_id) FROM cities) - 2)
+----
+SMALLINT	BIGINT
+9	1
+5	8
+4	7
+3	7
+2	8
+1	8
+NULL	1
+
+query I nosort
+SELECT ct_id % 2 AS g FROM cities GROUP BY 1 ORDER BY COUNT(*) * (SELECT MIN(zn_id) FROM zones) DESC, 1
+----
+SMALLINT
+0
+1
+
+query II nosort
+SELECT ct_id % 2 AS g, COUNT(*) AS c FROM cities GROUP BY ct_id % 2 ORDER BY ct_id % 2 + (SELECT MIN(zn_id) FROM zones) DESC
+----
+SMALLINT	BIGINT
+1	3
+0	3
+
+query II nosort
+SELECT zn_city, SUM(zn_id) AS s FROM zones GROUP BY zn_city ORDER BY zn_city * (SELECT MIN(ct_id) FROM cities) NULLS FIRST
+----
+SMALLINT	HUGEINT
+NULL	38
+1	148
+2	156
+3	126
+4	133
+5	180
+9	39
+
+query II nosort
+SELECT zn_city, SUM(zn_id) AS s FROM zones GROUP BY zn_city ORDER BY zn_city - (SELECT MAX(ct_id) FROM cities) DESC NULLS LAST
+----
+SMALLINT	HUGEINT
+9	39
+5	180
+4	133
+3	126
+2	156
+1	148
+NULL	38
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY COUNT(*) + (SELECT zn_id FROM zones WHERE zn_id > 100) NULLS FIRST, zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY (SELECT MAX(ct_id) FROM cities), zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY CASE WHEN COUNT(*) > (SELECT MAX(ct_id) FROM cities) THEN 0 ELSE 1 END, zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY CASE WHEN EXISTS (SELECT 1 FROM promos) THEN COUNT(*) ELSE -COUNT(*) END, zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+5	8
+3	7
+4	7
+9	1
+NULL	1
+
+query ID nosort
+SELECT tr_promo, SUM(tr_fare) AS f FROM trips GROUP BY tr_promo ORDER BY SUM(tr_fare) - (SELECT MAX(tf_rate) FROM tariffs) DESC, tr_promo
+----
+INTEGER	DECIMAL(38,2)
+NULL	44095.25
+4	247.25
+1	230.75
+2	226.25
+3	193.00
+
+# The same subquery in a select item and in ORDER BY, and ORDER BY the item's alias; LIMIT and OFFSET over an order
+# without ties.
+
+query II nosort
+SELECT zn_city, COUNT(*) * (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city ORDER BY COUNT(*) * (SELECT MAX(ct_id) FROM cities) DESC, zn_city
+----
+SMALLINT	BIGINT
+1	48
+2	48
+5	48
+3	42
+4	42
+9	6
+NULL	6
+
+query II nosort
+SELECT zn_city, SUM(zn_id) - (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city ORDER BY v DESC, zn_city
+----
+SMALLINT	HUGEINT
+5	174
+2	150
+1	142
+4	127
+3	120
+9	33
+NULL	32
+
+query II nosort
+SELECT zn_city, SUM(zn_id) AS s FROM zones GROUP BY zn_city ORDER BY SUM(zn_id) * (SELECT MAX(ct_id) FROM cities) DESC, zn_city LIMIT 3
+----
+SMALLINT	HUGEINT
+5	180
+2	156
+1	148
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY COUNT(*) - (SELECT MIN(ct_id) FROM cities), zn_city LIMIT 2 OFFSET 2
+----
+SMALLINT	BIGINT
+3	7
+4	7
+
+# SELECT DISTINCT over a grouped block with values in its items.
+
+query I nosort
+SELECT DISTINCT COUNT(*) - (SELECT MIN(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city ORDER BY v
+----
+BIGINT
+0
+6
+7
+
+query II nosort
+SELECT DISTINCT (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY c
+----
+SMALLINT	BIGINT
+6	1
+6	7
+6	8
+
+query I nosort
+SELECT DISTINCT zn_city % 2 * (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city ORDER BY v
+----
+SMALLINT
+0
+6
+NULL
+
+query T nosort
+SELECT DISTINCT CASE WHEN COUNT(*) > (SELECT MAX(ct_id) FROM cities) THEN 'many' ELSE 'few' END AS s FROM zones GROUP BY zn_city ORDER BY s
+----
+VARCHAR
+few
+many
+
+# ROLLUP, CUBE and GROUPING SETS of plain columns with values in select items (over COUNT, GROUPING() and inside an
+# aggregate's argument) and in ORDER BY; the subtotal rows read the same value.
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	22
+1	14
+2	14
+
+query III nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	SMALLINT	BIGINT
+NULL	6	16
+1	6	8
+2	6	8
+
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	HUGEINT
+NULL	1824
+1	888
+2	936
+
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city) ORDER BY COUNT(*) * (SELECT MAX(ct_id) FROM cities), 1
+----
+SMALLINT	BIGINT
+1	8
+2	8
+NULL	16
+
+query II nosort
+SELECT zn_city, GROUPING(zn_city) + (SELECT MIN(ct_id) FROM cities) AS g FROM zones WHERE zn_city < 3 GROUP BY GROUPING SETS ((zn_city), ()) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	2
+1	1
+2	1
+
+query II nosort
+SELECT zn_city, COUNT(*) * (SELECT MAX(ct_id) FROM cities) AS v FROM zones WHERE zn_city < 3 GROUP BY CUBE (zn_city) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	96
+1	48
+2	48
+
+query II nosort
+SELECT zn_city, CASE WHEN GROUPING(zn_city) = 1 THEN (SELECT COUNT(*) FROM zones) ELSE COUNT(*) END AS v FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	40
+1	8
+2	8
+
+query II nosort
+SELECT zn_city, SUM(zn_id) AS s FROM zones WHERE zn_city < 3 GROUP BY GROUPING SETS ((zn_city), ()) ORDER BY SUM(zn_id) - (SELECT MIN(ct_id) FROM cities) DESC, zn_city
+----
+SMALLINT	HUGEINT
+NULL	304
+2	156
+1	148
+
+query IIII rowsort
+SELECT zn_city, zn_parent, GROUPING(zn_city, zn_parent) AS g, COUNT(*) * (SELECT MAX(ct_id) FROM cities) AS v FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city, zn_parent)
+----
+SMALLINT	INTEGER	BIGINT	BIGINT
+1	1	0	42
+1	NULL	0	6
+1	NULL	1	48
+2	2	0	42
+2	NULL	0	6
+2	NULL	1	48
+NULL	NULL	3	96
+
+# A value of two rows fails in both engines, even in a CASE branch no group takes, and in a ROLLUP's select list: the
+# value's join is built before any row is read.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, CASE WHEN COUNT(*) > 100 THEN (SELECT ct_id FROM cities) ELSE 0 END AS v FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT ct_id FROM cities) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city)
+
+# A value over an aggregate overflows as the aggregate plus a column would: BIGINT MAX plus one.
+
+statement error Overflow in addition of
+SELECT id % 2 AS g, MAX(i64) + (SELECT i64 FROM edge WHERE id = 4) AS v FROM edge GROUP BY id % 2
+
+# ---- GROUP BY keys and HAVING aliases ----
+
+# A GROUP BY key holding a value, and a select item with the same expression: written again, as the key's alias or
+# position, in lower case, with a qualified column, with qualified columns on both sides, over a larger table.
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY k ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (select min(ct_id) from cities) ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT zones.zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT z.zn_city + (SELECT MIN(c.ct_id) FROM cities c) AS k, COUNT(*) AS c FROM zones z GROUP BY z.zn_city + (SELECT MIN(c.ct_id) FROM cities c) ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT tr_driver % (SELECT COUNT(*) FROM cities) AS k, COUNT(*) AS n FROM trips GROUP BY tr_driver % (SELECT COUNT(*) FROM cities) ORDER BY k
+----
+BIGINT	BIGINT
+0	493
+1	493
+2	463
+3	463
+4	492
+5	492
+NULL	104
+
+query II nosort
+SELECT tr_driver % (SELECT COUNT(*) FROM cities) AS k, COUNT(*) AS n FROM trips GROUP BY 1 ORDER BY k
+----
+BIGINT	BIGINT
+0	493
+1	493
+2	463
+3	463
+4	492
+5	492
+NULL	104
+
+# A key whose subquery is written another way (a table alias inside it) is another expression: the item matches no
+# key and reads an ungrouped column, a bind error in both engines.
+statement error
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(c.ct_id) FROM cities c) ORDER BY k
+
+# A bare value as the only key is one group, also when no select item reads it, and no group over an empty table; a
+# value of no row is a NULL key, alone or in arithmetic; COALESCE over a value turns the NULL key into the value.
+query II rowsort
+SELECT (SELECT COUNT(*) FROM cities) AS n, COUNT(*) AS c FROM zones GROUP BY (SELECT COUNT(*) FROM cities)
+----
+BIGINT	BIGINT
+6	40
+
+query II rowsort
+SELECT COUNT(*) AS c, SUM(zn_id) AS s FROM zones GROUP BY (SELECT COUNT(*) FROM cities)
+----
+BIGINT	HUGEINT
+40	820
+
+query II rowsort
+SELECT (SELECT COUNT(*) FROM cities) AS n, COUNT(*) AS c FROM promos GROUP BY (SELECT COUNT(*) FROM cities)
+----
+BIGINT	BIGINT
+
+query II rowsort
+SELECT (SELECT ct_id FROM cities WHERE ct_id > 99) AS k, COUNT(*) AS c FROM zones GROUP BY (SELECT ct_id FROM cities WHERE ct_id > 99)
+----
+SMALLINT	BIGINT
+NULL	40
+
+query II rowsort
+SELECT zn_city + (SELECT ct_id FROM cities WHERE ct_id > 99) AS k, COUNT(*) AS c FROM zones GROUP BY 1
+----
+SMALLINT	BIGINT
+NULL	40
+
+query II nosort
+SELECT COALESCE(zn_city, (SELECT MAX(ct_id) FROM cities)) AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+6	1
+9	1
+
+# A value key next to a plain key, by position, by alias and written again; a text key next to it; two value keys.
+query III nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones GROUP BY 1, 2 ORDER BY 1
+----
+SMALLINT	SMALLINT	BIGINT
+1	6	8
+2	6	8
+3	6	7
+4	6	7
+5	6	8
+9	6	1
+NULL	6	1
+
+query III nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones GROUP BY zn_city, m ORDER BY zn_city
+----
+SMALLINT	SMALLINT	BIGINT
+1	6	8
+2	6	8
+3	6	7
+4	6	7
+5	6	8
+9	6	1
+NULL	6	1
+
+query III nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones GROUP BY (SELECT MAX(ct_id) FROM cities), zn_city ORDER BY zn_city
+----
+SMALLINT	SMALLINT	BIGINT
+1	6	8
+2	6	8
+3	6	7
+4	6	7
+5	6	8
+9	6	1
+NULL	6	1
+
+query TII nosort
+SELECT tr_tariff, tr_driver % (SELECT COUNT(*) FROM cities) AS k, COUNT(*) AS n FROM trips WHERE tr_tariff IN ('STD', 'NIGHT') GROUP BY tr_tariff, 2 ORDER BY 1, 2
+----
+VARCHAR	BIGINT	BIGINT
+NIGHT	1	83
+NIGHT	3	82
+NIGHT	5	110
+NIGHT	NULL	9
+STD	0	82
+STD	2	110
+STD	4	82
+STD	NULL	10
+
+query III nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS a, zn_city * (SELECT MAX(ct_id) FROM cities) AS b, COUNT(*) AS c FROM zones GROUP BY 1, 2 ORDER BY 1
+----
+SMALLINT	SMALLINT	BIGINT
+2	6	8
+3	12	8
+4	18	7
+5	24	7
+6	30	8
+10	54	1
+NULL	NULL	1
+
+query III nosort
+SELECT zn_city % 2 + (SELECT MIN(ct_id) FROM cities) AS a, zn_id % (SELECT COUNT(*) FROM cities) AS b, COUNT(*) AS c FROM zones GROUP BY zn_city % 2 + (SELECT MIN(ct_id) FROM cities), zn_id % (SELECT COUNT(*) FROM cities) ORDER BY 1, 2
+----
+SMALLINT	BIGINT	BIGINT
+1	0	2
+1	1	3
+1	2	3
+1	3	2
+1	4	3
+1	5	2
+2	0	4
+2	1	4
+2	2	3
+2	3	5
+2	4	4
+2	5	4
+NULL	2	1
+
+# Other expressions over a value key: the key plus one, the key next to a plain key in one item, the key times
+# another value, a function of the key, a CASE over the key; a value over a plain key, which is no value key; and a
+# value over an aggregate next to a value key.
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) + 1 AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	BIGINT
+3	8
+4	8
+5	7
+6	7
+7	8
+11	1
+NULL	1
+
+query II nosort
+SELECT (zn_city + (SELECT MIN(ct_id) FROM cities)) * 10 - zn_city AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities), zn_city ORDER BY k
+----
+SMALLINT	BIGINT
+19	8
+28	8
+37	7
+46	7
+55	8
+91	1
+NULL	1
+
+query I nosort
+SELECT (zn_city + (SELECT MIN(ct_id) FROM cities)) * (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY v
+----
+SMALLINT
+12
+18
+24
+30
+36
+60
+NULL
+
+query II nosort
+SELECT ABS(zn_city - (SELECT MAX(ct_id) FROM cities)) AS k, COUNT(*) AS c FROM zones GROUP BY ABS(zn_city - (SELECT MAX(ct_id) FROM cities)) ORDER BY k
+----
+SMALLINT	BIGINT
+1	8
+2	7
+3	8
+4	8
+5	8
+NULL	1
+
+query TI nosort
+SELECT CASE WHEN zn_city + (SELECT MIN(ct_id) FROM cities) > 3 THEN 'big' ELSE 'small' END AS s, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 2, 1
+----
+VARCHAR	BIGINT
+big	1
+small	1
+big	7
+big	7
+big	8
+small	8
+small	8
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, MAX(zn_id) - (SELECT MIN(ct_id) FROM cities) AS m FROM zones GROUP BY 1 ORDER BY 1
+----
+SMALLINT	INTEGER
+2	35
+3	36
+4	32
+5	33
+6	39
+10	38
+NULL	37
+
+# A CASE as the key: over a value in WHEN, over a VARCHAR value in THEN, over EXISTS in WHEN (written again and by
+# position), over a DATE value.
+query TI nosort
+SELECT CASE WHEN zn_city > (SELECT AVG(ct_id) FROM cities) THEN 'hi' ELSE 'lo' END AS k, COUNT(*) AS c FROM zones GROUP BY CASE WHEN zn_city > (SELECT AVG(ct_id) FROM cities) THEN 'hi' ELSE 'lo' END ORDER BY k
+----
+VARCHAR	BIGINT
+hi	16
+lo	24
+
+query TI nosort
+SELECT CASE WHEN zn_city = (SELECT MIN(ct_id) FROM cities) THEN (SELECT label FROM cities WHERE ct_id = 1) ELSE 'other' END AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1
+----
+VARCHAR	BIGINT
+center	8
+other	32
+
+query II nosort
+SELECT CASE WHEN EXISTS (SELECT 1 FROM promos) THEN zn_city ELSE -zn_city END AS k, COUNT(*) AS c FROM zones GROUP BY CASE WHEN EXISTS (SELECT 1 FROM promos) THEN zn_city ELSE -zn_city END ORDER BY k
+----
+SMALLINT	BIGINT
+-9	1
+-5	8
+-4	7
+-3	7
+-2	8
+-1	8
+NULL	1
+
+query II nosort
+SELECT CASE WHEN EXISTS (SELECT 1 FROM promos) THEN zn_city ELSE -zn_city END AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT
+-9	1
+-5	8
+-4	7
+-3	7
+-2	8
+-1	8
+NULL	1
+
+query II nosort
+SELECT CASE WHEN tr_day < (SELECT MAX(sh_day) FROM shifts) THEN 1 ELSE 0 END AS k, COUNT(*) AS c FROM trips GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	267
+1	2733
+
+# The key's value elsewhere in the block: in an aggregate's argument, in WHERE, in GROUPING; and SELECT DISTINCT over
+# the aggregates of a value key.
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, SUM(zn_id + (SELECT MIN(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	HUGEINT
+2	156
+3	164
+4	133
+5	140
+6	188
+10	40
+NULL	39
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones WHERE zn_id > (SELECT MIN(ct_id) FROM cities) GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	BIGINT
+2	7
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(ct_id) FROM cities) AS k, GROUPING(ct_id % 2 + (SELECT MIN(ct_id) FROM cities)) AS gr FROM cities GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT
+1	0
+2	0
+
+query I nosort
+SELECT DISTINCT COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 1
+----
+BIGINT
+1
+7
+8
+
+# HAVING and ORDER BY over the key's expression, written again: alone, next to an aggregate, an ORDER BY key the select
+# list does not hold, descending.
+query II nosort
+SELECT zn_city * (SELECT MAX(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city * (SELECT MAX(ct_id) FROM cities) HAVING zn_city * (SELECT MAX(ct_id) FROM cities) > 12 ORDER BY k
+----
+SMALLINT	BIGINT
+18	7
+24	7
+30	8
+54	1
+
+query II nosort
+SELECT tr_driver % (SELECT COUNT(*) FROM cities) AS k, COUNT(*) AS n FROM trips GROUP BY k HAVING tr_driver % (SELECT COUNT(*) FROM cities) > 2 ORDER BY k
+----
+BIGINT	BIGINT
+3	463
+4	492
+5	492
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY 1 HAVING COUNT(*) > (SELECT MIN(ct_id) FROM cities) AND zn_city + (SELECT MIN(ct_id) FROM cities) < 6 ORDER BY 1
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+
+query I nosort
+SELECT COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY zn_city + (SELECT MIN(ct_id) FROM cities)
+----
+BIGINT
+8
+8
+7
+7
+8
+1
+1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY zn_city + (SELECT MIN(ct_id) FROM cities) DESC NULLS LAST
+----
+SMALLINT	BIGINT
+10	1
+6	8
+5	7
+4	7
+3	8
+2	8
+NULL	1
+
+# Value keys of other types: DECIMAL, a DECIMAL SUM and a DOUBLE AVG under an integer key, the type extremes with
+# NULLs; an overflow in the key fails in both engines.
+query DI nosort
+SELECT zn_city * (SELECT MAX(tf_rate) FROM tariffs) AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1
+----
+DECIMAL(10,3)	BIGINT
+2.500	8
+5.000	8
+7.500	7
+10.000	7
+12.500	8
+22.500	1
+NULL	1
+
+query IDR nosort
+SELECT tr_driver % (SELECT COUNT(*) FROM cities) AS k, SUM(tr_fare) AS s, AVG(tr_distance) AS a FROM trips GROUP BY 1 ORDER BY 1
+----
+BIGINT	DECIMAL(38,2)	DOUBLE
+0	7384.00	9.602650727650728
+1	7360.00	10.088541666666666
+2	7017.75	9.472345132743364
+3	7018.25	10.061393805309734
+4	7347.75	9.381263048016702
+5	7303.25	10.13929313929314
+NULL	1561.50	9.763480392156863
+
+query II nosort
+SELECT i32 % (SELECT COUNT(*) FROM cities) AS k, COUNT(*) AS c FROM edge GROUP BY 1 ORDER BY 1 NULLS FIRST
+----
+BIGINT	BIGINT
+NULL	2
+-4	1
+-2	1
+-1	2
+0	1
+1	3
+3	1
+4	1
+
+statement error Overflow in addition of
+SELECT i64 + (SELECT i64 FROM edge WHERE id = 1) AS k, COUNT(*) AS c FROM edge GROUP BY 1 ORDER BY 1
+
+# A key whose value has two rows fails in both engines, also over an empty table, as its join is built first.
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city + (SELECT ct_id FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city + (SELECT ct_id FROM cities) AS k, COUNT(*) AS c FROM promos, zones GROUP BY 1
+
+# HAVING reads the alias of a select item that holds a value over aggregates: a comparison, BETWEEN, an IN list, NOT
+# under OR, a value of no row (NULL), the alias next to another value, a value times COUNT(*), values over SUM and a
+# DECIMAL SUM; and in global aggregates, an empty one too.
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c > 8 ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	9
+2	9
+5	9
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c BETWEEN 8 AND 9 ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	9
+2	9
+3	8
+4	8
+5	9
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c IN (2, 8) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+3	8
+4	8
+9	2
+NULL	2
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING NOT c > 8 OR zn_city IS NULL ORDER BY zn_city
+----
+SMALLINT	BIGINT
+3	8
+4	8
+9	2
+NULL	2
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT ct_id FROM cities WHERE ct_id > 99) AS c FROM zones GROUP BY zn_city HAVING c IS NULL ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+9	NULL
+NULL	NULL
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c > 8 AND c < (SELECT MAX(ct_id) FROM cities) + 4 ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	9
+2	9
+5	9
+
+query II nosort
+SELECT ct_id % 2 AS g, COUNT(*) * (SELECT MIN(zn_id) FROM zones) AS m FROM cities GROUP BY 1 HAVING m > 2 ORDER BY 1
+----
+SMALLINT	BIGINT
+0	3
+1	3
+
+query II nosort
+SELECT ct_id % 2 AS g, SUM(ct_pop) + (SELECT MIN(zn_id) FROM zones) AS s FROM cities GROUP BY 1 HAVING s > 50000 ORDER BY 1
+----
+SMALLINT	HUGEINT
+1	158001
+
+query ID nosort
+SELECT tr_driver, SUM(tr_fare) + (SELECT COUNT(*) FROM zones) AS s FROM trips GROUP BY tr_driver HAVING s > 400 ORDER BY tr_driver LIMIT 3
+----
+INTEGER	DECIMAL(38,2)
+1000	450.00
+1037	472.00
+1074	467.25
+
+query II rowsort
+SELECT COUNT(*) AS c, SUM(zn_id) * (SELECT MAX(ct_id) FROM cities) AS s FROM zones HAVING s > 100 AND c > 1
+----
+BIGINT	HUGEINT
+40	4920
+
+query II rowsort
+SELECT COUNT(*) AS c, COUNT(*) - (SELECT MAX(ct_id) FROM cities) AS d FROM promos HAVING d < 0
+----
+BIGINT	BIGINT
+0	-6
+
+# HAVING reads the alias of an aggregate item whose argument holds a value: the aggregate's column.
+query II nosort
+SELECT ct_id % 2 AS g, SUM(ct_pop * (SELECT MIN(zn_id) FROM zones)) AS s FROM cities GROUP BY 1 HAVING s > 1 ORDER BY 1
+----
+SMALLINT	HUGEINT
+0	47500
+1	158000
+
+# HAVING reads the alias of a bare value item: alone, against an aggregate, inside arithmetic, in a global block.
+query II nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY zn_city HAVING m > 0 ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	6
+NULL	6
+
+query II nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY zn_city HAVING COUNT(*) > m ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	6
+2	6
+3	6
+4	6
+5	6
+
+query II nosort
+SELECT ct_id % 2 AS g, (SELECT COUNT(*) FROM zones) AS n FROM cities GROUP BY 1 HAVING n > 3 ORDER BY 1
+----
+SMALLINT	BIGINT
+0	40
+1	40
+
+query II nosort
+SELECT ct_id % 2 AS g, (SELECT COUNT(*) FROM zones) AS n FROM cities GROUP BY 1 HAVING n + 1 > 3 ORDER BY 1
+----
+SMALLINT	BIGINT
+0	40
+1	40
+
+query II rowsort
+SELECT COUNT(*) AS c, (SELECT MIN(zn_id) FROM zones) AS m FROM cities HAVING m > 0
+----
+BIGINT	INTEGER
+6	1
+
+# HAVING reads the alias of a key item holding a value, alone and inside arithmetic, and of an expression over the key
+# (DuckDB answers); the alias of a value over a plain key; next to the alias of a value over aggregates.
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) AS k, COUNT(*) AS c FROM cities GROUP BY 1 HAVING k > 1 ORDER BY 1
+----
+INTEGER	BIGINT
+2	3
+
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) AS m, COUNT(*) AS c FROM cities GROUP BY m HAVING m + 1 > 2 ORDER BY 1
+----
+INTEGER	BIGINT
+2	3
+
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) + 1 AS m, COUNT(*) AS c FROM cities GROUP BY ct_id % 2 + (SELECT MIN(zn_id) FROM zones) HAVING m * 2 > 4 ORDER BY 1
+----
+INTEGER	BIGINT
+3	3
+
+query II nosort
+SELECT zn_city, zn_city * (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY zn_city HAVING m > 12 ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+3	18
+4	24
+5	30
+9	54
+
+query II nosort
+SELECT zn_city % 2 + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS c FROM zones GROUP BY 1 HAVING k > 1 AND c > 20 ORDER BY 1
+----
+SMALLINT	BIGINT
+2	30
+
+# HAVING IN and NOT IN a subquery whose probe is the alias of an item holding a value.
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c IN (SELECT zn_id FROM zones WHERE zn_id > 8) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	9
+2	9
+5	9
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city HAVING c NOT IN (SELECT zn_id FROM zones WHERE zn_id > 8) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+3	8
+4	8
+9	2
+NULL	2
+
+query II nosort
+SELECT zn_city, (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY zn_city HAVING m IN (SELECT ct_id FROM cities) ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	6
+NULL	6
+
+# A HAVING alias whose value has two rows fails in both engines, also with no group.
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT ct_id FROM cities) AS c FROM zones GROUP BY zn_city HAVING c > 8
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT ct_id FROM cities) AS c FROM promos, zones GROUP BY zn_city HAVING c > 8
+
+# ORDER BY an expression over the alias of a key item holding a value: DuckDB answers, as the item is the key or an
+# expression over it; and over the alias of an aggregate item whose argument holds a value.
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY k ORDER BY k * 2
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) AS k, COUNT(*) AS c FROM cities GROUP BY 1 ORDER BY k + 1
+----
+INTEGER	BIGINT
+1	3
+2	3
+
+query II nosort
+SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) + 1 AS m, COUNT(*) AS c FROM cities GROUP BY ct_id % 2 + (SELECT MIN(zn_id) FROM zones) ORDER BY m * 2, c
+----
+INTEGER	BIGINT
+2	3
+3	3
+
+query II nosort
+SELECT ct_id % 2 AS g, (SELECT MIN(zn_id) FROM zones) AS m FROM cities GROUP BY 1, 2 ORDER BY m + g
+----
+SMALLINT	INTEGER
+0	1
+1	1
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY k ORDER BY -k NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	1
+10	1
+6	8
+5	7
+4	7
+3	8
+2	8
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY k ORDER BY CASE WHEN k > 3 THEN 0 ELSE 1 END, k
+----
+SMALLINT	BIGINT
+4	7
+5	7
+6	8
+10	1
+2	8
+3	8
+NULL	1
+
+query II nosort
+SELECT ct_id % 2 AS g, SUM(ct_pop * (SELECT MIN(zn_id) FROM zones)) + 1 AS s FROM cities GROUP BY 1 ORDER BY s * 2, g
+----
+SMALLINT	HUGEINT
+0	47501
+1	158001
+
+# ROLLUP and CUBE over plain keys, with a value in a select item: over COUNT(*), in HAVING through the item's alias,
+# and a bare value item.
+query II rowsort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY ROLLUP (zn_city) ORDER BY zn_city NULLS FIRST, c
+----
+SMALLINT	BIGINT
+1	9
+2	9
+3	8
+4	8
+5	9
+9	2
+NULL	2
+NULL	41
+
+query III nosort
+SELECT zn_city % 2 AS g, CASE WHEN zn_parent IS NULL THEN 1 ELSE 0 END AS p, COUNT(*) * (SELECT MAX(ct_id) FROM cities) AS c FROM zones GROUP BY ROLLUP (zn_city % 2, CASE WHEN zn_parent IS NULL THEN 1 ELSE 0 END) ORDER BY 1, 2, 3
+----
+SMALLINT	INTEGER	BIGINT
+0	0	78
+0	1	12
+0	NULL	90
+1	0	126
+1	1	18
+1	NULL	144
+NULL	0	6
+NULL	NULL	6
+NULL	NULL	240
+
+query III rowsort
+SELECT zn_city % 2 AS g, COUNT(*) AS c, (SELECT MAX(ct_id) FROM cities) AS m FROM zones GROUP BY CUBE (zn_city % 2) ORDER BY 1 NULLS FIRST, 2
+----
+SMALLINT	BIGINT	SMALLINT
+0	15	6
+1	24	6
+NULL	1	6
+NULL	40	6
+
+query II rowsort
+SELECT zn_city, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY ROLLUP (zn_city) HAVING c > 8 ORDER BY zn_city NULLS FIRST, c
+----
+SMALLINT	BIGINT
+1	9
+2	9
+5	9
+NULL	41
+
+# ---- divergence D37: an ORDER BY expression over the alias of a grouped item that still holds a value ----
+
+# The item holds the value after its keys and aggregates are taken out: a value over COUNT(*), a value times a plain
+# key, a value over a plain key, a CASE over an aggregate with a value in THEN. DuckDB refuses the alias inside an
+# ORDER BY expression; antb1 binds the item again, which reads the same value, and answers.
+onlyif duckdb
+statement error Alias "c" referenced in a SELECT clause - but the expression has a subquery
+SELECT ct_id % 2 AS g, COUNT(*) + (SELECT MIN(zn_id) FROM zones) AS c FROM cities GROUP BY 1 ORDER BY c * 2, g
+
+onlyif antb1
+query II nosort
+SELECT ct_id % 2 AS g, COUNT(*) + (SELECT MIN(zn_id) FROM zones) AS c FROM cities GROUP BY 1 ORDER BY c * 2, g
+----
+SMALLINT	BIGINT
+0	4
+1	4
+
+onlyif duckdb
+statement error Alias "m" referenced in a SELECT clause - but the expression has a subquery
+SELECT ct_id, (SELECT MIN(zn_id) FROM zones) * ct_id AS m FROM cities GROUP BY ct_id ORDER BY m + 1
+
+onlyif antb1
+query II nosort
+SELECT ct_id, (SELECT MIN(zn_id) FROM zones) * ct_id AS m FROM cities GROUP BY ct_id ORDER BY m + 1
+----
+SMALLINT	INTEGER
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+
+onlyif duckdb
+statement error Alias "k" referenced in a SELECT clause - but the expression has a subquery
+SELECT zn_city, zn_city + (SELECT MIN(ct_id) FROM cities) AS k FROM zones GROUP BY zn_city ORDER BY k * 2, zn_city
+
+onlyif antb1
+query II nosort
+SELECT zn_city, zn_city + (SELECT MIN(ct_id) FROM cities) AS k FROM zones GROUP BY zn_city ORDER BY k * 2, zn_city
+----
+SMALLINT	SMALLINT
+1	2
+2	3
+3	4
+4	5
+5	6
+9	10
+NULL	NULL
+
+onlyif duckdb
+statement error Alias "m" referenced in a SELECT clause - but the expression has a subquery
+SELECT zn_city % 2 AS g, CASE WHEN COUNT(*) > 20 THEN (SELECT MIN(ct_id) FROM cities) ELSE 0 END AS m FROM zones GROUP BY 1 ORDER BY -m, g
+
+onlyif antb1
+query II nosort
+SELECT zn_city % 2 AS g, CASE WHEN COUNT(*) > 20 THEN (SELECT MIN(ct_id) FROM cities) ELSE 0 END AS m FROM zones GROUP BY 1 ORDER BY -m, g
+----
+SMALLINT	SMALLINT
+1	1
+0	0
+NULL	0
+
+# ---- aggregate arguments and other blocks ----
+
+# A value with a column inside an aggregate's argument, in a global aggregate: computed once, before any row is read,
+# and joined to every row below the aggregation. An integer SUM of it is HUGEINT; COUNT skips the rows whose argument
+# is NULL; COUNT(DISTINCT) counts the argument's distinct values, a remainder by the value too.
+
+query I nosort
+SELECT SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s FROM zones
+----
+HUGEINT
+4920
+
+query II nosort
+SELECT MAX(zn_id + (SELECT MIN(ct_id) FROM cities)) AS mx, MIN(zn_id - (SELECT MIN(ct_id) FROM cities)) AS mn FROM zones
+----
+INTEGER	INTEGER
+41	0
+
+query II nosort
+SELECT COUNT(zn_city + (SELECT MIN(ct_id) FROM cities)) AS c, COUNT(*) AS n FROM zones
+----
+BIGINT	BIGINT
+39	40
+
+query I nosort
+SELECT COUNT(DISTINCT zn_city + (SELECT MAX(ct_id) FROM cities)) AS c FROM zones
+----
+BIGINT
+6
+
+query I nosort
+SELECT COUNT(DISTINCT ct_id % 2 + (SELECT MIN(ct_id) FROM cities)) AS c FROM cities
+----
+BIGINT
+2
+
+query I nosort
+SELECT COUNT(DISTINCT zn_id % (SELECT MAX(ct_id) FROM cities)) AS c FROM zones
+----
+BIGINT
+6
+
+# The variance family over a column and a value: DOUBLE, sample and population, with DuckDB's VARIANCE alias.
+
+query R nosort
+SELECT VAR_SAMP(ct_id + (SELECT COUNT(*) FROM zones)) AS v FROM cities
+----
+DOUBLE
+3.5
+
+query RR nosort
+SELECT STDDEV_SAMP(zn_id * (SELECT MIN(ct_id) + 1 FROM cities)) AS sd, VAR_POP(zn_id - (SELECT MAX(ct_id) FROM cities)) AS vp FROM zones
+----
+DOUBLE	DOUBLE
+23.38090388900024	133.25
+
+query RR nosort
+SELECT STDDEV_POP(ct_pop + (SELECT MAX(ct_id) FROM cities)) AS sp, VARIANCE(ct_id * (SELECT MIN(ct_id) FROM cities)) AS va FROM cities
+----
+DOUBLE	DOUBLE
+42306.50068251923	3.5
+
+# DECIMAL and DATE arguments: a DECIMAL column times a DECIMAL value sums to DECIMAL(38,5) and averages to DOUBLE; a
+# DATE minus an INTEGER value of days stays a DATE.
+
+query D nosort
+SELECT SUM(tr_fare * (SELECT MAX(tf_rate) FROM tariffs)) AS s FROM trips
+----
+DECIMAL(38,5)
+112481.25000
+
+query R nosort
+SELECT AVG(tr_fare * (SELECT MAX(tf_rate) FROM tariffs)) AS a FROM trips
+----
+DOUBLE
+38.746555287633484
+
+query T nosort
+SELECT MIN(dy_day - (SELECT MIN(ct_id) FROM cities)::INTEGER) AS d FROM days
+----
+DATE
+2025-12-28
+
+# CASE and COALESCE over a value inside an argument, and EXISTS / NOT EXISTS in a CASE's WHEN there.
+
+query I nosort
+SELECT SUM(CASE WHEN zn_id > (SELECT AVG(zn_id) FROM zones) THEN 1 ELSE 0 END) AS s FROM zones
+----
+HUGEINT
+20
+
+query I nosort
+SELECT SUM(COALESCE(ct_pop, (SELECT MIN(ct_pop) FROM cities))) AS s FROM cities
+----
+HUGEINT
+208000
+
+query I nosort
+SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM promos) THEN zn_id ELSE 0 END) AS s FROM zones
+----
+HUGEINT
+0
+
+query II nosort
+SELECT SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM promos) THEN zn_id ELSE 0 END) AS s, COUNT(CASE WHEN EXISTS (SELECT 1 FROM tariffs) THEN zn_city END) AS c FROM zones
+----
+HUGEINT	BIGINT
+820	39
+
+# A HUGEINT sum over the BIGINT extremes; a value of no row, which makes every argument NULL (SUM NULL, COUNT 0); an
+# empty table; the same value inside an argument and over the aggregate, joined once below and once above it.
+
+query I nosort
+SELECT SUM(i64 * (SELECT MAX(i16) FROM edge WHERE id = 4)) AS s FROM edge
+----
+HUGEINT
+6
+
+query III nosort
+SELECT SUM(zn_id + (SELECT pm_id FROM promos)) AS s, COUNT(zn_id + (SELECT pm_id FROM promos)) AS c, COUNT(*) AS n FROM zones
+----
+HUGEINT	BIGINT	BIGINT
+NULL	0	40
+
+query II nosort
+SELECT SUM(pm_id * (SELECT MAX(ct_id) FROM cities)) AS s, COUNT(*) AS n FROM promos
+----
+HUGEINT	BIGINT
+NULL	0
+
+query I nosort
+SELECT SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) + (SELECT MAX(ct_id) FROM cities) AS s FROM zones
+----
+HUGEINT
+4926
+
+# Grouped blocks: values inside the arguments of SUM, AVG, COUNT, the variance family, a DECIMAL and a DATE argument.
+
+query II nosort
+SELECT zn_city, SUM(zn_id - (SELECT MIN(zn_id) FROM zones)) AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	140
+2	148
+3	119
+4	126
+5	172
+9	38
+NULL	37
+
+query IRI nosort
+SELECT zn_city, AVG(zn_id + (SELECT COUNT(*) FROM cities)) AS a, COUNT(zn_parent + (SELECT MIN(ct_id) FROM cities)) AS c FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	DOUBLE	BIGINT
+1	24.5	7
+2	25.5	7
+3	24	6
+4	25	6
+5	28.5	7
+9	45	1
+NULL	44	1
+
+query IRR nosort
+SELECT zn_city, STDDEV_POP(zn_id + (SELECT MAX(ct_id) FROM cities)) AS sp, VAR_SAMP(zn_id * (SELECT MIN(ct_id) FROM cities)) AS vs FROM zones WHERE zn_city < 9 GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	DOUBLE	DOUBLE
+1	11.4564392373896	150
+2	11.4564392373896	150
+3	10	116.66666666666667
+4	10	116.66666666666667
+5	11.4564392373896	150
+
+query TDI nosort
+SELECT tr_tariff, SUM(tr_fare * (SELECT MAX(tf_rate) FROM tariffs)) AS s, COUNT(*) AS n FROM trips GROUP BY tr_tariff ORDER BY tr_tariff
+----
+VARCHAR	DECIMAL(38,5)	BIGINT
+(empty)	10543.75000	284
+AIRPORT	10483.12500	285
+NIGHT	10489.37500	284
+POOL	10769.37500	284
+STD	10763.12500	284
+Std	10569.37500	284
+XL	10842.50000	284
+XL\x20	10535.00000	285
+std	10738.12500	284
+Ж-1	10777.50000	284
+NULL	5970.00000	158
+
+query ITT nosort
+SELECT dy_year, MIN(dy_day + (SELECT MAX(ct_id) FROM cities)) AS d, MAX(dy_day - (SELECT MIN(ct_id) FROM cities)) AS e FROM days GROUP BY dy_year ORDER BY dy_year
+----
+SMALLINT	DATE	DATE
+2026	2026-01-04	2026-12-26
+2027	2027-01-03	2027-12-25
+2028	2028-01-02	2028-12-23
+2029	2028-12-31	2029-12-22
+
+# Grouped CASE over a DOUBLE value and EXISTS in a CASE, inside an argument.
+
+query II nosort
+SELECT zn_city, SUM(CASE WHEN zn_radius > (SELECT AVG(zn_radius) FROM zones) THEN 1 ELSE 0 END) AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	4
+2	4
+3	3
+4	4
+5	3
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, SUM(CASE WHEN EXISTS (SELECT 1 FROM tariffs WHERE tf_rate > 2) THEN zn_id ELSE 0 END) AS s FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+3	126
+4	133
+5	180
+9	39
+NULL	38
+
+# A value in an argument next to the same value over aggregates; the same value in a GROUP BY key and an argument (one
+# join for both); in WHERE and in an argument; in an argument over a join; a value of no row; DISTINCT over the
+# grouped results.
+
+query IIII nosort
+SELECT zn_city, SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s, MAX(zn_id) + (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT	INTEGER	BIGINT
+1	888	42	14
+2	936	43	14
+3	756	39	13
+4	798	40	13
+5	1080	46	14
+9	234	45	7
+NULL	228	44	7
+
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY k
+----
+SMALLINT	HUGEINT
+2	148
+3	156
+4	126
+5	133
+6	180
+10	39
+NULL	38
+
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s FROM zones WHERE zn_id > (SELECT MIN(ct_id) FROM cities) GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	147
+2	156
+3	126
+4	133
+5	180
+9	39
+NULL	38
+
+query IDI nosort
+SELECT z.zn_city, SUM(t.tr_fare * (SELECT MAX(tf_rate) FROM tariffs)) AS s, COUNT(*) AS n FROM trips t JOIN zones z ON t.tr_pickup = z.zn_id GROUP BY z.zn_city ORDER BY z.zn_city
+----
+SMALLINT	DECIMAL(38,5)	BIGINT
+1	21004.37500	559
+2	21081.87500	559
+3	18390.00000	490
+4	18321.87500	489
+5	20801.25000	558
+9	2540.00000	69
+NULL	2583.75000	69
+
+query III nosort
+SELECT zn_city, MAX(zn_id + (SELECT zn_id FROM zones WHERE zn_id > 100)) AS m, COUNT(*) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	INTEGER	BIGINT
+1	NULL	8
+2	NULL	8
+3	NULL	7
+4	NULL	7
+5	NULL	8
+9	NULL	1
+NULL	NULL	1
+
+query I nosort
+SELECT DISTINCT MAX(zn_id * (SELECT MIN(ct_id) FROM cities)) % 3 AS p FROM zones GROUP BY zn_city ORDER BY p
+----
+INTEGER
+0
+1
+2
+
+# HAVING over an aggregate whose argument holds a value, grouped and global (a global HAVING that keeps no row returns
+# none), next to a value in the select list's argument or in the HAVING condition itself.
+
+query I nosort
+SELECT ct_id % 2 AS g FROM cities GROUP BY 1 HAVING SUM(ct_pop * (SELECT MIN(zn_id) FROM zones)) > 50000 ORDER BY 1
+----
+SMALLINT
+1
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city HAVING COUNT(DISTINCT zn_id % (SELECT MAX(ct_id) FROM cities)) > 5 ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+
+query IR nosort
+SELECT zn_city, AVG(zn_id) AS a FROM zones GROUP BY zn_city HAVING AVG(zn_id + (SELECT MIN(ct_id) FROM cities)) > (SELECT MAX(ct_id) * 4 FROM cities) ORDER BY zn_city
+----
+SMALLINT	DOUBLE
+9	39
+NULL	38
+
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city HAVING MAX(zn_id - (SELECT MAX(ct_id) FROM cities)) >= 30 ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	148
+2	156
+5	180
+9	39
+NULL	38
+
+query TI nosort
+SELECT tr_tariff, COUNT(*) AS n FROM trips GROUP BY tr_tariff HAVING SUM(tr_fare * (SELECT MIN(tf_rate) FROM tariffs)) > 3720 ORDER BY tr_tariff
+----
+VARCHAR	BIGINT
+POOL	284
+STD	284
+XL	284
+std	284
+Ж-1	284
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city HAVING SUM(CASE WHEN EXISTS (SELECT 1 FROM promos) THEN 1 ELSE zn_id END) > 140 ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+5	8
+
+query I nosort
+SELECT COUNT(*) AS n FROM trips HAVING SUM(tr_fare * (SELECT MAX(zn_radius) FROM zones)) > 0
+----
+BIGINT
+3000
+
+query I nosort
+SELECT COUNT(*) AS n FROM trips HAVING SUM(tr_fare * (SELECT MAX(tf_rate) FROM tariffs)) < 0
+----
+BIGINT
+
+# ORDER BY an aggregate whose argument holds a value, grouped and in a global block (where the ORDER BY has one row to
+# order, but its value is still joined).
+
+query I nosort
+SELECT ct_id % 2 AS g FROM cities GROUP BY 1 ORDER BY SUM(ct_pop * (SELECT MIN(zn_id) FROM zones)) DESC, g
+----
+SMALLINT
+1
+0
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city ORDER BY MAX(zn_id + (SELECT MAX(ct_id) FROM cities)) DESC, zn_city
+----
+SMALLINT	BIGINT
+5	8
+9	1
+NULL	1
+2	8
+1	8
+4	7
+3	7
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones WHERE zn_city IS NOT NULL GROUP BY zn_city ORDER BY COUNT(DISTINCT zn_id % (SELECT MIN(ct_id) + 3 FROM cities)), zn_city
+----
+SMALLINT	BIGINT
+9	1
+1	8
+2	8
+3	7
+4	7
+5	8
+
+query I nosort
+SELECT COUNT(*) AS n FROM zones ORDER BY SUM(zn_id * (SELECT MAX(ct_id) FROM cities))
+----
+BIGINT
+40
+
+query II nosort
+SELECT COUNT(*) AS n, MAX(zn_id) AS m FROM zones ORDER BY AVG(zn_id + (SELECT MIN(ct_id) FROM cities)) DESC
+----
+BIGINT	INTEGER
+40	40
+
+# An ORDER BY expression over the alias of an aggregate item whose value stands only inside the aggregate's argument:
+# both engines answer; the alias and the position of such an item as plain ORDER BY keys.
+
+query II nosort
+SELECT ct_id % 2 AS g, SUM(ct_pop * (SELECT MIN(zn_id) FROM zones)) AS s FROM cities GROUP BY 1 ORDER BY s + 1, g
+----
+SMALLINT	HUGEINT
+0	47500
+1	158000
+
+query II nosort
+SELECT zn_city, SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city ORDER BY 2, 1
+----
+SMALLINT	HUGEINT
+NULL	228
+9	234
+3	756
+4	798
+1	888
+2	936
+5	1080
+
+query IT nosort
+SELECT dy_year, MIN(dy_day + (SELECT MAX(ct_id) FROM cities)) AS d FROM days GROUP BY dy_year ORDER BY d DESC, dy_year
+----
+SMALLINT	DATE
+2029	2028-12-31
+2028	2028-01-02
+2027	2027-01-03
+2026	2026-01-04
+
+# The contrast (divergence D37): with the value outside the aggregate, DuckDB refuses the alias in an ORDER BY
+# expression, and antb1 answers.
+
+onlyif duckdb
+statement error
+SELECT ct_id % 2 AS g, SUM(ct_pop) + (SELECT MIN(zn_id) FROM zones) AS s FROM cities GROUP BY 1 ORDER BY s + 1, g
+
+onlyif antb1
+query II nosort
+SELECT ct_id % 2 AS g, SUM(ct_pop) + (SELECT MIN(zn_id) FROM zones) AS s FROM cities GROUP BY 1 ORDER BY s + 1, g
+----
+SMALLINT	HUGEINT
+0	47501
+1	158001
+
+# Row errors in both engines: a value of two rows inside an argument fails in the select list, under zero groups, in a
+# global block's ORDER BY, in HAVING and in a CASE branch no row takes, since its join is built before any row is read.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(zn_id * (SELECT zn_id FROM zones)) AS s FROM zones
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(DISTINCT zn_id % (SELECT ct_id FROM cities WHERE ct_id > 4)) AS c FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT pm_id, SUM(pm_id * (SELECT zn_id FROM zones)) AS s FROM promos GROUP BY pm_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) AS n FROM zones ORDER BY SUM(zn_id * (SELECT ct_id FROM cities))
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city FROM zones GROUP BY zn_city HAVING SUM(zn_id + (SELECT ct_id FROM cities WHERE ct_id < 3)) > 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(CASE WHEN zn_id > 100 THEN (SELECT ct_id FROM cities) ELSE zn_id END) AS s FROM zones
+
+# Overflow of a column and a value inside an argument, before the aggregate sees it: INTEGER multiplication and
+# SMALLINT addition.
+
+statement error Overflow in multiplication of
+SELECT SUM(ct_pop * (SELECT MAX(i32) FROM edge)) AS s FROM cities
+
+statement error Overflow in addition of
+SELECT zn_city, MAX(zn_city + (SELECT MAX(i16) FROM edge)) AS m FROM zones WHERE zn_city = 1 GROUP BY zn_city
+
+# Derived tables whose block aggregates with a value, read whole, by an outer WHERE, a join and an outer aggregate,
+# and a derived global aggregate.
+
+query II nosort
+SELECT * FROM (SELECT zn_city, COUNT(*) - (SELECT MIN(ct_id) FROM cities) AS d FROM zones GROUP BY zn_city) x ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	7
+2	7
+3	6
+4	6
+5	7
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, s FROM (SELECT zn_city, SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city) x WHERE s > 800 ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	888
+2	936
+5	1080
+
+query TI nosort
+SELECT c.label, x.s FROM (SELECT zn_city, SUM(zn_id + (SELECT MIN(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city) x JOIN cities c ON c.ct_id = x.zn_city ORDER BY c.label
+----
+VARCHAR	HUGEINT
+airport	140
+center	156
+harbor	164
+hills	133
+old town	188
+
+query II nosort
+SELECT MAX(s) AS mx, COUNT(*) AS n FROM (SELECT zn_city, SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city) x
+----
+HUGEINT	BIGINT
+1080	7
+
+query II nosort
+SELECT * FROM (SELECT SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) AS s, COUNT(*) + (SELECT MIN(ct_id) FROM cities) AS n FROM zones) x
+----
+HUGEINT	BIGINT
+4920	41
+
+# CTEs whose block aggregates with a value: grouped by a value, read twice and joined, read by an outer WHERE and
+# aggregate, and with a value in HAVING's argument and in the select list.
+
+query II nosort
+WITH g AS (SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities)) SELECT * FROM g ORDER BY k
+----
+SMALLINT	BIGINT
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+NULL	1
+
+query II nosort
+WITH g AS (SELECT zn_city, MAX(zn_id - (SELECT MIN(ct_id) FROM cities)) AS m FROM zones GROUP BY zn_city) SELECT a.zn_city, a.m + b.m AS s FROM g a JOIN g b ON a.zn_city = b.zn_city ORDER BY a.zn_city
+----
+SMALLINT	INTEGER
+1	70
+2	72
+3	64
+4	66
+5	78
+9	76
+
+query IR nosort
+WITH g AS (SELECT zn_city, AVG(zn_id + (SELECT COUNT(*) FROM cities)) AS a FROM zones GROUP BY zn_city) SELECT COUNT(*) AS n, MAX(a) AS m FROM g WHERE a > 30
+----
+BIGINT	DOUBLE
+2	45
+
+query II nosort
+WITH g AS (SELECT zn_city, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS n FROM zones GROUP BY zn_city HAVING SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) > 100) SELECT c.ct_id, g.n FROM cities c JOIN g ON g.zn_city = c.ct_id ORDER BY c.ct_id
+----
+SMALLINT	BIGINT
+1	14
+2	14
+3	13
+4	13
+5	14
+
+# Set operations whose arms aggregate with values, wrapped in a derived table ordered outside: EXCEPT, UNION ALL,
+# UNION of two global arms, INTERSECT.
+
+query II nosort
+SELECT * FROM (SELECT zn_city, COUNT(*) - (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city EXCEPT SELECT ct_id, 7 FROM cities) u ORDER BY zn_city
+----
+SMALLINT	BIGINT
+3	6
+4	6
+9	0
+NULL	0
+
+query II nosort
+SELECT * FROM (SELECT zn_city AS k, SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s FROM zones GROUP BY zn_city UNION ALL SELECT ct_id, MAX(ct_pop + (SELECT MAX(ct_id) FROM cities)) FROM cities GROUP BY ct_id) u ORDER BY k, s
+----
+SMALLINT	HUGEINT
+1	148
+1	120006
+2	156
+2	45006
+3	126
+3	30006
+4	133
+4	NULL
+5	180
+5	8006
+6	2506
+9	39
+NULL	38
+
+query I nosort
+SELECT * FROM (SELECT COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS n FROM zones UNION SELECT SUM(ct_id * (SELECT MIN(ct_id) FROM cities)) FROM cities) u ORDER BY n
+----
+HUGEINT
+21
+46
+
+query II nosort
+SELECT * FROM (SELECT zn_city % 2 AS p, COUNT(*) * (SELECT MIN(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city % 2 INTERSECT SELECT ct_id % 2, 15 + ct_id % 2 * 9 FROM cities) u ORDER BY p
+----
+SMALLINT	BIGINT
+0	15
+1	24
+
+# IN subqueries whose block aggregates with a value: in HAVING's argument, over its aggregate in the select list, and
+# inside the argument of NOT IN's aggregate.
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones GROUP BY zn_city HAVING SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) > 140) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT COUNT(*) - (SELECT MAX(ct_id) FROM cities) FROM zones GROUP BY zn_city) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id NOT IN (SELECT MAX(zn_id % (SELECT MAX(ct_id) FROM cities)) FROM zones WHERE zn_city IS NOT NULL GROUP BY zn_city) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+4
+6
+
+# Values inside values: a scalar subquery whose block aggregates with a value of its own, in WHERE, in the select list,
+# in a CASE, in a HAVING condition, inside its aggregate's argument, and as a value over the outer block's aggregate.
+
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id < (SELECT MAX(zn_city) - (SELECT MIN(ct_id) FROM cities) FROM zones WHERE zn_city < 9) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+query II nosort
+SELECT ct_id, (SELECT MAX(zn_id) + (SELECT COUNT(*) FROM cities) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	46
+2	46
+3	46
+4	46
+5	46
+6	46
+
+query IT nosort
+SELECT ct_id, (SELECT CASE WHEN COUNT(*) > (SELECT MAX(ct_id) FROM cities) THEN 'many' ELSE 'few' END FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	many
+2	many
+3	many
+4	many
+5	many
+6	many
+
+query I nosort
+SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) > (SELECT MAX(ct_id) + (SELECT MIN(ct_id) FROM cities) FROM cities) ORDER BY zn_city
+----
+SMALLINT
+1
+2
+5
+
+query II nosort
+SELECT ct_id, (SELECT SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) FROM zones) AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	HUGEINT
+1	820
+2	820
+3	820
+4	820
+5	820
+6	820
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city HAVING MAX(zn_id) > (SELECT MAX(zn_id - (SELECT MIN(ct_id) FROM cities)) FROM zones WHERE zn_city < 5) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+2	8
+5	8
+9	1
+NULL	1
+
+query II nosort
+SELECT zn_city, COUNT(*) + (SELECT SUM(ct_id * (SELECT MIN(ct_id) FROM cities)) FROM cities) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	29
+2	29
+3	28
+4	28
+5	29
+9	22
+NULL	22
+
+# EXISTS and NOT EXISTS blocks that aggregate with a value: in HAVING's argument, in the dropped select list over an
+# aggregate or inside its argument, and an EXISTS in HAVING whose list holds one.
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT zn_city FROM zones GROUP BY zn_city HAVING SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) > 1000) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT zn_city FROM zones GROUP BY zn_city HAVING SUM(zn_id * (SELECT MAX(ct_id) FROM cities)) > 2000) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT COUNT(*) + (SELECT MIN(ct_id) FROM cities) FROM zones GROUP BY zn_city) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s FROM zones WHERE zn_id > 100) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query II nosort
+SELECT zn_city, COUNT(*) AS n FROM zones GROUP BY zn_city HAVING EXISTS (SELECT MAX(ct_id) + (SELECT MIN(zn_id) FROM zones) FROM cities) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+# Row errors in both through such blocks: an IN subquery's HAVING argument, a value inside a value's argument, and a
+# derived table's argument.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones GROUP BY zn_city HAVING SUM(zn_id * (SELECT ct_id FROM cities)) > 0) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT SUM(zn_id * (SELECT zn_id FROM zones)) FROM zones) AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT * FROM (SELECT zn_city, SUM(zn_id * (SELECT ct_id FROM cities)) AS s FROM zones GROUP BY zn_city) x ORDER BY zn_city
+
+# ---- errors and boundaries ----
+
+# A value of two rows fails in a block that aggregates, in both engines: as a GROUP BY key (an expression, or the
+# value alone), in a select item over a key or over an aggregate, in a CASE branch over aggregates, in an item that a
+# HAVING reads by its alias, under DISTINCT and in a ROLLUP block's select list.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city + (SELECT ct_id FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT ct_id FROM cities)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) AS c FROM zones GROUP BY (SELECT zn_city FROM zones WHERE zn_id < 3)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, zn_city * (SELECT ct_id FROM cities) AS v FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, CASE WHEN COUNT(*) > 100 THEN (SELECT zn_id FROM zones) ELSE 0 END AS v FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM zones GROUP BY zn_city HAVING c > 5
+
+statement error More than one row returned by a subquery used as an expression
+SELECT DISTINCT COUNT(*) + (SELECT zn_id FROM zones) AS c FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM zones GROUP BY ROLLUP (zn_city)
+
+# The value's join is built before any row is read, so it fails where no row or group reads it: a key over an empty
+# table, a HAVING aggregate's argument and an ORDER BY over zero groups, an item behind a HAVING that keeps no group
+# (or no global row), a global aggregate over an empty table, and a key behind a WHERE IN that turns out empty.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT pm_id + (SELECT ct_id FROM cities) AS k, COUNT(*) AS c FROM promos GROUP BY pm_id + (SELECT ct_id FROM cities)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT pm_id FROM promos GROUP BY pm_id HAVING SUM(pm_id * (SELECT zn_id FROM zones)) > 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT pm_id FROM promos GROUP BY pm_id ORDER BY COUNT(*) + (SELECT zn_id FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, (SELECT zn_id FROM zones) AS v FROM zones GROUP BY zn_city HAVING COUNT(*) < 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT tr_driver, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM trips GROUP BY tr_driver HAVING COUNT(*) < 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) AS c, (SELECT zn_id FROM zones) AS v FROM zones HAVING COUNT(*) < 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) + (SELECT zn_id FROM zones) AS c FROM promos
+
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(pm_id * (SELECT zn_id FROM zones)) AS s FROM promos
+
+statement error More than one row returned by a subquery used as an expression
+SELECT tr_driver % (SELECT zn_id FROM zones) AS k, COUNT(*) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id < 0) GROUP BY 1
+
+# In an aggregate's argument next to a column: SUM, COUNT DISTINCT, a MAX that only HAVING reads, a CASE branch no
+# row takes, and COALESCE whose first argument is never NULL.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(zn_id * (SELECT ct_id FROM cities)) AS s FROM zones
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, COUNT(DISTINCT zn_id % (SELECT ct_id FROM cities)) AS n FROM zones GROUP BY zn_city
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city FROM zones GROUP BY zn_city HAVING MAX(zn_id + (SELECT ct_id FROM cities)) > 0
+
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(CASE WHEN zn_id > 100 THEN zn_id * (SELECT ct_id FROM cities) ELSE 0 END) AS s FROM zones
+
+statement error More than one row returned by a subquery used as an expression
+SELECT MAX(COALESCE(ct_id, (SELECT zn_id FROM zones))) AS m FROM cities
+
+# In ORDER BY: over a key of a grouped block, and in a global aggregate's ORDER BY, whose one row needs no sort but
+# whose key both engines still compute (the value alone, and inside an aggregate's argument).
+
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city FROM zones GROUP BY zn_city ORDER BY zn_city + (SELECT ct_id FROM cities)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) AS c FROM zones ORDER BY (SELECT zn_id FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips ORDER BY SUM(tr_fare * (SELECT zn_id FROM zones))
+
+# In a block that aggregates inside another block: a derived table, a UNION ALL arm, an IN subquery's select list, a
+# scalar subquery's select list, an EXISTS block's GROUP BY key and its ORDER BY under LIMIT.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT * FROM (SELECT zn_city, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM zones GROUP BY zn_city) d ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT * FROM (SELECT zn_city, MAX(zn_id) + (SELECT ct_id FROM cities) AS m FROM zones GROUP BY zn_city UNION ALL SELECT ct_id, ct_id FROM cities) u ORDER BY 1, 2
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE ct_id IN (SELECT COUNT(*) + (SELECT zn_id FROM zones) FROM zones GROUP BY zn_city) ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, (SELECT COUNT(*) + (SELECT zn_id FROM zones) FROM zones) AS v FROM cities ORDER BY ct_id
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones GROUP BY zn_city + (SELECT zn_id FROM zones)) ORDER BY 1
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT 1 FROM zones GROUP BY zn_city ORDER BY COUNT(*) + (SELECT zn_id FROM zones) LIMIT 1) ORDER BY ct_id
+
+# Overflow of a value next to a column or an aggregate, as both engines raise it: INTEGER multiplication in a HAVING
+# aggregate's argument and SMALLINT addition in a select item's, INTEGER addition in a key, BIGINT addition over
+# COUNT(*), INTEGER multiplication over MAX, INTEGER addition in a grouped ORDER BY, DECIMAL(38,0) addition inside MAX;
+# a WHERE that drops the rows that would overflow answers.
+
+statement error Overflow in multiplication of
+SELECT ct_id % 2 AS g FROM cities GROUP BY 1 HAVING SUM(ct_pop * (SELECT MAX(i32) FROM edge)) > 0
+
+statement error Overflow in addition of
+SELECT id % 2 AS g, SUM(i16 + (SELECT i16 FROM edge WHERE id = 1)) AS s FROM edge WHERE id IN (1, 4) GROUP BY 1
+
+statement error Overflow in addition of
+SELECT i32 + (SELECT MAX(i32) FROM edge) AS k, COUNT(*) AS c FROM edge GROUP BY i32 + (SELECT MAX(i32) FROM edge)
+
+statement error Overflow in addition of
+SELECT COUNT(*) + (SELECT MAX(i64) FROM edge) AS c FROM edge
+
+statement error Overflow in multiplication of
+SELECT id % 2 AS g, MAX(i32) * (SELECT MAX(i32) FROM edge) AS m FROM edge GROUP BY 1
+
+statement error Overflow in addition of
+SELECT id % 2 AS g FROM edge GROUP BY 1 ORDER BY MAX(i32) + (SELECT MAX(i32) FROM edge)
+
+statement error Overflow in addition of
+SELECT MAX(d38_0 + (SELECT MAX(d38_0) FROM decimals)) AS m FROM decimals
+
+query II nosort
+SELECT id % 2 AS g, MAX(i32) * (SELECT MAX(i32) FROM edge) AS m FROM edge WHERE id IN (2, 3, 4) GROUP BY 1 ORDER BY 1
+----
+INTEGER	INTEGER
+0	2147483647
+1	-2147483647
+
+# A value of two columns is a bind error in each new place: a grouped select item, a GROUP BY key, an aggregate's
+# argument.
+
+statement error
+SELECT zn_city, COUNT(*) + (SELECT zn_id, zn_city FROM zones LIMIT 1) AS c FROM zones GROUP BY zn_city
+
+statement error
+SELECT COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT zn_id, zn_city FROM zones LIMIT 1)
+
+statement error
+SELECT SUM(zn_id * (SELECT ct_id, label FROM cities LIMIT 1)) AS s FROM zones
+
+# A column that is not grouped stays a bind error next to a value: the column of a value key read alone (in the select
+# list or ORDER BY), an ungrouped column inside an item or an ORDER BY key that holds a value, a global aggregate's
+# item, a key spelled with its operands swapped, and an ungrouped item that a HAVING reads by its alias.
+
+statement error
+SELECT COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY zn_city
+
+statement error
+SELECT zn_city % 2 + (SELECT MIN(ct_id) FROM cities) AS k, zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city % 2 + (SELECT MIN(ct_id) FROM cities)
+
+statement error
+SELECT zn_city, zn_id + (SELECT MAX(ct_id) FROM cities) AS v FROM zones GROUP BY zn_city
+
+statement error
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city ORDER BY zn_id * (SELECT MIN(ct_id) FROM cities)
+
+statement error
+SELECT zn_id + (SELECT MAX(ct_id) FROM cities) AS v, COUNT(*) AS c FROM zones
+
+statement error
+SELECT (SELECT MIN(ct_id) FROM cities) + ct_id % 2 AS k, COUNT(*) AS c FROM cities GROUP BY ct_id % 2 + (SELECT MIN(ct_id) FROM cities) ORDER BY 1
+
+statement error
+SELECT ct_id + (SELECT MIN(zn_id) FROM zones) AS v, COUNT(*) AS c FROM cities GROUP BY ct_id % 2 HAVING v > 1
+
+# The alias of a value item inside a GROUP BY expression is a bind error in both.
+
+statement error
+SELECT (SELECT MAX(ct_id) FROM cities) AS m, COUNT(*) AS c FROM zones GROUP BY m + 1
+
+# ---- DuckDB only until constant aggregate arguments get a PR (ADR 0041: SUM((q)) exits 4) ----
+
+# A subquery as the whole of an aggregate's argument, or an argument of a value and literals alone: MIN, COUNT
+# DISTINCT, SUM, COUNT of a value of no row, MAX of a NULL, MIN of a VARCHAR, SUM and COUNT of a value times 2, over an
+# empty table, and grouped.
+
+onlyif duckdb
+query I nosort
+SELECT MIN((SELECT MAX(ct_id) FROM cities)) AS m FROM zones
+----
+SMALLINT
+6
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(DISTINCT (SELECT MAX(ct_id) FROM cities)) AS m FROM zones
+----
+BIGINT
+1
+
+onlyif duckdb
+query I nosort
+SELECT SUM((SELECT MAX(ct_id) FROM cities)) AS s FROM zones
+----
+HUGEINT
+240
+
+onlyif duckdb
+query II nosort
+SELECT COUNT((SELECT ct_id FROM cities WHERE ct_id > 99)) AS c, COUNT(*) AS n FROM zones
+----
+BIGINT	BIGINT
+0	40
+
+onlyif duckdb
+query I nosort
+SELECT MAX((SELECT ct_pop FROM cities WHERE ct_id = 4)) AS m FROM zones
+----
+INTEGER
+NULL
+
+onlyif duckdb
+query T nosort
+SELECT MIN((SELECT label FROM cities WHERE ct_id = 2)) AS m FROM zones
+----
+VARCHAR
+harbor
+
+onlyif duckdb
+query I nosort
+SELECT SUM((SELECT MAX(ct_id) FROM cities) * 2) AS s FROM zones
+----
+HUGEINT
+480
+
+onlyif duckdb
+query I nosort
+SELECT COUNT((SELECT MIN(zn_id) FROM zones) * 2) AS c FROM cities
+----
+BIGINT
+6
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(DISTINCT (SELECT MAX(ct_id) FROM cities)) AS c FROM promos
+----
+BIGINT
+0
+
+onlyif duckdb
+query II nosort
+SELECT zn_city, MIN((SELECT MAX(ct_id) FROM cities)) AS m FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	SMALLINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	6
+NULL	6
+
+# A value of two rows as the whole argument fails over an empty table too.
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT MIN((SELECT zn_id FROM zones)) AS m FROM promos
+
+# ---- DuckDB only, for good: a subquery in a grouping-set element (ADR 0041's decision 8) ----
+
+# A value as a ROLLUP element of its own, inside a CUBE element, as a GROUPING SETS set, inside a ROLLUP element.
+
+onlyif duckdb
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city, (SELECT MAX(ct_id) FROM cities)) ORDER BY 1, 2
+----
+SMALLINT	BIGINT
+1	8
+1	8
+2	8
+2	8
+NULL	16
+
+onlyif duckdb
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY CUBE (zn_city + (SELECT MIN(ct_id) FROM cities)) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	16
+2	8
+3	8
+
+onlyif duckdb
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY GROUPING SETS ((zn_city), ((SELECT MAX(ct_id) FROM cities)), ()) ORDER BY 1 NULLS FIRST, 2
+----
+SMALLINT	BIGINT
+NULL	16
+NULL	16
+1	8
+2	8
+
+onlyif duckdb
+query II nosort
+SELECT zn_city * (SELECT MAX(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones WHERE zn_city < 3 GROUP BY ROLLUP (zn_city * (SELECT MAX(ct_id) FROM cities)) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	16
+6	8
+12	8
+
+# ---- DuckDB only until SQ5/SQ13 get a PR (ADR 0041: a correlated value in a block that aggregates exits 4) ----
+
+# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key; and an uncorrelated
+# value over a correlated scalar subquery's aggregate, in a WHERE (a city with no zone counts 0 there).
+
+onlyif duckdb
+query II nosort
+SELECT (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS k, COUNT(*) AS c FROM cities c GROUP BY 1 ORDER BY 1
+----
+BIGINT	BIGINT
+0	1
+7	2
+8	3
+
+onlyif duckdb
+query I nosort
+SELECT SUM(ct_id * (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id)) AS s FROM cities c
+----
+HUGEINT
+113
+
+onlyif duckdb
+query II nosort
+SELECT ct_id, COUNT(*) + (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS n FROM cities c GROUP BY ct_id ORDER BY ct_id
+----
+SMALLINT	BIGINT
+1	9
+2	9
+3	8
+4	8
+5	9
+6	1
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities c WHERE ct_id < (SELECT COUNT(*) - (SELECT MIN(ct_id) FROM cities) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+# ---- DuckDB only until SQ7 gets a PR (ADR 0041: IN (subquery) as a value exits 4) ----
+
+# IN of a subquery in a CASE WHEN: in a select item, and in an aggregate's argument.
+
+onlyif duckdb
+query II nosort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_city < 3) THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
+----
+SMALLINT	INTEGER
+1	1
+2	1
+3	0
+4	0
+5	0
+6	0
+
+onlyif duckdb
+query II nosort
+SELECT zn_city, SUM(CASE WHEN zn_id IN (SELECT ct_id FROM cities) THEN 1 ELSE 0 END) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	HUGEINT
+1	2
+2	1
+3	1
+4	1
+5	1
+9	0
+NULL	0
