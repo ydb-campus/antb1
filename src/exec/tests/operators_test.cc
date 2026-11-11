@@ -18,6 +18,7 @@
 #include "antb1/exec/table_scan.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../part_operators.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -77,6 +78,125 @@ class OperatorsTest : public testing::ExecTest {
   }
 };
 
+struct ScanFinishTrace {
+  std::vector<std::string> events;
+  arrow::Status read = arrow::Status::OK();
+  arrow::Status close = arrow::Status::OK();
+  arrow::Status finish = arrow::Status::OK();
+};
+
+class TracedScanState final : public plan::TableScanState {
+ public:
+  explicit TracedScanState(std::shared_ptr<ScanFinishTrace> trace) : trace_(std::move(trace)) {}
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* /*pool*/) override {
+    EXPECT_EQ(part, 0);
+    trace_->events.emplace_back("finish");
+    return trace_->finish;
+  }
+
+ private:
+  std::shared_ptr<ScanFinishTrace> trace_;
+};
+
+class ScanContextTable final : public plan::Table {
+ public:
+  explicit ScanContextTable(std::shared_ptr<ScanFinishTrace> trace) : trace_(std::move(trace)) {}
+  const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
+  std::optional<int64_t> exact_row_count() const override { return 0; }
+  std::string Describe() const override { return "scan context probe"; }
+  std::shared_ptr<plan::TableScanState> MakeScanState() const override {
+    trace_->events.emplace_back("make");
+    return std::make_shared<TracedScanState>(trace_);
+  }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<plan::ScanContext>& /*context*/) const override {
+    return arrow::Status::NotImplemented("scan context probes do not read rows");
+  }
+
+ private:
+  std::shared_ptr<ScanFinishTrace> trace_;
+  std::shared_ptr<arrow::Schema> schema_ = arrow::schema({});
+};
+
+class ScanContextProbe final : public Operator {
+ public:
+  const std::shared_ptr<arrow::Schema>& output_schema() const override { return table_.schema(); }
+  arrow::Status Open(ExecContext& ctx) override {
+    trace_->events.emplace_back("open");
+    contexts_.push_back(ctx.scans);
+    EXPECT_EQ(PartContext(ctx).scans, ctx.scans);
+    ARROW_ASSIGN_OR_RAISE(const auto state, ctx.scans->Get(table_));
+    static_cast<void>(state);
+    return arrow::Status::OK();
+  }
+  arrow::Result<Batch> Next() override {
+    ARROW_RETURN_NOT_OK(trace_->read);
+    return Batch{};
+  }
+  arrow::Status Close() override {
+    trace_->events.emplace_back("close");
+    return trace_->close;
+  }
+
+  const std::vector<std::shared_ptr<plan::ScanContext>>& contexts() const { return contexts_; }
+  ScanFinishTrace& trace() { return *trace_; }
+
+ private:
+  std::shared_ptr<ScanFinishTrace> trace_ = std::make_shared<ScanFinishTrace>();
+  ScanContextTable table_{trace_};
+  std::vector<std::shared_ptr<plan::ScanContext>> contexts_;
+};
+
+TEST_F(OperatorsTest, DrainUsesFreshScanContextWithoutChangingTheCaller) {
+  const auto caller_scope = std::make_shared<plan::ScanContext>();
+  ExecContext ctx{.scans = caller_scope};
+  ScanContextProbe probe;
+  ASSERT_TRUE(Drain(probe, ctx).ok());
+  ASSERT_TRUE(Drain(probe, ctx).ok());
+  ASSERT_EQ(probe.contexts().size(), 2);
+  EXPECT_NE(probe.contexts()[0], nullptr);
+  EXPECT_NE(probe.contexts()[1], nullptr);
+  EXPECT_NE(probe.contexts()[0], probe.contexts()[1]);
+  EXPECT_NE(probe.contexts()[0], caller_scope);
+  EXPECT_NE(probe.contexts()[1], caller_scope);
+  EXPECT_EQ(ctx.scans, caller_scope);
+  EXPECT_EQ(probe.trace().events, (std::vector<std::string>{"open", "make", "close", "finish",
+                                                            "open", "make", "close", "finish"}));
+}
+
+TEST_F(OperatorsTest, DrainRejectsRowsWhenFinalScanValidationFails) {
+  ScanContextProbe probe;
+  probe.trace().finish = arrow::Status::IOError("the input changed before completion");
+  ExecContext ctx;
+  const auto failed = Drain(probe, ctx);
+  EXPECT_TRUE(failed.status().IsIOError());
+  EXPECT_EQ(failed.status().message(), "the input changed before completion");
+  EXPECT_EQ(probe.trace().events, (std::vector<std::string>{"open", "make", "close", "finish"}));
+  probe.trace().finish = arrow::Status::OK();
+  ASSERT_TRUE(Drain(probe, ctx).ok());
+  ASSERT_EQ(probe.contexts().size(), 2);
+  EXPECT_NE(probe.contexts()[0], probe.contexts()[1]);
+}
+
+TEST_F(OperatorsTest, DrainPreservesReadAndCloseErrorsWithoutFinalValidation) {
+  for (const bool read_fails : {false, true}) {
+    ScanContextProbe probe;
+    probe.trace().close = arrow::Status::IOError("close failed");
+    probe.trace().finish = arrow::Status::IOError("finish failed");
+    if (read_fails) {
+      probe.trace().read = arrow::Status::IOError("read failed");
+    }
+    ExecContext ctx;
+    const auto failed = Drain(probe, ctx);
+    EXPECT_TRUE(failed.status().IsIOError());
+    EXPECT_EQ(failed.status().message(), read_fails ? "read failed" : "close failed");
+    EXPECT_EQ(probe.trace().events, (std::vector<std::string>{"open", "make", "close"}));
+  }
+}
+
 TEST_F(OperatorsTest, TableScanReadsTheFieldsInBatches) {
   const auto table = Table();
   TableScanOperator scan(table, {1, 0});
@@ -128,7 +248,9 @@ TEST_F(OperatorsTest, FilteredNarrowScanNumbersTheRowsThatPass) {
       /*split=*/true);
   const LateScan late{.late = {false, true}, .row_id = 1, .ordinal = 3};
   const auto x = testing::Column(0, "x", plan::LogicalType::kBigInt);
+  split->set_track_scan_contexts(true);
   for (const int64_t batch_size : {1, 2, 64}) {
+    split->ClearScanCalls();
     TableScanOperator narrow(split, {0, 1}, 0, late,
                              {Compare(x, plan::CompareOp::kGe, testing::BigInt(3))});
     const auto rows = Run(narrow, batch_size);
@@ -137,6 +259,9 @@ TEST_F(OperatorsTest, FilteredNarrowScanNumbersTheRowsThatPass) {
     EXPECT_EQ(Int64Column(*rows, 1),
               (std::vector<std::optional<int64_t>>{RowId(3, 2), RowId(3, 3)}))
         << "batch_size=" << batch_size;
+    const auto calls = split->scan_calls();
+    ASSERT_EQ(calls.size(), 1);
+    EXPECT_NE(calls.front().context, nullptr);
   }
   EXPECT_EQ(split->filtered_scans(), 3);
   TableScanOperator on_late(
@@ -162,14 +287,15 @@ class PreparedFilteredTable final : public plan::Table {
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
-      arrow::MemoryPool* /*pool*/) const override {
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<plan::ScanContext>& /*context*/) const override {
     return arrow::Status::NotImplemented("prepared batches are for filtered scans");
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
       arrow::MemoryPool* /*pool*/, const std::shared_ptr<const plan::ScanFilter>& /*filter*/,
-      bool /*positions*/, int /*returned*/) const override {
+      bool /*positions*/, int /*returned*/,
+      const std::shared_ptr<plan::ScanContext>& /*context*/) const override {
     return std::make_unique<testing::VectorReader>(batches_.front()->schema(), batches_);
   }
 

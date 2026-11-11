@@ -1,11 +1,17 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <arrow/memory_pool.h>
@@ -17,6 +23,37 @@
 #include "antb1/common/int128.h"
 
 namespace antb1::plan {
+
+class ScanContext;
+
+// Table-specific state shared by the scans of one execution. It must not retain a query's
+// memory pool or open files: readers own those resources and may outlive their context.
+class TableScanState {
+ public:
+  virtual ~TableScanState() = default;
+  // Independent final checks, called after all readers/workers have closed and before their rows
+  // become a successful result. Different pieces may run concurrently. Any piece, including an
+  // already successful one, must be safe to repeat after another piece runs out of memory.
+  // Retain no allocation made from the pool after the call returns.
+  virtual int64_t num_finish_parts() const { return 1; }
+  virtual arrow::Status FinishPart(int64_t part, arrow::MemoryPool* /*pool*/) {
+    return part == 0 ? arrow::Status::OK()
+                     : arrow::Status::Invalid("finish of part ", part, " of a scan with 1 part");
+  }
+
+  // Direct callers use serial validation. The executor can schedule the same pieces on its
+  // bounded query executor, including a serial retry when parallel checks run out of memory.
+  arrow::Status Finish(arrow::MemoryPool* pool) {
+    const int64_t parts = num_finish_parts();
+    if (parts < 0) {
+      return arrow::Status::Invalid("negative number of scan finish parts: ", parts);
+    }
+    for (int64_t part = 0; part < parts; ++part) {
+      ARROW_RETURN_NOT_OK(FinishPart(part, pool));
+    }
+    return arrow::Status::OK();
+  }
+};
 
 // What a part's footer says about one integer-valued column (integers, USMALLINT, DATE as days
 // since 1970-01-01), for skipping parts that cannot hold a matching row.
@@ -91,13 +128,19 @@ class Table {
   // Exact row count without scanning (e.g. from Parquet footers), if known.
   virtual std::optional<int64_t> exact_row_count() const = 0;
 
+  // Called once per table in a ScanContext, before any of its readers use the returned state.
+  // Tables without shared scan preparation need no state. This creates state only, without
+  // reading a file: a pruned part must not open or validate its input.
+  virtual std::shared_ptr<TableScanState> MakeScanState() const { return nullptr; }
+
   // Scans the given top-level fields (indices into schema()) in order; batches have at most
   // batch_size rows and columns typed as in schema(). Their buffers are allocated from `pool`
   // (the query's memory budget).
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Scan(
       const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool = arrow::default_memory_pool()) const {
-    return DoScan(fields, batch_size, pool);
+      arrow::MemoryPool* pool = arrow::default_memory_pool(),
+      const std::shared_ptr<ScanContext>& context = nullptr) const {
+    return DoScan(fields, batch_size, pool, context);
   }
 
   // The table split into parts, the units of parallel work (ADR 0013): scanning parts 0 ..
@@ -115,8 +158,18 @@ class Table {
   // for a part out of range.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool = arrow::default_memory_pool()) const {
-    return DoScanPart(part, fields, batch_size, pool);
+      arrow::MemoryPool* pool = arrow::default_memory_pool(),
+      const std::shared_ptr<ScanContext>& context = nullptr) const {
+    return DoScanPart(part, fields, batch_size, pool, context);
+  }
+
+  // Preserve the original explicit-null-filter call when the context overload is also viable.
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(int64_t part,
+                                                                    const std::vector<int>& fields,
+                                                                    int64_t batch_size,
+                                                                    arrow::MemoryPool* pool,
+                                                                    std::nullptr_t) const {
+    return DoScanPart(part, fields, batch_size, pool, nullptr);
   }
 
   // Whether ScanPart can apply a ScanFilter while it scans these top-level fields.
@@ -143,7 +196,8 @@ class Table {
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ScanPart(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
       const std::shared_ptr<const ScanFilter>& filter, bool positions = false,
-      std::optional<int> returned = std::nullopt) const {
+      std::optional<int> returned = std::nullopt,
+      const std::shared_ptr<ScanContext>& context = nullptr) const {
     if (returned.has_value() && (*returned < 0 || std::cmp_greater(*returned, fields.size()))) {
       return arrow::Status::Invalid("a scan returns ", *returned, " of ", fields.size(), " fields");
     }
@@ -154,10 +208,10 @@ class Table {
       if (returned.has_value() && std::cmp_less(*returned, fields.size())) {
         return arrow::Status::Invalid("a scan reads a field it does not return only to filter on");
       }
-      return DoScanPart(part, fields, batch_size, pool);
+      return DoScanPart(part, fields, batch_size, pool, context);
     }
     return DoScanPartFiltered(part, fields, batch_size, pool, filter, positions,
-                              returned.value_or(static_cast<int>(fields.size())));
+                              returned.value_or(static_cast<int>(fields.size())), context);
   }
 
   // The exact statistics of top-level field `field` in part `part`, if known and integer-valued;
@@ -196,22 +250,77 @@ class Table {
  protected:
   // Scan and ScanPart. A table that does not split itself keeps the default DoScanPart.
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const = 0;
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<ScanContext>& context) const = 0;
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool) const {
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<ScanContext>& context) const {
     if (part != 0) {
       return arrow::Status::Invalid("scan of part ", part, " of a table with 1 part");
     }
-    return DoScan(fields, batch_size, pool);
+    return DoScan(fields, batch_size, pool, context);
   }
   // ScanPart with a filter, for tables that support it.
   virtual arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t /*part*/, const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
       arrow::MemoryPool* /*pool*/, const std::shared_ptr<const ScanFilter>& /*filter*/,
-      bool /*positions*/, int /*returned*/) const {
+      bool /*positions*/, int /*returned*/, const std::shared_ptr<ScanContext>& /*context*/) const {
     return arrow::Status::NotImplemented("this table cannot filter while it scans");
   }
+};
+
+// A fresh context belongs to one execution, shared by its ordinary, filtered and late scans.
+// Without a context each Table scan performs its own preparation. A context must not be reused
+// for another execution: external files are validated again even when a session reuses tables.
+// Call Finish after closing every reader, before exposing a successful result. Shared preparation
+// may use cheaper checks between its first validation and this final validation.
+// Tables referenced here must outlive the context; their operators already own them during a run.
+class ScanContext {
+ public:
+  // A runner must finish/join every task before returning, including on failure. It must preserve
+  // part-order errors and use the supplied pool. An empty runner validates serially.
+  using FinishRunner = std::function<arrow::Status(TableScanState&, arrow::MemoryPool*)>;
+
+  arrow::Result<std::shared_ptr<TableScanState>> Get(const Table& table) {
+    try {
+      const std::scoped_lock lock(mutex_);
+      const auto found = states_.find(&table);
+      if (found != states_.end()) {
+        return found->second;
+      }
+      auto state = table.MakeScanState();
+      states_.emplace(&table, state);
+      return state;
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory preparing a table scan");
+    }
+  }
+
+  arrow::Status Finish(arrow::MemoryPool* pool, const FinishRunner& runner = {}) {
+    try {
+      std::vector<std::shared_ptr<TableScanState>> states;
+      {
+        const std::scoped_lock lock(mutex_);
+        states.reserve(states_.size());
+        for (const auto& [table, state] : states_) {
+          static_cast<void>(table);
+          if (state != nullptr) {
+            states.push_back(state);
+          }
+        }
+      }
+      for (const auto& state : states) {
+        ARROW_RETURN_NOT_OK(runner ? runner(*state, pool) : state->Finish(pool));
+      }
+      return arrow::Status::OK();
+    } catch (const std::bad_alloc&) {
+      return arrow::Status::OutOfMemory("out of memory validating completed table scans");
+    }
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<const Table*, std::shared_ptr<TableScanState>> states_;
 };
 
 }  // namespace antb1::plan

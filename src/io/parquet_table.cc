@@ -1,6 +1,7 @@
 #include "antb1/io/parquet_table.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -8,12 +9,14 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -36,9 +39,117 @@
 
 #include "filtered_scan.h"
 #include "scan_segment.h"
+#include <sys/stat.h>
 
 namespace antb1::io {
+
+// No file handle or pool-owned buffer survives validation. Each part opens its own descriptor
+// for independent column reads, while this small state belongs to the execution's ScanContext.
+struct FileValidation {
+  std::mutex mutex;
+  std::optional<struct stat> version;
+};
+
 namespace {
+
+struct ParquetScanState final : public plan::TableScanState {
+  ParquetScanState(const std::vector<std::string>& paths, const std::vector<int64_t>& bytes,
+                   const std::vector<std::shared_ptr<arrow::Buffer>>& footers) {
+    files.reserve(paths.size());
+    for (std::size_t file = 0; file < paths.size(); ++file) {
+      files.push_back(Segment{.path = paths[file],
+                              .metadata = nullptr,
+                              .bytes = bytes[file],
+                              .footer = footers[file],
+                              .row_groups = {},
+                              .validation = std::make_shared<FileValidation>()});
+    }
+  }
+
+  int64_t num_finish_parts() const override { return Narrow<int64_t>(files.size()); }
+
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* pool) override {
+    if (part < 0 || part >= num_finish_parts()) {
+      return arrow::Status::Invalid("final validation of file ", part, " of a table with ",
+                                    num_finish_parts(), " files");
+    }
+    const Segment& file = files[Narrow<std::size_t>(part)];
+    const std::scoped_lock lock(file.validation->mutex);
+    if (!file.validation->version.has_value()) {
+      return arrow::Status::OK();  // Pruned/unused files must not be opened here.
+    }
+    // Timestamp granularity can hide an in-place rewrite within the execution. Compare the
+    // exact footer again before the result is returned, independently of the cached identity.
+    Segment check = file;
+    check.validation.reset();
+    const auto input = OpenSegmentFile(check, pool);
+    if (!input.ok()) {
+      if (input.status().IsOutOfMemory()) {
+        return input.status();
+      }
+      return arrow::Status::IOError("cannot validate Parquet file '", file.path,
+                                    "' at the end of the scan: ", input.status().message());
+    }
+    return arrow::Status::OK();
+  }
+
+  std::vector<Segment> files;
+};
+
+arrow::Result<std::shared_ptr<FileValidation>> ValidationOf(
+    const std::shared_ptr<plan::ScanContext>& context, const ParquetTable& table,
+    std::size_t file) {
+  if (context == nullptr) {
+    return nullptr;
+  }
+  ARROW_ASSIGN_OR_RAISE(auto state, context->Get(table));
+  return std::static_pointer_cast<ParquetScanState>(state)->files.at(file).validation;
+}
+
+arrow::Result<struct stat> FileVersion(const arrow::io::ReadableFile& file) {
+  struct stat version{};
+  int result = 0;
+  do {
+    result = ::fstat(file.file_descriptor(), &version);
+  } while (result != 0 && errno == EINTR);
+  if (result != 0) {
+    return arrow::Status::IOError("cannot inspect an open Parquet file: ",
+                                  std::error_code(errno, std::generic_category()).message());
+  }
+  return version;
+}
+
+bool SameFileVersion(const struct stat& left, const struct stat& right) {
+#ifdef __APPLE__
+  const auto& left_modified = left.st_mtimespec;
+  const auto& right_modified = right.st_mtimespec;
+  const auto& left_changed = left.st_ctimespec;
+  const auto& right_changed = right.st_ctimespec;
+#else
+  const auto& left_modified = left.st_mtim;
+  const auto& right_modified = right.st_mtim;
+  const auto& left_changed = left.st_ctim;
+  const auto& right_changed = right.st_ctim;
+#endif
+  return left.st_dev == right.st_dev && left.st_ino == right.st_ino &&
+         left.st_size == right.st_size && left_modified.tv_sec == right_modified.tv_sec &&
+         left_modified.tv_nsec == right_modified.tv_nsec &&
+         left_changed.tv_sec == right_changed.tv_sec &&
+         left_changed.tv_nsec == right_changed.tv_nsec;
+}
+
+arrow::Status CheckFooter(arrow::io::ReadableFile& input, const Segment& segment, int64_t size) {
+  if (size != segment.bytes) {
+    return arrow::Status::IOError("the file changed after it was opened (", size, " bytes, was ",
+                                  segment.bytes, ")");
+  }
+  ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> footer,
+                        input.ReadAt(size - segment.footer->size(), segment.footer->size()));
+  if (!footer->Equals(*segment.footer)) {
+    return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
+  }
+  return arrow::Status::OK();
+}
 
 struct FileInfo {
   std::shared_ptr<arrow::Schema> schema;
@@ -666,16 +777,29 @@ std::optional<Int128> IntegerOf(const arrow::Scalar& scalar) {
 arrow::Result<std::shared_ptr<arrow::io::ReadableFile>> OpenSegmentFile(const Segment& segment,
                                                                         arrow::MemoryPool* pool) {
   ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(segment.path, pool));
-  ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
-  if (size != segment.bytes) {
-    return arrow::Status::IOError("the file changed after it was opened (", size, " bytes, was ",
-                                  segment.bytes, ")");
+  if (segment.validation == nullptr) {
+    ARROW_ASSIGN_OR_RAISE(const int64_t size, input->GetSize());
+    ARROW_RETURN_NOT_OK(CheckFooter(*input, segment, size));
+    return input;
   }
-  ARROW_ASSIGN_OR_RAISE(const std::shared_ptr<arrow::Buffer> footer,
-                        input->ReadAt(size - segment.footer->size(), segment.footer->size()));
-  if (!footer->Equals(*segment.footer)) {
-    return arrow::Status::IOError("the file changed after it was opened (its footer differs)");
+  // Only the first part reads the whole footer. The lock serializes validation, not column
+  // reads. Inspect this descriptor rather than the path, which may have been replaced since open.
+  const std::scoped_lock lock(segment.validation->mutex);
+  ARROW_ASSIGN_OR_RAISE(const auto before, FileVersion(*input));
+  if (before.st_size != segment.bytes) {
+    return arrow::Status::IOError("the file changed after it was opened (", before.st_size,
+                                  " bytes, was ", segment.bytes, ")");
   }
+  if (segment.validation->version.has_value() &&
+      SameFileVersion(before, *segment.validation->version)) {
+    return input;
+  }
+  ARROW_RETURN_NOT_OK(CheckFooter(*input, segment, segment.bytes));
+  ARROW_ASSIGN_OR_RAISE(const auto after, FileVersion(*input));
+  if (!SameFileVersion(before, after)) {
+    return arrow::Status::IOError("the file changed while its footer was being checked");
+  }
+  segment.validation->version = after;
   return input;
 }
 
@@ -737,18 +861,25 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
   return table;
 }
 
+std::shared_ptr<plan::TableScanState> ParquetTable::MakeScanState() const {
+  return std::make_shared<ParquetScanState>(files_, file_bytes_, footers_);
+}
+
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScan(
-    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const {
+    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+    const std::shared_ptr<plan::ScanContext>& context) const {
   std::vector<Segment> segments;
   segments.reserve(files_.size());
   for (std::size_t file = 0; file < files_.size(); ++file) {
+    ARROW_ASSIGN_OR_RAISE(auto validation, ValidationOf(context, *this, file));
     std::vector<int> row_groups(Narrow<std::size_t>(metadata_[file]->num_row_groups()));
     std::ranges::iota(row_groups, 0);
     segments.push_back(Segment{.path = files_[file],
                                .metadata = metadata_[file],
                                .bytes = file_bytes_[file],
                                .footer = footers_[file],
-                               .row_groups = std::move(row_groups)});
+                               .row_groups = std::move(row_groups),
+                               .validation = std::move(validation)});
   }
   return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size, pool);
 }
@@ -841,19 +972,21 @@ std::optional<int64_t> ParquetTable::part_distinct_count(int64_t part, int field
 }
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPart(
-    int64_t part, const std::vector<int>& fields, int64_t batch_size,
-    arrow::MemoryPool* pool) const {
+    int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+    const std::shared_ptr<plan::ScanContext>& context) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
   }
   const Part& p = parts_[Narrow<std::size_t>(part)];
+  ARROW_ASSIGN_OR_RAISE(auto validation, ValidationOf(context, *this, p.file));
   std::vector<Segment> segments;
   segments.push_back(Segment{.path = files_[p.file],
                              .metadata = metadata_[p.file],
                              .bytes = file_bytes_[p.file],
                              .footer = footers_[p.file],
-                             .row_groups = std::vector<int>{p.row_group}});
+                             .row_groups = std::vector<int>{p.row_group},
+                             .validation = std::move(validation)});
   return MakeScan(std::move(segments), *storage_schema_, *schema_, fields, batch_size, pool);
 }
 
@@ -871,7 +1004,8 @@ bool ParquetTable::supports_scan_filter(const std::vector<int>& fields) const {
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPartFiltered(
     int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-    const std::shared_ptr<const plan::ScanFilter>& filter, bool positions, int returned) const {
+    const std::shared_ptr<const plan::ScanFilter>& filter, bool positions, int returned,
+    const std::shared_ptr<plan::ScanContext>& context) const {
   if (part < 0 || part >= num_parts()) {
     return arrow::Status::Invalid("scan of part ", part, " of a table with ", num_parts(),
                                   " parts");
@@ -898,11 +1032,13 @@ arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> ParquetTable::DoScanPar
       engine_fields.push_back(schema_->field(field));
     }
   }
+  ARROW_ASSIGN_OR_RAISE(auto validation, ValidationOf(context, *this, p.file));
   return MakeFilteredScan(Segment{.path = files_[p.file],
                                   .metadata = metadata_[p.file],
                                   .bytes = file_bytes_[p.file],
                                   .footer = footers_[p.file],
-                                  .row_groups = std::vector<int>{p.row_group}},
+                                  .row_groups = std::vector<int>{p.row_group},
+                                  .validation = std::move(validation)},
                           std::move(columns), arrow::schema(std::move(engine_fields)), batch_size,
                           pool, filter, positions, returned);
 }

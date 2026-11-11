@@ -446,7 +446,7 @@ std::shared_ptr<arrow::Schema> SchemaOf(const PartPipeline& pipeline) {
 // The rows the probe pipeline gives in part order (a part union), with `builds` prepared first.
 arrow::Result<std::shared_ptr<arrow::Table>> RunUnion(
     const PartPipeline& pipeline, int64_t parts, std::vector<std::shared_ptr<JoinBuild>> builds,
-    ExecContext ctx) {
+    const ExecContext& ctx) {
   BuildsFirstOperator op(
       std::make_unique<PartUnionOperator>(pipeline, parts, SchemaOf(pipeline), std::nullopt),
       std::move(builds));
@@ -1128,8 +1128,7 @@ TEST_F(HashJoinTest, EmptyBuildOpensNoProbeInput) {
         const ScriptedSource& probed = *source;
         auto join = MakeJoin(std::move(source), empty(), {0}, /*prepares=*/true);
         ASSERT_NE(join, nullptr);
-        ExecContext run = ctx;
-        auto result = Drain(*join, run);
+        auto result = Drain(*join, ctx);
         ASSERT_TRUE(result.ok()) << result.status().ToString();
         EXPECT_EQ((*result)->num_rows(), 0);
         EXPECT_EQ(probed.opens(), 0);
@@ -1142,8 +1141,7 @@ TEST_F(HashJoinTest, EmptyBuildOpensNoProbeInput) {
             std::make_unique<PartAggregateOperator>(ProbePipeline(probe_table, build, {0}),
                                                     probe_table->num_parts(), 4, count_star),
             {build});
-        ExecContext run = ctx;
-        auto result = Drain(op, run);
+        auto result = Drain(op, ctx);
         ASSERT_TRUE(result.ok()) << result.status().ToString();
         EXPECT_EQ(testing::SingleInt64(**result), 0);
         EXPECT_TRUE(probe_table->scanned_parts().empty());
@@ -1165,8 +1163,7 @@ TEST_F(HashJoinTest, EmptyBuildOpensNoProbeInput) {
           HashJoinOperator::Make(std::move(first), outer, {2}, BuildSide::kRight, {}, false));
       return second;
     };
-    ExecContext run = ctx;
-    auto result = RunUnion(chain, probe_table->num_parts(), {outer, inner}, run);
+    auto result = RunUnion(chain, probe_table->num_parts(), {outer, inner}, ctx);
     ASSERT_TRUE(result.ok()) << result.status().ToString();
     EXPECT_EQ((*result)->num_rows(), 0);
     EXPECT_TRUE(inner_table->scanned_parts().empty());
@@ -3722,7 +3719,8 @@ plan::LogicalPlan PlanOf(plan::LogicalNodePtr root, std::size_t width) {
 }
 
 // The rows of `plan`, run with `ctx` and profiled into `profile` (nullptr: not profiled).
-arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& plan, ExecContext ctx,
+arrow::Result<std::shared_ptr<arrow::Table>> RunPlan(const plan::LogicalPlan& plan,
+                                                     const ExecContext& ctx,
                                                      ProfileNode* profile = nullptr) {
   ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, BuildPhysicalPlan(plan, profile));
   return Drain(*op, ctx);
@@ -3798,14 +3796,15 @@ class LoggedTable final : public plan::Table {
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const override {
-    return table_->Scan(fields, batch_size, pool);
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
+    return table_->Scan(fields, batch_size, pool, context);
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool) const override {
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
     log_->Add(name_);
-    return table_->ScanPart(part, fields, batch_size, pool);
+    return table_->ScanPart(part, fields, batch_size, pool, context);
   }
 
  private:

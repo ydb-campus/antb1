@@ -28,6 +28,7 @@
 #include <arrow/util/thread_pool.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
 #include "antb1/exec/memory_budget.h"
@@ -61,6 +62,236 @@ std::shared_ptr<arrow::internal::ThreadPool> Pool() {
   auto pool = arrow::internal::ThreadPool::Make(kThreads);
   EXPECT_TRUE(pool.ok()) << pool.status().ToString();
   return *pool;
+}
+
+// A table whose final checks behave like independent file validations. The counters are inspected
+// as soon as Drain returns, before destroying the table or waiting for the executor to go idle.
+struct FinalValidationCalls {
+  explicit FinalValidationCalls(std::size_t parts) : starts(parts), ends(parts) {}
+  std::vector<std::atomic<int>> starts;
+  std::vector<std::atomic<int>> ends;
+};
+
+class FinalValidationState final : public plan::TableScanState {
+ public:
+  using Check = std::function<arrow::Status(int64_t, arrow::MemoryPool*)>;
+
+  FinalValidationState(int64_t parts, std::shared_ptr<FinalValidationCalls> calls, Check check)
+      : parts_(parts), calls_(std::move(calls)), check_(std::move(check)) {}
+
+  int64_t num_finish_parts() const override { return parts_; }
+  arrow::Status FinishPart(int64_t part, arrow::MemoryPool* pool) override {
+    const auto at = Narrow<std::size_t>(part);
+    ++calls_->starts.at(at);
+    const arrow::Status status = check_(part, pool);
+    ++calls_->ends.at(at);
+    return status;
+  }
+
+ private:
+  int64_t parts_;
+  std::shared_ptr<FinalValidationCalls> calls_;
+  Check check_;
+};
+
+class FinalValidationTable final : public plan::Table {
+ public:
+  explicit FinalValidationTable(std::shared_ptr<plan::TableScanState> state)
+      : state_(std::move(state)) {}
+
+  const std::shared_ptr<arrow::Schema>& schema() const override { return rows_.schema(); }
+  std::optional<int64_t> exact_row_count() const override { return rows_.exact_row_count(); }
+  std::string Describe() const override { return "final validation probe"; }
+  std::shared_ptr<plan::TableScanState> MakeScanState() const override { return state_; }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
+    ARROW_ASSIGN_OR_RAISE(const auto state, context->Get(*this));
+    static_cast<void>(state);
+    return rows_.Scan(fields, batch_size, pool);
+  }
+
+ private:
+  std::shared_ptr<plan::TableScanState> state_;
+  MemoryTable rows_{arrow::schema({arrow::field("x", arrow::int64())}), {}};
+};
+
+TEST(ScanFinishTest, UsesQueryWorkersAndCompletesBeforeDrainReturns) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    for (const int64_t parts : {1, 11, 257}) {
+      SCOPED_TRACE(parts);
+      const auto calls = std::make_shared<FinalValidationCalls>(Narrow<std::size_t>(parts));
+      std::atomic<int> on_worker = 0;
+      std::atomic<int> on_caller = 0;
+      const auto state = std::make_shared<FinalValidationState>(
+          parts, calls, [&](int64_t /*part*/, arrow::MemoryPool* memory) {
+            if (pool->OwnsThisThread()) {
+              ++on_worker;
+            } else {
+              ++on_caller;
+            }
+            // A final validation allocates from the query's pool and releases the buffer before
+            // publishing its result. None of these buffers may survive Drain.
+            const auto buffer = arrow::AllocateBuffer(4096, memory);
+            return buffer.status();
+          });
+      const auto table = std::make_shared<FinalValidationTable>(state);
+      TableScanOperator scan(table, {0});
+      MemoryBudget memory(std::nullopt);
+      const ExecContext ctx{.pool = &memory,
+                            .executor = executor,
+                            .threads = executor == nullptr ? 1 : kThreads,
+                            .budget = &memory};
+      const auto result = Drain(scan, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      for (std::size_t part = 0; part < calls->starts.size(); ++part) {
+        EXPECT_EQ(calls->starts[part].load(), 1) << part;
+        EXPECT_EQ(calls->ends[part].load(), 1) << part;
+      }
+      const bool parallel = executor != nullptr && parts > 1;
+      EXPECT_EQ(on_worker.load(), parallel ? parts : 0);
+      EXPECT_EQ(on_caller.load(), parallel ? 0 : parts);
+      EXPECT_EQ(memory.bytes_allocated(), 0);
+    }
+  }
+}
+
+TEST(ScanFinishTest, FirstFailureInPartOrderWaitsForOtherStartedChecks) {
+  const auto pool = Pool();
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    const auto calls = std::make_shared<FinalValidationCalls>(11);
+    const auto state = std::make_shared<FinalValidationState>(
+        11, calls, [](int64_t part, arrow::MemoryPool* memory) -> arrow::Status {
+          ARROW_ASSIGN_OR_RAISE(const auto buffer, arrow::AllocateBuffer(4096, memory));
+          std::memset(buffer->mutable_data(), 1, Narrow<std::size_t>(buffer->size()));
+          if (part == 1 || part == 3) {
+            return arrow::Status::IOError("changed file ", part);
+          }
+          return arrow::Status::OK();
+        });
+    const auto table = std::make_shared<FinalValidationTable>(state);
+    TableScanOperator scan(table, {0});
+    MemoryBudget memory(std::nullopt);
+    const ExecContext ctx{.pool = &memory,
+                          .executor = executor,
+                          .threads = executor == nullptr ? 1 : kThreads,
+                          .budget = &memory};
+    const auto failed = Drain(scan, ctx);
+    EXPECT_TRUE(failed.status().IsIOError());
+    EXPECT_EQ(failed.status().message(), "changed file 1");
+    EXPECT_EQ(calls->starts[1].load(), 1);
+    for (std::size_t part = 0; part < calls->starts.size(); ++part) {
+      EXPECT_EQ(calls->starts[part].load(), calls->ends[part].load()) << part << " still runs";
+    }
+    EXPECT_EQ(memory.bytes_allocated(), 0);
+  }
+}
+
+TEST(ScanFinishTest, WorkerOutOfMemoryRetriesAloneOnTheCaller) {
+  const auto pool = Pool();
+  for (const int64_t parts : {7, 37}) {
+    SCOPED_TRACE(parts);
+    const auto calls = std::make_shared<FinalValidationCalls>(Narrow<std::size_t>(parts));
+    std::atomic<int> active_workers = 0;
+    std::vector<int> caller_checks(Narrow<std::size_t>(parts));
+    const auto state = std::make_shared<FinalValidationState>(
+        parts, calls, [&](int64_t part, arrow::MemoryPool* memory) {
+          const bool worker = pool->OwnsThisThread();
+          if (worker) {
+            ++active_workers;
+          } else {
+            EXPECT_EQ(active_workers.load(), 0) << "the retry must have the budget to itself";
+          }
+          const auto buffer = arrow::AllocateBuffer(4096, memory);
+          if (worker) {
+            --active_workers;
+          } else if (buffer.ok()) {
+            ++caller_checks[Narrow<std::size_t>(part)];
+          }
+          return buffer.status();
+        });
+    const auto table = std::make_shared<FinalValidationTable>(state);
+    TableScanOperator scan(table, {0});
+    MemoryBudget memory(std::nullopt);
+    testing::WorkerFailingPool failing(&memory);
+    const ExecContext ctx{
+        .pool = &failing, .executor = pool.get(), .threads = kThreads, .budget = &memory};
+    const auto result = Drain(scan, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_GT(failing.failures(), 0);
+    EXPECT_EQ(active_workers.load(), 0);
+    for (std::size_t part = 0; part < calls->starts.size(); ++part) {
+      EXPECT_EQ(caller_checks[part], 1) << part;
+      EXPECT_EQ(calls->starts[part].load(), calls->ends[part].load()) << part << " still runs";
+    }
+    EXPECT_EQ(memory.bytes_allocated(), 0);
+  }
+}
+
+TEST(ScanFinishTest, WorkerOutOfMemoryAfterSuccessfulChecksReplaysTheBatch) {
+  const auto pool = Pool();
+  constexpr int64_t kParts = 257;
+  const auto calls = std::make_shared<FinalValidationCalls>(Narrow<std::size_t>(kParts));
+  std::vector<std::atomic<int>> successes(Narrow<std::size_t>(kParts));
+  std::vector<int> caller_checks(Narrow<std::size_t>(kParts));
+  std::atomic<int> active_workers = 0;
+  std::atomic<int> worker_failures = 0;
+  const auto state = std::make_shared<FinalValidationState>(
+      kParts, calls, [&](int64_t part, arrow::MemoryPool* memory) {
+        const bool worker = pool->OwnsThisThread();
+        if (worker) {
+          ++active_workers;
+        } else {
+          EXPECT_EQ(active_workers.load(), 0) << "no worker may retain the retry's budget";
+        }
+        arrow::Status status;
+        {
+          const auto buffer = arrow::AllocateBuffer(4096, memory);
+          status = buffer.status();
+          if (status.ok()) {
+            std::memset((*buffer)->mutable_data(), 1, Narrow<std::size_t>((*buffer)->size()));
+            // Part 0 has already succeeded in this batch. A failed later allocation must cause
+            // the whole batch to run again safely, with no lost final checks.
+            if (worker && part == 1) {
+              ++worker_failures;
+              status = arrow::Status::OutOfMemory("later footer allocation");
+            } else {
+              ++successes[Narrow<std::size_t>(part)];
+              if (!worker) {
+                ++caller_checks[Narrow<std::size_t>(part)];
+              }
+            }
+          }
+        }
+        if (worker) {
+          --active_workers;
+        }
+        return status;
+      });
+  const auto table = std::make_shared<FinalValidationTable>(state);
+  TableScanOperator scan(table, {0});
+  MemoryBudget memory(std::nullopt);
+  const ExecContext ctx{
+      .pool = &memory, .executor = pool.get(), .threads = kThreads, .budget = &memory};
+  const auto result = Drain(scan, ctx);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_EQ(worker_failures.load(), 1);
+  EXPECT_EQ(successes[0].load(), 2) << "the successful prefix must be safe to check again";
+  EXPECT_EQ(caller_checks[0], 1);
+  EXPECT_EQ(caller_checks[1], 1);
+  EXPECT_EQ(active_workers.load(), 0);
+  for (std::size_t part = 0; part < calls->starts.size(); ++part) {
+    EXPECT_GE(successes[part].load(), 1) << part;
+    EXPECT_EQ(calls->starts[part].load(), calls->ends[part].load()) << part << " still runs";
+  }
+  EXPECT_EQ(memory.bytes_allocated(), 0);
 }
 
 // ---- PartScheduler ----
@@ -2546,6 +2777,34 @@ TEST_F(PartOperatorsTest, TopNFetchesLateColumns) {
                              .offset = 0}),
         5);
   };
+  // Both the narrow part scans and their late column fetches share this run's context. A second
+  // run of the same table must get another context, including on the existing parallel executor.
+  const auto observed = WideTable(true);
+  observed->set_track_scan_contexts(true);
+  std::shared_ptr<plan::ScanContext> previous;
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      observed->ClearScanCalls();
+      ASSERT_TRUE(Run(top_of(observed), executor).ok());
+      const auto calls = observed->scan_calls();
+      ASSERT_FALSE(calls.empty());
+      const auto current = calls.front().context;
+      ASSERT_NE(current, nullptr);
+      EXPECT_NE(current, previous);
+      bool saw_early = false;
+      bool saw_late = false;
+      for (const auto& call : calls) {
+        EXPECT_EQ(call.context, current);
+        saw_early = saw_early || call.fields == std::vector<int>{0};
+        saw_late = saw_late || call.fields == std::vector<int>{1};
+      }
+      EXPECT_TRUE(saw_early);
+      EXPECT_TRUE(saw_late);
+      previous = current;
+    }
+  }
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool.get())}) {

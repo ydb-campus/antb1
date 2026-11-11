@@ -62,6 +62,7 @@ class ParquetTable final : public plan::Table {
   [[nodiscard]] bool supports_scan_filter(const std::vector<int>& fields) const override;
   // The sum of the file sizes (total_bytes()).
   std::optional<int64_t> data_size() const override { return total_bytes_; }
+  std::shared_ptr<plan::TableScanState> MakeScanState() const override;
 
   [[nodiscard]] const std::vector<std::string>& files() const { return files_; }
   [[nodiscard]] int64_t total_bytes() const { return total_bytes_; }
@@ -76,19 +77,20 @@ class ParquetTable final : public plan::Table {
   // repeated field or batch_size < 1; IOError when a file cannot be read or changed after Open (its
   // size or footer differs). Pages, decoded columns and conversions are allocated from `pool`.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const override;
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override;
   // ScanPart reads the part's row group as Scan reads a file.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool) const override;
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override;
   // ScanPart with a filter: the row group through Parquet's column readers, the filter's columns
   // first (strings as views into the decoded pages), then only the rows that pass of the first
   // `returned` columns (filtered_scan.h). A field past `returned` is read and filtered on and
   // never copied into a batch.
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions,
-      int returned) const override;
+      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions, int returned,
+      const std::shared_ptr<plan::ScanContext>& context) const override;
 
  private:
   // One row group of one file.
@@ -102,7 +104,11 @@ class ParquetTable final : public plan::Table {
 
   // The footers read at Open are reused by every scan, so a scan never parses a footer and always
   // reads the row groups and types counted at Open; it checks that the file still ends with the
-  // same footer bytes.
+  // same footer bytes. An execution's scan context shares successful validation across parts;
+  // each part still checks the descriptor's identity/size/change timestamps, and a new execution
+  // checks the full footer again. ScanContext::Finish checks every used file's footer before a
+  // result is returned, even when timestamps were unchanged. Files must remain stable while an
+  // execution reads them: these checks are not a transactional snapshot of concurrent writes.
   std::vector<std::string> files_;
   std::vector<std::shared_ptr<parquet::FileMetaData>> metadata_;  // per file
   std::vector<int64_t> file_bytes_;                               // per file

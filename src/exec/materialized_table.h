@@ -59,7 +59,8 @@ class MaterializedTable final : public plan::Table {
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool) const override;
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override;
 
  private:
   std::shared_ptr<arrow::Schema> schema_;
