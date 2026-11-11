@@ -265,16 +265,18 @@ class Scope {
   // Whether column `id` is a binding's column stored as FLOAT (false for a computed column).
   [[nodiscard]] bool StoredAsFloat(ColumnId id) const;
 
-  // Whether this block is binding a condition of WHERE or an inner ON while a subquery's block in
-  // it binds (its binder sets it first). An aggregate of this block's columns written inside that
-  // subquery is then in this block's WHERE, which DuckDB refuses, where one inside a HAVING
-  // subquery is an outer aggregate it answers (ADR 0041's decision 23).
-  void set_binding_condition(bool condition) { binding_condition_ = condition; }
-  [[nodiscard]] bool binding_condition() const { return binding_condition_; }
+  // Where in this block the subquery stands whose block binds now (its binder sets it first). An
+  // aggregate of this block's columns written inside that subquery is then in this block's WHERE
+  // or ON, GROUP BY or an aggregate's argument, which DuckDB refuses with a bind error of each, or
+  // elsewhere (HAVING, the select list, ORDER BY), an outer aggregate it answers (ADR 0041's
+  // decision 23).
+  enum class SubqueryPlace : std::uint8_t { kCondition, kGroupBy, kAggregateArgument, kOther };
+  void set_subquery_place(SubqueryPlace place) { subquery_place_ = place; }
+  [[nodiscard]] SubqueryPlace subquery_place() const { return subquery_place_; }
 
  private:
   std::vector<Binding> bindings_;
-  bool binding_condition_ = false;
+  SubqueryPlace subquery_place_ = SubqueryPlace::kOther;
   const Scope* outer_ = nullptr;
   Visibility outer_visible_;  // of `outer_`, where this block is written
 };

@@ -166,9 +166,10 @@ TEST(ParserTest, VarianceFamily) {
   EXPECT_TRUE(EqualIgnoringSpans(*stmt, *again));
 }
 
-// ADR 0041's decision 23: an aggregate in a WHERE or ON inside a subquery that some HAVING encloses
-// parses, also under a subquery nested in that one: it may be an enclosing block's aggregate, which
-// DuckDB answers, and the binder judges it by the block it belongs to.
+// ADR 0041's decision 23: an aggregate in a WHERE or ON inside a subquery that some HAVING, select
+// list or ORDER BY encloses parses (the select list's and ORDER BY's since SQ2b), also under a
+// subquery nested in that one: it may be an enclosing block's aggregate, which DuckDB answers, and
+// the binder judges it by the block it belongs to.
 TEST(ParserTest, AnAggregateInASubqueryUnderHavingParses) {
   for (const char* sql : {
            "SELECT a FROM events GROUP BY a HAVING (SELECT COUNT(*) FROM events e WHERE e.a < "
@@ -177,6 +178,13 @@ TEST(ParserTest, AnAggregateInASubqueryUnderHavingParses) {
            "e.a = u.a AND e.a < SUM(events.a))",
            "SELECT a FROM events GROUP BY a HAVING COUNT(*) IN (SELECT e.a FROM events e WHERE e.a "
            "< (SELECT MAX(u.a) FROM users u WHERE u.a > SUM(events.a)))",
+           "SELECT (SELECT COUNT(*) FROM events e JOIN users u ON e.a = u.a AND SUM(e.a) > 1) FROM "
+           "events",
+           "SELECT a FROM events ORDER BY (SELECT COUNT(*) FROM users u WHERE u.a < MAX(events.a))",
+           "SELECT (SELECT SUM(u.a * (SELECT COUNT(*) FROM users v WHERE v.a < MAX(events.a))) "
+           "FROM users u) FROM events",
+           "SELECT a FROM events WHERE a < (SELECT (SELECT COUNT(*) FROM users u WHERE u.a > "
+           "SUM(events.a)) FROM users)",
        }) {
     const auto stmt = Parse(sql);
     EXPECT_TRUE(stmt.has_value()) << sql << ": " << stmt.error().message;
@@ -4206,19 +4214,35 @@ INSTANTIATE_TEST_SUITE_P(
                    "aggregate function calls cannot be nested"},
         RejectCase{"AggregateInWhere", "SELECT a FROM events WHERE ^COUNT(*) > 1", kSyntax, 5,
                    "aggregate functions are not allowed in WHERE"},
-        // Inside subqueries that no HAVING encloses, an aggregate in WHERE or ON keeps the parse
-        // error (ADR 0041's decision 23 admits one only under a HAVING subquery); inside a derived
-        // table or a CTE body under a HAVING subquery it is unsupported, since DuckDB may answer
-        // it.
+        // Inside subqueries that no HAVING, select list or ORDER BY encloses (a WHERE's, a GROUP
+        // BY's, an aggregate argument's alone), an aggregate in WHERE or ON keeps the parse error
+        // (ADR 0041's decision 23); inside a derived table or a CTE body under a HAVING,
+        // select-list or ORDER BY subquery it is unsupported, since DuckDB may answer it.
         RejectCase{"AggregateInWhereSubquery",
                    "SELECT a FROM events WHERE a < (SELECT COUNT(*) FROM events e WHERE e.a < "
                    "^SUM(a))",
                    kSyntax, 3, "aggregate functions are not allowed in WHERE"},
+        RejectCase{"AggregateInGroupBySubquery",
+                   "SELECT COUNT(*) FROM events GROUP BY (SELECT COUNT(*) FROM users u WHERE u.a < "
+                   "^MAX(events.a))",
+                   kSyntax, 3, "aggregate functions are not allowed in WHERE"},
+        RejectCase{"AggregateInAggregateArgumentSubquery",
+                   "SELECT SUM(a * (SELECT COUNT(*) FROM users u WHERE u.a < ^MAX(events.a))) FROM "
+                   "events",
+                   kSyntax, 3, "aggregate functions are not allowed in WHERE"},
         RejectCase{
-            "AggregateInSelectSubquery",
-            "SELECT (SELECT COUNT(*) FROM events e JOIN users u ON e.a = u.a AND ^SUM(e.a) > "
-            "1) FROM events",
-            kSyntax, 3, "aggregate functions are not allowed in ON"},
+            "AggregateInDerivedTableUnderSelect",
+            "SELECT a, (SELECT COUNT(*) FROM (SELECT b FROM users WHERE ^MAX(b) > 1) d) FROM "
+            "events",
+            kUnsupported, 3,
+            "an aggregate in the WHERE or ON of a derived table or a CTE inside a subquery in "
+            "HAVING, the select list or ORDER BY"},
+        RejectCase{"AggregateInCteUnderOrderBy",
+                   "SELECT a FROM events ORDER BY (WITH c AS (SELECT b FROM users WHERE ^MAX(b) > "
+                   "1) SELECT COUNT(*) FROM c)",
+                   kUnsupported, 3,
+                   "an aggregate in the WHERE or ON of a derived table or a CTE inside a subquery "
+                   "in HAVING, the select list or ORDER BY"},
         RejectCase{"AggregateInDerivedTableUnderHaving",
                    "SELECT a FROM events GROUP BY a HAVING (SELECT COUNT(*) FROM (SELECT b FROM "
                    "events WHERE ^SUM(b) > 1) AS d) > 0",

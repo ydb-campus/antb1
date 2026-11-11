@@ -2261,6 +2261,50 @@ std::vector<Relation> AllRelations() {
                             Q("SELECT tr_row, tr_pickup FROM trips WHERE tr_row < 300 ORDER BY "
                               "tr_pickup * 5 DESC, tr_row LIMIT 40")},
                  .check = AllEqualInOrder()});
+    // In blocks that aggregate (ADR 0041's SQ2b): a value equals the literal it holds as a GROUP BY
+    // key, in an aggregate's argument (also in HAVING), over aggregates, in a global block and
+    // through a HAVING alias, at any batch size, and in ORDER BY over aggregates it orders as its
+    // literal.
+    const slt::FeatureSet in_groups =
+        SetWith(in_items, kGroupBy, kCountStar, kSum, kArithmetic, kGroupValue);
+    for (const auto& [name, with_value, with_literal] :
+         {std::tuple{
+              "group_key",
+              "SELECT tr_pickup % 3 + ({0}) AS k, COUNT(*) FROM trips GROUP BY tr_pickup % 3 "
+              "+ ({0})",
+              "SELECT tr_pickup % 3 + 5 AS k, COUNT(*) FROM trips GROUP BY tr_pickup % 3 + 5"},
+          std::tuple{"aggregate_argument",
+                     "SELECT tr_pickup, SUM(tr_row * ({0})) FROM trips GROUP BY tr_pickup",
+                     "SELECT tr_pickup, SUM(tr_row * 5) FROM trips GROUP BY tr_pickup"},
+          std::tuple{
+              "over_aggregate",
+              "SELECT tr_pickup, COUNT(*) + ({0}), SUM(tr_row) * ({0}) FROM trips GROUP BY "
+              "tr_pickup",
+              "SELECT tr_pickup, COUNT(*) + 5, SUM(tr_row) * 5 FROM trips GROUP BY tr_pickup"},
+          std::tuple{"global", "SELECT COUNT(*) * ({0}), SUM(tr_row + ({0})) FROM trips",
+                     "SELECT COUNT(*) * 5, SUM(tr_row + 5) FROM trips"},
+          std::tuple{"having",
+                     "SELECT tr_pickup, COUNT(*) + ({0}) AS c FROM trips GROUP BY tr_pickup HAVING "
+                     "c > 74 AND SUM(tr_row * ({0})) > 100000",
+                     "SELECT tr_pickup, COUNT(*) + 5 AS c FROM trips GROUP BY tr_pickup HAVING c > "
+                     "74 AND SUM(tr_row * 5) > 100000"}}) {
+      const std::string value = std::vformat(with_value, std::make_format_args(kOneRow));
+      r.push_back({.name = std::format("group_value_equals_its_literal_{}", name),
+                   .features = SetWith(in_groups, kAlias, kHaving),
+                   .probes = {Q(value), Q(std::string(with_literal)), Q(value, 1), Q(value, 7)},
+                   .check = AllEqual()});
+    }
+    r.push_back(
+        {.name = "order_by_group_value_orders_as_its_literal",
+         .features = SetWith(in_groups, kOrderBy, kLimit),
+         .probes = {Q(std::format(
+                        "SELECT tr_pickup, SUM(tr_row) FROM trips GROUP BY tr_pickup ORDER BY "
+                        "SUM(tr_row) * ({}) DESC, tr_pickup LIMIT 10",
+                        kOneRow)),
+                    Q("SELECT tr_pickup, SUM(tr_row) FROM trips GROUP BY tr_pickup ORDER BY "
+                      "SUM(tr_row) * "
+                      "5 DESC, tr_pickup LIMIT 10")},
+         .check = AllEqualInOrder()});
     // An EXISTS block's select list is dropped, correlated or not: a value there that would fail
     // with more than one row (zones has 40) changes nothing.
     for (const auto& [name, block, star] :

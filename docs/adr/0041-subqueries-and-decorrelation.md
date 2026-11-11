@@ -876,6 +876,53 @@ aggregates, and decision 23's select-list half. SQ2a completes Q9, and the ratch
   adds a select item that holds a value or a CASE over one, from a stream of its own; nine metamorphic relations
   cover select items, ORDER BY and an EXISTS block's dropped list.
 
+## Update (2026-11-11, SQ2b): values in blocks that aggregate and decision 23's select-list half, built
+
+SQ2's second PR. With it SQ2 is built; no query completes, the ratchet stays at 79, and no TPC-H or TPC-DS plan
+changes.
+
+- **Decision 8, as built in blocks that aggregate.** An uncorrelated scalar subquery is a value in a select item or an
+  ORDER BY item over GROUP BY keys and aggregates, in grouped and global blocks; in a GROUP BY key; and in an
+  aggregate's argument that reads a column, in the select list, HAVING and ORDER BY. HAVING reads the alias of a select
+  item that holds one. Still exit 4, each with its own message: a subquery written inside a ROLLUP, CUBE or GROUPING
+  SETS element (refused as a constant there is; a plain key next to them may hold one, and an alias or a position of a
+  value item inside them binds as a key); an aggregate's argument of values and literals alone (`SUM((q))`, until
+  constant aggregate arguments); and a value over the aggregate of a correlated subquery, whose join would stand above
+  the aggregation Path 2 unnests (SQ5 and SQ0 teach it). A correlated subquery or EXISTS over a block's aggregates
+  outside HAVING now names that place in its refusal.
+- **Decision 9, as built.** A GROUP BY key's and an aggregate argument's values join in the per-row slot, below the
+  aggregation; a value over the keys and aggregates joins in HAVING's slot, after it, and so does a HAVING conjunct
+  that reads a value item's alias, as a filter of that slot.
+- **Decision 10: the lookup-only speculation.** The binder's speculative binding of an output expression as a GROUP BY
+  key only looks values up in the memo and never binds or plants one, so `k % 2 + (q)` in the select list, HAVING or
+  ORDER BY matches the key written alike (or named by alias or position), one join below the aggregation; an
+  expression that no key holds plants its value after the aggregation, as SQ1b required. The flag is saved and
+  restored, so that a nested speculation could not end it.
+- **Decision 23's select-list half.** The parser admits an aggregate in a subquery's WHERE or ON where some subquery
+  around it stands in HAVING, the select list or ORDER BY; inside a derived table or a CTE body under such a subquery
+  it is exit 4, as SQ1b made it under HAVING, since DuckDB answers an enclosing block's aggregate there (the plan kept
+  the parse error, on the critique's P2-3, believing DuckDB failed both: its review found it answers the outer one).
+  The binder judges the aggregate by the place in the owning
+  block where the subquery stands (`Scope::SubqueryPlace`): HAVING, the select list or ORDER BY make it an outer
+  aggregate, exit 4 until SQ13; GROUP BY gives DuckDB's "GROUP BY clause cannot contain aggregates!", an aggregate's
+  argument "aggregate function calls cannot be nested", a WHERE or ON "WHERE clause cannot contain aggregates!". A
+  constant argument (`SUM(1)`) there is the binder's bind error now, exit 1 as in DuckDB, since the gate leaves an
+  aggregate in a WHERE or ON to the binder (SQ1b had it at exit 4 under HAVING).
+- **D35** gains three members, in which antb1 answers and DuckDB fails: an aggregate item's value binds with the select
+  list, before WHERE, so its join stands below a WHERE IN; a per-row value (a GROUP BY key's, an aggregate argument's)
+  stands below the aggregation, so below every HAVING IN; and a value over the aggregates binds before HAVING, below a
+  HAVING IN. When that IN turns out empty, the value's error is never reported (the maintainer chose to register such
+  members rather than reorder the joins, 2026-11-11). **D38**, new: a GROUP BY key that holds a subquery is matched only
+  by the subquery written alike as parsed, so another select alias or another case of a name inside it is a bind error
+  where DuckDB answers; a looser comparison that merged two different subqueries would answer wrong. **D37** covers
+  grouped items: DuckDB answers the alias of a key item, or of an aggregate over a value, inside an ORDER BY expression,
+  and refuses one whose item still holds the value.
+- **Decision 28.** `tests/slt/cases/subqueries/group_values.slt` holds about 390 records, written first under `pending
+  SQ2b` and checked against DuckDB, with the D35, D32 and D37 pins and the DuckDB-only boundaries; the generator's
+  Feature `group_value` adds a value block, or a COUNT of a CASE over a condition with values, to a block that
+  aggregates; six metamorphic relations cover keys, arguments, values over aggregates, global blocks, HAVING aliases
+  and ORDER BY.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

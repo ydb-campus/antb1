@@ -1090,10 +1090,11 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     Subqueries, BindErrorTest,
     ::testing::Values(
-        // A select or ORDER BY item's value is answered in a block that does not aggregate (ADR
-        // 0041's SQ2a); in one that does it waits for SQ2b.
-        ErrorCase{"SELECT COUNT(*) + (SELECT COUNT(*) FROM u) FROM t", kUnsupported, "(",
-                  "a subquery's value in a query block that aggregates is not supported"},
+        // A value is answered in every clause of a block (ADR 0041's SQ2) but as an aggregate's
+        // whole argument, which waits for constant aggregate arguments.
+        ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported,
+                  "(SELECT COUNT(*) FROM u)",
+                  "an aggregate of subquery values alone is not supported"},
         // An uncorrelated scalar subquery of any shape is its single value (ADR 0041's SQ4a). A
         // correlated one is ADR 0023's Path 2 only over an aggregate over every row; any other
         // shape needs the single join (SQ4b).
@@ -1322,6 +1323,28 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT COUNT(*) FROM u WHERE "
                   "u.i32 < (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 > SUM(u.i32)))",
                   kBind, "SUM(u.i32)", "WHERE clause cannot contain aggregates!"},
+        // SQ2b: under a subquery in the select list or ORDER BY too, the owner's place deciding:
+        // its select list or ORDER BY an outer aggregate, its GROUP BY or an aggregate's argument
+        // DuckDB's bind error of each.
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < MAX(t.i32)) FROM t", kUnsupported,
+                  "MAX(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY (SELECT COUNT(*) FROM u WHERE u.i32 < "
+                  "MAX(t.i32))",
+                  kUnsupported, "MAX(t.i32)",
+                  "an aggregate of an enclosing query block's columns inside a subquery is not "
+                  "supported"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < MAX(t.i32)) AS n FROM t GROUP BY n",
+                  kBind, "MAX(t.i32)", "GROUP BY clause cannot contain aggregates!"},
+        ErrorCase{"SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 < "
+                  "MAX(u.i16))) FROM u) FROM t",
+                  kBind, "MAX(u.i16)", "aggregate function calls cannot be nested"},
+        ErrorCase{"SELECT i16, (SELECT MIN(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 < "
+                  "MAX(u.i16))) FROM u) FROM t",
+                  kBind, "MAX(u.i16)", "aggregate function calls cannot be nested"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < SUM(1)) FROM t", kBind, "SUM(1)",
+                  "WHERE clause cannot contain aggregates!"},
         // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
         // above this block's joins with the probe's free variable on its outer side, which neither
         // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
@@ -1380,12 +1403,15 @@ INSTANTIATE_TEST_SUITE_P(
     SubqueryPlacements, BindErrorTest,
     ::testing::Values(
         // Clauses that are no conjunct list.
-        ErrorCase{"SELECT i16 FROM t GROUP BY (SELECT COUNT(*) FROM u)", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY (SELECT COUNT(*) FROM u)", kUnsupported,
-                  "(", "a subquery's value in a query block that aggregates is not supported"},
-        ErrorCase{"SELECT SUM((SELECT COUNT(*) FROM u)) FROM t", kUnsupported, "(",
-                  "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY ROLLUP (i16, (SELECT COUNT(*) FROM u))", kUnsupported,
+                  "(", "a subquery inside ROLLUP, CUBE or GROUPING SETS is not supported"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY GROUPING SETS ((i16), (i16 + (SELECT MIN(i16) FROM "
+                  "u)))",
+                  kUnsupported, "(",
+                  "a subquery inside ROLLUP, CUBE or GROUPING SETS is not supported"},
+        ErrorCase{"SELECT COUNT((SELECT COUNT(*) FROM u) * 2) FROM t", kUnsupported,
+                  "(SELECT COUNT(*) FROM u) * 2",
+                  "an aggregate of subquery values alone is not supported"},
         // A BETWEEN's subquery bound is a value (ADR 0041's SQ1); a correlated one waits for SQ5.
         ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u WHERE u.i64 = "
                   "t.i64) AND 10",
@@ -1403,10 +1429,16 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "(", "a scalar subquery is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE s LIKE (SELECT s FROM u)", kUnsupported, "(",
                   "a scalar subquery is not supported"},
-        ErrorCase{"SELECT i16, CASE WHEN (SELECT COUNT(*) FROM u) > 0 THEN 1 ELSE 0 END FROM t "
-                  "GROUP BY i16",
+        // A correlated one over a block's aggregates names the place (ADR 0041's SQ2b).
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 ORDER BY (SELECT MIN(u.i32) FROM u WHERE u.i16 = "
+                  "t.i16)",
                   kUnsupported, "(",
-                  "a subquery's value in a query block that aggregates is not supported"},
+                  "a correlated subquery over a query block's aggregates is not supported"},
+        ErrorCase{
+            "SELECT i16, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16) THEN 1 ELSE 0 "
+            "END FROM t GROUP BY i16",
+            kUnsupported, "EXISTS",
+            "a correlated EXISTS over a query block's aggregates is not supported"},
         // An IN list's values read no column: a subquery's value among literals (ADR 0041's SQ1),
         // typed as DuckDB types the list, all its values in one type.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT COUNT(*) FROM u), i16)", kUnsupported,
@@ -1481,13 +1513,18 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN (subquery) is not supported"},
         ErrorCase{"SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
                   kUnsupported, "IN", "IN (subquery) is not supported"},
-        // A block that aggregates, its EXISTS blocks' included (SQ2b).
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) "
-                  "FROM u)",
-                  kUnsupported, "(",
-                  "a subquery's value in a query block that aggregates is not supported"},
-        ErrorCase{"SELECT DISTINCT i16, (SELECT MIN(i16) FROM u) FROM t GROUP BY i16", kUnsupported,
-                  "(", "a subquery's value in a query block that aggregates is not supported"},
+        // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
+        // not look (SQ5).
+        ErrorCase{
+            "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) + (SELECT MIN(i16) FROM ok) FROM "
+            "u WHERE u.i64 = t.i64)",
+            kUnsupported, "(",
+            "a subquery's value over the aggregate of a correlated subquery is not supported"},
+        ErrorCase{
+            "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64 HAVING "
+            "SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
+            kUnsupported, "(",
+            "a subquery's value over the aggregate of a correlated subquery is not supported"},
         // A compound's own ORDER BY (ADR 0039's X5).
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY (SELECT MIN(i16) FROM "
                   "ok)",
@@ -7207,6 +7244,145 @@ TEST(BinderTest, AnExistsSelectListPlantsNothing) {
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     const std::string text = Explain(Optimized(*plan));
     EXPECT_TRUE(text.contains(computed)) << sql << "\n" << text;
+  }
+}
+
+// ADR 0041's SQ2b: a value in a block that aggregates binds and resolves in every place: select
+// items and ORDER BY over keys and aggregates, GROUP BY keys and their alias and position,
+// aggregate arguments, HAVING over a value item's alias, global blocks and grouping sets with plain
+// elements.
+TEST(BinderTest, GroupValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (
+      const char* sql : {
+          "SELECT i16, COUNT(*) + (SELECT COUNT(*) FROM u) AS c FROM t GROUP BY i16",
+          "SELECT COUNT(*) * (SELECT MIN(i16) FROM u) FROM t",
+          "SELECT i16 + (SELECT MIN(i16) FROM u), SUM(i32) FROM t GROUP BY i16",
+          "SELECT i16, CASE WHEN COUNT(*) > (SELECT COUNT(*) FROM u) THEN i16 ELSE 0 END FROM t "
+          "GROUP BY i16",
+          "SELECT i16, CASE WHEN EXISTS (SELECT 1 FROM u) THEN COUNT(*) ELSE 0 END FROM t GROUP BY "
+          "i16",
+          "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) AS k, COUNT(*) FROM t GROUP BY i16 % 2 + "
+          "(SELECT MIN(i16) FROM u)",
+          "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) AS k, COUNT(*) FROM t GROUP BY k ORDER BY k",
+          "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) AS k, COUNT(*) FROM t GROUP BY 1 HAVING k > 1",
+          "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) + 1 AS m, COUNT(*) AS c FROM t GROUP BY i16 % "
+          "2 + (SELECT MIN(i16) FROM u) ORDER BY m * 2, c",
+          "SELECT (SELECT MIN(i16) FROM u), COUNT(*) FROM t GROUP BY (SELECT MIN(i16) FROM u)",
+          "SELECT i16, SUM(i32 * (SELECT MIN(i16) FROM u)) FROM t GROUP BY i16",
+          "SELECT COUNT(DISTINCT i32 % (SELECT MIN(i16) FROM u)), MAX(i16 + (SELECT MIN(i16) FROM "
+          "u)) FROM t",
+          "SELECT i16 FROM t GROUP BY i16 HAVING SUM(i32 * (SELECT MIN(i16) FROM u)) > 0 ORDER BY "
+          "SUM(i32 + (SELECT MAX(i16) FROM u))",
+          "SELECT i16, COUNT(*) + (SELECT COUNT(*) FROM u) AS c FROM t GROUP BY i16 HAVING c > 2 "
+          "AND c BETWEEN 1 AND 9",
+          "SELECT i16, MAX(i32) + (SELECT MIN(i32) FROM u) AS c FROM t GROUP BY i16 HAVING c IN "
+          "(SELECT i16 FROM ok)",
+          "SELECT i16 % 2 + 1 AS k, COUNT(*) FROM t GROUP BY i16 % 2 + 1 HAVING k + (SELECT "
+          "MIN(i16) FROM u) > 2",
+          "SELECT COUNT(*) AS c, (SELECT MAX(i16) FROM u) AS m FROM t ORDER BY m",
+          "SELECT SUM(i32) FROM t ORDER BY SUM(i32 * (SELECT MIN(i16) FROM u))",
+          "SELECT DISTINCT i16 % 3, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY i16",
+          "SELECT i16, i32, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY ROLLUP (i16, i32)",
+          "SELECT d.c FROM (SELECT i16, COUNT(*) * (SELECT MIN(i16) FROM u) AS c FROM t GROUP BY "
+          "i16) AS d",
+          "SELECT i16 FROM t WHERE i32 > (SELECT SUM(i32) + (SELECT MIN(i16) FROM ok) FROM u)",
+          // Divergence D37 over a grouped item that still holds its value.
+          "SELECT i16, COUNT(*) + (SELECT COUNT(*) FROM u) AS c FROM t GROUP BY i16 ORDER BY c * 2",
+      }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
+}
+
+// Decision 9's slots in a block that aggregates: a value over the aggregation joins above it, one
+// in a GROUP BY key or an aggregate's argument below it, per row (EXPLAIN writes a node before its
+// inputs, and the per-row join's own input is the scan of t).
+TEST(BinderTest, GroupValuesJoinInTheirSlots) {
+  const Catalog catalog = MakeCatalog();
+  const auto text = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? Explain(*plan) : std::string();
+  };
+  for (const char* sql : {
+           "SELECT i16, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY i16",
+           "SELECT i16 FROM t GROUP BY i16 ORDER BY COUNT(*) * (SELECT MIN(i16) FROM u)",
+           "SELECT i16, COUNT(*) + (SELECT COUNT(*) FROM u) AS c FROM t GROUP BY i16 HAVING c > 2",
+       }) {
+    const std::string plan = text(sql);
+    EXPECT_LT(plan.find("Join ONE-ROW"), plan.find("GroupAggregate")) << sql << "\n" << plan;
+  }
+  for (const char* sql : {
+           "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) AS k, COUNT(*) FROM t GROUP BY 1",
+           "SELECT i16, SUM(i32 * (SELECT MIN(i16) FROM u)) FROM t GROUP BY i16",
+           "SELECT i16 FROM t GROUP BY i16 HAVING SUM(i32 * (SELECT MIN(i16) FROM u)) > 0",
+       }) {
+    const std::string plan = text(sql);
+    EXPECT_GT(plan.find("Join ONE-ROW"), plan.find("GroupAggregate")) << sql << "\n" << plan;
+  }
+}
+
+// A GROUP BY key that holds a value binds it per row, and the select item, HAVING and ORDER BY
+// written alike find the key through the value already bound (BindOutput's lookup-only
+// speculation): one join, below the aggregation. A HAVING operand that no key holds still plants no
+// per-row join (SQ1b's rule), also next to the alias of a key item (the SQ2 critique's c27).
+TEST(BinderTest, AValueKeyIsMatchedWithoutASecondJoin) {
+  const Catalog catalog = MakeCatalog();
+  const auto joins = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return std::pair<std::size_t, std::string>{0, ""};
+    }
+    const std::string text = Explain(*plan);
+    std::size_t n = 0;
+    for (std::size_t at = text.find("Join ONE-ROW"); at != std::string::npos;
+         at = text.find("Join ONE-ROW", at + 1)) {
+      ++n;
+    }
+    return std::pair{n, text};
+  };
+  for (const char* sql : {
+           "SELECT i16 % 2 + (SELECT MIN(i16) FROM u), COUNT(*) FROM t GROUP BY i16 % 2 + (SELECT "
+           "MIN(i16) FROM u) HAVING i16 % 2 + (SELECT MIN(i16) FROM u) > 1 ORDER BY i16 % 2 + "
+           "(SELECT MIN(i16) FROM u)",
+           "SELECT i16 % 2 + (SELECT MIN(i16) FROM u) AS k, COUNT(*) FROM t GROUP BY k",
+       }) {
+    const auto [n, text] = joins(sql);
+    EXPECT_EQ(n, 1U) << sql << "\n" << text;
+    EXPECT_GT(text.find("Join ONE-ROW"), text.find("GroupAggregate")) << sql << "\n" << text;
+  }
+  const auto [n, text] = joins(
+      "SELECT i16 % 2 + 1 AS k, COUNT(*) FROM t GROUP BY i16 % 2 + 1 HAVING k + (SELECT "
+      "MIN(i16) FROM u) > 2");
+  EXPECT_EQ(n, 1U) << text;
+  EXPECT_LT(text.find("Join ONE-ROW"), text.find("GroupAggregate")) << text;
+}
+
+// An aggregate is computed even in an EXISTS block's dropped item (divergence D32), so a value in
+// its argument is planted, dry run or not, its join below the aggregation: under WHERE and under
+// HAVING, grouped or not.
+TEST(BinderTest, AnExistsAggregateArgumentValueIsPlanted) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT SUM(i32 * (SELECT MIN(i16) FROM ok)) + 1 FROM "
+           "u)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16, MAX(i32 + (SELECT MIN(i16) FROM ok)) * 2 "
+           "FROM u "
+           "GROUP BY i16 ORDER BY 1 LIMIT 1)",
+           "SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT SUM(i32 * (SELECT "
+           "MIN(i16) "
+           "FROM ok)) + 1 FROM u)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(*plan);
+    EXPECT_TRUE(text.contains("table=ok")) << sql << "\n" << text;
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << text;
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
   }
 }
 

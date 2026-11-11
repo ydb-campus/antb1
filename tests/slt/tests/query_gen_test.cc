@@ -118,7 +118,8 @@ bool HasSubquery(const GeneratedQuery& q) {
          q.features.Has(Feature::kCorrelatedExists) ||
          q.features.Has(Feature::kCorrelatedAggregate) ||
          q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
-         q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue);
+         q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue) ||
+         q.features.Has(Feature::kGroupValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -987,7 +988,7 @@ TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
     const auto without = MakeOver(WithoutRefs(JoinTables()), 47, options);
     int joins = 0;
     int dims_by_path = 0;  // 60% of them come from a join that failed
-    for (uint64_t i = 0; i < 2500; ++i) {
+    for (uint64_t i = 0; i < 3000; ++i) {
       const auto q = with_refs.Generate(i);
       if (UsesRefs(q)) {
         joins += Joins(q) ? 1 : 0;
@@ -3289,6 +3290,71 @@ TEST(QueryGenerator, ItemValuesChangeOnlyTheirQueries) {
   EXPECT_GT(cases, 150);
   EXPECT_GT(exists, 30);
   EXPECT_GT(starred, 80);
+}
+
+// A value in a block that aggregates (ADR 0041's SQ2b), on item_value's terms: its own stream, only
+// where the query holds no other subquery, one more select item, last, whose value blocks return
+// at most one row: the value alone, or a COUNT of a CASE over a condition with values.
+TEST(QueryGenerator, GroupValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 89, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 89,
+      {.supported = kSupportedFeatures.Minus({Feature::kGroupValue}), .target_percent = 0});
+  const std::vector<GenTable> tables = JoinTables();
+  int took = 0;
+  int same = 0;
+  int bare = 0;     // the value alone
+  int counted = 0;  // a COUNT of a CASE over a condition
+  int grouped = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kGroupValue)) << plain.sql;
+    if (!q.features.Has(Feature::kGroupValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_GE(parsed->items.size(), 2U);
+    const sql::SelectExpr* last = parsed->items.back().expr();
+    ASSERT_NE(last, nullptr);
+    std::vector<const sql::SubqueryExpr*> in_last;
+    DeepSubqueries(*last, in_last);
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_FALSE(in_last.empty());
+    EXPECT_EQ(all.size(), in_last.size());
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_NE(sub->kind, sql::SubqueryExpr::Kind::kIn) << "an IN subquery is SQ7's";
+      CheckOwnColumns(*sub->query, tables);
+      if (sub->kind == sql::SubqueryExpr::Kind::kScalar) {
+        EXPECT_TRUE(AtMostOneRow(*sub->query)) << "a value block of at most one row";
+      }
+    }
+    bare += std::holds_alternative<sql::SubqueryExpr>(*last) ? 1 : 0;
+    counted += std::holds_alternative<sql::AggregateCall>(*last) ? 1 : 0;
+    grouped += parsed->group_by.empty() && parsed->grouping.empty() ? 0 : 1;
+  }
+  EXPECT_GT(took, 250) << "values in blocks that aggregate: " << took << ", alone " << bare
+                       << ", in a COUNT " << counted << ", grouped " << grouped;
+  EXPECT_GT(same, 6000);
+  EXPECT_GT(bare, 120);
+  EXPECT_GT(counted, 120);
+  EXPECT_GT(grouped, 90);
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

@@ -312,6 +312,10 @@ So do select items (ADR 0041's SQ2a, feature `item_value`): where the select lis
 to the end of the list, half the time one more select item holds a value block alone, or `CASE WHEN <condition> THEN 1
 ELSE 0 END` over one of `condition_value`'s conditions, from a stream of its own. No `ORDER BY` reads it.
 
+A block that aggregates takes one on the same terms (ADR 0041's SQ2b, feature `group_value`), 20% of the time: a value
+block alone, joined after the aggregation, or `COUNT(CASE WHEN <condition> THEN probe END)`, a value inside an
+aggregate's argument that reads a column, computed per row; a `HAVING` value then no longer fires in that query.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

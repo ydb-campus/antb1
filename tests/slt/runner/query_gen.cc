@@ -753,6 +753,9 @@ constexpr uint64_t kHavingValueStreamSalt = 0x686176672D76616CULL;
 // is the query this seed generated before the SQ2a PR.
 constexpr unsigned kItemValuePercent = 50;
 constexpr uint64_t kItemValueStreamSalt = 0x6974656D2D76616CULL;
+// The same for a block that aggregates (ADR 0041's SQ2b): one more select item holding a value.
+constexpr unsigned kGroupValuePercent = 20;
+constexpr uint64_t kGroupValueStreamSalt = 0x67726F75702D7661ULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1058,7 +1061,7 @@ class Builder {
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
-          FeatureSet allowed)
+          Rng& group_value_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1082,6 +1085,7 @@ class Builder {
         condition_value_rng_(condition_value_rng),
         having_value_rng_(having_value_rng),
         item_value_rng_(item_value_rng),
+        group_value_rng_(group_value_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1967,6 +1971,8 @@ class Builder {
     Where(from.where_keys, from.null_equal);
     if (shape != Shape::kAggregates) {
       ItemValue(select_end, /*lone_star=*/shape == Shape::kStar);
+    } else {
+      GroupValue(select_end);
     }
     // GROUP BY a constant's position alone still groups: no row over no input rows.
     const bool constant_group =
@@ -2560,7 +2566,8 @@ class Builder {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
         used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue);
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
+        used_.Has(Feature::kGroupValue);
     if (const std::vector<SubqueryCandidate> values = HavingValueCandidates(keys);
         !other_subquery && !values.empty() && having_value_rng_.Percent(kHavingValuePercent)) {
       Keyword("AND");
@@ -3104,6 +3111,55 @@ class Builder {
       Keyword("ELSE");
       ValueNumber(0);
       Keyword("END");
+    } else {
+      ValueBlock(c);
+    }
+    block_draws_ = nullptr;
+    std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at),
+                tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+  }
+
+  // One more select item holding an uncorrelated value in a block that aggregates (ADR 0041's
+  // SQ2b), on ItemValue's terms: `COUNT(CASE WHEN <condition> THEN probe END)`, a value inside an
+  // aggregate's argument that reads a column (one of values alone waits for constant aggregate
+  // arguments), computed per row; or the value alone, joined after the aggregation. The COUNT makes
+  // a list of constants a global aggregate, so it counts as an aggregate of the list's.
+  void GroupValue(std::size_t at) {
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue);
+    if (other_subquery || !allowed_.Has(Feature::kGroupValue) ||
+        !allowed_.Has(Feature::kMultipleItems)) {
+      return;
+    }
+    std::vector<SubqueryCandidate> values = SubqueryCandidates();
+    std::erase_if(values, [](const SubqueryCandidate& c) { return c.column == nullptr; });
+    if (values.empty() || !group_value_rng_.Percent(kGroupValuePercent)) {
+      return;
+    }
+    const SubqueryCandidate& c = values[group_value_rng_.Below(values.size())];
+    const std::size_t end = tokens_.size();
+    block_draws_ = &group_value_rng_;
+    form_rng_ = &group_value_rng_;
+    form_feature_ = Feature::kGroupValue;
+    used_.Add(Feature::kGroupValue);
+    used_.Add(Feature::kMultipleItems);
+    Symbol(",");
+    if (allowed_.Has(Feature::kCountColumn) && allowed_.Has(Feature::kCase) &&
+        group_value_rng_.Percent(50)) {
+      used_.Add(Feature::kCountColumn);
+      used_.Add(Feature::kCase);
+      aggregate_emitted_ = true;
+      Keyword("COUNT");
+      Symbol("(");
+      Keyword("CASE");
+      Keyword("WHEN");
+      ConditionValueForm(c);
+      Keyword("THEN");
+      Column(*c.probe);
+      Keyword("END");
+      Symbol(")");
     } else {
       ValueBlock(c);
     }
@@ -4915,6 +4971,7 @@ class Builder {
   Rng& condition_value_rng_;  // the draws that only a value inside a condition needs
   Rng& having_value_rng_;     // the draws that only a value inside a HAVING condition needs
   Rng& item_value_rng_;       // the draws that only a value in a select item needs
+  Rng& group_value_rng_;      // the draws that only a value in a block that aggregates needs
   // The stream and the feature of the value form being written (ConditionValue, HavingValue,
   // ItemValue).
   Rng* form_rng_ = nullptr;
@@ -5148,10 +5205,11 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng condition_value_rng(Mix(seed ^ kConditionValueStreamSalt));
   Rng having_value_rng(Mix(seed ^ kHavingValueStreamSalt));
   Rng item_value_rng(Mix(seed ^ kItemValueStreamSalt));
+  Rng group_value_rng(Mix(seed ^ kGroupValueStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-               having_value_rng, item_value_rng, options.supported)
+               having_value_rng, item_value_rng, group_value_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -5187,6 +5245,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng condition_value_rng(Mix(state ^ kConditionValueStreamSalt));
   Rng having_value_rng(Mix(state ^ kHavingValueStreamSalt));
   Rng item_value_rng(Mix(state ^ kItemValueStreamSalt));
+  Rng group_value_rng(Mix(state ^ kGroupValueStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
@@ -5194,7 +5253,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
       Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-              having_value_rng, item_value_rng, allowed)
+              having_value_rng, item_value_rng, group_value_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

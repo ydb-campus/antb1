@@ -154,6 +154,9 @@ enum class Feature : std::uint8_t {
   // A value as one more select item of a projection (ADR 0041's SQ2a): a value block alone, or a
   // CASE WHEN over kConditionValue's conditions.
   kItemValue,  // SELECT x, (SELECT ...), CASE WHEN x > (SELECT ...) THEN 1 ELSE 0 END
+  // One more select item of a block that aggregates (ADR 0041's SQ2b): a value block alone, or a
+  // COUNT of a CASE WHEN over kConditionValue's conditions.
+  kGroupValue,  // SELECT k, (SELECT ...), COUNT(CASE WHEN x > (SELECT ...) THEN x END)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -330,6 +333,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "having_value";
     case Feature::kItemValue:
       return "item_value";
+    case Feature::kGroupValue:
+      return "group_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -493,6 +498,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kConditionValue,
     Feature::kHavingValue,
     Feature::kItemValue,
+    Feature::kGroupValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

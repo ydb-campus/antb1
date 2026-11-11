@@ -633,7 +633,8 @@ struct Rejection {
 // The first construct of a value expression, in source order, that is not a column, a literal
 // or (where allowed) an aggregate of a column. `values`: inside a condition of WHERE or of an inner
 // ON, where a scalar subquery is a value (ADR 0041's decision 8).
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values = false);
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values = false,
+                                          bool where = false);
 
 // Why a condition (WHERE, HAVING, CASE WHEN) is not one the binder answers, or std::nullopt.
 // `values`: one of WHERE or of an inner ON, where a scalar subquery is a value and EXISTS a
@@ -1034,9 +1035,9 @@ void CollectAggregateArgRefs(const sql::Expr& expr, std::vector<const sql::Colum
 }
 
 std::optional<Rejection> FirstUnsupportedIn(const std::vector<sql::Expr>& exprs,
-                                            bool values = false) {
+                                            bool values = false, bool where = false) {
   for (const sql::Expr& e : exprs) {
-    if (auto r = FirstUnsupported(e, values)) {
+    if (auto r = FirstUnsupported(e, values, where)) {
       return r;
     }
   }
@@ -1057,6 +1058,7 @@ bool IsGroupingCall(const sql::FunctionCall& call) {
 
 struct FirstUnsupportedOf {
   bool values = false;  // see FirstUnsupported
+  bool where = false;   // see FirstUnsupported
 
   // A qualified name is no rejection: the scope resolves it among the bindings it names, and says
   // so when none does (rules 1 to 3 of ADR 0022).
@@ -1072,11 +1074,18 @@ struct FirstUnsupportedOf {
       return (*this)(*column);
     }
     const sql::Expr& arg = **call.arg;
-    // A subquery in an aggregate's argument waits for ADR 0041's SQ2, wherever the aggregate is.
-    if (auto r = FirstUnsupported(arg)) {
+    // A subquery's value with a column in an aggregate's argument is one of the values mode's (ADR
+    // 0041's SQ2b), bound per row; one that reads no column waits for constant arguments, unless
+    // the aggregate stands in a WHERE or ON, where the binder refuses every aggregate (decision
+    // 23).
+    if (auto r = FirstUnsupported(arg, values, where)) {
       return r;
     }
-    if (!ReadsColumn(arg)) {
+    if (!where && !ReadsColumn(arg)) {
+      if (HoldsSubquery(arg)) {
+        return Rejection{.span = arg.span(),
+                         .message = "an aggregate of subquery values alone is not supported"};
+      }
       return Rejection{.span = arg.span(),
                        .message = std::string("constant aggregate arguments are not supported") +
                                   (call.kind == sql::AggKind::kCount ? " (use COUNT(*))" : "")};
@@ -1085,12 +1094,12 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::UnaryExpr& unary) const {
     if (unary.op == sql::UnaryOp::kNegate) {
-      return FirstUnsupported(*unary.operand, values);
+      return FirstUnsupported(*unary.operand, values, where);
     }
     return Rejection{.span = unary.op_span, .message = std::string("NOT") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BinaryExpr& binary) const {
-    if (auto r = FirstUnsupported(*binary.left, values)) {
+    if (auto r = FirstUnsupported(*binary.left, values, where)) {
       return r;
     }
     std::string message;
@@ -1101,7 +1110,7 @@ struct FirstUnsupportedOf {
       case sql::BinaryOp::kDivide:
       case sql::BinaryOp::kIntegerDivide:
       case sql::BinaryOp::kModulo:
-        return FirstUnsupported(*binary.right, values);
+        return FirstUnsupported(*binary.right, values, where);
       case sql::BinaryOp::kAnd:
         message = std::string("AND") + kConditionsOnly;
         break;
@@ -1115,25 +1124,25 @@ struct FirstUnsupportedOf {
     return Rejection{.span = binary.op_span, .message = std::move(message)};
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand, values)) {
+    if (auto r = FirstUnsupported(*like.operand, values, where)) {
       return r;
     }
     return Rejection{.span = like.op_span, .message = std::string("LIKE") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand, values)) {
+    if (auto r = FirstUnsupported(*in.operand, values, where)) {
       return r;
     }
     return Rejection{.span = in.op_span, .message = std::string("IN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::BetweenExpr& between) const {
-    if (auto r = FirstUnsupported(*between.operand, values)) {
+    if (auto r = FirstUnsupported(*between.operand, values, where)) {
       return r;
     }
     return Rejection{.span = between.op_span, .message = std::string("BETWEEN") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    if (auto r = FirstUnsupported(*is_null.operand, values)) {
+    if (auto r = FirstUnsupported(*is_null.operand, values, where)) {
       return r;
     }
     return Rejection{
@@ -1141,10 +1150,10 @@ struct FirstUnsupportedOf {
         .message = std::string(is_null.negated ? "IS NOT NULL" : "IS NULL") + kConditionsOnly};
   }
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
-    if (auto r = FirstUnsupported(*distinct.left, values)) {
+    if (auto r = FirstUnsupported(*distinct.left, values, where)) {
       return r;
     }
-    if (auto r = FirstUnsupported(*distinct.right, values)) {
+    if (auto r = FirstUnsupported(*distinct.right, values, where)) {
       return r;
     }
     return Rejection{
@@ -1154,10 +1163,10 @@ struct FirstUnsupportedOf {
   }
   std::optional<Rejection> operator()(const sql::FunctionCall& call) const {
     if (IsCoalesce(call)) {
-      return FirstUnsupportedIn(call.args, values);  // any values (ADR 0037's NL5)
+      return FirstUnsupportedIn(call.args, values, where);  // any values (ADR 0037's NL5)
     }
     if (IsGroupingCall(call)) {
-      return FirstUnsupportedIn(call.args, values);  // the keys it reads (ADR 0038)
+      return FirstUnsupportedIn(call.args, values, where);  // the keys it reads (ADR 0038)
     }
     const std::span<const FunctionOverload> overloads = FindFunction(call);
     if (overloads.empty()) {
@@ -1220,7 +1229,7 @@ struct FirstUnsupportedOf {
           ++j;  // the escaped character
         }
       }
-      if (auto r = FirstUnsupported(call.args[i], values)) {
+      if (auto r = FirstUnsupported(call.args[i], values, where)) {
         return r;
       }
     }
@@ -1230,7 +1239,7 @@ struct FirstUnsupportedOf {
   // operand; the binder rejects it where the scope has none); CASE x WHEN v as x = v.
   std::optional<Rejection> operator()(const sql::CaseExpr& c) const {
     if (c.operand.has_value()) {
-      if (auto r = FirstUnsupported(**c.operand, values)) {
+      if (auto r = FirstUnsupported(**c.operand, values, where)) {
         return r;
       }
     }
@@ -1247,12 +1256,12 @@ struct FirstUnsupportedOf {
       } else if (auto r = RejectCondition(*branch.when, /*having=*/true, values)) {
         return r;
       }
-      if (auto r = FirstUnsupported(*branch.then, values)) {
+      if (auto r = FirstUnsupported(*branch.then, values, where)) {
         return r;
       }
     }
     if (c.otherwise.has_value()) {
-      return FirstUnsupported(**c.otherwise, values);
+      return FirstUnsupported(**c.otherwise, values, where);
     }
     return std::nullopt;
   }
@@ -1263,7 +1272,7 @@ struct FirstUnsupportedOf {
                                               "lists the fields)",
                                               Clip(e.field))};
     }
-    return FirstUnsupported(*e.source, values);
+    return FirstUnsupported(*e.source, values, where);
   }
   // Every cast that FoldDateCasts left (all but CAST('YYYY-MM-DD' AS DATE)): to a type antb1 has
   // (ADR 0037's CT1), whose operands the binder then checks.
@@ -1271,7 +1280,7 @@ struct FirstUnsupportedOf {
     if (cast.try_cast) {
       return Rejection{.span = cast.op_span, .message = "TRY_CAST is not supported"};
     }
-    if (auto r = FirstUnsupported(*cast.operand, values)) {
+    if (auto r = FirstUnsupported(*cast.operand, values, where)) {
       return r;
     }
     if (!KnownCastTarget(cast)) {
@@ -1307,8 +1316,9 @@ struct FirstUnsupportedOf {
   }
 };
 
-std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values) {
-  return std::visit(FirstUnsupportedOf{.values = values}, static_cast<const sql::ExprNode&>(expr));
+std::optional<Rejection> FirstUnsupported(const sql::Expr& expr, bool values, bool where) {
+  return std::visit(FirstUnsupportedOf{.values = values, .where = where},
+                    static_cast<const sql::ExprNode&>(expr));
 }
 
 arrow::Status Reject(const Rejection& r) {
@@ -1430,10 +1440,10 @@ struct RejectConditionOf {
   // The sides of a comparison: each supported, one reading a column, and the other a column's
   // value too, a literal or a constant the binder folds.
   std::optional<Rejection> ComparisonSides(const sql::Expr& left, const sql::Expr& right) const {
-    if (auto r = FirstUnsupported(left, values)) {
+    if (auto r = FirstUnsupported(left, values, !having)) {
       return r;
     }
-    if (auto r = FirstUnsupported(right, values)) {
+    if (auto r = FirstUnsupported(right, values, !having)) {
       return r;
     }
     if (!IsOperand(left) && !IsOperand(right)) {
@@ -1457,7 +1467,7 @@ struct RejectConditionOf {
   // `expr` is no condition the binder answers: the first construct in it that is not supported
   // anywhere, else `message`, at the whole of `expr`.
   std::optional<Rejection> NotACondition(std::string_view message) const {
-    if (auto r = FirstUnsupported(expr, values)) {
+    if (auto r = FirstUnsupported(expr, values, !having)) {
       return r;
     }
     return Rejection{.span = expr.span(), .message = std::string(message)};
@@ -1499,7 +1509,7 @@ struct RejectConditionOf {
     return NotACondition(kOtherConditions);
   }
   std::optional<Rejection> operator()(const sql::LikeExpr& like) const {
-    if (auto r = FirstUnsupported(*like.operand, values)) {
+    if (auto r = FirstUnsupported(*like.operand, values, !having)) {
       return r;
     }
     if (!IsOperand(*like.operand)) {
@@ -1518,7 +1528,7 @@ struct RejectConditionOf {
                          "supported"};
   }
   std::optional<Rejection> operator()(const sql::InExpr& in) const {
-    if (auto r = FirstUnsupported(*in.operand, values)) {
+    if (auto r = FirstUnsupported(*in.operand, values, !having)) {
       return r;
     }
     if (!IsOperand(*in.operand)) {
@@ -1539,7 +1549,7 @@ struct RejectConditionOf {
                              "subquery without the second pair of parentheses)"};
       }
     }
-    if (auto r = FirstUnsupportedIn(in.list, values)) {
+    if (auto r = FirstUnsupportedIn(in.list, values, !having)) {
       return r;
     }
     for (const sql::Expr& value : in.list) {
@@ -1570,7 +1580,7 @@ struct RejectConditionOf {
   }
   // Of any value: a condition as the operand is refused as a value is ((a = 1) IS NULL).
   std::optional<Rejection> operator()(const sql::IsNullExpr& is_null) const {
-    return FirstUnsupported(*is_null.operand, values);
+    return FirstUnsupported(*is_null.operand, values, !having);
   }
   // As a comparison's sides (ADR 0037's OJ5b): one reads a column; the other may be NULL too.
   std::optional<Rejection> operator()(const sql::DistinctFromExpr& distinct) const {
@@ -2928,7 +2938,8 @@ bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == C
 // (Binder::GateCorrelatedExists).
 struct ExistsConjunct {
   SourceSpan op_span;
-  bool having = false;
+  bool having = false;          // above the aggregation of the block that holds it
+  bool outside_having = false;  // there, in its select list or ORDER BY (ADR 0041's SQ2b)
 };
 
 // Binds a nested block as a sub-plan of its own, in a scope whose enclosing one is the given scope,
@@ -3331,7 +3342,14 @@ class Binder {
     if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
       return bound;
     }
-    ARROW_ASSIGN_OR_RAISE(const Typed arg, BindInput(**call.arg));
+    // An aggregate is computed even where its item is dropped (an EXISTS block's list, D32), so its
+    // argument's values are planted, dry run or not.
+    const bool argument = std::exchange(aggregate_argument_, true);
+    const bool dry_run = std::exchange(dry_run_, false);
+    const arrow::Result<Typed> bound_arg = BindInput(**call.arg);
+    aggregate_argument_ = argument;
+    dry_run_ = dry_run;
+    ARROW_ASSIGN_OR_RAISE(const Typed arg, bound_arg);
     BoundColumn column = InputColumn(arg);
     if (call.arg_column() == nullptr) {
       column.name = arg.expr->name;
@@ -3365,8 +3383,13 @@ class Binder {
         !call.arg.has_value() || Correlated()) {
       return std::nullopt;
     }
-    ARROW_ASSIGN_OR_RAISE(const Typed whole, BindInput(**call.arg));
-    return SumRewriteOf(RewriteArithmetic(whole.expr));
+    const bool argument = std::exchange(aggregate_argument_, true);
+    const bool dry_run = std::exchange(dry_run_, false);  // as BindAggregate's
+    const arrow::Result<Typed> whole = BindInput(**call.arg);
+    aggregate_argument_ = argument;
+    dry_run_ = dry_run;
+    ARROW_RETURN_NOT_OK(whole.status());
+    return SumRewriteOf(RewriteArithmetic(whole->expr));
   }
 
   // The sum rewrite of SUM(arg) for a bound and rewritten `arg`, or std::nullopt.
@@ -3605,11 +3628,13 @@ class Binder {
   // An expression over the aggregation's output: a subexpression equal to a GROUP BY key is that
   // key, an aggregate its column; any other column is a bind error.
   arrow::Result<Typed> BindOutput(const sql::Expr& expr) {
-    // An expression that holds a subquery's value is no GROUP BY key (a key with one is SQ2's), and
-    // binding it as an input would plant the value's join per row, below the aggregation.
-    if (!ContainsAggregate(expr) && !std::holds_alternative<sql::Literal>(expr) &&
-        !HoldsSubquery(expr)) {
+    // A GROUP BY key that holds a subquery's value has bound it per row before (ADR 0041's SQ2b),
+    // so the speculation only looks values up: binding one as an input would plant its join per
+    // row, below the aggregation. Saved and restored, so that a nested speculation cannot end it.
+    if (!ContainsAggregate(expr) && !std::holds_alternative<sql::Literal>(expr)) {
+      const bool lookup_only = std::exchange(lookup_only_, true);
       auto input = BindInput(expr);
+      lookup_only_ = lookup_only;
       if (input.ok()) {
         for (std::size_t k = 0; k < key_exprs_.size(); ++k) {
           if (SameExpr(*input->expr, *key_exprs_[k])) {
@@ -3777,6 +3802,9 @@ class Binder {
   // One top-level conjunct of HAVING, bound with `bind` (BindHavingOperand).
   template <class BindFn>
   arrow::Status BindGroupConjunct(const sql::Expr& conjunct, const BindFn& bind);
+  // Whether `e` names, unqualified, the alias of an expression item that holds a subquery's value,
+  // which HAVING then reads from its slot (ADR 0041's SQ2b).
+  [[nodiscard]] bool NamesValueItem(const sql::Expr& e) const;
   // The column of a subquery join's own side: a column of the tree below as is, anything else
   // computed in that join's layer directly below it.
   BoundColumn SubqueryColumn(SubqueryJoin& join, const Typed& t);
@@ -4227,6 +4255,12 @@ class Binder {
   std::vector<BoundValue> values_;
   // OR factoring's bind-only path: subquery values are bound for their errors, and plant nothing.
   bool dry_run_ = false;
+  // BindOutput's speculative binding of an expression as a GROUP BY key: a subquery's value is only
+  // looked up in the memo, never bound or planted (ADR 0041's SQ2b).
+  bool lookup_only_ = false;
+  // An aggregate's argument is binding: where a subquery's block in it binds (ADR 0041's decision
+  // 23).
+  bool aggregate_argument_ = false;
   // The filter of the conjunct being bound that holds a value: where its operands are computed.
   SlotFilter* in_slot_ = nullptr;
 };
@@ -6435,8 +6469,19 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error. An EXISTS
   // block's binder gates a correlated block itself (GateCorrelatedExists).
-  const ExistsConjunct exists{.op_span = form.subquery->op_span, .having = having};
-  scope_.set_binding_condition(WhereClause(clause_));  // ADR 0041's decision 23
+  const ExistsConjunct exists{.op_span = form.subquery->op_span,
+                              .having = having,
+                              .outside_having = having && clause_ != Clause::kHaving};
+  // ADR 0041's decision 23
+  if (aggregate_argument_) {
+    scope_.set_subquery_place(Scope::SubqueryPlace::kAggregateArgument);
+  } else if (WhereClause(clause_)) {
+    scope_.set_subquery_place(Scope::SubqueryPlace::kCondition);
+  } else if (clause_ == Clause::kGroupBy) {
+    scope_.set_subquery_place(Scope::SubqueryPlace::kGroupBy);
+  } else {
+    scope_.set_subquery_place(Scope::SubqueryPlace::kOther);
+  }
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound, (*bind_block_)(*form.subquery->query, &scope_, visible_,
                                                          form.exists() ? &exists : nullptr));
   // A subquery whose plan reads ids its own nodes do not define is correlated, and becomes a
@@ -6527,7 +6572,10 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
     // refusal the dependent join is stacked above the aggregation, whose output does not define
     // the free variable, and ResolvePositions aborts the process.
     return Reject(Rejection{.span = form.subquery->op_span,
-                            .message = "a correlated subquery in HAVING is not supported"});
+                            .message = clause_ == Clause::kHaving
+                                           ? "a correlated subquery in HAVING is not supported"
+                                           : "a correlated subquery over a query block's "
+                                             "aggregates is not supported"});
   }
   if (correlated && !form.scalar()) {
     // Correlated IN and NOT IN need the set's NULL and empty flags for each binding, which a semi
@@ -6868,6 +6916,17 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   if (const BoundValue* known = FindValue(s, group)) {
     return known->value;
   }
+  if (lookup_only_) {
+    // No GROUP BY key holds this value (a key's is bound first): the speculation fails.
+    return BindError("a subquery's value that no GROUP BY key holds", s.op_span);
+  }
+  if (group && Correlated() && !dry_run_) {
+    // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look
+    // (ADR 0041's SQ5 and SQ0 teach it).
+    return Reject(Rejection{.span = s.op_span,
+                            .message = "a subquery's value over the aggregate of a correlated "
+                                       "subquery is not supported"});
+  }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
   // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
   // (decision 3); a dry run (OR factoring's, an EXISTS block's dropped item) binds one of those.
@@ -6966,10 +7025,18 @@ arrow::Status Binder::AggregateInCondition(const sql::AggregateCall& call) const
     for (std::size_t level = 0; level < *nearest && owner != nullptr; ++level) {
       owner = owner->outer();
     }
-    if (owner != nullptr && !owner->binding_condition()) {
-      return UnsupportedError(
-          "an aggregate of an enclosing query block's columns inside a subquery is not supported",
-          call.span);
+    switch (owner != nullptr ? owner->subquery_place() : Scope::SubqueryPlace::kCondition) {
+      case Scope::SubqueryPlace::kOther:
+        return UnsupportedError(
+            "an aggregate of an enclosing query block's columns inside a subquery is not "
+            "supported",
+            call.span);
+      case Scope::SubqueryPlace::kGroupBy:
+        return BindError("GROUP BY clause cannot contain aggregates!", call.span);
+      case Scope::SubqueryPlace::kAggregateArgument:
+        return BindError("aggregate function calls cannot be nested", call.span);
+      case Scope::SubqueryPlace::kCondition:
+        break;
     }
   }
   return BindError("WHERE clause cannot contain aggregates!", call.span);
@@ -7813,6 +7880,20 @@ arrow::Status Binder::BindHaving() {
   return arrow::Status::OK();
 }
 
+bool Binder::NamesValueItem(const sql::Expr& e) const {
+  std::vector<const sql::ColumnRef*> refs;
+  CollectRefs(e, refs);
+  return std::ranges::any_of(refs, [this](const sql::ColumnRef* ref) {
+    const std::optional<std::size_t> alias =
+        ref->qualifier.empty() ? FindAlias(select_, ref->name) : std::nullopt;
+    if (!alias.has_value()) {
+      return false;
+    }
+    const auto [kind, index] = select_.items[*alias];
+    return kind == ItemKind::kExpression && HoldsSubquery(*select_.exprs[index]);
+  });
+}
+
 // One top-level conjunct of HAVING. One that holds a subquery stands in HAVING's slot, after the
 // aggregation and the filter of the others (ADR 0041's decision 9): an IN as its semi or anti join,
 // a value as its one-row join (bound once per slot, decision 10) with the conjunct a filter over
@@ -7828,6 +7909,10 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
     std::optional<Typed> value;
     if (known != nullptr) {
       value = known->value;
+    } else if (Correlated()) {
+      return Reject(Rejection{.span = form->subquery->op_span,
+                              .message = "a subquery's value over the aggregate of a correlated "
+                                         "subquery is not supported"});
     } else {
       // A block in HAVING that reads an enclosing one is refused while it binds ("a correlated
       // subquery in HAVING", "EXISTS in HAVING"), so none is correlated here.
@@ -7845,7 +7930,8 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
     }
     return BindValueConjunct(conjunct, span, /*group=*/true);
   }
-  if (HoldsSubquery(conjunct)) {
+  // A conjunct that reads a value item's alias reads its value too, which stands in the slot.
+  if (HoldsSubquery(conjunct) || NamesValueItem(conjunct)) {
     // A plain BETWEEN is its two comparisons, typed as DuckDB types all three values; a half
     // without a value is a predicate of HAVING's filter, below the slot.
     if (const auto* between = std::get_if<sql::BetweenExpr>(&conjunct);
@@ -7854,7 +7940,7 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
       const std::optional<LogicalType> folded = BetweenType(*between, bind);
       for (const sql::Expr& comparison : BetweenComparisons(*between)) {
         const WrittenScope written(*this, comparison, WrittenComparison{.folded_type = folded});
-        if (HoldsSubquery(comparison)) {
+        if (HoldsSubquery(comparison) || NamesValueItem(comparison)) {
           ARROW_RETURN_NOT_OK(BindValueConjunct(comparison, span, /*group=*/true));
           continue;
         }
@@ -8068,8 +8154,11 @@ arrow::Status Binder::GateCorrelatedExists() const {
         .message = std::format("EXISTS over a subquery with {} is not supported", clause)});
   }
   if (exists_->having) {
-    return Reject(
-        Rejection{.span = exists_->op_span, .message = "EXISTS in HAVING is not supported"});
+    return Reject(Rejection{.span = exists_->op_span,
+                            .message = exists_->outside_having
+                                           ? "a correlated EXISTS over a query block's aggregates "
+                                             "is not supported"
+                                           : "EXISTS in HAVING is not supported"});
   }
   return arrow::Status::OK();
 }
@@ -8777,13 +8866,24 @@ std::optional<Rejection> RejectCompoundTail(const sql::SelectStatement& stmt) {
 }
 
 // A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
-// item's, its elements in turn.
-arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
+// item's, its elements in turn. A plain key at the top (next to a ROLLUP, say) may hold a
+// subquery's value as any key does (ADR 0041's SQ2b); one inside ROLLUP, CUBE or GROUPING SETS may
+// not, as no constant may there (decision 8). An alias or a position there names a select item,
+// which binds as a key.
+arrow::Status CheckGroupingElement(const sql::GroupingElement& element, bool inside = false) {
   for (const sql::Expr& expr : element.exprs) {
-    ARROW_RETURN_NOT_OK(CheckValue(expr));
+    if (const std::optional<SourceSpan> subquery = FirstSubquerySpan(expr); inside && subquery) {
+      return Reject(
+          Rejection{.span = *subquery,
+                    .message = "a subquery inside ROLLUP, CUBE or GROUPING SETS is not supported"});
+    }
+    ARROW_RETURN_NOT_OK(CheckValue(expr, /*values=*/!inside));
   }
+  const bool sets = element.kind == sql::GroupingElement::Kind::kRollup ||
+                    element.kind == sql::GroupingElement::Kind::kCube ||
+                    element.kind == sql::GroupingElement::Kind::kSets;
   for (const sql::GroupingElement& inner : element.elements) {
-    ARROW_RETURN_NOT_OK(CheckGroupingElement(inner));
+    ARROW_RETURN_NOT_OK(CheckGroupingElement(inner, inside || sets));
   }
   return arrow::Status::OK();
 }
@@ -8801,35 +8901,24 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
     }
     return arrow::Status::OK();
   }
-  // A select item or an ORDER BY item may hold a subquery's value (ADR 0041's SQ2a) in a block that
-  // does not aggregate; in one that does, that waits for SQ2b.
-  const bool aggregates = HasGroupBy(stmt) || IsAggregateQuery(stmt);
-  const auto check_item = [aggregates](const sql::Expr& expr) -> arrow::Status {
-    ARROW_RETURN_NOT_OK(CheckValue(expr, /*values=*/true));
-    if (const std::optional<SourceSpan> subquery = FirstSubquerySpan(expr);
-        aggregates && subquery.has_value()) {
-      return Reject(Rejection{
-          .span = *subquery,
-          .message = "a subquery's value in a query block that aggregates is not supported"});
-    }
-    return arrow::Status::OK();
-  };
+  // A select item, a plain GROUP BY key, an ORDER BY item and an aggregate's argument may hold a
+  // subquery's value (ADR 0041's SQ2).
   for (const sql::SelectItem& item : stmt.items) {
     if (const sql::SelectExpr* expr = item.expr()) {  // a star's names bind later (BindSelectList)
-      ARROW_RETURN_NOT_OK(check_item(*expr));
+      ARROW_RETURN_NOT_OK(CheckValue(*expr, /*values=*/true));
     }
   }
   ARROW_RETURN_NOT_OK(CheckFromList(stmt.from));
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.where, /*having=*/false));
   for (const sql::Expr& expr : stmt.group_by) {
-    ARROW_RETURN_NOT_OK(CheckValue(expr));
+    ARROW_RETURN_NOT_OK(CheckValue(expr, /*values=*/true));
   }
   for (const sql::GroupingElement& element : stmt.grouping) {
     ARROW_RETURN_NOT_OK(CheckGroupingElement(element));
   }
   ARROW_RETURN_NOT_OK(CheckConjuncts(stmt.having, /*having=*/true));
   for (const sql::OrderItem& item : stmt.order_by) {
-    ARROW_RETURN_NOT_OK(check_item(item.expr));
+    ARROW_RETURN_NOT_OK(CheckValue(item.expr, /*values=*/true));
   }
   return arrow::Status::OK();
 }
