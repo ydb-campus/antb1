@@ -270,7 +270,7 @@ SMALLINT	BIGINT
 5	2
 
 # CASE over a key or an aggregate and a value: the value in WHEN, THEN or ELSE, a simple CASE over a value, over a key
-# or an aggregate with values in its WHENs, a WHEN over a value of no row.
+# or an aggregate with values in its WHEN clauses, a WHEN over a value of no row.
 
 query II nosort
 SELECT zn_city, CASE WHEN zn_city > (SELECT AVG(ct_id) FROM cities) THEN COUNT(*) ELSE (SELECT MAX(ct_id) FROM cities) END AS v FROM zones GROUP BY zn_city ORDER BY zn_city
