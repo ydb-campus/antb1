@@ -917,7 +917,7 @@ changes.
   where DuckDB answers; a looser comparison that merged two different subqueries would answer wrong. **D37** covers
   grouped items: DuckDB answers the alias of a key item, or of an aggregate over a value, inside an ORDER BY expression,
   and refuses one whose item still holds the value.
-- **Decision 28.** `tests/slt/cases/subqueries/group_values.slt` holds about 350 records, written first under `pending
+- **Decision 28.** `tests/slt/cases/subqueries/group_values.slt` holds about 390 records, written first under `pending
   SQ2b` and checked against DuckDB, with the D35, D32 and D37 pins and the DuckDB-only boundaries; the generator's
   Feature `group_value` adds a value block, or a COUNT of a CASE over a condition with values, to a block that
   aggregates; six metamorphic relations cover keys, arguments, values over aggregates, global blocks, HAVING aliases
