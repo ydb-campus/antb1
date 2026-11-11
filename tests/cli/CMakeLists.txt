@@ -732,6 +732,37 @@ antb1_add_cli_golden(
     "zones=${_f}/star/zones.parquet"
 )
 
+# In a block that aggregates (ADR 0041's SQ2b) a value in an aggregate's argument joins per row,
+# below the aggregation, and one over the aggregates joins after it, below the computed item.
+antb1_add_cli_golden(
+  explain_select_value_over_aggregate
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_city, SUM(zn_id * (SELECT MIN(ct_id) FROM cities)) AS s, COUNT(*) + (SELECT MAX(ct_id) FROM cities) AS c FROM zones GROUP BY zn_city ORDER BY zn_city"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# A GROUP BY key that holds a value and the select item written alike read one join: the item is
+# the key.
+antb1_add_cli_golden(
+  explain_group_by_value_key
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT ct_id % 2 + (SELECT MIN(zn_id) FROM zones) AS k, COUNT(*) FROM cities GROUP BY ct_id % 2 + (SELECT MIN(zn_id) FROM zones) ORDER BY k"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
 # a CMake list would split at the ; separators inside [ ].

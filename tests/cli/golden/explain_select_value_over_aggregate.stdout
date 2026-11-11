@@ -1,0 +1,13 @@
+Output: zn_city:SMALLINT s:HUGEINT c:BIGINT
+Project zn_city, s, c
+  Sort zn_city ASC NULLS LAST
+    Compute (count_star() + max(ct_id))
+      Join ONE-ROW build=right keys=[]
+        GroupAggregate keys=[zn_city] SUM("(zn_id * min(ct_id))"), COUNT(*)
+          Compute (zn_id * min(ct_id))
+            Join ONE-ROW build=right keys=[]
+              Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city]
+              Aggregate MIN(ct_id)
+                Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]
+        Aggregate MAX(ct_id)
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]
