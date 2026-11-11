@@ -2087,8 +2087,7 @@ SELECT zn_city FROM zones GROUP BY zn_city HAVING (SELECT COUNT(*) FROM cities W
 statement error
 SELECT zn_city FROM zones GROUP BY zn_city HAVING (SELECT COUNT(*) FROM cities WHERE ct_id < COUNT(*)) > 1
 
-# A literal argument: antb1 refuses a constant aggregate argument wherever it stands (exit code 4).
-onlyif duckdb
+# A literal argument: an aggregate in a WHERE is the binder's, so the same bind error, whatever its argument (SQ2b).
 statement error
 SELECT zn_city FROM zones GROUP BY zn_city HAVING (SELECT COUNT(*) FROM cities WHERE ct_id < SUM(1)) > 1
 
