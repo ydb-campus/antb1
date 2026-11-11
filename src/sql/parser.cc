@@ -1973,10 +1973,12 @@ class Parser {
         switch (context) {
           case Context::kOn:
           case Context::kWhere:
-            // Inside a subquery that some HAVING encloses, the aggregate may be an enclosing
-            // block's, which DuckDB answers: the binder judges it by the block it belongs to (ADR
-            // 0041's decision 23).
-            if (std::ranges::contains(subquery_contexts_, Context::kHaving)) {
+            // Inside a subquery that some HAVING, select list or ORDER BY encloses, the aggregate
+            // may be an enclosing block's, which DuckDB answers: the binder judges it by the block
+            // it belongs to (ADR 0041's decision 23).
+            if (std::ranges::any_of(subquery_contexts_, [](Context c) {
+                  return c == Context::kHaving || c == Context::kSelect || c == Context::kOrderBy;
+                })) {
               break;
             }
             // Inside a derived table or a CTE body under such a subquery, DuckDB may answer it as

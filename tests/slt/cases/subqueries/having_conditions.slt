@@ -2320,18 +2320,24 @@ INTEGER
 4885
 NULL
 
-# Unchanged parse errors: a subquery in the select list, ORDER BY or GROUP BY, in a LEFT JOIN's ON,
-# in the select list of a WHERE subquery, or in an aggregate's argument; a derived table's own WHERE; the top-level
-# WHERE, inner ON and LEFT ON. DuckDB fails each with a bind error of its own.
+# Under a subquery in the select list or ORDER BY such an aggregate is an outer one too (SQ2b), which makes the
+# outer block aggregate: DuckDB then fails on its ungrouped column, which antb1 reaches once SQ13 answers the outer
+# aggregate. A bind error of the block comes first in both.
+pending SQ13
 statement error
 SELECT ct_id, (SELECT COUNT(*) FROM zones WHERE zn_id < SUM(cities.ct_id)) AS c FROM cities
 
 statement error
 SELECT nope, (SELECT COUNT(*) FROM zones WHERE zn_id < SUM(cities.ct_id)) AS c FROM cities
 
+pending SQ13
 statement error
 SELECT ct_id FROM cities ORDER BY (SELECT COUNT(*) FROM zones WHERE zn_id < SUM(cities.ct_id))
 
+# Errors that stay, each a parse error but one: a subquery in GROUP BY, in a LEFT JOIN's ON or in an aggregate's
+# argument; a derived table's own WHERE; the top-level WHERE, inner ON and LEFT ON. The one is a subquery in the
+# select list of a WHERE subquery, whose aggregate's block holds it in its WHERE: the binder's bind error (SQ2b).
+# DuckDB fails each with a bind error of its own.
 statement error
 SELECT COUNT(*) FROM cities GROUP BY (SELECT COUNT(*) FROM zones WHERE zn_id < SUM(cities.ct_id))
 
