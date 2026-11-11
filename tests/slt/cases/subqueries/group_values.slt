@@ -2951,3 +2951,58 @@ SMALLINT	HUGEINT
 5	1
 9	0
 NULL	0
+
+# ---- divergences D35 and D32: values in blocks that aggregate ----
+
+# An aggregate item's value binds with the select list, before WHERE, so its join stands below WHERE's IN; a value
+# over the aggregates binds before HAVING, so its join stands below HAVING's IN. When that IN turns out empty, the
+# value's build never runs and antb1 answers, while DuckDB builds the value first and fails.
+onlyif antb1
+query I nosort
+SELECT SUM(zn_id * (SELECT ct_id FROM cities)) AS s FROM zones WHERE zn_city IN (SELECT pm_id FROM promos)
+----
+HUGEINT
+NULL
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT SUM(zn_id * (SELECT ct_id FROM cities)) AS s FROM zones WHERE zn_city IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query II rowsort
+SELECT tr_driver, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM trips GROUP BY tr_driver HAVING COUNT(*) IN (SELECT zn_id FROM zones WHERE zn_id < 0)
+----
+INTEGER	BIGINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT tr_driver, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM trips GROUP BY tr_driver HAVING COUNT(*) IN (SELECT zn_id FROM zones WHERE zn_id < 0)
+
+# An EXISTS block's aggregates are computed (D32), so a failing value in an aggregate's argument there fails in
+# antb1, where DuckDB drops the aggregate with the list; a value over the aggregate is dropped in both.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id FROM cities WHERE EXISTS (SELECT SUM(zn_id + (SELECT zn_id FROM zones)) FROM zones) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT SUM(zn_id + (SELECT zn_id FROM zones)) FROM zones) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT COUNT(*) + (SELECT zn_id FROM zones) FROM zones) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
