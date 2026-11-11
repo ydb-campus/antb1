@@ -3006,3 +3006,144 @@ SMALLINT
 4
 5
 6
+
+# ---- decision 23's select-list half: aggregates in the WHERE or ON of a subquery in the select list or ORDER BY ----
+
+# An aggregate of the enclosing block's columns there is that block's (an outer aggregate), which DuckDB answers and
+# antb1 refuses until SQ13: under a select item, in a global block, under ORDER BY, under DISTINCT, in an ON, and
+# through a subquery inside an aggregate's argument of a select-list subquery.
+
+pending SQ13
+query II nosort
+SELECT zn_city, (SELECT COUNT(*) FROM cities WHERE ct_id < COUNT(z.zn_id)) AS n FROM zones z GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	0
+NULL	0
+
+pending SQ13
+query I nosort
+SELECT (SELECT COUNT(*) FROM cities WHERE ct_id * 10 < COUNT(z.zn_id)) AS n FROM zones z
+----
+BIGINT
+3
+
+pending SQ13
+query II nosort
+SELECT zn_city, (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(zn_id) / 8) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	4
+2	4
+3	4
+4	4
+5	4
+9	4
+NULL	4
+
+pending SQ13
+query I nosort
+SELECT zn_city FROM zones z GROUP BY zn_city ORDER BY (SELECT COUNT(*) FROM cities WHERE ct_id <= COUNT(z.zn_id) / 2), zn_city
+----
+SMALLINT
+9
+NULL
+3
+4
+1
+2
+5
+
+pending SQ13
+query I nosort
+SELECT (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(z.zn_city)) AS n FROM zones z
+----
+BIGINT
+6
+
+pending SQ13
+query II nosort
+SELECT zn_city, (SELECT COUNT(*) FROM cities a JOIN cities b ON a.ct_id = b.ct_id AND a.ct_id < COUNT(z.zn_id)) AS n FROM zones z GROUP BY zn_city ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	6
+2	6
+3	6
+4	6
+5	6
+9	0
+NULL	0
+
+pending SQ13
+query I nosort
+SELECT DISTINCT (SELECT COUNT(*) FROM cities WHERE ct_id < COUNT(z.zn_id)) AS n FROM zones z GROUP BY zn_city ORDER BY n
+----
+BIGINT
+0
+6
+
+pending SQ13
+query II nosort
+SELECT (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(z.zn_city)) AS n, zn_city FROM zones z WHERE zn_city < 3 GROUP BY zn_city ORDER BY zn_city
+----
+BIGINT	SMALLINT
+0	1
+1	2
+
+pending SQ13
+query II nosort
+SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city HAVING COUNT(*) > 1 ORDER BY (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(zones.zn_id) / 8), zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+
+pending SQ13
+query I nosort
+SELECT (SELECT SUM(ct_id * (SELECT COUNT(*) FROM zones WHERE zn_id < MAX(c.ct_pop))) FROM cities c2) AS n FROM cities c
+----
+HUGEINT
+840
+
+# An aggregate of the subquery's own columns, of no column (a literal argument too) or of both is in that subquery's
+# WHERE: a bind error in both engines (their texts differ). Under a subquery in GROUP BY it is DuckDB's GROUP BY error.
+
+statement error
+SELECT ct_id, (SELECT COUNT(*) FROM zones WHERE zn_id > MAX(zn_id)) AS v FROM cities ORDER BY ct_id
+
+statement error
+SELECT zn_city, (SELECT COUNT(*) FROM cities WHERE ct_id < COUNT(*)) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+
+statement error
+SELECT ct_id FROM cities ORDER BY (SELECT COUNT(*) FROM zones WHERE zn_id > MAX(zn_id)), ct_id
+
+statement error
+SELECT zn_city, (SELECT COUNT(*) FROM cities WHERE ct_id < SUM(1)) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+
+statement error
+SELECT zn_city, (SELECT COUNT(*) FROM cities c WHERE c.ct_id < MAX(c.ct_id)) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+
+statement error
+SELECT zn_city, COUNT(*) AS c FROM zones WHERE zn_city IN (1, 2) GROUP BY zn_city ORDER BY (SELECT COUNT(*) FROM cities WHERE ct_id < COUNT(*)), zn_city
+
+statement error GROUP BY clause cannot contain aggregates
+SELECT (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(z.zn_city)) AS n FROM zones z GROUP BY n
+
+# Inside a derived table under such a subquery the parse error stays: DuckDB fails each with a bind error of its own.
+
+statement error
+SELECT zn_city, (SELECT COUNT(*) FROM (SELECT * FROM cities WHERE MAX(ct_id) > 1) d) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
+
+statement error
+SELECT ct_id, (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d) AS n FROM cities ORDER BY ct_id
+
+statement error
+SELECT ct_id FROM cities ORDER BY (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d), ct_id
