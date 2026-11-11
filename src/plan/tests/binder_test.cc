@@ -1128,6 +1128,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "a subquery of a comparison must have one column, not 2"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT i16, i32 FROM u WHERE u.i64 = t.i64)",
                   kBind, "(", "a subquery of a comparison must have one column, not 2"},
+        // A value inside an expression is no comparison's operand (ADR 0041's SQ2a message).
+        ErrorCase{"SELECT i16 FROM t WHERE i32 > 1 + (SELECT i16, i32 FROM u)", kBind, "(",
+                  "a scalar subquery must have one column, not 2"},
+        ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COALESCE((SELECT i16, i32 FROM u), 1) > 0",
+                  kBind, "(", "a scalar subquery must have one column, not 2"},
         // A scalar subquery's refusals that depend on its shape come once its block is bound: the
         // enclosing select list's and the block's own bind errors come first, as in DuckDB, which
         // answers the subquery.
