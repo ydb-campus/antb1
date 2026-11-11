@@ -124,13 +124,15 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
       return arrow::Status::Invalid("a narrow scan of a part needs its late columns and row id");
     }
     if (pushed_.empty()) {
-      ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool));
+      ARROW_ASSIGN_OR_RAISE(reader_,
+                            table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool, ctx.scans));
     } else {
       // The predicates read output columns; the scan reads only the early ones (read_), and
       // reports the positions of the rows that pass for their row ids.
       ARROW_ASSIGN_OR_RAISE(auto filter, NarrowFilter(late, ctx.pool));
-      ARROW_ASSIGN_OR_RAISE(reader_, table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool,
-                                                      filter, /*positions=*/true));
+      ARROW_ASSIGN_OR_RAISE(reader_,
+                            table_->ScanPart(*part_, read_, ctx.batch_size, ctx.pool, filter,
+                                             /*positions=*/true, std::nullopt, ctx.scans));
       positioned_ = true;
     }
   } else if (part_.has_value()) {
@@ -167,9 +169,9 @@ arrow::Status TableScanOperator::Open(ExecContext& ctx) {
     }
     ARROW_ASSIGN_OR_RAISE(reader_,
                           table_->ScanPart(*part_, scan_fields_, ctx.batch_size, ctx.pool, filter,
-                                           /*positions=*/false, returned_));
+                                           /*positions=*/false, returned_, ctx.scans));
   } else {
-    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool));
+    ARROW_ASSIGN_OR_RAISE(reader_, table_->Scan(fields_, ctx.batch_size, ctx.pool, ctx.scans));
   }
   return arrow::Status::OK();
 }

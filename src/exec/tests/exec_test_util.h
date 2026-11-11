@@ -316,6 +316,19 @@ class MemoryTable final : public plan::Table {
   std::string Describe() const override { return "memory"; }
 
   [[nodiscard]] int scans() const { return scans_; }
+  struct ScanCall {
+    std::vector<int> fields;
+    std::shared_ptr<plan::ScanContext> context;
+  };
+  void set_track_scan_contexts(bool on) { track_scan_contexts_ = on; }
+  [[nodiscard]] std::vector<ScanCall> scan_calls() const {
+    const std::scoped_lock lock(mutex_);
+    return scan_calls_;
+  }
+  void ClearScanCalls() {
+    const std::scoped_lock lock(mutex_);
+    scan_calls_.clear();
+  }
   // The parts ScanPart was called for, sorted.
   [[nodiscard]] std::vector<int64_t> scanned_parts() const {
     const std::scoped_lock lock(mutex_);
@@ -404,20 +417,22 @@ class MemoryTable final : public plan::Table {
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* /*pool*/) const override {
+      const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
+    RecordScanContext(fields, context);
     ++scans_;
     return Read(batches_, fields, batch_size);
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPart(
-      int64_t part, const std::vector<int>& fields, int64_t batch_size,
-      arrow::MemoryPool* pool) const override {
+      int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
     if (!split_) {
-      return plan::Table::DoScanPart(part, fields, batch_size, pool);
+      return plan::Table::DoScanPart(part, fields, batch_size, pool, context);
     }
     if (part < 0 || part >= num_parts()) {
       return arrow::Status::Invalid("no part ", part);
     }
+    RecordScanContext(fields, context);
     {
       const std::scoped_lock lock(mutex_);
       scanned_parts_.push_back(part);
@@ -432,14 +447,14 @@ class MemoryTable final : public plan::Table {
   }
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScanPartFiltered(
       int64_t part, const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* pool,
-      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions,
-      int returned) const override {
+      const std::shared_ptr<const plan::ScanFilter>& filter, bool positions, int returned,
+      const std::shared_ptr<plan::ScanContext>& context) const override {
     if (!split_ || !scan_filter_) {
       return plan::Table::DoScanPartFiltered(part, fields, batch_size, pool, filter, positions,
-                                             returned);
+                                             returned, context);
     }
     ++filtered_scans_;
-    ARROW_ASSIGN_OR_RAISE(auto reader, DoScanPart(part, fields, batch_size, pool));
+    ARROW_ASSIGN_OR_RAISE(auto reader, DoScanPart(part, fields, batch_size, pool, context));
     auto schema = reader->schema();
     // A field past `returned` is read, filtered on, and dropped before the batch leaves -- as a
     // Parquet table never materialises it at all. The fake pays for it and then throws it away,
@@ -526,6 +541,14 @@ class MemoryTable final : public plan::Table {
   }
 
  private:
+  void RecordScanContext(const std::vector<int>& fields,
+                         const std::shared_ptr<plan::ScanContext>& context) const {
+    if (track_scan_contexts_) {
+      const std::scoped_lock lock(mutex_);
+      scan_calls_.push_back(ScanCall{.fields = fields, .context = context});
+    }
+  }
+
   [[nodiscard]] const std::shared_ptr<arrow::RecordBatch>& Batch(int64_t part) const {
     return batches_[static_cast<std::size_t>(part)];
   }
@@ -563,6 +586,8 @@ class MemoryTable final : public plan::Table {
   std::optional<int> failing_field_;
   bool stats_ = true;
   bool scan_filter_ = true;
+  bool track_scan_contexts_ = false;
+  mutable std::vector<ScanCall> scan_calls_;
   std::optional<int64_t> claimed_rows_;
   mutable std::atomic<int> filtered_scans_ = 0;
   mutable std::atomic<int> scans_ = 0;

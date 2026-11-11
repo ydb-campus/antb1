@@ -2546,6 +2546,34 @@ TEST_F(PartOperatorsTest, TopNFetchesLateColumns) {
                              .offset = 0}),
         5);
   };
+  // Both the narrow part scans and their late column fetches share this run's context. A second
+  // run of the same table must get another context, including on the existing parallel executor.
+  const auto observed = WideTable(true);
+  observed->set_track_scan_contexts(true);
+  std::shared_ptr<plan::ScanContext> previous;
+  for (arrow::internal::Executor* executor :
+       {static_cast<arrow::internal::Executor*>(nullptr),
+        static_cast<arrow::internal::Executor*>(pool.get())}) {
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      observed->ClearScanCalls();
+      ASSERT_TRUE(Run(top_of(observed), executor).ok());
+      const auto calls = observed->scan_calls();
+      ASSERT_FALSE(calls.empty());
+      const auto current = calls.front().context;
+      ASSERT_NE(current, nullptr);
+      EXPECT_NE(current, previous);
+      bool saw_early = false;
+      bool saw_late = false;
+      for (const auto& call : calls) {
+        EXPECT_EQ(call.context, current);
+        saw_early = saw_early || call.fields == std::vector<int>{0};
+        saw_late = saw_late || call.fields == std::vector<int>{1};
+      }
+      EXPECT_TRUE(saw_early);
+      EXPECT_TRUE(saw_late);
+      previous = current;
+    }
+  }
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool.get())}) {

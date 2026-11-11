@@ -101,7 +101,8 @@ std::optional<int64_t> MaterializedTable::exact_row_count() const {
 }
 
 arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> MaterializedTable::DoScan(
-    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/) const {
+    const std::vector<int>& fields, int64_t batch_size, arrow::MemoryPool* /*pool*/,
+    const std::shared_ptr<plan::ScanContext>& /*context*/) const {
   // The batches are taken under the lock and sliced outside it: filling is over before any scan
   // starts, so this only publishes the handover, and holding it through the slicing would serialise
   // consumers that open at the same time -- which the ones this exists for do.

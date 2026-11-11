@@ -2,6 +2,7 @@
 // group and batch in order; ParquetTable::ScanPart: the same for one row group.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -111,6 +112,37 @@ class ParquetScanTest : public ::testing::Test {
         {Build<arrow::Int64Builder, int64_t>(Sequence(first, count)),
          Build<arrow::Int32Builder, int32_t>(b)});
     return Write(name, table, row_group_rows);
+  }
+
+  // Equal row counts produce equal file sizes even when values and footer statistics differ.
+  std::string WritePlainNumbers(const std::string& name, int64_t first) {
+    const std::string path = (dir_ / name).string();
+    auto out = arrow::io::FileOutputStream::Open(path);
+    EXPECT_TRUE(out.ok()) << out.status().ToString();
+    const auto properties = parquet::WriterProperties::Builder()
+                                .disable_dictionary()
+                                ->compression(parquet::Compression::UNCOMPRESSED)
+                                ->build();
+    auto data = arrow::Table::Make(arrow::schema({arrow::field("a", arrow::int64())}),
+                                   {Build<arrow::Int64Builder, int64_t>(Sequence(first, 100))});
+    EXPECT_TRUE(
+        parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), *out, 50, properties).ok());
+    EXPECT_TRUE((*out)->Close().ok());
+    return path;
+  }
+
+  static int64_t CountRows(arrow::RecordBatchReader& reader) {
+    int64_t rows = 0;
+    while (true) {
+      std::shared_ptr<arrow::RecordBatch> batch;
+      const arrow::Status status = reader.ReadNext(&batch);
+      EXPECT_TRUE(status.ok()) << status.ToString();
+      if (!status.ok() || batch == nullptr) {
+        break;
+      }
+      rows += batch->num_rows();
+    }
+    return rows;
   }
 
   static Scanned Scan(const plan::Table& table, const std::vector<int>& fields,
@@ -747,6 +779,131 @@ TEST_F(ParquetScanTest, PartsAreRowGroupsInFileOrder) {
   }
 }
 
+// With no projected columns, the only Arrow-buffer read is footer validation. Its allocation
+// volume must depend on files and scan contexts, rather than the number of row-group readers.
+TEST_F(ParquetScanTest, ScanContextValidatesEachFileOnce) {
+  WriteNumbers("a.parquet", 0, 16, 2);
+  WriteNumbers("b.parquet", 16, 10, 2);
+  auto table = ParquetTable::Open({(dir_ / "*.parquet").string()});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_EQ((*table)->num_parts(), 13);
+
+  arrow::ProxyMemoryPool baseline(arrow::default_memory_pool());
+  {
+    auto reader = (*table)->Scan({}, 2, &baseline);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 26);
+  }
+  const int64_t footer_bytes = baseline.total_bytes_allocated();
+  ASSERT_GT(footer_bytes, 0);
+  EXPECT_EQ(baseline.bytes_allocated(), 0);
+
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  auto context = std::make_shared<plan::ScanContext>();
+  const auto scan_parts = [&](const std::shared_ptr<plan::ScanContext>& scan_context) {
+    int64_t rows = 0;
+    for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
+      auto reader = (*table)->ScanPart(part, {}, 2, &pool, scan_context);
+      ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+      rows += CountRows(**reader);
+    }
+    EXPECT_EQ(rows, 26);
+  };
+  scan_parts(context);
+  EXPECT_EQ(pool.total_bytes_allocated(), footer_bytes);
+  scan_parts(context);
+  EXPECT_EQ(pool.total_bytes_allocated(), footer_bytes);
+  scan_parts(std::make_shared<plan::ScanContext>());
+  EXPECT_EQ(pool.total_bytes_allocated(), 2 * footer_bytes);
+  EXPECT_EQ(pool.bytes_allocated(), 0);
+}
+
+TEST_F(ParquetScanTest, ScanContextFinishesOnlyUsedFilesWithTheCurrentPool) {
+  const std::string first = WriteNumbers("a.parquet", 0, 8, 2);
+  const std::string second = WriteNumbers("b.parquet", 8, 10, 2);
+  const std::string unused = WriteNumbers("unused.parquet", 18, 8, 2);
+  auto table = ParquetTable::Open({first, second, unused});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  auto scan_pool = std::make_unique<arrow::ProxyMemoryPool>(arrow::default_memory_pool());
+  int64_t rows = 0;
+  for (int64_t part = 0; part < 9; ++part) {
+    auto reader = (*table)->ScanPart(part, {}, 2, scan_pool.get(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    rows += CountRows(**reader);
+  }
+  EXPECT_EQ(rows, 18);
+  const int64_t footer_bytes = scan_pool->total_bytes_allocated();
+  ASSERT_GT(footer_bytes, 0);
+  EXPECT_EQ(scan_pool->bytes_allocated(), 0);
+  scan_pool.reset();
+
+  // A file with no scanned part must not be opened by the final check. All used files are
+  // checked again even with unchanged timestamps, allocating through the final check's pool.
+  ASSERT_TRUE(fs::remove(unused));
+  arrow::ProxyMemoryPool finish_pool(arrow::default_memory_pool());
+  const arrow::Status status = context->Finish(&finish_pool);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  EXPECT_EQ(finish_pool.total_bytes_allocated(), footer_bytes);
+  EXPECT_EQ(finish_pool.bytes_allocated(), 0);
+}
+
+TEST_F(ParquetScanTest, ScanContextDoesNotRetainQueryPool) {
+  auto table = ParquetTable::Open({WriteNumbers("a.parquet", 0, 12, 4)});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  auto first_pool = std::make_unique<arrow::ProxyMemoryPool>(arrow::default_memory_pool());
+  {
+    auto reader = (*table)->ScanPart(0, {0}, 2, first_pool.get(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 4);
+  }
+  EXPECT_EQ(first_pool->bytes_allocated(), 0);
+  const int64_t first_bytes = first_pool->total_bytes_allocated();
+  ASSERT_GT(first_bytes, 0);
+  arrow::ProxyMemoryPool second_pool(arrow::default_memory_pool());
+  {
+    auto reader = (*table)->ScanPart(1, {0}, 2, &second_pool, context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 4);
+  }
+  EXPECT_GT(second_pool.total_bytes_allocated(), 0);
+  EXPECT_EQ(second_pool.bytes_allocated(), 0);
+  EXPECT_EQ(first_pool->total_bytes_allocated(), first_bytes);
+  first_pool.reset();
+  {
+    auto reader = (*table)->Scan({0}, 2, &second_pool, context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    context.reset();  // the reader also keeps its validation state alive independently
+    EXPECT_EQ(CountRows(**reader), 12);
+  }
+  EXPECT_EQ(second_pool.bytes_allocated(), 0);
+}
+
+TEST_F(ParquetScanTest, ScanContextRevalidatesAnUnchangedFooterAfterStampChange) {
+  const std::string path = WriteNumbers("a.parquet", 0, 8, 2);
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  const auto scan_part = [&](int64_t part) {
+    auto reader = (*table)->ScanPart(part, {}, 2, &pool, context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 2);
+  };
+  scan_part(0);
+  const int64_t footer_bytes = pool.total_bytes_allocated();
+  ASSERT_GT(footer_bytes, 0);
+  scan_part(1);
+  EXPECT_EQ(pool.total_bytes_allocated(), footer_bytes);
+  fs::last_write_time(path, fs::last_write_time(path) - std::chrono::hours(24));
+  scan_part(2);
+  EXPECT_EQ(pool.total_bytes_allocated(), 2 * footer_bytes);
+  scan_part(3);
+  EXPECT_EQ(pool.total_bytes_allocated(), 2 * footer_bytes);
+  EXPECT_EQ(pool.bytes_allocated(), 0);
+}
+
 // A part converts its columns to the engine view exactly as the scan of the whole table does.
 TEST_F(ParquetScanTest, PartsConvertToTheEngineView) {
   const std::vector<std::optional<std::string>> strings = {"a", std::nullopt, "", "\xff", "bc"};
@@ -805,16 +962,22 @@ TEST_F(ParquetScanTest, FileChangedAfterOpenIsIOErrorForParts) {
   auto table = ParquetTable::Open({a, b});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
   ASSERT_EQ((*table)->num_parts(), 4);
+  auto context = std::make_shared<plan::ScanContext>();
+  {
+    auto reader = (*table)->Scan({0}, 8, arrow::default_memory_pool(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 8);
+  }
   WriteNumbers("b.parquet", 100, 50, 10);
   // Parts of a.parquet still read.
-  auto reader = (*table)->ScanPart(1, {0}, 8);
+  auto reader = (*table)->ScanPart(1, {0}, 8, arrow::default_memory_pool(), context);
   ASSERT_TRUE(reader.ok()) << reader.status().ToString();
   std::shared_ptr<arrow::RecordBatch> batch;
   ASSERT_TRUE((*reader)->ReadNext(&batch).ok());
   ASSERT_NE(batch, nullptr);
   EXPECT_EQ(batch->num_rows(), 2);
   // Parts of b.parquet do not.
-  reader = (*table)->ScanPart(2, {0}, 8);
+  reader = (*table)->ScanPart(2, {0}, 8, arrow::default_memory_pool(), context);
   ASSERT_TRUE(reader.ok()) << reader.status().ToString();
   const arrow::Status st = (*reader)->ReadNext(&batch);
   EXPECT_TRUE(st.IsIOError()) << st.ToString();
@@ -825,29 +988,53 @@ TEST_F(ParquetScanTest, FileChangedAfterOpenIsIOErrorForParts) {
 // A file rewritten with the same size but other values (and so other statistics in its footer)
 // is not decoded with the footer read at Open.
 TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
-  const auto write_plain = [&](const std::string& name, int64_t first) {
-    const std::string path = (dir_ / name).string();
-    auto out = arrow::io::FileOutputStream::Open(path);
-    EXPECT_TRUE(out.ok()) << out.status().ToString();
-    const auto properties = parquet::WriterProperties::Builder()
-                                .disable_dictionary()
-                                ->compression(parquet::Compression::UNCOMPRESSED)
-                                ->build();
-    auto data = arrow::Table::Make(arrow::schema({arrow::field("a", arrow::int64())}),
-                                   {Build<arrow::Int64Builder, int64_t>(Sequence(first, 100))});
-    EXPECT_TRUE(
-        parquet::arrow::WriteTable(*data, arrow::default_memory_pool(), *out, 50, properties).ok());
-    EXPECT_TRUE((*out)->Close().ok());
-    return path;
-  };
-  const std::string path = write_plain("a.parquet", 0);
-  const std::string other = write_plain("other.parquet", 1000);
+  const std::string path = WritePlainNumbers("a.parquet", 0);
+  const std::string other = WritePlainNumbers("other.parquet", 1000);
   ASSERT_EQ(fs::file_size(path), fs::file_size(other));
   auto table = ParquetTable::Open({path});
   ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  {
+    auto reader = (*table)->Scan({0}, 8, arrow::default_memory_pool(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 100);
+  }
+  const auto original_time = fs::last_write_time(path);
   fs::copy_file(other, path, fs::copy_options::overwrite_existing);
-  for (int64_t part = -1; part < (*table)->num_parts(); ++part) {
-    auto reader = part < 0 ? (*table)->Scan({0}, 8) : (*table)->ScanPart(part, {0}, 8);
+  // Force a distinct stamp without sleeps or relying on the filesystem's timestamp resolution.
+  fs::last_write_time(path, original_time - std::chrono::hours(24));
+  for (const auto& scan_context :
+       {context, std::make_shared<plan::ScanContext>(), std::shared_ptr<plan::ScanContext>{}}) {
+    for (int64_t part = -1; part < (*table)->num_parts(); ++part) {
+      auto reader =
+          part < 0 ? (*table)->Scan({0}, 8, arrow::default_memory_pool(), scan_context)
+                   : (*table)->ScanPart(part, {0}, 8, arrow::default_memory_pool(), scan_context);
+      ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+      std::shared_ptr<arrow::RecordBatch> batch;
+      const arrow::Status st = (*reader)->ReadNext(&batch);
+      EXPECT_TRUE(st.IsIOError()) << part << ": " << st.ToString();
+      EXPECT_NE(st.message().find("footer differs"), std::string::npos) << st.ToString();
+      EXPECT_NE(st.message().find("a.parquet"), std::string::npos) << st.ToString();
+    }
+  }
+}
+
+TEST_F(ParquetScanTest, ScanContextDetectsSameSizeReplacement) {
+  const std::string path = WritePlainNumbers("a.parquet", 0);
+  const std::string replacement = WritePlainNumbers("replacement.parquet", 1000);
+  ASSERT_EQ(fs::file_size(path), fs::file_size(replacement));
+  fs::last_write_time(replacement, fs::last_write_time(path));
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  {
+    auto reader = (*table)->ScanPart(0, {0}, 8, arrow::default_memory_pool(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 50);
+  }
+  fs::rename(replacement, path);
+  for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
+    auto reader = (*table)->ScanPart(part, {0}, 8, arrow::default_memory_pool(), context);
     ASSERT_TRUE(reader.ok()) << reader.status().ToString();
     std::shared_ptr<arrow::RecordBatch> batch;
     const arrow::Status st = (*reader)->ReadNext(&batch);
@@ -855,6 +1042,32 @@ TEST_F(ParquetScanTest, SameSizeRewriteIsIOError) {
     EXPECT_NE(st.message().find("footer differs"), std::string::npos) << st.ToString();
     EXPECT_NE(st.message().find("a.parquet"), std::string::npos) << st.ToString();
   }
+}
+
+TEST_F(ParquetScanTest, ScanContextFinishRejectsSameSizeRewriteAfterLastRead) {
+  const std::string path = WritePlainNumbers("a.parquet", 0);
+  const std::string replacement = WritePlainNumbers("replacement.parquet", 1000);
+  ASSERT_EQ(fs::file_size(path), fs::file_size(replacement));
+  auto table = ParquetTable::Open({path});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  auto context = std::make_shared<plan::ScanContext>();
+  {
+    auto reader = (*table)->ScanPart(0, {0}, 8, arrow::default_memory_pool(), context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(CountRows(**reader), 50);
+  }
+  const auto original_time = fs::last_write_time(path);
+  fs::copy_file(replacement, path, fs::copy_options::overwrite_existing);
+  fs::last_write_time(path, original_time);
+  // No reader opens after this rewrite. Finishing must compare the complete footer, without
+  // relying on another part or a changed mtime to discover it.
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  const arrow::Status status = context->Finish(&pool);
+  EXPECT_TRUE(status.IsIOError()) << status.ToString();
+  EXPECT_NE(status.message().find("footer differs"), std::string::npos) << status.ToString();
+  EXPECT_NE(status.message().find("a.parquet"), std::string::npos) << status.ToString();
+  EXPECT_GT(pool.total_bytes_allocated(), 0);
+  EXPECT_EQ(pool.bytes_allocated(), 0);
 }
 
 // The narrowing conversion's own cases (ADR 0021's decimal64 item). A BYTE_ARRAY decimal's length

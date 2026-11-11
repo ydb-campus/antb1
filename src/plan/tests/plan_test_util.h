@@ -99,8 +99,8 @@ class FakeTable final : public Table {
 
  protected:
   arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
-      const std::vector<int>& /*fields*/, int64_t /*batch_size*/,
-      arrow::MemoryPool* /*pool*/) const override {
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<ScanContext>& /*context*/) const override {
     return arrow::Status::NotImplemented("fake tables cannot be scanned");
   }
 

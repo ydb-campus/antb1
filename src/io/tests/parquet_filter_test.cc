@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -767,6 +768,44 @@ TEST_F(ParquetFilterErrorsTest, FilterErrorsAndChangedFiles) {
   EXPECT_NE(io.message().find("t.parquet"), std::string::npos) << io.ToString();
 }
 
+TEST_F(ParquetFilterErrorsTest, ScanContextRevalidatesChangedFooter) {
+  const std::string path = Write(Encoding::kPlain);
+  const auto table = Open(path);
+  auto context = std::make_shared<plan::ScanContext>();
+  auto filter = std::make_shared<TestFilter>(
+      std::vector<int>{0}, std::vector<Predicate>{[](const Value&) { return true; }});
+  {
+    auto reader = table->ScanPart(0, {6}, 100, arrow::default_memory_pool(), filter,
+                                  /*positions=*/false, std::nullopt, context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(Drain(**reader, 100)->num_rows(), table->part_rows(0));
+  }
+  const auto bytes = fs::file_size(path);
+  const auto original_time = fs::last_write_time(path);
+  {
+    // Damage only the final magic byte: the already parsed footer could still decode the pages
+    // if a successful validation incorrectly kept this file trusted forever.
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+    file.seekp(-1, std::ios::end);
+    file.put('X');
+    ASSERT_TRUE(file.good());
+  }
+  ASSERT_EQ(fs::file_size(path), bytes);
+  fs::last_write_time(path, original_time - std::chrono::hours(24));
+  for (const auto& scan_context :
+       {context, std::make_shared<plan::ScanContext>(), std::shared_ptr<plan::ScanContext>{}}) {
+    auto reader = table->ScanPart(1, {6}, 100, arrow::default_memory_pool(), filter,
+                                  /*positions=*/false, std::nullopt, scan_context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    std::shared_ptr<arrow::RecordBatch> batch;
+    const arrow::Status status = (*reader)->ReadNext(&batch);
+    EXPECT_TRUE(status.IsIOError()) << status.ToString();
+    EXPECT_NE(status.message().find("footer differs"), std::string::npos) << status.ToString();
+    EXPECT_NE(status.message().find("t.parquet"), std::string::npos) << status.ToString();
+  }
+}
+
 // A corrupt data page (the file's size and footer unchanged): an I/O error naming the file, from a
 // filter's column and from another column.
 TEST_F(ParquetFilterErrorsTest, CorruptPagesAreIOErrors) {
@@ -821,6 +860,55 @@ TEST_F(ParquetFilterErrorsTest, PartsOfEveryFile) {
   EXPECT_GT(rows, 0);
 }
 
+TEST_F(ParquetFilterErrorsTest, ScanContextSharesValidationAcrossFilteredParts) {
+  const std::string first = Write(Encoding::kDictionary);
+  const std::string second = (dir_ / "u.parquet").string();
+  fs::copy_file(first, second);
+  auto table = ParquetTable::Open({first, second});
+  ASSERT_TRUE(table.ok()) << table.status().ToString();
+  ASSERT_GT((*table)->num_parts(), 2);
+
+  // No columns means the ordinary reader allocates only the two validation buffers. The
+  // filtered reader additionally allocates a selection bitmap per batch, identical each pass.
+  arrow::ProxyMemoryPool baseline(arrow::default_memory_pool());
+  {
+    auto reader = (*table)->Scan({}, 400, &baseline);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(Drain(**reader, 400)->num_rows(), 2 * kRows);
+  }
+  const int64_t footer_bytes = baseline.total_bytes_allocated();
+  ASSERT_GT(footer_bytes, 0);
+  EXPECT_EQ(baseline.bytes_allocated(), 0);
+
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  auto context = std::make_shared<plan::ScanContext>();
+  auto filter = std::make_shared<TestFilter>(std::vector<int>{}, std::vector<Predicate>{});
+  const auto scan_parts = [&](const std::shared_ptr<plan::ScanContext>& scan_context) {
+    int64_t rows = 0;
+    for (int64_t part = 0; part < (*table)->num_parts(); ++part) {
+      auto reader = (*table)->ScanPart(part, {}, 400, &pool, filter, /*positions=*/false,
+                                       /*returned=*/0, scan_context);
+      ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+      rows += Drain(**reader, 400)->num_rows();
+    }
+    EXPECT_EQ(rows, 2 * kRows);
+  };
+  scan_parts(context);
+  const int64_t first_bytes = pool.total_bytes_allocated();
+  scan_parts(context);
+  const int64_t repeat_bytes = pool.total_bytes_allocated() - first_bytes;
+  EXPECT_GT(repeat_bytes, 0);  // the repeated scan still allocates its selection bitmaps
+  EXPECT_EQ(first_bytes - repeat_bytes, footer_bytes);
+  const int64_t before_fresh = pool.total_bytes_allocated();
+  scan_parts(std::make_shared<plan::ScanContext>());
+  EXPECT_EQ(pool.total_bytes_allocated() - before_fresh, first_bytes);
+  const int64_t before_finish = pool.total_bytes_allocated();
+  const arrow::Status finished = context->Finish(&pool);
+  ASSERT_TRUE(finished.ok()) << finished.ToString();
+  EXPECT_EQ(pool.total_bytes_allocated() - before_finish, footer_bytes);
+  EXPECT_EQ(pool.bytes_allocated(), 0);
+}
+
 // A pool that fails every allocation that would take it past `cap` bytes in use.
 class CappedPool final : public arrow::MemoryPool {
  public:
@@ -856,6 +944,29 @@ class CappedPool final : public arrow::MemoryPool {
   int64_t cap_;
   int64_t used_ = 0;
 };
+
+TEST_F(ParquetFilterErrorsTest, ScanContextFinishOutOfMemoryCanBeRetried) {
+  const auto table = Open(Write(Encoding::kDictionary));
+  auto context = std::make_shared<plan::ScanContext>();
+  auto filter = std::make_shared<TestFilter>(
+      std::vector<int>{0}, std::vector<Predicate>{[](const Value&) { return true; }});
+  {
+    auto reader = table->ScanPart(0, {6}, 100, arrow::default_memory_pool(), filter,
+                                  /*positions=*/false, std::nullopt, context);
+    ASSERT_TRUE(reader.ok()) << reader.status().ToString();
+    EXPECT_EQ(Drain(**reader, 100)->num_rows(), table->part_rows(0));
+  }
+  CappedPool capped(0);
+  const arrow::Status failed = context->Finish(&capped);
+  EXPECT_TRUE(failed.IsOutOfMemory()) << failed.ToString();
+  EXPECT_EQ(capped.bytes_allocated(), 0);
+
+  arrow::ProxyMemoryPool retry_pool(arrow::default_memory_pool());
+  const arrow::Status retried = context->Finish(&retry_pool);
+  EXPECT_TRUE(retried.ok()) << retried.ToString();
+  EXPECT_GT(retry_pool.total_bytes_allocated(), 0);
+  EXPECT_EQ(retry_pool.bytes_allocated(), 0);
+}
 
 // Out of memory anywhere in a filtered scan (pages, decoded values, the filter's kept strings,
 // the output, the rows' positions): an OutOfMemory status, never a crash, and every byte given

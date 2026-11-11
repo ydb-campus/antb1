@@ -510,6 +510,7 @@ class PartTopNOperator final : public PartSink {
   arrow::MemoryPool* pool_ = arrow::default_memory_pool();
   int64_t batch_size_ = 1;
   std::optional<LateColumns> late_;
+  std::shared_ptr<plan::ScanContext> scans_;
   std::optional<TopNPruning> pruning_;
   std::shared_ptr<Bound> bound_;  // nullptr without pruning_
   arrow::internal::Executor* executor_ = nullptr;

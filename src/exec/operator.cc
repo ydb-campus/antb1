@@ -9,6 +9,8 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 
+#include "antb1/plan/table.h"
+
 namespace antb1::exec {
 
 int64_t Batch::selected_rows() const {
@@ -61,12 +63,19 @@ arrow::Result<arrow::RecordBatchVector> PullAllChecked(Operator& op, arrow::Memo
 
 }  // namespace
 
-arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, ExecContext& ctx) {
-  ARROW_RETURN_NOT_OK(op.Open(ctx));
-  auto batches = PullAllChecked(op, ctx.pool);
+arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecContext& ctx) {
+  ExecContext run = ctx;
+  try {
+    run.scans = std::make_shared<plan::ScanContext>();
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("out of memory preparing query scans");
+  }
+  ARROW_RETURN_NOT_OK(op.Open(run));
+  auto batches = PullAllChecked(op, run.pool);
   const arrow::Status closed = op.Close();  // also after a failure: release files and readers
   ARROW_RETURN_NOT_OK(batches.status());
   ARROW_RETURN_NOT_OK(closed);
+  ARROW_RETURN_NOT_OK(run.scans->Finish(run.pool));
   return arrow::Table::FromRecordBatches(op.output_schema(), *batches);
 }
 

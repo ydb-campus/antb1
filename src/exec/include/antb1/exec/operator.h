@@ -21,6 +21,10 @@ namespace arrow::internal {
 class Executor;
 }  // namespace arrow::internal
 
+namespace antb1::plan {
+class ScanContext;
+}  // namespace antb1::plan
+
 namespace antb1::exec {
 
 class MemoryBudget;
@@ -38,6 +42,8 @@ struct ExecContext {
   // The budget `pool` counts against (nullptr: no limit, nothing to reserve). Operators reserve
   // the memory of their own containers here, and parts are started one at a time under pressure.
   MemoryBudget* budget = nullptr;
+  // Shared by every scan of one run; Drain supplies a fresh context for each execution.
+  std::shared_ptr<plan::ScanContext> scans = nullptr;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection
@@ -87,6 +93,6 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> Materialize(const Batch& batc
                                                                arrow::MemoryPool* pool);
 
 // Opens op, pulls every batch into a table (materializing selections), closes op.
-arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, ExecContext& ctx);
+arrow::Result<std::shared_ptr<arrow::Table>> Drain(Operator& op, const ExecContext& ctx);
 
 }  // namespace antb1::exec

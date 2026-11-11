@@ -56,7 +56,18 @@ Responsibilities:
   engine view: UTF8 and large strings to binary without UTF-8 validation, FLOAT to DOUBLE, a USMALLINT or INTEGER
   column read as DATE to date32. Every Parquet exception and read failure becomes an `IOError` here. The footers
   read at `Open` are kept and reused by every scan; a file whose size or footer bytes changed since is an
-  `IOError`. The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
+  `IOError`. Each execution has a `plan::ScanContext`: the first reader of a file compares the full footer,
+  and later parts share that successful validation while the open descriptor's device, inode, size, modification
+  time and change time remain equal. A changed fingerprint requires another full comparison. At successful
+  completion, after readers close and before results return, the context compares every used file's full footer
+  again: timestamp granularity must not hide a footer rewrite. Every new execution also compares the footer again,
+  even when these attributes are unchanged. C++ calls to `Table::Scan` or `Table::ScanPart` that omit a context
+  validate independently; SQL execution supplies the context automatically. Validation retains no file handle
+  or query-pool buffer; parts keep independent readers and their
+  column reads run concurrently. Files must remain stable during an execution: these checks detect observed
+  changes but do not provide a transactional snapshot against concurrent writers. Callers that supply their own
+  scan context must finish its readers and call `ScanContext::Finish` before accepting the results.
+  The table's parts (`plan::Table::num_parts`, `part_rows`, `ScanPart`), the units of parallel work of
   [ADR 0013](adr/0013-parallel-execution.md), are its row groups with rows in file order; scanning them one after
   another gives the rows of `Scan`. Other tables are one part by default. A part's footer statistics are the exact
   min, max and NULL count of an integer-valued column (`part_stats`, for skipping parts) and the distinct count a
@@ -238,7 +249,8 @@ Every operator instance is used by one thread.
 built once per part with a `TableScanOperator` of that part, so parts share no operator state; the probes of every
 part read the same builds, made once with the pipeline. `exec::PartScheduler` runs the parts on
 `ExecContext::executor` (an Arrow `ThreadPool` the `Session` owns when it has more than one thread) and hands their
-results back strictly in part order. At most
+results back strictly in part order. `exec::Drain` creates a fresh scan context per execution; part pipelines and
+late-column fetches share it so independent readers can reuse file validation. At most
 2 × threads parts are running or finished but not yet taken, or 4 × threads under a sink that merges the parts into
 partial states (an aggregate or a top-N, a join's probe below one included), whose finished parts mostly hold far
 less than their rows: one slow part then holds up fewer of the others (ADR 0013, amended 2026-10-22). With one

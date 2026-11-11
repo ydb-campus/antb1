@@ -43,7 +43,8 @@ ExecContext PartContext(const ExecContext& ctx) {
                      .batch_size = ctx.batch_size,
                      .executor = nullptr,
                      .threads = 1,
-                     .budget = ctx.budget};
+                     .budget = ctx.budget,
+                     .scans = ctx.scans};
 }
 
 int64_t PartWindow(const ExecContext& ctx) {
@@ -1462,6 +1463,7 @@ arrow::Status PartTopNOperator::Open(ExecContext& ctx) {
     return arrow::Status::Invalid("a top-N needs a positive LIMIT and no negative OFFSET");
   }
   pool_ = ctx.pool;
+  scans_ = ctx.scans;
   executor_ = ctx.executor;
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   int64_t keep = 0;
@@ -1635,7 +1637,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> PartTopNOperator::Fetch(
     const std::size_t column = task % columns;
     ARROW_ASSIGN_OR_RAISE(
         auto reader, late.table->ScanPart((*late.parts)[static_cast<std::size_t>(ordinals[part])],
-                                          {late.fields[column]}, batch_size_, pool_));
+                                          {late.fields[column]}, batch_size_, pool_, scans_));
     arrow::ArrayVector read;
     while (true) {
       std::shared_ptr<arrow::RecordBatch> batch;
@@ -1696,6 +1698,7 @@ arrow::Status PartTopNOperator::Close() {
   merged_.reset();
   window_.reset();
   bound_.reset();  // a task still running holds its own reference
+  scans_.reset();
   memory_.Release();
   return arrow::Status::OK();
 }

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,6 +24,135 @@ namespace {
 
 using testing::AllTypesSchema;
 using testing::FakeTable;
+
+struct ScanFinishRecord {
+  int calls = 0;
+  bool fail_allocation = false;
+  arrow::Status status = arrow::Status::OK();
+  arrow::MemoryPool* expected_pool = nullptr;
+};
+
+class FinishingScanState final : public TableScanState {
+ public:
+  explicit FinishingScanState(std::shared_ptr<ScanFinishRecord> record)
+      : record_(std::move(record)) {}
+  arrow::Status Finish(arrow::MemoryPool* pool) override {
+    ++record_->calls;
+    EXPECT_EQ(pool, record_->expected_pool);
+    if (record_->fail_allocation) {
+      throw std::bad_alloc();
+    }
+    return record_->status;
+  }
+
+ private:
+  std::shared_ptr<ScanFinishRecord> record_;
+};
+
+class StatefulTable final : public Table {
+ public:
+  const std::shared_ptr<arrow::Schema>& schema() const override { return schema_; }
+  std::optional<int64_t> exact_row_count() const override { return 0; }
+  std::string Describe() const override { return "stateful"; }
+  std::shared_ptr<TableScanState> MakeScanState() const override {
+    ++made_;
+    if (fail_) {
+      throw std::bad_alloc();
+    }
+    if (finish_ != nullptr) {
+      return std::make_shared<FinishingScanState>(finish_);
+    }
+    return std::make_shared<TableScanState>();
+  }
+
+  int made() const { return made_; }
+  void set_fail(bool fail) { fail_ = fail; }
+  void set_finish(std::shared_ptr<ScanFinishRecord> finish) { finish_ = std::move(finish); }
+
+ protected:
+  arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> DoScan(
+      const std::vector<int>& /*fields*/, int64_t /*batch_size*/, arrow::MemoryPool* /*pool*/,
+      const std::shared_ptr<ScanContext>& /*context*/) const override {
+    return arrow::Status::NotImplemented("stateful test tables cannot be scanned");
+  }
+
+ private:
+  mutable int made_ = 0;
+  bool fail_ = false;
+  std::shared_ptr<ScanFinishRecord> finish_;
+  std::shared_ptr<arrow::Schema> schema_ = arrow::schema({});
+};
+
+TEST(TableTest, ScanStateIsSharedOnlyWithinOneContext) {
+  StatefulTable first;
+  StatefulTable second;
+  const FakeTable no_state(AllTypesSchema(), 0);
+  ScanContext one;
+  ScanContext two;
+  auto a = one.Get(first);
+  auto again = one.Get(first);
+  auto b = one.Get(second);
+  auto next_run = two.Get(first);
+  ASSERT_TRUE(a.ok());
+  ASSERT_TRUE(again.ok());
+  ASSERT_TRUE(b.ok());
+  ASSERT_TRUE(next_run.ok());
+  ASSERT_NE(*a, nullptr);
+  EXPECT_EQ(*a, *again);
+  EXPECT_NE(*a, *b);
+  EXPECT_NE(*a, *next_run);
+  EXPECT_EQ(first.made(), 2);
+  EXPECT_EQ(second.made(), 1);
+  const auto empty = one.Get(no_state);
+  ASSERT_TRUE(empty.ok());
+  EXPECT_EQ(*empty, nullptr);
+  EXPECT_TRUE(one.Finish(arrow::default_memory_pool()).ok());
+}
+
+TEST(TableTest, FailedScanStateCreationCanBeRetried) {
+  StatefulTable table;
+  ScanContext context;
+  table.set_fail(true);
+  EXPECT_TRUE(context.Get(table).status().IsOutOfMemory());
+  table.set_fail(false);
+  const auto state = context.Get(table);
+  ASSERT_TRUE(state.ok());
+  EXPECT_NE(*state, nullptr);
+  EXPECT_EQ(table.made(), 2);
+}
+
+TEST(TableTest, ScanFinishChecksUsedStatesWithTheCallersPool) {
+  arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+  const auto record = std::make_shared<ScanFinishRecord>();
+  record->expected_pool = &pool;
+  StatefulTable used;
+  StatefulTable unused;
+  used.set_finish(record);
+  unused.set_finish(record);
+  ScanContext context;
+  ASSERT_TRUE(context.Get(used).ok());
+  ASSERT_TRUE(context.Get(used).ok());
+  ASSERT_TRUE(context.Finish(&pool).ok());
+  EXPECT_EQ(record->calls, 1);
+  EXPECT_EQ(used.made(), 1);
+  EXPECT_EQ(unused.made(), 0);
+}
+
+TEST(TableTest, ScanFinishPreservesValidationErrorsAndConvertsAllocationFailure) {
+  const auto record = std::make_shared<ScanFinishRecord>();
+  record->expected_pool = arrow::default_memory_pool();
+  record->status = arrow::Status::IOError("the input changed");
+  StatefulTable table;
+  table.set_finish(record);
+  ScanContext context;
+  ASSERT_TRUE(context.Get(table).ok());
+  const auto failed = context.Finish(record->expected_pool);
+  EXPECT_TRUE(failed.IsIOError());
+  EXPECT_EQ(failed.message(), "the input changed");
+  record->fail_allocation = true;
+  EXPECT_TRUE(context.Finish(record->expected_pool).IsOutOfMemory());
+  EXPECT_EQ(record->calls, 2);
+}
 
 // A table that does not split itself is one part: the whole table.
 TEST(TableTest, WholeTableIsOnePartByDefault) {
