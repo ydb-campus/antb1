@@ -984,6 +984,11 @@ docs/sql-subset.md sections it changes.
       ON, and one in a LEFT JOIN's ON whose conjunct reads the left input or no column, so those stay exit 4 for
       good; a LEFT JOIN's ON conjunct that reads the right input alone (a value, an IN or an EXISTS) stays the
       coverage item.
+    - Update (2026-11-11, SQ2a): built for the select items and ORDER BY of a block that neither groups nor
+      aggregates (ADR 0041's SQ2a update), in the per-row slot, below the computed items, the sort and the
+      projection. An EXISTS block's list is dropped, so a value there that no clause reads binds as a dry run. One
+      newly opened place answers where DuckDB raises a bind error, by the maintainer's choice: an ORDER BY expression
+      over the alias of an item that holds a value (divergence D37). SQ2b answers the blocks that aggregate.
   - **IN and NOT IN under OR, NOT or CASE (SQ7).** A top-level conjunct keeps its semi or null-aware anti join.
     Elsewhere in a condition, IN becomes a null-aware mark join, a new kind that keeps each left row once and appends
     a BOOLEAN: TRUE on a match; else FALSE for an empty set, even for a NULL probe; else NULL where the probe is NULL

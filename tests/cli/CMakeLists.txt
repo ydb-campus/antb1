@@ -687,6 +687,51 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
 )
 
+# Values in a block that does not aggregate (ADR 0041's SQ2a) join in block 0's per-row slot, below
+# the computed select items, the sort and the limit: one join per distinct subquery, the item's and
+# the ORDER BY's.
+antb1_add_cli_golden(
+  explain_select_value
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_row, tr_pickup * (SELECT MIN(zn_id) FROM zones) AS v, CASE WHEN EXISTS (SELECT * FROM zones WHERE zn_id > 39) THEN 1 ELSE 0 END AS e FROM trips WHERE tr_row < 5 ORDER BY (SELECT MAX(zn_id) FROM zones) - tr_row, tr_row LIMIT 3"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# An EXISTS block's select list is dropped: a value there that no clause reads plants nothing.
+antb1_add_cli_golden(
+  explain_exists_select_list_value
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT (SELECT zn_id FROM zones) FROM zones z WHERE z.zn_id = trips.tr_pickup)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
+antb1_add_cli_golden(
+  query_select_value_names
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT ct_id, (SELECT MIN(zn_id) FROM zones), ct_id + (SELECT COUNT(*) FROM cities) FROM cities WHERE ct_id < 3 ORDER BY ct_id"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+
 # ---- bench: ClickBench-format JSON (docs/benchmarks.md); timings vary, so regexes ----
 # CMake regex: [.] [{] [}] [[] []] match the character itself; \n is a newline. Built with string(APPEND):
 # a CMake list would split at the ; separators inside [ ].

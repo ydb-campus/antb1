@@ -307,6 +307,11 @@ evaluation could hide (divergences D16 and D35).
 other subquery and a `GROUP BY` key can be a probe, 70% of the time one more `AND` conjunct holds the same forms over
 that key, from a stream of its own, so a query without one is the query its seed gave before.
 
+So do select items (ADR 0041's SQ2a, feature `item_value`): where the select list is a projection (no aggregate, no
+`GROUP BY`) and the query holds no other subquery, which only `WHERE` tells, so the item is written after it and moved
+to the end of the list, half the time one more select item holds a value block alone, or `CASE WHEN <condition> THEN 1
+ELSE 0 END` over one of `condition_value`'s conditions, from a stream of its own. No `ORDER BY` reads it.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

@@ -1,0 +1,18 @@
+Output: tr_row:INTEGER v:INTEGER e:INTEGER
+Project tr_row, v, e
+  Limit 3
+    Sort "(max(zn_id) - tr_row)" ASC NULLS LAST, tr_row ASC NULLS LAST
+      Compute (tr_pickup * min(zn_id)), CASE  WHEN (EXISTS (SELECT * FROM zones WHERE zn_id > 39)) THEN (1) ELSE 0 END, (max(zn_id) - tr_row)
+        Join ONE-ROW build=right keys=[]
+          Join ONE-ROW build=right keys=[]
+            Join ONE-ROW build=right keys=[]
+              Filter tr_row < 5
+                Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_pickup]
+              Aggregate MIN(zn_id)
+                Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]  [shared #1 of 3, 1 field]
+            Aggregate COUNT(*)
+              Limit 1
+                Filter zn_id > 39
+                  Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]  [shared #1 of 3, 1 field]
+          Aggregate MAX(zn_id)
+            Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id]  [shared #1 of 3, 1 field]

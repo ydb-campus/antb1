@@ -118,7 +118,7 @@ bool HasSubquery(const GeneratedQuery& q) {
          q.features.Has(Feature::kCorrelatedExists) ||
          q.features.Has(Feature::kCorrelatedAggregate) ||
          q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
-         q.features.Has(Feature::kHavingValue);
+         q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -987,7 +987,7 @@ TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
     const auto without = MakeOver(WithoutRefs(JoinTables()), 47, options);
     int joins = 0;
     int dims_by_path = 0;  // 60% of them come from a join that failed
-    for (uint64_t i = 0; i < 2000; ++i) {
+    for (uint64_t i = 0; i < 2500; ++i) {
       const auto q = with_refs.Generate(i);
       if (UsesRefs(q)) {
         joins += Joins(q) ? 1 : 0;
@@ -3218,6 +3218,77 @@ TEST(QueryGenerator, HavingValuesChangeOnlyTheirQueries) {
   }
   EXPECT_GT(took, 50) << "values in HAVING: " << took;
   EXPECT_GT(same, 6000);
+}
+
+// A value in a select item (ADR 0041's SQ2a) draws from a stream of its own and fires only in a
+// projection whose query holds no other subquery, so declaring it changes the queries that take
+// one and no others; each is one more select item, last, over no GROUP BY, HAVING or aggregate,
+// whose value blocks return at most one row and read only their own table.
+TEST(QueryGenerator, ItemValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 83, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 83,
+               {.supported = kSupportedFeatures.Minus({Feature::kItemValue}), .target_percent = 0});
+  const std::vector<GenTable> tables = JoinTables();
+  int took = 0;
+  int same = 0;
+  int bare = 0;     // the value alone
+  int cases = 0;    // a CASE WHEN over a condition
+  int exists = 0;   // an EXISTS among the conditions
+  int starred = 0;  // after a star
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kItemValue)) << plain.sql;
+    if (!q.features.Has(Feature::kItemValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kGroupBy, Feature::kHaving}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_GE(parsed->items.size(), 2U);
+    // Every subquery is in the last select item: the others and WHERE hold none.
+    const sql::SelectExpr* last = parsed->items.back().expr();
+    ASSERT_NE(last, nullptr);
+    std::vector<const sql::SubqueryExpr*> in_last;
+    DeepSubqueries(*last, in_last);
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_FALSE(in_last.empty());
+    EXPECT_EQ(all.size(), in_last.size());
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_NE(sub->kind, sql::SubqueryExpr::Kind::kIn) << "an IN subquery is SQ7's";
+      CheckOwnColumns(*sub->query, tables);
+      if (sub->kind == sql::SubqueryExpr::Kind::kScalar) {
+        EXPECT_TRUE(AtMostOneRow(*sub->query)) << "a value block of at most one row";
+      } else {
+        ++exists;
+      }
+    }
+    bare += std::holds_alternative<sql::SubqueryExpr>(*last) ? 1 : 0;
+    cases += std::holds_alternative<sql::CaseExpr>(*last) ? 1 : 0;
+    starred += parsed->items.front().star() != nullptr ? 1 : 0;
+  }
+  EXPECT_GT(took, 350) << "values in select items: " << took << ", alone " << bare << ", in a CASE "
+                       << cases << ", EXISTS " << exists << ", after a star " << starred;
+  EXPECT_GT(same, 6000);
+  EXPECT_GT(bare, 150);
+  EXPECT_GT(cases, 150);
+  EXPECT_GT(exists, 30);
+  EXPECT_GT(starred, 80);
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

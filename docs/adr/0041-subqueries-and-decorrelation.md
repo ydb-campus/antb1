@@ -826,6 +826,56 @@ SQ1's second PR. With it SQ1 is built; no query completes, and no TPC-H or TPC-D
   generator's Feature `having_value` adds a HAVING conjunct with a value from a stream of its own; three metamorphic
   relations cover HAVING values.
 
+## Update (2026-11-11, SQ2a): values in the select items and ORDER BY of blocks that do not aggregate, built
+
+At the maintainer's request SQ2 is two PRs: SQ2a, values in the select items and ORDER BY of a block that neither
+groups nor aggregates; and SQ2b, values in GROUP BY keys and aggregate arguments, in select items and ORDER BY over
+aggregates, and decision 23's select-list half. SQ2a completes Q9, and the ratchet is at 79.
+
+- **Decision 8, as built in blocks that do not aggregate** (no GROUP BY, no aggregate in the select list, HAVING or
+  ORDER BY): an uncorrelated scalar subquery is a value anywhere in a select item or an ORDER BY item -- alone, in
+  arithmetic, functions, COALESCE, casts and CASE, next to a star and under SELECT DISTINCT -- and an uncorrelated
+  EXISTS, an IN list and a BETWEEN with values are conditions in a CASE WHEN there, as in a condition. That holds in
+  such a block of an IN subquery, a scalar subquery, a derived table, a CTE and a compound's arm too. In a block that
+  aggregates a value there is refused until SQ2b, with its own message. Still exit 4: EXISTS and an IN subquery as a
+  value of their own (decision 3's BOOLEAN items; IN under a CASE is SQ7's), a correlated value or EXISTS outside a
+  condition (SQ5, SQ8), LIMIT and OFFSET, a LEFT or FULL JOIN's ON, and a compound's own ORDER BY (ADR 0036's X5).
+- **Decision 9, as built.** These values join in the per-row slot WHERE's values join in, below the computed items,
+  the sort, DISTINCT and the projection; the assembly of a block does not change. **Decision 10:** the memo covers
+  them, so a subquery written in a select item and in ORDER BY is one join.
+- **The select list of an EXISTS block.** DuckDB drops it for an uncorrelated EXISTS too, so an item that holds a
+  value and that its block's ORDER BY does not read binds as a dry run, as OR factoring's dropped branch does: its bind
+  errors and refusals stay, it plants nothing, and a computed 0 keeps its place so the items after it keep their
+  positions. The ORDER BY reads an item as it binds: by its position, the unexpanded stars' columns counted, by a bare
+  name that the item is the last alias of, or inside an expression by a name that no column of the block has and the
+  item is the last alias of. (A block with GROUP BY or HAVING aggregates, so SQ2b settles theirs; any position or name
+  equal to the alias counts there for now.) A value there that would fail answers, as in DuckDB, and so does a
+  correlated value of the shape Path 2 takes, an aggregate over every row; a correlated value of another shape keeps
+  its refusal. Under SELECT DISTINCT and in a compound the list is the block's rows, and is computed. A value in the
+  list of a derived table or a CTE right under the EXISTS block still joins in that block's slot, although D32 drops
+  the list, so its error fails the query where DuckDB answers (D32 and D35 now say so).
+- **Decision 11, as built.** An unaliased select item that holds a subquery is named by antb1's own text of the item,
+  under D8. The column count of a value is DuckDB's class of bind error, "a scalar subquery must have one column, not
+  N".
+- **D37, a new divergence.** An ORDER BY expression over the alias of an item that holds a value binds the item's
+  expression again, and the memo returns the same value, so antb1 answers where DuckDB raises a bind error ("Alias ...
+  referenced in a SELECT clause - but the expression has a subquery"). The maintainer chose to answer it
+  (2026-11-11), an exception to the rule that a newly opened place raises DuckDB's binder errors. The alias alone and
+  the item's position answer in both engines.
+- **D35** gains SQ2a's values: one next to a condition DuckDB's filter combiner proves never true, and one in a
+  derived table's column that nothing reads (D32), fail in antb1 and answer in DuckDB. D16's eager values cover the
+  select items and ORDER BY.
+- **Decision 26, PF4 and PF16.** Q9 at SF 1 takes 3.4 s in the release build on Apple silicon and peaks at 9.8 MiB
+  (ADR 0037's SQ2a update), so the budget gate does not fire and PF4 stays conditional, although Q9's values are
+  fifteen scans of one table that PF4 would merge into one. On SQ1a's synthetic file of 400,000 rows in 98 parts, a
+  value in a top-N's select item costs the top-N its late materialization, and under a WHERE that the literal form's
+  part pruning reduces to one part, the pruning too: 98 parts and 376,000 rows read, against 1 part and 3,850 rows.
+  No TPC query's plan regresses, so PF16 stays a guard, with these figures added to SQ1a's.
+- **Decision 28.** `tests/slt/cases/subqueries/select_values.slt` holds about 250 records, written first under
+  `pending SQ2a` and checked against DuckDB, with the D35, D32 and D37 pins; the generator's Feature `item_value`
+  adds a select item that holds a value or a CASE over one, from a stream of its own; nine metamorphic relations
+  cover select items, ORDER BY and an EXISTS block's dropped list.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

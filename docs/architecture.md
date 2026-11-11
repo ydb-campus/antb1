@@ -120,7 +120,9 @@ steps (only step 7 uses more than one thread):
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (an `IN` subquery anywhere but as a top-level conjunct of
    `WHERE`, of an inner `ON` or of `HAVING`; a scalar subquery or an `EXISTS` outside a condition of `WHERE`, of an
-   inner `ON` or of `HAVING`, and a scalar one in an `IN` subquery's probe (ADR 0041's SQ7); a lateral reference, more
+   inner `ON` or of `HAVING` and outside the select items and `ORDER BY` of a block that neither groups nor aggregates
+   (ADR 0041's SQ2a; an `EXISTS` there only in a `CASE WHEN`), and a scalar one in an `IN` subquery's probe (ADR
+   0041's SQ7); a lateral reference, more
    than 256 relations counting every sub-plan and every subquery, a compound's own `ORDER BY`, `LIMIT` or `OFFSET` and
    an `IN` subquery over one (ADR 0036's X5, and X6 until ADR 0041's SQ7), many expressions) is `kUnsupported` before
    any name resolves, over every
