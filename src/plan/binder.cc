@@ -3812,12 +3812,11 @@ class Binder {
   arrow::Status BindGroupBy();
   arrow::Status CheckGrouped();
   arrow::Status BindSelectExpressions();
-  // Whether select item `i` is read by a clause other than the select list, as BindOrderBy resolves
-  // an ORDER BY item: its position (the unexpanded stars counted, PositionOf), a bare name the item
-  // is the last alias of (FindOrderAlias), or, inside an expression, a name that no column of the
-  // block has and the item is the last alias of (AliasFallback). In GROUP BY and HAVING, of a block
-  // that aggregates, any position or unqualified name equal to its alias counts. An EXISTS block's
-  // item that holds a subquery is bound for real only then.
+  // Whether select item `i` is read as a column by a clause other than the select list, as
+  // BindOrderBy resolves an ORDER BY item: its position (the unexpanded stars counted, PositionOf)
+  // or a bare name the item is the last alias of (FindOrderAlias). In GROUP BY and HAVING, of a
+  // block that aggregates, any position or unqualified name equal to its alias counts. An EXISTS
+  // block's item that holds a subquery is bound for real only then.
   [[nodiscard]] bool ReadOutsideItems(std::size_t i) const;
   // A WHERE or HAVING conjunct as a predicate over the scope's columns.
   arrow::Result<Predicate> BindCondition(const sql::Expr& conjunct, bool having);
@@ -7683,18 +7682,10 @@ bool Binder::ReadOutsideItems(std::size_t i) const {
       const arrow::Result<std::optional<std::size_t>> at = PositionOf(*lit, select_, "ORDER BY");
       return at.ok() && *at == i;  // an error is BindOrderBy's to report
     }
-    if (const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
-        ref != nullptr && ref->qualifier.empty()) {
-      if (const std::optional<std::size_t> alias = FindOrderAlias(select_, ref->name)) {
-        return *alias == i;
-      }
-    }
-    std::vector<const sql::ColumnRef*> refs;
-    CollectRefs(item.expr, refs);
-    return std::ranges::any_of(refs, [&](const sql::ColumnRef* ref) {
-      return ref->qualifier.empty() && scope_.LookUp(*ref).outcome == Lookup::Outcome::kMissing &&
-             FindAlias(select_, ref->name) == i;
-    });
+    // An alias inside an expression binds the item's expression again (AliasFallback), which
+    // plants its value then.
+    const auto* ref = std::get_if<sql::ColumnRef>(&item.expr);
+    return ref != nullptr && ref->qualifier.empty() && FindOrderAlias(select_, ref->name) == i;
   };
   return std::ranges::any_of(stmt_.group_by, names_item) ||
          std::ranges::any_of(stmt_.having, names_item) ||

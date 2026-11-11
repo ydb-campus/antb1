@@ -7189,6 +7189,20 @@ TEST(BinderTest, AnExistsSelectListPlantsNothing) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << text;
     EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
   }
+  // The items after a dropped one keep their columns: ORDER BY 2 sorts by b, ORDER BY 3 by c, the
+  // one expression the optimized plan computes.
+  for (const auto& [position, computed] :
+       {std::pair{2, "Compute (i16 * 2)\n"}, std::pair{3, "Compute (i16 * 3)\n"}}) {
+    const std::string sql = std::format(
+        "SELECT i16 FROM t WHERE EXISTS (SELECT i16 + (SELECT MIN(i16) FROM ok) AS a, i16 * 2 AS "
+        "b, "
+        "i16 * 3 AS c FROM u ORDER BY {} LIMIT 1)",
+        position);
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(Optimized(*plan));
+    EXPECT_TRUE(text.contains(computed)) << sql << "\n" << text;
+  }
 }
 
 TEST(BinderTest, AnExistsOrderByThatReadsAnItemPlantsIt) {
