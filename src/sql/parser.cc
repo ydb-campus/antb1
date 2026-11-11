@@ -1030,12 +1030,12 @@ class Parser {
       return Syntax(Peek().span, "expected ( after AS in the WITH list, found " + Describe(Peek()));
     }
     // A CTE's query is no subquery expression's, whatever encloses its WITH (decision 23).
-    const bool having = std::ranges::contains(subquery_contexts_, Context::kHaving);
-    having_outside_ += having ? 1 : 0;
+    const bool outer = AggregateMayBeOuter();
+    outer_aggregates_outside_ += outer ? 1 : 0;
     std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
     auto query = ParseNestedQuery();
     subquery_contexts_ = std::move(enclosing);
-    having_outside_ -= having ? 1 : 0;
+    outer_aggregates_outside_ -= outer ? 1 : 0;
     if (!query) {
       return std::unexpected(std::move(query.error()));
     }
@@ -1976,18 +1976,16 @@ class Parser {
             // Inside a subquery that some HAVING, select list or ORDER BY encloses, the aggregate
             // may be an enclosing block's, which DuckDB answers: the binder judges it by the block
             // it belongs to (ADR 0041's decision 23).
-            if (std::ranges::any_of(subquery_contexts_, [](Context c) {
-                  return c == Context::kHaving || c == Context::kSelect || c == Context::kOrderBy;
-                })) {
+            if (AggregateMayBeOuter()) {
               break;
             }
             // Inside a derived table or a CTE body under such a subquery, DuckDB may answer it as
             // the enclosing block's aggregate too, which no binder path reads: unsupported.
-            if (having_outside_ > 0) {
+            if (outer_aggregates_outside_ > 0) {
               return Unsupported(
                   token.span,
                   "an aggregate in the WHERE or ON of a derived table or a CTE inside "
-                  "a subquery in HAVING");
+                  "a subquery in HAVING, the select list or ORDER BY");
             }
             return Syntax(token.span, context == Context::kOn
                                           ? "aggregate functions are not allowed in ON"
@@ -2923,12 +2921,12 @@ class Parser {
         if (next.kind == TokenKind::kLeftParen || Contains(kSubqueryStarts, KeywordOf(next)) ||
             StartsOtherQuery(1)) {
           // A derived table's query is no subquery expression's (decision 23).
-          const bool having = std::ranges::contains(subquery_contexts_, Context::kHaving);
-          having_outside_ += having ? 1 : 0;
+          const bool outer = AggregateMayBeOuter();
+          outer_aggregates_outside_ += outer ? 1 : 0;
           std::vector<Context> enclosing = std::exchange(subquery_contexts_, {});
           auto derived = ParseNestedQuery();
           subquery_contexts_ = std::move(enclosing);
-          having_outside_ -= having ? 1 : 0;
+          outer_aggregates_outside_ -= outer ? 1 : 0;
           if (!derived) {
             return std::unexpected(std::move(derived.error()));
           }
@@ -3616,6 +3614,14 @@ class Parser {
     return token;
   }
 
+  // Whether some open subquery expression stands in a HAVING, a select list or an ORDER BY, where
+  // an aggregate in its WHERE or ON may be an enclosing block's (ADR 0041's decision 23).
+  [[nodiscard]] bool AggregateMayBeOuter() const {
+    return std::ranges::any_of(subquery_contexts_, [](Context c) {
+      return c == Context::kHaving || c == Context::kSelect || c == Context::kOrderBy;
+    });
+  }
+
   // Inside the argument of an aggregate call: whether OVER follows the ')' that closes that call,
   // found by lookahead once per call (nothing is consumed). False if the text ends first, also at
   // a lexer error, which is dropped: the caller then fails before it consumes that far.
@@ -3660,8 +3666,9 @@ class Parser {
   std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
   // The clause each open subquery expression stands in, outermost first (ADR 0041's decision 23).
   std::vector<Context> subquery_contexts_;
-  // How many derived tables and CTE bodies being parsed stand inside a subquery in HAVING.
-  std::size_t having_outside_ = 0;
+  // How many derived tables and CTE bodies being parsed stand inside a subquery in HAVING, the
+  // select list or ORDER BY (AggregateMayBeOuter).
+  std::size_t outer_aggregates_outside_ = 0;
   bool minus_operand_ = false;  // the next prefix is a unary minus's operand, which -(x) wraps
   BlockEnd block_end_ = BlockEnd::kStatement;  // where the block being parsed ends
 };

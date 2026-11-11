@@ -989,10 +989,10 @@ docs/sql-subset.md sections it changes.
       projection. An EXISTS block's list is dropped, so a value there that no clause reads binds as a dry run. One
       newly opened place answers where DuckDB raises a bind error, by the maintainer's choice: an ORDER BY expression
       over the alias of an item that holds a value (divergence D37). SQ2b answers the blocks that aggregate.
-    - Update (2026-11-11, SQ2b): built for blocks that aggregate (ADR 0041's SQ2b update): `GROUP BY` keys and
-      aggregate arguments per row, select items and `ORDER BY` over keys and aggregates after the aggregation, a
-      key matched through the value it bound; a subquery inside a grouping-set element stays exit 4, as a constant
-      there does, and so does one as an aggregate's whole argument.
+    - Update (2026-11-11, SQ2b): built for blocks that aggregate (ADR 0041's SQ2b update): `GROUP BY` keys and aggregate
+      arguments per row, select items and `ORDER BY` over keys and aggregates after the aggregation, a key matched
+      through the value it bound; a subquery written inside a grouping-set element stays exit 4, as a constant there
+      does, and so does one as an aggregate's whole argument.
   - **IN and NOT IN under OR, NOT or CASE (SQ7).** A top-level conjunct keeps its semi or null-aware anti join.
     Elsewhere in a condition, IN becomes a null-aware mark join, a new kind that keeps each left row once and appends
     a BOOLEAN: TRUE on a match; else FALSE for an empty set, even for a NULL probe; else NULL where the probe is NULL

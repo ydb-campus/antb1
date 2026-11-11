@@ -2285,9 +2285,9 @@ std::vector<Relation> AllRelations() {
                      "SELECT COUNT(*) * 5, SUM(tr_row + 5) FROM trips"},
           std::tuple{"having",
                      "SELECT tr_pickup, COUNT(*) + ({0}) AS c FROM trips GROUP BY tr_pickup HAVING "
-                     "c > 75 AND SUM(tr_row * ({0})) > 100000",
+                     "c > 74 AND SUM(tr_row * ({0})) > 100000",
                      "SELECT tr_pickup, COUNT(*) + 5 AS c FROM trips GROUP BY tr_pickup HAVING c > "
-                     "75 AND SUM(tr_row * 5) > 100000"}}) {
+                     "74 AND SUM(tr_row * 5) > 100000"}}) {
       const std::string value = std::vformat(with_value, std::make_format_args(kOneRow));
       r.push_back({.name = std::format("group_value_equals_its_literal_{}", name),
                    .features = SetWith(in_groups, kAlias, kHaving),
@@ -2297,12 +2297,13 @@ std::vector<Relation> AllRelations() {
     r.push_back(
         {.name = "order_by_group_value_orders_as_its_literal",
          .features = SetWith(in_groups, kOrderBy, kLimit),
-         .probes =
-             {Q(std::format("SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup ORDER BY "
-                            "COUNT(*) * ({}) DESC, tr_pickup LIMIT 10",
-                            kOneRow)),
-              Q("SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup ORDER BY COUNT(*) * 5 "
-                "DESC, tr_pickup LIMIT 10")},
+         .probes = {Q(std::format(
+                        "SELECT tr_pickup, SUM(tr_row) FROM trips GROUP BY tr_pickup ORDER BY "
+                        "SUM(tr_row) * ({}) DESC, tr_pickup LIMIT 10",
+                        kOneRow)),
+                    Q("SELECT tr_pickup, SUM(tr_row) FROM trips GROUP BY tr_pickup ORDER BY "
+                      "SUM(tr_row) * "
+                      "5 DESC, tr_pickup LIMIT 10")},
          .check = AllEqualInOrder()});
     // An EXISTS block's select list is dropped, correlated or not: a value there that would fail
     // with more than one row (zones has 40) changes nothing.

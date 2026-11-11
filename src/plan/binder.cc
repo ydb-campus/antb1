@@ -8860,19 +8860,24 @@ std::optional<Rejection> RejectCompoundTail(const sql::SelectStatement& stmt) {
 }
 
 // A GROUP BY element in grouping-set syntax (ADR 0038): its expressions are checked as any GROUP BY
-// item's, its elements in turn, but hold no subquery, as they hold no constant (ADR 0041's decision
-// 8).
-arrow::Status CheckGroupingElement(const sql::GroupingElement& element) {
+// item's, its elements in turn. A plain key at the top (next to a ROLLUP, say) may hold a
+// subquery's value as any key does (ADR 0041's SQ2b); one inside ROLLUP, CUBE or GROUPING SETS may
+// not, as no constant may there (decision 8). An alias or a position there names a select item,
+// which binds as a key.
+arrow::Status CheckGroupingElement(const sql::GroupingElement& element, bool inside = false) {
   for (const sql::Expr& expr : element.exprs) {
-    if (const std::optional<SourceSpan> subquery = FirstSubquerySpan(expr)) {
+    if (const std::optional<SourceSpan> subquery = FirstSubquerySpan(expr); inside && subquery) {
       return Reject(
           Rejection{.span = *subquery,
                     .message = "a subquery inside ROLLUP, CUBE or GROUPING SETS is not supported"});
     }
-    ARROW_RETURN_NOT_OK(CheckValue(expr));
+    ARROW_RETURN_NOT_OK(CheckValue(expr, /*values=*/!inside));
   }
+  const bool sets = element.kind == sql::GroupingElement::Kind::kRollup ||
+                    element.kind == sql::GroupingElement::Kind::kCube ||
+                    element.kind == sql::GroupingElement::Kind::kSets;
   for (const sql::GroupingElement& inner : element.elements) {
-    ARROW_RETURN_NOT_OK(CheckGroupingElement(inner));
+    ARROW_RETURN_NOT_OK(CheckGroupingElement(inner, inside || sets));
   }
   return arrow::Status::OK();
 }

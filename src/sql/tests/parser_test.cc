@@ -4235,7 +4235,15 @@ INSTANTIATE_TEST_SUITE_P(
             "AggregateInDerivedTableUnderSelect",
             "SELECT a, (SELECT COUNT(*) FROM (SELECT b FROM users WHERE ^MAX(b) > 1) d) FROM "
             "events",
-            kSyntax, 3, "aggregate functions are not allowed in WHERE"},
+            kUnsupported, 3,
+            "an aggregate in the WHERE or ON of a derived table or a CTE inside a subquery in "
+            "HAVING, the select list or ORDER BY"},
+        RejectCase{"AggregateInCteUnderOrderBy",
+                   "SELECT a FROM events ORDER BY (WITH c AS (SELECT b FROM users WHERE ^MAX(b) > "
+                   "1) SELECT COUNT(*) FROM c)",
+                   kUnsupported, 3,
+                   "an aggregate in the WHERE or ON of a derived table or a CTE inside a subquery "
+                   "in HAVING, the select list or ORDER BY"},
         RejectCase{"AggregateInDerivedTableUnderHaving",
                    "SELECT a FROM events GROUP BY a HAVING (SELECT COUNT(*) FROM (SELECT b FROM "
                    "events WHERE ^SUM(b) > 1) AS d) > 0",

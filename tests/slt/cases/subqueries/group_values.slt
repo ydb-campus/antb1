@@ -2978,6 +2978,28 @@ onlyif duckdb
 statement error More than one row returned by a subquery used as an expression
 SELECT tr_driver, COUNT(*) + (SELECT zn_id FROM zones) AS c FROM trips GROUP BY tr_driver HAVING COUNT(*) IN (SELECT zn_id FROM zones WHERE zn_id < 0)
 
+# Per-row values -- a GROUP BY key's, an aggregate argument's -- stand below the aggregation, so below every HAVING
+# IN too.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM zones GROUP BY zn_city + (SELECT ct_id FROM cities) HAVING COUNT(*) IN (SELECT pm_id FROM promos)
+----
+BIGINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM zones GROUP BY zn_city + (SELECT ct_id FROM cities) HAVING COUNT(*) IN (SELECT pm_id FROM promos)
+
+onlyif antb1
+query II rowsort
+SELECT zn_city, SUM(zn_id * (SELECT ct_id FROM cities)) FROM zones GROUP BY zn_city HAVING zn_city IN (SELECT pm_id FROM promos)
+----
+SMALLINT	HUGEINT
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT zn_city, SUM(zn_id * (SELECT ct_id FROM cities)) FROM zones GROUP BY zn_city HAVING zn_city IN (SELECT pm_id FROM promos)
+
 # An EXISTS block's aggregates are computed (D32), so a failing value in an aggregate's argument there fails in
 # antb1, where DuckDB drops the aggregate with the list; a value over the aggregate is dropped in both.
 onlyif antb1
@@ -3137,16 +3159,28 @@ SELECT zn_city, COUNT(*) AS c FROM zones WHERE zn_city IN (1, 2) GROUP BY zn_cit
 statement error GROUP BY clause cannot contain aggregates
 SELECT (SELECT COUNT(*) FROM cities WHERE ct_id < MAX(z.zn_city)) AS n FROM zones z GROUP BY n
 
-# Inside a derived table under such a subquery the parse error stays: DuckDB fails each with a bind error of its own.
+# Inside a derived table or a CTE body under such a subquery antb1 refuses every aggregate in a WHERE or ON (exit
+# 4), as under a HAVING subquery: no binder path reads one there. DuckDB fails one of the derived table's own columns
+# with a bind error and answers one of an enclosing block's.
 
+onlyif duckdb
 statement error
 SELECT zn_city, (SELECT COUNT(*) FROM (SELECT * FROM cities WHERE MAX(ct_id) > 1) d) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
 
+onlyif duckdb
 statement error
 SELECT ct_id, (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d) AS n FROM cities ORDER BY ct_id
 
+onlyif duckdb
 statement error
 SELECT ct_id FROM cities ORDER BY (SELECT COUNT(*) FROM (SELECT * FROM zones WHERE MAX(zn_id) > 1) d), ct_id
+
+onlyif duckdb
+query I nosort
+SELECT (SELECT COUNT(*) FROM (SELECT zn_id FROM zones WHERE zn_id < SUM(cities.ct_id)) d) FROM cities
+----
+BIGINT
+20
 
 # The owner holds the subquery in an aggregate's argument, or in its GROUP BY: a bind error in both engines (their
 # texts differ).
@@ -3155,3 +3189,122 @@ SELECT ct_id, (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM drivers WHERE dv_city 
 
 statement error
 SELECT ct_id, (SELECT COUNT(*) FROM zones z GROUP BY z.zn_city, (SELECT COUNT(*) FROM drivers WHERE dv_city < MAX(z.zn_id)) LIMIT 1) AS s FROM cities ORDER BY ct_id
+
+# ---- divergence D38: a GROUP BY key that holds a subquery, written again otherwise ----
+
+# antb1 matches the select item to the key only where the subquery is written alike, as parsed: another select alias
+# inside it, or another case of a name, is another expression, whose column is not grouped. DuckDB ignores both.
+onlyif antb1
+statement error must appear in the GROUP BY clause
+SELECT zn_city + (SELECT MIN(ct_id) AS m FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 1 NULLS FIRST
+
+onlyif duckdb
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) AS m FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	1
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+
+onlyif antb1
+statement error must appear in the GROUP BY clause
+SELECT zn_city + (SELECT MIN(CT_ID) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 1 NULLS FIRST
+
+onlyif duckdb
+query II nosort
+SELECT zn_city + (SELECT MIN(CT_ID) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	1
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+
+# Written alike, by alias or by position, both engines answer.
+query II nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY 1 ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	1
+2	8
+3	8
+4	7
+5	7
+6	8
+10	1
+
+# ---- a plain GROUP BY key that holds a value next to ROLLUP; a value item inside ROLLUP by alias or position ----
+
+query III nosort
+SELECT zn_city + (SELECT MIN(ct_id) FROM cities) AS k, zn_parent, COUNT(*) AS c FROM zones GROUP BY zn_city + (SELECT MIN(ct_id) FROM cities), ROLLUP (zn_parent) ORDER BY 1 NULLS FIRST, 2 NULLS FIRST
+----
+SMALLINT	INTEGER	BIGINT
+NULL	NULL	1
+NULL	3	1
+2	NULL	8
+2	NULL	1
+2	1	7
+3	NULL	8
+3	NULL	1
+3	2	7
+4	NULL	7
+4	NULL	1
+4	3	6
+5	NULL	7
+5	NULL	1
+5	4	6
+6	NULL	8
+6	NULL	1
+6	5	6
+6	77	1
+10	NULL	1
+10	4	1
+
+query II nosort
+SELECT zn_city % 3 + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY ROLLUP (k) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	40
+NULL	1
+1	8
+2	15
+3	16
+
+query III nosort
+SELECT zn_city % 3 + (SELECT MIN(ct_id) FROM cities) AS k, zn_id % 2 AS p, COUNT(*) AS c FROM zones GROUP BY CUBE (1, 2) ORDER BY 1 NULLS FIRST, 2 NULLS FIRST
+----
+SMALLINT	INTEGER	BIGINT
+NULL	NULL	40
+NULL	NULL	1
+NULL	0	1
+NULL	0	20
+NULL	1	20
+1	NULL	8
+1	0	3
+1	1	5
+2	NULL	15
+2	0	8
+2	1	7
+3	NULL	16
+3	0	8
+3	1	8
+
+# Written inside the element it stays refused, as a constant there is.
+onlyif duckdb
+query II nosort
+SELECT zn_city % 3 + (SELECT MIN(ct_id) FROM cities) AS k, COUNT(*) AS c FROM zones GROUP BY ROLLUP (zn_city % 3 + (SELECT MIN(ct_id) FROM cities)) ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+NULL	40
+NULL	1
+1	8
+2	15
+3	16
