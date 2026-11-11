@@ -70,11 +70,11 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   blocks; in a `GROUP BY` key, which the select list, `HAVING` and `ORDER BY` match by the same expression, its alias
   or its position; in an aggregate's argument that reads a column; and in such a block of an `IN` subquery, of a scalar
   subquery, of a derived table, a CTE or a compound's block. `HAVING` reads the alias of a select item that holds one.
-  Its query may have any shape: its
-  value is NULL over no row, the row's over one, and over two or more the query fails with DuckDB's error (exit code 1).
-  An `EXISTS` block's select list is dropped, as in DuckDB, so a value there is bound for its errors of binding and
-  refusals only, and never computed, unless the block's `ORDER BY` reads its item or the list is the block's rows (a
-  `SELECT DISTINCT`'s, a compound's). A correlated scalar subquery must be a direct operand of a top-level comparison of
+  Its query may have any shape: its value is NULL over no row, the row's over one, and over two or more the query fails
+  with DuckDB's error (exit code 1). An `EXISTS` block's select list is dropped, as in DuckDB, so a value there is bound
+  for its errors of binding and refusals only, and never computed, unless the block's `ORDER BY` reads its item or the
+  list is the block's rows (a `SELECT DISTINCT`'s, a compound's), or it stands in an aggregate's argument, which is
+  computed (divergence D32). A correlated scalar subquery must be a direct operand of a top-level comparison of
   `WHERE` or of an inner `ON`, and an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of
   which could leave no row. Every other placement exits 4, `NOT (x NOT IN (query))`, `NOT NOT (x IN (query))`, an `IN`
   subquery under `OR`, `NOT` or `CASE` or outside a condition, a value in an `IN` subquery's probe (`x + (query) IN

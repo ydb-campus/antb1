@@ -3308,3 +3308,40 @@ NULL	1
 1	8
 2	15
 3	16
+
+# ---- an EXISTS block's dropped item with a value inside an aggregate's argument ----
+
+# The aggregate is computed (D32), so its argument's value joins below it, also in an item that nothing reads: under
+# WHERE, grouped with ORDER BY and LIMIT, and under HAVING.
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT SUM(tr_dropoff * (SELECT MIN(ct_id) FROM cities)) + 1 FROM trips) AND zn_id < 3 ORDER BY zn_id
+----
+INTEGER
+1
+2
+
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT tr_pickup, SUM(tr_dropoff * (SELECT MIN(ct_id) FROM cities)) + 1 FROM trips GROUP BY tr_pickup ORDER BY 1 LIMIT 1) AND zn_id < 3 ORDER BY zn_id
+----
+INTEGER
+1
+2
+
+query II nosort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING EXISTS (SELECT SUM(tr_dropoff * (SELECT MIN(ct_id) FROM cities)) + 1 FROM trips) ORDER BY zn_city
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query I nosort
+SELECT zn_id FROM zones WHERE EXISTS (SELECT COALESCE(MAX(tr_dropoff + (SELECT MIN(ct_id) FROM cities)), 0) FROM trips) AND zn_id < 3 ORDER BY zn_id
+----
+INTEGER
+1
+2

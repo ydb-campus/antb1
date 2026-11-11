@@ -3342,9 +3342,13 @@ class Binder {
     if (call.kind == sql::AggKind::kCountStar || !call.arg.has_value()) {
       return bound;
     }
+    // An aggregate is computed even where its item is dropped (an EXISTS block's list, D32), so its
+    // argument's values are planted, dry run or not.
     const bool argument = std::exchange(aggregate_argument_, true);
+    const bool dry_run = std::exchange(dry_run_, false);
     const arrow::Result<Typed> bound_arg = BindInput(**call.arg);
     aggregate_argument_ = argument;
+    dry_run_ = dry_run;
     ARROW_ASSIGN_OR_RAISE(const Typed arg, bound_arg);
     BoundColumn column = InputColumn(arg);
     if (call.arg_column() == nullptr) {
@@ -3380,8 +3384,10 @@ class Binder {
       return std::nullopt;
     }
     const bool argument = std::exchange(aggregate_argument_, true);
+    const bool dry_run = std::exchange(dry_run_, false);  // as BindAggregate's
     const arrow::Result<Typed> whole = BindInput(**call.arg);
     aggregate_argument_ = argument;
+    dry_run_ = dry_run;
     ARROW_RETURN_NOT_OK(whole.status());
     return SumRewriteOf(RewriteArithmetic(whole->expr));
   }

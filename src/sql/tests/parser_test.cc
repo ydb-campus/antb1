@@ -4216,9 +4216,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "aggregate functions are not allowed in WHERE"},
         // Inside subqueries that no HAVING, select list or ORDER BY encloses (a WHERE's, a GROUP
         // BY's, an aggregate argument's alone), an aggregate in WHERE or ON keeps the parse error
-        // (ADR 0041's decision 23); inside a derived table or a CTE body under a HAVING subquery it
-        // is unsupported, since DuckDB may answer it, and under a select-list subquery the parse
-        // error stays, as DuckDB fails it.
+        // (ADR 0041's decision 23); inside a derived table or a CTE body under a HAVING,
+        // select-list or ORDER BY subquery it is unsupported, since DuckDB may answer it.
         RejectCase{"AggregateInWhereSubquery",
                    "SELECT a FROM events WHERE a < (SELECT COUNT(*) FROM events e WHERE e.a < "
                    "^SUM(a))",

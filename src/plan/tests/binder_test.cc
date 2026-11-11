@@ -1520,6 +1520,11 @@ INSTANTIATE_TEST_SUITE_P(
             "u WHERE u.i64 = t.i64)",
             kUnsupported, "(",
             "a subquery's value over the aggregate of a correlated subquery is not supported"},
+        ErrorCase{
+            "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64 HAVING "
+            "SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
+            kUnsupported, "(",
+            "a subquery's value over the aggregate of a correlated subquery is not supported"},
         // A compound's own ORDER BY (ADR 0039's X5).
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY (SELECT MIN(i16) FROM "
                   "ok)",
@@ -7355,6 +7360,30 @@ TEST(BinderTest, AValueKeyIsMatchedWithoutASecondJoin) {
       "MIN(i16) FROM u) > 2");
   EXPECT_EQ(n, 1U) << text;
   EXPECT_LT(text.find("Join ONE-ROW"), text.find("GroupAggregate")) << text;
+}
+
+// An aggregate is computed even in an EXISTS block's dropped item (divergence D32), so a value in
+// its argument is planted, dry run or not, its join below the aggregation: under WHERE and under
+// HAVING, grouped or not.
+TEST(BinderTest, AnExistsAggregateArgumentValueIsPlanted) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE EXISTS (SELECT SUM(i32 * (SELECT MIN(i16) FROM ok)) + 1 FROM "
+           "u)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT i16, MAX(i32 + (SELECT MIN(i16) FROM ok)) * 2 "
+           "FROM u "
+           "GROUP BY i16 ORDER BY 1 LIMIT 1)",
+           "SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING EXISTS (SELECT SUM(i32 * (SELECT "
+           "MIN(i16) "
+           "FROM ok)) + 1 FROM u)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    const std::string text = Explain(*plan);
+    EXPECT_TRUE(text.contains("table=ok")) << sql << "\n" << text;
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << text;
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
 }
 
 TEST(BinderTest, AnExistsOrderByThatReadsAnItemPlantsIt) {
