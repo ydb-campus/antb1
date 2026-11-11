@@ -2082,6 +2082,164 @@ TEST_F(ComputeTest, AResultPast18DigitsStaysDecimal128) {
   EXPECT_EQ(UnscaledText(**out), "DECIMAL(38,0): 246913578024691357802469134");
 }
 
+TEST_F(ComputeTest, DecimalProgramsReadSlicedValuesAndValidityAtBothWidths) {
+  for (const LogicalType type : {LogicalType::Decimal(18, 0), LogicalType::Decimal(38, 0)}) {
+    SCOPED_TRACE(ToString(type));
+    const bool wide = type.width() > 18;
+    // Different non-byte-aligned offsets, and NULLs from both inputs across a bitmap byte.
+    const auto left =
+        Decimals(type, {"99", "99", "99", wide ? "18446744073709551626" : "10", std::nullopt, "12",
+                        "13", "14", "15", std::nullopt, "17", "18", "99"})
+            ->Slice(3, 9);
+    const auto right = Decimals(type, {"99", "99", "99", "99", "99", "3", "4", "5", std::nullopt,
+                                       "7", "8", "9", "10", "11", "99"})
+                           ->Slice(5, 9);
+    const auto expr = Arith(
+        ArithOp::kMultiply, Arith(ArithOp::kAdd, ColumnAt(0, type), ConstantOf(7, type), type),
+        Arith(ArithOp::kSubtract, ColumnAt(1, type), ConstantOf(2, type), type), type);
+
+    auto out = Eval(expr, {left, right});
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_TRUE((*out)->ValidateFull().ok());
+    EXPECT_EQ((*out)->offset(), 0);
+    EXPECT_EQ((*out)->null_count(), 3);
+    EXPECT_TRUE(
+        (*out)->Equals(Decimals(type, {wide ? "18446744073709551633" : "17", std::nullopt, "57",
+                                       std::nullopt, "105", "132", std::nullopt, "192", "225"})))
+        << UnscaledText(**out);
+  }
+}
+
+TEST_F(ComputeTest, DecimalProgramsHandleEmptyAndAllNullBatches) {
+  for (const LogicalType type : {LogicalType::Decimal(18, 0), LogicalType::Decimal(38, 0)}) {
+    SCOPED_TRACE(ToString(type));
+    const auto expr = Arith(ArithOp::kAdd, ColumnAt(0, type), ColumnAt(1, type), type);
+    for (const std::size_t rows : {std::size_t{0}, std::size_t{9}}) {
+      SCOPED_TRACE(rows);
+      const std::string beyond = "1" + std::string(type.width(), '0');
+      auto out =
+          Eval(expr, {Decimals(type, std::vector<std::optional<std::string>>(rows)),
+                      Decimals(type, std::vector<std::optional<std::string>>(rows, beyond))});
+      ASSERT_TRUE(out.ok()) << out.status().ToString();
+      EXPECT_TRUE((*out)->ValidateFull().ok());
+      EXPECT_TRUE((*out)->type()->Equals(plan::ToArrow(type)));
+      EXPECT_EQ((*out)->length(), Narrow<int64_t>(rows));
+      EXPECT_EQ((*out)->null_count(), Narrow<int64_t>(rows))
+          << "NULL rows must not evaluate the other column's out-of-range values";
+    }
+  }
+}
+
+TEST_F(ComputeTest, DecimalProgramResultsOwnTheirValuesAndValidityInTheQueryPool) {
+  const LogicalType input_type = LogicalType::Decimal(18, 0);
+  for (const LogicalType result_type : {input_type, LogicalType::Decimal(38, 0)}) {
+    SCOPED_TRACE(ToString(result_type));
+    arrow::ProxyMemoryPool input_pool(arrow::default_memory_pool());
+    arrow::ProxyMemoryPool output_pool(arrow::default_memory_pool());
+    std::shared_ptr<arrow::Array> output;
+    {
+      arrow::Decimal64Builder builder(plan::ToArrow(input_type), &input_pool);
+      ASSERT_TRUE(builder.Append(arrow::Decimal64(10)).ok());
+      ASSERT_TRUE(builder.AppendNull().ok());
+      ASSERT_TRUE(builder.Append(arrow::Decimal64(30)).ok());
+      auto values = builder.Finish();
+      ASSERT_TRUE(values.ok()) << values.status().ToString();
+      const auto expr =
+          Arith(ArithOp::kAdd, ColumnAt(0, input_type), ConstantOf(7, input_type), result_type);
+      auto out = EvaluateExpr(*expr, *BatchOf({*values}), &output_pool);
+      ASSERT_TRUE(out.ok()) << out.status().ToString();
+      output = *out;
+    }
+    // A single nullable input lets ProgramValidity borrow its bitmap. The result must copy it
+    // into the query pool, otherwise destroying a scan's input pool leaves a dangling owner.
+    EXPECT_EQ(input_pool.bytes_allocated(), 0);
+    EXPECT_GT(output_pool.bytes_allocated(), 0);
+    EXPECT_TRUE(output->ValidateFull().ok());
+    EXPECT_TRUE(output->Equals(Decimals(result_type, {"17", std::nullopt, "37"})));
+    output.reset();
+    EXPECT_EQ(output_pool.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(ComputeTest, DecimalProgramAllocationFailuresReleasePartialOutput) {
+  for (const LogicalType type : {LogicalType::Decimal(18, 0), LogicalType::Decimal(38, 0)}) {
+    SCOPED_TRACE(ToString(type));
+    std::vector<std::optional<std::string>> values(32, "10");
+    values[5] = std::nullopt;
+    const auto batch = BatchOf({Decimals(type, values)});
+    const auto expr = Arith(ArithOp::kAdd, ColumnAt(0, type), ConstantOf(7, type), type);
+    const int64_t value_bytes = type.width() <= 18 ? 8 * 32 : 16 * 32;
+    // Zero cannot allocate any output; the second limit admits a values buffer alone, but not
+    // both the values and their validity. Either allocation order must clean up after failure.
+    for (const int64_t limit : {int64_t{0}, value_bytes}) {
+      MemoryBudget budget(limit);
+      auto out = EvaluateExpr(*expr, *batch, &budget);
+      EXPECT_TRUE(out.status().IsOutOfMemory()) << out.status().ToString();
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      if (limit != 0) {
+        EXPECT_GT(budget.max_memory(), 0) << "this case must fail after a successful allocation";
+      }
+    }
+  }
+}
+
+TEST_F(ComputeTest, ANarrowProgramKeepsTheFirstOperandErrorAfterAValidAndNullPrefix) {
+  const LogicalType type = LogicalType::Decimal(3, 0);
+  const auto sum = Arith(ArithOp::kAdd, Named(ColumnAt(0, type), "left"),
+                         Named(ColumnAt(1, type), "right"), type);
+  const auto expr = Arith(ArithOp::kMultiply, sum,
+                          Arith(ArithOp::kAdd, ColumnAt(2, type), ConstantOf(1, type), type), type);
+  const auto batch =
+      BatchOf({Decimals(type, {"1", std::nullopt, "1000"}), Decimals(type, {"2", "-2000", "-1000"}),
+               Decimals(type, {"3", "3000", "2"})});
+  MemoryBudget budget(std::nullopt);
+  auto out = EvaluateExpr(*expr, *batch, &budget);
+  EXPECT_TRUE(out.status().IsExecutionError()) << out.status().ToString();
+  EXPECT_EQ(out.status().message(),
+            "Casting value \"1000\" to type DECIMAL(3,0) failed: value is out of range! when "
+            "casting from source column left");
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(ComputeTest, ANarrowProgramDoesNotTruncateAWideConstant) {
+  const LogicalType narrow = LogicalType::Decimal(18, 0);
+  const LogicalType wide = LogicalType::Decimal(38, 0);
+  // Its low 64 bits are 5. Truncation would make the last row succeed, and zero and NULL before
+  // it exercise a successful prefix without changing the eventual overflow's operands.
+  const auto big = static_cast<Int128>((UInt128{1} << 64U) + 5);
+  const auto left = ColumnAt(0, narrow);
+  const auto right = ConstantOf(big, wide);
+  const auto values = Decimals(narrow, {"0", std::nullopt, "1"});
+  auto out = Eval(Arith(ArithOp::kMultiply, left, right, narrow), {values});
+  auto control = Eval(ThroughInt128(ArithOp::kMultiply, left, right, narrow), {values});
+  ASSERT_TRUE(control.status().IsExecutionError()) << control.status().ToString();
+  EXPECT_EQ(out.status().ToString(), control.status().ToString());
+}
+
+TEST_F(ComputeTest, DecimalProgramsReuseResultsAcrossPhysicalWidths) {
+  const LogicalType narrow = LogicalType::Decimal(18, 0);
+  const LogicalType wide = LogicalType::Decimal(38, 0);
+  const auto big = static_cast<Int128>((UInt128{1} << 64U) + 5);
+  const auto small = Arith(ArithOp::kAdd, ColumnAt(0, narrow), ConstantOf(7, narrow), narrow);
+  const auto enlarged = Arith(ArithOp::kMultiply, small, ConstantOf(big, wide), wide);
+  const auto restored =
+      Arith(ArithOp::kAdd, Arith(ArithOp::kMultiply, enlarged, ConstantOf(0, narrow), narrow),
+            small, narrow);
+  const auto input = Decimals(narrow, {"999", "100", std::nullopt, "5", "-4", "999"})->Slice(1, 4);
+  auto out = Appended({small, enlarged, restored}, {input});
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  ASSERT_EQ(out->size(), 3U);
+  const auto expected = Decimals(narrow, {"107", std::nullopt, "12", "3"});
+  EXPECT_TRUE((*out)[0]->Equals(expected));
+  EXPECT_TRUE(
+      (*out)[1]->Equals(Decimals(wide, {Int128ToString(big * 107), std::nullopt,
+                                        Int128ToString(big * 12), Int128ToString(big * 3)})));
+  EXPECT_TRUE((*out)[2]->Equals(expected));
+  for (const auto& column : *out) {
+    EXPECT_TRUE(column->ValidateFull().ok());
+  }
+}
+
 // The recursive fallbacks at the narrow width (ADR 0021's decimal64 item). Each of these shapes
 // makes Compile bail, so the program path is not involved: a negation, a CASE whose branch type is
 // its own, a cast, and a chain whose operand the program cannot read.
