@@ -22,6 +22,7 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/cast.h>
 #include <arrow/compute/exec.h>
+#include <arrow/util/bitmap_ops.h>
 #include <arrow/util/utf8.h>
 
 #include "antb1/common/int128.h"
@@ -619,23 +620,97 @@ bool NarrowStep(const DecimalProgram::Step& step, std::int64_t x, std::int64_t y
   return true;
 }
 
-// One unscaled value into a column of whichever physical width plan::ToArrow asked for. A narrow
-// column takes the low 64 bits, which is the whole value: every result the program appends has been
-// range-checked against its step's type, and a type of at most 18 digits cannot hold more (ADR
-// 0021's N3).
-//
-// Overloads rather than a branch, and the loop below is a template rather than a switch on each
-// value, so neither width pays for the other's existence in a per-row test.
-void AppendUnscaled(arrow::Decimal128Builder& builder, const Int128& value) {
-  builder.UnsafeAppend(FromInt128(value));
-}
-void AppendUnscaled(arrow::Decimal64Builder& builder, const Int128& value) {
-  builder.UnsafeAppend(arrow::Decimal64(static_cast<std::int64_t>(value)));
+// The program knows the whole output size. Store each checked value directly into its slot;
+// construct the Arrow array and its validity once, rather than append through a builder per row.
+template <bool NarrowOutput>
+void StoreUnscaled(std::uint8_t* out, const Int128& value) {
+  if constexpr (NarrowOutput) {
+    const auto narrow = static_cast<std::int64_t>(value);
+    std::memcpy(out, &narrow, sizeof(narrow));
+  } else {
+    FromInt128(value).ToBytes(out);
+  }
 }
 
-template <class Builder>
+// A program input bound once for this batch. Columns advance one int64 per row;
+// constants and intermediate slots stay at the same address. The bindings and
+// slots never move while the row loop uses their addresses.
+struct NarrowProgramInput {
+  const std::int64_t* values = nullptr;
+  std::size_t stride = 0;
+  std::int64_t constant = 0;
+};
+
+bool BindNarrowProgramInput(const DecimalProgram::Source& source, const DecimalProgram& program,
+                            std::span<const std::int64_t> slots, NarrowProgramInput& input) {
+  switch (source.kind) {
+    case DecimalProgram::Source::Kind::kColumn:
+      input.values = program.columns[source.at].narrow;
+      input.stride = 1;
+      return input.values != nullptr;
+    case DecimalProgram::Source::Kind::kConstant:
+      if (!FitsInt64(program.constants[source.at], &input.constant)) {
+        return false;
+      }
+      input.values = &input.constant;
+      return true;
+    case DecimalProgram::Source::Kind::kStep:
+      input.values = &slots[source.at];
+      return true;
+  }
+  return false;
+}
+
+// Writes a prefix using prebound, physically narrow operands. The original
+// program starts at the returned row: zero for an unsupported shape, the first
+// row whose checked step needs the generic path, or rows when everything fits.
+// No partial row is stored, and neither buffers nor error messages are rebuilt
+// on fallback. Re-evaluating the current row from its first step preserves the
+// generic path's error ordering, including a file's out-of-precision decimals.
+template <bool NarrowOutput>
+int64_t StoreNarrowProgramPrefix(const DecimalProgram& program, int64_t rows,
+                                 const std::uint8_t* valid, std::uint8_t*& out,
+                                 int64_t& null_count) {
+  constexpr int64_t kWidth = NarrowOutput ? 8 : 16;
+  struct Inputs {
+    NarrowProgramInput left;
+    NarrowProgramInput right;
+  };
+  std::array<std::int64_t, kMaxProgramSteps> slots{};
+  std::array<Inputs, kMaxProgramSteps> inputs{};
+  const std::span<const DecimalProgram::Step> steps(program.steps);
+  for (std::size_t s = 0; s < steps.size(); ++s) {
+    const DecimalProgram::Step& step = steps[s];
+    if (!step.narrow || !BindNarrowProgramInput(step.left, program, slots, inputs[s].left) ||
+        !BindNarrowProgramInput(step.right, program, slots, inputs[s].right)) {
+      return 0;
+    }
+  }
+  for (int64_t row = 0; row < rows; ++row, out += kWidth) {
+    if (valid != nullptr && !arrow::bit_util::GetBit(valid, Narrow<std::uint64_t>(row))) {
+      StoreUnscaled<NarrowOutput>(out, 0);
+      ++null_count;
+      continue;
+    }
+    const auto at = Narrow<std::size_t>(row);
+    for (std::size_t s = 0; s < steps.size(); ++s) {
+      const Inputs& bound = inputs[s];
+      const std::int64_t left = bound.left.values[at * bound.left.stride];
+      const std::int64_t right = bound.right.values[at * bound.right.stride];
+      if (!NarrowStep(steps[s], left, right, &slots[s])) {
+        return row;
+      }
+    }
+    StoreUnscaled<NarrowOutput>(out, slots[steps.size() - 1]);
+  }
+  return rows;
+}
+
+template <bool NarrowOutput>
 arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t rows,
-                                       const std::uint8_t* valid, Builder& builder);
+                                       const std::uint8_t* valid,
+                                       const std::shared_ptr<arrow::DataType>& type,
+                                       arrow::MemoryPool* pool);
 
 arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t rows,
                                           const std::uint8_t* valid, plan::LogicalType result,
@@ -643,17 +718,30 @@ arrow::Result<ArrayPtr> RunDecimalProgram(const DecimalProgram& program, int64_t
   // One test per call, not per row: the width is a property of the result type.
   std::shared_ptr<arrow::DataType> type = plan::ToArrow(result);
   if (type->id() == arrow::Type::DECIMAL64) {
-    arrow::Decimal64Builder narrow(type, pool);
-    return RunProgramInto(program, rows, valid, narrow);
+    return RunProgramInto<true>(program, rows, valid, type, pool);
   }
-  arrow::Decimal128Builder wide(type, pool);
-  return RunProgramInto(program, rows, valid, wide);
+  return RunProgramInto<false>(program, rows, valid, type, pool);
 }
 
-template <class Builder>
+template <bool NarrowOutput>
 arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t rows,
-                                       const std::uint8_t* valid, Builder& builder) {
-  ARROW_RETURN_NOT_OK(builder.Reserve(rows));
+                                       const std::uint8_t* valid,
+                                       const std::shared_ptr<arrow::DataType>& type,
+                                       arrow::MemoryPool* pool) {
+  constexpr int64_t kWidth = NarrowOutput ? 8 : 16;
+  if (rows < 0 || rows > std::numeric_limits<int64_t>::max() / kWidth) {
+    return arrow::Status::CapacityError("DECIMAL program output size overflow");
+  }
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
+                        arrow::AllocateBuffer(rows * kWidth, pool));
+  std::shared_ptr<arrow::Buffer> bitmap;
+  if (valid != nullptr) {
+    ARROW_ASSIGN_OR_RAISE(bitmap, arrow::internal::CopyBitmap(pool, valid, 0, rows));
+  }
+  int64_t null_count = 0;
+  std::uint8_t* out = values->mutable_data();
+  const int64_t first_row =
+      StoreNarrowProgramPrefix<NarrowOutput>(program, rows, valid, out, null_count);
   std::array<Int128, kMaxProgramSteps> slots{};
   const std::span<const DecimalProgram::Step> steps(program.steps);
   const std::size_t last = steps.size() - 1;  // Compile returns a step, so there is one
@@ -667,9 +755,10 @@ arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t ro
         return slots[source.at];
     }
   };
-  for (int64_t row = 0; row < rows; ++row) {
+  for (int64_t row = first_row; row < rows; ++row, out += kWidth) {
     if (valid != nullptr && !arrow::bit_util::GetBit(valid, static_cast<std::uint64_t>(row))) {
-      builder.UnsafeAppendNull();
+      StoreUnscaled<NarrowOutput>(out, 0);
+      ++null_count;
       continue;
     }
     const auto at = static_cast<std::size_t>(row);
@@ -734,14 +823,18 @@ arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t ro
       slots[s] = value;
     }
     if (null) {
-      builder.UnsafeAppendNull();
+      if (bitmap == nullptr) {
+        ARROW_ASSIGN_OR_RAISE(bitmap, arrow::AllocateBitmap(rows, pool));
+        arrow::bit_util::SetBitsTo(bitmap->mutable_data(), 0, rows, true);
+      }
+      arrow::bit_util::ClearBit(bitmap->mutable_data(), row);
+      StoreUnscaled<NarrowOutput>(out, 0);
+      ++null_count;
       continue;
     }
-    AppendUnscaled(builder, slots[last]);
+    StoreUnscaled<NarrowOutput>(out, slots[last]);
   }
-  std::shared_ptr<arrow::Array> out;
-  ARROW_RETURN_NOT_OK(builder.Finish(&out));
-  return out;
+  return arrow::MakeArray(arrow::ArrayData::Make(type, rows, {bitmap, values}, null_count));
 }
 
 // ---- TIMESTAMP and DATE fields and floors, in 64-bit civil arithmetic (Arrow's temporal kernels
