@@ -8313,7 +8313,7 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
     return Explain(*plan);
   };
-  // The plans before the optimizer, whose pruning would only shorten the scans' lists.
+    // The plans before the optimizer, whose pruning would only shorten the scans' lists.
   EXPECT_EQ(
       plan_of("SELECT SUM(CASE WHEN i32 + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
               "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
@@ -8375,6 +8375,25 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
             "            Project i16\n"
             "              Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
             "\"Mixed Case\", from]\n");
+}
+
+// A global block's one row is never sorted, so its ORDER BY items are dropped, but a mark one of
+// them plants reads its probe's aggregate, which stays: the generator found
+// it dropped with the item, and the plan's ids did not resolve (an abort).
+TEST(BinderTest, AGlobalBlocksOrderByMarkKeepsItsProbesAggregate) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT COUNT(*) FROM t ORDER BY CASE WHEN MIN(i16) IN (SELECT i16 FROM u) THEN 1 ELSE 0 "
+           "END",
+           "SELECT COUNT(*) FROM t ORDER BY CASE WHEN SUM(i32) NOT IN (SELECT i64 FROM u) OR "
+           "MIN(i16) = 1 THEN 1 ELSE 0 END",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+  }
 }
 
 }  // namespace

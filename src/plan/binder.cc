@@ -8195,12 +8195,20 @@ arrow::Status Binder::BindOrderBy() {
                               name->span);
     } else {
       // A global aggregate's only row needs no sort: its ORDER BY items are checked, and computed
-      // or hidden aggregates for them dropped again.
+      // or hidden aggregates for them dropped again -- unless the item planted a mark (ADR 0041's
+      // SQ7a), whose join reads its probe's aggregates; they stay, computed with the one row, and
+      // nothing reads the mark.
       const std::size_t aggregates = select_.aggregates.size();
       const std::size_t posts = post_exprs_.size();
+      const std::size_t bound = values_.size();
       ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(item.expr));
       if (shape_ == Shape::kGlobal) {
-        select_.aggregates.resize(aggregates);
+        const bool marked =
+            std::ranges::any_of(std::span(values_).subspan(bound),
+                                [](const BoundValue& value) { return value.probe != nullptr; });
+        if (!marked) {
+          select_.aggregates.resize(aggregates);
+        }
         post_exprs_.resize(posts);
         post_ids_.resize(posts);
         continue;

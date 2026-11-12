@@ -685,6 +685,27 @@ TEST(ColumnIdsTest, AClonePassesThroughAProjectsOwnPassThroughIds) {
   EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
 }
 
+// A mark join defines its mark (ADR 0041's decision 13), so a clone mints it again and the reads
+// above follow: a clone that kept it would define the original's column a second time wherever
+// the two meet, which ADR 0023's Path 2 makes when it clones an outer side holding a mark.
+TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  mark.mark = ColumnId{9};
+  const LogicalNodePtr reader = Node(FilterNode{
+      .input = Node(std::move(mark)),
+      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull, .column = Column(ColumnId{9}, 3)}},
+      .span = {}});
+  ASSERT_EQ(PositionMismatch(Plan(reader)), std::nullopt);
+  ColumnId last = MaxColumnId(*reader);
+  const ColumnId before = last;
+  const LogicalNodePtr clone = CloneWithFreshIds(reader, last);
+  EXPECT_EQ(PositionMismatch(Plan(clone)), std::nullopt) << Explain(Plan(clone));
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), 4U);
+  EXPECT_GT(std::to_underlying(cloned.back()), std::to_underlying(before)) << "not a fresh mark";
+  EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
+}
+
 // An id the subtree reads but does not define is read from outside it, so it is left alone: that is
 // what keeps a clone of a dependent join's left input binding the right input's references, and a
 // clone of any subtree reading the columns above it.
