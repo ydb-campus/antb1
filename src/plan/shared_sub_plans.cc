@@ -219,7 +219,16 @@ class Origins {
   void Define(const FilterNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const SortNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const LimitNode& /*node*/, const LogicalNode& /*at*/) {}
-  void Define(const JoinNode& /*node*/, const LogicalNode& /*at*/) {}
+  // A join passes its inputs' columns through; a mark join also mints its mark, which depends on its
+  // probe key and its set's key (ADR 0041's decision 13), so that two marks of one subtree over
+  // other keys stay apart.
+  void Define(const JoinNode& node, const LogicalNode& at) {
+    std::string origin = "mark(";
+    for (const JoinKey& key : node.keys) {
+      origin += Key(key.left, at) + '=' + Key(key.right, at) + ',';
+    }
+    Set(node.mark, origin + ')');
+  }
 
   // A call's origin: what it computes over which argument. COUNT(*) has none, so every COUNT(*) of
   // the plan has one origin whatever it counts -- and a read of one is told from a read of another

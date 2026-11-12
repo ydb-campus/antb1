@@ -321,6 +321,10 @@ TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
   EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kAnti)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
+  // A mark join: the left input's ids, then its mark (ADR 0041's decision 13).
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  mark.mark = ColumnId{9};
+  EXPECT_EQ(OutputIds(mark), (std::vector<ColumnId>{kA, kB, kC, ColumnId{9}}));
 }
 
 // A dependent join outputs its inputs' ids by its kind's rule, exactly as the join of that kind.
@@ -486,9 +490,14 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth
 
 TEST(ColumnIdsTest, EveryJoinKindResolves) {
   for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-                              JoinKind::kNullAwareAnti, JoinKind::kFull}) {
+                              JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark}) {
     JoinNode join = Join(kind);
-    join.residual = {Residual(kC, kF)};
+    if (Traits(kind).residuals) {
+      join.residual = {Residual(kC, kF)};
+    }
+    if (Traits(kind).appends_mark) {
+      join.mark = ColumnId{9};
+    }
     const LogicalPlan resolved = ResolvePositions(Plan(Node(join)));
     EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << ToString(kind);
   }
@@ -504,6 +513,22 @@ TEST(ColumnIdsTest, EveryJoinKindResolves) {
 }
 
 TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
+  // A mark join has its mark and builds on its right input; no other kind has a mark, and a kind
+  // without residuals has none (ADR 0041's decision 13).
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  EXPECT_EQ(PositionMismatch(Plan(Node(mark))), "Join: NULL-AWARE MARK join without a mark");
+  mark.mark = ColumnId{9};
+  mark.build = BuildSide::kLeft;
+  EXPECT_EQ(PositionMismatch(Plan(Node(mark))),
+            "Join: NULL-AWARE MARK join builds on its left input");
+  JoinNode marked_semi = Join(JoinKind::kSemi);
+  marked_semi.mark = ColumnId{9};
+  EXPECT_EQ(PositionMismatch(Plan(Node(marked_semi))), "Join: SEMI join with a mark");
+  JoinNode anti_residual = Join(JoinKind::kNullAwareAnti);
+  anti_residual.residual = {Residual(kC, kF)};
+  EXPECT_EQ(PositionMismatch(Plan(Node(anti_residual))),
+            "Join: NULL-AWARE ANTI join with a residual");
+
   JoinNode types = Join(JoinKind::kInner);
   types.keys[0].right.type = LogicalType::kInteger;
   EXPECT_EQ(PositionMismatch(Plan(Node(types))),

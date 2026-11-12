@@ -803,6 +803,11 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     schema = spec.schema();
   } else if (pass_through) {
     schema = probe->output_schema();
+  } else if (traits.appends_mark) {
+    // The probe's columns, then its three-valued mark (ADR 0041's decision 13).
+    arrow::FieldVector fields = probe_schema.fields();
+    fields.push_back(arrow::field("mark", arrow::boolean(), /*nullable=*/true));
+    schema = arrow::schema(std::move(fields));
   } else {
     schema = JoinSchema(probe_schema, *spec.schema(), build_side, /*nullable_probe=*/false);
   }
@@ -984,6 +989,17 @@ arrow::Status HashJoinOperator::Start() {
       ANTB1_CHECK(values_ != nullptr);
       keep_ = Keep::kAll;
       break;
+    case plan::JoinKind::kNullAwareMark:
+      // Every row is marked and none dropped. Over an empty build input every mark is FALSE, a NULL
+      // key's too; over NULL keys alone every one is NULL; else each row looks its key up (empty(),
+      // not num_rows() == 0: a build of NULL keys alone has rows but holds none).
+      if (table_->empty()) {
+        mark_mode_ = MarkMode::kFalse;
+      } else {
+        mark_mode_ = table_->num_rows() == 0 ? MarkMode::kNull : MarkMode::kLookup;
+      }
+      keep_ = mark_mode_ == MarkMode::kLookup ? Keep::kMatched : Keep::kAll;  // kAll: no lookup
+      break;
     // Listed rather than left to a `default:` so that a new kind, or a build-side direction that
     // outputs the build's rows (ADR 0026's C2b and C2c), does not compile until it is handled here.
     case plan::JoinKind::kInner:
@@ -1039,6 +1055,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
       return table_->unique() && residual_.empty() ? NextLeftWindow() : NextPadded();
     case plan::JoinKind::kOneRow:
       return NextOneRow();
+    case plan::JoinKind::kNullAwareMark:
+      return NextMarked();
     // Semi, anti and null-aware anti, which output the probe's rows and none of the build's. Listed
     // rather than left to a `default:`: this is the arm a build-side direction (ADR 0026's C2b and
     // C2c) would otherwise fall into silently, emitting slices of the probe batch -- the left-sided
@@ -1205,6 +1223,61 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOneRow() {
   }
   const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
   return Batch{.data = Assemble(probe->columns(), build, rows), .selection = *std::move(selection)};
+}
+
+arrow::Result<std::optional<Batch>> HashJoinOperator::NextMarked() {
+  const std::optional<std::pair<int64_t, int64_t>> range = NextRange(batch_size_);
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  const auto [begin, rows] = *range;
+  std::optional<std::shared_ptr<arrow::BooleanArray>> selection = SelectionOf(begin, rows);
+  if (!selection.has_value()) {
+    return std::nullopt;
+  }
+  std::shared_ptr<arrow::Array> mark;
+  switch (mark_mode_) {
+    case MarkMode::kFalse: {
+      ARROW_ASSIGN_OR_RAISE(mark, arrow::MakeArrayFromScalar(arrow::BooleanScalar(false), rows,
+                                                              ctx_.pool));
+      break;
+    }
+    case MarkMode::kNull: {
+      ARROW_ASSIGN_OR_RAISE(mark, arrow::MakeArrayOfNull(arrow::boolean(), rows, ctx_.pool));
+      break;
+    }
+    case MarkMode::kLookup: {
+      // TRUE on a match; else NULL where the key is NULL or the build holds a NULL key; else
+      // FALSE. Find gives a NULL key, and a row that is not selected, no match.
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
+                            arrow::AllocateEmptyBitmap(rows, ctx_.pool));
+      std::shared_ptr<arrow::Buffer> validity;
+      int64_t nulls = 0;
+      const bool set_has_null = table_->has_null();
+      const arrow::Array& key = *keys_[0];
+      for (int64_t i = 0; i < rows; ++i) {
+        const JoinMatches& m = matches_[static_cast<std::size_t>(begin + i)];
+        if (m.end > m.begin) {
+          arrow::bit_util::SetBit(values->mutable_data(), i);
+          continue;
+        }
+        if (set_has_null || key.IsNull(begin + i)) {
+          if (validity == nullptr) {
+            ARROW_ASSIGN_OR_RAISE(validity, arrow::AllocateBitmap(rows, ctx_.pool));
+            arrow::bit_util::SetBitsTo(validity->mutable_data(), 0, rows, true);
+          }
+          arrow::bit_util::ClearBit(validity->mutable_data(), i);
+          ++nulls;
+        }
+      }
+      mark = arrow::MakeArray(arrow::ArrayData::Make(arrow::boolean(), rows,
+                                                     {std::move(validity), std::move(values)}, nulls));
+      break;
+    }
+  }
+  const std::shared_ptr<arrow::RecordBatch> probe = batch_.data->Slice(begin, rows);
+  return Batch{.data = Assemble(probe->columns(), {std::move(mark)}, rows),
+               .selection = *std::move(selection)};
 }
 
 arrow::Result<std::optional<Batch>> HashJoinOperator::NextLeftWindow() {

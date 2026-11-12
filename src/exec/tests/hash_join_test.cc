@@ -5529,7 +5529,8 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
   const auto build_schema = Int64Schema({"bk", "bid"});
   for (const plan::JoinKind kind :
        {plan::JoinKind::kInner, plan::JoinKind::kLeft, plan::JoinKind::kSemi, plan::JoinKind::kAnti,
-        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kFull}) {
+        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kFull,
+        plan::JoinKind::kNullAwareMark}) {
     const plan::JoinKindTraits traits = plan::Traits(kind);
     for (const bool keyless : {false, true}) {
       if (keyless != traits.one_row && (!keyless || !traits.nested_loop)) {
@@ -5585,7 +5586,8 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
           auto result = Drain(*join, ctx);
           ASSERT_TRUE(result.ok()) << result.status().ToString();
           const arrow::Table& table = **result;
-          EXPECT_EQ(table.num_columns(), traits.outputs_right ? 4 : 2) << "outputs_right";
+          EXPECT_EQ(table.num_columns(), traits.outputs_right ? 4 : traits.appends_mark ? 3 : 2)
+              << "outputs_right, appends_mark";
           const Rows rows = RowsOf(table);
           std::vector<int> times(pids.size(), 0);        // how often each probe row comes out
           std::vector<int> build_times(bids.size(), 0);  // and each build row, where it does
@@ -5613,6 +5615,9 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
             if (traits.pads_right || traits.one_row) {
               EXPECT_GE(times[pid], 1) << "every probe row comes out: " << pid;
             }
+            if (traits.appends_mark) {
+              EXPECT_EQ(times[pid], 1) << "appends_mark: every probe row once: " << pid;
+            }
           }
           for (std::size_t bid = 0; bid < bids.size(); ++bid) {
             if (traits.pads_left) {
@@ -5627,6 +5632,56 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
             EXPECT_EQ(rows.size(), build_rows == 0 && traits.pads_right ? pids.size() : pairs);
           }
         }
+      }
+    }
+  }
+}
+
+// A null-aware mark join (ADR 0041's decision 12) marks every probe row exactly once, three-valued:
+// TRUE on a match; else FALSE over an empty build input, a NULL key included; else NULL where the
+// key is NULL or the build holds a NULL key; else FALSE. At batch sizes 1, 2 and the default, so
+// that windows cut the probe batch, and with a selection that drops a row.
+TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
+  const auto probe_schema = Int64Schema({"k", "pid"});
+  const auto build_schema = Int64Schema({"bk", "bid"});
+  const std::optional<int64_t> null;
+  const std::vector<std::optional<int64_t>> probe_keys = {1, 3, null, 2};
+  struct Case {
+    std::string name;
+    std::vector<std::optional<int64_t>> build;
+    std::vector<std::string> marks;  // per probe row
+  };
+  const std::vector<Case> cases = {
+      {.name = "empty", .build = {}, .marks = {"false", "false", "false", "false"}},
+      {.name = "{1, 2}", .build = {1, 2}, .marks = {"true", "false", "null", "true"}},
+      {.name = "{1, NULL}", .build = {1, null}, .marks = {"true", "null", "null", "null"}},
+      {.name = "{NULL, NULL}", .build = {null, null}, .marks = {"null", "null", "null", "null"}},
+  };
+  for (const Case& c : cases) {
+    for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{1024}}) {
+      SCOPED_TRACE(std::format("{}, batch size {}", c.name, batch_size));
+      std::vector<std::optional<int64_t>> bids;
+      for (std::size_t i = 0; i < c.build.size(); ++i) {
+        bids.emplace_back(100 + static_cast<int64_t>(i));
+      }
+      auto join = MakeJoin(
+          SourceOf(probe_schema, {Int64s(probe_keys), Int64s({0, 1, 2, 3})}),
+          DrainedBuild(plan::JoinKind::kNullAwareMark,
+                       SourceOf(build_schema, {Int64s(c.build), Int64s(bids)}), {0}),
+          {0}, /*prepares=*/true);
+      ASSERT_NE(join, nullptr);
+      ASSERT_EQ(join->output_schema()->num_fields(), 3);
+      EXPECT_TRUE(join->output_schema()->field(2)->type()->Equals(arrow::boolean()));
+      EXPECT_TRUE(join->output_schema()->field(2)->nullable());
+      ExecContext ctx = ContextOf(nullptr, batch_size);
+      auto result = Drain(*join, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      Rows rows = RowsOf(**result);
+      std::ranges::sort(rows, {}, [](const std::vector<std::string>& row) { return row.at(1); });
+      ASSERT_EQ(rows.size(), 4U);
+      for (std::size_t pid = 0; pid < rows.size(); ++pid) {
+        EXPECT_EQ(rows[pid].at(1), std::to_string(pid));
+        EXPECT_EQ(rows[pid].at(2), c.marks[pid]) << "probe row " << pid;
       }
     }
   }
