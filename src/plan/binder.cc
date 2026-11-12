@@ -2985,7 +2985,7 @@ struct SubqueryJoin {
   std::vector<ExprPtr> exprs;
   std::vector<ColumnId> ids;  // per expression: its column
   std::vector<Predicate> filter;
-  SourceSpan span;  // the [NOT] IN, or the comparison's operator
+  SourceSpan span;              // the [NOT] IN, or the comparison's operator
   ColumnId mark = kNoColumnId;  // a null-aware mark join's BOOLEAN (ADR 0041's SQ7)
 
   // Whether this join leaves a column above the node it stands on: its own computed layer, a
@@ -6760,8 +6760,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
 arrow::Result<LogicalType> Binder::InKeyType(const Typed& probe, LogicalType set,
                                              const sql::SubqueryExpr& s) {
   const std::optional<LogicalType> type = KeyType(probe.expr->type, set);
-  if (type.has_value() && IsExactWidening(probe.expr->type, *type) &&
-      IsExactWidening(set, *type)) {
+  if (type.has_value() && IsExactWidening(probe.expr->type, *type) && IsExactWidening(set, *type)) {
     return *type;
   }
   const bool dbl = probe.expr->type == LogicalType::kDouble || set == LogicalType::kDouble;
@@ -6795,8 +6794,9 @@ void Binder::InKeys(SubqueryJoin& join, const Typed& probe, const SubqueryBlock&
     join.right_key = BoundColumn{.id = block.column.id, .name = block.column.name, .type = type};
   } else {
     const ExprPtr widened =
-        WidenTo(std::make_shared<const Expr>(Expr{
-                    .node = ColumnExpr{.id = block.column.id}, .type = block.type, .name = block.column.name}),
+        WidenTo(std::make_shared<const Expr>(Expr{.node = ColumnExpr{.id = block.column.id},
+                                                  .type = block.type,
+                                                  .name = block.column.name}),
                 type);
     const ColumnId id = ids_.Next();
     join.right = Make(
@@ -7056,8 +7056,7 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
 }
 
 template <class BindFn>
-arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn& bind,
-                                       bool group) {
+arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn& bind, bool group) {
   // The probe first, for its bind errors, which a mark of the same text bound in another clause
   // must not hide; an aggregate in it before the rule below, as a top-level IN conjunct's.
   const sql::Expr& operand = **s.operand;
@@ -7080,14 +7079,13 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   sql::SubqueryExpr written = s;
   written.negated = false;
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
-  if (const auto known = std::ranges::find_if(values_,
-                                              [&](const BoundValue& bound) {
-                                                return bound.block == block &&
-                                                       bound.probe != nullptr &&
-                                                       SameExpr(*bound.probe, *probe->expr) &&
-                                                       sql::EqualIgnoringSpans(
-                                                           *bound.written.query, *written.query);
-                                              });
+  if (const auto known = std::ranges::find_if(
+          values_,
+          [&](const BoundValue& bound) {
+            return bound.block == block && bound.probe != nullptr &&
+                   SameExpr(*bound.probe, *probe->expr) &&
+                   sql::EqualIgnoringSpans(*bound.written.query, *written.query);
+          });
       known != values_.end()) {
     // Read by a clause after the select list: from the slot's tail to the end of its own entries.
     if (known->deferred && !deferring_ && !dry_run_) {

@@ -923,6 +923,52 @@ changes.
   aggregates; six metamorphic relations cover keys, arguments, values over aggregates, global blocks, HAVING aliases
   and ORDER BY.
 
+## Update (2026-11-12, SQ7a): IN and NOT IN inside conditions through a null-aware mark join, built
+
+SQ7 is two PRs at the maintainer's request: SQ7a, the mark end to end, and SQ7b, the IN forms (`= ANY`, `= SOME` and
+`<> ALL`, NOT parity folded at the top level, constant and value probes, IN over a set operation, and decision 23's
+type bind error). SQ7a completes Q45: the ratchet is at 80. No other TPC-H or TPC-DS plan changes.
+
+- **Decisions 12 and 13, as built.** `JoinKind::kNullAwareMark` takes the null-aware anti join's trait and a new one,
+  `appends_mark`: each left row comes out once, then the mark. `PaddedJoinRows` gives it the left input's rows, and
+  `EmptyBuildEmptiesJoin` and `ProbeDropsUnmatchedRows` start with the `appends_mark` test, so they hold for SQ8's
+  `kMark` too; every other reader of the traits is unchanged. `JoinNode::mark` is the column; `OutputIds`, the
+  resolver, `IdsOfNode`, `CloneWithFreshIds` and the shared sub-plans' fingerprint carry it, and the resolver now
+  fails a mark on any other kind, a kind that appends one without it, a left-built mark and a residual on a kind that
+  takes none (unchecked before for every kind). The operator reads the build's `empty()` and `has_null()` once, at
+  its start: FALSE throughout, NULL throughout (a set of NULL keys alone), or a lookup that appends TRUE, FALSE or
+  NULL per row and keeps the probe's selection. A mark publishes no dynamic filter.
+- **Decision 14, as built.** The gate admits an IN in a condition that takes values with the rules of a top-level IN
+  conjunct: a probe that reads a column (an aggregate in HAVING and in a `CASE WHEN` over aggregates), no value in
+  it, and no set operation (both SQ7b's). `BindBool` binds it through `MarkValue`, in this order: the probe's
+  enclosing-block check (exit 4, as a top-level IN's), the probe itself, the memo, the lookup-only speculation, the
+  refusal over a correlated block's aggregation (as a value's), the block, the IN key typing a semi join uses (shared,
+  so the three kinds agree), the dry run, and the plant. IN as a BOOLEAN value outside a condition stays exit 4
+  (decision 3).
+- **Decision 10 for marks.** A mark is remembered by its slot, its set's query and its probe as bound, not as written:
+  the probe binds first, so a text that resolves differently in two clauses of a slot (an inner ON sees fewer FROM
+  items than WHERE does) is still that clause's bind error, and two spellings of one column are one mark, so a
+  `GROUP BY` key that holds a mark is matched where D38 refuses a value. IN and NOT IN of one probe and set share one
+  mark, NOT IN reading it under a NOT.
+- **The slot's tail (the maintainer's choice, 2026-11-12).** The select list binds before WHERE, and its expressions
+  over aggregates before HAVING, so a mark planted then would compute its probe below their filters, for rows and
+  groups DuckDB never computes it for. Such a mark goes into its slot's tail, assembled after the slot's own entries
+  and so above WHERE's and HAVING's filters, below the computed columns. A later clause whose memo lookup finds it
+  moves it to the end of the slot's own entries, where that clause computes the probe anyway; ORDER BY binds last.
+  Values keep their places (their joins compute nothing per row).
+- **OR factoring first.** An IN that every branch of an OR shares is a top-level conjunct after factoring: a semi
+  join, no mark. Its error visibility is D35's new member (the maintainer's choice, 2026-11-12): over an empty set
+  the semi join empties and a failing value written before it never builds, where DuckDB keeps a mark per branch and
+  fails.
+- **Divergences.** D16 gains a mark written before a value conjunct, whose probe is computed before the value's
+  filter; D32 a mark's probe keys over an empty set; D35 the shared IN, a mark's set next to an IN conjunct that turns
+  out empty, and a contradiction pair next to a failing set; D37 an ORDER BY expression over an item's alias that
+  holds a mark. Each is pinned in `tests/slt/cases/subqueries/in_marks.slt`.
+- **Decision 28.** `in_marks.slt` holds about 370 records, written first under `pending SQ7a` and checked against
+  DuckDB, with the pins and the DuckDB-only boundaries; the guards of `conditions.slt` that SQ7a answers are lifted
+  and the rest, with `setops/errors.slt`'s, wait for SQ7b. @@FEATURE@@
+- **Q45.** @@Q45@@
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

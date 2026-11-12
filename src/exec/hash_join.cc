@@ -1238,8 +1238,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextMarked() {
   std::shared_ptr<arrow::Array> mark;
   switch (mark_mode_) {
     case MarkMode::kFalse: {
-      ARROW_ASSIGN_OR_RAISE(mark, arrow::MakeArrayFromScalar(arrow::BooleanScalar(false), rows,
-                                                              ctx_.pool));
+      ARROW_ASSIGN_OR_RAISE(
+          mark, arrow::MakeArrayFromScalar(arrow::BooleanScalar(false), rows, ctx_.pool));
       break;
     }
     case MarkMode::kNull: {
@@ -1270,8 +1270,8 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextMarked() {
           ++nulls;
         }
       }
-      mark = arrow::MakeArray(arrow::ArrayData::Make(arrow::boolean(), rows,
-                                                     {std::move(validity), std::move(values)}, nulls));
+      mark = arrow::MakeArray(arrow::ArrayData::Make(
+          arrow::boolean(), rows, {std::move(validity), std::move(values)}, nulls));
       break;
     }
   }

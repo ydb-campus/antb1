@@ -190,8 +190,9 @@ constexpr bool EmptyBuildEmptiesJoin(JoinKind kind) {
 // filters, D1, D2 and D5): a left probe (a right build) whose kind drops its unmatched rows, or a
 // right probe (a left build) whose unmatched rows are not padded, since a right row comes out of
 // every kind only as part of a match or not at all. A null-aware or one-row join never takes such a
-// filter: its keys do not decide alone; nor does a mark join, which outputs every left row. (A nested loop without keys has none to filter by either,
-// which the filters' own rules check: they need a key.)
+// filter: its keys do not decide alone; nor does a mark join, which outputs every left row. (A
+// nested loop without keys has none to filter by either, which the filters' own rules check: they
+// need a key.)
 constexpr bool ProbeDropsUnmatchedRows(JoinKind kind, BuildSide build) {
   const JoinKindTraits traits = Traits(kind);
   if (traits.appends_mark || traits.null_aware || traits.one_row) {

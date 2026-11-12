@@ -489,8 +489,9 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth
 }
 
 TEST(ColumnIdsTest, EveryJoinKindResolves) {
-  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-                              JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark}) {
+  for (const JoinKind kind :
+       {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+        JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark}) {
     JoinNode join = Join(kind);
     if (Traits(kind).residuals) {
       join.residual = {Residual(kC, kF)};

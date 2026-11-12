@@ -5619,7 +5619,9 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
           auto result = Drain(*join, ctx);
           ASSERT_TRUE(result.ok()) << result.status().ToString();
           const arrow::Table& table = **result;
-          EXPECT_EQ(table.num_columns(), traits.outputs_right ? 4 : traits.appends_mark ? 3 : 2)
+          EXPECT_EQ(table.num_columns(), traits.outputs_right  ? 4
+                                         : traits.appends_mark ? 3
+                                                               : 2)
               << "outputs_right, appends_mark";
           const Rows rows = RowsOf(table);
           std::vector<int> times(pids.size(), 0);        // how often each probe row comes out
@@ -5697,11 +5699,11 @@ TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
       for (std::size_t i = 0; i < c.build.size(); ++i) {
         bids.emplace_back(100 + static_cast<int64_t>(i));
       }
-      auto join = MakeJoin(
-          SourceOf(probe_schema, {Int64s(probe_keys), Int64s({0, 1, 2, 3})}),
-          DrainedBuild(plan::JoinKind::kNullAwareMark,
-                       SourceOf(build_schema, {Int64s(c.build), Int64s(bids)}), {0}),
-          {0}, /*prepares=*/true);
+      auto join =
+          MakeJoin(SourceOf(probe_schema, {Int64s(probe_keys), Int64s({0, 1, 2, 3})}),
+                   DrainedBuild(plan::JoinKind::kNullAwareMark,
+                                SourceOf(build_schema, {Int64s(c.build), Int64s(bids)}), {0}),
+                   {0}, /*prepares=*/true);
       ASSERT_NE(join, nullptr);
       ASSERT_EQ(join->output_schema()->num_fields(), 3);
       EXPECT_TRUE(join->output_schema()->field(2)->type()->Equals(arrow::boolean()));
@@ -5757,10 +5759,10 @@ TEST_F(HashJoinPlanTest, AMarkJoinMatchesTheNestedLoopReference) {
     const Rows build_rows = RowsOf(*build_table);
     for (const int column : {0, 1}) {
       const Rows expected = ReferenceMark(probe_rows, build_rows, column, column);
-      const auto plan = PlanOf(JoinOf(plan::JoinKind::kNullAwareMark, ScanOf(probe_table, "p"),
-                                      ScanOf(build_table, "b"), {MixedColumn("p", column)},
-                                      {MixedColumn("b", column)}),
-                               4);
+      const auto plan = PlanOf(
+          JoinOf(plan::JoinKind::kNullAwareMark, ScanOf(probe_table, "p"), ScanOf(build_table, "b"),
+                 {MixedColumn("p", column)}, {MixedColumn("b", column)}),
+          4);
       for (const bool parallel : {false, true}) {
         for (const int64_t batch_size : {1, 3, 64, 65536}) {
           SCOPED_TRACE(std::format("build {}, key column {}, {} thread(s), batch size {}",

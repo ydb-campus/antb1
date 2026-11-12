@@ -1450,8 +1450,8 @@ INSTANTIATE_TEST_SUITE_P(
         // Under an OR, NOT or CASE an IN is a mark (ADR 0041's SQ7a), with a top-level IN's
         // probe and set: a probe that reads no column, a set operation and a correlated set wait
         // for SQ7b and SQ8; a DOUBLE key has no join.
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR 2 IN (SELECT i16 FROM u)", kUnsupported,
-                  "2", "IN needs a column on the left"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR 2 IN (SELECT i16 FROM u)", kUnsupported, "2",
+                  "IN needs a column on the left"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u UNION ALL "
                   "SELECT i16 FROM ok)",
                   kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
@@ -8173,7 +8173,8 @@ TEST(BinderTest, InMarkPlacements) {
            "SELECT i16 FROM t GROUP BY i16 ORDER BY CASE WHEN i16 IN (SELECT i16 FROM u) THEN 0 "
            "ELSE 1 END, i16",
            // Inside a derived table, a CTE, and the blocks of an IN, a scalar and an EXISTS.
-           "SELECT x FROM (SELECT i16 AS x FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) AS d",
+           "SELECT x FROM (SELECT i16 AS x FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) AS "
+           "d",
            "WITH c AS (SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) SELECT i16 "
            "FROM c",
            "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u WHERE i32 IN (SELECT i16 FROM ok) OR "
@@ -8197,8 +8198,7 @@ TEST(BinderTest, InMarkPlacements) {
     auto plan = BindSql(sql, catalog);
     ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
-    EXPECT_EQ(CountOf(Explain(*plan), "Join NULL-AWARE MARK"), 1U) << sql << "\n"
-                                                                    << Explain(*plan);
+    EXPECT_EQ(CountOf(Explain(*plan), "Join NULL-AWARE MARK"), 1U) << sql << "\n" << Explain(*plan);
     const LogicalPlan optimized = Optimized(*plan);
     ASSERT_NE(optimized.root, nullptr) << sql;
     EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
@@ -8285,11 +8285,12 @@ TEST(BinderTest, ASharedInUnderOrIsASemiJoin) {
             "    Compute CAST(i16 AS INTEGER)\n"
             "      Project i16\n"
             "        Scan table=u source=fake columns=[i16]\n");
-  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT i16 FROM u)) OR i16 = 2"),
-            "Output: i16:SMALLINT\n"
-            "Project i16\n"
-            "  Filter i16 = 2\n"
-            "    Scan table=t source=fake columns=[i16]\n");
+  EXPECT_EQ(
+      optimized("SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT i16 FROM u)) OR i16 = 2"),
+      "Output: i16:SMALLINT\n"
+      "Project i16\n"
+      "  Filter i16 = 2\n"
+      "    Scan table=t source=fake columns=[i16]\n");
   constexpr std::string_view kDropped =
       "SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT nope FROM u)) OR i16 = 2";
   auto error = BindSql(kDropped, catalog);
@@ -8313,40 +8314,46 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
     return Explain(*plan);
   };
   // The plans before the optimizer, whose pruning would only shorten the scans' lists.
-  EXPECT_EQ(plan_of("SELECT SUM(CASE WHEN i32 + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
-                    "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
-            "Output: sum(CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
-            "Aggregate SUM(\"CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
-            "  Compute CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
-            "    Join NULL-AWARE MARK build=right keys=[\"(i32 + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
-            "      Compute (i32 + 1)\n"
-            "        Filter i16 > \"min(i16)\"\n"
-            "          Join ONE-ROW build=right keys=[]\n"
-            "            Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
-            "            Aggregate MIN(i16)\n"
-            "              Scan table=ok source=fake columns=[i16, s]\n"
-            "      Compute CAST(i16 AS INTEGER)\n"
-            "        Project i16\n"
-            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
-  EXPECT_EQ(plan_of("SELECT i16, CASE WHEN MAX(i32) + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END "
-                    "FROM t GROUP BY i16 HAVING i16 > (SELECT MIN(i16) FROM ok)"),
-            "Output: i16:SMALLINT CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
-            "END:INTEGER\n"
-            "Project i16, \"CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
-            "END\"\n"
-            "  Compute CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
-            "    Join NULL-AWARE MARK build=right keys=[\"(max(i32) + 1)\" = \"CAST(i16 AS "
-            "INTEGER)\"]\n"
-            "      Compute (max(i32) + 1)\n"
-            "        Filter i16 > \"min(i16)\"\n"
-            "          Join ONE-ROW build=right keys=[]\n"
-            "            GroupAggregate keys=[i16] MAX(i32)\n"
-            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
-            "            Aggregate MIN(i16)\n"
-            "              Scan table=ok source=fake columns=[i16, s]\n"
-            "      Compute CAST(i16 AS INTEGER)\n"
-            "        Project i16\n"
-            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
+  EXPECT_EQ(
+      plan_of("SELECT SUM(CASE WHEN i32 + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
+              "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
+      "Output: sum(CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
+      "Aggregate SUM(\"CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
+      "  Compute CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+      "    Join NULL-AWARE MARK build=right keys=[\"(i32 + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
+      "      Compute (i32 + 1)\n"
+      "        Filter i16 > \"min(i16)\"\n"
+      "          Join ONE-ROW build=right keys=[]\n"
+      "            Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "Case\", from]\n"
+      "            Aggregate MIN(i16)\n"
+      "              Scan table=ok source=fake columns=[i16, s]\n"
+      "      Compute CAST(i16 AS INTEGER)\n"
+      "        Project i16\n"
+      "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "Case\", from]\n");
+  EXPECT_EQ(
+      plan_of("SELECT i16, CASE WHEN MAX(i32) + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END "
+              "FROM t GROUP BY i16 HAVING i16 > (SELECT MIN(i16) FROM ok)"),
+      "Output: i16:SMALLINT CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
+      "END:INTEGER\n"
+      "Project i16, \"CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
+      "END\"\n"
+      "  Compute CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+      "    Join NULL-AWARE MARK build=right keys=[\"(max(i32) + 1)\" = \"CAST(i16 AS "
+      "INTEGER)\"]\n"
+      "      Compute (max(i32) + 1)\n"
+      "        Filter i16 > \"min(i16)\"\n"
+      "          Join ONE-ROW build=right keys=[]\n"
+      "            GroupAggregate keys=[i16] MAX(i32)\n"
+      "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+      "\"Mixed Case\", from]\n"
+      "            Aggregate MIN(i16)\n"
+      "              Scan table=ok source=fake columns=[i16, s]\n"
+      "      Compute CAST(i16 AS INTEGER)\n"
+      "        Project i16\n"
+      "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "Case\", from]\n");
   // WHERE reads the select list's mark: it stands where WHERE's conjunct binds, after the filter
   // of the conjunct written before it, and is one join.
   EXPECT_EQ(plan_of("SELECT SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
@@ -8360,12 +8367,14 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
             "        Join NULL-AWARE MARK build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"]\n"
             "          Filter i16 > \"min(i16)\"\n"
             "            Join ONE-ROW build=right keys=[]\n"
-            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
+            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "\"Mixed Case\", from]\n"
             "              Aggregate MIN(i16)\n"
             "                Scan table=ok source=fake columns=[i16, s]\n"
             "          Compute CAST(i16 AS INTEGER)\n"
             "            Project i16\n"
-            "              Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
+            "              Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "\"Mixed Case\", from]\n");
 }
 
 }  // namespace
