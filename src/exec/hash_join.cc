@@ -21,6 +21,8 @@
 #include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/bitmap_generate.h>
+#include <arrow/util/bitmap_ops.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
@@ -1248,28 +1250,27 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextMarked() {
     }
     case MarkMode::kLookup: {
       // TRUE on a match; else NULL where the key is NULL or the build holds a NULL key; else
-      // FALSE. Find gives a NULL key, and a row that is not selected, no match.
+      // FALSE. Find gives a NULL key, and a row that is not selected, no match. So the values are
+      // the matches, written a byte at a time; and the validity, where the build holds a NULL key,
+      // is the matches too (every other row NULL), else the key's own (a NULL key never matches).
       ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
                             arrow::AllocateEmptyBitmap(rows, ctx_.pool));
+      auto next = static_cast<std::size_t>(begin);
+      arrow::internal::GenerateBitsUnrolled(values->mutable_data(), 0, rows, [this, &next] {
+        const JoinMatches& m = matches_[next++];
+        return m.end > m.begin;
+      });
       std::shared_ptr<arrow::Buffer> validity;
-      int64_t nulls = 0;
-      const bool set_has_null = table_->has_null();
       const arrow::Array& key = *keys_[0];
-      for (int64_t i = 0; i < rows; ++i) {
-        const JoinMatches& m = matches_[static_cast<std::size_t>(begin + i)];
-        if (m.end > m.begin) {
-          arrow::bit_util::SetBit(values->mutable_data(), i);
-          continue;
-        }
-        if (set_has_null || key.IsNull(begin + i)) {
-          if (validity == nullptr) {
-            ARROW_ASSIGN_OR_RAISE(validity, arrow::AllocateBitmap(rows, ctx_.pool));
-            arrow::bit_util::SetBitsTo(validity->mutable_data(), 0, rows, true);
-          }
-          arrow::bit_util::ClearBit(validity->mutable_data(), i);
-          ++nulls;
-        }
+      if (table_->has_null()) {
+        validity = values;
+      } else if (key.null_count() > 0) {
+        ARROW_ASSIGN_OR_RAISE(validity,
+                              arrow::internal::CopyBitmap(ctx_.pool, key.null_bitmap_data(),
+                                                          key.offset() + begin, rows));
       }
+      const int64_t nulls =
+          validity == nullptr ? 0 : rows - arrow::internal::CountSetBits(validity->data(), 0, rows);
       mark = arrow::MakeArray(arrow::ArrayData::Make(
           arrow::boolean(), rows, {std::move(validity), std::move(values)}, nulls));
       break;
