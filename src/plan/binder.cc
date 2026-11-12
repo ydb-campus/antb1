@@ -7060,21 +7060,24 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   // The probe first, for its bind errors, which a mark of the same text bound in another clause
   // must not hide; an aggregate in it before the rule below, as a top-level IN conjunct's.
   const sql::Expr& operand = **s.operand;
-  const bool aggregate = ContainsAggregate(operand);
-  std::optional<Typed> probe;
-  if (aggregate) {
-    ARROW_ASSIGN_OR_RAISE(probe, bind(operand));
-  }
-  if (ReadsOuterColumn(operand, visible_)) {
+  const auto outer_probe = [&] -> arrow::Status {
+    if (!ReadsOuterColumn(operand, visible_)) {
+      return arrow::Status::OK();
+    }
     // Its mark would stand below the correlated filter with the probe's free variable on its outer
     // side, which neither unnesting path of ADR 0023 takes.
     return Reject(Rejection{
         .span = s.op_span,
         .message = "an IN subquery whose probe reads a column of an enclosing query block is not "
                    "supported"});
-  }
+  };
+  const bool aggregate = ContainsAggregate(operand);
   if (!aggregate) {
-    ARROW_ASSIGN_OR_RAISE(probe, bind(operand));
+    ARROW_RETURN_NOT_OK(outer_probe());
+  }
+  ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(operand));
+  if (aggregate) {
+    ARROW_RETURN_NOT_OK(outer_probe());
   }
   sql::SubqueryExpr written = s;
   written.negated = false;
@@ -7083,7 +7086,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
           values_,
           [&](const BoundValue& bound) {
             return bound.block == block && bound.probe != nullptr &&
-                   SameExpr(*bound.probe, *probe->expr) &&
+                   SameExpr(*bound.probe, *probe.expr) &&
                    sql::EqualIgnoringSpans(*bound.written.query, *written.query);
           });
       known != values_.end()) {
@@ -7114,7 +7117,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   }
   const SubqueryConjunct form{.subquery = &s, .other = &operand, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
-  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(*probe, bound.type, s));
+  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, bound.type, s));
   const std::string name = ExprName(sql::Expr(written));
   if (dry_run_) {
     // A branch OR factoring drops, or an EXISTS block's dropped item: its bind errors stand, and
@@ -7131,7 +7134,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                     .filter = {},
                     .span = s.op_span,
                     .mark = ids_.Next()};
-  InKeys(join, *probe, bound, type, s.span);
+  InKeys(join, probe, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
   if (deferring_) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON
@@ -7142,7 +7145,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   values_.push_back(BoundValue{.block = block,
                                .written = std::move(written),
                                .value = value,
-                               .probe = probe->expr,
+                               .probe = probe.expr,
                                .deferred = deferring_});
   return value;
 }
