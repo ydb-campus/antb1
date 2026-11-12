@@ -890,7 +890,9 @@ TPC-H or TPC-DS plan changes. SQ7, IN in any condition (Q45), is next.
 
 Update (2026-11-12, SQ7a): SQ7 is two PRs at the maintainer's request (ADR 0041's SQ7a update). SQ7a, built, answers
 uncorrelated IN and NOT IN under OR, NOT and CASE through a null-aware mark join, and completes Q45: the ratchet is at
-80. No other TPC-H or TPC-DS plan changes. @@Q45@@ SQ7b, the IN forms, follows.
+80. No other TPC-H or TPC-DS plan changes. On Apple silicon antb1 answers Q45 at SF 1 in 0.10 s in the release
+build (26 ms inside the engine on 14 threads) and 0.16 s in the Debug build, and it peaks at 8.1 MB; shard 6 of 8,
+which holds it, takes 43 s under AddressSanitizer here. SQ7b, the IN forms, follows.
 
 ## Alternatives considered
 

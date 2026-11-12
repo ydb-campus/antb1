@@ -966,8 +966,13 @@ type bind error). SQ7a completes Q45: the ratchet is at 80. No other TPC-H or TP
   holds a mark. Each is pinned in `tests/slt/cases/subqueries/in_marks.slt`.
 - **Decision 28.** `in_marks.slt` holds about 370 records, written first under `pending SQ7a` and checked against
   DuckDB, with the pins and the DuckDB-only boundaries; the guards of `conditions.slt` that SQ7a answers are lifted
-  and the rest, with `setops/errors.slt`'s, wait for SQ7b. @@FEATURE@@
-- **Q45.** @@Q45@@
+  and the rest, with `setops/errors.slt`'s, wait for SQ7b. The generator's Feature `in_mark` writes a mark in WHERE,
+  HAVING, a select item or an ORDER BY item, under OR, NOT and CASE, over sets with a NULL, of NULLs alone, empty and
+  limited; 47 metamorphic relations hold it against NOT IN, the union of an OR's branches, the semi join's counts and
+  its three-valued composition from a LEFT JOIN, at three batch sizes.
+- **Q45.** On Apple silicon antb1 answers Q45 at SF 1 in 0.10 s in the release build (26 ms inside the engine on 14
+  threads) and 0.16 s in the Debug build, and it peaks at 8.1 MB; shard 6 of 8, which holds it, takes 43 s under
+  AddressSanitizer here, far inside the 870-second inner timeout.
 
 ## Consequences
 
