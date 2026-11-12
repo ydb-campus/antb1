@@ -1447,19 +1447,44 @@ INSTANTIATE_TEST_SUITE_P(
                   "subquery values that read no column are supported in an IN list"},
         ErrorCase{"SELECT i16 FROM t WHERE i64 IN (1.5e0, (SELECT MIN(i64) FROM u))", kUnsupported,
                   "IN", "IN of a DOUBLE value and a BIGINT"},
-        // Under an OR, which is no top-level conjunct: or_factoring flattens AND only, so the
-        // conjunct never reaches the acceptance list.
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)", kUnsupported,
+        // Under an OR, NOT or CASE an IN is a mark (ADR 0041's SQ7a), with a top-level IN's
+        // probe and set: a probe that reads no column, a set operation and a correlated set wait
+        // for SQ7b and SQ8; a DOUBLE key has no join.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR 2 IN (SELECT i16 FROM u)", kUnsupported,
+                  "2", "IN needs a column on the left"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u UNION ALL "
+                  "SELECT i16 FROM ok)",
+                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT u.i16 FROM u WHERE u.i64 = "
+                  "t.i64)",
+                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 NOT IN (SELECT u.i16 FROM u WHERE "
+                  "u.i64 = t.i64)",
+                  kUnsupported, "NOT IN", "a correlated subquery of NOT IN is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR d IN (SELECT i16 FROM u)", kUnsupported,
+                  "IN", "IN (subquery) over a DOUBLE is not supported"},
+        // A mark as a BOOLEAN value, here IS NULL's operand (ADR 0041's decision 3).
+        ErrorCase{"SELECT i16 FROM t WHERE (i32 IN (SELECT i16 FROM u)) IS NULL", kUnsupported,
                   "IN", "IN (subquery) is not supported"},
+        // A mark whose probe reads an enclosing block would stand below that block's correlated
+        // filter with a free variable, which neither unnesting path takes.
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND (u.i32 "
+                  "< 0 OR t.i32 IN (SELECT i16 FROM ok)))",
+                  kUnsupported, "IN",
+                  "an IN subquery whose probe reads a column of an enclosing query block"},
+        // A mark above a correlated block's aggregation, where ADR 0023's Path 2 does not look.
+        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT CASE WHEN COUNT(*) IN (SELECT i16 FROM "
+                  "ok) THEN 1 ELSE 0 END FROM u WHERE u.i64 = t.i64)",
+                  kUnsupported, "IN",
+                  "an IN subquery over the aggregate of a correlated subquery is not supported"},
+        // The probe binds before the memo is read: one text that an inner ON resolves and WHERE
+        // finds ambiguous is that bind error in WHERE, not the ON's mark.
+        ErrorCase{"SELECT 1 FROM t AS a JOIN u ON u.i16 = a.i16 AND (i32 IN (SELECT i16 FROM ok) "
+                  "OR u.i64 = 1), t AS b WHERE i32 IN (SELECT i16 FROM ok) OR b.i16 = 1",
+                  kBind, "i32", "ambiguous"},
         // A LEFT JOIN's ON, which rule 11 does not let a semi join filter (ADR 0022).
         ErrorCase{"SELECT t.i16 FROM t LEFT JOIN u ON t.i32 IN (SELECT i16 FROM ok)", kUnsupported,
                   "IN", "IN (subquery) is not supported"},
-        // Beyond the three spellings the ADR names: both double negations mean IN, so a classifier
-        // that counts one NOT and stops would answer NOT IN's rows.
-        ErrorCase{"SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))", kUnsupported,
-                  "IN", "IN (subquery) is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))", kUnsupported,
-                  "NOT IN", "IN (subquery) is not supported"},
         // An IN list holding one scalar subquery, which is what the grammar reads from a second
         // pair of parentheses (divergence D21); DuckDB reads an IN subquery.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN ((SELECT i16 FROM u))", kUnsupported, "(",
@@ -1508,11 +1533,12 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END "
                   "FROM t",
                   kUnsupported, "EXISTS", "a correlated EXISTS"},
-        // An IN subquery outside a condition (SQ7).
+        // An IN subquery outside a condition, a BOOLEAN value (ADR 0041's decision 3); in a CASE
+        // WHEN it is a mark, whose probe reads a column (SQ7b takes the others).
         ErrorCase{"SELECT i16 IN (SELECT i16 FROM u) FROM t", kUnsupported, "IN",
                   "IN (subquery) is not supported"},
-        ErrorCase{"SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
-                  kUnsupported, "IN", "IN (subquery) is not supported"},
+        ErrorCase{"SELECT CASE WHEN 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
+                  kUnsupported, "1", "IN needs a column or an aggregate on the left"},
         // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
         // not look (SQ5).
         ErrorCase{
@@ -8099,6 +8125,241 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
             "          Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
             "      Project s16\n"
             "        Scan table=dec source=fake columns=[s16]\n");
+}
+
+// ---- ADR 0041's SQ7a: IN and NOT IN inside a condition, through a null-aware mark join ----
+
+std::size_t CountOf(std::string_view text, std::string_view what) {
+  std::size_t n = 0;
+  for (std::size_t at = text.find(what); at != std::string_view::npos;
+       at = text.find(what, at + 1)) {
+    ++n;
+  }
+  return n;
+}
+
+// Every clause and block an IN under OR, NOT or CASE may stand in binds to a plan whose ids
+// resolve, which the optimizer then takes; each plants exactly one mark. A route the gate opens
+// without an arm in the binder aborts here (RejectedSubquery), not in a user's query.
+TEST(BinderTest, InMarkPlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           // WHERE, under OR, NOT, CASE, and NOT over NOT IN.
+           "SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)",
+           "SELECT i16 FROM t WHERE i16 < 10 OR i32 NOT IN (SELECT i16 FROM u)",
+           "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))",
+           "SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))",
+           "SELECT i16 FROM t WHERE CASE WHEN i32 + 1 IN (SELECT i64 FROM u) THEN 1 ELSE 0 END = 0",
+           // An inner ON, inside a FULL JOIN's left input too, and a keyless one.
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 IN (SELECT i16 FROM ok) OR "
+           "u.i32 < 0)",
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 IN (SELECT i16 FROM ok) OR "
+           "u.i32 < 0) FULL JOIN dec ON u.i32 = dec.i",
+           "SELECT t.i16 FROM t JOIN u ON t.i32 IN (SELECT i16 FROM ok) OR u.i32 < 0",
+           // HAVING, its probe an aggregate or a key.
+           "SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) IN (SELECT i64 FROM u) OR i16 < 0",
+           "SELECT i16 FROM t GROUP BY i16 HAVING NOT (i16 IN (SELECT i16 FROM u)) OR MAX(i32) > 1",
+           // A select item, ORDER BY, GROUP BY key and aggregate argument, in each shape.
+           "SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
+           "SELECT i16 FROM t ORDER BY CASE WHEN i32 NOT IN (SELECT i16 FROM u) THEN 0 ELSE 1 END",
+           "SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END AS k, COUNT(*) FROM t "
+           "GROUP BY k",
+           "SELECT SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t",
+           "SELECT i16, SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN i64 END) FROM t GROUP BY i16",
+           "SELECT i16, CASE WHEN MAX(i32) IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t GROUP "
+           "BY i16",
+           "SELECT i16 FROM t GROUP BY i16 HAVING SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 "
+           "ELSE 0 END) > 1",
+           "SELECT i16 FROM t GROUP BY i16 ORDER BY CASE WHEN i16 IN (SELECT i16 FROM u) THEN 0 "
+           "ELSE 1 END, i16",
+           // Inside a derived table, a CTE, and the blocks of an IN, a scalar and an EXISTS.
+           "SELECT x FROM (SELECT i16 AS x FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) AS d",
+           "WITH c AS (SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) SELECT i16 "
+           "FROM c",
+           "SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u WHERE i32 IN (SELECT i16 FROM ok) OR "
+           "i64 < 0)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT MIN(i16) FROM u WHERE i32 IN (SELECT i16 FROM "
+           "ok) OR i64 < 0)",
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE i32 IN (SELECT i16 FROM ok) OR "
+           "i64 < 0)",
+           // A correlated block's conjunct whose mark's probe is inner: a Path 1 or 2 residual.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND (u.i32 IN "
+           "(SELECT i16 FROM ok) OR t.i64 < 0))",
+           "SELECT i16 FROM t WHERE i32 > (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64 AND (u.i32 "
+           "IN (SELECT i16 FROM ok) OR u.i16 < 0))",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(CountOf(Explain(*plan), "Join NULL-AWARE MARK"), 1U) << sql << "\n"
+                                                                    << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    ASSERT_NE(optimized.root, nullptr) << sql;
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+  }
+}
+
+// The mark join keeps each row of its left input and appends the mark, which the OR's filter
+// reads; its probe is widened to the key type in its own layer, below it, as a semi join's is.
+TEST(BinderTest, AnInUnderOrIsAMarkJoin) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql("SELECT i16 FROM t WHERE i16 < 10 OR i16 IN (SELECT i64 FROM u)", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(Explain(Optimized(*plan)),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter \"((i16 < 10) OR i16 IN (SELECT i64 FROM u))\"\n"
+            "    Compute ((i16 < 10) OR i16 IN (SELECT i64 FROM u))\n"
+            "      Join NULL-AWARE MARK build=right keys=[\"CAST(i16 AS BIGINT)\" = i64] carries 1 "
+            "of 3 unread above\n"
+            "        Compute CAST(i16 AS BIGINT)\n"
+            "          Scan table=t source=fake columns=[i16]\n"
+            "        Project i64\n"
+            "          Scan table=u source=fake columns=[i64]\n");
+}
+
+// One slot binds one mark per set and probe: IN and NOT IN share it, a select item reads a GROUP
+// BY key's, HAVING and a select item over aggregates share one; WHERE and a grouped select item
+// are two slots, and one set with two probes two marks. A probe spelled otherwise is one column,
+// and so one mark.
+TEST(BinderTest, InAndNotInShareOneMark) {
+  const Catalog catalog = MakeCatalog();
+  const auto marks = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return std::size_t{0};
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return CountOf(Explain(*plan), "Join NULL-AWARE MARK");
+  };
+  EXPECT_EQ(marks("SELECT i16 FROM t WHERE (i32 IN (SELECT i16 FROM u) AND i16 > 0) OR (i32 NOT "
+                  "IN (SELECT i16 FROM u) AND i16 < 0)"),
+            1U);
+  EXPECT_EQ(marks("SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 IN (SELECT i16 FROM "
+                  "u)"),
+            2U);
+  EXPECT_EQ(marks("SELECT CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END, COUNT(*) FROM t "
+                  "GROUP BY CASE WHEN I16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END"),
+            1U);
+  EXPECT_EQ(marks("SELECT i16, CASE WHEN COUNT(*) IN (SELECT i64 FROM u) THEN 1 ELSE 0 END FROM t "
+                  "GROUP BY i16 HAVING COUNT(*) NOT IN (SELECT i64 FROM u) OR i16 < 0"),
+            1U);
+  EXPECT_EQ(marks("SELECT i16, SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
+                  "WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0 GROUP BY i16"),
+            1U);
+  EXPECT_EQ(marks("SELECT i16, CASE WHEN i16 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t "
+                  "WHERE i16 IN (SELECT i16 FROM u) OR i32 < 0 GROUP BY i16"),
+            2U);
+}
+
+// An IN that every branch of an OR shares is factored out first (ADR 0022's OR factoring) and is
+// then a top-level conjunct: a semi join, with no mark. A branch that the shared conjuncts alone
+// make true is dropped, bound as a dry run that plants no mark but keeps its bind errors.
+TEST(BinderTest, ASharedInUnderOrIsASemiJoin) {
+  const Catalog catalog = MakeCatalog();
+  const auto optimized = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(Optimized(*plan));
+  };
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i16 > 0 AND i32 IN (SELECT i16 FROM u)) OR (i16 < "
+                      "-5 AND i32 IN (SELECT i16 FROM u))"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"] carries 2 of 3 unread "
+            "above\n"
+            "    Filter \"((i16 > 0) OR (i16 < -5))\"\n"
+            "      Compute ((i16 > 0) OR (i16 < -5))\n"
+            "        Scan table=t source=fake columns=[i16, i32]\n"
+            "    Compute CAST(i16 AS INTEGER)\n"
+            "      Project i16\n"
+            "        Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(optimized("SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT i16 FROM u)) OR i16 = 2"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Filter i16 = 2\n"
+            "    Scan table=t source=fake columns=[i16]\n");
+  constexpr std::string_view kDropped =
+      "SELECT i16 FROM t WHERE (i16 = 2 AND i32 IN (SELECT nope FROM u)) OR i16 = 2";
+  auto error = BindSql(kDropped, catalog);
+  ASSERT_FALSE(error.ok());
+  EXPECT_EQ(SpanText(kDropped, error.status()), "nope");
+}
+
+// The select list binds before WHERE, and its expressions over aggregates before HAVING, but a mark
+// it plants stands above their filters, in its slot's tail, so that it computes its probe only for
+// the rows and groups they keep, as DuckDB does. A later clause that reads the same mark moves it
+// to where that clause binds, which computes the probe there anyway.
+TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(*plan);
+  };
+  // The plans before the optimizer, whose pruning would only shorten the scans' lists.
+  EXPECT_EQ(plan_of("SELECT SUM(CASE WHEN i32 + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
+                    "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
+            "Output: sum(CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
+            "Aggregate SUM(\"CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
+            "  Compute CASE  WHEN ((i32 + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+            "    Join NULL-AWARE MARK build=right keys=[\"(i32 + 1)\" = \"CAST(i16 AS INTEGER)\"]\n"
+            "      Compute (i32 + 1)\n"
+            "        Filter i16 > \"min(i16)\"\n"
+            "          Join ONE-ROW build=right keys=[]\n"
+            "            Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
+            "            Aggregate MIN(i16)\n"
+            "              Scan table=ok source=fake columns=[i16, s]\n"
+            "      Compute CAST(i16 AS INTEGER)\n"
+            "        Project i16\n"
+            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
+  EXPECT_EQ(plan_of("SELECT i16, CASE WHEN MAX(i32) + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END "
+                    "FROM t GROUP BY i16 HAVING i16 > (SELECT MIN(i16) FROM ok)"),
+            "Output: i16:SMALLINT CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
+            "END:INTEGER\n"
+            "Project i16, \"CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 "
+            "END\"\n"
+            "  Compute CASE  WHEN ((max(i32) + 1) IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+            "    Join NULL-AWARE MARK build=right keys=[\"(max(i32) + 1)\" = \"CAST(i16 AS "
+            "INTEGER)\"]\n"
+            "      Compute (max(i32) + 1)\n"
+            "        Filter i16 > \"min(i16)\"\n"
+            "          Join ONE-ROW build=right keys=[]\n"
+            "            GroupAggregate keys=[i16] MAX(i32)\n"
+            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
+            "            Aggregate MIN(i16)\n"
+            "              Scan table=ok source=fake columns=[i16, s]\n"
+            "      Compute CAST(i16 AS INTEGER)\n"
+            "        Project i16\n"
+            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
+  // WHERE reads the select list's mark: it stands where WHERE's conjunct binds, after the filter
+  // of the conjunct written before it, and is one join.
+  EXPECT_EQ(plan_of("SELECT SUM(CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
+                    "WHERE i16 > (SELECT MIN(i16) FROM ok) AND (i32 IN (SELECT i16 FROM u) OR "
+                    "i64 < 0)"),
+            "Output: sum(CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END):HUGEINT\n"
+            "Aggregate SUM(\"CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\")\n"
+            "  Compute CASE  WHEN (i32 IN (SELECT i16 FROM u)) THEN (1) ELSE 0 END\n"
+            "    Filter \"(i32 IN (SELECT i16 FROM u) OR (i64 < 0))\"\n"
+            "      Compute (i32 IN (SELECT i16 FROM u) OR (i64 < 0))\n"
+            "        Join NULL-AWARE MARK build=right keys=[i32 = \"CAST(i16 AS INTEGER)\"]\n"
+            "          Filter i16 > \"min(i16)\"\n"
+            "            Join ONE-ROW build=right keys=[]\n"
+            "              Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n"
+            "              Aggregate MIN(i16)\n"
+            "                Scan table=ok source=fake columns=[i16, s]\n"
+            "          Compute CAST(i16 AS INTEGER)\n"
+            "            Project i16\n"
+            "              Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed Case\", from]\n");
 }
 
 }  // namespace

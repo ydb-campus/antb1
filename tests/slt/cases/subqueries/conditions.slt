@@ -2293,11 +2293,10 @@ SMALLINT	HUGEINT
 1	740
 2	780
 
-# ---- pending: IN, NOT IN, = ANY and <> ALL in any condition (ADR 0041; roadmap PR SQ7 removes these guards) ----
+# ---- IN and NOT IN in any condition (ADR 0041's SQ7a; more in in_marks.slt) ----
 
 # The set holds 1, 2, 5, 9 and a NULL, so IN is true for cities 1, 2 and 5 and NULL for the others, and NOT IN is
 # never true: IN under OR, NOT NOT over IN, IN in a CASE WHEN (whose ELSE takes the NULLs), NOT IN under OR.
-pending SQ7
 query I nosort
 SELECT ct_id FROM cities WHERE ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
 ----
@@ -2307,7 +2306,6 @@ SMALLINT
 5
 6
 
-pending SQ7
 query I nosort
 SELECT ct_id FROM cities WHERE NOT (NOT (ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35))) ORDER BY ct_id
 ----
@@ -2316,7 +2314,6 @@ SMALLINT
 2
 5
 
-pending SQ7
 query I nosort
 SELECT ct_id FROM cities WHERE CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) THEN 1 ELSE 0 END = 0 ORDER BY ct_id
 ----
@@ -2325,34 +2322,13 @@ SMALLINT
 4
 6
 
-pending SQ7
 query I nosort
 SELECT ct_id FROM cities WHERE ct_id NOT IN (SELECT zn_city FROM zones WHERE zn_id > 35) OR ct_id = 6 ORDER BY ct_id
 ----
 SMALLINT
 6
 
-# = ANY is IN, and <> ALL over the same set without its NULL is NOT IN.
-pending SQ7
-query I nosort
-SELECT ct_id FROM cities WHERE ct_id = ANY (SELECT zn_city FROM zones WHERE zn_id > 35) ORDER BY ct_id
-----
-SMALLINT
-1
-2
-5
-
-pending SQ7
-query I nosort
-SELECT ct_id FROM cities WHERE ct_id <> ALL (SELECT zn_city FROM zones WHERE zn_id > 35 AND zn_city IS NOT NULL) ORDER BY ct_id
-----
-SMALLINT
-3
-4
-6
-
-# An IN that every branch of an OR shares, which OR factoring would make a conjunct; city 6's IN is NULL.
-pending SQ7
+# An IN that every branch of an OR shares, which OR factoring makes a conjunct (a semi join); city 6's IN is NULL.
 query I nosort
 SELECT ct_id FROM cities WHERE (ct_pop > 40000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) OR (ct_pop < 10000 AND ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35)) ORDER BY ct_id
 ----
@@ -2361,8 +2337,29 @@ SMALLINT
 2
 5
 
+# ---- pending: = ANY, <> ALL, and probes that read no column (ADR 0041; roadmap PR SQ7b removes these guards) ----
+
+# = ANY is IN, and <> ALL over the same set without its NULL is NOT IN.
+pending SQ7b
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id = ANY (SELECT zn_city FROM zones WHERE zn_id > 35) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+5
+
+pending SQ7b
+query I nosort
+SELECT ct_id FROM cities WHERE ct_id <> ALL (SELECT zn_city FROM zones WHERE zn_id > 35 AND zn_city IS NOT NULL) ORDER BY ct_id
+----
+SMALLINT
+3
+4
+6
+
 # A probe that reads no column: a value (zone 7's city, 2) and a literal.
-pending SQ7
+pending SQ7b
 query I nosort
 SELECT ct_id FROM cities WHERE (SELECT zn_city FROM zones WHERE zn_id = 7) IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id < 3 ORDER BY ct_id
 ----
@@ -2370,7 +2367,7 @@ SMALLINT
 1
 2
 
-pending SQ7
+pending SQ7b
 query I nosort
 SELECT ct_id FROM cities WHERE 2 IN (SELECT zn_city FROM zones WHERE zn_id > 35) AND ct_id = 1 ORDER BY ct_id
 ----
