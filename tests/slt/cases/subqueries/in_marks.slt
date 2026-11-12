@@ -2689,6 +2689,65 @@ SELECT zn_city % 2 AS zn_id, COUNT(*) AS c FROM zones GROUP BY zn_city % 2 HAVIN
 statement error
 SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING zn_id IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR COUNT(*) > 1
 
+# ---- HAVING over the alias of an item that holds a mark ----
+
+# The item's mark, over an aggregate or a key, is planted while the select list binds; HAVING reads it through the
+# alias: in a comparison, under OR, next to an IN and a value, and in a global block.
+query II nosort
+SELECT zn_city, CASE WHEN SUM(zn_id) IN (SELECT ct_pop FROM cities) THEN 1 ELSE 0 END AS k FROM zones GROUP BY zn_city HAVING k = 0 ORDER BY 1
+----
+SMALLINT	INTEGER
+1	0
+2	0
+3	0
+4	0
+5	0
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city IN (SELECT ct_id FROM cities WHERE ct_id < 3) THEN 1 ELSE 0 END AS k FROM zones GROUP BY zn_city HAVING k = 1 ORDER BY 1
+----
+SMALLINT	INTEGER
+1	1
+2	1
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city IN (SELECT ct_id FROM cities WHERE ct_id < 3) THEN 1 ELSE 0 END AS k FROM zones GROUP BY zn_city HAVING k = 0 OR zn_city = 2 ORDER BY 1
+----
+SMALLINT	INTEGER
+2	1
+3	0
+4	0
+5	0
+9	0
+NULL	0
+
+query II nosort
+SELECT zn_city, CASE WHEN zn_city IN (SELECT ct_id FROM cities WHERE ct_id < 3) THEN 1 ELSE 0 END AS k FROM zones GROUP BY zn_city HAVING k IN (SELECT ct_id FROM cities) ORDER BY 1
+----
+SMALLINT	INTEGER
+1	1
+2	1
+
+query II nosort
+SELECT zn_city, CASE WHEN MAX(zn_parent) NOT IN (SELECT zn_id FROM zones WHERE zn_id > 30) THEN 1 ELSE 0 END AS k FROM zones GROUP BY zn_city HAVING k > (SELECT MIN(ct_id) - 1 FROM cities) ORDER BY 1
+----
+SMALLINT	INTEGER
+1	1
+2	1
+3	1
+4	1
+5	1
+9	1
+NULL	1
+
+query I rowsort
+SELECT CASE WHEN SUM(zn_id) IN (SELECT ct_pop FROM cities) THEN 1 ELSE 0 END AS k FROM zones HAVING k = 0
+----
+INTEGER
+0
+
 # ---- a global block's ORDER BY ----
 
 # Its one row is never sorted, but a mark in an ORDER BY item still joins, reading its probe's aggregate, which no
@@ -2867,23 +2926,23 @@ INTEGER	INTEGER
 
 # ---- boundaries ----
 
-# The shapes below stay exit code 4 after SQ7a, each until the item its heading names; DuckDB answers them, or fails
-# with a bind error, so they run in DuckDB alone until then.
+# The shapes below stay exit code 4 after SQ7a, each until the item its heading names: pending on a roadmap PR, or in
+# DuckDB alone where no PR plans them yet. DuckDB answers them, or fails with a bind error.
 
-# ---- DuckDB only until SQ7b gets a PR (ADR 0041: the IN forms SQ7a leaves out) ----
+# ---- pending: the IN forms SQ7a leaves out (ADR 0041; roadmap PR SQ7b removes these guards) ----
 
 # = ANY over a UNION under OR; = SOME in a HAVING under OR; <> ALL three-valued in a select CASE (a NULL probe is N,
 # a probe in the set F); a constant probe of NOT IN over a set holding a NULL, never TRUE, under OR; a probe holding a
 # scalar subquery under OR; and a DATE probe against an INTEGER set in a CASE, a bind error.
 
-onlyif duckdb
+pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities) OR tr_row < 10
 ----
 BIGINT	HUGEINT
 843	1253668
 
-onlyif duckdb
+pending SQ7b
 query II nosort
 SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city HAVING zn_city = SOME (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR COUNT(*) < 2 ORDER BY zn_city
 ----
@@ -2893,7 +2952,7 @@ SMALLINT	BIGINT
 9	1
 NULL	1
 
-onlyif duckdb
+pending SQ7b
 query IT nosort
 SELECT id, CASE WHEN i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 4)) THEN 'T' WHEN NOT (i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 4))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
 ----
@@ -2911,21 +2970,21 @@ INTEGER	VARCHAR
 10	T
 11	T
 
-onlyif duckdb
+pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE -1 NOT IN (SELECT zn_parent FROM zones) OR tr_row < 5
 ----
 BIGINT	HUGEINT
 5	10
 
-onlyif duckdb
+pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 3
 ----
 BIGINT	HUGEINT
 492	733227
 
-onlyif duckdb
+pending SQ7b
 statement error
 SELECT COUNT(*) FROM trips WHERE CASE WHEN tr_day IN (SELECT zn_id FROM zones) THEN 1 ELSE 0 END = 1
 
@@ -3158,81 +3217,81 @@ SELECT COUNT(*), SUM(id) FROM edge WHERE i32 IN (SELECT 10 / (i32 - i32) FROM ed
 BIGINT	HUGEINT
 1	0
 
-# ---- DuckDB only until SQ8 and SQ12 get a PR (ADR 0041: correlated IN, and probes of an enclosing block) ----
+# ---- pending: correlated IN, and IN probes of an enclosing block (ADR 0041; roadmap PRs SQ8 and SQ12) ----
 
 # A correlated IN set: as a conjunct (SQ8), under OR (SQ12), NOT IN, and correlated on the IN's own pair. Then an IN
 # inside a correlated EXISTS whose probe reads the outer block, as a conjunct and under OR (SQ12).
 
-onlyif duckdb
+pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = tr_row % 5 + 1)
 ----
 BIGINT	HUGEINT
 532	753340
 
-onlyif duckdb
+pending SQ12
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = tr_row % 5 + 1) OR tr_row % 7 = 0
 ----
 BIGINT	HUGEINT
 885	1289652
 
-onlyif duckdb
+pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones WHERE zn_city = tr_row % 5 + 1)
 ----
 BIGINT	HUGEINT
 2468	3745160
 
-onlyif duckdb
+pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id = tr_pickup)
 ----
 BIGINT	HUGEINT
 2793	4187379
 
-onlyif duckdb
+pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE EXISTS (SELECT 1 FROM zones WHERE zn_id = tr_pickup AND tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = 1))
 ----
 BIGINT	HUGEINT
 526	784680
 
-onlyif duckdb
+pending SQ12
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE EXISTS (SELECT 1 FROM zones WHERE zn_id = tr_pickup AND (tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR zn_city = 2))
 ----
 BIGINT	HUGEINT
 980	1461122
 
-# ---- DuckDB only until X5 gets a PR (ADR 0036: ORDER BY and LIMIT on a set operation) ----
+# ---- pending: ORDER BY and LIMIT on a set operation (ADR 0036; roadmap PR X5 removes these guards) ----
 
 # A set operation with its own ORDER BY, LIMIT or OFFSET as the set: IN over a UNION's first three, over LIMIT 0;
 # NOT IN over the top two, past the NULL that sorts last, under OR; a UNION ALL's first four in an aggregate's
 # CASE; and an EXCEPT with LIMIT and OFFSET.
 
-onlyif duckdb
+pending X5
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones UNION SELECT ct_id FROM cities ORDER BY 1 LIMIT 3)
 ----
 BIGINT	HUGEINT
 210	311745
 
-onlyif duckdb
+pending X5
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones UNION SELECT ct_id FROM cities LIMIT 0)
 ----
 BIGINT	HUGEINT
 0	NULL
 
-onlyif duckdb
+pending X5
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_parent FROM zones UNION SELECT ct_id FROM cities ORDER BY 1 DESC LIMIT 2) OR tr_dropoff = 6
 ----
 BIGINT	HUGEINT
 2824	4234764
 
-onlyif duckdb
+pending X5
 query II nosort
 SELECT zn_city, SUM(CASE WHEN zn_id IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION ALL SELECT ct_id FROM cities ORDER BY 1 LIMIT 4) THEN 1 ELSE 0 END) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
 ----
@@ -3245,7 +3304,7 @@ SMALLINT	HUGEINT
 9	0
 NULL	0
 
-onlyif duckdb
+pending X5
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 1 ORDER BY 1 DESC LIMIT 5 OFFSET 2)
 ----

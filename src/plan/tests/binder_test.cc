@@ -8172,6 +8172,9 @@ TEST(BinderTest, InMarkPlacements) {
            "ELSE 0 END) > 1",
            "SELECT i16 FROM t GROUP BY i16 ORDER BY CASE WHEN i16 IN (SELECT i16 FROM u) THEN 0 "
            "ELSE 1 END, i16",
+           // HAVING over the alias of an item whose mark waits in the slot's tail: moved first.
+           "SELECT i16, CASE WHEN MAX(i32) IN (SELECT i16 FROM u) THEN 1 ELSE 0 END AS k FROM t "
+           "GROUP BY i16 HAVING k = 0",
            // Inside a derived table, a CTE, and the blocks of an IN, a scalar and an EXISTS.
            "SELECT x FROM (SELECT i16 AS x FROM t WHERE i32 IN (SELECT i16 FROM u) OR i16 < 0) AS "
            "d",

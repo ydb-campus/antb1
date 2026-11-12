@@ -5675,7 +5675,7 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
 // A null-aware mark join (ADR 0041's decision 12) marks every probe row exactly once, three-valued:
 // TRUE on a match; else FALSE over an empty build input, a NULL key included; else NULL where the
 // key is NULL or the build holds a NULL key; else FALSE. At batch sizes 1, 2 and the default, so
-// that windows cut the probe batch, and with a selection that drops a row.
+// that windows cut the probe batch.
 TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
   const auto probe_schema = Int64Schema({"k", "pid"});
   const auto build_schema = Int64Schema({"bk", "bid"});
@@ -5775,6 +5775,32 @@ TEST_F(HashJoinPlanTest, AMarkJoinMatchesTheNestedLoopReference) {
         }
       }
     }
+  }
+}
+
+// A mark join keeps its probe batch's selection: a row that is not selected stays unselected and
+// comes out of no window, and each selected row is marked by its own key, at any window size.
+TEST_F(HashJoinTest, AMarkJoinKeepsItsProbesSelection) {
+  const auto probe_schema = Int64Schema({"k", "pid"});
+  const auto build_schema = Int64Schema({"bk", "bid"});
+  const std::optional<int64_t> null;
+  const auto probe = BatchOf(probe_schema, {Int64s({1, 3, null, 2, 5}), Int64s({0, 1, 2, 3, 4})});
+  const auto selection = Bools({true, false, true, true, true});
+  for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
+    SCOPED_TRACE(std::format("batch size {}", batch_size));
+    auto join = MakeJoin(
+        std::make_unique<ScriptedSource>(
+            probe_schema, std::vector<Batch>{Batch{.data = probe, .selection = selection}}),
+        DrainedBuild(plan::JoinKind::kNullAwareMark,
+                     SourceOf(build_schema, {Int64s({1, 2}), Int64s({10, 20})}), {0}),
+        {0}, /*prepares=*/true);
+    ASSERT_NE(join, nullptr);
+    ExecContext ctx = ContextOf(nullptr, batch_size);
+    auto result = Drain(*join, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(
+        RowsOf(**result),
+        (Rows{{"1", "0", "true"}, {"null", "2", "null"}, {"2", "3", "true"}, {"5", "4", "false"}}));
   }
 }
 

@@ -3801,6 +3801,8 @@ class Binder {
   // per slot as a value is; NOT IN reads it under a NOT.
   template <class BindFn>
   arrow::Result<Typed> MarkValue(const sql::SubqueryExpr& s, const BindFn& bind, bool group);
+  // Moves each mark in HAVING's slot tail that `expr` reads to the end of the slot's own entries.
+  void PromoteTailMarks(const Expr& expr);
   // A WHERE, inner-ON or (`group`) HAVING conjunct that holds a value: a filter of its own at the
   // end of its slot.
   arrow::Status BindValueConjunct(const sql::Expr& conjunct, SourceSpan element,
@@ -7056,6 +7058,34 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
   return value;
 }
 
+void Binder::PromoteTailMarks(const Expr& expr) {
+  std::vector<ColumnId> reads;
+  CollectColumnIds(expr, reads);
+  // Through the computed columns over the aggregation it reads, too.
+  for (std::size_t i = 0; i < reads.size(); ++i) {
+    if (const auto post = std::ranges::find(post_ids_, reads[i]); post != post_ids_.end()) {
+      CollectColumnIds(*post_exprs_.at(Narrow<std::size_t>(post - post_ids_.begin())), reads);
+    }
+  }
+  for (BoundValue& value : values_) {
+    if (!value.deferred || value.block.has_value()) {
+      continue;
+    }
+    const ColumnId mark = std::get<ColumnExpr>(value.value.expr->node).id;
+    if (std::ranges::find(reads, mark) == reads.end()) {
+      continue;
+    }
+    const auto entry = std::ranges::find_if(group_tail_, [&](const SlotEntry& e) {
+      const auto* join = std::get_if<SubqueryJoin>(&e);
+      return join != nullptr && join->mark == mark;
+    });
+    ANTB1_CHECK(entry != group_tail_.end());
+    group_slot_.push_back(std::move(*entry));
+    group_tail_.erase(entry);
+    value.deferred = false;
+  }
+}
+
 template <class BindFn>
 arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn& bind, bool group) {
   // The probe first, for its bind errors, which a mark of the same text bound in another clause
@@ -8032,6 +8062,9 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
         item->expr = post_exprs_.at(Narrow<std::size_t>(post - post_ids_.begin()));
       }
     }
+    // A mark the item planted waits in the slot's tail, above where HAVING reads it: it stands
+    // where HAVING binds instead, as a memo hit would put it.
+    PromoteTailMarks(*item->expr);
   }
   return item;
 }

@@ -954,7 +954,8 @@ type bind error). SQ7a completes Q45: the ratchet is at 80. No other TPC-H or TP
   over aggregates before HAVING, so a mark planted then would compute its probe below their filters, for rows and
   groups DuckDB never computes it for. Such a mark goes into its slot's tail, assembled after the slot's own entries
   and so above WHERE's and HAVING's filters, below the computed columns. A later clause whose memo lookup finds it
-  moves it to the end of the slot's own entries, where that clause computes the probe anyway; ORDER BY binds last.
+  moves it to the end of the slot's own entries, where that clause computes the probe anyway, and so does HAVING that
+  reads it through the item's alias (found by the review); ORDER BY binds last.
   Values keep their places (their joins compute nothing per row).
 - **OR factoring first.** An IN that every branch of an OR shares is a top-level conjunct after factoring: a semi
   join, no mark. Its error visibility is D35's new member (the maintainer's choice, 2026-11-12): over an empty set
