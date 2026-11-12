@@ -1761,6 +1761,7 @@ std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bo
 }
 
 std::optional<Rejection> RejectInCondition(const sql::SubqueryExpr& s, bool having) {
+  ANTB1_CHECK(s.operand.has_value());  // the parser writes no kIn node without one
   return RejectSubqueryConjunct(
       SubqueryConjunct{.subquery = &s, .other = &**s.operand, .negated = s.negated}, having);
 }
@@ -7059,6 +7060,7 @@ template <class BindFn>
 arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn& bind, bool group) {
   // The probe first, for its bind errors, which a mark of the same text bound in another clause
   // must not hide; an aggregate in it before the rule below, as a top-level IN conjunct's.
+  ANTB1_CHECK(s.operand.has_value());  // the parser writes no kIn node without one
   const sql::Expr& operand = **s.operand;
   const auto outer_probe = [&] -> arrow::Status {
     if (!ReadsOuterColumn(operand, visible_)) {

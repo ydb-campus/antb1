@@ -5696,6 +5696,7 @@ TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
     for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{1024}}) {
       SCOPED_TRACE(std::format("{}, batch size {}", c.name, batch_size));
       std::vector<std::optional<int64_t>> bids;
+      bids.reserve(c.build.size());
       for (std::size_t i = 0; i < c.build.size(); ++i) {
         bids.emplace_back(100 + static_cast<int64_t>(i));
       }
@@ -5711,13 +5712,14 @@ TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
       ExecContext ctx = ContextOf(nullptr, batch_size);
       auto result = Drain(*join, ctx);
       ASSERT_TRUE(result.ok()) << result.status().ToString();
-      Rows rows = RowsOf(**result);
-      std::ranges::sort(rows, {}, [](const std::vector<std::string>& row) { return row.at(1); });
+      // Each probe row once, in any order: its mark by its pid.
+      const Rows rows = RowsOf(**result);
       ASSERT_EQ(rows.size(), 4U);
-      for (std::size_t pid = 0; pid < rows.size(); ++pid) {
-        EXPECT_EQ(rows[pid].at(1), std::to_string(pid));
-        EXPECT_EQ(rows[pid].at(2), c.marks[pid]) << "probe row " << pid;
+      std::vector<std::string> marks(rows.size());
+      for (const std::vector<std::string>& row : rows) {
+        marks.at(static_cast<std::size_t>(std::stoi(row.at(1)))) = row.at(2);
       }
+      EXPECT_EQ(marks, c.marks);
     }
   }
 }
