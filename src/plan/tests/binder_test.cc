@@ -8182,6 +8182,12 @@ TEST(BinderTest, InMarkPlacements) {
            "ok) OR i64 < 0)",
            "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE i32 IN (SELECT i16 FROM ok) OR "
            "i64 < 0)",
+           // A mark on the outer side of a correlated subquery, which ADR 0023's Path 2 clones for
+           // its semi-join reduction (fresh ids, the mark's among them), and Path 1 keeps below.
+           "SELECT i16 FROM t WHERE (i16 < 0 OR i32 IN (SELECT i16 FROM ok)) AND i32 > (SELECT "
+           "MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
+           "SELECT i16 FROM t WHERE (i16 < 0 OR i32 IN (SELECT i16 FROM ok)) AND EXISTS (SELECT 1 "
+           "FROM u WHERE u.i64 = t.i64)",
            // A correlated block's conjunct whose mark's probe is inner: a Path 1 or 2 residual.
            "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND (u.i32 IN "
            "(SELECT i16 FROM ok) OR t.i64 < 0))",

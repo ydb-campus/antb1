@@ -516,6 +516,53 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# An IN under OR is a null-aware mark join (ADR 0041's SQ7a): every probe row once, with a BOOLEAN
+# mark that the OR's filter reads above it; its probe's cast to the key type is a Compute of its own
+# directly below the join, as a semi join's is.
+antb1_add_cli_golden(
+  explain_in_subquery_mark
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_row < 10 OR tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# An IN that every branch of an OR shares is factored out first and is a semi join, with no mark.
+antb1_add_cli_golden(
+  explain_in_subquery_or_factored
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE (tr_row < 10 AND tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1)) OR (tr_row > 2990 AND tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1))"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# A mark in HAVING stands over the groups, above the aggregation; one in an aggregate's argument
+# stands below it, over the rows, above WHERE's filter.
+antb1_add_cli_golden(
+  explain_in_subquery_mark_having
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_pickup, SUM(CASE WHEN tr_rider IN (SELECT rd_id FROM riders WHERE rd_id < 50) THEN 1 ELSE 0 END) FROM trips WHERE tr_row > 100 GROUP BY tr_pickup HAVING COUNT(*) > 60 OR tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # HAVING computes what its conditions read and filters directly above the aggregation, before the
 # select list and ORDER BY are computed, as DuckDB does: their expressions run only over the groups
 # that pass.
@@ -1225,6 +1272,29 @@ antb1_add_cli_golden(
   explain_analyze_json
   STDOUT_REGEX "${_explain_analyze_json}"
   ARGS explain --analyze --threads 1 --format json -c "SELECT COUNT(*) FROM t WHERE RegionID > 100" --table "${_split}"
+)
+# A mark join outputs every probe row once (rows=40 of zones' 40); its build counts the set's NULL
+# keys, which make the mark NULL where it does not match (ADR 0041's SQ7a).
+string(
+  CONCAT _explain_analyze_mark
+  # Balanced brackets only: an unbalanced [ would keep CMake from splitting the arguments after it.
+  "HashJoin Join NULL-AWARE MARK build=right keys=.\"CAST.zn_city AS INTEGER.\" = zn_parent. "
+  "carries 2 of 4 unread above  .rows=40 [^\n]*\n"
+  ".*HashBuild Join NULL-AWARE MARK build=right keys=.\"CAST.zn_city AS INTEGER.\" = zn_parent. "
+  "carries 2 of 4 unread above  .rows=3 [^\n]* null_keys=5 "
+)
+antb1_add_cli_golden(
+  explain_analyze_in_subquery_mark
+  STDOUT_REGEX "${_explain_analyze_mark}"
+  ARGS
+    explain
+    --analyze
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR zn_city NOT IN (SELECT zn_parent FROM zones WHERE zn_id < 9)"
+    --table
+    "zones=${_f}/star/zones.parquet"
 )
 antb1_add_cli_golden(
   explain_analyze_bind_error

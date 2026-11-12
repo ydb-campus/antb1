@@ -1,0 +1,10 @@
+Output: count_star():BIGINT
+Aggregate COUNT(*)
+  Filter "((tr_row < 10) OR tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5))"
+    Compute ((tr_row < 10) OR tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5))
+      Join NULL-AWARE MARK build=right keys=["CAST(tr_driver AS BIGINT)" = dv_id] carries 2 of 4 unread above
+        Compute CAST(tr_driver AS BIGINT)
+          Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_row, tr_driver]
+        Project dv_id
+          Filter dv_id > 5
+            Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id]

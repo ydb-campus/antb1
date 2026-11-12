@@ -1903,7 +1903,7 @@ follows.
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q44 | unsupported | needs scalar subqueries that are not aggregates, scalar subqueries inside a condition and rank() (phase 9) |
-| Q45 | unsupported | needs an IN subquery under OR (SQ7) |
+| Q45 | pass | an IN subquery under OR, through a null-aware mark join (SQ7a) |
 | Q46 | pass | constant integer expressions in IN lists |
 | Q47 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
 | Q48 | pass | answered when the ratchet was added |
