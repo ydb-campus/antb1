@@ -2322,6 +2322,145 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- IN and NOT IN inside conditions: null-aware marks (ADR 0041's SQ7a) ----
+  // A mark is TRUE on a match, FALSE over an empty set (also for a NULL probe), else NULL where the
+  // probe is NULL or the set holds a NULL, else FALSE; NOT IN is NOT over it. The probe is
+  // tr_dropoff, NULL on some trips; each relation runs over five sets (tools/fixturegen/star.h):
+  // one with NULLs and three values, the empty promos, NULLs only, values without a NULL, and the
+  // whole zn_parent with its NULLs and a value no zone has.
+  {
+    const slt::FeatureSet marks = {kCountStar,          kColumns,    kIntegerColumns,
+                                   kTableName,          kWhere,      kIntegerLiteral,
+                                   kBooleanExpressions, kArithmetic, kInMark};
+    struct MarkSet {
+      std::string_view name;
+      std::string_view column;
+      std::string_view from;  // the table and its WHERE
+    };
+    constexpr auto kMarkSets = std::to_array<MarkSet>({
+        {.name = "a_null", .column = "zn_parent", .from = "zones WHERE zn_id < 9"},
+        {.name = "empty", .column = "pm_id", .from = "promos"},
+        {.name = "nulls_only", .column = "zn_parent", .from = "zones WHERE zn_id < 3"},
+        {.name = "no_null", .column = "zn_id", .from = "zones WHERE zn_id > 25"},
+        {.name = "all_parents", .column = "zn_parent", .from = "zones"},
+    });
+    for (const MarkSet& set : kMarkSets) {
+      const std::string q = std::format("SELECT {} FROM {}", set.column, set.from);
+      // Under OR, so each is a mark rather than a semi or an anti join: NOT over IN is NOT IN, and
+      // NOT NOT over IN is IN, at any batch size.
+      const std::string not_in = std::format(
+          "SELECT tr_row FROM trips WHERE tr_row % 5 = 0 OR NOT (tr_dropoff IN ({}))", q);
+      r.push_back(
+          {.name = std::format("in_mark_not_over_in_is_not_in_over_{}", set.name),
+           .features = marks,
+           .probes = {Q(not_in),
+                      Q(std::format(
+                          "SELECT tr_row FROM trips WHERE tr_row % 5 = 0 OR tr_dropoff NOT IN ({})",
+                          q)),
+                      Q(not_in, 1), Q(not_in, 7)},
+           .check = AllEqual()});
+      const std::string double_not = std::format(
+          "SELECT tr_row FROM trips WHERE tr_row % 5 = 0 OR NOT (NOT (tr_dropoff IN ({})))", q);
+      r.push_back(
+          {.name = std::format("in_mark_double_not_is_in_over_{}", set.name),
+           .features = marks,
+           .probes = {Q(double_not),
+                      Q(std::format(
+                          "SELECT tr_row FROM trips WHERE tr_row % 5 = 0 OR tr_dropoff IN ({})",
+                          q)),
+                      Q(double_not, 1), Q(double_not, 7)},
+           .check = AllEqual()});
+      // The three-valued classification of a CASE over IN and NOT (IN) equals the one computed
+      // without a mark: a LEFT JOIN with the set's distinct values finds the matches ('T'); one row
+      // of the set's row and NULL counts tells the rest apart: 'F' over an empty set, 'N' for a
+      // NULL probe or a set that holds a NULL, else 'F'.
+      const std::string classified = std::format(
+          "SELECT tr_row, CASE WHEN tr_dropoff IN ({0}) THEN 'T' WHEN NOT (tr_dropoff IN ({0})) "
+          "THEN 'F' ELSE 'N' END FROM trips",
+          q);
+      r.push_back(
+          {.name = std::format("in_mark_is_its_three_valued_composition_over_{}", set.name),
+           .features = SetWith(marks, kMultipleItems, kCase, kStringLiteral, kCountColumn,
+                               kSelectDistinct, kDerivedTable, kLeftJoin, kCommaJoin, kCrossJoin,
+                               kAlias, kTableAlias, kQualifiedName),
+           .probes = {Q(classified),
+                      Q(std::format(
+                          "SELECT t.tr_row, CASE WHEN d.v IS NOT NULL THEN 'T' WHEN c.n = 0 THEN "
+                          "'F' WHEN t.tr_dropoff IS NULL OR c.nulls > 0 THEN 'N' ELSE 'F' END FROM "
+                          "trips AS t LEFT JOIN (SELECT DISTINCT {0} AS v FROM {1}) AS d ON "
+                          "t.tr_dropoff = d.v CROSS JOIN (SELECT COUNT(*) AS n, COUNT(*) - "
+                          "COUNT({0}) AS nulls FROM {1}) AS c",
+                          set.column, set.from)),
+                      Q(classified, 1), Q(classified, 7)},
+           .check = AllEqual()});
+      // `p OR x [NOT] IN (q)` keeps the rows of p and those of the mark: p's rows and the others'
+      // that the semi or anti join keeps, which a UNION of the two filters (by the unique tr_row)
+      // also gives.
+      for (const std::string_view in : {"IN", "NOT IN"}) {
+        const std::string name = in == "IN" ? "in" : "not_in";
+        const std::string mark = std::format("tr_dropoff {} ({})", in, q);
+        r.push_back(
+            {.name = std::format("in_mark_or_is_its_disjoint_branches_{}_over_{}", name, set.name),
+             .features = SetWith(marks, kWhereAnd),
+             .probes = {Q(std::format("SELECT tr_row FROM trips WHERE tr_row % 5 = 0 OR {}", mark)),
+                        Q("SELECT tr_row FROM trips WHERE tr_row % 5 = 0"),
+                        Q(std::format("SELECT tr_row FROM trips WHERE NOT (tr_row % 5 = 0) AND {}",
+                                      mark))},
+             .check = FirstIsUnionOfRest()});
+        r.push_back(
+            {.name =
+                 std::format("in_mark_or_is_the_union_of_its_branches_{}_over_{}", name, set.name),
+             .features = SetWith(marks, kInSubquery, kUnionAll, kUnion),
+             .probes = {Q(std::format("SELECT tr_row FROM trips WHERE {} OR tr_row % 5 = 0", mark)),
+                        Q(std::format("SELECT tr_row FROM trips WHERE tr_row % 5 = 0 UNION SELECT "
+                                      "tr_row FROM trips WHERE {}",
+                                      mark))},
+             .check = AllEqual()});
+        // In an aggregate's argument the mark counts the rows its semi or anti join keeps, per
+        // group too.
+        const std::string counted = std::format(
+            "SELECT tr_pickup % 4, COUNT(CASE WHEN {} THEN 1 END) FROM trips GROUP BY tr_pickup % "
+            "4",
+            mark);
+        r.push_back(
+            {.name = std::format("in_mark_count_is_its_semi_join_count_{}_over_{}", name, set.name),
+             .features = SetWith(marks, kInSubquery, kMultipleItems, kCase, kCountColumn, kGroupBy,
+                                 kLeftJoin, kDerivedTable, kAlias, kTableAlias, kQualifiedName),
+             .probes = {Q(counted),
+                        Q(std::format(
+                            "SELECT g.k, COUNT(m.tr_row) FROM (SELECT DISTINCT tr_pickup % 4 AS k "
+                            "FROM trips) AS g LEFT JOIN (SELECT tr_row, tr_pickup % 4 AS k FROM "
+                            "trips WHERE {}) AS m ON g.k = m.k GROUP BY g.k",
+                            mark)),
+                        Q(counted, 1), Q(counted, 7)},
+             .check = AllEqual()});
+      }
+    }
+    // A VARCHAR probe and set (tr_tariff against tariffs' codes, one of them NULL): the
+    // three-valued composition, with and without the NULL.
+    for (const auto& [name, from] :
+         {std::pair{"varchar_with_a_null", "tariffs"},
+          std::pair{"varchar_without_a_null", "tariffs WHERE tf_code IS NOT NULL"}}) {
+      const std::string q = std::format("SELECT tf_code FROM {}", from);
+      r.push_back(
+          {.name = std::format("in_mark_is_its_three_valued_composition_over_{}", name),
+           .features = SetWith(marks, kVarcharColumns, kMultipleItems, kCase, kStringLiteral,
+                               kCountColumn, kSelectDistinct, kDerivedTable, kLeftJoin, kCommaJoin,
+                               kCrossJoin, kAlias, kTableAlias, kQualifiedName),
+           .probes = {Q(std::format("SELECT tr_row, CASE WHEN tr_tariff IN ({0}) THEN 'T' WHEN NOT "
+                                    "(tr_tariff IN ({0})) THEN 'F' ELSE 'N' END FROM trips",
+                                    q)),
+                      Q(std::format(
+                          "SELECT t.tr_row, CASE WHEN d.v IS NOT NULL THEN 'T' WHEN c.n = 0 THEN "
+                          "'F' WHEN t.tr_tariff IS NULL OR c.nulls > 0 THEN 'N' ELSE 'F' END FROM "
+                          "trips AS t LEFT JOIN (SELECT DISTINCT tf_code AS v FROM {0}) AS d ON "
+                          "t.tr_tariff = d.v CROSS JOIN (SELECT COUNT(*) AS n, COUNT(*) - "
+                          "COUNT(tf_code) AS nulls FROM {0}) AS c",
+                          from))},
+           .check = AllEqual()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

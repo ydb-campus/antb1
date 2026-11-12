@@ -316,6 +316,25 @@ A block that aggregates takes one on the same terms (ADR 0041's SQ2b, feature `g
 block alone, joined after the aggregation, or `COUNT(CASE WHEN <condition> THEN probe END)`, a value inside an
 aggregate's argument that reads a column, computed per row; a `HAVING` value then no longer fires in that query.
 
+An uncorrelated `IN` or `NOT IN` goes inside a condition as a null-aware mark (ADR 0041's SQ7a, feature `in_mark`):
+TRUE on a match, FALSE over an empty set (also for a NULL probe), else NULL where the probe is NULL or the set holds a
+NULL, else FALSE. It is drawn last, once `ORDER BY` is written, from a random stream of its own and only where the
+query holds no other subquery, so it displaces none and a query without one is the query its seed gave before: 35%
+of the queries with a candidate (the uncorrelated `IN`'s, whose probe and set column are the two ends of a ref, so
+of one type family and never `DOUBLE`) take one, its tokens moved to their place. It is one more `WHERE` conjunct,
+one more `HAVING` conjunct over a `GROUP BY` key or `MIN` or `MAX` of the probe, one more select item (a
+projection's `CASE`, or in a block that aggregates a `CASE` over a key or `COUNT(CASE WHEN <condition> THEN probe
+END)`), or one more `ORDER BY` item (a `CASE`); a place the block rules out is `WHERE`. A conjunct is `(mark OR probe <op>
+literal)` in either order, `NOT (probe NOT IN (set))` or `NOT` over such an `OR`, `CASE WHEN <condition> THEN 1 ELSE
+0 END = n`, or the three-valued `CASE WHEN mark THEN 1 WHEN NOT (mark) THEN 0 ELSE 2 END = n` -- never the bare `IN`
+nor `NOT (probe IN (set))`, which are `in_subquery`'s semi and anti joins. Its set reads one column of one named
+table, unqualified: the whole column (NULLs where the table has them; no row over the empty `promos`), its values
+that are not NULL, its NULLs alone, a `CASE` that keeps the values a literal comparison holds and NULL elsewhere,
+the first rows in its order under `NULLS FIRST` or `NULLS LAST` (`LIMIT 0` too: a `LIMIT` follows the column's
+full order, so the set is one in any order), `DISTINCT`, `GROUP BY`, or the NULLs with the values a comparison
+holds; these clauses record no feature of their own. The probe reads a column and computes nothing that can
+overflow, no block holds a value that can fail, and a key is written again only without grouping sets.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count
