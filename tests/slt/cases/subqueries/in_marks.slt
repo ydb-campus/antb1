@@ -2689,6 +2689,34 @@ SELECT zn_city % 2 AS zn_id, COUNT(*) AS c FROM zones GROUP BY zn_city % 2 HAVIN
 statement error
 SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING zn_id IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR COUNT(*) > 1
 
+# ---- a global block's ORDER BY ----
+
+# Its one row is never sorted, but a mark in an ORDER BY item still joins, reading its probe's aggregate, which no
+# select item holds: under IN, NOT IN and OR.
+query I rowsort
+SELECT COUNT(*) FROM cities ORDER BY CASE WHEN MIN(ct_id) IN (SELECT zn_city FROM zones) THEN 1 ELSE 0 END
+----
+BIGINT
+6
+
+query I rowsort
+SELECT COUNT(*) FROM cities ORDER BY CASE WHEN SUM(ct_id) NOT IN (SELECT zn_city FROM zones) THEN 1 ELSE 0 END
+----
+BIGINT
+6
+
+query I rowsort
+SELECT COUNT(*) FROM cities ORDER BY CASE WHEN MIN(ct_id) = 1 OR MAX(ct_pop) IN (SELECT zn_id FROM zones) THEN 1 ELSE 0 END
+----
+BIGINT
+6
+
+query I rowsort
+SELECT n FROM (SELECT COUNT(*) AS n FROM cities ORDER BY CASE WHEN MIN(ct_id) IN (SELECT zn_city FROM zones) THEN 1 ELSE 0 END) AS d
+----
+BIGINT
+6
+
 # ---- divergence D35: a mark next to an IN that turns out empty, or a condition that never holds ----
 
 # An IN that every branch of an OR shares is one semi join, which OR factoring makes a conjunct of its own: over the

@@ -690,11 +690,13 @@ TEST(ColumnIdsTest, AClonePassesThroughAProjectsOwnPassThroughIds) {
 // the two meet, which ADR 0023's Path 2 makes when it clones an outer side holding a mark.
 TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
   JoinNode mark = Join(JoinKind::kNullAwareMark);
+  mark.keys = {JoinKey{.left = Column(kB, 1), .right = Column(kE, 1)}};  // at their positions
   mark.mark = ColumnId{9};
-  const LogicalNodePtr reader = Node(FilterNode{
-      .input = Node(std::move(mark)),
-      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull, .column = Column(ColumnId{9}, 3)}},
-      .span = {}});
+  const LogicalNodePtr reader =
+      Node(FilterNode{.input = Node(std::move(mark)),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                               .column = Column(ColumnId{9}, 3)}},
+                      .span = {}});
   ASSERT_EQ(PositionMismatch(Plan(reader)), std::nullopt);
   ColumnId last = MaxColumnId(*reader);
   const ColumnId before = last;

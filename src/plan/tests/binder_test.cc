@@ -8313,7 +8313,7 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
     return Explain(*plan);
   };
-    // The plans before the optimizer, whose pruning would only shorten the scans' lists.
+  // The plans before the optimizer, whose pruning would only shorten the scans' lists.
   EXPECT_EQ(
       plan_of("SELECT SUM(CASE WHEN i32 + 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END) FROM t "
               "WHERE i16 > (SELECT MIN(i16) FROM ok)"),
@@ -8383,7 +8383,8 @@ TEST(BinderTest, ASelectListMarkStandsAboveTheFilters) {
 TEST(BinderTest, AGlobalBlocksOrderByMarkKeepsItsProbesAggregate) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql : {
-           "SELECT COUNT(*) FROM t ORDER BY CASE WHEN MIN(i16) IN (SELECT i16 FROM u) THEN 1 ELSE 0 "
+           "SELECT COUNT(*) FROM t ORDER BY CASE WHEN MIN(i16) IN (SELECT i16 FROM u) THEN 1 ELSE "
+           "0 "
            "END",
            "SELECT COUNT(*) FROM t ORDER BY CASE WHEN SUM(i32) NOT IN (SELECT i64 FROM u) OR "
            "MIN(i16) = 1 THEN 1 ELSE 0 END",
