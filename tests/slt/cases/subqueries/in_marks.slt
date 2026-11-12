@@ -1,8 +1,8 @@
 # Uncorrelated IN and NOT IN subqueries inside a condition (ADR 0041's SQ7, its first PR): under OR, NOT and CASE WHEN
-# in WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, and in the CASE WHEN of a select item, an ORDER
-# BY item, a GROUP BY key and an aggregate's argument, in plain, grouped and global blocks and inside derived tables,
-# CTEs and subquery blocks. Each is a null-aware mark join: TRUE on a match; FALSE over an empty set, even for a NULL
-# probe; else NULL where the probe is NULL or the set holds a NULL; else FALSE. NOT IN is NOT over it. A top-level
+# in WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, and in the CASE WHEN of a select item, an
+# ORDER BY item, a GROUP BY key and an aggregate's argument, in plain, grouped and global blocks and inside derived
+# tables, CTEs and subquery blocks. Each is a null-aware mark join: TRUE on a match; FALSE over an empty set, even for a
+# NULL probe; else NULL where the probe is NULL or the set holds a NULL; else FALSE. NOT IN is NOT over it. A top-level
 # conjunct keeps its semi or null-aware anti join, and so does an IN that every branch of an OR shares.
 
 # ---- WHERE and ON ----
@@ -2688,6 +2688,154 @@ SELECT zn_city % 2 AS zn_id, COUNT(*) AS c FROM zones GROUP BY zn_city % 2 HAVIN
 
 statement error
 SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING zn_id IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR COUNT(*) > 1
+
+# ---- divergence D35: a mark next to an IN that turns out empty, or a condition that never holds ----
+
+# An IN that every branch of an OR shares is one semi join, which OR factoring makes a conjunct of its own: over the
+# empty promos it empties its join, so the failing value written before it never builds; DuckDB keeps a mark per branch,
+# builds every join and fails. With a set that is not empty, both fail.
+onlyif antb1
+query I rowsort
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) AND ((ct_id IN (SELECT pm_id FROM promos) AND ct_id < 3) OR (ct_id IN (SELECT pm_id FROM promos) AND ct_id > 4))
+----
+BIGINT
+0
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) AND ((ct_id IN (SELECT pm_id FROM promos) AND ct_id < 3) OR (ct_id IN (SELECT pm_id FROM promos) AND ct_id > 4))
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM cities WHERE ct_pop > (SELECT zn_city FROM zones) AND ((ct_id IN (SELECT zn_city FROM zones) AND ct_id < 3) OR (ct_id IN (SELECT zn_city FROM zones) AND ct_id > 4))
+
+# A mark whose set holds a failing value, written before an IN conjunct over the empty promos: antb1 prepares the IN's
+# build first, finds it empty and never builds the mark's set; DuckDB builds every join and fails. With an IN over a
+# set that is not empty, both fail.
+onlyif antb1
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3) AND tr_pickup IN (SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+0	NULL
+
+onlyif duckdb
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3) AND tr_pickup IN (SELECT pm_id FROM promos)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3) AND tr_pickup IN (SELECT zn_id FROM zones)
+
+# The same failing set beside a pair of comparisons that never holds: DuckDB's filter combiner removes the block's
+# plan and answers; antb1 has no filter combiner (D34) and fails. A condition that only the data makes false removes
+# nothing in either engine.
+onlyif antb1
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND tr_row > 5 AND (tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3)
+
+onlyif duckdb
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND tr_row > 5 AND (tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3)
+----
+BIGINT	HUGEINT
+0	NULL
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND (tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3)
+
+# ---- divergence D32: a mark's probe keys over an empty set ----
+
+# antb1 computes a mark's probe for every row that reaches it, also where the set turns out empty, so an overflow there
+# fails the query; DuckDB computes no probe key over an empty hash table and answers. Over a set that is not empty,
+# both fail.
+onlyif antb1
+statement error Overflow in addition of
+SELECT COUNT(*), SUM(id) FROM edge WHERE i32 + 2147483647 NOT IN (SELECT i32 FROM edge WHERE id < 0) OR id = 0
+
+onlyif duckdb
+query II rowsort
+SELECT COUNT(*), SUM(id) FROM edge WHERE i32 + 2147483647 NOT IN (SELECT i32 FROM edge WHERE id < 0) OR id = 0
+----
+BIGINT	HUGEINT
+12	66
+
+onlyif antb1
+statement error Overflow in addition of
+SELECT COUNT(*), SUM(id) FROM edge WHERE i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id < 0) OR id = 0
+
+onlyif duckdb
+query II rowsort
+SELECT COUNT(*), SUM(id) FROM edge WHERE i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id < 0) OR id = 0
+----
+BIGINT	HUGEINT
+1	0
+
+statement error Overflow in addition of
+SELECT COUNT(*), SUM(id) FROM edge WHERE i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id IN (2, 3)) OR id = 0
+
+# ---- divergence D16: a mark written before a value conjunct ----
+
+# A WHERE conjunct computes its operands for the rows the conjuncts with a subquery written before it keep, so a mark
+# under OR written first computes its probe for every row and overflows; DuckDB filters by the value first and answers.
+# Written after the value's conjunct, which keeps no row, the probe is never computed in either engine.
+onlyif antb1
+statement error Overflow in addition of
+SELECT COUNT(*) FROM edge WHERE (i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id IN (2, 3, 4)) OR id >= 0) AND id > (SELECT MAX(id) FROM edge)
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE (i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id IN (2, 3, 4)) OR id >= 0) AND id > (SELECT MAX(id) FROM edge)
+----
+BIGINT
+0
+
+query I rowsort
+SELECT COUNT(*) FROM edge WHERE id > (SELECT MAX(id) FROM edge) AND (i32 + 2147483647 IN (SELECT i32 FROM edge WHERE id IN (2, 3, 4)) OR id >= 0)
+----
+BIGINT
+0
+
+# ---- divergence D37: an ORDER BY expression over the alias of an item that holds a mark ----
+
+# antb1 binds the item again inside the ORDER BY expression, which reads the same mark; DuckDB refuses the alias. Both
+# answer the alias alone.
+onlyif antb1
+query II nosort
+SELECT id, CASE WHEN i32 IN (SELECT i32 FROM edge WHERE id IN (2, 5)) THEN 1 ELSE 0 END AS m FROM edge ORDER BY m + 0, id
+----
+INTEGER	INTEGER
+0	0
+1	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+11	0
+2	1
+
+onlyif duckdb
+statement error Alias "m" referenced in a SELECT clause - but the expression has a subquery
+SELECT id, CASE WHEN i32 IN (SELECT i32 FROM edge WHERE id IN (2, 5)) THEN 1 ELSE 0 END AS m FROM edge ORDER BY m + 0, id
+
+query II nosort
+SELECT id, CASE WHEN i32 IN (SELECT i32 FROM edge WHERE id IN (2, 5)) THEN 1 ELSE 0 END AS m FROM edge ORDER BY m, id
+----
+INTEGER	INTEGER
+0	0
+1	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+11	0
+2	1
 
 # ---- boundaries ----
 
