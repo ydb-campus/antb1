@@ -3256,10 +3256,14 @@ class Builder {
                           (!aggregate || key_probe || (aggregated && extremes));
     enum class Place : std::uint8_t { kWhere, kItem, kHaving, kOrderBy };
     const uint64_t roll = in_mark_rng_.Below(100);
-    Place place = roll < 40   ? Place::kWhere
-                  : roll < 65 ? Place::kItem
-                  : roll < 85 ? Place::kHaving
-                              : Place::kOrderBy;
+    Place place = Place::kOrderBy;
+    if (roll < 40) {
+      place = Place::kWhere;
+    } else if (roll < 65) {
+      place = Place::kItem;
+    } else if (roll < 85) {
+      place = Place::kHaving;
+    }
     if ((place == Place::kItem && !item_ok) || (place == Place::kHaving && !having_ok) ||
         (place == Place::kOrderBy && !order_ok)) {
       place = Place::kWhere;
@@ -3310,7 +3314,7 @@ class Builder {
         }
         Symbol(",");
         if (aggregate &&
-            !(key_probe && (!allowed_.Has(Feature::kCountColumn) || in_mark_rng_.Percent(40)))) {
+            (!key_probe || (allowed_.Has(Feature::kCountColumn) && !in_mark_rng_.Percent(40)))) {
           // COUNT(CASE WHEN <condition> THEN probe END): the mark per row, inside an argument.
           const std::vector<Token> probe = column();
           used_.Add(Feature::kCountColumn);

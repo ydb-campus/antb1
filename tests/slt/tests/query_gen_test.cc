@@ -3499,7 +3499,10 @@ TEST(QueryGenerator, InMarksAreConditionsOverUncorrelatedSets) {
       groups += set.group_by.empty() ? 0 : 1;
       case_sets += std::holds_alternative<sql::CaseExpr>(*set.items.front().expr()) ? 1 : 0;
       // The probe reads a column, and computes nothing that could overflow.
-      ASSERT_TRUE(sub->operand.has_value());
+      if (!sub->operand.has_value()) {
+        ADD_FAILURE() << "an IN subquery without a probe";
+        continue;
+      }
       const sql::Expr& probe = **sub->operand;
       const auto* aggregate = std::get_if<sql::AggregateCall>(&probe);
       EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(probe) ||
