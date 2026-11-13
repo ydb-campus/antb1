@@ -1047,28 +1047,38 @@ TEST(ParserTest, QuantifiedComparisonsAreInAndNotIn) {
     std::string_view printed;
   };
   for (const Case& c : {
-           Case{"SELECT a FROM t WHERE a = ANY (SELECT b FROM u)", false, "= ANY",
-                "a IN (SELECT b FROM u)"},
-           Case{"SELECT a FROM t WHERE a = some (SELECT b FROM u)", false, "= some",
-                "a IN (SELECT b FROM u)"},
-           Case{"SELECT a FROM t WHERE a=ANY(SELECT b FROM u)", false, "=ANY",
-                "a IN (SELECT b FROM u)"},
-           Case{"SELECT a FROM t WHERE a <> ALL (SELECT b FROM u)", true, "<> ALL",
-                "a NOT IN (SELECT b FROM u)"},
-           Case{"SELECT a FROM t WHERE a + 1 != ALL (SELECT b FROM u)", true, "!= ALL",
-                "a + 1 NOT IN (SELECT b FROM u)"},
+           Case{.sql = "SELECT a FROM t WHERE a = ANY (SELECT b FROM u)",
+                .negated = false,
+                .op = "= ANY",
+                .printed = "a IN (SELECT b FROM u)"},
+           Case{.sql = "SELECT a FROM t WHERE a = some (SELECT b FROM u)",
+                .negated = false,
+                .op = "= some",
+                .printed = "a IN (SELECT b FROM u)"},
+           Case{.sql = "SELECT a FROM t WHERE a=ANY(SELECT b FROM u)",
+                .negated = false,
+                .op = "=ANY",
+                .printed = "a IN (SELECT b FROM u)"},
+           Case{.sql = "SELECT a FROM t WHERE a <> ALL (SELECT b FROM u)",
+                .negated = true,
+                .op = "<> ALL",
+                .printed = "a NOT IN (SELECT b FROM u)"},
+           Case{.sql = "SELECT a FROM t WHERE a + 1 != ALL (SELECT b FROM u)",
+                .negated = true,
+                .op = "!= ALL",
+                .printed = "a + 1 NOT IN (SELECT b FROM u)"},
        }) {
     SCOPED_TRACE(c.sql);
     auto stmt = Parse(c.sql);
     ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
     ASSERT_EQ(stmt->where.size(), 1U);
-    const auto* in = std::get_if<SubqueryExpr>(&stmt->where[0]);
+    const auto* in = std::get_if<SubqueryExpr>(&stmt->where.front());
     ASSERT_NE(in, nullptr);
     EXPECT_EQ(in->kind, SubqueryExpr::Kind::kIn);
     EXPECT_EQ(in->negated, c.negated);
     EXPECT_EQ(At(c.sql, in->op_span), c.op);
     EXPECT_EQ(At(c.sql, in->span), c.sql.substr(c.sql.find("WHERE ") + 6));
-    EXPECT_EQ(ToSql(stmt->where[0]), c.printed);
+    EXPECT_EQ(ToSql(stmt->where.front()), c.printed);
   }
 }
 

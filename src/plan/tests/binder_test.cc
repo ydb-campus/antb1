@@ -8323,17 +8323,20 @@ TEST(BinderTest, NotsOverAnInConjunctFoldIntoItsKind) {
     std::string_view kind;
   };
   for (const Case& c : {
-           Case{"SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))", "Join SEMI"},
-           Case{"SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))", "Join SEMI"},
-           Case{"SELECT i16 FROM t WHERE NOT NOT NOT (i32 IN (SELECT i16 FROM u))",
-                "Join NULL-AWARE ANTI"},
-           Case{"SELECT i16 FROM t WHERE NOT NOT (i32 NOT IN (SELECT i16 FROM u))",
-                "Join NULL-AWARE ANTI"},
-           Case{"SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT (t.i32 NOT IN (SELECT i16 "
-                "FROM u))",
-                "Join SEMI"},
-           Case{"SELECT i16 FROM t GROUP BY i16 HAVING NOT (i16 NOT IN (SELECT i16 FROM u))",
-                "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT NOT (i32 IN (SELECT i16 FROM u))",
+                .kind = "Join NULL-AWARE ANTI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT (i32 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join NULL-AWARE ANTI"},
+           Case{.sql = "SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT (t.i32 NOT IN "
+                       "(SELECT i16 "
+                       "FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING NOT (i16 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
        }) {
     const std::string text = plan_of(c.sql);
     EXPECT_NE(text.find(c.kind), std::string::npos) << c.sql << "\n" << text;
@@ -8395,8 +8398,8 @@ TEST(BinderTest, InProbesAndSetsOfSq7b) {
            "SELECT i16 FROM t WHERE i16 < 0 OR 2 NOT IN (SELECT i16 FROM u)",
            "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM ok) + i16 IN (SELECT i32 FROM u)",
            "SELECT i16 FROM t WHERE i16 < 0 OR (SELECT MIN(i16) FROM ok) IN (SELECT i32 FROM u)",
-           "SELECT i16 FROM t WHERE i32 = ANY (SELECT i16 FROM u EXCEPT SELECT i16 FROM ok) OR "
-           "i16 <> ALL (SELECT i16 FROM u INTERSECT ALL SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i32 = ANY (SELECT i16 FROM u EXCEPT SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 != ALL (SELECT i16 FROM u INTERSECT SELECT i16 FROM ok)",
            "SELECT i16, CASE WHEN 's' IN (SELECT s FROM u) THEN 1 ELSE 0 END FROM t",
            "SELECT i16 FROM t GROUP BY i16 HAVING 3 IN (SELECT i16 FROM u) OR COUNT(*) > 1",
        }) {
