@@ -577,14 +577,16 @@ struct Descent {
   Next operator()(const RowCountNode& /*row_count*/) { return Next::kDeclined; }
 };
 
-// The spine of `root`, a dependent join's right input, or std::nullopt where a rule declines.
-std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root) {
+// The spine of `root`, a dependent join's right input, or std::nullopt where a rule declines, the
+// node it declined at in `declined`.
+std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root, LogicalNodePtr* declined) {
   Descent descent{.mode = mode, .stage = Descent::Stage::kAbove, .spine = {}, .node = root};
   while (descent.node != nullptr) {
     switch (std::visit(descent, *descent.node)) {
       case Descent::Next::kFound:
         return std::move(descent.spine);
       case Descent::Next::kDeclined:
+        *declined = descent.node;
         return std::nullopt;
       case Descent::Next::kInput:
         break;
@@ -1591,8 +1593,15 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
                                 .build_side_ratio = build_side_ratio,
                                 .above = above,
                                 .report = report};
-  const std::optional<Spine> spine = Descend(*mode, join.right);
+  LogicalNodePtr declined;
+  const std::optional<Spine> spine = Descend(*mode, join.right, &declined);
   if (!spine.has_value()) {
+    // In value mode, a join over the static aggregate that filters its one row is an IN or NOT IN
+    // conjunct of the block's HAVING: no rule takes it, where a one-row join moves up (SQ6).
+    if (const auto* filter = declined == nullptr ? nullptr : std::get_if<JoinNode>(declined.get());
+        *mode == Mode::kValue && filter != nullptr && Traits(filter->kind).filters_left) {
+      return correlation.Refuse("whose HAVING holds an IN subquery");
+    }
     return correlation.RefuseShape();
   }
   Rewritten out;

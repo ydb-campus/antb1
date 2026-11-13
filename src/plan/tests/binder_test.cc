@@ -1106,15 +1106,21 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "GROUP BY i16)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        // A HAVING is answered, as a CASE over the block's value (ADR 0041's SQ6), but an IN or
-        // NOT IN conjunct of it, which no rule of the unnesting takes.
+        // A HAVING is answered, as a CASE over the block's value (ADR 0041's SQ6). An IN or NOT IN
+        // conjunct of it binds in full, so its bind errors come first, as in DuckDB; the unnesting
+        // refuses it afterwards (unnesting_test).
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
-                  "HAVING COUNT(*) IN (SELECT i16 FROM ok))",
-                  kUnsupported, "IN", "an IN subquery over the aggregate of a correlated subquery"},
+                  "HAVING nosuch IN (SELECT i16 FROM ok))",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
-                  "HAVING COUNT(*) NOT IN (SELECT i16 FROM ok))",
-                  kUnsupported, "NOT IN",
-                  "an IN subquery over the aggregate of a correlated subquery"},
+                  "HAVING COUNT(*) IN (SELECT nosuch FROM ok))",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) NOT IN (SELECT dt FROM u))",
+                  kBind, "NOT IN", "cannot compare values of type BIGINT and DATE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) IN (SELECT i16 FROM ok) AND nosuch > 0)",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
         // The other side is checked as any comparison's is: an operand, a literal, or a constant
         // integer expression.
         ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,

@@ -658,6 +658,17 @@ TEST(UnnestingTest, AnUncorrelatedOneRowJoinMovesUpWithTheItem) {
     }
     EXPECT_LT(one_row, group) << unnested.text;
   }
+  // An IN or NOT IN conjunct of the block's HAVING is a semi or null-aware anti join over the
+  // aggregate, which filters its one row: no rule takes it. The binder bound it in full first.
+  const auto identity = [](const LogicalNodePtr& root) { return root; };
+  for (const std::string_view in : {"IN", "NOT IN"}) {
+    EXPECT_EQ(RefusalOf(std::format("SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE "
+                                    "u.i64 = t.i64 HAVING COUNT(*) {} (SELECT i16 FROM ok))",
+                                    in),
+                        identity),
+              "a correlated scalar subquery whose HAVING holds an IN subquery is not supported")
+        << in;
+  }
   // A one-row join whose right input reads an outer column has no rule: it would need unnesting on
   // both inputs (SQ8, SQ10).
   const auto correlated_one_row = [](const LogicalNodePtr& root) {

@@ -8137,14 +8137,8 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
   const SourceSpan span = conjunct.span();
   if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct)) {
     if (!form->scalar() && !form->exists()) {
-      if (Correlated()) {
-        // A semi or null-aware anti join over the static aggregate of a correlated block, which the
-        // unnesting has no rule for: it would filter the block's one row where the HAVING it
-        // stands in makes the value NULL (ADR 0041's SQ6 takes one-row joins only).
-        return Reject(Rejection{.span = form->subquery->op_span,
-                                .message = "an IN subquery over the aggregate of a correlated "
-                                           "subquery is not supported"});
-      }
+      // In a correlated block its semi or null-aware anti join stands over the block's aggregate,
+      // which the unnesting refuses once the whole query is bound, its bind errors first.
       return BindSubqueryConjunct(conjunct, *form, /*having=*/true, bind);
     }
     const BoundValue* known = FindValue(*form->subquery, /*group=*/true);

@@ -1753,6 +1753,41 @@ TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
   EXPECT_EQ(PositionMismatch(above), std::nullopt) << Explain(above);
   EXPECT_EQ(semi_joins(above), 1U) << "the lower rewrite's only: " << Explain(above);
 
+  // The base is reached through the left input of a join that outputs every left row unpadded,
+  // never through a FULL JOIN's: its rows of the right input carry NULL left keys, which a
+  // NULL-equal correlation would read as the inner NULL group, and a clone of the left input
+  // alone has none. So over a LEFT JOIN both rewrites restrict, and over a FULL JOIN only the
+  // lower one, inside its right input.
+  for (const JoinKind kind : {JoinKind::kLeft, JoinKind::kFull}) {
+    const LogicalNodePtr right = Node(DependentJoinNode{
+        .kind = JoinKind::kOneRow,
+        .left = FourFieldsRows(31, 10),
+        .right = ScalarBlockRows({Compare(FieldOf(41, 1), FieldOf(31, 1), CompareOp::kEq),
+                                  Compare(FieldOf(41, 2), FieldOf(31, 2), CompareOp::kEq)},
+                                 250, 1000, 41),
+        .span = {}});
+    const LogicalNodePtr outer =
+        Node(JoinNode{.kind = kind,
+                      .left = FourFieldsRows(1, 10),
+                      .right = right,
+                      .keys = {JoinKey{.left = FieldOf(1, 1), .right = FieldOf(31, 1)}},
+                      .residual = {},
+                      .build = BuildSide::kRight,
+                      .estimate = 10,
+                      .span = {}});
+    const LogicalPlan plan = Optimized(PlanOverJoin(
+        Node(DependentJoinNode{
+            .kind = JoinKind::kOneRow,
+            .left = outer,
+            .right = ScalarBlockRows({Compare(FieldOf(21, 1), FieldOf(1, 1), CompareOp::kEq),
+                                      Compare(FieldOf(21, 2), FieldOf(1, 2), CompareOp::kEq)},
+                                     150, 1000, 21),
+            .span = {}}),
+        1));
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+    EXPECT_EQ(semi_joins(plan), kind == JoinKind::kLeft ? 2U : 1U) << Explain(plan);
+  }
+
   const LogicalPlan limited = Optimized(PlanOverJoin(
       Node(DependentJoinNode{
           .kind = JoinKind::kOneRow,

@@ -682,6 +682,28 @@ ORDER BY 1
 ----
 SMALLINT
 
+# A HAVING over a value is two conditions, the plain conjuncts below the value's join and the conjunct that reads it
+# above; the second holds only where the first does. Cities 1 and 2 count 77, which `> 77` rejects whatever the
+# second conjunct says, and `< 78` keeps.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) > 77 AND COUNT(*) < (SELECT COUNT(*) FROM drivers)) > 0
+ORDER BY 1
+----
+SMALLINT
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) < 78 AND COUNT(*) < (SELECT COUNT(*) FROM drivers)) >= 77
+ORDER BY 1
+----
+SMALLINT
+1
+2
+
 # ---- an uncorrelated value or EXISTS inside the block (ADR 0041's SQ6) ----
 
 # An uncorrelated scalar value in the item is added to the empty value too: 0 + 0, 0 + 6, 0 + 1.
@@ -1247,6 +1269,33 @@ SMALLINT
 5
 6
 
+# A stack over an outer join: the semi-join reduction clones the base below the stack through a LEFT JOIN, whose left
+# rows all come out, and declines at a FULL JOIN, whose rows of its right input carry a NULL rider. With the
+# correlation NULL-equal, those read the trips without a rider, a group a clone of riders alone would drop.
+query II nosort
+SELECT r.rd_id, x.c FROM riders r
+FULL JOIN (SELECT c.ct_id AS c FROM cities c WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) > 15) x
+ON x.c = r.rd_city + 100 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider IS NOT DISTINCT FROM r.rd_id) = 0
+ORDER BY 1, 2
+----
+BIGINT	SMALLINT
+237	NULL
+238	NULL
+239	NULL
+240	NULL
+
+query II nosort
+SELECT r.rd_id, x.c FROM riders r
+LEFT JOIN (SELECT c.ct_id AS c FROM cities c WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) > 15) x
+ON x.c = r.rd_city + 100 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider IS NOT DISTINCT FROM r.rd_id) = 0
+ORDER BY 1, 2
+----
+BIGINT	SMALLINT
+237	NULL
+238	NULL
+239	NULL
+240	NULL
+
 # ---- inside other query blocks (ADR 0041's SQ6) ----
 
 # Inside EXISTS, NOT EXISTS and IN, a derived table, a CTE, a UNION ALL branch and a block that aggregates; over a join
@@ -1384,6 +1433,46 @@ SELECT e.id FROM edge e WHERE (SELECT COUNT(*) + 9223372036854775807 FROM edge e
 statement error Overflow in addition of
 SELECT e.id FROM edge e
 WHERE (SELECT COUNT(*) - 1 + (-9223372036854775807 - 1) FROM edge e2 WHERE e2.i32 = e.i32) < 0 ORDER BY 1
+
+# ---- each engine's outcome: a HAVING's operands over every group (divergence D16) ----
+
+# antb1 computes a HAVING's operands for every group, and over a LEFT join back for the empty row too, before the AND
+# decides; DuckDB computes a later conjunct only where the earlier ones hold. COUNT(*) - 1 is -1 over no rows, which
+# the cast cannot take, and COUNT(*) - 78 is -1 for the cities of 77 riders.
+onlyif antb1
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) % 2 = 1 AND CAST(COUNT(*) - 1 AS USMALLINT) >= 0) < 100
+ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) % 2 = 1 AND CAST(COUNT(*) - 1 AS USMALLINT) >= 0) < 100
+ORDER BY 1
+----
+SMALLINT
+1
+2
+
+onlyif antb1
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) > 77 AND CAST(COUNT(*) - 78 AS USMALLINT) >= 0) > 1
+ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+HAVING COUNT(*) > 77 AND CAST(COUNT(*) - 78 AS USMALLINT) >= 0) > 1
+ORDER BY 1
+----
+SMALLINT
+3
 
 # ---- DuckDB only, for good: an error on the empty row in a HAVING operand that another conjunct rejects ----
 

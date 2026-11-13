@@ -1075,7 +1075,8 @@ a `Compute`.
   - a NULL-equal correlation reads the NULL group, as before.
 
   An IN or NOT IN conjunct in a correlated scalar subquery's HAVING, and a mark over its aggregate, stay refused: no
-  rule takes a semi or mark join there.
+  rule takes a semi or mark join there. The IN conjunct binds in full and the unnesting refuses it, so its bind errors
+  come first, as on main and in DuckDB.
 - **The semi-join reduction.** D5's exception (one key over a bare scan) applies to the INNER join back only. D5 offers
   keys to the aggregation under a probe that drops unmatched rows, which a LEFT join's is not, so the LEFT join back is
   restricted over one key too. For a stack of dependent joins it no longer declines (the maintainer's choice,
@@ -1088,8 +1089,11 @@ a `Compute`.
   INNER join back never computes: a HAVING operand or a select item that fails only over the empty values fails DuckDB
   alone. D35 notes that a LEFT join back never empties its join. D16 notes a HAVING's operands computed over the empty
   row too.
-- **Decision 28.** `tests/slt/cases/subqueries/empty_values.slt` holds 130 records, written as `pending SQ6` before
-  the code and each answered by it, and `scalar.slt`'s and `group_values.slt`'s SQ6 guards are on. DuckDB's own
+- **Decision 28.** `tests/slt/cases/subqueries/empty_values.slt` began as 130 records written as `pending SQ6` before
+  the code, each answered by it; later records pin what the mutation checks and the review found the first ones
+  missed (a bare call under a HAVING that rejects a real group, a chained HAVING, concat over no rows, a stack over a
+  FULL JOIN, and both engines' outcomes of D16's HAVING operands). `scalar.slt`'s and `group_values.slt`'s SQ6 guards
+  are on. DuckDB's own
   wrong answers in decision 29's family (a constant item, or a HAVING, over calls that are all NULL over no rows) have
   no record; the metamorphic self-checks cover them. The SQ0 guard showed each change to be a refusal turned into an
   answer equal to DuckDB's, a reworded refusal, or a stacked plan gaining its upper restriction with its answers
