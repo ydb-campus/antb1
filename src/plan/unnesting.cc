@@ -206,6 +206,61 @@ bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
   return std::ranges::any_of(InputsOf(*node), ReadsAJoinOrUnion);
 }
 
+// Whether a plan holds a Limit, whose clone would be computed twice and could pick other rows
+// among ties (SharedSubPlans shares no sub-plan that holds one, ADR 0030).
+bool HoldsALimit(const LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return false;
+  }
+  if (std::holds_alternative<LimitNode>(*node)) {
+    return true;
+  }
+  return std::ranges::any_of(InputsOf(*node),
+                             [](const LogicalNodePtr& input) { return HoldsALimit(input); });
+}
+
+// The part of a dependent join's left input that the semi-join reduction clones for its domain, or
+// nullptr where it declines: the first node down from `outer` that holds no dependent join and no
+// free variable and outputs every column of `keys`, through the nodes that keep a binding's key
+// values as they are and add no row -- a Filter or a Compute that defines no key, the left input
+// of a dependent join (stacked correlated subqueries, which the pass rewrites after this one), and
+// the left input of a join that outputs no row of it padded. Every binding the outer side makes is
+// then a row of the base, so its keys are a superset of the bound ones, which is all a domain needs
+// to be: the restriction removes only groups no outer row reads.
+LogicalNodePtr DomainBase(const LogicalNodePtr& outer, const std::vector<ColumnId>& keys) {
+  LogicalNodePtr node = outer;
+  while (node != nullptr &&
+         (FirstDependentJoin(node) != nullptr || !FreeVariables(*node).empty())) {
+    if (const auto* filter = std::get_if<FilterNode>(node.get())) {
+      node = filter->input;
+    } else if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+      if (std::ranges::any_of(compute->ids, [&keys](ColumnId id) {
+            return std::ranges::find(keys, id) != keys.end();
+          })) {
+        return nullptr;  // a key computed above the base: no clone of it carries the key
+      }
+      node = compute->input;
+    } else if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+      node = dependent->left;
+    } else if (const auto* join = std::get_if<JoinNode>(node.get());
+               join != nullptr && !Traits(join->kind).pads_left) {
+      node = join->left;
+    } else {
+      return nullptr;
+    }
+  }
+  if (node == nullptr || HoldsALimit(node)) {
+    return nullptr;
+  }
+  const std::vector<ColumnId> outputs = OutputIds(*node);
+  if (!std::ranges::all_of(keys, [&outputs](ColumnId id) {
+        return std::ranges::find(outputs, id) != outputs.end();
+      })) {
+    return nullptr;
+  }
+  return node;
+}
+
 // ADR 0023's **semi-join reduction**: `input` restricted to the rows whose correlated key the outer
 // side binds, or `input` itself where the gate refuses or the pass cannot name a key.
 //
@@ -276,27 +331,34 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   if (join_back == JoinBack::kInner && equivalent.size() < 2 && !ReadsAJoinOrUnion(input)) {
     return input;
   }
-  // **An outer side holding a dependent join is not cloned, and that is what bounds the copying.**
-  // The pass is top-down, so a dependent join still in this one's left input is one this rewrite
-  // has not reached: cloning it would duplicate a rewrite that clones in turn, and k stacked
+  // **An outer side holding a dependent join is not cloned whole, and that is what bounds the
+  // copying.** The pass is top-down, so a dependent join still in this one's left input is one this
+  // rewrite has not reached: cloning it would duplicate a rewrite that clones in turn, and k stacked
   // correlated subqueries would cost 2^k nodes. Measured before this condition, on a query of k
   // conjuncts over one correlation: 45 plan lines at k=1, 1,533 at k=8 and 24,573 at k=12, where
-  // planning alone took 1.3 s. With it, the outermost such join declines, then the next, down to
-  // the innermost, whose left input holds none and which clones once -- so a chain costs one clone
-  // and a plan's size stays linear in the rewrites, which is what ADR 0022's relation limit needs
-  // in order to go on bounding every walk of a plan.
+  // planning alone took 1.3 s. So the clone is of the base below the stack (DomainBase): each join
+  // of a chain clones that base once, and a plan's size stays linear in the rewrites, which is what
+  // ADR 0022's relation limit needs in order to go on bounding every walk of a plan. Where no such
+  // base outputs every key, the restriction declines, as it did for any stack before ADR 0041's SQ6
+  // -- where a LEFT join back, which D5 does not reach, would otherwise group every inner key.
   //
-  // It also makes the Lemma 3.1 check below unreachable by construction: a free variable can only
-  // enter `join.left` through a dependent join, and the clone lands in the new join's right input,
-  // where a free variable would fail the query with an internal error rather than decline.
-  if (FirstDependentJoin(join.left) != nullptr || !FreeVariables(*join.left).empty()) {
+  // It also keeps the Lemma 3.1 check below unreachable by construction: a free variable can only
+  // enter `join.left` through a dependent join, which the base holds none of, and the clone lands
+  // in the new join's right input, where a free variable would fail the query with an internal
+  // error rather than decline.
+  std::vector<ColumnId> wanted;  // the outer columns the restriction keys on
+  for (const auto& [outer_id, inner_id] : equivalent) {
+    wanted.push_back(outer_id);
+  }
+  const LogicalNodePtr base = DomainBase(join.left, wanted);
+  if (base == nullptr) {
     return input;
   }
-  if (!RestrictionIsWorth(EstimateRows(*join.left), EstimateRows(*input))) {
+  if (!RestrictionIsWorth(EstimateRows(*base), EstimateRows(*input))) {
     return input;
   }
-  const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
-  const LogicalNodePtr domain = CloneWithFreshIds(join.left, last_id);
+  const std::vector<ColumnId> outer_ids = OutputIds(*base);
+  const LogicalNodePtr domain = CloneWithFreshIds(base, last_id);
   const std::vector<ColumnId> domain_ids = OutputIds(*domain);
   if (domain_ids.size() != outer_ids.size()) {
     return input;  // a clone outputs what it cloned: nothing to key on if it does not

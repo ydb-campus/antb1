@@ -1665,31 +1665,25 @@ TEST(OptimizerTest, TheSemiJoinReductionRestrictsTheAggregatesInput) {
 // the condition that forbids it, on a query of k conjuncts over one correlation: 1,533 plan lines
 // at k=8 and 24,573 at k=12, where planning alone took 1.3 s.
 //
-// So the outer of two stacked rewrites declines and the inner one restricts: one clone for the
-// chain, and a node count within a factor of the unstacked plan's.
-TEST(OptimizerTest, TheSemiJoinReductionDoesNotCloneAStackOfRewrites) {
+// So each rewrite of a stack clones the base below it, which holds no dependent join (ADR 0041's
+// SQ6): every join of the chain is restricted, and the plan grows by a constant per rewrite.
+TEST(OptimizerTest, TheSemiJoinReductionClonesTheBaseBelowAStack) {
   const auto two_keys = [](std::uint32_t inner) {
     return std::vector<ExprPtr>{Compare(FieldOf(inner, 1), FieldOf(1, 1), CompareOp::kEq),
                                 Compare(FieldOf(inner, 2), FieldOf(1, 2), CompareOp::kEq)};
   };
-  const LogicalNodePtr inner =
-      Node(DependentJoinNode{.kind = JoinKind::kOneRow,
-                             .left = FourFieldsRows(1, 10),
-                             .right = ScalarBlockRows(two_keys(11), 50, 1000, 11),
-                             .span = {}});
-  const LogicalPlan one = Optimized(PlanOverJoin(inner, 1));
-  const LogicalPlan two = Optimized(
-      PlanOverJoin(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
-                                          .left = inner,
-                                          .right = ScalarBlockRows(two_keys(21), 60, 1000, 21),
-                                          .span = {}}),
-                   1));
-  EXPECT_EQ(PositionMismatch(one), std::nullopt) << Explain(one);
-  EXPECT_EQ(PositionMismatch(two), std::nullopt) << Explain(two);
-
-  // Exactly one restriction in the stacked plan: the inner rewrite's, whose own left input holds no
-  // dependent join. Doubling would show here as two, and as a node count far above the single
-  // plan's.
+  // k one-row dependent joins stacked on the same outer side, each over a block of its own.
+  const auto stack = [&two_keys](std::uint32_t k) {
+    LogicalNodePtr node = FourFieldsRows(1, 10);
+    for (std::uint32_t i = 0; i < k; ++i) {
+      node = Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = node,
+          .right = ScalarBlockRows(two_keys(11 + (10 * i)), 50 + (100 * i), 1000, 11 + (10 * i)),
+          .span = {}});
+    }
+    return Optimized(PlanOverJoin(node, 1));
+  };
   const auto semi_joins = [](const LogicalNodePtr& node) {
     std::size_t found = 0;
     const auto walk = [&found](const LogicalNodePtr& n, const auto& self) -> void {
@@ -1707,10 +1701,67 @@ TEST(OptimizerTest, TheSemiJoinReductionDoesNotCloneAStackOfRewrites) {
     walk(node, walk);
     return found;
   };
+  const LogicalPlan one = stack(1);
+  const LogicalPlan two = stack(2);
+  const LogicalPlan eight = stack(8);
+  for (const LogicalPlan* plan : {&one, &two, &eight}) {
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << Explain(*plan);
+  }
+  // One restriction per rewrite, each over a clone of the base alone.
   EXPECT_EQ(semi_joins(one.root), 1U) << Explain(one);
-  EXPECT_EQ(semi_joins(two.root), 1U) << Explain(two);
-  EXPECT_LT(NodeCount(two.root), NodeCount(one.root) * 2)
-      << "a stacked rewrite costs a constant, not a factor: " << Explain(two);
+  EXPECT_EQ(semi_joins(two.root), 2U) << Explain(two);
+  EXPECT_EQ(semi_joins(eight.root), 8U) << Explain(eight);
+  EXPECT_LT(NodeCount(eight.root), NodeCount(one.root) * 8 * 2)
+      << "a stacked rewrite costs a constant, not a factor: " << Explain(eight);
+}
+
+// What the base below a stack may not be. A key computed above it -- here a Compute over the lower
+// rewrite defines the upper one's outer column -- is a column no clone of the base carries, so the
+// upper rewrite declines and only the lower one restricts. A base that holds a Limit declines too:
+// its clone would be computed a second time and could keep other rows among ties.
+TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
+  const auto semi_joins = [](const LogicalPlan& plan) {
+    const std::string text = Explain(plan);
+    std::size_t found = 0;
+    for (std::size_t at = text.find("Join SEMI"); at != std::string::npos;
+         at = text.find("Join SEMI", at + 1)) {
+      ++found;
+    }
+    return found;
+  };
+  const BoundColumn computed{.index = 0, .id = ColumnId{5}, .name = "k", .type = LogicalType::kSmallInt};
+  const LogicalNodePtr lower = Node(DependentJoinNode{
+      .kind = JoinKind::kOneRow,
+      .left = FourFieldsRows(1, 10),
+      .right = ScalarBlockRows({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
+                               50, 1000, 11),
+      .span = {}});
+  const LogicalNodePtr keyed = Node(ComputeNode{
+      .input = lower, .exprs = {Ref(FieldOf(1, 0))}, .ids = {computed.id}, .span = {}});
+  const LogicalPlan above = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = keyed,
+          .right = ScalarBlockRows({Compare(FieldOf(21, 0), computed, CompareOp::kEq),
+                                    Compare(FieldOf(21, 2), FieldOf(1, 2), CompareOp::kEq)},
+                                   150, 1000, 21),
+          .span = {}}),
+      1));
+  EXPECT_EQ(PositionMismatch(above), std::nullopt) << Explain(above);
+  EXPECT_EQ(semi_joins(above), 1U) << "the lower rewrite's only: " << Explain(above);
+
+  const LogicalPlan limited = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = Node(LimitNode{.input = FourFieldsRows(1, 10), .limit = 5, .offset = 0, .span = {}}),
+          .right = ScalarBlockRows({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
+                                    Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
+                                   50, 1000, 11),
+          .span = {}}),
+      1));
+  EXPECT_EQ(PositionMismatch(limited), std::nullopt) << Explain(limited);
+  EXPECT_EQ(semi_joins(limited), 0U) << Explain(limited);
 }
 
 // One correlated column is ADR 0029's D5 to restrict: it costs a filter where this costs a build

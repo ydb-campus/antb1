@@ -936,6 +936,24 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
+# Two stacked LEFT join backs, both restricted (ADR 0041's SQ6): each semi-join reduction clones the base below the
+# stack, the scan of cities, so the outer rewrite no longer declines for the dependent join below it, and no rewrite
+# is cloned.
+antb1_add_cli_golden(
+  explain_unnest_stacked_left_restricted
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names
