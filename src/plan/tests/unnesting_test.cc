@@ -666,6 +666,7 @@ TEST(UnnestingTest, TheWalkerTellsTheInputsOfAJoinApart) {
     const arrow::Result<LogicalNodePtr> out = Unnest(root, kBuildSideRatio, &report);
     EXPECT_TRUE(out.ok()) << out.status().ToString();
     std::vector<JoinBack> found;
+    found.reserve(report.join_backs.size());
     for (const UnnestReport::Entry& entry : report.join_backs) {
       found.push_back(entry.join_back);
     }

@@ -3780,7 +3780,7 @@ class Binder {
   Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
   // The value of a subquery written alike in the same slot before, or nullptr.
   struct BoundValue;
-  [[nodiscard]] BoundValue* FindValue(const sql::SubqueryExpr& s, bool group);
+  [[nodiscard]] const BoundValue* FindValue(const sql::SubqueryExpr& s, bool group) const;
   // Where a correlated value may stand (ADR 0041's SQ5): OK, or the refusal of this place -- a
   // padded unit's left input, a conjunct that reads an enclosing block itself, an EXISTS (a mark,
   // SQ8), or a clause other than a condition of WHERE or an inner ON (SQ5b).
@@ -7045,7 +7045,7 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
-Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) {
+const Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) const {
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
   const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
     return bound.block == block && SameSubquery(bound.written, s);
@@ -7079,7 +7079,7 @@ arrow::Status Binder::AdmitCorrelatedValue(const sql::SubqueryExpr& s) const {
 }
 
 arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
-  BoundValue* known = FindValue(s, group);
+  const BoundValue* const known = FindValue(s, group);
   // An uncorrelated value's text is its binding -- all its names resolve inside it -- so a text
   // written alike before is that value (decision 10).
   if (known != nullptr && known->free.empty()) {
