@@ -794,6 +794,101 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# ADR 0041's SQ0 keeps the unnesting's plans byte for byte; these pin what only its EXPLAIN shows.
+# A scalar subquery's key is named by the last correlated conjunct that names its column.
+antb1_add_cli_golden(
+  explain_unnest_key_named_by_its_last_spelling
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_id = z.zn_city AND z.zn_city = ct_id) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# Its keys, and the group's, follow the outer columns' order, not the conjuncts'.
+antb1_add_cli_golden(
+  explain_unnest_keys_in_outer_column_order
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_id > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_id = z.zn_city AND c.ct_pop = z.zn_parent AND c.ct_row = z.zn_row) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# An EXISTS's keys of two types: each side cast to the key type, the outer casts first.
+antb1_add_cli_golden(
+  explain_unnest_key_casts
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = z.zn_id AND r.rd_id = z.zn_city) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A nested EXISTS without a key is refused at its own span, not at the outer one's.
+antb1_add_cli_golden(
+  unsupported_unnest_nested_refusal
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The outer subquery is unnested first: when both are refused, the outer one's refusal is reported.
+antb1_add_cli_golden(
+  unsupported_unnest_nested_outer_first
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id < z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# Of two stacked scalar subqueries that are refused, the one written last is met first.
+antb1_add_cli_golden(
+  unsupported_unnest_stacked_refusal
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT COUNT(*) FROM cities c WHERE c.ct_id = z.zn_city) AND z.zn_row > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_pop < z.zn_parent) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names

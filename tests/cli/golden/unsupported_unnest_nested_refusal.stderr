@@ -1,0 +1,4 @@
+antb1: unsupported error: a correlated EXISTS without a key is not supported
+  at line 1, column 94
+  SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id
+                                                                                               ^^^^^^

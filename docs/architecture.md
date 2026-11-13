@@ -199,8 +199,10 @@ steps (only step 7 uses more than one thread):
    column gets a `plan::ColumnId` where it is created (a field, a computed expression, an aggregate call or key, a
    select item), and a column reference names the column it reads by id and by its position in the input ([ADR
    0022](adr/0022-joins-and-query-blocks.md)).
-5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass, which replaces every `DependentJoin` with
-   ordinary joins or rejects the query with exit code 4, so no later rule and no operator meets one (ADR 0023); then
+5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass (`src/plan/unnesting.h`), which replaces
+   every `DependentJoin` with ordinary joins or rejects the query with exit code 4, so no later rule and no operator
+   meets one (ADR 0023): one rule table, read by the join's kind traits, with a rule per node type on the way to the
+   correlated filter and substitution as its terminal step (ADR 0041's decisions 16 to 20); then
    the conditions of a `Filter` over a `UnionAll` go on top of each of its inputs, and an input whose constants make
    one never true is ruled out (a union of one input stays a union; of none, its first input stays, under a `FALSE`
    filter: ADR 0036's X7a); `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other
@@ -424,8 +426,8 @@ state's groups through a group map, so partial results of separate parts of the 
 | --- | --- | --- |
 | SQL syntax | `src/sql/` (lexer, parser, AST, unparser) with tests in `src/sql/tests/` | [sql-subset.md](sql-subset.md) grammar |
 | Name resolution or type rules | `src/plan/binder.cc`, `src/plan/scope.cc`, `src/plan/types.cc`, `src/plan/type_fold.cc` (the common type of CASE values and UNION ALL columns) | [sql-subset.md](sql-subset.md), [ADR 0004](adr/0004-types-null-overflow-semantics.md) if semantics change |
-| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds`, the ids a node reads and defines (`MaxColumnId`, `FreeVariables`), the position resolver, `CloneWithFreshIds`, pruning, `EstimateRows`, the shared sub-plans' origins and keys, EXPLAIN, the physical planner); then check the walks that compile for any node but assume a shape, such as the semi-join reduction's gate in `src/plan/optimizer.cc` | tests in `src/plan/tests/` and `src/exec/tests/` |
-| An optimizer rule | `src/plan/optimizer.cc` | tests in `src/plan/tests/optimizer_test.cc`, an EXPLAIN golden in `tests/cli/` |
+| A logical plan node | the variant in `src/plan/include/antb1/plan/logical_plan.h`; the compiler then points at every `std::visit` to extend (`InputsOf`, `WithInputs`, `OutputIds`, the ids a node reads and defines (`MaxColumnId`, `FreeVariables`), the position resolver, `CloneWithFreshIds`, pruning, `EstimateRows`, the shared sub-plans' origins and keys, EXPLAIN, the physical planner, the unnesting's descent in `src/plan/unnesting.cc`); then check the walks that compile for any node but assume a shape, such as the semi-join reduction's gate in `src/plan/unnesting.cc` | tests in `src/plan/tests/` and `src/exec/tests/` |
+| An optimizer rule | `src/plan/optimizer.cc`; a rule of the unnesting, `src/plan/unnesting.cc` (one rule per node type in its descent) | tests in `src/plan/tests/optimizer_test.cc` or `src/plan/tests/unnesting_test.cc`, an EXPLAIN golden in `tests/cli/` |
 | A physical operator | `src/exec/`; its name in the physical planner (`Builder::Name`), and metrics for its phases through `profile()` and `ProfileTimer` | tests in `src/exec/tests/` |
 | A SQL feature antb1 now answers | the modules above | `.slt` records in `tests/slt/cases/` (`pixi run slt-complete`), the feature in `tests/slt/supported_features.h`, [sql-subset.md](sql-subset.md); when `pixi run test-data` reports a new ClickBench pass, the ratchet `tests/data/clickbench_status.json` and the status table; when a query derived from TPC-H or TPC-DS starts to pass, `tests/data/tpch_status.json` or `tests/data/tpcds_status.json` and its table |
 | A table source or file format | a new `plan::Table` implementation in `src/io/` | an ADR if it needs a new dependency |
