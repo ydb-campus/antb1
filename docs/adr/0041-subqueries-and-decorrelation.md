@@ -1144,12 +1144,13 @@ goes from 81 to 82; SQ5b answers them in select items, ORDER BY, GROUP BY keys a
   occurrences of a value now hides its error, as D35 says of an uncorrelated value, where main planted a second join
   above the IN and failed, as DuckDB does.
 - **Decision 28.** `correlated_values.slt` holds 204 records written as pending before the code (98 SQ5a, 97 SQ5b, 7
-  SQ13, 2 SQ8); SQ5a answers its 98 and `conditions.slt`'s four, and pins D24's members with each engine's outcome.
-  The review added eleven: the ONs of two comma groups, an EXISTS block's item that repeats a value of its WHERE, and
-  D24's third member. Each of eight mutations fails named tests, the one that drops the ids comparison above among
-  them. The SQ0 guard showed only refusals turned into answers equal to DuckDB's and reworded refusals; outside its
-  corpus, the shapes of D24's third member and D35 above, which main failed at exit 1, now answer. Of the TPC-derived
-  plans, only Q6's changed.
+  SQ13, 2 SQ8); SQ5a answers its 98 and `conditions.slt`'s four, and pins D24's members with each engine's outcome. The
+  review added eleven: the ONs of two comma groups, an EXISTS block's item that repeats a value of its WHERE, and D24's
+  third member. Each of ten mutations fails named tests, among them the three the review asked for: one drops the ids
+  comparison above, one takes the first entry written alike, and one admits a dry run's memo hit (an EXISTS block's
+  dropped item). The SQ0 guard showed only refusals turned into answers equal to DuckDB's and reworded refusals; outside
+  its corpus, the shapes of D24's third member and D35 above, which main failed at exit 1, now answer. Of the
+  TPC-derived plans, only Q6's changed.
 - **Follow-ups, outside SQ5.** The semi-join reduction above a nested value (`ReadsAJoinOrUnion` counts no dependent
   join, so D5's exception applies where D5 cannot reach); a join whose key reads a value NULL over no rows counted as
   deciding; constant folding in the proof.

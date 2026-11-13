@@ -7102,8 +7102,8 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   ANTB1_CHECK(admitted);
   // A correlated value written alike before where the same FROM items are visible binds to the
   // same ids, and its bind errors were those of that binding: it is that value (ADR 0041's SQ5),
-  // where this place admits one. Under other visibility -- WHERE after an inner ON, which sees
-  // fewer FROM items, or the ONs of two comma groups, which resolve one name in their own groups
+  // where this place admits one. Under other visibility -- WHERE, which sees more FROM items than
+  // an inner ON before it, or the ON of another comma group, which resolves a name in its own group
   // first -- it is bound again below, for this occurrence's own bind errors, and matched by the ids
   // it reads.
   if (const BoundValue* const same = FindValue(s, group,
