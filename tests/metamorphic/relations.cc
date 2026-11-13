@@ -2807,6 +2807,261 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- SQ5a's correlated values in conditions (ADR 0041) ----
+  // A correlated scalar subquery whose block aggregates over every row is a value anywhere in a
+  // condition of WHERE, and an outer row without a match reads the block's value over no rows
+  // wherever it stands: COUNT 0, SUM NULL. The star schema (tools/fixturegen/star.h): cities 1 to 3
+  // have 77, 77 and 78 riders and 4 to 6 none, drivers are in cities 1 to 4, riders 237 to 240 have
+  // no trip, and riders, drivers and zones have NULL cities, which only IS NOT DISTINCT FROM
+  // matches.
+  {
+    const slt::FeatureSet values = {kColumns,    kCountStar,      kIntegerColumns,
+                                    kTableName,  kQualifiedName,  kWhere,
+                                    kTableAlias, kIntegerLiteral, kCorrelatedConditionValue};
+    // The rows of `(q) <op> k OR p` are those of `(q) <op> k` and of `p` together: the UNION of the
+    // two, distinct by the outer table's key, and the DISTINCT keys of their UNION ALL. The two
+    // overlap, so the deduplication matters. At any batch size.
+    struct OrBranches {
+      std::string_view name;
+      std::string_view from;   // the outer table, read as `o`
+      std::string_view key;    // a column of `o` that tells its rows apart
+      std::string_view value;  // a comparison of the value
+      std::string_view other;  // a condition over `o` alone
+      slt::FeatureSet features;
+    };
+    const auto or_branches = std::to_array<OrBranches>({
+        {.name = "count",
+         .from = "cities",
+         .key = "ct_id",
+         .value = "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = o.ct_id) = 0",
+         .other = "o.ct_pop < 10000",
+         .features = {}},
+        {.name = "sum",
+         .from = "cities",
+         .key = "ct_id",
+         .value = "(SELECT SUM(riders.rd_row) FROM riders WHERE riders.rd_city = o.ct_id) > 9200",
+         .other = "o.ct_id >= 3",
+         .features = {kSum}},
+        {.name = "riders_and_trips",
+         .from = "riders",
+         .key = "rd_row",
+         .value = "(SELECT COUNT(*) FROM trips WHERE trips.tr_rider = o.rd_id) < 12",
+         .other = "o.rd_tier = 'gold'",
+         .features = {kVarcharColumns, kStringLiteral}},
+        {.name = "null_equal",
+         .from = "riders",
+         .key = "rd_row",
+         .value = "(SELECT COUNT(*) FROM drivers WHERE drivers.dv_city IS NOT DISTINCT FROM "
+                  "o.rd_city) > 22",
+         .other = "o.rd_row < 40",
+         .features = {kNullEqualKeys}},
+    });
+    for (const OrBranches& branches : or_branches) {
+      const auto block = [&](std::string_view where) {
+        return std::format("SELECT o.{} FROM {} AS o WHERE {}", branches.key, branches.from, where);
+      };
+      const std::string either = block(std::format("{} OR {}", branches.value, branches.other));
+      slt::FeatureSet features =
+          SetWith(values, kBooleanExpressions, kUnion, kUnionAll, kSelectDistinct, kDerivedTable);
+      features.Add(branches.features);
+      r.push_back(
+          {.name = std::format("correlated_value_under_or_is_the_union_of_its_branches_{}",
+                               branches.name),
+           .features = features,
+           .probes = {Q(either),
+                      Q(std::format("{} UNION {}", block(branches.value), block(branches.other))),
+                      Q(std::format("SELECT DISTINCT u.{} FROM ({} UNION ALL {}) AS u",
+                                    branches.key, block(branches.value), block(branches.other))),
+                      Q(either, 1), Q(either, 7)},
+           .check = AllEqual()});
+    }
+    // `(q1) > (q2)`, `(q1) <= (q2)` and the rows where either is NULL split the outer rows, every
+    // one in exactly one part. A count is never NULL, so a SUM, a MIN or a MAX over no rows, or a
+    // HAVING that rejects the row over no rows (or a real group), fills the third part.
+    struct Compared {
+      std::string_view name;
+      std::string_view from;  // the outer table, read as `o`
+      std::string_view key;   // a column of `o` that tells its rows apart
+      std::string_view first;
+      std::string_view second;
+      slt::FeatureSet features;
+    };
+    const auto compared = std::to_array<Compared>({
+        {.name = "counts",
+         .from = "cities",
+         .key = "ct_id",
+         .first = "SELECT COUNT(*) FROM riders WHERE riders.rd_city = o.ct_id",
+         .second = "SELECT COUNT(*) FROM drivers WHERE drivers.dv_city = o.ct_id",
+         .features = {}},
+        {.name = "sums",
+         .from = "cities",
+         .key = "ct_id",
+         .first = "SELECT SUM(riders.rd_row) FROM riders WHERE riders.rd_city = o.ct_id",
+         .second = "SELECT SUM(drivers.dv_row) FROM drivers WHERE drivers.dv_city = o.ct_id",
+         .features = {kSum}},
+        {.name = "tiers",
+         .from = "cities",
+         .key = "ct_id",
+         .first = "SELECT MIN(riders.rd_tier) FROM riders WHERE riders.rd_city = o.ct_id",
+         .second = "SELECT MAX(riders.rd_tier) FROM riders WHERE riders.rd_city = o.ct_id",
+         .features = {kMin, kMax, kVarcharColumns}},
+        {.name = "having",
+         .from = "cities",
+         .key = "ct_id",
+         .first = "SELECT COUNT(*) FROM riders WHERE riders.rd_city = o.ct_id HAVING COUNT(*) > 77",
+         .second = "SELECT COUNT(*) FROM drivers WHERE drivers.dv_city = o.ct_id",
+         .features = {kHaving}},
+        {.name = "zones_pickups_and_dropoffs",
+         .from = "zones",
+         .key = "zn_row",
+         .first = "SELECT COUNT(*) FROM trips WHERE trips.tr_pickup = o.zn_id",
+         .second = "SELECT COUNT(*) FROM trips WHERE trips.tr_dropoff = o.zn_id",
+         .features = {}},
+        {.name = "null_equal",
+         .from = "riders",
+         .key = "rd_row",
+         .first =
+             "SELECT COUNT(*) FROM drivers WHERE drivers.dv_city IS NOT DISTINCT FROM o.rd_city",
+         .second = "SELECT COUNT(*) FROM zones WHERE zones.zn_city IS NOT DISTINCT FROM o.rd_city",
+         .features = {kNullEqualKeys}},
+    });
+    for (const Compared& pair : compared) {
+      const auto block = [&](std::string_view where) {
+        return std::format("SELECT o.{} FROM {} AS o{}", pair.key, pair.from, where);
+      };
+      slt::FeatureSet features = SetWith(values, kBooleanExpressions);
+      features.Add(pair.features);
+      r.push_back(
+          {.name = std::format("correlated_values_compared_partition_the_outer_rows_{}", pair.name),
+           .features = features,
+           .probes = {Q(block("")),
+                      Q(block(std::format(" WHERE ({}) > ({})", pair.first, pair.second))),
+                      Q(block(std::format(" WHERE ({}) <= ({})", pair.first, pair.second))),
+                      Q(block(std::format(" WHERE ({}) IS NULL OR ({}) IS NULL", pair.first,
+                                          pair.second)))},
+           .check = FirstIsUnionOfRest()});
+    }
+    // `x BETWEEN a AND b` is `x >= a AND x <= b`, and NOT BETWEEN `x < a OR x > b`: over a count
+    // whose value over no rows is inside the range and one whose is not, a SUM whose is NULL, a
+    // string, and with the values as the bounds. At any batch size.
+    struct Between {
+      std::string_view name;
+      std::string_view operand;  // over the city `o`
+      std::string_view low;
+      std::string_view high;
+      slt::FeatureSet features;
+    };
+    constexpr std::string_view kRiders =
+        "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = o.ct_id)";
+    const auto betweens = std::to_array<Between>({
+        {.name = "count", .operand = kRiders, .low = "0", .high = "77", .features = {}},
+        {.name = "count_above_the_empty_value",
+         .operand = kRiders,
+         .low = "1",
+         .high = "78",
+         .features = {}},
+        {.name = "sum",
+         .operand = "(SELECT SUM(riders.rd_row) FROM riders WHERE riders.rd_city = o.ct_id)",
+         .low = "9000",
+         .high = "9250",
+         .features = {kSum}},
+        {.name = "tier",
+         .operand = "(SELECT MIN(riders.rd_tier) FROM riders WHERE riders.rd_city = o.ct_id)",
+         .low = "'basic'",
+         .high = "'gold'",
+         .features = {kMin, kVarcharColumns, kStringLiteral}},
+        {.name = "bounds",
+         .operand = "o.ct_id * 10",
+         .low = kRiders,
+         .high = "(SELECT COUNT(*) FROM drivers WHERE drivers.dv_city = o.ct_id) + 100",
+         .features = {kArithmetic}},
+    });
+    for (const Between& between : betweens) {
+      const auto block = [](std::string_view where) {
+        return std::format("SELECT o.ct_id FROM cities AS o WHERE {}", where);
+      };
+      slt::FeatureSet features = SetWith(values, kBetween, kWhereAnd, kBooleanExpressions);
+      features.Add(between.features);
+      const std::string inside =
+          block(std::format("{} BETWEEN {} AND {}", between.operand, between.low, between.high));
+      const std::string outside = block(
+          std::format("{} NOT BETWEEN {} AND {}", between.operand, between.low, between.high));
+      r.push_back(
+          {.name = std::format("correlated_between_equals_two_comparisons_{}", between.name),
+           .features = features,
+           .probes = {Q(inside),
+                      Q(block(std::format("{0} >= {1} AND {0} <= {2}", between.operand, between.low,
+                                          between.high))),
+                      Q(inside, 1), Q(inside, 7)},
+           .check = AllEqual()});
+      r.push_back({.name = std::format("correlated_between_equals_two_comparisons_{}_negated",
+                                       between.name),
+                   .features = features,
+                   .probes = {Q(outside),
+                              Q(block(std::format("{0} < {1} OR {0} > {2}", between.operand,
+                                                  between.low, between.high))),
+                              Q(outside, 1), Q(outside, 7)},
+                   .check = AllEqual()});
+    }
+    // The self-check of ADR 0041's decision 28 for SQ5a's places: the correlated value's rows are
+    // those of the subquery with each city written as a literal (cities 1 to 6, none NULL), which
+    // needs no DuckDB; and the same rows at any batch size. `{0}` stands for the outer city's id.
+    // A constant over ORDER BY MAX is decision 29's family, which DuckDB 1.5.6 answers wrongly
+    // (docs/testing.md) and the random generator never writes, so only this check covers it here.
+    struct SelfCheck {
+      std::string_view name;
+      std::string_view condition;
+      slt::FeatureSet features;
+    };
+    const auto self_checks = std::to_array<SelfCheck>({
+        {.name = "under_case",
+         .condition = "CASE WHEN (SELECT COUNT(*) FROM riders WHERE riders.rd_city = {0}) > 77 "
+                      "THEN 1 ELSE 0 END = 0",
+         .features = {kCase}},
+        {.name = "under_not",
+         .condition = "NOT ((SELECT SUM(riders.rd_row) FROM riders WHERE riders.rd_city = {0}) > "
+                      "9200)",
+         .features = {kSum, kBooleanExpressions}},
+        {.name = "in_arithmetic",
+         .condition = "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = {0}) * 3 + "
+                      "cities.ct_id > 232",
+         .features = {kArithmetic}},
+        {.name = "under_or",
+         .condition = "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = {0}) = 0 OR "
+                      "cities.ct_pop < 10000",
+         .features = {kBooleanExpressions}},
+        {.name = "two_compared",
+         .condition = "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = {0}) > (SELECT "
+                      "COUNT(*) FROM drivers WHERE drivers.dv_city = {0})",
+         .features = {}},
+        {.name = "constant_over_order_by_max_under_or",
+         .condition = "(SELECT 42 FROM riders WHERE riders.rd_city = {0} ORDER BY "
+                      "MAX(riders.rd_row)) = 42 OR cities.ct_id = 1",
+         .features = {kConstant, kMax, kOrderBy, kBooleanExpressions}},
+    });
+    for (const SelfCheck& check : self_checks) {
+      const std::string correlated =
+          std::format("SELECT ct_id FROM cities WHERE {}",
+                      std::vformat(check.condition, std::make_format_args("cities.ct_id")));
+      std::vector<Probe> probes = {Q(correlated)};
+      for (int id = 1; id <= 6; ++id) {
+        probes.push_back(Q(std::format("SELECT ct_id FROM cities WHERE ct_id = {} AND ({})", id,
+                                       std::vformat(check.condition, std::make_format_args(id)))));
+      }
+      slt::FeatureSet features = SetWith(values, kWhereAnd, kUncorrelatedValue, kConditionValue);
+      features.Add(check.features);
+      r.push_back(
+          {.name = std::format("correlated_value_{}_is_its_bindings_as_literals", check.name),
+           .features = features,
+           .probes = std::move(probes),
+           .check = FirstIsUnionOfRest()});
+      r.push_back({.name = std::format("correlated_value_{}_batch_size_invariance", check.name),
+                   .features = features,
+                   .probes = {Q(correlated), Q(correlated, 1), Q(correlated, 7)},
+                   .check = AllEqual()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

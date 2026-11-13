@@ -178,6 +178,15 @@ enum class Feature : std::uint8_t {
   // value over no rows. Its ORDER BY, HAVING, COALESCE and constant record no feature of their own;
   // its calls, CASE, arithmetic, literals and IS NOT DISTINCT FROM record theirs.
   kCorrelatedEmptyValue,  // (SELECT COUNT(*) FROM i WHERE i.k = o.k) = 0
+  // SQ5a's correlated values in conditions (ADR 0041): kCorrelatedEmptyValue's block as a value
+  // inside one top-level WHERE conjunct: under OR or NOT, in a CASE WHEN, times 2 or 3 or plus an
+  // outer column (integers whose type holds the result), in COALESCE (a call NULL over no rows),
+  // IS [NOT] NULL, [NOT] BETWEEN two literals, an element of an outer column's [NOT] IN list, two
+  // such blocks of one type compared, or one block twice, `(q) > k AND (q) < k`. A DOUBLE value is
+  // compared with 0 alone. Its IS [NOT] NULL and COALESCE record no feature of their own; its OR,
+  // NOT, CASE, arithmetic, BETWEEN, IN, AND and literals record theirs, its blocks as
+  // kCorrelatedEmptyValue's do.
+  kCorrelatedConditionValue,  // (SELECT COUNT(*) FROM i WHERE i.k = o.k) = 0 OR o.x > 2
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -362,6 +371,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "in_form";
     case Feature::kCorrelatedEmptyValue:
       return "correlated_empty_value";
+    case Feature::kCorrelatedConditionValue:
+      return "correlated_condition_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -529,6 +540,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kInMark,
     Feature::kInForm,
     Feature::kCorrelatedEmptyValue,
+    Feature::kCorrelatedConditionValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,
