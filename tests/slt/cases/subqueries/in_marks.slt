@@ -551,7 +551,7 @@ SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT ((tr_pickup IN (SELECT zn_id F
 BIGINT	HUGEINT
 2962	4441563
 
-# NOT (x NOT IN q), NOT NOT (x IN q) and NOT NOT NOT as conjuncts in WHERE (SQ7a answers them as NOT over a mark, SQ7b
+# NOT (x NOT IN q), NOT NOT (x IN q) and NOT NOT NOT as conjuncts in WHERE (SQ7a answered them as NOT over a mark, SQ7b
 # as semi and anti joins): equal to IN, IN and NOT IN. Over a set with a NULL, NOT (x NOT IN q) keeps the matches and
 # NOT NOT (x NOT IN q) no row; over the empty set and a set of NULLs only, no row, NULL probes included; a NULL probe
 # drops; beside another conjunct; in a derived table.
@@ -2924,25 +2924,18 @@ INTEGER	INTEGER
 11	0
 2	1
 
-# ---- boundaries ----
-
-# The shapes below stay exit code 4 after SQ7a, each until the item its heading names: pending on a roadmap PR, or in
-# DuckDB alone where no PR plans them yet. DuckDB answers them, or fails with a bind error.
-
-# ---- pending: the IN forms SQ7a leaves out (ADR 0041; roadmap PR SQ7b removes these guards) ----
+# ---- the IN forms of SQ7b in marks (ADR 0041's SQ7b; more in in_forms.slt) ----
 
 # = ANY over a UNION under OR; = SOME in a HAVING under OR; <> ALL three-valued in a select CASE (a NULL probe is N,
 # a probe in the set F); a constant probe of NOT IN over a set holding a NULL, never TRUE, under OR; a probe holding a
 # scalar subquery under OR; and a DATE probe against an INTEGER set in a CASE, a bind error.
 
-pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities) OR tr_row < 10
 ----
 BIGINT	HUGEINT
 843	1253668
 
-pending SQ7b
 query II nosort
 SELECT zn_city, COUNT(*) AS c FROM zones GROUP BY zn_city HAVING zn_city = SOME (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR COUNT(*) < 2 ORDER BY zn_city
 ----
@@ -2952,7 +2945,6 @@ SMALLINT	BIGINT
 9	1
 NULL	1
 
-pending SQ7b
 query IT nosort
 SELECT id, CASE WHEN i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 4)) THEN 'T' WHEN NOT (i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 4))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
 ----
@@ -2970,23 +2962,25 @@ INTEGER	VARCHAR
 10	T
 11	T
 
-pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE -1 NOT IN (SELECT zn_parent FROM zones) OR tr_row < 5
 ----
 BIGINT	HUGEINT
 5	10
 
-pending SQ7b
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 3
 ----
 BIGINT	HUGEINT
 492	733227
 
-pending SQ7b
 statement error
 SELECT COUNT(*) FROM trips WHERE CASE WHEN tr_day IN (SELECT zn_id FROM zones) THEN 1 ELSE 0 END = 1
+
+# ---- boundaries ----
+
+# The shapes below stay exit code 4 after SQ7b, each until the item its heading names: pending on a roadmap PR, or in
+# DuckDB alone where no PR plans them yet. DuckDB answers them, or fails with a bind error.
 
 # ---- DuckDB only until decision 3's BOOLEAN values get a PR (ADR 0041: IN as a value outside a condition) ----
 

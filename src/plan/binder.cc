@@ -1725,41 +1725,18 @@ std::string CompoundName(const sql::SelectStatement& compound) {
   return (tree.op == sql::SetOp::kUnion ? "a " : "an ") + SetOperatorName(tree.op, tree.all);
 }
 
-// A compound as the query of an IN subquery, which ADR 0036's X6 answers with ADR 0041's SQ7 (a
-// scalar's and an EXISTS's are answered since SQ4a): at the subquery's operator, as every shape of
-// a subquery is refused, and before any check that reads a block's clauses, which a compound keeps
-// in its blocks.
-std::optional<Rejection> RejectCompoundSubquery(const SubqueryConjunct& form) {
-  if (form.subquery->query->set_operation.empty()) {
-    return std::nullopt;
-  }
-  return Rejection{.span = form.subquery->op_span,
-                   .message = std::format("a subquery over {} is not supported",
-                                          CompoundName(*form.subquery->query))};
-}
-
 // Why an accepted shape is still not answered, or std::nullopt when it is, as far as the shape
 // alone tells: what depends on whether the subquery reads an enclosing block is checked once its
 // block is bound (Binder::BindSubqueryBlock, and GateCorrelatedExists for an EXISTS block).
 //
-// The IN form's probe is checked exactly as the left-hand side of an IN list is -- a construct that
-// is unsupported anywhere comes first, a nested subquery among them, then its kind -- so
-// `x IN (query)` and `x IN (1, 2)` take the same left-hand sides; an aggregate counts as reading a
-// column, in a WHERE too, where the parser admits one only inside a subquery in HAVING and the
-// binder judges it (ADR 0041's decision 23). A set operation as the query is refused until SQ7
-// (RejectCompoundSubquery). CheckConjunct passes IN forms alone: a scalar or EXISTS form is a
-// condition with values like any other.
+// The IN form's probe is any operand a condition with values takes (ADR 0041's SQ7b): a column, an
+// aggregate, a constant, or an expression holding a subquery's value; a construct that is
+// unsupported anywhere is refused first. Its query may be a set operation whose arms read no
+// enclosing block (ADR 0036's X6), which BindSubqueryBlock checks once bound. CheckConjunct passes
+// IN forms alone: a scalar or EXISTS form is a condition with values like any other.
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
   ANTB1_CHECK(form.subquery->kind == sql::SubqueryExpr::Kind::kIn);
-  if (auto r = FirstUnsupported(*form.other)) {
-    return r;
-  }
-  if (!ReadsColumn(*form.other, /*aggregates=*/true)) {
-    return Rejection{.span = form.other->span(),
-                     .message = std::format("IN needs {} on the left",
-                                            having ? "a column or an aggregate" : "a column")};
-  }
-  return RejectCompoundSubquery(form);
+  return FirstUnsupported(*form.other, /*values=*/true, /*where=*/!having);
 }
 
 std::optional<Rejection> RejectInCondition(const sql::SubqueryExpr& s, bool having) {
@@ -5523,6 +5500,44 @@ bool IsStringLiteral(const sql::Expr& expr) {
   return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
 }
 
+// An IN subquery's probe as DuckDB types a string literal one, by its set (ADR 0041's SQ7b): a
+// DATE's or a TIMESTAMP's, parsed as a comparison parses it; against a number set it is D3's bind
+// error, as the comparison's. Any other probe as bound.
+arrow::Result<Typed> TypeInProbe(const sql::Expr& operand, Typed probe, LogicalType set) {
+  const auto* lit = IsStringLiteral(operand) ? &std::get<sql::Literal>(operand) : nullptr;
+  if (lit == nullptr) {
+    return probe;
+  }
+  const auto constant = [&](LogicalType type, Int128 value) {
+    return Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = type, .value = value}},
+                     .type = type,
+                     .name = probe.expr->name});
+  };
+  if (set == LogicalType::kDate) {
+    const auto days = ParseDate(lit->text);
+    if (!days.has_value()) {
+      return BindError("invalid date '" + Clip(lit->text) + "': expected YYYY-MM-DD", lit->span);
+    }
+    return constant(LogicalType::kDate, Int128{*days});
+  }
+  if (set == LogicalType::kTimestamp) {
+    const auto micros = ParseTimestamp(lit->text);
+    if (!micros.has_value()) {
+      return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit->text) + "': expected " +
+                           std::string(kTimestampForm),
+                       lit->span);
+    }
+    return constant(LogicalType::kTimestamp, Int128{*micros});
+  }
+  if (IsNumeric(set) || set == LogicalType::kDecimal) {
+    return BindError(std::format("cannot compare the {} values of an IN subquery with {}; write a "
+                                 "number without quotes",
+                                 ToString(set), LiteralKind(*lit)),
+                     lit->span);
+  }
+  return probe;
+}
+
 // An integer literal as DuckDB's CASE typing sees one (IsIntegerLiteral: -(7) is one), with its
 // value and its type by value (INTEGER, BIGINT or HUGEINT); `1 + 1` and `7 + 0` are none.
 std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
@@ -6751,7 +6766,8 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
     (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
-  ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(*form.other));
+  ARROW_ASSIGN_OR_RAISE(Typed bound, bind(*form.other));
+  ARROW_ASSIGN_OR_RAISE(const Typed probe, TypeInProbe(*form.other, std::move(bound), block.type));
   ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, block.type, *form.subquery));
   join.kind = form.negated ? JoinKind::kNullAwareAnti : JoinKind::kSemi;
   InKeys(join, probe, block, type, form.subquery->span);
@@ -6764,6 +6780,24 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
 // and mark joins type their keys alike.
 arrow::Result<LogicalType> Binder::InKeyType(const Typed& probe, LogicalType set,
                                              const sql::SubqueryExpr& s) {
+  // DuckDB's bind error (ADR 0041's decision 23): a VARCHAR or a DATE against a value of another
+  // family. A DATE against a TIMESTAMP, which DuckDB answers, stays a refusal below.
+  const auto family = [](LogicalType t) {
+    if (t == LogicalType::kVarchar || t == LogicalType::kDate || t == LogicalType::kTimestamp) {
+      return t.id();
+    }
+    return LogicalType::kDouble;  // every number
+  };
+  const LogicalType::Id probe_family = family(probe.expr->type);
+  const LogicalType::Id set_family = family(set);
+  const auto is = [&](LogicalType::Id id) { return probe_family == id || set_family == id; };
+  if (probe_family != set_family &&
+      (is(LogicalType::kVarchar) || (is(LogicalType::kDate) && !is(LogicalType::kTimestamp)))) {
+    return BindError(std::format("cannot compare values of type {} and {} in IN (subquery) (write "
+                                 "an explicit CAST)",
+                                 ToString(probe.expr->type), ToString(set)),
+                     s.op_span);
+  }
   const std::optional<LogicalType> type = KeyType(probe.expr->type, set);
   if (type.has_value() && IsExactWidening(probe.expr->type, *type) && IsExactWidening(set, *type)) {
     return *type;
@@ -7151,7 +7185,8 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   }
   const SubqueryConjunct form{.subquery = &s, .other = &operand, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
-  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, bound.type, s));
+  ARROW_ASSIGN_OR_RAISE(const Typed typed, TypeInProbe(operand, probe, bound.type));
+  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(typed, bound.type, s));
   const std::string name = ExprName(sql::Expr(written));
   if (dry_run_) {
     // A branch OR factoring drops, or an EXISTS block's dropped item: its bind errors stand, and
@@ -7168,7 +7203,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                     .filter = {},
                     .span = s.op_span,
                     .mark = ids_.Next()};
-  InKeys(join, probe, bound, type, s.span);
+  InKeys(join, typed, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
   if (deferring_) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON

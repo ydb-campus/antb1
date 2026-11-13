@@ -929,13 +929,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT md5(s) FROM t ORDER BY 1", kUnsupported,
                   "md5", "function md5() is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM u UNION ALL SELECT i16 "
-                  "FROM t)",
-                  kUnsupported, "NOT IN", "a subquery over a UNION ALL is not supported"},
-        // A scalar's or an EXISTS's UNION ALL is answered where no arm reads an enclosing column
-        // (ADR 0041's SQ4a); a correlated arm is SQ15's, refused at the subquery.
+        // A scalar's, an EXISTS's and an IN's UNION ALL is answered where no arm reads an enclosing
+        // column (ADR 0041's SQ4a and SQ7b); a correlated arm is SQ15's, refused at the subquery.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u WHERE u.i32 = t.i32 UNION ALL "
+                  "SELECT i16 FROM t)",
+                  kUnsupported, "IN", "a correlated subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u WHERE u.i32 = t.i32 UNION "
                   "ALL SELECT MAX(i16) FROM t)",
                   kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
@@ -950,22 +948,19 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MAX(i16) FROM u WHERE "
                   "u.i16 = t.i16 UNION ALL SELECT MAX(i16) FROM t)",
                   kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT i32 FROM u "
-                  "UNION ALL SELECT i32 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE md5(s) IN (SELECT s FROM u UNION ALL SELECT s FROM t)",
                   kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT md5(s) FROM u UNION ALL SELECT s FROM "
                   "t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+                  kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1) SELECT x "
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
 // Every set operator is answered (ADR 0039's X4b to X4d); what stays refused is a compound's own
 // tail, which X5 keeps at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a
-// update) -- an IN over a compound (X6, answered with ADR 0041's SQ7) and a scalar's or an EXISTS's
-// compound with a correlated arm (SQ15). Each names the compound by its root operator.
+// update) -- inside an IN's set too -- and a compound with a correlated arm under a scalar, an
+// EXISTS or an IN (SQ15). Each names the compound by its root operator.
 INSTANTIATE_TEST_SUITE_P(
     SetOperatorRefusals, BindErrorTest,
     ::testing::Values(
@@ -975,16 +970,18 @@ INSTANTIATE_TEST_SUITE_P(
                   "LIMIT 2", "LIMIT on a UNION is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u UNION ALL SELECT i16 FROM t OFFSET 1",
                   kUnsupported, "OFFSET 1", "OFFSET on a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t ORDER "
+                  "BY 1)",
+                  kUnsupported, "ORDER BY 1", "ORDER BY on a UNION is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u WHERE u.i16 = t.i16 EXCEPT "
                   "SELECT i16 FROM t)",
                   kUnsupported, "EXISTS", "a correlated subquery over an EXCEPT is not supported"},
         ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u LIMIT 1", kUnsupported, "LIMIT 1",
                   "LIMIT on an INTERSECT is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u INTERSECT ALL SELECT i16 "
-                  "FROM t)",
-                  kUnsupported, "IN", "a subquery over an INTERSECT ALL is not supported"},
+                  "FROM ok WHERE ok.i16 = t.i32)",
+                  kUnsupported, "IN",
+                  "a correlated subquery over an INTERSECT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u OFFSET 3", kUnsupported,
                   "OFFSET 3", "OFFSET on an EXCEPT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t "
@@ -1235,8 +1232,16 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN (subquery) over a DOUBLE is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE h IN (SELECT z FROM dec)", kUnsupported, "IN",
                   "IN (subquery) of DECIMAL(38,0) and DECIMAL(38,10) is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE s IN (SELECT dt FROM u)", kUnsupported, "IN",
-                  "IN (subquery) of VARCHAR and DATE is not supported"},
+        // DuckDB's bind error for a VARCHAR or a DATE against another family (ADR 0041's SQ7b).
+        ErrorCase{"SELECT i16 FROM t WHERE s IN (SELECT dt FROM u)", kBind, "IN",
+                  "cannot compare values of type VARCHAR and DATE in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 0 OR dt NOT IN (SELECT i32 FROM u)", kBind,
+                  "NOT IN", "cannot compare values of type DATE and INTEGER in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = ANY (SELECT s FROM u)", kBind, "= ANY",
+                  "cannot compare values of type INTEGER and VARCHAR in IN (subquery)"},
+        // A string literal probe against a number set is divergence D3's bind error.
+        ErrorCase{"SELECT i16 FROM t WHERE '1' IN (SELECT i32 FROM u)", kBind, "'1'",
+                  "cannot compare the INTEGER values of an IN subquery with a string"},
         // One column, as in DuckDB, which reports a bind error for two.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16, i32 FROM u)", kBind, "IN",
                   "a subquery of IN must have one column, not 2"},
@@ -1448,13 +1453,10 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i64 IN (1.5e0, (SELECT MIN(i64) FROM u))", kUnsupported,
                   "IN", "IN of a DOUBLE value and a BIGINT"},
         // Under an OR, NOT or CASE an IN is a mark (ADR 0041's SQ7a), with a top-level IN's
-        // probe and set: a probe that reads no column, a set operation and a correlated set wait
-        // for SQ7b and SQ8; a DOUBLE key has no join.
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR 2 IN (SELECT i16 FROM u)", kUnsupported, "2",
-                  "IN needs a column on the left"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u UNION ALL "
-                  "SELECT i16 FROM ok)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        // probe and set: a NULL literal probe, a correlated set (SQ8, SQ12) and a DOUBLE key stay
+        // refused.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR NULL IN (SELECT i16 FROM u)", kUnsupported,
+                  "NULL", "NULL literals are not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT u.i16 FROM u WHERE u.i64 = "
                   "t.i64)",
                   kUnsupported, "IN", "a correlated subquery of IN is not supported"},
@@ -1495,8 +1497,9 @@ INSTANTIATE_TEST_SUITE_P(
         // assume away, which is an abort rather than an error.
         ErrorCase{"SELECT i16 FROM t WHERE TRY_CAST(i32 AS BIGINT) IN (SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IN (SELECT i16 FROM u)",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) IN "
+                  "(SELECT i16 FROM ok)",
+                  kUnsupported, "(", "a correlated scalar subquery"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING TRY_CAST(COUNT(*) AS BIGINT) IN "
                   "(SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
@@ -1534,11 +1537,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM t",
                   kUnsupported, "EXISTS", "a correlated EXISTS"},
         // An IN subquery outside a condition, a BOOLEAN value (ADR 0041's decision 3); in a CASE
-        // WHEN it is a mark, whose probe reads a column (SQ7b takes the others).
+        // WHEN it is a mark, of any probe but a NULL literal.
         ErrorCase{"SELECT i16 IN (SELECT i16 FROM u) FROM t", kUnsupported, "IN",
                   "IN (subquery) is not supported"},
-        ErrorCase{"SELECT CASE WHEN 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
-                  kUnsupported, "1", "IN needs a column or an aggregate on the left"},
+        ErrorCase{"SELECT CASE WHEN NULL IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
+                  kUnsupported, "NULL", "NULL literals are not supported"},
         // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
         // not look (SQ5).
         ErrorCase{
