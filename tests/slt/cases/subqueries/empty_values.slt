@@ -428,6 +428,16 @@ SMALLINT
 2
 3
 
+# concat skips a NULL argument, so over no rows it is not NULL: 'x' for the cities without a rider.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT concat(MAX(r.rd_tier), 'x') FROM riders r WHERE r.rd_city = c.ct_id) = 'x'
+ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
 # ---- the variance family (ADR 0041's SQ6) ----
 
 # VAR_POP, VAR_SAMP, VARIANCE, STDDEV_POP and STDDEV_SAMP are NULL over no rows, and the sample forms over one row.
@@ -655,6 +665,22 @@ GROUP BY 1 ORDER BY 1
 ----
 SMALLINT	BIGINT
 NULL	8
+
+# The block's value is its bare call, which the HAVING decides too: a group the HAVING rejects reads NULL, not its
+# count. Cities 1 and 2 count 77 and city 3 counts 78, so `< 78` keeps 1 and 2 only and `> 77` keeps no 77.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) >= 77
+ORDER BY 1
+----
+SMALLINT
+1
+2
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 77) = 77
+ORDER BY 1
+----
+SMALLINT
 
 # ---- an uncorrelated value or EXISTS inside the block (ADR 0041's SQ6) ----
 
