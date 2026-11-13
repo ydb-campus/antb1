@@ -27,14 +27,16 @@ using EmptyValue = std::optional<Constant>;
 EmptyValue EmptyValueOf(const AggregateCall& call);
 
 // Decision 20, the consumer proof: whether a dependent join that appends its right input's row may
-// be joined back INNER, which drops an outer row the subquery has no row for. Only where a reader
-// of the subquery's value rejects its empty value before anything else can see it: from the
-// dependent join's parent up through Computes, Filters none of whose conjuncts decides, and joins
-// reached from their left input that pad no left row (ADR 0041's SQ5), to the first Filter one of
-// whose conjuncts over the value is true for no row holding its empty value (TruthOver). Each node
-// passed decides each of its rows by that row alone and keeps its columns, so the rows of a binding
-// without a group all reach that Filter and fail there. Anything else -- another node, a join
-// reached from its right input or one that pads its left, the root reached -- leaves it LEFT.
+// be joined back INNER, which drops an outer row the subquery has no row for. Only where a Filter
+// rejects the subquery's empty value and every node between it and the join decides each row by
+// that row alone: from the dependent join's parent up through Computes, Filters none of whose
+// conjuncts decides, and joins reached from their left input that pad no left row (ADR 0041's SQ5),
+// to the first Filter one of whose conjuncts over the value is true for no row holding its empty
+// value (TruthOver). Each node passed keeps its columns, so the rows of a binding without a group
+// all reach that Filter and fail there. The nodes passed may read the value too; over an INNER join
+// back they never see a row without a group, so an error only such a row would raise is never
+// raised (divergence D24). Anything else -- another node, a join reached from its right input or
+// one that pads its left, the root reached -- leaves it LEFT.
 enum class JoinBack : std::uint8_t { kInner, kLeft };
 
 // A node above a dependent join, and the input of it the walk came up from: an index into

@@ -1118,10 +1118,13 @@ goes from 81 to 82; SQ5b answers them in select items, ORDER BY, GROUP BY keys a
     as an IN or mark probe, and two different correlated subqueries compared, the first a value below the second's
     join, in the order written.
   - The memo is keyed by binding. A correlated text binds to the same ids wherever the same FROM items are visible, so
-    a second occurrence there is the remembered value without binding again; an occurrence where fewer are visible (an
-    inner ON against WHERE) binds again, for its own bind errors (an ambiguous name, which a memo keyed by text would
-    hide), and is matched by the ids it reads. That comparison is defensive: a name an inner ON cannot see resolves
-    further out, which is refused, so today the ids always agree.
+    a second occurrence there is the remembered value without binding again. Inner ONs bind before WHERE, in FROM
+    order, so an occurrence under other visibility is a later one: WHERE, which sees more FROM items than an inner ON
+    (a name the ON resolved can be ambiguous there, which a memo keyed by text would hide), or the ON of another comma
+    group, which resolves a name in its own group first. It binds again, for its own bind errors, and is a remembered
+    value only if it reads the same ids. That comparison decides answers: in the ONs of two comma groups one text can
+    read `ct_id` of two tables, two values. A lookup takes the entry of the same visibility first, then one of the same
+    ids, so each value's later occurrences find its own join.
   - A direct comparison operand records its value too (the maintainer's choice), and the same text on both sides of
     one goes to the general path: one join per value and slot.
   - A place's refusals (a padded unit's left input, a conjunct that reads an enclosing block, EXISTS) come before the
@@ -1131,15 +1134,22 @@ goes from 81 to 82; SQ5b answers them in select items, ORDER BY, GROUP BY keys a
   SQ8` (the maintainer's choice); and every boundary the plan lists (SQ13, decision 3, constant aggregate arguments).
   A shape the unnesting refuses now reports its own message where the binder's direct-operand one stood, and a bind
   error that a correlated value under OR hid now comes first, at exit 1, as in DuckDB.
-- **Divergences (the maintainer accepted them).** D24: over an inner join back antb1 never computes the value over no
-  rows, so an earlier condition whose operand fails only there, and an operand of the deciding condition that reads no
-  value and fails for an outer row without a group, fail DuckDB alone. D16 and D35 name correlated values with
-  uncorrelated ones.
+- **Divergences (the maintainer accepted them).** D24: over an inner join back antb1 computes whatever stands between
+  the join back and the condition that rejects the value over no rows only for the outer rows with a group, so an
+  error raised only for the others fails DuckDB alone: an earlier condition whose operand fails only over the value
+  over no rows, an operand of the deciding condition that reads no value, and a condition between the two that reads
+  no value (an IN conjunct's probe, another value's comparison). The last also holds with the first value a direct
+  operand, which main joined back LEFT apart from the second, failing as DuckDB does. D16 and D35 name correlated
+  values with uncorrelated ones; with the direct operand remembered, an IN that turns out empty written between two
+  occurrences of a value now hides its error, as D35 says of an uncorrelated value, where main planted a second join
+  above the IN and failed, as DuckDB does.
 - **Decision 28.** `correlated_values.slt` holds 204 records written as pending before the code (98 SQ5a, 97 SQ5b, 7
   SQ13, 2 SQ8); SQ5a answers its 98 and `conditions.slt`'s four, and pins D24's members with each engine's outcome.
-  Of eight mutations, seven fail named tests; the survivor drops the defensive comparison above. The SQ0 guard showed
-  only refusals turned into answers equal to DuckDB's and reworded refusals; of the TPC-derived plans, only Q6's
-  changed.
+  The review added eleven: the ONs of two comma groups, an EXISTS block's item that repeats a value of its WHERE, and
+  D24's third member. Each of eight mutations fails named tests, the one that drops the ids comparison above among
+  them. The SQ0 guard showed only refusals turned into answers equal to DuckDB's and reworded refusals; outside its
+  corpus, the shapes of D24's third member and D35 above, which main failed at exit 1, now answer. Of the TPC-derived
+  plans, only Q6's changed.
 - **Follow-ups, outside SQ5.** The semi-join reduction above a nested value (`ReadsAJoinOrUnion` counts no dependent
   join, so D5's exception applies where D5 cannot reach); a join whose key reads a value NULL over no rows counted as
   deciding; constant folding in the proof.

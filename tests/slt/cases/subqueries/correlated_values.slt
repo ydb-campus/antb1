@@ -954,6 +954,72 @@ statement error out of range for the destination type UINT16
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 > CAST(3 - c.ct_id AS USMALLINT) ORDER BY 1
 
+# ---- divergence D24: an operand between the join back and the condition that decides it ----
+
+# Everything a condition computes between a value's INNER join back and the condition that rejects its value over no
+# rows is computed only for the outer rows with a group, whether it reads the value or not: an IN conjunct's probe and
+# another value's direct comparison. antb1 answers 1 2 3; DuckDB fails on cities 4 to 6. That holds with the first
+# value a direct operand too, which main joined back LEFT apart from the second and failed on. With the failing
+# conjunct written first both engines fail.
+onlyif antb1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 >= 0
+AND CAST(3 - c.ct_id AS USMALLINT) IN (SELECT tr_row FROM trips)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+onlyif duckdb
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 >= 0
+AND CAST(3 - c.ct_id AS USMALLINT) IN (SELECT tr_row FROM trips)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
+ORDER BY 1
+
+onlyif antb1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 >= 0
+AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) > CAST(3 - c.ct_id AS USMALLINT)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+onlyif duckdb
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 >= 0
+AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) > CAST(3 - c.ct_id AS USMALLINT)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
+
+onlyif antb1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) >= 0
+AND CAST(3 - c.ct_id AS USMALLINT) IN (SELECT tr_row FROM trips)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+onlyif duckdb
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) >= 0
+AND CAST(3 - c.ct_id AS USMALLINT) IN (SELECT tr_row FROM trips)
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
+ORDER BY 1
+
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE CAST(3 - c.ct_id AS USMALLINT) + (SELECT MIN(ct_id) FROM cities) > 0
+AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
+
 # ---- pending: select items (ADR 0041; roadmap PR SQ5b removes these guards) ----
 
 # Every outer row comes out, so the join back is LEFT and cities 4 to 6 read the value over no rows: COUNT 0, SUM
@@ -1919,6 +1985,27 @@ INTEGER
 8
 11
 
+# An EXISTS block's item that repeats a correlated value of its WHERE, directly and in an expression: the item is
+# dropped, bound as a dry run, which reads the WHERE's value and admits it anywhere (it computes nothing).
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city)
+FROM zones z
+WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) > 77) ORDER BY 1
+----
+SMALLINT
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) * 2
+FROM zones z WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) + 0 < 78)
+ORDER BY 1
+----
+SMALLINT
+1
+2
+4
+5
+
 # ---- pending: in the select items of other query blocks (ADR 0041; roadmap PR SQ5b removes these guards) ----
 
 # A derived table's and a CTE's select item, read by a filter and a join; a UNION ALL arm; a correlated value in the
@@ -2360,6 +2447,18 @@ SELECT a.ct_id FROM cities a
 JOIN zones z ON z.zn_city = a.ct_id AND (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = zn_id) > 0
 JOIN zones z2 ON z2.zn_id = z.zn_id WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = zn_id) > 0 ORDER BY 1
 
+# The ONs of two comma groups resolve one name in their own group first: the same text reads b.ct_id in the first ON
+# and d.ct_id in the second, two values, each read by its own ON (decision 10 matches a value by the ids it reads).
+query IIII nosort
+SELECT r1.rd_row, b.ct_id, r2.rd_row AS r2row, d.ct_id AS dct
+FROM riders r1 JOIN cities b ON (SELECT COUNT(*) FROM zones z WHERE z.zn_city = ct_id) > 7 AND r1.rd_city = b.ct_id,
+riders r2 JOIN cities d ON (SELECT COUNT(*) FROM zones z WHERE z.zn_city = ct_id) < 8 AND r2.rd_city = d.ct_id
+WHERE r1.rd_row < 3 AND r2.rd_row < 3 ORDER BY 1, 3
+----
+INTEGER	SMALLINT	INTEGER	SMALLINT
+0	1	2	3
+1	2	2	3
+
 # ---- the same with the ON's value inside an expression (ADR 0041's SQ5a) ----
 
 # The ON's value binds on the general path; WHERE's copy of its text must still be bound again, and is ambiguous.
@@ -2367,6 +2466,17 @@ statement error [Aa]mbiguous
 SELECT a.ct_id FROM cities a
 JOIN zones z ON z.zn_city = a.ct_id AND (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = zn_id) + 1 > 0
 JOIN zones z2 ON z2.zn_id = z.zn_id WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = zn_id) > 0 ORDER BY 1
+
+# The two comma groups' ONs again, each value inside an expression.
+query IIII nosort
+SELECT r1.rd_row, b.ct_id, r2.rd_row AS r2row, d.ct_id AS dct
+FROM riders r1 JOIN cities b ON (SELECT COUNT(*) FROM zones z WHERE z.zn_city = ct_id) + 0 > 7 AND r1.rd_city = b.ct_id,
+riders r2 JOIN cities d ON (SELECT COUNT(*) FROM zones z WHERE z.zn_city = ct_id) + 0 < 8 AND r2.rd_city = d.ct_id
+WHERE r1.rd_row < 3 AND r2.rd_row < 3 ORDER BY 1, 3
+----
+INTEGER	SMALLINT	INTEGER	SMALLINT
+0	1	2	3
+1	2	2	3
 
 # ---- pending: a correlated value above an aggregation (ADR 0041; roadmap PR SQ13 removes these guards) ----
 

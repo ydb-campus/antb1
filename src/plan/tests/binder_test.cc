@@ -1536,11 +1536,23 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT ok.i16 FROM ok WHERE ok.i16 = "
                   "u.i32) FROM u)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        // A correlated value or EXISTS outside a condition (ADR 0041's SQ5 and SQ13).
+        // A correlated value outside a condition (ADR 0041's SQ5b): a select item, ORDER BY, a
+        // GROUP BY key and an aggregate argument with a column; and a correlated EXISTS (SQ8).
         ErrorCase{"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) FROM t", kUnsupported, "(",
-                  "a correlated scalar subquery"},
+                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
+                  "inner ON"},
         ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
-                  kUnsupported, "(", "a correlated scalar subquery"},
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
+                  "inner ON"},
+        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
+                  "inner ON"},
+        ErrorCase{"SELECT SUM(i32 + (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)) FROM t",
+                  kUnsupported, "(",
+                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
+                  "inner ON"},
         ErrorCase{"SELECT CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END "
                   "FROM t",
                   kUnsupported, "EXISTS", "a correlated EXISTS"},
@@ -7138,10 +7150,12 @@ std::size_t DependentJoins(const LogicalPlan& plan) {
 }
 
 // Decision 10 for a correlated value (ADR 0041's SQ5a): written alike in one slot, it is one
-// dependent join, whether its first occurrence is a direct operand or not, and on both sides of one
-// comparison; a dry run (OR factoring's dropped branch) plants none. A text is its binding only
-// where the same FROM items are visible: an inner ON sees fewer than WHERE, so the WHERE copy binds
-// again and reports its own bind error -- an ambiguity a memo keyed by text would hide.
+// dependent join, whether its first occurrence is a direct operand or not, on both sides of one
+// comparison and in a CASE's WHEN and THEN; a dry run (OR factoring's dropped branch) plants none.
+// A text is its binding only where the same FROM items are visible: the ONs of two comma groups
+// resolve a name in their own groups first, so one text there is two values; and an inner ON sees
+// fewer items than WHERE, so the WHERE copy binds again and reports its own bind error -- an
+// ambiguity a memo keyed by text would hide.
 TEST(BinderTest, ACorrelatedValueIsRememberedByItsBinding) {
   const Catalog catalog = MakeCatalog();
   const auto bound = [&catalog](std::string_view sql) {
@@ -7159,10 +7173,29 @@ TEST(BinderTest, ACorrelatedValueIsRememberedByItsBinding) {
   EXPECT_EQ(
       DependentJoins(bound(std::format("SELECT i16 FROM t WHERE {} > {} - 1", kCount, kCount))),
       1U);
+  EXPECT_EQ(DependentJoins(bound(std::format(
+                "SELECT i16 FROM t WHERE CASE WHEN {} > 0 THEN {} ELSE 0 END > 1", kCount, kCount))),
+            1U);
   EXPECT_EQ(DependentJoins(bound(std::format("SELECT i16 FROM t WHERE (i32 = 1 AND {} > 0) OR "
                                              "i32 = 1",
                                              kCount))),
             0U);
+  // The ONs of two comma groups resolve `i` in their own groups first, to d1.i and d2.i: one text,
+  // two values, however each is written.
+  constexpr std::string_view kOwn = "(SELECT COUNT(*) FROM u WHERE u.i32 = i)";
+  const auto two_groups = [](std::string_view first, std::string_view second) {
+    return std::format("SELECT 1 FROM ok AS o1 JOIN dec AS d1 ON d1.s16 = o1.i16 AND {}, ok AS o2 "
+                       "JOIN dec AS d2 ON d2.s16 = o2.i16 AND {}",
+                       first, second);
+  };
+  for (const std::string& sql : {
+           two_groups(std::format("{} > 0", kOwn), std::format("{} < 9", kOwn)),
+           two_groups(std::format("{} + 0 > 0", kOwn), std::format("{} + 0 < 9", kOwn)),
+           two_groups(std::format("CASE WHEN {} > 0 THEN 1 ELSE 0 END = 1", kOwn),
+                      std::format("CASE WHEN {} < 9 THEN 1 ELSE 0 END = 1", kOwn)),
+       }) {
+    EXPECT_EQ(DependentJoins(bound(sql)), 2U) << sql;
+  }
   const auto ambiguous = BindSql(
       "SELECT dec.i FROM dec JOIN ok ON ok.i16 = dec.s16 AND (SELECT COUNT(*) FROM u WHERE "
       "u.i32 = i) + 1 > 0 JOIN dec AS d2 ON d2.s16 = ok.i16 WHERE (SELECT COUNT(*) FROM u WHERE "
