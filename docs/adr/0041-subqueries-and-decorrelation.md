@@ -666,8 +666,8 @@ Defects the design discussion found, to which no item is assigned:
 
 - **Misleading messages and stale comments:** a DOUBLE correlation is refused as having no key; a correlation inside a
   derived table nested in a subquery is called "a lateral qualified column"; EXPLAIN prints Path 2's substituted inner
-  columns under their outer names (`MapColumns` keeps `Expr::name`), which SQ0 keeps since it changes no golden; and
-  comments in `src/plan/optimizer.cc` still describe U1's pass.
+  columns under their outer names (`MapColumns` keeps `Expr::name`), which SQ0 keeps since it changes no golden.
+  (Comments in `src/plan/optimizer.cc` that still described U1's pass went with SQ0.)
 - **The semi-join reduction's clone** recomputes the outer side's one-row and mark joins, which never restrict its
   keys.
 - **D4's text** does not name a DATE column against a VARCHAR operand, which a scalar subquery reaches.

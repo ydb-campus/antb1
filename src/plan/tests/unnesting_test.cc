@@ -127,8 +127,9 @@ TEST(UnnestingTest, EveryKindButSemiAntiAndOneRowIsRefused) {
 
 // Decision 17: the descent has a rule per node type, and each mode declines the nodes it has no
 // rule for yet with its shape message, whatever the node: one the binder never puts on the way
-// (a LIMIT, a grouping, a join, a union, a second dependent join, a bare leaf), or a mode's own
-// misfit (an aggregate under EXISTS, a sort over a scalar's aggregate).
+// (a LIMIT, a grouping, grouping sets, a join, a union, a set operation, a second dependent join,
+// a bare leaf), or a mode's own misfit (an aggregate under EXISTS, a sort over a scalar's
+// aggregate). Each node stands directly under the dependent join, above the block.
 TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
   const auto over = [](const std::function<LogicalNode(const LogicalNodePtr&)>& make) {
     return [make](const LogicalNodePtr& root) {
@@ -155,6 +156,48 @@ TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
            [](const LogicalNodePtr& in) {
              return LogicalNode(GroupAggregateNode{
                  .input = in, .keys = {}, .key_ids = {}, .aggregates = {}, .span = {}});
+           }},
+          {"a GroupingSets",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(GroupingSetsNode{.input = in,
+                                                 .keys = {},
+                                                 .key_ids = {},
+                                                 .sets = {{}},
+                                                 .aggregates = {},
+                                                 .grouping = {},
+                                                 .span = {}});
+           }},
+          {"a Join",
+           [](const LogicalNodePtr& in) {
+             ColumnId last = MaxColumnId(*in);
+             return LogicalNode(JoinNode{.kind = JoinKind::kInner,
+                                         .left = in,
+                                         .right = CloneWithFreshIds(in, last),
+                                         .keys = {},
+                                         .residual = {},
+                                         .build = BuildSide::kRight,
+                                         .span = {}});
+           }},
+          {"a second DependentJoin",
+           [](const LogicalNodePtr& in) {
+             ColumnId last = MaxColumnId(*in);
+             return LogicalNode(DependentJoinNode{.kind = JoinKind::kSemi,
+                                                  .left = in,
+                                                  .right = CloneWithFreshIds(in, last),
+                                                  .span = {}});
+           }},
+          {"a SetOperation",
+           [](const LogicalNodePtr& in) {
+             ColumnId last = MaxColumnId(*in);
+             return LogicalNode(SetOperationNode{.inputs = {in, CloneWithFreshIds(in, last)},
+                                                 .columns = {},
+                                                 .ids = {},
+                                                 .formula = {},
+                                                 .span = {}});
+           }},
+          {"a UnionAll",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(UnionAllNode{.inputs = {in}, .columns = {}, .ids = {}, .span = {}});
            }},
   };
   constexpr std::string_view kLift = "over a block that is not a plain FROM and WHERE";
@@ -191,14 +234,16 @@ TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
             std::format("a correlated EXISTS {} is not supported", kLift));
   EXPECT_EQ(RefusalOf(kScalar, replaced),
             std::format("a correlated scalar subquery {} is not supported", kValue));
-  const auto unioned = [](const LogicalNodePtr& root) {
-    return WithRight(root, [](const LogicalNodePtr& right) {
+  const auto counted = [](const LogicalNodePtr& root) {
+    return WithRight(root, [](const LogicalNodePtr& /*right*/) {
       return std::make_shared<const LogicalNode>(
-          UnionAllNode{.inputs = {right}, .columns = {}, .ids = {}, .span = {}});
+          RowCountNode{.table = nullptr, .table_name = "t", .id = ColumnId{900}, .span = {}});
     });
   };
-  EXPECT_EQ(RefusalOf(kExists, unioned),
+  EXPECT_EQ(RefusalOf(kExists, counted),
             std::format("a correlated EXISTS {} is not supported", kLift));
+  EXPECT_EQ(RefusalOf(kScalar, counted),
+            std::format("a correlated scalar subquery {} is not supported", kValue));
 }
 
 // Decision 17's first row: each conjunct of the correlated filter is a kIsTrue over a column its
@@ -236,14 +281,15 @@ TEST(UnnestingTest, EmptyValuesFollowDecisionNineteen) {
         AggKind::kStddevPop, AggKind::kVarSamp, AggKind::kVarPop, AggKind::kSingleValue}) {
     const LogicalType type = kind == AggKind::kAvg ? LogicalType::kDouble : LogicalType::kBigInt;
     const EmptyValue value = EmptyValueOf(AggregateCall{.kind = kind, .arg = {}, .type = type});
-    ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value->type, type);
+    const Constant* constant = value.has_value() ? &*value : nullptr;
+    ASSERT_NE(constant, nullptr);
+    EXPECT_EQ(constant->type, type);
     const bool count = kind == AggKind::kCountStar || kind == AggKind::kCount ||
                        kind == AggKind::kCountDistinct || kind == AggKind::kSumCounts;
     if (count) {
-      EXPECT_EQ(std::get<Int128>(value->value), Int128{0});
+      EXPECT_EQ(std::get<Int128>(constant->value), Int128{0});
     } else {
-      EXPECT_TRUE(std::holds_alternative<std::monostate>(value->value));
+      EXPECT_TRUE(std::holds_alternative<std::monostate>(constant->value));
     }
   }
 }
@@ -277,20 +323,21 @@ Predicate CompareColumns(ColumnId column, CompareOp op, ColumnId other) {
 
 JoinBack Proof(const std::vector<LogicalNode>& above_root_first, EmptyValue value) {
   std::vector<const LogicalNode*> above;
+  above.reserve(above_root_first.size());
   for (const LogicalNode& node : above_root_first) {
     above.push_back(&node);
   }
   return ProveJoinBack(above, {{kValue, std::move(value)}});
 }
 
-const EmptyValue kNullValue = Constant{.type = LogicalType::kBigInt, .value = std::monostate{}};
+EmptyValue NullValue() { return Constant{.type = LogicalType::kBigInt, .value = std::monostate{}}; }
 
 // A comparison of the value is true for no row where the value is NULL, whatever its other side:
 // the INNER join back loses no row SQL keeps.
 TEST(UnnestingTest, TheProofAcceptsAComparisonOverAnEmptyValueOfNull) {
-  EXPECT_EQ(Proof({FilterOf({CompareColumns(kOuter, CompareOp::kGt, kValue)})}, kNullValue),
+  EXPECT_EQ(Proof({FilterOf({CompareColumns(kOuter, CompareOp::kGt, kValue)})}, NullValue()),
             JoinBack::kInner);
-  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kLt, 3)})}, kNullValue), JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kLt, 3)})}, NullValue()), JoinBack::kInner);
   // Through a strict Compute: 2 * v is NULL where v is.
   const ExprPtr v = std::make_shared<const Expr>(
       Expr{.node = ColumnExpr{.id = kValue}, .type = LogicalType::kBigInt, .name = "v"});
@@ -307,7 +354,7 @@ TEST(UnnestingTest, TheProofAcceptsAComparisonOverAnEmptyValueOfNull) {
   constexpr ColumnId kTwoV{52};
   EXPECT_EQ(Proof({FilterOf({CompareColumns(kTwoV, CompareOp::kGt, kOuter)}),
                    ComputeNode{.input = nullptr, .exprs = {two_v}, .ids = {kTwoV}, .span = {}}},
-                  kNullValue),
+                  NullValue()),
             JoinBack::kInner);
 }
 
@@ -317,13 +364,13 @@ TEST(UnnestingTest, TheProofAcceptsAComparisonOverAnEmptyValueOfNull) {
 TEST(UnnestingTest, TheProofRefusesWhatCanPassTheEmptyValue) {
   EXPECT_EQ(
       Proof({FilterOf({Predicate{.kind = Predicate::Kind::kIsNull, .column = Bigint(kValue)}})},
-            kNullValue),
+            NullValue()),
       JoinBack::kLeft);
   for (const Predicate::Kind kind :
        {Predicate::Kind::kIsDistinct, Predicate::Kind::kIsNotDistinct}) {
     EXPECT_EQ(Proof({FilterOf({Predicate{
                         .kind = kind, .column = Bigint(kValue), .other = Bigint(kOuter)}})},
-                    kNullValue),
+                    NullValue()),
               JoinBack::kLeft);
   }
   const ExprPtr v = std::make_shared<const Expr>(
@@ -336,18 +383,18 @@ TEST(UnnestingTest, TheProofRefusesWhatCanPassTheEmptyValue) {
   EXPECT_EQ(
       Proof({FilterOf({Compare(kCoalesced, CompareOp::kGt, 0)}),
              ComputeNode{.input = nullptr, .exprs = {coalesce}, .ids = {kCoalesced}, .span = {}}},
-            kNullValue),
+            NullValue()),
       JoinBack::kLeft);
   EXPECT_EQ(
       Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
              ProjectNode{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = {}}},
-            kNullValue),
+            NullValue()),
       JoinBack::kLeft);
   EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
                    FilterOf({Compare(kOuter, CompareOp::kGt, 0)})},
-                  kNullValue),
+                  NullValue()),
             JoinBack::kLeft);
-  EXPECT_EQ(Proof({}, kNullValue), JoinBack::kLeft);
+  EXPECT_EQ(Proof({}, NullValue()), JoinBack::kLeft);
 }
 
 // An empty value that is no NULL -- COUNT's 0, which SQ6 answers -- is decided by the comparison

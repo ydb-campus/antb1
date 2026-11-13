@@ -837,7 +837,7 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
-# A nested EXISTS without a key is refused at its own span, after the outer one is rewritten.
+# A nested EXISTS without a key is refused at its own span, not at the outer one's.
 antb1_add_cli_golden(
   unsupported_unnest_nested_refusal
   EXIT_CODE 4
@@ -848,6 +848,24 @@ antb1_add_cli_golden(
     1
     -c
     "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The outer subquery is unnested first: when both are refused, the outer one's refusal is reported.
+antb1_add_cli_golden(
+  unsupported_unnest_nested_outer_first
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id < z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
     --table
     "zones=${_f}/star/zones.parquet"
     --table

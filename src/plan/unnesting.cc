@@ -383,8 +383,7 @@ std::optional<Mode> ModeOf(JoinKind kind) {
 struct Correlation {
   const DependentJoinNode& join;
   Mode mode;
-  std::vector<ColumnId> outer_ids;  // the left input's output, in order
-  std::set<ColumnId> outer;         // the same, as a set
+  std::set<ColumnId> outer;  // the left input's output
   ColumnId& last_id;
   int64_t build_side_ratio;
   std::span<const LogicalNode* const> above;  // the plan's root down to the join's parent
@@ -606,12 +605,14 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
     }
     const auto& project = std::get<ProjectNode>(*step.node);
     for (std::size_t i = 0; i < project.columns.size() && i < project.ids.size(); ++i) {
-      if (i < project.constants.size() && project.constants[i].has_value()) {
-        const Constant& constant = *project.constants[i];
+      const std::optional<Constant>* entry =
+          i < project.constants.size() ? &project.constants[i] : nullptr;
+      if (const auto* constant = entry != nullptr && entry->has_value() ? &**entry : nullptr;
+          constant != nullptr) {
         values.insert_or_assign(project.ids[i],
-                                std::holds_alternative<std::monostate>(constant.value)
+                                std::holds_alternative<std::monostate>(constant->value)
                                     ? EmptyValue()
-                                    : EmptyValue(constant));
+                                    : EmptyValue(*constant));
         continue;
       }
       const auto it = values.find(project.columns[i].id);
@@ -1064,11 +1065,13 @@ arrow::Result<LogicalNodePtr> ValueJoin(const Correlation& correlation, const Sp
         right = Make(std::move(args));
         break;
       }
-      case Role::kStatic:
-        grouped.input = RestrictToTheOuterKeys(std::move(right), join, equivalent,
-                                               representatives.null_equal, described, last_id);
-        right = Make(std::move(grouped));
+      case Role::kStatic: {
+        GroupAggregateNode node = grouped;  // the one static step
+        node.input = RestrictToTheOuterKeys(std::move(right), join, equivalent,
+                                            representatives.null_equal, described, last_id);
+        right = Make(std::move(node));
         break;
+      }
       case Role::kMap: {
         // A Compute passes its input's columns through, but a Project outputs only its own, so the
         // group's key columns are added to it: the join above reads them, and without them its key
@@ -1150,7 +1153,6 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
   const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
   const Correlation correlation{.join = join,
                                 .mode = *mode,
-                                .outer_ids = outer_ids,
                                 .outer = std::set<ColumnId>(outer_ids.begin(), outer_ids.end()),
                                 .last_id = last_id,
                                 .build_side_ratio = build_side_ratio,
