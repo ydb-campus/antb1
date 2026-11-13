@@ -37,7 +37,7 @@ LogicalNodePtr Make(LogicalNode node) {
   return std::make_shared<const LogicalNode>(std::move(node));
 }
 
-// ---- ADR 0023's Path 1: correlated selections pulled up (EXISTS and NOT EXISTS, U2) ----
+// ---- the pieces the rules share ----
 
 // Which side of a dependent join an expression reads.
 struct Sides {
@@ -59,44 +59,6 @@ Sides SidesOf(const Expr& expr, const std::set<ColumnId>& outer_ids) {
     (outer_ids.contains(id) ? sides.outer : sides.inner) = true;
   }
   return sides;
-}
-
-// The block of a correlated subquery, as ADR 0023's Binding section leaves it: the nodes a semi or
-// anti join reads none of (the Project of the select list, the Compute of its computed items and
-// the Sort of an ORDER BY) over the one Filter that holds the block's correlated conjuncts, over
-// the Compute that evaluates them, over the block's own joins. Path 1 strips the first group,
-// moves the conjuncts into the join and keeps the rest.
-struct Block {
-  const FilterNode* filter = nullptr;     // the correlated conjuncts, as kIsTrue over `computed`
-  const ComputeNode* computed = nullptr;  // their expressions
-  LogicalNodePtr below;                   // the block's joins: what the new join's right input is
-};
-
-// Strips the select list and the sort, then matches the correlated filter and its Compute.
-// std::nullopt when the block does not have that shape, which makes Path 1 decline rather than
-// rewrite something it has not understood.
-std::optional<Block> BlockOf(const LogicalNodePtr& root) {
-  LogicalNodePtr node = root;
-  while (node != nullptr &&
-         (std::holds_alternative<ProjectNode>(*node) ||
-          std::holds_alternative<ComputeNode>(*node) || std::holds_alternative<SortNode>(*node))) {
-    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
-    if (inputs.size() != 1) {
-      return std::nullopt;
-    }
-    // A Compute here is the select list's; the correlated layer sits below the Filter, so a
-    // Compute reached before any Filter is never it.
-    node = inputs.front();
-  }
-  const auto* filter = node == nullptr ? nullptr : std::get_if<FilterNode>(node.get());
-  if (filter == nullptr) {
-    return std::nullopt;
-  }
-  const auto* computed = std::get_if<ComputeNode>(filter->input.get());
-  if (computed == nullptr) {
-    return std::nullopt;
-  }
-  return Block{.filter = filter, .computed = computed, .below = computed->input};
 }
 
 // The expression of `computed` that defines `id`, or nullptr.
@@ -167,8 +129,6 @@ std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_
                   .null_equal = null_equal};
 }
 
-// ---- ADR 0023's Path 2: equivalence substitution (scalar aggregates, U3) ----
-
 // A union-find over column ids. ADR 0023 builds the classes from the equalities between two
 // columns among the WHERE conjuncts of the subquery's block; this takes only the CORRELATED ones,
 // the conjuncts of the block's top filter.
@@ -204,198 +164,6 @@ class Classes {
   std::map<ColumnId, ColumnId> parent_;
 };
 
-// The subquery's block as Path 2 needs it: an ungrouped aggregate over the correlated filter.
-//
-//   [Project]           the select list, dropped: the join reads the aggregate's columns
-//   [Compute]           the select item over the aggregate (0.2 * avg(x)), kept above the join
-//   Aggregate           becomes a GroupAggregate keyed by the inner equivalents
-//   [Compute]           the aggregate's own arguments, kept below it
-//   Filter              the correlated conjuncts, each dropped once it reads inner columns only
-//   Compute             their expressions
-//   <below>             the block's joins
-struct ScalarBlock {
-  std::vector<LogicalNodePtr> above;  // between the dependent join and the Aggregate, top-down
-  const AggregateNode* aggregate = nullptr;
-  LogicalNodePtr args;  // the Compute of the aggregate's arguments, or nullptr
-  const FilterNode* filter = nullptr;
-  const ComputeNode* computed = nullptr;
-  LogicalNodePtr below;
-};
-
-std::optional<ScalarBlock> ScalarBlockOf(const LogicalNodePtr& root) {
-  ScalarBlock out;
-  LogicalNodePtr node = root;
-  while (node != nullptr && (std::holds_alternative<ProjectNode>(*node) ||
-                             std::holds_alternative<ComputeNode>(*node))) {
-    out.above.push_back(node);
-    const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
-    if (inputs.size() != 1) {
-      return std::nullopt;
-    }
-    node = inputs.front();
-  }
-  out.aggregate = node == nullptr ? nullptr : std::get_if<AggregateNode>(node.get());
-  if (out.aggregate == nullptr) {
-    return std::nullopt;  // the binder admits only an ungrouped aggregate here
-  }
-  LogicalNodePtr under = out.aggregate->input;
-  if (under != nullptr && std::holds_alternative<ComputeNode>(*under)) {
-    out.args = under;
-    under = std::get<ComputeNode>(*under).input;
-  }
-  out.filter = under == nullptr ? nullptr : std::get_if<FilterNode>(under.get());
-  if (out.filter == nullptr) {
-    return std::nullopt;
-  }
-  out.computed = std::get_if<ComputeNode>(out.filter->input.get());
-  if (out.computed == nullptr) {
-    return std::nullopt;
-  }
-  out.below = out.computed->input;
-  return out;
-}
-
-// Path 1's rewrite (ADR 0023, the formalization's Lemma 4.8 then Lemma 3.1): the block's select
-// list is dropped, since the join reads none of its columns, and the conjuncts of the block's top
-// filter move into the join, which becomes a semi join (EXISTS) or a plain anti join (NOT EXISTS,
-// which has no NULL case, unlike NOT IN). Its build side is the subquery (ADR 0022).
-//
-//   DependentJoin SEMI                     Join SEMI  keys o.k = t.k  residual t.x < o.x
-//     <outer>                                <outer>
-//     Project ...                            Filter t.z = 1
-//       Filter <correlated conjuncts>          Scan t
-//         Compute <their expressions>
-//           Filter t.z = 1
-//             Scan t
-arrow::Result<LogicalNodePtr> Path1(const DependentJoinNode& join, ColumnId& last_id,
-                                    int64_t build_side_ratio) {
-  const auto refuse = [&join](std::string_view what) {
-    return UnsupportedError(
-        std::format("a correlated {} {} is not supported",
-                    join.kind == JoinKind::kSemi ? "EXISTS" : "NOT EXISTS", what),
-        join.span);
-  };
-  const std::optional<Block> block = BlockOf(join.right);
-  if (!block.has_value()) {
-    // An aggregate, GROUP BY, HAVING, LIMIT or OFFSET leaves a node Path 1 does not know between
-    // the join and the correlated filter. The binder refuses those statically, so this is the
-    // backstop for a shape it has not met.
-    return refuse("over a block that is not a plain FROM and WHERE");
-  }
-  const std::vector<ColumnId> left_ids = OutputIds(*join.left);
-  const std::set<ColumnId> outer(left_ids.begin(), left_ids.end());
-
-  std::vector<JoinKey> keys;
-  std::vector<ExprPtr> residual;
-  std::vector<ExprPtr> inner_casts;  // a key's inner side widened to the key type
-  std::vector<ColumnId> inner_cast_ids;
-  std::vector<ExprPtr> outer_casts;  // and its outer side
-  std::vector<ColumnId> outer_cast_ids;
-
-  for (const Predicate& predicate : block->filter->predicates) {
-    if (predicate.kind != Predicate::Kind::kIsTrue || !predicate.column.has_value()) {
-      return refuse("whose correlated conjunct the pass does not recognize");
-    }
-    const ExprPtr* defined = DefinedBy(*block->computed, predicate.column->id);
-    if (defined == nullptr) {
-      return refuse("whose correlated conjunct the pass does not recognize");
-    }
-    const ExprPtr& expr = *defined;
-    const Sides sides = SidesOf(*expr, outer);
-    if (!sides.outer) {
-      // An inner-only conjunct stays where the binder put it; one can only reach the block's top
-      // filter when it shares a computed column with a correlated one.
-      residual.push_back(expr);
-      continue;
-    }
-    if (sides.outer_only()) {
-      // ADR 0023: an outer-only conjunct must not become a filter on the outer rows of an anti
-      // join -- where it is false or NULL the subquery has no row, so NOT EXISTS keeps the outer
-      // row that a filter would drop. A residual gets that right: the pair does not match, and
-      // the anti join keeps the row.
-      //
-      // The ADR puts an EXISTS's outer-only conjunct in a filter below the semi join instead,
-      // which is the same answer and drops the rows earlier. A residual is used for both here:
-      // the filter would have to compute the conjunct on the probe side, which widens the semi
-      // join's output and so breaks Optimize's contract that a plan keeps its output columns,
-      // and it would need a Project to undo. Pushing it down is a performance refinement, and
-      // the pass is correct without it.
-      residual.push_back(expr);
-      continue;
-    }
-    if (const std::optional<KeyParts> key = AsKey(*expr, outer)) {
-      // Both sides cast to the common type, as ADR 0022's keys are, each in a layer of its own on
-      // its side of the join: ResolvePositions requires a key's two sides to have one type, and
-      // exec compares that type against the column's own.
-      const auto side = [&last_id](const ColumnExpr& column, LogicalType from, LogicalType to,
-                                   std::vector<ExprPtr>& casts, std::vector<ColumnId>& cast_ids,
-                                   std::string name) {
-        if (from == to) {
-          return BoundColumn{.id = column.id, .name = std::move(name), .type = to};
-        }
-        casts.push_back(WidenTo(
-            std::make_shared<const Expr>(Expr{.node = column, .type = from, .name = name}), to));
-        cast_ids.push_back(ColumnId{std::to_underlying(last_id) + 1});
-        last_id = cast_ids.back();
-        return BoundColumn{.id = cast_ids.back(), .name = casts.back()->name, .type = to};
-      };
-      keys.push_back(JoinKey{.left = side(key->outer, key->outer_type, key->key_type, outer_casts,
-                                          outer_cast_ids, key->outer_name),
-                             .right = side(key->inner, key->inner_type, key->key_type, inner_casts,
-                                           inner_cast_ids, key->inner_name),
-                             .null_equal = key->null_equal});
-      continue;
-    }
-    residual.push_back(expr);  // reads both sides and is no key: a residual over candidate pairs
-  }
-
-  if (keys.empty()) {
-    // ADR 0023: as a LEFT JOIN without one does in ADR 0022, since the hash table and the
-    // candidate pairs need a key.
-    return refuse("without a key");
-  }
-
-  LogicalNodePtr left = join.left;
-  if (!outer_casts.empty()) {
-    left = Make(ComputeNode{
-        .input = std::move(left), .exprs = outer_casts, .ids = outer_cast_ids, .span = join.span});
-  }
-  LogicalNodePtr right = block->below;
-  if (!inner_casts.empty()) {
-    right = Make(ComputeNode{
-        .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
-  }
-  // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
-  // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
-  // EXISTS over a large relation has, where ADR 0022's rule built the whole of that relation to
-  // probe it with far fewer rows. A null-aware anti join (NOT IN) still cannot emit its build rows,
-  // so it keeps building on the subquery side whatever the estimates say.
-  const std::optional<int64_t> left_rows = EstimateRows(*left);
-  const bool chooses = Traits(join.kind).may_build_left;
-  const BuildSide build = chooses
-                              ? ChooseBuildSide(left_rows, EstimateRows(*right), build_side_ratio)
-                              : BuildSide::kRight;
-  LogicalNodePtr out = Make(JoinNode{.kind = join.kind,
-                                     .left = std::move(left),
-                                     .right = std::move(right),
-                                     .keys = std::move(keys),
-                                     .residual = std::move(residual),
-                                     .build = build,
-                                     // A semi or an anti join keeps a subset of its left input, so
-                                     // that is an upper bound: without it every join above this
-                                     // rewrite would read its own left input as unknown.
-                                     .estimate = left_rows,
-                                     .span = join.span});
-  // Lemma 3.1: the rewrite is legal only when the new join's right input has no free variables
-  // left. A bug in the classification above is the only way this fails, and it must not reach
-  // ResolvePositions, which would abort the process rather than fail the query.
-  if (!FreeVariables(*std::get<JoinNode>(*out).right).empty()) {
-    return arrow::Status::NotImplemented(
-        "the unnesting pass left a free variable in a rewritten join's right input");
-  }
-  return out;
-}
-
 // Whether an expression over the aggregate's columns is STRICT: NULL whenever an operand is NULL.
 // ADR 0023's Path 2 accepts only such a combination, and the reason is the COUNT bug (R. A. Ganski
 // and H. K. T. Wong, SIGMOD 1987): the rewrite gives an outer row with no group no row at all, so
@@ -420,79 +188,6 @@ bool IsStrict(const Expr& expr) {
         }
       },
       expr.node);
-}
-
-// Whether the aggregation's calls are the four ADR 0023's Path 2 admits. COUNT in any spelling is
-// 0 over no rows, which is what breaks the rewrite.
-bool StrictAggregates(const std::vector<AggregateCall>& calls) {
-  return std::ranges::all_of(calls, [](const AggregateCall& call) {
-    switch (call.kind) {
-      case AggKind::kSum:
-      case AggKind::kAvg:
-      case AggKind::kMin:
-      case AggKind::kMax:
-        return true;
-      case AggKind::kCountStar:
-      case AggKind::kCount:
-      case AggKind::kCountDistinct:
-      // A sum of counts is a count for this rule's purpose, and for its stated reason: it answers
-      // 0 over no rows, by design (ADR 0032's G2c). Unreachable today, since the unnesting runs
-      // before the exchange that makes one, and correct if that ever changes.
-      case AggKind::kSumCounts:
-      // The variance family is NULL over no rows too, but stays out of the rewrite until a query
-      // needs it there (ADR 0037's AG2).
-      case AggKind::kStddevSamp:
-      case AggKind::kStddevPop:
-      case AggKind::kVarSamp:
-      case AggKind::kVarPop:
-      // The binder wraps only an uncorrelated subquery in it, so no dependent join holds one; and
-      // its check of the row count belongs to each binding, which grouping by the correlated keys
-      // would lose (ADR 0041's decision 22).
-      case AggKind::kSingleValue:
-        return false;
-    }
-    return false;
-  });
-}
-
-// Whether every column of `values` -- what the subquery outputs, which the comparison above the
-// dependent join reads -- is NULL when the aggregation has no row to aggregate: an aggregate call
-// (each SUM, AVG, MIN or MAX, StrictAggregates), or a strict combination (IsStrict) that reads at
-// least one such column, through the Computes and Projects above the aggregation. The inner join
-// gives an outer row with no group no row, which is SQL's answer only where the subquery's value is
-// NULL there, so that the comparison rejects the row. IsStrict alone does not say it: a constant is
-// strict and reads no call, and so is the select item of `SELECT 1 ... ORDER BY COUNT(*)`, whose
-// aggregation is left with no call at all -- 1 over no rows, not NULL.
-bool NullOverNoRows(const ScalarBlock& block, const std::vector<ColumnId>& values) {
-  std::set<ColumnId> nulls;
-  for (const AggregateCall& call : block.aggregate->aggregates) {
-    nulls.insert(call.id);
-  }
-  for (const LogicalNodePtr& node : std::ranges::reverse_view(block.above)) {
-    if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
-      for (std::size_t i = 0; i < compute->exprs.size(); ++i) {
-        std::vector<ColumnId> reads;
-        CollectColumnIds(*compute->exprs[i], reads);
-        if (IsStrict(*compute->exprs[i]) &&
-            std::ranges::any_of(reads, [&nulls](ColumnId id) { return nulls.contains(id); })) {
-          nulls.insert(compute->ids[i]);
-        }
-      }
-      continue;
-    }
-    const auto* project = std::get_if<ProjectNode>(node.get());
-    if (project == nullptr) {
-      return false;  // ScalarBlockOf admits Computes and Projects only
-    }
-    for (std::size_t i = 0; i < project->columns.size() && i < project->ids.size(); ++i) {
-      const bool constant = i < project->constants.size() && project->constants[i].has_value();
-      if (!constant && nulls.contains(project->columns[i].id)) {
-        nulls.insert(project->ids[i]);
-      }
-    }
-  }
-  return !values.empty() &&
-         std::ranges::all_of(values, [&nulls](ColumnId id) { return nulls.contains(id); });
 }
 
 // How many times the aggregation's own input must exceed the outer side before restricting it to
@@ -654,83 +349,483 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
                        .span = join.span});
 }
 
-// Path 2's rewrite (ADR 0023, the formalization's Lemmas 4.14 and 4.2): each outer column is
-// replaced by its inner equivalent, so the correlated conjuncts read inner columns only and stay
-// below the aggregation; an equality that became c = c is dropped. The aggregation groups by the
-// inner equivalents, and the one-row dependent join becomes an inner join with one key per outer
-// column the subquery reads.
-//
-//   Filter o.v <= s                      Filter o.v <= s
-//     DependentJoin one-row                Join inner  keys o.k = <key of t.k>
-//       Scan o                               Scan o
-//       Aggregate m := max(t.x)              GroupAggregate keys t.k  m := max(t.x)
-//         Filter t.k = o.k                     Scan t
-//           Scan t
-arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& last_id,
-                                    int64_t build_side_ratio) {
-  const auto refuse = [&join](std::string_view what) {
-    return UnsupportedError(std::format("a correlated scalar subquery {} is not supported", what),
-                            join.span);
-  };
-  const std::optional<ScalarBlock> block = ScalarBlockOf(join.right);
-  if (!block.has_value()) {
-    return refuse("over a block that is not an ungrouped aggregate over its correlation");
-  }
-  if (!StrictAggregates(block->aggregate->aggregates)) {
-    return refuse("whose aggregate is not SUM, AVG, MIN or MAX");
-  }
-  for (const LogicalNodePtr& node : block->above) {
-    const auto* compute = std::get_if<ComputeNode>(node.get());
-    if (compute == nullptr) {
-      continue;  // a Project passes columns through, which is strict
-    }
-    if (!std::ranges::all_of(compute->exprs, [](const ExprPtr& expr) { return IsStrict(*expr); })) {
-      return refuse("whose select item does not combine its aggregate strictly");
-    }
-  }
-  if (!NullOverNoRows(*block, OutputIds(*join.right))) {
-    return refuse("whose select item does not combine its aggregate strictly");
-  }
-  const std::vector<ColumnId> left_ids = OutputIds(*join.left);
-  const std::set<ColumnId> outer(left_ids.begin(), left_ids.end());
-  const std::vector<ColumnId> inner_ids = OutputIds(*block->below);
-  const std::set<ColumnId> inner(inner_ids.begin(), inner_ids.end());
+// ---- the rule table (ADR 0041's decisions 16 to 18) ----
 
-  // The classes, and the conjuncts that survive the substitution. An equality of two plain columns
-  // of one type feeds a class; anything else is a conjunct that has to keep reading what it reads.
+// How a dependent join's kind is unnested, read from its traits, never from its name (decision 16).
+enum class Mode : std::uint8_t {
+  // A join that keeps or drops left rows and reads none of its right input's columns, and that can
+  // evaluate the correlated conjuncts over candidate pairs (semi and anti): they move into it, as
+  // ADR
+  // 0023's Path 1 has it.
+  kLift,
+  // A join that appends its right input's one row (one-row): a static aggregate grouped by the
+  // representatives of the outer columns, by substitution, as ADR 0023's Path 2 has it.
+  kValue,
+};
+
+// std::nullopt where the pass answers no correlated subquery of the kind: a null-aware anti join
+// and a mark take no residual, so their correlation cannot move into them (SQ8 and SQ12), and the
+// binder makes no dependent inner, LEFT or FULL join.
+std::optional<Mode> ModeOf(JoinKind kind) {
+  const JoinKindTraits traits = Traits(kind);
+  if (traits.one_row) {
+    return Mode::kValue;
+  }
+  if (traits.filters_left && traits.residuals) {
+    return Mode::kLift;
+  }
+  return std::nullopt;
+}
+
+// What every rule reads of the dependent join it unnests (decision 16).
+struct Correlation {
+  const DependentJoinNode& join;
+  Mode mode;
+  std::vector<ColumnId> outer_ids;  // the left input's output, in order
+  std::set<ColumnId> outer;         // the same, as a set
+  ColumnId& last_id;
+  int64_t build_side_ratio;
+
+  // The refusal of a shape, in the wording each mode has always had, at the subquery's span.
+  [[nodiscard]] arrow::Status Refuse(std::string_view what) const {
+    if (mode == Mode::kValue) {
+      return UnsupportedError(std::format("a correlated scalar subquery {} is not supported", what),
+                              join.span);
+    }
+    return UnsupportedError(
+        std::format("a correlated {} {} is not supported",
+                    Traits(join.kind).drops_unmatched_left ? "EXISTS" : "NOT EXISTS", what),
+        join.span);
+  }
+  // A node on the way to the correlated filter that the mode has no rule for. An aggregate, GROUP
+  // BY, HAVING, LIMIT or OFFSET leaves one; the binder refuses those statically, so this is the
+  // backstop for a shape it has not met.
+  [[nodiscard]] arrow::Status RefuseShape() const {
+    return Refuse(mode == Mode::kValue
+                      ? "over a block that is not an ungrouped aggregate over its correlation"
+                      : "over a block that is not a plain FROM and WHERE");
+  }
+};
+
+// What a node between the dependent join and its correlated filter is to the rewrite (decision 17).
+enum class Role : std::uint8_t {
+  kDropped,  // lift: the select list, its computed items or its sort, which the join reads none of
+  kMap,      // value: a Project or Compute over the static aggregate, rebuilt above it
+  kStatic,   // value: the ungrouped Aggregate, grouped by the representatives
+  kArguments,  // value: the Compute of the aggregate's arguments, substituted
+};
+
+struct Step {
+  LogicalNodePtr node;
+  Role role = Role::kDropped;
+};
+
+// The way from the dependent join down to its correlated filter, as the descent found it.
+struct Spine {
+  std::vector<Step> steps;                // top-down
+  const FilterNode* filter = nullptr;     // the correlated conjuncts, as kIsTrue over `computed`
+  const ComputeNode* computed = nullptr;  // their expressions
+  LogicalNodePtr below;                   // the block's own joins, kept whole
+};
+
+// The descent: one rule per node type, and no other overload, so that a new node type does not
+// compile until it has its rule (decision 17). Each rule records the node and goes on into its
+// input, ends the descent at the correlated filter, or declines, which refuses the shape. The first
+// Filter over a Compute is the correlated one: the binder pulls every correlated conjunct of a
+// block up into it, so nothing below it reads an outer column, which Lemma 3.1's check after the
+// rewrite verifies.
+struct Descent {
+  enum class Stage : std::uint8_t { kAbove, kUnderStatic, kUnderArguments };
+  enum class Next : std::uint8_t { kInput, kFound, kDeclined };
+
+  Mode mode;
+  Stage stage = Stage::kAbove;
+  Spine spine;
+  LogicalNodePtr node;  // the node the rule is called on
+
+  Next Record(Role role) {
+    spine.steps.push_back(Step{.node = node, .role = role});
+    return Next::kInput;
+  }
+  // A correlated filter where the stage admits one: lift mode above everything, value mode under
+  // the static aggregate.
+  Next Filter(const FilterNode& filter) {
+    const bool admitted = mode == Mode::kLift ? stage == Stage::kAbove : stage != Stage::kAbove;
+    const auto* computed = std::get_if<ComputeNode>(filter.input.get());
+    if (!admitted || computed == nullptr) {
+      return Next::kDeclined;
+    }
+    spine.filter = &filter;
+    spine.computed = computed;
+    spine.below = computed->input;
+    return Next::kFound;
+  }
+
+  Next operator()(const FilterNode& filter) { return Filter(filter); }
+  Next operator()(const ProjectNode& /*project*/) {
+    if (stage != Stage::kAbove) {
+      return Next::kDeclined;
+    }
+    return Record(mode == Mode::kLift ? Role::kDropped : Role::kMap);
+  }
+  Next operator()(const ComputeNode& /*compute*/) {
+    switch (stage) {
+      case Stage::kAbove:
+        return Record(mode == Mode::kLift ? Role::kDropped : Role::kMap);
+      case Stage::kUnderStatic:
+        stage = Stage::kUnderArguments;
+        return Record(Role::kArguments);
+      case Stage::kUnderArguments:
+        return Next::kDeclined;
+    }
+    return Next::kDeclined;
+  }
+  // An ORDER BY nothing limits orders rows no semi or anti join reads in order. A scalar block's
+  // ORDER BY over one aggregated row is one the binder never leaves.
+  Next operator()(const SortNode& /*sort*/) {
+    return mode == Mode::kLift && stage == Stage::kAbove ? Record(Role::kDropped) : Next::kDeclined;
+  }
+  // The static aggregate of a scalar subquery (decision 17's "Aggregate (static)" row, INNER until
+  // SQ6); an EXISTS over one is SQ8's.
+  Next operator()(const AggregateNode& /*aggregate*/) {
+    if (mode != Mode::kValue || stage != Stage::kAbove) {
+      return Next::kDeclined;
+    }
+    stage = Stage::kUnderStatic;
+    return Record(Role::kStatic);
+  }
+  // SQ8 and SQ14 (LIMIT), SQ8 and SQ4b (GROUP BY), SQ16 (grouping sets), SQ15 (set operations),
+  // SQ8 and SQ10 (joins on the way, decision 17's join rule), and the leaves and a nested dependent
+  // join, which stand below a correlated filter, never above one.
+  Next operator()(const LimitNode& /*limit*/) { return Next::kDeclined; }
+  Next operator()(const GroupAggregateNode& /*group*/) { return Next::kDeclined; }
+  Next operator()(const GroupingSetsNode& /*sets*/) { return Next::kDeclined; }
+  Next operator()(const UnionAllNode& /*union_all*/) { return Next::kDeclined; }
+  Next operator()(const SetOperationNode& /*set_operation*/) { return Next::kDeclined; }
+  Next operator()(const JoinNode& /*join*/) { return Next::kDeclined; }
+  Next operator()(const DependentJoinNode& /*join*/) { return Next::kDeclined; }
+  Next operator()(const ScanNode& /*scan*/) { return Next::kDeclined; }
+  Next operator()(const RowCountNode& /*row_count*/) { return Next::kDeclined; }
+};
+
+// The spine of `root`, a dependent join's right input, or std::nullopt where a rule declines.
+std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root) {
+  Descent descent{.mode = mode, .stage = Descent::Stage::kAbove, .spine = {}, .node = root};
+  while (descent.node != nullptr) {
+    switch (std::visit(descent, *descent.node)) {
+      case Descent::Next::kFound:
+        return std::move(descent.spine);
+      case Descent::Next::kDeclined:
+        return std::nullopt;
+      case Descent::Next::kInput:
+        break;
+    }
+    const std::vector<LogicalNodePtr> inputs = InputsOf(*descent.node);
+    if (inputs.size() != 1) {
+      return std::nullopt;
+    }
+    descent.node = inputs.front();
+  }
+  return std::nullopt;
+}
+
+// ---- the static aggregate's rule: its calls and their empty values (decisions 17 and 19) ----
+
+// Whether the rule answers a static aggregate's call. COUNT in any spelling is 0 over no rows,
+// which the INNER join back loses (the COUNT bug, R. A. Ganski and H. K. T. Wong, SIGMOD 1987); the
+// LEFT join back that answers it is SQ6's.
+bool AnsweredCall(AggKind kind) {
+  switch (kind) {
+    case AggKind::kSum:
+    case AggKind::kAvg:
+    case AggKind::kMin:
+    case AggKind::kMax:
+      return true;
+    case AggKind::kCountStar:
+    case AggKind::kCount:
+    case AggKind::kCountDistinct:
+    // A sum of counts is a count for this rule's purpose, and for its stated reason: it answers 0
+    // over no rows, by design (ADR 0032's G2c). Unreachable today, since the unnesting runs before
+    // the exchange that makes one, and correct if that ever changes.
+    case AggKind::kSumCounts:
+    // The variance family is NULL over no rows too, but stays out of the rewrite until a query
+    // needs it there (ADR 0037's AG2).
+    case AggKind::kStddevSamp:
+    case AggKind::kStddevPop:
+    case AggKind::kVarSamp:
+    case AggKind::kVarPop:
+    // The binder wraps only an uncorrelated subquery in it, so no dependent join holds one; and its
+    // check of the row count belongs to each binding, which grouping by the correlated keys would
+    // lose (ADR 0041's decision 22).
+    case AggKind::kSingleValue:
+      return false;
+  }
+  return false;
+}
+
+bool IsNull(const EmptyValue& value) {
+  return value.has_value() && std::holds_alternative<std::monostate>(value->value);
+}
+
+// The empty value of each column the static aggregate and the maps above it define (decision 19):
+// each call's, then, bottom-up through the maps, NULL for a strict combination (IsStrict) that
+// reads at least one NULL, a Project's column its source's, and not known otherwise. IsStrict alone
+// does not make a NULL: a constant is strict and reads no call, and so is the select item of
+// `SELECT 1
+// ... ORDER BY COUNT(*)`, whose aggregation is left with no call at all -- 1 over no rows, not
+// NULL (ADR 0023's update of 2026-11-08). A constant item keeps its constant, a NULL one excepted,
+// which no select list the binder leaves here holds.
+std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const Spine& spine) {
+  std::map<ColumnId, EmptyValue> values;
+  for (const AggregateCall& call : aggregate.aggregates) {
+    values.insert_or_assign(call.id, EmptyValueOf(call));
+  }
+  for (const Step& step : std::ranges::reverse_view(spine.steps)) {
+    if (step.role != Role::kMap) {
+      continue;
+    }
+    if (const auto* compute = std::get_if<ComputeNode>(step.node.get())) {
+      for (std::size_t i = 0; i < compute->exprs.size(); ++i) {
+        std::vector<ColumnId> reads;
+        CollectColumnIds(*compute->exprs[i], reads);
+        const bool null =
+            IsStrict(*compute->exprs[i]) && std::ranges::any_of(reads, [&](ColumnId id) {
+              const auto it = values.find(id);
+              return it != values.end() && IsNull(it->second);
+            });
+        values.insert_or_assign(
+            compute->ids[i],
+            null ? EmptyValue(Constant{.type = compute->exprs[i]->type, .value = std::monostate{}})
+                 : EmptyValue());
+      }
+      continue;
+    }
+    const auto& project = std::get<ProjectNode>(*step.node);
+    for (std::size_t i = 0; i < project.columns.size() && i < project.ids.size(); ++i) {
+      if (i < project.constants.size() && project.constants[i].has_value()) {
+        const Constant& constant = *project.constants[i];
+        values.insert_or_assign(project.ids[i],
+                                std::holds_alternative<std::monostate>(constant.value)
+                                    ? EmptyValue()
+                                    : EmptyValue(constant));
+        continue;
+      }
+      const auto it = values.find(project.columns[i].id);
+      values.insert_or_assign(project.ids[i], it == values.end() ? EmptyValue() : it->second);
+    }
+  }
+  return values;
+}
+
+// The static aggregate's rule in value mode: its calls, then the maps over it, then its value. The
+// INNER join back gives an outer row with no group no row, which is SQL's answer only where the
+// subquery's value is NULL there, so that the comparison rejects the row.
+arrow::Status CheckStatic(const Correlation& correlation, const Spine& spine,
+                          std::map<ColumnId, EmptyValue>& values) {
+  const AggregateNode* aggregate = nullptr;
+  for (const Step& step : spine.steps) {
+    if (step.role == Role::kStatic) {
+      aggregate = &std::get<AggregateNode>(*step.node);
+    }
+  }
+  ANTB1_CHECK(aggregate != nullptr);  // the descent finds the filter in value mode only under one
+  if (!std::ranges::all_of(aggregate->aggregates,
+                           [](const AggregateCall& call) { return AnsweredCall(call.kind); })) {
+    return correlation.Refuse("whose aggregate is not SUM, AVG, MIN or MAX");
+  }
+  // CASE, COALESCE, OR, AND and some functions turn a NULL into a value, so the comparison could
+  // accept a row the inner join drops -- a silently wrong answer, not a refusal.
+  for (const Step& step : spine.steps) {
+    const auto* compute = std::get_if<ComputeNode>(step.node.get());
+    if (step.role == Role::kMap && compute != nullptr &&
+        !std::ranges::all_of(compute->exprs, [](const ExprPtr& expr) { return IsStrict(*expr); })) {
+      return correlation.Refuse("whose select item does not combine its aggregate strictly");
+    }
+  }
+  values = EmptyValues(*aggregate, spine);
+  const std::vector<ColumnId> outputs = OutputIds(*correlation.join.right);
+  if (outputs.empty() || !std::ranges::all_of(outputs, [&values](ColumnId id) {
+        const auto it = values.find(id);
+        return it != values.end() && IsNull(it->second);
+      })) {
+    return correlation.Refuse("whose select item does not combine its aggregate strictly");
+  }
+  return arrow::Status::OK();
+}
+
+// ---- the correlated filter's rule (decision 17's first row) ----
+
+// Each conjunct of the correlated filter, as its Compute defines it, in filter order; a conjunct
+// that is no kIsTrue over a computed column is refused.
+arrow::Result<std::vector<const ExprPtr*>> ConjunctsOf(const Correlation& correlation,
+                                                       const Spine& spine) {
+  std::vector<const ExprPtr*> conjuncts;
+  for (const Predicate& predicate : spine.filter->predicates) {
+    const ExprPtr* defined =
+        predicate.kind == Predicate::Kind::kIsTrue && predicate.column.has_value()
+            ? DefinedBy(*spine.computed, predicate.column->id)
+            : nullptr;
+    if (defined == nullptr) {
+      return correlation.Refuse("whose correlated conjunct the pass does not recognize");
+    }
+    conjuncts.push_back(defined);
+  }
+  return conjuncts;
+}
+
+// Lift mode's join (ADR 0023's Path 1; the formalization's Lemma 4.8 then Lemma 3.1): the steps are
+// dropped, since the join reads none of their columns, and the conjuncts of the correlated filter
+// move into the join, which becomes a semi join (EXISTS) or a plain anti join (NOT EXISTS, which
+// has no NULL case, unlike NOT IN). Every outer reference moves with them, so substitution has
+// nothing left to replace. Its build side is chosen by the estimates where the kind may build on
+// its left.
+//
+//   DependentJoin SEMI                     Join SEMI  keys o.k = t.k  residual t.x < o.x
+//     <outer>                                <outer>
+//     Project ...                            Filter t.z = 1
+//       Filter <correlated conjuncts>          Scan t
+//         Compute <their expressions>
+//           Filter t.z = 1
+//             Scan t
+arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spine& spine) {
+  const DependentJoinNode& join = correlation.join;
+  ColumnId& last_id = correlation.last_id;
+  std::vector<JoinKey> keys;
+  std::vector<ExprPtr> residual;
+  std::vector<ExprPtr> inner_casts;  // a key's inner side widened to the key type
+  std::vector<ColumnId> inner_cast_ids;
+  std::vector<ExprPtr> outer_casts;  // and its outer side
+  std::vector<ColumnId> outer_cast_ids;
+
+  ARROW_ASSIGN_OR_RAISE(const std::vector<const ExprPtr*> conjuncts,
+                        ConjunctsOf(correlation, spine));
+  for (const ExprPtr* defined : conjuncts) {
+    const ExprPtr& expr = *defined;
+    const Sides sides = SidesOf(*expr, correlation.outer);
+    if (!sides.outer) {
+      // An inner-only conjunct stays where the binder put it; one can only reach the block's top
+      // filter when it shares a computed column with a correlated one.
+      residual.push_back(expr);
+      continue;
+    }
+    if (sides.outer_only()) {
+      // ADR 0023: an outer-only conjunct must not become a filter on the outer rows of an anti
+      // join -- where it is false or NULL the subquery has no row, so NOT EXISTS keeps the outer
+      // row that a filter would drop. A residual gets that right: the pair does not match, and
+      // the anti join keeps the row.
+      //
+      // The ADR puts an EXISTS's outer-only conjunct in a filter below the semi join instead,
+      // which is the same answer and drops the rows earlier. A residual is used for both here:
+      // the filter would have to compute the conjunct on the probe side, which widens the semi
+      // join's output and so breaks Optimize's contract that a plan keeps its output columns,
+      // and it would need a Project to undo. Pushing it down is a performance refinement, and
+      // the pass is correct without it.
+      residual.push_back(expr);
+      continue;
+    }
+    if (const std::optional<KeyParts> key = AsKey(*expr, correlation.outer)) {
+      // Both sides cast to the common type, as ADR 0022's keys are, each in a layer of its own on
+      // its side of the join: ResolvePositions requires a key's two sides to have one type, and
+      // exec compares that type against the column's own.
+      const auto side = [&last_id](const ColumnExpr& column, LogicalType from, LogicalType to,
+                                   std::vector<ExprPtr>& casts, std::vector<ColumnId>& cast_ids,
+                                   std::string name) {
+        if (from == to) {
+          return BoundColumn{.id = column.id, .name = std::move(name), .type = to};
+        }
+        casts.push_back(WidenTo(
+            std::make_shared<const Expr>(Expr{.node = column, .type = from, .name = name}), to));
+        cast_ids.push_back(ColumnId{std::to_underlying(last_id) + 1});
+        last_id = cast_ids.back();
+        return BoundColumn{.id = cast_ids.back(), .name = casts.back()->name, .type = to};
+      };
+      keys.push_back(JoinKey{.left = side(key->outer, key->outer_type, key->key_type, outer_casts,
+                                          outer_cast_ids, key->outer_name),
+                             .right = side(key->inner, key->inner_type, key->key_type, inner_casts,
+                                           inner_cast_ids, key->inner_name),
+                             .null_equal = key->null_equal});
+      continue;
+    }
+    residual.push_back(expr);  // reads both sides and is no key: a residual over candidate pairs
+  }
+
+  if (keys.empty()) {
+    // ADR 0023: as a LEFT JOIN without one does in ADR 0022, since the hash table and the
+    // candidate pairs need a key (ADR 0040's decision 3).
+    return correlation.Refuse("without a key");
+  }
+
+  LogicalNodePtr left = join.left;
+  if (!outer_casts.empty()) {
+    left = Make(ComputeNode{
+        .input = std::move(left), .exprs = outer_casts, .ids = outer_cast_ids, .span = join.span});
+  }
+  LogicalNodePtr right = spine.below;
+  if (!inner_casts.empty()) {
+    right = Make(ComputeNode{
+        .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
+  }
+  // ADR 0026's C2b, C2c and C3: a semi or an anti join may build on its left input, the side it
+  // preserves, when the subquery side is decisively larger -- the shape a correlated EXISTS or NOT
+  // EXISTS over a large relation has, where ADR 0022's rule built the whole of that relation to
+  // probe it with far fewer rows.
+  const std::optional<int64_t> left_rows = EstimateRows(*left);
+  const BuildSide build =
+      Traits(join.kind).may_build_left
+          ? ChooseBuildSide(left_rows, EstimateRows(*right), correlation.build_side_ratio)
+          : BuildSide::kRight;
+  return Make(JoinNode{.kind = join.kind,
+                       .left = std::move(left),
+                       .right = std::move(right),
+                       .keys = std::move(keys),
+                       .residual = std::move(residual),
+                       .build = build,
+                       // A semi or an anti join keeps a subset of its left input, so that is an
+                       // upper bound: without it every join above this rewrite would read its own
+                       // left input as unknown.
+                       .estimate = left_rows,
+                       .span = join.span});
+}
+
+// The equalities that fed a class, with their two columns: each is dropped where the substitution
+// makes it c = c, and kept as an inner condition otherwise.
+struct Equality {
+  const Expr* expr = nullptr;
+  ColumnId a = kNoColumnId;
+  ColumnId b = kNoColumnId;
+};
+
+// A correlated IS NOT DISTINCT FROM between an outer and an inner column of one type (ADR 0037's
+// OJ5b). It feeds no class, since the classes' members are equal values and these also match NULL
+// to NULL; an outer column with no equivalent in a class takes its inner column from one instead,
+// and its key is then NULL-equal. The substitution stays exact: a NULL is replaced by a NULL, and a
+// value by the same value.
+struct NullEqualLink {
+  const Expr* expr = nullptr;
+  ColumnId outer = kNoColumnId;
+  ColumnId inner = kNoColumnId;
+};
+
+// Value mode's reading of the correlated filter: the classes, and the conjuncts that survive the
+// substitution. An equality of two plain columns of one type feeds a class; anything else is a
+// conjunct that has to keep reading what it reads.
+struct Equivalences {
   Classes classes;
-  std::vector<const Expr*> kept;
-  // The equalities that fed a class, with their two columns: each is dropped below only where the
-  // substitution makes it c = c, and kept as an inner condition otherwise.
-  struct Equality {
-    const Expr* expr = nullptr;
-    ColumnId a = kNoColumnId;
-    ColumnId b = kNoColumnId;
-  };
   std::vector<Equality> equalities;
-  // The correlated IS NOT DISTINCT FROM conjuncts between an outer and an inner column of one type
-  // (ADR 0037's OJ5b). They feed no class, since the classes' members are equal values and these
-  // also match NULL to NULL; an outer column with no equivalent in a class takes its inner column
-  // from one instead, and its key is then NULL-equal. The substitution stays exact: a NULL is
-  // replaced by a NULL, and a value by the same value.
-  struct NullEqualLink {
-    const Expr* expr = nullptr;
-    ColumnId outer = kNoColumnId;
-    ColumnId inner = kNoColumnId;
-  };
   std::vector<NullEqualLink> links;
   // The name and type of each column a correlated conjunct names: BindBool's column_of stores them
   // in the PredicateExpr's own predicate, positionally, while the ids live in the operands. It is
-  // the only place the pass can learn what to call a column.
+  // the only place the pass can learn what to call a column; the last conjunct to name one names
+  // it.
   std::map<ColumnId, BoundColumn> described;
-  for (const Predicate& predicate : block->filter->predicates) {
-    if (predicate.kind != Predicate::Kind::kIsTrue || !predicate.column.has_value()) {
-      return refuse("whose correlated conjunct the pass does not recognize");
-    }
-    const ExprPtr* defined = DefinedBy(*block->computed, predicate.column->id);
-    if (defined == nullptr) {
-      return refuse("whose correlated conjunct the pass does not recognize");
-    }
+  std::vector<const Expr*> kept;
+};
+
+arrow::Result<Equivalences> EquivalencesOf(const Correlation& correlation, const Spine& spine) {
+  Equivalences out;
+  ARROW_ASSIGN_OR_RAISE(const std::vector<const ExprPtr*> conjuncts,
+                        ConjunctsOf(correlation, spine));
+  for (const ExprPtr* defined : conjuncts) {
     const Expr& expr = **defined;
     const auto* compare = std::get_if<PredicateExpr>(&expr.node);
     const ColumnExpr* a = compare == nullptr || compare->operands.size() != 2
@@ -741,54 +836,68 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     const bool equality = b != nullptr &&
                           compare->predicate.kind == Predicate::Kind::kCompareColumns &&
                           compare->predicate.op == CompareOp::kEq;
-    const bool not_distinct = b != nullptr &&
-                              compare->predicate.kind == Predicate::Kind::kIsNotDistinct &&
-                              outer.contains(a->id) != outer.contains(b->id);
+    const bool not_distinct =
+        b != nullptr && compare->predicate.kind == Predicate::Kind::kIsNotDistinct &&
+        correlation.outer.contains(a->id) != correlation.outer.contains(b->id);
     // One type on both ends, which KeyType answers for: it is the same question, and it excludes
     // DOUBLE, whose comparison is not exact.
     const bool one_type =
         (equality || not_distinct) && compare->operands[0]->type == compare->operands[1]->type &&
         KeyType(compare->operands[0]->type, compare->operands[1]->type).has_value();
-    if (one_type) {
-      const auto describe = [&described](ColumnId id, const std::optional<BoundColumn>& from,
-                                         LogicalType type) {
-        BoundColumn column = from.value_or(BoundColumn{});
-        column.id = id;
-        column.type = type;
-        described.insert_or_assign(id, std::move(column));
-      };
-      describe(a->id, compare->predicate.column, compare->operands[0]->type);
-      describe(b->id, compare->predicate.other, compare->operands[1]->type);
-      if (not_distinct) {
-        const bool a_outer = outer.contains(a->id);
-        links.push_back(NullEqualLink{
-            .expr = &expr, .outer = a_outer ? a->id : b->id, .inner = a_outer ? b->id : a->id});
-        continue;
-      }
-      classes.Merge(a->id, b->id);
-      equalities.push_back(Equality{.expr = &expr, .a = a->id, .b = b->id});
+    if (!one_type) {
+      out.kept.push_back(&expr);
       continue;
     }
-    kept.push_back(&expr);
+    const auto describe = [&out](ColumnId id, const std::optional<BoundColumn>& from,
+                                 LogicalType type) {
+      BoundColumn column = from.value_or(BoundColumn{});
+      column.id = id;
+      column.type = type;
+      out.described.insert_or_assign(id, std::move(column));
+    };
+    describe(a->id, compare->predicate.column, compare->operands[0]->type);
+    describe(b->id, compare->predicate.other, compare->operands[1]->type);
+    if (not_distinct) {
+      const bool a_outer = correlation.outer.contains(a->id);
+      out.links.push_back(NullEqualLink{
+          .expr = &expr, .outer = a_outer ? a->id : b->id, .inner = a_outer ? b->id : a->id});
+      continue;
+    }
+    out.classes.Merge(a->id, b->id);
+    out.equalities.push_back(Equality{.expr = &expr, .a = a->id, .b = b->id});
   }
+  return out;
+}
 
-  // Every outer column the subquery reads needs an inner equivalent, and gets its OWN key: one key
-  // per class would drop a second outer column's constraint and keep rows SQL rejects.
-  const std::vector<ColumnId> free = FreeVariables(*join.right);
-  std::map<ColumnId, ColumnId> equivalent;  // outer id -> the inner column it is replaced by
-  std::set<ColumnId> null_equal;            // the outer ids whose key is NULL-equal
+// ---- the terminal step: substitution (decision 18) ----
+
+// The representatives of the outer columns: per outer id, the inner column it is replaced by.
+struct Representatives {
+  std::map<ColumnId, ColumnId> of;  // outer id -> inner column; the map's order is the keys' order
+  std::set<ColumnId> null_equal;    // the outer ids whose key is NULL-equal
   std::set<const NullEqualLink*> used_links;
-  for (const ColumnId id : free) {
+};
+
+// Every outer column the subquery reads needs a representative among the columns below the
+// correlated filter, and gets its OWN key: one key per class would drop a second outer column's
+// constraint and keep rows SQL rejects. Phase 8 has no other terminal step: an outer column without
+// one is refused (the domain D is SQ9's).
+arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation, const Spine& spine,
+                                                 Equivalences& equivalences) {
+  const std::vector<ColumnId> inner_ids = OutputIds(*spine.below);
+  const std::set<ColumnId> inner(inner_ids.begin(), inner_ids.end());
+  Representatives out;
+  for (const ColumnId id : FreeVariables(*correlation.join.right)) {
     ColumnId found = kNoColumnId;
     for (const ColumnId candidate : inner_ids) {
-      if (classes.Same(id, candidate)) {
+      if (equivalences.classes.Same(id, candidate)) {
         found = candidate;
         break;
       }
     }
     if (found == kNoColumnId) {
       const NullEqualLink* used = nullptr;
-      for (const NullEqualLink& link : links) {
+      for (const NullEqualLink& link : equivalences.links) {
         if (link.outer == id && inner.contains(link.inner)) {
           used = &link;
           break;
@@ -796,17 +905,17 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
       }
       if (used != nullptr) {
         found = used->inner;
-        null_equal.insert(id);
-        used_links.insert(used);
+        out.null_equal.insert(id);
+        out.used_links.insert(used);
       }
     }
     if (found == kNoColumnId) {
-      return refuse("with an outer column that has no inner equivalent");
+      return correlation.Refuse("with an outer column that has no inner equivalent");
     }
-    equivalent.emplace(id, found);
+    out.of.emplace(id, found);
   }
-  if (equivalent.empty()) {
-    return refuse("that reads no column of its enclosing block");
+  if (out.of.empty()) {
+    return correlation.Refuse("that reads no column of its enclosing block");
   }
   // An equality the substitution turns into c = c says no more than the key that replaces it: it is
   // dropped. Any other one is a condition between inner columns -- two inner columns equal to one
@@ -819,26 +928,59 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   // over two outer columns that only IS NOT DISTINCT FROM links to an inner column would let an
   // outer row whose columns are NULL read that group, where the equality is NULL in SQL and the
   // subquery sees no row. Kept, `c = c` leaves the NULL rows out of the aggregation.
-  const auto substituted = [&equivalent](ColumnId id) {
-    const auto it = equivalent.find(id);
-    return it == equivalent.end() ? id : it->second;
+  const auto substituted = [&out](ColumnId id) {
+    const auto it = out.of.find(id);
+    return it == out.of.end() ? id : it->second;
   };
-  for (const Equality& equality : equalities) {
-    if (substituted(equality.a) != substituted(equality.b) || null_equal.contains(equality.a) ||
-        null_equal.contains(equality.b)) {
-      kept.push_back(equality.expr);
+  for (const Equality& equality : equivalences.equalities) {
+    if (substituted(equality.a) != substituted(equality.b) || out.null_equal.contains(equality.a) ||
+        out.null_equal.contains(equality.b)) {
+      equivalences.kept.push_back(equality.expr);
     }
   }
-  // A link that gave its outer column the equivalent says no more than the NULL-equal key that
+  // A link that gave its outer column the representative says no more than the NULL-equal key that
   // replaces it; any other is a condition between inner columns once substituted, and is kept.
-  for (const NullEqualLink& link : links) {
-    if (!used_links.contains(&link)) {
-      kept.push_back(link.expr);
+  for (const NullEqualLink& link : equivalences.links) {
+    if (!out.used_links.contains(&link)) {
+      equivalences.kept.push_back(link.expr);
     }
   }
+  return out;
+}
 
-  // The aggregation groups by the inner equivalents, each output as a new column that the join's
-  // key then reads. Distinct, in a stable order.
+// Value mode's rewrite (ADR 0023's Path 2; the formalization's Lemmas 4.14 and 4.2): each outer
+// column is replaced by its representative, so the correlated conjuncts read inner columns only and
+// stay below the aggregation; an equality that became c = c is dropped. The static aggregate groups
+// by the representatives, the maps over it are rebuilt above the group, and the one-row dependent
+// join becomes an INNER join with one key per outer column the subquery reads (decision 20's proof
+// decides LEFT from SQ6 on).
+//
+//   Filter o.v <= s                      Filter o.v <= s
+//     DependentJoin one-row                Join inner  keys o.k = <key of t.k>
+//       Scan o                               Scan o
+//       Aggregate m := max(t.x)              GroupAggregate keys t.k  m := max(t.x)
+//         Filter t.k = o.k                     Scan t
+//           Scan t
+arrow::Result<LogicalNodePtr> ValueJoin(const Correlation& correlation, const Spine& spine) {
+  const DependentJoinNode& join = correlation.join;
+  ColumnId& last_id = correlation.last_id;
+  std::map<ColumnId, EmptyValue> values;
+  ARROW_RETURN_NOT_OK(CheckStatic(correlation, spine, values));
+  ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
+  ARROW_ASSIGN_OR_RAISE(const Representatives representatives,
+                        RepresentativesOf(correlation, spine, equivalences));
+  const std::map<ColumnId, ColumnId>& equivalent = representatives.of;
+  const std::map<ColumnId, BoundColumn>& described = equivalences.described;
+
+  // The static aggregate's keys, allocated first: the representatives, distinct, in the map's
+  // order, each output as a new column that the join's key then reads.
+  const AggregateNode* aggregate = nullptr;
+  for (const Step& step : spine.steps) {
+    if (step.role == Role::kStatic) {
+      aggregate = &std::get<AggregateNode>(*step.node);
+    }
+  }
+  ANTB1_CHECK(aggregate != nullptr);
   std::vector<ColumnId> group;
   for (const auto& [id, equiv] : equivalent) {
     if (std::ranges::find(group, equiv) == group.end()) {
@@ -848,13 +990,13 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   GroupAggregateNode grouped{.input = nullptr,
                              .keys = {},
                              .key_ids = {},
-                             .aggregates = block->aggregate->aggregates,
-                             .span = block->aggregate->span};
+                             .aggregates = aggregate->aggregates,
+                             .span = aggregate->span};
   std::map<ColumnId, ColumnId> key_of;  // the inner column -> the GroupAggregate's output for it
   for (const ColumnId id : group) {
     const auto column = described.find(id);
     if (column == described.end()) {
-      return refuse("whose correlated key the pass cannot name");
+      return correlation.Refuse("whose correlated key the pass cannot name");
     }
     grouped.keys.push_back(column->second);
     grouped.key_ids.push_back(ColumnId{std::to_underlying(last_id) + 1});
@@ -862,7 +1004,8 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
     key_of.emplace(id, grouped.key_ids.back());
   }
 
-  // The substitution: every outer id an expression reads becomes its inner equivalent's.
+  // The substitution: every outer id an expression reads becomes its representative's. MapColumns
+  // keeps each expression's name, so the outer names stay printed.
   const auto substitute = [&equivalent](const ExprPtr& expr) {
     return MapColumns(expr, [&equivalent](ColumnExpr column) {
       const auto it = equivalent.find(column.id);
@@ -872,12 +1015,13 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
       return column;
     });
   };
-  LogicalNodePtr right = block->below;
-  if (!kept.empty()) {
+  // Bottom-up: the kept conjuncts over the terminal, then the steps.
+  LogicalNodePtr right = spine.below;
+  if (!equivalences.kept.empty()) {
     std::vector<ExprPtr> exprs;
     std::vector<ColumnId> ids;
     std::vector<Predicate> predicates;
-    for (const Expr* expr : kept) {
+    for (const Expr* expr : equivalences.kept) {
       exprs.push_back(substitute(std::make_shared<const Expr>(*expr)));
       ids.push_back(ColumnId{std::to_underlying(last_id) + 1});
       last_id = ids.back();
@@ -885,86 +1029,123 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
                                      .column = BoundColumn{.id = ids.back(),
                                                            .name = exprs.back()->name,
                                                            .type = LogicalType::kBoolean},
-                                     .span = block->filter->span});
+                                     .span = spine.filter->span});
     }
     right = Make(ComputeNode{
-        .input = std::move(right), .exprs = exprs, .ids = ids, .span = block->computed->span});
+        .input = std::move(right), .exprs = exprs, .ids = ids, .span = spine.computed->span});
     right = Make(FilterNode{
-        .input = std::move(right), .predicates = predicates, .span = block->filter->span});
-  }
-  if (block->args != nullptr) {
-    ComputeNode args = std::get<ComputeNode>(*block->args);
-    for (ExprPtr& expr : args.exprs) {
-      expr = substitute(expr);
-    }
-    args.input = std::move(right);
-    right = Make(std::move(args));
+        .input = std::move(right), .predicates = predicates, .span = spine.filter->span});
   }
   // The keys as the join will name them, taken before `grouped` is moved into its node.
   const std::vector<BoundColumn> group_keys = grouped.keys;
-  grouped.input =
-      RestrictToTheOuterKeys(std::move(right), join, equivalent, null_equal, described, last_id);
-  right = Make(std::move(grouped));
-  // The select item over the aggregate, and the select list, rebuilt above it. A Compute passes
-  // its input's columns through, but a Project outputs only its own, so the group's key columns
-  // are added to it: the join above reads them, and without them its key would name a column its
-  // input does not output, which ResolvePositions turns into an abort.
-  for (const LogicalNodePtr& node : std::ranges::reverse_view(block->above)) {
-    if (const auto* project = std::get_if<ProjectNode>(node.get())) {
-      ProjectNode out = *project;
-      out.input = std::move(right);
-      for (const ColumnId id : group) {
-        BoundColumn column =
-            group_keys[Narrow<std::size_t>(std::ranges::find(group, id) - group.begin())];
-        column.id = key_of.at(id);
-        out.ids.push_back(column.id);
-        out.columns.push_back(std::move(column));
-        if (!out.constants.empty()) {
-          out.constants.emplace_back(std::nullopt);
+  for (const Step& step : std::ranges::reverse_view(spine.steps)) {
+    switch (step.role) {
+      case Role::kArguments: {
+        ComputeNode args = std::get<ComputeNode>(*step.node);
+        for (ExprPtr& expr : args.exprs) {
+          expr = substitute(expr);
         }
+        args.input = std::move(right);
+        right = Make(std::move(args));
+        break;
       }
-      right = Make(std::move(out));
-      continue;
+      case Role::kStatic:
+        grouped.input = RestrictToTheOuterKeys(std::move(right), join, equivalent,
+                                               representatives.null_equal, described, last_id);
+        right = Make(std::move(grouped));
+        break;
+      case Role::kMap: {
+        // A Compute passes its input's columns through, but a Project outputs only its own, so the
+        // group's key columns are added to it: the join above reads them, and without them its key
+        // would name a column its input does not output, which ResolvePositions turns into an
+        // abort.
+        const auto* project = std::get_if<ProjectNode>(step.node.get());
+        if (project == nullptr) {
+          right = WithInputs(*step.node, {std::move(right)});
+          break;
+        }
+        ProjectNode out = *project;
+        out.input = std::move(right);
+        for (const ColumnId id : group) {
+          BoundColumn column =
+              group_keys[Narrow<std::size_t>(std::ranges::find(group, id) - group.begin())];
+          column.id = key_of.at(id);
+          out.ids.push_back(column.id);
+          out.columns.push_back(std::move(column));
+          if (!out.constants.empty()) {
+            out.constants.emplace_back(std::nullopt);
+          }
+        }
+        right = Make(std::move(out));
+        break;
+      }
+      case Role::kDropped:
+        ANTB1_CHECK(false);  // lift mode's only
+        break;
     }
-    right = WithInputs(*node, {std::move(right)});
   }
 
-  // One key per outer column, the outer column equal to the group's output for its equivalent.
+  // One key per outer column, the outer column equal to the group's output for its representative.
   std::vector<JoinKey> keys;
   for (const auto& [id, equiv] : equivalent) {
     const auto outer_column = described.find(id);
     if (outer_column == described.end()) {
-      return refuse("whose correlated key the pass cannot name");
+      return correlation.Refuse("whose correlated key the pass cannot name");
     }
     BoundColumn key = outer_column->second;
     BoundColumn group_key =
         group_keys[Narrow<std::size_t>(std::ranges::find(group, equiv) - group.begin())];
     group_key.id = key_of.at(equiv);
     if (key.type != group_key.type) {
-      return refuse("whose correlated key has two types");
+      return correlation.Refuse("whose correlated key has two types");
     }
     keys.push_back(JoinKey{.left = std::move(key),
                            .right = std::move(group_key),
-                           .null_equal = null_equal.contains(id)});
+                           .null_equal = representatives.null_equal.contains(id)});
   }
-  // Path 2's join is an inner join, so either side may build: the aggregate it puts on the right
-  // is often far larger than the outer rows that probe it (ADR 0026). Its estimate is its left
-  // input's rows: the keys above are exactly the aggregate's group keys, which a group by makes
-  // unique, so each outer row matches at most one group and the join cannot multiply its left
-  // input. That is an upper bound rather than a count of the groups, which nothing estimates --
-  // but leaving it unknown left every join above this rewrite reading its own left input as
-  // unknown, which is what kept a lopsided join building on the wrong side (ADR 0026).
+  // The join is an inner join, so either side may build: the aggregate it puts on the right is
+  // often far larger than the outer rows that probe it (ADR 0026). Its estimate is its left input's
+  // rows: the keys above are exactly the aggregate's group keys, which a group by makes unique, so
+  // each outer row matches at most one group and the join cannot multiply its left input. That is
+  // an upper bound rather than a count of the groups, which nothing estimates -- but leaving it
+  // unknown left every join above this rewrite reading its own left input as unknown, which is what
+  // kept a lopsided join building on the wrong side (ADR 0026).
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
   const std::optional<int64_t> right_rows = EstimateRows(*right);
-  LogicalNodePtr out =
-      Make(JoinNode{.kind = JoinKind::kInner,
-                    .left = join.left,
-                    .right = std::move(right),
-                    .keys = std::move(keys),
-                    .residual = {},
-                    .build = ChooseBuildSide(left_rows, right_rows, build_side_ratio),
-                    .estimate = left_rows,
-                    .span = join.span});
+  return Make(
+      JoinNode{.kind = JoinKind::kInner,
+               .left = join.left,
+               .right = std::move(right),
+               .keys = std::move(keys),
+               .residual = {},
+               .build = ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
+               .estimate = left_rows,
+               .span = join.span});
+}
+
+// The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
+arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
+                                         int64_t build_side_ratio) {
+  const std::optional<Mode> mode = ModeOf(join.kind);
+  if (!mode.has_value()) {
+    return UnsupportedError("a correlated subquery is not supported", join.span);
+  }
+  const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
+  const Correlation correlation{.join = join,
+                                .mode = *mode,
+                                .outer_ids = outer_ids,
+                                .outer = std::set<ColumnId>(outer_ids.begin(), outer_ids.end()),
+                                .last_id = last_id,
+                                .build_side_ratio = build_side_ratio};
+  const std::optional<Spine> spine = Descend(*mode, join.right);
+  if (!spine.has_value()) {
+    return correlation.RefuseShape();
+  }
+  ARROW_ASSIGN_OR_RAISE(LogicalNodePtr out, *mode == Mode::kLift ? LiftJoin(correlation, *spine)
+                                                                 : ValueJoin(correlation, *spine));
+  // Lemma 3.1: the rewrite is legal only when the new join's right input has no free variables
+  // left. A bug in a rule is the only way this fails, and it must not reach ResolvePositions, which
+  // would abort the process rather than fail the query.
   if (!FreeVariables(*std::get<JoinNode>(*out).right).empty()) {
     return arrow::Status::NotImplemented(
         "the unnesting pass left a free variable in a rewritten join's right input");
@@ -972,35 +1153,19 @@ arrow::Result<LogicalNodePtr> Path2(const DependentJoinNode& join, ColumnId& las
   return out;
 }
 
-// The pass, outermost first as the top-down algorithm goes: a dependent join is rewritten before
+// The walk, outermost first as the top-down algorithm goes: a dependent join is rewritten before
 // anything inside it, and the rewrite's own inputs are then walked, so a dependent join nested in
 // a correlated block is rewritten too (or refused at its own span, which is more useful than a
-// blanket refusal at the outer one).
-arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& last_id,
-                                         int64_t build_side_ratio) {
+// blanket refusal at the outer one). An unchanged subtree keeps its node.
+arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node, ColumnId& last_id,
+                                   int64_t build_side_ratio) {
   if (node == nullptr) {
     return node;
   }
   if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
-    switch (dependent->kind) {
-      case JoinKind::kSemi:
-      case JoinKind::kAnti: {
-        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
-                              Path1(*dependent, last_id, build_side_ratio));
-        return UnnestNode(rewritten, last_id, build_side_ratio);  // its inputs may hold more
-      }
-      case JoinKind::kOneRow: {
-        ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
-                              Path2(*dependent, last_id, build_side_ratio));
-        return UnnestNode(rewritten, last_id, build_side_ratio);
-      }
-      case JoinKind::kInner:
-      case JoinKind::kLeft:
-      case JoinKind::kNullAwareAnti:
-      case JoinKind::kFull:
-      case JoinKind::kNullAwareMark:
-        return UnsupportedError("a correlated subquery is not supported", dependent->span);
-    }
+    ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
+                          UnnestJoin(*dependent, last_id, build_side_ratio));
+    return Walk(rewritten, last_id, build_side_ratio);  // its inputs may hold more
   }
   std::vector<LogicalNodePtr> inputs = InputsOf(*node);
   bool changed = false;
@@ -1008,7 +1173,7 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
     if (input == nullptr) {
       continue;
     }
-    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr rewritten, UnnestNode(input, last_id, build_side_ratio));
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr rewritten, Walk(input, last_id, build_side_ratio));
     if (rewritten != input) {
       input = std::move(rewritten);
       changed = true;
@@ -1016,8 +1181,28 @@ arrow::Result<LogicalNodePtr> UnnestNode(const LogicalNodePtr& node, ColumnId& l
   }
   return changed ? WithInputs(*node, std::move(inputs)) : node;
 }
-
 }  // namespace
+
+EmptyValue EmptyValueOf(const AggregateCall& call) {
+  switch (call.kind) {
+    case AggKind::kCountStar:
+    case AggKind::kCount:
+    case AggKind::kCountDistinct:
+    case AggKind::kSumCounts:
+      return Constant{.type = call.type, .value = Int128{0}};
+    case AggKind::kSum:
+    case AggKind::kAvg:
+    case AggKind::kMin:
+    case AggKind::kMax:
+    case AggKind::kStddevSamp:
+    case AggKind::kStddevPop:
+    case AggKind::kVarSamp:
+    case AggKind::kVarPop:
+    case AggKind::kSingleValue:
+      return Constant{.type = call.type, .value = std::monostate{}};
+  }
+  return std::nullopt;
+}
 
 // The outermost dependent join of the plan, nullptr when it has none. Pre-order, so the first one
 // found is the one whose span names the whole correlated subquery.
@@ -1041,7 +1226,7 @@ arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root, int64_t build_s
     return root;
   }
   ColumnId last_id = MaxColumnId(*root);
-  return UnnestNode(root, last_id, build_side_ratio);
+  return Walk(root, last_id, build_side_ratio);
 }
 
 }  // namespace antb1::plan

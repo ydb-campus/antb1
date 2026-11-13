@@ -1,9 +1,12 @@
 #include "../unnesting.h"
 
 #include <cstddef>
+#include <format>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <arrow/result.h>
@@ -12,6 +15,7 @@
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/plan_options.h"
+#include "antb1/plan/sql_status.h"
 
 #include "legacy_unnesting.h"
 #include "plan_test_util.h"
@@ -293,6 +297,222 @@ TEST(UnnestingTest, TheRuleTableBuildsTodaysPlans) {
     EXPECT_EQ(now_nodes, before_nodes);
   }
   EXPECT_GT(compared, 20U);
+}
+
+// The first dependent join of `node`, its right input rewritten by `f`, the rest as it was.
+LogicalNodePtr WithRight(const LogicalNodePtr& node,
+                         const std::function<LogicalNodePtr(const LogicalNodePtr&)>& f) {
+  if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+    DependentJoinNode out = *dependent;
+    out.right = f(out.right);
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  for (LogicalNodePtr& input : inputs) {
+    if (input != nullptr && FirstDependentJoin(input) != nullptr) {
+      input = WithRight(input, f);
+      return WithInputs(*node, std::move(inputs));
+    }
+  }
+  return node;
+}
+
+// The first dependent join of `node`, its kind replaced.
+LogicalNodePtr WithKind(const LogicalNodePtr& node, JoinKind kind) {
+  if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+    DependentJoinNode out = *dependent;
+    out.kind = kind;
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  for (LogicalNodePtr& input : inputs) {
+    if (input != nullptr && FirstDependentJoin(input) != nullptr) {
+      input = WithKind(input, kind);
+      return WithInputs(*node, std::move(inputs));
+    }
+  }
+  return node;
+}
+
+// `node`'s correlated filter -- the first Filter over a Compute -- rewritten by `f`.
+LogicalNodePtr WithFilter(const LogicalNodePtr& node,
+                          const std::function<FilterNode(const FilterNode&)>& f) {
+  if (const auto* filter = std::get_if<FilterNode>(node.get());
+      filter != nullptr && std::holds_alternative<ComputeNode>(*filter->input)) {
+    return std::make_shared<const LogicalNode>(f(*filter));
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  if (inputs.size() != 1) {
+    return node;
+  }
+  inputs.front() = WithFilter(inputs.front(), f);
+  return WithInputs(*node, std::move(inputs));
+}
+
+constexpr std::string_view kExists =
+    "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND u.i32 > 0)";
+constexpr std::string_view kNotExists =
+    "SELECT i16 FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16)";
+constexpr std::string_view kScalar =
+    "SELECT i16 FROM t WHERE i32 > (SELECT MAX(u.i32) FROM u WHERE u.i64 = t.i64)";
+
+// The refusal Unnest gives the bound `sql` with `change` applied to its plan, or "" where it
+// answers.
+std::string RefusalOf(std::string_view sql,
+                      const std::function<LogicalNodePtr(const LogicalNodePtr&)>& change) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  if (!plan.ok()) {
+    return "<bind error>";
+  }
+  const arrow::Result<LogicalNodePtr> out = Unnest(change(plan->root), kBuildSideRatio);
+  if (out.ok()) {
+    return "";
+  }
+  EXPECT_NE(GetSqlError(out.status()), nullptr) << out.status().ToString();
+  return out.status().message();
+}
+
+// ADR 0041's decision 16: a dependent join is unnested by its kind's traits. A semi or anti join
+// takes its correlated conjuncts (lift mode), a one-row join appends a static aggregate's row
+// (value mode), and every other kind -- one whose join takes no residual, or that the binder never
+// makes dependent -- keeps the one refusal it has always had.
+TEST(UnnestingTest, EveryKindButSemiAntiAndOneRowIsRefused) {
+  for (const JoinKind kind :
+       {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+        JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull, JoinKind::kNullAwareMark}) {
+    SCOPED_TRACE(ToString(kind));
+    const std::string refusal =
+        RefusalOf(kind == JoinKind::kOneRow ? kScalar : kExists,
+                  [kind](const LogicalNodePtr& root) { return WithKind(root, kind); });
+    switch (kind) {
+      case JoinKind::kSemi:
+      case JoinKind::kAnti:
+      case JoinKind::kOneRow:
+        EXPECT_EQ(refusal, "");
+        break;
+      default:
+        EXPECT_EQ(refusal, "a correlated subquery is not supported");
+    }
+  }
+}
+
+// Decision 17: the descent has a rule per node type, and each mode declines the nodes it has no
+// rule for yet with its shape message, whatever the node: one the binder never puts on the way
+// (a LIMIT, a grouping, a join, a union, a second dependent join, a bare leaf), or a mode's own
+// misfit (an aggregate under EXISTS, a sort over a scalar's aggregate).
+TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
+  const auto over = [](const std::function<LogicalNode(const LogicalNodePtr&)>& make) {
+    return [make](const LogicalNodePtr& root) {
+      return WithRight(root, [&make](const LogicalNodePtr& right) {
+        return std::make_shared<const LogicalNode>(make(right));
+      });
+    };
+  };
+  const std::vector<std::pair<std::string, std::function<LogicalNode(const LogicalNodePtr&)>>>
+      nodes = {
+          {"a Limit",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(LimitNode{.input = in, .limit = 1, .offset = 0, .span = {}});
+           }},
+          {"a Sort",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(SortNode{.input = in, .keys = {}, .span = {}});
+           }},
+          {"an Aggregate",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(AggregateNode{.input = in, .aggregates = {}, .span = {}});
+           }},
+          {"a GroupAggregate",
+           [](const LogicalNodePtr& in) {
+             return LogicalNode(GroupAggregateNode{
+                 .input = in, .keys = {}, .key_ids = {}, .aggregates = {}, .span = {}});
+           }},
+  };
+  constexpr std::string_view kLift = "over a block that is not a plain FROM and WHERE";
+  constexpr std::string_view kValue =
+      "over a block that is not an ungrouped aggregate over its correlation";
+  for (const auto& [name, make] : nodes) {
+    SCOPED_TRACE(name);
+    // Lift mode drops a Sort above the filter, as it drops the select list; anything else above
+    // it is refused.
+    const std::string exists = RefusalOf(kExists, over(make));
+    const std::string not_exists = RefusalOf(kNotExists, over(make));
+    if (name == "a Sort") {
+      EXPECT_EQ(exists, "");
+      EXPECT_EQ(not_exists, "");
+    } else {
+      EXPECT_EQ(exists, std::format("a correlated EXISTS {} is not supported", kLift));
+      EXPECT_EQ(not_exists, std::format("a correlated NOT EXISTS {} is not supported", kLift));
+    }
+    // Value mode admits nothing over its static aggregate but the maps.
+    EXPECT_EQ(RefusalOf(kScalar, over(make)),
+              std::format("a correlated scalar subquery {} is not supported", kValue));
+  }
+  // A leaf in place of the block, and a join or a union over it: no correlated filter on the way.
+  const Catalog catalog = MakeCatalog();
+  auto leaf = BindSql("SELECT i16 FROM ok", catalog);
+  ASSERT_TRUE(leaf.ok()) << leaf.status().ToString();
+  const auto replaced = [&leaf](const LogicalNodePtr& root) {
+    return WithRight(root, [&leaf](const LogicalNodePtr& right) {
+      ColumnId last = MaxColumnId(*right);
+      return CloneWithFreshIds(leaf->root, last);
+    });
+  };
+  EXPECT_EQ(RefusalOf(kExists, replaced),
+            std::format("a correlated EXISTS {} is not supported", kLift));
+  EXPECT_EQ(RefusalOf(kScalar, replaced),
+            std::format("a correlated scalar subquery {} is not supported", kValue));
+  const auto unioned = [](const LogicalNodePtr& root) {
+    return WithRight(root, [](const LogicalNodePtr& right) {
+      return std::make_shared<const LogicalNode>(
+          UnionAllNode{.inputs = {right}, .columns = {}, .ids = {}, .span = {}});
+    });
+  };
+  EXPECT_EQ(RefusalOf(kExists, unioned),
+            std::format("a correlated EXISTS {} is not supported", kLift));
+}
+
+// Decision 17's first row: each conjunct of the correlated filter is a kIsTrue over a column its
+// Compute defines; any other is refused in each mode's words.
+TEST(UnnestingTest, AConjunctTheFilterRuleDoesNotRecognizeIsRefused) {
+  const auto unrecognized = [](const LogicalNodePtr& root) {
+    return WithRight(root, [](const LogicalNodePtr& right) {
+      return WithFilter(right, [](const FilterNode& filter) {
+        FilterNode out = filter;
+        out.predicates.front().kind = Predicate::Kind::kIsNotNull;
+        return out;
+      });
+    });
+  };
+  EXPECT_EQ(RefusalOf(kExists, unrecognized),
+            "a correlated EXISTS whose correlated conjunct the pass does not recognize is not "
+            "supported");
+  EXPECT_EQ(RefusalOf(kScalar, unrecognized),
+            "a correlated scalar subquery whose correlated conjunct the pass does not recognize is "
+            "not supported");
+}
+
+// Decision 19: a static aggregate's empty values. COUNT in each spelling, and a sum of counts, is
+// 0; every other call NULL; each of the call's type.
+TEST(UnnestingTest, EmptyValuesFollowDecisionNineteen) {
+  for (const AggKind kind :
+       {AggKind::kCountStar, AggKind::kCount, AggKind::kSum, AggKind::kAvg, AggKind::kMin,
+        AggKind::kMax, AggKind::kCountDistinct, AggKind::kSumCounts, AggKind::kStddevSamp,
+        AggKind::kStddevPop, AggKind::kVarSamp, AggKind::kVarPop, AggKind::kSingleValue}) {
+    const LogicalType type = kind == AggKind::kAvg ? LogicalType::kDouble : LogicalType::kBigInt;
+    const EmptyValue value = EmptyValueOf(AggregateCall{.kind = kind, .arg = {}, .type = type});
+    ASSERT_TRUE(value.has_value());
+    EXPECT_EQ(value->type, type);
+    const bool count = kind == AggKind::kCountStar || kind == AggKind::kCount ||
+                       kind == AggKind::kCountDistinct || kind == AggKind::kSumCounts;
+    if (count) {
+      EXPECT_EQ(std::get<Int128>(value->value), Int128{0});
+    } else {
+      EXPECT_TRUE(std::holds_alternative<std::monostate>(value->value));
+    }
+  }
 }
 
 }  // namespace
