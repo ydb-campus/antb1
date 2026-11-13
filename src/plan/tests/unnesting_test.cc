@@ -12,6 +12,7 @@
 #include <arrow/result.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/int128.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/plan_options.h"
@@ -513,6 +514,160 @@ TEST(UnnestingTest, EmptyValuesFollowDecisionNineteen) {
       EXPECT_TRUE(std::holds_alternative<std::monostate>(value->value));
     }
   }
+}
+
+// ---- decision 20: the consumer proof ----
+
+constexpr ColumnId kValue{50};  // the column the dependent join appends
+constexpr ColumnId kOuter{51};  // an outer column
+
+BoundColumn Bigint(ColumnId id) {
+  return BoundColumn{.id = id, .name = "c", .type = LogicalType::kBigInt};
+}
+
+LogicalNode FilterOf(std::vector<Predicate> predicates) {
+  return FilterNode{.input = nullptr, .predicates = std::move(predicates), .span = {}};
+}
+
+Predicate Compare(ColumnId column, CompareOp op, int64_t constant) {
+  return Predicate{.kind = Predicate::Kind::kCompare,
+                   .column = Bigint(column),
+                   .op = op,
+                   .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{constant}}};
+}
+
+Predicate CompareColumns(ColumnId column, CompareOp op, ColumnId other) {
+  return Predicate{.kind = Predicate::Kind::kCompareColumns,
+                   .column = Bigint(column),
+                   .other = Bigint(other),
+                   .op = op};
+}
+
+JoinBack Proof(const std::vector<LogicalNode>& above_root_first, EmptyValue value) {
+  std::vector<const LogicalNode*> above;
+  for (const LogicalNode& node : above_root_first) {
+    above.push_back(&node);
+  }
+  return ProveJoinBack(above, {{kValue, std::move(value)}});
+}
+
+const EmptyValue kNullValue = Constant{.type = LogicalType::kBigInt, .value = std::monostate{}};
+
+// A comparison of the value is true for no row where the value is NULL, whatever its other side:
+// the INNER join back loses no row SQL keeps.
+TEST(UnnestingTest, TheProofAcceptsAComparisonOverAnEmptyValueOfNull) {
+  EXPECT_EQ(Proof({FilterOf({CompareColumns(kOuter, CompareOp::kGt, kValue)})}, kNullValue),
+            JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kLt, 3)})}, kNullValue), JoinBack::kInner);
+  // Through a strict Compute: 2 * v is NULL where v is.
+  const ExprPtr v = std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.id = kValue}, .type = LogicalType::kBigInt, .name = "v"});
+  const ExprPtr two_v = std::make_shared<const Expr>(Expr{
+      .node = ArithExpr{.op = ArithOp::kMultiply,
+                        .left = std::make_shared<const Expr>(Expr{
+                            .node = ConstantExpr{.value = Constant{.type = LogicalType::kBigInt,
+                                                                   .value = Int128{2}}},
+                            .type = LogicalType::kBigInt,
+                            .name = "2"}),
+                        .right = v},
+      .type = LogicalType::kBigInt,
+      .name = "2 * v"});
+  constexpr ColumnId kTwoV{52};
+  EXPECT_EQ(Proof({FilterOf({CompareColumns(kTwoV, CompareOp::kGt, kOuter)}),
+                   ComputeNode{.input = nullptr, .exprs = {two_v}, .ids = {kTwoV}, .span = {}}},
+                  kNullValue),
+            JoinBack::kInner);
+}
+
+// What can pass the empty value, or reads none of it, leaves the join back LEFT: IS NULL and the
+// DISTINCT FROM pair, a Compute that is not strict, a node on the way that is not a Compute, a
+// Filter that reads no value, and nothing above at all.
+TEST(UnnestingTest, TheProofRefusesWhatCanPassTheEmptyValue) {
+  EXPECT_EQ(
+      Proof({FilterOf({Predicate{.kind = Predicate::Kind::kIsNull, .column = Bigint(kValue)}})},
+            kNullValue),
+      JoinBack::kLeft);
+  for (const Predicate::Kind kind :
+       {Predicate::Kind::kIsDistinct, Predicate::Kind::kIsNotDistinct}) {
+    EXPECT_EQ(Proof({FilterOf({Predicate{
+                        .kind = kind, .column = Bigint(kValue), .other = Bigint(kOuter)}})},
+                    kNullValue),
+              JoinBack::kLeft);
+  }
+  const ExprPtr v = std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.id = kValue}, .type = LogicalType::kBigInt, .name = "v"});
+  const ExprPtr coalesce = std::make_shared<const Expr>(
+      Expr{.node = CaseExpr{.whens = {nullptr}, .thens = {v}, .otherwise = v},
+           .type = LogicalType::kBigInt,
+           .name = "COALESCE(v, v)"});
+  constexpr ColumnId kCoalesced{52};
+  EXPECT_EQ(
+      Proof({FilterOf({Compare(kCoalesced, CompareOp::kGt, 0)}),
+             ComputeNode{.input = nullptr, .exprs = {coalesce}, .ids = {kCoalesced}, .span = {}}},
+            kNullValue),
+      JoinBack::kLeft);
+  EXPECT_EQ(
+      Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+             ProjectNode{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = {}}},
+            kNullValue),
+      JoinBack::kLeft);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                   FilterOf({Compare(kOuter, CompareOp::kGt, 0)})},
+                  kNullValue),
+            JoinBack::kLeft);
+  EXPECT_EQ(Proof({}, kNullValue), JoinBack::kLeft);
+}
+
+// An empty value that is no NULL -- COUNT's 0, which SQ6 answers -- is decided by the comparison
+// over it: `v > 0` is false for 0, `v >= 0` true, and `v > o.x` depends on the outer row.
+TEST(UnnestingTest, TheProofReadsAConstantEmptyValue) {
+  const EmptyValue zero = Constant{.type = LogicalType::kBigInt, .value = Int128{0}};
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)})}, zero), JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGe, 0)})}, zero), JoinBack::kLeft);
+  EXPECT_EQ(Proof({FilterOf({CompareColumns(kValue, CompareOp::kGt, kOuter)})}, zero),
+            JoinBack::kLeft);
+}
+
+// Every correlated scalar subquery SQL answers today proves its INNER join back, nested and stacked
+// ones too; a dependent join with nothing above it -- a plan only a test builds -- does not.
+TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view sql : {
+           kScalar,
+           std::string_view("SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) * 2 FROM u WHERE "
+                            "u.i64 = t.i64)"),
+           std::string_view("SELECT i16 FROM t WHERE i32 > (SELECT MAX(u.i32) FROM u WHERE u.i64 = "
+                            "t.i64) AND i16 < (SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)"),
+           std::string_view("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 "
+                            "AND u.i32 > (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = u.i16))"),
+           std::string_view("SELECT i16 FROM t WHERE i32 > (SELECT MAX(u.i32) FROM u WHERE u.i64 = "
+                            "t.i64 AND EXISTS (SELECT 1 FROM ok WHERE ok.i16 = u.i16))"),
+       }) {
+    SCOPED_TRACE(sql);
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+    UnnestReport report;
+    const arrow::Result<LogicalNodePtr> out = Unnest(plan->root, kBuildSideRatio, &report);
+    ASSERT_TRUE(out.ok()) << out.status().ToString();
+    EXPECT_FALSE(report.join_backs.empty());
+    for (const UnnestReport::Entry& entry : report.join_backs) {
+      EXPECT_EQ(entry.join_back, JoinBack::kInner);
+    }
+  }
+  // The dependent join alone, no consumer above it: the proof fails, and the join back is still the
+  // INNER one SQ0 builds.
+  auto plan = BindSql(kScalar, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  LogicalNodePtr alone = plan->root;
+  while (!std::holds_alternative<DependentJoinNode>(*alone)) {
+    alone = InputsOf(*alone).front();
+  }
+  UnnestReport report;
+  const arrow::Result<LogicalNodePtr> out = Unnest(alone, kBuildSideRatio, &report);
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  ASSERT_EQ(report.join_backs.size(), 1U);
+  EXPECT_EQ(report.join_backs.front().join_back, JoinBack::kLeft);
+  EXPECT_EQ(std::get<JoinNode>(**out).kind, JoinKind::kInner);
 }
 
 }  // namespace

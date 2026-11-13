@@ -9,6 +9,7 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -18,6 +19,7 @@
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
+#include "antb1/plan/branch_truth.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
@@ -385,6 +387,8 @@ struct Correlation {
   std::set<ColumnId> outer;         // the same, as a set
   ColumnId& last_id;
   int64_t build_side_ratio;
+  std::span<const LogicalNode* const> above;  // the plan's root down to the join's parent
+  UnnestReport* report = nullptr;
 
   // The refusal of a shape, in the wording each mode has always had, at the subquery's span.
   [[nodiscard]] arrow::Status Refuse(std::string_view what) const {
@@ -969,6 +973,17 @@ arrow::Result<LogicalNodePtr> ValueJoin(const Correlation& correlation, const Sp
   ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
   ARROW_ASSIGN_OR_RAISE(const Representatives representatives,
                         RepresentativesOf(correlation, spine, equivalences));
+  // Decision 20's proof, over the values the subquery appends. It decides nothing yet: the join
+  // back is INNER, which every shape this rule answers proves (the binder puts the comparison that
+  // reads the value directly above the join); SQ6 joins back LEFT where it fails.
+  std::map<ColumnId, EmptyValue> appended;
+  for (const ColumnId id : OutputIds(*join.right)) {
+    appended.insert_or_assign(id, values.at(id));
+  }
+  const JoinBack join_back = ProveJoinBack(correlation.above, appended);
+  if (correlation.report != nullptr) {
+    correlation.report->join_backs.push_back({.span = join.span, .join_back = join_back});
+  }
   const std::map<ColumnId, ColumnId>& equivalent = representatives.of;
   const std::map<ColumnId, BoundColumn>& described = equivalences.described;
 
@@ -1125,7 +1140,9 @@ arrow::Result<LogicalNodePtr> ValueJoin(const Correlation& correlation, const Sp
 
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
 arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
-                                         int64_t build_side_ratio) {
+                                         int64_t build_side_ratio,
+                                         std::span<const LogicalNode* const> above,
+                                         UnnestReport* report) {
   const std::optional<Mode> mode = ModeOf(join.kind);
   if (!mode.has_value()) {
     return UnsupportedError("a correlated subquery is not supported", join.span);
@@ -1136,7 +1153,9 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
                                 .outer_ids = outer_ids,
                                 .outer = std::set<ColumnId>(outer_ids.begin(), outer_ids.end()),
                                 .last_id = last_id,
-                                .build_side_ratio = build_side_ratio};
+                                .build_side_ratio = build_side_ratio,
+                                .above = above,
+                                .report = report};
   const std::optional<Spine> spine = Descend(*mode, join.right);
   if (!spine.has_value()) {
     return correlation.RefuseShape();
@@ -1156,31 +1175,50 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
 // The walk, outermost first as the top-down algorithm goes: a dependent join is rewritten before
 // anything inside it, and the rewrite's own inputs are then walked, so a dependent join nested in
 // a correlated block is rewritten too (or refused at its own span, which is more useful than a
-// blanket refusal at the outer one). An unchanged subtree keeps its node.
-arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node, ColumnId& last_id,
-                                   int64_t build_side_ratio) {
-  if (node == nullptr) {
-    return node;
-  }
-  if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
-    ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
-                          UnnestJoin(*dependent, last_id, build_side_ratio));
-    return Walk(rewritten, last_id, build_side_ratio);  // its inputs may hold more
-  }
-  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
-  bool changed = false;
-  for (LogicalNodePtr& input : inputs) {
-    if (input == nullptr) {
-      continue;
+// blanket refusal at the outer one). An unchanged subtree keeps its node. The walk keeps the nodes
+// above the one it is at, root first, for the consumer proof: a rewritten join stands where its
+// dependent join stood, under the same nodes.
+class Walker {
+ public:
+  Walker(ColumnId& last_id, int64_t build_side_ratio, UnnestReport* report)
+      : last_id_(last_id), build_side_ratio_(build_side_ratio), report_(report) {}
+
+  arrow::Result<LogicalNodePtr> Walk(const LogicalNodePtr& node) {
+    if (node == nullptr) {
+      return node;
     }
-    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr rewritten, Walk(input, last_id, build_side_ratio));
-    if (rewritten != input) {
-      input = std::move(rewritten);
-      changed = true;
+    if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
+      ARROW_ASSIGN_OR_RAISE(const LogicalNodePtr rewritten,
+                            UnnestJoin(*dependent, last_id_, build_side_ratio_, above_, report_));
+      return Walk(rewritten);  // its inputs may hold more
     }
+    std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+    bool changed = false;
+    above_.push_back(node.get());
+    for (LogicalNodePtr& input : inputs) {
+      if (input == nullptr) {
+        continue;
+      }
+      arrow::Result<LogicalNodePtr> rewritten = Walk(input);
+      if (!rewritten.ok()) {
+        above_.pop_back();
+        return rewritten.status();
+      }
+      if (*rewritten != input) {
+        input = *std::move(rewritten);
+        changed = true;
+      }
+    }
+    above_.pop_back();
+    return changed ? WithInputs(*node, std::move(inputs)) : node;
   }
-  return changed ? WithInputs(*node, std::move(inputs)) : node;
-}
+
+ private:
+  ColumnId& last_id_;
+  int64_t build_side_ratio_;
+  UnnestReport* report_;
+  std::vector<const LogicalNode*> above_;
+};
 }  // namespace
 
 EmptyValue EmptyValueOf(const AggregateCall& call) {
@@ -1204,6 +1242,55 @@ EmptyValue EmptyValueOf(const AggregateCall& call) {
   return std::nullopt;
 }
 
+JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
+                       const std::map<ColumnId, EmptyValue>& values) {
+  std::map<ColumnId, EmptyValue> tracked = values;
+  const auto value_of = [&tracked](const std::optional<BoundColumn>& column) -> EmptyValue {
+    if (!column.has_value()) {
+      return std::nullopt;
+    }
+    const auto it = tracked.find(column->id);
+    return it == tracked.end() ? std::nullopt : it->second;
+  };
+  const auto reads = [&tracked](const std::optional<BoundColumn>& column) {
+    return column.has_value() && tracked.contains(column->id);
+  };
+  for (const LogicalNode* node : std::ranges::reverse_view(above)) {
+    if (const auto* compute = std::get_if<ComputeNode>(node)) {
+      for (std::size_t i = 0; i < compute->exprs.size() && i < compute->ids.size(); ++i) {
+        std::vector<ColumnId> ids;
+        CollectColumnIds(*compute->exprs[i], ids);
+        if (!std::ranges::any_of(ids, [&tracked](ColumnId id) { return tracked.contains(id); })) {
+          continue;
+        }
+        const bool null =
+            IsStrict(*compute->exprs[i]) && std::ranges::any_of(ids, [&](ColumnId id) {
+              const auto it = tracked.find(id);
+              return it != tracked.end() && IsNull(it->second);
+            });
+        tracked.insert_or_assign(
+            compute->ids[i],
+            null ? EmptyValue(Constant{.type = compute->exprs[i]->type, .value = std::monostate{}})
+                 : EmptyValue());
+      }
+      continue;
+    }
+    const auto* filter = std::get_if<FilterNode>(node);
+    if (filter == nullptr) {
+      return JoinBack::kLeft;  // a node on the way that is not a Compute
+    }
+    for (const Predicate& predicate : filter->predicates) {
+      if ((reads(predicate.column) || reads(predicate.other)) &&
+          TruthOver(predicate, value_of(predicate.column), value_of(predicate.other)) ==
+              BranchTruth::kNever) {
+        return JoinBack::kInner;  // every row whose value is empty fails this conjunct
+      }
+    }
+    return JoinBack::kLeft;  // the first Filter on the way rejects nothing for sure
+  }
+  return JoinBack::kLeft;  // nothing reads the value: an INNER join would drop outer rows
+}
+
 // The outermost dependent join of the plan, nullptr when it has none. Pre-order, so the first one
 // found is the one whose span names the whole correlated subquery.
 const DependentJoinNode* FirstDependentJoin(const LogicalNodePtr& node) {
@@ -1221,12 +1308,13 @@ const DependentJoinNode* FirstDependentJoin(const LogicalNodePtr& node) {
   return nullptr;
 }
 
-arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root, int64_t build_side_ratio) {
+arrow::Result<LogicalNodePtr> Unnest(const LogicalNodePtr& root, int64_t build_side_ratio,
+                                     UnnestReport* report) {
   if (FirstDependentJoin(root) == nullptr) {
     return root;
   }
   ColumnId last_id = MaxColumnId(*root);
-  return Walk(root, last_id, build_side_ratio);
+  return Walker(last_id, build_side_ratio, report).Walk(root);
 }
 
 }  // namespace antb1::plan
