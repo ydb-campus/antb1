@@ -48,7 +48,6 @@ if(ANTB1_BUILD_TESTS)
       tests/union_branches_test.cc
       tests/optimizer_test.cc
       tests/unnesting_test.cc
-      tests/legacy_unnesting.cc
       tests/shared_sub_plans_test.cc
       tests/explain_test.cc
       tests/logical_plan_test.cc

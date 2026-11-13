@@ -199,8 +199,10 @@ steps (only step 7 uses more than one thread):
    column gets a `plan::ColumnId` where it is created (a field, a computed expression, an aggregate call or key, a
    select item), and a column reference names the column it reads by id and by its position in the input ([ADR
    0022](adr/0022-joins-and-query-blocks.md)).
-5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass, which replaces every `DependentJoin` with
-   ordinary joins or rejects the query with exit code 4, so no later rule and no operator meets one (ADR 0023); then
+5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass (`src/plan/unnesting.h`), which replaces
+   every `DependentJoin` with ordinary joins or rejects the query with exit code 4, so no later rule and no operator
+   meets one (ADR 0023): one rule table, read by the join's kind traits, with a rule per node type on the way to the
+   correlated filter and substitution as its terminal step (ADR 0041's decisions 16 to 20); then
    the conditions of a `Filter` over a `UnionAll` go on top of each of its inputs, and an input whose constants make
    one never true is ruled out (a union of one input stays a union; of none, its first input stays, under a `FALSE`
    filter: ADR 0036's X7a); `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other

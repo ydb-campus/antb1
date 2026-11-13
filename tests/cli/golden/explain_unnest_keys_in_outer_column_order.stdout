@@ -1,0 +1,8 @@
+Output: zn_id:INTEGER
+Project zn_id
+  Sort zn_id ASC NULLS LAST
+    Filter zn_id > "max(c.ct_pop)"
+      Join INNER build=right keys=["z.zn_row" = "c.ct_row", "z.zn_city" = "c.ct_id", "z.zn_parent" = "c.ct_pop"] carries 6 of 8 unread above
+        Scan table=zones source=parquet(files=1, rows=40) columns=[zn_row, zn_id, zn_city, zn_parent]
+        GroupAggregate keys=["c.ct_row", "c.ct_id", "c.ct_pop"] MAX(ct_pop)
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_row, ct_id, ct_pop]

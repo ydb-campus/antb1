@@ -597,6 +597,10 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
       list and every ON, earlier WHERE conjuncts, its select list, and for a HAVING EXISTS its grouping) reports its
       bind errors first (ADR 0041's SQ4a update);
     - IS NOT DISTINCT FROM keys: built with OJ5b (its update above).
+- Update (2026-11-13, ADR 0041's SQ0): **Path 1 and Path 2 are now the lift and value modes of one rule table**
+  (`src/plan/unnesting.{h,cc}`), chosen by the dependent join's kind traits, with a rule per node type on the way to
+  the correlated filter and substitution as the terminal step. Their plans, the ids they mint and their refusal
+  messages are unchanged; the consumer proof runs and decides nothing yet (ADR 0041's SQ0 update).
 
 ## Alternatives considered
 

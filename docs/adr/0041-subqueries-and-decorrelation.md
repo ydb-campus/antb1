@@ -1007,6 +1007,42 @@ changes.
 - **From the review.** A mark is a value of the condition, so a CASE over `2 IN (q)` compared with a number is no
   comparison of two literals (`ReadsColumn` counts an IN's mark as it counts a scalar's or an EXISTS's value).
 
+## Update (2026-11-13, SQ0): one rule table for the unnesting, built
+
+SQ0 changes no answer, no plan of a shape answered today and no refusal message. No query completes and the ratchet
+stays at 80.
+
+- **Decisions 16 and 17, as built.** `src/plan/unnesting.{h,cc}` holds the pass, moved out of `optimizer.cc`.
+  - A dependent join's kind picks its mode through `JoinKindTraits`: lift mode for a kind that filters its left input
+    and takes residuals (semi, anti: ADR 0023's Path 1), value mode for a one-row join (Path 2). Every other kind keeps
+    "a correlated subquery is not supported"; a null-aware anti join and a mark take no residual.
+  - One exhaustive visitor, the descent, has a rule per node type and no other overload. It walks from the dependent
+    join's right input to the correlated filter (the first Filter over a Compute):
+    - lift mode drops a Project, a Compute or a Sort above it;
+    - value mode keeps the maps, groups the static Aggregate and substitutes the Compute of its arguments;
+    - every other node refuses the shape with today's message. **The Join rule is deferred to SQ8** (the maintainer's
+      choice, 2026-11-13): no SQL reaches it, since the binder pulls every correlation above the block's joins.
+  - The checks run in today's order -- shape, calls, maps and empty values, conjuncts, representatives -- so a shape
+    with two defects keeps today's message. A test pins it.
+- **Decision 18.** Substitution is the only terminal step. Lift mode moves every correlated conjunct into the join,
+  so it builds no classes and leaves nothing to substitute; value mode replaces each outer reference by its
+  representative, keys in ascending outer column id, as before.
+- **Decision 19.** `EmptyValueOf` gives each call's empty value of the call's own type (0 for the COUNT kinds and a sum
+  of counts, NULL otherwise); the static aggregate's rule carries them through the maps, replacing
+  `StrictAggregates` and `NullOverNoRows` with the same outcomes.
+- **Decision 20, read literally.** The proof follows the subquery's value from the join's parent up through Computes
+  to the first Filter that reads it, which must be true for no row holding the empty value (`TruthOver`). A Filter
+  that reads no value counts as a node on the way and leaves the join LEFT. The verdict is recorded and decides
+  nothing: the join back stays INNER. Every SQL shape answered today passes, checked by making a failed proof fatal
+  over the guard and the TPC-derived plans. **For SQ6:** the hand-built `optimizer_test` plans with no consumer above
+  the join fail it, correctly; when the proof decides, they gain a consumer Filter or expect LEFT.
+- **Decision 28.** The guard, outside the repository, held 570 correlated queries (every correlated `.slt` record,
+  `binder_test`'s correlated SQL, the CLI golden and boundary shapes) with main's EXPLAIN, answers and exit codes:
+  every commit showed no difference, and nor did the EXPLAIN of every TPC-derived query. A shadow test compared the
+  rule table with a frozen copy of the paths, plan by plan and id by id, until the paths were gone. What only the guard
+  saw is now pinned by CLI goldens: a key named by its last spelling, keys in outer-column order, cast order, and the
+  order of refusals across nested and stacked subqueries.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

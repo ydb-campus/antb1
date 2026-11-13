@@ -190,7 +190,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ1 | Uncorrelated subqueries as values in conditions: WHERE, an inner ON (inside a FULL JOIN's left input too) and HAVING, under AND, OR, NOT and CASE; each block's slots for their joins, and each subquery bound once | | Built (SQ1a: WHERE and an inner ON; SQ1b: HAVING) |
 | SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Built (SQ2a: blocks that do not aggregate; SQ2b: blocks that aggregate) |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Built (SQ7a: the mark under OR, NOT and CASE; SQ7b: the IN forms) |
-| SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Planned |
+| SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Built |
 | SQ5, SQ6 | One PR or two. SQ6: correlated static aggregates of any kind, COUNT included, joined back LEFT with their empty values where the consumer proof fails; SQ5: correlated aggregates as values in the per-row slots, under the proof. Split, SQ6 lands first, since SQ5's correlated aggregates of any kind with any select item need its LEFT join back; SQ6 completes 41 and SQ5 6 | 6, 41 | Planned |
 | SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Planned |
 | **Phase 9** | **Window functions** | | |
@@ -898,6 +898,11 @@ Update (2026-11-13, SQ7b): SQ7b, built, answers `= ANY`, `= SOME` and `<> ALL`, 
 value probes and IN over a set operation, and makes decision 23's SQ7 row DuckDB's bind error (ADR 0041's SQ7b
 update), which completes SQ7. No query completes, the ratchet stays at 80, and no TPC-H or TPC-DS plan changes. SQ0,
 the unnesting framework, is next.
+
+Update (2026-11-13, SQ0): SQ0, built, replaces ADR 0023's Path 1 and Path 2 with one rule table and lands the consumer
+proof, deciding nothing yet (ADR 0041's SQ0 update). No answer, plan or refusal message changes, no query completes,
+the ratchet stays at 80, and no TPC-H or TPC-DS plan changes. SQ5 and SQ6, correlated values and the LEFT join back,
+follow.
 
 ## Alternatives considered
 
