@@ -120,7 +120,7 @@ bool HasSubquery(const GeneratedQuery& q) {
          q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
          q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue) ||
          q.features.Has(Feature::kGroupValue) || q.features.Has(Feature::kInMark) ||
-         q.features.Has(Feature::kInForm);
+         q.features.Has(Feature::kInForm) || q.features.Has(Feature::kCorrelatedEmptyValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -1571,7 +1571,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
   EXPECT_EQ(q.features.Has(Feature::kQualifiedName),
             qualified || q.features.Has(Feature::kCorrelatedExists) ||
-                q.features.Has(Feature::kCorrelatedAggregate));
+                q.features.Has(Feature::kCorrelatedAggregate) ||
+                q.features.Has(Feature::kCorrelatedEmptyValue));
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
   // A subquery's block always names its one table, so it records kTableName even where every FROM
   // item is read by a path; a correlated block also qualifies both ends of its key, so it records
@@ -2463,9 +2464,10 @@ TEST(QueryGenerator, StarsFollowTheirRules) {
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
 // the query it did before ADR 0023's T3, SQL and features alike.
 TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
-  // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms.
-  const FeatureSet with_corr =
-      Union(kSupportedFeatures, {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
+  // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms; and
+  // SQ6's empty values (kCorrelatedEmptyValue), which read the same list, go too.
+  const FeatureSet with_corr = Union(kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue}),
+                                     {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
   const auto with = MakeOver(JoinTables(), 71, {.supported = with_corr, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 71,
@@ -3362,9 +3364,10 @@ TEST(QueryGenerator, GroupValuesChangeOnlyTheirQueries) {
 // stream of its own, only where the query holds no other subquery, so declaring it changes the
 // queries that take one and no others, and every other subquery feature keeps its queries.
 TEST(QueryGenerator, InMarksChangeOnlyTheirQueries) {
-  // Without kInForm, drawn after a mark only where none fired, so that a query a mark leaves out
-  // holds no subquery at all.
-  const FeatureSet supported = kSupportedFeatures.Minus({Feature::kInForm});
+  // Without kInForm and kCorrelatedEmptyValue, drawn after a mark only where none fired, so that a
+  // query a mark leaves out holds no subquery at all.
+  const FeatureSet supported =
+      kSupportedFeatures.Minus({Feature::kInForm, Feature::kCorrelatedEmptyValue});
   const auto with = MakeOver(JoinTables(), 97, {.supported = supported, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 97, {.supported = supported.Minus({Feature::kInMark}), .target_percent = 0});
@@ -3578,11 +3581,12 @@ TEST(QueryGenerator, InMarksAreConditionsOverUncorrelatedSets) {
 // the query holds no other subquery and no mark, so declaring them changes the queries that take
 // one and no others.
 TEST(QueryGenerator, InFormsChangeOnlyTheirQueries) {
-  const auto with =
-      MakeOver(JoinTables(), 103, {.supported = kSupportedFeatures, .target_percent = 0});
-  const auto without =
-      MakeOver(JoinTables(), 103,
-               {.supported = kSupportedFeatures.Minus({Feature::kInForm}), .target_percent = 0});
+  // Without kCorrelatedEmptyValue, drawn after the forms only where none fired, so that a query a
+  // form leaves out holds no subquery at all.
+  const FeatureSet supported = kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue});
+  const auto with = MakeOver(JoinTables(), 103, {.supported = supported, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 103, {.supported = supported.Minus({Feature::kInForm}), .target_percent = 0});
   int took = 0;
   int same = 0;
   for (uint64_t i = 0; i < 12000; ++i) {
@@ -3925,6 +3929,360 @@ TEST(QueryGenerator, InFormsAreQuantifiedLiteralOrSetOperationSets) {
   EXPECT_GT(having, 95);
   EXPECT_GT(items, 145);
   EXPECT_GT(ordered, 70);
+}
+
+// SQ6's empty values (ADR 0041): drawn last, after the IN forms, from a stream of their own, only
+// where the query holds no other subquery, so declaring them changes the queries that take one and
+// no others.
+TEST(QueryGenerator, CorrelatedEmptyValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 109, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 109,
+               {.supported = kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue}),
+                .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kCorrelatedEmptyValue)) << plain.sql;
+    if (!q.features.Has(Feature::kCorrelatedEmptyValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(HasSubquery(plain)) << "it displaces no other subquery: " << plain.sql;
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    EXPECT_EQ(q.sort, plain.sort);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue, Feature::kGroupValue, Feature::kInMark,
+          Feature::kInForm}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+  }
+  EXPECT_GT(took, 265) << "empty values: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// What an empty value writes (ADR 0041's SQ6): one top-level WHERE conjunct that compares a
+// correlated scalar subquery, a direct operand, with a literal or a qualified outer column in
+// either order; the block names one table, correlates through one key of one type (= or IS NOT
+// DISTINCT FROM, either way round), groups nothing and has no LIMIT. Its item is a call, COALESCE
+// over a call that is NULL over no rows, a CASE over a call, a COUNT plus 1 to 9, a constant (over
+// ORDER BY COUNT(*) or under a HAVING), or the variance family against the literal 0 alone (> or
+// =); a HAVING compares a COUNT kind with an integer. Never (decision 29's family, docs/testing.md)
+// a constant item or a HAVING without a COUNT kind in the block, never a division nor other
+// arithmetic, never an AVG nor a variance against a column, never AVG of a DOUBLE. Floors per form.
+TEST(QueryGenerator, CorrelatedEmptyValuesAreAggregatesOverEveryRow) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 113, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto table_of = [&](std::string_view name) -> const GenTable* {
+    const auto t = std::ranges::find_if(
+        tables, [&](const GenTable& g) { return Lower(g.name) == Lower(std::string(name)); });
+    return t == tables.end() ? nullptr : &*t;
+  };
+  const auto column_of = [](const GenTable* table, std::string_view name) -> const GenColumn* {
+    if (table == nullptr) {
+      return nullptr;
+    }
+    const auto c = std::ranges::find_if(table->columns, [&](const GenColumn& g) {
+      return Lower(g.name) == Lower(std::string(name));
+    });
+    return c == table->columns.end() ? nullptr : &*c;
+  };
+  const auto counts = [](const sql::AggregateCall& call) {
+    return call.kind == sql::AggKind::kCountStar || call.kind == sql::AggKind::kCount;
+  };
+  const auto variance = [](const sql::AggregateCall& call) {
+    return call.kind >= sql::AggKind::kStddevSamp;
+  };
+  const auto is_comparison = [](sql::BinaryOp op) {
+    return op >= sql::BinaryOp::kEq && op <= sql::BinaryOp::kGe;
+  };
+  int queries = 0;
+  int count_stars = 0;
+  int count_columns = 0;
+  int count_distincts = 0;
+  int sums = 0;
+  int avgs = 0;
+  int extremes = 0;  // MIN and MAX
+  int variances = 0;
+  int calls = 0;  // the item a call
+  int coalesces = 0;
+  int cases = 0;
+  int pluses = 0;
+  int ordered_constants = 0;
+  int having_constants = 0;
+  int havings = 0;
+  int null_equal = 0;
+  int outer_first = 0;
+  int against_columns = 0;
+  int subquery_first = 0;
+  for (uint64_t i = 0; i < 20000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedEmptyValue)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_EQ(all.size(), 1U);
+    // The conjunct: a comparison with the subquery as one operand, directly.
+    const sql::BinaryExpr* comparison = nullptr;
+    int holding = 0;
+    for (const sql::Expr& conjunct : parsed->where) {
+      std::vector<const sql::SubqueryExpr*> inside;
+      DeepSubqueries(conjunct, inside);
+      if (inside.empty()) {
+        continue;
+      }
+      ++holding;
+      comparison = std::get_if<sql::BinaryExpr>(&conjunct);
+    }
+    ASSERT_EQ(holding, 1) << "one top-level WHERE conjunct";
+    ASSERT_NE(comparison, nullptr);
+    ASSERT_TRUE(is_comparison(comparison->op));
+    const auto* left = std::get_if<sql::SubqueryExpr>(&*comparison->left);
+    const auto* right = std::get_if<sql::SubqueryExpr>(&*comparison->right);
+    ASSERT_TRUE((left == nullptr) != (right == nullptr)) << "a direct operand, once";
+    const sql::SubqueryExpr& sub = left != nullptr ? *left : *right;
+    const sql::Expr& other = left != nullptr ? *comparison->right : *comparison->left;
+    subquery_first += left != nullptr ? 1 : 0;
+    ASSERT_EQ(sub.kind, sql::SubqueryExpr::Kind::kScalar);
+    const auto* against = std::get_if<sql::ColumnRef>(&other);
+    if (against != nullptr) {
+      ++against_columns;
+      EXPECT_FALSE(against->qualifier.empty());
+    } else {
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(other) ||
+                  std::holds_alternative<sql::CastExpr>(other))
+          << sql::ToSql(other);
+    }
+    // The block: one item over one named table, one key, no grouping, no LIMIT.
+    const sql::SelectStatement& block = *sub.query;
+    EXPECT_TRUE(block.with.empty());
+    EXPECT_TRUE(block.set_operation.empty());
+    EXPECT_FALSE(block.distinct);
+    EXPECT_TRUE(block.group_by.empty());
+    EXPECT_TRUE(block.grouping.empty());
+    EXPECT_FALSE(block.limit.has_value());
+    EXPECT_FALSE(block.offset.has_value());
+    ASSERT_EQ(block.items.size(), 1U);
+    ASSERT_EQ(block.from.size(), 1U);
+    ASSERT_NE(block.from.front().table(), nullptr);
+    EXPECT_EQ(block.from.front().table()->kind, sql::TableRef::Kind::kName);
+    EXPECT_FALSE(block.from.front().alias.has_value());
+    const std::string inner_name = block.from.front().table()->name;
+    const GenTable* inner = table_of(inner_name);
+    ASSERT_NE(inner, nullptr) << inner_name;
+    ASSERT_EQ(block.where.size(), 1U) << "the key alone";
+    const sql::Expr* key_left = nullptr;
+    const sql::Expr* key_right = nullptr;
+    if (const auto* eq = std::get_if<sql::BinaryExpr>(&block.where.front())) {
+      EXPECT_EQ(eq->op, sql::BinaryOp::kEq);
+      key_left = &*eq->left;
+      key_right = &*eq->right;
+    } else if (const auto* nd = std::get_if<sql::DistinctFromExpr>(&block.where.front())) {
+      EXPECT_TRUE(nd->negated) << "IS NOT DISTINCT FROM";
+      ++null_equal;
+      key_left = &*nd->left;
+      key_right = &*nd->right;
+    }
+    ASSERT_NE(key_left, nullptr) << sql::ToSql(block.where.front());
+    const auto* a = std::get_if<sql::ColumnRef>(key_left);
+    const auto* b = std::get_if<sql::ColumnRef>(key_right);
+    ASSERT_TRUE(a != nullptr && b != nullptr);
+    const bool inner_left = Lower(a->qualifier) == Lower(inner_name);
+    outer_first += inner_left ? 0 : 1;
+    const sql::ColumnRef& inner_key = inner_left ? *a : *b;
+    const sql::ColumnRef& outer_key = inner_left ? *b : *a;
+    EXPECT_EQ(Lower(inner_key.qualifier), Lower(inner_name));
+    EXPECT_NE(Lower(outer_key.qualifier), Lower(inner_name)) << "the outer binding's own name";
+    // One type on both ends: the outer binding's table by its alias or its name.
+    const GenTable* outer = nullptr;
+    for (const sql::FromItem& item : parsed->from) {
+      // A binding read by path is never correlated (CorrelatedCandidates).
+      const sql::TableRef* ref = item.table();
+      if (ref == nullptr || ref->kind != sql::TableRef::Kind::kName) {
+        continue;
+      }
+      const std::string name = item.alias.has_value() ? *item.alias : ref->name;
+      if (Lower(name) == Lower(outer_key.qualifier)) {
+        outer = table_of(ref->name);
+      }
+    }
+    const GenColumn* ik = column_of(inner, inner_key.name);
+    const GenColumn* ok = column_of(outer, outer_key.name);
+    ASSERT_NE(ik, nullptr);
+    ASSERT_NE(ok, nullptr) << outer_key.qualifier << "." << outer_key.name;
+    EXPECT_EQ(ik->kind, ok->kind);
+    EXPECT_EQ(ik->min, ok->min);
+    EXPECT_EQ(ik->max, ok->max);
+    EXPECT_EQ(ik->precision, ok->precision);
+    EXPECT_EQ(ik->scale, ok->scale);
+    // The HAVING: one comparison of a COUNT kind with an integer.
+    bool having_count = false;
+    EXPECT_LE(block.having.size(), 1U);
+    for (const sql::Expr& h : block.having) {
+      ++havings;
+      const auto* cmp = std::get_if<sql::BinaryExpr>(&h);
+      ASSERT_NE(cmp, nullptr) << sql::ToSql(h);
+      EXPECT_TRUE(is_comparison(cmp->op));
+      const auto* call = std::get_if<sql::AggregateCall>(&*cmp->left);
+      ASSERT_NE(call, nullptr) << sql::ToSql(h);
+      EXPECT_TRUE(counts(*call)) << "a HAVING reads a COUNT kind";
+      having_count = counts(*call);
+      const auto* n = std::get_if<sql::Literal>(&*cmp->right);
+      EXPECT_TRUE(n != nullptr && n->kind == sql::Literal::Kind::kInteger);
+    }
+    // ORDER BY COUNT(*) alone, under a constant.
+    bool ordered = false;
+    EXPECT_LE(block.order_by.size(), 1U);
+    for (const sql::OrderItem& item : block.order_by) {
+      const auto* call = std::get_if<sql::AggregateCall>(&item.expr);
+      ASSERT_NE(call, nullptr);
+      EXPECT_EQ(call->kind, sql::AggKind::kCountStar);
+      ordered = true;
+    }
+    // No arithmetic but `COUNT + k`, and every call over one column of the inner table.
+    const sql::Expr& item = *block.items.front().expr();
+    ForEachNode(item, [&](const sql::Expr& node) {
+      if (const auto* bin = std::get_if<sql::BinaryExpr>(&node)) {
+        EXPECT_TRUE(bin->op == sql::BinaryOp::kAdd || is_comparison(bin->op))
+            << "no division and no other arithmetic";
+      }
+      if (const auto* call = std::get_if<sql::AggregateCall>(&node)) {
+        EXPECT_TRUE(call->kind == sql::AggKind::kCountStar || call->arg_column() != nullptr);
+        if (const sql::ColumnRef* arg = call->arg_column()) {
+          EXPECT_EQ(Lower(arg->qualifier), Lower(inner_name));
+          const GenColumn* column = column_of(inner, arg->name);
+          ASSERT_NE(column, nullptr) << arg->name;
+          if (call->kind == sql::AggKind::kAvg || variance(*call)) {
+            EXPECT_TRUE(column->kind == ValueKind::kInteger || column->kind == ValueKind::kDecimal)
+                << "AVG and the variance family only over integers and DECIMALs";
+          }
+          if (call->kind == sql::AggKind::kSum) {
+            EXPECT_NE(column->kind, ValueKind::kDouble);
+          }
+          if (call->distinct) {
+            EXPECT_NE(column->kind, ValueKind::kDouble);
+          }
+        }
+        count_stars += call->kind == sql::AggKind::kCountStar ? 1 : 0;
+        count_columns += call->kind == sql::AggKind::kCount && !call->distinct ? 1 : 0;
+        count_distincts += call->kind == sql::AggKind::kCount && call->distinct ? 1 : 0;
+        sums += call->kind == sql::AggKind::kSum ? 1 : 0;
+        avgs += call->kind == sql::AggKind::kAvg ? 1 : 0;
+        extremes += call->kind == sql::AggKind::kMin || call->kind == sql::AggKind::kMax ? 1 : 0;
+        variances += variance(*call) ? 1 : 0;
+      }
+    });
+    const auto never_against_a_column = [&] {
+      EXPECT_EQ(against, nullptr) << "never against a column";
+    };
+    if (const auto* call = std::get_if<sql::AggregateCall>(&item)) {
+      ++calls;
+      EXPECT_FALSE(ordered);
+      if (call->kind == sql::AggKind::kAvg) {
+        never_against_a_column();
+      }
+      if (variance(*call)) {
+        never_against_a_column();
+        const auto* zero = std::get_if<sql::Literal>(&other);
+        EXPECT_TRUE(zero != nullptr && zero->text == "0" && !zero->negative) << "against 0 alone";
+        const bool mirrored = left == nullptr;
+        EXPECT_TRUE(comparison->op == sql::BinaryOp::kEq ||
+                    comparison->op == (mirrored ? sql::BinaryOp::kLt : sql::BinaryOp::kGt))
+            << "> 0 or = 0";
+      }
+    } else if (const auto* fn = std::get_if<sql::FunctionCall>(&item)) {
+      ++coalesces;
+      EXPECT_FALSE(ordered);
+      EXPECT_EQ(Lower(fn->name), "coalesce");
+      ASSERT_EQ(fn->args.size(), 2U);
+      const auto* coalesced = std::get_if<sql::AggregateCall>(&fn->args.front());
+      ASSERT_NE(coalesced, nullptr);
+      EXPECT_FALSE(counts(*coalesced) || variance(*coalesced)) << "a call NULL over no rows";
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(fn->args[1]));
+      if (coalesced->kind == sql::AggKind::kAvg) {
+        never_against_a_column();
+      }
+    } else if (const auto* when = std::get_if<sql::CaseExpr>(&item)) {
+      ++cases;
+      EXPECT_FALSE(ordered);
+      EXPECT_FALSE(when->operand.has_value());
+      ASSERT_EQ(when->branches.size(), 1U);
+      const auto* test = std::get_if<sql::BinaryExpr>(&*when->branches.front().when);
+      ASSERT_NE(test, nullptr);
+      EXPECT_TRUE(is_comparison(test->op));
+      const auto* tested = std::get_if<sql::AggregateCall>(&*test->left);
+      ASSERT_NE(tested, nullptr);
+      EXPECT_FALSE(variance(*tested));
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(*when->branches.front().then));
+      EXPECT_TRUE(when->otherwise.has_value() &&
+                  std::holds_alternative<sql::Literal>(**when->otherwise))
+          << "an ELSE constant";
+    } else if (const auto* plus = std::get_if<sql::BinaryExpr>(&item)) {
+      ++pluses;
+      EXPECT_FALSE(ordered);
+      EXPECT_EQ(plus->op, sql::BinaryOp::kAdd);
+      const auto* counted = std::get_if<sql::AggregateCall>(&*plus->left);
+      ASSERT_NE(counted, nullptr);
+      EXPECT_TRUE(counts(*counted)) << "only a count takes arithmetic";
+      const auto* k = std::get_if<sql::Literal>(&*plus->right);
+      ASSERT_NE(k, nullptr);
+      EXPECT_EQ(k->kind, sql::Literal::Kind::kInteger);
+      EXPECT_FALSE(k->negative);
+      EXPECT_EQ(k->text.size(), 1U) << "1 to 9";
+    } else if (const auto* constant = std::get_if<sql::Literal>(&item)) {
+      EXPECT_EQ(constant->kind, sql::Literal::Kind::kInteger);
+      EXPECT_TRUE(ordered || having_count)
+          << "a constant only with a COUNT kind in the block (decision 29)";
+      ordered_constants += ordered ? 1 : 0;
+      having_constants += ordered ? 0 : 1;
+    } else {
+      ADD_FAILURE() << "an item of no known kind: " << sql::ToSql(item);
+    }
+  }
+  EXPECT_GT(queries, 440) << "empty values: " << queries << "; COUNT(*) " << count_stars
+                          << ", COUNT(x) " << count_columns << ", COUNT(DISTINCT x) "
+                          << count_distincts << ", SUM " << sums << ", AVG " << avgs
+                          << ", MIN or MAX " << extremes << ", variance " << variances
+                          << "; items: a call " << calls << ", COALESCE " << coalesces << ", CASE "
+                          << cases << ", COUNT + k " << pluses << ", a constant over ORDER BY "
+                          << ordered_constants << ", under a HAVING " << having_constants
+                          << "; HAVING " << havings << ", NULL-equal keys " << null_equal
+                          << ", outer key first " << outer_first << ", against a column "
+                          << against_columns << ", subquery first " << subquery_first;
+  EXPECT_GT(count_stars, 75);
+  EXPECT_GT(count_columns, 55);
+  EXPECT_GT(count_distincts, 44);
+  EXPECT_GT(sums, 28);
+  EXPECT_GT(avgs, 28);
+  EXPECT_GT(extremes, 100);
+  EXPECT_GT(variances, 48);
+  EXPECT_GT(calls, 180);
+  EXPECT_GT(coalesces, 66);
+  EXPECT_GT(cases, 64);
+  EXPECT_GT(pluses, 68);
+  EXPECT_GT(ordered_constants, 40);
+  EXPECT_GT(having_constants, 16);
+  EXPECT_GT(havings, 100);
+  EXPECT_GT(null_equal, 95);
+  EXPECT_GT(outer_first, 97);
+  EXPECT_GT(against_columns, 92);
+  EXPECT_GT(subquery_first, 230);
+  EXPECT_GT(queries - subquery_first, 200) << "the other operand first too";
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

@@ -768,6 +768,12 @@ constexpr uint64_t kInMarkStreamSalt = 0x696E2D6D61726B21ULL;
 // query this seed generated before the SQ7b PR.
 constexpr unsigned kInFormPercent = 40;
 constexpr uint64_t kInFormStreamSalt = 0x696E2D666F726D73ULL;
+// The same for SQ6's empty values (ADR 0041): a correlated scalar subquery whose block aggregates
+// over every row, a direct operand of a comparison in one more top-level WHERE conjunct, drawn last
+// (after the IN forms) where the query holds no other subquery. Its stream is its own, so a query
+// without one is the query this seed generated before the SQ6 PR.
+constexpr unsigned kEmptyValuePercent = 60;
+constexpr uint64_t kEmptyValueStreamSalt = 0x656D7074792D7661ULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1073,7 +1079,8 @@ class Builder {
           Rng& star_rng, Rng& variance_rng, Rng& distinct_rng, Rng& rollup_rng, Rng& setop_rng,
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
-          Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, FeatureSet allowed)
+          Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, Rng& empty_value_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1100,6 +1107,7 @@ class Builder {
         group_value_rng_(group_value_rng),
         in_mark_rng_(in_mark_rng),
         in_form_rng_(in_form_rng),
+        empty_value_rng_(empty_value_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2088,6 +2096,8 @@ class Builder {
     InMark(slots, shape, keys, ordered);
     // Where no mark was written (InForm writes nothing then), and only there: the slots stand.
     InForm(slots, shape, keys, ordered);
+    // Where neither wrote a mark, and only there: the slots stand.
+    CorrelatedEmptyValue(slots);
     // Any star of the select list over more than kStarMaxRows rows takes a LIMIT, as a lone one
     // does: the guard is FROM's bound, even for a qualified star of a smaller binding.
     const bool limited = Limit(starred_ && from.rows > kStarMaxRows);
@@ -3364,6 +3374,405 @@ class Builder {
     }
     lit.tokens.push_back({.kind = Token::Kind::kLiteral, .text = std::move(text)});
     return lit;
+  }
+
+  // A call of SQ6's block (ADR 0041's SQ6): an aggregate and its argument (none for COUNT(*)), or,
+  // where `variance` is set, one of the variance family over the argument.
+  struct EmptyCall {
+    Agg agg = Agg::kCountStar;
+    const GenColumn* arg = nullptr;
+    bool variance = false;
+
+    // COUNT(*), COUNT(x) and COUNT(DISTINCT x): 0 over no rows, where every other call is NULL.
+    [[nodiscard]] bool Counts() const {
+      return !variance &&
+             (agg == Agg::kCountStar || agg == Agg::kCount || agg == Agg::kCountDistinct);
+    }
+  };
+
+  // The calls SQ6's block over `inner` may write (pure: no draw). `counts`: COUNT(*), COUNT(x) and
+  // COUNT(DISTINCT x) of any column but a DOUBLE one (whose NaN and -0.0 DISTINCT may tell apart
+  // differently). `values`: SUM, AVG, MIN and MAX where CorrelatedAggregateFits and a literal of
+  // their values can be written. `variances`: the variance family over an integer or DECIMAL
+  // argument, as AG2 writes it.
+  void EmptyCalls(const GenTable& inner, std::vector<EmptyCall>& counts,
+                  std::vector<EmptyCall>& values, std::vector<EmptyCall>& variances) const {
+    if (allowed_.Has(Feature::kCountStar)) {
+      counts.push_back({.agg = Agg::kCountStar, .arg = nullptr, .variance = false});
+    }
+    for (const GenColumn& arg : inner.columns) {
+      if (!allowed_.Has(TypeFeature(arg.kind))) {
+        continue;
+      }
+      if (allowed_.Has(Feature::kCountColumn)) {
+        counts.push_back({.agg = Agg::kCount, .arg = &arg, .variance = false});
+      }
+      if (allowed_.Has(Feature::kCountDistinct) && arg.kind != ValueKind::kDouble) {
+        counts.push_back({.agg = Agg::kCountDistinct, .arg = &arg, .variance = false});
+      }
+      for (const Agg agg : {Agg::kSum, Agg::kAvg, Agg::kMin, Agg::kMax}) {
+        if (allowed_.Has(AggFeature(agg)) && CorrelatedAggregateFits(agg, &arg) &&
+            CanLiteral(ValuesOf(inner.rows, agg, &arg).kind)) {
+          values.push_back({.agg = agg, .arg = &arg, .variance = false});
+        }
+      }
+      if (allowed_.Has(Feature::kVariance) &&
+          (arg.kind == ValueKind::kInteger || arg.kind == ValueKind::kDecimal)) {
+        variances.push_back({.agg = Agg::kAvg, .arg = &arg, .variance = true});
+      }
+    }
+  }
+
+  // `AGG(inner.x)`, `COUNT(*)`, `COUNT(DISTINCT inner.x)` or `VAR_POP(inner.x)` and its kin.
+  void EmptyCallText(const CorrelatedCandidate& c, const EmptyCall& call) {
+    static constexpr auto kVarianceNames = std::to_array<std::string_view>(
+        {"STDDEV_SAMP", "STDDEV", "STDDEV_POP", "VAR_SAMP", "VARIANCE", "VAR_POP"});
+    if (call.variance) {
+      used_.Add(Feature::kVariance);
+      Keyword(empty_value_rng_.Pick(kVarianceNames));
+    } else {
+      used_.Add(AggFeature(call.agg));
+      Keyword(AggName(call.agg));
+    }
+    Symbol("(");
+    if (call.arg == nullptr) {
+      Symbol("*");
+    } else {
+      if (call.agg == Agg::kCountDistinct && !call.variance) {
+        Keyword("DISTINCT");
+      }
+      InnerColumn(c, *call.arg);
+    }
+    Symbol(")");
+  }
+
+  // A small integer literal: a count, a CASE's value or a constant item.
+  static Literal SmallLiteral(int64_t value) {
+    Literal lit;
+    lit.features.Add(Feature::kIntegerLiteral);
+    if (value < 0) {
+      lit.features.Add(Feature::kNegativeLiteral);
+    }
+    lit.tokens.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(value)});
+    return lit;
+  }
+
+  // A literal for a count of up to `rows` rows: mostly 0 to 3, where the empty value and small
+  // groups tell apart, else MakeLiteral's over the whole range.
+  Literal CountLiteral(int64_t rows) {
+    if (empty_value_rng_.Percent(60)) {
+      return SmallLiteral(static_cast<int64_t>(empty_value_rng_.Below(4)));
+    }
+    return MakeLiteral(empty_value_rng_, ValuesOf(rows, Agg::kCountStar, nullptr));
+  }
+
+  // Whether COALESCE(call, k) has one type in both engines for an integer constant k: an integer,
+  // a DOUBLE (AVG) or a DECIMAL whose scale leaves room for an INTEGER's ten digits within 38, or a
+  // VARCHAR against a string. Not a DATE, which a string constant would have to be cast to.
+  static bool Coalescible(const EmptyCall& call) {
+    if (call.Counts() || call.variance || call.arg == nullptr) {
+      return false;
+    }
+    switch (call.agg == Agg::kAvg ? ValueKind::kDouble : call.arg->kind) {
+      case ValueKind::kInteger:
+      case ValueKind::kDouble:
+      case ValueKind::kVarchar:
+        return true;
+      case ValueKind::kDecimal:
+        return call.arg->scale <= kMaxDecimalDigits - 10;
+      case ValueKind::kDate:
+        return false;
+    }
+    return false;
+  }
+
+  // SQ6's empty values (ADR 0041's SQ6), where the query holds no other subquery and no IN mark or
+  // form was written: drawn last, from a stream of its own, so that a query without one is the
+  // query its seed gave before. One more top-level WHERE conjunct (written at the end and moved to
+  // its place, as a mark's), `<literal> <op> (q)`, `(q) <op> <literal>`, or q against a column of
+  // the outer binding of the item's type in either order, where q is
+  // `(SELECT <item> FROM inner WHERE inner.k = outer.k [HAVING <count> <op> n] [ORDER BY
+  // COUNT(*)])`, correlated through one key of one type (`=` or IS NOT DISTINCT FROM, either way
+  // round). The item is a call (SUM, AVG, MIN, MAX and the COUNT kinds), COALESCE(call, k) over a
+  // call that is NULL over no rows, `CASE WHEN call <op> k THEN a ELSE b END`, a COUNT plus a small
+  // constant, a constant over ORDER BY COUNT(*) or under a HAVING, or one of the variance family
+  // compared with the literal 0 alone (`> 0` or `= 0`, its DOUBLE value exact only there). A HAVING
+  // reads a COUNT kind. Never a constant item or a HAVING in a block whose every call is NULL over
+  // no rows, which DuckDB answers wrongly (docs/testing.md's family of ADR 0041's decision 29), a
+  // division, arithmetic that can overflow (a count plus at most 9), a correlation of two types
+  // (CorrelatedCandidates), nor an AVG or a variance against a column.
+  void CorrelatedEmptyValue(const MarkSlots& slots) {
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
+        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
+        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
+        used_.Has(Feature::kInForm);
+    // An inner aggregate needs a select list that settles the row shape (InnerAggregateFits).
+    if (other_subquery || !allowed_.Has(Feature::kCorrelatedEmptyValue) ||
+        !allowed_.Has(Feature::kWhere) || !allowed_.Has(Feature::kIntegerLiteral) ||
+        !InnerAggregateFits()) {
+      return;
+    }
+    const std::vector<CorrelatedCandidate> candidates = CorrelatedCandidates();
+    if (candidates.empty() || !empty_value_rng_.Percent(kEmptyValuePercent)) {
+      return;
+    }
+    Rng& rng = empty_value_rng_;
+    const CorrelatedCandidate& c = candidates[rng.Below(candidates.size())];
+    std::vector<EmptyCall> counts;
+    std::vector<EmptyCall> values;
+    std::vector<EmptyCall> variances;
+    EmptyCalls(*c.inner, counts, values, variances);
+    std::vector<EmptyCall> calls = counts;
+    calls.insert(calls.end(), values.begin(), values.end());
+    if (calls.empty()) {
+      return;
+    }
+    std::vector<EmptyCall> coalescible;
+    std::ranges::copy_if(values, std::back_inserter(coalescible), Coalescible);
+    const bool count_star = allowed_.Has(Feature::kCountStar);
+    // A call of `from`, COUNT(*) (counts' first, where allowed) with `star_percent` more weight:
+    // one of many counts otherwise.
+    const auto pick = [&](const std::vector<EmptyCall>& from, unsigned star_percent) {
+      if (count_star && rng.Percent(star_percent)) {
+        return counts.front();
+      }
+      return from[rng.Below(from.size())];
+    };
+    enum class Item : std::uint8_t { kCall, kCoalesce, kCase, kPlus, kConstant, kVariance };
+    const uint64_t roll = rng.Below(100);
+    Item item = Item::kCall;
+    if (roll >= 88) {
+      item = Item::kVariance;
+    } else if (roll >= 75) {
+      item = Item::kConstant;
+    } else if (roll >= 60) {
+      item = Item::kPlus;
+    } else if (roll >= 45) {
+      item = Item::kCase;
+    } else if (roll >= 30) {
+      item = Item::kCoalesce;
+    }
+    if ((item == Item::kVariance && variances.empty()) ||
+        (item == Item::kConstant && counts.empty()) ||
+        (item == Item::kPlus && (counts.empty() || !allowed_.Has(Feature::kArithmetic))) ||
+        (item == Item::kCase && !allowed_.Has(Feature::kCase)) ||
+        (item == Item::kCoalesce && coalescible.empty())) {
+      item = Item::kCall;
+    }
+    const int64_t rows = c.inner->rows;
+    // The item's call (none for a constant), and what it is compared with: a literal of `kind`'s
+    // values, or a column of the outer binding of `kind` (and of `scale` for a DECIMAL).
+    EmptyCall call;    // unused for a constant
+    Literal fallback;  // COALESCE's constant
+    Literal when;      // CASE's: the call <op> when
+    std::string_view when_op;
+    int64_t then = 0;
+    int64_t otherwise = 0;
+    int64_t constant = 0;
+    GenColumn result{.name = {}, .kind = ValueKind::kInteger, .min = 0, .max = rows};
+    bool columns_ok = true;  // an outer column may stand for the literal
+    Literal lit;
+    switch (item) {
+      case Item::kCall:
+        call = pick(calls, 20);
+        if (call.Counts()) {
+          lit = CountLiteral(rows);
+        } else {
+          result = ValuesOf(rows, call.agg, call.arg);
+          columns_ok = call.agg != Agg::kAvg;
+          lit = MakeLiteral(rng, result);
+        }
+        break;
+      case Item::kCoalesce: {
+        call = coalescible[rng.Below(coalescible.size())];
+        result = ValuesOf(rows, call.agg, call.arg);
+        if (call.agg == Agg::kAvg) {
+          columns_ok = false;
+        }
+        if (call.arg->kind == ValueKind::kVarchar) {
+          fallback = MakeLiteral(rng, *call.arg);
+        } else {
+          static constexpr auto kFallbacks = std::to_array<int64_t>({0, 1, -1, 100});
+          fallback = SmallLiteral(rng.Pick(kFallbacks));
+        }
+        if (!allowed_.Contains(fallback.features)) {
+          fallback = SmallLiteral(0);
+        }
+        // The constant itself now and then, which only the empty value (and equal values) give.
+        lit = rng.Percent(40) ? fallback : MakeLiteral(rng, result);
+        break;
+      }
+      case Item::kCase: {
+        call = pick(calls, 20);
+        when = call.Counts() ? CountLiteral(rows)
+                             : MakeLiteral(rng, ValuesOf(rows, call.agg, call.arg));
+        when_op = rng.Pick(kOps);
+        then = static_cast<int64_t>(rng.Below(3));
+        otherwise = (then + 1 + static_cast<int64_t>(rng.Below(2))) % 3;
+        // One of its values mostly, else any of 0 to 3.
+        const int64_t value = rng.Percent(50) ? then : otherwise;
+        lit = SmallLiteral(rng.Percent(70) ? value : static_cast<int64_t>(rng.Below(4)));
+        break;
+      }
+      case Item::kPlus:
+        call = pick(counts, 50);
+        constant = 1 + static_cast<int64_t>(rng.Below(9));
+        lit = rng.Percent(40) ? SmallLiteral(constant) : CountLiteral(rows);
+        break;
+      case Item::kConstant: {
+        static constexpr auto kConstants = std::to_array<int64_t>({1, 5, 7, 42});
+        constant = rng.Pick(kConstants);
+        lit = SmallLiteral(rng.Percent(60) ? constant : static_cast<int64_t>(rng.Below(3)));
+        break;
+      }
+      case Item::kVariance:
+        call = variances[rng.Below(variances.size())];
+        columns_ok = false;
+        lit = SmallLiteral(0);
+        break;
+    }
+    // ORDER BY COUNT(*) under a constant (DuckDB's form of decision 29's family), else a HAVING
+    // over a count; any other item takes a HAVING now and then.
+    const bool ordered = item == Item::kConstant && count_star && rng.Percent(60);
+    const bool having = !counts.empty() &&
+                        (item == Item::kConstant ? !ordered || rng.Percent(30) : rng.Percent(25));
+    // The other operand: an outer column of the item's type now and then.
+    std::vector<const GenColumn*> outer_columns;
+    if (columns_ok) {
+      for (const GenColumn& column : c.outer->columns) {
+        const bool same_type = column.kind == result.kind &&
+                               (column.kind != ValueKind::kDecimal || column.scale == result.scale);
+        if (same_type && allowed_.Has(TypeFeature(column.kind))) {
+          outer_columns.push_back(&column);
+        }
+      }
+    }
+    const GenColumn* against = !outer_columns.empty() && rng.Percent(30)
+                                   ? outer_columns[rng.Below(outer_columns.size())]
+                                   : nullptr;
+    std::string_view op = rng.Pick(kOps);
+    if (item == Item::kVariance) {
+      op = rng.Percent(50) ? ">" : "=";
+    }
+    const bool other_first = rng.Percent(50);
+    if (!allowed_.Contains(lit.features)) {
+      lit = SmallLiteral(0);
+    }
+    const std::size_t end = tokens_.size();
+    used_.Add(Feature::kCorrelatedEmptyValue);
+    used_.Add(Feature::kWhere);
+    Keyword(slots.where_written ? "AND" : "WHERE");
+    const auto other = [&] {
+      if (against != nullptr) {
+        used_.Add(Feature::kQualifiedName);
+        used_.Add(TypeFeature(against->kind));
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer->name});
+        Symbol(".");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = against->name});
+      } else {
+        used_.Add(lit.features);
+        Emit(lit.tokens);
+      }
+    };
+    if (other_first) {
+      other();
+      Symbol(Flip(op));
+    }
+    Symbol("(");
+    Keyword("SELECT");
+    switch (item) {
+      case Item::kCall:
+      case Item::kVariance:
+        EmptyCallText(c, call);
+        break;
+      case Item::kCoalesce:
+        Keyword("COALESCE");
+        Symbol("(");
+        EmptyCallText(c, call);
+        Symbol(",");
+        used_.Add(fallback.features);
+        Emit(fallback.tokens);
+        Symbol(")");
+        break;
+      case Item::kCase:
+        used_.Add(Feature::kCase);
+        Keyword("CASE");
+        Keyword("WHEN");
+        EmptyCallText(c, call);
+        Symbol(when_op);
+        if (!allowed_.Contains(when.features)) {
+          when = SmallLiteral(0);
+        }
+        used_.Add(when.features);
+        Emit(when.tokens);
+        Keyword("THEN");
+        ValueNumber(then);
+        Keyword("ELSE");
+        ValueNumber(otherwise);
+        Keyword("END");
+        used_.Add(Feature::kIntegerLiteral);
+        break;
+      case Item::kPlus:
+        used_.Add(Feature::kArithmetic);
+        EmptyCallText(c, call);
+        Symbol("+");
+        ValueNumber(constant);
+        used_.Add(Feature::kIntegerLiteral);
+        break;
+      case Item::kConstant:
+        ValueNumber(constant);
+        used_.Add(Feature::kIntegerLiteral);
+        break;
+    }
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    const bool outer_first = rng.Percent(25);
+    if (outer_first) {
+      OuterColumn(c);
+    } else {
+      InnerColumn(c, *c.inner_key);
+    }
+    // Drawn whether or not NULL-equal keys are allowed, so that ruling them out changes only the
+    // queries that write one.
+    if (rng.Percent(kNullEqualPercent) && allowed_.Has(Feature::kNullEqualKeys)) {
+      NotDistinctFrom();
+    } else {
+      Symbol("=");
+    }
+    if (outer_first) {
+      InnerColumn(c, *c.inner_key);
+    } else {
+      OuterColumn(c);
+    }
+    if (having) {
+      static constexpr auto kCounts = std::to_array<int64_t>({0, 1, 2, 3, 5});
+      Keyword("HAVING");
+      EmptyCallText(c, pick(counts, 50));
+      Symbol(rng.Pick(kOps));
+      ValueNumber(rng.Pick(kCounts));
+      used_.Add(Feature::kIntegerLiteral);
+    }
+    if (ordered) {
+      used_.Add(Feature::kCountStar);
+      Keyword("ORDER");
+      Keyword("BY");
+      Keyword("COUNT");
+      Symbol("(");
+      Symbol("*");
+      Symbol(")");
+    }
+    Symbol(")");
+    if (!other_first) {
+      Symbol(op);
+      other();
+    }
+    std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.where_end),
+                tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
   }
 
   // A mark over candidate `c` in one of four places of the block QueryFrom has just written,
@@ -5686,6 +6095,7 @@ class Builder {
   Rng& group_value_rng_;      // the draws that only a value in a block that aggregates needs
   Rng& in_mark_rng_;          // the draws that only an IN or NOT IN inside a condition needs
   Rng& in_form_rng_;          // the draws that only SQ7b's IN forms need
+  Rng& empty_value_rng_;      // the draws that only SQ6's empty values need
   // The stream of the mark being written: in_mark_rng_ or in_form_rng_ (PlaceMark).
   Rng* mark_rng_ = nullptr;
   // What InForm drew for the mark being written; std::nullopt while InMark writes one.
@@ -5926,11 +6336,12 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng group_value_rng(Mix(seed ^ kGroupValueStreamSalt));
   Rng in_mark_rng(Mix(seed ^ kInMarkStreamSalt));
   Rng in_form_rng(Mix(seed ^ kInFormStreamSalt));
+  Rng empty_value_rng(Mix(seed ^ kEmptyValueStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
                having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
-               options.supported)
+               empty_value_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -5969,6 +6380,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng group_value_rng(Mix(state ^ kGroupValueStreamSalt));
   Rng in_mark_rng(Mix(state ^ kInMarkStreamSalt));
   Rng in_form_rng(Mix(state ^ kInFormStreamSalt));
+  Rng empty_value_rng(Mix(state ^ kEmptyValueStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
@@ -5976,7 +6388,8 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
       Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
-              having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng, allowed)
+              having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
+              empty_value_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

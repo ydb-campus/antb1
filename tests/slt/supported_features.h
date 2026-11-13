@@ -170,6 +170,14 @@ enum class Feature : std::uint8_t {
   // three uncorrelated one-column arms of the set column's type. The set's own clauses record no
   // feature of their own, as kInMark's; its set operators and literals record theirs.
   kInForm,  // x = ANY (SELECT ...), 2 IN (SELECT a FROM t UNION SELECT b FROM u)
+  // SQ6's empty values (ADR 0041): a correlated scalar subquery whose block aggregates over every
+  // row, a direct operand of a comparison in a top-level WHERE conjunct, compared with a literal or
+  // an outer column; the block holds any aggregate call (the variance family compared with 0
+  // only), a call, COALESCE or a CASE over one, COUNT plus a constant, or a constant over ORDER BY
+  // COUNT(*), and an optional HAVING over a COUNT. An outer row without a match reads the block's
+  // value over no rows. Its ORDER BY, HAVING, COALESCE and constant record no feature of their own;
+  // its calls, CASE, arithmetic, literals and IS NOT DISTINCT FROM record theirs.
+  kCorrelatedEmptyValue,  // (SELECT COUNT(*) FROM i WHERE i.k = o.k) = 0
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -352,6 +360,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "in_mark";
     case Feature::kInForm:
       return "in_form";
+    case Feature::kCorrelatedEmptyValue:
+      return "correlated_empty_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -518,6 +528,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kGroupValue,
     Feature::kInMark,
     Feature::kInForm,
+    Feature::kCorrelatedEmptyValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,
