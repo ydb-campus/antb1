@@ -8,8 +8,8 @@
 namespace antb1::plan {
 
 // Whether an expression is STRICT: NULL whenever an operand is NULL. Columns, literals, arithmetic,
-// negation and casts are; CASE, COALESCE, OR, AND, predicates and functions are not in general,
-// since they can turn a NULL into a value.
+// negation, casts and every function but concat are; CASE, COALESCE, OR, AND and predicates are not
+// in general, since they can turn a NULL into a value.
 [[nodiscard]] bool IsStrict(const Expr& expr);
 
 // Whether an expression is NULL whenever every column it reads is NULL: strict, and reading at

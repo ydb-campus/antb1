@@ -444,6 +444,10 @@ TEST(AggregatePlacementTest, AStrictArgumentTravelsDownOverAPaddedSide) {
   EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(CAST(-facts.v AS BIGINT)) FROM wide LEFT JOIN facts "
                        "ON wide.dk = facts.few GROUP BY wide.dk"),
             2);
+  // A function is NULL for a NULL argument too.
+  EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(abs(facts.v)) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk"),
+            2);
 }
 
 // A join ABOVE the candidate whose key reads the pre-grouping column. The partial defines a fresh
