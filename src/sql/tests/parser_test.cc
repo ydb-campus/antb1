@@ -1036,6 +1036,42 @@ TEST(ParserTest, UnionAllCompoundsInNestedQueries) {
                   "SELECT l FROM u");
 }
 
+// The quantified comparisons DuckDB reads as IN and NOT IN (ADR 0041's SQ7b): `= ANY` and `= SOME`
+// are IN, `<> ALL` and `!= ALL` NOT IN, in any case and with or without a space before the
+// parenthesis; the operator spans the comparison and the quantifier. They print as IN and NOT IN.
+TEST(ParserTest, QuantifiedComparisonsAreInAndNotIn) {
+  struct Case {
+    std::string_view sql;
+    bool negated = false;
+    std::string_view op;
+    std::string_view printed;
+  };
+  for (const Case& c : {
+           Case{"SELECT a FROM t WHERE a = ANY (SELECT b FROM u)", false, "= ANY",
+                "a IN (SELECT b FROM u)"},
+           Case{"SELECT a FROM t WHERE a = some (SELECT b FROM u)", false, "= some",
+                "a IN (SELECT b FROM u)"},
+           Case{"SELECT a FROM t WHERE a=ANY(SELECT b FROM u)", false, "=ANY",
+                "a IN (SELECT b FROM u)"},
+           Case{"SELECT a FROM t WHERE a <> ALL (SELECT b FROM u)", true, "<> ALL",
+                "a NOT IN (SELECT b FROM u)"},
+           Case{"SELECT a FROM t WHERE a + 1 != ALL (SELECT b FROM u)", true, "!= ALL",
+                "a + 1 NOT IN (SELECT b FROM u)"},
+       }) {
+    SCOPED_TRACE(c.sql);
+    auto stmt = Parse(c.sql);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    ASSERT_EQ(stmt->where.size(), 1U);
+    const auto* in = std::get_if<SubqueryExpr>(&stmt->where[0]);
+    ASSERT_NE(in, nullptr);
+    EXPECT_EQ(in->kind, SubqueryExpr::Kind::kIn);
+    EXPECT_EQ(in->negated, c.negated);
+    EXPECT_EQ(At(c.sql, in->op_span), c.op);
+    EXPECT_EQ(At(c.sql, in->span), c.sql.substr(c.sql.find("WHERE ") + 6));
+    EXPECT_EQ(ToSql(stmt->where[0]), c.printed);
+  }
+}
+
 // The names of a column alias list follow the rules of an implicit table alias (as in DuckDB):
 // names, quoted identifiers and BETWEEN, EXISTS, INTERVAL and OVER, as written. A CTE's list may
 // be of any length.
@@ -3705,8 +3741,18 @@ INSTANTIATE_TEST_SUITE_P(
                    "string concatenation (||) is not supported"},
         RejectCase{"TableFunction", "SELECT * FROM ^read_parquet('x.parquet')", kUnsupported, 12,
                    "table functions are not supported"},
-        RejectCase{"Any", "SELECT a FROM events WHERE a = ^ANY (SELECT 1)", kUnsupported, 3,
-                   "ANY (quantified comparisons) is not supported"},
+        RejectCase{"LessAny", "SELECT a FROM events WHERE a < ^ANY (SELECT a FROM events)",
+                   kUnsupported, 3,
+                   "< ANY (a quantified comparison other than = ANY, = SOME and <> ALL over a "
+                   "subquery) is not supported"},
+        RejectCase{"EqualAll", "SELECT a FROM events WHERE a = ^ALL (SELECT a FROM events)",
+                   kUnsupported, 3, "= ALL (a quantified comparison"},
+        RejectCase{"NotEqualAny", "SELECT a FROM events WHERE a <> ^ANY (SELECT a FROM events)",
+                   kUnsupported, 3, "<> ANY (a quantified comparison"},
+        RejectCase{"AnyOfAList", "SELECT a FROM events WHERE a = ^ANY (1, 2)", kUnsupported, 3,
+                   "= ANY (a quantified comparison"},
+        RejectCase{"AnyAsAnOperand", "SELECT a FROM events WHERE a + ^ANY (SELECT 1) > 0",
+                   kUnsupported, 3, "ANY (quantified comparisons) is not supported"},
         RejectCase{"MultipleStatements", "SELECT a FROM events; ^SELECT b FROM events",
                    kUnsupported, 6, "multiple statements are not supported"},
         RejectCase{"EmptySecondStatement", "SELECT a FROM events;^;", kUnsupported, 1,

@@ -8144,11 +8144,11 @@ std::size_t CountOf(std::string_view text, std::string_view what) {
 TEST(BinderTest, InMarkPlacements) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql : {
-           // WHERE, under OR, NOT, CASE, and NOT over NOT IN.
+           // WHERE, under OR, NOT and CASE (NOTs over the whole conjunct fold into a semi or anti
+           // join instead: NotsOverAnInConjunctFoldIntoItsKind).
            "SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)",
            "SELECT i16 FROM t WHERE i16 < 10 OR i32 NOT IN (SELECT i16 FROM u)",
-           "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))",
-           "SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))",
+           "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u) AND i16 < 0)",
            "SELECT i16 FROM t WHERE CASE WHEN i32 + 1 IN (SELECT i64 FROM u) THEN 1 ELSE 0 END = 0",
            // An inner ON, inside a FULL JOIN's left input too, and a keyless one.
            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 IN (SELECT i16 FROM ok) OR "
@@ -8299,6 +8299,45 @@ TEST(BinderTest, ASharedInUnderOrIsASemiJoin) {
   auto error = BindSql(kDropped, catalog);
   ASSERT_FALSE(error.ok());
   EXPECT_EQ(SpanText(kDropped, error.status()), "nope");
+}
+
+// NOTs over a top-level IN conjunct fold into its parity (ADR 0041's SQ7b): an even number keeps
+// the IN a semi join, an odd one makes NOT IN a semi join and IN a null-aware anti join, in WHERE,
+// an inner ON and HAVING -- no mark, which a NOT NOT over EXISTS still is.
+TEST(BinderTest, NotsOverAnInConjunctFoldIntoItsKind) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(*plan);
+  };
+  struct Case {
+    std::string_view sql;
+    std::string_view kind;
+  };
+  for (const Case& c : {
+           Case{"SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))", "Join SEMI"},
+           Case{"SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))", "Join SEMI"},
+           Case{"SELECT i16 FROM t WHERE NOT NOT NOT (i32 IN (SELECT i16 FROM u))",
+                "Join NULL-AWARE ANTI"},
+           Case{"SELECT i16 FROM t WHERE NOT NOT (i32 NOT IN (SELECT i16 FROM u))",
+                "Join NULL-AWARE ANTI"},
+           Case{"SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT (t.i32 NOT IN (SELECT i16 "
+                "FROM u))",
+                "Join SEMI"},
+           Case{"SELECT i16 FROM t GROUP BY i16 HAVING NOT (i16 NOT IN (SELECT i16 FROM u))",
+                "Join SEMI"},
+       }) {
+    const std::string text = plan_of(c.sql);
+    EXPECT_NE(text.find(c.kind), std::string::npos) << c.sql << "\n" << text;
+    EXPECT_EQ(text.find("MARK"), std::string::npos) << c.sql << "\n" << text;
+  }
+  EXPECT_NE(plan_of("SELECT i16 FROM t WHERE NOT NOT EXISTS (SELECT 1 FROM u)").find("ONE-ROW"),
+            std::string::npos);
 }
 
 // The select list binds before WHERE, and its expressions over aggregates before HAVING, but a mark

@@ -1624,10 +1624,10 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, boo
 }
 
 // One top-level conjunct that is a subquery form the binder answers (ADR 0022's J5): `x IN
-// (query)`, `x NOT IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order. The ADR
-// names those spellings and says every other placement exits 4, so `NOT (x NOT IN (query))` and
-// `NOT NOT (x IN (query))` -- which both mean IN, where one NOT means NOT IN -- are no match and
-// keep their refusal rather than risking the rows of the other form.
+// (query)`, `x NOT IN (query)` and `x <op> (query)` in either order, and an IN under any number of
+// NOTs, whose parity it folds with the IN's own (ADR 0041's SQ7b): `NOT (x NOT IN (query))` and
+// `NOT NOT (x IN (query))` are IN, exactly in three-valued logic, since NOT NOT p is p and a
+// conjunct keeps only TRUE. EXISTS takes one NOT: a NOT NOT EXISTS is a mark's (SQ8).
 //
 // Syntactic only, and the single place that decides: CheckConjunct checks exactly what this
 // accepts by the form's own rule (RejectSubqueryConjunct) -- where a condition takes values (ADR
@@ -1660,12 +1660,14 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
     return std::nullopt;
   }
   const sql::Expr* form = &conjunct;
-  bool negated = false;
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(form);
-      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
-    form = &*unary->operand;  // one NOT only: NOT NOT (x IN (query)) is no match
-    negated = true;
+  int nots = 0;
+  for (const auto* unary = std::get_if<sql::UnaryExpr>(form);
+       unary != nullptr && unary->op == sql::UnaryOp::kNot;
+       unary = std::get_if<sql::UnaryExpr>(form)) {
+    form = &*unary->operand;
+    ++nots;
   }
+  const bool negated = nots % 2 == 1;
   const auto* subquery = std::get_if<sql::SubqueryExpr>(form);
   if (subquery == nullptr) {
     return std::nullopt;
@@ -1673,18 +1675,18 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
   if (subquery->kind == sql::SubqueryExpr::Kind::kExists) {
     // The conjunct is the subquery itself, so there is no other side; the parser writes NOT EXISTS
     // as a kExists node with `negated`, and a written NOT over it negates again.
+    if (nots > 1) {
+      return std::nullopt;
+    }
     return SubqueryConjunct{
         .subquery = subquery, .other = nullptr, .negated = negated != subquery->negated};
   }
   if (subquery->kind != sql::SubqueryExpr::Kind::kIn) {
     return std::nullopt;
   }
-  if (negated && subquery->negated) {
-    return std::nullopt;  // NOT (x NOT IN (query)) means IN, which the ADR does not name
-  }
   ANTB1_CHECK(subquery->operand.has_value());  // the parser writes no kIn node without one
   return SubqueryConjunct{
-      .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
+      .subquery = subquery, .other = &**subquery->operand, .negated = negated != subquery->negated};
 }
 
 // A comparison of two scalar subqueries, each a direct operand: `(q1) <op> (q2)` (ADR 0041's SQ1).

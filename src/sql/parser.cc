@@ -543,6 +543,21 @@ Literal::Kind LiteralKindOf(TokenKind kind) {
 }
 
 // The binary operator of an operator token (the parser only calls it for one).
+// Whether the token is one of the six comparison operators.
+bool IsComparison(const Token& token) {
+  switch (token.kind) {
+    case TokenKind::kEqual:
+    case TokenKind::kNotEqual:
+    case TokenKind::kLess:
+    case TokenKind::kLessEqual:
+    case TokenKind::kGreater:
+    case TokenKind::kGreaterEqual:
+      return true;
+    default:
+      return false;
+  }
+}
+
 BinaryOp BinaryOpOf(const Token& token) {
   switch (token.kind) {
     case TokenKind::kPlus:
@@ -1592,6 +1607,10 @@ class Parser {
       return ParseInList(context, std::move(lhs), negated, op_span);
     }
     const Token op = Take();
+    if (const std::string quantifier = KeywordOf(Peek());
+        IsComparison(op) && (quantifier == "ANY" || quantifier == "SOME" || quantifier == "ALL")) {
+      return ParseQuantified(context, std::move(lhs), op, quantifier);
+    }
     auto rhs = ParseExpr(context, precedence + 1);
     if (!rhs) {
       return rhs;
@@ -1660,6 +1679,32 @@ class Parser {
   }
 
   // IN (value, ...), positioned at '(' after [NOT] IN.
+  // `x = ANY (q)` and `x = SOME (q)`, which are `x IN (q)`, and `x <> ALL (q)` and `x != ALL (q)`,
+  // which are `x NOT IN (q)` (ADR 0041's SQ7b), positioned at the quantifier: an IN subquery
+  // whose operator spans the comparison and the quantifier. Any other quantified comparison, and
+  // a quantifier over anything but a query, is unsupported at the quantifier (decision 3).
+  Expected<Expr> ParseQuantified(Context context, Expr lhs, const Token& op,
+                                 const std::string& quantifier) {
+    const bool in = op.kind == TokenKind::kEqual && quantifier != "ALL";
+    const bool not_in = op.kind == TokenKind::kNotEqual && quantifier == "ALL";
+    if (!(in || not_in) || !OpensNestedQuery(1)) {
+      return Unsupported(Peek().span,
+                         std::format("{} {} (a quantified comparison other than = ANY, = SOME and "
+                                     "<> ALL over a subquery) is not supported",
+                                     op.text, quantifier));
+    }
+    const SourceSpan op_span = Cover(op.span, Take().span);
+    auto sub = ParseSubquery(SubqueryExpr::Kind::kIn, context);
+    if (!sub) {
+      return std::unexpected(std::move(sub.error()));
+    }
+    sub->operand = Box<Expr>(std::move(lhs));
+    sub->negated = not_in;
+    sub->op_span = op_span;
+    sub->span = Cover((*sub->operand)->span(), sub->span);
+    return Expr(*std::move(sub));
+  }
+
   Expected<Expr> ParseInList(Context context, Expr lhs, bool negated, SourceSpan op_span) {
     if (Peek().kind != TokenKind::kLeftParen) {
       return Syntax(Peek().span, "expected ( after IN, found " + Describe(Peek()));
