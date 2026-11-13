@@ -243,7 +243,10 @@ binding written as literals, which holds where DuckDB's decorrelation is wrong. 
 the star schema; each item that answers a correlated shape adds its own. A null-aware mark (ADR 0041's SQ7a) is
 checked against operators that existed before it too: `in_mark_is_its_three_valued_composition_*` classifies each row
 as TRUE, FALSE or NULL from a `LEFT JOIN` to the set's distinct values and a `CROSS JOIN` to its row and NULL counts,
-over sets with a NULL, without one, of NULLs alone and empty. The oracle's other traps (internal
+over sets with a NULL, without one, of NULLs alone and empty. SQ7b's forms are held to the same composition
+(`in_form_any_is_in_*`, `in_form_not_equal_all_is_not_in_*`), and an `IN` over a set operation to its arms' marks:
+`UNION` to their `OR`, three-valued, and `INTERSECT` and `EXCEPT` to `IN` and `IN`, or `IN` and `NOT IN`, over arms
+without a NULL. The oracle's other traps (internal
 errors, a leak of DuckDB 1.5.5, ASOF matches of NULL) are noted in [tests/slt/README.md](../tests/slt/README.md).
 
 ## Random differential tests
