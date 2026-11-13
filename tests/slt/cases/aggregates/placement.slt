@@ -241,6 +241,60 @@ DATE	DECIMAL(38,2)	DECIMAL(9,2)
 2026-03-31	NULL	NULL
 NULL	NULL	NULL
 
+# ---- an argument computed over the side that can go missing ----
+
+# The argument's Compute travels down with the partial, where a padded row has no input and gets the partial's
+# NULL. That is right only where the argument is NULL whenever every column it reads is NULL: a negation and a cast
+# are, so these two are still placed (two GroupAggregate nodes). The riders no driver matches are the NULL key.
+query II nosort
+SELECT rd_city, SUM(-dv_id) FROM riders LEFT JOIN drivers ON dv_city = rd_city GROUP BY rd_city ORDER BY rd_city
+----
+SMALLINT	HUGEINT
+1	-330717090396
+2	-4662658
+3	-4633668
+NULL	NULL
+
+query TI nosort
+SELECT rd_tier, COUNT(CAST(dv_id AS BIGINT)) FROM riders LEFT JOIN drivers ON dv_city = rd_city
+GROUP BY rd_tier ORDER BY rd_tier
+----
+VARCHAR	BIGINT
+basic	1710
+gold	1677
+plus	1716
+
+# COALESCE and CASE turn the padded row's NULL into a value, so the exchange declines them: placed, the padded
+# city summed nothing and the tiers counted none of their riders without a driver.
+query II nosort
+SELECT rd_city, SUM(COALESCE(dv_id, 0)) FROM riders LEFT JOIN drivers ON dv_city = rd_city
+GROUP BY rd_city ORDER BY rd_city
+----
+SMALLINT	HUGEINT
+1	330717090396
+2	4662658
+3	4633668
+NULL	0
+
+query TI nosort
+SELECT rd_tier, COUNT(COALESCE(dv_id, 0)) FROM riders LEFT JOIN drivers ON dv_city = rd_city
+GROUP BY rd_tier ORDER BY rd_tier
+----
+VARCHAR	BIGINT
+basic	1714
+gold	1718
+plus	1757
+
+query II nosort
+SELECT rd_city, SUM(CASE WHEN dv_id IS NULL THEN 1 ELSE 0 END) FROM riders LEFT JOIN drivers ON dv_city = rd_city
+GROUP BY rd_city ORDER BY rd_city
+----
+SMALLINT	HUGEINT
+1	0
+2	0
+3	78
+NULL	8
+
 # ---- counts, which merge through a kind of their own ----
 
 # COUNT of a column of the grouped side, which is the shape ADR 0032 was written for. The exchange counts

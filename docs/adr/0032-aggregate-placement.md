@@ -385,6 +385,14 @@ entirely, because a pre-grouped relation has exactly one row per key.
     (`ResolvePositions` aborts), it is reachable from two inner joins over four columns, and **neither the 22
     nor 6,000 `diff-random` queries produced the shape** -- it came out of reading the rebuild, which is worth
     recording as the limit of what those gates cover.
+  - Update (2026-11-13, a fix found by ADR 0041's SQ6 design): **a fourth refusal, and this one was a wrong
+    answer.** Over a padded side, a `Compute` that travels down meets no padded row below the join, where above
+    it the padded row computed the expression over NULL columns. The two agree only for an expression that is
+    NULL wherever every column it reads is NULL: `SUM(COALESCE(x, 0))` gave NULL for a group of padded rows
+    where the written plan gives 0, and `COUNT(COALESCE(x, 0))` missed the padded rows. So under
+    `needs_identity` a moving `Compute` must be strict and read a column (`PropagatesNull`,
+    `src/plan/strictness.h`); a CASE, a COALESCE or a literal keeps the written plan.
+    `tests/slt/cases/aggregates/placement.slt` pins both sides.
 - **G3, docs(adr): record what G1 and G2 measured**, and either accept this ADR or defer it with the numbers.
   - Update (2026-10-22, G3): **accepted, on one query of the 22 and on its memory rather than its time.**
     Everything below is SF 100, four threads, interleaved and rotated, both arms built from the same tree,
