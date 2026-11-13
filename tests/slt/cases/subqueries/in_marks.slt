@@ -2232,6 +2232,128 @@ INTEGER	INTEGER
 5	0
 9	1
 
+# A select item's CASE under OFFSET. Without ORDER BY the CASE is computed above the LIMIT, over the rows of the mark
+# join's batch that the OFFSET leaves, so it reads a mark that starts inside its buffers (the first part of cities is
+# four rows, whose marks are TRUE, TRUE, TRUE and FALSE): as the WHEN, under LIMIT too and after a WHERE the scan
+# takes; as a later WHEN; as an OR's and an AND's later argument, which every row still waits on; under COALESCE; as
+# = ANY and <> ALL; three-valued over a set holding a NULL, a TRUE after two NULLs; over zones. NOT IN, NOT over the
+# mark, is the contrast. Rows come in file order, as in limit/limit.slt. Under ORDER BY, the last two, the CASE is
+# computed below the sort.
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END FROM cities OFFSET 2
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+6	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities LIMIT 3 OFFSET 1
+----
+SMALLINT	INTEGER
+2	1
+3	1
+4	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities WHERE ct_id > 1 LIMIT 3 OFFSET 1
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id = 0 THEN 9 WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities OFFSET 2
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+6	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id = 0 OR ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities OFFSET 2
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+6	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id > 0 AND ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities OFFSET 3
+----
+SMALLINT	INTEGER
+4	0
+5	0
+6	0
+
+query II rowsort
+SELECT ct_id, COALESCE(CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 END, 0) AS m FROM cities OFFSET 2
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+6	0
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id = ANY(SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 WHEN ct_id <> ALL(SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 0 END AS m FROM cities OFFSET 1
+----
+SMALLINT	INTEGER
+2	1
+3	1
+4	0
+5	0
+6	0
+
+query IT rowsort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NULL OR rd_city = 3) THEN 'T' WHEN NOT (ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NULL OR rd_city = 3)) THEN 'F' ELSE 'N' END AS m FROM cities OFFSET 2
+----
+SMALLINT	VARCHAR
+3	T
+4	N
+5	N
+6	N
+
+query II rowsort
+SELECT zn_id, CASE WHEN zn_city IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) THEN 1 ELSE 0 END AS m FROM zones LIMIT 4 OFFSET 3
+----
+INTEGER	INTEGER
+4	0
+5	0
+6	1
+7	1
+
+query II rowsort
+SELECT ct_id, CASE WHEN ct_id NOT IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities OFFSET 2
+----
+SMALLINT	INTEGER
+3	0
+4	1
+5	1
+6	1
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities ORDER BY ct_id OFFSET 2
+----
+SMALLINT	INTEGER
+3	1
+4	0
+5	0
+6	0
+
+query II nosort
+SELECT ct_id, CASE WHEN ct_id = 0 OR ct_id IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL) THEN 1 ELSE 0 END AS m FROM cities ORDER BY ct_id DESC LIMIT 3 OFFSET 1
+----
+SMALLINT	INTEGER
+5	0
+4	0
+3	1
+
 # ORDER BY's CASE: a plain block, NOT beside the plain mark, a grouped block with a key or an aggregate probe, NOT IN
 # over an empty set, the alias and the position of an item that holds the mark, a three-valued order, and a derived
 # table's top 10.

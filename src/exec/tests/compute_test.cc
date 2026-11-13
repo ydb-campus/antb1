@@ -33,6 +33,7 @@ namespace {
 
 using plan::ArithOp;
 using plan::LogicalType;
+using testing::Bools;
 using testing::Decimals;
 using testing::Int16s;
 using testing::Int64s;
@@ -2404,6 +2405,119 @@ TEST_F(ComputeTest, ANarrowDecimalCaseScattersIntoItsResult) {
   // Rows 0 and 2 come from the first and second branches; the rest from the ELSE, which is where
   // the NULL key lands.
   EXPECT_EQ(UnscaledText(**out), "DECIMAL(15,2): 1700 null -25 null null 13");
+}
+
+// Arrow 25's replace_with_mask, the kernel under Scatter, reads a BOOLEAN input's values from the
+// first bit of its buffer, not from the input's offset (apache/arrow GH-51223); the mask, and every
+// validity bitmap, it reads at the offset. So it reads each value of a slice as many rows early as
+// the slice's offset: the three FALSE values from row 3 come out as the three TRUE values of rows 0
+// to 2, as the values it scatters and as the array it scatters into alike. Scatter copies a sliced
+// BOOLEAN to offset 0 first (the case below). When this case fails, the Arrow in use reads the
+// offset, and that copy can go, with this case.
+TEST_F(ComputeTest, ArrowsReplaceWithMaskReadsASlicedBooleanFromItsBuffersFirstBit) {
+  const auto rows = Bools({true, true, true, false, false, false});
+  const auto from_row_3 = rows->Slice(3);  // false, false, false
+  const auto rows_0_to_2 = rows->Slice(0, 3);
+  const auto nulls = arrow::MakeArrayOfNull(arrow::boolean(), 3).ValueOrDie();
+  const auto every_row = arrow::MakeArrayFromScalar(arrow::BooleanScalar(true), 3).ValueOrDie();
+  const auto no_row = arrow::MakeArrayFromScalar(arrow::BooleanScalar(false), 3).ValueOrDie();
+  const char* const fixed =
+      "replace_with_mask reads a sliced BOOLEAN at its offset now (GH-51223 is fixed in this "
+      "Arrow): Scatter's copy of one to offset 0 can go, and so can this case";
+  auto scattered =
+      arrow::compute::CallFunction("replace_with_mask", {nulls, every_row, from_row_3});
+  ASSERT_TRUE(scattered.ok()) << scattered.status().ToString();
+  EXPECT_TRUE(scattered->make_array()->Equals(*rows_0_to_2))
+      << scattered->make_array()->ToString() << "\n"
+      << fixed;
+  auto kept = arrow::compute::CallFunction("replace_with_mask", {from_row_3, no_row, Bools({})});
+  ASSERT_TRUE(kept.ok()) << kept.status().ToString();
+  EXPECT_TRUE(kept->make_array()->Equals(*rows_0_to_2)) << kept->make_array()->ToString() << "\n"
+                                                        << fixed;
+}
+
+// A BOOLEAN column of a sliced batch is read at its own rows wherever a CASE or an AND/OR scatters
+// it -- a mark join's mark under a LIMIT's OFFSET, which slices the batch the join emits (the shape
+// of `SELECT ..., CASE WHEN x IN (SELECT ...) THEN 1 ELSE 0 END FROM t OFFSET 2`). Each of these
+// hands the column over whole while every row is still open, and Scatter puts it in place through
+// replace_with_mask, which alone would read each value as many rows early as the slice's offset
+// (the case above): a WHEN, a later WHEN, IS TRUE of the column as a WHEN, a THEN, an ELSE, a
+// COALESCE argument, and an AND or an OR argument after the first. A first argument of OR and a NOT
+// reach Arrow's boolean kernels instead, which read the offset; they stay here as the contrast.
+// Every offset from 1 to 9 (within a byte and across one), with NULLs among the values and without:
+// each answer must be the one over the same rows as a batch of their own.
+TEST_F(ComputeTest, ABooleanOfASlicedBatchIsScatteredFromItsOwnRows) {
+  using Kind = plan::Predicate::Kind;
+  using plan::BoolOp;
+  using plan::CompareOp;
+  const auto mark = ColumnAt(0, LogicalType::kBoolean);
+  const auto row = ColumnAt(1, LogicalType::kSmallInt);
+  const auto never = Condition(Kind::kCompare, CompareOp::kLt, 0, row);   // row < 0
+  const auto always = Condition(Kind::kCompare, CompareOp::kGe, 0, row);  // row >= 0
+  const auto one = ConstantOf(1, LogicalType::kInteger);
+  const auto zero = ConstantOf(0, LogicalType::kInteger);
+  const auto make = [](std::vector<plan::ExprPtr> whens, std::vector<plan::ExprPtr> thens,
+                       plan::ExprPtr otherwise, LogicalType type) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::CaseExpr{.whens = std::move(whens),
+                                          .thens = std::move(thens),
+                                          .otherwise = std::move(otherwise)},
+                   .type = type,
+                   .name = "case"});
+  };
+  const auto when_mark = make({mark}, {one}, zero, LogicalType::kInteger);
+
+  // The batch the LIMIT met: four rows whose marks are TRUE, TRUE, TRUE, FALSE, from row 2 on. Row
+  // 3's FALSE must not read as row 1's TRUE.
+  auto offset_2 = Eval(when_mark, {Bools({true, true, true, false})->Slice(2)});
+  ASSERT_TRUE(offset_2.ok()) << offset_2.status().ToString();
+  EXPECT_EQ((*offset_2)->ToString(), "[\n  1,\n  0\n]");
+
+  const std::vector<std::pair<std::string, plan::ExprPtr>> shapes = {
+      {"CASE WHEN m THEN 1 ELSE 0 END", when_mark},
+      {"CASE WHEN row < 0 THEN 1 WHEN m THEN 1 ELSE 0 END",
+       make({never, mark}, {one, one}, zero, LogicalType::kInteger)},
+      {"CASE WHEN m IS TRUE THEN 1 ELSE 0 END",
+       make({Condition(Kind::kIsTrue, CompareOp::kEq, 0, mark)}, {one}, zero,
+            LogicalType::kInteger)},
+      {"CASE WHEN row >= 0 THEN m END", make({always}, {mark}, nullptr, LogicalType::kBoolean)},
+      {"CASE WHEN row < 0 THEN NULL ELSE m END",
+       make({never}, {nullptr}, mark, LogicalType::kBoolean)},
+      {"COALESCE(m, row >= 0)", make({nullptr}, {mark}, always, LogicalType::kBoolean)},
+      {"row < 0 OR m", Bool(BoolOp::kOr, {never, mark})},
+      {"row >= 0 AND m", Bool(BoolOp::kAnd, {always, mark})},
+      {"m OR row < 0", Bool(BoolOp::kOr, {mark, never})},
+      {"NOT m", Bool(BoolOp::kNot, {mark})},
+  };
+  // TRUE, FALSE and NULL in runs that end inside a byte and across one, irregular enough that at
+  // every offset from 1 to 9 the rows from it differ from the rows from row 0, which a read that
+  // ignores the offset would take.
+  const std::string pattern = "TTFTFFFTTTNFTFTTFFNFTFTT";
+  for (const bool nulls : {false, true}) {
+    std::vector<std::optional<bool>> marks;
+    std::vector<std::optional<int16_t>> rows;
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+      marks.push_back(pattern[i] == 'N' && nulls ? std::nullopt
+                                                 : std::optional<bool>(pattern[i] == 'T'));
+      rows.emplace_back(Narrow<int16_t>(i));
+    }
+    const auto batch = BatchOf({Bools(marks), Int16s(rows)});
+    for (std::ptrdiff_t offset = 1; offset <= 9; ++offset) {
+      const auto sliced = batch->Slice(offset);
+      const auto own = BatchOf({Bools({marks.begin() + offset, marks.end()}),
+                                Int16s({rows.begin() + offset, rows.end()})});
+      for (const auto& [shape, expr] : shapes) {
+        auto got = EvaluateExpr(*expr, *sliced, arrow::default_memory_pool());
+        auto want = EvaluateExpr(*expr, *own, arrow::default_memory_pool());
+        ASSERT_TRUE(got.ok()) << shape << ": " << got.status().ToString();
+        ASSERT_TRUE(want.ok()) << shape << ": " << want.status().ToString();
+        EXPECT_TRUE((*got)->Equals(**want))
+            << shape << " at offset " << offset << (nulls ? ", with NULLs" : "") << ": "
+            << (*got)->ToString() << "\nagainst\n"
+            << (*want)->ToString();
+      }
+    }
+  }
 }
 
 }  // namespace
