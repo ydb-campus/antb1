@@ -144,12 +144,26 @@ bool SupportsPackedStrings(const std::vector<arrow::TypeHolder>& types) {
 // the low seven bytes are the value, zero-padded. Empty, NULL and embedded zero bytes stay
 // distinct. Packing is a batch operation, with no mutation of the Grouper until all columns fit.
 arrow::Result<std::optional<arrow::compute::ExecBatch>> PackStrings(
-    const arrow::compute::ExecBatch& keys, arrow::MemoryPool* pool) {
+    const arrow::compute::ExecBatch& keys, arrow::MemoryPool* pool,
+    std::vector<std::shared_ptr<arrow::Buffer>>& scratch) {
+  if (keys.length < 0 || keys.length > std::numeric_limits<int64_t>::max() / 8) {
+    return arrow::Status::CapacityError("packed key buffer size overflow");
+  }
   std::vector<arrow::Datum> columns;
   columns.reserve(keys.values.size());
-  for (const arrow::Datum& key : keys.values) {
-    const arrow::ArrayData& data = *key.array();
-    ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateWords(keys.length, 8, pool));
+  for (std::size_t column = 0; column < keys.values.size(); ++column) {
+    const arrow::ArrayData& data = *keys.values[column].array();
+    // Keep only small packing buffers between calls. Large batches retain the original
+    // temporary-buffer lifetime, without evicting a useful small cache.
+    constexpr int64_t kMaxCachedRows = 256;
+    std::shared_ptr<arrow::Buffer> temporary;
+    auto& buffer = keys.length <= kMaxCachedRows ? scratch[column] : temporary;
+    if (buffer == nullptr || buffer->size() < keys.length * 8) {
+      // No backend operation retains the packed input. Release old capacity before growing,
+      // keeping the query budget from charging both buffers during allocation.
+      buffer.reset();
+      ARROW_ASSIGN_OR_RAISE(buffer, AllocateWords(keys.length, 8, pool));
+    }
     auto* out = reinterpret_cast<std::uint64_t*>(buffer->mutable_data());
     const auto* offsets = data.GetValuesSafe<std::int32_t>(1);
     const auto* bytes = data.GetValuesSafe<std::uint8_t>(2, 0);
@@ -171,7 +185,7 @@ arrow::Result<std::optional<arrow::compute::ExecBatch>> PackStrings(
       out[row] = word;
     }
     columns.emplace_back(
-        arrow::ArrayData::Make(arrow::uint64(), keys.length, {nullptr, std::move(buffer)}, 0));
+        arrow::ArrayData::Make(arrow::uint64(), keys.length, {nullptr, buffer}, 0));
   }
   return arrow::compute::ExecBatch(std::move(columns), keys.length);
 }
@@ -226,12 +240,15 @@ class PackedStringKeyTable final : public KeyTable {
   PackedStringKeyTable(std::unique_ptr<KeyTable> backend,
                        std::vector<arrow::TypeHolder> original_types,
                        arrow::compute::ExecContext* ctx)
-      : backend_(std::move(backend)), original_types_(std::move(original_types)), ctx_(ctx) {}
+      : backend_(std::move(backend)),
+        original_types_(std::move(original_types)),
+        ctx_(ctx),
+        scratch_(original_types_.size()) {}
 
   arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) override {
     return NoBadAlloc([&] -> arrow::Result<KeyIds> {
       if (packed_) {
-        ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool()));
+        ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool(), scratch_));
         if (packed.has_value()) {
           return backend_->Consume(*packed);
         }
@@ -257,7 +274,7 @@ class PackedStringKeyTable final : public KeyTable {
       const arrow::compute::ExecBatch& keys) override {
     return NoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
       if (packed_) {
-        ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool()));
+        ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool(), scratch_));
         if (packed.has_value()) {
           return backend_->Lookup(*packed);
         }
@@ -320,6 +337,10 @@ class PackedStringKeyTable final : public KeyTable {
   // Build the replacement in isolation; even a failed allocation leaves the packed table intact.
   // A Grouper may number a seeding batch in its own order. Remember that permutation explicitly.
   arrow::Status Promote() {
+    // Scratch is disposable even when promotion fails; retain only the logical key state.
+    for (auto& buffer : scratch_) {
+      buffer.reset();
+    }
     ARROW_ASSIGN_OR_RAISE(const auto uniques, Uniques());
     ARROW_ASSIGN_OR_RAISE(auto replacement, MakeGrouper(original_types_, ctx_));
     ARROW_ASSIGN_OR_RAISE(const KeyIds seed, replacement->Consume(uniques));
@@ -356,6 +377,7 @@ class PackedStringKeyTable final : public KeyTable {
   std::unique_ptr<KeyTable> backend_;
   std::vector<arrow::TypeHolder> original_types_;
   arrow::compute::ExecContext* ctx_;
+  std::vector<std::shared_ptr<arrow::Buffer>> scratch_;
   std::shared_ptr<arrow::Buffer> backend_to_public_;
   std::shared_ptr<arrow::Buffer> public_to_backend_;
   std::uint32_t mapped_groups_ = 0;

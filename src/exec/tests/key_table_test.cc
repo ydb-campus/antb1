@@ -604,7 +604,7 @@ TEST_P(KeyTableTest, StringIdsAndUniquesOwnTheirMemoryAcrossPromotionAndDestruct
 
 class PackedStringKeyTableTest : public testing::ExecTest {};
 
-TEST_F(PackedStringKeyTableTest, FailedPackingAndPromotionPreserveKeysAndReleaseAllocations) {
+TEST_F(PackedStringKeyTableTest, FailedPromotionPreservesKeysAndReleasesAllocations) {
   constexpr std::int64_t kLimit = std::int64_t{4} * 1024 * 1024;
   std::vector<std::optional<std::string>> first;
   std::vector<std::optional<std::string>> second;
@@ -614,8 +614,8 @@ TEST_F(PackedStringKeyTableTest, FailedPackingAndPromotionPreserveKeysAndRelease
   }
   const auto initial = BatchOf({StringKeys(first), StringKeys(second, arrow::utf8())});
   const auto long_key = BatchOf({StringKeys({"a new long key"}), StringKeys({"z"}, arrow::utf8())});
-  // No headroom fails packing. A kilobyte fits a single packed row but cannot restore all 256
-  // unique strings during promotion, whose offsets alone need more than a kilobyte.
+  // A failed promotion keeps all existing keys intact. Disposable scratch may be released
+  // before the failure; retrying after restoring budget headroom must still work.
   for (const std::int64_t spare : {0, 1024}) {
     SCOPED_TRACE("spare bytes " + std::to_string(spare));
     MemoryBudget budget(kLimit);
@@ -641,6 +641,127 @@ TEST_F(PackedStringKeyTableTest, FailedPackingAndPromotionPreserveKeysAndRelease
       ASSERT_NO_FATAL_FAILURE(LookupAndCheck(**table, initial, expected));
     }
     EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(PackedStringKeyTableTest, RetainedResultsSurviveScratchReuseGrowthAndDestruction) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                             {.kind = KeyTableKind::kPackedStrings});
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    auto table = std::move(*made);
+    const auto initial = BatchOf({StringKeys({"a", "", std::nullopt, "1234567"}),
+                                  StringKeys({"x", std::nullopt, "", "z"}, arrow::utf8())});
+    Expected expected;
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    const auto ids = table->Consume(initial);
+    ASSERT_TRUE(ids.ok()) << ids.status().ToString();
+    const std::vector<std::uint32_t> copied_ids(ids->ids.begin(), ids->ids.end());
+    const auto probe = BatchOf(
+        {StringKeys({"a", "other", std::nullopt}), StringKeys({"x", "value", ""}, arrow::utf8())});
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, probe, expected));
+    const auto lookup = table->Lookup(probe);
+    ASSERT_TRUE(lookup.ok()) << lookup.status().ToString();
+    const auto lookup_copy = (*lookup)->ToString();
+    const auto uniques = table->Uniques();
+    ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
+    const auto initial_groups = expected.key_of.size();
+    std::vector<std::optional<std::string>> a(1024, "other");
+    std::vector<std::optional<std::string>> b(1024, "value");
+    const auto larger = BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+    const auto cached_growth = larger.Slice(1, 256);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, cached_growth, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, cached_growth, expected));
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, larger, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, larger, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    table.reset();
+    EXPECT_EQ(std::vector<std::uint32_t>(ids->ids.begin(), ids->ids.end()), copied_ids);
+    EXPECT_EQ((*lookup)->ToString(), lookup_copy);
+    CheckUniques(*uniques, expected, TypesOf(initial), initial_groups);
+    EXPECT_GT(budget.bytes_allocated(), 0);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(PackedStringKeyTableTest, SmallScratchSurvivesLargeTemporariesAndLookupPromotionReleasesIt) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                             {.kind = KeyTableKind::kPackedStrings});
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    auto table = std::move(*made);
+    const auto repeated = [](std::size_t rows) {
+      const std::vector<std::optional<std::string>> a(rows, "a");
+      const std::vector<std::optional<std::string>> b(rows, "b");
+      return BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+    };
+    const auto small = BatchOf({StringKeys({"a"}), StringKeys({"b"}, arrow::utf8())});
+    Expected expected;
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, repeated(255), expected));
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, repeated(255), expected));
+    const auto at_limit = repeated(256);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, at_limit, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, at_limit, expected));
+    const auto cached_bytes = budget.bytes_allocated();
+    // Only one group exists. Larger batches must not retain packing capacity, and must keep
+    // the existing small cache available. All returned ID/lookup buffers are released here.
+    for (const std::size_t rows : {std::size_t{257}, std::size_t{65536}}) {
+      SCOPED_TRACE(rows);
+      const auto large = repeated(rows);
+      ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, large, expected));
+      EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+      ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, large, expected));
+      EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+    }
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, small, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, small, expected));
+    EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+    const auto long_probe =
+        BatchOf({StringKeys({"a longer missing key"}), StringKeys({"b"}, arrow::utf8())});
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, long_probe, expected));
+    EXPECT_LT(budget.bytes_allocated(), cached_bytes);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, small, expected));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(PackedStringKeyTableTest, FailedCachedOrTemporaryPackingPreservesKeysAndAllowsRetry) {
+  constexpr std::int64_t kLimit = std::int64_t{4} * 1024 * 1024;
+  for (const bool lookup : {false, true}) {
+    SCOPED_TRACE(lookup ? "lookup" : "consume");
+    for (const std::size_t rows : {std::size_t{256}, std::size_t{4096}}) {
+      SCOPED_TRACE(rows);
+      MemoryBudget budget(kLimit);
+      {
+        arrow::compute::ExecContext ctx(&budget);
+        auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                                 {.kind = KeyTableKind::kPackedStrings});
+        ASSERT_TRUE(made.ok()) << made.status().ToString();
+        auto table = std::move(*made);
+        const auto initial = BatchOf(
+            {StringKeys({"a", "", std::nullopt}), StringKeys({"x", "y", "z"}, arrow::utf8())});
+        Expected expected;
+        ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+        const std::vector<std::optional<std::string>> a(rows, "new");
+        const std::vector<std::optional<std::string>> b(rows, "pair");
+        const auto large = BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+        const auto reserved = kLimit - budget.bytes_allocated();
+        ASSERT_TRUE(budget.Reserve(reserved).ok());
+        const arrow::Status failed =
+            lookup ? table->Lookup(large).status() : table->Consume(large).status();
+        EXPECT_TRUE(failed.IsOutOfMemory()) << failed.ToString();
+        budget.Release(reserved);
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, initial, expected));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, large, expected));
+        ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, large, expected));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, initial, expected));
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+    }
   }
 }
 
