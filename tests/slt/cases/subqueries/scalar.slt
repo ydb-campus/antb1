@@ -310,6 +310,14 @@ SELECT COUNT(*) FROM zones AS z WHERE z.zn_id < (SELECT SUM(d.dv_city + 1) FROM 
 BIGINT
 30
 
+# A function of the aggregate is NULL over no rows as the aggregate is, so the inner join back stands: the riders
+# without a trip have no group and fail the comparison either way.
+query I nosort
+SELECT COUNT(*) FROM riders WHERE rd_id < (SELECT abs(MAX(tr_fare) - 30) FROM trips WHERE tr_rider = rd_id)
+----
+BIGINT
+3
+
 # A subquery in an ON of a comma list: label is the join group's cities', although the comma sibling zones has one
 # too. (An ON that reads a comma sibling as well makes DuckDB 1.5.6 drop every row of a correlated scalar subquery
 # there, which antb1 answers, so no record has that shape.)

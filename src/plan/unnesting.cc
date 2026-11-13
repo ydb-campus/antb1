@@ -25,6 +25,7 @@
 
 #include "join_order.h"
 #include "key_type.h"
+#include "strictness.h"
 
 // The unnesting pass (ADR 0023; ADR 0041's decisions 16 to 20), the first and only fallible step of
 // Optimize: it replaces every dependent join with ordinary joins, or rejects the query with exit
@@ -165,32 +166,6 @@ class Classes {
  private:
   std::map<ColumnId, ColumnId> parent_;
 };
-
-// Whether an expression over the aggregate's columns is STRICT: NULL whenever an operand is NULL.
-// ADR 0023's Path 2 accepts only such a combination, and the reason is the COUNT bug (R. A. Ganski
-// and H. K. T. Wong, SIGMOD 1987): the rewrite gives an outer row with no group no row at all, so
-// the comparison must reject it, which it does exactly when the subquery's value is NULL there.
-// SUM, AVG, MIN and MAX are NULL over no rows and a strict combination keeps that NULL; COUNT is
-// 0, and CASE, COALESCE, OR, AND and some functions turn a NULL into a value, so the comparison
-// could accept a row the inner join drops -- a silently wrong answer, not a refusal.
-bool IsStrict(const Expr& expr) {
-  return std::visit(
-      [](const auto& node) {
-        using Node = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<Node, ColumnExpr> || std::is_same_v<Node, ConstantExpr>) {
-          return true;  // a column of the aggregation, or a literal
-        } else if constexpr (std::is_same_v<Node, ArithExpr>) {
-          return IsStrict(*node.left) && IsStrict(*node.right);
-        } else if constexpr (std::is_same_v<Node, NegateExpr> || std::is_same_v<Node, CastExpr>) {
-          // Unary minus, and the implicit casts of an operator's operands.
-          return IsStrict(*node.operand);
-        } else {
-          // FunctionExpr, PredicateExpr, BoolExpr, CaseExpr: none is strict in general.
-          return false;
-        }
-      },
-      expr.node);
-}
 
 // How many times the aggregation's own input must exceed the outer side before restricting it to
 // the keys that side binds is worth a build and a probe (RestrictToTheOuterKeys below).
@@ -638,8 +613,10 @@ arrow::Status CheckStatic(const Correlation& correlation, const Spine& spine,
                            [](const AggregateCall& call) { return AnsweredCall(call.kind); })) {
     return correlation.Refuse("whose aggregate is not SUM, AVG, MIN or MAX");
   }
+  // Only a strict combination (strictness.h) keeps the NULL of SUM, AVG, MIN and MAX over no rows:
   // CASE, COALESCE, OR, AND and some functions turn a NULL into a value, so the comparison could
-  // accept a row the inner join drops -- a silently wrong answer, not a refusal.
+  // accept a row the inner join drops -- a silently wrong answer, not a refusal (the COUNT bug,
+  // R. A. Ganski and H. K. T. Wong, SIGMOD 1987).
   for (const Step& step : spine.steps) {
     const auto* compute = std::get_if<ComputeNode>(step.node.get());
     if (step.role == Role::kMap && compute != nullptr &&
