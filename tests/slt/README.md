@@ -325,15 +325,31 @@ of one type family and never `DOUBLE`) take one, its tokens moved to their place
 one more `HAVING` conjunct over a `GROUP BY` key or `MIN` or `MAX` of the probe, one more select item (a
 projection's `CASE`, or in a block that aggregates a `CASE` over a key or `COUNT(CASE WHEN <condition> THEN probe
 END)`), or one more `ORDER BY` item (a `CASE`); a place the block rules out is `WHERE`. A conjunct is `(mark OR probe <op>
-literal)` in either order, `NOT (probe NOT IN (set))` or `NOT` over such an `OR`, `CASE WHEN <condition> THEN 1 ELSE
-0 END = n`, or the three-valued `CASE WHEN mark THEN 1 WHEN NOT (mark) THEN 0 ELSE 2 END = n` -- never the bare `IN`
-nor `NOT (probe IN (set))`, which are `in_subquery`'s semi and anti joins. Its set reads one column of one named
+literal)` in either order, `NOT (probe NOT IN (set) AND probe <op> literal)` or `NOT` over such an `OR`, `CASE WHEN
+<condition> THEN 1 ELSE 0 END = n`, or the three-valued `CASE WHEN mark THEN 1 WHEN NOT (mark) THEN 0 ELSE 2 END = n`
+-- never the bare `IN` nor `NOT`s over it alone, which are `in_subquery`'s semi and anti joins (SQ7b folds `NOT
+(probe NOT IN (set))` into a semi join; `in_form` writes it). Its set reads one column of one named
 table, unqualified: the whole column (NULLs where the table has them; no row over the empty `promos`), its values
 that are not NULL, its NULLs alone, a `CASE` that keeps the values a literal comparison holds and NULL elsewhere,
 the first rows in its order under `NULLS FIRST` or `NULLS LAST` (`LIMIT 0` too: a `LIMIT` follows the column's
 full order, so the set is one in any order), `DISTINCT`, `GROUP BY`, or the NULLs with the values a comparison
 holds; these clauses record no feature of their own. The probe reads a column and computes nothing that can
 overflow, no block holds a value that can fail, and a key is written again only without grouping sets.
+
+The `IN` forms of ADR 0041's SQ7b (feature `in_form`) are drawn right after a mark, from a random stream of their own
+and only where the query holds no other subquery and no mark, so a query without one is the query its seed gave
+before: 40% of the remaining queries with a candidate take one. It is written as a mark is, in the same places and
+over the same sets, with at least one of three forms: every `IN` spelled `= ANY` or `= SOME` and every `NOT IN` `<>
+ALL` or `!= ALL`; a literal of the set column's type family as the probe (an integer against integers, a value or a
+small integer against a `DECIMAL`, a string against a `VARCHAR`, a date or a string against a `DATE`; never a string
+against a number or a number against a `VARCHAR` or a `DATE`); or a set that is a set operation (`UNION ALL`,
+`UNION`, `INTERSECT [ALL]`, `EXCEPT [ALL]`) of two or three arms, each one column of the set column's own type, of a
+table the probe has a ref to, unqualified and so uncorrelated, kept whole, to its NULLs, to its values or to those a
+literal comparison holds, with no `ORDER BY` or `LIMIT` on the compound or an arm. A `WHERE` or `HAVING` conjunct may
+also be the bare `IN` or `NOT IN` (a semi or an anti join) or `NOT NOT (x IN (q))` and `NOT (x NOT IN (q))`, which
+fold into a semi join. A literal probe's mark never stands alone in a `CASE` compared with a number: antb1 refuses
+that as a comparison of two literals, so the bare `IN` stands there instead. The other quantified comparisons (`<
+ANY`, `= ALL`) are never written.
 
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
