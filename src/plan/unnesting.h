@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -26,16 +27,26 @@ using EmptyValue = std::optional<Constant>;
 EmptyValue EmptyValueOf(const AggregateCall& call);
 
 // Decision 20, the consumer proof: whether a dependent join that appends its right input's row may
-// be joined back INNER, which drops an outer row the subquery has no row for. Only where every
-// reader of the subquery's value rejects its empty value: from the dependent join's parent up
-// through Computes to the first Filter that reads the value, one of whose conjuncts over it must
-// be true for no row whose value is the empty value (TruthOver). Anything else -- a node that is
-// not a Compute on the way, a Filter that reads no value, the root reached -- leaves it LEFT.
+// be joined back INNER, which drops an outer row the subquery has no row for. Only where a reader
+// of the subquery's value rejects its empty value before anything else can see it: from the
+// dependent join's parent up through Computes, Filters none of whose conjuncts decides, and joins
+// reached from their left input that pad no left row (ADR 0041's SQ5), to the first Filter one of
+// whose conjuncts over the value is true for no row holding its empty value (TruthOver). Each node
+// passed decides each of its rows by that row alone and keeps its columns, so the rows of a binding
+// without a group all reach that Filter and fail there. Anything else -- another node, a join
+// reached from its right input or one that pads its left, the root reached -- leaves it LEFT.
 enum class JoinBack : std::uint8_t { kInner, kLeft };
+
+// A node above a dependent join, and the input of it the walk came up from: an index into
+// InputsOf(*node), so a join's left input is 0 and its right 1.
+struct Ancestor {
+  const LogicalNode* node = nullptr;
+  std::size_t input = 0;
+};
 
 // `above`: the nodes from the plan's root down to the dependent join's parent, root first.
 // `values`: each column the dependent join appends, with its empty value.
-JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
+JoinBack ProveJoinBack(std::span<const Ancestor> above,
                        const std::map<ColumnId, EmptyValue>& values);
 
 // The proof's verdict for each dependent join that appends its right input's row, in the order the

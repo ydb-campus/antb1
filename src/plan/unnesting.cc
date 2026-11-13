@@ -431,7 +431,7 @@ struct Correlation {
   std::set<ColumnId> outer;  // the left input's output
   ColumnId& last_id;
   int64_t build_side_ratio;
-  std::span<const LogicalNode* const> above;  // the plan's root down to the join's parent
+  std::span<const Ancestor> above;  // the plan's root down to the join's parent
   UnnestReport* report = nullptr;
 
   // The refusal of a shape, in the wording each mode has always had, at the subquery's span.
@@ -1578,8 +1578,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
 
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
 arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
-                                         int64_t build_side_ratio,
-                                         std::span<const LogicalNode* const> above,
+                                         int64_t build_side_ratio, std::span<const Ancestor> above,
                                          UnnestReport* report) {
   const std::optional<Mode> mode = ModeOf(join.kind);
   if (!mode.has_value()) {
@@ -1649,11 +1648,13 @@ class Walker {
     }
     std::vector<LogicalNodePtr> inputs = InputsOf(*node);
     bool changed = false;
-    above_.push_back(node.get());
-    for (LogicalNodePtr& input : inputs) {
+    above_.push_back(Ancestor{.node = node.get(), .input = 0});
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+      LogicalNodePtr& input = inputs[i];
       if (input == nullptr) {
         continue;
       }
+      above_.back().input = i;  // which input of this node the proof below comes up from
       arrow::Result<LogicalNodePtr> rewritten = Walk(input);
       if (!rewritten.ok()) {
         above_.pop_back();
@@ -1672,7 +1673,7 @@ class Walker {
   ColumnId& last_id_;
   int64_t build_side_ratio_;
   UnnestReport* report_;
-  std::vector<const LogicalNode*> above_;
+  std::vector<Ancestor> above_;
 };
 }  // namespace
 
@@ -1697,7 +1698,7 @@ EmptyValue EmptyValueOf(const AggregateCall& call) {
   return std::nullopt;
 }
 
-JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
+JoinBack ProveJoinBack(std::span<const Ancestor> above,
                        const std::map<ColumnId, EmptyValue>& values) {
   std::map<ColumnId, EmptyValue> tracked = values;
   const auto value_of = [&tracked](const std::optional<BoundColumn>& column) -> EmptyValue {
@@ -1710,7 +1711,8 @@ JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
   const auto reads = [&tracked](const std::optional<BoundColumn>& column) {
     return column.has_value() && tracked.contains(column->id);
   };
-  for (const LogicalNode* node : std::ranges::reverse_view(above)) {
+  for (const Ancestor& step : std::ranges::reverse_view(above)) {
+    const LogicalNode* node = step.node;
     if (const auto* compute = std::get_if<ComputeNode>(node)) {
       for (std::size_t i = 0; i < compute->exprs.size() && i < compute->ids.size(); ++i) {
         std::vector<ColumnId> ids;
@@ -1730,20 +1732,27 @@ JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
       }
       continue;
     }
-    const auto* filter = std::get_if<FilterNode>(node);
-    if (filter == nullptr) {
-      return JoinBack::kLeft;  // a node on the way that is not a Compute
-    }
-    for (const Predicate& predicate : filter->predicates) {
-      if ((reads(predicate.column) || reads(predicate.other)) &&
-          TruthOver(predicate, value_of(predicate.column), value_of(predicate.other)) ==
-              BranchTruth::kNever) {
-        return JoinBack::kInner;  // every row whose value is empty fails this conjunct
+    if (const auto* filter = std::get_if<FilterNode>(node)) {
+      for (const Predicate& predicate : filter->predicates) {
+        if ((reads(predicate.column) || reads(predicate.other)) &&
+            TruthOver(predicate, value_of(predicate.column), value_of(predicate.other)) ==
+                BranchTruth::kNever) {
+          return JoinBack::kInner;  // every row whose value is empty fails this conjunct
+        }
       }
+      continue;  // it only drops rows: each row it keeps meets the nodes above, its columns as they
+                 // were
     }
-    return JoinBack::kLeft;  // the first Filter on the way rejects nothing for sure
+    // A join reached from its left input that pads no left row (inner, LEFT, semi, anti, one-row,
+    // mark) decides each left row by that row and its right input alone, and outputs the row's
+    // columns as they are. A FULL join, or a join reached from its right input, does not.
+    if (const auto* join = std::get_if<JoinNode>(node);
+        join != nullptr && step.input == 0 && !Traits(join->kind).pads_left) {
+      continue;
+    }
+    return JoinBack::kLeft;  // a node whose rows depend on other rows, or that hides the value
   }
-  return JoinBack::kLeft;  // nothing reads the value: an INNER join would drop outer rows
+  return JoinBack::kLeft;  // nothing rejects the value: an INNER join would drop outer rows
 }
 
 // The outermost dependent join of the plan, nullptr when it has none. Pre-order, so the first one

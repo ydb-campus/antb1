@@ -358,13 +358,38 @@ Predicate CompareColumns(ColumnId column, CompareOp op, ColumnId other) {
                    .op = op};
 }
 
-JoinBack Proof(const std::vector<LogicalNode>& above_root_first, EmptyValue value) {
-  std::vector<const LogicalNode*> above;
+// A node on the proof's way and the input of it the walk came up from (0: its left).
+struct Above {
+  LogicalNode node;
+  std::size_t input = 0;
+};
+
+JoinBack Proof(const std::vector<Above>& above_root_first, EmptyValue value) {
+  std::vector<Ancestor> above;
   above.reserve(above_root_first.size());
-  for (const LogicalNode& node : above_root_first) {
-    above.push_back(&node);
+  for (const Above& step : above_root_first) {
+    above.push_back(Ancestor{.node = &step.node, .input = step.input});
   }
   return ProveJoinBack(above, {{kValue, std::move(value)}});
+}
+
+JoinBack Proof(const std::vector<LogicalNode>& above_root_first, EmptyValue value) {
+  std::vector<Above> above;
+  above.reserve(above_root_first.size());
+  for (const LogicalNode& node : above_root_first) {
+    above.push_back(Above{.node = node, .input = 0});
+  }
+  return Proof(above, std::move(value));
+}
+
+// A join of `kind` with nothing but its kind set; `key` reads the value where it is set.
+LogicalNode JoinOf(JoinKind kind, bool key_reads_value = false) {
+  JoinNode join;
+  join.kind = kind;
+  if (key_reads_value) {
+    join.keys.push_back(JoinKey{.left = Bigint(kValue), .right = Bigint(kOuter)});
+  }
+  return join;
 }
 
 EmptyValue NullValue() { return Constant{.type = LogicalType::kBigInt, .value = std::monostate{}}; }
@@ -395,9 +420,9 @@ TEST(UnnestingTest, TheProofAcceptsAComparisonOverAnEmptyValueOfNull) {
             JoinBack::kInner);
 }
 
-// What can pass the empty value, or reads none of it, leaves the join back LEFT: IS NULL and the
-// DISTINCT FROM pair, a Compute that is not strict, a node on the way that is not a Compute, a
-// Filter that reads no value, and nothing above at all.
+// What can pass the empty value leaves the join back LEFT: IS NULL and the DISTINCT FROM pair, a
+// Compute that is not strict, a node on the way that hides the value (a Project), and nothing above
+// at all.
 TEST(UnnestingTest, TheProofRefusesWhatCanPassTheEmptyValue) {
   EXPECT_EQ(
       Proof({FilterOf({Predicate{.kind = Predicate::Kind::kIsNull, .column = Bigint(kValue)}})},
@@ -427,11 +452,138 @@ TEST(UnnestingTest, TheProofRefusesWhatCanPassTheEmptyValue) {
              ProjectNode{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = {}}},
             NullValue()),
       JoinBack::kLeft);
+  EXPECT_EQ(Proof(std::vector<LogicalNode>{}, NullValue()), JoinBack::kLeft);
+}
+
+// ADR 0041's SQ5: a Filter none of whose conjuncts rejects the empty value only drops rows, so the
+// walk passes it on to a later Filter that does -- one that reads no value (which SQ0 read as a
+// refusal), and one that reads it without deciding. The first Filter that decides is the one.
+TEST(UnnestingTest, TheProofPassesAFilterThatDecidesNothing) {
+  const EmptyValue zero = Constant{.type = LogicalType::kBigInt, .value = Int128{0}};
   EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
                    FilterOf({Compare(kOuter, CompareOp::kGt, 0)})},
                   NullValue()),
+            JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                   FilterOf({Compare(kValue, CompareOp::kGe, 0)})},
+                  zero),
+            JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGe, 0)}),
+                   FilterOf({Compare(kValue, CompareOp::kGt, 0)})},
+                  zero),
+            JoinBack::kInner);
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGe, 0)}),
+                   FilterOf({Compare(kValue, CompareOp::kEq, 0)})},
+                  zero),
             JoinBack::kLeft);
-  EXPECT_EQ(Proof({}, NullValue()), JoinBack::kLeft);
+  // The accepted divergence of D24: a condition that fails only over the empty value stands below
+  // the one that rejects it, so an INNER join back never computes it.
+  constexpr ColumnId kCast{53};
+  EXPECT_EQ(Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                   FilterOf({Compare(kCast, CompareOp::kGe, 0)}),
+                   ComputeNode{.input = nullptr,
+                               .exprs = {std::make_shared<const Expr>(
+                                   Expr{.node = CastExpr{.operand = std::make_shared<const Expr>(
+                                                             Expr{.node = ColumnExpr{.id = kValue},
+                                                                  .type = LogicalType::kBigInt,
+                                                                  .name = "v"})},
+                                        .type = LogicalType::kUSmallInt,
+                                        .name = "CAST(v AS USMALLINT)"})},
+                               .ids = {kCast},
+                               .span = {}}},
+                  zero),
+            JoinBack::kInner);
+}
+
+// A join reached from its left input that pads no left row decides each left row by that row and
+// its right input alone, and keeps the row's columns: the walk passes it, also where its key reads
+// the value. From its right input, or where it pads its left (FULL), it stops.
+TEST(UnnestingTest, TheProofPassesAJoinReachedFromItsLeft) {
+  for (const JoinKind kind :
+       {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+        JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kNullAwareMark}) {
+    SCOPED_TRACE(ToString(kind));
+    for (const bool key : {false, true}) {
+      EXPECT_EQ(Proof(std::vector<Above>{{.node = FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                                          .input = 0},
+                                         {.node = JoinOf(kind, key), .input = 0}},
+                      NullValue()),
+                JoinBack::kInner);
+      EXPECT_EQ(Proof(std::vector<Above>{{.node = FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                                          .input = 0},
+                                         {.node = JoinOf(kind, key), .input = 1}},
+                      NullValue()),
+                JoinBack::kLeft);
+    }
+  }
+  for (const std::size_t input : {std::size_t{0}, std::size_t{1}}) {
+    EXPECT_EQ(Proof(std::vector<Above>{{.node = FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                                        .input = 0},
+                                       {.node = JoinOf(JoinKind::kFull), .input = input}},
+                    NullValue()),
+              JoinBack::kLeft);
+  }
+}
+
+// Every node that is no Compute, Filter or join reached from its left stops the walk: its rows
+// depend on other rows (an aggregation, a sort, a limit, a set operation) or it hides the value.
+TEST(UnnestingTest, TheProofStopsAtEveryOtherNode) {
+  const std::vector<LogicalNode> stops = {
+      ProjectNode{}, AggregateNode{}, GroupAggregateNode{}, GroupingSetsNode{}, SortNode{},
+      LimitNode{},   UnionAllNode{},  SetOperationNode{},   DependentJoinNode{}};
+  for (const LogicalNode& stop : stops) {
+    for (const std::size_t input : {std::size_t{0}, std::size_t{1}}) {
+      EXPECT_EQ(Proof(std::vector<Above>{{.node = FilterOf({Compare(kValue, CompareOp::kGt, 0)}),
+                                          .input = 0},
+                                         {.node = stop, .input = input}},
+                      NullValue()),
+                JoinBack::kLeft)
+          << ExplainNode(stop);
+    }
+  }
+}
+
+// What a Compute below a passed node derives from the value is tracked across it: 2 * v is NULL
+// where v is, through an inner join and a Filter that decides nothing; COALESCE(v, v) is not known.
+TEST(UnnestingTest, TheProofTracksComputesAcrossPassedNodes) {
+  const ExprPtr v = std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.id = kValue}, .type = LogicalType::kBigInt, .name = "v"});
+  const ExprPtr two_v = std::make_shared<const Expr>(Expr{
+      .node = ArithExpr{.op = ArithOp::kMultiply,
+                        .left = std::make_shared<const Expr>(Expr{
+                            .node = ConstantExpr{.value = Constant{.type = LogicalType::kBigInt,
+                                                                   .value = Int128{2}}},
+                            .type = LogicalType::kBigInt,
+                            .name = "2"}),
+                        .right = v},
+      .type = LogicalType::kBigInt,
+      .name = "2 * v"});
+  const ExprPtr coalesce = std::make_shared<const Expr>(
+      Expr{.node = CaseExpr{.whens = {nullptr}, .thens = {v}, .otherwise = v},
+           .type = LogicalType::kBigInt,
+           .name = "COALESCE(v, v)"});
+  constexpr ColumnId kDerived{52};
+  EXPECT_EQ(
+      Proof(
+          std::vector<Above>{
+              {.node = FilterOf({CompareColumns(kDerived, CompareOp::kGt, kOuter)}), .input = 0},
+              {.node = JoinOf(JoinKind::kInner), .input = 0},
+              {.node = FilterOf({Compare(kOuter, CompareOp::kGt, 0)}), .input = 0},
+              {.node =
+                   ComputeNode{.input = nullptr, .exprs = {two_v}, .ids = {kDerived}, .span = {}},
+               .input = 0}},
+          NullValue()),
+      JoinBack::kInner);
+  EXPECT_EQ(Proof(
+                std::vector<Above>{
+                    {.node = FilterOf({Compare(kDerived, CompareOp::kGt, 0)}), .input = 0},
+                    {.node = JoinOf(JoinKind::kOneRow), .input = 0},
+                    {.node =
+                         ComputeNode{
+                             .input = nullptr, .exprs = {coalesce}, .ids = {kDerived}, .span = {}},
+                     .input = 0}},
+                NullValue()),
+            JoinBack::kLeft);
 }
 
 // An empty value that is no NULL -- COUNT's 0, which SQ6 answers -- is decided by the comparison
@@ -484,6 +636,60 @@ TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
   ASSERT_EQ(report.join_backs.size(), 1U);
   EXPECT_EQ(report.join_backs.front().join_back, JoinBack::kLeft);
   EXPECT_NE(TreeText(*out).find("Join LEFT build=right"), std::string::npos) << TreeText(*out);
+}
+
+// The Walker tells a join's inputs apart: the same correlated COUNT under `> 0` proves INNER
+// through an inner join it is the left input of, and stays LEFT as its right input. Both in one
+// plan, the walk goes left first and resets the input between them.
+TEST(UnnestingTest, TheWalkerTellsTheInputsOfAJoinApart) {
+  const Catalog catalog = MakeCatalog();
+  auto plan =
+      BindSql("SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) >= 0", catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  LogicalNodePtr dependent = plan->root;
+  while (!std::holds_alternative<DependentJoinNode>(*dependent)) {
+    dependent = InputsOf(*dependent).front();
+  }
+  ColumnId last_id = MaxColumnId(*plan->root);
+  const LogicalNodePtr other = CloneWithFreshIds(dependent, last_id);
+  const auto value_of = [](const LogicalNodePtr& node) {
+    return OutputIds(*std::get<DependentJoinNode>(*node).right).front();
+  };
+  const auto rejects = [](ColumnId value) {
+    return Predicate{.kind = Predicate::Kind::kCompare,
+                     .column = Bigint(value),
+                     .op = CompareOp::kGt,
+                     .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{0}}};
+  };
+  const auto verdicts = [](const LogicalNodePtr& root) {
+    UnnestReport report;
+    const arrow::Result<LogicalNodePtr> out = Unnest(root, kBuildSideRatio, &report);
+    EXPECT_TRUE(out.ok()) << out.status().ToString();
+    std::vector<JoinBack> found;
+    for (const UnnestReport::Entry& entry : report.join_backs) {
+      found.push_back(entry.join_back);
+    }
+    return found;
+  };
+  const auto over = [](LogicalNodePtr left, LogicalNodePtr right, std::vector<Predicate> filter) {
+    JoinNode join;
+    join.kind = JoinKind::kInner;
+    join.left = std::move(left);
+    join.right = std::move(right);
+    join.build = BuildSide::kRight;
+    return std::make_shared<const LogicalNode>(
+        FilterNode{.input = std::make_shared<const LogicalNode>(std::move(join)),
+                   .predicates = std::move(filter),
+                   .span = {}});
+  };
+  const LogicalNodePtr scan = std::get<DependentJoinNode>(*other).left;  // fresh ids too
+  EXPECT_EQ(verdicts(over(dependent, scan, {rejects(value_of(dependent))})),
+            std::vector<JoinBack>{JoinBack::kInner});
+  EXPECT_EQ(verdicts(over(scan, dependent, {rejects(value_of(dependent))})),
+            std::vector<JoinBack>{JoinBack::kLeft});
+  EXPECT_EQ(
+      verdicts(over(dependent, other, {rejects(value_of(dependent)), rejects(value_of(other))})),
+      (std::vector<JoinBack>{JoinBack::kInner, JoinBack::kLeft}));
 }
 
 // The plan Unnest makes of `sql`, as EXPLAIN shows it, and the verdict of each join back.
