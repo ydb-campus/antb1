@@ -347,9 +347,7 @@ against a number or a number against a `VARCHAR` or a `DATE`); or a set that is 
 table the probe has a ref to, unqualified and so uncorrelated, kept whole, to its NULLs, to its values or to those a
 literal comparison holds, with no `ORDER BY` or `LIMIT` on the compound or an arm. A `WHERE` or `HAVING` conjunct may
 also be the bare `IN` or `NOT IN` (a semi or an anti join) or `NOT NOT (x IN (q))` and `NOT (x NOT IN (q))`, which
-fold into a semi join. A literal probe's mark never stands alone in a `CASE` compared with a number: antb1 refuses
-that as a comparison of two literals, so the bare `IN` stands there instead. The other quantified comparisons (`<
-ANY`, `= ALL`) are never written.
+fold into a semi join. The other quantified comparisons (`< ANY`, `= ALL`) are never written.
 
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave

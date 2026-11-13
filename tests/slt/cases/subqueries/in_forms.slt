@@ -2128,6 +2128,28 @@ SMALLINT	VARCHAR
 5	F
 6	F
 
+# ---- a CASE over a constant probe's mark ----
+
+# The mark of a constant probe is a value of the condition, so a CASE over it compared with a number is no comparison
+# of two literals: as a top-level conjunct, and three-valued.
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE CASE WHEN 2 IN (SELECT zn_parent FROM zones) THEN 1 ELSE 0 END = 1
+----
+BIGINT
+3000
+
+query I rowsort
+SELECT COUNT(*) FROM tariffs WHERE CASE WHEN 'A' IN (SELECT tf_code FROM tariffs) THEN 'T' WHEN NOT ('A' IN (SELECT tf_code FROM tariffs)) THEN 'F' ELSE 'N' END = 'T'
+----
+BIGINT
+0
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE CASE WHEN 99 NOT IN (SELECT zn_parent FROM zones) THEN 1 WHEN NOT (99 NOT IN (SELECT zn_parent FROM zones)) THEN 0 ELSE 2 END = 2
+----
+BIGINT
+40
+
 # ---- TIMESTAMP probes and sets ----
 
 # A string literal against a TIMESTAMP set is that TIMESTAMP, an invalid one an error in both; a TIMESTAMP against a

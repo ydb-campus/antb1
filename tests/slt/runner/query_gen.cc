@@ -3521,18 +3521,9 @@ class Builder {
     const bool cases = allowed_.Has(Feature::kCase) && allowed_.Has(Feature::kIntegerLiteral);
     const bool forms = in_form_.has_value();
     uint64_t form = mark_rng_->Below(forms ? 6 : 4);
-    // A CASE over the mark of a literal probe alone reads no column, and antb1 refuses a
-    // comparison of it with a number as one between two literals: the bare IN instead.
-    const bool literal = in_form_.has_value() && in_form_->literal.has_value();
-    if (literal && (form == 2 || form == 3)) {
-      form = 4;
-    }
     if ((form <= 1 && !booleans) || (form == 2 && !cases) || (form == 3 && !(cases && booleans)) ||
         (form == 5 && !booleans)) {
       form = booleans ? 1 : 2;
-      if (form == 2 && literal) {
-        form = 4;
-      }
     }
     switch (form) {
       case 0:

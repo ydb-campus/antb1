@@ -997,9 +997,15 @@ changes.
   number, is DuckDB's bind error (exit 1), checked where the IN's key is typed (`InKeyType`, shared by the semi, anti
   and mark joins), so also under a dropped OR branch; a DATE against a TIMESTAMP, which DuckDB answers, stays a refusal
   (no key type holds both). The review added TIMESTAMP to the rule, since DuckDB's is the same for it.
-- **Decision 28.** `tests/slt/cases/subqueries/in_forms.slt` holds 292 records, written first under `pending SQ7b` and
-  checked against DuckDB, with D3's pin; the guards of `conditions.slt`, `setops/errors.slt` and `in_marks.slt` that
-  SQ7b answers are lifted.
+- **Decision 28.** `tests/slt/cases/subqueries/in_forms.slt` holds about 300 records, written first under `pending
+  SQ7b` and checked against DuckDB, with D3's pin; the guards of `conditions.slt`, `setops/errors.slt` and
+  `in_marks.slt` that SQ7b answers are lifted. The generator's Feature `in_form` writes the quantified spellings,
+  literal probes of the set's family and set operations of two or three arms, in a mark's places and as a conjunct
+  under folded NOTs; `in_mark`'s NOT form keeps a mark (a NOT over an AND that holds it). 49 metamorphic relations
+  check them against the three-valued composition from a LEFT JOIN, the OR or AND of a set operation's arms, a one-row
+  column holding a constant probe, and an inner join for the folded NOTs.
+- **From the review.** A mark is a value of the condition, so a CASE over `2 IN (q)` compared with a number is no
+  comparison of two literals (`ReadsColumn` counts an IN's mark as it counts a scalar's or an EXISTS's value).
 
 ## Consequences
 

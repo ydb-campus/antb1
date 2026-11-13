@@ -3917,10 +3917,10 @@ TEST(QueryGenerator, InFormsAreQuantifiedLiteralOrSetOperationSets) {
   EXPECT_GT(all_intersects, 85);
   EXPECT_GT(excepts, 85);
   EXPECT_GT(all_excepts, 65);
-  EXPECT_GT(bare, 120);
+  EXPECT_GT(bare, 70);
   EXPECT_GT(double_nots, 25);
   EXPECT_GT(not_not_ins, 65);
-  EXPECT_GT(marks, 175);
+  EXPECT_GT(marks, 230);
   EXPECT_GT(where, 300);
   EXPECT_GT(having, 95);
   EXPECT_GT(items, 145);
