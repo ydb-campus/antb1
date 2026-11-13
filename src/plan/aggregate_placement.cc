@@ -19,6 +19,7 @@
 #include "antb1/plan/logical_plan.h"
 
 #include "join_order.h"
+#include "strictness.h"
 
 namespace antb1::plan {
 namespace {
@@ -696,6 +697,16 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
       if (std::ranges::any_of(
               reads, [&available](const ColumnId id) { return !available.contains(id); })) {
         return std::nullopt;  // it reads a column the aggregated side does not carry
+      }
+      // Over a padded side the join makes rows whose aggregated-side columns are all NULL, and the
+      // Compute above it computed its value over those NULLs. Below the join the padded row has no
+      // input, so it gets the partial's NULL instead: the same only for an expression that is NULL
+      // wherever every column it reads is. COALESCE(x, 0) is 0 there, and a literal keeps its
+      // value.
+      if (placement.needs_identity && !std::ranges::all_of(compute->exprs, [](const ExprPtr& expr) {
+            return PropagatesNull(*expr);
+          })) {
+        return std::nullopt;
       }
       for (const ColumnId id : compute->ids) {
         available.insert(id);

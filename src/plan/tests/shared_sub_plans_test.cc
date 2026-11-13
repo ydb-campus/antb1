@@ -414,6 +414,22 @@ TEST(SharedSubPlansTest, AJoinOnANullEqualKeyIsNotOneWithTheJoinOnAnEqualOne) {
   }
 }
 
+// A mark join's mark (ADR 0041's SQ7a) has its origin in the join's keys: a CTE that computes over
+// one, referenced twice, is one sub-plan up to its Project, while two marks over other probes of
+// the same tables are not one column, so what reads them is not shared.
+TEST(SharedSubPlansTest, AMarkIsOneColumnOnlyOverTheSameKeys) {
+  EXPECT_EQ(Groups("WITH g AS (SELECT i64, CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END "
+                   "AS m FROM t) SELECT COUNT(*) FROM g AS a, g AS b WHERE a.i64 = b.i64 AND "
+                   "a.m = b.m"),
+            (std::vector<std::string>{"Project 2x3"}))
+      << "the CTE's Project heads it, its mark join and the Compute that reads the mark inside";
+  EXPECT_EQ(Groups("SELECT COUNT(*) FROM (SELECT i64, CASE WHEN i32 IN (SELECT i16 FROM u) THEN 1 "
+                   "ELSE 0 END AS m FROM t) AS a, (SELECT i64, CASE WHEN i16 IN (SELECT i16 FROM "
+                   "u) THEN 1 ELSE 0 END AS m FROM t) AS b WHERE a.i64 = b.i64 AND a.m = b.m"),
+            (std::vector<std::string>{"Project 2x1"}))
+      << "only the set's sub-plan, read by both marks, is one";
+}
+
 // The same plan gives the same groups in the same order, which EXPLAIN's goldens depend on.
 TEST(SharedSubPlansTest, IsDeterministic) {
   static constexpr std::string_view kSql =

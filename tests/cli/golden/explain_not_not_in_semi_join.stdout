@@ -1,0 +1,8 @@
+Output: count_star():BIGINT
+Aggregate COUNT(*)
+  Join SEMI build=right keys=["CAST(tr_driver AS BIGINT)" = dv_id]
+    Compute CAST(tr_driver AS BIGINT)
+      Scan table=trips source=parquet(files=1, rows=3000) columns=[tr_driver]
+    Project dv_id
+      Filter dv_id > 5
+        Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id]

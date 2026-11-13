@@ -1,0 +1,4 @@
+antb1: unsupported error: a correlated scalar subquery with an outer column that has no inner equivalent is not supported
+  at line 1, column 125
+  SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT MIN(c.ct_pop) FROM cities c WHERE c.ct_id < z.zn_city) AND z.zn_row > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_pop < z.zn_parent) ORDER BY zn_id
+                                                                                                                              ^

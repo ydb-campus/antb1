@@ -350,6 +350,14 @@ TEST(AggregatePlacementTest, DeclinesToBuild) {
            Case{.sql = "SELECT twin.dk, SUM(facts.v) FROM facts, twin WHERE facts.many = twin.dk "
                        "GROUP BY twin.dk",
                 .why = "the gate refuses it"},
+           // An argument that is not NULL where every column it reads is NULL, over a side that can
+           // be missing: above the join the padded row computed 0, below it there is no row.
+           Case{.sql = "SELECT wide.dk, SUM(COALESCE(facts.v, 0)) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk",
+                .why = "COALESCE over a side that can be missing"},
+           Case{.sql = "SELECT wide.dk, COUNT(CASE WHEN facts.v IS NULL THEN 1 END) FROM wide "
+                       "LEFT JOIN facts ON wide.dk = facts.few GROUP BY wide.dk",
+                .why = "CASE over a side that can be missing"},
        }) {
     EXPECT_EQ(Aggregates(c.sql), 1) << c.why << ": " << c.sql;
   }
@@ -424,6 +432,22 @@ TEST(AggregatePlacementTest, AComputedArgumentTravelsDownWithThePartial) {
   ASSERT_NE(partial, std::string::npos) << text;
   ASSERT_NE(compute, std::string::npos) << text;
   EXPECT_GT(compute, partial) << text;
+}
+
+// Over a side that can be missing, an argument still travels down where it is NULL on a padded row
+// as the column it reads is: a strict expression over that side. Only one that turns a NULL into a
+// value stays above (DeclinesToBuild).
+TEST(AggregatePlacementTest, AStrictArgumentTravelsDownOverAPaddedSide) {
+  EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(facts.v * 2) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk"),
+            2);
+  EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(CAST(-facts.v AS BIGINT)) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk"),
+            2);
+  // A function is NULL for a NULL argument too.
+  EXPECT_EQ(Aggregates("SELECT wide.dk, SUM(abs(facts.v)) FROM wide LEFT JOIN facts "
+                       "ON wide.dk = facts.few GROUP BY wide.dk"),
+            2);
 }
 
 // A join ABOVE the candidate whose key reads the pre-grouping column. The partial defines a fresh

@@ -18,6 +18,8 @@ antb1_add_module(
     branch_truth.cc
     union_branches.cc
     optimizer.cc
+    unnesting.cc
+    strictness.cc
     shared_sub_plans.cc
     explain.cc
   PUBLIC_DEPS common sql
@@ -46,6 +48,7 @@ if(ANTB1_BUILD_TESTS)
       tests/branch_truth_test.cc
       tests/union_branches_test.cc
       tests/optimizer_test.cc
+      tests/unnesting_test.cc
       tests/shared_sub_plans_test.cc
       tests/explain_test.cc
       tests/logical_plan_test.cc

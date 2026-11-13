@@ -9,9 +9,9 @@
 namespace antb1::plan {
 namespace {
 
-constexpr std::array<JoinKind, 7> kKinds = {
+constexpr std::array<JoinKind, 8> kKinds = {
     JoinKind::kInner,         JoinKind::kLeft,   JoinKind::kSemi, JoinKind::kAnti,
-    JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull};
+    JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull, JoinKind::kNullAwareMark};
 
 // Each kind's row of the table (ADR 0037's OJ1), as its definition in join_kind.h says: what the
 // rules that read it rely on, pinned so that a change to a row is a change to this test too.
@@ -48,6 +48,8 @@ TEST(JoinKindTest, EachKindHasItsRow) {
                           .pads_left = true,
                           .nested_loop = true,
                           .residuals = true}},
+           Row{.kind = JoinKind::kNullAwareMark,
+               .traits = {.null_aware = true, .appends_mark = true}},
        }) {
     SCOPED_TRACE(ToString(row.kind));
     const JoinKindTraits traits = Traits(row.kind);
@@ -61,6 +63,7 @@ TEST(JoinKindTest, EachKindHasItsRow) {
     EXPECT_EQ(traits.null_aware, row.traits.null_aware);
     EXPECT_EQ(traits.residuals, row.traits.residuals);
     EXPECT_EQ(traits.may_build_left, row.traits.may_build_left);
+    EXPECT_EQ(traits.appends_mark, row.traits.appends_mark);
   }
 }
 
@@ -68,7 +71,8 @@ TEST(JoinKindTest, EachKindHasItsRow) {
 // adds: a filter of the left input outputs no right column and pads nothing; a padded row carries
 // both inputs' columns; a one-row join has a single right row and nothing to refine; a nested loop
 // (ADR 0040) outputs both inputs and has residuals to decide its matches, all it has without keys;
-// NOT IN is a filter; a join that drops its unmatched left rows does not pad them.
+// NOT IN is a filter or a mark; a join that drops its unmatched left rows does not pad them; a mark
+// join outputs each left row once and no right column, and builds on its right input only.
 TEST(JoinKindTest, EveryRowIsConsistent) {
   for (const JoinKind kind : kKinds) {
     SCOPED_TRACE(ToString(kind));
@@ -93,8 +97,17 @@ TEST(JoinKindTest, EveryRowIsConsistent) {
       EXPECT_FALSE(traits.null_aware);
     }
     if (traits.null_aware) {
-      EXPECT_TRUE(traits.filters_left);
+      EXPECT_TRUE(traits.filters_left || traits.appends_mark);
       EXPECT_FALSE(traits.residuals);
+    }
+    if (traits.appends_mark) {
+      EXPECT_FALSE(traits.outputs_right);
+      EXPECT_FALSE(traits.filters_left);
+      EXPECT_FALSE(traits.pads_left);
+      EXPECT_FALSE(traits.pads_right);
+      EXPECT_FALSE(traits.drops_unmatched_left);
+      EXPECT_FALSE(traits.one_row);
+      EXPECT_FALSE(traits.may_build_left);
     }
     if (traits.drops_unmatched_left) {
       EXPECT_FALSE(traits.pads_right);
@@ -107,7 +120,9 @@ TEST(JoinKindTest, EveryRowIsConsistent) {
 // its left), the unmatched ones for left, anti and null-aware anti; no right build emits its rows;
 // an empty build empties inner and semi joins; a probe drops its unmatched rows -- the gate of ADR
 // 0029's dynamic filters -- for inner and semi joins built on the right, and for every keyed kind
-// but null-aware anti built on the left; only inner outputs its matches alone.
+// but null-aware anti built on the left; only inner outputs its matches alone. A mark join (ADR
+// 0041's decision 13) emits no build row, is never emptied and takes no dynamic filter on either
+// side.
 TEST(JoinKindTest, DerivedRulesKeepTheirAnswers) {
   for (const JoinKind kind : kKinds) {
     SCOPED_TRACE(ToString(kind));
@@ -116,7 +131,8 @@ TEST(JoinKindTest, DerivedRulesKeepTheirAnswers) {
     const bool keyless = kind == JoinKind::kOneRow;
     const bool null_aware = kind == JoinKind::kNullAwareAnti;
     const bool full = kind == JoinKind::kFull;
-    EXPECT_EQ(EmitsBuildRows(kind, BuildSide::kLeft), !inner && !keyless);
+    const bool mark = kind == JoinKind::kNullAwareMark;
+    EXPECT_EQ(EmitsBuildRows(kind, BuildSide::kLeft), !inner && !keyless && !mark);
     EXPECT_EQ(EmitsBuildRows(kind, BuildSide::kRight), full) << "only FULL pads a right build";
     EXPECT_EQ(EmitsUnmatchedBuildRows(kind, BuildSide::kLeft),
               kind == JoinKind::kLeft || kind == JoinKind::kAnti || null_aware || full);
@@ -124,7 +140,8 @@ TEST(JoinKindTest, DerivedRulesKeepTheirAnswers) {
     EXPECT_EQ(EmitsProbeAndBuildRows(kind, BuildSide::kRight), full);
     EXPECT_EQ(EmptyBuildEmptiesJoin(kind), inner || semi);
     EXPECT_EQ(ProbeDropsUnmatchedRows(kind, BuildSide::kRight), inner || semi);
-    EXPECT_EQ(ProbeDropsUnmatchedRows(kind, BuildSide::kLeft), !keyless && !null_aware && !full);
+    EXPECT_EQ(ProbeDropsUnmatchedRows(kind, BuildSide::kLeft),
+              !keyless && !null_aware && !full && !mark);
     EXPECT_EQ(OutputsMatchesOnly(kind), inner);
   }
 }
@@ -138,6 +155,9 @@ TEST(JoinKindTest, PaddedJoinRowsBoundTheOutput) {
   EXPECT_EQ(PaddedJoinRows(JoinKind::kFull, 5, 100, 7), 112);
   constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
   EXPECT_EQ(PaddedJoinRows(JoinKind::kFull, kMax - 1, 1, 1), kMax);
+  // A mark join outputs each left row exactly once, whatever matches (ADR 0041's decision 13).
+  EXPECT_EQ(PaddedJoinRows(JoinKind::kNullAwareMark, 5, 100, 7), 100);
+  EXPECT_EQ(PaddedJoinRows(JoinKind::kNullAwareMark, 500, 100, 7), 100);
 }
 
 // Traits is constexpr, so a rule may read it where only a constant will do.

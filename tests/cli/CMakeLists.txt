@@ -516,6 +516,83 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# An IN under OR is a null-aware mark join (ADR 0041's SQ7a): every probe row once, with a BOOLEAN
+# mark that the OR's filter reads above it; its probe's cast to the key type is a Compute of its own
+# directly below the join, as a semi join's is.
+antb1_add_cli_golden(
+  explain_in_subquery_mark
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_row < 10 OR tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# An IN that every branch of an OR shares is factored out first and is a semi join, with no mark.
+antb1_add_cli_golden(
+  explain_in_subquery_or_factored
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE (tr_row < 10 AND tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1)) OR (tr_row > 2990 AND tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1))"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+)
+# NOTs over an IN conjunct fold into its kind (ADR 0041's SQ7b): NOT (x NOT IN q) is a semi join.
+antb1_add_cli_golden(
+  explain_not_not_in_semi_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE NOT (tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5))"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# An IN over a set operation: its set is the operation's node, the probe widened to its type.
+antb1_add_cli_golden(
+  explain_in_subquery_over_union
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# A mark in HAVING stands over the groups, above the aggregation; one in an aggregate's argument
+# stands below it, over the rows, above WHERE's filter.
+antb1_add_cli_golden(
+  explain_in_subquery_mark_having
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT tr_pickup, SUM(CASE WHEN tr_rider IN (SELECT rd_id FROM riders WHERE rd_id < 50) THEN 1 ELSE 0 END) FROM trips WHERE tr_row > 100 GROUP BY tr_pickup HAVING COUNT(*) > 60 OR tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # HAVING computes what its conditions read and filters directly above the aggregation, before the
 # select list and ORDER BY are computed, as DuckDB does: their expressions run only over the groups
 # that pass.
@@ -716,6 +793,166 @@ antb1_add_cli_golden(
     "trips=${_f}/star/trips.parquet"
     --table
     "zones=${_f}/star/zones.parquet"
+)
+# ADR 0041's SQ0 keeps the unnesting's plans byte for byte; these pin what only its EXPLAIN shows.
+# A scalar subquery's key is named by the last correlated conjunct that names its column.
+antb1_add_cli_golden(
+  explain_unnest_key_named_by_its_last_spelling
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_id = z.zn_city AND z.zn_city = ct_id) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# Its keys, and the group's, follow the outer columns' order, not the conjuncts'.
+antb1_add_cli_golden(
+  explain_unnest_keys_in_outer_column_order
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_id > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_id = z.zn_city AND c.ct_pop = z.zn_parent AND c.ct_row = z.zn_row) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# An EXISTS's keys of two types: each side cast to the key type, the outer casts first.
+antb1_add_cli_golden(
+  explain_unnest_key_casts
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = z.zn_id AND r.rd_id = z.zn_city) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A nested EXISTS without a key is refused at its own span, not at the outer one's.
+antb1_add_cli_golden(
+  unsupported_unnest_nested_refusal
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The outer subquery is unnested first: when both are refused, the outer one's refusal is reported.
+antb1_add_cli_golden(
+  unsupported_unnest_nested_outer_first
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id < z.zn_city AND EXISTS (SELECT 1 FROM riders r WHERE r.rd_city < c.ct_id)) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# Of two stacked scalar subqueries that are refused, the one written last is met first.
+antb1_add_cli_golden(
+  unsupported_unnest_stacked_refusal
+  EXIT_CODE 4
+  STDERR
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT MIN(c.ct_pop) FROM cities c WHERE c.ct_id < z.zn_city) AND z.zn_row > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_pop < z.zn_parent) ORDER BY zn_id"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
+# A correlated COUNT whose comparison passes its 0 is joined back LEFT (ADR 0041's SQ6): the join builds the grouped
+# riders, padded for the cities without one, the count is read above it through COALESCE(count, 0), and the semi-join
+# reduction restricts the one key over a bare scan, which D5 does not reach under a LEFT join.
+antb1_add_cli_golden(
+  explain_unnest_left_join_back
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A constant select item over ORDER BY COUNT(*) is the constant over no rows too, so it moves above the LEFT join back
+# and a padded city reads it (ADR 0041's SQ6).
+antb1_add_cli_golden(
+  explain_unnest_left_item_moved
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT 42 FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) = 42 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A HAVING inside a correlated scalar subquery is a CASE over its value, never a filter (ADR 0041's SQ6): a city whose
+# group it rejects reads NULL. COUNT(*) < 78 keeps the empty row's 0, which `= 0` passes, so the join back is LEFT
+# and the condition and the CASE stand above it.
+antb1_add_cli_golden(
+  explain_unnest_having_as_case
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# Two stacked LEFT join backs, both restricted (ADR 0041's SQ6): each semi-join reduction clones the base below the
+# stack, the scan of cities, so the outer rewrite no longer declines for the dependent join below it, and no rewrite
+# is cloned.
+antb1_add_cli_golden(
+  explain_unnest_stacked_left_restricted
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
 )
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
@@ -1225,6 +1462,29 @@ antb1_add_cli_golden(
   explain_analyze_json
   STDOUT_REGEX "${_explain_analyze_json}"
   ARGS explain --analyze --threads 1 --format json -c "SELECT COUNT(*) FROM t WHERE RegionID > 100" --table "${_split}"
+)
+# A mark join outputs every probe row once (rows=40 of zones' 40); its build counts the set's NULL
+# keys, which make the mark NULL where it does not match (ADR 0041's SQ7a).
+string(
+  CONCAT _explain_analyze_mark
+  # Balanced brackets only: an unbalanced [ would keep CMake from splitting the arguments after it.
+  "HashJoin Join NULL-AWARE MARK build=right keys=.\"CAST.zn_city AS INTEGER.\" = zn_parent. "
+  "carries 2 of 4 unread above  .rows=40 [^\n]*\n"
+  ".*HashBuild Join NULL-AWARE MARK build=right keys=.\"CAST.zn_city AS INTEGER.\" = zn_parent. "
+  "carries 2 of 4 unread above  .rows=3 [^\n]* null_keys=5 "
+)
+antb1_add_cli_golden(
+  explain_analyze_in_subquery_mark
+  STDOUT_REGEX "${_explain_analyze_mark}"
+  ARGS
+    explain
+    --analyze
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR zn_city NOT IN (SELECT zn_parent FROM zones WHERE zn_id < 9)"
+    --table
+    "zones=${_f}/star/zones.parquet"
 )
 antb1_add_cli_golden(
   explain_analyze_bind_error

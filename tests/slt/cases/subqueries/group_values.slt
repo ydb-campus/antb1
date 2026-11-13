@@ -2881,8 +2881,7 @@ NULL	16
 
 # ---- DuckDB only until SQ5/SQ13 get a PR (ADR 0041: a correlated value in a block that aggregates exits 4) ----
 
-# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key; and an uncorrelated
-# value over a correlated scalar subquery's aggregate, in a WHERE (a city with no zone counts 0 there).
+# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key.
 
 onlyif duckdb
 query II nosort
@@ -2912,7 +2911,9 @@ SMALLINT	BIGINT
 5	9
 6	1
 
-onlyif duckdb
+# ---- an uncorrelated value over a correlated scalar subquery's aggregate (ADR 0041's SQ6) ----
+
+# Its one-row join moves up with the item, above the LEFT join back, so a city with no zone counts 0 there.
 query I nosort
 SELECT ct_id FROM cities c WHERE ct_id < (SELECT COUNT(*) - (SELECT MIN(ct_id) FROM cities) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
 ----
@@ -2923,11 +2924,9 @@ SMALLINT
 4
 5
 
-# ---- DuckDB only until SQ7 gets a PR (ADR 0041: IN (subquery) as a value exits 4) ----
+# ---- IN subqueries in a CASE WHEN (ADR 0041's SQ7a; more in in_marks.slt) ----
 
 # IN of a subquery in a CASE WHEN: in a select item, and in an aggregate's argument.
-
-onlyif duckdb
 query II nosort
 SELECT ct_id, CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_city < 3) THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
 ----
@@ -2939,7 +2938,6 @@ SMALLINT	INTEGER
 5	0
 6	0
 
-onlyif duckdb
 query II nosort
 SELECT zn_city, SUM(CASE WHEN zn_id IN (SELECT ct_id FROM cities) THEN 1 ELSE 0 END) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
 ----

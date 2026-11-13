@@ -666,8 +666,8 @@ Defects the design discussion found, to which no item is assigned:
 
 - **Misleading messages and stale comments:** a DOUBLE correlation is refused as having no key; a correlation inside a
   derived table nested in a subquery is called "a lateral qualified column"; EXPLAIN prints Path 2's substituted inner
-  columns under their outer names (`MapColumns` keeps `Expr::name`), which SQ0 keeps since it changes no golden; and
-  comments in `src/plan/optimizer.cc` still describe U1's pass.
+  columns under their outer names (`MapColumns` keeps `Expr::name`), which SQ0 keeps since it changes no golden.
+  (Comments in `src/plan/optimizer.cc` that still described U1's pass went with SQ0.)
 - **The semi-join reduction's clone** recomputes the outer side's one-row and mark joins, which never restrict its
   keys.
 - **D4's text** does not name a DATE column against a VARCHAR operand, which a scalar subquery reaches.
@@ -922,6 +922,182 @@ changes.
   Feature `group_value` adds a value block, or a COUNT of a CASE over a condition with values, to a block that
   aggregates; six metamorphic relations cover keys, arguments, values over aggregates, global blocks, HAVING aliases
   and ORDER BY.
+
+## Update (2026-11-12, SQ7a): IN and NOT IN inside conditions through a null-aware mark join, built
+
+SQ7 is two PRs at the maintainer's request: SQ7a, the mark end to end, and SQ7b, the IN forms (`= ANY`, `= SOME` and
+`<> ALL`, NOT parity folded at the top level, constant and value probes, IN over a set operation, and decision 23's
+type bind error). SQ7a completes Q45: the ratchet is at 80. No other TPC-H or TPC-DS plan changes.
+
+- **Decisions 12 and 13, as built.** `JoinKind::kNullAwareMark` takes the null-aware anti join's trait and a new one,
+  `appends_mark`: each left row comes out once, then the mark. `PaddedJoinRows` gives it the left input's rows, and
+  `EmptyBuildEmptiesJoin` and `ProbeDropsUnmatchedRows` start with the `appends_mark` test, so they hold for SQ8's
+  `kMark` too; every other reader of the traits is unchanged. `JoinNode::mark` is the column; `OutputIds`, the
+  resolver, `IdsOfNode`, `CloneWithFreshIds` and the shared sub-plans' fingerprint carry it, and the resolver now
+  fails a mark on any other kind, a kind that appends one without it, a left-built mark and a residual on a kind that
+  takes none (unchecked before for every kind). The operator reads the build's `empty()` and `has_null()` once, at
+  its start: FALSE throughout, NULL throughout (a set of NULL keys alone), or a lookup that appends TRUE, FALSE or
+  NULL per row and keeps the probe's selection. A mark publishes no dynamic filter.
+- **Decision 14, as built.** The gate admits an IN in a condition that takes values with the rules of a top-level IN
+  conjunct: a probe that reads a column (an aggregate in HAVING and in a `CASE WHEN` over aggregates), no value in
+  it, and no set operation (both SQ7b's). `BindBool` binds it through `MarkValue`, in this order: the probe's
+  enclosing-block check (exit 4, as a top-level IN's), the probe itself, the memo, the lookup-only speculation, the
+  refusal over a correlated block's aggregation (as a value's), the block, the IN key typing a semi join uses (shared,
+  so the three kinds agree), the dry run, and the plant. IN as a BOOLEAN value outside a condition stays exit 4
+  (decision 3).
+- **Decision 10 for marks.** A mark is remembered by its slot, its set's query and its probe as bound, not as written:
+  the probe binds first, so a text that resolves differently in two clauses of a slot (an inner ON sees fewer FROM
+  items than WHERE does) is still that clause's bind error, and two spellings of one column are one mark, so a
+  `GROUP BY` key that holds a mark is matched where D38 refuses a value. IN and NOT IN of one probe and set share one
+  mark, NOT IN reading it under a NOT.
+- **The slot's tail (the maintainer's choice, 2026-11-12).** The select list binds before WHERE, and its expressions
+  over aggregates before HAVING, so a mark planted then would compute its probe below their filters, for rows and
+  groups DuckDB never computes it for. Such a mark goes into its slot's tail, assembled after the slot's own entries
+  and so above WHERE's and HAVING's filters, below the computed columns. A later clause whose memo lookup finds it
+  moves it to the end of the slot's own entries, where that clause computes the probe anyway, and so does HAVING that
+  reads it through the item's alias (found by the review); ORDER BY binds last.
+  Values keep their places (their joins compute nothing per row).
+- **OR factoring first.** An IN that every branch of an OR shares is a top-level conjunct after factoring: a semi
+  join, no mark. Its error visibility is D35's new member (the maintainer's choice, 2026-11-12): over an empty set
+  the semi join empties and a failing value written before it never builds, where DuckDB keeps a mark per branch and
+  fails.
+- **Divergences.** D16 gains a mark written before a value conjunct, whose probe is computed before the value's
+  filter; D32 a mark's probe keys over an empty set; D35 the shared IN, a mark's set next to an IN conjunct that turns
+  out empty, and a contradiction pair next to a failing set; D37 an ORDER BY expression over an item's alias that
+  holds a mark. Each is pinned in `tests/slt/cases/subqueries/in_marks.slt`.
+- **Decision 28.** `in_marks.slt` holds about 370 records, written first under `pending SQ7a` and checked against
+  DuckDB, with the pins and the DuckDB-only boundaries; the guards of `conditions.slt` that SQ7a answers are lifted
+  and the rest, with `setops/errors.slt`'s, wait for SQ7b. The generator's Feature `in_mark` writes a mark in WHERE,
+  HAVING, a select item or an ORDER BY item, under OR, NOT and CASE, over sets with a NULL, of NULLs alone, empty and
+  limited; 47 metamorphic relations hold it against NOT IN, the union of an OR's branches, the semi join's counts and
+  its three-valued composition from a LEFT JOIN, at three batch sizes.
+- **Q45.** On Apple silicon antb1 answers Q45 at SF 1 in 0.10 s in the release build (26 ms inside the engine on 14
+  threads) and 0.16 s in the Debug build, and it peaks at 8.1 MB; shard 6 of 8, which holds it, takes 43 s under
+  AddressSanitizer here, far inside the 870-second inner timeout.
+
+## Update (2026-11-13, SQ7b): the IN forms, built
+
+SQ7's second PR. With it SQ7 is built; no query completes, the ratchet stays at 80, and no TPC-H or TPC-DS plan
+changes.
+
+- **Decision 14's forms, as built.** The parser reads `= ANY` and `= SOME` over a subquery as IN and `<> ALL` and
+  `!= ALL` as NOT IN, the node's operator spanning the comparison and the quantifier; every other quantified
+  comparison, and a quantifier over anything but a query, is unsupported at the quantifier (decision 3). A top-level
+  conjunct peels any number of NOTs over an IN and folds their parity with the IN's own, exact in three-valued logic, so
+  `NOT (x NOT IN q)` and `NOT NOT (x IN q)` are semi joins; EXISTS keeps one NOT (a NOT NOT EXISTS is a value).
+- **Probes.** An IN's probe is any operand a condition with values takes: a constant, which is a key computed in the
+  join's own layer (a semi join with a constant key stays above the block's joins), or an expression holding a
+  subquery's value, planted below the IN's join. A string literal against a DATE or TIMESTAMP set is parsed into that
+  type, as a comparison parses it; against a number set it is D3's bind error, as in a comparison. A NULL literal
+  probe stays exit 4.
+- **Sets (ADR 0036's X6).** The set may be a set operation whose arms read no enclosing block, bound as a scalar's and
+  an EXISTS's are since SQ4a, its column of the arms' unified type; a correlated arm stays SQ15's, and a compound's own
+  ORDER BY, LIMIT or OFFSET X5's.
+- **Decision 23's SQ7 row.** A VARCHAR against a value of another type family, and a DATE or a TIMESTAMP against a
+  number, is DuckDB's bind error (exit 1), checked where the IN's key is typed (`InKeyType`, shared by the semi, anti
+  and mark joins), so also under a dropped OR branch; a DATE against a TIMESTAMP, which DuckDB answers, stays a refusal
+  (no key type holds both). The review added TIMESTAMP to the rule, since DuckDB's is the same for it.
+- **Decision 28.** `tests/slt/cases/subqueries/in_forms.slt` holds about 300 records, written first under `pending
+  SQ7b` and checked against DuckDB, with D3's pin; the guards of `conditions.slt`, `setops/errors.slt` and
+  `in_marks.slt` that SQ7b answers are lifted. The generator's Feature `in_form` writes the quantified spellings,
+  literal probes of the set's family and set operations of two or three arms, in a mark's places and as a conjunct
+  under folded NOTs; `in_mark`'s NOT form keeps a mark (a NOT over an AND that holds it). 49 metamorphic relations
+  check them against the three-valued composition from a LEFT JOIN, the OR or AND of a set operation's arms, a one-row
+  column holding a constant probe, and an inner join for the folded NOTs.
+- **From the review.** A mark is a value of the condition, so a CASE over `2 IN (q)` compared with a number is no
+  comparison of two literals (`ReadsColumn` counts an IN's mark as it counts a scalar's or an EXISTS's value).
+
+## Update (2026-11-13, SQ0): one rule table for the unnesting, built
+
+SQ0 changes no answer, no plan of a shape answered today and no refusal message. No query completes and the ratchet
+stays at 80.
+
+- **Decisions 16 and 17, as built.** `src/plan/unnesting.{h,cc}` holds the pass, moved out of `optimizer.cc`.
+  - A dependent join's kind picks its mode through `JoinKindTraits`: lift mode for a kind that filters its left input
+    and takes residuals (semi, anti: ADR 0023's Path 1), value mode for a one-row join (Path 2). Every other kind keeps
+    "a correlated subquery is not supported"; a null-aware anti join and a mark take no residual.
+  - One exhaustive visitor, the descent, has a rule per node type and no other overload. It walks from the dependent
+    join's right input to the correlated filter (the first Filter over a Compute):
+    - lift mode drops a Project, a Compute or a Sort above it;
+    - value mode keeps the maps, groups the static Aggregate and substitutes the Compute of its arguments;
+    - every other node refuses the shape with today's message. **The Join rule is deferred to SQ8** (the maintainer's
+      choice, 2026-11-13): no SQL reaches it, since the binder pulls every correlation above the block's joins.
+  - The checks run in today's order -- shape, calls, maps and empty values, conjuncts, representatives -- so a shape
+    with two defects keeps today's message. A test pins it.
+- **Decision 18.** Substitution is the only terminal step. Lift mode moves every correlated conjunct into the join,
+  so it builds no classes and leaves nothing to substitute; value mode replaces each outer reference by its
+  representative, keys in ascending outer column id, as before.
+- **Decision 19.** `EmptyValueOf` gives each call's empty value of the call's own type (0 for the COUNT kinds and a sum
+  of counts, NULL otherwise); the static aggregate's rule carries them through the maps, replacing
+  `StrictAggregates` and `NullOverNoRows` with the same outcomes.
+- **Decision 20, read literally.** The proof follows the subquery's value from the join's parent up through Computes
+  to the first Filter that reads it, which must be true for no row holding the empty value (`TruthOver`). A Filter
+  that reads no value counts as a node on the way and leaves the join LEFT. The verdict is recorded and decides
+  nothing: the join back stays INNER. Every SQL shape answered today passes, checked by making a failed proof fatal
+  over the guard and the TPC-derived plans. **For SQ6:** the hand-built `optimizer_test` plans with no consumer above
+  the join fail it, correctly; when the proof decides, they gain a consumer Filter or expect LEFT.
+- **Decision 28.** The guard, outside the repository, held 570 correlated queries (every correlated `.slt` record,
+  `binder_test`'s correlated SQL, the CLI golden and boundary shapes) with main's EXPLAIN, answers and exit codes:
+  every commit showed no difference, and nor did the EXPLAIN of every TPC-derived query. A shadow test compared the
+  rule table with a frozen copy of the paths, plan by plan and id by id, until the paths were gone. What only the guard
+  saw is now pinned by CLI goldens: a key named by its last spelling, keys in outer-column order, cast order, and the
+  order of refusals across nested and stacked subqueries.
+
+## Update (2026-11-13, SQ6): the LEFT join back and the empty values, built
+
+SQ5 and SQ6 split at the maintainer's request, SQ6 first. SQ6 completes Q41 and the ratchet goes from 80 to 81. Before
+it, a separate fix (#363) kept ADR 0032's aggregate placement from moving a non-strict `Compute` below a join that pads
+the aggregated side. That was a wrong answer on main, unrelated to subqueries, and SQ6 cannot reach it. It becomes
+required once a whole-argument value `SUM((q))` opens, where a `COALESCE(count, 0)` over a LEFT join back would be such
+a `Compute`.
+
+- **Decision 19, as built.** The static aggregate's rule answers every call but the single value: COUNT in each
+  spelling, a sum of counts and the variance family. The single value stays out, a deviation from decision 19's
+  table: the binder puts none under a dependent join, and the executor has no grouped state for one. The strictness
+  refusals are gone. The empty values carry through the maps as before, and through a HAVING: NULL where it rejects
+  the empty row, the value where it keeps it, unknown otherwise. They fold no constants, so `COUNT(*) + 1 > 1`, which
+  rejects the 1 over no rows, still joins back LEFT. That is correct, only slower; folding them is left as a refinement.
+- **Decision 20 decides.** The proof's verdict picks the join back. The hand-built `optimizer_test` plans with no
+  consumer gained the Filter their SQL has, and LEFT twins without one.
+- **Decision 21, as built.** Where the proof fails, the outer side is joined to the GroupAggregate by a LEFT JOIN,
+  built on its right input (`kLeft` has no `may_build_left`). Above the join:
+  - a COUNT-kind call, computed under a fresh id, is read under its own as `COALESCE(fresh, 0)`;
+  - the maps follow, the select list's Project as a Compute that defines its ids;
+  - a HAVING is a Compute of one BOOLEAN condition, and every map above it reads `CASE WHEN condition THEN value END`.
+    That holds on the INNER join back too, over the group: decision 17's "never a filter", which a binding whose group
+    the HAVING rejects needs in order to read NULL. Where the value the join appends is defined below the HAVING (a
+    bare `SELECT COUNT(*) ... HAVING`), its id is renamed below and redefined as the CASE above. A HAVING folded to
+    FALSE reads a group key, false or NULL alike to a CASE;
+  - an uncorrelated one-row join in the slot after the aggregation moves up with the maps, so a binding without rows
+    reads `0 + value`. This is the narrow piece of decision 17's Join rule that SQ6 needs, landed with the
+    maintainer's agreement (2026-11-13): a one-row join over the static aggregate whose right input reads no outer
+    column. Every other join stays SQ8's and SQ10's;
+  - a NULL-equal correlation reads the NULL group, as before.
+
+  An IN or NOT IN conjunct in a correlated scalar subquery's HAVING, and a mark over its aggregate, stay refused: no
+  rule takes a semi or mark join there. The IN conjunct binds in full and the unnesting refuses it, so its bind errors
+  come first, as on main and in DuckDB.
+- **The semi-join reduction.** D5's exception (one key over a bare scan) applies to the INNER join back only. D5 offers
+  keys to the aggregation under a probe that drops unmatched rows, which a LEFT join's is not, so the LEFT join back is
+  restricted over one key too. For a stack of dependent joins it no longer declines (the maintainer's choice,
+  2026-11-13): it clones the base below the stack, through Filters, Computes that define no key, a dependent join's
+  left input and a join that pads no left row. Each rewrite of a stack clones once, so the plan stays linear. A key
+  computed above the base, or a base that holds a Limit, declines.
+- **Lemma 3.1.** The check also verifies that what a rule puts above the join (maps, a HAVING, a moved one-row join)
+  reads no free variable the dependent join did not.
+- **Divergences.** D24 gains the LEFT join back, DuckDB's D for every COUNT shape (decision 25), and an error the
+  INNER join back never computes: a HAVING operand or a select item that fails only over the empty values fails DuckDB
+  alone. D35 notes that a LEFT join back never empties its join. D16 notes a HAVING's operands computed over the empty
+  row too.
+- **Decision 28.** `tests/slt/cases/subqueries/empty_values.slt` began as 130 records written as `pending SQ6` before
+  the code, each answered by it; later records pin what the mutation checks and the review found the first ones
+  missed (a bare call under a HAVING that rejects a real group, a chained HAVING, concat over no rows, a stack over a
+  FULL JOIN, and both engines' outcomes of D16's HAVING operands). `scalar.slt`'s and `group_values.slt`'s SQ6 guards
+  are on. DuckDB's own
+  wrong answers in decision 29's family (a constant item, or a HAVING, over calls that are all NULL over no rows) have
+  no record; the metamorphic self-checks cover them. The SQ0 guard showed each change to be a refusal turned into an
+  answer equal to DuckDB's, a reworded refusal, or a stacked plan gaining its upper restriction with its answers
+  unchanged. Of the TPC-derived plans, only Q41's changed.
 
 ## Consequences
 

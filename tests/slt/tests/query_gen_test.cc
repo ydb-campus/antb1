@@ -119,7 +119,8 @@ bool HasSubquery(const GeneratedQuery& q) {
          q.features.Has(Feature::kCorrelatedAggregate) ||
          q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
          q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue) ||
-         q.features.Has(Feature::kGroupValue);
+         q.features.Has(Feature::kGroupValue) || q.features.Has(Feature::kInMark) ||
+         q.features.Has(Feature::kInForm) || q.features.Has(Feature::kCorrelatedEmptyValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -682,7 +683,7 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
   const auto without = MakeOver(WithoutRefs(JoinTables()), 29, options);
   int joins = 0;
   int same = 0;
-  for (uint64_t i = 0; i < 2000; ++i) {
+  for (uint64_t i = 0; i < 2500; ++i) {
     const auto q = with_refs.Generate(i);
     const auto plain = without.Generate(i);
     EXPECT_FALSE(UsesRefs(plain)) << plain.sql;
@@ -694,7 +695,7 @@ TEST(QueryGenerator, JoinFeaturesChangeOnlyJoinQueries) {
     EXPECT_EQ(q.sql, plain.sql) << i;
     EXPECT_EQ(q.features, plain.features) << i;
   }
-  EXPECT_GT(joins, 400) << "more than 20% of the queries join";
+  EXPECT_GT(joins, 500) << "more than 20% of the queries join";
   EXPECT_GT(same, 400);
 }
 
@@ -988,7 +989,7 @@ TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
     const auto without = MakeOver(WithoutRefs(JoinTables()), 47, options);
     int joins = 0;
     int dims_by_path = 0;  // 60% of them come from a join that failed
-    for (uint64_t i = 0; i < 3000; ++i) {
+    for (uint64_t i = 0; i < 8000; ++i) {
       const auto q = with_refs.Generate(i);
       if (UsesRefs(q)) {
         joins += Joins(q) ? 1 : 0;
@@ -999,7 +1000,7 @@ TEST(QueryGenerator, FailedJoinsFallBackToTheQueriesWithoutRefs) {
       EXPECT_EQ(q.sql, plain.sql) << i;
       EXPECT_EQ(q.features, plain.features) << i;
     }
-    EXPECT_GT(joins, 400);
+    EXPECT_GT(joins, 660);
     EXPECT_GT(dims_by_path, 30);
   }
 }
@@ -1570,7 +1571,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
   EXPECT_EQ(q.features.Has(Feature::kQualifiedName),
             qualified || q.features.Has(Feature::kCorrelatedExists) ||
-                q.features.Has(Feature::kCorrelatedAggregate));
+                q.features.Has(Feature::kCorrelatedAggregate) ||
+                q.features.Has(Feature::kCorrelatedEmptyValue));
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
   // A subquery's block always names its one table, so it records kTableName even where every FROM
   // item is read by a path; a correlated block also qualifies both ends of its key, so it records
@@ -2462,9 +2464,10 @@ TEST(QueryGenerator, StarsFollowTheirRules) {
 // A correlated conjunct comes from the seventh stream, so every seed that declines one generates
 // the query it did before ADR 0023's T3, SQL and features alike.
 TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
-  // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms.
-  const FeatureSet with_corr =
-      Union(kSupportedFeatures, {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
+  // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms; and
+  // SQ6's empty values (kCorrelatedEmptyValue), which read the same list, go too.
+  const FeatureSet with_corr = Union(kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue}),
+                                     {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
   const auto with = MakeOver(JoinTables(), 71, {.supported = with_corr, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 71,
@@ -3355,6 +3358,932 @@ TEST(QueryGenerator, GroupValuesChangeOnlyTheirQueries) {
   EXPECT_GT(bare, 120);
   EXPECT_GT(counted, 120);
   EXPECT_GT(grouped, 90);
+}
+
+// An IN or NOT IN inside a condition (ADR 0041's SQ7a), a null-aware mark: drawn last, from a
+// stream of its own, only where the query holds no other subquery, so declaring it changes the
+// queries that take one and no others, and every other subquery feature keeps its queries.
+TEST(QueryGenerator, InMarksChangeOnlyTheirQueries) {
+  // Without kInForm and kCorrelatedEmptyValue, drawn after a mark only where none fired, so that a
+  // query a mark leaves out holds no subquery at all.
+  const FeatureSet supported =
+      kSupportedFeatures.Minus({Feature::kInForm, Feature::kCorrelatedEmptyValue});
+  const auto with = MakeOver(JoinTables(), 97, {.supported = supported, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 97, {.supported = supported.Minus({Feature::kInMark}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kInMark)) << plain.sql;
+    if (!q.features.Has(Feature::kInMark)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(HasSubquery(plain)) << "it displaces no other subquery: " << plain.sql;
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue, Feature::kGroupValue}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+  }
+  EXPECT_GT(took, 450) << "IN marks: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// Whether `e` is a bare IN subquery or NOTs over one alone: a semi or an anti join as a conjunct
+// (kInSubquery's forms, and the NOTs SQ7b folds into one), not a mark.
+bool SemiOrAntiJoin(const sql::Expr& e) {
+  const sql::Expr* inner = &e;
+  while (const auto* unary = std::get_if<sql::UnaryExpr>(inner)) {
+    if (unary->op != sql::UnaryOp::kNot) {
+      break;
+    }
+    inner = &*unary->operand;
+  }
+  const auto* sub = std::get_if<sql::SubqueryExpr>(inner);
+  return sub != nullptr && sub->kind == sql::SubqueryExpr::Kind::kIn;
+}
+
+// What an IN mark writes: one or two IN subqueries (the three-valued CASE writes its mark twice,
+// alike), uncorrelated sets over one named table whose columns are unqualified and of the probe's
+// type family, inside a condition and never a bare conjunct; in WHERE, HAVING, a select item and
+// ORDER BY, and every set shape.
+TEST(QueryGenerator, InMarksAreConditionsOverUncorrelatedSets) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 101, {.supported = kSupportedFeatures, .target_percent = 0});
+  int queries = 0;
+  int where = 0;
+  int having = 0;
+  int items = 0;
+  int counted = 0;  // inside an aggregate's argument
+  int ordered = 0;
+  int negated = 0;
+  int twice = 0;  // the three-valued CASE
+  int ors = 0;
+  int nots = 0;
+  int cases = 0;
+  int null_filters = 0;  // a set's WHERE (IS [NOT] NULL, a comparison)
+  int limits = 0;
+  int distincts = 0;
+  int groups = 0;
+  int case_sets = 0;
+  for (uint64_t i = 0; i < 20000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kInMark)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_GE(all.size(), 1U);
+    ASSERT_LE(all.size(), 2U);
+    // Alike up to the identifiers' case and quotes, which Render draws per token.
+    const auto spelled = [](const sql::SubqueryExpr& sub) {
+      std::string text = Lower(sql::ToSql(*sub.query));
+      std::erase(text, '"');
+      return text;
+    };
+    EXPECT_TRUE(all.size() == 1 || spelled(*all[0]) == spelled(*all[1]))
+        << "a mark written twice is written alike";
+    twice += all.size() == 2 ? 1 : 0;
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_EQ(sub->kind, sql::SubqueryExpr::Kind::kIn);
+      negated += sub->negated ? 1 : 0;
+      const sql::SelectStatement& set = *sub->query;
+      ASSERT_TRUE(set.set_operation.empty()) << "no IN over a set operation";
+      ASSERT_EQ(set.items.size(), 1U);
+      ASSERT_EQ(set.from.size(), 1U);
+      const sql::TableRef* ref = set.from.front().table();
+      ASSERT_NE(ref, nullptr);
+      EXPECT_EQ(ref->kind, sql::TableRef::Kind::kName);
+      const auto table = std::ranges::find_if(
+          tables, [&](const GenTable& t) { return Lower(t.name) == Lower(ref->name); });
+      ASSERT_NE(table, tables.end()) << ref->name;
+      std::vector<const sql::Expr*> parts;
+      parts.push_back(set.items.front().expr());
+      for (const sql::Expr& e : set.where) {
+        parts.push_back(&e);
+      }
+      for (const sql::Expr& e : set.group_by) {
+        parts.push_back(&e);
+      }
+      for (const sql::OrderItem& item : set.order_by) {
+        parts.push_back(&item.expr);
+        EXPECT_TRUE(set.limit.has_value());
+      }
+      EXPECT_TRUE(set.order_by.size() == 1 || !set.limit.has_value())
+          << "a LIMIT follows the set's full order";
+      for (const sql::Expr* part : parts) {
+        ASSERT_NE(part, nullptr);
+        ForEachNode(*part, [&](const sql::Expr& node) {
+          EXPECT_FALSE(std::holds_alternative<sql::SubqueryExpr>(node));
+          if (const auto* column = std::get_if<sql::ColumnRef>(&node)) {
+            EXPECT_TRUE(column->qualifier.empty()) << column->name;
+            EXPECT_TRUE(std::ranges::any_of(
+                table->columns,
+                [&](const GenColumn& c) { return Lower(c.name) == Lower(column->name); }))
+                << column->name << " is no column of " << table->name;
+          }
+        });
+      }
+      null_filters += set.where.empty() ? 0 : 1;
+      limits += set.limit.has_value() ? 1 : 0;
+      distincts += set.distinct ? 1 : 0;
+      groups += set.group_by.empty() ? 0 : 1;
+      case_sets += std::holds_alternative<sql::CaseExpr>(*set.items.front().expr()) ? 1 : 0;
+      // The probe reads a column, and computes nothing that could overflow.
+      if (!sub->operand.has_value()) {
+        ADD_FAILURE() << "an IN subquery without a probe";
+        continue;
+      }
+      const sql::Expr& probe = **sub->operand;
+      const auto* aggregate = std::get_if<sql::AggregateCall>(&probe);
+      EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(probe) ||
+                  (aggregate != nullptr && aggregate->arg.has_value() &&
+                   std::holds_alternative<sql::ColumnRef>(**aggregate->arg)))
+          << sql::ToSql(probe);
+    }
+    // Where the marks stand: inside one WHERE or HAVING conjunct (never a bare semi or anti join),
+    // one select item or one ORDER BY item.
+    const auto holds = [](const sql::Expr& e) { return sql::ToSql(e).contains("SELECT"); };
+    const auto conjunct = [&](const std::vector<sql::Expr>& conjuncts) {
+      int n = 0;
+      for (const sql::Expr& e : conjuncts) {
+        if (!holds(e)) {
+          continue;
+        }
+        ++n;
+        EXPECT_FALSE(SemiOrAntiJoin(e)) << "a mark, not a semi or an anti join";
+        if (const auto* binary = std::get_if<sql::BinaryExpr>(&e)) {
+          ors += binary->op == sql::BinaryOp::kOr ? 1 : 0;
+          cases += std::holds_alternative<sql::CaseExpr>(*binary->left) ? 1 : 0;
+        }
+        nots += std::holds_alternative<sql::UnaryExpr>(e) ? 1 : 0;
+      }
+      return n;
+    };
+    const int in_where = conjunct(parsed->where);
+    const int in_having = conjunct(parsed->having);
+    int in_items = 0;
+    for (const sql::SelectItem& item : parsed->items) {
+      if (item.expr() != nullptr && holds(*item.expr())) {
+        ++in_items;
+        counted += std::holds_alternative<sql::AggregateCall>(*item.expr()) ? 1 : 0;
+      }
+    }
+    int in_order = 0;
+    for (const sql::OrderItem& item : parsed->order_by) {
+      in_order += holds(item.expr) ? 1 : 0;
+    }
+    EXPECT_EQ(in_where + in_having + in_items + in_order, 1) << "one place";
+    where += in_where;
+    having += in_having;
+    items += in_items;
+    ordered += in_order;
+  }
+  EXPECT_GT(queries, 800) << "IN marks: " << queries << ", WHERE " << where << ", HAVING " << having
+                          << ", items " << items << " (" << counted << " in a COUNT), ORDER BY "
+                          << ordered << "; NOT IN " << negated << ", three-valued " << twice
+                          << ", OR " << ors << ", NOT " << nots << ", CASE " << cases
+                          << "; sets: WHERE " << null_filters << ", LIMIT " << limits
+                          << ", DISTINCT " << distincts << ", GROUP BY " << groups << ", CASE "
+                          << case_sets;
+  EXPECT_GT(where, 420);
+  EXPECT_GT(having, 120);
+  EXPECT_GT(items, 190);
+  EXPECT_GT(counted, 140);
+  EXPECT_GT(ordered, 45);
+  EXPECT_GT(negated, 400);
+  EXPECT_GT(twice, 170);
+  EXPECT_GT(ors, 130);
+  EXPECT_GT(nots, 130);
+  EXPECT_GT(cases, 280);
+  EXPECT_GT(null_filters, 380);
+  EXPECT_GT(limits, 120);
+  EXPECT_GT(distincts, 115);
+  EXPECT_GT(groups, 120);
+  EXPECT_GT(case_sets, 110);
+}
+
+// SQ7b's IN forms (ADR 0041): drawn right after an IN mark, from a stream of their own, only where
+// the query holds no other subquery and no mark, so declaring them changes the queries that take
+// one and no others.
+TEST(QueryGenerator, InFormsChangeOnlyTheirQueries) {
+  // Without kCorrelatedEmptyValue, drawn after the forms only where none fired, so that a query a
+  // form leaves out holds no subquery at all.
+  const FeatureSet supported = kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue});
+  const auto with = MakeOver(JoinTables(), 103, {.supported = supported, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 103, {.supported = supported.Minus({Feature::kInForm}), .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kInForm)) << plain.sql;
+    if (!q.features.Has(Feature::kInForm)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(HasSubquery(plain)) << "it displaces no other subquery: " << plain.sql;
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue, Feature::kGroupValue, Feature::kInMark}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+  }
+  EXPECT_GT(took, 380) << "IN forms: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// The operator of an IN subquery as written, lower case and without the layout's spaces and
+// comments: "in", "notin", "=any", "=some", "<>all" or "!=all".
+std::string InOperator(std::string_view sql, const sql::SubqueryExpr& sub) {
+  const std::string written =
+      Lower(std::string(sql.substr(sub.op_span.offset, sub.op_span.length)));
+  std::string op;
+  for (std::size_t k = 0; k < written.size();) {
+    if (written.compare(k, 2, "/*") == 0) {
+      const std::size_t close = written.find("*/", k + 2);
+      k = close == std::string::npos ? written.size() : close + 2;
+    } else if (written.compare(k, 2, "--") == 0) {
+      const std::size_t newline = written.find('\n', k);
+      k = newline == std::string::npos ? written.size() : newline + 1;
+    } else {
+      if (std::isspace(static_cast<unsigned char>(written[k])) == 0) {
+        op += written[k];
+      }
+      ++k;
+    }
+  }
+  return op;
+}
+
+// What an IN form writes: one or two IN subqueries (the three-valued CASE writes its mark twice,
+// alike) whose sets read no enclosing block, at least one of them quantified, of a literal probe
+// or over a set operation, and never another quantified comparison; a literal probe of the set's
+// type family; a set operation of two or three one-column arms of one type, nothing ordering or
+// limiting it; in WHERE (bare, under NOTs that fold, or inside a condition), HAVING, a select item
+// and ORDER BY. Floors per form.
+TEST(QueryGenerator, InFormsAreQuantifiedLiteralOrSetOperationSets) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 107, {.supported = kSupportedFeatures, .target_percent = 0});
+  // The kind of a column of `block`'s one named table (std::nullopt: none such).
+  const auto kind_of = [&](const sql::SelectStatement& block,
+                           const sql::ColumnRef& column) -> std::optional<ValueKind> {
+    if (block.from.size() != 1 || block.from.front().table() == nullptr) {
+      return std::nullopt;
+    }
+    const std::string table_name = Lower(block.from.front().table()->name);
+    const auto table = std::ranges::find_if(
+        tables, [&](const GenTable& t) { return Lower(t.name) == table_name; });
+    if (table == tables.end()) {
+      return std::nullopt;
+    }
+    const auto c = std::ranges::find_if(
+        table->columns, [&](const GenColumn& g) { return Lower(g.name) == Lower(column.name); });
+    return c == table->columns.end() ? std::nullopt : std::optional<ValueKind>(c->kind);
+  };
+  // Checks a block of the set (the set, or an arm): one item, one named table, unqualified columns
+  // of that table, no subquery; returns the kind of the column its item reads.
+  const auto check_block = [&](const sql::SelectStatement& block) -> std::optional<ValueKind> {
+    EXPECT_TRUE(block.with.empty());
+    EXPECT_TRUE(block.set_operation.empty());
+    EXPECT_EQ(block.items.size(), 1U);
+    EXPECT_EQ(block.from.size(), 1U);
+    if (block.items.size() != 1 || block.from.size() != 1 ||
+        block.items.front().expr() == nullptr) {
+      return std::nullopt;
+    }
+    const sql::TableRef* ref = block.from.front().table();
+    EXPECT_NE(ref, nullptr);
+    if (ref == nullptr) {
+      return std::nullopt;
+    }
+    EXPECT_EQ(ref->kind, sql::TableRef::Kind::kName);
+    std::vector<const sql::Expr*> parts = {block.items.front().expr()};
+    for (const sql::Expr& e : block.where) {
+      parts.push_back(&e);
+    }
+    for (const sql::Expr& e : block.group_by) {
+      parts.push_back(&e);
+    }
+    for (const sql::OrderItem& item : block.order_by) {
+      parts.push_back(&item.expr);
+    }
+    for (const sql::Expr* part : parts) {
+      ForEachNode(*part, [&](const sql::Expr& node) {
+        EXPECT_FALSE(std::holds_alternative<sql::SubqueryExpr>(node));
+        if (const auto* column = std::get_if<sql::ColumnRef>(&node)) {
+          EXPECT_TRUE(column->qualifier.empty()) << column->name;
+          EXPECT_TRUE(kind_of(block, *column).has_value())
+              << column->name << " is no column of " << ref->name;
+        }
+      });
+    }
+    std::optional<ValueKind> kind;
+    ForEachNode(*block.items.front().expr(), [&](const sql::Expr& node) {
+      if (const auto* column = std::get_if<sql::ColumnRef>(&node);
+          column != nullptr && !kind.has_value()) {
+        kind = kind_of(block, *column);
+      }
+    });
+    EXPECT_TRUE(kind.has_value());
+    EXPECT_NE(kind, ValueKind::kDouble) << "never DOUBLE keys";
+    return kind;
+  };
+  int queries = 0;
+  int any = 0;
+  int some = 0;
+  int ne_all = 0;
+  int bang_all = 0;
+  int literals = 0;
+  int integer_literals = 0;
+  int string_literals = 0;
+  int setops = 0;
+  int three_arms = 0;
+  int unions = 0;
+  int all_unions = 0;
+  int intersects = 0;
+  int all_intersects = 0;
+  int excepts = 0;
+  int all_excepts = 0;
+  int bare = 0;
+  int double_nots = 0;
+  int not_not_ins = 0;
+  int marks = 0;  // inside an OR, a CASE or a NOT over an OR
+  int where = 0;
+  int having = 0;
+  int items = 0;
+  int ordered = 0;
+  for (uint64_t i = 0; i < 20000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kInForm)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_GE(all.size(), 1U);
+    ASSERT_LE(all.size(), 2U);
+    const auto spelled = [](const sql::SubqueryExpr& sub) {
+      std::string text = Lower(sql::ToSql(*sub.query));
+      std::erase(text, '"');
+      return text;
+    };
+    EXPECT_TRUE(all.size() == 1 || spelled(*all[0]) == spelled(*all[1]))
+        << "a mark written twice is written alike";
+    bool new_form = false;  // quantified, a literal probe or a set operation
+    for (const sql::SubqueryExpr* sub : all) {
+      ASSERT_EQ(sub->kind, sql::SubqueryExpr::Kind::kIn);
+      const std::string op = InOperator(q.sql, *sub);
+      if (sub->negated) {
+        EXPECT_TRUE(op == "notin" || op == "<>all" || op == "!=all") << op;
+      } else {
+        EXPECT_TRUE(op == "in" || op == "=any" || op == "=some") << op;
+      }
+      any += op == "=any" ? 1 : 0;
+      some += op == "=some" ? 1 : 0;
+      ne_all += op == "<>all" ? 1 : 0;
+      bang_all += op == "!=all" ? 1 : 0;
+      new_form = new_form || (op != "in" && op != "notin");
+      // The set: a block of InMark's shapes, or a set operation of plain arms of one kind.
+      const sql::SelectStatement& set = *sub->query;
+      std::optional<ValueKind> set_kind;
+      if (set.set_operation.empty()) {
+        EXPECT_TRUE(set.order_by.size() == 1 || !set.limit.has_value());
+        set_kind = check_block(set);
+      } else {
+        new_form = true;
+        ++setops;
+        EXPECT_TRUE(set.with.empty());
+        EXPECT_TRUE(set.order_by.empty()) << "nothing orders the compound";
+        EXPECT_FALSE(set.limit.has_value());
+        EXPECT_FALSE(set.offset.has_value());
+        EXPECT_GE(set.set_operation.size(), 2U);
+        EXPECT_LE(set.set_operation.size(), 3U);
+        three_arms += set.set_operation.size() == 3 ? 1 : 0;
+        for (std::size_t k = 0; k < set.set_operation.size(); ++k) {
+          const sql::SetBranch& arm = set.set_operation[k];
+          EXPECT_TRUE(arm.query->order_by.empty());
+          EXPECT_FALSE(arm.query->limit.has_value());
+          EXPECT_FALSE(arm.query->distinct);
+          EXPECT_TRUE(arm.query->group_by.empty());
+          const std::optional<ValueKind> kind = check_block(*arm.query);
+          if (k == 0) {
+            set_kind = kind;
+          } else {
+            EXPECT_EQ(kind, set_kind) << "arms of one type family";
+            unions += arm.op == sql::SetOp::kUnion && !arm.all ? 1 : 0;
+            all_unions += arm.op == sql::SetOp::kUnion && arm.all ? 1 : 0;
+            intersects += arm.op == sql::SetOp::kIntersect && !arm.all ? 1 : 0;
+            all_intersects += arm.op == sql::SetOp::kIntersect && arm.all ? 1 : 0;
+            excepts += arm.op == sql::SetOp::kExcept && !arm.all ? 1 : 0;
+            all_excepts += arm.op == sql::SetOp::kExcept && arm.all ? 1 : 0;
+          }
+        }
+      }
+      // The probe: a column, MIN or MAX of one, or a literal of the set's family.
+      if (!sub->operand.has_value()) {
+        ADD_FAILURE() << "an IN subquery without a probe";
+        continue;
+      }
+      if (!set_kind.has_value()) {
+        ADD_FAILURE() << "a set of no known column";
+        continue;
+      }
+      const sql::Expr& probe = **sub->operand;
+      const auto* aggregate = std::get_if<sql::AggregateCall>(&probe);
+      const auto* lit = std::get_if<sql::Literal>(&probe);
+      const auto* cast = std::get_if<sql::CastExpr>(&probe);
+      if (lit != nullptr || cast != nullptr) {
+        new_form = true;
+        ++literals;
+        if (cast != nullptr) {
+          EXPECT_EQ(*set_kind, ValueKind::kDate) << "a cast probe is a DATE";
+          EXPECT_TRUE(std::holds_alternative<sql::Literal>(*cast->operand));
+        } else if (lit->kind == sql::Literal::Kind::kString ||
+                   lit->kind == sql::Literal::Kind::kDate) {
+          EXPECT_TRUE(*set_kind == ValueKind::kVarchar || *set_kind == ValueKind::kDate)
+              << "never a string against a number";
+          EXPECT_TRUE(lit->kind == sql::Literal::Kind::kString || *set_kind == ValueKind::kDate);
+          string_literals += *set_kind == ValueKind::kVarchar ? 1 : 0;
+        } else {
+          EXPECT_TRUE(*set_kind == ValueKind::kInteger || *set_kind == ValueKind::kDecimal)
+              << "never a number against a VARCHAR or a DATE";
+          EXPECT_TRUE(
+              lit->kind == sql::Literal::Kind::kInteger ||
+              (lit->kind == sql::Literal::Kind::kDecimal && *set_kind == ValueKind::kDecimal))
+              << "an integer against integers";
+          integer_literals += *set_kind == ValueKind::kInteger ? 1 : 0;
+        }
+      } else {
+        EXPECT_TRUE(std::holds_alternative<sql::ColumnRef>(probe) ||
+                    (aggregate != nullptr && aggregate->arg.has_value() &&
+                     std::holds_alternative<sql::ColumnRef>(**aggregate->arg)))
+            << sql::ToSql(probe);
+      }
+    }
+    EXPECT_TRUE(new_form) << "a quantified IN, a literal probe or a set operation";
+    // Where the forms stand: one WHERE or HAVING conjunct (bare, NOTs over the IN, or a condition
+    // that holds it), one select item or one ORDER BY item.
+    const auto holds = [](const sql::Expr& e) { return sql::ToSql(e).contains("SELECT"); };
+    const auto conjunct = [&](const std::vector<sql::Expr>& conjuncts) {
+      int n = 0;
+      for (const sql::Expr& e : conjuncts) {
+        if (!holds(e)) {
+          continue;
+        }
+        ++n;
+        const sql::Expr* inner = &e;
+        int nots = 0;
+        while (const auto* unary = std::get_if<sql::UnaryExpr>(inner)) {
+          if (unary->op != sql::UnaryOp::kNot) {
+            break;
+          }
+          ++nots;
+          inner = &*unary->operand;
+        }
+        const auto* sub = std::get_if<sql::SubqueryExpr>(inner);
+        if (sub == nullptr) {
+          ++marks;
+        } else if (nots == 0) {
+          ++bare;
+        } else {
+          EXPECT_LE(nots, 2);
+          EXPECT_TRUE(nots == 2 ? !sub->negated : sub->negated) << "NOTs that fold into IN";
+          double_nots += nots == 2 ? 1 : 0;
+          not_not_ins += nots == 1 ? 1 : 0;
+        }
+      }
+      return n;
+    };
+    const int in_where = conjunct(parsed->where);
+    const int in_having = conjunct(parsed->having);
+    int in_items = 0;
+    for (const sql::SelectItem& item : parsed->items) {
+      in_items += item.expr() != nullptr && holds(*item.expr()) ? 1 : 0;
+    }
+    int in_order = 0;
+    for (const sql::OrderItem& item : parsed->order_by) {
+      in_order += holds(item.expr) ? 1 : 0;
+    }
+    EXPECT_EQ(in_where + in_having + in_items + in_order, 1) << "one place";
+    where += in_where;
+    having += in_having;
+    items += in_items;
+    ordered += in_order;
+  }
+  EXPECT_GT(queries, 600) << "IN forms: " << queries << "; = ANY " << any << ", = SOME " << some
+                          << ", <> ALL " << ne_all << ", != ALL " << bang_all << "; literal probes "
+                          << literals << " (integer " << integer_literals << ", string "
+                          << string_literals << "); set operations " << setops << " (three arms "
+                          << three_arms << "; UNION " << unions << ", UNION ALL " << all_unions
+                          << ", INTERSECT " << intersects << ", INTERSECT ALL " << all_intersects
+                          << ", EXCEPT " << excepts << ", EXCEPT ALL " << all_excepts << "); bare "
+                          << bare << ", NOT NOT " << double_nots << ", NOT (NOT IN) " << not_not_ins
+                          << ", in a condition " << marks << "; WHERE " << where << ", HAVING "
+                          << having << ", items " << items << ", ORDER BY " << ordered;
+  EXPECT_GT(any, 130);
+  EXPECT_GT(some, 135);
+  EXPECT_GT(ne_all, 75);
+  EXPECT_GT(bang_all, 95);
+  EXPECT_GT(literals, 210);
+  EXPECT_GT(integer_literals, 90);
+  EXPECT_GT(string_literals, 60);
+  EXPECT_GT(setops, 360);
+  EXPECT_GT(three_arms, 80);
+  EXPECT_GT(unions, 65);
+  EXPECT_GT(all_unions, 65);
+  EXPECT_GT(intersects, 65);
+  EXPECT_GT(all_intersects, 85);
+  EXPECT_GT(excepts, 85);
+  EXPECT_GT(all_excepts, 65);
+  EXPECT_GT(bare, 70);
+  EXPECT_GT(double_nots, 25);
+  EXPECT_GT(not_not_ins, 65);
+  EXPECT_GT(marks, 230);
+  EXPECT_GT(where, 300);
+  EXPECT_GT(having, 95);
+  EXPECT_GT(items, 145);
+  EXPECT_GT(ordered, 70);
+}
+
+// SQ6's empty values (ADR 0041): drawn last, after the IN forms, from a stream of their own, only
+// where the query holds no other subquery, so declaring them changes the queries that take one and
+// no others.
+TEST(QueryGenerator, CorrelatedEmptyValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 109, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 109,
+               {.supported = kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue}),
+                .target_percent = 0});
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kCorrelatedEmptyValue)) << plain.sql;
+    if (!q.features.Has(Feature::kCorrelatedEmptyValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(HasSubquery(plain)) << "it displaces no other subquery: " << plain.sql;
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    EXPECT_EQ(q.sort, plain.sort);
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue, Feature::kGroupValue, Feature::kInMark,
+          Feature::kInForm}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+  }
+  EXPECT_GT(took, 265) << "empty values: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// What an empty value writes (ADR 0041's SQ6): one top-level WHERE conjunct that compares a
+// correlated scalar subquery, a direct operand, with a literal or a qualified outer column in
+// either order; the block names one table, correlates through one key of one type (= or IS NOT
+// DISTINCT FROM, either way round), groups nothing and has no LIMIT. Its item is a call, COALESCE
+// over a call that is NULL over no rows, a CASE over a call, a COUNT plus 1 to 9, a constant (over
+// ORDER BY COUNT(*) or under a HAVING), or the variance family against the literal 0 alone (> or
+// =); a HAVING compares a COUNT kind with an integer. Never (decision 29's family, docs/testing.md)
+// a constant item or a HAVING without a COUNT kind in the block, never a division nor other
+// arithmetic, never an AVG nor a variance against a column, never AVG of a DOUBLE. Floors per form.
+TEST(QueryGenerator, CorrelatedEmptyValuesAreAggregatesOverEveryRow) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen = MakeOver(tables, 113, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto table_of = [&](std::string_view name) -> const GenTable* {
+    const auto t = std::ranges::find_if(
+        tables, [&](const GenTable& g) { return Lower(g.name) == Lower(std::string(name)); });
+    return t == tables.end() ? nullptr : &*t;
+  };
+  const auto column_of = [](const GenTable* table, std::string_view name) -> const GenColumn* {
+    if (table == nullptr) {
+      return nullptr;
+    }
+    const auto c = std::ranges::find_if(table->columns, [&](const GenColumn& g) {
+      return Lower(g.name) == Lower(std::string(name));
+    });
+    return c == table->columns.end() ? nullptr : &*c;
+  };
+  const auto counts = [](const sql::AggregateCall& call) {
+    return call.kind == sql::AggKind::kCountStar || call.kind == sql::AggKind::kCount;
+  };
+  const auto variance = [](const sql::AggregateCall& call) {
+    return call.kind >= sql::AggKind::kStddevSamp;
+  };
+  const auto is_comparison = [](sql::BinaryOp op) {
+    return op >= sql::BinaryOp::kEq && op <= sql::BinaryOp::kGe;
+  };
+  int queries = 0;
+  int count_stars = 0;
+  int count_columns = 0;
+  int count_distincts = 0;
+  int sums = 0;
+  int avgs = 0;
+  int extremes = 0;  // MIN and MAX
+  int variances = 0;
+  int calls = 0;  // the item a call
+  int coalesces = 0;
+  int cases = 0;
+  int pluses = 0;
+  int ordered_constants = 0;
+  int having_constants = 0;
+  int havings = 0;
+  int null_equal = 0;
+  int outer_first = 0;
+  int against_columns = 0;
+  int subquery_first = 0;
+  for (uint64_t i = 0; i < 20000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedEmptyValue)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    ASSERT_EQ(all.size(), 1U);
+    // The conjunct: a comparison with the subquery as one operand, directly.
+    const sql::BinaryExpr* comparison = nullptr;
+    int holding = 0;
+    for (const sql::Expr& conjunct : parsed->where) {
+      std::vector<const sql::SubqueryExpr*> inside;
+      DeepSubqueries(conjunct, inside);
+      if (inside.empty()) {
+        continue;
+      }
+      ++holding;
+      comparison = std::get_if<sql::BinaryExpr>(&conjunct);
+    }
+    ASSERT_EQ(holding, 1) << "one top-level WHERE conjunct";
+    ASSERT_NE(comparison, nullptr);
+    ASSERT_TRUE(is_comparison(comparison->op));
+    const auto* left = std::get_if<sql::SubqueryExpr>(&*comparison->left);
+    const auto* right = std::get_if<sql::SubqueryExpr>(&*comparison->right);
+    ASSERT_TRUE((left == nullptr) != (right == nullptr)) << "a direct operand, once";
+    const sql::SubqueryExpr& sub = left != nullptr ? *left : *right;
+    const sql::Expr& other = left != nullptr ? *comparison->right : *comparison->left;
+    subquery_first += left != nullptr ? 1 : 0;
+    ASSERT_EQ(sub.kind, sql::SubqueryExpr::Kind::kScalar);
+    const auto* against = std::get_if<sql::ColumnRef>(&other);
+    if (against != nullptr) {
+      ++against_columns;
+      EXPECT_FALSE(against->qualifier.empty());
+    } else {
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(other) ||
+                  std::holds_alternative<sql::CastExpr>(other))
+          << sql::ToSql(other);
+    }
+    // The block: one item over one named table, one key, no grouping, no LIMIT.
+    const sql::SelectStatement& block = *sub.query;
+    EXPECT_TRUE(block.with.empty());
+    EXPECT_TRUE(block.set_operation.empty());
+    EXPECT_FALSE(block.distinct);
+    EXPECT_TRUE(block.group_by.empty());
+    EXPECT_TRUE(block.grouping.empty());
+    EXPECT_FALSE(block.limit.has_value());
+    EXPECT_FALSE(block.offset.has_value());
+    ASSERT_EQ(block.items.size(), 1U);
+    ASSERT_EQ(block.from.size(), 1U);
+    ASSERT_NE(block.from.front().table(), nullptr);
+    EXPECT_EQ(block.from.front().table()->kind, sql::TableRef::Kind::kName);
+    EXPECT_FALSE(block.from.front().alias.has_value());
+    const std::string inner_name = block.from.front().table()->name;
+    const GenTable* inner = table_of(inner_name);
+    ASSERT_NE(inner, nullptr) << inner_name;
+    ASSERT_EQ(block.where.size(), 1U) << "the key alone";
+    const sql::Expr* key_left = nullptr;
+    const sql::Expr* key_right = nullptr;
+    if (const auto* eq = std::get_if<sql::BinaryExpr>(&block.where.front())) {
+      EXPECT_EQ(eq->op, sql::BinaryOp::kEq);
+      key_left = &*eq->left;
+      key_right = &*eq->right;
+    } else if (const auto* not_distinct =
+                   std::get_if<sql::DistinctFromExpr>(&block.where.front())) {
+      EXPECT_TRUE(not_distinct->negated) << "IS NOT DISTINCT FROM";
+      ++null_equal;
+      key_left = &*not_distinct->left;
+      key_right = &*not_distinct->right;
+    }
+    ASSERT_NE(key_left, nullptr) << sql::ToSql(block.where.front());
+    const auto* a = std::get_if<sql::ColumnRef>(key_left);
+    const auto* b = std::get_if<sql::ColumnRef>(key_right);
+    ASSERT_TRUE(a != nullptr && b != nullptr);
+    const bool inner_left = Lower(a->qualifier) == Lower(inner_name);
+    outer_first += inner_left ? 0 : 1;
+    const sql::ColumnRef& inner_key = inner_left ? *a : *b;
+    const sql::ColumnRef& outer_key = inner_left ? *b : *a;
+    EXPECT_EQ(Lower(inner_key.qualifier), Lower(inner_name));
+    EXPECT_NE(Lower(outer_key.qualifier), Lower(inner_name)) << "the outer binding's own name";
+    // One type on both ends: the outer binding's table by its alias or its name.
+    const GenTable* outer = nullptr;
+    for (const sql::FromItem& item : parsed->from) {
+      // A binding read by path is never correlated (CorrelatedCandidates).
+      const sql::TableRef* ref = item.table();
+      if (ref == nullptr || ref->kind != sql::TableRef::Kind::kName) {
+        continue;
+      }
+      const std::string name = item.alias.has_value() ? *item.alias : ref->name;
+      if (Lower(name) == Lower(outer_key.qualifier)) {
+        outer = table_of(ref->name);
+      }
+    }
+    const GenColumn* ik = column_of(inner, inner_key.name);
+    const GenColumn* ok = column_of(outer, outer_key.name);
+    ASSERT_NE(ik, nullptr);
+    ASSERT_NE(ok, nullptr) << outer_key.qualifier << "." << outer_key.name;
+    EXPECT_EQ(ik->kind, ok->kind);
+    EXPECT_EQ(ik->min, ok->min);
+    EXPECT_EQ(ik->max, ok->max);
+    EXPECT_EQ(ik->precision, ok->precision);
+    EXPECT_EQ(ik->scale, ok->scale);
+    // The HAVING: one comparison of a COUNT kind with an integer.
+    bool having_count = false;
+    EXPECT_LE(block.having.size(), 1U);
+    for (const sql::Expr& h : block.having) {
+      ++havings;
+      const auto* cmp = std::get_if<sql::BinaryExpr>(&h);
+      ASSERT_NE(cmp, nullptr) << sql::ToSql(h);
+      EXPECT_TRUE(is_comparison(cmp->op));
+      const auto* call = std::get_if<sql::AggregateCall>(&*cmp->left);
+      ASSERT_NE(call, nullptr) << sql::ToSql(h);
+      EXPECT_TRUE(counts(*call)) << "a HAVING reads a COUNT kind";
+      having_count = counts(*call);
+      const auto* n = std::get_if<sql::Literal>(&*cmp->right);
+      EXPECT_TRUE(n != nullptr && n->kind == sql::Literal::Kind::kInteger);
+    }
+    // ORDER BY COUNT(*) alone, under a constant.
+    bool ordered = false;
+    EXPECT_LE(block.order_by.size(), 1U);
+    for (const sql::OrderItem& item : block.order_by) {
+      const auto* call = std::get_if<sql::AggregateCall>(&item.expr);
+      ASSERT_NE(call, nullptr);
+      EXPECT_EQ(call->kind, sql::AggKind::kCountStar);
+      ordered = true;
+    }
+    // No arithmetic but `COUNT + k`, and every call over one column of the inner table.
+    const sql::Expr& item = *block.items.front().expr();
+    ForEachNode(item, [&](const sql::Expr& node) {
+      if (const auto* bin = std::get_if<sql::BinaryExpr>(&node)) {
+        EXPECT_TRUE(bin->op == sql::BinaryOp::kAdd || is_comparison(bin->op))
+            << "no division and no other arithmetic";
+      }
+      if (const auto* call = std::get_if<sql::AggregateCall>(&node)) {
+        EXPECT_TRUE(call->kind == sql::AggKind::kCountStar || call->arg_column() != nullptr);
+        if (const sql::ColumnRef* arg = call->arg_column()) {
+          EXPECT_EQ(Lower(arg->qualifier), Lower(inner_name));
+          const GenColumn* column = column_of(inner, arg->name);
+          ASSERT_NE(column, nullptr) << arg->name;
+          if (call->kind == sql::AggKind::kAvg || variance(*call)) {
+            EXPECT_TRUE(column->kind == ValueKind::kInteger || column->kind == ValueKind::kDecimal)
+                << "AVG and the variance family only over integers and DECIMALs";
+          }
+          if (call->kind == sql::AggKind::kSum) {
+            EXPECT_NE(column->kind, ValueKind::kDouble);
+          }
+          if (call->distinct) {
+            EXPECT_NE(column->kind, ValueKind::kDouble);
+          }
+        }
+        count_stars += call->kind == sql::AggKind::kCountStar ? 1 : 0;
+        count_columns += call->kind == sql::AggKind::kCount && !call->distinct ? 1 : 0;
+        count_distincts += call->kind == sql::AggKind::kCount && call->distinct ? 1 : 0;
+        sums += call->kind == sql::AggKind::kSum ? 1 : 0;
+        avgs += call->kind == sql::AggKind::kAvg ? 1 : 0;
+        extremes += call->kind == sql::AggKind::kMin || call->kind == sql::AggKind::kMax ? 1 : 0;
+        variances += variance(*call) ? 1 : 0;
+      }
+    });
+    const auto never_against_a_column = [&] {
+      EXPECT_EQ(against, nullptr) << "never against a column";
+    };
+    if (const auto* call = std::get_if<sql::AggregateCall>(&item)) {
+      ++calls;
+      EXPECT_FALSE(ordered);
+      if (call->kind == sql::AggKind::kAvg) {
+        never_against_a_column();
+      }
+      if (variance(*call)) {
+        never_against_a_column();
+        const auto* zero = std::get_if<sql::Literal>(&other);
+        EXPECT_TRUE(zero != nullptr && zero->text == "0" && !zero->negative) << "against 0 alone";
+        const bool mirrored = left == nullptr;
+        EXPECT_TRUE(comparison->op == sql::BinaryOp::kEq ||
+                    comparison->op == (mirrored ? sql::BinaryOp::kLt : sql::BinaryOp::kGt))
+            << "> 0 or = 0";
+      }
+    } else if (const auto* fn = std::get_if<sql::FunctionCall>(&item)) {
+      ++coalesces;
+      EXPECT_FALSE(ordered);
+      EXPECT_EQ(Lower(fn->name), "coalesce");
+      ASSERT_EQ(fn->args.size(), 2U);
+      const auto* coalesced = std::get_if<sql::AggregateCall>(&fn->args.front());
+      ASSERT_NE(coalesced, nullptr);
+      EXPECT_FALSE(counts(*coalesced) || variance(*coalesced)) << "a call NULL over no rows";
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(fn->args[1]));
+      if (coalesced->kind == sql::AggKind::kAvg) {
+        never_against_a_column();
+      }
+    } else if (const auto* when = std::get_if<sql::CaseExpr>(&item)) {
+      ++cases;
+      EXPECT_FALSE(ordered);
+      EXPECT_FALSE(when->operand.has_value());
+      ASSERT_EQ(when->branches.size(), 1U);
+      const auto* test = std::get_if<sql::BinaryExpr>(&*when->branches.front().when);
+      ASSERT_NE(test, nullptr);
+      EXPECT_TRUE(is_comparison(test->op));
+      const auto* tested = std::get_if<sql::AggregateCall>(&*test->left);
+      ASSERT_NE(tested, nullptr);
+      EXPECT_FALSE(variance(*tested));
+      EXPECT_TRUE(std::holds_alternative<sql::Literal>(*when->branches.front().then));
+      EXPECT_TRUE(when->otherwise.has_value() &&
+                  std::holds_alternative<sql::Literal>(**when->otherwise))
+          << "an ELSE constant";
+    } else if (const auto* plus = std::get_if<sql::BinaryExpr>(&item)) {
+      ++pluses;
+      EXPECT_FALSE(ordered);
+      EXPECT_EQ(plus->op, sql::BinaryOp::kAdd);
+      const auto* counted = std::get_if<sql::AggregateCall>(&*plus->left);
+      ASSERT_NE(counted, nullptr);
+      EXPECT_TRUE(counts(*counted)) << "only a count takes arithmetic";
+      const auto* k = std::get_if<sql::Literal>(&*plus->right);
+      ASSERT_NE(k, nullptr);
+      EXPECT_EQ(k->kind, sql::Literal::Kind::kInteger);
+      EXPECT_FALSE(k->negative);
+      EXPECT_EQ(k->text.size(), 1U) << "1 to 9";
+    } else if (const auto* constant = std::get_if<sql::Literal>(&item)) {
+      EXPECT_EQ(constant->kind, sql::Literal::Kind::kInteger);
+      EXPECT_TRUE(ordered || having_count)
+          << "a constant only with a COUNT kind in the block (decision 29)";
+      ordered_constants += ordered ? 1 : 0;
+      having_constants += ordered ? 0 : 1;
+    } else {
+      ADD_FAILURE() << "an item of no known kind: " << sql::ToSql(item);
+    }
+  }
+  EXPECT_GT(queries, 440) << "empty values: " << queries << "; COUNT(*) " << count_stars
+                          << ", COUNT(x) " << count_columns << ", COUNT(DISTINCT x) "
+                          << count_distincts << ", SUM " << sums << ", AVG " << avgs
+                          << ", MIN or MAX " << extremes << ", variance " << variances
+                          << "; items: a call " << calls << ", COALESCE " << coalesces << ", CASE "
+                          << cases << ", COUNT + k " << pluses << ", a constant over ORDER BY "
+                          << ordered_constants << ", under a HAVING " << having_constants
+                          << "; HAVING " << havings << ", NULL-equal keys " << null_equal
+                          << ", outer key first " << outer_first << ", against a column "
+                          << against_columns << ", subquery first " << subquery_first;
+  EXPECT_GT(count_stars, 75);
+  EXPECT_GT(count_columns, 55);
+  EXPECT_GT(count_distincts, 44);
+  EXPECT_GT(sums, 28);
+  EXPECT_GT(avgs, 28);
+  EXPECT_GT(extremes, 100);
+  EXPECT_GT(variances, 48);
+  EXPECT_GT(calls, 180);
+  EXPECT_GT(coalesces, 66);
+  EXPECT_GT(cases, 64);
+  EXPECT_GT(pluses, 68);
+  EXPECT_GT(ordered_constants, 40);
+  EXPECT_GT(having_constants, 16);
+  EXPECT_GT(havings, 100);
+  EXPECT_GT(null_equal, 95);
+  EXPECT_GT(outer_first, 97);
+  EXPECT_GT(against_columns, 92);
+  EXPECT_GT(subquery_first, 230);
+  EXPECT_GT(queries - subquery_first, 200) << "the other operand first too";
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

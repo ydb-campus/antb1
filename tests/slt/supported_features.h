@@ -157,6 +157,27 @@ enum class Feature : std::uint8_t {
   // One more select item of a block that aggregates (ADR 0041's SQ2b): a value block alone, or a
   // COUNT of a CASE WHEN over kConditionValue's conditions.
   kGroupValue,  // SELECT k, (SELECT ...), COUNT(CASE WHEN x > (SELECT ...) THEN x END)
+  // An uncorrelated IN or NOT IN inside a condition (ADR 0041's SQ7a), a null-aware mark: under OR,
+  // NOT or CASE WHEN in WHERE or HAVING (the probe a GROUP BY key or MIN or MAX of a column), or in
+  // the CASE WHEN of a select item, of an aggregate's argument or of an ORDER BY item. Its set
+  // block
+  // reads one column of one table, of the probe's type family; its WHERE, IS [NOT] NULL, ORDER BY,
+  // NULLS FIRST or LAST, LIMIT, OFFSET, DISTINCT and GROUP BY record no feature of their own.
+  kInMark,  // x = 1 OR x IN (SELECT ...), CASE WHEN x NOT IN (SELECT ...) THEN 1 ELSE 0 END
+  // SQ7b's IN forms (ADR 0041), as a top-level conjunct of WHERE or HAVING or in kInMark's places:
+  // = ANY, = SOME, <> ALL and != ALL over a set; NOT NOT (x IN (...)) and NOT (x NOT IN (...)) as
+  // a conjunct; a literal probe of the set's type family; a set that is a set operation of two or
+  // three uncorrelated one-column arms of the set column's type. The set's own clauses record no
+  // feature of their own, as kInMark's; its set operators and literals record theirs.
+  kInForm,  // x = ANY (SELECT ...), 2 IN (SELECT a FROM t UNION SELECT b FROM u)
+  // SQ6's empty values (ADR 0041): a correlated scalar subquery whose block aggregates over every
+  // row, a direct operand of a comparison in a top-level WHERE conjunct, compared with a literal or
+  // an outer column; the block holds any aggregate call (the variance family compared with 0
+  // only), a call, COALESCE or a CASE over one, COUNT plus a constant, or a constant over ORDER BY
+  // COUNT(*), and an optional HAVING over a COUNT. An outer row without a match reads the block's
+  // value over no rows. Its ORDER BY, HAVING, COALESCE and constant record no feature of their own;
+  // its calls, CASE, arithmetic, literals and IS NOT DISTINCT FROM record theirs.
+  kCorrelatedEmptyValue,  // (SELECT COUNT(*) FROM i WHERE i.k = o.k) = 0
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -335,6 +356,12 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "item_value";
     case Feature::kGroupValue:
       return "group_value";
+    case Feature::kInMark:
+      return "in_mark";
+    case Feature::kInForm:
+      return "in_form";
+    case Feature::kCorrelatedEmptyValue:
+      return "correlated_empty_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -499,6 +526,9 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kHavingValue,
     Feature::kItemValue,
     Feature::kGroupValue,
+    Feature::kInMark,
+    Feature::kInForm,
+    Feature::kCorrelatedEmptyValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

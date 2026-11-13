@@ -246,11 +246,11 @@ arrow::Result<JoinShape> ShapeOf(const plan::JoinNode& join) {
     return arrow::Status::Invalid("a ", kind, " hash join without keys");
   }
   if (traits.null_aware && (join.keys.size() != 1 || !join.residual.empty())) {
-    return arrow::Status::Invalid("a NULL-AWARE ANTI join of ", join.keys.size(), " keys and ",
+    return arrow::Status::Invalid("a ", kind, " join of ", join.keys.size(), " keys and ",
                                   join.residual.size(), " residuals");
   }
   if (traits.null_aware && join.keys.front().null_equal) {
-    return arrow::Status::Invalid("a NULL-AWARE ANTI join with a NULL-equal key");
+    return arrow::Status::Invalid("a ", kind, " join with a NULL-equal key");
   }
   if (std::ranges::any_of(join.residual,
                           [](const plan::ExprPtr& residual) { return residual == nullptr; })) {

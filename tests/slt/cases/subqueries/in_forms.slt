@@ -1,0 +1,2234 @@
+# Uncorrelated IN subqueries in the forms of ADR 0041's SQ7b: `= ANY` and `= SOME` as IN, `<> ALL` and `!= ALL` as NOT
+# IN; a constant probe, a string literal typed by a DATE set, and a probe holding a subquery's value; a set operation as
+# the set; and DuckDB's bind error for a VARCHAR or a DATE against another type. Each as a top-level conjunct (a semi
+# or null-aware anti join) and under OR, NOT and CASE (a null-aware mark join; more in in_marks.slt).
+
+# ---- constant and value probes ----
+
+# An integer constant probe as a top-level WHERE conjunct keeps every row or none: 6 and 1 + 5 are in city 1's zones and
+# 2 is not; 99 is in no set, so NOT IN keeps every row over city 1's zones, but over zn_parent, which holds a NULL, both
+# IN and NOT IN are NULL and keep none; 77 is in zn_parent, so IN is TRUE despite the NULL.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 6 IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 1 + 5 IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 99 NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 99 IN (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 99 NOT IN (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 77 IN (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+# A constant probe over the empty promos (IN FALSE, NOT IN TRUE) and over a set of NULLs only (both NULL); the constant
+# beside a column conjunct.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 IN (SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 NOT IN (SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 IN (SELECT zn_parent FROM zones WHERE zn_parent IS NULL)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 NOT IN (SELECT zn_parent FROM zones WHERE zn_parent IS NULL)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query I nosort
+SELECT ct_id FROM cities WHERE 2 NOT IN (SELECT pm_id FROM promos) AND ct_pop > 10000 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+# Negative constants and the type extremes over edge's columns: -1 and INTEGER's minimum are in i32, which holds NULLs
+# at ids 5 and 9 (a match is TRUE all the same); -2 is not in i32 without its NULLs, so NOT IN keeps every row.
+
+query I nosort
+SELECT id FROM edge WHERE -1 IN (SELECT i32 FROM edge) ORDER BY id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+query I nosort
+SELECT id FROM edge WHERE -2147483648 IN (SELECT i32 FROM edge) AND id < 4 ORDER BY id
+----
+INTEGER
+0
+1
+2
+3
+
+query I nosort
+SELECT id FROM edge WHERE -2 NOT IN (SELECT i32 FROM edge WHERE i32 IS NOT NULL) ORDER BY id
+----
+INTEGER
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+
+# Constants of another integer width than the set: a BIGINT constant against INTEGER zone ids (no match; NOT IN keeps
+# every row), BIGINT's maximum in i64, INTEGER constants against BIGINT i64, SMALLINT zn_city and USMALLINT u16.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2147483648 IN (SELECT zn_id FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2147483648 NOT IN (SELECT zn_id FROM zones)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query I nosort
+SELECT id FROM edge WHERE 9223372036854775807 IN (SELECT i64 FROM edge) AND id > 9 ORDER BY id
+----
+INTEGER
+10
+11
+
+query I nosort
+SELECT ct_id FROM cities WHERE 42 IN (SELECT i64 FROM edge) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE 9 IN (SELECT zn_city FROM zones) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE 40000 IN (SELECT u16 FROM edge) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# A string constant against a VARCHAR set compares exactly: STD, the empty string and a Cyrillic code are tariff codes;
+# std (case) and XL (the code has a trailing space) are not, so their IN is NULL over tf_code, which holds a NULL, and
+# their NOT IN is TRUE only without it; city labels hold no NULL.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 'STD' IN (SELECT tf_code FROM tariffs)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE '' IN (SELECT tf_code FROM tariffs)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query I nosort
+SELECT ct_id FROM cities WHERE 'Ж-1' IN (SELECT tf_code FROM tariffs) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 'std' IN (SELECT tf_code FROM tariffs)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 'XL' NOT IN (SELECT tf_code FROM tariffs)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 'XL' NOT IN (SELECT tf_code FROM tariffs WHERE tf_code IS NOT NULL)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query I nosort
+SELECT zn_id FROM zones WHERE 'harbor' IN (SELECT label FROM cities) AND zn_id < 4 ORDER BY zn_id
+----
+INTEGER
+1
+2
+3
+
+query I nosort
+SELECT zn_id FROM zones WHERE 'river' NOT IN (SELECT label FROM cities) AND zn_id > 37 ORDER BY zn_id
+----
+INTEGER
+38
+39
+40
+
+# A DATE string constant against a DATE set, typed by the set: a day of March 2026 among the trip days, a day the days
+# table holds and one past its end; and a DATE literal.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE '2026-03-01' IN (SELECT tr_day FROM trips)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE DATE '2026-03-01' IN (SELECT tr_day FROM trips)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query I nosort
+SELECT ct_id FROM cities WHERE '2027-01-05' IN (SELECT dy_day FROM days) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE '2031-01-01' IN (SELECT dy_day FROM days) ORDER BY ct_id
+----
+SMALLINT
+
+query I nosort
+SELECT ct_id FROM cities WHERE '2031-01-01' NOT IN (SELECT dy_day FROM days) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# A constant probe under OR and NOT in WHERE: with a FALSE IN only the other branch keeps rows; with a NOT IN over a set
+# with a NULL (NULL) too; NOT over a NULL IN keeps only the other branch, NOT over an IN of the empty set every row and
+# NOT over a FALSE NOT IN every row; a FALSE string IN and a FALSE DATE NOT IN beside OR.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 5
+----
+BIGINT	HUGEINT
+5	10
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE -1 NOT IN (SELECT zn_parent FROM zones) OR tr_row < 5
+----
+BIGINT	HUGEINT
+5	10
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (99 IN (SELECT zn_parent FROM zones)) OR ct_id = 1 ORDER BY ct_id
+----
+SMALLINT
+1
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (2 IN (SELECT pm_id FROM promos)) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE NOT (2 NOT IN (SELECT zn_id FROM zones WHERE zn_city = 2)) AND ct_id < 4 ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT ct_id FROM cities WHERE 'std' IN (SELECT tf_code FROM tariffs WHERE tf_code IS NOT NULL) OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+2
+
+query I nosort
+SELECT ct_id FROM cities WHERE '2027-01-05' NOT IN (SELECT dy_day FROM days) OR ct_pop IS NULL ORDER BY ct_id
+----
+SMALLINT
+4
+
+# A constant probe in an inner ON, as a conjunct and under OR; in HAVING, as a conjunct and under OR; and in a CASE WHEN
+# of WHERE.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND 6 IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2793	4187379
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (2 IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR zn_city = 3)
+----
+BIGINT	HUGEINT
+490	735245
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING 6 IN (SELECT zn_id FROM zones WHERE zn_city = 1)) s
+----
+BIGINT	HUGEINT
+43	946
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING 99 NOT IN (SELECT zn_parent FROM zones) OR COUNT(*) > 69) s
+----
+BIGINT	HUGEINT
+33	561
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING 2 IN (SELECT pm_id FROM promos) OR MIN(zn_id) < 3
+----
+SMALLINT	BIGINT
+1	8
+2	8
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE CASE WHEN 6 IN (SELECT zn_id FROM zones WHERE zn_city = 1) THEN tr_row ELSE 0 END < 10
+----
+BIGINT	HUGEINT
+10	45
+
+# Three-valued constant marks in the CASE WHEN of select items: IN is TRUE on a match despite a NULL in the set, NULL
+# without a match over a set with a NULL, FALSE over the empty set; NOT IN is TRUE without a match over a set without a
+# NULL and NULL over a set with one or of NULLs only. A constant mark also picks a branch of an ORDER BY CASE.
+
+query ITTT nosort
+SELECT ct_id, CASE WHEN 77 IN (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT (77 IN (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END AS a, CASE WHEN 99 IN (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT (99 IN (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END AS b, CASE WHEN 2 IN (SELECT pm_id FROM promos) THEN 'T' WHEN NOT (2 IN (SELECT pm_id FROM promos)) THEN 'F' ELSE 'N' END AS c FROM cities WHERE ct_id < 3 ORDER BY ct_id
+----
+SMALLINT	VARCHAR	VARCHAR	VARCHAR
+1	T	N	F
+2	T	N	F
+
+query ITTT nosort
+SELECT ct_id, CASE WHEN 99 NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'T' WHEN NOT (99 NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1)) THEN 'F' ELSE 'N' END AS a, CASE WHEN 99 NOT IN (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT (99 NOT IN (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END AS b, CASE WHEN 2 NOT IN (SELECT zn_parent FROM zones WHERE zn_parent IS NULL) THEN 'T' WHEN NOT (2 NOT IN (SELECT zn_parent FROM zones WHERE zn_parent IS NULL)) THEN 'F' ELSE 'N' END AS c FROM cities WHERE ct_id < 3 ORDER BY ct_id
+----
+SMALLINT	VARCHAR	VARCHAR	VARCHAR
+1	T	N	N
+2	T	N	N
+
+query T rowsort
+SELECT CASE WHEN 2 IN (SELECT zn_id FROM zones WHERE zn_city = 2) THEN 'y' ELSE 'n' END AS m FROM cities WHERE ct_id = 1
+----
+VARCHAR
+y
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN 2 IN (SELECT zn_id FROM zones WHERE zn_city = 2) THEN -ct_id ELSE ct_id END
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+# A probe that is a scalar subquery's value, as a top-level conjunct: the smallest zone id, 1, is in city 1's zones; the
+# largest, 40, is not, so NOT IN keeps every row over city 1's zones and none over zn_parent; over the empty promos NOT
+# IN is TRUE, over NULLs only IN is NULL; a BIGINT value against INTEGER zone ids.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MAX(zn_id) FROM zones) NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MAX(zn_id) FROM zones) NOT IN (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MIN(zn_id) FROM zones) NOT IN (SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_parent FROM zones WHERE zn_parent IS NULL)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT MIN(tr_rider) FROM trips) IN (SELECT zn_id FROM zones) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# A NULL value probe: zone 1's parent, and a subquery of no row. Its IN is NULL over a non-empty set and FALSE over the
+# empty one, so its NOT IN keeps every row over promos only.
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_parent FROM zones WHERE zn_id = 1) NOT IN (SELECT pm_id FROM promos) ORDER BY ct_id
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT zn_id FROM zones WHERE zn_id < 0) NOT IN (SELECT pm_id FROM promos) AND ct_id > 4 ORDER BY ct_id
+----
+SMALLINT
+5
+6
+
+query ITT nosort
+SELECT ct_id, CASE WHEN (SELECT zn_parent FROM zones WHERE zn_id = 1) IN (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'T' WHEN NOT ((SELECT zn_parent FROM zones WHERE zn_id = 1) IN (SELECT zn_id FROM zones WHERE zn_city = 1)) THEN 'F' ELSE 'N' END AS a, CASE WHEN (SELECT zn_id FROM zones WHERE zn_id < 0) IN (SELECT pm_id FROM promos) THEN 'T' WHEN NOT ((SELECT zn_id FROM zones WHERE zn_id < 0) IN (SELECT pm_id FROM promos)) THEN 'F' ELSE 'N' END AS b FROM cities WHERE ct_id < 3 ORDER BY ct_id
+----
+SMALLINT	VARCHAR	VARCHAR
+1	N	F
+2	N	F
+
+# A value in arithmetic with a column: pickup + 1 in city 1's zones as a conjunct, under OR, under NOT and as a NOT IN
+# over a set with a NULL beside OR; a city id + 1 in an inner ON and in a select-item CASE, where the set of cities of
+# zones over 35 holds a NULL (TRUE for cities 1 and 4, else NULL); in HAVING and an ORDER BY CASE (city 1 last).
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+489	733224
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 3
+----
+BIGINT	HUGEINT
+492	733227
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1))
+----
+BIGINT	HUGEINT
+2511	3765276
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT MIN(zn_id) FROM zones) NOT IN (SELECT zn_parent FROM zones) OR tr_row < 3
+----
+BIGINT	HUGEINT
+3	3
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city + (SELECT MIN(ct_id) FROM cities) IN (SELECT ct_id FROM cities WHERE ct_pop > 40000)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city + (SELECT MIN(ct_id) FROM cities) IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR zn_id > 38)
+----
+BIGINT	HUGEINT
+697	1044627
+
+query IT nosort
+SELECT ct_id, CASE WHEN ct_id + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_city FROM zones WHERE zn_id > 35) THEN 'T' WHEN NOT (ct_id + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_city FROM zones WHERE zn_id > 35)) THEN 'F' ELSE 'N' END AS m FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	T
+2	N
+3	N
+4	T
+5	N
+6	N
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING tr_pickup + (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1)) s
+----
+BIGINT	HUGEINT
+7	140
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING COUNT(*) - (SELECT MAX(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 4)) s
+----
+BIGINT	HUGEINT
+10	385
+
+query I nosort
+SELECT ct_id FROM cities ORDER BY CASE WHEN ct_id + (SELECT MIN(zn_id) FROM zones) IN (SELECT ct_id FROM cities WHERE ct_pop > 40000) THEN 1 ELSE 0 END, ct_id
+----
+SMALLINT
+2
+3
+4
+5
+6
+1
+
+# A value probe under OR and NOT, in an inner ON, in HAVING and in a select-item CASE.
+
+query I nosort
+SELECT ct_id FROM cities WHERE (SELECT MAX(zn_id) FROM zones) IN (SELECT zn_parent FROM zones) OR ct_id = 2 ORDER BY ct_id
+----
+SMALLINT
+2
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (SELECT MIN(zn_id) FROM zones) IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2793	4187379
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM zones GROUP BY zn_city HAVING (SELECT MAX(zn_id) FROM zones) NOT IN (SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	7
+5	8
+9	1
+NULL	1
+
+query IT nosort
+SELECT ct_id, CASE WHEN (SELECT MAX(zn_id) FROM zones) IN (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT ((SELECT MAX(zn_id) FROM zones) IN (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END AS m FROM cities WHERE ct_id < 3 ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	N
+2	N
+
+# A value probe of two rows is DuckDB's row error: as a conjunct, in arithmetic with a column, under OR and in a
+# select-item CASE. A sum past INTEGER's range in the probe is an overflow error.
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT zn_id FROM zones WHERE zn_city = 2) IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + (SELECT zn_id FROM zones WHERE zn_city = 2) IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT zn_id FROM zones WHERE zn_city = 2) IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 3
+
+statement error More than one row returned by a subquery used as an expression
+SELECT ct_id, CASE WHEN (SELECT zn_id FROM zones WHERE zn_city = 2) IN (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'y' ELSE 'n' END AS m FROM cities
+
+statement error Overflow in (addition|subtraction|multiplication) of
+SELECT COUNT(*) FROM edge WHERE i32 + (SELECT MAX(i32) FROM edge) IN (SELECT i32 FROM edge WHERE id = 2)
+
+# ---- quantified comparisons ----
+
+# Spellings as a top-level WHERE conjunct: = ANY and = SOME are IN, <> ALL and != ALL are NOT IN, also written
+# without spaces and in lower case; NOT over = ANY and over <> ALL; <> ALL over a set holding a NULL keeps no row and
+# over the empty promos every row, NULL dropoffs too; = ANY over a set holding a NULL keeps the matches; an expression
+# probe; a BIGINT probe against an INTEGER set, a DECIMAL and a VARCHAR pair; two quantified conjuncts; = ANY over a
+# UNION.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = SOME (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup =ANY(SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = some (select zn_id from zones where zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2441	3660942
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup != ALL (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2441	3660942
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup<>ALL(SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2441	3660942
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1))
+----
+BIGINT	HUGEINT
+2441	3660942
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1))
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff <> ALL (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff <> ALL (SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff = ANY (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+354	533562
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup + 1 = ANY (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+489	733224
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_rider = SOME (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+97	142180
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_rate = ANY (SELECT tf_rate FROM tariffs WHERE tf_rate < 1.5)
+----
+BIGINT	HUGEINT
+698	1040150
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff <> ALL (SELECT tf_code FROM tariffs WHERE tf_rate > 1.5)
+----
+BIGINT	HUGEINT
+1704	2555024
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) AND tr_dropoff != ALL (SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+422	625113
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities WHERE ct_id = 2)
+----
+BIGINT	HUGEINT
+629	941473
+
+# An inner ON's conjunct and a HAVING conjunct: = ANY and <> ALL in ON (a NULL parent never passes <> ALL); in
+# HAVING, = ANY over COUNT(*), <> ALL over a key and = SOME over MIN.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city = ANY (SELECT ct_id FROM cities WHERE ct_pop > 40000)
+----
+BIGINT	HUGEINT
+1118	1675675
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_parent <> ALL (SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+1954	2933252
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING COUNT(*) = ANY (SELECT zn_id + 60 FROM zones)) s
+----
+BIGINT	HUGEINT
+43	946
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING tr_pickup <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1)) s
+----
+BIGINT	HUGEINT
+35	798
+
+query II nosort
+SELECT tr_pickup, MIN(tr_row) FROM trips WHERE tr_pickup < 13 GROUP BY tr_pickup HAVING MIN(tr_row) = SOME (SELECT zn_id FROM zones WHERE zn_city = 1) ORDER BY 1
+----
+INTEGER	INTEGER
+2	1
+7	6
+12	11
+
+# Under OR, NOT and CASE in WHERE: beside a comparison; NOT over = SOME; <> ALL over a set holding a NULL leaves only
+# the other branch, != ALL over the empty promos every row; two quantified marks; = ANY and IN over the same set; a
+# CASE over =ANY(, three-valued over <> ALL of a set holding a NULL, and != ALL in a later WHEN; NOT over an OR; ORs
+# on both sides of an AND; in a derived table, a CTE body and an IN subquery's block; NOT without parentheses.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10
+----
+BIGINT	HUGEINT
+567	837598
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10
+----
+BIGINT	HUGEINT
+2443	3660947
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup = SOME (SELECT zn_id FROM zones WHERE zn_city = 1)) OR tr_row < 10
+----
+BIGINT	HUGEINT
+2443	3660947
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff <> ALL (SELECT zn_parent FROM zones) OR tr_row < 10
+----
+BIGINT	HUGEINT
+10	45
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff != ALL (SELECT pm_id FROM promos) OR tr_row < 10
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_dropoff = SOME (SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+848	1274756
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE CASE WHEN tr_pickup =ANY(SELECT zn_id FROM zones WHERE zn_city = 1) THEN 1 ELSE 0 END = 1
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE CASE WHEN tr_dropoff <> ALL (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT (tr_dropoff <> ALL (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END = 'N'
+----
+BIGINT	HUGEINT
+2646	3964938
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE CASE WHEN tr_row < 1500 THEN 1 WHEN tr_dropoff != ALL (SELECT zn_id FROM zones WHERE zn_city = 2) THEN 1 ELSE 0 END = 1
+----
+BIGINT	HUGEINT
+2630	3666089
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10)
+----
+BIGINT	HUGEINT
+2433	3660902
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 100) AND (tr_dropoff <> ALL (SELECT zn_parent FROM zones) OR tr_row > 2900)
+----
+BIGINT	HUGEINT
+19	56040
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM (SELECT * FROM trips WHERE tr_pickup = SOME (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10) s
+----
+BIGINT	HUGEINT
+567	837598
+
+query II rowsort
+WITH c AS (SELECT * FROM trips WHERE tr_pickup != ALL (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10) SELECT COUNT(*), SUM(tr_row) FROM c
+----
+BIGINT	HUGEINT
+2443	3660947
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = ANY (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR zn_id > 35)
+----
+BIGINT	HUGEINT
+1325	1986175
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10
+----
+BIGINT	HUGEINT
+2443	3660947
+
+# Under OR, NOT and CASE in an inner ON and in HAVING: = ANY and <> ALL beside a comparison in ON, a CASE in ON over
+# <> ALL and = ANY of a set holding a NULL (<> ALL is never TRUE; zones 1-5 take = ANY, the others reach the ELSE);
+# NOT over <> ALL in HAVING over a key and over COUNT(*); != ALL over MIN under OR, over a set holding a NULL.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city = ANY (SELECT ct_id FROM cities WHERE ct_pop > 40000) OR zn_id < 5)
+----
+BIGINT	HUGEINT
+1258	1883715
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_parent <> ALL (SELECT zn_id FROM zones WHERE zn_city = 2) OR zn_id > 30)
+----
+BIGINT	HUGEINT
+2093	3142629
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND CASE WHEN zn_id <> ALL (SELECT zn_parent FROM zones) THEN 1 WHEN zn_id = ANY (SELECT zn_parent FROM zones) THEN 2 ELSE 3 END = 3
+----
+BIGINT	HUGEINT
+2443	3667454
+
+query II rowsort
+SELECT COUNT(*), SUM(k) FROM (SELECT tr_pickup AS k FROM trips GROUP BY tr_pickup HAVING NOT (tr_pickup <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1))) s
+----
+BIGINT	HUGEINT
+8	148
+
+query II nosort
+SELECT tr_pickup, COUNT(*) FROM trips WHERE tr_pickup < 4 GROUP BY tr_pickup HAVING NOT (COUNT(*) <> ALL (SELECT zn_id + 68 FROM zones)) ORDER BY 1
+----
+INTEGER	BIGINT
+1	70
+2	70
+3	70
+
+query II nosort
+SELECT tr_pickup, MIN(tr_row) FROM trips WHERE tr_pickup < 13 GROUP BY tr_pickup HAVING MIN(tr_row) != ALL (SELECT zn_parent FROM zones) OR tr_pickup < 3 ORDER BY 1
+----
+INTEGER	INTEGER
+1	0
+2	1
+
+# Three-valued marks in a select item's CASE over edge, whose i32 is NULL at ids 5 and 9. = ANY over 0 and a NULL is
+# TRUE at id 2 and NULL elsewhere; <> ALL over the same set is never TRUE; = SOME over 0, -1 and 1 is NULL for a
+# NULL probe and TRUE or FALSE for the others; <> ALL over the empty set is TRUE for every row, NULL probes too, and
+# = ANY FALSE; over NULLs only <> ALL is NULL everywhere; != ALL under OR; NOT over = SOME; a BIGINT probe against an
+# INTEGER set.
+
+query IT nosort
+SELECT id, CASE WHEN i32 = ANY (SELECT i32 FROM edge WHERE id IN (2, 5)) THEN 'T' WHEN NOT (i32 = ANY (SELECT i32 FROM edge WHERE id IN (2, 5))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	N
+1	N
+2	T
+3	N
+4	N
+5	N
+6	N
+7	N
+8	N
+9	N
+10	N
+11	N
+
+query IT nosort
+SELECT id, CASE WHEN i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 5)) THEN 'T' WHEN NOT (i32 <> ALL (SELECT i32 FROM edge WHERE id IN (2, 5))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	N
+1	N
+2	F
+3	N
+4	N
+5	N
+6	N
+7	N
+8	N
+9	N
+10	N
+11	N
+
+query IT nosort
+SELECT id, CASE WHEN i32 = SOME (SELECT i32 FROM edge WHERE id IN (2, 3, 4)) THEN 'T' WHEN NOT (i32 = SOME (SELECT i32 FROM edge WHERE id IN (2, 3, 4))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	F
+1	F
+2	T
+3	T
+4	T
+5	N
+6	F
+7	F
+8	F
+9	N
+10	F
+11	F
+
+query IT nosort
+SELECT id, CASE WHEN i32 <> ALL (SELECT i32 FROM edge WHERE id < 0) THEN 'T' WHEN NOT (i32 <> ALL (SELECT i32 FROM edge WHERE id < 0)) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	T
+1	T
+2	T
+3	T
+4	T
+5	T
+6	T
+7	T
+8	T
+9	T
+10	T
+11	T
+
+query IT nosort
+SELECT id, CASE WHEN i32 = ANY (SELECT pm_id FROM promos) THEN 'T' WHEN NOT (i32 = ANY (SELECT pm_id FROM promos)) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	F
+1	F
+2	F
+3	F
+4	F
+5	F
+6	F
+7	F
+8	F
+9	F
+10	F
+11	F
+
+query IT nosort
+SELECT id, CASE WHEN i32 <> ALL (SELECT i32 FROM edge WHERE id IN (5, 9)) THEN 'T' WHEN NOT (i32 <> ALL (SELECT i32 FROM edge WHERE id IN (5, 9))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	N
+1	N
+2	N
+3	N
+4	N
+5	N
+6	N
+7	N
+8	N
+9	N
+10	N
+11	N
+
+query IT nosort
+SELECT id, CASE WHEN i32 != ALL (SELECT i32 FROM edge WHERE id IN (2, 5)) OR id > 8 THEN 'T' WHEN NOT (i32 != ALL (SELECT i32 FROM edge WHERE id IN (2, 5)) OR id > 8) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	N
+1	N
+2	F
+3	N
+4	N
+5	N
+6	N
+7	N
+8	N
+9	T
+10	T
+11	T
+
+query IT nosort
+SELECT id, CASE WHEN NOT (i32 = SOME (SELECT i32 FROM edge WHERE id IN (2, 3, 4))) THEN 'T' WHEN NOT (NOT (i32 = SOME (SELECT i32 FROM edge WHERE id IN (2, 3, 4)))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	T
+1	T
+2	F
+3	F
+4	F
+5	N
+6	T
+7	T
+8	T
+9	N
+10	T
+11	T
+
+query IT nosort
+SELECT id, CASE WHEN i64 = ANY (SELECT i32 FROM edge WHERE id IN (1, 6, 8)) THEN 'T' WHEN NOT (i64 = ANY (SELECT i32 FROM edge WHERE id IN (1, 6, 8))) THEN 'F' ELSE 'N' END AS m FROM edge ORDER BY id
+----
+INTEGER	VARCHAR
+0	F
+1	F
+2	F
+3	F
+4	F
+5	N
+6	F
+7	F
+8	N
+9	F
+10	F
+11	T
+
+# Other select items: a plain block's CASE over a probe that holds NULLs, a grouped block's CASE over a key and over
+# COUNT(*), and a global block's CASE over an aggregate.
+
+query IT nosort
+SELECT zn_id, CASE WHEN zn_parent = ANY (SELECT zn_id FROM zones WHERE zn_city = 2) THEN 'T' WHEN NOT (zn_parent = ANY (SELECT zn_id FROM zones WHERE zn_city = 2)) THEN 'F' ELSE 'N' END AS m FROM zones WHERE zn_id < 13 ORDER BY zn_id
+----
+INTEGER	VARCHAR
+1	N
+2	N
+3	N
+4	N
+5	N
+6	F
+7	T
+8	F
+9	F
+10	F
+11	F
+12	T
+
+query IT nosort
+SELECT tr_pickup, CASE WHEN tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'in' ELSE 'out' END AS m FROM trips WHERE tr_pickup < 10 GROUP BY tr_pickup ORDER BY 1
+----
+INTEGER	VARCHAR
+1	in
+2	out
+3	out
+4	out
+5	out
+6	in
+7	out
+8	out
+9	out
+
+query ITI nosort
+SELECT tr_dropoff, CASE WHEN COUNT(*) <> ALL (SELECT zn_id + 60 FROM zones WHERE zn_city = 1) THEN 'T' ELSE 'F' END AS m, COUNT(*) FROM trips WHERE tr_dropoff < 8 OR tr_dropoff IS NULL GROUP BY tr_dropoff ORDER BY 1
+----
+INTEGER	VARCHAR	BIGINT
+1	F	71
+2	F	71
+3	F	71
+4	F	71
+5	T	70
+6	F	71
+7	T	70
+NULL	T	176
+
+query IT rowsort
+SELECT COUNT(*), CASE WHEN MAX(tr_pickup) != ALL (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'T' ELSE 'F' END AS m FROM trips
+----
+BIGINT	VARCHAR
+3000	T
+
+# ORDER BY, GROUP BY keys and aggregate arguments: an ORDER BY CASE over = ANY, and over <> ALL and = ANY of a set
+# holding a NULL; a GROUP BY key over = SOME and a three-valued key over <> ALL of a set holding a NULL; SUM and COUNT
+# of a CASE over = ANY, != ALL per group and <> ALL over the empty promos (NULL dropoffs counted).
+
+query I nosort
+SELECT zn_id FROM zones ORDER BY CASE WHEN zn_id = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 0 ELSE 1 END, zn_id LIMIT 10
+----
+INTEGER
+1
+6
+11
+16
+21
+26
+31
+36
+2
+3
+
+query I nosort
+SELECT zn_id FROM zones ORDER BY CASE WHEN zn_id <> ALL (SELECT zn_parent FROM zones) THEN 0 WHEN zn_id = ANY (SELECT zn_parent FROM zones) THEN 1 ELSE 2 END, zn_id DESC LIMIT 8
+----
+INTEGER
+5
+4
+3
+2
+1
+40
+39
+38
+
+query TI nosort
+SELECT CASE WHEN tr_pickup = SOME (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 'in' ELSE 'out' END AS k, COUNT(*) FROM trips GROUP BY k ORDER BY k
+----
+VARCHAR	BIGINT
+in	559
+out	2441
+
+query TI nosort
+SELECT CASE WHEN tr_dropoff <> ALL (SELECT zn_parent FROM zones) THEN 'T' WHEN NOT (tr_dropoff <> ALL (SELECT zn_parent FROM zones)) THEN 'F' ELSE 'N' END AS k, COUNT(*) FROM trips GROUP BY k ORDER BY k
+----
+VARCHAR	BIGINT
+F	354
+N	2646
+
+query II rowsort
+SELECT SUM(CASE WHEN tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1) THEN 1 ELSE 0 END), COUNT(*) FROM trips
+----
+HUGEINT	BIGINT
+559	3000
+
+query II nosort
+SELECT tr_pickup % 3 AS g, SUM(CASE WHEN tr_dropoff != ALL (SELECT zn_id FROM zones WHERE zn_city = 1) THEN tr_row END) FROM trips GROUP BY g ORDER BY g
+----
+INTEGER	HUGEINT
+0	1104095
+1	1183752
+2	1100567
+
+query II rowsort
+SELECT COUNT(CASE WHEN tr_dropoff <> ALL (SELECT pm_id FROM promos) THEN 1 END), COUNT(tr_dropoff) FROM trips
+----
+BIGINT	BIGINT
+3000	2824
+
+# The other SQ7b forms in their quantified spelling: a constant probe (= ANY true for every row; <> ALL true as a
+# conjunct), a probe that holds a scalar subquery's value under OR, sets over UNION ALL, EXCEPT and a UNION holding a
+# NULL under OR, and an INTERSECT in an aggregate's CASE.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 = ANY (SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 7 <> ALL (SELECT zn_id FROM zones WHERE zn_city = 1) AND tr_row < 10
+----
+BIGINT	HUGEINT
+10	45
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (SELECT MIN(zn_id) FROM zones) = ANY (SELECT zn_id FROM zones WHERE zn_city = 2) OR tr_row < 3
+----
+BIGINT	HUGEINT
+3	3
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION ALL SELECT zn_id FROM zones WHERE zn_city = 2) OR tr_row < 10
+----
+BIGINT	HUGEINT
+1124	1675708
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup <> ALL (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 10
+----
+BIGINT	HUGEINT
+774	1148719
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff != ALL (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT zn_parent FROM zones) OR tr_row < 10
+----
+BIGINT	HUGEINT
+10	45
+
+query I rowsort
+SELECT SUM(CASE WHEN tr_pickup = SOME (SELECT zn_id FROM zones INTERSECT SELECT ct_id FROM cities) THEN 1 ELSE 0 END) FROM trips
+----
+HUGEINT
+420
+
+# Errors in both engines: a set of two columns as a conjunct, under OR, in a select item's CASE and in HAVING; a
+# probe whose scalar subquery returns two rows.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id, zn_city FROM zones)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup <> ALL (SELECT zn_id, zn_city FROM zones) OR tr_row < 10
+
+statement error
+SELECT id, CASE WHEN i32 = SOME (SELECT i32, i64 FROM edge) THEN 'T' ELSE 'F' END FROM edge
+
+statement error
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING COUNT(*) != ALL (SELECT zn_id, zn_city FROM zones)
+
+statement error More than one row returned by a subquery used as an expression
+SELECT COUNT(*) FROM trips WHERE (SELECT zn_id FROM zones WHERE zn_city = 1) = ANY (SELECT zn_id FROM zones WHERE zn_city = 2) OR tr_row < 3
+
+# ---- set operations ----
+
+# IN over each set operation as a WHERE conjunct, answered as a semi join over the compound's rows. UNION and UNION ALL
+# of one pair of arms give one answer; INTERSECT and INTERSECT ALL keep the ids both arms hold; EXCEPT ALL keeps a value
+# its left arm repeats more often than its right arm does (zone cities 1-5), where EXCEPT keeps only city 9 and zone
+# 38's NULL city.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+839	1253638
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION ALL SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+839	1253638
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 INTERSECT SELECT zn_id FROM zones WHERE zn_id < 20)
+----
+BIGINT	HUGEINT
+280	417480
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones INTERSECT ALL SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+559	838117
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+2234	3349821
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones EXCEPT ALL SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+2373	3563259
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_city FROM zones EXCEPT ALL SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+420	624330
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_city FROM zones EXCEPT SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+70	104405
+
+# NOT IN over a set operation as a WHERE conjunct, a null-aware anti join over the compound's rows; a NULL dropoff is
+# never kept. A NULL from one arm of a UNION ALL keeps no row; EXCEPT drops the NULL parents that both arms hold, and
+# INTERSECT keeps the NULL that both arms hold (set operations compare NULLs as equal), which again keeps no row.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+1976	2959212
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_id FROM zones WHERE zn_id > 10 INTERSECT SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+2400	3601776
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION ALL SELECT zn_parent FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_parent FROM zones EXCEPT SELECT zn_parent FROM zones WHERE zn_id < 6)
+----
+BIGINT	HUGEINT
+2470	3701202
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_parent FROM zones INTERSECT SELECT zn_city FROM zones)
+----
+BIGINT	HUGEINT
+0	NULL
+
+# Three arms and parentheses: UNION and EXCEPT associate to the left, INTERSECT binds tighter than both, and a
+# parenthesized arm is one operand; a run of UNION ALL and UNION over three tables of INTEGER and BIGINT ids; a NOT IN
+# over a UNION ALL whose right operand is an INTERSECT ALL.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities EXCEPT SELECT zn_id FROM zones WHERE zn_id < 3)
+----
+BIGINT	HUGEINT
+699	1045878
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION (SELECT ct_id FROM cities EXCEPT SELECT zn_id FROM zones WHERE zn_id < 3))
+----
+BIGINT	HUGEINT
+769	1149723
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities INTERSECT SELECT zn_id FROM zones WHERE zn_id > 4)
+----
+BIGINT	HUGEINT
+629	941683
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 EXCEPT (SELECT zn_id FROM zones WHERE zn_id < 30 EXCEPT SELECT ct_id FROM cities))
+----
+BIGINT	HUGEINT
+279	417278
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 2 INTERSECT (SELECT ct_id FROM cities UNION SELECT zn_id FROM zones WHERE zn_id > 30))
+----
+BIGINT	HUGEINT
+209	313292
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_rider IN (SELECT rd_id FROM riders WHERE rd_city = 1 UNION ALL SELECT zn_id FROM zones WHERE zn_city = 3 UNION SELECT dv_id - 999 FROM drivers)
+----
+BIGINT	HUGEINT
+1026	1538937
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_city = 1 INTERSECT ALL SELECT zn_id FROM zones WHERE zn_id < 30)
+----
+BIGINT	HUGEINT
+2117	3170752
+
+# The set takes the type the compound unifies its arms to, and the probe compares in the common type of both: INTEGER
+# and BIGINT arms for a BIGINT probe (driver ids past the INTEGER range); a BIGINT probe of edge's extremes against
+# INTEGER and SMALLINT arms, three-valued (both arms hold a NULL); USMALLINT and SMALLINT arms under an EXCEPT that
+# drops the NULL.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_rider IN (SELECT zn_id FROM zones UNION ALL SELECT dv_id FROM drivers)
+----
+BIGINT	HUGEINT
+481	706222
+
+query IT rowsort
+SELECT id, CASE WHEN i64 IN (SELECT i32 FROM edge UNION SELECT i16 FROM edge) THEN 'T' WHEN NOT (i64 IN (SELECT i32 FROM edge UNION SELECT i16 FROM edge)) THEN 'F' ELSE 'N' END FROM edge
+----
+INTEGER	VARCHAR
+0	N
+1	N
+10	N
+11	T
+2	T
+3	T
+4	T
+5	N
+6	N
+7	N
+8	N
+9	N
+
+query I rowsort
+SELECT id FROM edge WHERE id NOT IN (SELECT u16 FROM edge EXCEPT SELECT i16 FROM edge)
+----
+INTEGER
+0
+1
+10
+11
+3
+4
+5
+6
+7
+8
+9
+
+# DECIMAL arms of two scales unify to the wider scale, so a rate of 0.88 does not meet a tariff of 0.875; a SMALLINT
+# arm next to a DECIMAL arm; DECIMAL(9,2) and DECIMAL(38,10) arms for a DECIMAL(18,4) probe; a DECIMAL(38,0) arm and a
+# BIGINT arm for a BIGINT probe under NOT IN.
+
+query DI rowsort
+SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate IN (SELECT tf_rate FROM tariffs UNION ALL SELECT d9_2 FROM decimals WHERE id < 10) GROUP BY tr_rate
+----
+DECIMAL(4,2)	BIGINT
+1.00	348
+1.25	350
+1.50	348
+1.75	350
+2.00	345
+2.50	342
+
+query DI rowsort
+SELECT tr_rate, COUNT(*) FROM trips WHERE tr_rate IN (SELECT ct_id FROM cities UNION SELECT tf_rate FROM tariffs WHERE tf_rate > 1.6) GROUP BY tr_rate
+----
+DECIMAL(4,2)	BIGINT
+1.00	348
+1.75	350
+2.00	345
+2.50	342
+
+query I rowsort
+SELECT id FROM decimals WHERE d18_4 IN (SELECT d9_2 FROM decimals UNION SELECT d38_10 FROM decimals)
+----
+INTEGER
+15
+37
+
+query I rowsort
+SELECT id FROM decimals WHERE b NOT IN (SELECT d38_0 FROM decimals WHERE d38_0 IS NOT NULL EXCEPT SELECT b FROM decimals WHERE b < 0)
+----
+INTEGER
+0
+1
+10
+12
+13
+14
+16
+18
+19
+2
+20
+21
+22
+24
+25
+27
+28
+3
+30
+31
+32
+33
+34
+36
+38
+39
+6
+7
+8
+9
+
+# VARCHAR arms for a VARCHAR probe; DATE arms for a DATE probe.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT tf_code FROM tariffs WHERE tf_rate > 1.2 UNION SELECT label FROM cities)
+----
+BIGINT	HUGEINT
+1706	2558617
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day IN (SELECT sh_day FROM shifts WHERE sh_hours > 11 INTERSECT SELECT dy_day FROM days WHERE dy_week = 10)
+----
+BIGINT	HUGEINT
+376	562297
+
+# Arms of any block shape: SELECT DISTINCT, GROUP BY with HAVING, grouped and global aggregates (COUNT over the
+# empty promos is 0), an inner join, a scalar subquery in an arm's WHERE, a parenthesized arm with its own ORDER BY
+# and LIMIT, a LEFT JOIN beside a derived table, and an IN subquery inside an arm.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT DISTINCT zn_city FROM zones WHERE zn_id > 30 UNION ALL SELECT DISTINCT ct_id + 20 FROM cities)
+----
+BIGINT	HUGEINT
+840	1256850
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_city FROM zones GROUP BY zn_city HAVING COUNT(*) >= 8 INTERSECT SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+210	311885
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff IN (SELECT MAX(zn_id) FROM zones GROUP BY zn_city UNION SELECT MIN(zn_id) FROM zones GROUP BY zn_city)
+----
+BIGINT	HUGEINT
+848	1269507
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup NOT IN (SELECT MAX(ct_id) FROM cities UNION ALL SELECT MIN(zn_id) FROM zones WHERE zn_city = 3 UNION ALL SELECT COUNT(*) FROM promos)
+----
+BIGINT	HUGEINT
+2860	4290320
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones JOIN cities ON zn_city = ct_id WHERE ct_pop > 40000 EXCEPT SELECT zn_id FROM zones WHERE zn_id > 30)
+----
+BIGINT	HUGEINT
+840	1257060
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id > (SELECT MAX(ct_id) FROM cities) * 6 INTERSECT SELECT zn_id FROM zones WHERE zn_city <> 5)
+----
+BIGINT	HUGEINT
+138	206862
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT ct_id FROM cities UNION ALL (SELECT zn_id FROM zones ORDER BY zn_id DESC LIMIT 3))
+----
+BIGINT	HUGEINT
+627	934620
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT ct_id FROM cities LEFT JOIN zones ON zn_id = ct_id * 7 WHERE zn_id IS NULL UNION SELECT v FROM (SELECT zn_parent AS v FROM zones) AS p WHERE v > 3)
+----
+BIGINT	HUGEINT
+210	312375
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT tr_dropoff FROM trips WHERE tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = 2))
+----
+BIGINT	HUGEINT
+1118	1675675
+
+# An empty arm: the empty promos add nothing to a UNION ALL, empty an INTERSECT (NOT IN over it keeps every row,
+# NULL dropoffs too) and leave an EXCEPT ALL's left arm whole. Over edge, whose i32 is NULL at ids 5 and 9,
+# three-valued: an arm that contributes the NULL of id 9 makes every miss NULL; a UNION with the empty promos adds no
+# NULL, so NOT IN is NULL only for the NULL probes.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT pm_id FROM promos UNION ALL SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+559	837558
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_id FROM zones INTERSECT SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+3000	4498500
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT zn_id FROM zones WHERE zn_city = 2 EXCEPT ALL SELECT pm_id FROM promos)
+----
+BIGINT	HUGEINT
+2259	3387809
+
+query IT rowsort
+SELECT id, CASE WHEN i32 IN (SELECT id FROM edge WHERE id < 3 UNION ALL SELECT i32 FROM edge WHERE id = 9) THEN 'T' WHEN NOT (i32 IN (SELECT id FROM edge WHERE id < 3 UNION ALL SELECT i32 FROM edge WHERE id = 9)) THEN 'F' ELSE 'N' END FROM edge
+----
+INTEGER	VARCHAR
+0	N
+1	N
+10	N
+11	N
+2	T
+3	N
+4	T
+5	N
+6	N
+7	N
+8	N
+9	N
+
+query IT rowsort
+SELECT id, CASE WHEN i32 NOT IN (SELECT id FROM edge WHERE id < 3 UNION SELECT pm_id FROM promos) THEN 'T' WHEN NOT (i32 NOT IN (SELECT id FROM edge WHERE id < 3 UNION SELECT pm_id FROM promos)) THEN 'F' ELSE 'N' END FROM edge
+----
+INTEGER	VARCHAR
+0	T
+1	T
+10	T
+11	T
+2	F
+3	T
+4	F
+5	N
+6	T
+7	T
+8	T
+9	N
+
+# Under OR, NOT and CASE WHEN in WHERE: a null-aware mark join over the compound; two set operations under one OR;
+# an OR inside an AND.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities) OR tr_row < 10
+----
+BIGINT	HUGEINT
+843	1253668
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 2) OR tr_dropoff < 5
+----
+BIGINT	HUGEINT
+977	1465155
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_pickup IN (SELECT zn_id FROM zones UNION SELECT ct_id FROM cities))
+----
+BIGINT	HUGEINT
+207	311121
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE CASE WHEN tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 2 INTERSECT SELECT zn_id FROM zones WHERE zn_id < 20) THEN tr_row ELSE 3000 - tr_row END < 100
+----
+BIGINT	HUGEINT
+102	268934
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 INTERSECT ALL SELECT zn_id FROM zones WHERE zn_id < 20) OR tr_dropoff IN (SELECT ct_id FROM cities EXCEPT SELECT zn_id FROM zones WHERE zn_city = 2)
+----
+BIGINT	HUGEINT
+604	907596
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE (tr_pickup IN (SELECT ct_id FROM cities UNION ALL SELECT zn_id FROM zones WHERE zn_city = 4) OR tr_row > 2990) AND tr_dropoff < 20
+----
+BIGINT	HUGEINT
+382	582660
+
+# In an inner ON: a conjunct over the joined zone's parent, an IN under OR beside a comparison, and a NOT IN read
+# per zone city.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_parent IN (SELECT ct_id FROM cities WHERE ct_pop > 20000 UNION SELECT zn_id FROM zones WHERE zn_city = 5)
+----
+BIGINT	HUGEINT
+1886	2831705
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (zn_city IN (SELECT ct_id FROM cities INTERSECT SELECT zn_id FROM zones WHERE zn_id < 3) OR tr_row < 50)
+----
+BIGINT	HUGEINT
+1145	1676305
+
+query II rowsort
+SELECT zn_city, COUNT(*) FROM trips JOIN zones ON tr_dropoff = zn_id AND tr_pickup NOT IN (SELECT zn_id FROM zones WHERE zn_city = 1 EXCEPT SELECT ct_id FROM cities) GROUP BY zn_city
+----
+SMALLINT	BIGINT
+1	486
+2	486
+3	426
+4	424
+5	485
+9	61
+NULL	61
+
+# In HAVING: a conjunct over the group key, one over an aggregate, a NOT IN under CASE whose set holds a NULL (so
+# every group is 'N' and kept) and a NOT IN conjunct over the group key, which drops the NULL dropoff's group.
+
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 3 EXCEPT SELECT zn_id FROM zones WHERE zn_id > 20)
+----
+INTEGER	BIGINT
+13	70
+18	70
+3	70
+8	70
+
+query II rowsort
+SELECT tr_pickup, SUM(tr_row) FROM trips GROUP BY tr_pickup HAVING MIN(tr_row) IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id * 5 FROM cities)
+----
+INTEGER	HUGEINT
+11	104545
+12	104615
+16	104895
+17	104965
+2	103915
+21	105245
+22	105315
+26	105595
+27	105665
+31	105945
+32	106015
+37	103362
+6	104195
+7	104265
+
+query II rowsort
+SELECT tr_dropoff, COUNT(*) FROM trips WHERE tr_dropoff > 30 GROUP BY tr_dropoff HAVING CASE WHEN tr_dropoff NOT IN (SELECT zn_id FROM zones WHERE zn_city = 5 UNION ALL SELECT zn_parent FROM zones WHERE zn_id = 1) THEN 'T' ELSE 'N' END = 'N'
+----
+INTEGER	BIGINT
+31	71
+32	70
+33	71
+34	70
+35	71
+36	70
+37	71
+38	70
+39	71
+40	71
+
+query II rowsort
+SELECT tr_dropoff, SUM(tr_row) FROM trips GROUP BY tr_dropoff HAVING tr_dropoff NOT IN (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+INTEGER	HUGEINT
+1	104360
+11	104300
+16	107325
+21	107220
+26	104350
+31	107290
+36	104250
+6	107255
+
+# In select items: a CASE inside SUM, the same per group, and a three-valued CASE over an EXCEPT ALL that keeps zone
+# 38's NULL city, so a city outside the set is NULL rather than TRUE.
+
+query I rowsort
+SELECT SUM(CASE WHEN tr_pickup IN (SELECT zn_id FROM zones INTERSECT SELECT ct_id * 7 FROM cities) THEN 1 ELSE 0 END) FROM trips
+----
+HUGEINT
+349
+
+query III rowsort
+SELECT zn_city, SUM(CASE WHEN zn_id IN (SELECT ct_id * 4 FROM cities UNION SELECT zn_parent FROM zones) THEN 1 ELSE 0 END), COUNT(*) FROM zones GROUP BY zn_city
+----
+SMALLINT	HUGEINT	BIGINT
+1	2	8
+2	2	8
+3	2	7
+4	2	7
+5	2	8
+9	0	1
+NULL	0	1
+
+query IT rowsort
+SELECT ct_id, CASE WHEN ct_id NOT IN (SELECT zn_city FROM zones EXCEPT ALL SELECT ct_id FROM cities) THEN 'T' WHEN ct_id IN (SELECT zn_city FROM zones EXCEPT ALL SELECT ct_id FROM cities) THEN 'F' ELSE 'N' END FROM cities
+----
+SMALLINT	VARCHAR
+1	F
+2	F
+3	F
+4	F
+5	F
+6	N
+
+# = ANY and = SOME are IN, <> ALL and != ALL are NOT IN, over a set operation as anywhere: as WHERE conjuncts
+# (!= ALL over a UNION ALL with a NULL keeps no row), in a select item's CASE (=ANY( without spaces), in HAVING over an
+# aggregate, in an inner ON and under NOT.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 3 UNION SELECT ct_id FROM cities)
+----
+BIGINT	HUGEINT
+840	1255380
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = SOME (SELECT zn_id FROM zones WHERE zn_city = 1 INTERSECT ALL SELECT zn_id FROM zones WHERE zn_id > 20)
+----
+BIGINT	HUGEINT
+279	420078
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff <> ALL (SELECT zn_id FROM zones EXCEPT SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+565	846350
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff != ALL (SELECT zn_city FROM zones WHERE zn_id > 30 UNION ALL SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT	HUGEINT
+0	NULL
+
+query IT rowsort
+SELECT ct_id, CASE WHEN ct_id <> ALL (SELECT zn_city FROM zones WHERE zn_id > 30 EXCEPT SELECT zn_id FROM zones WHERE zn_city = 2) THEN 'T' WHEN ct_id =ANY(SELECT zn_city FROM zones WHERE zn_id > 30 EXCEPT SELECT zn_id FROM zones WHERE zn_city = 2) THEN 'F' ELSE 'N' END FROM cities
+----
+SMALLINT	VARCHAR
+1	F
+2	N
+3	F
+4	F
+5	F
+6	N
+
+query II rowsort
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING MIN(tr_row) =ANY(SELECT zn_id FROM zones WHERE zn_city = 2 UNION SELECT ct_id * 7 FROM cities)
+----
+INTEGER	BIGINT
+13	70
+15	70
+18	70
+22	70
+23	70
+28	70
+29	70
+3	70
+33	70
+36	69
+38	69
+43	69
+8	70
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND zn_city = SOME (SELECT ct_id FROM cities WHERE ct_pop > 40000 UNION ALL SELECT zn_id FROM zones WHERE zn_id = 4)
+----
+BIGINT	HUGEINT
+1607	2408410
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_rider != ALL (SELECT rd_id FROM riders WHERE rd_city = 2 INTERSECT ALL SELECT dv_id - 1000 FROM drivers))
+----
+BIGINT	HUGEINT
+24	35436
+
+# CTEs and nesting: the IN query's own WITH list under a UNION; arms over a CTE of the enclosing statement; a CTE
+# whose body is a set operation used as an arm (a plain IN query over such a CTE is answered already), under OR as
+# NOT IN; an IN over a compound inside a CTE body, a derived table and a scalar subquery.
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (WITH c AS (SELECT zn_id AS v FROM zones WHERE zn_city = 1) SELECT v FROM c UNION SELECT v + 1 FROM c)
+----
+BIGINT	HUGEINT
+1118	1675675
+
+query II rowsort
+WITH c AS (SELECT zn_id AS v, zn_city AS w FROM zones) SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT v FROM c WHERE w = 1 UNION SELECT w FROM c)
+----
+BIGINT	HUGEINT
+909	1358043
+
+query II rowsort
+WITH s AS (SELECT zn_id AS v FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities) SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT v FROM s EXCEPT SELECT zn_id FROM zones WHERE zn_id > 20)
+----
+BIGINT	HUGEINT
+560	833560
+
+query II rowsort
+WITH s AS (SELECT zn_parent AS v FROM zones EXCEPT SELECT zn_parent FROM zones WHERE zn_id < 6) SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_dropoff NOT IN (SELECT v FROM s UNION ALL SELECT v + 10 FROM s) OR tr_row < 5
+----
+BIGINT	HUGEINT
+2121	3176759
+
+query II rowsort
+WITH t AS (SELECT tr_row, tr_pickup FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities)) SELECT COUNT(*), SUM(tr_row) FROM t
+----
+BIGINT	HUGEINT
+839	1253638
+
+query II rowsort
+SELECT COUNT(*), SUM(r) FROM (SELECT tr_row AS r FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones WHERE zn_city = 2 UNION ALL SELECT ct_id FROM cities) OR tr_row < 3) AS t
+----
+BIGINT	HUGEINT
+2094	3140181
+
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < (SELECT MAX(zn_id) FROM zones WHERE zn_id IN (SELECT ct_id * 3 FROM cities INTERSECT SELECT zn_id FROM zones WHERE zn_city = 3)) * 10
+----
+BIGINT	HUGEINT
+180	16110
+
+# Arms of two columns are DuckDB's bind error for IN, NOT IN and = ANY, as for a plain query of two columns.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id, zn_city FROM zones UNION SELECT ct_id, ct_id FROM cities)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id, zn_city FROM zones EXCEPT SELECT ct_id, ct_id FROM cities) OR tr_row < 10
+
+statement error
+SELECT SUM(CASE WHEN tr_pickup = ANY (SELECT zn_id, zn_city FROM zones INTERSECT SELECT ct_id, ct_pop FROM cities) THEN 1 ELSE 0 END) FROM trips
+
+# ---- the type bind error ----
+
+# A VARCHAR probe against an INTEGER, BIGINT, SMALLINT, DECIMAL, USMALLINT or DOUBLE set, and an INTEGER, SMALLINT,
+# DECIMAL or DOUBLE probe against a VARCHAR set, as a top-level conjunct: DuckDB's bind error (no cast is implied
+# between the two families).
+# A DOUBLE side fails the same way: the type check comes before the DOUBLE join key that stays unsupported.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT rd_id FROM riders)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT ct_id FROM cities)
+
+statement error
+SELECT COUNT(*) FROM zones WHERE zn_city IN (SELECT label FROM cities)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT tr_fare FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_fare IN (SELECT tr_tariff FROM trips)
+
+statement error
+SELECT COUNT(*) FROM edge WHERE u IN (SELECT u16 FROM edge)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT tr_distance FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_distance IN (SELECT tr_tariff FROM trips)
+
+# A DATE probe against a VARCHAR, INTEGER, BIGINT, DECIMAL or DOUBLE set, and a VARCHAR or INTEGER probe against a
+# DATE set: the same bind error.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT rd_joined FROM riders)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day IN (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_pickup IN (SELECT tr_day FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_day IN (SELECT tr_rider FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_day IN (SELECT tr_fare FROM trips)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_day IN (SELECT tr_distance FROM trips)
+
+# A set of a VARCHAR literal column against an INTEGER probe; NOT IN over the empty promos, over a DATE set and over
+# an INTEGER set: the error comes from the types, whatever the rows; two mismatched INs, and a mismatched IN beside a
+# well-typed one.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT '3' FROM cities)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff NOT IN (SELECT pm_id FROM promos)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff NOT IN (SELECT rd_joined FROM riders)
+
+statement error
+SELECT COUNT(*) FROM bookings WHERE bk_day NOT IN (SELECT bk_vehicles FROM bookings)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_tariff IN (SELECT tr_pickup FROM trips) AND tr_day IN (SELECT tr_fare FROM trips)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1) AND tr_tariff IN (SELECT zn_id FROM zones)
+
+# The aliases = ANY, = SOME, <> ALL and != ALL (and =ANY( without spaces) raise the same bind error as IN and NOT IN.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff = ANY (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day <> ALL (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = SOME (SELECT label FROM zones)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff != ALL (SELECT tf_rate FROM tariffs)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day =ANY(SELECT zn_id FROM zones)
+
+# Under OR (beside a comparison or a well-typed IN), under NOT, in a CASE WHEN of WHERE and in the CASE of a select
+# item: the bind error comes before any row is read.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_row < 3
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 3 OR tr_day NOT IN (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE NOT (tr_fare IN (SELECT tf_code FROM tariffs)) OR tr_row < 3
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup <> ALL (SELECT tr_day FROM trips) OR tr_row < 3
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = 1) OR tr_tariff IN (SELECT ct_id FROM cities)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE CASE WHEN tr_tariff IN (SELECT rd_id FROM riders) THEN 1 ELSE 0 END = 1
+
+statement error
+SELECT zn_id, CASE WHEN label IN (SELECT ct_id FROM cities) THEN 'T' ELSE 'F' END AS m FROM zones ORDER BY zn_id
+
+statement error
+SELECT dy_row, CASE WHEN dy_day = ANY (SELECT zn_id FROM zones) THEN 'T' ELSE 'F' END AS m FROM days WHERE dy_row < 5 ORDER BY dy_row
+
+# In HAVING (a grouped VARCHAR key, an INTEGER key under OR, a DATE aggregate) and in an inner ON (a conjunct, and
+# under OR).
+
+statement error
+SELECT COUNT(*) FROM trips GROUP BY tr_tariff HAVING tr_tariff IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+statement error
+SELECT tr_pickup, COUNT(*) FROM trips GROUP BY tr_pickup HAVING tr_pickup IN (SELECT tf_code FROM tariffs) OR COUNT(*) > 100
+
+statement error
+SELECT tr_pickup FROM trips GROUP BY tr_pickup HAVING MAX(tr_day) IN (SELECT zn_id FROM zones)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND label IN (SELECT ct_id FROM cities)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips JOIN zones ON tr_pickup = zn_id AND (tr_day IN (SELECT zn_id FROM zones) OR zn_city = 1)
+
+# Over a set operation the set's type is the compound's column type: INTEGER against a UNION of VARCHAR arms,
+# VARCHAR against a UNION ALL of INTEGER and BIGINT arms, DATE against an EXCEPT of numbers, VARCHAR against an
+# INTERSECT of DATE arms under OR, and = ANY over a UNION of VARCHAR arms.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT tf_code FROM tariffs UNION SELECT label FROM zones)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT zn_id FROM zones UNION ALL SELECT rd_id FROM riders)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_day NOT IN (SELECT zn_id FROM zones EXCEPT SELECT ct_id FROM cities)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_tariff IN (SELECT rd_joined FROM riders INTERSECT SELECT dy_day FROM days) OR tr_row < 3
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup = ANY (SELECT label FROM zones UNION SELECT label FROM cities)
+
+# A constant probe of a number against a VARCHAR or DATE set: an integer literal as a conjunct, a negative one under
+# OR with NOT IN, in a select item's CASE and through = ANY; a decimal literal against VARCHAR; an integer literal
+# against DATE.
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE 2 IN (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE -1 NOT IN (SELECT label FROM zones) OR tr_row < 3
+
+statement error
+SELECT zn_id, CASE WHEN 3 IN (SELECT tf_code FROM tariffs) THEN 'T' ELSE 'F' END AS m FROM zones WHERE zn_id < 4 ORDER BY zn_id
+
+statement error
+SELECT COUNT(*) FROM trips WHERE 2.5 IN (SELECT tf_code FROM tariffs)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE 2 IN (SELECT dy_day FROM days)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE 2 = ANY (SELECT tf_code FROM tariffs)
+
+# Controls of one family answer in both: a decimal literal against a DECIMAL set, a string literal against a VARCHAR
+# set in a select item's CASE (a miss of a set holding a NULL is N), and NOT IN of an integer literal past SMALLINT
+# against a USMALLINT set that holds it.
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE 1.25 IN (SELECT d9_2 FROM decimals)
+----
+BIGINT
+40
+
+query IT nosort
+SELECT ct_id, CASE WHEN 'std' IN (SELECT tf_code FROM tariffs) THEN 'T' WHEN NOT ('std' IN (SELECT tf_code FROM tariffs)) THEN 'F' ELSE 'N' END AS m FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	N
+2	N
+3	N
+4	N
+5	N
+6	N
+
+query IT nosort
+SELECT ct_id, CASE WHEN 32768 NOT IN (SELECT u16 FROM edge WHERE id < 5) THEN 'T' ELSE 'F' END AS m FROM cities ORDER BY ct_id
+----
+SMALLINT	VARCHAR
+1	F
+2	F
+3	F
+4	F
+5	F
+6	F
+
+# ---- a CASE over a constant probe's mark ----
+
+# The mark of a constant probe is a value of the condition, so a CASE over it compared with a number is no comparison
+# of two literals: as a top-level conjunct, and three-valued.
+query I rowsort
+SELECT COUNT(*) FROM trips WHERE CASE WHEN 2 IN (SELECT zn_parent FROM zones) THEN 1 ELSE 0 END = 1
+----
+BIGINT
+3000
+
+query I rowsort
+SELECT COUNT(*) FROM tariffs WHERE CASE WHEN 'A' IN (SELECT tf_code FROM tariffs) THEN 'T' WHEN NOT ('A' IN (SELECT tf_code FROM tariffs)) THEN 'F' ELSE 'N' END = 'T'
+----
+BIGINT
+0
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE CASE WHEN 99 NOT IN (SELECT zn_parent FROM zones) THEN 1 WHEN NOT (99 NOT IN (SELECT zn_parent FROM zones)) THEN 0 ELSE 2 END = 2
+----
+BIGINT
+40
+
+# ---- TIMESTAMP probes and sets ----
+
+# A string literal against a TIMESTAMP set is that TIMESTAMP, an invalid one an error in both; a TIMESTAMP against a
+# number or a VARCHAR is the bind error; TIMESTAMP keys of a semi join over a UNION, a null-aware anti join and a
+# mark under = ANY in a select CASE.
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE '2025-12-01 00:00:00' IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+40
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR '2025-12-01' NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+2
+
+statement error
+SELECT COUNT(*) FROM zones WHERE 'x' NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT date_trunc('month', dy_day) FROM days)
+
+statement error
+SELECT COUNT(*) FROM days WHERE date_trunc('month', dy_day) NOT IN (SELECT label FROM cities)
+
+query I rowsort
+SELECT COUNT(*) FROM days WHERE date_trunc('month', dy_day) IN (SELECT date_trunc('month', dy_day) FROM days WHERE dy_day < '2026-03-01' UNION SELECT date_trunc('year', dy_day) FROM days)
+----
+BIGINT
+155
+
+query I rowsort
+SELECT COUNT(*) FROM days WHERE date_trunc('week', dy_day) NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+1407
+
+query TI nosort
+SELECT dy_day, CASE WHEN date_trunc('month', dy_day) = ANY (SELECT date_trunc('month', dy_day) FROM days WHERE dy_day > '2026-06-01') THEN 1 ELSE 0 END AS m FROM days ORDER BY dy_day LIMIT 5
+----
+DATE	INTEGER
+2025-12-29	0
+2025-12-30	0
+2025-12-31	0
+2026-01-01	0
+2026-01-02	0
+
+# ---- DuckDB only until DATE and TIMESTAMP keys get a PR (a join key of DATE and TIMESTAMP) ----
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM days WHERE dy_day IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+48
+
+# ---- divergence D3: a string literal probe over a number set ----
+
+# antb1 refuses to compare a string with numbers, as it does in a comparison; DuckDB casts the string to the set's type.
+# Over a VARCHAR set both answer.
+onlyif antb1
+statement error cannot compare the INTEGER values of an IN subquery with a string
+SELECT COUNT(*) FROM zones WHERE '7' IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE '7' IN (SELECT zn_id FROM zones WHERE zn_city = 1)
+----
+BIGINT
+0
+
+onlyif antb1
+statement error cannot compare the SMALLINT values of an IN subquery with a string
+SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR '2' NOT IN (SELECT zn_city FROM zones)
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR '2' NOT IN (SELECT zn_city FROM zones)
+----
+BIGINT
+2

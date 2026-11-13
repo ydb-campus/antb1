@@ -273,8 +273,8 @@ what ADR 0023's U2 and U3 answer would exit 4 for good and so never be compared:
 the same type and not merely the same `ValueKind` (a widening pair feeds no equivalence class), the inner
 table is never named like the outer binding (the fixtures' self-reference edges would shadow it and make the
 subquery silently uncorrelated), and the outer binding is never read by a path (its name in SQL is the path's).
-`AVG` is written only over a `DECIMAL` argument, where ADR 0021 rule 13 makes the engines agree bit for bit.
-U2 and U3 declare both forms, so they are compared like any other.
+`AVG` is written only over a `DECIMAL` or an integer argument, where ADR 0021 rule 13 and ADR 0037's AG1 make the
+engines agree bit for bit. U2 and U3 declare both forms, so they are compared like any other.
 
 The refs carry **uncorrelated values of any shape** as well (ADR 0041's SQ4a, feature `uncorrelated_value`), from a
 random stream of their own and only where neither subquery form above fired, so a query holds at most one subquery
@@ -315,6 +315,48 @@ ELSE 0 END` over one of `condition_value`'s conditions, from a stream of its own
 A block that aggregates takes one on the same terms (ADR 0041's SQ2b, feature `group_value`), 20% of the time: a value
 block alone, joined after the aggregation, or `COUNT(CASE WHEN <condition> THEN probe END)`, a value inside an
 aggregate's argument that reads a column, computed per row; a `HAVING` value then no longer fires in that query.
+
+An uncorrelated `IN` or `NOT IN` goes inside a condition as a null-aware mark (ADR 0041's SQ7a, feature `in_mark`):
+TRUE on a match, FALSE over an empty set (also for a NULL probe), else NULL where the probe is NULL or the set holds a
+NULL, else FALSE. It is drawn last, once `ORDER BY` is written, from a random stream of its own and only where the
+query holds no other subquery, so it displaces none and a query without one is the query its seed gave before: 35%
+of the queries with a candidate (the uncorrelated `IN`'s, whose probe and set column are the two ends of a ref, so
+of one type family and never `DOUBLE`) take one, its tokens moved to their place. It is one more `WHERE` conjunct,
+one more `HAVING` conjunct over a `GROUP BY` key or `MIN` or `MAX` of the probe, one more select item (a
+projection's `CASE`, or in a block that aggregates a `CASE` over a key or `COUNT(CASE WHEN <condition> THEN probe
+END)`), or one more `ORDER BY` item (a `CASE`); a place the block rules out is `WHERE`. A conjunct is `(mark OR probe <op>
+literal)` in either order, `NOT (probe NOT IN (set) AND probe <op> literal)` or `NOT` over such an `OR`, `CASE WHEN
+<condition> THEN 1 ELSE 0 END = n`, or the three-valued `CASE WHEN mark THEN 1 WHEN NOT (mark) THEN 0 ELSE 2 END = n`
+-- never the bare `IN` nor `NOT`s over it alone, which are `in_subquery`'s semi and anti joins (SQ7b folds `NOT
+(probe NOT IN (set))` into a semi join; `in_form` writes it). Its set reads one column of one named
+table, unqualified: the whole column (NULLs where the table has them; no row over the empty `promos`), its values
+that are not NULL, its NULLs alone, a `CASE` that keeps the values a literal comparison holds and NULL elsewhere,
+the first rows in its order under `NULLS FIRST` or `NULLS LAST` (`LIMIT 0` too: a `LIMIT` follows the column's
+full order, so the set is one in any order), `DISTINCT`, `GROUP BY`, or the NULLs with the values a comparison
+holds; these clauses record no feature of their own. The probe reads a column and computes nothing that can
+overflow, no block holds a value that can fail, and a key is written again only without grouping sets.
+
+The `IN` forms of ADR 0041's SQ7b (feature `in_form`) are drawn right after a mark, from a random stream of their own
+and only where the query holds no other subquery and no mark, so a query without one is the query its seed gave
+before: 40% of the remaining queries with a candidate take one. It is written as a mark is, in the same places and
+over the same sets, with at least one of three forms: every `IN` spelled `= ANY` or `= SOME` and every `NOT IN` `<>
+ALL` or `!= ALL`; a literal of the set column's type family as the probe (an integer against integers, a value or a
+small integer against a `DECIMAL`, a string against a `VARCHAR`, a date or a string against a `DATE`; never a string
+against a number or a number against a `VARCHAR` or a `DATE`); or a set that is a set operation (`UNION ALL`,
+`UNION`, `INTERSECT [ALL]`, `EXCEPT [ALL]`) of two or three arms, each one column of the set column's own type, of a
+table the probe has a ref to, unqualified and so uncorrelated, kept whole, to its NULLs, to its values or to those a
+literal comparison holds, with no `ORDER BY` or `LIMIT` on the compound or an arm. A `WHERE` or `HAVING` conjunct may
+also be the bare `IN` or `NOT IN` (a semi or an anti join) or `NOT NOT (x IN (q))` and `NOT (x NOT IN (q))`, which
+fold into a semi join. The other quantified comparisons (`< ANY`, `= ALL`) are never written.
+
+The empty values of ADR 0041's SQ6 (feature `correlated_empty_value`) are drawn last, from a random stream of their
+own and only where the query holds no other subquery: a top-level `WHERE` conjunct that compares a correlated scalar
+subquery with a literal or an outer column of its type, in either order. Its block reads one named table correlated
+through one key of one type, `=` or `IS NOT DISTINCT FROM`, and aggregates over every row: `COUNT(*)`, `COUNT(x)`,
+`COUNT(DISTINCT x)`, `SUM`, `AVG` (over a `DECIMAL` or an integer), `MIN`, `MAX` or the variance family (compared with
+0 only), as a call, `COALESCE(call, k)`, a `CASE` over a call, a count plus a small constant, or a constant over `ORDER
+BY COUNT(*)`, with an optional `HAVING` over a count. A constant item and a `HAVING` stand only in a block that holds a
+count, which keeps out the family of DuckDB's wrong answers in docs/testing.md; nothing divides or can overflow.
 
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave

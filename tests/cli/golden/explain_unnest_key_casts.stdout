@@ -1,0 +1,8 @@
+Output: zn_id:INTEGER
+Project zn_id
+  Sort zn_id ASC NULLS LAST
+    Join SEMI build=left keys=["z.zn_id" = "CAST(r.rd_city AS INTEGER)", "CAST(z.zn_city AS BIGINT)" = "r.rd_id"] carries 2 of 3 unread above
+      Compute CAST(z.zn_city AS BIGINT)
+        Scan table=zones source=parquet(files=1, rows=40) columns=[zn_id, zn_city]
+      Compute CAST(r.rd_city AS INTEGER)
+        Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id, rd_city]
