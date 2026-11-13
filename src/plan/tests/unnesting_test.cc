@@ -754,6 +754,53 @@ TEST(UnnestingTest, TheProofDecidesTheJoinBack) {
   }
 }
 
+// ADR 0041's SQ5a: a correlated value anywhere in a condition. The proof passes Computes, Filters
+// that decide nothing and joins reached from their left to the condition that rejects the empty
+// value: a strict combination of a SUM is NULL there, a COUNT's 0 is not, an OR or a CASE decides
+// nothing, and a second value's join, an IN's semi join or an inner ON's filter stands between.
+TEST(UnnestingTest, TheProofDecidesTheJoinBackOfAValueInACondition) {
+  constexpr std::string_view kSum = "(SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64)";
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  constexpr std::string_view kOtherSum = "(SELECT SUM(ok.i16) FROM ok WHERE ok.i16 = t.i16)";
+  constexpr std::string_view kOtherCount = "(SELECT COUNT(*) FROM ok WHERE ok.i16 = t.i16)";
+  struct Case {
+    std::string sql;
+    std::vector<JoinBack> join_backs;
+  };
+  for (const Case& c : {
+           Case{.sql = std::format("SELECT i16 FROM t WHERE i32 > 2 * {}", kSum),
+                .join_backs = {JoinBack::kInner}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE i32 > 2 * {}", kCount),
+                .join_backs = {JoinBack::kLeft}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE {} > 0 OR i16 = 1", kCount),
+                .join_backs = {JoinBack::kLeft}},
+           Case{.sql =
+                    std::format("SELECT i16 FROM t WHERE CAST({} - 1 AS USMALLINT) >= 0 AND {} > 0",
+                                kCount, kCount),
+                .join_backs = {JoinBack::kInner}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE {} + {} > 3", kSum, kOtherSum),
+                .join_backs = {JoinBack::kInner, JoinBack::kInner}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE {} > {}", kCount, kOtherCount),
+                .join_backs = {JoinBack::kLeft, JoinBack::kLeft}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE {} + 0 >= 0 AND i16 IN (SELECT ok.i16 "
+                                   "FROM ok) AND {} > 0",
+                                   kCount, kCount),
+                .join_backs = {JoinBack::kInner}},
+           Case{.sql = std::format("SELECT t.i16 FROM t JOIN ok ON ok.i16 = t.i16 AND {} + 0 >= 0 "
+                                   "WHERE {} > 0",
+                                   kCount, kCount),
+                .join_backs = {JoinBack::kInner}},
+           Case{.sql = std::format("SELECT i16 FROM t WHERE {} >= 0 AND (SELECT MAX(u.i32) FROM u) "
+                                   "> 0",
+                                   kCount),
+                .join_backs = {JoinBack::kLeft}},
+       }) {
+    SCOPED_TRACE(c.sql);
+    const Unnested unnested = UnnestedOf(c.sql);
+    EXPECT_EQ(unnested.join_backs, c.join_backs) << unnested.text;
+  }
+}
+
 // On a LEFT join back a count is computed under a fresh id and read above the join through
 // COALESCE(fresh, 0) under its own, so the comparison above reads 0 for an outer row with no group;
 // the join builds the aggregate, which it pads.

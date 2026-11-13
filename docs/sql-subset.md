@@ -1883,7 +1883,7 @@ follows.
 | Q3 | pass | answered when the ratchet was added |
 | Q4 | pass | `UNION ALL` (ADR 0036) |
 | Q5 | pass | ROLLUP (RU3) |
-| Q6 | unsupported | needs scalar subqueries that are not aggregates and a correlated aggregate inside arithmetic (SQ5) |
+| Q6 | pass | a correlated aggregate inside arithmetic in a WHERE comparison, joined back inner (SQ5a) |
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | pass | `INTERSECT` (X4c) |
 | Q9 | pass | scalar subqueries in a select list's CASE (SQ2a) |

@@ -1,0 +1,11 @@
+Output: ct_id:SMALLINT
+Project ct_id
+  Sort ct_id ASC NULLS LAST
+    Filter "sum(r.rd_id)" > "sum(d.dv_id)"
+      Join INNER build=left keys=["c.ct_id" = "d.dv_city"] carries 2 of 5 unread above
+        Join INNER build=left keys=["c.ct_id" = "r.rd_city"] carries 1 of 3 unread above
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+          GroupAggregate keys=["r.rd_city"] SUM(rd_id)
+            Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id, rd_city]
+        GroupAggregate keys=["d.dv_city"] SUM(dv_id)
+          Scan table=drivers source=parquet(files=1, rows=97) columns=[dv_id, dv_city]

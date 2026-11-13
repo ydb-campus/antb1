@@ -954,6 +954,38 @@ antb1_add_cli_golden(
     --table
     "drivers=${_f}/star/drivers.parquet"
 )
+# A correlated value under OR (ADR 0041's SQ5a): the OR decides nothing over the count's 0, so the join back is LEFT and
+# the count is read through COALESCE above it, below the Compute of the condition.
+antb1_add_cli_golden(
+  explain_correlated_value_under_or
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 OR c.ct_id = 1 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# Two correlated values compared (ADR 0041's SQ5a): the first a value below the second's join, whose comparison rejects
+# a NULL SUM on either side, so both join back INNER, the lower one proved through the upper join.
+antb1_add_cli_golden(
+  explain_correlated_values_compared
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city = c.ct_id) > (SELECT SUM(d.dv_id) FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names

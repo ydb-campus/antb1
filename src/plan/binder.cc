@@ -3761,6 +3761,9 @@ class Binder {
     BindingColumn column;
     LogicalType type;  // the column's, which a BindingColumn holds as an optional
     bool correlated = false;
+    // The ids its plan reads from the blocks enclosing it (FreeVariables): empty exactly when it is
+    // not correlated. One text binds to the ids its outer names resolve to (ADR 0041's SQ5).
+    std::vector<ColumnId> free;
   };
   arrow::Result<SubqueryBlock> BindSubqueryBlock(const SubqueryConjunct& form, bool having);
   // The key type of an IN subquery's join, of its probe and its set's column, or its refusal.
@@ -3772,11 +3775,16 @@ class Binder {
   // or else the per-row slot of the conjunct being bound: its block bound once per slot, the first
   // binding planting its one-row join there, and its column read as one of the scope.
   arrow::Result<Typed> SubqueryValue(const sql::SubqueryExpr& s, bool group);
-  // An uncorrelated block's one-row join, planted in its slot, and its value remembered there.
+  // A block's one-row join, planted in its slot -- a dependent join where the block is correlated
+  // (ADR 0041's SQ5) -- and its value remembered there.
   Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
   // The value of a subquery written alike in the same slot before, or nullptr.
   struct BoundValue;
-  [[nodiscard]] const BoundValue* FindValue(const sql::SubqueryExpr& s, bool group) const;
+  [[nodiscard]] BoundValue* FindValue(const sql::SubqueryExpr& s, bool group);
+  // Where a correlated value may stand (ADR 0041's SQ5): OK, or the refusal of this place -- a
+  // padded unit's left input, a conjunct that reads an enclosing block itself, an EXISTS (a mark,
+  // SQ8), or a clause other than a condition of WHERE or an inner ON (SQ5b).
+  [[nodiscard]] arrow::Status AdmitCorrelatedValue(const sql::SubqueryExpr& s) const;
   // An IN subquery inside a condition (ADR 0041's SQ7): the BOOLEAN column of a null-aware mark
   // join of its probe and its set, in HAVING's slot (`group`) or else the per-row slot, bound once
   // per slot as a value is; NOT IN reads it under a NOT.
@@ -4267,6 +4275,12 @@ class Binder {
     Typed value;
     ExprPtr probe;          // a mark's bound probe; null for a value
     bool deferred = false;  // a mark in its slot's tail (row_tail_, group_tail_)
+    // A correlated value (ADR 0041's SQ5): the ids its block reads from the enclosing blocks, by
+    // which the memo knows it, and the inner ON it was bound in (none: where the whole FROM is
+    // visible), whose names an occurrence elsewhere may resolve differently. Empty for an
+    // uncorrelated value and a mark, whose text is their binding.
+    std::vector<ColumnId> free;
+    std::optional<std::size_t> on_position;
   };
   std::vector<BoundValue> values_;
   // The marks the select list plants, which bind before WHERE and HAVING do: each slot's tail,
@@ -6562,7 +6576,8 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // uncorrelated one keeps ADR 0022's direct join, so an IN subquery with GROUP BY or HAVING stays
   // allowed. The binder answers only the shape that is a top-level WHERE conjunct; the unnesting
   // pass then rewrites it or rejects the query.
-  const bool correlated = !FreeVariables(*bound.plan.root).empty();
+  std::vector<ColumnId> free = FreeVariables(*bound.plan.root);
+  const bool correlated = !free.empty();
   const sql::SelectStatement& query = *form.subquery->query;
   const auto correlated_compound = [&] -> std::optional<Rejection> {
     if (!correlated || query.set_operation.empty()) {
@@ -6581,8 +6596,11 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
     // Before the column-count rule below: an EXISTS block's select list is dropped, so it may have
     // no columns at all.
     if (correlated) {
-      return SubqueryBlock{
-          .right = bound.plan.root, .column = {}, .type = LogicalType::kBigInt, .correlated = true};
+      return SubqueryBlock{.right = bound.plan.root,
+                           .column = {},
+                           .type = LogicalType::kBigInt,
+                           .correlated = true,
+                           .free = std::move(free)};
     }
     // An uncorrelated EXISTS is DuckDB's own plan (ADR 0041's decision 5): COUNT(*) over LIMIT 1 of
     // the block, a one-row value, without the block's select list (WithoutSelectList).
@@ -6604,7 +6622,8 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
                                                  .unsupported_type = {},
                                                  .stored_as_float = false},
                          .type = LogicalType::kBigInt,
-                         .correlated = false};
+                         .correlated = false,
+                         .free = {}};
   }
   // The column count first, whatever the shape: a subquery of two columns is DuckDB's bind error.
   if (bound.columns.size() != 1) {
@@ -6678,7 +6697,8 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   return SubqueryBlock{.right = std::move(right),
                        .column = std::move(column),
                        .type = type,
-                       .correlated = correlated};
+                       .correlated = correlated,
+                       .free = std::move(free)};
 }
 
 template <class BindFn>
@@ -6765,6 +6785,18 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
                           BindConditionWith(conjunct, /*input=*/!having, bind_side, column_of,
                                             /*nested=*/false));
     join.filter.push_back(std::move(predicate));
+    if (block.correlated) {
+      // Decision 10 for a correlated value too (ADR 0041's SQ5): a later occurrence in this slot
+      // with the same binding reads this join's column rather than planting a join of its own.
+      values_.push_back(BoundValue{
+          .block = std::optional(RowBlock()),
+          .written = *form.subquery,
+          .value = ColumnLeaf(column.id, block.type, column.name, column.stored_as_float),
+          .probe = nullptr,
+          .deferred = false,
+          .free = block.free,
+          .on_position = on_position_});
+    }
     (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
@@ -7013,7 +7045,7 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
-const Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) const {
+Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group) {
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
   const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
     return bound.block == block && SameSubquery(bound.written, s);
@@ -7021,8 +7053,36 @@ const Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool gro
   return found == values_.end() ? nullptr : &*found;
 }
 
+arrow::Status Binder::AdmitCorrelatedValue(const sql::SubqueryExpr& s) const {
+  // A correlated EXISTS needs a mark (SQ8). A correlated value needs ADR 0041's consumer proof,
+  // which answers it in a condition of WHERE or an inner ON (SQ5a) and elsewhere from SQ5b; never
+  // inside a padded unit's left input, nor in a conjunct that reads an enclosing block itself.
+  std::string message;
+  if (padded_unit_.has_value()) {
+    message = std::format(
+        "a correlated subquery in the ON of a join inside a {} JOIN's left input is not supported",
+        ToString(units_[*padded_unit_].kind));
+  } else if (in_correlated_) {
+    message =
+        "a correlated subquery in a conjunct that also reads a column of an enclosing query block "
+        "is not supported";
+  } else if (s.kind == sql::SubqueryExpr::Kind::kExists) {
+    message =
+        "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an inner ON";
+  } else if (!WhereClause(clause_)) {
+    message =
+        "a correlated scalar subquery is supported only in a condition of WHERE or an inner ON";
+  } else {
+    return arrow::Status::OK();
+  }
+  return Reject(Rejection{.span = s.op_span, .message = std::move(message)});
+}
+
 arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool group) {
-  if (const BoundValue* known = FindValue(s, group)) {
+  BoundValue* known = FindValue(s, group);
+  // An uncorrelated value's text is its binding -- all its names resolve inside it -- so a text
+  // written alike before is that value (decision 10).
+  if (known != nullptr && known->free.empty()) {
     return known->value;
   }
   if (lookup_only_) {
@@ -7034,36 +7094,30 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   // (decision 3); a dry run (OR factoring's, an EXISTS block's dropped item) binds one of those.
   const bool admitted = dry_run_ || clause_ != Clause::kLeftOn;
   ANTB1_CHECK(admitted);
+  // A correlated value written alike before where the same FROM items are visible binds to the
+  // same ids, and its bind errors were those of that binding: it is that value (ADR 0041's SQ5),
+  // where this place admits one. Elsewhere -- an inner ON against WHERE -- it is bound again below,
+  // for this occurrence's own bind errors, and matched by the ids it reads.
+  if (known != nullptr && known->on_position == on_position_) {
+    if (!dry_run_) {
+      ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(s));
+    }
+    return known->value;
+  }
   const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
   if (dry_run_) {
-    // A branch OR factoring drops: its block's bind errors stand, and nothing is planted, whether
-    // the block reads an enclosing one or not.
+    // A branch OR factoring drops: its block's bind errors stand, and nothing is planted or
+    // remembered, whether the block reads an enclosing one or not.
     return ColumnLeaf(bound.column.id, bound.type, bound.column.name, bound.column.stored_as_float);
   }
   if (bound.correlated) {
-    // A correlated value needs the consumer proof of ADR 0041's SQ5, a correlated EXISTS a mark
-    // (SQ8): until then ADR 0023 answers each as a top-level conjunct only, and never inside a
-    // padded unit's left input or in a conjunct that reads an enclosing block itself.
-    std::string message;
-    if (padded_unit_.has_value()) {
-      message = std::format(
-          "a correlated subquery in the ON of a join inside a {} JOIN's left input is not "
-          "supported",
-          ToString(units_[*padded_unit_].kind));
-    } else if (in_correlated_) {
-      message =
-          "a correlated subquery in a conjunct that also reads a column of an enclosing query "
-          "block is not supported";
-    } else if (s.kind == sql::SubqueryExpr::Kind::kExists) {
-      message =
-          "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an inner ON";
-    } else {
-      message =
-          "a correlated scalar subquery is supported only as a direct operand of a comparison in a "
-          "top-level conjunct of WHERE or an inner ON";
+    // This place's refusals before the memo, so that a value remembered from another conjunct does
+    // not carry this one past them.
+    ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(s));
+    if (known != nullptr && known->free == bound.free) {
+      return known->value;
     }
-    return Reject(Rejection{.span = s.op_span, .message = std::move(message)});
   }
   return PlantValue(s, std::move(bound), group);
 }
@@ -7071,9 +7125,12 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
 Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group) {
   Typed value =
       ColumnLeaf(block.column.id, block.type, block.column.name, block.column.stored_as_float);
+  // A correlated block is a dependent join (ADR 0041's SQ5), which the unnesting replaces by its
+  // join back, still defining this column; an uncorrelated one a one-row join (SQ1).
+  const bool dependent = block.correlated;
   (group ? group_slot_ : RowSlot())
       .emplace_back(SubqueryJoin{.kind = JoinKind::kOneRow,
-                                 .dependent = false,
+                                 .dependent = dependent,
                                  .right = std::move(block.right),
                                  .left_key = {},
                                  .right_key = {},
@@ -7086,7 +7143,9 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
                                .written = s,
                                .value = value,
                                .probe = nullptr,
-                               .deferred = false});
+                               .deferred = false,
+                               .free = std::move(block.free),
+                               .on_position = dependent ? on_position_ : std::nullopt});
   return value;
 }
 
@@ -7211,7 +7270,9 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                                .written = std::move(written),
                                .value = value,
                                .probe = probe.expr,
-                               .deferred = deferring_});
+                               .deferred = deferring_,
+                               .free = {},
+                               .on_position = std::nullopt});
   return value;
 }
 
@@ -7353,8 +7414,8 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
                                 [this](const sql::Expr& e) { return BindInput(e); });
   }
   if (form.has_value()) {
-    // A subquery written alike before in this slot is that value (ADR 0041's decision 10): only
-    // uncorrelated ones are remembered.
+    // A subquery written alike before in this slot is that value (ADR 0041's decision 10); a
+    // correlated one is matched by its binding when the conjunct binds (SubqueryValue).
     if (const BoundValue* known = FindValue(*form->subquery, /*group=*/false)) {
       if (form->exists()) {
         ARROW_RETURN_NOT_OK(CheckInsidePaddedLeft(conjunct, element));
@@ -7370,6 +7431,14 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
     // A correlated EXISTS or scalar comparison is ADR 0023's dependent join; an uncorrelated one is
     // a value in the slot (ADR 0041's decisions 4 and 5), the conjunct a filter reading it.
     ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/false));
+    if (block.correlated && form->other != nullptr &&
+        HoldsSubqueryWhere(*form->other, [&form](const sql::SubqueryExpr& other) {
+          return SameSubquery(other, *form->subquery);
+        })) {
+      // The same subquery inside the other side as well, `(q) > (q) - 1`: one value read by both
+      // (decision 10), where the dependent join's own column could not stand below it.
+      return BindValueConjunct(conjunct, element);
+    }
     if (block.correlated) {
       if (padded_unit_.has_value()) {
         return Reject(
@@ -7398,7 +7467,8 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
   }
   // Two scalar subqueries compared, each a direct operand: their blocks bind in the order written.
   // An uncorrelated one is a value in the slot (the memo first); with one correlated, the
-  // comparison is that one's dependent join, the other a value below it, as in `corr > (q) + 0`.
+  // comparison is that one's dependent join, the other a value below it, as in `corr > (q) + 0`;
+  // with two, the first is a correlated value below the second's (ADR 0041's SQ5).
   if (const auto pair = AsSubqueryPair(conjunct)) {
     const std::array<const sql::SubqueryExpr*, 2> sides = {pair->first, pair->second};
     struct Dependent {
@@ -7420,9 +7490,9 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
         if (SameSubquery(*sides[dependent->side], *sides[i])) {
           continue;  // one subquery on both sides: its join's column is both
         }
-        return Reject(Rejection{
-            .span = sides[i]->op_span,
-            .message = "a comparison of two correlated scalar subqueries is not supported"});
+        // The first a value in the slot, in the order written, which the second's comparison
+        // reads through the memo; the consumer proof passes the upper join to its filter.
+        PlantValue(*sides[dependent->side], std::move(dependent->block), /*group=*/false);
       }
       dependent = Dependent{.side = i, .block = std::move(block)};
     }

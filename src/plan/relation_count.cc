@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -122,6 +123,16 @@ void EachSubqueryOf(const sql::Expr& expr, Fn& fn) {
 bool HoldsSubquery(const sql::Expr& expr) {
   bool holds = false;
   const auto found = [&holds](const sql::SubqueryExpr& /*s*/) { holds = true; };
+  EachSubqueryOf(expr, found);
+  return holds;
+}
+
+bool HoldsSubqueryWhere(const sql::Expr& expr,
+                        const std::function<bool(const sql::SubqueryExpr&)>& matches) {
+  bool holds = false;
+  const auto found = [&holds, &matches](const sql::SubqueryExpr& s) {
+    holds = holds || matches(s);
+  };
   EachSubqueryOf(expr, found);
   return holds;
 }

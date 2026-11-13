@@ -1166,18 +1166,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "inner ON"},
         ErrorCase{"SELECT i16 FROM t WHERE (EXISTS (SELECT i16 FROM u)) IS NOT NULL", kUnsupported,
                   "EXISTS", "EXISTS (subqueries) is not supported here"},
-        // A correlated value elsewhere than a direct operand of a top-level comparison waits for
-        // ADR 0041's SQ5, refused once its block binds.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR i32 > (SELECT MIN(u.i16) FROM u WHERE "
-                  "u.i64 = t.i64)",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only as a direct operand of a "
-                  "comparison"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 > (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) "
-                  "+ 1",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only as a direct operand of a "
-                  "comparison"},
         ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         // Path 1 takes a plain block only: every clause that would have to act per binding is
@@ -1379,17 +1367,26 @@ INSTANTIATE_TEST_SUITE_P(
                   kUnsupported, "IN",
                   "an IN subquery whose probe reads a column of an enclosing query block"},
         // A correlated subquery in a conjunct that reads the enclosing block itself (decision 8
-        // answers an uncorrelated value there), two correlated subqueries compared (SQ5), and a
-        // correlated value inside a FULL JOIN's left input, each named for what refuses it.
+        // answers an uncorrelated value there; SQ8), and a correlated value inside a FULL JOIN's
+        // left input, each named for what refuses it. A value of the block remembered from an
+        // earlier conjunct does not carry the conjunct past the first refusal (ADR 0041's SQ5).
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 > "
                   "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
                   kUnsupported, "(",
                   "a correlated subquery in a conjunct that also reads a column of an enclosing "
                   "query block is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < "
-                  "(SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)",
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16) > 0 AND t.i32 > "
+                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
                   kUnsupported, "(",
-                  "a comparison of two correlated scalar subqueries is not supported"},
+                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
+                  "query block is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+                  "COALESCE((SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16), 0) >= 0 AND "
+                  "t.i32 > (SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
+                  kUnsupported, "(",
+                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
+                  "query block is not supported"},
         ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND u.i32 > (SELECT MIN(dec.i) FROM "
                   "dec WHERE dec.i = u.i32) + 1 FULL JOIN ok ON u.i16 = ok.i16",
                   kUnsupported, "(",
@@ -1437,12 +1434,6 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT COUNT((SELECT COUNT(*) FROM u) * 2) FROM t", kUnsupported,
                   "(SELECT COUNT(*) FROM u) * 2",
                   "an aggregate of subquery values alone is not supported"},
-        // A BETWEEN's subquery bound is a value (ADR 0041's SQ1); a correlated one waits for SQ5.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u WHERE u.i64 = "
-                  "t.i64) AND 10",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only as a direct operand of a "
-                  "comparison"},
         // A subquery bound is typed as its column, with DuckDB's rules for the three values.
         ErrorCase{"SELECT i16 FROM t WHERE i64 BETWEEN (SELECT MIN(d) FROM u) AND 5", kUnsupported,
                   "BETWEEN", "BETWEEN of a DOUBLE value and a BIGINT"},
@@ -1517,9 +1508,6 @@ INSTANTIATE_TEST_SUITE_P(
         // assume away, which is an abort rather than an error.
         ErrorCase{"SELECT i16 FROM t WHERE TRY_CAST(i32 AS BIGINT) IN (SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) IN "
-                  "(SELECT i16 FROM ok)",
-                  kUnsupported, "(", "a correlated scalar subquery"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING TRY_CAST(COUNT(*) AS BIGINT) IN "
                   "(SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
@@ -7097,6 +7085,95 @@ TEST(BinderTest, ValuePlacements) {
     const LogicalPlan optimized = Optimized(*plan);
     EXPECT_NE(optimized.root, nullptr) << sql;
   }
+}
+
+// ADR 0041's SQ5a: a correlated value stands in any expression of a condition of WHERE or an inner
+// ON, as an uncorrelated one does (ValuePlacements), its dependent join in the slot.
+TEST(BinderTest, CorrelatedValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE i32 = 1 OR i32 > (SELECT MIN(u.i16) FROM u WHERE u.i64 = "
+           "t.i64)",
+           "SELECT i16 FROM t WHERE i32 > (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) + 1",
+           "SELECT i16 FROM t WHERE NOT (i32 > (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64))",
+           "SELECT i16 FROM t WHERE CASE WHEN (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) > 0 "
+           "THEN 1 ELSE 0 END = 1",
+           "SELECT i16 FROM t WHERE COALESCE((SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64), 0) "
+           "> 1",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) IS NULL",
+           "SELECT i16 FROM t WHERE i32 BETWEEN (SELECT MIN(i16) FROM u WHERE u.i64 = t.i64) AND "
+           "10",
+           "SELECT i16 FROM t WHERE i32 IN (1, (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64))",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) IN (SELECT "
+           "i16 FROM ok)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) NOT IN "
+           "(SELECT i16 FROM ok) OR i16 = 1",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) < (SELECT "
+           "MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) + (SELECT "
+           "COUNT(*) FROM ok WHERE ok.i16 = t.i16) > 3",
+           "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 > (SELECT COUNT(*) FROM ok "
+           "WHERE ok.i16 = t.i16) OR u.i32 < 0)",
+           // Inside a correlated block's own WHERE, on its own table.
+           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND (SELECT "
+           "COUNT(*) FROM ok WHERE ok.i16 = u.i16) + 0 > 0)",
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_NE(optimized.root, nullptr) << sql;
+  }
+}
+
+// The dependent joins of a bound plan, as EXPLAIN shows them.
+std::size_t DependentJoins(const LogicalPlan& plan) {
+  const std::string text = Explain(plan);
+  std::size_t found = 0;
+  for (std::size_t at = text.find("DependentJoin"); at != std::string::npos;
+       at = text.find("DependentJoin", at + 1)) {
+    ++found;
+  }
+  return found;
+}
+
+// Decision 10 for a correlated value (ADR 0041's SQ5a): written alike in one slot, it is one
+// dependent join, whether its first occurrence is a direct operand or not, and on both sides of one
+// comparison; a dry run (OR factoring's dropped branch) plants none. A text is its binding only
+// where the same FROM items are visible: an inner ON sees fewer than WHERE, so the WHERE copy binds
+// again and reports its own bind error -- an ambiguity a memo keyed by text would hide.
+TEST(BinderTest, ACorrelatedValueIsRememberedByItsBinding) {
+  const Catalog catalog = MakeCatalog();
+  const auto bound = [&catalog](std::string_view sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    return plan.ok() ? *plan : LogicalPlan{};
+  };
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  EXPECT_EQ(DependentJoins(
+                bound(std::format("SELECT i16 FROM t WHERE {} > 1 AND {} < 36", kCount, kCount))),
+            1U);
+  EXPECT_EQ(DependentJoins(bound(
+                std::format("SELECT i16 FROM t WHERE {} + 1 > 1 AND {} < 36", kCount, kCount))),
+            1U);
+  EXPECT_EQ(
+      DependentJoins(bound(std::format("SELECT i16 FROM t WHERE {} > {} - 1", kCount, kCount))),
+      1U);
+  EXPECT_EQ(DependentJoins(bound(std::format("SELECT i16 FROM t WHERE (i32 = 1 AND {} > 0) OR "
+                                             "i32 = 1",
+                                             kCount))),
+            0U);
+  const auto ambiguous = BindSql(
+      "SELECT dec.i FROM dec JOIN ok ON ok.i16 = dec.s16 AND (SELECT COUNT(*) FROM u WHERE "
+      "u.i32 = i) + 1 > 0 JOIN dec AS d2 ON d2.s16 = ok.i16 WHERE (SELECT COUNT(*) FROM u WHERE "
+      "u.i32 = i) > 0",
+      catalog);
+  ASSERT_FALSE(ambiguous.ok());
+  const auto detail = GetSqlError(ambiguous.status());
+  ASSERT_NE(detail, nullptr) << ambiguous.status().ToString();
+  EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kBind) << ambiguous.status().ToString();
+  EXPECT_NE(ambiguous.status().message().find("ambiguous"), std::string::npos)
+      << ambiguous.status().ToString();
 }
 
 // ADR 0041's SQ1b: a HAVING conjunct that holds a value is a filter of HAVING's slot, above the
