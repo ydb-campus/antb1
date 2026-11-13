@@ -453,6 +453,8 @@ std::string_view ToString(JoinKind kind) {
       return "ONE-ROW";
     case JoinKind::kFull:
       return "FULL";
+    case JoinKind::kNullAwareMark:
+      return "NULL-AWARE MARK";
   }
   return "?";
 }
@@ -756,8 +758,9 @@ std::vector<ColumnId> GroupingSetsIds(const GroupingSetsNode& node) {
 }
 
 // The output ids of a join of `kind` over inputs with these output ids, and then `own` where the
-// node defines a column of its own (a dependent join's `mark`; kNoColumnId for a plain join, which
-// defines none). One rule for both shapes of OutputIds: ADR 0023's "One output-id contract".
+// node defines a column of its own (a mark join's or a dependent join's `mark`; kNoColumnId for
+// every other join, which defines none). One rule for both shapes of OutputIds: ADR 0023's "One
+// output-id contract".
 std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
                               const std::vector<ColumnId>& right, ColumnId own = kNoColumnId) {
   if (Traits(kind).outputs_right) {
@@ -788,7 +791,7 @@ struct OutputIdsOf {
   std::vector<ColumnId> operator()(const LimitNode& node) const { return OutputIds(*node.input); }
   std::vector<ColumnId> operator()(const RowCountNode& node) const { return {node.id}; }
   std::vector<ColumnId> operator()(const JoinNode& node) const {
-    return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right));
+    return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
   }
   std::vector<ColumnId> operator()(const DependentJoinNode& node) const {
     return JoinIds(node.kind, OutputIds(*node.left), OutputIds(*node.right), node.mark);
@@ -895,6 +898,7 @@ struct IdsOfNode {
     for (const ExprPtr& conjunct : node.residual) {
       Read(conjunct);
     }
+    Define(node.mark);
   }
   void operator()(const DependentJoinNode& node) const { Define(node.mark); }
   void operator()(const UnionAllNode& node) const {
@@ -1250,11 +1254,20 @@ class Resolver {
     } else if (!traits.one_row && !traits.nested_loop && join.keys.empty()) {
       Fail(std::format("Join: {} join without keys", ToString(join.kind)));
     }
-    if (join.build == BuildSide::kLeft && (traits.one_row || traits.pads_left)) {
+    if ((join.mark != kNoColumnId) != traits.appends_mark) {
+      Fail(std::format("Join: {} join {} a mark", ToString(join.kind),
+                       traits.appends_mark ? "without" : "with"));
+    }
+    if (!traits.residuals && !join.residual.empty()) {
+      Fail(std::format("Join: {} join with a residual", ToString(join.kind)));
+    }
+    if (join.build == BuildSide::kLeft &&
+        (traits.one_row || traits.pads_left || traits.appends_mark)) {
       // Every other kind may build on either input in a plan since ADR 0026's C2b (the executor
       // runs those whose traits say `may_build_left`); a one-row join may not, because its right
       // input is the single-row side by definition, and nor may one that pads its left input's
-      // columns (FULL, ADR 0037's OJ2), whose build-emitting sink runs on a right build only.
+      // columns (FULL, ADR 0037's OJ2), whose build-emitting sink runs on a right build only, or a
+      // mark join, which marks each left row as it probes (ADR 0041's decision 13).
       Fail(std::format("Join: {} join builds on its left input", ToString(join.kind)));
     }
     if (traits.null_aware && std::ranges::any_of(join.keys, &JoinKey::null_equal)) {
@@ -1292,8 +1305,11 @@ class Resolver {
         changed = true;
       }
     }
+    if (join.mark != kNoColumnId) {
+      Define("Join", join.mark);
+    }
     return {.node = changed ? MakeNode(std::move(out)) : self,
-            .ids = JoinIds(join.kind, std::move(left.ids), right.ids)};
+            .ids = JoinIds(join.kind, std::move(left.ids), right.ids, join.mark)};
   }
 
   Resolved Visit(const LogicalNodePtr& self, const DependentJoinNode& join) {
@@ -1306,6 +1322,7 @@ class Resolver {
       case JoinKind::kLeft:
       case JoinKind::kNullAwareAnti:
       case JoinKind::kFull:
+      case JoinKind::kNullAwareMark:
         // Only the three kinds the binder plans (ADR 0023): a correlation is a predicate of the
         // right input, so there is nothing for the other kinds to match on.
         Fail(std::format("DependentJoin: a {} dependent join", ToString(join.kind)));
@@ -1567,6 +1584,7 @@ struct FreshIds {
     for (ExprPtr& conjunct : node.residual) {
       conjunct = Renamed(conjunct);
     }
+    node.mark = Mint(node.mark);
     return node;
   }
   LogicalNode operator()(DependentJoinNode node) const {

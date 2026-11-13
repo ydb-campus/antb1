@@ -237,6 +237,30 @@ Rows ReferenceFilter(plan::JoinKind kind, const Rows& probe, const Rows& build,
   return out;
 }
 
+// Every row of `probe` followed by its null-aware mark over `build` on one key (ADR 0041's decision
+// 13): "true" on a match; "false" over an empty build; else "null" where the probe's key is NULL or
+// the build holds a NULL key; else "false".
+Rows ReferenceMark(const Rows& probe, const Rows& build, int probe_key, int build_key) {
+  const bool null_in_build = std::ranges::any_of(
+      build, [&](const std::vector<std::string>& b) { return NullKey(b, {build_key}); });
+  Rows out;
+  for (const std::vector<std::string>& p : probe) {
+    const bool matched = std::ranges::any_of(build, [&](const std::vector<std::string>& b) {
+      return KeysMatch(p, b, {probe_key}, {build_key});
+    });
+    std::string mark = "false";
+    if (matched) {
+      mark = "true";
+    } else if (!build.empty() && (null_in_build || NullKey(p, {probe_key}))) {
+      mark = "null";
+    }
+    std::vector<std::string> row = p;
+    row.push_back(std::move(mark));
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
 // Every row of `probe` followed by the cells of `row` (the build row of a one-row join).
 Rows ReferenceOneRow(const Rows& probe, const std::vector<std::string>& row) {
   Rows out = probe;
@@ -4222,6 +4246,7 @@ TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
            {.kind = plan::JoinKind::kSemi},
            {.kind = plan::JoinKind::kAnti},
            {.kind = plan::JoinKind::kNullAwareAnti},
+           {.kind = plan::JoinKind::kNullAwareMark},
            {.kind = plan::JoinKind::kLeft},
            {.kind = plan::JoinKind::kSemi, .residual = &residual, .label = " with residuals"},
            {.kind = plan::JoinKind::kAnti, .residual = &residual, .label = " with residuals"},
@@ -4238,10 +4263,13 @@ TEST_F(HashJoinPlanTest, EveryKindGivesTheSameResultsOnOneAndFourThreads) {
     const std::string name = std::string(plan::ToString(kind)) + std::string(variant.label);
     const std::vector<plan::ExprPtr> conditions =
         with_residual ? *variant.residual : std::vector<plan::ExprPtr>{};
-    // The width of the join of a probe and a build of these widths: a left join's has both.
-    const auto width = [left = kind == plan::JoinKind::kLeft](std::size_t probe,
-                                                              std::size_t build) {
-      return left ? probe + build : probe;
+    // The width of the join of a probe and a build of these widths: a left join's has both, a
+    // mark join's its probe's and the mark.
+    const auto width = [kind](std::size_t probe, std::size_t build) {
+      if (kind == plan::JoinKind::kNullAwareMark) {
+        return probe + 1;
+      }
+      return kind == plan::JoinKind::kLeft ? probe + build : probe;
     };
     const auto join = JoinOf(kind, ScanOf(p, "p"), ScanOf(b, "b"), {pk}, {bk}, conditions);
     shapes.emplace_back(name + " join", PlanOf(join, width(3, 3)));
@@ -4356,14 +4384,19 @@ TEST_F(HashJoinPlanTest, AKeyFilterDropsProbeRowsAndKeepsTheAnswer) {
     // filter is taken. The build's keys are 0, 40, 80, 120 and 160 against probe keys 0 to 59, so
     // most probe rows cannot match and two keys can.
     const auto build = MixedTable("b", 1, 5, build_keys);
-    for (const plan::JoinKind kind :
-         {plan::JoinKind::kInner, plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kInner, plan::JoinKind::kSemi,
+                                      plan::JoinKind::kAnti, plan::JoinKind::kNullAwareMark}) {
       SCOPED_TRACE(static_cast<int>(kind));
-      // An inner join emits both sides' columns; a semi or anti join its probe's alone.
-      const std::size_t columns = kind == plan::JoinKind::kInner ? 6U : 3U;
+      // An inner join emits both sides' columns; a semi or anti join its probe's alone, and a mark
+      // join its probe's and the mark.
+      std::size_t columns = kind == plan::JoinKind::kInner ? 6U : 3U;
+      if (kind == plan::JoinKind::kNullAwareMark) {
+        columns = 4U;
+      }
       // An anti join of this orientation emits the probe rows that found no match, so the rows a
-      // filter would drop are exactly the rows it must keep: it must not be filtered.
-      const bool filtered = kind != plan::JoinKind::kAnti;
+      // filter would drop are exactly the rows it must keep: it must not be filtered. Nor must a
+      // mark join, which emits every probe row (ADR 0041's decision 13).
+      const bool filtered = kind != plan::JoinKind::kAnti && kind != plan::JoinKind::kNullAwareMark;
       const auto one = MixedTable("p", 6, 80, probe_keys);
       ProfileNode got_profile;
       auto got =
@@ -5529,7 +5562,8 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
   const auto build_schema = Int64Schema({"bk", "bid"});
   for (const plan::JoinKind kind :
        {plan::JoinKind::kInner, plan::JoinKind::kLeft, plan::JoinKind::kSemi, plan::JoinKind::kAnti,
-        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kFull}) {
+        plan::JoinKind::kNullAwareAnti, plan::JoinKind::kOneRow, plan::JoinKind::kFull,
+        plan::JoinKind::kNullAwareMark}) {
     const plan::JoinKindTraits traits = plan::Traits(kind);
     for (const bool keyless : {false, true}) {
       if (keyless != traits.one_row && (!keyless || !traits.nested_loop)) {
@@ -5585,7 +5619,10 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
           auto result = Drain(*join, ctx);
           ASSERT_TRUE(result.ok()) << result.status().ToString();
           const arrow::Table& table = **result;
-          EXPECT_EQ(table.num_columns(), traits.outputs_right ? 4 : 2) << "outputs_right";
+          EXPECT_EQ(table.num_columns(), traits.outputs_right  ? 4
+                                         : traits.appends_mark ? 3
+                                                               : 2)
+              << "outputs_right, appends_mark";
           const Rows rows = RowsOf(table);
           std::vector<int> times(pids.size(), 0);        // how often each probe row comes out
           std::vector<int> build_times(bids.size(), 0);  // and each build row, where it does
@@ -5613,6 +5650,9 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
             if (traits.pads_right || traits.one_row) {
               EXPECT_GE(times[pid], 1) << "every probe row comes out: " << pid;
             }
+            if (traits.appends_mark) {
+              EXPECT_EQ(times[pid], 1) << "appends_mark: every probe row once: " << pid;
+            }
           }
           for (std::size_t bid = 0; bid < bids.size(); ++bid) {
             if (traits.pads_left) {
@@ -5629,6 +5669,138 @@ TEST_F(HashJoinTest, EveryKindDoesWhatItsTraitsSay) {
         }
       }
     }
+  }
+}
+
+// A null-aware mark join (ADR 0041's decision 12) marks every probe row exactly once, three-valued:
+// TRUE on a match; else FALSE over an empty build input, a NULL key included; else NULL where the
+// key is NULL or the build holds a NULL key; else FALSE. At batch sizes 1, 2 and the default, so
+// that windows cut the probe batch.
+TEST_F(HashJoinTest, ANullAwareMarkMarksEveryRowThreeValued) {
+  const auto probe_schema = Int64Schema({"k", "pid"});
+  const auto build_schema = Int64Schema({"bk", "bid"});
+  const std::optional<int64_t> null;
+  const std::vector<std::optional<int64_t>> probe_keys = {1, 3, null, 2};
+  struct Case {
+    std::string name;
+    std::vector<std::optional<int64_t>> build;
+    std::vector<std::string> marks;  // per probe row
+  };
+  const std::vector<Case> cases = {
+      {.name = "empty", .build = {}, .marks = {"false", "false", "false", "false"}},
+      {.name = "{1, 2}", .build = {1, 2}, .marks = {"true", "false", "null", "true"}},
+      {.name = "{1, NULL}", .build = {1, null}, .marks = {"true", "null", "null", "null"}},
+      {.name = "{NULL, NULL}", .build = {null, null}, .marks = {"null", "null", "null", "null"}},
+  };
+  for (const Case& c : cases) {
+    for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{1024}}) {
+      SCOPED_TRACE(std::format("{}, batch size {}", c.name, batch_size));
+      std::vector<std::optional<int64_t>> bids;
+      bids.reserve(c.build.size());
+      for (std::size_t i = 0; i < c.build.size(); ++i) {
+        bids.emplace_back(100 + static_cast<int64_t>(i));
+      }
+      auto join =
+          MakeJoin(SourceOf(probe_schema, {Int64s(probe_keys), Int64s({0, 1, 2, 3})}),
+                   DrainedBuild(plan::JoinKind::kNullAwareMark,
+                                SourceOf(build_schema, {Int64s(c.build), Int64s(bids)}), {0}),
+                   {0}, /*prepares=*/true);
+      ASSERT_NE(join, nullptr);
+      ASSERT_EQ(join->output_schema()->num_fields(), 3);
+      EXPECT_TRUE(join->output_schema()->field(2)->type()->Equals(arrow::boolean()));
+      EXPECT_TRUE(join->output_schema()->field(2)->nullable());
+      ExecContext ctx = ContextOf(nullptr, batch_size);
+      auto result = Drain(*join, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      // Each probe row once, in any order: its mark by its pid.
+      const Rows rows = RowsOf(**result);
+      ASSERT_EQ(rows.size(), 4U);
+      std::vector<std::string> marks(rows.size());
+      for (const std::vector<std::string>& row : rows) {
+        marks.at(static_cast<std::size_t>(std::stoi(row.at(1)))) = row.at(2);
+      }
+      EXPECT_EQ(marks, c.marks);
+    }
+  }
+}
+
+// Through the physical planner, a null-aware mark join gives the nested-loop reference, every probe
+// row once in part order with its mark: on a BIGINT or a VARCHAR key ('' is no NULL), over builds
+// with unique keys, repeated keys, a NULL key now and then, NULL keys alone and no row at all, for
+// batch sizes up to more rows than the probe has, on one thread and on four.
+TEST_F(HashJoinPlanTest, AMarkJoinMatchesTheNestedLoopReference) {
+  const auto pool = MakeThreadPool();
+  const auto probe_table = MixedTable("p", 6, 7, ProbeKey);
+  const Rows probe_rows = RowsOf(*probe_table);
+  struct Build {
+    std::string name;
+    int64_t parts = 0;
+    int64_t rows = 0;
+    std::function<std::optional<int64_t>(int64_t)> key;
+  };
+  const std::vector<Build> builds = {
+      {.name = "unique", .parts = 2, .rows = 6, .key = [](int64_t i) { return i; }},
+      {.name = "repeated", .parts = 3, .rows = 5, .key = [](int64_t i) { return i % 4; }},
+      {.name = "a NULL now and then",
+       .parts = 2,
+       .rows = 6,
+       .key = [](int64_t i) -> std::optional<int64_t> {
+         if (i % 4 == 3) {
+           return std::nullopt;
+         }
+         return i;
+       }},
+      {.name = "NULLs alone",
+       .parts = 1,
+       .rows = 3,
+       .key = [](int64_t /*i*/) -> std::optional<int64_t> { return std::nullopt; }},
+      {.name = "no row", .parts = 1, .rows = 0, .key = [](int64_t i) { return i; }},
+  };
+  for (const Build& build : builds) {
+    const auto build_table = MixedTable("b", build.parts, build.rows, build.key);
+    const Rows build_rows = RowsOf(*build_table);
+    for (const int column : {0, 1}) {
+      const Rows expected = ReferenceMark(probe_rows, build_rows, column, column);
+      const auto plan = PlanOf(
+          JoinOf(plan::JoinKind::kNullAwareMark, ScanOf(probe_table, "p"), ScanOf(build_table, "b"),
+                 {MixedColumn("p", column)}, {MixedColumn("b", column)}),
+          4);
+      for (const bool parallel : {false, true}) {
+        for (const int64_t batch_size : {1, 3, 64, 65536}) {
+          SCOPED_TRACE(std::format("build {}, key column {}, {} thread(s), batch size {}",
+                                   build.name, column, parallel ? 4 : 1, batch_size));
+          auto result = RunPlan(plan, ContextOf(parallel ? pool.get() : nullptr, batch_size));
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          EXPECT_EQ(RowsOf(**result), expected);
+        }
+      }
+    }
+  }
+}
+
+// A mark join keeps its probe batch's selection: a row that is not selected stays unselected and
+// comes out of no window, and each selected row is marked by its own key, at any window size.
+TEST_F(HashJoinTest, AMarkJoinKeepsItsProbesSelection) {
+  const auto probe_schema = Int64Schema({"k", "pid"});
+  const auto build_schema = Int64Schema({"bk", "bid"});
+  const std::optional<int64_t> null;
+  const auto probe = BatchOf(probe_schema, {Int64s({1, 3, null, 2, 5}), Int64s({0, 1, 2, 3, 4})});
+  const auto selection = Bools({true, false, true, true, true});
+  for (const int64_t batch_size : {int64_t{1}, int64_t{2}, int64_t{64}}) {
+    SCOPED_TRACE(std::format("batch size {}", batch_size));
+    auto join = MakeJoin(
+        std::make_unique<ScriptedSource>(
+            probe_schema, std::vector<Batch>{Batch{.data = probe, .selection = selection}}),
+        DrainedBuild(plan::JoinKind::kNullAwareMark,
+                     SourceOf(build_schema, {Int64s({1, 2}), Int64s({10, 20})}), {0}),
+        {0}, /*prepares=*/true);
+    ASSERT_NE(join, nullptr);
+    ExecContext ctx = ContextOf(nullptr, batch_size);
+    auto result = Drain(*join, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(
+        RowsOf(**result),
+        (Rows{{"1", "0", "true"}, {"null", "2", "null"}, {"2", "3", "true"}, {"5", "4", "false"}}));
   }
 }
 

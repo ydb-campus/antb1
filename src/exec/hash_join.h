@@ -364,6 +364,11 @@ class HashJoinOperator final : public Operator {
   // build row; null-aware anti over an empty build input) or none (null-aware anti over a build
   // input with a NULL key). An inner or a left probe looks up as kMatched does.
   enum class Keep : std::uint8_t { kMatched, kUnmatched, kUnmatchedNotNull, kAll, kNone };
+  // What a null-aware mark join marks every row with, decided per run from the build (Start, ADR
+  // 0041's decision 12): FALSE over an empty build input, a NULL key included; NULL over a build
+  // input of NULL keys alone; else a lookup: TRUE on a match, else NULL where the row's key is NULL
+  // or the build holds a NULL key, else FALSE.
+  enum class MarkMode : std::uint8_t { kFalse, kNull, kLookup };
 
   HashJoinOperator(std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build,
                    std::vector<int> probe_keys, plan::BuildSide build_side,
@@ -393,6 +398,8 @@ class HashJoinOperator final : public Operator {
   arrow::Result<std::optional<Batch>> NextPairs();
   arrow::Result<std::optional<Batch>> NextSelected();
   arrow::Result<std::optional<Batch>> NextOneRow();
+  // A null-aware mark join's window: the probe's columns and selection, then the mark.
+  arrow::Result<std::optional<Batch>> NextMarked();
   // A join that emits its build rows: marks the build rows the current probe batch matched, the
   // whole batch at once, and returns no batch. With residuals it walks the batch's candidate pairs
   // as EvaluatePairs does and marks the build row of each pair that passes (an alike row's one
@@ -488,6 +495,7 @@ class HashJoinOperator final : public Operator {
   bool input_opened_ = false;  // its Open was called: Close closes it
   bool done_ = false;          // the input ended, or the build empties the join
   Keep keep_ = Keep::kMatched;
+  MarkMode mark_mode_ = MarkMode::kLookup;  // a null-aware mark join's
   std::shared_ptr<const JoinTable> table_;
   std::shared_ptr<const JoinColumns> columns_;       // the table's, for PairBatch and GatherBuild
   std::shared_ptr<const OneRowValues> values_;       // a one-row join's

@@ -321,6 +321,10 @@ TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
   EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kAnti)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
+  // A mark join: the left input's ids, then its mark (ADR 0041's decision 13).
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  mark.mark = ColumnId{9};
+  EXPECT_EQ(OutputIds(mark), (std::vector<ColumnId>{kA, kB, kC, ColumnId{9}}));
 }
 
 // A dependent join outputs its inputs' ids by its kind's rule, exactly as the join of that kind.
@@ -485,10 +489,16 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth
 }
 
 TEST(ColumnIdsTest, EveryJoinKindResolves) {
-  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-                              JoinKind::kNullAwareAnti, JoinKind::kFull}) {
+  for (const JoinKind kind :
+       {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+        JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark}) {
     JoinNode join = Join(kind);
-    join.residual = {Residual(kC, kF)};
+    if (Traits(kind).residuals) {
+      join.residual = {Residual(kC, kF)};
+    }
+    if (Traits(kind).appends_mark) {
+      join.mark = ColumnId{9};
+    }
     const LogicalPlan resolved = ResolvePositions(Plan(Node(join)));
     EXPECT_EQ(PositionMismatch(resolved), std::nullopt) << ToString(kind);
   }
@@ -504,6 +514,22 @@ TEST(ColumnIdsTest, EveryJoinKindResolves) {
 }
 
 TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
+  // A mark join has its mark and builds on its right input; no other kind has a mark, and a kind
+  // without residuals has none (ADR 0041's decision 13).
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  EXPECT_EQ(PositionMismatch(Plan(Node(mark))), "Join: NULL-AWARE MARK join without a mark");
+  mark.mark = ColumnId{9};
+  mark.build = BuildSide::kLeft;
+  EXPECT_EQ(PositionMismatch(Plan(Node(mark))),
+            "Join: NULL-AWARE MARK join builds on its left input");
+  JoinNode marked_semi = Join(JoinKind::kSemi);
+  marked_semi.mark = ColumnId{9};
+  EXPECT_EQ(PositionMismatch(Plan(Node(marked_semi))), "Join: SEMI join with a mark");
+  JoinNode anti_residual = Join(JoinKind::kNullAwareAnti);
+  anti_residual.residual = {Residual(kC, kF)};
+  EXPECT_EQ(PositionMismatch(Plan(Node(anti_residual))),
+            "Join: NULL-AWARE ANTI join with a residual");
+
   JoinNode types = Join(JoinKind::kInner);
   types.keys[0].right.type = LogicalType::kInteger;
   EXPECT_EQ(PositionMismatch(Plan(Node(types))),
@@ -656,6 +682,29 @@ TEST(ColumnIdsTest, AClonePassesThroughAProjectsOwnPassThroughIds) {
     EXPECT_NE(id, kA);
     EXPECT_NE(id, kB);
   }
+  EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
+}
+
+// A mark join defines its mark (ADR 0041's decision 13), so a clone mints it again and the reads
+// above follow: a clone that kept it would define the original's column a second time wherever
+// the two meet, which ADR 0023's Path 2 makes when it clones an outer side holding a mark.
+TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
+  JoinNode mark = Join(JoinKind::kNullAwareMark);
+  mark.keys = {JoinKey{.left = Column(kB, 1), .right = Column(kE, 1)}};  // at their positions
+  mark.mark = ColumnId{9};
+  const LogicalNodePtr reader =
+      Node(FilterNode{.input = Node(std::move(mark)),
+                      .predicates = {Predicate{.kind = Predicate::Kind::kIsNotNull,
+                                               .column = Column(ColumnId{9}, 3)}},
+                      .span = {}});
+  ASSERT_EQ(PositionMismatch(Plan(reader)), std::nullopt);
+  ColumnId last = MaxColumnId(*reader);
+  const ColumnId before = last;
+  const LogicalNodePtr clone = CloneWithFreshIds(reader, last);
+  EXPECT_EQ(PositionMismatch(Plan(clone)), std::nullopt) << Explain(Plan(clone));
+  const std::vector<ColumnId> cloned = OutputIds(*clone);
+  ASSERT_EQ(cloned.size(), 4U);
+  EXPECT_GT(std::to_underlying(cloned.back()), std::to_underlying(before)) << "not a fresh mark";
   EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
 }
 

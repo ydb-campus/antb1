@@ -1002,6 +1002,11 @@ docs/sql-subset.md sections it changes.
     shares is hoisted rather than made a mark. SQ7 also answers NOT over NOT IN and NOT NOT over IN, which the J5a
     update leaves at exit 4, and makes an IN of VARCHAR against INTEGER or DATE DuckDB's bind error (exit code 1),
     where it exits 4 today.
+    - Update (2026-11-12, SQ7a): SQ7 is two PRs at the maintainer's request (ADR 0041's SQ7a update). SQ7a builds the
+      mark: IN and NOT IN under OR, NOT and CASE in WHERE, an inner ON and HAVING, and in a `CASE WHEN` of the
+      select items, `ORDER BY`, `GROUP BY` keys and aggregate arguments, with the probe and set J5a takes; `NOT (x
+      NOT IN (q))` and `NOT NOT (x IN (q))` answer as NOT over a mark until SQ7b folds them into J5's conjunct forms.
+      SQ7b adds the quantified aliases, constant and value probes, IN over a set operation and the type bind error.
   - **An aggregate whose arguments are only the enclosing block's columns** is the enclosing block's aggregate,
     anywhere in a subquery. Where the subquery stands in the enclosing WHERE, ON or GROUP BY, DuckDB raises a bind
     error; where it stands in the enclosing HAVING or select list, DuckDB answers it. In the subquery's WHERE it is a

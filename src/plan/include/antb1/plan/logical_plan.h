@@ -512,7 +512,8 @@ struct JoinKey {
 };
 
 // A join of two inputs, its rows and columns as its kind's traits say (join_kind.h): the left
-// input's columns, then the right input's where `outputs_right`; at least one key unless `one_row`,
+// input's columns, then the right input's where `outputs_right`, or its `mark` where
+// `appends_mark`; at least one key unless `one_row`,
 // and none then, or `nested_loop`, which may have none (ADR 0040). A plan may build any kind but a
 // one-row one on its left input (ADR 0026's C2b and
 // C2c); the executor runs that only where `may_build_left`, and the physical planner builds a left
@@ -525,6 +526,9 @@ struct JoinNode {
   // BOOLEAN conjuncts over the left input's columns, then the right input's (their `index`: the
   // position in that concatenation); every one must be true for a match.
   std::vector<ExprPtr> residual;
+  // The column this join defines where its kind `appends_mark` (ADR 0041's decision 13): a
+  // nullable BOOLEAN after the left input's columns; kNoColumnId for every other kind.
+  ColumnId mark = kNoColumnId;
   BuildSide build = BuildSide::kRight;
   // The rows this join outputs, as the join order estimated them (join_order.h's rule 3, which
   // divides by the largest domain of the keys), or std::nullopt where nothing estimated it. The
@@ -563,10 +567,10 @@ struct DependentJoinNode {
   JoinKind kind = JoinKind::kSemi;
   LogicalNodePtr left;
   LogicalNodePtr right;  // reads columns of the left input as free variables
-  // A column this node defines that neither input has: a mark join's three-valued marker. No kind
-  // defines one yet, so every bound plan leaves it unset; OutputIds and ResolvePositions honour it
-  // so that adding the mark kind needs a kind and this field on JoinNode, not a second rewrite of
-  // either (ADR 0023, "One output-id contract for two shapes").
+  // A column this node defines that neither input has: a mark join's three-valued marker, as
+  // JoinNode::mark is for the uncorrelated kNullAwareMark (ADR 0041's SQ7). No dependent kind
+  // defines one yet (SQ8 and SQ12), so every bound plan leaves it unset (ADR 0023, "One output-id
+  // contract for two shapes").
   ColumnId mark = kNoColumnId;
   SourceSpan span;  // the subquery in the query
 };

@@ -21,9 +21,12 @@ enum class JoinKind : std::uint8_t {
   kOneRow,         // each left row with the right input's single row (no keys)
   kFull,           // every match, each left row without one padded with NULLs, and each right row
                    // without one padded with NULLs (ADR 0037's OJ2)
+  kNullAwareMark,  // each left row once, then its mark (ADR 0041's decisions 12 and 13): TRUE on a
+                   // match; else FALSE when the right is empty, even for a NULL key; else NULL when
+                   // the left key is NULL or the right holds a NULL key; else FALSE
 };
 
-// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW", "FULL".
+// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW", "FULL", "NULL-AWARE MARK".
 std::string_view ToString(JoinKind kind);
 
 // The input a join builds its hash table on; the other is probed.
@@ -59,6 +62,9 @@ struct JoinKindTraits {
   bool residuals = false;
   // The executor can build on the left input (ADR 0026's C2b and C2c) as well as the right one.
   bool may_build_left = false;
+  // Each left row comes out exactly once, its columns followed by one BOOLEAN column, its mark
+  // (ADR 0041's decisions 12 and 13); no right column is output.
+  bool appends_mark = false;
 };
 
 // The row of `kind` in the table above. An exhaustive switch: a new kind does not compile without
@@ -90,6 +96,8 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
               .pads_left = true,
               .nested_loop = true,
               .residuals = true};
+    case JoinKind::kNullAwareMark:
+      return {.null_aware = true, .appends_mark = true};
   }
   return {};
 }
@@ -109,6 +117,9 @@ constexpr bool OutputsMatchesOnly(JoinKind kind) {
 // FULL join outputs at most that.
 constexpr int64_t PaddedJoinRows(JoinKind kind, int64_t matches, int64_t left, int64_t right) {
   const JoinKindTraits traits = Traits(kind);
+  if (traits.appends_mark) {
+    return left;  // each left row exactly once, whatever matches
+  }
   if (traits.pads_left && traits.pads_right) {
     int64_t sum = 0;
     if (__builtin_add_overflow(matches, left, &sum) || __builtin_add_overflow(sum, right, &sum)) {
@@ -164,9 +175,13 @@ constexpr bool EmitsUnmatchedBuildRows(JoinKind kind, BuildSide side) {
 
 // Whether a join of `kind` whose build input holds no row outputs no row, whatever the other input
 // holds: every output row needs a matched left row and no right row is padded. True for inner and
-// semi joins; an anti join over no row keeps every left row, and a padding join pads.
+// semi joins; an anti join over no row keeps every left row, a padding join pads, and a mark join
+// marks every left row.
 constexpr bool EmptyBuildEmptiesJoin(JoinKind kind) {
   const JoinKindTraits traits = Traits(kind);
+  if (traits.appends_mark) {
+    return false;
+  }
   return traits.drops_unmatched_left && !traits.pads_left;
 }
 
@@ -175,11 +190,12 @@ constexpr bool EmptyBuildEmptiesJoin(JoinKind kind) {
 // filters, D1, D2 and D5): a left probe (a right build) whose kind drops its unmatched rows, or a
 // right probe (a left build) whose unmatched rows are not padded, since a right row comes out of
 // every kind only as part of a match or not at all. A null-aware or one-row join never takes such a
-// filter: its keys do not decide alone. (A nested loop without keys has none to filter by either,
-// which the filters' own rules check: they need a key.)
+// filter: its keys do not decide alone; nor does a mark join, which outputs every left row. (A
+// nested loop without keys has none to filter by either, which the filters' own rules check: they
+// need a key.)
 constexpr bool ProbeDropsUnmatchedRows(JoinKind kind, BuildSide build) {
   const JoinKindTraits traits = Traits(kind);
-  if (traits.null_aware || traits.one_row) {
+  if (traits.appends_mark || traits.null_aware || traits.one_row) {
     return false;
   }
   return build == BuildSide::kRight ? traits.drops_unmatched_left : !traits.pads_left;

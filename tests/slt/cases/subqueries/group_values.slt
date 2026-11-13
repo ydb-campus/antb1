@@ -2923,11 +2923,9 @@ SMALLINT
 4
 5
 
-# ---- DuckDB only until SQ7 gets a PR (ADR 0041: IN (subquery) as a value exits 4) ----
+# ---- IN subqueries in a CASE WHEN (ADR 0041's SQ7a; more in in_marks.slt) ----
 
 # IN of a subquery in a CASE WHEN: in a select item, and in an aggregate's argument.
-
-onlyif duckdb
 query II nosort
 SELECT ct_id, CASE WHEN ct_id IN (SELECT zn_city FROM zones WHERE zn_city < 3) THEN 1 ELSE 0 END AS v FROM cities ORDER BY ct_id
 ----
@@ -2939,7 +2937,6 @@ SMALLINT	INTEGER
 5	0
 6	0
 
-onlyif duckdb
 query II nosort
 SELECT zn_city, SUM(CASE WHEN zn_id IN (SELECT ct_id FROM cities) THEN 1 ELSE 0 END) AS n FROM zones GROUP BY zn_city ORDER BY zn_city
 ----
