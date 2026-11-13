@@ -1099,6 +1099,51 @@ a `Compute`.
   answer equal to DuckDB's, a reworded refusal, or a stacked plan gaining its upper restriction with its answers
   unchanged. Of the TPC-derived plans, only Q41's changed.
 
+## Update (2026-11-13, SQ5a): correlated values in conditions, built
+
+SQ5 splits at the maintainer's request: SQ5a answers correlated values in conditions and completes Q6, and the ratchet
+goes from 81 to 82; SQ5b answers them in select items, ORDER BY, GROUP BY keys and aggregate arguments.
+
+- **Decision 20, amended.** With a value anywhere in a condition, other nodes stand between its join back and the
+  condition that rejects its empty value. The proof's walk from the dependent join's parent now passes, besides a
+  Compute, a Filter none of whose conjuncts decides and a join reached from its left input that pads no left row
+  (inner, LEFT, semi, anti, null-aware anti, one-row, mark); it is INNER at the first Filter that rejects the empty
+  value, and LEFT at any other node. Each node passed decides each of its rows by that row alone and keeps its
+  columns, so the rows of a binding without a group all reach that Filter and fail there. The walker records the input
+  of each node it came up from (`Ancestor`), so a join's inputs are told apart without comparing pointers. No verdict
+  of a shape answered before changed.
+- **Decisions 8 to 10 for a correlated value, as built.**
+  - Its block's dependent join is planted in the slot as an uncorrelated value's one-row join is, in any expression of
+    a condition of WHERE or an inner ON: under OR, NOT, CASE, arithmetic, COALESCE, BETWEEN, an IN list or a function,
+    as an IN or mark probe, and two different correlated subqueries compared, the first a value below the second's
+    join, in the order written.
+  - The memo is keyed by binding. A correlated text binds to the same ids wherever the same FROM items are visible, so
+    a second occurrence there is the remembered value without binding again; an occurrence where fewer are visible (an
+    inner ON against WHERE) binds again, for its own bind errors (an ambiguous name, which a memo keyed by text would
+    hide), and is matched by the ids it reads. That comparison is defensive: a name an inner ON cannot see resolves
+    further out, which is refused, so today the ids always agree.
+  - A direct comparison operand records its value too (the maintainer's choice), and the same text on both sides of
+    one goes to the general path: one join per value and slot.
+  - A place's refusals (a padded unit's left input, a conjunct that reads an enclosing block, EXISTS) come before the
+    memo, so a value remembered from another conjunct carries no conjunct past them.
+- **What stays exit 4.** A select item, ORDER BY, a GROUP BY key and an aggregate's argument, with a message of their
+  own until SQ5b; a correlated subquery in a conjunct that also reads an enclosing block, whose records are `pending
+  SQ8` (the maintainer's choice); and every boundary the plan lists (SQ13, decision 3, constant aggregate arguments).
+  A shape the unnesting refuses now reports its own message where the binder's direct-operand one stood, and a bind
+  error that a correlated value under OR hid now comes first, at exit 1, as in DuckDB.
+- **Divergences (the maintainer accepted them).** D24: over an inner join back antb1 never computes the value over no
+  rows, so an earlier condition whose operand fails only there, and an operand of the deciding condition that reads no
+  value and fails for an outer row without a group, fail DuckDB alone. D16 and D35 name correlated values with
+  uncorrelated ones.
+- **Decision 28.** `correlated_values.slt` holds 204 records written as pending before the code (98 SQ5a, 97 SQ5b, 7
+  SQ13, 2 SQ8); SQ5a answers its 98 and `conditions.slt`'s four, and pins D24's members with each engine's outcome.
+  Of eight mutations, seven fail named tests; the survivor drops the defensive comparison above. The SQ0 guard showed
+  only refusals turned into answers equal to DuckDB's and reworded refusals; of the TPC-derived plans, only Q6's
+  changed.
+- **Follow-ups, outside SQ5.** The semi-join reduction above a nested value (`ReadsAJoinOrUnion` counts no dependent
+  join, so D5's exception applies where D5 cannot reach); a join whose key reads a value NULL over no rows counted as
+  deciding; constant folding in the proof.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

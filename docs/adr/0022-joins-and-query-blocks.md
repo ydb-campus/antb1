@@ -489,6 +489,8 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     - Update (2026-11-13, ADR 0041's SQ6): a correlated scalar subquery (ADR 0023) gets the same values over no rows:
       COUNT's 0 reaches an outer row with no group through a LEFT join back, and so does any select item and a HAVING
       inside it.
+    - Update (2026-11-13, ADR 0041's SQ5a): and it stands, as a value, wherever an uncorrelated one may in a condition
+      of WHERE or an inner ON, not only as a direct operand of a top-level comparison.
     - Update (2026-10-09, E2a): a one-row join's build is keyless (`exec::JoinBuildSpec::Keyless`). It must hold
       exactly one row: any other count is `Invalid` from its `Prepare`, before any probe part runs, a planner bug
       that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than
