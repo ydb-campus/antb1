@@ -58,12 +58,15 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   `ON` has no equality key between its own two inputs is a nested loop too,
   padding the rows no pair passes (ADR 0040's OJ4c).
   A derived table and a `WITH` list are answered too, each bound as a sub-plan of its own. Of the subquery forms in
-  an expression, `x [NOT] IN (query)` and `NOT (x IN (query))` are answered as a top-level `AND` conjunct of `WHERE`,
-  of an inner join's `ON` or of `HAVING`, where `x` is an operand (a column, or an expression over one; in `HAVING`,
-  an aggregate too) and the query has exactly one column; an `IN` key needs a type that holds both sides (so no
-  `DOUBLE`). The same `x [NOT] IN (query)`, with the same `x` and query, that reads no enclosing block is a condition
+  an expression, `x [NOT] IN (query)` -- also written `x = ANY (query)` or `x = SOME (query)`, and `x <> ALL (query)`
+  or `x != ALL (query)` for `NOT IN` -- is answered as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON`
+  or of `HAVING`, under any number of `NOT`s, where `x` is an operand (a column, an aggregate, a literal, or an
+  expression over them or over a subquery's value; a string literal takes a `DATE` set's type, as in DuckDB) and the
+  query has exactly one column, a set operation of arms that read no enclosing block included (ADR 0041's SQ7b); an
+  `IN` key needs a type that holds both sides (so no `DOUBLE`), and a `VARCHAR` or a `DATE` against another type is
+  DuckDB's bind error (exit code 1). The same `x [NOT] IN (query)` that reads no enclosing block is a condition
   anywhere inside a condition of `WHERE`, of an inner `ON` (one inside a `FULL JOIN`'s left input too) or of `HAVING`
-  -- under `OR`, `NOT` and `CASE WHEN`, `NOT (x NOT IN (query))` and `NOT NOT (x IN (query))` among them -- and in a
+  -- under `OR`, `NOT` and `CASE WHEN` -- and in a
   `CASE WHEN` of a select item, an `ORDER BY` item, a `GROUP BY` key or an aggregate's argument (ADR 0041's SQ7a): a
   null-aware mark join gives each row TRUE where `x` is in the set, FALSE where the set is empty (even for a NULL `x`),
   else NULL where `x` is NULL or the set holds a NULL, else FALSE, and `NOT IN` is `NOT` over it. One probe and set
@@ -85,9 +88,9 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   computed (divergence D32). A correlated scalar subquery must be a direct operand of a top-level comparison of
   `WHERE` or of an inner `ON`, and an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of
   which could leave no row. Every other placement exits 4, an `IN` subquery outside a condition (a BOOLEAN value,
-  `SELECT x IN (query)` or `(x IN (query)) IS NULL`), one whose `x` reads no column or holds a value (`2 IN (query)`,
-  `x + (query) IN (query)`), reads an enclosing block or is correlated, `= ANY`, `= SOME` and `<> ALL` (ADR 0041's
-  SQ7b) and every other quantified comparison, a value written inside a `ROLLUP`, `CUBE` or `GROUPING SETS` element
+  `SELECT x IN (query)` or `(x IN (query)) IS NULL`), one whose `x` is the `NULL` literal, reads an enclosing block or
+  is correlated, every quantified comparison but `= ANY`, `= SOME` and `<> ALL` over a query (`< ANY`, `= ALL`), a
+  value written inside a `ROLLUP`, `CUBE` or `GROUPING SETS` element
   (a plain key next to
   them, and an alias or a position of a value item inside them, are answered), as an aggregate's whole argument or in
   one of values and literals alone (`SUM((query))`, until constant aggregate arguments), over the aggregate of a
@@ -252,8 +255,8 @@ and `OFFSET` -- the outermost compound's, or a parenthesized one's -- are unsupp
 them, after any construct in its branches that is unsupported anyway, until ADR 0036's X5; a parenthesized block's own
 are answered. A compound as the query of a scalar or `EXISTS` subquery is answered where no arm reads an enclosing
 block (X6, [ADR 0041](adr/0041-subqueries-and-decorrelation.md)'s SQ4a); one with such an arm is unsupported at the
-subquery's `EXISTS` or `(`, until SQ15, and so is a compound as the query of an `IN` subquery, at its `IN` once the
-other side of its conjunct is checked, until SQ7b. A compound in the FROM list of a subquery's query is answered. A
+subquery's `EXISTS` or `(`, until SQ15; so is a compound as the query of an `IN` subquery, which is answered where
+no arm reads an enclosing block (SQ7b). A compound in the FROM list of a subquery's query is answered. A
 compound in a CTE that nothing references is never checked or bound, tail included, as no such CTE is.
 
 Lexical rules: an `identifier` is a letter or `_` followed by letters, digits or `_`, or any text in double quotes
@@ -1713,7 +1716,7 @@ compare against DuckDB, so an unregistered difference is a bug.
 | --- | --- | --- | --- | --- |
 | D1 | Files with different schemas | a table (or a `FROM '<glob>'`) whose files have different Parquet schemas is an I/O error, exit code 3: `schema of '<file>' differs from '<first file>'` | `read_parquet` over the same files reads them and answers | an `onlyif antb1` record in `tests/slt/cases/basic/errors.slt`; `integration.ParquetErrors.*` (mismatched and mixed schemas); the CLI golden `io_schema_mismatch`; every table in `tests/slt/tables.txt` has a single schema |
 | D2 | Column-type overrides | `--clickbench` and `--column-type COL=DATE` apply to every table with that column, including tables opened with `FROM '<path>'` | the oracle applies `make_date(EventDate)` only to the named tables with the `clickbench` option in `tests/slt/tables.txt`; `FROM '<path>'` reads the raw integers | the runner rejects a table list where some tables with an `EventDate` column have the option and others do not; the random generator reads no overridden column in a query with a `FROM '<path>'` item, a join's included; `.slt` records read `EventDate` only through table names |
-| D3 | Literal types | a string literal compared with a numeric or DECIMAL column is a bind error | casts the string to the column's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt`; the query generator writes numbers for numeric and DECIMAL columns |
+| D3 | Literal types | a string literal compared with a numeric or DECIMAL column is a bind error, and so is one as the probe of an `IN` subquery over numbers or DECIMALs (`'1' IN (SELECT i FROM t)`, ADR 0041's SQ7b) | casts the string to the column's or the set's type | `onlyif antb1` records in `tests/slt/cases/basic/bind_errors.slt` and `tests/slt/cases/subqueries/in_forms.slt`; the query generator writes numbers for numeric and DECIMAL columns and sets |
 | D4 | Literal types | a number or a `DATE` literal (also written as a cast) compared with a VARCHAR column is a bind error, and so is a number (a DECIMAL too) compared with a VARCHAR, DATE or TIMESTAMP operand that is no literal | casts the column's values at run time (a conversion error unless every value converts); with `=`, `<>` and `IN` it casts a VARCHAR operand to the number, and a number against a DATE or TIMESTAMP operand fails only when a row is compared | as D3, and in `tests/slt/cases/where/cast_date.slt`; `plan.Expressions/BindErrorTest` pins the operand errors (`h = s`, `h = dt`, `h = toDateTime(i64)`); the generator writes strings for VARCHAR columns and compares a DECIMAL column only with columns of numbers |
 | D5 | Date and timestamp literals | a date must be written exactly `YYYY-MM-DD` (also in a cast to DATE), a timestamp exactly as in the literal table (two-digit fields, one space or `T`, hours 00 to 23) | also accepts `2013-7-1`, surrounding spaces and a time of day for a DATE, and single-digit fields, spaces and `24:00:00` for a TIMESTAMP | as D4; the generator writes `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` |
 | D7 | DOUBLE literals and BIGINT | a number that DuckDB types as DOUBLE (an exponent, or a decimal of more than 38 digits) is rounded to the nearest double like in DuckDB, then compared exactly with the integer column; in an `IN` list with such a number every value is rounded to the nearest double, a decimal literal too, and an integer outside -2^127 to 2^128 - 1 does not make the list DOUBLE | converts BIGINT (and HUGEINT) values to DOUBLE for the comparison, so values beyond 2^53 compare rounded: `i64 >= 9223372036854775808e0` holds for `9223372036854775807`; in a DOUBLE `IN` list a decimal literal converts as its DECIMAL (`9007199254740993.5` becomes 2^53), and an integer outside -2^127 to 2^128 - 1 is DOUBLE as well | the `.slt` records with such literals avoid BIGINT values beyond 2^53 (`tests/slt/cases/where/folding.slt`); `plan.ApproximateNumbers/FoldThroughBinderTest.*` and `plan.BinderTest.In` pin antb1's folding; the generator writes no exponents for integer columns |

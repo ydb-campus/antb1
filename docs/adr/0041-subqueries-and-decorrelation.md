@@ -975,6 +975,31 @@ type bind error). SQ7a completes Q45: the ratchet is at 80. No other TPC-H or TP
   threads) and 0.16 s in the Debug build, and it peaks at 8.1 MB; shard 6 of 8, which holds it, takes 43 s under
   AddressSanitizer here, far inside the 870-second inner timeout.
 
+## Update (2026-11-13, SQ7b): the IN forms, built
+
+SQ7's second PR. With it SQ7 is built; no query completes, the ratchet stays at 80, and no TPC-H or TPC-DS plan
+changes.
+
+- **Decision 14's forms, as built.** The parser reads `= ANY` and `= SOME` over a subquery as IN and `<> ALL` and
+  `!= ALL` as NOT IN, the node's operator spanning the comparison and the quantifier; every other quantified
+  comparison, and a quantifier over anything but a query, is unsupported at the quantifier (decision 3). A top-level
+  conjunct peels any number of NOTs over an IN and folds their parity with the IN's own, exact in three-valued logic, so
+  `NOT (x NOT IN q)` and `NOT NOT (x IN q)` are semi joins; EXISTS keeps one NOT (a NOT NOT EXISTS is a value).
+- **Probes.** An IN's probe is any operand a condition with values takes: a constant, which is a key computed in the
+  join's own layer (a semi join with a constant key stays above the block's joins), or an expression holding a
+  subquery's value, planted below the IN's join. A string literal against a DATE or TIMESTAMP set is parsed into that
+  type, as a comparison parses it; against a number set it is D3's bind error, as in a comparison. A NULL literal
+  probe stays exit 4.
+- **Sets (ADR 0036's X6).** The set may be a set operation whose arms read no enclosing block, bound as a scalar's and
+  an EXISTS's are since SQ4a, its column of the arms' unified type; a correlated arm stays SQ15's, and a compound's own
+  ORDER BY, LIMIT or OFFSET X5's.
+- **Decision 23's SQ7 row.** A VARCHAR or a DATE against a value of another type family is DuckDB's bind error (exit
+  1), checked where the IN's key is typed (`InKeyType`, shared by the semi, anti and mark joins), so also under a
+  dropped OR branch; a DATE against a TIMESTAMP, which DuckDB answers, stays a refusal.
+- **Decision 28.** `tests/slt/cases/subqueries/in_forms.slt` holds 292 records, written first under `pending SQ7b` and
+  checked against DuckDB, with D3's pin; the guards of `conditions.slt`, `setops/errors.slt` and `in_marks.slt` that
+  SQ7b answers are lifted.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

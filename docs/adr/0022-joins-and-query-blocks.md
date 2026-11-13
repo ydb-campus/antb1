@@ -1007,6 +1007,9 @@ docs/sql-subset.md sections it changes.
       select items, `ORDER BY`, `GROUP BY` keys and aggregate arguments, with the probe and set J5a takes; `NOT (x
       NOT IN (q))` and `NOT NOT (x IN (q))` answer as NOT over a mark until SQ7b folds them into J5's conjunct forms.
       SQ7b adds the quantified aliases, constant and value probes, IN over a set operation and the type bind error.
+    - Update (2026-11-13, SQ7b): built (ADR 0041's SQ7b update). J5's conjunct forms now take any number of NOTs,
+      whose parity folds with the IN's, a probe of any operand (a constant, a subquery's value) and a set operation as
+      the set; `= ANY`, `= SOME`, `<> ALL` and `!= ALL` parse as IN and NOT IN.
   - **An aggregate whose arguments are only the enclosing block's columns** is the enclosing block's aggregate,
     anywhere in a subquery. Where the subquery stands in the enclosing WHERE, ON or GROUP BY, DuckDB raises a bind
     error; where it stands in the enclosing HAVING or select list, DuckDB answers it. In the subquery's WHERE it is a
