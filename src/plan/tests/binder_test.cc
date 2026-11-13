@@ -929,13 +929,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "ORDER BY 1", "ORDER BY on a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT md5(s) FROM t ORDER BY 1", kUnsupported,
                   "md5", "function md5() is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION ALL SELECT i16 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 NOT IN (SELECT i16 FROM u UNION ALL SELECT i16 "
-                  "FROM t)",
-                  kUnsupported, "NOT IN", "a subquery over a UNION ALL is not supported"},
-        // A scalar's or an EXISTS's UNION ALL is answered where no arm reads an enclosing column
-        // (ADR 0041's SQ4a); a correlated arm is SQ15's, refused at the subquery.
+        // A scalar's, an EXISTS's and an IN's UNION ALL is answered where no arm reads an enclosing
+        // column (ADR 0041's SQ4a and SQ7b); a correlated arm is SQ15's, refused at the subquery.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u WHERE u.i32 = t.i32 UNION ALL "
+                  "SELECT i16 FROM t)",
+                  kUnsupported, "IN", "a correlated subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 > (SELECT MAX(i16) FROM u WHERE u.i32 = t.i32 UNION "
                   "ALL SELECT MAX(i16) FROM t)",
                   kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
@@ -950,22 +948,19 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING COUNT(*) > (SELECT MAX(i16) FROM u WHERE "
                   "u.i16 = t.i16 UNION ALL SELECT MAX(i16) FROM t)",
                   kUnsupported, "(", "a correlated subquery over a UNION ALL is not supported"},
-        ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND t.i32 IN (SELECT i32 FROM u "
-                  "UNION ALL SELECT i32 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE md5(s) IN (SELECT s FROM u UNION ALL SELECT s FROM t)",
                   kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT md5(s) FROM u UNION ALL SELECT s FROM "
                   "t)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+                  kUnsupported, "md5", "function md5() is not supported"},
         ErrorCase{"WITH c AS (SELECT a FROM nope UNION ALL SELECT b FROM nada ORDER BY 1) SELECT x "
                   "FROM missing",
                   kBind, "missing", "table 'missing' does not exist"}));
 
 // Every set operator is answered (ADR 0039's X4b to X4d); what stays refused is a compound's own
 // tail, which X5 keeps at any depth -- a parenthesized compound's own tail too (ADR 0039's X4a
-// update) -- an IN over a compound (X6, answered with ADR 0041's SQ7) and a scalar's or an EXISTS's
-// compound with a correlated arm (SQ15). Each names the compound by its root operator.
+// update) -- inside an IN's set too -- and a compound with a correlated arm under a scalar, an
+// EXISTS or an IN (SQ15). Each names the compound by its root operator.
 INSTANTIATE_TEST_SUITE_P(
     SetOperatorRefusals, BindErrorTest,
     ::testing::Values(
@@ -975,16 +970,18 @@ INSTANTIATE_TEST_SUITE_P(
                   "LIMIT 2", "LIMIT on a UNION is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION SELECT i16 FROM u UNION ALL SELECT i16 FROM t OFFSET 1",
                   kUnsupported, "OFFSET 1", "OFFSET on a UNION ALL is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t)",
-                  kUnsupported, "IN", "a subquery over a UNION is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i16 FROM t ORDER "
+                  "BY 1)",
+                  kUnsupported, "ORDER BY 1", "ORDER BY on a UNION is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM u WHERE u.i16 = t.i16 EXCEPT "
                   "SELECT i16 FROM t)",
                   kUnsupported, "EXISTS", "a correlated subquery over an EXCEPT is not supported"},
         ErrorCase{"SELECT i16 FROM t INTERSECT SELECT i16 FROM u LIMIT 1", kUnsupported, "LIMIT 1",
                   "LIMIT on an INTERSECT is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u INTERSECT ALL SELECT i16 "
-                  "FROM t)",
-                  kUnsupported, "IN", "a subquery over an INTERSECT ALL is not supported"},
+                  "FROM ok WHERE ok.i16 = t.i32)",
+                  kUnsupported, "IN",
+                  "a correlated subquery over an INTERSECT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t EXCEPT ALL SELECT i16 FROM u OFFSET 3", kUnsupported,
                   "OFFSET 3", "OFFSET on an EXCEPT ALL is not supported"},
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u EXCEPT SELECT i16 FROM t "
@@ -1235,8 +1232,24 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN (subquery) over a DOUBLE is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE h IN (SELECT z FROM dec)", kUnsupported, "IN",
                   "IN (subquery) of DECIMAL(38,0) and DECIMAL(38,10) is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE s IN (SELECT dt FROM u)", kUnsupported, "IN",
-                  "IN (subquery) of VARCHAR and DATE is not supported"},
+        // DuckDB's bind error for a VARCHAR or a DATE against another family (ADR 0041's SQ7b).
+        ErrorCase{"SELECT i16 FROM t WHERE s IN (SELECT dt FROM u)", kBind, "IN",
+                  "cannot compare values of type VARCHAR and DATE in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 0 OR dt NOT IN (SELECT i32 FROM u)", kBind,
+                  "NOT IN", "cannot compare values of type DATE and INTEGER in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = ANY (SELECT s FROM u)", kBind, "= ANY",
+                  "cannot compare values of type INTEGER and VARCHAR in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT date_trunc('month', dt) FROM u)", kBind,
+                  "IN", "cannot compare values of type INTEGER and TIMESTAMP in IN (subquery)"},
+        // A DATE against a TIMESTAMP, which DuckDB answers, has no join key yet.
+        ErrorCase{"SELECT i16 FROM t WHERE dt IN (SELECT date_trunc('month', dt) FROM u)",
+                  kUnsupported, "IN", "IN (subquery) of DATE and TIMESTAMP is not supported"},
+        // Under an OR branch that OR factoring drops: bound for its errors, the type's among them.
+        ErrorCase{"SELECT i16 FROM t WHERE (i16 = 2 AND dt IN (SELECT i32 FROM u)) OR i16 = 2",
+                  kBind, "IN", "cannot compare values of type DATE and INTEGER in IN (subquery)"},
+        // A string literal probe against a number set is divergence D3's bind error.
+        ErrorCase{"SELECT i16 FROM t WHERE '1' IN (SELECT i32 FROM u)", kBind, "'1'",
+                  "cannot compare the INTEGER values of an IN subquery with a string"},
         // One column, as in DuckDB, which reports a bind error for two.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16, i32 FROM u)", kBind, "IN",
                   "a subquery of IN must have one column, not 2"},
@@ -1448,13 +1461,10 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i64 IN (1.5e0, (SELECT MIN(i64) FROM u))", kUnsupported,
                   "IN", "IN of a DOUBLE value and a BIGINT"},
         // Under an OR, NOT or CASE an IN is a mark (ADR 0041's SQ7a), with a top-level IN's
-        // probe and set: a probe that reads no column, a set operation and a correlated set wait
-        // for SQ7b and SQ8; a DOUBLE key has no join.
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR 2 IN (SELECT i16 FROM u)", kUnsupported, "2",
-                  "IN needs a column on the left"},
-        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u UNION ALL "
-                  "SELECT i16 FROM ok)",
-                  kUnsupported, "IN", "a subquery over a UNION ALL is not supported"},
+        // probe and set: a NULL literal probe, a correlated set (SQ8, SQ12) and a DOUBLE key stay
+        // refused.
+        ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR NULL IN (SELECT i16 FROM u)", kUnsupported,
+                  "NULL", "NULL literals are not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT u.i16 FROM u WHERE u.i64 = "
                   "t.i64)",
                   kUnsupported, "IN", "a correlated subquery of IN is not supported"},
@@ -1495,8 +1505,9 @@ INSTANTIATE_TEST_SUITE_P(
         // assume away, which is an abort rather than an error.
         ErrorCase{"SELECT i16 FROM t WHERE TRY_CAST(i32 AS BIGINT) IN (SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM u) IN (SELECT i16 FROM u)",
-                  kUnsupported, "(", "a scalar subquery is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) IN "
+                  "(SELECT i16 FROM ok)",
+                  kUnsupported, "(", "a correlated scalar subquery"},
         ErrorCase{"SELECT i16 FROM t GROUP BY i16 HAVING TRY_CAST(COUNT(*) AS BIGINT) IN "
                   "(SELECT i16 FROM u)",
                   kUnsupported, "TRY_CAST", "TRY_CAST is not supported"},
@@ -1534,11 +1545,11 @@ INSTANTIATE_TEST_SUITE_P(
                   "FROM t",
                   kUnsupported, "EXISTS", "a correlated EXISTS"},
         // An IN subquery outside a condition, a BOOLEAN value (ADR 0041's decision 3); in a CASE
-        // WHEN it is a mark, whose probe reads a column (SQ7b takes the others).
+        // WHEN it is a mark, of any probe but a NULL literal.
         ErrorCase{"SELECT i16 IN (SELECT i16 FROM u) FROM t", kUnsupported, "IN",
                   "IN (subquery) is not supported"},
-        ErrorCase{"SELECT CASE WHEN 1 IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
-                  kUnsupported, "1", "IN needs a column or an aggregate on the left"},
+        ErrorCase{"SELECT CASE WHEN NULL IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
+                  kUnsupported, "NULL", "NULL literals are not supported"},
         // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
         // not look (SQ5).
         ErrorCase{
@@ -8144,11 +8155,11 @@ std::size_t CountOf(std::string_view text, std::string_view what) {
 TEST(BinderTest, InMarkPlacements) {
   const Catalog catalog = MakeCatalog();
   for (const char* sql : {
-           // WHERE, under OR, NOT, CASE, and NOT over NOT IN.
+           // WHERE, under OR, NOT and CASE (NOTs over the whole conjunct fold into a semi or anti
+           // join instead: NotsOverAnInConjunctFoldIntoItsKind).
            "SELECT i16 FROM t WHERE i16 < 10 OR i32 IN (SELECT i16 FROM u)",
            "SELECT i16 FROM t WHERE i16 < 10 OR i32 NOT IN (SELECT i16 FROM u)",
-           "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))",
-           "SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))",
+           "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u) AND i16 < 0)",
            "SELECT i16 FROM t WHERE CASE WHEN i32 + 1 IN (SELECT i64 FROM u) THEN 1 ELSE 0 END = 0",
            // An inner ON, inside a FULL JOIN's left input too, and a keyless one.
            "SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND (t.i32 IN (SELECT i16 FROM ok) OR "
@@ -8299,6 +8310,109 @@ TEST(BinderTest, ASharedInUnderOrIsASemiJoin) {
   auto error = BindSql(kDropped, catalog);
   ASSERT_FALSE(error.ok());
   EXPECT_EQ(SpanText(kDropped, error.status()), "nope");
+}
+
+// NOTs over a top-level IN conjunct fold into its parity (ADR 0041's SQ7b): an even number keeps
+// the IN a semi join, an odd one makes NOT IN a semi join and IN a null-aware anti join, in WHERE,
+// an inner ON and HAVING -- no mark, which a NOT NOT over EXISTS still is.
+TEST(BinderTest, NotsOverAnInConjunctFoldIntoItsKind) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(*plan);
+  };
+  struct Case {
+    std::string_view sql;
+    std::string_view kind;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t WHERE NOT (i32 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT (i32 IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT NOT (i32 IN (SELECT i16 FROM u))",
+                .kind = "Join NULL-AWARE ANTI"},
+           Case{.sql = "SELECT i16 FROM t WHERE NOT NOT (i32 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join NULL-AWARE ANTI"},
+           Case{.sql = "SELECT t.i16 FROM t JOIN ok ON t.i16 = ok.i16 AND NOT (t.i32 NOT IN "
+                       "(SELECT i16 "
+                       "FROM u))",
+                .kind = "Join SEMI"},
+           Case{.sql = "SELECT i16 FROM t GROUP BY i16 HAVING NOT (i16 NOT IN (SELECT i16 FROM u))",
+                .kind = "Join SEMI"},
+       }) {
+    const std::string text = plan_of(c.sql);
+    EXPECT_NE(text.find(c.kind), std::string::npos) << c.sql << "\n" << text;
+    EXPECT_EQ(text.find("MARK"), std::string::npos) << c.sql << "\n" << text;
+  }
+  EXPECT_NE(plan_of("SELECT i16 FROM t WHERE NOT NOT EXISTS (SELECT 1 FROM u)").find("ONE-ROW"),
+            std::string::npos);
+}
+
+// ADR 0041's SQ7b: an IN's probe is any operand, and its set any query whose arms read no enclosing
+// block. A constant probe is a key computed in the join's own layer, so the semi join stays above
+// the block's joins (no relation's branch holds its key); a string literal against a DATE set is
+// that DATE; a set operation's set is its unified type, the probe widened to it.
+TEST(BinderTest, InProbesAndSetsOfSq7b) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+    return Explain(optimized);
+  };
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE 2 IN (SELECT i16 FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"2\" = \"CAST(i16 AS INTEGER)\"] carries 1 of 2 unread "
+            "above\n"
+            "    Compute 2\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    Compute CAST(i16 AS INTEGER)\n"
+            "      Project i16\n"
+            "        Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE '2027-01-05' IN (SELECT dt FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"'2027-01-05'\" = dt] carries 1 of 2 unread above\n"
+            "    Compute '2027-01-05'\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    Project dt\n"
+            "      Scan table=u source=fake columns=[dt]\n");
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i64 FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"CAST(i16 AS BIGINT)\" = i16] carries 1 of 2 unread "
+            "above\n"
+            "    Compute CAST(i16 AS BIGINT)\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
+            "      Compute CAST(i16 AS BIGINT)\n"
+            "        Project i16\n"
+            "          Scan table=u source=fake columns=[i16]\n"
+            "      Project i64\n"
+            "        Scan table=u source=fake columns=[i64]\n");
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE i16 < 0 OR 2 NOT IN (SELECT i16 FROM u)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM ok) + i16 IN (SELECT i32 FROM u)",
+           "SELECT i16 FROM t WHERE i16 < 0 OR (SELECT MIN(i16) FROM ok) IN (SELECT i32 FROM u)",
+           "SELECT i16 FROM t WHERE i32 = ANY (SELECT i16 FROM u EXCEPT SELECT i16 FROM ok)",
+           "SELECT i16 FROM t WHERE i16 != ALL (SELECT i16 FROM u INTERSECT SELECT i16 FROM ok)",
+           "SELECT i16, CASE WHEN 's' IN (SELECT s FROM u) THEN 1 ELSE 0 END FROM t",
+           "SELECT i16 FROM t GROUP BY i16 HAVING 3 IN (SELECT i16 FROM u) OR COUNT(*) > 1",
+       }) {
+    EXPECT_NE(plan_of(sql), "") << sql;
+  }
 }
 
 // The select list binds before WHERE, and its expressions over aggregates before HAVING, but a mark

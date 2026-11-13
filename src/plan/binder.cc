@@ -930,11 +930,11 @@ struct ReadsColumnOf {
   }
   // A subquery's own block reads its own columns, which are no columns of this one; a correlated
   // reference would be, and ADR 0023's U-series revisits this when it answers one. Its IN operand
-  // belongs to this block, though, and a scalar subquery's or an EXISTS's value is an operand where
-  // `subqueries` (ADR 0041's decision 9: `(q) > 5` is no comparison of two literals, nor is a CASE
-  // over an EXISTS).
+  // belongs to this block, though, and a subquery's value -- a scalar's, an EXISTS's, an IN's mark
+  // -- is an operand where `subqueries` (ADR 0041's decisions 9 and 13: `(q) > 5` is no comparison
+  // of two literals, nor is a CASE over an EXISTS or over `2 IN (q)`).
   bool operator()(const sql::SubqueryExpr& s) const {
-    return (subqueries && s.kind != sql::SubqueryExpr::Kind::kIn) ||
+    return subqueries ||
            (s.operand.has_value() && ReadsColumn(**s.operand, aggregates, subqueries));
   }
 };
@@ -1624,10 +1624,10 @@ std::optional<Rejection> RejectCondition(const sql::Expr& expr, bool having, boo
 }
 
 // One top-level conjunct that is a subquery form the binder answers (ADR 0022's J5): `x IN
-// (query)`, `x NOT IN (query)`, `NOT (x IN (query))` and `x <op> (query)` in either order. The ADR
-// names those spellings and says every other placement exits 4, so `NOT (x NOT IN (query))` and
-// `NOT NOT (x IN (query))` -- which both mean IN, where one NOT means NOT IN -- are no match and
-// keep their refusal rather than risking the rows of the other form.
+// (query)`, `x NOT IN (query)` and `x <op> (query)` in either order, and an IN under any number of
+// NOTs, whose parity it folds with the IN's own (ADR 0041's SQ7b): `NOT (x NOT IN (query))` and
+// `NOT NOT (x IN (query))` are IN, exactly in three-valued logic, since NOT NOT p is p and a
+// conjunct keeps only TRUE. EXISTS takes one NOT: a NOT NOT EXISTS is a mark's (SQ8).
 //
 // Syntactic only, and the single place that decides: CheckConjunct checks exactly what this
 // accepts by the form's own rule (RejectSubqueryConjunct) -- where a condition takes values (ADR
@@ -1660,12 +1660,14 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
     return std::nullopt;
   }
   const sql::Expr* form = &conjunct;
-  bool negated = false;
-  if (const auto* unary = std::get_if<sql::UnaryExpr>(form);
-      unary != nullptr && unary->op == sql::UnaryOp::kNot) {
-    form = &*unary->operand;  // one NOT only: NOT NOT (x IN (query)) is no match
-    negated = true;
+  int nots = 0;
+  for (const auto* unary = std::get_if<sql::UnaryExpr>(form);
+       unary != nullptr && unary->op == sql::UnaryOp::kNot;
+       unary = std::get_if<sql::UnaryExpr>(form)) {
+    form = &*unary->operand;
+    ++nots;
   }
+  const bool negated = nots % 2 == 1;
   const auto* subquery = std::get_if<sql::SubqueryExpr>(form);
   if (subquery == nullptr) {
     return std::nullopt;
@@ -1673,18 +1675,18 @@ std::optional<SubqueryConjunct> AsSubqueryConjunct(const sql::Expr& conjunct) {
   if (subquery->kind == sql::SubqueryExpr::Kind::kExists) {
     // The conjunct is the subquery itself, so there is no other side; the parser writes NOT EXISTS
     // as a kExists node with `negated`, and a written NOT over it negates again.
+    if (nots > 1) {
+      return std::nullopt;
+    }
     return SubqueryConjunct{
         .subquery = subquery, .other = nullptr, .negated = negated != subquery->negated};
   }
   if (subquery->kind != sql::SubqueryExpr::Kind::kIn) {
     return std::nullopt;
   }
-  if (negated && subquery->negated) {
-    return std::nullopt;  // NOT (x NOT IN (query)) means IN, which the ADR does not name
-  }
   ANTB1_CHECK(subquery->operand.has_value());  // the parser writes no kIn node without one
   return SubqueryConjunct{
-      .subquery = subquery, .other = &**subquery->operand, .negated = negated || subquery->negated};
+      .subquery = subquery, .other = &**subquery->operand, .negated = negated != subquery->negated};
 }
 
 // A comparison of two scalar subqueries, each a direct operand: `(q1) <op> (q2)` (ADR 0041's SQ1).
@@ -1723,41 +1725,18 @@ std::string CompoundName(const sql::SelectStatement& compound) {
   return (tree.op == sql::SetOp::kUnion ? "a " : "an ") + SetOperatorName(tree.op, tree.all);
 }
 
-// A compound as the query of an IN subquery, which ADR 0036's X6 answers with ADR 0041's SQ7 (a
-// scalar's and an EXISTS's are answered since SQ4a): at the subquery's operator, as every shape of
-// a subquery is refused, and before any check that reads a block's clauses, which a compound keeps
-// in its blocks.
-std::optional<Rejection> RejectCompoundSubquery(const SubqueryConjunct& form) {
-  if (form.subquery->query->set_operation.empty()) {
-    return std::nullopt;
-  }
-  return Rejection{.span = form.subquery->op_span,
-                   .message = std::format("a subquery over {} is not supported",
-                                          CompoundName(*form.subquery->query))};
-}
-
 // Why an accepted shape is still not answered, or std::nullopt when it is, as far as the shape
 // alone tells: what depends on whether the subquery reads an enclosing block is checked once its
 // block is bound (Binder::BindSubqueryBlock, and GateCorrelatedExists for an EXISTS block).
 //
-// The IN form's probe is checked exactly as the left-hand side of an IN list is -- a construct that
-// is unsupported anywhere comes first, a nested subquery among them, then its kind -- so
-// `x IN (query)` and `x IN (1, 2)` take the same left-hand sides; an aggregate counts as reading a
-// column, in a WHERE too, where the parser admits one only inside a subquery in HAVING and the
-// binder judges it (ADR 0041's decision 23). A set operation as the query is refused until SQ7
-// (RejectCompoundSubquery). CheckConjunct passes IN forms alone: a scalar or EXISTS form is a
-// condition with values like any other.
+// The IN form's probe is any operand a condition with values takes (ADR 0041's SQ7b): a column, an
+// aggregate, a constant, or an expression holding a subquery's value; a construct that is
+// unsupported anywhere is refused first. Its query may be a set operation whose arms read no
+// enclosing block (ADR 0036's X6), which BindSubqueryBlock checks once bound. CheckConjunct passes
+// IN forms alone: a scalar or EXISTS form is a condition with values like any other.
 std::optional<Rejection> RejectSubqueryConjunct(const SubqueryConjunct& form, bool having) {
   ANTB1_CHECK(form.subquery->kind == sql::SubqueryExpr::Kind::kIn);
-  if (auto r = FirstUnsupported(*form.other)) {
-    return r;
-  }
-  if (!ReadsColumn(*form.other, /*aggregates=*/true)) {
-    return Rejection{.span = form.other->span(),
-                     .message = std::format("IN needs {} on the left",
-                                            having ? "a column or an aggregate" : "a column")};
-  }
-  return RejectCompoundSubquery(form);
+  return FirstUnsupported(*form.other, /*values=*/true, /*where=*/!having);
 }
 
 std::optional<Rejection> RejectInCondition(const sql::SubqueryExpr& s, bool having) {
@@ -5521,6 +5500,44 @@ bool IsStringLiteral(const sql::Expr& expr) {
   return lit != nullptr && lit->kind == sql::Literal::Kind::kString;
 }
 
+// An IN subquery's probe as DuckDB types a string literal one, by its set (ADR 0041's SQ7b): a
+// DATE's or a TIMESTAMP's, parsed as a comparison parses it; against a number set it is D3's bind
+// error, as the comparison's. Any other probe as bound.
+arrow::Result<Typed> TypeInProbe(const sql::Expr& operand, Typed probe, LogicalType set) {
+  const auto* lit = IsStringLiteral(operand) ? &std::get<sql::Literal>(operand) : nullptr;
+  if (lit == nullptr) {
+    return probe;
+  }
+  const auto constant = [&](LogicalType type, Int128 value) {
+    return Leaf(Expr{.node = ConstantExpr{.value = Constant{.type = type, .value = value}},
+                     .type = type,
+                     .name = probe.expr->name});
+  };
+  if (set == LogicalType::kDate) {
+    const auto days = ParseDate(lit->text);
+    if (!days.has_value()) {
+      return BindError("invalid date '" + Clip(lit->text) + "': expected YYYY-MM-DD", lit->span);
+    }
+    return constant(LogicalType::kDate, Int128{*days});
+  }
+  if (set == LogicalType::kTimestamp) {
+    const auto micros = ParseTimestamp(lit->text);
+    if (!micros.has_value()) {
+      return BindError(std::string(kInvalidTimestamp) + " '" + Clip(lit->text) + "': expected " +
+                           std::string(kTimestampForm),
+                       lit->span);
+    }
+    return constant(LogicalType::kTimestamp, Int128{*micros});
+  }
+  if (IsNumeric(set) || set == LogicalType::kDecimal) {
+    return BindError(std::format("cannot compare the {} values of an IN subquery with {}; write a "
+                                 "number without quotes",
+                                 ToString(set), LiteralKind(*lit)),
+                     lit->span);
+  }
+  return probe;
+}
+
 // An integer literal as DuckDB's CASE typing sees one (IsIntegerLiteral: -(7) is one), with its
 // value and its type by value (INTEGER, BIGINT or HUGEINT); `1 + 1` and `7 + 0` are none.
 std::optional<TypedConstant> CaseIntegerLiteral(const sql::Expr& expr) {
@@ -6749,7 +6766,8 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
     (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
     return arrow::Status::OK();
   }
-  ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(*form.other));
+  ARROW_ASSIGN_OR_RAISE(Typed bound, bind(*form.other));
+  ARROW_ASSIGN_OR_RAISE(const Typed probe, TypeInProbe(*form.other, std::move(bound), block.type));
   ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, block.type, *form.subquery));
   join.kind = form.negated ? JoinKind::kNullAwareAnti : JoinKind::kSemi;
   InKeys(join, probe, block, type, form.subquery->span);
@@ -6762,6 +6780,25 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
 // and mark joins type their keys alike.
 arrow::Result<LogicalType> Binder::InKeyType(const Typed& probe, LogicalType set,
                                              const sql::SubqueryExpr& s) {
+  // DuckDB's bind error (ADR 0041's decision 23): a VARCHAR against a value of another family, and
+  // a DATE or a TIMESTAMP against a number. A DATE against a TIMESTAMP, which DuckDB answers, stays
+  // a refusal below.
+  const auto family = [](LogicalType t) {
+    if (t == LogicalType::kVarchar || t == LogicalType::kDate || t == LogicalType::kTimestamp) {
+      return t.id();
+    }
+    return LogicalType::kDouble;  // every number
+  };
+  const LogicalType::Id probe_family = family(probe.expr->type);
+  const LogicalType::Id set_family = family(set);
+  const auto is = [&](LogicalType::Id id) { return probe_family == id || set_family == id; };
+  const bool temporal_pair = is(LogicalType::kDate) && is(LogicalType::kTimestamp);
+  if (probe_family != set_family && !temporal_pair) {
+    return BindError(std::format("cannot compare values of type {} and {} in IN (subquery) (write "
+                                 "an explicit CAST)",
+                                 ToString(probe.expr->type), ToString(set)),
+                     s.op_span);
+  }
   const std::optional<LogicalType> type = KeyType(probe.expr->type, set);
   if (type.has_value() && IsExactWidening(probe.expr->type, *type) && IsExactWidening(set, *type)) {
     return *type;
@@ -7149,7 +7186,8 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   }
   const SubqueryConjunct form{.subquery = &s, .other = &operand, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
-  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, bound.type, s));
+  ARROW_ASSIGN_OR_RAISE(const Typed typed, TypeInProbe(operand, probe, bound.type));
+  ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(typed, bound.type, s));
   const std::string name = ExprName(sql::Expr(written));
   if (dry_run_) {
     // A branch OR factoring drops, or an EXISTS block's dropped item: its bind errors stand, and
@@ -7166,7 +7204,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                     .filter = {},
                     .span = s.op_span,
                     .mark = ids_.Next()};
-  InKeys(join, probe, bound, type, s.span);
+  InKeys(join, typed, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
   if (deferring_) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON

@@ -2461,6 +2461,187 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- SQ7b's IN forms (ADR 0041): = ANY, <> ALL, set operations, constant probes, NOTs ----
+  // The probe is tr_dropoff, NULL on some trips, as for the marks above; the sets are zones' and
+  // promos' (tools/fixturegen/star.h): zn_id runs 1 to 40, zn_parent is NULL for zones 1 and 2.
+  {
+    const slt::FeatureSet forms = {kCountStar, kColumns,        kIntegerColumns,     kTableName,
+                                   kWhere,     kIntegerLiteral, kBooleanExpressions, kArithmetic,
+                                   kInMark,    kInForm};
+    const slt::FeatureSet classified = SetWith(
+        forms, kMultipleItems, kCase, kStringLiteral, kCountColumn, kSelectDistinct, kDerivedTable,
+        kLeftJoin, kCommaJoin, kCrossJoin, kAlias, kTableAlias, kQualifiedName);
+    // `x = ANY (q)` and `x = SOME (q)` are `x IN (q)`, and `x <> ALL (q)` and `x != ALL (q)` are
+    // `x NOT IN (q)`: TRUE, FALSE and NULL alike, over a set with a NULL, the empty one, NULLs only
+    // and values only, each checked against the composition of the IN marks above (a LEFT JOIN with
+    // the set's distinct values and a CROSS JOIN with its row and NULL counts), whose plan holds no
+    // mark.
+    struct FormSet {
+      std::string_view name;
+      std::string_view column;
+      std::string_view from;  // the table and its WHERE
+    };
+    constexpr auto kFormSets = std::to_array<FormSet>({
+        {.name = "a_null", .column = "zn_parent", .from = "zones WHERE zn_id < 9"},
+        {.name = "empty", .column = "pm_id", .from = "promos"},
+        {.name = "nulls_only", .column = "zn_parent", .from = "zones WHERE zn_id < 3"},
+        {.name = "no_null", .column = "zn_id", .from = "zones WHERE zn_id > 25"},
+    });
+    for (const FormSet& set : kFormSets) {
+      const std::string q = std::format("SELECT {} FROM {}", set.column, set.from);
+      const auto three_valued = [&](std::string_view op) {
+        return std::format(
+            "SELECT tr_row, CASE WHEN tr_dropoff {0} ({1}) THEN 'T' WHEN NOT (tr_dropoff {0} "
+            "({1})) THEN 'F' ELSE 'N' END FROM trips",
+            op, q);
+      };
+      // The composition, with `match` for a row whose probe the set holds and `miss` for one it
+      // does not hold over a set without a NULL.
+      const auto composition = [&](std::string_view match, std::string_view miss) {
+        return std::format(
+            "SELECT t.tr_row, CASE WHEN d.v IS NOT NULL THEN '{2}' WHEN c.n = 0 THEN '{3}' WHEN "
+            "t.tr_dropoff IS NULL OR c.nulls > 0 THEN 'N' ELSE '{3}' END FROM trips AS t LEFT JOIN "
+            "(SELECT DISTINCT {0} AS v FROM {1}) AS d ON t.tr_dropoff = d.v CROSS JOIN (SELECT "
+            "COUNT(*) AS n, COUNT(*) - COUNT({0}) AS nulls FROM {1}) AS c",
+            set.column, set.from, match, miss);
+      };
+      r.push_back(
+          {.name = std::format("in_form_any_is_in_over_{}", set.name),
+           .features = classified,
+           .probes = {Q(three_valued("= ANY")), Q(three_valued("= SOME")), Q(three_valued("IN")),
+                      Q(composition("T", "F")), Q(three_valued("= ANY"), 7)},
+           .check = AllEqual()});
+      r.push_back({.name = std::format("in_form_not_equal_all_is_not_in_over_{}", set.name),
+                   .features = classified,
+                   .probes = {Q(three_valued("<> ALL")), Q(three_valued("!= ALL")),
+                              Q(three_valued("NOT IN")), Q(composition("F", "T")),
+                              Q(three_valued("!= ALL"), 7)},
+                   .check = AllEqual()});
+      // NOTs over a top-level IN conjunct fold into a semi join: `NOT (x NOT IN q)`, `NOT NOT (x
+      // IN q)` and `NOT (x <> ALL q)` keep the rows `x IN q` keeps, which an inner join with the
+      // set's distinct values keeps too.
+      const std::string folded =
+          std::format("SELECT tr_row FROM trips WHERE NOT (tr_dropoff NOT IN ({}))", q);
+      r.push_back(
+          {.name = std::format("in_form_not_over_not_in_is_in_over_{}", set.name),
+           .features = SetWith(forms, kSelectDistinct, kDerivedTable, kJoinOn, kAlias, kTableAlias,
+                               kQualifiedName),
+           .probes =
+               {Q(folded),
+                Q(std::format("SELECT tr_row FROM trips WHERE NOT NOT (tr_dropoff IN ({}))", q)),
+                Q(std::format("SELECT tr_row FROM trips WHERE NOT (tr_dropoff <> ALL ({}))", q)),
+                Q(std::format("SELECT tr_row FROM trips WHERE tr_dropoff IN ({})", q)),
+                Q(std::format("SELECT t.tr_row FROM trips AS t JOIN (SELECT DISTINCT {} AS v "
+                              "FROM {}) AS d ON t.tr_dropoff = d.v",
+                              set.column, set.from)),
+                Q(folded, 7)},
+           .check = AllEqual()});
+      // A constant probe is a column of one row that holds it, three-valued and as a filter under
+      // OR: 2 (the parent of a zone under 9) and 33 (no zone's parent, but a zone over 25).
+      for (const std::string_view constant : {"2", "33"}) {
+        const std::string one_row =
+            std::format("(SELECT zn_id AS k FROM zones WHERE zn_id = {}) AS c", constant);
+        r.push_back(
+            {.name = std::format("in_form_constant_probe_is_its_one_row_column_{}_over_{}",
+                                 constant, set.name),
+             .features = classified,
+             .probes =
+                 {Q(std::format("SELECT t.tr_row, CASE WHEN {0} IN ({1}) THEN 'T' WHEN NOT ({0} IN "
+                                "({1})) THEN 'F' ELSE 'N' END FROM trips AS t WHERE t.tr_row < 50",
+                                constant, q)),
+                  Q(std::format("SELECT t.tr_row, CASE WHEN c.k IN ({0}) THEN 'T' WHEN NOT (c.k IN "
+                                "({0})) THEN 'F' ELSE 'N' END FROM trips AS t CROSS JOIN {1} WHERE "
+                                "t.tr_row < 50",
+                                q, one_row))},
+             .check = AllEqual()});
+        r.push_back(
+            {.name = std::format("in_form_constant_probe_filters_as_its_one_row_column_{}_over_{}",
+                                 constant, set.name),
+             .features = classified,
+             .probes = {Q(std::format("SELECT t.tr_row FROM trips AS t WHERE t.tr_row % 5 = 0 OR "
+                                      "{} = ANY ({})",
+                                      constant, q)),
+                        Q(std::format("SELECT t.tr_row FROM trips AS t CROSS JOIN {} WHERE "
+                                      "t.tr_row % 5 = 0 OR c.k = ANY ({})",
+                                      one_row, q))},
+             .check = AllEqual()});
+      }
+    }
+    // `x IN (q1 UNION q2)` is `x IN (q1) OR x IN (q2)`, TRUE, FALSE and NULL alike, with UNION ALL
+    // too: a match in either set, else FALSE where both are empty, else NULL for a NULL probe or a
+    // NULL in either set, else FALSE.
+    for (const auto& [name, q1, q2] : {
+             std::tuple{"a_null_and_no_null", "SELECT zn_parent FROM zones WHERE zn_id < 9",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+             std::tuple{"empty_and_no_null", "SELECT pm_id FROM promos",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+             std::tuple{"nulls_only_and_empty", "SELECT zn_parent FROM zones WHERE zn_id < 3",
+                        "SELECT pm_id FROM promos"},
+             std::tuple{"empty_and_empty", "SELECT pm_id FROM promos",
+                        "SELECT zn_id FROM zones WHERE zn_id > 40"},
+             std::tuple{"no_null_and_no_null", "SELECT zn_id FROM zones WHERE zn_id < 6",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+         }) {
+      const auto three_valued = [](std::string_view mark) {
+        return std::format(
+            "SELECT tr_row, CASE WHEN {0} THEN 'T' WHEN NOT ({0}) THEN 'F' ELSE 'N' END FROM trips",
+            mark);
+      };
+      const std::string unioned = three_valued(std::format("tr_dropoff IN ({} UNION {})", q1, q2));
+      r.push_back(
+          {.name = std::format("in_form_union_is_the_or_of_its_arms_{}", name),
+           .features = SetWith(classified, kUnionAll, kUnion),
+           .probes = {Q(unioned),
+                      Q(three_valued(std::format("tr_dropoff IN ({} UNION ALL {})", q1, q2))),
+                      Q(three_valued(
+                          std::format("(tr_dropoff IN ({}) OR tr_dropoff IN ({}))", q1, q2))),
+                      Q(unioned, 7)},
+           .check = AllEqual()});
+    }
+    // Over arms without a NULL, `x IN (q1 INTERSECT q2)` keeps the rows `x IN (q1) AND x IN (q2)`
+    // keeps, and `x IN (q1 EXCEPT q2)` those `x IN (q1) AND x NOT IN (q2)` keeps (their ALL forms
+    // too, the arms' values being distinct), as conjuncts and under OR. Over a NULL probe and an
+    // empty intersection they differ (FALSE against NULL), so only the rows kept are compared.
+    for (const auto& [name, q1, q2] : {
+             std::tuple{"overlapping", "SELECT zn_id FROM zones WHERE zn_id < 30",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+             std::tuple{"disjoint", "SELECT zn_id FROM zones WHERE zn_id < 6",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+             std::tuple{"empty_right", "SELECT zn_id FROM zones WHERE zn_id < 30",
+                        "SELECT pm_id FROM promos"},
+             std::tuple{"empty_left", "SELECT pm_id FROM promos",
+                        "SELECT zn_id FROM zones WHERE zn_id > 25"},
+         }) {
+      for (const std::string_view filter : {"{}", "tr_row % 5 = 0 OR {}"}) {
+        const auto where = [&](const std::string& condition) {
+          return std::format("SELECT tr_row FROM trips WHERE {}",
+                             std::vformat(filter, std::make_format_args(condition)));
+        };
+        const std::string_view under = filter == "{}" ? "" : "_under_or";
+        const std::string intersected =
+            where(std::format("tr_dropoff IN ({} INTERSECT {})", q1, q2));
+        r.push_back(
+            {.name = std::format("in_form_intersect_is_the_and_of_its_arms_{}{}", name, under),
+             .features = SetWith(forms, kUnionAll, kIntersect, kSetOpAll, kWhereAnd),
+             .probes = {Q(intersected),
+                        Q(where(std::format("tr_dropoff IN ({} INTERSECT ALL {})", q1, q2))),
+                        Q(where(
+                            std::format("(tr_dropoff IN ({}) AND tr_dropoff IN ({}))", q1, q2))),
+                        Q(intersected, 7)},
+             .check = AllEqual()});
+        const std::string excepted = where(std::format("tr_dropoff IN ({} EXCEPT {})", q1, q2));
+        r.push_back(
+            {.name = std::format("in_form_except_is_in_and_not_in_its_arms_{}{}", name, under),
+             .features = SetWith(forms, kUnionAll, kExcept, kSetOpAll, kWhereAnd),
+             .probes =
+                 {Q(excepted), Q(where(std::format("tr_dropoff IN ({} EXCEPT ALL {})", q1, q2))),
+                  Q(where(std::format("(tr_dropoff IN ({}) AND tr_dropoff NOT IN ({}))", q1, q2))),
+                  Q(excepted, 7)},
+             .check = AllEqual()});
+      }
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

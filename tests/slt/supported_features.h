@@ -164,6 +164,12 @@ enum class Feature : std::uint8_t {
   // reads one column of one table, of the probe's type family; its WHERE, IS [NOT] NULL, ORDER BY,
   // NULLS FIRST or LAST, LIMIT, OFFSET, DISTINCT and GROUP BY record no feature of their own.
   kInMark,  // x = 1 OR x IN (SELECT ...), CASE WHEN x NOT IN (SELECT ...) THEN 1 ELSE 0 END
+  // SQ7b's IN forms (ADR 0041), as a top-level conjunct of WHERE or HAVING or in kInMark's places:
+  // = ANY, = SOME, <> ALL and != ALL over a set; NOT NOT (x IN (...)) and NOT (x NOT IN (...)) as
+  // a conjunct; a literal probe of the set's type family; a set that is a set operation of two or
+  // three uncorrelated one-column arms of the set column's type. The set's own clauses record no
+  // feature of their own, as kInMark's; its set operators and literals record theirs.
+  kInForm,  // x = ANY (SELECT ...), 2 IN (SELECT a FROM t UNION SELECT b FROM u)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -344,6 +350,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "group_value";
     case Feature::kInMark:
       return "in_mark";
+    case Feature::kInForm:
+      return "in_form";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -509,6 +517,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kItemValue,
     Feature::kGroupValue,
     Feature::kInMark,
+    Feature::kInForm,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

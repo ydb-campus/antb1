@@ -135,13 +135,14 @@ steps (only step 7 uses more than one thread):
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (an `IN` subquery outside a condition of `WHERE`, of an
    inner `ON` or of `HAVING` and outside a `CASE WHEN` of a select item, `GROUP BY` key, aggregate argument or `ORDER
-   BY` item, or one whose probe reads no column or holds a value (ADR 0041's SQ7b); a scalar subquery or an `EXISTS`
+   BY` item (the parser refuses the quantified comparisons other than `= ANY`, `= SOME`, `<> ALL` and `!= ALL`, which
+   it reads as IN and NOT IN); a scalar subquery or an `EXISTS`
    outside a condition of `WHERE`, of an
    inner `ON` or of `HAVING` and outside the select items, `GROUP BY` keys, aggregate arguments and `ORDER BY` of a
    block (ADR 0041's SQ2; an `EXISTS` there only in a `CASE WHEN`), a scalar one inside a grouping-set element or as an
    aggregate's whole argument; a lateral reference, more
    than 256 relations counting every sub-plan and every subquery, a compound's own `ORDER BY`, `LIMIT` or `OFFSET` and
-   an `IN` subquery over one (ADR 0036's X5, and X6 until ADR 0041's SQ7b), many expressions) is `kUnsupported` before
+   a subquery over one (ADR 0036's X5), many expressions) is `kUnsupported` before
    any name resolves, over every
    block the statement reaches — its own, each derived table's, each subquery's, each compound's blocks, and the body of
    each CTE something references; then each FROM item resolves, in FROM order, one binding per item in the block's scope
