@@ -1043,6 +1043,58 @@ stays at 80.
   saw is now pinned by CLI goldens: a key named by its last spelling, keys in outer-column order, cast order, and the
   order of refusals across nested and stacked subqueries.
 
+## Update (2026-11-13, SQ6): the LEFT join back and the empty values, built
+
+SQ5 and SQ6 split at the maintainer's request, SQ6 first. SQ6 completes Q41 and the ratchet goes from 80 to 81. Before
+it, a separate fix (#363) kept ADR 0032's aggregate placement from moving a non-strict `Compute` below a join that pads
+the aggregated side. That was a wrong answer on main, unrelated to subqueries, and SQ6 cannot reach it. It becomes
+required once a whole-argument value `SUM((q))` opens, where a `COALESCE(count, 0)` over a LEFT join back would be such
+a `Compute`.
+
+- **Decision 19, as built.** The static aggregate's rule answers every call but the single value: COUNT in each
+  spelling, a sum of counts and the variance family. The single value stays out, a deviation from decision 19's
+  table: the binder puts none under a dependent join, and the executor has no grouped state for one. The strictness
+  refusals are gone. The empty values carry through the maps as before, and through a HAVING: NULL where it rejects
+  the empty row, the value where it keeps it, unknown otherwise. They fold no constants, so `COUNT(*) + 1 > 1`, which
+  rejects the 1 over no rows, still joins back LEFT. That is correct, only slower; folding them is left as a refinement.
+- **Decision 20 decides.** The proof's verdict picks the join back. The hand-built `optimizer_test` plans with no
+  consumer gained the Filter their SQL has, and LEFT twins without one.
+- **Decision 21, as built.** Where the proof fails, the outer side is joined to the GroupAggregate by a LEFT JOIN,
+  built on its right input (`kLeft` has no `may_build_left`). Above the join:
+  - a COUNT-kind call, computed under a fresh id, is read under its own as `COALESCE(fresh, 0)`;
+  - the maps follow, the select list's Project as a Compute that defines its ids;
+  - a HAVING is a Compute of one BOOLEAN condition, and every map above it reads `CASE WHEN condition THEN value END`.
+    That holds on the INNER join back too, over the group: decision 17's "never a filter", which a binding whose group
+    the HAVING rejects needs in order to read NULL. Where the value the join appends is defined below the HAVING (a
+    bare `SELECT COUNT(*) ... HAVING`), its id is renamed below and redefined as the CASE above. A HAVING folded to
+    FALSE reads a group key, false or NULL alike to a CASE;
+  - an uncorrelated one-row join in the slot after the aggregation moves up with the maps, so a binding without rows
+    reads `0 + value`. This is the narrow piece of decision 17's Join rule that SQ6 needs, landed with the
+    maintainer's agreement (2026-11-13): a one-row join over the static aggregate whose right input reads no outer
+    column. Every other join stays SQ8's and SQ10's;
+  - a NULL-equal correlation reads the NULL group, as before.
+
+  An IN or NOT IN conjunct in a correlated scalar subquery's HAVING, and a mark over its aggregate, stay refused: no
+  rule takes a semi or mark join there.
+- **The semi-join reduction.** D5's exception (one key over a bare scan) applies to the INNER join back only. D5 offers
+  keys to the aggregation under a probe that drops unmatched rows, which a LEFT join's is not, so the LEFT join back is
+  restricted over one key too. For a stack of dependent joins it no longer declines (the maintainer's choice,
+  2026-11-13): it clones the base below the stack, through Filters, Computes that define no key, a dependent join's
+  left input and a join that pads no left row. Each rewrite of a stack clones once, so the plan stays linear. A key
+  computed above the base, or a base that holds a Limit, declines.
+- **Lemma 3.1.** The check also verifies that what a rule puts above the join (maps, a HAVING, a moved one-row join)
+  reads no free variable the dependent join did not.
+- **Divergences.** D24 gains the LEFT join back, DuckDB's D for every COUNT shape (decision 25), and an error the
+  INNER join back never computes: a HAVING operand or a select item that fails only over the empty values fails DuckDB
+  alone. D35 notes that a LEFT join back never empties its join. D16 notes a HAVING's operands computed over the empty
+  row too.
+- **Decision 28.** `tests/slt/cases/subqueries/empty_values.slt` holds 130 records, written as `pending SQ6` before
+  the code and each answered by it, and `scalar.slt`'s and `group_values.slt`'s SQ6 guards are on. DuckDB's own
+  wrong answers in decision 29's family (a constant item, or a HAVING, over calls that are all NULL over no rows) have
+  no record; the metamorphic self-checks cover them. The SQ0 guard showed each change to be a refusal turned into an
+  answer equal to DuckDB's, a reworded refusal, or a stacked plan gaining its upper restriction with its answers
+  unchanged. Of the TPC-derived plans, only Q41's changed.
+
 ## Consequences
 
 - **The ratchet** climbs from 75 to 84 through phase 8, ADR 0037's figure for its end, and reaches 99 with phase 9.

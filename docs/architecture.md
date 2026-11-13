@@ -202,7 +202,10 @@ steps (only step 7 uses more than one thread):
 5. Optimize (`plan::Optimize`, which can fail): first the unnesting pass (`src/plan/unnesting.h`), which replaces
    every `DependentJoin` with ordinary joins or rejects the query with exit code 4, so no later rule and no operator
    meets one (ADR 0023): one rule table, read by the join's kind traits, with a rule per node type on the way to the
-   correlated filter and substitution as its terminal step (ADR 0041's decisions 16 to 20); then
+   correlated filter and substitution as its terminal step (ADR 0041's decisions 16 to 20). A scalar subquery's
+   aggregate is joined back inner only where the consumer proof shows the comparison over it rejects its value over
+   no rows, and `LEFT` otherwise, the select list, a `HAVING` (a `CASE`) and a `COALESCE(count, 0)` above the join
+   (decisions 19 and 21, SQ6); then
    the conditions of a `Filter` over a `UnionAll` go on top of each of its inputs, and an input whose constants make
    one never true is ruled out (a union of one input stays a union; of none, its first input stays, under a `FALSE`
    filter: ADR 0036's X7a); `COUNT(*)` without `WHERE` to `RowCount`; a `GROUP BY` key computed only from other

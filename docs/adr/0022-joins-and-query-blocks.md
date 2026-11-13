@@ -486,6 +486,9 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     checked at run time. Any other scalar subquery exits 4. It becomes a one-row join that appends its row's
     columns, and a comparison above it. Over an empty input SUM, AVG, MIN and MAX are NULL, which the comparison
     rejects, and COUNT is 0, which it compares as usual; both as in DuckDB.
+    - Update (2026-11-13, ADR 0041's SQ6): a correlated scalar subquery (ADR 0023) gets the same values over no rows:
+      COUNT's 0 reaches an outer row with no group through a LEFT join back, and so does any select item and a HAVING
+      inside it.
     - Update (2026-10-09, E2a): a one-row join's build is keyless (`exec::JoinBuildSpec::Keyless`). It must hold
       exactly one row: any other count is `Invalid` from its `Prepare`, before any probe part runs, a planner bug
       that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than

@@ -216,11 +216,13 @@ wrong answers, not divergences: antb1 answers them right, or refuses them (exit 
     outer row, but NULL in DuckDB for one whose `a` no `i.k` matches; over `ORDER BY COUNT(*)` DuckDB answers 42, the
     form `tests/slt/cases/subqueries/scalar.slt` uses;
   - a constant item under `HAVING SUM(x) IS NULL OR SUM(x) > 0`: the constant, since the row over no input passes the
-    `HAVING`, but NULL in DuckDB;
+    `HAVING`, but NULL in DuckDB; under `HAVING MAX(x) IS NULL` likewise, where DuckDB keeps no outer row that
+    compares the constant;
   - `GROUPING()` in a correlated block with grouping sets: 1 in the `()` set's row over no input, but NULL in DuckDB.
 
   The PR of each [ADR 0041](adr/0041-subqueries-and-decorrelation.md) item whose generator Feature could write a member
-  of this family adds it to the generator's list of shapes it never writes.
+  of this family adds it to the generator's list of shapes it never writes. SQ6's `correlated_empty_value` writes a
+  constant item or a `HAVING` only in a block that holds a `COUNT`, which DuckDB joins `LEFT` and answers right.
 - **A correlated scalar subquery in an `ON` that also reads a comma sibling** (`FROM a, b JOIN c ON ...`, the `ON`
   reading `a` as well): DuckDB can drop every row there, or fail with an internal error, where antb1 answers, so no
   record of `tests/slt/cases/subqueries/scalar.slt` has that shape.
@@ -240,7 +242,12 @@ A self-check that needs no DuckDB covers the correlated shapes above in antb1 fr
 binding written as literals, which holds where DuckDB's decorrelation is wrong. The metamorphic relations
 `correlated_exists_is_its_bindings_as_literals`, `correlated_not_exists_is_its_bindings_as_literals` and
 `correlated_aggregate_is_its_bindings_as_literals` (`tests/metamorphic/relations.cc`) hold it over the six cities of
-the star schema; each item that answers a correlated shape adds its own. A null-aware mark (ADR 0041's SQ7a) is
+the star schema; each item that answers a correlated shape adds its own. ADR 0041's SQ6 adds
+`correlated_empty_value_*_is_its_bindings_as_literals` for a count, a `CASE`, a `COALESCE`, a `HAVING`, a moved
+uncorrelated value and the three constant shapes above, which only these cover, with their batch-size invariance; it
+also holds a correlated `COUNT` to its `LEFT JOIN`, `GROUP BY` and `COALESCE` rewrite
+(`correlated_count_equals_a_left_join_group_by_and_coalesce_*`) and `= 0` and `> 0` to a partition of the outer rows
+(`correlated_count_partitions_the_outer_rows_*`), NULL-equal keys included. A null-aware mark (ADR 0041's SQ7a) is
 checked against operators that existed before it too: `in_mark_is_its_three_valued_composition_*` classifies each row
 as TRUE, FALSE or NULL from a `LEFT JOIN` to the set's distinct values and a `CROSS JOIN` to its row and NULL counts,
 over sets with a NULL, without one, of NULLs alone and empty. SQ7b's forms are held to the same composition

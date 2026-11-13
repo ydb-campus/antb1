@@ -601,6 +601,13 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   (`src/plan/unnesting.{h,cc}`), chosen by the dependent join's kind traits, with a rule per node type on the way to
   the correlated filter and substitution as the terminal step. Their plans, the ids they mint and their refusal
   messages are unchanged; the consumer proof runs and decides nothing yet (ADR 0041's SQ0 update).
+- Update (2026-11-13, ADR 0041's SQ6): **the value mode answers the COUNT bug.** Every aggregate call is answered, with
+  any select item over the calls, a `HAVING` and an uncorrelated value inside the block. The consumer proof now
+  decides the join back: inner where the comparison above rejects the subquery's value over no rows, as every Path 2
+  plan did and still does, byte for byte; a `LEFT` join otherwise, built on the grouped aggregate, with a count read
+  through `COALESCE(count, 0)`, the select list computed above the join and a `HAVING` a `CASE` over it. The semi-join
+  reduction applies D5's exception to the inner join back only, and clones the base below a stack of dependent joins
+  instead of declining (ADR 0041's SQ6 update). This list's exit-4 shapes lose `COUNT` and the non-strict items.
 
 ## Alternatives considered
 
