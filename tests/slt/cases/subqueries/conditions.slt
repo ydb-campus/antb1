@@ -2370,11 +2370,11 @@ SELECT ct_id FROM cities WHERE 2 IN (SELECT zn_city FROM zones WHERE zn_id > 35)
 SMALLINT
 1
 
-# ---- pending: a correlated value outside a top-level comparison (ADR 0041; roadmap PR SQ5 removes these guards) ----
+# ---- pending: a correlated value outside a top-level comparison (ADR 0041; roadmap PR SQ5a removes these guards) ----
 
 # A correlated MAX in arithmetic; under OR, where city 5 passes by its comparison and city 6, which has no zone and so a
 # NULL MAX, by the other branch; and in a COALESCE, which turns city 6's NULL into 0 and keeps the row.
-pending SQ5
+pending SQ5a
 query I nosort
 SELECT ct_id FROM cities WHERE ct_pop > (SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id) * 1000 ORDER BY ct_id
 ----
@@ -2382,7 +2382,7 @@ SMALLINT
 1
 2
 
-pending SQ5
+pending SQ5a
 query I nosort
 SELECT ct_id FROM cities WHERE ct_id < (SELECT MAX(zn_parent) FROM zones WHERE zn_city = ct_id) OR ct_id = 6 ORDER BY ct_id
 ----
@@ -2390,7 +2390,7 @@ SMALLINT
 5
 6
 
-pending SQ5
+pending SQ5a
 query I nosort
 SELECT ct_id FROM cities WHERE COALESCE((SELECT MAX(zn_id) FROM zones WHERE zn_city = ct_id), 0) < ct_id * 10 ORDER BY ct_id
 ----
@@ -2400,7 +2400,7 @@ SMALLINT
 6
 
 # Two correlated aggregates compared: one dependent join each.
-pending SQ5
+pending SQ5a
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT MAX(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) > (SELECT MIN(d.dv_city) * 10 FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY 1
 ----

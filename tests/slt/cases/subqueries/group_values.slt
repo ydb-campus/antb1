@@ -2879,11 +2879,11 @@ NULL	16
 6	8
 12	8
 
-# ---- DuckDB only until SQ5/SQ13 get a PR (ADR 0041: a correlated value in a block that aggregates exits 4) ----
+# ---- pending: a correlated value as a GROUP BY key or in an aggregate's argument (ADR 0041; roadmap PR SQ5b) ----
 
-# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key.
+# A correlated value as a GROUP BY key, and in an aggregate's argument with a column.
 
-onlyif duckdb
+pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS k, COUNT(*) AS c FROM cities c GROUP BY 1 ORDER BY 1
 ----
@@ -2892,14 +2892,17 @@ BIGINT	BIGINT
 7	2
 8	3
 
-onlyif duckdb
+pending SQ5b
 query I nosort
 SELECT SUM(ct_id * (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id)) AS s FROM cities c
 ----
 HUGEINT
 113
 
-onlyif duckdb
+# ---- pending: a correlated value over a group's aggregate (ADR 0041; roadmap PR SQ13 removes this guard) ----
+
+# Added to COUNT(*) per group, it reads the group's key: its free variable is the key's output (SQ13 remaps it).
+pending SQ13
 query II nosort
 SELECT ct_id, COUNT(*) + (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS n FROM cities c GROUP BY ct_id ORDER BY ct_id
 ----
