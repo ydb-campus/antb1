@@ -445,8 +445,8 @@ TEST(UnnestingTest, TheProofReadsAConstantEmptyValue) {
 }
 
 // Every correlated scalar subquery of SUM, AVG, MIN or MAX under a comparison that rejects NULL
-// proves its INNER join back, nested and stacked ones too; a dependent join with nothing above it --
-// a plan only a test builds -- does not.
+// proves its INNER join back, nested and stacked ones too; a dependent join with nothing above it
+// -- a plan only a test builds -- does not.
 TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
   const Catalog catalog = MakeCatalog();
   for (const std::string_view sql : {
@@ -528,7 +528,8 @@ TEST(UnnestingTest, TheProofDecidesTheJoinBack) {
            Case{.sql = "SELECT i16 FROM t WHERE i32 > (SELECT MAX(u.i32) * 2 FROM u WHERE u.i64 = "
                        "t.i64)",
                 .join_back = JoinBack::kInner},
-           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COUNT(*) + 1 FROM u WHERE u.i64 = t.i64) > 1",
+           Case{.sql =
+                    "SELECT i16 FROM t WHERE (SELECT COUNT(*) + 1 FROM u WHERE u.i64 = t.i64) > 1",
                 .join_back = JoinBack::kLeft},
            Case{.sql = "SELECT i16 FROM t WHERE (SELECT COALESCE(SUM(u.i32), 0) FROM u WHERE u.i64 "
                        "= t.i64) > 0",
@@ -603,8 +604,8 @@ TEST(UnnestingTest, AHavingIsACaseOnBothJoinBacks) {
     const Unnested unnested = UnnestedOf(sql);
     ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
     const std::size_t having = unnested.text.find("Compute HAVING");
-    const std::size_t join = unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER"
-                                                                                : "Join LEFT");
+    const std::size_t join =
+        unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER" : "Join LEFT");
     const std::size_t group = unnested.text.find("GroupAggregate");
     ASSERT_NE(having, std::string::npos) << unnested.text;
     ASSERT_NE(join, std::string::npos) << unnested.text;
@@ -644,8 +645,8 @@ TEST(UnnestingTest, AnUncorrelatedOneRowJoinMovesUpWithTheItem) {
     const Unnested unnested = UnnestedOf(c.sql);
     ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
     const std::size_t one_row = unnested.text.find("Join ONE-ROW");
-    const std::size_t join = unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER"
-                                                                                : "Join LEFT");
+    const std::size_t join =
+        unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER" : "Join LEFT");
     const std::size_t group = unnested.text.find("GroupAggregate");
     ASSERT_NE(one_row, std::string::npos) << unnested.text;
     ASSERT_NE(join, std::string::npos) << unnested.text;

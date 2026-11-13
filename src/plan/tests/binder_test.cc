@@ -7912,10 +7912,10 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
 }
 
 // An inner join back gives an outer row with no group no row: right only where the comparison
-// above rejects the subquery's value over no rows too. A select item that reads no aggregate call is
-// not NULL there: a constant over an aggregation that an ORDER BY aggregate makes one row (its call
-// is then dropped) is that constant over no rows. Such a block is joined back LEFT (ADR 0041's SQ6),
-// the item computed above the join, and the strict combinations keep their INNER join back.
+// above rejects the subquery's value over no rows too. A select item that reads no aggregate call
+// is not NULL there: a constant over an aggregation that an ORDER BY aggregate makes one row (its
+// call is then dropped) is that constant over no rows. Such a block is joined back LEFT (ADR 0041's
+// SQ6), the item computed above the join, and the strict combinations keep their INNER join back.
 TEST(BinderTest, ACorrelatedScalarKeepsItsValueOverNoRows) {
   const auto catalog = testing::MakeCatalog();
   const auto optimize = [&catalog](std::string_view sql) {

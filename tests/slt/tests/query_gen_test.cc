@@ -4092,11 +4092,12 @@ TEST(QueryGenerator, CorrelatedEmptyValuesAreAggregatesOverEveryRow) {
       EXPECT_EQ(eq->op, sql::BinaryOp::kEq);
       key_left = &*eq->left;
       key_right = &*eq->right;
-    } else if (const auto* nd = std::get_if<sql::DistinctFromExpr>(&block.where.front())) {
-      EXPECT_TRUE(nd->negated) << "IS NOT DISTINCT FROM";
+    } else if (const auto* not_distinct =
+                   std::get_if<sql::DistinctFromExpr>(&block.where.front())) {
+      EXPECT_TRUE(not_distinct->negated) << "IS NOT DISTINCT FROM";
       ++null_equal;
-      key_left = &*nd->left;
-      key_right = &*nd->right;
+      key_left = &*not_distinct->left;
+      key_right = &*not_distinct->right;
     }
     ASSERT_NE(key_left, nullptr) << sql::ToSql(block.where.front());
     const auto* a = std::get_if<sql::ColumnRef>(key_left);

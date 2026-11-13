@@ -1520,7 +1520,8 @@ LogicalPlan PlanOverJoin(LogicalNodePtr join, std::uint32_t outer_first,
           .input = std::move(join),
           .predicates = {Predicate{
               .kind = Predicate::Kind::kCompare,
-              .column = BoundColumn{.id = values.front(), .name = "v", .type = LogicalType::kBigInt},
+              .column =
+                  BoundColumn{.id = values.front(), .name = "v", .type = LogicalType::kBigInt},
               .op = *consumer,
               .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{0}}}},
           .span = {}});
@@ -1729,7 +1730,8 @@ TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
     }
     return found;
   };
-  const BoundColumn computed{.index = 0, .id = ColumnId{5}, .name = "k", .type = LogicalType::kSmallInt};
+  const BoundColumn computed{
+      .index = 0, .id = ColumnId{5}, .name = "k", .type = LogicalType::kSmallInt};
   const LogicalNodePtr lower = Node(DependentJoinNode{
       .kind = JoinKind::kOneRow,
       .left = FourFieldsRows(1, 10),
@@ -1737,8 +1739,8 @@ TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
                                 Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
                                50, 1000, 11),
       .span = {}});
-  const LogicalNodePtr keyed = Node(ComputeNode{
-      .input = lower, .exprs = {Ref(FieldOf(1, 0))}, .ids = {computed.id}, .span = {}});
+  const LogicalNodePtr keyed = Node(
+      ComputeNode{.input = lower, .exprs = {Ref(FieldOf(1, 0))}, .ids = {computed.id}, .span = {}});
   const LogicalPlan above = Optimized(PlanOverJoin(
       Node(DependentJoinNode{
           .kind = JoinKind::kOneRow,
@@ -1754,7 +1756,8 @@ TEST(OptimizerTest, TheSemiJoinReductionDeclinesABaseItCannotClone) {
   const LogicalPlan limited = Optimized(PlanOverJoin(
       Node(DependentJoinNode{
           .kind = JoinKind::kOneRow,
-          .left = Node(LimitNode{.input = FourFieldsRows(1, 10), .limit = 5, .offset = 0, .span = {}}),
+          .left =
+              Node(LimitNode{.input = FourFieldsRows(1, 10), .limit = 5, .offset = 0, .span = {}}),
           .right = ScalarBlockRows({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
                                     Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq)},
                                    50, 1000, 11),
@@ -2069,13 +2072,13 @@ TEST(OptimizerTest, Path2AnswersEveryCountKindAndRefusesTheSingleValue) {
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << text;
   }
   const auto status =
-      Optimize(PlanOverJoin(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
-                                                   .left = FourFields(1),
-                                                   .right = ScalarBlock({Compare(FieldOf(11, 1),
-                                                                                 FieldOf(1, 1),
-                                                                                 CompareOp::kEq)},
-                                                                        AggKind::kSingleValue, 50),
-                                                   .span = {}}),
+      Optimize(PlanOverJoin(Node(DependentJoinNode{
+                                .kind = JoinKind::kOneRow,
+                                .left = FourFields(1),
+                                .right = ScalarBlock(
+                                    {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)},
+                                    AggKind::kSingleValue, 50),
+                                .span = {}}),
                             1))
           .status();
   ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
@@ -2090,11 +2093,12 @@ TEST(OptimizerTest, Path2AnswersEveryCountKindAndRefusesTheSingleValue) {
 // reduction, since D5 does not reach a LEFT join (twin of the INNER plans above and below).
 TEST(OptimizerTest, Path2JoinsBackLeftWithoutAConsumer) {
   const LogicalPlan plan = Optimized(PlanOverJoin(
-      Node(DependentJoinNode{.kind = JoinKind::kOneRow,
-                             .left = FourFieldsRows(1, 10),
-                             .right = ScalarBlockRows(
-                                 {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50, 1000),
-                             .span = {}}),
+      Node(DependentJoinNode{
+          .kind = JoinKind::kOneRow,
+          .left = FourFieldsRows(1, 10),
+          .right =
+              ScalarBlockRows({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50, 1000),
+          .span = {}}),
       1, /*consumer=*/std::nullopt));
   const auto* join = JoinUnder(plan);
   ASSERT_NE(join, nullptr) << Explain(plan);
@@ -2104,7 +2108,8 @@ TEST(OptimizerTest, Path2JoinsBackLeftWithoutAConsumer) {
   ASSERT_NE(grouped, nullptr) << Explain(plan);
   EXPECT_EQ(grouped->aggregates[0].id, ColumnId{140}) << "MIN keeps its id: NULL over no rows";
   const auto* restriction = std::get_if<JoinNode>(grouped->input.get());
-  ASSERT_NE(restriction, nullptr) << "one key over a scan is restricted for LEFT: " << Explain(plan);
+  ASSERT_NE(restriction, nullptr) << "one key over a scan is restricted for LEFT: "
+                                  << Explain(plan);
   EXPECT_EQ(restriction->kind, JoinKind::kSemi);
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }

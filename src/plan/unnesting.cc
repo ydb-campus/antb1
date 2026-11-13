@@ -289,11 +289,11 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
                                       JoinBack join_back, ColumnId& last_id) {
   // **One correlated column over a bare scan is ADR 0029's D5 to restrict, not this -- under an
   // INNER join back.** D5 publishes the join's key set to the aggregation's own scan, which costs a
-  // filter rather than a build and a probe, and it takes exactly one key. Where it can apply, this rewrite can only repeat it:
-  // measured at SF 100 on the query whose correlation is a single key over a scan, restricting it
-  // as well cost **1.420x** -- the aggregate's rows and groups did not move at all, because D5 had
-  // already removed the same rows, while the clone re-read the 600-million-row join its outer side
-  // is.
+  // filter rather than a build and a probe, and it takes exactly one key. Where it can apply, this
+  // rewrite can only repeat it: measured at SF 100 on the query whose correlation is a single key
+  // over a scan, restricting it as well cost **1.420x** -- the aggregate's rows and groups did not
+  // move at all, because D5 had already removed the same rows, while the clone re-read the
+  // 600-million-row join its outer side is.
   //
   // **A join below the aggregation is the case where D5 cannot apply either**, and so is this
   // rewrite's as much as more than one key is. The reason is not the scan's one filter slot: a join
@@ -333,13 +333,14 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   }
   // **An outer side holding a dependent join is not cloned whole, and that is what bounds the
   // copying.** The pass is top-down, so a dependent join still in this one's left input is one this
-  // rewrite has not reached: cloning it would duplicate a rewrite that clones in turn, and k stacked
-  // correlated subqueries would cost 2^k nodes. Measured before this condition, on a query of k
-  // conjuncts over one correlation: 45 plan lines at k=1, 1,533 at k=8 and 24,573 at k=12, where
-  // planning alone took 1.3 s. So the clone is of the base below the stack (DomainBase): each join
-  // of a chain clones that base once, and a plan's size stays linear in the rewrites, which is what
-  // ADR 0022's relation limit needs in order to go on bounding every walk of a plan. Where no such
-  // base outputs every key, the restriction declines, as it did for any stack before ADR 0041's SQ6
+  // rewrite has not reached: cloning it would duplicate a rewrite that clones in turn, and k
+  // stacked correlated subqueries would cost 2^k nodes. Measured before this condition, on a query
+  // of k conjuncts over one correlation: 45 plan lines at k=1, 1,533 at k=8 and 24,573 at k=12,
+  // where planning alone took 1.3 s. So the clone is of the base below the stack (DomainBase): each
+  // join of a chain clones that base once, and a plan's size stays linear in the rewrites, which is
+  // what ADR 0022's relation limit needs in order to go on bounding every walk of a plan. Where no
+  // such base outputs every key, the restriction declines, as it did for any stack before ADR
+  // 0041's SQ6
   // -- where a LEFT join back, which D5 does not reach, would otherwise group every inner key.
   //
   // It also keeps the Lemma 3.1 check below unreachable by construction: a free variable can only
@@ -603,7 +604,8 @@ std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root) {
 // ---- the static aggregate's rule: its calls and their empty values (decisions 17 and 19) ----
 
 // Whether the rule answers a static aggregate's call: each has its empty value (decision 19), which
-// the LEFT join back gives an outer row with no group (decision 21) -- COUNT's 0 through a COALESCE.
+// the LEFT join back gives an outer row with no group (decision 21) -- COUNT's 0 through a
+// COALESCE.
 bool AnsweredCall(AggKind kind) {
   switch (kind) {
     case AggKind::kSum:
@@ -665,8 +667,8 @@ std::optional<std::set<ColumnId>> IdsAboveHaving(const Spine& spine) {
 // each call's, then, bottom-up through the maps, NULL for a strict combination (IsStrict) that
 // reads at least one NULL, a Project's column its source's, and not known otherwise. IsStrict alone
 // does not make a NULL: a constant is strict and reads no call, and so is the select item of
-// `SELECT 1 ... ORDER BY COUNT(*)`, whose aggregation is left with no call at all -- 1 over no rows,
-// not NULL (ADR 0023's update of 2026-11-08). A constant item keeps its constant, a NULL one
+// `SELECT 1 ... ORDER BY COUNT(*)`, whose aggregation is left with no call at all -- 1 over no
+// rows, not NULL (ADR 0023's update of 2026-11-08). A constant item keeps its constant, a NULL one
 // excepted, which no select list the binder leaves here holds. A HAVING decides what the maps above
 // it give: NULL where it rejects the empty row, their value where it keeps it, and not known
 // otherwise.
@@ -683,7 +685,7 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
     const auto it = values.find(column->id);
     return it == values.end() ? std::nullopt : it->second;
   };
-  BranchTruth having = BranchTruth::kAlways;  // the HAVINGs below, over the empty row
+  BranchTruth having = BranchTruth::kAlways;  // the HAVING clauses below, over the empty row
   const auto record = [&values, &having](ColumnId id, LogicalType type, EmptyValue value) {
     switch (having) {
       case BranchTruth::kNever:
@@ -722,10 +724,10 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
               const auto it = values.find(id);
               return it != values.end() && IsNull(it->second);
             });
-        record(compute->ids[i], compute->exprs[i]->type,
-               null ? EmptyValue(Constant{.type = compute->exprs[i]->type,
-                                          .value = std::monostate{}})
-                    : EmptyValue());
+        record(
+            compute->ids[i], compute->exprs[i]->type,
+            null ? EmptyValue(Constant{.type = compute->exprs[i]->type, .value = std::monostate{}})
+                 : EmptyValue());
       }
       continue;
     }
@@ -737,7 +739,7 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
           constant != nullptr) {
         record(project.ids[i], constant->type,
                std::holds_alternative<std::monostate>(constant->value) ? EmptyValue()
-                                                                        : EmptyValue(*constant));
+                                                                       : EmptyValue(*constant));
         continue;
       }
       const auto it = values.find(project.columns[i].id);
@@ -1089,8 +1091,10 @@ ExprPtr ConditionOf(const Predicate& predicate, const BoundColumn& any) {
   Predicate local = predicate;
   std::vector<ExprPtr> operands;
   const auto operand = [&operands](BoundColumn& column) {
-    operands.push_back(std::make_shared<const Expr>(Expr{
-        .node = ColumnExpr{.index = 0, .id = column.id}, .type = column.type, .name = column.name}));
+    operands.push_back(
+        std::make_shared<const Expr>(Expr{.node = ColumnExpr{.index = 0, .id = column.id},
+                                          .type = column.type,
+                                          .name = column.name}));
     column.index = Narrow<int>(operands.size() - 1);
     column.id = kNoColumnId;
   };
@@ -1116,8 +1120,8 @@ struct Rewritten {
   LogicalNodePtr right;
 };
 
-// The name a reader of the call's column gives it: the select list's, else the call as EXPLAIN shows
-// one.
+// The name a reader of the call's column gives it: the select list's, else the call as EXPLAIN
+// shows one.
 std::string NameOfCall(const AggregateCall& call, const Spine& spine) {
   for (const Step& step : spine.steps) {
     if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
@@ -1246,8 +1250,8 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   for (AggregateCall& call : grouped.aggregates) {
     call.id = rename(call.id);
   }
-  // On a LEFT join back each call whose empty value is no NULL (the COUNT kinds) is computed under a
-  // fresh id, and its own id is defined above the join as COALESCE(fresh, <empty value>): a real
+  // On a LEFT join back each call whose empty value is no NULL (the COUNT kinds) is computed under
+  // a fresh id, and its own id is defined above the join as COALESCE(fresh, <empty value>): a real
   // group's count is never NULL, so only an outer row with no group takes the empty value. The
   // other calls keep their ids, NULL on such a row already.
   std::vector<std::pair<AggregateCall, ColumnId>> coalesced;  // the call as written, its fresh id
@@ -1295,8 +1299,8 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   }
   // The keys as the join will name them, taken before `grouped` is moved into its node.
   const std::vector<BoundColumn> group_keys = grouped.keys;
-  // The steps above the static aggregate, bottom-up, where they are rebuilt rather than re-made over
-  // the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
+  // The steps above the static aggregate, bottom-up, where they are rebuilt rather than re-made
+  // over the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
   const bool rebuilt =
       join_back == JoinBack::kLeft || having ||
       std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kOneRow; });
@@ -1314,9 +1318,9 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       }
       case Role::kStatic: {
         GroupAggregateNode node = grouped;  // the one static step
-        node.input = RestrictToTheOuterKeys(std::move(right), join, equivalent,
-                                            representatives.null_equal, described, join_back,
-                                            last_id);
+        node.input =
+            RestrictToTheOuterKeys(std::move(right), join, equivalent, representatives.null_equal,
+                                   described, join_back, last_id);
         right = Make(std::move(node));
         break;
       }
@@ -1402,7 +1406,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   };
   const auto rebuild = [&maps, &last_id, &any_key, &rename, &rename_reads, &renamed,
                         &typed](LogicalNodePtr top) {
-    std::optional<BoundColumn> guard;  // the HAVINGs below, once there is one
+    std::optional<BoundColumn> guard;  // the HAVING clauses below, once there is one
     std::set<ColumnId> defined;        // the renamed ids the select list defines
     const auto guarded = [&guard](ExprPtr expr) -> ExprPtr {
       if (!guard.has_value()) {
@@ -1430,10 +1434,10 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         const auto& filter = std::get<FilterNode>(*step->node);
         std::vector<ExprPtr> conditions;
         if (guard.has_value()) {
-          conditions.push_back(std::make_shared<const Expr>(
-              Expr{.node = ColumnExpr{.index = 0, .id = guard->id},
-                   .type = LogicalType::kBoolean,
-                   .name = guard->name}));
+          conditions.push_back(
+              std::make_shared<const Expr>(Expr{.node = ColumnExpr{.index = 0, .id = guard->id},
+                                                .type = LogicalType::kBoolean,
+                                                .name = guard->name}));
         }
         for (Predicate predicate : filter.predicates) {
           for (std::optional<BoundColumn>* column : {&predicate.column, &predicate.other}) {
@@ -1476,9 +1480,8 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
       ComputeNode items{.input = std::move(top), .exprs = {}, .ids = {}, .span = project.span};
       for (std::size_t i = 0; i < project.ids.size() && i < project.columns.size(); ++i) {
         const std::optional<Constant>* constant =
-            i < project.constants.size() && project.constants[i].has_value()
-                ? &project.constants[i]
-                : nullptr;
+            i < project.constants.size() && project.constants[i].has_value() ? &project.constants[i]
+                                                                             : nullptr;
         const BoundColumn& column = project.columns[i];
         if (constant == nullptr && rename(column.id) == project.ids[i]) {
           continue;  // passed through, and no HAVING guards it: defined below already
@@ -1498,17 +1501,18 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     }
     // A value the join appends that no select list defines: the CASE over its fresh id, over the
     // last HAVING.
-    ComputeNode values{.input = std::move(top), .exprs = {}, .ids = {}, .span = {}};
+    ComputeNode guarded_values{.input = std::move(top), .exprs = {}, .ids = {}, .span = {}};
     for (const auto& [id, fresh] : renamed) {
       if (defined.contains(id)) {
         continue;
       }
       const auto& [type, name] = typed.at(id);
-      values.exprs.push_back(guarded(std::make_shared<const Expr>(
+      guarded_values.exprs.push_back(guarded(std::make_shared<const Expr>(
           Expr{.node = ColumnExpr{.index = 0, .id = fresh}, .type = type, .name = name})));
-      values.ids.push_back(id);
+      guarded_values.ids.push_back(id);
     }
-    return values.exprs.empty() ? std::move(values.input) : Make(std::move(values));
+    return guarded_values.exprs.empty() ? std::move(guarded_values.input)
+                                        : Make(std::move(guarded_values));
   };
 
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
@@ -1521,15 +1525,15 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     // An inner join, so either side may build: the aggregate it puts on the right is often far
     // larger than the outer rows that probe it (ADR 0026).
     const std::optional<int64_t> right_rows = EstimateRows(*right);
-    LogicalNodePtr out = Make(JoinNode{
-        .kind = JoinKind::kInner,
-        .left = join.left,
-        .right = right,
-        .keys = std::move(keys),
-        .residual = {},
-        .build = ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
-        .estimate = left_rows,
-        .span = join.span});
+    LogicalNodePtr out =
+        Make(JoinNode{.kind = JoinKind::kInner,
+                      .left = join.left,
+                      .right = right,
+                      .keys = std::move(keys),
+                      .residual = {},
+                      .build = ChooseBuildSide(left_rows, right_rows, correlation.build_side_ratio),
+                      .estimate = left_rows,
+                      .span = join.span});
     return Rewritten{.node = std::move(out), .right = std::move(right)};
   }
   // LEFT builds its right input: it pads that side, which only a probe of the left one can tell
@@ -1545,20 +1549,20 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   if (!coalesced.empty()) {
     ComputeNode counts{.input = std::move(top), .exprs = {}, .ids = {}, .span = aggregate->span};
     for (const auto& [call, fresh] : coalesced) {
-      const std::string name = std::format("COALESCE({}, {})", NameOfCall(call, spine),
-                                           ToString(*EmptyValueOf(call)));
-      counts.exprs.push_back(std::make_shared<const Expr>(Expr{
-          .node = CaseExpr{.whens = {nullptr},
-                           .thens = {std::make_shared<const Expr>(
-                               Expr{.node = ColumnExpr{.index = 0, .id = fresh},
-                                    .type = call.type,
-                                    .name = NameOfCall(call, spine)})},
-                           .otherwise = std::make_shared<const Expr>(
-                               Expr{.node = ConstantExpr{.value = *EmptyValueOf(call)},
-                                    .type = call.type,
-                                    .name = ToString(*EmptyValueOf(call))})},
-          .type = call.type,
-          .name = name}));
+      const std::string name =
+          std::format("COALESCE({}, {})", NameOfCall(call, spine), ToString(*EmptyValueOf(call)));
+      counts.exprs.push_back(std::make_shared<const Expr>(
+          Expr{.node = CaseExpr{.whens = {nullptr},
+                                .thens = {std::make_shared<const Expr>(
+                                    Expr{.node = ColumnExpr{.index = 0, .id = fresh},
+                                         .type = call.type,
+                                         .name = NameOfCall(call, spine)})},
+                                .otherwise = std::make_shared<const Expr>(
+                                    Expr{.node = ConstantExpr{.value = *EmptyValueOf(call)},
+                                         .type = call.type,
+                                         .name = ToString(*EmptyValueOf(call))})},
+               .type = call.type,
+               .name = name}));
       counts.ids.push_back(call.id);
     }
     top = Make(std::move(counts));
