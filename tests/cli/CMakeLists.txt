@@ -546,6 +546,36 @@ antb1_add_cli_golden(
     --table
     "zones=${_f}/star/zones.parquet"
 )
+# NOTs over an IN conjunct fold into its kind (ADR 0041's SQ7b): NOT (x NOT IN q) is a semi join.
+antb1_add_cli_golden(
+  explain_not_not_in_semi_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE NOT (tr_driver NOT IN (SELECT dv_id FROM drivers WHERE dv_id > 5))"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# An IN over a set operation: its set is the operation's node, the probe widened to its type.
+antb1_add_cli_golden(
+  explain_in_subquery_over_union
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT COUNT(*) FROM trips WHERE tr_pickup = ANY (SELECT zn_id FROM zones WHERE zn_city = 1 UNION SELECT ct_id FROM cities)"
+    --table
+    "trips=${_f}/star/trips.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "cities=${_f}/star/cities.parquet"
+)
 # A mark in HAVING stands over the groups, above the aggregation; one in an aggregate's argument
 # stands below it, over the rows, above WHERE's filter.
 antb1_add_cli_golden(

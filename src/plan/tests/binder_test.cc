@@ -8343,6 +8343,67 @@ TEST(BinderTest, NotsOverAnInConjunctFoldIntoItsKind) {
             std::string::npos);
 }
 
+// ADR 0041's SQ7b: an IN's probe is any operand, and its set any query whose arms read no enclosing
+// block. A constant probe is a key computed in the join's own layer, so the semi join stays above
+// the block's joins (no relation's branch holds its key); a string literal against a DATE set is
+// that DATE; a set operation's set is its unified type, the probe widened to it.
+TEST(BinderTest, InProbesAndSetsOfSq7b) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+    return Explain(optimized);
+  };
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE 2 IN (SELECT i16 FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"2\" = \"CAST(i16 AS INTEGER)\"] carries 1 of 2 unread "
+            "above\n"
+            "    Compute 2\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    Compute CAST(i16 AS INTEGER)\n"
+            "      Project i16\n"
+            "        Scan table=u source=fake columns=[i16]\n");
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE '2027-01-05' IN (SELECT dt FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"'2027-01-05'\" = dt] carries 1 of 2 unread above\n"
+            "    Compute '2027-01-05'\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    Project dt\n"
+            "      Scan table=u source=fake columns=[dt]\n");
+  EXPECT_EQ(plan_of("SELECT i16 FROM t WHERE i16 IN (SELECT i16 FROM u UNION SELECT i64 FROM u)"),
+            "Output: i16:SMALLINT\n"
+            "Project i16\n"
+            "  Join SEMI build=right keys=[\"CAST(i16 AS BIGINT)\" = i16] carries 1 of 2 unread "
+            "above\n"
+            "    Compute CAST(i16 AS BIGINT)\n"
+            "      Scan table=t source=fake columns=[i16]\n"
+            "    SetOperation inputs=2 formula=(0 UNION 1) columns=[i16]\n"
+            "      Compute CAST(i16 AS BIGINT)\n"
+            "        Project i16\n"
+            "          Scan table=u source=fake columns=[i16]\n"
+            "      Project i64\n"
+            "        Scan table=u source=fake columns=[i64]\n");
+  for (const char* sql : {
+           "SELECT i16 FROM t WHERE i16 < 0 OR 2 NOT IN (SELECT i16 FROM u)",
+           "SELECT i16 FROM t WHERE (SELECT MIN(i16) FROM ok) + i16 IN (SELECT i32 FROM u)",
+           "SELECT i16 FROM t WHERE i16 < 0 OR (SELECT MIN(i16) FROM ok) IN (SELECT i32 FROM u)",
+           "SELECT i16 FROM t WHERE i32 = ANY (SELECT i16 FROM u EXCEPT SELECT i16 FROM ok) OR "
+           "i16 <> ALL (SELECT i16 FROM u INTERSECT ALL SELECT i16 FROM ok)",
+           "SELECT i16, CASE WHEN 's' IN (SELECT s FROM u) THEN 1 ELSE 0 END FROM t",
+           "SELECT i16 FROM t GROUP BY i16 HAVING 3 IN (SELECT i16 FROM u) OR COUNT(*) > 1",
+       }) {
+    EXPECT_NE(plan_of(sql), "") << sql;
+  }
+}
+
 // The select list binds before WHERE, and its expressions over aggregates before HAVING, but a mark
 // it plants stands above their filters, in its slot's tail, so that it computes its probe only for
 // the rows and groups they keep, as DuckDB does. A later clause that reads the same mark moves it
