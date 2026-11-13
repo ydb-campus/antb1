@@ -76,6 +76,36 @@ LogicalNodePtr WithFilter(const LogicalNodePtr& node,
   return WithInputs(*node, std::move(inputs));
 }
 
+// `node`'s static aggregate, each call rewritten by `f`.
+LogicalNodePtr WithAggregate(const LogicalNodePtr& node,
+                             const std::function<AggregateCall(const AggregateCall&)>& f) {
+  if (const auto* aggregate = std::get_if<AggregateNode>(node.get())) {
+    AggregateNode out = *aggregate;
+    for (AggregateCall& call : out.aggregates) {
+      call = f(call);
+    }
+    return std::make_shared<const LogicalNode>(std::move(out));
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  if (inputs.size() != 1) {
+    return node;
+  }
+  inputs.front() = WithAggregate(inputs.front(), f);
+  return WithInputs(*node, std::move(inputs));
+}
+
+// A subtree as EXPLAIN shows a plan's nodes: one line per node, inputs indented below it.
+std::string TreeText(const LogicalNodePtr& node, std::size_t depth = 0) {
+  if (node == nullptr) {
+    return "";
+  }
+  std::string text = std::string(2 * depth, ' ') + ExplainNode(*node) + "\n";
+  for (const LogicalNodePtr& input : InputsOf(*node)) {
+    text += TreeText(input, depth + 1);
+  }
+  return text;
+}
+
 constexpr std::string_view kExists =
     "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND u.i32 > 0)";
 constexpr std::string_view kNotExists =
@@ -265,11 +295,18 @@ TEST(UnnestingTest, AConjunctTheFilterRuleDoesNotRecognizeIsRefused) {
             "a correlated scalar subquery whose correlated conjunct the pass does not recognize is "
             "not supported");
   // Two defects: the checks keep their order, the aggregate's calls before the conjuncts, so the
-  // refusal is the one the pass has always given.
-  EXPECT_EQ(RefusalOf("SELECT i16 FROM t WHERE i32 > (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)",
-                      unrecognized),
-            "a correlated scalar subquery whose aggregate is not SUM, AVG, MIN or MAX is not "
-            "supported");
+  // refusal is the calls'. The single value is the one call the rule refuses, and only a plan built
+  // by hand puts one under a dependent join.
+  const auto single_value = [&unrecognized](const LogicalNodePtr& root) {
+    return WithRight(unrecognized(root), [](const LogicalNodePtr& right) {
+      return WithAggregate(right, [](AggregateCall call) {
+        call.kind = AggKind::kSingleValue;
+        return call;
+      });
+    });
+  };
+  EXPECT_EQ(RefusalOf(kScalar, single_value),
+            "a correlated scalar subquery whose aggregate is a single value is not supported");
 }
 
 // Decision 19: a static aggregate's empty values. COUNT in each spelling, and a sum of counts, is
@@ -407,8 +444,9 @@ TEST(UnnestingTest, TheProofReadsAConstantEmptyValue) {
             JoinBack::kLeft);
 }
 
-// Every correlated scalar subquery SQL answers today proves its INNER join back, nested and stacked
-// ones too; a dependent join with nothing above it -- a plan only a test builds -- does not.
+// Every correlated scalar subquery of SUM, AVG, MIN or MAX under a comparison that rejects NULL
+// proves its INNER join back, nested and stacked ones too; a dependent join with nothing above it
+// -- a plan only a test builds -- does not.
 TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
   const Catalog catalog = MakeCatalog();
   for (const std::string_view sql : {
@@ -433,8 +471,7 @@ TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
       EXPECT_EQ(entry.join_back, JoinBack::kInner);
     }
   }
-  // The dependent join alone, no consumer above it: the proof fails, and the join back is still the
-  // INNER one SQ0 builds.
+  // The dependent join alone, no consumer above it: the proof fails, and the join back is LEFT.
   auto plan = BindSql(kScalar, catalog);
   ASSERT_TRUE(plan.ok()) << plan.status().ToString();
   LogicalNodePtr alone = plan->root;
@@ -446,7 +483,209 @@ TEST(UnnestingTest, EveryAnsweredCorrelatedScalarPassesTheProof) {
   ASSERT_TRUE(out.ok()) << out.status().ToString();
   ASSERT_EQ(report.join_backs.size(), 1U);
   EXPECT_EQ(report.join_backs.front().join_back, JoinBack::kLeft);
-  EXPECT_EQ(std::get<JoinNode>(**out).kind, JoinKind::kInner);
+  EXPECT_NE(TreeText(*out).find("Join LEFT build=right"), std::string::npos) << TreeText(*out);
+}
+
+// The plan Unnest makes of `sql`, as EXPLAIN shows it, and the verdict of each join back.
+struct Unnested {
+  std::string text;
+  std::vector<JoinBack> join_backs;
+};
+Unnested UnnestedOf(std::string_view sql) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(sql, catalog);
+  EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+  if (!plan.ok()) {
+    return {};
+  }
+  UnnestReport report;
+  const arrow::Result<LogicalNodePtr> out = Unnest(plan->root, kBuildSideRatio, &report);
+  EXPECT_TRUE(out.ok()) << sql << ": " << out.status().ToString();
+  if (!out.ok()) {
+    return {};
+  }
+  Unnested unnested{.text = TreeText(*out), .join_backs = {}};
+  for (const UnnestReport::Entry& entry : report.join_backs) {
+    unnested.join_backs.push_back(entry.join_back);
+  }
+  return unnested;
+}
+
+// Decision 20's proof decides the join back (ADR 0041's SQ6): INNER only where the comparison
+// rejects the subquery's empty value. COUNT's 0 passes `= 0` and fails `> 0`; a strict combination
+// of MAX keeps its NULL. The proof folds no constants, so `COUNT(*) + 1 > 1`, which rejects the 1
+// the empty row gives, still joins back LEFT, as COALESCE and CASE items do: correct, only slower.
+TEST(UnnestingTest, TheProofDecidesTheJoinBack) {
+  struct Case {
+    std::string_view sql;
+    JoinBack join_back;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) > 0",
+                .join_back = JoinBack::kInner},
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) = 0",
+                .join_back = JoinBack::kLeft},
+           Case{.sql = "SELECT i16 FROM t WHERE i32 > (SELECT MAX(u.i32) * 2 FROM u WHERE u.i64 = "
+                       "t.i64)",
+                .join_back = JoinBack::kInner},
+           Case{.sql =
+                    "SELECT i16 FROM t WHERE (SELECT COUNT(*) + 1 FROM u WHERE u.i64 = t.i64) > 1",
+                .join_back = JoinBack::kLeft},
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COALESCE(SUM(u.i32), 0) FROM u WHERE u.i64 "
+                       "= t.i64) > 0",
+                .join_back = JoinBack::kLeft},
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT CASE WHEN MAX(u.i32) > 0 THEN 1 ELSE 2 END "
+                       "FROM u WHERE u.i64 = t.i64) = 1",
+                .join_back = JoinBack::kLeft},
+       }) {
+    SCOPED_TRACE(c.sql);
+    const Unnested unnested = UnnestedOf(c.sql);
+    ASSERT_EQ(unnested.join_backs.size(), 1U) << unnested.text;
+    EXPECT_EQ(unnested.join_backs.front(), c.join_back) << unnested.text;
+    EXPECT_NE(unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER" : "Join LEFT"),
+              std::string::npos)
+        << unnested.text;
+  }
+}
+
+// On a LEFT join back a count is computed under a fresh id and read above the join through
+// COALESCE(fresh, 0) under its own, so the comparison above reads 0 for an outer row with no group;
+// the join builds the aggregate, which it pads.
+TEST(UnnestingTest, TheLeftJoinBackReadsACountThroughCoalesce) {
+  const Unnested unnested =
+      UnnestedOf("SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) = 0");
+  const std::string& text = unnested.text;
+  const std::size_t coalesce = text.find("Compute COALESCE(count_star(), 0)");
+  const std::size_t join = text.find("Join LEFT build=right");
+  const std::size_t group = text.find("GroupAggregate");
+  ASSERT_NE(coalesce, std::string::npos) << text;
+  ASSERT_NE(join, std::string::npos) << text;
+  ASSERT_NE(group, std::string::npos) << text;
+  EXPECT_LT(coalesce, join) << "above the join: " << text;
+  EXPECT_LT(join, group) << text;
+}
+
+// The select list moves above a LEFT join back, so a padded row computes it over the empty values:
+// a constant item keeps its constant (1 over ORDER BY COUNT(*)), which the comparison then passes.
+TEST(UnnestingTest, TheSelectItemMovesAboveALeftJoinBack) {
+  const Unnested unnested = UnnestedOf(
+      "SELECT i16 FROM t WHERE 1 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY COUNT(*))");
+  const std::string& text = unnested.text;
+  ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{JoinBack::kLeft}) << text;
+  const std::size_t item = text.find("Compute 1");
+  const std::size_t join = text.find("Join LEFT build=right");
+  ASSERT_NE(item, std::string::npos) << text;
+  ASSERT_NE(join, std::string::npos) << text;
+  EXPECT_LT(item, join) << "the constant is computed above the join: " << text;
+}
+
+// A HAVING inside the block decides its value over the empty row too (decision 19): NULL where it
+// rejects that row, the item where it keeps it, and not known otherwise. So COUNT(*) > 1 makes the
+// value NULL there and `= 0` rejects it, INNER; COUNT(*) < 5 keeps the count's 0, which `= 0`
+// passes, LEFT; a computed condition is not known, LEFT. Either way the HAVING is a CASE over the
+// value, never a filter: a binding whose group it rejects still reads NULL (decision 17), so the
+// condition's column stands above the group on both join backs. A HAVING folded to FALSE reads no
+// column and rejects every row.
+TEST(UnnestingTest, AHavingIsACaseOnBothJoinBacks) {
+  struct Case {
+    std::string_view having;
+    JoinBack join_back;
+  };
+  for (const Case& c : {
+           Case{.having = "COUNT(*) > 1", .join_back = JoinBack::kInner},
+           Case{.having = "COUNT(*) < 5", .join_back = JoinBack::kLeft},
+           Case{.having = "COUNT(*) % 2 = 0", .join_back = JoinBack::kLeft},
+           Case{.having = "MAX(u.i16) > 100000", .join_back = JoinBack::kInner},
+       }) {
+    const std::string sql = std::format(
+        "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 HAVING {}) = 0",
+        c.having);
+    SCOPED_TRACE(sql);
+    const Unnested unnested = UnnestedOf(sql);
+    ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
+    const std::size_t having = unnested.text.find("Compute HAVING");
+    const std::size_t join =
+        unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER" : "Join LEFT");
+    const std::size_t group = unnested.text.find("GroupAggregate");
+    ASSERT_NE(having, std::string::npos) << unnested.text;
+    ASSERT_NE(join, std::string::npos) << unnested.text;
+    ASSERT_NE(group, std::string::npos) << unnested.text;
+    EXPECT_EQ(unnested.text.find("Filter \"count_star()\" >"), std::string::npos)
+        << "no filter over the group: " << unnested.text;
+    if (c.join_back == JoinBack::kInner) {
+      EXPECT_LT(join, having) << "over the group, below the join: " << unnested.text;
+    } else {
+      EXPECT_LT(having, join) << "above the join: " << unnested.text;
+    }
+    EXPECT_LT(having, group) << unnested.text;
+  }
+}
+
+// An uncorrelated value over the block's aggregate, from the slot after the aggregation, is a
+// one-row join that moves up with the maps (decision 21): over the group below an INNER join back,
+// above a LEFT one, where a binding without rows combines the empty value with it -- in a select
+// item and in a HAVING alike.
+TEST(UnnestingTest, AnUncorrelatedOneRowJoinMovesUpWithTheItem) {
+  struct Case {
+    std::string_view sql;
+    JoinBack join_back;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) + (SELECT MIN(i16) FROM "
+                       "ok) FROM u WHERE u.i64 = t.i64)",
+                .join_back = JoinBack::kInner},
+           Case{.sql = "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = "
+                       "t.i64 HAVING SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
+                .join_back = JoinBack::kInner},
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) FROM "
+                       "u WHERE u.i64 = t.i64) = 1",
+                .join_back = JoinBack::kLeft},
+       }) {
+    SCOPED_TRACE(c.sql);
+    const Unnested unnested = UnnestedOf(c.sql);
+    ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
+    const std::size_t one_row = unnested.text.find("Join ONE-ROW");
+    const std::size_t join =
+        unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER" : "Join LEFT");
+    const std::size_t group = unnested.text.find("GroupAggregate");
+    ASSERT_NE(one_row, std::string::npos) << unnested.text;
+    ASSERT_NE(join, std::string::npos) << unnested.text;
+    ASSERT_NE(group, std::string::npos) << unnested.text;
+    if (c.join_back == JoinBack::kInner) {
+      EXPECT_LT(join, one_row) << "over the group, below the join: " << unnested.text;
+    } else {
+      EXPECT_LT(one_row, join) << "above the join: " << unnested.text;
+    }
+    EXPECT_LT(one_row, group) << unnested.text;
+  }
+  // An IN or NOT IN conjunct of the block's HAVING is a semi or null-aware anti join over the
+  // aggregate, which filters its one row: no rule takes it. The binder bound it in full first.
+  const auto identity = [](const LogicalNodePtr& root) { return root; };
+  for (const std::string_view in : {"IN", "NOT IN"}) {
+    EXPECT_EQ(RefusalOf(std::format("SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE "
+                                    "u.i64 = t.i64 HAVING COUNT(*) {} (SELECT i16 FROM ok))",
+                                    in),
+                        identity),
+              "a correlated scalar subquery whose HAVING holds an IN subquery is not supported")
+        << in;
+  }
+  // A one-row join whose right input reads an outer column has no rule: it would need unnesting on
+  // both inputs (SQ8, SQ10).
+  const auto correlated_one_row = [](const LogicalNodePtr& root) {
+    return WithRight(root, [](const LogicalNodePtr& right) {
+      return std::make_shared<const LogicalNode>(JoinNode{.kind = JoinKind::kOneRow,
+                                                          .left = right,
+                                                          .right = right,
+                                                          .keys = {},
+                                                          .residual = {},
+                                                          .build = BuildSide::kRight,
+                                                          .estimate = std::nullopt,
+                                                          .span = {}});
+    });
+  };
+  EXPECT_EQ(RefusalOf(kScalar, correlated_one_row),
+            "a correlated scalar subquery over a block that is not an ungrouped aggregate over its "
+            "correlation is not supported");
 }
 
 }  // namespace

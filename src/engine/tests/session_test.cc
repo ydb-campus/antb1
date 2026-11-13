@@ -498,11 +498,10 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   ASSERT_TRUE(session->RegisterParquet("u", {path_}).ok());
   for (const char* sql : {
-           // A correlated COUNT: the one shape Path 2 must refuse rather than answer. COUNT is 0
-           // over no rows, and the rewrite gives an outer row with no group no row at all, so the
-           // comparison would keep rows the inner join drops -- the COUNT bug.
-           "SELECT COUNT(*) FROM t WHERE 0 = "
-           "(SELECT COUNT(*) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+           // A correlation the unnesting refuses: an outer column with no inner equivalent, which
+           // only the domain D answers (ADR 0041's SQ9).
+           "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
+           "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID < t.AdvEngineID)",
            // The shapes the binder itself rejects, each with its own rule.
            "SELECT COUNT(*) FROM t WHERE AdvEngineID IN "
            "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
@@ -523,9 +522,12 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
     }
   }
   // An uncorrelated scalar subquery still answers, and so do the correlated forms the unnesting
-  // pass now rewrites (roadmap ids U2 and U3), through all three entry points.
+  // pass now rewrites (roadmap ids U2 and U3; a correlated COUNT joined back LEFT, ADR 0041's SQ6),
+  // through all three entry points.
   for (const char* answered :
        {"SELECT COUNT(*) FROM t WHERE AdvEngineID = (SELECT MIN(u.AdvEngineID) FROM u)",
+        "SELECT COUNT(*) FROM t WHERE 0 = "
+        "(SELECT COUNT(*) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
         "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE EXISTS "

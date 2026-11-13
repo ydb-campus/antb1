@@ -1745,11 +1745,13 @@ std::optional<Rejection> RejectInCondition(const sql::SubqueryExpr& s, bool havi
       SubqueryConjunct{.subquery = &s, .other = &**s.operand, .negated = s.negated}, having);
 }
 
-// Whether a correlated scalar subquery's query is the one shape ADR 0023's Path 2 takes, an
-// aggregate over every row: no GROUP BY, HAVING, LIMIT or OFFSET, each of which could leave no row.
+// Whether a correlated scalar subquery's query is the shape the unnesting's value mode takes, an
+// aggregate over every row: no GROUP BY, LIMIT or OFFSET, each of which could leave no row or
+// several. A HAVING may leave no row too, which the unnesting answers as a CASE over the empty
+// values (ADR 0041's SQ6).
 bool AggregateOverEveryRow(const sql::SelectStatement& query) {
-  return !HasGroupBy(query) && query.having.empty() && !query.limit.has_value() &&
-         !query.offset.has_value() && IsAggregateQuery(query);
+  return !HasGroupBy(query) && !query.limit.has_value() && !query.offset.has_value() &&
+         IsAggregateQuery(query);
 }
 
 arrow::Result<std::shared_ptr<Table>> ResolveTable(const sql::TableRef& ref,
@@ -6628,12 +6630,12 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
     return Reject(*r);
   }
   if (correlated && form.scalar() && !AggregateOverEveryRow(query)) {
-    // ADR 0023's Path 2 unnests an aggregate over every row; any other correlated scalar needs the
-    // single join (ADR 0041's SQ4b).
+    // The unnesting's value mode takes an aggregate over every row; any other correlated scalar
+    // needs the single join (ADR 0041's SQ4b) or per-binding limits (SQ14).
     return Reject(Rejection{.span = form.subquery->op_span,
                             .message = "a scalar subquery other than an aggregate over every row "
-                                       "is not supported (no GROUP BY, HAVING, LIMIT or OFFSET, "
-                                       "which could leave no row)"});
+                                       "is not supported (no GROUP BY, LIMIT or OFFSET, which "
+                                       "could leave no row or several)"});
   }
   if (correlated && having) {
     // ADR 0023: a correlated subquery in HAVING exits 4, since its outer references would read the
@@ -7026,13 +7028,6 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   if (lookup_only_) {
     // No GROUP BY key holds this value (a key's is bound first): the speculation fails.
     return BindError("a subquery's value that no GROUP BY key holds", s.op_span);
-  }
-  if (group && Correlated() && !dry_run_) {
-    // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look
-    // (ADR 0041's SQ5 and SQ0 teach it).
-    return Reject(Rejection{.span = s.op_span,
-                            .message = "a subquery's value over the aggregate of a correlated "
-                                       "subquery is not supported"});
   }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
   // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
@@ -8142,19 +8137,18 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
   const SourceSpan span = conjunct.span();
   if (const std::optional<SubqueryConjunct> form = AsSubqueryConjunct(conjunct)) {
     if (!form->scalar() && !form->exists()) {
+      // In a correlated block its semi or null-aware anti join stands over the block's aggregate,
+      // which the unnesting refuses once the whole query is bound, its bind errors first.
       return BindSubqueryConjunct(conjunct, *form, /*having=*/true, bind);
     }
     const BoundValue* known = FindValue(*form->subquery, /*group=*/true);
     std::optional<Typed> value;
     if (known != nullptr) {
       value = known->value;
-    } else if (Correlated()) {
-      return Reject(Rejection{.span = form->subquery->op_span,
-                              .message = "a subquery's value over the aggregate of a correlated "
-                                         "subquery is not supported"});
     } else {
       // A block in HAVING that reads an enclosing one is refused while it binds ("a correlated
-      // subquery in HAVING", "EXISTS in HAVING"), so none is correlated here.
+      // subquery in HAVING", "EXISTS in HAVING"), so none is correlated here. In a correlated
+      // block its one-row join moves up with the block's value (ADR 0041's SQ6).
       ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/true));
       ANTB1_CHECK(!block.correlated);
       value = PlantValue(*form->subquery, std::move(block), /*group=*/true);

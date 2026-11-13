@@ -1106,9 +1106,21 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "GROUP BY i16)",
                   kUnsupported, "(", "other than an aggregate over every row"},
+        // A HAVING is answered, as a CASE over the block's value (ADR 0041's SQ6). An IN or NOT IN
+        // conjunct of it binds in full, so its bind errors come first, as in DuckDB; the unnesting
+        // refuses it afterwards (unnesting_test).
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
-                  "HAVING COUNT(*) > 1)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+                  "HAVING nosuch IN (SELECT i16 FROM ok))",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) IN (SELECT nosuch FROM ok))",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) NOT IN (SELECT dt FROM u))",
+                  kBind, "NOT IN", "cannot compare values of type BIGINT and DATE"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) IN (SELECT i16 FROM ok) AND nosuch > 0)",
+                  kBind, "nosuch", "column 'nosuch' does not exist"},
         // The other side is checked as any comparison's is: an operand, a literal, or a constant
         // integer expression.
         ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,
@@ -1550,18 +1562,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN (subquery) is not supported"},
         ErrorCase{"SELECT CASE WHEN NULL IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
                   kUnsupported, "NULL", "NULL literals are not supported"},
-        // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
-        // not look (SQ5).
-        ErrorCase{
-            "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) + (SELECT MIN(i16) FROM ok) FROM "
-            "u WHERE u.i64 = t.i64)",
-            kUnsupported, "(",
-            "a subquery's value over the aggregate of a correlated subquery is not supported"},
-        ErrorCase{
-            "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64 HAVING "
-            "SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
-            kUnsupported, "(",
-            "a subquery's value over the aggregate of a correlated subquery is not supported"},
         // A compound's own ORDER BY (ADR 0039's X5).
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY (SELECT MIN(i16) FROM "
                   "ok)",
@@ -7917,17 +7917,24 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_TRUE(Optimize(*plain).ok());
 }
 
-// Path 2 joins the outer side to the grouped subquery with an inner join, which gives an outer row
-// with no group no row: right only where the subquery's value is NULL over no rows, so that the
-// comparison above rejects that row too. A select item that reads no aggregate call is not: a
-// constant over an aggregation that an ORDER BY aggregate makes one row (its call is then dropped)
-// is that constant over no rows. Refused, with the strict combinations kept answered.
-TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
+// An inner join back gives an outer row with no group no row: right only where the comparison
+// above rejects the subquery's value over no rows too. A select item that reads no aggregate call
+// is not NULL there: a constant over an aggregation that an ORDER BY aggregate makes one row (its
+// call is then dropped) is that constant over no rows. Such a block is joined back LEFT (ADR 0041's
+// SQ6), the item computed above the join, and the strict combinations keep their INNER join back.
+TEST(BinderTest, ACorrelatedScalarKeepsItsValueOverNoRows) {
   const auto catalog = testing::MakeCatalog();
   const auto optimize = [&catalog](std::string_view sql) {
     auto plan = BindSql(sql, catalog);
     EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     return plan.ok() ? Optimize(*plan) : arrow::Result<LogicalPlan>(plan.status());
+  };
+  const auto join_back = [](const LogicalPlan& plan) {
+    const std::string text = Explain(plan);
+    if (text.contains("Join LEFT")) {
+      return JoinKind::kLeft;
+    }
+    return text.contains("Join INNER") ? JoinKind::kInner : JoinKind::kSemi;
   };
   for (const std::string_view sql : {
            "SELECT i16 FROM t WHERE i32 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY COUNT(*))",
@@ -7937,14 +7944,8 @@ TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
            "MIN(u.i32))",
        }) {
     const auto optimized = optimize(sql);
-    ASSERT_FALSE(optimized.ok()) << sql;
-    const auto detail = GetSqlError(optimized.status());
-    ASSERT_NE(detail, nullptr) << sql << ": " << optimized.status().ToString();
-    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
-    EXPECT_EQ(optimized.status().message(),
-              "a correlated scalar subquery whose select item does not combine its aggregate "
-              "strictly is not supported")
-        << sql;
+    ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    EXPECT_EQ(join_back(*optimized), JoinKind::kLeft) << Explain(*optimized);
   }
   for (const std::string_view sql : {
            "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u WHERE u.i64 = t.i64)",
@@ -7955,7 +7956,8 @@ TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
            "t.i64)",
        }) {
     const auto optimized = optimize(sql);
-    EXPECT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    EXPECT_EQ(join_back(*optimized), JoinKind::kInner) << Explain(*optimized);
   }
 }
 

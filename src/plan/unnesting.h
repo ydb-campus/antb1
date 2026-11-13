@@ -39,8 +39,7 @@ JoinBack ProveJoinBack(std::span<const LogicalNode* const> above,
                        const std::map<ColumnId, EmptyValue>& values);
 
 // The proof's verdict for each dependent join that appends its right input's row, in the order the
-// pass met them. SQ0 joins back INNER whatever the verdict, which every shape answered today
-// proves; ADR 0041's SQ6 lets it decide.
+// pass met them: the join back each got (ADR 0041's SQ6).
 struct UnnestReport {
   struct Entry {
     SourceSpan span;

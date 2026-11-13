@@ -191,7 +191,8 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ2 | Uncorrelated subqueries as values in the select list (CASE included), ORDER BY, GROUP BY keys and aggregate arguments | 9 | Built (SQ2a: blocks that do not aggregate; SQ2b: blocks that aggregate) |
 | SQ7 | Uncorrelated IN, NOT IN, `= ANY` and `<> ALL` in any condition, through a null-aware mark join under OR, NOT or CASE, and IN over a set operation (ADR 0036's X6) | 45 | Built (SQ7a: the mark under OR, NOT and CASE; SQ7b: the IN forms) |
 | SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Built |
-| SQ5, SQ6 | One PR or two. SQ6: correlated static aggregates of any kind, COUNT included, joined back LEFT with their empty values where the consumer proof fails; SQ5: correlated aggregates as values in the per-row slots, under the proof. Split, SQ6 lands first, since SQ5's correlated aggregates of any kind with any select item need its LEFT join back; SQ6 completes 41 and SQ5 6 | 6, 41 | Planned |
+| SQ6 | Correlated static aggregates of any kind, COUNT included, with any select item, a HAVING and an uncorrelated value inside, joined back LEFT with their empty values where the consumer proof fails; lands before SQ5, whose correlated aggregates of any kind need its LEFT join back | 41 | Built |
+| SQ5 | Correlated aggregates as values in the per-row slots, under the consumer proof | 6 | Planned |
 | SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Planned |
 | **Phase 9** | **Window functions** | | |
 | W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
@@ -903,6 +904,10 @@ Update (2026-11-13, SQ0): SQ0, built, replaces ADR 0023's Path 1 and Path 2 with
 proof, deciding nothing yet (ADR 0041's SQ0 update). No answer, plan or refusal message changes, no query completes,
 the ratchet stays at 80, and no TPC-H or TPC-DS plan changes. SQ5 and SQ6, correlated values and the LEFT join back,
 follow.
+
+Update (2026-11-13, SQ6): SQ5 and SQ6 split, SQ6 first, as the plan above allows. SQ6, built, joins a correlated static
+aggregate of any kind back LEFT with its empty values where the consumer proof fails (ADR 0041's SQ6 update); it
+completes Q41, and the ratchet goes from 80 to 81. Q41 is the only TPC-H or TPC-DS plan that changes. SQ5 is next.
 
 ## Alternatives considered
 

@@ -2642,6 +2642,171 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- SQ6's empty values (ADR 0041) ----
+  // A correlated scalar subquery whose block aggregates over every row gives an outer row without
+  // a match the block's value over no rows: COUNT 0, the other calls NULL, a constant its value,
+  // NULL where a HAVING rejects that row. The pairs (tools/fixturegen/star.h): cities 4 to 6 have
+  // no rider, riders 237 to 240 no trip, and riders and drivers both have NULL cities, which only
+  // IS NOT DISTINCT FROM matches.
+  {
+    const slt::FeatureSet empty = {kColumns,    kCountStar,      kIntegerColumns,
+                                   kTableName,  kQualifiedName,  kWhere,
+                                   kTableAlias, kIntegerLiteral, kCorrelatedEmptyValue};
+    struct EmptyPair {
+      std::string_view name;
+      std::string_view outer;  // the outer table, read as `o`
+      std::string_view row;    // a column of `o` that tells its rows apart
+      std::string_view outer_key;
+      std::string_view inner;
+      std::string_view inner_key;
+      std::string_view key_op;  // = or IS NOT DISTINCT FROM
+    };
+    constexpr auto kEmptyPairs = std::to_array<EmptyPair>({
+        {.name = "cities_and_riders",
+         .outer = "cities",
+         .row = "ct_id",
+         .outer_key = "ct_id",
+         .inner = "riders",
+         .inner_key = "rd_city",
+         .key_op = "="},
+        {.name = "riders_and_trips",
+         .outer = "riders",
+         .row = "rd_row",
+         .outer_key = "rd_id",
+         .inner = "trips",
+         .inner_key = "tr_rider",
+         .key_op = "="},
+        {.name = "riders_and_drivers",
+         .outer = "riders",
+         .row = "rd_row",
+         .outer_key = "rd_city",
+         .inner = "drivers",
+         .inner_key = "dv_city",
+         .key_op = "="},
+        {.name = "riders_and_drivers_null_equal",
+         .outer = "riders",
+         .row = "rd_row",
+         .outer_key = "rd_city",
+         .inner = "drivers",
+         .inner_key = "dv_city",
+         .key_op = "IS NOT DISTINCT FROM"},
+    });
+    for (const EmptyPair& pair : kEmptyPairs) {
+      const slt::FeatureSet keyed = pair.key_op == "=" ? empty : SetWith(empty, kNullEqualKeys);
+      const auto correlated = [&](std::string_view op) {
+        return std::format(
+            "SELECT o.{} FROM {} AS o WHERE (SELECT COUNT(*) FROM {} WHERE {}.{} {} o.{}) {}",
+            pair.row, pair.outer, pair.inner, pair.inner, pair.inner_key, pair.key_op,
+            pair.outer_key, op);
+      };
+      // The COUNT is a LEFT JOIN with the inner groups and a COALESCE to 0, for a comparison that
+      // keeps the empty value and for ones that drop it, at any batch size.
+      for (const auto& [op, label] :
+           {std::pair{"= 0", "eq_0"}, std::pair{"< 12", "lt_12"}, std::pair{">= 13", "ge_13"}}) {
+        const std::string count = correlated(op);
+        r.push_back(
+            {.name = std::format("correlated_count_equals_a_left_join_group_by_and_coalesce_{}_{}",
+                                 pair.name, label),
+             .features = SetWith(keyed, kLeftJoin, kDerivedTable, kGroupBy, kAlias),
+             .probes = {Q(count),
+                        Q(std::format("SELECT o.{0} FROM {1} AS o LEFT JOIN (SELECT {3} AS k, "
+                                      "COUNT(*) AS n FROM {2} GROUP BY {3}) AS g ON g.k {4} o.{5} "
+                                      "WHERE COALESCE(g.n, 0) {6}",
+                                      pair.row, pair.outer, pair.inner, pair.inner_key, pair.key_op,
+                                      pair.outer_key, op)),
+                        Q(count, 1), Q(count, 7)},
+             .check = AllEqual()});
+      }
+      // A COUNT is never NULL, so `= 0` and `> 0` split the outer rows, every one in one of them.
+      r.push_back({.name = std::format("correlated_count_partitions_the_outer_rows_{}", pair.name),
+                   .features = keyed,
+                   .probes = {Q(std::format("SELECT o.{} FROM {} AS o", pair.row, pair.outer)),
+                              Q(correlated("= 0")), Q(correlated("> 0"))},
+                   .check = FirstIsUnionOfRest()});
+    }
+    // The self-check of ADR 0041's decision 28 for SQ6's shapes: the correlated subquery's rows
+    // are those of the subquery with each city written as a literal (cities 1 to 6, none NULL),
+    // which needs no DuckDB; and the same rows at any batch size. A constant over ORDER BY MAX, and
+    // a constant under `HAVING SUM(x) IS NULL OR ...` or `HAVING MAX(x) IS NULL`, are shapes DuckDB
+    // 1.5.6 answers wrongly (docs/testing.md), so only this check covers them.
+    const auto per_binding = [](std::string_view correlated, std::string_view literal) {
+      std::vector<Probe> probes = {Q(std::string(correlated))};
+      for (int id = 1; id <= 6; ++id) {
+        probes.push_back(Q(std::vformat(literal, std::make_format_args(id, id))));
+      }
+      return probes;
+    };
+    struct SelfCheck {
+      std::string_view name;
+      std::string_view block;  // `{}` stands for the outer city's id
+      std::string_view comparison;
+      slt::FeatureSet features;
+    };
+    const auto self_checks = std::to_array<SelfCheck>({
+        {.name = "count",
+         .block = "SELECT COUNT(*) FROM riders WHERE riders.rd_city = {}",
+         .comparison = "= 0",
+         .features = {}},
+        {.name = "count_column",
+         .block = "SELECT COUNT(riders.rd_tier) FROM riders WHERE riders.rd_city = {}",
+         .comparison = "< 70",
+         .features = {kCountColumn, kVarcharColumns}},
+        {.name = "case",
+         .block = "SELECT CASE WHEN COUNT(*) > 70 THEN 1 ELSE 0 END FROM riders WHERE "
+                  "riders.rd_city = {}",
+         .comparison = "= 0",
+         .features = {kCase}},
+        {.name = "coalesce",
+         .block = "SELECT COALESCE(SUM(riders.rd_row), -1) FROM riders WHERE riders.rd_city = {}",
+         .comparison = "< 0",
+         .features = {kSum, kNegativeLiteral}},
+        {.name = "having",
+         .block = "SELECT COUNT(*) FROM riders WHERE riders.rd_city = {} HAVING COUNT(*) < 78",
+         .comparison = "= 0",
+         .features = {kHaving}},
+        {.name = "constant_over_order_by_max",
+         .block = "SELECT 42 FROM riders WHERE riders.rd_city = {} ORDER BY MAX(riders.rd_row)",
+         .comparison = "= 42",
+         .features = {kConstant, kMax, kOrderBy}},
+        {.name = "constant_under_having_sum_is_null_or",
+         .block = "SELECT 7 FROM riders WHERE riders.rd_city = {} HAVING SUM(riders.rd_row) IS "
+                  "NULL OR SUM(riders.rd_row) > 0",
+         .comparison = "= 7",
+         .features = {kConstant, kSum, kHaving, kBooleanExpressions}},
+        {.name = "constant_under_having_max_is_null",
+         .block = "SELECT 7 FROM riders WHERE riders.rd_city = {} HAVING MAX(riders.rd_row) IS "
+                  "NULL",
+         .comparison = "= 7",
+         .features = {kConstant, kMax, kHaving, kBooleanExpressions}},
+        {.name = "moved_uncorrelated_value",
+         .block = "SELECT COUNT(*) + (SELECT MIN(zn_city) FROM zones) FROM riders WHERE "
+                  "riders.rd_city = {}",
+         .comparison = "= 1",
+         .features = {kMin, kArithmetic, kUncorrelatedValue}},
+    });
+    for (const SelfCheck& check : self_checks) {
+      const std::string block = std::vformat(check.block, std::make_format_args("cities.ct_id"));
+      const std::string correlated =
+          std::format("SELECT ct_id FROM cities WHERE ({}) {}", block, check.comparison);
+      // One `{}` for the city's id in `ct_id = {}` and one in the block, both from the same
+      // argument (per_binding passes it twice).
+      const std::string literal = std::format(
+          "SELECT ct_id FROM cities WHERE ct_id = {{}} AND ({}) {}", check.block, check.comparison);
+      slt::FeatureSet features = SetWith(empty, kWhereAnd, kUncorrelatedValue);
+      features.Add(check.features);
+      r.push_back(
+          {.name = std::format("correlated_empty_value_{}_is_its_bindings_as_literals", check.name),
+           .features = features,
+           .probes = per_binding(correlated, literal),
+           .check = FirstIsUnionOfRest()});
+      r.push_back(
+          {.name = std::format("correlated_empty_value_{}_batch_size_invariance", check.name),
+           .features = features,
+           .probes = {Q(correlated), Q(correlated, 1), Q(correlated, 7)},
+           .check = AllEqual()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

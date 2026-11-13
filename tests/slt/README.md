@@ -273,8 +273,8 @@ what ADR 0023's U2 and U3 answer would exit 4 for good and so never be compared:
 the same type and not merely the same `ValueKind` (a widening pair feeds no equivalence class), the inner
 table is never named like the outer binding (the fixtures' self-reference edges would shadow it and make the
 subquery silently uncorrelated), and the outer binding is never read by a path (its name in SQL is the path's).
-`AVG` is written only over a `DECIMAL` argument, where ADR 0021 rule 13 makes the engines agree bit for bit.
-U2 and U3 declare both forms, so they are compared like any other.
+`AVG` is written only over a `DECIMAL` or an integer argument, where ADR 0021 rule 13 and ADR 0037's AG1 make the
+engines agree bit for bit. U2 and U3 declare both forms, so they are compared like any other.
 
 The refs carry **uncorrelated values of any shape** as well (ADR 0041's SQ4a, feature `uncorrelated_value`), from a
 random stream of their own and only where neither subquery form above fired, so a query holds at most one subquery
@@ -348,6 +348,15 @@ table the probe has a ref to, unqualified and so uncorrelated, kept whole, to it
 literal comparison holds, with no `ORDER BY` or `LIMIT` on the compound or an arm. A `WHERE` or `HAVING` conjunct may
 also be the bare `IN` or `NOT IN` (a semi or an anti join) or `NOT NOT (x IN (q))` and `NOT (x NOT IN (q))`, which
 fold into a semi join. The other quantified comparisons (`< ANY`, `= ALL`) are never written.
+
+The empty values of ADR 0041's SQ6 (feature `correlated_empty_value`) are drawn last, from a random stream of their
+own and only where the query holds no other subquery: a top-level `WHERE` conjunct that compares a correlated scalar
+subquery with a literal or an outer column of its type, in either order. Its block reads one named table correlated
+through one key of one type, `=` or `IS NOT DISTINCT FROM`, and aggregates over every row: `COUNT(*)`, `COUNT(x)`,
+`COUNT(DISTINCT x)`, `SUM`, `AVG` (over a `DECIMAL` or an integer), `MIN`, `MAX` or the variance family (compared with
+0 only), as a call, `COALESCE(call, k)`, a `CASE` over a call, a count plus a small constant, or a constant over `ORDER
+BY COUNT(*)`, with an optional `HAVING` over a count. A constant item and a `HAVING` stand only in a block that holds a
+count, which keeps out the family of DuckDB's wrong answers in docs/testing.md; nothing divides or can overflow.
 
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave

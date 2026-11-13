@@ -2881,8 +2881,7 @@ NULL	16
 
 # ---- DuckDB only until SQ5/SQ13 get a PR (ADR 0041: a correlated value in a block that aggregates exits 4) ----
 
-# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key; and an uncorrelated
-# value over a correlated scalar subquery's aggregate, in a WHERE (a city with no zone counts 0 there).
+# A correlated value as a GROUP BY key, in an aggregate's argument and added to COUNT(*) on a key.
 
 onlyif duckdb
 query II nosort
@@ -2912,7 +2911,9 @@ SMALLINT	BIGINT
 5	9
 6	1
 
-onlyif duckdb
+# ---- an uncorrelated value over a correlated scalar subquery's aggregate (ADR 0041's SQ6) ----
+
+# Its one-row join moves up with the item, above the LEFT join back, so a city with no zone counts 0 there.
 query I nosort
 SELECT ct_id FROM cities c WHERE ct_id < (SELECT COUNT(*) - (SELECT MIN(ct_id) FROM cities) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY ct_id
 ----
