@@ -7029,13 +7029,6 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
     // No GROUP BY key holds this value (a key's is bound first): the speculation fails.
     return BindError("a subquery's value that no GROUP BY key holds", s.op_span);
   }
-  if (group && Correlated() && !dry_run_) {
-    // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look
-    // (ADR 0041's SQ5 and SQ0 teach it).
-    return Reject(Rejection{.span = s.op_span,
-                            .message = "a subquery's value over the aggregate of a correlated "
-                                       "subquery is not supported"});
-  }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
   // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
   // (decision 3); a dry run (OR factoring's, an EXISTS block's dropped item) binds one of those.
@@ -8158,13 +8151,10 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
     std::optional<Typed> value;
     if (known != nullptr) {
       value = known->value;
-    } else if (Correlated()) {
-      return Reject(Rejection{.span = form->subquery->op_span,
-                              .message = "a subquery's value over the aggregate of a correlated "
-                                         "subquery is not supported"});
     } else {
       // A block in HAVING that reads an enclosing one is refused while it binds ("a correlated
-      // subquery in HAVING", "EXISTS in HAVING"), so none is correlated here.
+      // subquery in HAVING", "EXISTS in HAVING"), so none is correlated here. In a correlated
+      // block its one-row join moves up with the block's value (ADR 0041's SQ6).
       ARROW_ASSIGN_OR_RAISE(SubqueryBlock block, BindSubqueryBlock(*form, /*having=*/true));
       ANTB1_CHECK(!block.correlated);
       value = PlantValue(*form->subquery, std::move(block), /*group=*/true);

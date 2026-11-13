@@ -620,5 +620,61 @@ TEST(UnnestingTest, AHavingIsACaseOnBothJoinBacks) {
   }
 }
 
+// An uncorrelated value over the block's aggregate, from the slot after the aggregation, is a
+// one-row join that moves up with the maps (decision 21): over the group below an INNER join back,
+// above a LEFT one, where a binding without rows combines the empty value with it -- in a select
+// item and in a HAVING alike.
+TEST(UnnestingTest, AnUncorrelatedOneRowJoinMovesUpWithTheItem) {
+  struct Case {
+    std::string_view sql;
+    JoinBack join_back;
+  };
+  for (const Case& c : {
+           Case{.sql = "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) + (SELECT MIN(i16) FROM "
+                       "ok) FROM u WHERE u.i64 = t.i64)",
+                .join_back = JoinBack::kInner},
+           Case{.sql = "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = "
+                       "t.i64 HAVING SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
+                .join_back = JoinBack::kInner},
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) FROM "
+                       "u WHERE u.i64 = t.i64) = 1",
+                .join_back = JoinBack::kLeft},
+       }) {
+    SCOPED_TRACE(c.sql);
+    const Unnested unnested = UnnestedOf(c.sql);
+    ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
+    const std::size_t one_row = unnested.text.find("Join ONE-ROW");
+    const std::size_t join = unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER"
+                                                                                : "Join LEFT");
+    const std::size_t group = unnested.text.find("GroupAggregate");
+    ASSERT_NE(one_row, std::string::npos) << unnested.text;
+    ASSERT_NE(join, std::string::npos) << unnested.text;
+    ASSERT_NE(group, std::string::npos) << unnested.text;
+    if (c.join_back == JoinBack::kInner) {
+      EXPECT_LT(join, one_row) << "over the group, below the join: " << unnested.text;
+    } else {
+      EXPECT_LT(one_row, join) << "above the join: " << unnested.text;
+    }
+    EXPECT_LT(one_row, group) << unnested.text;
+  }
+  // A one-row join whose right input reads an outer column has no rule: it would need unnesting on
+  // both inputs (SQ8, SQ10).
+  const auto correlated_one_row = [](const LogicalNodePtr& root) {
+    return WithRight(root, [](const LogicalNodePtr& right) {
+      return std::make_shared<const LogicalNode>(JoinNode{.kind = JoinKind::kOneRow,
+                                                          .left = right,
+                                                          .right = right,
+                                                          .keys = {},
+                                                          .residual = {},
+                                                          .build = BuildSide::kRight,
+                                                          .estimate = std::nullopt,
+                                                          .span = {}});
+    });
+  };
+  EXPECT_EQ(RefusalOf(kScalar, correlated_one_row),
+            "a correlated scalar subquery over a block that is not an ungrouped aggregate over its "
+            "correlation is not supported");
+}
+
 }  // namespace
 }  // namespace antb1::plan

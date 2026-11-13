@@ -398,6 +398,7 @@ enum class Role : std::uint8_t {
   kStatic,   // value: the ungrouped Aggregate, grouped by the representatives
   kArguments,  // value: the Compute of the aggregate's arguments, substituted
   kHaving,     // value: a HAVING over the static aggregate, a CASE above it (decision 17)
+  kOneRow,     // value: an uncorrelated one-row join over it, which moves up with the maps
 };
 
 struct Step {
@@ -495,7 +496,18 @@ struct Descent {
   Next operator()(const GroupingSetsNode& /*sets*/) { return Next::kDeclined; }
   Next operator()(const UnionAllNode& /*union_all*/) { return Next::kDeclined; }
   Next operator()(const SetOperationNode& /*set_operation*/) { return Next::kDeclined; }
-  Next operator()(const JoinNode& /*join*/) { return Next::kDeclined; }
+  // Decision 17's Join rule, the one piece SQ6 needs: an uncorrelated value's one-row join over the
+  // static aggregate, from the slot after the aggregation, moves up with the select list, so that a
+  // binding without rows reads the empty value combined with the value. It appends to each row of
+  // its left input and pads none, and its right input reads no outer column, so the descent goes on
+  // into its left. Every other join is SQ8's and SQ10's.
+  Next operator()(const JoinNode& join) {
+    if (mode != Mode::kValue || stage != Stage::kAbove || !Traits(join.kind).one_row ||
+        !FreeVariables(*join.right).empty()) {
+      return Next::kDeclined;
+    }
+    return Record(Role::kOneRow);
+  }
   Next operator()(const DependentJoinNode& /*join*/) { return Next::kDeclined; }
   Next operator()(const ScanNode& /*scan*/) { return Next::kDeclined; }
   Next operator()(const RowCountNode& /*row_count*/) { return Next::kDeclined; }
@@ -512,6 +524,10 @@ std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root) {
         return std::nullopt;
       case Descent::Next::kInput:
         break;
+    }
+    if (const auto* join = std::get_if<JoinNode>(descent.node.get())) {
+      descent.node = join->left;  // a one-row join's left input: the spine goes on through it
+      continue;
     }
     const std::vector<LogicalNodePtr> inputs = InputsOf(*descent.node);
     if (inputs.size() != 1) {
@@ -1219,7 +1235,9 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   const std::vector<BoundColumn> group_keys = grouped.keys;
   // The steps above the static aggregate, bottom-up, where they are rebuilt rather than re-made over
   // the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
-  const bool rebuilt = join_back == JoinBack::kLeft || having;
+  const bool rebuilt =
+      join_back == JoinBack::kLeft || having ||
+      std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kOneRow; });
   std::vector<const Step*> maps;
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
     switch (step.role) {
@@ -1241,6 +1259,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         break;
       }
       case Role::kHaving:
+      case Role::kOneRow:
         ANTB1_CHECK(rebuilt);
         maps.push_back(&step);
         break;
@@ -1340,6 +1359,11 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                .name = std::move(name)});
     };
     for (const Step* step : maps) {
+      if (step->role == Role::kOneRow) {
+        // Its right input reads no column below it, so it stands over the new top as it stood.
+        top = WithInputs(*step->node, {std::move(top), std::get<JoinNode>(*step->node).right});
+        continue;
+      }
       if (step->role == Role::kHaving) {
         const auto& filter = std::get<FilterNode>(*step->node);
         std::vector<ExprPtr> conditions;
@@ -1427,8 +1451,10 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
 
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
   if (join_back == JoinBack::kInner) {
-    if (having) {
-      right = rebuild(std::move(right));  // over the group, which the CASE reads as it is
+    if (rebuilt) {
+      // Over the group: a HAVING's CASE reads it as it is, and a one-row join moves up with the
+      // maps, which a Project's single input cannot carry.
+      right = rebuild(std::move(right));
     }
     // An inner join, so either side may build: the aggregate it puts on the right is often far
     // larger than the outer rows that probe it (ADR 0026).

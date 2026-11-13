@@ -656,10 +656,9 @@ GROUP BY 1 ORDER BY 1
 SMALLINT	BIGINT
 NULL	8
 
-# ---- pending: an uncorrelated value or EXISTS inside the block (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- an uncorrelated value or EXISTS inside the block (ADR 0041's SQ6) ----
 
 # An uncorrelated scalar value in the item is added to the empty value too: 0 + 0, 0 + 6, 0 + 1.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) + (SELECT COUNT(*) FROM promos) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
@@ -669,7 +668,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) + (SELECT MAX(ct_id) FROM cities) FROM riders r WHERE r.rd_city = c.ct_id) = 6 ORDER BY 1
@@ -679,7 +677,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT SUM(r.rd_row) + (SELECT MIN(ct_id) FROM cities) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
@@ -689,7 +686,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(SUM(r.rd_row), 0) + (SELECT MIN(ct_id) FROM cities) FROM riders r WHERE r.rd_city = c.ct_id) = 1
@@ -700,7 +696,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN COUNT(*) > (SELECT MIN(zn_city) FROM zones) THEN 1 ELSE 0 END FROM riders r
@@ -714,7 +709,6 @@ SMALLINT
 
 # The same in the HAVING: 97 drivers, so COUNT(*) < 78 again; and an uncorrelated EXISTS conjunct, false over the empty
 # promos, true over drivers.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < (SELECT COUNT(*) FROM drivers) - 19)
@@ -728,7 +722,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) >= 0 AND EXISTS (SELECT 1 FROM promos))
@@ -737,7 +730,6 @@ ORDER BY 1
 ----
 SMALLINT
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) >= 0 AND EXISTS (SELECT 1 FROM drivers))
@@ -749,7 +741,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING NOT EXISTS (SELECT 1 FROM promos)) = 0

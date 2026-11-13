@@ -1556,18 +1556,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "IN (subquery) is not supported"},
         ErrorCase{"SELECT CASE WHEN NULL IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t",
                   kUnsupported, "NULL", "NULL literals are not supported"},
-        // A value over the aggregate of a correlated scalar subquery, where ADR 0023's Path 2 does
-        // not look (SQ5).
-        ErrorCase{
-            "SELECT i16 FROM t WHERE i32 > (SELECT SUM(u.i32) + (SELECT MIN(i16) FROM ok) FROM "
-            "u WHERE u.i64 = t.i64)",
-            kUnsupported, "(",
-            "a subquery's value over the aggregate of a correlated subquery is not supported"},
-        ErrorCase{
-            "SELECT i16 FROM t WHERE i32 < (SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64 HAVING "
-            "SUM(u.i32) > (SELECT MIN(i16) FROM ok))",
-            kUnsupported, "(",
-            "a subquery's value over the aggregate of a correlated subquery is not supported"},
         // A compound's own ORDER BY (ADR 0039's X5).
         ErrorCase{"SELECT i16 FROM t UNION ALL SELECT i16 FROM u ORDER BY (SELECT MIN(i16) FROM "
                   "ok)",
