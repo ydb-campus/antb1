@@ -490,11 +490,10 @@ INTEGER
 10
 11
 
-# ---- pending: HAVING inside the block (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- HAVING inside the block (ADR 0041's SQ6) ----
 
 # A HAVING over the block's calls decides for each binding, the empty one included, whether the value is the item or
 # NULL. COUNT(*) < 78 passes 0, so cities 4 to 6 read 0 and city 3 reads NULL; COUNT(*) > 70 rejects 0.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 70) > 0
 ORDER BY 1
@@ -504,14 +503,12 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 70) = 0
 ORDER BY 1
 ----
 SMALLINT
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) = 0
 ORDER BY 1
@@ -521,7 +518,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) < 78
 ORDER BY 1
@@ -533,7 +529,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING MAX(r.rd_row) > 0) > 0 ORDER BY 1
@@ -545,7 +540,6 @@ SMALLINT
 
 # A constant item under a HAVING over COUNT: COUNT(*) >= 0 and COUNT(*) = 0 pass the empty row, COUNT(*) < 78 passes
 # it and two of the cities with riders.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT 7 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) >= 0) = 7
 ORDER BY 1
@@ -558,7 +552,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT 5 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) = 0) = 5
 ORDER BY 1
@@ -568,7 +561,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT 7 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) = 7
 ORDER BY 1
@@ -581,7 +573,6 @@ SMALLINT
 6
 
 # A HAVING over a call that is NULL over no rows, with a COUNT item: MAX(x) IS NULL holds only for the empty row.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING MAX(r.rd_row) IS NULL) = 0 ORDER BY 1
@@ -592,7 +583,6 @@ SMALLINT
 6
 
 # HAVING over MIN of a VARCHAR, and two HAVING conjuncts.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING MIN(r.rd_tier) = 'basic') > 0 ORDER BY 1
@@ -601,7 +591,6 @@ SMALLINT
 1
 2
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78 AND COUNT(r.rd_tier) >= 0) < 50
@@ -614,14 +603,12 @@ SMALLINT
 
 # A HAVING that its types make false for every group (a SMALLINT maximum against a larger constant) gives NULL for
 # every binding; its twin that holds for every group with a row gives NULL only for the empty ones.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING MAX(r.rd_city) > 100000) >= 0 ORDER BY 1
 ----
 SMALLINT
 
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z
 WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city
@@ -640,7 +627,6 @@ INTEGER
 39
 40
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING MAX(r.rd_city) < 100000) < 78 ORDER BY 1
@@ -650,7 +636,6 @@ SMALLINT
 2
 
 # A HAVING conjunct that rejects the empty row, written before a cast that would fail on it there.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
@@ -663,7 +648,6 @@ SMALLINT
 3
 
 # A HAVING over NULL-equal keys: the riders without a city form one group.
-pending SQ6
 query II nosort
 SELECT r.rd_city, COUNT(*) FROM riders r
 WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city HAVING COUNT(*) < 20) = 8
@@ -875,7 +859,6 @@ INTEGER
 5
 9
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e
 WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16 HAVING COUNT(*) > 1) = 2 ORDER BY 1

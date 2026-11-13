@@ -1106,9 +1106,15 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
                   "GROUP BY i16)",
                   kUnsupported, "(", "other than an aggregate over every row"},
+        // A HAVING is answered, as a CASE over the block's value (ADR 0041's SQ6), but an IN or
+        // NOT IN conjunct of it, which no rule of the unnesting takes.
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
-                  "HAVING COUNT(*) > 1)",
-                  kUnsupported, "(", "other than an aggregate over every row"},
+                  "HAVING COUNT(*) IN (SELECT i16 FROM ok))",
+                  kUnsupported, "IN", "an IN subquery over the aggregate of a correlated subquery"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 "
+                  "HAVING COUNT(*) NOT IN (SELECT i16 FROM ok))",
+                  kUnsupported, "NOT IN",
+                  "an IN subquery over the aggregate of a correlated subquery"},
         // The other side is checked as any comparison's is: an operand, a literal, or a constant
         // integer expression.
         ErrorCase{"SELECT i16 FROM t WHERE 1 + 2.5 = (SELECT COUNT(*) FROM u)", kUnsupported,

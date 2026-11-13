@@ -920,6 +920,22 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
+# A HAVING inside a correlated scalar subquery is a CASE over its value, never a filter (ADR 0041's SQ6): a city whose
+# group it rejects reads NULL. COUNT(*) < 78 keeps the empty row's 0, which `= 0` passes, so the join back is LEFT
+# and the condition and the CASE stand above it.
+antb1_add_cli_golden(
+  explain_unnest_having_as_case
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names

@@ -397,6 +397,7 @@ enum class Role : std::uint8_t {
   kMap,      // value: a Project or Compute over the static aggregate, rebuilt above it
   kStatic,   // value: the ungrouped Aggregate, grouped by the representatives
   kArguments,  // value: the Compute of the aggregate's arguments, substituted
+  kHaving,     // value: a HAVING over the static aggregate, a CASE above it (decision 17)
 };
 
 struct Step {
@@ -445,7 +446,15 @@ struct Descent {
     return Next::kFound;
   }
 
-  Next operator()(const FilterNode& filter) { return Filter(filter); }
+  // A Filter above the static aggregate in value mode is its HAVING, which becomes a CASE over the
+  // maps above it, never a filter (decision 17's Filter row): a binding whose group it rejects
+  // still reads the subquery's value, NULL.
+  Next operator()(const FilterNode& filter) {
+    if (mode == Mode::kValue && stage == Stage::kAbove) {
+      return Record(Role::kHaving);
+    }
+    return Filter(filter);
+  }
   Next operator()(const ProjectNode& /*project*/) {
     if (stage != Stage::kAbove) {
       return Next::kDeclined;
@@ -547,20 +556,82 @@ bool IsNull(const EmptyValue& value) {
   return value.has_value() && std::holds_alternative<std::monostate>(value->value);
 }
 
+// The ids the maps above a block's topmost HAVING define -- its select list's own columns -- or
+// std::nullopt where the block has no HAVING. A value the dependent join appends that is not among
+// them is defined below the HAVING, which decides it all the same.
+std::optional<std::set<ColumnId>> IdsAboveHaving(const Spine& spine) {
+  if (std::ranges::none_of(spine.steps,
+                           [](const Step& step) { return step.role == Role::kHaving; })) {
+    return std::nullopt;
+  }
+  std::set<ColumnId> above;
+  for (const Step& step : spine.steps) {
+    if (step.role == Role::kHaving) {
+      break;
+    }
+    if (const auto* compute = std::get_if<ComputeNode>(step.node.get())) {
+      above.insert(compute->ids.begin(), compute->ids.end());
+    } else if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
+      for (std::size_t i = 0; i < project->ids.size() && i < project->columns.size(); ++i) {
+        const bool constant = i < project->constants.size() && project->constants[i].has_value();
+        if (constant || project->columns[i].id != project->ids[i]) {
+          above.insert(project->ids[i]);
+        }
+      }
+    }
+  }
+  return above;
+}
+
 // The empty value of each column the static aggregate and the maps above it define (decision 19):
 // each call's, then, bottom-up through the maps, NULL for a strict combination (IsStrict) that
 // reads at least one NULL, a Project's column its source's, and not known otherwise. IsStrict alone
 // does not make a NULL: a constant is strict and reads no call, and so is the select item of
-// `SELECT 1
-// ... ORDER BY COUNT(*)`, whose aggregation is left with no call at all -- 1 over no rows, not
-// NULL (ADR 0023's update of 2026-11-08). A constant item keeps its constant, a NULL one excepted,
-// which no select list the binder leaves here holds.
-std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const Spine& spine) {
+// `SELECT 1 ... ORDER BY COUNT(*)`, whose aggregation is left with no call at all -- 1 over no rows,
+// not NULL (ADR 0023's update of 2026-11-08). A constant item keeps its constant, a NULL one
+// excepted, which no select list the binder leaves here holds. A HAVING decides what the maps above
+// it give: NULL where it rejects the empty row, their value where it keeps it, and not known
+// otherwise.
+std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const Spine& spine,
+                                           const std::vector<ColumnId>& outputs) {
   std::map<ColumnId, EmptyValue> values;
   for (const AggregateCall& call : aggregate.aggregates) {
     values.insert_or_assign(call.id, EmptyValueOf(call));
   }
+  const auto value_of = [&values](const std::optional<BoundColumn>& column) -> EmptyValue {
+    if (!column.has_value()) {
+      return std::nullopt;
+    }
+    const auto it = values.find(column->id);
+    return it == values.end() ? std::nullopt : it->second;
+  };
+  BranchTruth having = BranchTruth::kAlways;  // the HAVINGs below, over the empty row
+  const auto record = [&values, &having](ColumnId id, LogicalType type, EmptyValue value) {
+    switch (having) {
+      case BranchTruth::kNever:
+        value = Constant{.type = type, .value = std::monostate{}};
+        break;
+      case BranchTruth::kUnknown:
+        value = std::nullopt;
+        break;
+      case BranchTruth::kAlways:
+        break;
+    }
+    values.insert_or_assign(id, std::move(value));
+  };
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
+    if (step.role == Role::kHaving) {
+      for (const Predicate& predicate : std::get<FilterNode>(*step.node).predicates) {
+        const BranchTruth truth =
+            TruthOver(predicate, value_of(predicate.column), value_of(predicate.other));
+        if (truth == BranchTruth::kNever) {
+          having = BranchTruth::kNever;
+        } else if (truth == BranchTruth::kUnknown && having == BranchTruth::kAlways) {
+          having = BranchTruth::kUnknown;
+        }
+      }
+      continue;
+    }
     if (step.role != Role::kMap) {
       continue;
     }
@@ -573,10 +644,10 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
               const auto it = values.find(id);
               return it != values.end() && IsNull(it->second);
             });
-        values.insert_or_assign(
-            compute->ids[i],
-            null ? EmptyValue(Constant{.type = compute->exprs[i]->type, .value = std::monostate{}})
-                 : EmptyValue());
+        record(compute->ids[i], compute->exprs[i]->type,
+               null ? EmptyValue(Constant{.type = compute->exprs[i]->type,
+                                          .value = std::monostate{}})
+                    : EmptyValue());
       }
       continue;
     }
@@ -586,14 +657,25 @@ std::map<ColumnId, EmptyValue> EmptyValues(const AggregateNode& aggregate, const
           i < project.constants.size() ? &project.constants[i] : nullptr;
       if (const auto* constant = entry != nullptr && entry->has_value() ? &**entry : nullptr;
           constant != nullptr) {
-        values.insert_or_assign(project.ids[i],
-                                std::holds_alternative<std::monostate>(constant->value)
-                                    ? EmptyValue()
-                                    : EmptyValue(*constant));
+        record(project.ids[i], constant->type,
+               std::holds_alternative<std::monostate>(constant->value) ? EmptyValue()
+                                                                        : EmptyValue(*constant));
         continue;
       }
       const auto it = values.find(project.columns[i].id);
-      values.insert_or_assign(project.ids[i], it == values.end() ? EmptyValue() : it->second);
+      record(project.ids[i], project.columns[i].type,
+             it == values.end() ? EmptyValue() : it->second);
+    }
+  }
+  // The values the join appends from below the topmost HAVING, which it decides as well.
+  if (const std::optional<std::set<ColumnId>> above = IdsAboveHaving(spine); above.has_value()) {
+    for (const ColumnId id : outputs) {
+      const auto it = values.find(id);
+      if (above->contains(id) || it == values.end()) {
+        continue;
+      }
+      const LogicalType type = it->second.has_value() ? it->second->type : LogicalType::kBigInt;
+      record(id, type, it->second);
     }
   }
   return values;
@@ -616,7 +698,7 @@ arrow::Status CheckStatic(const Correlation& correlation, const Spine& spine,
                            [](const AggregateCall& call) { return AnsweredCall(call.kind); })) {
     return correlation.Refuse("whose aggregate is a single value");
   }
-  values = EmptyValues(*aggregate, spine);
+  values = EmptyValues(*aggregate, spine, OutputIds(*correlation.join.right));
   return arrow::Status::OK();
 }
 
@@ -915,6 +997,39 @@ arrow::Result<Representatives> RepresentativesOf(const Correlation& correlation,
   return out;
 }
 
+// A HAVING conjunct as a BOOLEAN expression over the columns the filter read, as the binder builds
+// a condition inside an expression: a computed condition is its column, any other predicate reads
+// its columns as operands. A folded FALSE reads none, so it reads `any`: false or NULL, it takes
+// no CASE branch either way.
+ExprPtr ConditionOf(const Predicate& predicate, const BoundColumn& any) {
+  if (predicate.kind == Predicate::Kind::kIsTrue && predicate.column.has_value()) {
+    return std::make_shared<const Expr>(
+        Expr{.node = ColumnExpr{.index = 0, .id = predicate.column->id},
+             .type = LogicalType::kBoolean,
+             .name = predicate.column->name});
+  }
+  Predicate local = predicate;
+  std::vector<ExprPtr> operands;
+  const auto operand = [&operands](BoundColumn& column) {
+    operands.push_back(std::make_shared<const Expr>(Expr{
+        .node = ColumnExpr{.index = 0, .id = column.id}, .type = column.type, .name = column.name}));
+    column.index = Narrow<int>(operands.size() - 1);
+    column.id = kNoColumnId;
+  };
+  if (!local.column.has_value()) {
+    local.column = any;
+  }
+  operand(*local.column);
+  if (local.other.has_value()) {
+    operand(*local.other);
+  }
+  std::string name = local.column->name;
+  return std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = std::move(local), .operands = std::move(operands)},
+           .type = LogicalType::kBoolean,
+           .name = std::move(name)});
+}
+
 // A rule's rewrite: the node that stands where the dependent join stood, and the right input of the
 // join it makes, which Lemma 3.1's check reads. Lift mode's node is that join; value mode's may be
 // the maps over a LEFT join back.
@@ -1017,6 +1132,42 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     last_id = grouped.key_ids.back();
     key_of.emplace(id, grouped.key_ids.back());
   }
+  // Under a HAVING the subquery's value is CASE WHEN having THEN item END, which needs a column of
+  // its own wherever the value the join appends is defined below the HAVING -- by the aggregate, as
+  // `SELECT COUNT(*) ... HAVING ...` appends its call, or passed through the select list. Such an
+  // id is renamed: whatever defined it defines a fresh one, which everything below reads, and the
+  // id the join appends becomes the CASE over the fresh one, above the HAVING.
+  const bool having =
+      std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kHaving; });
+  std::map<ColumnId, ColumnId> renamed;
+  std::map<ColumnId, std::pair<LogicalType, std::string>> typed;  // each renamed id's type, name
+  if (const std::optional<std::set<ColumnId>> above = IdsAboveHaving(spine); above.has_value()) {
+    for (const AggregateCall& call : aggregate->aggregates) {
+      typed.insert_or_assign(call.id, std::pair{call.type, NameOfCall(call, spine)});
+    }
+    for (const Step& step : spine.steps) {
+      if (const auto* compute = std::get_if<ComputeNode>(step.node.get());
+          compute != nullptr && step.role == Role::kMap) {
+        for (std::size_t i = 0; i < compute->ids.size(); ++i) {
+          typed.insert_or_assign(compute->ids[i],
+                                 std::pair{compute->exprs[i]->type, compute->exprs[i]->name});
+        }
+      }
+    }
+    for (const ColumnId id : OutputIds(*join.right)) {
+      if (!above->contains(id) && typed.contains(id)) {
+        renamed.emplace(id, ColumnId{std::to_underlying(last_id) + 1});
+        last_id = renamed.at(id);
+      }
+    }
+  }
+  const auto rename = [&renamed](ColumnId id) {
+    const auto it = renamed.find(id);
+    return it == renamed.end() ? id : it->second;
+  };
+  for (AggregateCall& call : grouped.aggregates) {
+    call.id = rename(call.id);
+  }
   // On a LEFT join back each call whose empty value is no NULL (the COUNT kinds) is computed under a
   // fresh id, and its own id is defined above the join as COALESCE(fresh, <empty value>): a real
   // group's count is never NULL, so only an outer row with no group takes the empty value. The
@@ -1066,7 +1217,10 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   }
   // The keys as the join will name them, taken before `grouped` is moved into its node.
   const std::vector<BoundColumn> group_keys = grouped.keys;
-  std::vector<const Step*> maps;  // LEFT: the maps, bottom-up, rebuilt above the join
+  // The steps above the static aggregate, bottom-up, where they are rebuilt rather than re-made over
+  // the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
+  const bool rebuilt = join_back == JoinBack::kLeft || having;
+  std::vector<const Step*> maps;
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
     switch (step.role) {
       case Role::kArguments: {
@@ -1086,8 +1240,12 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         right = Make(std::move(node));
         break;
       }
+      case Role::kHaving:
+        ANTB1_CHECK(rebuilt);
+        maps.push_back(&step);
+        break;
       case Role::kMap: {
-        if (join_back == JoinBack::kLeft) {
+        if (rebuilt) {
           maps.push_back(&step);
           break;
         }
@@ -1145,8 +1303,133 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   // count of the groups, which nothing estimates -- but leaving it unknown left every join above
   // this rewrite reading its own left input as unknown, which is what kept a lopsided join building
   // on the wrong side (ADR 0026).
+  // The steps above the static aggregate over `top`, bottom-up: a Compute as it was, a HAVING as a
+  // Compute of its condition, which the maps above it then read as CASE WHEN condition THEN value
+  // END, and the select list's Project as a Compute that defines its ids, since the join reads
+  // columns past it. A constant item keeps its value, COALESCE(SUM(x), 0) its default.
+  // A column for a HAVING folded to FALSE to read: NULL or not, a CASE takes it as not true.
+  BoundColumn any_key = group_keys.front();
+  any_key.id = key_of.at(group.front());
+  const auto rename_reads = [&rename, &renamed](const ExprPtr& expr) {
+    if (renamed.empty()) {
+      return expr;
+    }
+    return MapColumns(expr, [&rename](ColumnExpr column) {
+      column.id = rename(column.id);
+      return column;
+    });
+  };
+  const auto rebuild = [&maps, &last_id, &any_key, &rename, &rename_reads, &renamed,
+                        &typed](LogicalNodePtr top) {
+    std::optional<BoundColumn> guard;  // the HAVINGs below, once there is one
+    std::set<ColumnId> defined;        // the renamed ids the select list defines
+    const auto guarded = [&guard](ExprPtr expr) -> ExprPtr {
+      if (!guard.has_value()) {
+        return expr;
+      }
+      const LogicalType type = expr->type;
+      std::string name = expr->name;
+      return std::make_shared<const Expr>(
+          Expr{.node = CaseExpr{.whens = {std::make_shared<const Expr>(
+                                    Expr{.node = ColumnExpr{.index = 0, .id = guard->id},
+                                         .type = LogicalType::kBoolean,
+                                         .name = guard->name})},
+                                .thens = {std::move(expr)},
+                                .otherwise = nullptr},
+               .type = type,
+               .name = std::move(name)});
+    };
+    for (const Step* step : maps) {
+      if (step->role == Role::kHaving) {
+        const auto& filter = std::get<FilterNode>(*step->node);
+        std::vector<ExprPtr> conditions;
+        if (guard.has_value()) {
+          conditions.push_back(std::make_shared<const Expr>(
+              Expr{.node = ColumnExpr{.index = 0, .id = guard->id},
+                   .type = LogicalType::kBoolean,
+                   .name = guard->name}));
+        }
+        for (Predicate predicate : filter.predicates) {
+          for (std::optional<BoundColumn>* column : {&predicate.column, &predicate.other}) {
+            if (column->has_value()) {
+              (*column)->id = rename((*column)->id);
+            }
+          }
+          conditions.push_back(ConditionOf(predicate, any_key));
+        }
+        Expr condition =
+            conditions.size() == 1
+                ? *conditions.front()
+                : Expr{.node = BoolExpr{.op = BoolOp::kAnd, .args = std::move(conditions)},
+                       .type = LogicalType::kBoolean,
+                       .name = ""};
+        condition.name = "HAVING";  // EXPLAIN's name for the condition's column
+        guard = BoundColumn{.id = ColumnId{std::to_underlying(last_id) + 1},
+                            .name = condition.name,
+                            .type = LogicalType::kBoolean};
+        last_id = guard->id;
+        top = Make(ComputeNode{.input = std::move(top),
+                               .exprs = {std::make_shared<const Expr>(std::move(condition))},
+                               .ids = {guard->id},
+                               .span = filter.span});
+        continue;
+      }
+      if (const auto* compute = std::get_if<ComputeNode>(step->node.get())) {
+        ComputeNode out = *compute;
+        out.input = std::move(top);
+        for (ExprPtr& expr : out.exprs) {
+          expr = guarded(rename_reads(expr));
+        }
+        for (ColumnId& id : out.ids) {
+          id = rename(id);
+        }
+        top = Make(std::move(out));
+        continue;
+      }
+      const auto& project = std::get<ProjectNode>(*step->node);
+      ComputeNode items{.input = std::move(top), .exprs = {}, .ids = {}, .span = project.span};
+      for (std::size_t i = 0; i < project.ids.size() && i < project.columns.size(); ++i) {
+        const std::optional<Constant>* constant =
+            i < project.constants.size() && project.constants[i].has_value()
+                ? &project.constants[i]
+                : nullptr;
+        const BoundColumn& column = project.columns[i];
+        if (constant == nullptr && rename(column.id) == project.ids[i]) {
+          continue;  // passed through, and no HAVING guards it: defined below already
+        }
+        items.exprs.push_back(guarded(std::make_shared<const Expr>(
+            constant != nullptr
+                ? Expr{.node = ConstantExpr{.value = **constant},
+                       .type = (*constant)->type,
+                       .name = column.name.empty() ? ToString(**constant) : column.name}
+                : Expr{.node = ColumnExpr{.index = 0, .id = rename(column.id)},
+                       .type = column.type,
+                       .name = column.name})));
+        items.ids.push_back(project.ids[i]);
+        defined.insert(project.ids[i]);
+      }
+      top = items.exprs.empty() ? std::move(items.input) : Make(std::move(items));
+    }
+    // A value the join appends that no select list defines: the CASE over its fresh id, over the
+    // last HAVING.
+    ComputeNode values{.input = std::move(top), .exprs = {}, .ids = {}, .span = {}};
+    for (const auto& [id, fresh] : renamed) {
+      if (defined.contains(id)) {
+        continue;
+      }
+      const auto& [type, name] = typed.at(id);
+      values.exprs.push_back(guarded(std::make_shared<const Expr>(
+          Expr{.node = ColumnExpr{.index = 0, .id = fresh}, .type = type, .name = name})));
+      values.ids.push_back(id);
+    }
+    return values.exprs.empty() ? std::move(values.input) : Make(std::move(values));
+  };
+
   const std::optional<int64_t> left_rows = EstimateRows(*join.left);
   if (join_back == JoinBack::kInner) {
+    if (having) {
+      right = rebuild(std::move(right));  // over the group, which the CASE reads as it is
+    }
     // An inner join, so either side may build: the aggregate it puts on the right is often far
     // larger than the outer rows that probe it (ADR 0026).
     const std::optional<int64_t> right_rows = EstimateRows(*right);
@@ -1192,38 +1475,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
     }
     top = Make(std::move(counts));
   }
-  // The maps, bottom-up, over the padded rows too: a Compute as it was, and the select list's
-  // Project as a Compute that defines its ids, since the join above reads the outer side's columns
-  // past it. A constant item keeps its value, COALESCE(SUM(x), 0) its default.
-  for (const Step* step : maps) {
-    const auto* project = std::get_if<ProjectNode>(step->node.get());
-    if (project == nullptr) {
-      top = WithInputs(*step->node, {std::move(top)});
-      continue;
-    }
-    ComputeNode items{.input = std::move(top), .exprs = {}, .ids = {}, .span = project->span};
-    for (std::size_t i = 0; i < project->ids.size() && i < project->columns.size(); ++i) {
-      const std::optional<Constant>* constant =
-          i < project->constants.size() && project->constants[i].has_value()
-              ? &project->constants[i]
-              : nullptr;
-      const BoundColumn& column = project->columns[i];
-      if (constant == nullptr && column.id == project->ids[i]) {
-        continue;  // passed through: defined below already
-      }
-      items.exprs.push_back(std::make_shared<const Expr>(
-          constant != nullptr
-              ? Expr{.node = ConstantExpr{.value = **constant},
-                     .type = (*constant)->type,
-                     .name = column.name.empty() ? ToString(**constant) : column.name}
-              : Expr{.node = ColumnExpr{.index = 0, .id = column.id},
-                     .type = column.type,
-                     .name = column.name}));
-      items.ids.push_back(project->ids[i]);
-    }
-    top = items.exprs.empty() ? std::move(items.input) : Make(std::move(items));
-  }
-  return Rewritten{.node = std::move(top), .right = std::move(right)};
+  return Rewritten{.node = rebuild(std::move(top)), .right = std::move(right)};
 }
 
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.

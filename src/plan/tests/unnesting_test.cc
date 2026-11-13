@@ -578,5 +578,47 @@ TEST(UnnestingTest, TheSelectItemMovesAboveALeftJoinBack) {
   EXPECT_LT(item, join) << "the constant is computed above the join: " << text;
 }
 
+// A HAVING inside the block decides its value over the empty row too (decision 19): NULL where it
+// rejects that row, the item where it keeps it, and not known otherwise. So COUNT(*) > 1 makes the
+// value NULL there and `= 0` rejects it, INNER; COUNT(*) < 5 keeps the count's 0, which `= 0`
+// passes, LEFT; a computed condition is not known, LEFT. Either way the HAVING is a CASE over the
+// value, never a filter: a binding whose group it rejects still reads NULL (decision 17), so the
+// condition's column stands above the group on both join backs. A HAVING folded to FALSE reads no
+// column and rejects every row.
+TEST(UnnestingTest, AHavingIsACaseOnBothJoinBacks) {
+  struct Case {
+    std::string_view having;
+    JoinBack join_back;
+  };
+  for (const Case& c : {
+           Case{.having = "COUNT(*) > 1", .join_back = JoinBack::kInner},
+           Case{.having = "COUNT(*) < 5", .join_back = JoinBack::kLeft},
+           Case{.having = "COUNT(*) % 2 = 0", .join_back = JoinBack::kLeft},
+           Case{.having = "MAX(u.i16) > 100000", .join_back = JoinBack::kInner},
+       }) {
+    const std::string sql = std::format(
+        "SELECT i16 FROM t WHERE (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 HAVING {}) = 0",
+        c.having);
+    SCOPED_TRACE(sql);
+    const Unnested unnested = UnnestedOf(sql);
+    ASSERT_EQ(unnested.join_backs, std::vector<JoinBack>{c.join_back}) << unnested.text;
+    const std::size_t having = unnested.text.find("Compute HAVING");
+    const std::size_t join = unnested.text.find(c.join_back == JoinBack::kInner ? "Join INNER"
+                                                                                : "Join LEFT");
+    const std::size_t group = unnested.text.find("GroupAggregate");
+    ASSERT_NE(having, std::string::npos) << unnested.text;
+    ASSERT_NE(join, std::string::npos) << unnested.text;
+    ASSERT_NE(group, std::string::npos) << unnested.text;
+    EXPECT_EQ(unnested.text.find("Filter \"count_star()\" >"), std::string::npos)
+        << "no filter over the group: " << unnested.text;
+    if (c.join_back == JoinBack::kInner) {
+      EXPECT_LT(join, having) << "over the group, below the join: " << unnested.text;
+    } else {
+      EXPECT_LT(having, join) << "above the join: " << unnested.text;
+    }
+    EXPECT_LT(having, group) << unnested.text;
+  }
+}
+
 }  // namespace
 }  // namespace antb1::plan
