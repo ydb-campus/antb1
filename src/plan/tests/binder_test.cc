@@ -7173,9 +7173,10 @@ TEST(BinderTest, ACorrelatedValueIsRememberedByItsBinding) {
   EXPECT_EQ(
       DependentJoins(bound(std::format("SELECT i16 FROM t WHERE {} > {} - 1", kCount, kCount))),
       1U);
-  EXPECT_EQ(DependentJoins(bound(std::format(
-                "SELECT i16 FROM t WHERE CASE WHEN {} > 0 THEN {} ELSE 0 END > 1", kCount, kCount))),
-            1U);
+  EXPECT_EQ(
+      DependentJoins(bound(std::format(
+          "SELECT i16 FROM t WHERE CASE WHEN {} > 0 THEN {} ELSE 0 END > 1", kCount, kCount))),
+      1U);
   EXPECT_EQ(DependentJoins(bound(std::format("SELECT i16 FROM t WHERE (i32 = 1 AND {} > 0) OR "
                                              "i32 = 1",
                                              kCount))),
@@ -7184,9 +7185,10 @@ TEST(BinderTest, ACorrelatedValueIsRememberedByItsBinding) {
   // two values, however each is written.
   constexpr std::string_view kOwn = "(SELECT COUNT(*) FROM u WHERE u.i32 = i)";
   const auto two_groups = [](std::string_view first, std::string_view second) {
-    return std::format("SELECT 1 FROM ok AS o1 JOIN dec AS d1 ON d1.s16 = o1.i16 AND {}, ok AS o2 "
-                       "JOIN dec AS d2 ON d2.s16 = o2.i16 AND {}",
-                       first, second);
+    return std::format(
+        "SELECT 1 FROM ok AS o1 JOIN dec AS d1 ON d1.s16 = o1.i16 AND {}, ok AS o2 "
+        "JOIN dec AS d2 ON d2.s16 = o2.i16 AND {}",
+        first, second);
   };
   for (const std::string& sql : {
            two_groups(std::format("{} > 0", kOwn), std::format("{} < 9", kOwn)),
