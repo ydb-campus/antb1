@@ -135,7 +135,8 @@ steps (only step 7 uses more than one thread):
    `plan::ToArrowStatus` into an `arrow::Status` that carries a `SqlErrorDetail`.
 4. Bind (`plan::Bind`): what the binder does not answer yet (an `IN` subquery outside a condition of `WHERE`, of an
    inner `ON` or of `HAVING` and outside a `CASE WHEN` of a select item, `GROUP BY` key, aggregate argument or `ORDER
-   BY` item, a quantified comparison other than `= ANY`, `= SOME` and `<> ALL`; a scalar subquery or an `EXISTS`
+   BY` item (the parser refuses the quantified comparisons other than `= ANY`, `= SOME`, `<> ALL` and `!= ALL`, which
+   it reads as IN and NOT IN); a scalar subquery or an `EXISTS`
    outside a condition of `WHERE`, of an
    inner `ON` or of `HAVING` and outside the select items, `GROUP BY` keys, aggregate arguments and `ORDER BY` of a
    block (ADR 0041's SQ2; an `EXISTS` there only in a `CASE WHEN`), a scalar one inside a grouping-set element or as an

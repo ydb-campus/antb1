@@ -2128,6 +2128,63 @@ SMALLINT	VARCHAR
 5	F
 6	F
 
+# ---- TIMESTAMP probes and sets ----
+
+# A string literal against a TIMESTAMP set is that TIMESTAMP, an invalid one an error in both; a TIMESTAMP against a
+# number or a VARCHAR is the bind error; TIMESTAMP keys of a semi join over a UNION, a null-aware anti join and a
+# mark under = ANY in a select CASE.
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE '2025-12-01 00:00:00' IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+40
+
+query I rowsort
+SELECT COUNT(*) FROM zones WHERE zn_id < 3 OR '2025-12-01' NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+2
+
+statement error
+SELECT COUNT(*) FROM zones WHERE 'x' NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+
+statement error
+SELECT COUNT(*) FROM trips WHERE tr_row IN (SELECT date_trunc('month', dy_day) FROM days)
+
+statement error
+SELECT COUNT(*) FROM days WHERE date_trunc('month', dy_day) NOT IN (SELECT label FROM cities)
+
+query I rowsort
+SELECT COUNT(*) FROM days WHERE date_trunc('month', dy_day) IN (SELECT date_trunc('month', dy_day) FROM days WHERE dy_day < '2026-03-01' UNION SELECT date_trunc('year', dy_day) FROM days)
+----
+BIGINT
+155
+
+query I rowsort
+SELECT COUNT(*) FROM days WHERE date_trunc('week', dy_day) NOT IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+1407
+
+query TI nosort
+SELECT dy_day, CASE WHEN date_trunc('month', dy_day) = ANY (SELECT date_trunc('month', dy_day) FROM days WHERE dy_day > '2026-06-01') THEN 1 ELSE 0 END AS m FROM days ORDER BY dy_day LIMIT 5
+----
+DATE	INTEGER
+2025-12-29	0
+2025-12-30	0
+2025-12-31	0
+2026-01-01	0
+2026-01-02	0
+
+# ---- DuckDB only until DATE and TIMESTAMP keys get a PR (a join key of DATE and TIMESTAMP) ----
+
+onlyif duckdb
+query I rowsort
+SELECT COUNT(*) FROM days WHERE dy_day IN (SELECT date_trunc('month', dy_day) FROM days)
+----
+BIGINT
+48
+
 # ---- divergence D3: a string literal probe over a number set ----
 
 # antb1 refuses to compare a string with numbers, as it does in a comparison; DuckDB casts the string to the set's type.

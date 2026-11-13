@@ -6780,8 +6780,9 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
 // and mark joins type their keys alike.
 arrow::Result<LogicalType> Binder::InKeyType(const Typed& probe, LogicalType set,
                                              const sql::SubqueryExpr& s) {
-  // DuckDB's bind error (ADR 0041's decision 23): a VARCHAR or a DATE against a value of another
-  // family. A DATE against a TIMESTAMP, which DuckDB answers, stays a refusal below.
+  // DuckDB's bind error (ADR 0041's decision 23): a VARCHAR against a value of another family, and
+  // a DATE or a TIMESTAMP against a number. A DATE against a TIMESTAMP, which DuckDB answers, stays
+  // a refusal below.
   const auto family = [](LogicalType t) {
     if (t == LogicalType::kVarchar || t == LogicalType::kDate || t == LogicalType::kTimestamp) {
       return t.id();
@@ -6791,8 +6792,8 @@ arrow::Result<LogicalType> Binder::InKeyType(const Typed& probe, LogicalType set
   const LogicalType::Id probe_family = family(probe.expr->type);
   const LogicalType::Id set_family = family(set);
   const auto is = [&](LogicalType::Id id) { return probe_family == id || set_family == id; };
-  if (probe_family != set_family &&
-      (is(LogicalType::kVarchar) || (is(LogicalType::kDate) && !is(LogicalType::kTimestamp)))) {
+  const bool temporal_pair = is(LogicalType::kDate) && is(LogicalType::kTimestamp);
+  if (probe_family != set_family && !temporal_pair) {
     return BindError(std::format("cannot compare values of type {} and {} in IN (subquery) (write "
                                  "an explicit CAST)",
                                  ToString(probe.expr->type), ToString(set)),

@@ -61,10 +61,11 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   an expression, `x [NOT] IN (query)` -- also written `x = ANY (query)` or `x = SOME (query)`, and `x <> ALL (query)`
   or `x != ALL (query)` for `NOT IN` -- is answered as a top-level `AND` conjunct of `WHERE`, of an inner join's `ON`
   or of `HAVING`, under any number of `NOT`s, where `x` is an operand (a column, an aggregate, a literal, or an
-  expression over them or over a subquery's value; a string literal takes a `DATE` set's type, as in DuckDB) and the
-  query has exactly one column, a set operation of arms that read no enclosing block included (ADR 0041's SQ7b); an
-  `IN` key needs a type that holds both sides (so no `DOUBLE`), and a `VARCHAR` or a `DATE` against another type is
-  DuckDB's bind error (exit code 1). The same `x [NOT] IN (query)` that reads no enclosing block is a condition
+  expression over them or over a subquery's value; a string literal takes a `DATE` or `TIMESTAMP` set's type, as in
+  DuckDB) and the query has exactly one column, a set operation of arms that read no enclosing block included (ADR
+  0041's SQ7b); an `IN` key needs a type that holds both sides (so no `DOUBLE`, and no `DATE` against a `TIMESTAMP`),
+  and a `VARCHAR` against another type, or a `DATE` or a `TIMESTAMP` against a number, is DuckDB's bind error (exit
+  code 1). The same `x [NOT] IN (query)` that reads no enclosing block is a condition
   anywhere inside a condition of `WHERE`, of an inner `ON` (one inside a `FULL JOIN`'s left input too) or of `HAVING`
   -- under `OR`, `NOT` and `CASE WHEN` -- and in a
   `CASE WHEN` of a select item, an `ORDER BY` item, a `GROUP BY` key or an aggregate's argument (ADR 0041's SQ7a): a
@@ -89,7 +90,8 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   `WHERE` or of an inner `ON`, and an aggregate over every row — no `GROUP BY`, `HAVING`, `LIMIT` or `OFFSET`, each of
   which could leave no row. Every other placement exits 4, an `IN` subquery outside a condition (a BOOLEAN value,
   `SELECT x IN (query)` or `(x IN (query)) IS NULL`), one whose `x` is the `NULL` literal, reads an enclosing block or
-  is correlated, every quantified comparison but `= ANY`, `= SOME` and `<> ALL` over a query (`< ANY`, `= ALL`), a
+  is correlated, every quantified comparison but `= ANY`, `= SOME` and `<> ALL` (or `!= ALL`) over a query (`< ANY`,
+  `= ALL`), a
   value written inside a `ROLLUP`, `CUBE` or `GROUPING SETS` element
   (a plain key next to
   them, and an alias or a position of a value item inside them, are answered), as an aggregate's whole argument or in

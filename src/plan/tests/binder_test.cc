@@ -1239,6 +1239,14 @@ INSTANTIATE_TEST_SUITE_P(
                   "NOT IN", "cannot compare values of type DATE and INTEGER in IN (subquery)"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = ANY (SELECT s FROM u)", kBind, "= ANY",
                   "cannot compare values of type INTEGER and VARCHAR in IN (subquery)"},
+        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT date_trunc('month', dt) FROM u)", kBind,
+                  "IN", "cannot compare values of type INTEGER and TIMESTAMP in IN (subquery)"},
+        // A DATE against a TIMESTAMP, which DuckDB answers, has no join key yet.
+        ErrorCase{"SELECT i16 FROM t WHERE dt IN (SELECT date_trunc('month', dt) FROM u)",
+                  kUnsupported, "IN", "IN (subquery) of DATE and TIMESTAMP is not supported"},
+        // Under an OR branch that OR factoring drops: bound for its errors, the type's among them.
+        ErrorCase{"SELECT i16 FROM t WHERE (i16 = 2 AND dt IN (SELECT i32 FROM u)) OR i16 = 2",
+                  kBind, "IN", "cannot compare values of type DATE and INTEGER in IN (subquery)"},
         // A string literal probe against a number set is divergence D3's bind error.
         ErrorCase{"SELECT i16 FROM t WHERE '1' IN (SELECT i32 FROM u)", kBind, "'1'",
                   "cannot compare the INTEGER values of an IN subquery with a string"},

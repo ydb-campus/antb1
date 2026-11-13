@@ -993,9 +993,10 @@ changes.
 - **Sets (ADR 0036's X6).** The set may be a set operation whose arms read no enclosing block, bound as a scalar's and
   an EXISTS's are since SQ4a, its column of the arms' unified type; a correlated arm stays SQ15's, and a compound's own
   ORDER BY, LIMIT or OFFSET X5's.
-- **Decision 23's SQ7 row.** A VARCHAR or a DATE against a value of another type family is DuckDB's bind error (exit
-  1), checked where the IN's key is typed (`InKeyType`, shared by the semi, anti and mark joins), so also under a
-  dropped OR branch; a DATE against a TIMESTAMP, which DuckDB answers, stays a refusal.
+- **Decision 23's SQ7 row.** A VARCHAR against a value of another type family, and a DATE or a TIMESTAMP against a
+  number, is DuckDB's bind error (exit 1), checked where the IN's key is typed (`InKeyType`, shared by the semi, anti
+  and mark joins), so also under a dropped OR branch; a DATE against a TIMESTAMP, which DuckDB answers, stays a refusal
+  (no key type holds both). The review added TIMESTAMP to the rule, since DuckDB's is the same for it.
 - **Decision 28.** `tests/slt/cases/subqueries/in_forms.slt` holds 292 records, written first under `pending SQ7b` and
   checked against DuckDB, with D3's pin; the guards of `conditions.slt`, `setops/errors.slt` and `in_marks.slt` that
   SQ7b answers are lifted.
