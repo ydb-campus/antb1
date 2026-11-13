@@ -173,7 +173,11 @@ std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 //     or the final grouping. Such a `Compute` TRAVELS DOWN with the partial, because the
 //     aggregate's argument may be its output and a partial cannot aggregate a column that does not
 //     exist below it; moving it is sound only while nothing above still needs it. One whose
-//     expression reads a column the aggregated side does not carry is declined for the same reason.
+//     expression reads a column the aggregated side does not carry is declined for the same reason,
+//     and so, over a side the join pads, is one that is not NULL wherever every column it reads is
+//     NULL (`PropagatesNull`): a padded row has no input below the join, where above it the
+//     expression turned the row's NULLs into a value (COALESCE, CASE, a literal).
+//   - `kCountStar` over a side the join pads, which counted the padded row itself.
 //   - a node further up the path reading any other column of the aggregated side, since a partial
 //     outputs its keys and its calls and nothing else. Condition 3 covers the candidate's own keys
 //     and the grouping set and says nothing about the rest of the path.
