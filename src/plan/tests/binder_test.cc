@@ -7925,9 +7925,10 @@ TEST(BinderTest, ACorrelatedScalarKeepsItsValueOverNoRows) {
   };
   const auto join_back = [](const LogicalPlan& plan) {
     const std::string text = Explain(plan);
-    return text.find("Join LEFT") != std::string::npos    ? JoinKind::kLeft
-           : text.find("Join INNER") != std::string::npos ? JoinKind::kInner
-                                                          : JoinKind::kSemi;
+    if (text.contains("Join LEFT")) {
+      return JoinKind::kLeft;
+    }
+    return text.contains("Join INNER") ? JoinKind::kInner : JoinKind::kSemi;
   };
   for (const std::string_view sql : {
            "SELECT i16 FROM t WHERE i32 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY COUNT(*))",

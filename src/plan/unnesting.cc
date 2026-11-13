@@ -348,6 +348,7 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
   // in the new join's right input, where a free variable would fail the query with an internal
   // error rather than decline.
   std::vector<ColumnId> wanted;  // the outer columns the restriction keys on
+  wanted.reserve(equivalent.size());
   for (const auto& [outer_id, inner_id] : equivalent) {
     wanted.push_back(outer_id);
   }
@@ -1549,8 +1550,11 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   if (!coalesced.empty()) {
     ComputeNode counts{.input = std::move(top), .exprs = {}, .ids = {}, .span = aggregate->span};
     for (const auto& [call, fresh] : coalesced) {
+      // Every call here has an empty value that is no NULL; the default is never taken.
+      const Constant empty =
+          EmptyValueOf(call).value_or(Constant{.type = call.type, .value = Int128{0}});
       const std::string name =
-          std::format("COALESCE({}, {})", NameOfCall(call, spine), ToString(*EmptyValueOf(call)));
+          std::format("COALESCE({}, {})", NameOfCall(call, spine), ToString(empty));
       counts.exprs.push_back(std::make_shared<const Expr>(
           Expr{.node = CaseExpr{.whens = {nullptr},
                                 .thens = {std::make_shared<const Expr>(
@@ -1558,9 +1562,9 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                                          .type = call.type,
                                          .name = NameOfCall(call, spine)})},
                                 .otherwise = std::make_shared<const Expr>(
-                                    Expr{.node = ConstantExpr{.value = *EmptyValueOf(call)},
+                                    Expr{.node = ConstantExpr{.value = empty},
                                          .type = call.type,
-                                         .name = ToString(*EmptyValueOf(call))})},
+                                         .name = ToString(empty)})},
                .type = call.type,
                .name = name}));
       counts.ids.push_back(call.id);
