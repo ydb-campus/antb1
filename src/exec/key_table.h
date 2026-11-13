@@ -56,7 +56,8 @@ class KeyTable {
 // (never of the budget, the threads or the environment); the others name a table, for tests.
 enum class KeyTableKind : std::uint8_t {
   kAuto,
-  kGrouper,  // arrow::compute::Grouper, for every key shape
+  kGrouper,        // arrow::compute::Grouper, for every key shape
+  kPackedStrings,  // short STRING/BINARY keys; unsupported shapes use kGrouper
 };
 
 struct KeyTableOptions {

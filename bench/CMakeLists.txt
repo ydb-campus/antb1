@@ -4,6 +4,8 @@
 # they keep building and running.
 # Benchmark numbers never gate a PR.
 add_executable(antb1-bench-micro micro_bench.cc)
+# Key-table comparisons exercise the same private factory that GroupTable uses.
+target_include_directories(antb1-bench-micro PRIVATE ${PROJECT_SOURCE_DIR}/src/exec)
 target_link_libraries(
   antb1-bench-micro
   PRIVATE
