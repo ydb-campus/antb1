@@ -1,5 +1,6 @@
 #include "strictness.h"
 
+#include <algorithm>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -17,8 +18,13 @@ bool IsStrict(const Expr& expr) {
         } else if constexpr (std::is_same_v<Node, NegateExpr> || std::is_same_v<Node, CastExpr>) {
           // Unary minus, and the implicit casts of an operator's operands.
           return IsStrict(*node.operand);
+        } else if constexpr (std::is_same_v<Node, FunctionExpr>) {
+          // Every function is NULL for a NULL argument, as DuckDB's are, but concat, which skips
+          // one (ADR 0037's FN5).
+          return node.function != Function::kConcat &&
+                 std::ranges::all_of(node.args, [](const ExprPtr& arg) { return IsStrict(*arg); });
         } else {
-          // FunctionExpr, PredicateExpr, BoolExpr, CaseExpr: none is strict in general.
+          // PredicateExpr, BoolExpr, CaseExpr: none is strict in general (IS NULL, OR, COALESCE).
           return false;
         }
       },

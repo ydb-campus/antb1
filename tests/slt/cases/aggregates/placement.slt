@@ -264,6 +264,17 @@ basic	1710
 gold	1677
 plus	1716
 
+# A function is NULL for a NULL argument too, abs as much as a negation, so it is placed as well.
+query II nosort
+SELECT rd_city, SUM(abs(dv_id - 50)) FROM riders LEFT JOIN drivers ON dv_city = rd_city
+GROUP BY rd_city ORDER BY rd_city
+----
+SMALLINT	HUGEINT
+1	330717001846
+2	4577958
+3	4551768
+NULL	NULL
+
 # COALESCE and CASE turn the padded row's NULL into a value, so the exchange declines them: placed, the padded
 # city summed nothing and the tiers counted none of their riders without a driver.
 query II nosort
