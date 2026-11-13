@@ -4,6 +4,7 @@
 // never gate a PR. Inputs are synthetic (splitmix64), never ClickBench data.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,7 @@
 #include <benchmark/benchmark.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/common/version.h"
 #include "antb1/exec/aggregate_state.h"
 #include "antb1/exec/join_table.h"
@@ -36,6 +39,7 @@
 #include "antb1/sql/parser.h"
 
 #include "group_loops.h"
+#include "key_table.h"
 #include <unistd.h>
 
 namespace antb1::bench {
@@ -992,6 +996,368 @@ BENCHMARK(BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random)
     ->ANTB1_STEP0_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_STEP0_COUNTS
 
+// Compare the production key-table implementations, including packing, decoded uniques and
+// destruction. Fixtures and the independent string-key oracle are deliberately outside timing.
+// Shapes cover short keys, fallback, small batches, high cardinality and changing batch sizes.
+struct StringKeyCase {
+  int columns = 1;
+  int length = 3;
+  uint32_t groups = 8;
+  int64_t batch_rows = kBatchSize;
+  bool shuffled = true;
+  bool nullable = false;
+  bool sliced = false;
+  bool binary = false;
+  bool promote = false;
+  bool shrinking = false;
+  bool mixed = false;
+};
+
+struct StringKeyInput {
+  std::vector<arrow::TypeHolder> types;
+  std::vector<arrow::compute::ExecBatch> batches;
+  int64_t rows = 0;
+  int64_t value_bytes = 0;
+  int64_t nulls = 0;
+  int min_length = 24;
+  int max_length = 0;
+};
+
+std::string StringKeyValue(uint32_t group, int column, const StringKeyCase& shape) {
+  constexpr std::string_view kAlphabet =
+      "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-";
+  const uint64_t capacity = uint64_t{1} << Narrow<unsigned>(6 * std::min(shape.length, 7));
+  uint64_t value = group;
+  if (column != 0) {
+    // The quotient makes two one-byte columns represent all 4096 distinct pairs; the other
+    // term varies both columns even at low cardinality.
+    value = (value / capacity) + value * 13U + 7U;
+  }
+  std::string out(Narrow<std::size_t>(shape.length), '0');
+  for (char& byte : out) {
+    byte = kAlphabet[Narrow<std::size_t>(value % kAlphabet.size())];
+    value /= kAlphabet.size();
+  }
+  if (shape.binary) {
+    out.back() = '\0';  // Embedded NUL is a value byte, never a terminator.
+  }
+  return out;
+}
+
+arrow::Result<StringKeyInput> MakeStringKeyInput(const StringKeyCase& shape) {
+  StringKeyInput input;
+  constexpr std::array<int64_t, 6> kMixedBatchRows{1, 256, kBatchSize, 16, 257, 256};
+  const int64_t batch_count = shape.mixed ? Narrow<int64_t>(kMixedBatchRows.size())
+                                          : (shape.batch_rows == kBatchSize ? 4 : 64);
+  if (shape.mixed) {
+    for (const int64_t rows : kMixedBatchRows) {
+      input.rows += rows;
+    }
+  } else {
+    input.rows = shape.shrinking ? shape.batch_rows + 33 : shape.batch_rows * batch_count;
+  }
+  const auto row_count = Narrow<std::size_t>(input.rows);
+  std::vector<uint32_t> groups(row_count);
+  for (std::size_t i = 0; i < row_count; ++i) {
+    groups[i] =
+        Narrow<uint32_t>(shape.shuffled ? i % shape.groups : (i * shape.groups) / row_count);
+  }
+  if (shape.shuffled) {
+    uint64_t seed = 0x535452494E474B45ULL;
+    for (std::size_t end = groups.size(); end > 1; --end) {
+      const auto other = Narrow<std::size_t>(SplitMix64(seed) % end);
+      std::swap(groups[end - 1], groups[other]);
+    }
+  }
+  const auto type = shape.binary ? arrow::binary() : arrow::utf8();
+  std::vector<std::vector<std::string>> values(Narrow<std::size_t>(shape.columns));
+  for (int column = 0; column < shape.columns; ++column) {
+    input.types.emplace_back(type);
+    auto& keys = values[Narrow<std::size_t>(column)];
+    keys.reserve(shape.groups);
+    for (uint32_t group = 0; group < shape.groups; ++group) {
+      keys.push_back(StringKeyValue(group, column, shape));
+    }
+  }
+  int64_t row_start = 0;
+  for (int64_t batch_index = 0; batch_index < batch_count; ++batch_index) {
+    const int64_t batch_rows =
+        shape.mixed
+            ? kMixedBatchRows[Narrow<std::size_t>(batch_index)]
+            : (shape.shrinking && batch_index > 0 ? (batch_index == 2 ? 1 : 16) : shape.batch_rows);
+    std::vector<arrow::Datum> columns;
+    for (int column = 0; column < shape.columns; ++column) {
+      ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(type));
+      auto* binary_builder = static_cast<arrow::BinaryBuilder*>(builder.get());
+      const int64_t prefix = shape.sliced ? 7 : 0;
+      const int64_t suffix = shape.sliced ? 3 : 0;
+      ARROW_RETURN_NOT_OK(binary_builder->Reserve(batch_rows + prefix + suffix));
+      for (int64_t i = 0; i < prefix; ++i) {
+        ARROW_RETURN_NOT_OK(binary_builder->Append("prefix-outside-the-slice"));
+      }
+      for (int64_t row = 0; row < batch_rows; ++row) {
+        const uint32_t group = groups[Narrow<std::size_t>(row_start + row)];
+        const uint32_t pattern = group + Narrow<uint32_t>(column) * 3U;
+        if (shape.nullable && pattern % 11U == 0) {
+          ARROW_RETURN_NOT_OK(binary_builder->AppendNull());
+          ++input.nulls;
+          continue;
+        }
+        std::string_view value = values[Narrow<std::size_t>(column)][group];
+        if (shape.nullable && pattern % 13U == 2) {
+          value = {};
+        }
+        // Two complete short batches precede this new long key. The last batch contains the
+        // original short keys again, exercising stable ids after permanent promotion.
+        if (shape.promote && batch_index == 2 && row == 0 && column == shape.columns - 1) {
+          value = "a-new-long-key-after-run";
+        }
+        ARROW_RETURN_NOT_OK(binary_builder->Append(value));
+        input.value_bytes += Narrow<int64_t>(value.size());
+        input.min_length = std::min(input.min_length, Narrow<int>(value.size()));
+        input.max_length = std::max(input.max_length, Narrow<int>(value.size()));
+      }
+      for (int64_t i = 0; i < suffix; ++i) {
+        ARROW_RETURN_NOT_OK(binary_builder->Append("suffix-outside-the-slice"));
+      }
+      ARROW_ASSIGN_OR_RAISE(auto array, builder->Finish());
+      columns.emplace_back(array->Slice(prefix, batch_rows));
+    }
+    input.batches.emplace_back(std::move(columns), batch_rows);
+    row_start += batch_rows;
+  }
+  return input;
+}
+
+// An unambiguous semantic representation, unrelated to the packed adapter's word encoding.
+// Input and unique arrays are both read through Arrow, including offsets and NULL validity.
+std::string ModelStringKey(const arrow::ArrayVector& columns, int64_t row) {
+  std::string key;
+  for (const auto& array : columns) {
+    if (array->IsNull(row)) {
+      key += "N;";
+      continue;
+    }
+    const auto bytes = static_cast<const arrow::BinaryArray&>(*array).GetView(row);
+    key += 'S';
+    key += std::to_string(bytes.size());
+    key += ':';
+    key.append(bytes);
+    key += ';';
+  }
+  return key;
+}
+
+arrow::Result<uint32_t> ValidateStringKeyTable(const StringKeyInput& input,
+                                               exec::KeyTableKind kind) {
+  exec::MemoryBudget budget(std::nullopt);
+  arrow::compute::ExecContext ctx(&budget);
+  ARROW_ASSIGN_OR_RAISE(auto table, exec::MakeKeyTable(input.types, &ctx, {.kind = kind}));
+  std::unordered_map<std::string, uint32_t> model;
+  std::vector<std::optional<std::string>> keys_by_id;
+  for (const auto& batch : input.batches) {
+    const auto before = Narrow<uint32_t>(model.size());
+    arrow::ArrayVector columns;
+    for (const auto& value : batch.values) {
+      columns.push_back(value.make_array());
+    }
+    ARROW_ASSIGN_OR_RAISE(auto ids, table->Consume(batch));
+    if (ids.before != before || ids.after < ids.before || ids.after != table->num_groups() ||
+        ids.ids.size() != Narrow<std::size_t>(batch.length)) {
+      return arrow::Status::Invalid("key-table benchmark: invalid group-count contract");
+    }
+    keys_by_id.resize(ids.after);
+    for (int64_t row = 0; row < batch.length; ++row) {
+      const uint32_t id = ids.ids[Narrow<std::size_t>(row)];
+      if (id >= ids.after) {
+        return arrow::Status::Invalid("key-table benchmark: out-of-range group id");
+      }
+      auto key = ModelStringKey(columns, row);
+      const auto [entry, inserted] = model.try_emplace(key, id);
+      if (entry->second != id || (keys_by_id[id] && *keys_by_id[id] != key)) {
+        return arrow::Status::Invalid("key-table benchmark: inconsistent key-to-id mapping");
+      }
+      if (inserted) {
+        keys_by_id[id] = std::move(key);
+      }
+    }
+    if (model.size() != ids.after) {
+      return arrow::Status::Invalid("key-table benchmark: distinct-key count differs from oracle");
+    }
+  }
+  ARROW_ASSIGN_OR_RAISE(auto uniques, table->Uniques());
+  if (uniques.length != Narrow<int64_t>(model.size()) ||
+      uniques.values.size() != input.types.size()) {
+    return arrow::Status::Invalid("key-table benchmark: wrong unique dimensions");
+  }
+  arrow::ArrayVector unique_columns;
+  for (std::size_t column = 0; column < input.types.size(); ++column) {
+    if (!uniques.values[column].type()->Equals(*input.types[column].type)) {
+      return arrow::Status::Invalid("key-table benchmark: wrong unique type");
+    }
+    unique_columns.push_back(uniques.values[column].make_array());
+  }
+  for (int64_t id = 0; id < uniques.length; ++id) {
+    const auto& expected = keys_by_id[Narrow<std::size_t>(id)];
+    if (!expected || *expected != ModelStringKey(unique_columns, id)) {
+      return arrow::Status::Invalid("key-table benchmark: unique keys not in public id order");
+    }
+  }
+  return table->num_groups();
+}
+
+struct StringKeyMemory {
+  int64_t after_first = 0;
+  int64_t after_consume = 0;
+  int64_t with_uniques = 0;
+};
+
+template <bool kMeasureMemory = false>
+arrow::Status StringKeyTableLifecycle(const StringKeyInput& input, exec::KeyTableKind kind,
+                                      arrow::compute::ExecContext* ctx,
+                                      StringKeyMemory* memory = nullptr) {
+  ARROW_ASSIGN_OR_RAISE(auto table, exec::MakeKeyTable(input.types, ctx, {.kind = kind}));
+  for (const auto& batch : input.batches) {
+    {
+      ARROW_ASSIGN_OR_RAISE(auto ids, table->Consume(batch));
+      benchmark::DoNotOptimize(ids.ids.data());
+    }
+    if constexpr (kMeasureMemory) {
+      if (&batch == &input.batches.front()) {
+        memory->after_first = ctx->memory_pool()->bytes_allocated();
+      }
+    }
+  }
+  if constexpr (kMeasureMemory) {
+    memory->after_consume = ctx->memory_pool()->bytes_allocated();
+  }
+  ARROW_ASSIGN_OR_RAISE(auto uniques, table->Uniques());
+  benchmark::DoNotOptimize(uniques);
+  if constexpr (kMeasureMemory) {
+    memory->with_uniques = ctx->memory_pool()->bytes_allocated();
+  }
+  return arrow::Status::OK();  // The decoded arrays and table are destroyed before returning.
+}
+
+void StringKeyTables(benchmark::State& state, StringKeyCase shape, exec::KeyTableKind kind) {
+  auto input = MakeStringKeyInput(shape);
+  if (!input.ok()) {
+    state.SkipWithError(input.status().ToString());
+    return;
+  }
+  auto groups = ValidateStringKeyTable(*input, kind);
+  if (!groups.ok()) {
+    state.SkipWithError(groups.status().ToString());
+    return;
+  }
+  exec::MemoryBudget budget(std::nullopt);
+  arrow::compute::ExecContext ctx(&budget);
+  // Sample pool statistics during one separate lifecycle. No oracle/input allocations occur
+  // between snapshots. These counters exclude allocations outside Arrow's query pool.
+  const int64_t bytes_before = budget.total_bytes_allocated();
+  const int64_t allocations_before = budget.num_allocations();
+  StringKeyMemory memory;
+  const auto measured = StringKeyTableLifecycle<true>(*input, kind, &ctx, &memory);
+  if (!measured.ok()) {
+    state.SkipWithError(measured.ToString());
+    return;
+  }
+  const int64_t allocated_bytes = budget.total_bytes_allocated() - bytes_before;
+  const int64_t allocations = budget.num_allocations() - allocations_before;
+  const int64_t peak_bytes = budget.max_memory();
+  if (budget.bytes_allocated() != 0) {
+    state.SkipWithError("key-table benchmark: lifecycle left query-pool allocations alive");
+    return;
+  }
+  for (auto _ : state) {
+    const auto status = StringKeyTableLifecycle(*input, kind, &ctx);
+    if (!status.ok()) {
+      state.SkipWithError(status.ToString());
+      return;
+    }
+  }
+  state.SetItemsProcessed(state.iterations() * input->rows);
+  state.SetBytesProcessed(state.iterations() * input->value_bytes);
+  state.counters["groups"] = *groups;
+  state.counters["rows"] = static_cast<double>(input->rows);
+  state.counters["columns"] = shape.columns;
+  state.counters["batch_rows"] = static_cast<double>(shape.batch_rows);
+  state.counters["min_key_bytes"] = input->min_length;
+  state.counters["max_key_bytes"] = input->max_length;
+  const int64_t value_count = input->rows * shape.columns;
+  state.counters["mean_key_bytes"] =
+      static_cast<double>(input->value_bytes) / static_cast<double>(value_count - input->nulls);
+  state.counters["null_fraction"] =
+      static_cast<double>(input->nulls) / static_cast<double>(value_count);
+  state.counters["pool_peak_bytes"] = static_cast<double>(peak_bytes);
+  state.counters["pool_total_bytes"] = static_cast<double>(allocated_bytes);
+  state.counters["pool_allocations"] = static_cast<double>(allocations);
+  state.counters["pool_live_after_first"] = static_cast<double>(memory.after_first);
+  state.counters["pool_live_after_consume"] = static_cast<double>(memory.after_consume);
+  state.counters["pool_live_with_uniques"] = static_cast<double>(memory.with_uniques);
+  state.counters["seconds_per_row"] = benchmark::Counter(
+      static_cast<double>(input->rows),
+      benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
+}
+
+void RegisterStringKeyTables() {
+  const auto add = [](const StringKeyCase& shape) {
+    std::string name = "/keys:" + std::to_string(shape.columns) +
+                       "/len:" + std::to_string(shape.length) + (shape.promote ? "_to24" : "") +
+                       "/input_groups:" + std::to_string(shape.groups) +
+                       "/batch:" + std::to_string(shape.batch_rows) +
+                       (shape.shuffled ? "/shuffled" : "/clustered");
+    if (shape.nullable) {
+      name += "/null_empty";
+    }
+    if (shape.sliced) {
+      name += "/sliced";
+    }
+    name += shape.binary ? "/binary" : "/string";
+    if (shape.shrinking) {
+      name += "/shrinking";
+    }
+    if (shape.mixed) {
+      name += "/mixed_1_256_65536_16_257_256";
+    }
+    benchmark::RegisterBenchmark(("BM_KeyTableGrouper" + name).c_str(),
+                                 [shape](benchmark::State& state) {
+                                   StringKeyTables(state, shape, exec::KeyTableKind::kGrouper);
+                                 })
+        ->Unit(benchmark::kMillisecond);
+    benchmark::RegisterBenchmark(("BM_KeyTablePacked" + name).c_str(), [shape](benchmark::State&
+                                                                                   state) {
+      StringKeyTables(state, shape, exec::KeyTableKind::kPackedStrings);
+    })->Unit(benchmark::kMillisecond);
+  };
+  for (const int columns : {1, 2}) {
+    for (const int length : {1, 3, 7, 8, 24}) {
+      add({.columns = columns, .length = length});
+      const uint32_t high_groups = length == 1 ? (columns == 1 ? 64U : 4096U) : 32768U;
+      add({.columns = columns, .length = length, .groups = high_groups});
+    }
+    for (const int length : {1, 3, 7}) {
+      add({.columns = columns, .length = length, .shuffled = false});
+    }
+    add({.columns = columns, .length = 7, .groups = 32768, .shuffled = false});
+    for (const int64_t batch_rows :
+         {int64_t{1}, int64_t{16}, int64_t{255}, int64_t{256}, int64_t{257}}) {
+      add({.columns = columns, .batch_rows = batch_rows});
+    }
+    for (const bool binary : {false, true}) {
+      add({.columns = columns,
+           .length = 7,
+           .groups = 64,
+           .nullable = true,
+           .sliced = true,
+           .binary = binary});
+    }
+    add({.columns = columns, .promote = true});
+    add({.columns = columns, .shrinking = true});
+    add({.columns = columns, .mixed = true});
+  }
+}
+
 }  // namespace
 }  // namespace antb1::bench
 
@@ -999,6 +1365,7 @@ int main(int argc, char** argv) {
   if (!arrow::compute::Initialize().ok()) {
     return 1;
   }
+  antb1::bench::RegisterStringKeyTables();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
