@@ -883,11 +883,42 @@ antb1_add_cli_golden(
     --threads
     1
     -c
-    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT COUNT(*) FROM cities c WHERE c.ct_id = z.zn_city) AND z.zn_row > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_pop < z.zn_parent) ORDER BY zn_id"
+    "SELECT zn_id FROM zones z WHERE z.zn_parent > (SELECT MIN(c.ct_pop) FROM cities c WHERE c.ct_id < z.zn_city) AND z.zn_row > (SELECT MAX(c.ct_pop) FROM cities c WHERE c.ct_pop < z.zn_parent) ORDER BY zn_id"
     --table
     "zones=${_f}/star/zones.parquet"
     --table
     "cities=${_f}/star/cities.parquet"
+)
+# A correlated COUNT whose comparison passes its 0 is joined back LEFT (ADR 0041's SQ6): the join builds the grouped
+# riders, padded for the cities without one, the count is read above it through COALESCE(count, 0), and the semi-join
+# reduction restricts the one key over a bare scan, which D5 does not reach under a LEFT join.
+antb1_add_cli_golden(
+  explain_unnest_left_join_back
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A constant select item over ORDER BY COUNT(*) is the constant over no rows too, so it moves above the LEFT join back
+# and a padded city reads it (ADR 0041's SQ6).
+antb1_add_cli_golden(
+  explain_unnest_left_item_moved
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE (SELECT 42 FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) = 42 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
 )
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(

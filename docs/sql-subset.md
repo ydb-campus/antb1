@@ -1914,7 +1914,7 @@ follows.
 | Q38 | pass | `INTERSECT` (X4c) |
 | Q39 | pass | stddev_samp (AG2) |
 | Q40 | pass | an identity CAST (CT1) |
-| Q41 | unsupported | needs a correlated COUNT subquery (SQ6) |
+| Q41 | pass | a correlated COUNT subquery, joined back LEFT where its comparison can pass 0 (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q44 | unsupported | needs scalar subqueries that are not aggregates, scalar subqueries inside a condition and rank() (phase 9) |

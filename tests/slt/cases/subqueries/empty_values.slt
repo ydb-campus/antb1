@@ -55,11 +55,10 @@ INTEGER	SMALLINT	INTEGER	BIGINT	USMALLINT
 8	NULL	7	NULL	2
 9	12345	NULL	42	NULL
 
-# ---- pending: COUNT(*) under every comparison (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- COUNT(*) under every comparison (ADR 0041's SQ6) ----
 
 # Cities 4 to 6 have no rider, so their COUNT(*) is 0, not NULL: a comparison that 0 passes keeps them, one that 0
 # fails drops them. Several operators, the subquery on either side and the correlation written either way round.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
 ----
@@ -68,7 +67,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
 ----
@@ -77,7 +75,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE 0 = (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
 ----
@@ -86,7 +83,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78 ORDER BY 1
 ----
@@ -97,7 +93,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) >= 0 ORDER BY 1
 ----
@@ -109,7 +104,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) <> 77 ORDER BY 1
 ----
@@ -119,7 +113,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 77 ORDER BY 1
 ----
@@ -127,7 +120,6 @@ SMALLINT
 1
 2
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE c.ct_id = r.rd_city) = 0 ORDER BY 1
 ----
@@ -137,7 +129,6 @@ SMALLINT
 6
 
 # Riders 237 to 240 have no trip. The outer block aggregates the riders it keeps.
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
@@ -145,11 +136,10 @@ WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
 BIGINT	BIGINT	BIGINT	HUGEINT
 4	237	240	954
 
-# ---- pending: COUNT(x) and COUNT(DISTINCT x) (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- COUNT(x) and COUNT(DISTINCT x) (ADR 0041's SQ6) ----
 
 # COUNT of a column is 0 over no rows as well; over a column with NULLs it counts fewer rows than COUNT(*), so a rider
 # with trips but no promotion passes too.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(r.rd_tier) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
 ----
@@ -158,7 +148,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COUNT(t.tr_promo) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
@@ -166,7 +155,6 @@ WHERE (SELECT COUNT(t.tr_promo) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
 BIGINT	BIGINT	BIGINT	HUGEINT
 181	2	240	22097
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(DISTINCT r.rd_tier) FROM riders r WHERE r.rd_city = c.ct_id) < 2
 ORDER BY 1
@@ -176,7 +164,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COUNT(DISTINCT t.tr_pickup) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
@@ -185,7 +172,6 @@ BIGINT	BIGINT	BIGINT	HUGEINT
 4	237	240	954
 
 # Two calls of one block: COUNT(*) and COUNT(x) are both 0 over no rows.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) - COUNT(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
@@ -198,11 +184,10 @@ SMALLINT
 5
 6
 
-# ---- pending: arithmetic over COUNT (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- arithmetic over COUNT (ADR 0041's SQ6) ----
 
 # The item is computed over the empty value too: 0 + 1, 0 * 2 - 1, 0 % 2. Dividing by a COUNT of 0: `/` gives an
 # infinity and `//` gives NULL.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) + 1 FROM riders r WHERE r.rd_city = c.ct_id) = 1 ORDER BY 1
 ----
@@ -211,7 +196,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) * 2 - 1 FROM riders r WHERE r.rd_city = c.ct_id) < 0 ORDER BY 1
 ----
@@ -220,7 +204,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) % 2 FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
 ----
@@ -230,7 +213,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT 100 / COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 1 ORDER BY 1
 ----
@@ -242,7 +224,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(100 // COUNT(*), -1) FROM riders r WHERE r.rd_city = c.ct_id) = -1 ORDER BY 1
@@ -252,10 +233,9 @@ SMALLINT
 5
 6
 
-# ---- pending: an empty inner table (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- an empty inner table (ADR 0041's SQ6) ----
 
 # promos has no row, so every binding reads the empty value.
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z WHERE (SELECT COUNT(*) FROM promos p WHERE p.pm_id = z.zn_id) = 0 AND z.zn_id < 5 ORDER BY 1
 ----
@@ -265,7 +245,6 @@ INTEGER
 3
 4
 
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z
 WHERE (SELECT COUNT(p.pm_discount) FROM promos p WHERE p.pm_id = z.zn_parent) < 1 AND z.zn_id > 35 ORDER BY 1
@@ -277,7 +256,6 @@ INTEGER
 39
 40
 
-pending SQ6
 query II nosort
 SELECT COUNT(*), SUM(t.tr_row) FROM trips t
 WHERE (SELECT COUNT(DISTINCT p.pm_code) + 1 FROM promos p WHERE p.pm_id = t.tr_promo) = 1
@@ -285,10 +263,9 @@ WHERE (SELECT COUNT(DISTINCT p.pm_code) + 1 FROM promos p WHERE p.pm_id = t.tr_p
 BIGINT	HUGEINT
 3000	4498500
 
-# ---- pending: constants and items that are not NULL over no rows (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- constants and items that are not NULL over no rows (ADR 0041's SQ6) ----
 
 # A constant over an aggregate that only ORDER BY has keeps its value over no rows.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT 42 FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) = 42
 ORDER BY 1
@@ -301,7 +278,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z WHERE (SELECT 'y' FROM cities c WHERE c.ct_id = z.zn_city ORDER BY COUNT(*)) = 'y'
 AND z.zn_id > 30 ORDER BY 1
@@ -319,7 +295,6 @@ INTEGER
 40
 
 # COALESCE over SUM, MAX of a VARCHAR, MIN of a DATE, and over another call.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COALESCE(SUM(r.rd_row), 0) FROM riders r WHERE r.rd_city = c.ct_id) = 0
 ORDER BY 1
@@ -329,7 +304,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COALESCE(SUM(r.rd_row), 0) FROM riders r WHERE r.rd_city = c.ct_id) > 100
 ORDER BY 1
@@ -339,7 +313,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COALESCE(SUM(t.tr_fare), -1) FROM trips t WHERE t.tr_rider = r.rd_id) < 0
@@ -347,7 +320,6 @@ WHERE (SELECT COALESCE(SUM(t.tr_fare), -1) FROM trips t WHERE t.tr_rider = r.rd_
 BIGINT	BIGINT	BIGINT	HUGEINT
 4	237	240	954
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(MAX(r.rd_tier), 'none') FROM riders r WHERE r.rd_city = c.ct_id) = 'none' ORDER BY 1
@@ -357,7 +329,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(MIN(d.dv_since), DATE '1999-12-31') FROM drivers d WHERE d.dv_city = c.ct_id) < DATE '2000-01-01'
@@ -367,7 +338,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(SUM(r.rd_row), COUNT(*)) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
@@ -378,7 +348,6 @@ SMALLINT
 6
 
 # CASE over the calls: a branch over COUNT, a constant ELSE, a THEN under a test of NULL.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN COUNT(*) > 0 THEN SUM(r.rd_row) ELSE -1 END FROM riders r WHERE r.rd_city = c.ct_id) < 0
@@ -389,7 +358,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE MAX(r.rd_row) END FROM riders r WHERE r.rd_city = c.ct_id) > 0
@@ -400,7 +368,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN SUM(r.rd_row) IS NULL THEN 0 ELSE 1 END FROM riders r WHERE r.rd_city = c.ct_id) = 0
@@ -411,7 +378,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN MAX(r.rd_row) > 100 THEN 1 ELSE 0 END FROM riders r WHERE r.rd_city = c.ct_id) = 0
@@ -422,7 +388,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE WHEN MIN(r.rd_row) IS NULL THEN 1 END FROM riders r WHERE r.rd_city = c.ct_id) = 1 ORDER BY 1
@@ -432,7 +397,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT CASE COUNT(*) WHEN 0 THEN 'none' WHEN 77 THEN 'some' ELSE 'many' END FROM riders r
@@ -446,7 +410,6 @@ SMALLINT
 6
 
 # Mixes of a call that is NULL over no rows and one that is 0: the item is NULL then.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT AVG(r.rd_row) + COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
 ORDER BY 1
@@ -456,7 +419,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT SUM(r.rd_row) / COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 100
 ORDER BY 1
@@ -466,10 +428,9 @@ SMALLINT
 2
 3
 
-# ---- pending: the variance family (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- the variance family (ADR 0041's SQ6) ----
 
 # VAR_POP, VAR_SAMP, VARIANCE, STDDEV_POP and STDDEV_SAMP are NULL over no rows, and the sample forms over one row.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT VAR_POP(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
 ----
@@ -478,7 +439,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COALESCE(VAR_SAMP(r.rd_row), -1) FROM riders r WHERE r.rd_city = c.ct_id) < 0 ORDER BY 1
@@ -488,7 +448,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT STDDEV_SAMP(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id) > 5
@@ -496,7 +455,6 @@ WHERE (SELECT STDDEV_SAMP(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id) > 
 BIGINT	BIGINT	BIGINT	HUGEINT
 236	1	236	27958
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT VARIANCE(t.tr_distance) FROM trips t WHERE t.tr_rider = r.rd_id) >= 0
@@ -504,7 +462,6 @@ WHERE (SELECT VARIANCE(t.tr_distance) FROM trips t WHERE t.tr_rider = r.rd_id) >
 BIGINT	BIGINT	BIGINT	HUGEINT
 236	1	236	27958
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COALESCE(STDDEV_POP(t.tr_fare), 0) FROM trips t WHERE t.tr_rider = r.rd_id) = 0
@@ -512,7 +469,6 @@ WHERE (SELECT COALESCE(STDDEV_POP(t.tr_fare), 0) FROM trips t WHERE t.tr_rider =
 BIGINT	BIGINT	BIGINT	HUGEINT
 4	237	240	954
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT AVG(t.tr_fare) * COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) > 50
@@ -520,7 +476,6 @@ WHERE (SELECT AVG(t.tr_fare) * COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id)
 BIGINT	BIGINT	BIGINT	HUGEINT
 236	1	236	27958
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT STDDEV_POP(e2.i32) FROM edge e2 WHERE e2.i16 = e.i16) = 0 ORDER BY 1
 ----
@@ -822,7 +777,6 @@ SMALLINT
 6
 
 # An uncorrelated value on the other side of the comparison.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = (SELECT COUNT(*) FROM promos) ORDER BY 1
@@ -832,11 +786,10 @@ SMALLINT
 5
 6
 
-# ---- pending: NULL keys and NULL-equal keys (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- NULL keys and NULL-equal keys (ADR 0041's SQ6) ----
 
 # A NULL outer key matches nothing under `=`, so it reads the empty value; under IS NOT DISTINCT FROM it reads the
 # group of the inner NULLs. edge has NULLs in i16 (rows 5 and 8), i32 (5 and 9), i64 (5 and 8), u16 (5 and 9).
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 = e.i32) = 0 ORDER BY 1
 ----
@@ -844,7 +797,6 @@ INTEGER
 5
 9
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(e2.i16) FROM edge e2 WHERE e2.i64 = e.i64) = 0 ORDER BY 1
 ----
@@ -852,7 +804,6 @@ INTEGER
 5
 8
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.u = e.u) = 1 ORDER BY 1
 ----
@@ -868,7 +819,6 @@ INTEGER
 9
 10
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16) > 1 ORDER BY 1
 ----
@@ -876,7 +826,6 @@ INTEGER
 5
 8
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16) = 1 ORDER BY 1
 ----
@@ -892,7 +841,6 @@ INTEGER
 10
 11
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e WHERE (SELECT COUNT(e2.i32) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16) = 0
 ORDER BY 1
@@ -900,7 +848,6 @@ ORDER BY 1
 INTEGER
 9
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e
 WHERE (SELECT 1 FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16 ORDER BY COUNT(*)) = 1 ORDER BY 1
@@ -919,7 +866,6 @@ INTEGER
 10
 11
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e
 WHERE (SELECT COALESCE(SUM(e2.i32), 0) FROM edge e2 WHERE e2.u16 IS NOT DISTINCT FROM e.u16) = 0 ORDER BY 1
@@ -939,7 +885,6 @@ INTEGER
 8
 
 # The same across tables: riders without a city read the drivers without one (8), and the zone without one (1).
-pending SQ6
 query II nosort
 SELECT r.rd_city, COUNT(*) FROM riders r
 WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city) = 8 GROUP BY 1 ORDER BY 1
@@ -947,7 +892,6 @@ WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_
 SMALLINT	BIGINT
 NULL	8
 
-pending SQ6
 query II nosort
 SELECT r.rd_city, COUNT(*) FROM riders r
 WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city) < 23 GROUP BY 1 ORDER BY 1
@@ -957,7 +901,6 @@ SMALLINT	BIGINT
 3	78
 NULL	8
 
-pending SQ6
 query II nosort
 SELECT r.rd_city, COUNT(*) FROM riders r
 WHERE (SELECT COUNT(*) FROM zones z WHERE z.zn_city IS NOT DISTINCT FROM r.rd_city) = 1 GROUP BY 1 ORDER BY 1
@@ -965,17 +908,15 @@ WHERE (SELECT COUNT(*) FROM zones z WHERE z.zn_city IS NOT DISTINCT FROM r.rd_ci
 SMALLINT	BIGINT
 NULL	8
 
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM decimals d WHERE (SELECT COUNT(*) FROM edge e WHERE e.i64 IS NOT DISTINCT FROM d.b) > 0
 ----
 BIGINT
 12
 
-# ---- pending: several keys (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- several keys (ADR 0041's SQ6) ----
 
 # Two, three and two NULL-equal correlations: a binding is empty when any key has no match.
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z
 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_dropoff = z.zn_parent) = 0 ORDER BY 1
@@ -989,7 +930,6 @@ INTEGER
 31
 40
 
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z
 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_dropoff = z.zn_parent) > 1 ORDER BY 1
@@ -1020,7 +960,6 @@ INTEGER
 37
 39
 
-pending SQ6
 query I nosort
 SELECT z.zn_id FROM zones z
 WHERE (SELECT COUNT(*) FROM zones z2 WHERE z2.zn_city = z.zn_city AND z2.zn_parent IS NOT DISTINCT FROM z.zn_parent) = 1
@@ -1035,7 +974,6 @@ INTEGER
 39
 40
 
-pending SQ6
 query II nosort
 SELECT COUNT(*), SUM(b.bk_row) FROM bookings b
 WHERE (SELECT COUNT(*) FROM fleet f
@@ -1044,7 +982,6 @@ WHERE (SELECT COUNT(*) FROM fleet f
 BIGINT	HUGEINT
 1644	1479282
 
-pending SQ6
 query II nosort
 SELECT COUNT(*), SUM(b.bk_row) FROM bookings b
 WHERE (SELECT COALESCE(SUM(f.fl_available), 0) FROM fleet f
@@ -1053,7 +990,6 @@ WHERE (SELECT COALESCE(SUM(f.fl_available), 0) FROM fleet f
 BIGINT	HUGEINT
 1766	1589427
 
-pending SQ6
 query II nosort
 SELECT COUNT(*), SUM(s.sh_row) FROM shifts s
 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day = s.sh_day) = 0
@@ -1061,7 +997,6 @@ WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day
 BIGINT	HUGEINT
 53	12982
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e
 WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16 AND e2.i64 IS NOT DISTINCT FROM e.i64) = 2
@@ -1071,7 +1006,6 @@ INTEGER
 5
 8
 
-pending SQ6
 query I nosort
 SELECT e.id FROM edge e
 WHERE (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 = e.i16 AND e2.i64 IS NOT DISTINCT FROM e.i64) = 0 ORDER BY 1
@@ -1080,11 +1014,10 @@ INTEGER
 5
 8
 
-# ---- pending: filters beside the correlation (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- filters beside the correlation (ADR 0041's SQ6) ----
 
 # An inner filter empties a group that has rows (city 1 has no gold rider), or every group; an outer filter beside the
 # subquery, and one that leaves no outer row at all.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') = 0 ORDER BY 1
@@ -1095,7 +1028,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE c.ct_id > 2 AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
 ORDER BY 1
@@ -1105,14 +1037,12 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE c.ct_id > 100 AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
 ORDER BY 1
 ----
 SMALLINT
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0) = 0
 ORDER BY 1
@@ -1125,10 +1055,9 @@ SMALLINT
 5
 6
 
-# ---- pending: compared with an outer column (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- compared with an outer column (ADR 0041's SQ6) ----
 
 # The empty value 0 against a column: city 4's NULL population rejects it.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < c.ct_id * 20 ORDER BY 1
 ----
@@ -1137,7 +1066,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > c.ct_id ORDER BY 1
 ----
@@ -1146,7 +1074,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < c.ct_pop ORDER BY 1
 ----
@@ -1157,7 +1084,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE c.ct_id + 3 = (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
 ----
@@ -1165,9 +1091,8 @@ SMALLINT
 4
 5
 
-# ---- pending: an inner ON (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- an inner ON (ADR 0041's SQ6) ----
 
-pending SQ6
 query II nosort
 SELECT c.ct_id, z.zn_id FROM cities c
 JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1, 2
@@ -1189,7 +1114,6 @@ SMALLINT	INTEGER
 5	35
 5	40
 
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM cities c
 JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 77
@@ -1197,10 +1121,9 @@ JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.r
 BIGINT
 7
 
-# ---- pending: outer sides that are joins (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- outer sides that are joins (ADR 0041's SQ6) ----
 
 # An inner join, and a LEFT join whose padded zone reads 0 (city 6 has no zone).
-pending SQ6
 query II nosort
 SELECT c.ct_id, COUNT(*) FROM cities c JOIN zones z ON z.zn_city = c.ct_id
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 GROUP BY 1 ORDER BY 1
@@ -1209,7 +1132,6 @@ SMALLINT	BIGINT
 4	7
 5	8
 
-pending SQ6
 query II nosort
 SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id
 WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) = 0 ORDER BY 1, 2
@@ -1217,7 +1139,6 @@ WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) = 0 ORDER BY 1,
 SMALLINT	INTEGER
 6	NULL
 
-pending SQ6
 query II nosort
 SELECT c.ct_id, COUNT(z.zn_id) FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id
 WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = z.zn_city) < 23 GROUP BY 1 ORDER BY 1
@@ -1229,10 +1150,9 @@ SMALLINT	BIGINT
 5	8
 6	0
 
-# ---- pending: several correlated subqueries (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- several correlated subqueries (ADR 0041's SQ6) ----
 
 # Stacked in separate conjuncts, and nested: a correlated subquery in the WHERE of another.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
@@ -1242,7 +1162,6 @@ ORDER BY 1
 SMALLINT
 4
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78
@@ -1255,7 +1174,6 @@ SMALLINT
 4
 5
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
@@ -1266,7 +1184,6 @@ ORDER BY 1
 SMALLINT
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
@@ -1277,7 +1194,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r
@@ -1289,7 +1205,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r
@@ -1301,7 +1216,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM zones z
@@ -1312,7 +1226,6 @@ SMALLINT
 6
 
 # The same correlated conjunct in each branch of an OR, which OR factoring takes out as a top-level conjunct.
-pending SQ6
 query I nosort
 SELECT ct_id FROM cities
 WHERE (ct_id < 3 AND (SELECT COUNT(*) FROM zones WHERE zn_city = ct_id) > 7)
@@ -1324,7 +1237,6 @@ SMALLINT
 2
 5
 
-pending SQ6
 query I nosort
 SELECT ct_id FROM cities
 WHERE (ct_id < 3 AND (SELECT COUNT(*) FROM riders WHERE rd_city = ct_id) = 0)
@@ -1335,11 +1247,10 @@ SMALLINT
 5
 6
 
-# ---- pending: inside other query blocks (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- inside other query blocks (ADR 0041's SQ6) ----
 
 # Inside EXISTS, NOT EXISTS and IN, a derived table, a CTE, a UNION ALL branch and a block that aggregates; over a join
 # and over a UNION ALL inside the subquery; and under SELECT DISTINCT.
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE EXISTS (SELECT 1 FROM riders r
@@ -1351,7 +1262,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE NOT EXISTS (SELECT 1 FROM riders r
@@ -1366,7 +1276,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) = 0)
@@ -1377,7 +1286,6 @@ SMALLINT
 2
 3
 
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM (SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0)
 AS x
@@ -1385,7 +1293,6 @@ AS x
 BIGINT
 3
 
-pending SQ6
 query I nosort
 WITH x AS (SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0)
 SELECT * FROM x ORDER BY 1
@@ -1395,7 +1302,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT * FROM (SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
                UNION ALL SELECT 100 FROM cities WHERE ct_id = 1) u
@@ -1407,14 +1313,12 @@ INTEGER
 6
 100
 
-pending SQ6
 query II nosort
 SELECT COUNT(*), SUM(c.ct_id) FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0
 ----
 BIGINT	HUGEINT
 3	15
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r JOIN trips t ON t.tr_rider = r.rd_id WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
@@ -1424,7 +1328,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT COUNT(*) FROM (SELECT r.rd_city k FROM riders r UNION ALL SELECT d.dv_city FROM drivers d) u
@@ -1435,7 +1338,6 @@ SMALLINT
 5
 6
 
-pending SQ6
 query I nosort
 SELECT c.ct_id FROM cities c WHERE (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 ORDER BY 1
 ----
@@ -1444,24 +1346,21 @@ SMALLINT
 5
 6
 
-# ---- pending: key types (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- key types (ADR 0041's SQ6) ----
 
 # BIGINT, DATE and VARCHAR keys.
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM decimals d WHERE (SELECT COUNT(*) FROM edge e WHERE e.i64 = d.b) = 0
 ----
 BIGINT
 34
 
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM days y WHERE (SELECT COUNT(*) FROM bookings b WHERE b.bk_day = y.dy_day) = 0
 ----
 BIGINT
 728
 
-pending SQ6
 query IIII nosort
 SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id), SUM(r.rd_id) FROM riders r
 WHERE (SELECT COUNT(*) FROM bookings b WHERE b.bk_rider = r.rd_id) = 0
@@ -1469,22 +1368,19 @@ WHERE (SELECT COUNT(*) FROM bookings b WHERE b.bk_rider = r.rd_id) = 0
 BIGINT	BIGINT	BIGINT	HUGEINT
 4	237	240	954
 
-pending SQ6
 query I nosort
 SELECT COUNT(*) FROM tariffs f WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_tariff = f.tf_code) = 0
 ----
 BIGINT
 1
 
-# ---- pending: errors (ADR 0041; roadmap PR SQ6 removes these guards) ----
+# ---- errors (ADR 0041's SQ6) ----
 
 # An overflow from a group with rows, and one only from the empty value (0 - 1 plus the BIGINT minimum, for the rows
 # whose NULL i32 matches nothing): the item is computed over the empty row, so both fail.
-pending SQ6
 statement error Overflow in addition of
 SELECT e.id FROM edge e WHERE (SELECT COUNT(*) + 9223372036854775807 FROM edge e2 WHERE e2.i16 = e.i16) > 0 ORDER BY 1
 
-pending SQ6
 statement error Overflow in addition of
 SELECT e.id FROM edge e
 WHERE (SELECT COUNT(*) - 1 + (-9223372036854775807 - 1) FROM edge e2 WHERE e2.i32 = e.i32) < 0 ORDER BY 1

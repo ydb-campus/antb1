@@ -7917,17 +7917,23 @@ TEST(BinderTest, ACorrelatedScalarSubqueryBindsToADependentJoin) {
   EXPECT_TRUE(Optimize(*plain).ok());
 }
 
-// Path 2 joins the outer side to the grouped subquery with an inner join, which gives an outer row
-// with no group no row: right only where the subquery's value is NULL over no rows, so that the
-// comparison above rejects that row too. A select item that reads no aggregate call is not: a
-// constant over an aggregation that an ORDER BY aggregate makes one row (its call is then dropped)
-// is that constant over no rows. Refused, with the strict combinations kept answered.
-TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
+// An inner join back gives an outer row with no group no row: right only where the comparison
+// above rejects the subquery's value over no rows too. A select item that reads no aggregate call is
+// not NULL there: a constant over an aggregation that an ORDER BY aggregate makes one row (its call
+// is then dropped) is that constant over no rows. Such a block is joined back LEFT (ADR 0041's SQ6),
+// the item computed above the join, and the strict combinations keep their INNER join back.
+TEST(BinderTest, ACorrelatedScalarKeepsItsValueOverNoRows) {
   const auto catalog = testing::MakeCatalog();
   const auto optimize = [&catalog](std::string_view sql) {
     auto plan = BindSql(sql, catalog);
     EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
     return plan.ok() ? Optimize(*plan) : arrow::Result<LogicalPlan>(plan.status());
+  };
+  const auto join_back = [](const LogicalPlan& plan) {
+    const std::string text = Explain(plan);
+    return text.find("Join LEFT") != std::string::npos    ? JoinKind::kLeft
+           : text.find("Join INNER") != std::string::npos ? JoinKind::kInner
+                                                          : JoinKind::kSemi;
   };
   for (const std::string_view sql : {
            "SELECT i16 FROM t WHERE i32 = (SELECT 1 FROM u WHERE u.i64 = t.i64 ORDER BY COUNT(*))",
@@ -7937,14 +7943,8 @@ TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
            "MIN(u.i32))",
        }) {
     const auto optimized = optimize(sql);
-    ASSERT_FALSE(optimized.ok()) << sql;
-    const auto detail = GetSqlError(optimized.status());
-    ASSERT_NE(detail, nullptr) << sql << ": " << optimized.status().ToString();
-    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << sql;
-    EXPECT_EQ(optimized.status().message(),
-              "a correlated scalar subquery whose select item does not combine its aggregate "
-              "strictly is not supported")
-        << sql;
+    ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    EXPECT_EQ(join_back(*optimized), JoinKind::kLeft) << Explain(*optimized);
   }
   for (const std::string_view sql : {
            "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i32) FROM u WHERE u.i64 = t.i64)",
@@ -7955,7 +7955,8 @@ TEST(BinderTest, ACorrelatedScalarValueMustBeNullOverNoRows) {
            "t.i64)",
        }) {
     const auto optimized = optimize(sql);
-    EXPECT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status().ToString();
+    EXPECT_EQ(join_back(*optimized), JoinKind::kInner) << Explain(*optimized);
   }
 }
 

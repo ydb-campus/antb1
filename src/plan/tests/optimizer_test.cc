@@ -1506,7 +1506,26 @@ LogicalNodePtr ScalarBlock(std::vector<ExprPtr> conjuncts, AggKind kind, std::ui
 
 // A plan over a dependent join as a real query has it: a Project of the outer columns on top, so
 // the plan's output does not change when Path 2 adds the group's key columns to the join's own.
-LogicalPlan PlanOverJoin(LogicalNodePtr join, std::uint32_t outer_first) {
+// Over a one-row dependent join, `consumer` puts the comparison a scalar subquery stands in above
+// it, `value <op> 0`. Its default, `value > 0`, rejects the NULL a SUM, AVG, MIN or MAX has over no
+// rows: decision 20's proof then joins back INNER, as for the SQL these plans stand for. Without a
+// consumer nothing reads the value and the join back is LEFT (ADR 0041's SQ6).
+LogicalPlan PlanOverJoin(LogicalNodePtr join, std::uint32_t outer_first,
+                         std::optional<CompareOp> consumer = CompareOp::kGt) {
+  if (const auto* dependent = std::get_if<DependentJoinNode>(join.get());
+      consumer.has_value() && dependent != nullptr && Traits(dependent->kind).one_row) {
+    const std::vector<ColumnId> values = OutputIds(*dependent->right);
+    if (!values.empty()) {
+      join = Node(FilterNode{
+          .input = std::move(join),
+          .predicates = {Predicate{
+              .kind = Predicate::Kind::kCompare,
+              .column = BoundColumn{.id = values.front(), .name = "v", .type = LogicalType::kBigInt},
+              .op = *consumer,
+              .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{0}}}},
+          .span = {}});
+    }
+  }
   ProjectNode project{.input = std::move(join), .columns = {}, .constants = {}, .ids = {}};
   for (int field = 0; field < 4; ++field) {
     BoundColumn column = FieldOf(outer_first, field);
@@ -1516,10 +1535,18 @@ LogicalPlan PlanOverJoin(LogicalNodePtr join, std::uint32_t outer_first) {
   return PlanOver(Node(std::move(project)));
 }
 
-// The join below the plan's Project.
+// The join below the plan's Project: below the consumer Filter PlanOverJoin puts there, and below
+// the Computes a LEFT join back defines its values in.
 const JoinNode* JoinUnder(const LogicalPlan& plan) {
   const auto* project = std::get_if<ProjectNode>(plan.root.get());
-  return project == nullptr ? nullptr : std::get_if<JoinNode>(project->input.get());
+  if (project == nullptr) {
+    return nullptr;
+  }
+  const LogicalNode* node = project->input.get();
+  while (std::holds_alternative<FilterNode>(*node) || std::holds_alternative<ComputeNode>(*node)) {
+    node = InputsOf(*node).front().get();
+  }
+  return std::get_if<JoinNode>(node);
 }
 
 // The rewrite: the aggregation groups by the inner equivalent, the dependent join becomes an inner
@@ -1955,27 +1982,80 @@ TEST(OptimizerTest, Path2KeysEveryOuterColumn) {
 }
 
 // The COUNT bug (R. A. Ganski and H. K. T. Wong, SIGMOD 1987): COUNT is 0 over no rows, so an
-// outer row with no group would pass a comparison the inner join drops it from. It must refuse,
-// not answer -- this was a live wrong answer before the strictness classifier existed.
-TEST(OptimizerTest, Path2RefusesACountAndAnyNonStrictCombination) {
-  // A scalar subquery's single value (ADR 0041's decision 4) never reaches Path 2, which the binder
-  // keeps from it; if it did, its row check would be lost per binding, so it is refused too.
-  for (const AggKind kind :
-       {AggKind::kCountStar, AggKind::kCount, AggKind::kCountDistinct, AggKind::kSingleValue}) {
-    const auto status =
-        Optimize(PlanOver(Node(DependentJoinNode{
-                     .kind = JoinKind::kOneRow,
-                     .left = FourFields(1),
-                     .right = ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)},
-                                          kind, 50),
-                     .span = {}})))
-            .status();
-    ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
-    EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
-    EXPECT_EQ(status.message(),
-              "a correlated scalar subquery whose aggregate is not SUM, AVG, MIN or MAX is not "
-              "supported");
+// outer row with no group passes a comparison an inner join drops it from. Where nothing proves
+// the comparison rejects that 0, the join back is LEFT and the count is read through COALESCE(c, 0)
+// above it (ADR 0041's SQ6): the GroupAggregate counts under a fresh id, the call's own id is the
+// COALESCE's. A scalar subquery's single value (ADR 0041's decision 4) never reaches here, which
+// the binder keeps from it; if it did, its row check would be lost per binding, so it is refused.
+TEST(OptimizerTest, Path2AnswersEveryCountKindAndRefusesTheSingleValue) {
+  for (const AggKind kind : {AggKind::kCountStar, AggKind::kCount, AggKind::kCountDistinct}) {
+    const auto plan_of = [kind](CompareOp consumer) {
+      return Optimized(PlanOverJoin(
+          Node(DependentJoinNode{
+              .kind = JoinKind::kOneRow,
+              .left = FourFields(1),
+              .right =
+                  ScalarBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, kind, 50),
+              .span = {}}),
+          1, consumer));
+    };
+    // `value > 0` is false over the count's 0, so it drops what an inner join drops; `value <= 0`
+    // keeps it.
+    const LogicalPlan inner = plan_of(CompareOp::kGt);
+    ASSERT_NE(JoinUnder(inner), nullptr) << Explain(inner);
+    EXPECT_EQ(JoinUnder(inner)->kind, JoinKind::kInner) << Explain(inner);
+    const LogicalPlan plan = plan_of(CompareOp::kLe);
+    const auto* join = JoinUnder(plan);
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(join->kind, JoinKind::kLeft) << "the comparison passes the count's 0";
+    EXPECT_EQ(join->build, BuildSide::kRight) << "a LEFT join pads its build";
+    const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+    ASSERT_NE(grouped, nullptr) << Explain(plan);
+    ASSERT_EQ(grouped->aggregates.size(), 1U);
+    EXPECT_NE(grouped->aggregates[0].id, ColumnId{140}) << "counted under a fresh id";
+    const std::string text = Explain(plan);
+    EXPECT_NE(text.find("Compute COALESCE("), std::string::npos) << text;
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt) << text;
   }
+  const auto status =
+      Optimize(PlanOverJoin(Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                                                   .left = FourFields(1),
+                                                   .right = ScalarBlock({Compare(FieldOf(11, 1),
+                                                                                 FieldOf(1, 1),
+                                                                                 CompareOp::kEq)},
+                                                                        AggKind::kSingleValue, 50),
+                                                   .span = {}}),
+                            1))
+          .status();
+  ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
+  EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
+  EXPECT_EQ(status.message(),
+            "a correlated scalar subquery whose aggregate is a single value is not supported");
+}
+
+// Without a consumer nothing proves the join back may drop an outer row, so it is LEFT even over a
+// MIN, whose empty value is NULL: the rows it pads read NULL, as the subquery gives them. It builds
+// on its right, and the one correlated key over a bare scan is restricted by the semi-join
+// reduction, since D5 does not reach a LEFT join (twin of the INNER plans above and below).
+TEST(OptimizerTest, Path2JoinsBackLeftWithoutAConsumer) {
+  const LogicalPlan plan = Optimized(PlanOverJoin(
+      Node(DependentJoinNode{.kind = JoinKind::kOneRow,
+                             .left = FourFieldsRows(1, 10),
+                             .right = ScalarBlockRows(
+                                 {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50, 1000),
+                             .span = {}}),
+      1, /*consumer=*/std::nullopt));
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  EXPECT_EQ(join->kind, JoinKind::kLeft);
+  EXPECT_EQ(join->build, BuildSide::kRight);
+  const auto* grouped = std::get_if<GroupAggregateNode>(join->right.get());
+  ASSERT_NE(grouped, nullptr) << Explain(plan);
+  EXPECT_EQ(grouped->aggregates[0].id, ColumnId{140}) << "MIN keeps its id: NULL over no rows";
+  const auto* restriction = std::get_if<JoinNode>(grouped->input.get());
+  ASSERT_NE(restriction, nullptr) << "one key over a scan is restricted for LEFT: " << Explain(plan);
+  EXPECT_EQ(restriction->kind, JoinKind::kSemi);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }
 
 // A correlated IS NOT DISTINCT FROM gives its outer column an inner equivalent where no `=` does

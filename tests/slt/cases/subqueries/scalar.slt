@@ -1,6 +1,6 @@
 # Scalar subqueries over the star schema: uncorrelated ungrouped aggregates (ADR 0022), zero rows among them, and
-# correlated SUM, AVG, MIN and MAX under comparisons that reject NULL (ADR 0023), over empty groups, on one and two
-# columns, and into a middle block.
+# correlated aggregates under comparisons (ADR 0023), over empty groups, on one and two columns, and into a middle
+# block. An empty group's COUNT and a constant item are joined back LEFT (ADR 0041's SQ6; more in empty_values.slt).
 
 # ---- the inputs, one table at a time ----
 
@@ -336,11 +336,10 @@ SELECT COUNT(*) FROM edge AS e WHERE e.i32 < (SELECT SUM(f.i16 + 1) FROM edge AS
 BIGINT
 7
 
-# ---- DuckDB only until correlated COUNT gets a PR (ADR 0023: the COUNT bug) ----
+# ---- correlated COUNT, and a constant over ORDER BY COUNT(*): the COUNT bug (ADR 0041's SQ6) ----
 
 # A constant over an aggregate that only ORDER BY has is 1 over no rows too, so every zone passes; the inner join would
 # keep only the zones with a city. (A strict ORDER BY aggregate such as MAX makes DuckDB 1.5.6 drop them too.)
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM zones AS z WHERE 1 = (SELECT 1 FROM cities AS c WHERE c.ct_id = z.zn_city ORDER BY COUNT(*))
 ----
@@ -348,16 +347,14 @@ BIGINT
 40
 
 # COUNT over no rows is 0, so the riders without a trip pass: an inner join on the grouped trips would drop them.
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 0 = (SELECT COUNT(*) FROM trips WHERE tr_rider = rd_id)
 ----
 BIGINT
 4
 
-# ---- DuckDB only until CASE over correlated aggregates gets a PR (ADR 0023) ----
+# ---- CASE over correlated aggregates (ADR 0041's SQ6) ----
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM riders WHERE 0 = (SELECT CASE WHEN SUM(tr_fare) > 0 THEN 1 ELSE 0 END FROM trips WHERE tr_rider = rd_id)
 ----
