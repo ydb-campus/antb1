@@ -10,6 +10,10 @@
 #include <gtest/gtest.h>
 #include <parquet/arrow/writer.h>
 
+#include "antb1/plan/types.h"
+
+#include "../unfit_annotation.h"
+
 namespace antb1::io {
 namespace {
 
@@ -128,6 +132,27 @@ TEST_F(ParquetTableTest, MissingAndCorruptFilesAreIOErrors) {
   std::ofstream(bad) << "this is not a parquet file";
   EXPECT_TRUE(ParquetTable::Open({bad}).status().IsIOError());
   EXPECT_TRUE(ParquetTable::Open({}).status().IsInvalid());
+}
+
+// The engine type of a column whose Parquet logical type does not fit its physical type
+// (ParquetTable marks such a column unsupported; tests/integration's ParquetErrors registers such a
+// file): an extension type over the physical type, equal only to itself over the same storage, kept
+// by its serialization, that names the reason and that no engine type takes.
+TEST(UnfitAnnotationTypeTest, IsAnExtensionTypeThatNoEngineTypeTakes) {
+  const auto type = std::make_shared<UnfitAnnotationType>(arrow::int32());
+  EXPECT_TRUE(type->Equals(UnfitAnnotationType(arrow::int32())));
+  EXPECT_FALSE(type->Equals(UnfitAnnotationType(arrow::int64())));
+  EXPECT_FALSE(type->Equals(*arrow::int32()));
+  const auto back = type->Deserialize(arrow::int32(), type->Serialize());
+  ASSERT_TRUE(back.ok()) << back.status().ToString();
+  EXPECT_TRUE((*back)->Equals(*type));
+  EXPECT_EQ(type->ToString(/*show_metadata=*/false),
+            "int32 under a Parquet logical type that does not fit it");
+  EXPECT_FALSE(plan::FromArrow(*type).ok());
+  const auto empty = type->MakeArray(arrow::ArrayData::Make(type, 0, {nullptr, nullptr}));
+  ASSERT_NE(empty, nullptr);
+  EXPECT_EQ(empty->length(), 0);
+  EXPECT_TRUE(empty->type()->Equals(*type));
 }
 
 }  // namespace
