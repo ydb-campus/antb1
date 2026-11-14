@@ -110,13 +110,13 @@ def glibc_source(env: Path) -> tuple[str, str, str, int, list[str]]:
 
 
 def prefix_label(path: Path, pins: list[str]) -> str:
-    """`brotli-LICENSE` -> `brotli 1.0.9: LICENSE`, by the pinned tarball of the same library."""
+    """`brotli-LICENSE` -> `brotli 1.2.1: LICENSE`, by the pinned tarball of the same library."""
     library, _, member = path.name.partition("-")
     start = "apache-arrow-" if library == "arrow" else f"{library}-"
     tarballs = [pin for pin in pins if pin.startswith(start)]
     if not member or len(tarballs) != 1:
         fail(f"{path}: no single pin of cmake/static/arrow-sources.lock starts with {start}")
-    version = tarballs[0][len(start) :].removesuffix(".tar.gz").removeprefix("v")
+    version = re.sub(r"\.tar\.(gz|bz2)$", "", tarballs[0][len(start) :]).removeprefix("v")
     if re.fullmatch(r"[0-9a-f]{40}", version):
         version = version[:12]
     return f"{NAMES.get(library, library)} {version}: {member}"
@@ -147,6 +147,9 @@ def cmd_notices(args: argparse.Namespace) -> None:
     sections = [
         (prefix_label(path, arrow_pins()), path) for path in sorted((prefix / "share/antb1-licenses").iterdir())
     ]
+    # Notices that a pinned library's own licence leaves out, of code it compiles in from elsewhere (simdjson's from
+    # PyTorch and Grisu2), kept in cmake/static/licenses as <library>-NOTICES.txt.
+    sections += [(prefix_label(path, arrow_pins()), path) for path in sorted(LICENSES.glob("*-NOTICES.txt"))]
     sections.append((f"CLI11 {conda_meta(env, 'cli11')['version']}: LICENSE", LICENSES / "CLI11-LICENSE.txt"))
     boost = conda_meta(env, "libboost-headers")["version"]  # Arrow's bundled Thrift compiles Boost's headers in
     sections.append((f"Boost {boost}: LICENSE_1_0.txt", LICENSES / "Boost-LICENSE_1_0.txt"))
@@ -357,7 +360,7 @@ them, and installing the environment installs them and accepts that EULA (CONTRI
 docs/adr/0006-test-strategy-and-data-policy.md).
 
   tar -xzf antb1-source.tar.gz && cd antb1-{version}
-  mkdir -p ~/.cache/antb1/arrow/src && cp ../third-party/*.tar.gz ~/.cache/antb1/arrow/src/
+  mkdir -p ~/.cache/antb1/arrow/src && cp ../third-party/*.tar.* ~/.cache/antb1/arrow/src/
   pixi run static          # the package is then in build/static/package
 
 Relink it with a modified glibc: build glibc from the source package (rpmbuild --rebuild), then copy every static

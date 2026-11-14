@@ -385,7 +385,9 @@ def test_the_repository_lock_lists_two_operators_per_file() -> None:
     assert "-" in variables
     # static-arrow.sh packages the licence of every pinned file but Arrow's own (Arrow's LICENSE and NOTICE come from
     # its source tree), and of nothing else.
-    licensed = re.findall(r"^(\S+\.tar\.gz) \S+$", (REPO / "scripts" / "static-arrow.sh").read_text(), re.MULTILINE)
+    licensed = re.findall(
+        r"^(\S+\.tar\.(?:gz|bz2)) \S+$", (REPO / "scripts" / "static-arrow.sh").read_text(), re.MULTILINE
+    )
     arrow = {name for name in names if name.startswith("apache-arrow-")}
     assert licensed and set(licensed) == names - arrow, set(licensed) ^ (names - arrow)
 
@@ -403,10 +405,14 @@ def test_every_packaged_licence_gets_a_label_from_its_pin() -> None:
     static_package = load_static_package()
     pins = static_package.arrow_pins()
     files = ["arrow-LICENSE.txt", "arrow-NOTICE.txt"]
-    for name, member in re.findall(r"^(\S+\.tar\.gz) (\S+)$", (REPO / "scripts" / "static-arrow.sh").read_text(), re.M):
+    script = (REPO / "scripts" / "static-arrow.sh").read_text()
+    for name, member in re.findall(r"^(\S+\.tar\.(?:gz|bz2)) (\S+)$", script, re.M):
         files.append(f"{re.split(r'-[0-9v]', name, maxsplit=1)[0]}-{member.rsplit('/', 1)[-1]}")
+    # and the notices a library's own licence leaves out, which cmake/static/licenses keeps
+    files += [path.name for path in (REPO / "cmake" / "static" / "licenses").glob("*-NOTICES.txt")]
     labels = [static_package.prefix_label(Path(f), pins) for f in files]
-    assert "Apache Arrow 25.0.0: LICENSE.txt" in labels and "Apache Thrift 0.22.0: NOTICE" in labels, labels
+    assert "Apache Arrow 26.0.1: LICENSE.txt" in labels and "Apache Thrift 0.24.0: NOTICE" in labels, labels
+    assert "uriparser 1.0.2: COPYING.BSD-3-Clause" in labels and "simdjson 4.6.4: NOTICES.txt" in labels, labels
     assert all(re.fullmatch(r"\S+( \S+)? [0-9a-f.-]+: \S+", label) for label in labels), labels
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `pixi run static-arrow [--print-key | --print-prefix | --check-urls] [--keep-build]` (NETWORK on the first run):
-# builds Apache Arrow 25 and the dependencies it bundles as static libraries, with the Clang of env `static`, -O3,
+# builds Apache Arrow 26 and the dependencies it bundles as static libraries, with the Clang of env `static`, -O3,
 # ThinLTO and the CPU baseline of cmake/static/toolchain.cmake, into $ANTB1_ARROW_DIR/<key>/prefix (default
 # ~/.cache/antb1/arrow; a relative path is relative to the repository root). `pixi run static` and
 # `pixi run static-test` run it first and link antb1 against that prefix (docs/adr/0033-standalone-static-binary.md).
@@ -163,25 +163,27 @@ mkdir -p "$licenses"
 cp "$work/source/LICENSE.txt" "$licenses/arrow-LICENSE.txt"
 cp "$work/source/NOTICE.txt" "$licenses/arrow-NOTICE.txt"
 # <tarball name> <file inside its top directory>: each bundled library's own licence (lz4: the library's, not the
-# programs'). The member is looked up first, so GNU tar and macOS' bsdtar both work.
+# programs'). The member is looked up first, so GNU tar and macOS' bsdtar both work, and neither is told the
+# compression: each detects it when it reads (uriparser's pin is a .tar.bz2).
 while read -r name file; do
   out="$licenses/${name%%-[0-9v]*}-$(basename "$file")"
-  member=$(tar -tzf "$src/$name" | awk -v f="$file" \
+  member=$(tar -tf "$src/$name" | awk -v f="$file" \
     'm == "" && index($0, "/" f) == length($0) - length(f) && split($0, p, "/") == split(f, q, "/") + 1 { m = $0 }
      END { print m }')
-  if [ -z "$member" ] || ! tar -xOzf "$src/$name" "$member" >"$out" || [ ! -s "$out" ]; then
+  if [ -z "$member" ] || ! tar -xOf "$src/$name" "$member" >"$out" || [ ! -s "$out" ]; then
     echo "static-arrow: no $file in $name" >&2
     exit 1
   fi
 done <<'EOF'
-brotli-v1.0.9.tar.gz LICENSE
+brotli-v1.2.1.tar.gz LICENSE
 lz4-v1.10.0.tar.gz lib/LICENSE
-mimalloc-v3.3.1.tar.gz LICENSE
-rapidjson-232389d4f1012dddec4ef84861face2d2ba85709.tar.gz license.txt
+mimalloc-v3.4.1.tar.gz LICENSE
 re2-2023-03-01.tar.gz LICENSE
+simdjson-v4.6.4.tar.gz LICENSE
 snappy-1.2.2.tar.gz COPYING
-thrift-0.22.0.tar.gz LICENSE
-thrift-0.22.0.tar.gz NOTICE
+thrift-0.24.0.tar.gz LICENSE
+thrift-0.24.0.tar.gz NOTICE
+uriparser-1.0.2.tar.bz2 COPYING.BSD-3-Clause
 utf8proc-v2.10.0.tar.gz LICENSE.md
 xsimd-14.2.0.tar.gz LICENSE
 zlib-1.3.1.tar.gz LICENSE

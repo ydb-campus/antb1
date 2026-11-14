@@ -72,9 +72,21 @@ def tool(env: Path, name: str) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 # prefix
 
-# Bundled dependencies whose sources are compiled (xsimd and rapidjson are header-only); each must show up in a
-# compilation database, so a dependency built outside the -O3 and ThinLTO flags cannot go unnoticed.
-COMPILED_DEPS = ["brotli", "lz4", "mimalloc", "re2", "snappy", "thrift", "utf8proc", "zlib", "zstd"]
+# Bundled dependencies whose sources are compiled (xsimd is header-only); each must show up in a compilation database,
+# so a dependency built outside the -O3 and ThinLTO flags cannot go unnoticed.
+COMPILED_DEPS = [
+    "brotli",
+    "lz4",
+    "mimalloc",
+    "re2",
+    "simdjson",
+    "snappy",
+    "thrift",
+    "uriparser",
+    "utf8proc",
+    "zlib",
+    "zstd",
+]
 ARROW_ARCHIVES = ["libarrow.a", "libarrow_compute.a", "libparquet.a"]
 BUNDLED_ARCHIVE = "libarrow_bundled_dependencies.a"
 OPTIONS_ON = [
@@ -186,7 +198,9 @@ def gate_prefix(args: argparse.Namespace) -> None:
                 )
             path = source.replace("\\", "/").lower()
             for dep in COMPILED_DEPS:
-                if f"/{dep}" in path or f"{dep}_ep" in path:
+                # An ExternalProject's tree (<dep>_ep) or a FetchContent one (_deps/<dep>-src): a bare `/<dep>` would
+                # also match Arrow's own sources, such as arrow/util/simdjson_internal.cc.
+                if f"{dep}_ep" in path or f"/_deps/{dep}-src/" in path:
                     seen_deps.add(dep)
     check(
         tus > 0 and not bad,
