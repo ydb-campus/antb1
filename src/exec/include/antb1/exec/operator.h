@@ -44,6 +44,8 @@ struct ExecContext {
   MemoryBudget* budget = nullptr;
   // Shared by every scan of one run; Drain supplies a fresh context for each execution.
   std::shared_ptr<plan::ScanContext> scans = nullptr;
+  // Experimental: ordinary-string top-N combines input selection and its threshold before Take.
+  bool sort_selection_before_gather = false;
 };
 
 // Rows flowing from one operator to the next: the columns and, optionally, a selection. A selection

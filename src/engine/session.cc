@@ -151,7 +151,8 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
                         .batch_size = options_.batch_size,
                         .executor = pool_.get(),
                         .threads = options_.threads,
-                        .budget = memory_.get()};
+                        .budget = memory_.get(),
+                        .sort_selection_before_gather = options_.sort_selection_before_gather};
   ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);
@@ -196,7 +197,8 @@ arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
                           .batch_size = options_.batch_size,
                           .executor = pool_.get(),
                           .threads = options_.threads,
-                          .budget = memory_.get()};
+                          .budget = memory_.get(),
+                          .sort_selection_before_gather = options_.sort_selection_before_gather};
     ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
     profile.rows = table->num_rows();
   }

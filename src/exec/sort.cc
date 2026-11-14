@@ -324,20 +324,59 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> SortBuffer::ClearChunks() {
   return chunks;
 }
 
-arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool) {
-  if (rows == nullptr || rows->num_rows() == 0) {
+arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool,
+                              const std::shared_ptr<arrow::BooleanArray>& selection) {
+  if (selection != nullptr && (rows == nullptr || selection->length() != rows->num_rows())) {
+    return arrow::Status::Invalid("sort selection length differs from its batch");
+  }
+  if (rows == nullptr || rows->num_rows() == 0 ||
+      (selection != nullptr && selection->true_count() == 0)) {
     return arrow::Status::OK();
+  }
+  const bool selected = selection != nullptr && selection->true_count() != rows->num_rows();
+  const bool fuse_selection = selected && threshold_.has_value();
+  if (fuse_selection && pool == nullptr) {
+    return arrow::Status::Invalid("sort selection needs a memory pool");
+  }
+  if (!fuse_selection && selection != nullptr) {
+    ARROW_ASSIGN_OR_RAISE(rows, Materialize(Batch{.data = rows, .selection = selection}, pool));
   }
   if (!rows->schema()->Equals(*comparator_.schema(), /*check_metadata=*/false)) {
     return arrow::Status::Invalid("sort input with another schema");
   }
-  if (!TryNarrow<std::uint32_t>(rows->num_rows()).has_value() ||
+  if ((!fuse_selection && !TryNarrow<std::uint32_t>(rows->num_rows()).has_value()) ||
       !TryNarrow<std::uint32_t>(chunks_.size() + 1).has_value()) {
     return arrow::Status::CapacityError("too many rows to sort in memory");
   }
   sorted_ = false;
   RowComparator::KeyArrays keys = comparator_.KeysOf(*rows);
-  if (threshold_.has_value()) {
+  if (fuse_selection) {
+    // Apply both predicates in original row order before copying any column. A row tying the
+    // threshold arrives later than the retained row, so it cannot enter the stable top-N.
+    arrow::Int64Builder indices(pool);
+    const RowComparator::KeyArrays& last = chunk_keys_[threshold_->chunk];
+    for (int64_t i = 0; i < rows->num_rows(); ++i) {
+      if (selection->IsNull(i) || !selection->Value(i) ||
+          comparator_.Compare(keys, i, last, threshold_->row) >= 0) {
+        continue;
+      }
+      ARROW_RETURN_NOT_OK(indices.Append(i));
+    }
+    if (indices.length() == 0) {
+      return arrow::Status::OK();
+    }
+    if (!TryNarrow<std::uint32_t>(indices.length()).has_value()) {
+      return arrow::Status::CapacityError("too many rows to sort in memory");
+    }
+    ARROW_ASSIGN_OR_RAISE(const auto index_array, indices.Finish());
+    arrow::compute::ExecContext kernels(pool);
+    ARROW_ASSIGN_OR_RAISE(
+        const arrow::Datum taken,
+        arrow::compute::Take(rows, index_array, arrow::compute::TakeOptions::NoBoundsCheck(),
+                             &kernels));
+    rows = taken.record_batch();
+    keys = comparator_.KeysOf(*rows);
+  } else if (threshold_.has_value()) {
     // Only rows before the last kept one can still be among the first `keep` rows; a row that ties
     // with it comes later in the input, so it loses the tie.
     const RowComparator::KeyArrays& last = chunk_keys_[threshold_->chunk];
@@ -362,6 +401,9 @@ arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::M
       rows = taken.record_batch();
       keys = comparator_.KeysOf(*rows);
     }
+  }
+  if (rows->num_rows() > std::numeric_limits<int64_t>::max() - rows_) {
+    return arrow::Status::CapacityError("sort retained row count overflow");
   }
   rows_ += rows->num_rows();
   PushChunk(std::move(rows), std::move(keys));
@@ -548,6 +590,11 @@ arrow::Status SortOperator::Open(ExecContext& ctx) {
     return arrow::Status::Invalid("negative LIMIT or OFFSET");
   }
   pool_ = ctx.pool;
+  selection_before_gather_ =
+      ctx.sort_selection_before_gather && limit_.has_value() &&
+      std::ranges::any_of(input_->output_schema()->fields(), [](const auto& field) {
+        return field->type()->id() == arrow::Type::BINARY;
+      });
   memory_.Reset(ctx.budget);
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   ARROW_ASSIGN_OR_RAISE(RowComparator comparator,
@@ -571,8 +618,20 @@ arrow::Result<Batch> SortOperator::Next() {
       if (in.end()) {
         break;
       }
-      ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
-      ARROW_RETURN_NOT_OK(buffer_->Add(std::move(rows), pool_));
+      if (selection_before_gather_) {
+        ARROW_RETURN_NOT_OK(buffer_->Add(in.data, pool_, in.selection));
+        if (profile() != nullptr && in.selection != nullptr && in.selection->true_count() > 0 &&
+            in.selection->true_count() < in.data->num_rows()) {
+          profile()->Add("selection_before_gather_batches", MetricUnit::kCount, 1);
+          profile()->Add("selection_before_gather_input_rows", MetricUnit::kCount,
+                         in.data->num_rows());
+          profile()->Add("selection_before_gather_selected_rows", MetricUnit::kCount,
+                         in.selection->true_count());
+        }
+      } else {
+        ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
+        ARROW_RETURN_NOT_OK(buffer_->Add(std::move(rows), pool_));
+      }
       ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     }
     ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage() + buffer_->sort_memory()));
