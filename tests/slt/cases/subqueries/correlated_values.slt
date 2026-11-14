@@ -3512,6 +3512,58 @@ SMALLINT
 5
 6
 
+# Under an EXISTS the select list of a derived table or a CTE right under it is dropped, as DuckDB drops it, but a
+# correlated value's join back stays in that block's slot, so its aggregate is computed: one that overflows fails antb1
+# alone (DuckDB answers 1 to 6), as an uncorrelated value's does (select_values.slt). The subquery's own item above the
+# join back is dropped unread, so an item that overflows fails neither engine.
+onlyif antb1
+statement error Overflow in addition of
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM (SELECT z.zn_id, (SELECT MAX(t.tr_rider + 9223372036854775807)
+FROM trips t WHERE t.tr_pickup = z.zn_id) AS m FROM zones z) x) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM (SELECT z.zn_id, (SELECT MAX(t.tr_rider + 9223372036854775807)
+FROM trips t WHERE t.tr_pickup = z.zn_id) AS m FROM zones z) x) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+onlyif antb1
+statement error Overflow in addition of
+WITH w AS (SELECT z.zn_id, (SELECT MAX(t.tr_rider + 9223372036854775807) FROM trips t WHERE t.tr_pickup = z.zn_id) AS m
+FROM zones z) SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM w) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+WITH w AS (SELECT z.zn_id, (SELECT MAX(t.tr_rider + 9223372036854775807) FROM trips t WHERE t.tr_pickup = z.zn_id) AS m
+FROM zones z) SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM w) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM (SELECT z.zn_id, (SELECT MAX(t.tr_rider) + 9223372036854775807
+FROM trips t WHERE t.tr_pickup = z.zn_id) AS m FROM zones z) x) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
 # A global block's ORDER BY is dropped with its aggregate, but the value's join back, which the aggregate's argument
 # planted, stays. Nothing reads the subquery's item, MAX + 9223372036854775807 above that join back, so antb1 drops it
 # unread and answers 6; DuckDB computes it and fails. The same in a correlated EXISTS block's ORDER BY: antb1 answers

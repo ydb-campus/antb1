@@ -1197,29 +1197,29 @@ reads a column, in any block. No query completes, the ratchet stays at 82, and n
   restricts the aggregation by an IN that turns out empty, antb1 answers where DuckDB, keeping no D, fails. D32: where a
   global block's or a correlated EXISTS block's ORDER BY is dropped, a correlated value's join back stays, but the
   subquery's own item above it is pruned, so its error never shows where DuckDB's does; a derived table's unread
-  correlated value fails antb1 alone, as an uncorrelated one does. D16, D37 and D38 name correlated values.
-- **Decision 28.** `correlated_values.slt` grows from 240 records to 361. Before the code came 100: 96 more pending SQ5b
+  correlated value fails antb1 alone, as an uncorrelated one does, and so does the aggregate of a correlated value in a
+  derived table's or a CTE's list that an EXISTS drops, whose join back stays. D16, D37 and D38 name correlated values.
+- **Decision 28.** `correlated_values.slt` grows from 240 records to 366. Before the code came 100: 96 more pending SQ5b
   (the new places, the killers of the tail's and the speculation's mutations, the passes' records, HAVING over a key),
-  one pending SQ13, one pending SQ8 and two errors both engines report. After it came 21 more: eight divergence pairs
-  (D24 three, D32 three, D35, D37), two controls, a correlated D38 member pending SQ13 and three records the review
-  asked for, less one duplicate. SQ5b answers its 192 pending records and `group_values.slt`'s two; 12 stay pending (9
-  SQ13, 3 SQ8). The SQ0 guard, over 4,779 queries (every `.slt` record with a subquery and the review probes), showed
-  only SQ5b refusals that changed: 507 now answer, as DuckDB does but for the pinned pairs; 51 are errors, which DuckDB
-  reports too but for the D32 pair and the LIMIT record the PR replaced; and 12 refusals are reworded (SQ13's, the
-  conjunct that reads an enclosing block, the unnesting's). The generator's `correlated_item_value` passes
-  `diff-random`, and 25 metamorphic relations hold the places to LEFT JOINs of the inner groups and to their bindings
-  written as literals. Of 27 mutations, 23 fail named tests: the WHERE-only refusal kept, no tail, a tail for
-  uncorrelated values, no promotion at either memo hit or by a GROUP BY key, the first, the last or the front entry, a
-  promotion while the select list binds or in a dry run, three speculations (as on main, without "else the first", by
-  "is the key"), Admit skipped at a memo hit, the aggregate argument's dry-run exception dropped, HAVING's routing
-  dropped or taking uncorrelated keys too, the proof INNER at any other node or at a comparison Compute,
-  LimitBelowProject stopping at a Compute or crossing a LEFT join, and ExchangeAggregates without its read-above refusal
-  (a SUM-valued key next to a computed key aborts). Three survive as the design says they must: no promotion in the
-  speculation (a bind it would change fails with SQ13's refusal anyway), the speculation's first entry without the key
-  step (two entries need the ONs of two comma groups), and Admit's dry-run guard (no dry run meets a refusal since
-  SQ5b). One survives that is ADR 0032's: ExchangeAggregates without its any-above refusal, which the check that every
-  Compute on the path reads only the aggregated side backs up over a join back; no test pins it on its own (a
-  follow-up).
+  one pending SQ13, one pending SQ8 and two errors both engines report. After it came 26 more: ten divergence pairs (D24
+  three, D32 five, D35, D37), three controls, a correlated D38 member pending SQ13 and three records the review asked
+  for, less one duplicate. SQ5b answers its 192 pending records and `group_values.slt`'s two; 12 stay pending (9 SQ13, 3
+  SQ8). The SQ0 guard, over 4,779 queries (every `.slt` record with a subquery and the review probes), showed only SQ5b
+  refusals that changed: 507 now answer, as DuckDB does but for the pinned pairs; 51 are errors, which DuckDB reports
+  too but for the D32 pair and the LIMIT record the PR replaced; and 12 refusals are reworded (SQ13's, the conjunct that
+  reads an enclosing block, the unnesting's). The generator's `correlated_item_value` passes `diff-random`, and 25
+  metamorphic relations hold the places to LEFT JOINs of the inner groups and to their bindings written as literals. Of
+  27 mutations, 23 fail named tests: the WHERE-only refusal kept, no tail, a tail for uncorrelated values, no promotion
+  at either memo hit or by a GROUP BY key, the first, the last or the front entry, a promotion while the select list
+  binds or in a dry run, three speculations (as on main, without "else the first", by "is the key"), Admit skipped at a
+  memo hit, the aggregate argument's dry-run exception dropped, HAVING's routing dropped or taking uncorrelated keys
+  too, the proof INNER at any other node or at a comparison Compute, LimitBelowProject stopping at a Compute or crossing
+  a LEFT join, and ExchangeAggregates without its read-above refusal (a SUM-valued key next to a computed key aborts).
+  Three survive as the design says they must: no promotion in the speculation (a bind it would change fails with SQ13's
+  refusal anyway), the speculation's first entry without the key step (two entries need the ONs of two comma groups),
+  and Admit's dry-run guard (no dry run meets a refusal since SQ5b). One survives that is ADR 0032's: ExchangeAggregates
+  without its any-above refusal, which the check that every Compute on the path reads only the aggregated side backs up
+  over a join back; no test pins it on its own (a follow-up).
 - **Follow-ups.** A dropped global ORDER BY aggregate's join back is built though nothing reads it; EXPLAIN notes a
   placement over a join back as worth doing ("groupable below the left of join ... worth") where ExchangeAggregates
   then declines it (a COUNT-valued key, or a key computed next to a value key); constant folding in the proof
