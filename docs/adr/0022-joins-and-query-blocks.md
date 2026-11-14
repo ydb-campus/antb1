@@ -492,6 +492,9 @@ Accepted (with the maintainer-approved roadmap for joins, query blocks and uncor
     - Update (2026-11-13, ADR 0041's SQ5a): and it stands, as a value, in any expression of a condition of WHERE or
       an inner ON, not only as a direct operand of a top-level comparison; unlike an uncorrelated one, not inside a
       FULL JOIN's left input, nor in a conjunct that also reads an enclosing block (SQ8).
+    - Update (2026-11-14, ADR 0041's SQ5b): and in a select item, ORDER BY, a GROUP BY key and an aggregate's
+      argument that reads a column, below the block's aggregation; above it (HAVING, or a grouped block's item that is
+      no key) it waits for SQ13.
     - Update (2026-10-09, E2a): a one-row join's build is keyless (`exec::JoinBuildSpec::Keyless`). It must hold
       exactly one row: any other count is `Invalid` from its `Prepare`, before any probe part runs, a planner bug
       that SQL never sees. Its values are made once, as columns that every probe window slices, of fewer rows than
