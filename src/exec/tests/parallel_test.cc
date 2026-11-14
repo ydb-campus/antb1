@@ -478,31 +478,6 @@ TEST(PartSchedulerTest, PressureNarrowsTheWindow) {
   }
 }
 
-// Runs every task on `pool`, except that spawn number `refuse_at` (from 0) fails with `refusal`.
-class RefusingExecutor final : public arrow::internal::Executor {
- public:
-  RefusingExecutor(arrow::internal::Executor* pool, int refuse_at,
-                   arrow::Status refusal = arrow::Status::IOError("no room for a task"))
-      : pool_(pool), refuse_at_(refuse_at), refusal_(std::move(refusal)) {}
-
-  int GetCapacity() override { return pool_->GetCapacity(); }
-
- protected:
-  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
-                          arrow::StopToken stop_token, StopCallback&& stop_callback) override {
-    if (spawns_++ == refuse_at_) {
-      return refusal_;
-    }
-    return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
-  }
-
- private:
-  arrow::internal::Executor* pool_;
-  int refuse_at_;
-  arrow::Status refusal_;
-  int spawns_ = 0;  // Submit is called from one thread
-};
-
 // Arrow 26's thread pool returns an UnknownError where it cannot start a worker (apache/arrow
 // GH-48137): a limit of the machine, which exec reports as an ExecutionError (exit code 1, not a
 // bug's 70). Any other status of a Submit is its own.
@@ -521,7 +496,8 @@ TEST(SubmitStatusTest, AWorkerThePoolCannotStartIsAnExecutionError) {
 // The part scheduler's Next() fails with it where the pool cannot start a worker for a part.
 TEST(PartSchedulerTest, AWorkerThePoolCannotStartFailsNextAsAnExecutionError) {
   const auto pool = Pool();
-  RefusingExecutor executor(pool.get(), 2, arrow::Status::UnknownError("Failed to launch worker"));
+  testing::RefusingExecutor executor(pool.get(), 2,
+                                     arrow::Status::UnknownError("Failed to launch worker"));
   {
     PartScheduler<int64_t> scheduler(
         10, [](int64_t part, const std::atomic<bool>&) -> arrow::Result<int64_t> { return part; },
@@ -551,7 +527,7 @@ TEST(PartSchedulerTest, APartTheExecutorCannotTakeFailsNext) {
       if (throws) {
         executor = std::make_unique<testing::ThrowingExecutor>(pool.get(), refuse_at);
       } else {
-        executor = std::make_unique<RefusingExecutor>(pool.get(), refuse_at);
+        executor = std::make_unique<testing::RefusingExecutor>(pool.get(), refuse_at);
       }
       {
         PartScheduler<int64_t> scheduler(

@@ -31,17 +31,24 @@ if(NOT ANTB1_FUZZ_ONLY)
   endif()
   # ArrowConfigVersion uses SameMajorVersion: never pass a version here, check a minimum instead.
   find_package(Arrow CONFIG REQUIRED)
-  if(Arrow_VERSION VERSION_LESS 26)
+  if(Arrow_VERSION VERSION_LESS 26.0.1)
     message(
       FATAL_ERROR
-      "antb1 needs Apache Arrow >= 26 (replace_with_mask reads a sliced BOOLEAN at its offset, GH-51223; BYTE_ARRAY "
-      "decimals stay inside their buffer, GH-51135); found ${Arrow_VERSION}. CI uses 26.x"
+      "antb1 needs Apache Arrow >= 26.0.1 (replace_with_mask reads a sliced BOOLEAN at its offset, GH-51223; "
+      "BYTE_ARRAY decimals stay inside their buffer, GH-51135; an unknown codec is an error, GH-53518); found "
+      "${Arrow_VERSION}. CI uses 26.0.x"
     )
   endif()
   # conda installs a package's headers with the package's own mtimes, older than the objects of a build tree made
   # before an upgrade, so ninja would keep objects built against the previous Arrow and link a mix that crashes at
   # run time. A changed lock configures again, and the version on every compile line then rebuilds every object.
-  set_property(DIRECTORY "${CMAKE_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/pixi.lock")
+  if(EXISTS "${PROJECT_SOURCE_DIR}/pixi.lock")
+    set_property(
+      DIRECTORY "${PROJECT_SOURCE_DIR}"
+      APPEND
+      PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/pixi.lock"
+    )
+  endif()
   add_compile_definitions(ANTB1_ARROW_VERSION=${Arrow_VERSION})
   find_package(ArrowCompute CONFIG REQUIRED) # ArrowCompute::arrow_compute_<linkage> (kernels; call compute::Initialize())
   find_package(Parquet CONFIG REQUIRED) # Parquet::parquet_<linkage>

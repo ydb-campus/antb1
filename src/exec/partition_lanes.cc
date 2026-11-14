@@ -182,7 +182,7 @@ arrow::Status PartitionLanes::Queue(std::size_t lane, const std::shared_ptr<Part
   // that fails. The task waits for mu_, held here, so the lane is marked running before it runs.
   arrow::Status submitted;
   try {
-    submitted = executor_->Submit([this, lane] { Drain(lane); }).status();
+    submitted = SubmitStatus(executor_->Submit([this, lane] { Drain(lane); }).status());
   } catch (const std::bad_alloc&) {
     submitted = arrow::Status::OutOfMemory("out of memory while starting a partition lane");
   }

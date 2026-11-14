@@ -22,6 +22,7 @@
 #include <parquet/properties.h>
 
 #include "antb1/engine/session.h"
+#include "antb1/plan/sql_status.h"
 
 #include "integration_util.h"
 
@@ -251,20 +252,29 @@ TEST_F(ParquetErrors, UnknownCompressionCodec) {
   EXPECT_NE(read.status().message().find(path), std::string::npos) << read.status().ToString();
 }
 
-// A logical type that does not fit its physical type is dropped (apache/arrow GH-50910, Arrow 26),
-// where Arrow 25 refused the file: the column reads by its converted type. The column is a DATE:
-// SchemaElement's name (field 4, "c") is followed by its converted_type (field 6: 0x25, then 0x0c
-// for DATE) and its logicalType (field 10: 0x4c, then the union's member, 0x6c for field 6, DATE).
-// The patch writes INT_32 (17, zigzag 0x22) and a STRING logical type (0x1c, field 1), which no
-// INT32 column can have.
+// A column whose logical type does not fit its physical type is unsupported: the file registers,
+// and a query that reads the column fails as unsupported (exit code 4). Arrow 26 drops such an
+// annotation and the converted type with it (apache/arrow GH-50910), so the column would read as
+// its physical type, day numbers here, where DuckDB reads by the converted type; Arrow 25 refused
+// the file. The column is a DATE: SchemaElement's name (field 4, "c") is followed by its
+// converted_type (field 6: 0x25, then 0x0c for DATE) and its logicalType (field 10: 0x4c, then the
+// union's member, 0x6c for field 6, DATE); the patch makes the logical type a STRING (0x1c, field
+// 1), which no INT32 can be.
 TEST_F(ParquetErrors, LogicalTypeThatDoesNotFitItsColumn) {
   const std::string path = WriteColumn("logical.parquet", ArrayOf<arrow::Date32Builder>({1, 2, 3}));
   ASSERT_NO_FATAL_FAILURE(Patch(path, Bytes({0x18, 0x01, 'c', 0x25, 0x0c, 0x4c, 0x6c}),
-                                Bytes({0x18, 0x01, 'c', 0x25, 0x22, 0x4c, 0x1c})));
+                                Bytes({0x18, 0x01, 'c', 0x25, 0x0c, 0x4c, 0x1c})));
   ASSERT_TRUE(session_->RegisterParquet("t", {path}).ok());
+  const auto rows = Count(*session_, "SELECT COUNT(*) FROM t");  // reads no column
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ(*rows, 3);
   const auto read = Count(*session_, "SELECT COUNT(*) FROM t WHERE c = 2");
-  ASSERT_TRUE(read.ok()) << read.status().ToString();
-  EXPECT_EQ(*read, 1);
+  ASSERT_FALSE(read.ok());
+  const auto detail = plan::GetSqlError(read.status());
+  ASSERT_NE(detail, nullptr) << read.status().ToString();
+  EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << read.status().ToString();
+  EXPECT_NE(read.status().message().find("logical type that does not fit"), std::string::npos)
+      << read.status().ToString();
 }
 
 }  // namespace

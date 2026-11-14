@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/extension_type.h>
 #include <arrow/io/file.h>
 #include <arrow/util/bit_util.h>
 #include <parquet/arrow/reader.h>
@@ -214,6 +215,45 @@ arrow::Result<FileInfo> ReadFooter(const std::string& path) {
   } catch (const std::exception& e) {
     return arrow::Status::IOError("cannot read '", path, "': ", e.what());
   }
+}
+
+// The engine type of a column whose Parquet logical type does not fit its physical type (a STRING
+// annotation on an INT32 column, say). Arrow 26 drops such an annotation, and the column's
+// converted type with it, and reads the physical type (apache/arrow GH-50910), where DuckDB reads
+// by the converted type: an INT32 DECIMAL(9,2) would read as its unscaled INTEGERs, a DATE as day
+// numbers. The engine view marks such a column unsupported instead, so that a query reading it
+// exits 4 and no query answers by values the file does not mean; the file still registers. No query
+// reads the column, so no array of this type is ever made.
+class UnfitAnnotationType final : public arrow::ExtensionType {
+ public:
+  explicit UnfitAnnotationType(std::shared_ptr<arrow::DataType> storage)
+      : arrow::ExtensionType(std::move(storage)) {}
+
+  std::string extension_name() const override { return "antb1.unfit_annotation"; }
+  bool ExtensionEquals(const arrow::ExtensionType& other) const override {
+    return other.extension_name() == extension_name() &&
+           other.storage_type()->Equals(*storage_type());
+  }
+  std::shared_ptr<arrow::Array> MakeArray(std::shared_ptr<arrow::ArrayData> data) const override {
+    return std::make_shared<arrow::ExtensionArray>(std::move(data));
+  }
+  arrow::Result<std::shared_ptr<arrow::DataType>> Deserialize(
+      std::shared_ptr<arrow::DataType> storage, const std::string& /*serialized*/) const override {
+    return std::make_shared<UnfitAnnotationType>(std::move(storage));
+  }
+  std::string Serialize() const override { return {}; }
+  // What `antb1 schema` shows, as unsupported(...), and the message of a query that reads it.
+  std::string ToString(bool /*show_metadata*/) const override {
+    return storage_type()->ToString() + " under a Parquet logical type that does not fit it";
+  }
+};
+
+// Whether a column override (--column-type) names `field`: the override decides its type.
+bool Overridden(const arrow::Field& field, const ParquetTableOptions& options) {
+  const std::string lower = plan::AsciiLower(field.name());
+  return std::ranges::any_of(options.overrides, [&lower](const ColumnOverride& ov) {
+    return plan::AsciiLower(ov.column) == lower;
+  });
 }
 
 std::shared_ptr<arrow::Field> EngineField(const std::shared_ptr<arrow::Field>& storage,
@@ -838,12 +878,7 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
   for (const auto& ov : options.overrides) {
     ARROW_RETURN_NOT_OK(ValidateOverride(ov, *table->storage_schema_));
   }
-  arrow::FieldVector fields;
-  for (const auto& f : table->storage_schema_->fields()) {
-    fields.push_back(EngineField(f, options));
-  }
-  table->schema_ = arrow::schema(std::move(fields));
-  table->leaf_of_field_.assign(Narrow<std::size_t>(table->schema_->num_fields()), -1);
+  table->leaf_of_field_.assign(Narrow<std::size_t>(table->storage_schema_->num_fields()), -1);
   if (!table->metadata_.empty()) {
     const auto& first = table->metadata_.front();
     parquet::arrow::SchemaManifest manifest;
@@ -858,6 +893,21 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
       }
     }
   }
+  arrow::FieldVector fields;
+  for (int i = 0; i < table->storage_schema_->num_fields(); ++i) {
+    const std::shared_ptr<arrow::Field>& f = table->storage_schema_->field(i);
+    const int leaf = table->leaf_of_field_[Narrow<std::size_t>(i)];
+    // A leaf whose logical type Arrow dropped as unfit (UnfitAnnotationType): the first file's
+    // annotations, as the storage schema is the first file's.
+    if (leaf >= 0 && !Overridden(*f, options) &&
+        table->metadata_.front()->schema()->Column(leaf)->logical_type()->is_invalid()) {
+      fields.push_back(
+          arrow::field(f->name(), std::make_shared<UnfitAnnotationType>(f->type()), f->nullable()));
+    } else {
+      fields.push_back(EngineField(f, options));
+    }
+  }
+  table->schema_ = arrow::schema(std::move(fields));
   return table;
 }
 

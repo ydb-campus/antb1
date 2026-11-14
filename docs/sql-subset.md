@@ -1361,11 +1361,13 @@ Project RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]
 | – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`) or a literal; a Parquet timestamp column is unsupported |
 | anything else | – | unsupported | `antb1 schema` shows `unsupported(<type>)`; a query that uses the column is rejected |
 
-A logical type that does not fit its physical type (a STRING annotation on an INT32 column, say) is dropped, as Arrow
-26 reads it (apache/arrow GH-50910): the column reads by its converted type, or as its physical type where it has
-none, where Arrow 25 refused the file (exit code 3). A schema nested deeper than 100 levels is an I/O error when the
-file is registered (GH-51238), and so is a column chunk of a compression codec that Parquet does not define, when a
-scan reads it (GH-53518).
+A column whose logical type does not fit its physical type (a STRING annotation on an INT32 column, say) is
+unsupported: the file registers, and a query that reads the column exits 4. Arrow 26 drops such an annotation, and the
+column's converted type with it (apache/arrow GH-50910), so the column would read as its physical type (an INT32
+DECIMAL(9,2) as its unscaled integers, a DATE as day numbers) where DuckDB reads it by the converted type; Arrow 25
+refused the file (exit code 3). A schema nested deeper than 100 levels is an I/O error when the file is registered
+(GH-51238), and so is a column chunk of a compression codec that Parquet does not define, when a scan reads it
+(GH-53518).
 
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
 shortcut for `EventDate`. Both apply to every table (registered or opened with `FROM 'path'`) that has a column with

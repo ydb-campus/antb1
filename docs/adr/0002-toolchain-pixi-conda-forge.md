@@ -41,7 +41,7 @@ Accepted
 - Update (2026-10-25): [ADR 0033](0033-standalone-static-binary.md) adds a fourth environment, `static`, for the
   standalone release binary. It keeps this toolchain but builds Arrow and its bundled dependencies from pinned
   sources instead of taking conda-forge's Arrow; every other environment is unchanged.
-- Update (2026-11-14): Arrow, Arrow compute and Parquet 26 (26.0.1), the minimum antb1 builds against
+- Update (2026-11-14): Arrow, Arrow compute and Parquet 26.0.1, also the minimum antb1 builds against
   ([ADR 0042](0042-arrow-26.md)).
 - Never `-stdlib=libc++` on Linux and never `_GLIBCXX_DEBUG`; the configure step rejects both in `CMAKE_CXX_FLAGS`.
   Debug builds use `_GLIBCXX_ASSERTIONS` (and libc++ hardening on macOS).

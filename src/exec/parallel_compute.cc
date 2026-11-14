@@ -75,7 +75,7 @@ arrow::Status ParallelComputeOperator::Open(ExecContext& ctx) {
 arrow::Result<arrow::Future<>> ParallelComputeOperator::Submit(Entry& entry) {
   // The task holds the shared state and a copy of the input's references only until it has run.
   arrow::Result<arrow::Future<>> submitted = executor_->Submit(
-      [shared = shared_, id = entry.id, batch = entry.input, pool = pool_]() mutable {
+      [shared = shared_, id = entry.id, batch = entry.input, pool = pool_] mutable {
         shared->ComputeIntoSlot(id, std::move(batch), pool);
         return arrow::Status::OK();
       });

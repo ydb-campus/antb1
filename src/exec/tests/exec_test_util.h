@@ -89,6 +89,33 @@ class ThrowingExecutor final : public arrow::internal::Executor {
   std::atomic<int> spawns_ = 0;
 };
 
+// Runs every task on `pool`, except that spawn number `refuse_at` (from 0) fails with `refusal`, as
+// Arrow 26's thread pool fails with an UnknownError where it cannot start a worker: that task never
+// runs.
+class RefusingExecutor final : public arrow::internal::Executor {
+ public:
+  RefusingExecutor(arrow::internal::Executor* pool, int refuse_at,
+                   arrow::Status refusal = arrow::Status::IOError("no room for a task"))
+      : pool_(pool), refuse_at_(refuse_at), refusal_(std::move(refusal)) {}
+
+  int GetCapacity() override { return pool_->GetCapacity(); }
+
+ protected:
+  arrow::Status SpawnReal(arrow::internal::TaskHints hints, arrow::internal::FnOnce<void()> task,
+                          arrow::StopToken stop_token, StopCallback&& stop_callback) override {
+    if (spawns_++ == refuse_at_) {
+      return refusal_;
+    }
+    return pool_->Spawn(hints, std::move(task), std::move(stop_token), std::move(stop_callback));
+  }
+
+ private:
+  arrow::internal::Executor* pool_;
+  int refuse_at_;
+  arrow::Status refusal_;
+  std::atomic<int> spawns_ = 0;
+};
+
 // A pool that fails every allocation off the thread that made it (the consumer's): every part or
 // batch computed on a worker runs out of memory, and only one computed again alone succeeds.
 class WorkerFailingPool final : public arrow::MemoryPool {
