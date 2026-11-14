@@ -144,6 +144,34 @@ TEST_F(CliTest, QueryCountStarJson) {
   EXPECT_EQ(r.out, "[\n {\"count_star()\": 3}\n]\n");
 }
 
+TEST_F(CliTest, SelectionBeforeGatherFlagPreservesResultsAndPhysicalPlan) {
+  const std::string sql =
+      "SELECT EventDate, 'ordinary payload' AS payload FROM t "
+      "ORDER BY payload, EventDate LIMIT 2";
+  const auto ordinary =
+      Invoke({"query", "--threads", "1", "-c", sql, "--table", "t=" + path_, "--format", "csv"});
+  ASSERT_EQ(ordinary.code, kExitOk) << ordinary.err;
+  const auto ordinary_plan =
+      Invoke({"explain", "--threads", "1", "--physical", "-c", sql, "--table", "t=" + path_});
+  ASSERT_EQ(ordinary_plan.code, kExitOk) << ordinary_plan.err;
+  for (const char* flag : {"--sort-selection-before-gather", "--sort-selection-before-gather=0",
+                           "--sort-selection-before-gather=1"}) {
+    SCOPED_TRACE(flag);
+    const auto selected = Invoke(
+        {"query", "--threads", "1", flag, "-c", sql, "--table", "t=" + path_, "--format", "csv"});
+    ASSERT_EQ(selected.code, kExitOk) << selected.err;
+    EXPECT_EQ(selected.out, ordinary.out);
+    const auto selected_plan = Invoke(
+        {"explain", "--threads", "1", "--physical", flag, "-c", sql, "--table", "t=" + path_});
+    ASSERT_EQ(selected_plan.code, kExitOk) << selected_plan.err;
+    EXPECT_EQ(selected_plan.out, ordinary_plan.out);
+    const auto profile = Invoke(
+        {"explain", "--threads", "1", "--analyze", flag, "-c", sql, "--table", "t=" + path_});
+    ASSERT_EQ(profile.code, kExitOk) << profile.err;
+    EXPECT_NE(profile.out.find("TopN"), std::string::npos) << profile.out;
+  }
+}
+
 TEST_F(CliTest, SqlFromStdinAndFile) {
   auto r = Invoke({"query", "-c", "-", "--table", "t=" + path_, "--format", "csv"},
                   "SELECT COUNT(*) FROM t");

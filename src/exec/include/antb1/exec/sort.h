@@ -86,8 +86,11 @@ class SortBuffer {
 
   SortBuffer(RowComparator comparator, std::optional<int64_t> keep);
 
-  // Rows with the comparator's schema, without a selection.
-  arrow::Status Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool);
+  // Rows with the comparator's schema. An optional selection drops false and NULL entries.
+  // Combine a partial selection with an established threshold before gathering survivors.
+  // Stored chunks own materialized rows and never borrow the selection.
+  arrow::Status Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool,
+                    const std::shared_ptr<arrow::BooleanArray>& selection = nullptr);
   // Moves the rows of `other` (another buffer of the same schema and keep) behind this buffer's
   // rows. `other` is left empty and unsorted, like a new buffer, also when adding its rows fails; a
   // merge it refuses (of a buffer into itself, or of another schema or keep) changes neither.
@@ -168,6 +171,7 @@ class SortOperator final : public Operator {
   int64_t next_ = 0;  // the next sorted row to emit
   int64_t end_ = 0;   // one past the last sorted row to emit
   bool sorted_ = false;
+  bool selection_before_gather_ = false;
 };
 
 }  // namespace antb1::exec

@@ -14,12 +14,15 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../part_operators.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -79,6 +82,250 @@ std::shared_ptr<arrow::RecordBatch> WithIds(
 }
 
 using Ids = std::vector<std::optional<int64_t>>;
+
+TEST_F(SortTest, MaskedAdmissionMatchesMaterializationWithThresholdsAndStableTies) {
+  auto* pool = arrow::default_memory_pool();
+  const std::vector<std::optional<std::string>> payloads = {
+      "masked",        std::string(13, 'a'), std::nullopt,
+      "threshold tie", "null key",           std::string("x\0\xFF", 3)};
+  const std::vector<std::optional<std::string>> initial = {"first tie", "second tie", "bound"};
+  const auto sliced = std::static_pointer_cast<arrow::BooleanArray>(
+      testing::Bools({false, false, true, true, true, true, std::nullopt, false})->Slice(1, 6));
+  const std::vector<std::shared_ptr<arrow::BooleanArray>> masks = {
+      nullptr, testing::Bools(std::vector<std::optional<bool>>(6, true)),
+      testing::Bools(std::vector<std::optional<bool>>(6, false)), sliced};
+  const auto next =
+      WithIds({Int64s({0, 2, 2, 4, std::nullopt, 1}),
+               Strings({"masked", "b", "b", "a", std::nullopt, "z"}), Strings(payloads)});
+  const auto seed = WithIds({Int64s({2, 2, 4}), Strings({"b", "b", "a"}), Strings(initial)});
+  for (const bool threshold : {false, true}) {
+    for (const bool nulls_first : {false, true}) {
+      for (const auto& mask : masks) {
+        const auto comparator =
+            RowComparator::Make(next->schema(), {Key(1, LogicalType::kBigInt, false, nulls_first),
+                                                 Key(2, LogicalType::kVarchar)})
+                .ValueOrDie();
+        SortBuffer fused(comparator, 3);
+        SortBuffer reference(comparator, 3);
+        if (threshold) {
+          ASSERT_TRUE(fused.Add(seed, pool).ok());
+          ASSERT_TRUE(reference.Add(seed, pool).ok());
+          ASSERT_TRUE(fused.Tighten(pool).ok());
+          ASSERT_TRUE(reference.Tighten(pool).ok());
+        }
+        const auto materialized = Materialize(Batch{.data = next, .selection = mask}, pool);
+        ASSERT_TRUE(materialized.ok()) << materialized.status().ToString();
+        ASSERT_TRUE(reference.Add(*materialized, pool).ok());
+        ASSERT_TRUE(fused.Add(next, pool, mask).ok());
+        ASSERT_TRUE(reference.Sort(pool).ok());
+        ASSERT_TRUE(fused.Sort(pool).ok());
+        const auto expected = reference.Slice(0, 3, pool).ValueOrDie();
+        const auto actual = fused.Slice(0, 3, pool).ValueOrDie();
+        ASSERT_TRUE(actual->ValidateFull().ok());
+        EXPECT_TRUE(actual->Equals(*expected));
+      }
+    }
+  }
+}
+
+TEST_F(SortTest, MaskedAdmissionChecksBoundsAndRejectsAllRowsWithoutAllocating) {
+  const auto input = WithIds({Int64s({2, 1}), Strings({std::string(13, 'a'), "b"})});
+  MemoryBudget no_memory(0);
+  SortBuffer buffer(
+      RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+  auto* pool = arrow::default_memory_pool();
+  EXPECT_TRUE(buffer.Add(input, pool, testing::Bools({true})).IsInvalid());
+  EXPECT_TRUE(buffer.Add(input->Slice(0, 0), pool, testing::Bools({true})).IsInvalid());
+  EXPECT_TRUE(buffer.Add(nullptr, pool, testing::Bools({})).IsInvalid());
+  EXPECT_TRUE(buffer.Add(input, &no_memory, testing::Bools({false, std::nullopt})).ok());
+  EXPECT_TRUE(buffer.Add(input->Slice(0, 0), &no_memory, testing::Bools({})).ok());
+  EXPECT_EQ(buffer.num_rows(), 0);
+  EXPECT_EQ(no_memory.bytes_allocated(), 0);
+  ASSERT_TRUE(buffer.Add(input->Slice(1, 1), pool).ok());
+  ASSERT_TRUE(buffer.Tighten(pool).ok());
+  // The masked best key and selected worse key admit no rows and allocate no indices.
+  EXPECT_TRUE(buffer.Add(input, &no_memory, testing::Bools({true, false})).ok());
+  EXPECT_EQ(buffer.num_rows(), 1);
+  EXPECT_EQ(buffer.ThresholdKey(), Int128{1});
+  EXPECT_EQ(no_memory.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, MaskedBinaryAdmissionCopiesOnlySelectedRowsBeforeTheThreshold) {
+  MemoryBudget budget(16 * 1024);
+  std::shared_ptr<arrow::RecordBatch> output;
+  std::weak_ptr<arrow::Buffer> source_owner;
+  const std::string kept(13, 'k');
+  {
+    auto first = WithIds({Int64s({10, 9}), Strings({"first", "second"})});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    ASSERT_TRUE(buffer.Tighten(&budget).ok());
+    std::vector<std::optional<std::string>> values = {
+        std::string(std::size_t{128} * 1024, 'm'), std::string(std::size_t{128} * 1024, 'r'), kept,
+        std::nullopt, std::string(std::size_t{128} * 1024, 't')};
+    Ids keys{0, 20, 5, 4, 10};
+    std::vector<std::optional<bool>> selected{false, true, true, true, true};
+    // Arrow Take reserves payload capacity from the input's mean string length. Empty losing
+    // rows keep that estimate within this budget; eager materialization must still copy the
+    // two selected large strings, which cannot fit. The test checks copying, not exact capacity.
+    for (int row = 0; row < 128; ++row) {
+      values.emplace_back("");
+      keys.emplace_back(20);
+      selected.emplace_back(true);
+    }
+    auto payload = Strings(values);
+    source_owner = payload->data()->buffers.at(2);
+    auto next = WithIds({Int64s(keys), payload});
+    payload.reset();
+    const auto mask = testing::Bools(selected);
+    {
+      MemoryBudget eager_budget(16 * 1024);
+      const auto filtered = Materialize(Batch{.data = next, .selection = mask}, &eager_budget);
+      EXPECT_TRUE(filtered.status().IsOutOfMemory()) << filtered.status().ToString();
+      EXPECT_EQ(eager_budget.bytes_allocated(), 0);
+    }
+    EXPECT_TRUE(buffer.Add(next, nullptr, mask).IsInvalid());
+    EXPECT_EQ(buffer.num_rows(), 2);
+    EXPECT_EQ(buffer.ThresholdKey(), Int128{10});
+    // Masked, worse and threshold-tied rows all carry large strings. Only the two winners
+    // fit; filtering the selected strings before applying the threshold failed above.
+    const auto admitted = buffer.Add(next, &budget, mask);
+    ASSERT_TRUE(admitted.ok()) << admitted.ToString();
+    first.reset();
+    next.reset();
+    EXPECT_TRUE(source_owner.expired());
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    const auto result = buffer.Slice(0, 2, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    output = *result;
+  }
+  EXPECT_TRUE(output->column(2)->Equals(*Strings({std::nullopt, kept})));
+  ASSERT_TRUE(output->ValidateFull().ok());
+  output.reset();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, MaskedAdmissionFailuresPreserveThresholdAndPermitRetry) {
+  const std::string kept(17, 'k');
+  const std::vector<std::optional<std::string>> initial = {std::string(13, 'a'),
+                                                           std::string(13, 'b')};
+  const std::vector<std::optional<std::string>> payloads = {std::string(81, 'x'), kept, "masked",
+                                                            std::nullopt, "threshold tie"};
+  const std::vector<std::optional<std::string>> expected = {std::nullopt, kept};
+  const auto mask = testing::Bools({true, true, std::nullopt, true, true});
+  const auto seed = WithIds({Int64s({10, 9}), Strings(initial)});
+  const auto next = WithIds({Int64s({20, 8, 7, 6, 10}), Strings(payloads)});
+  int failures = 0;
+  int successes = 0;
+  for (int64_t headroom = 0; headroom <= 4096; headroom += 64) {
+    SCOPED_TRACE(headroom);
+    constexpr int64_t kLimit = int64_t{64} * 1024;
+    MemoryBudget budget(kLimit);
+    {
+      SortBuffer buffer(
+          RowComparator::Make(seed->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+      ASSERT_TRUE(buffer.Add(seed, &budget).ok());
+      ASSERT_TRUE(buffer.Tighten(&budget).ok());
+      const int64_t held = kLimit - budget.bytes_allocated() - headroom;
+      ASSERT_GE(held, 0);
+      ASSERT_TRUE(budget.Reserve(held).ok());
+      const int64_t before = budget.bytes_allocated();
+      const auto status = buffer.Add(next, &budget, mask);
+      if (status.IsOutOfMemory()) {
+        ++failures;
+        EXPECT_EQ(buffer.num_rows(), 2);
+        EXPECT_EQ(buffer.ThresholdKey(), Int128{10});
+        EXPECT_EQ(budget.bytes_allocated(), before);
+      } else {
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ++successes;
+        EXPECT_EQ(buffer.num_rows(), 4);
+      }
+      budget.Release(held);
+      if (!status.ok()) {
+        ASSERT_TRUE(buffer.Add(next, &budget, mask).ok());
+      }
+      ASSERT_TRUE(buffer.Sort(&budget).ok());
+      const auto result = buffer.Slice(0, 2, &budget).ValueOrDie();
+      const auto expected_payload = Strings(expected);
+      EXPECT_TRUE(result->column(2)->Equals(*expected_payload));
+      EXPECT_EQ(buffer.num_rows(), 2);
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+  EXPECT_GT(failures, 0);
+  EXPECT_GT(successes, 0);
+}
+
+TEST_F(SortTest, OrdinarySelectionBeforeGatherKeepsTopNResultsAcrossReopen) {
+  // The first batch exceeds keep + 4096, establishing a threshold before the selected batch.
+  constexpr int64_t kInitialRows = 4200;
+  Ids keys;
+  for (int64_t row = 0; row < kInitialRows; ++row) {
+    keys.emplace_back(100 + row);
+  }
+  const auto mask = std::static_pointer_cast<arrow::BooleanArray>(
+      testing::Bools({true, false, true, std::nullopt, true, true, true, true, false, true})
+          ->Slice(1, 8));
+  for (const bool binary : {false, true}) {
+    SCOPED_TRACE(binary);
+    arrow::ArrayVector initial_columns{Int64s(keys)};
+    arrow::ArrayVector next_columns{Int64s({4200, 4201, 4202, 4203, 4204, 4205, 4206, 4207}),
+                                    Int64s({0, 100, 101, 99, 102, std::nullopt, 98, 97})};
+    arrow::ArrayVector expected_columns{Int64s({4203, 0}), Int64s({99, 100})};
+    if (binary) {
+      initial_columns.push_back(Strings(
+          std::vector<std::optional<std::string>>(Narrow<std::size_t>(kInitialRows), "old")));
+      next_columns.push_back(Strings({"masked", "late tie", "null selection", "lower",
+                                      "threshold tie", "null key", "lowest", "masked"}));
+      expected_columns.push_back(Strings({"lower", "old"}));
+    }
+    const auto first = WithIds(initial_columns);
+    const auto next = arrow::RecordBatch::Make(first->schema(), 8, next_columns);
+    const auto expected_batch = arrow::RecordBatch::Make(first->schema(), 2, expected_columns);
+    const auto expected = arrow::Table::FromRecordBatches({expected_batch}).ValueOrDie();
+    for (const bool enabled : {false, true}) {
+      SCOPED_TRACE(enabled);
+      auto source = std::make_unique<ScriptedSource>(
+          first->schema(), std::vector<Batch>{{.data = first}, {.data = next, .selection = mask}});
+      ProfileNode profile;
+      SortOperator op(std::move(source), {Key(1, LogicalType::kBigInt)}, 2, 1);
+      op.set_profile(&profile);
+      ExecContext ctx{.batch_size = 1};
+      ctx.sort_selection_before_gather = enabled;
+      for (int64_t run = 0; run < 2; ++run) {
+        const auto result = Drain(op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        ASSERT_TRUE((*result)->ValidateFull().ok());
+        EXPECT_TRUE((*result)->Equals(*expected));
+        int64_t batches = 0;
+        int64_t input_rows = 0;
+        int64_t selected_rows = 0;
+        for (const auto& metric : profile.metrics()) {
+          if (metric.name == "selection_before_gather_batches") {
+            batches = metric.value;
+          } else if (metric.name == "selection_before_gather_input_rows") {
+            input_rows = metric.value;
+          } else if (metric.name == "selection_before_gather_selected_rows") {
+            selected_rows = metric.value;
+          }
+        }
+        const int64_t forwarded = binary && enabled ? run + 1 : 0;
+        EXPECT_EQ(batches, forwarded);
+        EXPECT_EQ(input_rows, 8 * forwarded);
+        EXPECT_EQ(selected_rows, 5 * forwarded);
+      }
+    }
+  }
+}
+
+TEST_F(SortTest, PartContextPreservesOrdinarySelectionBeforeGather) {
+  ExecContext ctx;
+  EXPECT_FALSE(PartContext(ctx).sort_selection_before_gather);
+  ctx.sort_selection_before_gather = true;
+  EXPECT_TRUE(PartContext(ctx).sort_selection_before_gather);
+}
 
 TEST_F(SortTest, NullsLastByDefaultInBothDirections) {
   const auto batch = WithIds({Int64s({2, std::nullopt, 1, 3})});

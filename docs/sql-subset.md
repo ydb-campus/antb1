@@ -1202,6 +1202,15 @@ Project x, tag
 `--build-side-ratio` and `--join-order`, and cannot be given together with `--analyze`; its errors and exit codes
 are those of `antb1 query`.
 
+`--sort-selection-before-gather` is an independent, opt-in execution experiment on `query`,
+`explain` and `bench`. A TopN operator carrying ordinary Binary strings can combine its input
+selection with the current threshold before gathering surviving rows. It is off by default and
+changes neither the logical or physical plan nor the answers.
+With `--analyze`, `selection_before_gather_batches`, `selection_before_gather_input_rows` and
+`selection_before_gather_selected_rows` count partial input selections forwarded to eligible
+TopN buffers before gathering. These counters include batches arriving before a threshold exists;
+they do not count rows rejected by the threshold.
+
 It shows what no logical plan holds, because the physical planner is what decides it:
 
 - part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,
