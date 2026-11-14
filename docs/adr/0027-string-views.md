@@ -6,6 +6,10 @@ Date: 2026-10-15
 
 Proposed (deferred: S3 measured the lever at 18% of one query, not at the gap; see S3)
 
+The [2026-11-13 amendment](#amendment-2026-11-13-owned-views-and-staged-adoption) records new evidence and
+the next proposed experiment. It revises the proposed ownership contract and implementation order below;
+the original investigation remains as history. Production adoption of the view path remains deferred.
+
 ## Context
 
 - **The target.** A VARCHAR value is `arrow::binary()` everywhere above the scan — one decision, in
@@ -242,6 +246,190 @@ answer to the same question — carry a row reference rather than a cheaper valu
 - **Leave it to ADR 0019's hash table alone.** Tempting, since that ADR already owns the grouper's 46%. Rejected
   because the measurement above puts 16.338 s in `gather`, which is a join cost and not a GROUP BY cost: the group
   count did not change between the two rows at all. The two halves are separable, and S1 is the separable one.
+
+## Amendment (2026-11-13): owned views and staged adoption
+
+### What changed since S3
+
+[PR #364](https://github.com/ydb-campus/antb1/pull/364), merged as `8b0d4a4`, addressed
+[issue #355](https://github.com/ydb-campus/antb1/issues/355) without a new hash table or a view array.
+`exec::PackedStringKeyTable` packs one or two ordinary STRING/BINARY keys of at most seven bytes into
+UInt64 words, uses the existing integer-key backend and decodes unique keys. Longer values promote to the
+ordinary Grouper while preserving public group IDs. Packing buffers are cached only for batches of up to
+256 rows, retaining at most 2 KiB per key column. This is a complete, independent optimization. It neither
+implements S2's general string-key layout nor makes Arrow Grouper accept BinaryView.
+
+A separate synthetic investigation tested three selection/gather stages followed by a consumer that reads
+every output byte. The 36 shapes varied string length (1, 7, 12, 13, 32 and 128 bytes), selection density
+(1%, 10% and 100%), fanout (1 and 4), batch size, slices, NULLs and empty values. The measurements used
+static Release ThinLTO, Arrow 25, one pinned CPU and ten interleaved repetitions. Each arm's estimate is the
+mean of its seven fastest wall-time repetitions; ratios below are geometric means across equally weighted
+shapes, not a workload-weighted estimate or a statistical-significance claim.
+
+| Timed work | View / ordinary Binary time | Shapes faster with views |
+| --- | ---: | ---: |
+| Binary-to-view conversion, transport and byte consumer | 2.315 | 11 / 36 |
+| The same, plus final conversion back to Binary | 2.629 | 4 / 36 |
+| Transport and byte consumer, with both input representations prepared outside timing | 0.784 | 36 / 36 |
+
+The prepared-input ratio excluding the two tiny-batch shapes was 0.819. These are transport measurements,
+not scan or SQL speedups. Creating descriptors for an entire source before keeping 1% of it visits rows
+that ordinary selection never copies. Converting back to Binary can also consume the transport saving.
+An eligible producer and a complete chain of consumers must therefore be measured together.
+
+Retention is a separate constraint. In the prepared-input case with 262,144 rows, 128-byte values and 1%
+selection, views retained 30,207,552 bytes of source capacity for 301,952 distinct live payload bytes.
+Dense long-string fanout reduced both allocation and copying, but sparse views kept roughly 100 times
+their useful source payload. Short inline values need 16-byte descriptors and can use more memory than
+Binary even when processing is faster. These are Arrow buffer capacities and logical bytes, not RSS.
+
+Arrow 25 capability probes still reject BinaryView/StringView in Take, Filter and Grouper. The saved
+prototype supplies limited checked gathers only; it is not a replacement for those engine dependencies.
+Reports and provenance remain local under `build/static/bench-results/binary-view-investigation-20261113/`
+(`FINAL.txt`, `verification.json`, `summary.json`, `native-summary.json`). Source snapshots and the
+benchmark-only patch are preserved separately from the merged packed-key implementation. These results
+justify the experiment below, not enabling a general view representation.
+
+### Proposed representation and ownership contract
+
+This proposal replaces the original rule that every retained view must be materialized, and the claim
+that Binary is the only possible physical representation at every operator boundary. It keeps the SQL
+type and the default representation unchanged:
+
+- **Logical VARCHAR remains arbitrary bytes.** Use `arrow::binary_view()` in an eligible physical path,
+  not `arrow::utf8_view()`. Preserve byte-wise ordering, embedded zeros, invalid UTF-8, NULLs and empty
+  values. `plan::ToArrow(kVarchar)` and public result columns continue to use `arrow::binary()`.
+- **A view array owns its dependencies.** Its Arrow buffers must hold shared ownership of every referenced
+  payload allocation. It may then outlive the input batch, join operator or producer. A bare
+  `std::string_view`, a pointer into a decoder page, or a pointer whose owner has already been released
+  does not meet this contract. Referenced bytes and addresses must remain immutable and stable while
+  views exist; keeping a reusable decoder buffer alive does not prevent its next read from overwriting
+  old results. Existing `plan::ScanValues` views remain borrowed for one call.
+- **Physical schemas describe the arrays actually emitted.** An operator advertising BINARY cannot emit
+  BINARY_VIEW under that schema. Eligible operators propagate an explicit physical representation while
+  binding and SQL types stay unchanged. Projection, empty outputs, reopening an operator and final
+  result assembly must honor the same schema. A materialization boundary advertises Binary itself.
+- **Retention is budgeted for its full lifetime.** Descriptors, validity buffers, ownership metadata,
+  copied payload and retained source allocations stay charged while reachable. Sharing a source does
+  not charge its capacity again, and dropping the producer does not uncharge bytes still owned by a
+  result. Retained capacity is measured by distinct backing allocations, not by the visible size of a
+  slice; aliased slices must not make a large allocation appear small. The allocating MemoryPool and
+  MemoryBudget must themselves outlive all buffers that call them on destruction; shared buffer
+  ownership alone does not extend the pool's lifetime. Keep the necessary query/result owner alive.
+- **Compaction controls sparse retention.** Drop unreferenced payload buffers and remap view buffer
+  indices after selection. For referenced allocations with poor live-byte utilization, copy surviving
+  values into compact owned buffers while keeping the BinaryView physical type. Count distinct live
+  source ranges separately from duplicate output references so fanout cannot hide retention. The pilot
+  must define and measure an explicit retention limit before enabling views, including the transient
+  source-plus-destination peak during compaction. A failed allocation returns a checked error and
+  releases temporary ownership; it must not bypass the query budget to finish the copy.
+- **Eligibility covers the whole path.** Resolve consumer support before a producer emits views.
+  Ordinary Binary remains the path for unsupported shapes. Do not discover missing kernels by failing
+  halfway through a query, silently convert at every boundary, or change a stream's physical type in
+  response to one batch's values. Preserve existing evaluation order and error behavior.
+
+Materialization now has two distinct meanings: selecting rows from a batch, and copying view payload into
+ordinary Binary. The implementation must distinguish them. `exec::Materialize` currently performs the
+first through Arrow Filter; merely keeping its name or return type does not make it support views.
+
+### Next implementation: payload transport through a complete narrow path
+
+The first engine experiment is an integer-key INNER equijoin carrying selected build-side VARCHAR
+payloads through numeric selection and numeric top-N, followed by one explicit Binary output boundary.
+Strings are payload only: no string join key, grouping key, sort key or string expression is eligible.
+Exclude residual join predicates, subsequent joins, shared subplans and aggregation/distinct consumers
+from this first path. This gives a view producer a compatible consumer without waiting for a replacement
+Grouper. The original S2-before-S1 dependency still applies to the measured string-grouping shape, but
+not to this payload path.
+
+Build the following pieces together before assessing the query speedup:
+
+1. **Produce only gathered views from owned join chunks.** Extend the path around `exec::GatherRows`
+   and hash-join output assembly. Write descriptors for emitted rows directly from the retained Binary
+   arrays; do not convert a whole scan batch before its selection. Handle multiple chunks, sliced
+   arrays, duplicate matches and valid NULL values. The shared gather helper must preserve no-row/NULL
+   padding semantics before any outer-join caller uses it; outer-join eligibility is a later extension.
+   Reading the inline bytes and prefix still costs work; this is not a zero-cost conversion. The scan
+   API and pushed predicates remain unchanged in this first experiment.
+2. **Select and carry the physical payload explicitly.** Provide checked exec-owned selection/gather
+   helpers for the index types used by the participating paths. Honor nullable index and selection
+   semantics where the caller permits them; keep Batch's non-null selection invariant. Projection,
+   selection materialization and numeric top-N must preserve the view arrays and their owners.
+   Unsupported Arrow calls are not a fallback mechanism. Keep the helpers local to exec instead of
+   adding process-global kernels to Arrow's registry.
+3. **Bound retention while rows are buffered.** The sort/top-N buffer must account for the source
+   allocations its surviving rows pin, compact sparse payloads and release discarded owners. Sorting
+   only numeric keys does not exempt the retained payload from this requirement. Exercise bounded-memory
+   operation as well as an unconstrained run; the ordinary Binary path is the reference for retained
+   and peak capacity.
+4. **Materialize the final selected output once.** Preserve the public Binary schema, exact row order
+   and existing overflow checks at the boundary before `Drain` assembles the result. Test a result
+   retained after operators and input batches are destroyed. Keep the ordinary Binary execution path
+   available for the controlled comparison and for ineligible plans.
+
+The physical planner must prove this complete path, including any parallel merge or projection nodes it
+inserts. Eligibility must be structural and deterministic, not based on observed values in the first
+batch. Do not change join order, scan filtering, batch size or grouping strategy in the comparison.
+
+### Later steps: consumers, dictionaries and scan production
+
+These are separate decisions after the payload experiment, each requiring its own complete-path
+measurement:
+
+- **View-aware string grouping and joins.** Use the existing `KeyTable` interface to investigate a
+  consumer that hashes and compares Binary and BinaryView values without first copying every row to
+  Binary. It must own retained key bytes, preserve public IDs, non-inserting Lookup and merge semantics,
+  and support longer values and high cardinality. The merged seven-byte packing specialization remains
+  a separate choice for its eligible key shapes. A custom hash table is a candidate, not a prerequisite
+  established by the transport microbenchmarks.
+- **Dictionary encoding complements value layout.** A dictionary stores distinct values plus row
+  indices; its values may themselves be Binary or BinaryView. Views reduce value movement, while a
+  dictionary can avoid repeated hashing or predicate evaluation. Codes identify a value only within
+  their dictionary domain. Cross-batch, cross-part and join comparisons need a checked translation to
+  shared semantic IDs or a value-based fallback, never raw code equality across domains. Count the
+  dictionary owners and translation tables in the memory budget. Existing dictionary predicate
+  evaluation in the filtered scan remains useful independently of transport. Partition routing must
+  hash equal values identically across Binary, view and dictionary representations, including composite
+  keys and NULLs. Worker-local canonical IDs are not a common hash domain. Cached dictionary-entry
+  hashes must preserve the ordinary keys' content-based routing semantics.
+- **Dictionary grouping is still an experiment.** [ADR 0028](0028-dictionary-group-keys.md) remains
+  rejected: the scan's per-batch dictionaries, routed rows and rebuild costs were measured limitations.
+  Do not assume a stable dictionary per row group or raise the engine batch size to manufacture a win.
+  Reconsider only with new evidence for stable domains or sufficiently cheap remapping, including high
+  cardinality, changing dictionaries, NULLs and the complete scan/merge cost.
+- **Native view production and wider expressions come later.** Reading owned views directly from
+  Parquet, or producing owned views only for survivors of a pushed predicate, may avoid adaptation
+  costs. Decoder-backed borrowed pointers cannot simply escape. Measure decode, filtering and final
+  output together before changing the scan contract. Add each expression or key consumer deliberately;
+  do not flip the global VARCHAR mapping in anticipation of future support.
+
+### Acceptance and stopping conditions
+
+Use independent generated fixtures for committed tests and benchmarks. The payload pilot needs tests for
+lengths around the 12-byte inline boundary, invalid UTF-8 and embedded zeros, NULL and empty values,
+offset slices, multiple and aliased source buffers, repeated indices, outer-join padding, empty inputs,
+zero-column projections, deterministic top-N ties and limits, and unsupported-path eligibility. Verify
+ownership after dropping sources and closing operators, compaction after sparse selection, memory-budget
+failure and cleanup, cancellation, and repeated Open/Close. Cover the existing serial and parallel
+harnesses without adding new test threads or network access. Expected SQL answers come from the existing
+DuckDB oracle; do not hand-write new `.slt` expectations.
+
+Performance acceptance requires complete static Release query runs including producer work, every
+selection, compaction, final materialization and destruction. Compare the same physical plan with views
+disabled/enabled on dense and sparse selections, short and long payloads, low and high fanout, and top-N
+and output sizes that stress retention. Use ten interleaved measured repetitions after warm-up, balanced
+first position, fastest-seven means and all-ten medians/ranges. Record OS CPU, wall time, peak RSS, peak
+and retained query-pool capacity, allocation counts, and copied payload versus descriptor bytes. Include
+normal 16-thread execution and a serial diagnostic. Microbenchmarks and operator profiles explain the
+result; they do not replace it. Report losses as well as gains and recheck the full 22-query workload
+derived from TPC-H before enabling a production path.
+
+Keep the pilot disabled if final materialization consumes its benefit, retention cannot be bounded
+within the normal query budget, or improvements depend on excluding producer/consumer work. Do not
+compensate with a different join order or claim that a transport gain resolves the planner, hash-build
+finalization or high-cardinality aggregation issues. `pixi run check` is required for a PR;
+`pixi run check-full` is required for the ownership implementation. This amendment changes the proposed
+roadmap, not the ADR status, Arrow dependency, SQL semantics or production execution path.
 
 This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
 this implementation does not comply with all requirements of the TPC-H Benchmark.

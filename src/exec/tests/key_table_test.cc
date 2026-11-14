@@ -41,7 +41,8 @@ using testing::Column;
 using testing::Int32s;
 using testing::Int64s;
 
-constexpr std::array kKinds = {KeyTableKind::kGrouper};
+constexpr std::array kKinds = {KeyTableKind::kAuto, KeyTableKind::kGrouper,
+                               KeyTableKind::kPackedStrings};
 
 std::string_view KindName(KeyTableKind kind) {
   switch (kind) {
@@ -49,6 +50,8 @@ std::string_view KindName(KeyTableKind kind) {
       return "Auto";
     case KeyTableKind::kGrouper:
       return "Grouper";
+    case KeyTableKind::kPackedStrings:
+      return "PackedStrings";
   }
   return "Unknown";
 }
@@ -80,9 +83,9 @@ std::vector<std::shared_ptr<arrow::DataType>> TypesOf(const arrow::compute::Exec
   return types;
 }
 
-// A row's key values as bytes that tell any two rows apart: per fixed-width column a tag, then
-// its value's bytes, or only a NULL tag whatever bytes lie under it. One or two keys stay within a
-// string's own small buffer.
+// A row's key values as bytes that tell any two rows apart: per column a tag, then its value's
+// bytes, or only a NULL tag whatever bytes lie under it. Variable-width values include their
+// length, so embedded NULs and boundaries between adjacent columns cannot collide.
 std::string KeyBytes(const arrow::ArrayVector& columns, std::int64_t row) {
   std::string key;
   for (const auto& column : columns) {
@@ -90,9 +93,16 @@ std::string KeyBytes(const arrow::ArrayVector& columns, std::int64_t row) {
       key += 'N';
       continue;
     }
+    key += 'V';
+    if (column->type_id() == arrow::Type::BINARY || column->type_id() == arrow::Type::STRING) {
+      const auto value = static_cast<const arrow::BinaryArray&>(*column).GetView(row);
+      const auto length = Narrow<std::uint64_t>(value.size());
+      key.append(reinterpret_cast<const char*>(&length), sizeof(length));
+      key.append(value);
+      continue;
+    }
     const int width = column->type()->byte_width();
     const auto* bytes = column->data()->GetValues<char>(1, (column->offset() + row) * width);
-    key += 'V';
     key.append(bytes, static_cast<std::size_t>(width));
   }
   return key;
@@ -149,6 +159,24 @@ void ConsumeAndCheck(KeyTable& table, const arrow::compute::ExecBatch& batch, Ex
   EXPECT_EQ(table.num_groups(), ids->after);
 }
 
+void LookupAndCheck(KeyTable& table, const arrow::compute::ExecBatch& batch,
+                    const Expected& expected) {
+  const auto found = table.Lookup(batch);
+  ASSERT_TRUE(found.ok()) << found.status().ToString();
+  ASSERT_EQ((*found)->length(), batch.length);
+  const arrow::ArrayVector columns = ArraysOf(batch);
+  for (std::int64_t row = 0; row < batch.length; ++row) {
+    const auto known = expected.id_of.find(KeyBytes(columns, row));
+    if (known == expected.id_of.end()) {
+      EXPECT_TRUE((*found)->IsNull(row)) << "row " << row;
+    } else {
+      ASSERT_TRUE((*found)->IsValid(row)) << "row " << row;
+      EXPECT_EQ((*found)->Value(row), known->second) << "row " << row;
+    }
+  }
+  EXPECT_EQ(table.num_groups(), expected.key_of.size()) << "a lookup adds no group";
+}
+
 // `uniques`: one row per group of `expected` (or its first `groups`), in id order, each its key,
 // of exactly `types`.
 void CheckUniques(const arrow::compute::ExecBatch& uniques, const Expected& expected,
@@ -178,6 +206,15 @@ std::shared_ptr<arrow::Array> Int64sOver(const std::vector<std::optional<std::in
 
 std::shared_ptr<arrow::Array> Doubles(const std::vector<std::optional<double>>& values) {
   return testing::ArrayOf<arrow::DoubleBuilder>(arrow::float64(), values);
+}
+
+std::shared_ptr<arrow::Array> StringKeys(
+    const std::vector<std::optional<std::string>>& values,
+    const std::shared_ptr<arrow::DataType>& type = arrow::binary()) {
+  if (type->id() == arrow::Type::STRING) {
+    return testing::ArrayOf<arrow::StringBuilder>(type, values);
+  }
+  return testing::ArrayOf<arrow::BinaryBuilder>(type, values);
 }
 
 // An int64 column of `rows` NULLs with no values buffer, which the Arrow format allows.
@@ -459,6 +496,275 @@ TEST_P(KeyTableTest, ATinyBudgetFailsWithItsOwnErrorAndLeavesNothing) {
   EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
+TEST_P(KeyTableTest, StringKeysKeepNullEmptyPrefixesAndEmbeddedNulsDistinct) {
+  for (const auto& type : {arrow::binary(), arrow::utf8()}) {
+    SCOPED_TRACE(type->ToString());
+    const auto keys = StringKeys(
+        {std::nullopt, "", std::string("\0", 1), std::string("\0\0", 2), "a", std::string("a\0", 2),
+         "abcdef", "abcdefg", std::string("abcdef\0", 7), "abcdefg", std::nullopt, ""},
+        type);
+    Check({BatchOf({keys}), BatchOf({keys->Slice(3, 7)}),
+           BatchOf({StringKeys(
+               {"abcdefgh", "abcdefg", std::string("abcdefg\0", 8), "a", "", std::nullopt}, type)}),
+           BatchOf({keys})});
+  }
+}
+
+TEST_P(KeyTableTest, StringSlicesEmptyBatchesAndAllNullBatches) {
+  const auto binary = StringKeys(
+      {"discarded long prefix", "x", "", std::nullopt, "1234567", "ignored long suffix"});
+  const auto utf8 =
+      StringKeys({"discarded long prefix", "", "x", "1234567", std::nullopt, "ignored long suffix"},
+                 arrow::utf8());
+  Check({BatchOf({binary->Slice(1, 0), utf8->Slice(1, 0)}),
+         BatchOf({StringKeys({std::nullopt, std::nullopt}),
+                  StringKeys({std::nullopt, std::nullopt}, arrow::utf8())}),
+         BatchOf({binary->Slice(1, 4), utf8->Slice(1, 4)}),
+         BatchOf({binary->Slice(3, 0), utf8->Slice(3, 0)}),
+         BatchOf({binary->Slice(2, 2), utf8->Slice(2, 2)})});
+}
+
+TEST_P(KeyTableTest, StringColumnBoundariesAndUnsupportedMixedSchemas) {
+  const auto first = StringKeys({"a", "ab", "", "abc", std::nullopt, "", "a"});
+  const auto second = StringKeys({"bc", "c", "abc", "", "", std::nullopt, "bc"}, arrow::utf8());
+  const auto numbers = Int64s({1, 2, 3, 4, 5, 6, 1});
+  Check({BatchOf({first, second}), BatchOf({first->Slice(1, 5), second->Slice(1, 5)})});
+  Check({BatchOf({first, numbers}), BatchOf({first, numbers})});
+  Check({BatchOf({first, second, first}), BatchOf({first, second, first})});
+}
+
+TEST_P(KeyTableTest, StringPromotionPreservesIdsAndLookupNeverAddsGroups) {
+  const std::unique_ptr<KeyTable> table = MakeTable({arrow::binary(), arrow::utf8()});
+  ASSERT_NE(table, nullptr);
+  Expected expected;
+  const auto initial = BatchOf({StringKeys({std::nullopt, "", "a", "abc", "1234567"}),
+                                StringKeys({"", std::nullopt, "bc", "", "x"}, arrow::utf8())});
+  ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+  ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(
+      *table,
+      BatchOf({StringKeys({"b", "a", ""}), StringKeys({"c", "bc", std::nullopt}, arrow::utf8())}),
+      expected));
+  const auto early = table->Uniques();
+  ASSERT_TRUE(early.ok()) << early.status().ToString();
+  const std::size_t early_groups = expected.key_of.size();
+  const auto short_probe = BatchOf({StringKeys({"a", "missing", std::nullopt, ""}),
+                                    StringKeys({"bc", "", "", std::nullopt}, arrow::utf8())});
+  ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, short_probe, expected));
+  // A long lookup is unknown even where replacing its value by NULL would find a group.
+  const auto long_probe =
+      BatchOf({StringKeys({"unknown long value", "a", ""}),
+               StringKeys({"", "long unknown value", std::nullopt}, arrow::utf8())});
+  ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, long_probe, expected));
+  ASSERT_NO_FATAL_FAILURE(
+      ConsumeAndCheck(*table,
+                      BatchOf({StringKeys({"abcdefgh", "a", std::nullopt, ""}),
+                               StringKeys({"x", "bc", "", "long second column"}, arrow::utf8())}),
+                      expected));
+  ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+  ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, short_probe, expected));
+  ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, long_probe, expected));
+  ASSERT_NO_FATAL_FAILURE(
+      LookupAndCheck(*table,
+                     BatchOf({StringKeys({"abcdefgh", "", "abcdefgh"}),
+                              StringKeys({"x", "long second column", "missing"}, arrow::utf8())}),
+                     expected));
+  const auto uniques = table->Uniques();
+  ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
+  CheckUniques(*uniques, expected, TypesOf(initial), expected.key_of.size());
+  CheckUniques(*early, expected, TypesOf(initial), early_groups);
+}
+
+TEST_P(KeyTableTest, StringIdsAndUniquesOwnTheirMemoryAcrossPromotionAndDestruction) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto made = MakeKeyTable({arrow::binary()}, &ctx, {.kind = GetParam()});
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    auto table = std::move(*made);
+    const auto initial = BatchOf({StringKeys({"a", "", std::nullopt, "1234567", "a"})});
+    Expected expected;
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    const auto retained_ids = table->Consume(initial);
+    ASSERT_TRUE(retained_ids.ok()) << retained_ids.status().ToString();
+    const std::vector<std::uint32_t> copied_ids(retained_ids->ids.begin(), retained_ids->ids.end());
+    const auto retained_uniques = table->Uniques();
+    ASSERT_TRUE(retained_uniques.ok()) << retained_uniques.status().ToString();
+    const std::size_t retained_groups = expected.key_of.size();
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(
+        *table, BatchOf({StringKeys({"12345678", "a", "new longer value", ""})}), expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    table.reset();
+    EXPECT_EQ(std::vector<std::uint32_t>(retained_ids->ids.begin(), retained_ids->ids.end()),
+              copied_ids);
+    CheckUniques(*retained_uniques, expected, TypesOf(initial), retained_groups);
+    EXPECT_GT(budget.bytes_allocated(), 0);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+class PackedStringKeyTableTest : public testing::ExecTest {};
+
+TEST_F(PackedStringKeyTableTest, FailedPromotionPreservesKeysAndReleasesAllocations) {
+  constexpr std::int64_t kLimit = std::int64_t{4} * 1024 * 1024;
+  std::vector<std::optional<std::string>> first;
+  std::vector<std::optional<std::string>> second;
+  for (int i = 0; i < 256; ++i) {
+    first.emplace_back(std::to_string(i));
+    second.emplace_back("tag");
+  }
+  const auto initial = BatchOf({StringKeys(first), StringKeys(second, arrow::utf8())});
+  const auto long_key = BatchOf({StringKeys({"a new long key"}), StringKeys({"z"}, arrow::utf8())});
+  // A failed promotion keeps all existing keys intact. Disposable scratch may be released
+  // before the failure; retrying after restoring budget headroom must still work.
+  for (const std::int64_t spare : {0, 1024}) {
+    SCOPED_TRACE("spare bytes " + std::to_string(spare));
+    MemoryBudget budget(kLimit);
+    {
+      arrow::compute::ExecContext ctx(&budget);
+      auto table = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                                {.kind = KeyTableKind::kPackedStrings});
+      ASSERT_TRUE(table.ok()) << table.status().ToString();
+      Expected expected;
+      ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(**table, initial, expected));
+      EXPECT_GT(budget.bytes_allocated(), 0);
+      const std::int64_t reserved = kLimit - budget.bytes_allocated() - spare;
+      ASSERT_TRUE(budget.Reserve(reserved).ok());
+      const auto failed = (*table)->Consume(long_key);
+      EXPECT_TRUE(failed.status().IsOutOfMemory()) << failed.status().ToString();
+      EXPECT_NE(failed.status().message().find("memory limit"), std::string::npos);
+      budget.Release(reserved);
+      ASSERT_NO_FATAL_FAILURE(LookupAndCheck(**table, initial, expected));
+      const auto uniques = (*table)->Uniques();
+      ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
+      CheckUniques(*uniques, expected, TypesOf(initial), expected.key_of.size());
+      ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(**table, long_key, expected));
+      ASSERT_NO_FATAL_FAILURE(LookupAndCheck(**table, initial, expected));
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(PackedStringKeyTableTest, RetainedResultsSurviveScratchReuseGrowthAndDestruction) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                             {.kind = KeyTableKind::kPackedStrings});
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    auto table = std::move(*made);
+    const auto initial = BatchOf({StringKeys({"a", "", std::nullopt, "1234567"}),
+                                  StringKeys({"x", std::nullopt, "", "z"}, arrow::utf8())});
+    Expected expected;
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    const auto ids = table->Consume(initial);
+    ASSERT_TRUE(ids.ok()) << ids.status().ToString();
+    const std::vector<std::uint32_t> copied_ids(ids->ids.begin(), ids->ids.end());
+    const auto probe = BatchOf(
+        {StringKeys({"a", "other", std::nullopt}), StringKeys({"x", "value", ""}, arrow::utf8())});
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, probe, expected));
+    const auto lookup = table->Lookup(probe);
+    ASSERT_TRUE(lookup.ok()) << lookup.status().ToString();
+    const auto lookup_copy = (*lookup)->ToString();
+    const auto uniques = table->Uniques();
+    ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
+    const auto initial_groups = expected.key_of.size();
+    std::vector<std::optional<std::string>> a(1024, "other");
+    std::vector<std::optional<std::string>> b(1024, "value");
+    const auto larger = BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+    const auto cached_growth = larger.Slice(1, 256);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, cached_growth, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, cached_growth, expected));
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, larger, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, larger, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+    table.reset();
+    EXPECT_EQ(std::vector<std::uint32_t>(ids->ids.begin(), ids->ids.end()), copied_ids);
+    EXPECT_EQ((*lookup)->ToString(), lookup_copy);
+    CheckUniques(*uniques, expected, TypesOf(initial), initial_groups);
+    EXPECT_GT(budget.bytes_allocated(), 0);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(PackedStringKeyTableTest, SmallScratchSurvivesLargeTemporariesAndLookupPromotionReleasesIt) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                             {.kind = KeyTableKind::kPackedStrings});
+    ASSERT_TRUE(made.ok()) << made.status().ToString();
+    auto table = std::move(*made);
+    const auto repeated = [](std::size_t rows) {
+      const std::vector<std::optional<std::string>> a(rows, "a");
+      const std::vector<std::optional<std::string>> b(rows, "b");
+      return BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+    };
+    const auto small = BatchOf({StringKeys({"a"}), StringKeys({"b"}, arrow::utf8())});
+    Expected expected;
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, repeated(255), expected));
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, repeated(255), expected));
+    const auto at_limit = repeated(256);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, at_limit, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, at_limit, expected));
+    const auto cached_bytes = budget.bytes_allocated();
+    // Only one group exists. Larger batches must not retain packing capacity, and must keep
+    // the existing small cache available. All returned ID/lookup buffers are released here.
+    for (const std::size_t rows : {std::size_t{257}, std::size_t{65536}}) {
+      SCOPED_TRACE(rows);
+      const auto large = repeated(rows);
+      ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, large, expected));
+      EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+      ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, large, expected));
+      EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+    }
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, small, expected));
+    ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, small, expected));
+    EXPECT_EQ(budget.bytes_allocated(), cached_bytes);
+    const auto long_probe =
+        BatchOf({StringKeys({"a longer missing key"}), StringKeys({"b"}, arrow::utf8())});
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, long_probe, expected));
+    EXPECT_LT(budget.bytes_allocated(), cached_bytes);
+    ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, small, expected));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(PackedStringKeyTableTest, FailedCachedOrTemporaryPackingPreservesKeysAndAllowsRetry) {
+  constexpr std::int64_t kLimit = std::int64_t{4} * 1024 * 1024;
+  for (const bool lookup : {false, true}) {
+    SCOPED_TRACE(lookup ? "lookup" : "consume");
+    for (const std::size_t rows : {std::size_t{256}, std::size_t{4096}}) {
+      SCOPED_TRACE(rows);
+      MemoryBudget budget(kLimit);
+      {
+        arrow::compute::ExecContext ctx(&budget);
+        auto made = MakeKeyTable({arrow::binary(), arrow::utf8()}, &ctx,
+                                 {.kind = KeyTableKind::kPackedStrings});
+        ASSERT_TRUE(made.ok()) << made.status().ToString();
+        auto table = std::move(*made);
+        const auto initial = BatchOf(
+            {StringKeys({"a", "", std::nullopt}), StringKeys({"x", "y", "z"}, arrow::utf8())});
+        Expected expected;
+        ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, initial, expected));
+        const std::vector<std::optional<std::string>> a(rows, "new");
+        const std::vector<std::optional<std::string>> b(rows, "pair");
+        const auto large = BatchOf({StringKeys(a), StringKeys(b, arrow::utf8())});
+        const auto reserved = kLimit - budget.bytes_allocated();
+        ASSERT_TRUE(budget.Reserve(reserved).ok());
+        const arrow::Status failed =
+            lookup ? table->Lookup(large).status() : table->Consume(large).status();
+        EXPECT_TRUE(failed.IsOutOfMemory()) << failed.ToString();
+        budget.Release(reserved);
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, initial, expected));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, large, expected));
+        ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, large, expected));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, initial, expected));
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+    }
+  }
+}
+
 // The rows of a GROUP BY (COUNT(*) and SUM per key), through part tables of the kind whose
 // partitions merge into lane tables of the kind, and through one serial table of the kind: both
 // are the keys' own counts and sums.
@@ -571,6 +877,121 @@ TEST_P(KeyTableTest, AGroupByGivesTheSameRowsWithEveryKind) {
   }
   std::ranges::sort(single);
   EXPECT_EQ(single, expected);
+}
+
+TEST_P(KeyTableTest, TwoStringGroupsMergeAfterPromotionWithTheirOriginalValues) {
+  using StringPair = std::pair<std::optional<std::string>, std::optional<std::string>>;
+  using Totals = std::map<StringPair, std::pair<std::int64_t, std::int64_t>>;
+  using Results = std::map<StringPair, std::pair<std::int64_t, std::string>>;
+  const std::vector<plan::BoundColumn> keys = {Column(0, "a", LogicalType::kVarchar),
+                                               Column(1, "b", LogicalType::kVarchar)};
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kSum,
+       .arg = Column(2, "v", LogicalType::kBigInt),
+       .type = LogicalType::kHugeInt}};
+  const auto schema =
+      arrow::schema({arrow::field("a", arrow::binary()), arrow::field("b", arrow::binary()),
+                     arrow::field("v", arrow::int64())});
+  const auto out =
+      arrow::schema({arrow::field("a", arrow::binary()), arrow::field("b", arrow::binary()),
+                     arrow::field("count", arrow::int64()),
+                     arrow::field("sum", plan::ToArrow(LogicalType::kHugeInt))});
+  const KeyTableOptions kind{.kind = GetParam()};
+  const std::array<std::optional<std::string>, 6> palette = {
+      std::nullopt, "", "a", "ab", std::string("a\0", 2), "1234567"};
+  std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> parts(3);
+  Totals totals;
+  for (std::size_t p = 0; p < parts.size(); ++p) {
+    for (std::size_t b = 0; b < 2; ++b) {
+      std::vector<std::optional<std::string>> first;
+      std::vector<std::optional<std::string>> second;
+      std::vector<std::optional<std::int64_t>> values;
+      for (std::size_t r = 0; r < 30; ++r) {
+        auto a = palette[r % palette.size()];
+        auto other = palette[((r / palette.size()) + b) % palette.size()];
+        if (p == 1 && b == 1 && r == 0) {
+          a = "a longer first key";
+        }
+        if (p == 2 && b == 1 && r == 1) {
+          other = "a longer second key";
+        }
+        const auto value = Narrow<std::int64_t>(r) - 12;
+        first.push_back(a);
+        second.push_back(other);
+        values.emplace_back(value);
+        auto& [count, sum] = totals[{a, other}];
+        ++count;
+        sum += value;
+      }
+      parts[p].push_back(
+          arrow::RecordBatch::Make(schema, Narrow<std::int64_t>(values.size()),
+                                   {StringKeys(first), StringKeys(second), Int64s(values)}));
+    }
+  }
+  Results expected;
+  for (const auto& [key, total] : totals) {
+    expected.emplace(key, std::make_pair(total.first, std::to_string(total.second)));
+  }
+  const auto collect = [&out](GroupTable& table, Results& results) {
+    while (true) {
+      const auto chunk = table.NextChunk(out);
+      ASSERT_TRUE(chunk.ok()) << chunk.status().ToString();
+      if (*chunk == nullptr) {
+        return;
+      }
+      const auto& first = static_cast<const arrow::BinaryArray&>(*(*chunk)->column(0));
+      const auto& second = static_cast<const arrow::BinaryArray&>(*(*chunk)->column(1));
+      const auto& counts = static_cast<const arrow::Int64Array&>(*(*chunk)->column(2));
+      for (std::int64_t r = 0; r < (*chunk)->num_rows(); ++r) {
+        const StringPair key = {
+            first.IsNull(r) ? std::nullopt : std::optional<std::string>(first.GetString(r)),
+            second.IsNull(r) ? std::nullopt : std::optional<std::string>(second.GetString(r))};
+        const auto sum = (*chunk)->column(3)->GetScalar(r);
+        ASSERT_TRUE(sum.ok()) << sum.status().ToString();
+        EXPECT_TRUE(
+            results.emplace(key, std::make_pair(counts.Value(r), (*sum)->ToString())).second)
+            << "one group appeared twice";
+      }
+    }
+  };
+  MemoryBudget budget(std::nullopt);
+  {
+    std::vector<std::unique_ptr<GroupTable>> part_tables;
+    for (const auto& batches : parts) {
+      auto part = GroupTable::Make(keys, calls, 3, &budget, &budget,
+                                   /*first_keys=*/false, GroupTable::kPartitions, kind);
+      ASSERT_TRUE(part.ok()) << part.status().ToString();
+      for (const auto& batch : batches) {
+        ASSERT_TRUE((*part)->Consume(*batch).ok());
+      }
+      ASSERT_TRUE((*part)->Partition().ok());
+      part_tables.push_back(std::move(*part));
+    }
+    Results merged;
+    for (std::size_t p = 0; p < GroupTable::kPartitions; ++p) {
+      auto lane = GroupTable::Make(keys, calls, 3, &budget, &budget,
+                                   /*first_keys=*/true, GroupTable::kPartitions, kind);
+      ASSERT_TRUE(lane.ok()) << lane.status().ToString();
+      for (const auto& part : part_tables) {
+        ASSERT_TRUE((*lane)->MergePartition(*part, p).ok());
+      }
+      ASSERT_NO_FATAL_FAILURE(collect(**lane, merged));
+    }
+    EXPECT_EQ(merged, expected);
+    auto serial = GroupTable::Make(keys, calls, 3, &budget, &budget,
+                                   /*first_keys=*/true, GroupTable::kPartitions, kind);
+    ASSERT_TRUE(serial.ok()) << serial.status().ToString();
+    for (const auto& batches : parts) {
+      for (const auto& batch : batches) {
+        ASSERT_TRUE((*serial)->Consume(*batch).ok());
+      }
+    }
+    Results single;
+    ASSERT_NO_FATAL_FAILURE(collect(**serial, single));
+    EXPECT_EQ(single, expected);
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
 // Lookup (a set operation's inputs that only look up, docs/adr/0039-set-operations.md): a known
