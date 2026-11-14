@@ -1,0 +1,8 @@
+Output: s:HUGEINT
+Aggregate SUM("(c.ct_id * count_star())")
+  Compute (c.ct_id * count_star())
+    Filter "count_star()" > 0
+      Join INNER build=left keys=["c.ct_id" = "r.rd_city"] carries 1 of 3 unread above
+        Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+        GroupAggregate keys=["r.rd_city"] COUNT(*)
+          Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]

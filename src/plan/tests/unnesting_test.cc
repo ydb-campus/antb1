@@ -543,6 +543,39 @@ TEST(UnnestingTest, TheProofStopsAtEveryOtherNode) {
   }
 }
 
+// What the walk meets from where a value outside a condition stands (ADR 0041's SQ5b): a select
+// item's comparison over the value is a Compute, which rejects nothing, so the Project above
+// decides LEFT; and an aggregate's argument over the value stops at the aggregation, below any
+// Filter over the aggregation that reads the value's column.
+TEST(UnnestingTest, TheProofLeavesAValueOutsideAConditionLeft) {
+  const ExprPtr v = std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.id = kValue}, .type = LogicalType::kBigInt, .name = "v"});
+  const ExprPtr positive = std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = Compare(kValue, CompareOp::kGt, 0), .operands = {v}},
+           .type = LogicalType::kBoolean,
+           .name = "(v > 0)"});
+  constexpr ColumnId kPositive{52};
+  EXPECT_EQ(
+      Proof({ProjectNode{.input = nullptr, .columns = {}, .constants = {}, .ids = {}, .span = {}},
+             ComputeNode{.input = nullptr, .exprs = {positive}, .ids = {kPositive}, .span = {}}},
+            NullValue()),
+      JoinBack::kLeft);
+  const ExprPtr product = std::make_shared<const Expr>(Expr{
+      .node = ArithExpr{.op = ArithOp::kMultiply,
+                        .left = std::make_shared<const Expr>(Expr{.node = ColumnExpr{.id = kOuter},
+                                                                  .type = LogicalType::kBigInt,
+                                                                  .name = "o"}),
+                        .right = v},
+      .type = LogicalType::kBigInt,
+      .name = "o * v"});
+  constexpr ColumnId kProduct{53};
+  EXPECT_EQ(
+      Proof({FilterOf({Compare(kValue, CompareOp::kGt, 0)}), GroupAggregateNode{},
+             ComputeNode{.input = nullptr, .exprs = {product}, .ids = {kProduct}, .span = {}}},
+            NullValue()),
+      JoinBack::kLeft);
+}
+
 // What a Compute below a passed node derives from the value is tracked across it: 2 * v is NULL
 // where v is, through an inner join and a Filter that decides nothing; COALESCE(v, v) is not known.
 TEST(UnnestingTest, TheProofTracksComputesAcrossPassedNodes) {
@@ -795,6 +828,70 @@ TEST(UnnestingTest, TheProofDecidesTheJoinBackOfAValueInACondition) {
                                    "> 0",
                                    kCount),
                 .join_backs = {JoinBack::kLeft}},
+       }) {
+    SCOPED_TRACE(c.sql);
+    const Unnested unnested = UnnestedOf(c.sql);
+    EXPECT_EQ(unnested.join_backs, c.join_backs) << unnested.text;
+  }
+}
+
+// ADR 0041's SQ5b: a correlated value outside a condition. Its join back meets the block's
+// aggregation, Sort or Project before any Filter that rejects its empty value, so it is LEFT: a
+// select item (alone, in a CASE, under LIMIT or DISTINCT), an ORDER BY item, a GROUP BY key (next
+// to ROLLUP too), an aggregate's argument (also in HAVING), a value in a correlated block's item.
+// Where a condition of WHERE or an inner ON that rejects it reads the value too, the value stands
+// below that condition, which decides it INNER; under OR, or as an IN probe, it stays LEFT.
+TEST(UnnestingTest, TheProofDecidesTheJoinBackOfAValueOutsideConditions) {
+  constexpr std::string_view kSum = "(SELECT SUM(u.i32) FROM u WHERE u.i64 = t.i64)";
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  constexpr std::string_view kOtherSum = "(SELECT SUM(ok.i16) FROM ok WHERE ok.i16 = t.i16)";
+  constexpr JoinBack kLeft = JoinBack::kLeft;
+  constexpr JoinBack kInner = JoinBack::kInner;
+  struct Case {
+    std::string sql;
+    std::vector<JoinBack> join_backs;
+  };
+  for (const Case& c : {
+           Case{.sql = std::format("SELECT i16, {} FROM t", kCount), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT i16, {} FROM t", kSum), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT CASE WHEN {} > 0 THEN 1 ELSE 0 END FROM t", kSum),
+                .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT i16, {} FROM t LIMIT 2", kSum), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT DISTINCT {} FROM t", kSum), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT i16 FROM t ORDER BY {}", kSum), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT {} AS k, COUNT(*) FROM t GROUP BY 1", kSum),
+                .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT {0} AS k, i16 % 2 AS p, COUNT(*) FROM t GROUP BY {0}, "
+                                   "ROLLUP (i16 % 2)",
+                                   kSum),
+                .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT SUM(i32 * {}) FROM t", kSum), .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT i16 FROM t GROUP BY i16 HAVING SUM(i32 * {}) > 0", kSum),
+                .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT {}, {} FROM t", kSum, kOtherSum),
+                .join_backs = {kLeft, kLeft}},
+           Case{.sql = std::format("SELECT i16, {0} FROM t WHERE {0} > 0", kSum),
+                .join_backs = {kInner}},
+           Case{.sql = std::format("SELECT i16, {0} FROM t WHERE {0} > 0 OR i16 = 1", kSum),
+                .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT t.i16, {0} FROM t JOIN ok ON ok.i16 = t.i16 AND {0} > 0",
+                                   kSum),
+                .join_backs = {kInner}},
+           Case{.sql =
+                    std::format("SELECT {0} AS k, COUNT(*) FROM t WHERE {0} > 0 GROUP BY 1", kSum),
+                .join_backs = {kInner}},
+           Case{
+               .sql = std::format("SELECT i16, {0} FROM t WHERE {0} IN (SELECT i16 FROM ok)", kSum),
+               .join_backs = {kLeft}},
+           Case{.sql = std::format("SELECT i16, {} FROM t WHERE {} > 0", kSum, kOtherSum),
+                .join_backs = {kLeft, kInner}},
+           // The outer value in WHERE, and the value in its block's aggregate argument.
+           Case{.sql = "SELECT i16 FROM t WHERE (SELECT MAX(u.i32 + (SELECT COUNT(*) FROM ok WHERE "
+                       "ok.i16 = u.i16)) FROM u WHERE u.i64 = t.i64) > 5",
+                .join_backs = {kInner, kLeft}},
+           Case{.sql = "SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 = "
+                       "u.i16)) FROM u WHERE u.i64 = t.i64) FROM t",
+                .join_backs = {kLeft, kLeft}},
        }) {
     SCOPED_TRACE(c.sql);
     const Unnested unnested = UnnestedOf(c.sql);

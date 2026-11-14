@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -2272,6 +2273,126 @@ TEST(OptimizerTest, Path2RefusesAnOuterColumnWithoutAnInnerEquivalent) {
 TEST(OptimizerTest, TheUnnestingPassLeavesAnOrdinaryPlanAlone) {
   const LogicalPlan plan = Optimized("SELECT COUNT(*) FROM t");
   EXPECT_TRUE(std::holds_alternative<RowCountNode>(*plan.root)) << Explain(plan);
+}
+
+// ---- ADR 0041's SQ5b: the passes over a correlated value outside a condition ----
+
+// A LIMIT without ORDER BY moves below the maps above a LEFT join back (LimitBelowProject crosses
+// Projects and Computes): the subquery's own item, COALESCE and the select item are computed only
+// for the rows kept, which is D24's member (DuckDB computes the subquery's item for every binding).
+// It never crosses a join -- the join back, nor the one-row join of an uncorrelated value that the
+// item holds -- so the outer row count it limits is the join's own; with ORDER BY it stays above
+// the Sort.
+TEST(OptimizerTest, ALimitMovesBelowTheItemsOverALeftJoinBack) {
+  EXPECT_EQ(Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1 "
+                              "FROM t LIMIT 2")),
+            "Output: i16:SMALLINT ((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1):BIGINT\n"
+            "Project i16, \"((SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) - 1)\"\n"
+            "  Compute ((count_star() - 1) - 1)\n"
+            "    Compute (count_star() - 1)\n"
+            "      Compute (count_star() - 1)\n"
+            "        Compute COALESCE(count_star(), 0)\n"
+            "          Limit 2\n"
+            "            Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread "
+            "above\n"
+            "              Scan table=t source=fake columns=[i16, i64]\n"
+            "              GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
+            "                Scan table=u source=fake columns=[i64]\n");
+  EXPECT_EQ(Explain(Optimized("SELECT i16, (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64) FROM t "
+                              "ORDER BY 2 LIMIT 2")),
+            "Output: i16:SMALLINT (SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64):BIGINT\n"
+            "Project i16, \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\"\n"
+            "  Limit 2\n"
+            "    Sort \"(SELECT COUNT(*) - 1 FROM u WHERE u.i64 = t.i64)\" ASC NULLS LAST\n"
+            "      Compute (count_star() - 1)\n"
+            "        Compute (count_star() - 1)\n"
+            "          Compute COALESCE(count_star(), 0)\n"
+            "            Join LEFT build=right keys=[\"t.i64\" = \"u.i64\"] carries 2 of 4 unread "
+            "above\n"
+            "              Scan table=t source=fake columns=[i16, i64]\n"
+            "              GroupAggregate keys=[\"u.i64\"] COUNT(*)\n"
+            "                Scan table=u source=fake columns=[i64]\n");
+  const std::string one_row = Explain(Optimized(
+      "SELECT i16, (SELECT COUNT(*) + (SELECT MIN(i16) FROM ok) FROM u WHERE u.i64 = t.i64) FROM t "
+      "LIMIT 2"));
+  const std::size_t limit = one_row.find("Limit 2");
+  const std::size_t join = one_row.find("Join ONE-ROW");
+  ASSERT_NE(limit, std::string::npos) << one_row;
+  ASSERT_NE(join, std::string::npos) << one_row;
+  EXPECT_LT(limit, join) << one_row;
+  EXPECT_EQ(one_row.find('\n', limit) + 1, one_row.rfind('\n', join) + 1) << "directly above it\n"
+                                                                          << one_row;
+}
+
+// DependentKeys over a join back's value: a key computed from another key moves above the
+// aggregation, (q) + 1 over (q), but not under a LIMIT without ORDER BY (ADR 0018), and an outer
+// column next to the value stays a key of its own.
+TEST(OptimizerTest, DependentKeysOverAJoinBack) {
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  const auto keys = [](const LogicalPlan& plan) -> std::size_t {
+    for (LogicalNodePtr node = plan.root; node != nullptr;) {
+      if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
+        return group->keys.size();
+      }
+      const std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+      node = inputs.empty() ? nullptr : inputs[0];
+    }
+    return 0;
+  };
+  const LogicalPlan dependent = Optimized(
+      std::format("SELECT {0} AS k, {0} + 1 AS k1, COUNT(*) FROM t GROUP BY 1, 2", kCount));
+  EXPECT_EQ(keys(dependent), 1U) << Explain(dependent);
+  EXPECT_NE(Explain(dependent).find("Compute (count_star() + 1)\n      GroupAggregate"),
+            std::string::npos)
+      << Explain(dependent);
+  const LogicalPlan limited = Optimized(
+      std::format("SELECT {0} AS k, {0} + 1 AS k1, COUNT(*) FROM t GROUP BY 1, 2 LIMIT 1", kCount));
+  EXPECT_EQ(keys(limited), 2U) << Explain(limited);
+  for (const std::string_view limit : {"", " LIMIT 1"}) {
+    const LogicalPlan outer = Optimized(
+        std::format("SELECT i16, {} AS k, COUNT(*) FROM t GROUP BY 1, 2{}", kCount, limit));
+    EXPECT_EQ(keys(outer), 2U) << Explain(outer);
+  }
+}
+
+// A join back stands above the block's own joins, which join ordering arranges among FROM's
+// relations alone (ADR 0040): the LEFT join's left input is the inner join of t and ok.
+TEST(OptimizerTest, AJoinBackStandsAboveTheBlocksJoins) {
+  const LogicalPlan plan = Optimized(
+      "SELECT t.i16, (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) FROM t JOIN ok ON ok.i16 = "
+      "t.i16");
+  const auto* join = JoinUnder(plan);
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  EXPECT_EQ(join->kind, JoinKind::kLeft) << Explain(plan);
+  const auto* below = std::get_if<JoinNode>(join->left.get());
+  ASSERT_NE(below, nullptr) << Explain(plan);
+  EXPECT_EQ(below->kind, JoinKind::kInner) << Explain(plan);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+}
+
+// The semi-join reduction under a select item's LEFT join back clones the outer side below it,
+// WHERE's filters included, so the aggregation computes only the keys WHERE keeps; below a stack,
+// where WHERE holds a correlated value of its own, it clones the base under that value's join.
+TEST(OptimizerTest, ATailValuesReductionClonesWhatWhereKeeps) {
+  const std::string filtered = Explain(Optimized(
+      "SELECT ok.i16, (SELECT COUNT(*) FROM t WHERE t.i16 = ok.i16) FROM ok WHERE ok.i16 > 0"));
+  EXPECT_NE(filtered.find("      GroupAggregate keys=[\"t.i16\"] COUNT(*)\n"
+                          "        Join SEMI build=right keys=[\"t.i16\" = \"ok.i16\"]\n"
+                          "          Scan table=t source=fake columns=[i16]\n"
+                          "          Filter i16 > 0"),
+            std::string::npos)
+      << filtered;
+  const std::string stacked = Explain(Optimized(
+      "SELECT ok.i16, (SELECT COUNT(*) FROM t WHERE t.i16 = ok.i16) FROM ok WHERE (SELECT COUNT(*) "
+      "FROM st WHERE st.i16 = ok.i16) > 0"));
+  EXPECT_NE(stacked.find("GroupAggregate keys=[\"t.i16\"] COUNT(*)\n"), std::string::npos)
+      << stacked;
+  const std::size_t semi = stacked.find(R"(Join SEMI build=right keys=["t.i16" = "ok.i16"])");
+  ASSERT_NE(semi, std::string::npos) << stacked;
+  // The clone, its build: the bare scan of ok.
+  const std::size_t clone = stacked.find("Scan table=ok", semi);
+  ASSERT_NE(clone, std::string::npos) << stacked;
+  EXPECT_EQ(stacked.find("Join", semi + 1), std::string::npos) << stacked;
 }
 
 }  // namespace

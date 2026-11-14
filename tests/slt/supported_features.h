@@ -187,6 +187,16 @@ enum class Feature : std::uint8_t {
   // NOT, CASE, arithmetic, BETWEEN, IN, AND and literals record theirs, its blocks as
   // kCorrelatedEmptyValue's do.
   kCorrelatedConditionValue,  // (SELECT COUNT(*) FROM i WHERE i.k = o.k) = 0 OR o.x > 2
+  // SQ5b's correlated values outside conditions (ADR 0041): kCorrelatedEmptyValue's block as a
+  // value in one more select item of a block that does not aggregate (alone, plus an outer
+  // integer column whose type holds the sum, in a CASE WHEN, or in COALESCE over a call NULL over
+  // no rows), in its ORDER BY (written there, or such an item ordered by its alias or position),
+  // as a GROUP BY key (such an item grouped by its alias or position), or inside an aggregate's
+  // argument beside an outer integer column, SUM(o.x * (q)), in the select list, HAVING or ORDER
+  // BY. Its COALESCE, ASC, DESC and the outer columns that break an ORDER BY's ties record no
+  // feature of their own; its CASE, arithmetic, alias, position, ORDER BY, NULLS order, GROUP BY,
+  // HAVING, aggregates and literals record theirs, its block as kCorrelatedEmptyValue's does.
+  kCorrelatedItemValue,  // SELECT o.x, (SELECT COUNT(*) FROM i WHERE i.k = o.k) FROM o
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -373,6 +383,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_empty_value";
     case Feature::kCorrelatedConditionValue:
       return "correlated_condition_value";
+    case Feature::kCorrelatedItemValue:
+      return "correlated_item_value";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -541,6 +553,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kInForm,
     Feature::kCorrelatedEmptyValue,
     Feature::kCorrelatedConditionValue,
+    Feature::kCorrelatedItemValue,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

@@ -1536,23 +1536,8 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT ok.i16 FROM ok WHERE ok.i16 = "
                   "u.i32) FROM u)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        // A correlated value outside a condition (ADR 0041's SQ5b): a select item, ORDER BY, a
-        // GROUP BY key and an aggregate argument with a column; and a correlated EXISTS (SQ8).
-        ErrorCase{"SELECT (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) FROM t", kUnsupported, "(",
-                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
-                  "inner ON"},
-        ErrorCase{"SELECT i16 FROM t ORDER BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
-                  "inner ON"},
-        ErrorCase{"SELECT COUNT(*) FROM t GROUP BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
-                  "inner ON"},
-        ErrorCase{"SELECT SUM(i32 + (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)) FROM t",
-                  kUnsupported, "(",
-                  "a correlated scalar subquery is supported only in a condition of WHERE or an "
-                  "inner ON"},
+        // A correlated EXISTS outside a top-level conjunct (SQ8); a correlated value stands in a
+        // select item (CorrelatedSelectValuePlacements, ADR 0041's SQ5b).
         ErrorCase{"SELECT CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END "
                   "FROM t",
                   kUnsupported, "EXISTS", "a correlated EXISTS"},
@@ -8625,6 +8610,337 @@ TEST(BinderTest, AGlobalBlocksOrderByMarkKeepsItsProbesAggregate) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
     const LogicalPlan optimized = Optimized(*plan);
     EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+  }
+}
+
+// ADR 0041's SQ5b: a correlated value in a select item, ORDER BY, a GROUP BY key and an
+// aggregate's argument that reads a column, in any block, as an uncorrelated one stands there
+// (SelectValuePlacements, GroupValuePlacements) and SQ5a's in a condition.
+TEST(BinderTest, CorrelatedSelectValuePlacements) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  for (const std::string& sql : {
+           std::string("SELECT (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64) FROM t"),
+           std::string("SELECT i16 FROM t ORDER BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)"),
+           std::string(
+               "SELECT COUNT(*) FROM t GROUP BY (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)"),
+           std::string("SELECT SUM(i32 + (SELECT MIN(u.i16) FROM u WHERE u.i64 = t.i64)) FROM t"),
+           // HAVING's and ORDER BY's aggregate arguments, DISTINCT, LIMIT.
+           std::format("SELECT i16 FROM t GROUP BY i16 HAVING SUM(i32 * {}) > 0", kCount),
+           std::format("SELECT i16 FROM t GROUP BY i16 ORDER BY MAX(i32 + {})", kCount),
+           std::format("SELECT DISTINCT {} FROM t", kCount),
+           std::format("SELECT i16, {} FROM t LIMIT 2", kCount),
+           // A derived table, a CTE read twice, a UNION ALL arm.
+           std::format("SELECT x.n FROM (SELECT {} AS n FROM t) x WHERE x.n > 0", kCount),
+           std::format("WITH c AS (SELECT i16, {} AS n FROM t) SELECT a.n, b.n FROM c AS a JOIN c "
+                       "AS b ON a.i16 = b.i16",
+                       kCount),
+           std::format("SELECT {} FROM t UNION ALL SELECT COUNT(*) FROM ok", kCount),
+           // An EXISTS block's item that adds to an aggregate, whose argument is computed though
+           // the item is dropped (D32); a value in the aggregate argument of a correlated block.
+           std::string(
+               "SELECT i16 FROM t WHERE EXISTS (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok "
+               "WHERE ok.i16 = u.i16)) + 1 FROM u)"),
+           std::string("SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 = "
+                       "u.i16)) FROM u WHERE u.i64 = t.i64) FROM t"),
+           // A key next to ROLLUP, and an inner ON's value that a key reads again.
+           std::format(
+               "SELECT {} AS k, i16 % 2 AS p, COUNT(*) FROM t GROUP BY {}, ROLLUP (i16 % 2)",
+               kCount, kCount),
+           std::format("SELECT {} AS k, COUNT(*) FROM t JOIN ok ON ok.i16 = t.i16 AND {} + 0 > 0 "
+                       "GROUP BY 1",
+                       kCount, kCount),
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    ASSERT_NE(optimized.root, nullptr) << sql;
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+  }
+}
+
+// What SQ5b leaves refused, and the errors that come first: a correlated value above the
+// aggregation (SQ13), a GROUP BY key spelled otherwise among them (D38); a value in a conjunct that
+// reads an enclosing block itself; and the bind errors of a later clause, which come before the
+// unnesting's refusal of an item's subquery.
+INSTANTIATE_TEST_SUITE_P(
+    CorrelatedSelectValues, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) AS k, COUNT(*) FROM t GROUP "
+                  "BY (SELECT COUNT(*) FROM u AS U WHERE U.i64 = t.i64)",
+                  kUnsupported, "(",
+                  "a correlated subquery over a query block's aggregates is not supported"},
+        ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) AS n, SUM(i32 * (SELECT "
+                  "COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t GROUP BY i16 % 2",
+                  kUnsupported, "(",
+                  "a correlated subquery over a query block's aggregates is not supported"},
+        ErrorCase{"SELECT i16 % 2, SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t "
+                  "GROUP BY 1 HAVING (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) > 0",
+                  kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
+        ErrorCase{"SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16)) "
+                  "FROM u WHERE u.i64 = t.i64 AND (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16) > "
+                  "t.i32) FROM t",
+                  kUnsupported, "(",
+                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
+                  "query block is not supported"},
+        ErrorCase{
+            "SELECT SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t WHERE nope "
+            "> 0",
+            kBind, "nope", "column 'nope' does not exist"},
+        ErrorCase{"SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i64 < t.i64) FROM t ORDER BY nope",
+                  kBind, "nope", "column 'nope' does not exist"}));
+
+// The unnesting refuses an item's subquery whose correlation it cannot substitute -- here one of
+// two types -- once the whole query is bound: the binder answers it, and Optimize reports it.
+TEST(BinderTest, AnItemsCorrelationOfTwoTypesIsTheUnnestingsRefusal) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i32 = t.i16) FROM t";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto optimized = Optimize(*plan);
+  ASSERT_FALSE(optimized.ok()) << Explain(*optimized);
+  const auto detail = GetSqlError(optimized.status());
+  ASSERT_NE(detail, nullptr) << optimized.status().ToString();
+  EXPECT_EQ(detail->kind(), kUnsupported) << optimized.status().ToString();
+  EXPECT_EQ(SpanText(kSql, optimized.status()), "(") << optimized.status().ToString();
+  EXPECT_NE(optimized.status().message().find("has no inner equivalent"), std::string::npos)
+      << optimized.status().message();
+}
+
+// A correlated value the select list binds waits in the slot's tail, above WHERE's filters, as a
+// select-list mark does (ASelectListMarkStandsAboveTheFilters): its join back computes the
+// subquery's maps per outer row, so only over the rows WHERE keeps. That holds for a bare
+// aggregate item's argument, which binds before WHERE, and for an expression item.
+TEST(BinderTest, ACorrelatedValueInTheSelectListStandsInTheTail) {
+  const Catalog catalog = MakeCatalog();
+  const auto plan_of = [&catalog](std::string_view sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return Explain(*plan);
+  };
+  EXPECT_EQ(
+      plan_of("SELECT SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t WHERE i16 > "
+              "(SELECT MIN(i16) FROM ok)"),
+      "Output: sum((i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64))):HUGEINT\n"
+      "Aggregate SUM(\"(i32 * count_star())\")\n"
+      "  Compute (i32 * count_star())\n"
+      "    DependentJoin ONE-ROW\n"
+      "      Filter i16 > \"min(i16)\"\n"
+      "        Join ONE-ROW build=right keys=[]\n"
+      "          Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "Case\", from]\n"
+      "          Aggregate MIN(i16)\n"
+      "            Scan table=ok source=fake columns=[i16, s]\n"
+      "      Aggregate COUNT(*)\n"
+      "        Filter \"(u.i64 = t.i64)\"\n"
+      "          Compute (u.i64 = t.i64)\n"
+      "            Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+      "Case\", from]\n");
+  EXPECT_EQ(plan_of("SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) FROM t WHERE i16 > "
+                    "(SELECT MIN(i16) FROM ok)"),
+            "Output: i16:SMALLINT (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64):BIGINT\n"
+            "Project i16, \"(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)\"\n"
+            "  DependentJoin ONE-ROW\n"
+            "    Filter i16 > \"min(i16)\"\n"
+            "      Join ONE-ROW build=right keys=[]\n"
+            "        Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "\"Mixed Case\", from]\n"
+            "        Aggregate MIN(i16)\n"
+            "          Scan table=ok source=fake columns=[i16, s]\n"
+            "    Aggregate COUNT(*)\n"
+            "      Filter \"(u.i64 = t.i64)\"\n"
+            "        Compute (u.i64 = t.i64)\n"
+            "          Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, "
+            "\"Mixed Case\", from]\n");
+}
+
+// A later clause that reads a select-list value moves it from the tail to the end of its slot's
+// own entries, below that clause's own filter, join or mark (TakeFromTail): a WHERE condition, a
+// BETWEEN, an IN conjunct's probe, a mark's probe under OR, an inner ON, the other side of a
+// direct pair, and the probe of a GROUP BY key's, an ORDER BY's or a HAVING's mark. Left in the
+// tail, the value's join would stand above its reader, which would read a column nothing defines
+// there. (A plain GROUP BY key reads the value above the tail anyway, in the aggregation's input,
+// so the move only reorders.) It stays one join, and it stands above the filters of the conjuncts
+// written before its reader.
+TEST(BinderTest, ACorrelatedTailValueIsPromotedByItsReaders) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  constexpr std::string_view kOther = "(SELECT COUNT(*) FROM ok WHERE ok.i16 = t.i16)";
+  struct Case {
+    std::string sql;
+    std::string_view reader;  // the reader's node, which EXPLAIN prints above the value's join
+    std::size_t joins = 1;
+  };
+  const auto bound = [&catalog](const std::string& sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return LogicalPlan{};
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    return *std::move(plan);
+  };
+  for (const Case& c : {
+           Case{.sql = std::format("SELECT SUM(i32 * {0}) FROM t WHERE {0} > 0", kCount),
+                .reader = "Filter \"count_star()\" > 0"},
+           Case{.sql =
+                    std::format("SELECT SUM(i32 * {0}) FROM t WHERE {0} BETWEEN 1 AND 77", kCount),
+                .reader = "Filter \"count_star()\" >= 1"},
+           Case{.sql = std::format("SELECT SUM(i32 * {0}) FROM t WHERE {0} IN (SELECT i16 FROM ok)",
+                                   kCount),
+                .reader = "Join SEMI"},
+           Case{.sql = std::format(
+                    "SELECT SUM(i32 * {0}) FROM t WHERE i16 = 5 OR {0} IN (SELECT i16 FROM ok)",
+                    kCount),
+                .reader = "Join NULL-AWARE MARK"},
+           Case{.sql = std::format(
+                    "SELECT SUM(ok.i16 * {0}) FROM t JOIN ok ON ok.i16 = t.i16 AND {0} > 77",
+                    kCount),
+                .reader = "Filter \"count_star()\" > 77"},
+           Case{.sql = std::format("SELECT CASE WHEN {0} IN (SELECT i16 FROM ok) THEN 1 ELSE 0 END "
+                                   "AS k, SUM(i32 * {0}) FROM t GROUP BY 1",
+                                   kCount),
+                .reader = "Join NULL-AWARE MARK"},
+           Case{.sql = std::format("SELECT SUM(i32 * {0}), SUM(i32 * {1}) FROM t WHERE {0} >= {1}",
+                                   kCount, kOther),
+                .reader = "Filter \"count_star()\" >= \"count_star()\"",
+                .joins = 2},
+           Case{.sql = std::format("SELECT i16, {0} AS n FROM t ORDER BY CASE WHEN {0} IN (SELECT "
+                                   "i16 FROM ok) THEN 0 ELSE 1 END, 1",
+                                   kCount),
+                .reader = "Join NULL-AWARE MARK"},
+           Case{.sql = std::format("SELECT SUM(i32 * {0}) FROM t HAVING SUM(CASE WHEN {0} IN "
+                                   "(SELECT i16 FROM ok) THEN i32 ELSE 0 END) > 0",
+                                   kCount),
+                .reader = "Join NULL-AWARE MARK"},
+       }) {
+    const LogicalPlan plan = bound(c.sql);
+    ASSERT_NE(plan.root, nullptr) << c.sql;
+    const std::string text = Explain(plan);
+    EXPECT_EQ(DependentJoins(plan), c.joins) << c.sql << "\n" << text;
+    ASSERT_NE(text.find(c.reader), std::string::npos) << c.sql << "\n" << text;
+    EXPECT_LT(text.find(c.reader), text.find("DependentJoin")) << c.sql << "\n" << text;
+  }
+  // Moved when its reader binds, so after the entries of the conjuncts written before it: the
+  // value's join stands above the earlier conjunct's filter, which rejects the rows the value fails
+  // on, and below its reader's.
+  const LogicalPlan plan = bound(std::format(
+      "SELECT SUM(i32 * {0}) FROM t WHERE (SELECT MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16) + 0 > "
+      "0 AND {0} >= 0",
+      kCount));
+  ASSERT_NE(plan.root, nullptr);
+  const std::string text = Explain(plan);
+  const std::size_t reader = text.find("Filter \"count_star()\" >= 0");
+  const std::size_t join = text.find("DependentJoin");
+  const std::size_t earlier = text.find("Filter \"(max(ok.i16) + 0)\" > 0");
+  ASSERT_NE(earlier, std::string::npos) << text;
+  EXPECT_LT(reader, join) << text;
+  EXPECT_LT(join, earlier) << text;
+}
+
+// A dry run promotes nothing: OR factoring binds the branch it drops for its errors alone, so the
+// value a select-list aggregate holds stays in the tail, above the filter of the conjunct written
+// after that branch, as it would without the branch.
+TEST(BinderTest, ADryRunPromotesNothing) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t WHERE ((i16 < 9 AND "
+      "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) IS NOT NULL) OR i16 < 9) AND (SELECT "
+      "MAX(ok.i16) FROM ok WHERE ok.i16 = t.i16) + 0 > 0";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << Explain(*plan);
+  EXPECT_EQ(DependentJoins(*plan), 2U) << Explain(*plan);
+  const std::string text = Explain(*plan);
+  const std::size_t later = text.find("Filter \"(max(ok.i16) + 0)\" > 0");
+  ASSERT_NE(later, std::string::npos) << text;
+  EXPECT_LT(text.find("DependentJoin"), later) << text;
+}
+
+// The GROUP BY speculation (BindOutput) only looks a value up: a correlated one written alike is
+// the entry some key reads -- a key that is the value or an expression over it, `(q) % 2` -- else
+// the first, which a key that is a mark over the value reads through the mark. So the select list,
+// HAVING and ORDER BY read the key's value through its one join, and HAVING's direct comparison
+// over the key is read as the key too (ADR 0041's SQ5b).
+TEST(BinderTest, TheGroupBySpeculationReadsTheKeysValue) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  for (const std::string& sql : {
+           std::format("SELECT {0} % 2 AS p, COUNT(*) FROM t GROUP BY {0} % 2 ORDER BY {0} % 2",
+                       kCount),
+           std::format("SELECT CASE WHEN {0} IN (SELECT i16 FROM ok) THEN 1 ELSE 0 END AS k, "
+                       "COUNT(*) FROM t GROUP BY 1",
+                       kCount),
+           std::format("SELECT CASE WHEN {0} IN (SELECT i16 FROM ok) THEN 1 ELSE 0 END AS m, "
+                       "COUNT(*) FROM t GROUP BY {0}",
+                       kCount),
+           std::format("SELECT {0} + 1 AS k1, COUNT(*) FROM t GROUP BY {0} ORDER BY {0} DESC",
+                       kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} + 0 > 0", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING k > 0", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} > 0", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} > COUNT(*)", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} IN (SELECT i16 FROM "
+                       "ok)",
+                       kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} IN (1, 2)", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1 HAVING {0} BETWEEN 1 AND 77",
+                       kCount),
+           // An inner ON's value that a key reads again.
+           std::format("SELECT {0} AS k, COUNT(*) FROM t JOIN ok ON ok.i16 = t.i16 AND {0} + 0 > 0 "
+                       "GROUP BY 1",
+                       kCount),
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(DependentJoins(*plan), 1U) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    EXPECT_NE(optimized.root, nullptr) << sql;
+  }
+}
+
+// HAVING's direct comparison over a GROUP BY key reads a correlated key's value as the key (ADR
+// 0041's SQ5b), but an uncorrelated one keeps SQ2b's plan: the comparison's own one-row join over
+// the aggregation, next to the key's below it, which compute the same one row.
+TEST(BinderTest, HavingsDirectFormOverAnUncorrelatedKeyKeepsItsPlan) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT (SELECT MIN(i16) FROM ok) AS k, COUNT(*) FROM t GROUP BY 1 HAVING (SELECT MIN(i16) "
+      "FROM ok) > 0",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string text = Explain(*plan);
+  const std::size_t above = text.find("Join ONE-ROW");
+  const std::size_t group = text.find("GroupAggregate");
+  ASSERT_NE(above, std::string::npos) << text;
+  ASSERT_NE(group, std::string::npos) << text;
+  EXPECT_LT(above, group) << "HAVING's join stands over the aggregation\n" << text;
+  EXPECT_NE(text.find("Join ONE-ROW", group), std::string::npos) << "the key's, below it\n" << text;
+}
+
+// Decision 10 across clauses (ADR 0041's SQ5b): a select item, ORDER BY or GROUP BY key written
+// like a value a condition holds reads that value's join -- WHERE's direct operand, an inner ON's
+// value, a key's -- rather than planting one of its own.
+TEST(BinderTest, ACorrelatedValueIsReadThroughOneJoin) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
+  for (const std::string& sql : {
+           std::format("SELECT i16, {0} FROM t WHERE {0} > 0 ORDER BY {0}", kCount),
+           std::format("SELECT t.i16, {0} FROM t JOIN ok ON ok.i16 = t.i16 AND {0} > 0", kCount),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY {0} ORDER BY {0}", kCount),
+           std::format("SELECT {0} AS k, SUM(i32 * {0}) FROM t WHERE {0} > 0 GROUP BY 1", kCount),
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(DependentJoins(*plan), 1U) << sql << "\n" << Explain(*plan);
   }
 }
 

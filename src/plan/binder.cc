@@ -3771,21 +3771,26 @@ class Binder {
                                               const sql::SubqueryExpr& s);
   void InKeys(SubqueryJoin& join, const Typed& probe, const SubqueryBlock& block, LogicalType type,
               SourceSpan span);
-  // A subquery's value in a condition (ADR 0041's decisions 9 and 10), in HAVING's slot (`group`)
-  // or else the per-row slot of the conjunct being bound: its block bound once per slot, the first
-  // binding planting its one-row join there, and its column read as one of the scope.
+  // A subquery's value (ADR 0041's decisions 9 and 10), in HAVING's slot (`group`) or else the
+  // per-row slot: its block bound once per slot, the first binding planting its one-row join there,
+  // and its column read as one of the scope.
   arrow::Result<Typed> SubqueryValue(const sql::SubqueryExpr& s, bool group);
   // A block's one-row join, planted in its slot -- a dependent join where the block is correlated
-  // (ADR 0041's SQ5) -- and its value remembered there.
+  // (ADR 0041's SQ5), in the slot's tail where the select list binds it (SQ5b) -- and its value
+  // remembered there.
   Typed PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool group);
   // The value of a subquery written alike in the same slot before, or nullptr.
   struct BoundValue;
-  [[nodiscard]] const BoundValue* FindValue(
-      const sql::SubqueryExpr& s, bool group,
-      const std::function<bool(const BoundValue&)>& also = nullptr) const;
+  [[nodiscard]] BoundValue* FindValue(const sql::SubqueryExpr& s, bool group,
+                                      const std::function<bool(const BoundValue&)>& also = nullptr);
+  // A value or mark read by a clause after the select list: from its slot's tail to the end of the
+  // slot's own entries (ADR 0041's SQ7a, SQ5b); nothing for one that is not in the tail.
+  void TakeFromTail(BoundValue& known, bool group);
+  // Whether a GROUP BY key reads `value`'s column.
+  [[nodiscard]] bool KeyReads(const Typed& value) const;
   // Where a correlated value may stand (ADR 0041's SQ5): OK, or the refusal of this place -- a
-  // padded unit's left input, a conjunct that reads an enclosing block itself, an EXISTS (a mark,
-  // SQ8), or a clause other than a condition of WHERE or an inner ON (SQ5b).
+  // padded unit's left input, a conjunct that reads an enclosing block itself, or an EXISTS (a
+  // mark, SQ8).
   [[nodiscard]] arrow::Status AdmitCorrelatedValue(const sql::SubqueryExpr& s) const;
   // An IN subquery inside a condition (ADR 0041's SQ7): the BOOLEAN column of a null-aware mark
   // join of its probe and its set, in HAVING's slot (`group`) or else the per-row slot, bound once
@@ -4275,8 +4280,10 @@ class Binder {
     std::optional<std::size_t> block;  // the block whose per-row slot holds it; none: HAVING's
     sql::SubqueryExpr written;         // a copy: the first binding is often of a temporary
     Typed value;
-    ExprPtr probe;          // a mark's bound probe; null for a value
-    bool deferred = false;  // a mark in its slot's tail (row_tail_, group_tail_)
+    ExprPtr probe;  // a mark's bound probe; null for a value
+    // Its join's sub-plan, by which TakeFromTail finds the join in its slot's tail.
+    const LogicalNode* right = nullptr;
+    bool deferred = false;  // in its slot's tail (row_tail_, group_tail_)
     // A correlated value (ADR 0041's SQ5): the ids its block reads from the enclosing blocks, by
     // which the memo knows it, and the inner ON it was bound in (none: where the whole FROM is
     // visible), whose names an occurrence elsewhere may resolve differently. Empty for an
@@ -4285,17 +4292,19 @@ class Binder {
     std::optional<std::size_t> on_position;
   };
   std::vector<BoundValue> values_;
-  // The marks the select list plants, which bind before WHERE and HAVING do: each slot's tail,
-  // assembled above the slot's own entries, so a mark computes its probe only over the rows that
-  // WHERE's and HAVING's filters keep. A later clause that reads one moves it to the end of its
-  // slot's own entries, where that clause computes the probe anyway.
+  // The marks and the correlated values (ADR 0041's SQ7a, SQ5b) the select list plants -- its bare
+  // aggregate items bind before WHERE, its other items after WHERE and GROUP BY, all before HAVING:
+  // each slot's tail, assembled above the slot's own entries, so a mark computes its probe, and a
+  // correlated value's join back its maps, only over the rows that WHERE's and HAVING's filters
+  // keep. A later clause that reads one moves it to the end of its slot's own entries
+  // (TakeFromTail), below that clause's own entry.
   std::vector<SlotEntry> row_tail_;
   std::vector<SlotEntry> group_tail_;
   bool deferring_ = false;  // while the select list binds
   // OR factoring's bind-only path: subquery values are bound for their errors, and plant nothing.
   bool dry_run_ = false;
   // BindOutput's speculative binding of an expression as a GROUP BY key: a subquery's value is only
-  // looked up in the memo, never bound or planted (ADR 0041's SQ2b).
+  // looked up in the memo (and taken from the tail), never bound or planted (ADR 0041's SQ2b).
   bool lookup_only_ = false;
   // An aggregate's argument is binding: where a subquery's block in it binds (ADR 0041's decision
   // 23).
@@ -6576,9 +6585,10 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // A subquery whose plan reads ids its own nodes do not define is correlated, and becomes a
   // dependent join over the block's plan at this point, which defines them (ADR 0023). An
   // uncorrelated one keeps ADR 0022's direct join, so an IN subquery with GROUP BY or HAVING stays
-  // allowed. The binder plants it only in a condition of WHERE or an inner ON -- an EXISTS as a
-  // top-level conjunct, a scalar subquery as a value in any expression (ADR 0041's SQ5a) -- and the
-  // unnesting pass then rewrites it or rejects the query.
+  // allowed. The binder plants an EXISTS as a top-level conjunct of WHERE or an inner ON, and a
+  // scalar subquery as a value in any expression of a condition there (ADR 0041's SQ5a), of a
+  // select item, an ORDER BY item, a GROUP BY key or an aggregate's argument (SQ5b), never above
+  // the block's aggregation (below); the unnesting pass then rewrites it or rejects the query.
   std::vector<ColumnId> free = FreeVariables(*bound.plan.root);
   const bool correlated = !free.empty();
   const sql::SelectStatement& query = *form.subquery->query;
@@ -6796,6 +6806,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
           .written = *form.subquery,
           .value = ColumnLeaf(column.id, block.type, column.name, column.stored_as_float),
           .probe = nullptr,
+          .right = join.right.get(),
           .deferred = false,
           .free = block.free,
           .on_position = on_position_});
@@ -7048,9 +7059,8 @@ arrow::Status Binder::BindWhere() {
   return OrderRelations();
 }
 
-const Binder::BoundValue* Binder::FindValue(
-    const sql::SubqueryExpr& s, bool group,
-    const std::function<bool(const BoundValue&)>& also) const {
+Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group,
+                                      const std::function<bool(const BoundValue&)>& also) {
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
   const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
     return bound.block == block && SameSubquery(bound.written, s) && (!also || also(bound));
@@ -7058,10 +7068,20 @@ const Binder::BoundValue* Binder::FindValue(
   return found == values_.end() ? nullptr : &*found;
 }
 
+bool Binder::KeyReads(const Typed& value) const {
+  const ColumnId id = std::get<ColumnExpr>(value.expr->node).id;
+  return std::ranges::any_of(key_exprs_, [id](const ExprPtr& key) {
+    std::vector<ColumnId> reads;
+    CollectColumnIds(*key, reads);
+    return std::ranges::contains(reads, id);
+  });
+}
+
 arrow::Status Binder::AdmitCorrelatedValue(const sql::SubqueryExpr& s) const {
-  // A correlated EXISTS needs a mark (SQ8). A correlated value needs ADR 0041's consumer proof,
-  // which answers it in a condition of WHERE or an inner ON (SQ5a) and elsewhere from SQ5b; never
-  // inside a padded unit's left input, nor in a conjunct that reads an enclosing block itself.
+  // A correlated EXISTS needs a mark (SQ8). A correlated value stands where ADR 0041's consumer
+  // proof answers it, in any clause below the block's aggregation (SQ5a, SQ5b; above it
+  // BindSubqueryBlock refuses it, SQ13), but never inside a padded unit's left input, nor in a
+  // conjunct that reads an enclosing block itself.
   std::string message;
   if (padded_unit_.has_value()) {
     message = std::format(
@@ -7074,9 +7094,6 @@ arrow::Status Binder::AdmitCorrelatedValue(const sql::SubqueryExpr& s) const {
   } else if (s.kind == sql::SubqueryExpr::Kind::kExists) {
     message =
         "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an inner ON";
-  } else if (!WhereClause(clause_)) {
-    message =
-        "a correlated scalar subquery is supported only in a condition of WHERE or an inner ON";
   } else {
     return arrow::Status::OK();
   }
@@ -7092,8 +7109,19 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
     return known->value;
   }
   if (lookup_only_) {
-    // No GROUP BY key holds this value (a key's is bound first): the speculation fails.
-    return BindError("a subquery's value that no GROUP BY key holds", s.op_span);
+    // A GROUP BY key's value is bound before the speculation, so a correlated one written alike is
+    // the entry some key reads, else the first (a key that is a mark over it reads the mark). A
+    // wrong pick matches no key, and the speculation fails, as it does with no entry at all.
+    BoundValue* known =
+        FindValue(s, group, [this](const BoundValue& bound) { return KeyReads(bound.value); });
+    if (known == nullptr) {
+      known = FindValue(s, group);
+    }
+    if (known == nullptr) {
+      return BindError("a subquery's value that no GROUP BY key holds", s.op_span);
+    }
+    TakeFromTail(*known, group);
+    return known->value;
   }
   // The gate admits a subquery's value in a condition of WHERE, an inner ON or HAVING (`group`),
   // and in the select list and ORDER BY (ADR 0041's SQ1, SQ2), never in an outer join's ON
@@ -7106,15 +7134,20 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
   // an inner ON before it, or the ON of another comma group, which resolves a name in its own group
   // first -- it is bound again below, for this occurrence's own bind errors, and matched by the ids
   // it reads.
-  if (const BoundValue* const same = FindValue(s, group,
-                                               [this](const BoundValue& bound) {
-                                                 return !bound.free.empty() &&
-                                                        bound.on_position == on_position_;
-                                               });
+  if (BoundValue* const same = FindValue(s, group,
+                                         [this](const BoundValue& bound) {
+                                           return !bound.free.empty() &&
+                                                  bound.on_position == on_position_;
+                                         });
       same != nullptr) {
+    // A dry run returns before Admit, as below. Since SQ5b no refusal is left for one to meet here:
+    // in_correlated_ is set only inside BindCorrelatedConjunct, which no dry run enters; a value is
+    // remembered inside a padded unit's left input only by a bind that is then refused; and a
+    // correlated EXISTS is never remembered.
     if (!dry_run_) {
       ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(s));
     }
+    TakeFromTail(*same, group);
     return same->value;
   }
   const SubqueryConjunct form{.subquery = &s, .other = nullptr, .negated = s.negated};
@@ -7128,9 +7161,10 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
     // This place's refusals before the memo, so that a value remembered from another conjunct does
     // not carry this one past them.
     ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(s));
-    if (const BoundValue* const bound_alike = FindValue(
+    if (BoundValue* const bound_alike = FindValue(
             s, group, [&bound](const BoundValue& known) { return known.free == bound.free; });
         bound_alike != nullptr) {
+      TakeFromTail(*bound_alike, group);
       return bound_alike->value;
     }
   }
@@ -7141,27 +7175,59 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
   Typed value =
       ColumnLeaf(block.column.id, block.type, block.column.name, block.column.stored_as_float);
   // A correlated block is a dependent join (ADR 0041's SQ5), which the unnesting replaces by its
-  // join back, still defining this column; an uncorrelated one a one-row join (SQ1).
+  // join back, still defining this column; an uncorrelated one a one-row join (SQ1). A correlated
+  // one the select list binds waits in the slot's tail, as a mark does (SQ5b): its join back
+  // computes per outer row, so only over the rows WHERE keeps, until a later clause reads it.
   const bool dependent = block.correlated;
-  (group ? group_slot_ : RowSlot())
-      .emplace_back(SubqueryJoin{.kind = JoinKind::kOneRow,
-                                 .dependent = dependent,
-                                 .right = std::move(block.right),
-                                 .left_key = {},
-                                 .right_key = {},
-                                 .exprs = {},
-                                 .ids = {},
-                                 .filter = {},
-                                 .span = s.op_span,
-                                 .mark = kNoColumnId});
+  const bool deferred = dependent && deferring_;
+  const LogicalNode* const right = block.right.get();  // before it moves into the join
+  SubqueryJoin join{.kind = JoinKind::kOneRow,
+                    .dependent = dependent,
+                    .right = std::move(block.right),
+                    .left_key = {},
+                    .right_key = {},
+                    .exprs = {},
+                    .ids = {},
+                    .filter = {},
+                    .span = s.op_span,
+                    .mark = kNoColumnId};
+  if (deferred) {
+    // The select list binds per row (BindSubqueryBlock refuses one above the aggregation), outside
+    // every ON.
+    ANTB1_CHECK(!group);
+    ANTB1_CHECK(!padded_unit_.has_value());
+    row_tail_.emplace_back(std::move(join));
+  } else {
+    (group ? group_slot_ : RowSlot()).emplace_back(std::move(join));
+  }
   values_.push_back(BoundValue{.block = group ? std::nullopt : std::optional(RowBlock()),
                                .written = s,
                                .value = value,
                                .probe = nullptr,
-                               .deferred = false,
+                               .right = right,
+                               .deferred = deferred,
                                .free = std::move(block.free),
                                .on_position = dependent ? on_position_ : std::nullopt});
   return value;
+}
+
+void Binder::TakeFromTail(BoundValue& known, bool group) {
+  // Read by a clause after the select list: from the slot's tail to the end of its own entries,
+  // below the reader, which plants its own entry after it. Never while the select list binds, nor
+  // in a dry run, which plants nothing.
+  if (!known.deferred || deferring_ || dry_run_) {
+    return;
+  }
+  ANTB1_CHECK(known.right != nullptr);
+  std::vector<SlotEntry>& tail = group ? group_tail_ : row_tail_;
+  const auto entry = std::ranges::find_if(tail, [&](const SlotEntry& e) {
+    const auto* join = std::get_if<SubqueryJoin>(&e);
+    return join != nullptr && join->right.get() == known.right;
+  });
+  ANTB1_CHECK(entry != tail.end());
+  (group ? group_slot_ : RowSlot()).push_back(std::move(*entry));
+  tail.erase(entry);
+  known.deferred = false;
 }
 
 void Binder::PromoteTailMarks(const Expr& expr) {
@@ -7228,19 +7294,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                    sql::EqualIgnoringSpans(*bound.written.query, *written.query);
           });
       known != values_.end()) {
-    // Read by a clause after the select list: from the slot's tail to the end of its own entries.
-    if (known->deferred && !deferring_ && !dry_run_) {
-      std::vector<SlotEntry>& tail = group ? group_tail_ : row_tail_;
-      const ColumnId mark = std::get<ColumnExpr>(known->value.expr->node).id;
-      const auto entry = std::ranges::find_if(tail, [&](const SlotEntry& e) {
-        const auto* join = std::get_if<SubqueryJoin>(&e);
-        return join != nullptr && join->mark == mark;
-      });
-      ANTB1_CHECK(entry != tail.end());
-      (group ? group_slot_ : RowSlot()).push_back(std::move(*entry));
-      tail.erase(entry);
-      known->deferred = false;
-    }
+    TakeFromTail(*known, group);
     return known->value;
   }
   if (lookup_only_) {
@@ -7275,6 +7329,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                     .mark = ids_.Next()};
   InKeys(join, typed, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
+  const LogicalNode* const right = join.right.get();  // after InKeys, before the join moves
   if (deferring_) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON
     (group ? group_tail_ : row_tail_).emplace_back(std::move(join));
@@ -7285,6 +7340,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                                .written = std::move(written),
                                .value = value,
                                .probe = probe.expr,
+                               .right = right,
                                .deferred = deferring_,
                                .free = {},
                                .on_position = std::nullopt});
@@ -8225,6 +8281,12 @@ arrow::Status Binder::BindGroupConjunct(const sql::Expr& conjunct, const BindFn&
       // In a correlated block its semi or null-aware anti join stands over the block's aggregate,
       // which the unnesting refuses once the whole query is bound, its bind errors first.
       return BindSubqueryConjunct(conjunct, *form, /*having=*/true, bind);
+    }
+    // A correlated value bound per row before -- a GROUP BY key's -- is read over the aggregation
+    // as that key (BindOutput, ADR 0041's SQ5b); where no key reads it, its refusal follows there.
+    if (const BoundValue* const row = FindValue(*form->subquery, /*group=*/false);
+        form->scalar() && row != nullptr && !row->free.empty()) {
+      return BindValueConjunct(conjunct, span, /*group=*/true);
     }
     const BoundValue* known = FindValue(*form->subquery, /*group=*/true);
     std::optional<Typed> value;

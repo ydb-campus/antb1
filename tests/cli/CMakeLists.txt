@@ -986,6 +986,52 @@ antb1_add_cli_golden(
     --table
     "drivers=${_f}/star/drivers.parquet"
 )
+# A correlated value in an aggregate item (ADR 0041's SQ5b) waits in the slot's tail, so its LEFT join back stands
+# above WHERE's filter and the INNER join back of the value WHERE reads: its maps are computed only for the cities
+# WHERE keeps.
+antb1_add_cli_golden(
+  explain_correlated_item_in_the_tail
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c WHERE (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) + 0 > 0"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# The same value read by WHERE too (ADR 0041's SQ5b): WHERE moves it from the tail below its own filter, so it is one
+# join, which that filter decides INNER, and the SUM reads its column.
+antb1_add_cli_golden(
+  explain_correlated_item_promoted
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A select item's correlated value under a LIMIT without ORDER BY (ADR 0041's SQ5b): the Limit stands directly above the
+# LEFT join back, below COALESCE and the subquery's own item, which are computed only for the two rows kept (D24).
+antb1_add_cli_golden(
+  explain_correlated_item_under_limit
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id, (SELECT COUNT(*) - 1 FROM riders r WHERE r.rd_city = c.ct_id) AS v FROM cities c LIMIT 2"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names
