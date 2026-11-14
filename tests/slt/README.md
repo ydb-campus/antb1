@@ -358,6 +358,13 @@ through one key of one type, `=` or `IS NOT DISTINCT FROM`, and aggregates over 
 BY COUNT(*)`, with an optional `HAVING` over a count. A constant item and a `HAVING` stand only in a block that holds a
 count, which keeps out the family of DuckDB's wrong answers in docs/testing.md; nothing divides or can overflow.
 
+The correlated values of ADR 0041's SQ5a (feature `correlated_condition_value`) are drawn right after SQ6's, from a
+random stream of their own and only where the query holds no other subquery. The same block stands as a value inside
+one top-level `WHERE` conjunct: under `OR` or `NOT`, in a `CASE WHEN`, times 2 or 3 or plus an outer column (integers
+whose type holds every value), in `COALESCE` (a call that is NULL over no rows), `IS [NOT] NULL`, `[NOT] BETWEEN` two
+literals, an element of an outer column's `[NOT] IN` list, two such blocks of one type compared, or one block written
+twice, `(q) > k AND (q) < k2`. A DOUBLE value is compared with 0 alone, and SQ6's never-list holds.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

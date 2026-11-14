@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -59,6 +60,11 @@ std::vector<const sql::SelectStatement*> ReachableBlocks(const sql::SelectStatem
 // Whether `expr` holds a subquery expression, its IN operand included; not inside a nested query's
 // block, which is a block of its own.
 bool HoldsSubquery(const sql::Expr& expr);
+
+// Whether `expr` holds a subquery expression for which `matches` is true, as HoldsSubquery finds
+// them.
+bool HoldsSubqueryWhere(const sql::Expr& expr,
+                        const std::function<bool(const sql::SubqueryExpr&)>& matches);
 
 // The span (its opening parenthesis, or EXISTS) of the first subquery expression `expr` holds, as
 // HoldsSubquery finds them; std::nullopt when it holds none.

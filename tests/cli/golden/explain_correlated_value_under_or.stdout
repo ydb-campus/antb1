@@ -1,0 +1,12 @@
+Output: ct_id:SMALLINT
+Project ct_id
+  Sort ct_id ASC NULLS LAST
+    Filter "(((SELECT COUNT(*) FROM riders AS ""r"" WHERE r.rd_city = c.ct_id) = 0) OR (c.ct_id = 1))"
+      Compute (((SELECT COUNT(*) FROM riders AS "r" WHERE r.rd_city = c.ct_id) = 0) OR (c.ct_id = 1))
+        Compute COALESCE(count_star(), 0)
+          Join LEFT build=right keys=["c.ct_id" = "r.rd_city"] carries 1 of 3 unread above
+            Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]
+            GroupAggregate keys=["r.rd_city"] COUNT(*)
+              Join SEMI build=right keys=["r.rd_city" = "c.ct_id"]
+                Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]
+                Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]

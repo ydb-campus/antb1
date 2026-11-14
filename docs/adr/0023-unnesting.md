@@ -608,6 +608,11 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   through `COALESCE(count, 0)`, the select list computed above the join and a `HAVING` a `CASE` over it. The semi-join
   reduction applies D5's exception to the inner join back only, and clones the base below a stack of dependent joins
   instead of declining (ADR 0041's SQ6 update). This list's exit-4 shapes lose `COUNT` and the non-strict items.
+- Update (2026-11-13, ADR 0041's SQ5a): **a correlated aggregate is a value in any expression of a condition** of
+  `WHERE` or an inner `ON`, no longer only a direct operand of a top-level comparison, and two different correlated
+  subqueries may be compared. Its dependent join stands in the block's slot with the uncorrelated values, and the
+  consumer proof passes the conditions and joins between it and the condition that rejects its value over no rows
+  (ADR 0041's SQ5a update). A select item, `ORDER BY`, a `GROUP BY` key and an aggregate's argument wait for SQ5b.
 
 ## Alternatives considered
 
