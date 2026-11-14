@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/binary_view_util.h>
 #include <gtest/gtest.h>
 
 #include "antb1/exec/compute.h"
@@ -693,6 +694,94 @@ TEST_F(OperatorsTest, MaterializeKeepsRowCountsOfBatchesWithoutColumns) {
   auto end = Materialize(Batch{}, arrow::default_memory_pool());
   ASSERT_TRUE(end.ok());
   EXPECT_EQ(*end, nullptr);
+}
+
+TEST_F(OperatorsTest, MaterializeSelectsBinaryViewsWithTheirPhysicalSchemaAndOwners) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary_view())});
+  auto payload = testing::ArrayOf<arrow::BinaryViewBuilder, std::string>(
+      arrow::binary_view(), {std::string(13, 'a'), "", std::nullopt, std::string("\xFF\0z", 3)});
+  auto input = arrow::RecordBatch::Make(schema, 4, {Int64s({4, 3, 2, 1}), payload});
+  const auto selected =
+      Materialize(Batch{.data = input, .selection = Bools({false, true, true, true})},
+                  arrow::default_memory_pool());
+  ASSERT_TRUE(selected.ok()) << selected.status().ToString();
+  EXPECT_TRUE((*selected)->schema()->Equals(*schema));
+  ASSERT_TRUE((*selected)->ValidateFull().ok());
+  ASSERT_EQ((*selected)->num_rows(), 3);
+  {
+    const auto none =
+        Materialize(Batch{.data = input, .selection = Bools({false, false, false, false})},
+                    arrow::default_memory_pool());
+    ASSERT_TRUE(none.ok()) << none.status().ToString();
+    EXPECT_EQ((*none)->num_rows(), 0);
+    EXPECT_TRUE((*none)->schema()->Equals(*schema));
+    const auto all = Materialize(Batch{.data = input}, arrow::default_memory_pool());
+    ASSERT_TRUE(all.ok());
+    EXPECT_EQ(*all, input);
+  }
+  input.reset();
+  payload.reset();
+  const auto& out = static_cast<const arrow::BinaryViewArray&>(*(*selected)->column(1));
+  EXPECT_EQ(out.GetView(0), "");
+  EXPECT_TRUE(out.IsNull(1));
+  EXPECT_EQ(out.GetView(2), std::string("\xFF\0z", 3));
+}
+
+TEST_F(OperatorsTest, NumericFilterAndProjectionPreserveBinaryViewPayloadsAcrossRuns) {
+  const auto schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("s", arrow::binary_view())});
+  const auto payload = testing::ArrayOf<arrow::BinaryViewBuilder, std::string>(
+      arrow::binary_view(), {std::string(13, 'a'), "", std::nullopt, std::string(12, 'b')});
+  auto source = std::make_unique<ScriptedSource>(
+      schema, std::vector<Batch>{
+                  {.data = arrow::RecordBatch::Make(schema, 4, {Int64s({1, 2, 3, 4}), payload}),
+                   .selection = Bools({true, false, true, true})}});
+  auto filter = std::make_unique<FilterOperator>(
+      std::move(source), std::vector<Predicate>{Compare(Column(0, "x", LogicalType::kBigInt),
+                                                        CompareOp::kLt, BigInt(4))});
+  ProjectOperator project(std::move(filter), {1, 0, 1});
+  EXPECT_EQ(project.output_schema()->field(0)->type()->id(), arrow::Type::BINARY_VIEW);
+  for (int run = 0; run < 2; ++run) {
+    const auto result = Run(project);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(Int64Column(*result, 1), (std::vector<std::optional<int64_t>>{1, 3}));
+    ASSERT_TRUE(result->ValidateFull().ok());
+    ASSERT_EQ(result->column(0)->num_chunks(), 1);
+    const auto& views = static_cast<const arrow::BinaryViewArray&>(*result->column(0)->chunk(0));
+    EXPECT_EQ(views.GetView(0), std::string(13, 'a'));
+    EXPECT_TRUE(views.IsNull(1));
+    EXPECT_TRUE(result->column(0)->Equals(result->column(2)));
+  }
+}
+
+TEST_F(OperatorsTest, MaterializeSharesSparseViewPayloadUntilItsLastConsumerReleasesIt) {
+  auto source = Strings({std::string(std::size_t{128} * 1024, 'x'), std::string(13, 'y')});
+  std::weak_ptr<arrow::Buffer> owner = source->data()->buffers[2];
+  const auto& binary = static_cast<const arrow::BinaryArray&>(*source);
+  const char* expected_address = binary.GetView(1).data();
+  std::shared_ptr<arrow::Buffer> descriptors = arrow::AllocateBuffer(32).ValueOrDie();
+  auto* views = descriptors->mutable_data_as<arrow::BinaryViewType::c_type>();
+  for (int row = 0; row < 2; ++row) {
+    views[row] = arrow::util::ToBinaryView(binary.GetView(row), 0, binary.value_offset(row));
+  }
+  auto payload = std::make_shared<arrow::BinaryViewArray>(
+      arrow::binary_view(), 2, descriptors, arrow::BufferVector{source->data()->buffers[2]});
+  const auto schema = arrow::schema({arrow::field("s", arrow::binary_view())});
+  auto input = arrow::RecordBatch::Make(schema, 2, {payload});
+  auto selected = Materialize(Batch{.data = input, .selection = Bools({false, true})},
+                              arrow::default_memory_pool())
+                      .ValueOrDie();
+  source.reset();
+  payload.reset();
+  input.reset();
+  ASSERT_FALSE(owner.expired());
+  ASSERT_TRUE(selected->ValidateFull().ok());
+  const auto& output = static_cast<const arrow::BinaryViewArray&>(*selected->column(0));
+  EXPECT_EQ(output.GetView(0), std::string(13, 'y'));
+  EXPECT_EQ(output.GetView(0).data(), expected_address);
+  selected.reset();
+  EXPECT_TRUE(owner.expired());
 }
 
 }  // namespace

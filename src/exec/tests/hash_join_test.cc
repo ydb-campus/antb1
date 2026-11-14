@@ -47,6 +47,7 @@
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/table.h"
 
+#include "../binary_view.h"
 #include "../gather.h"
 #include "../part_operators.h"
 #include "exec_test_util.h"
@@ -1693,6 +1694,82 @@ TEST_F(HashJoinTest, MisuseIsInvalid) {
   ASSERT_TRUE(op.Next().ok());
   ASSERT_TRUE(op.Close().ok());
   EXPECT_TRUE(op.Next().status().IsInvalid());
+}
+
+TEST_F(HashJoinTest, BinaryViewMaskRejectsWrongWidthAndNonBinaryFields) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("s", arrow::binary()),
+                     arrow::field("p", arrow::binary())});
+  const auto make = [&](std::vector<bool> mask) {
+    return HashJoinOperator::Make(
+        SourceOf(Int64Schema({"probe"}), {Int64s({1})}),
+        DrainedBuild(SourceOf(schema, {Int64s({1}), Strings({"key"}), Strings({"payload"})}), {0}),
+        {0}, BuildSide::kRight, {}, true, std::move(mask));
+  };
+  for (const std::vector<bool>& mask :
+       {std::vector<bool>{true}, std::vector<bool>{false, true},
+        std::vector<bool>{false, true, false, true}, std::vector<bool>{true, false, false}}) {
+    const auto result = make(mask);
+    EXPECT_TRUE(result.status().IsInvalid()) << result.status().ToString();
+  }
+  EXPECT_TRUE(make({}).ok());
+  EXPECT_TRUE(make({false, false, false}).ok());
+  EXPECT_TRUE(make({false, false, true}).ok());
+}
+
+TEST_F(HashJoinTest, BinaryViewMaskKeepsOtherBuildStringsBinaryOnBothJoinPaths) {
+  const auto build_schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("ordered", arrow::binary()),
+                     arrow::field("payload", arrow::binary())});
+  const auto probe_schema = Int64Schema({"probe"});
+  for (const bool duplicate_keys : {false, true}) {
+    for (const BuildSide side : {BuildSide::kLeft, BuildSide::kRight}) {
+      const auto make = [&](std::vector<bool> mask) {
+        return HashJoinOperator::Make(
+            SourceOf(probe_schema, {Int64s({2, 8, 1})}),
+            DrainedBuild(
+                SourceOf(build_schema, {duplicate_keys ? Int64s({1, 1, 2}) : Int64s({1, 2, 3}),
+                                        Strings({std::string(15, 'k'), "", std::nullopt}),
+                                        Strings({std::nullopt, std::string(40, 'p'), "tail"})}),
+                {0}),
+            {0}, side, {}, true, std::move(mask));
+      };
+      auto ordinary = make({});
+      ASSERT_TRUE(ordinary.ok()) << ordinary.status().ToString();
+      const auto expected = Drain(**ordinary, ContextOf(nullptr, 2));
+      ASSERT_TRUE(expected.ok()) << expected.status().ToString();
+      EXPECT_EQ((*expected)->num_rows(), duplicate_keys ? 3 : 2);
+      const int offset = side == BuildSide::kLeft ? 0 : 1;
+      for (const bool views : {false, true}) {
+        auto join = make({false, false, views});
+        ASSERT_TRUE(join.ok()) << join.status().ToString();
+        EXPECT_EQ((*join)->output_schema()->field(offset + 1)->type()->id(), arrow::Type::BINARY);
+        EXPECT_EQ((*join)->output_schema()->field(offset + 2)->type()->id(),
+                  views ? arrow::Type::BINARY_VIEW : arrow::Type::BINARY);
+        for (int run = 0; run < 2; ++run) {
+          // Drain closes and releases the build before these retained result arrays are read.
+          const auto result = Drain(**join, ContextOf(nullptr, 2));
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          ASSERT_TRUE((*result)->ValidateFull().ok());
+          arrow::TableBatchReader reader(**result);
+          arrow::RecordBatchVector batches;
+          while (true) {
+            std::shared_ptr<arrow::RecordBatch> batch;
+            ASSERT_TRUE(reader.ReadNext(&batch).ok());
+            if (batch == nullptr) {
+              break;
+            }
+            const auto materialized = MaterializeBinaryViews(batch, arrow::default_memory_pool());
+            ASSERT_TRUE(materialized.ok()) << materialized.status().ToString();
+            batches.push_back(*materialized);
+          }
+          const auto normalized = arrow::Table::FromRecordBatches(batches);
+          ASSERT_TRUE(normalized.ok()) << normalized.status().ToString();
+          EXPECT_TRUE((*normalized)->Equals(**expected));
+        }
+      }
+    }
+  }
 }
 
 // ---- lifecycle ----

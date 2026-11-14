@@ -10,6 +10,9 @@ The [2026-11-13 amendment](#amendment-2026-11-13-owned-views-and-staged-adoption
 the next proposed experiment. It revises the proposed ownership contract and implementation order below;
 the original investigation remains as history. Production adoption of the view path remains deferred.
 
+The [2026-11-14 amendment](#amendment-2026-11-14-prototype-results-and-dictionary-roadmap) records the
+preserved experiment branch, the implemented payload path, its final measurements and the dictionary roadmap.
+
 ## Context
 
 - **The target.** A VARCHAR value is `arrow::binary()` everywhere above the scan — one decision, in
@@ -431,5 +434,224 @@ finalization or high-cardinality aggregation issues. `pixi run check` is require
 `pixi run check-full` is required for the ownership implementation. This amendment changes the proposed
 roadmap, not the ADR status, Arrow dependency, SQL semantics or production execution path.
 
-This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
-this implementation does not comply with all requirements of the TPC-H Benchmark.
+### Retention-policy experiment, 2026-11-13
+
+The first owned-payload pilot bounded each gathered array's retained capacity by the larger of 64 KiB
+and four times distinct live out-of-line bytes. In its independent synthetic long-string fanout
+profile, sorting and merging referenced byte ranges consumed 40.35% of sampled serial CPU. Complete
+16-thread query measurements across twelve shapes showed a 1.031 wall-time ratio and a 1.175 CPU
+ratio against ordinary Binary, despite substantial copy and memory savings in some cases. The pilot
+remains off by default. Evidence is local in
+`build/static/bench-results/owned-view-pilot-20261113/REPORT.txt`.
+
+The next opt-in experiment replaces that per-array sparse-retention rule with decisions at buffering
+operators. It keeps the representation, immutable shared ownership, query-pool lifetime, complete-path
+eligibility and public Binary output contracts above. Specifically:
+
+- A streaming gather retains only the source buffers its descriptors reference and remaps buffer
+  indices. It does not calculate an exact union of string intervals. Filters continue to use existing
+  selections; selecting a new view array uses the same cheap sharing path.
+- Top-N rejects rows using its numeric threshold first, then copies accepted long values into compact
+  Arrow-owned payload buffers. The physical type remains BinaryView. Copying repeated values is
+  allowed; this deliberately trades some fanout sharing for simpler lifetime and retention rules.
+- Periodic top-N rebuilding gathers only survivors into fresh owned payload buffers and drops the
+  old chunks. The existing row slack and an allocated-payload-byte threshold both trigger cleanup.
+  The byte threshold is the larger of 8 MiB and twice the payload capacity just after the previous
+  rebuild; cleanup requires discardable rows. This avoids repeatedly rebuilding large required
+  survivors. It is an amortized cleanup policy, not a fixed upper bound on a query's string bytes.
+- The hard query limit still charges each actual allocation once for its full lifetime, including
+  descriptors, ownership metadata and old-plus-new payload during rebuilding. A row threshold alone
+  does not bound variable-length payload. Allocation failure remains a checked error with cleanup.
+- Final sorted output shares the owned payload buffers until the explicit Binary output boundary.
+  Retained output remains valid after input batches or operators are destroyed.
+
+The earlier exact-bound helper remains available for its general alias-aware behavior and tests;
+the experimental pipeline selects the sharing/copying policy explicitly. No buffer is certified as
+having passed the earlier exact live-byte bound merely because its ownership is safe.
+
+This experiment may lose: the join can still own its build buffers while top-N copies strings, so
+copying does not necessarily release any source memory and can increase peak allocation. Measure
+ordinary Binary, the first pilot and this policy with unchanged inputs and plans, including the full
+producer/consumer path, serial and 16-thread execution, bounded-memory runs and CPU profiles. Retain
+all samples and balance interleaving positions as closely as possible across three arms. This changes
+the experimental retention policy only; adoption and the ADR status remain deferred.
+
+### Allocation-capacity sharing experiment
+
+The eager-copy experiment removed interval sorting, but the twelve synthetic shapes still had a
+1.042 complete-query wall-time ratio against ordinary Binary at sixteen threads. Its long-string
+fanout case copied 168.93 MiB of payload versus 6.26 MiB with the exact-range pilot and 165.99 MiB
+with ordinary Binary. Evidence is local in
+`build/static/bench-results/view-retention-experiment-20261113/REPORT.txt`.
+
+The next opt-in experiment keeps streaming sharing and changes the buffering decision:
+
+- Within each output view column, compare each distinct backing allocation's full capacity with the
+  total copy volume of its selected long values. Duplicate output references count in copy volume,
+  as they would occupy separate
+  storage under eager copying. Share the allocation when capacity is no larger; otherwise copy only
+  its selected values into compact owned blocks. Make the choice separately for each allocation.
+- Follow buffer parents when identifying an allocation, so slices and aliases cannot hide retained
+  capacity or charge it repeatedly. Preserve descriptor offsets relative to their actual owners.
+  Inline and null values retain no payload buffers. Do not sort or merge per-value byte intervals.
+- Apply this policy after top-N pruning, during survivor rebuilding and when merging part buffers.
+  Already compact part storage can remain shared when copying would duplicate more bytes. Periodic
+  cleanup counts distinct backing allocations across buffered chunks and columns; the hard query
+  memory budget still charges actual allocations and metadata for their full lifetime.
+- This is a capacity-versus-copy-volume policy, not the original exact distinct-live-byte bound.
+  Fanout can justify retaining a whole allocation even when its distinct selected bytes are sparse.
+  Hybrid results must not be cached as having passed the earlier exact bound merely because they
+  have safe ownership. The earlier bounded and eager-copy helpers keep their existing contracts.
+
+Compare four interleaved arms: ordinary Binary, the exact-range pilot, eager copying and this policy.
+Retain the same complete-output correctness checks, serial and sixteen-thread measurements, copy
+counters, bounded-memory checks and profiles. The option remains off by default, and adoption and
+the ADR status remain deferred.
+
+## Amendment (2026-11-14): prototype results and dictionary roadmap
+
+The ADR status remains **Proposed (deferred)**. This amendment records the implemented research path
+and its stopping point; it does not accept a general view representation or enable one by default.
+The earlier experiments remain historical evidence. The research branch
+[`perf/binary-view-dictionaries`](https://github.com/ydb-campus/antb1/tree/perf/binary-view-dictionaries)
+preserves the 28-file runtime/test prototype on base `c633669`, with views opt-in through
+`--binary-view-payload` and disabled by default. It is not rebased onto the separately extracted
+ordinary PR #370 and has no BinaryView adoption PR. The preserved runtime/test file hashes match
+the prototype's completed `pixi run check-full` and static-build evidence; the ADR amendment records
+that state without claiming new dictionary runtime support.
+
+### What the prototype implements
+
+- **Owned BinaryView transport.** Exec-local gather, Take and Filter helpers support the participating
+  paths without registering global Arrow kernels. Descriptors own immutable payload dependencies;
+  inline values need no payload owner. Slices, aliases, NULLs and repeated references preserve their
+  byte semantics. Descriptors, ownership metadata and payload allocations remain budgeted, and their
+  allocating pool must outlive the results. These helpers do not make Arrow 25 Grouper or arbitrary
+  string expressions view-aware.
+- **Retention policies with different contracts.** The exact-range and eager-copy implementations
+  remain comparison paths. Streaming gathers share referenced owners. The hybrid retaining path
+  compares full backing-allocation capacity with selected long-value copy volume, including duplicate
+  references, separately within each output view column. It shares on equality or larger copy volume
+  and otherwise copies selected values into compact owned blocks. Parent aliases share one decision;
+  descriptor offsets remain relative to the actual owners. This is not certification of the earlier
+  exact distinct-live-byte bound. TopN tracks distinct backing allocations across its retained
+  columns/chunks and applies cleanup after pruning, rebuilding and merging, within the hard budget.
+- **A complete, narrow physical path.** An integer-key inner join without residual predicates may
+  produce selected build-side Binary payloads as views. Its children can contain ordinary joins or
+  aggregation, but produce ordinary arrays. Above that producer, the planner permits only the checked
+  projection, non-string selection/computation and TopN path. String sort keys remain Binary; using
+  one projected alias as a sort key demotes that source column and all its aliases. Unsupported
+  consumers, shared subplans and payloads dropped before output do not gain a view path. One explicit
+  final boundary restores the public Binary schema. Logical VARCHAR and `plan::ToArrow` are unchanged.
+- **Less repeated transport work.** A Binary-only sharing gather avoids generic source/root metadata
+  processing while retaining checked source and index handling. View TopN combines selection with
+  threshold pruning before one hybrid gather and avoids immediately retaining the same selection
+  again. These are implemented mechanisms, not evidence of a complete-query win.
+
+The later eligibility refinement therefore relaxes the original simple-input and numeric-sort-only
+pilot, but does not allow a view value to become a string key or an arbitrary expression input. The
+ownership, public-schema, deterministic eligibility and failure-cleanup requirements above still apply.
+
+### What remains deferred
+
+There is no new dictionary-encoded payload pipeline, dictionary-domain unification, dictionary grouping,
+general view-aware string-key table, or native view scan in this prototype. Existing scan dictionary
+predicate handling and the merged short-string packed-key specialization are independent mechanisms.
+[ADR 0028](0028-dictionary-group-keys.md) retains its status and measured objections.
+
+A future dictionary may store Binary or BinaryView values. Its indices identify values only within
+that dictionary domain. A complete design must establish domain lifetime and identity, budget owned
+values and translation tables, and use checked remapping or value comparison across batches, workers
+and joins. Equal values must retain the ordinary content-based partition hash, including composite
+keys and NULLs; worker-local IDs are not a shared hash domain. Changing dictionaries, high cardinality
+and merge costs belong in the first test matrix, not in a fallback added after adoption.
+
+### Final complete-query evidence and the separate ordinary optimization
+
+The final controlled view comparison held ordinary selection-before-gather enabled in both arms and
+changed only the view option. The observed view-eligible query was Q2 derived from TPC-H; the other queries
+did not activate this path. The Q2 result did not justify adoption:
+
+| Independent same-binary comparison | Q2 off wall | Q2 on wall | On/off wall | On/off CPU |
+| --- | ---: | ---: | ---: | ---: |
+| BinaryView, ordinary selection enabled in both arms | 0.909832 s | 0.912853 s | 1.003321 | 1.005333 |
+| Extracted ordinary selection optimization, no BinaryView | 0.915622 s | 0.899885 s | 0.982813 | 0.997878 |
+
+These are separate builds and campaigns: compare ratios within each row, not absolute times between
+rows. In the view campaign, enabled was slower in nine of ten wall pairs and eight of ten CPU pairs.
+A separate explicit-boolean launch control also found Q2 views slower, with wall/CPU ratios
+1.014527/1.004979. Retention or transport savings alone did not establish an end-to-end advantage.
+
+The independently extracted ordinary change is [PR #370](https://github.com/ydb-campus/antb1/pull/370),
+with `--sort-selection-before-gather` off by default. It applies an existing selection mask and TopN
+threshold before gathering ordinary columns. It contains no BinaryView implementation or dictionary
+work. Its own full gates and static build passed; the original prototype's validation was not used as
+proof of the extraction.
+
+For that candidate, Q2 primary wall improved 1.72%, its all-ten wall median improved 1.28%, and eight
+of ten paired wall runs favored enabled. The CPU point estimate improved only 0.21%, with six paired
+wins and mixed order-stratum direction; no robust CPU reduction is claimed. The all-22 primary
+geomeans were 0.998661 wall and 0.999361 CPU. Only Q2 activated partial-mask forwarding in the exact
+candidate's separate activation check, so these small aggregate changes are not a broad optimization
+claim. Q11 remains a caveat: primary wall was 0.83% worse and its all-ten median 1.61% worse, with
+six paired losses. CPU signs split evenly and the all-ten mean wall favored enabled because disabled
+had slow tails. That adverse wall observation is retained; it does not establish a repeatable
+regression caused by the inactive forwarding path.
+
+### Machine, method and limits of these measurements
+
+The workload was derived from TPC-H at SF100 using the partitioned DECIMAL Parquet dataset. Both full
+comparisons ran all 22 queries with the same static Release binary within each comparison, 16 engine
+threads, CPU affinity 0–15 and a 700GB query-pool budget. The host had two Intel Xeon Gold 6338
+2.00GHz sockets, 32 physical cores per socket, SMT2, about 1007.5 GiB RAM, Ubuntu 20.04.6 and
+Linux 5.4.210-39.4 on x86-64. The selected CPUs are distinct physical cores on socket/NUMA node 0;
+affinity does not imply a memory-binding policy, fixed clocks or an exclusive host.
+
+Each query/arm had one warmup and ten adjacent measured pairs, with first position balanced five/five
+and query order rotated. Primary wall is the mean of the fastest seven wall runs; CPU uses those
+same seven runs, separately selected for each arm. All-ten medians/ranges and paired order strata are
+retained. Native process wall and user-plus-system CPU include startup, execution, output and
+shutdown; parent oracle checking is excluded. Runs used warm caches without cache flushing.
+Separate diagnostics never enter native means. Both full suites passed their saved output oracles;
+DECIMAL/integer/text comparisons are exact and only predefined DOUBLE result fields use the existing
+1e-12 tolerance. Required order and multiplicity are checked without excusing LIMIT ties.
+
+The final ordinary candidate used explicit `=0`/`=1` arguments in both arms and a frozen allowlisted
+child environment: `PATH=/usr/bin:/bin`, `TZ=UTC`, `LC_ALL=C`, `LANG=C`,
+`MIMALLOC_PURGE_DELAY=-1`, `PYTHONDONTWRITEBYTECODE=1`. The prototype full suites instead used
+absent/present flags and wrappers with a temporary Git/Pixi PATH. The separate explicit-boolean
+launch control used another PATH context and substantially different absolute times. It did not
+isolate argument syntax as a unique cause across campaigns. No raw timings are pooled across these
+builds or environments. The saved evidence includes binary/source/helper hashes and input
+stat/footer identities; it is not a full dataset-content rehash on every phase.
+
+The requested fastest-seven estimator drops three slow runs per arm and may change apparent effects.
+Small changes on one host with ten pairs are not significance claims or general guarantees.
+Public conclusions are limited to the measured local optimization and the absence of a demonstrated
+view-path benefit. Private evidence, including all per-query timings and provenance, is retained under
+`build/static/bench-results/tpch-sf100/strings-all22-t16-20261114/experiment/`
+(`REPORT.txt`, `views/`, `candidate-suite/`, `candidate-independent-findings.txt`). Query text,
+answers, plans, profiles and workload cardinalities remain outside this amendment.
+
+### Next experiment and acceptance boundary
+
+1. Keep the research branch separate from the ordinary PR. Preserve an ordinary baseline with
+   selection-before-gather enabled before attributing any future saving to views or dictionaries.
+2. Choose one complete consumer path that can avoid repeated string hashing/comparison or final
+   conversion work. Establish the remaining cost before broadening eligibility; another descriptor
+   transport microbenchmark alone cannot justify adoption.
+3. For dictionaries, first implement a small domain/lifetime/remapping experiment using generated
+   fixtures. Compare ordinary Binary, owned views and dictionary-backed values on equal semantics,
+   including changing domains, sparse retention, duplicates, NULLs, high cardinality and merge.
+   Keep the dictionary path opt-in; do not assume Parquet or worker dictionaries are interchangeable.
+4. Before proposing a production path, require complete-query producer/consumer measurements,
+   same-binary explicit-flag controls, matched plans, final Binary output, full-query CPU/RSS and
+   budgeted retained capacity. Exercise aliasing, slices, reopening, deterministic ties, failed
+   allocation cleanup and retained-result lifetime, then rerun the existing ownership gates and
+   all-22 regression comparison. Stop if conversion, retention or remapping consumes the benefit.
+
+This amendment changes the recorded implementation state and next experiments, not the ADR status,
+SQL byte semantics, Arrow dependency, default representation or adoption decision.
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark
+results, as this implementation does not comply with all requirements of the TPC-H Benchmark.

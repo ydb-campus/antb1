@@ -39,6 +39,7 @@ antb1_add_module(
     set_operation.cc
     union_all.cc
     gather.cc
+    binary_view.cc
     hash_join.cc
     sort.cc
     row_count.cc
@@ -78,6 +79,7 @@ if(ANTB1_BUILD_TESTS)
       tests/profile_test.cc
       tests/memory_test.cc
       tests/gather_test.cc
+      tests/binary_view_test.cc
       tests/hash_join_test.cc
       tests/pool_vector_test.cc
       tests/key_table_test.cc

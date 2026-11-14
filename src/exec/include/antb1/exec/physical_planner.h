@@ -10,6 +10,11 @@
 
 namespace antb1::exec {
 
+struct PhysicalPlanOptions {
+  // Experimental ADR 0027 payload path. Ineligible plans retain ordinary Binary arrays.
+  bool binary_view_payload = false;
+};
+
 // Builds the operator tree of an (optimized) logical plan, one operator per node: Scan ->
 // TableScanOperator, Filter -> FilterOperator, Project -> ProjectOperator, Aggregate ->
 // ScalarAggregateOperator, GroupAggregate -> GroupAggregateOperator, Sort -> SortOperator,
@@ -30,6 +35,7 @@ namespace antb1::exec {
 // each input a child, a part pipeline profiled once per part into the same nodes, a join's build
 // under the operator that prepares it.
 arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
-                                                           ProfileNode* profile = nullptr);
+                                                           ProfileNode* profile = nullptr,
+                                                           PhysicalPlanOptions options = {});
 
 }  // namespace antb1::exec

@@ -145,13 +145,16 @@ arrow::Result<QueryResult> Session::Execute(std::string_view sql) {
   ARROW_ASSIGN_OR_RAISE(auto logical,
                         ParseAndBind(sql, catalog_, BindOptionsOf(options_), &result.timings));
   const auto t0 = Clock::now();
-  ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical));
+  ARROW_ASSIGN_OR_RAISE(
+      auto op, exec::BuildPhysicalPlan(logical, nullptr,
+                                       {.binary_view_payload = options_.binary_view_payload}));
   result.memory = memory_;
   exec::ExecContext ctx{.pool = memory_.get(),
                         .batch_size = options_.batch_size,
                         .executor = pool_.get(),
                         .threads = options_.threads,
-                        .budget = memory_.get()};
+                        .budget = memory_.get(),
+                        .sort_selection_before_gather = options_.sort_selection_before_gather};
   ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
   for (const auto& col : logical.output) {
     result.names.push_back(col.name);
@@ -177,7 +180,8 @@ arrow::Result<std::string> Session::ExplainPhysical(std::string_view sql) {
   // node and records what the planner decided (physical_planner.cc's Builder), and nothing here
   // opens a part or reserves a buffer.
   ARROW_ASSIGN_OR_RAISE(const std::unique_ptr<exec::Operator> op,
-                        exec::BuildPhysicalPlan(logical, &root));
+                        exec::BuildPhysicalPlan(
+                            logical, &root, {.binary_view_payload = options_.binary_view_payload}));
   return FormatPhysicalPlan(plan::ExplainOutput(logical), root);
 }
 
@@ -191,12 +195,15 @@ arrow::Result<QueryProfile> Session::ExplainAnalyze(std::string_view sql) {
   memory_->ResetPeak();
   const auto t0 = Clock::now();
   {
-    ARROW_ASSIGN_OR_RAISE(auto op, exec::BuildPhysicalPlan(logical, profile.root.get()));
+    ARROW_ASSIGN_OR_RAISE(
+        auto op, exec::BuildPhysicalPlan(logical, profile.root.get(),
+                                         {.binary_view_payload = options_.binary_view_payload}));
     exec::ExecContext ctx{.pool = memory_.get(),
                           .batch_size = options_.batch_size,
                           .executor = pool_.get(),
                           .threads = options_.threads,
-                          .budget = memory_.get()};
+                          .budget = memory_.get(),
+                          .sort_selection_before_gather = options_.sort_selection_before_gather};
     ARROW_ASSIGN_OR_RAISE(auto table, exec::Drain(*op, ctx));
     profile.rows = table->num_rows();
   }

@@ -25,6 +25,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "binary_view.h"
 #include "decimal.h"
 #include "gather.h"
 
@@ -225,6 +226,17 @@ int64_t SaturatingAdd(int64_t a, int64_t b) {
   return __builtin_add_overflow(a, b, &sum) ? std::numeric_limits<int64_t>::max() : sum;
 }
 
+// Mix the aligned allocation identity before masking into a power-of-two pointer table.
+std::size_t RootSlot(const arrow::Buffer* root, std::size_t slots) {
+  auto hash = Narrow<uint64_t>(reinterpret_cast<std::uintptr_t>(root));
+  hash ^= hash >> 33U;
+  hash *= uint64_t{0xff51afd7ed558ccd};
+  hash ^= hash >> 33U;
+  hash *= uint64_t{0xc4ceb9fe1a85ec53};
+  hash ^= hash >> 33U;
+  return Narrow<std::size_t>(hash) & (slots - 1);
+}
+
 }  // namespace
 
 // ---- RowComparator ----
@@ -297,6 +309,138 @@ RowComparator::Prefix RowComparator::PrefixOf(const KeyArrays& keys, int64_t row
 
 // ---- SortBuffer ----
 
+SortBuffer::PayloadRoots::PayloadRoots(PayloadRoots&& other) noexcept
+    : slots_(std::move(other.slots_)),
+      num_slots_(std::exchange(other.num_slots_, 0)),
+      roots_(std::exchange(other.roots_, 0)),
+      bytes_(std::exchange(other.bytes_, 0)) {}
+
+SortBuffer::PayloadRoots& SortBuffer::PayloadRoots::operator=(PayloadRoots&& other) noexcept {
+  if (this != &other) {
+    slots_ = std::move(other.slots_);
+    num_slots_ = std::exchange(other.num_slots_, 0);
+    roots_ = std::exchange(other.roots_, 0);
+    bytes_ = std::exchange(other.bytes_, 0);
+  }
+  return *this;
+}
+
+bool SortBuffer::PayloadRoots::Contains(const arrow::Buffer* root) const {
+  if (num_slots_ == 0) {
+    return false;
+  }
+  const auto* slots = slots_->data_as<const arrow::Buffer*>();
+  std::size_t at = RootSlot(root, num_slots_);
+  while (slots[at] != nullptr) {
+    if (slots[at] == root) {
+      return true;
+    }
+    at = (at + 1) & (num_slots_ - 1);
+  }
+  return false;
+}
+
+void SortBuffer::PayloadRoots::Insert(const arrow::Buffer* root) {
+  ANTB1_CHECK(roots_ < num_slots_ / 2);
+  auto* slots = slots_->mutable_data_as<const arrow::Buffer*>();
+  std::size_t at = RootSlot(root, num_slots_);
+  while (slots[at] != nullptr) {
+    at = (at + 1) & (num_slots_ - 1);
+  }
+  slots[at] = root;
+  ++roots_;
+}
+
+arrow::Status SortBuffer::PayloadRoots::Reserve(std::size_t roots, arrow::MemoryPool* pool) {
+  if (roots <= num_slots_ / 2) {
+    return arrow::Status::OK();
+  }
+  const auto max_slots =
+      Narrow<std::size_t>(std::numeric_limits<int64_t>::max()) / sizeof(const arrow::Buffer*);
+  std::size_t next_slots = std::max<std::size_t>(8, num_slots_);
+  while (roots > next_slots / 2) {
+    if (next_slots > max_slots / 2) {
+      return arrow::Status::CapacityError("sort view root table capacity overflow");
+    }
+    next_slots *= 2;
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto next,
+      arrow::AllocateBuffer(Narrow<int64_t>(next_slots * sizeof(const arrow::Buffer*)), pool));
+  auto* next_data = next->mutable_data_as<const arrow::Buffer*>();
+  std::fill_n(next_data, next_slots, nullptr);
+  if (num_slots_ != 0) {
+    const auto* old_data = slots_->data_as<const arrow::Buffer*>();
+    for (std::size_t i = 0; i < num_slots_; ++i) {
+      if (old_data[i] == nullptr) {
+        continue;
+      }
+      std::size_t at = RootSlot(old_data[i], next_slots);
+      while (next_data[at] != nullptr) {
+        at = (at + 1) & (next_slots - 1);
+      }
+      next_data[at] = old_data[i];
+    }
+  }
+  slots_ = std::move(next);
+  num_slots_ = next_slots;
+  return arrow::Status::OK();
+}
+
+arrow::Status SortBuffer::PayloadRoots::Add(const arrow::RecordBatch& rows,
+                                            arrow::MemoryPool* pool) {
+  // Stage only new allocation roots. An already-retained root needs neither another capacity
+  // charge nor scratch storage, even when many incoming columns or chunks alias it.
+  PayloadRoots added;
+  for (const auto& column : rows.columns()) {
+    if (column->type_id() != arrow::Type::BINARY_VIEW) {
+      continue;
+    }
+    const auto& buffers = column->data()->buffers;
+    for (std::size_t i = 2; i < buffers.size(); ++i) {
+      const arrow::Buffer* root = buffers[i].get();
+      if (root == nullptr) {
+        continue;
+      }
+      while (root->parent() != nullptr) {
+        root = root->parent().get();
+      }
+      if (Contains(root) || added.Contains(root)) {
+        continue;
+      }
+      const int64_t capacity = root->capacity();
+      if (capacity < 0 || capacity > std::numeric_limits<int64_t>::max() - bytes_ - added.bytes_) {
+        return arrow::Status::CapacityError("sort view payload capacity overflow");
+      }
+      if (added.roots_ == std::numeric_limits<std::size_t>::max()) {
+        return arrow::Status::CapacityError("sort view root count overflow");
+      }
+      ARROW_RETURN_NOT_OK(added.Reserve(added.roots_ + 1, pool));
+      added.Insert(root);
+      added.bytes_ += capacity;
+    }
+  }
+  if (added.roots_ == 0) {
+    return arrow::Status::OK();
+  }
+  if (roots_ == 0) {
+    *this = std::move(added);
+    return arrow::Status::OK();
+  }
+  if (added.roots_ > std::numeric_limits<std::size_t>::max() - roots_) {
+    return arrow::Status::CapacityError("sort view root count overflow");
+  }
+  ARROW_RETURN_NOT_OK(Reserve(roots_ + added.roots_, pool));
+  const auto* added_data = added.slots_->data_as<const arrow::Buffer*>();
+  for (std::size_t i = 0; i < added.num_slots_; ++i) {
+    if (added_data[i] != nullptr) {
+      Insert(added_data[i]);
+    }
+  }
+  bytes_ += added.bytes_;
+  return arrow::Status::OK();
+}
+
 SortBuffer::SortBuffer(RowComparator comparator, std::optional<int64_t> keep)
     : comparator_(std::move(comparator)),
       keep_(keep),
@@ -321,23 +465,76 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> SortBuffer::ClearChunks() {
   for (std::vector<const arrow::Array*>& arrays : column_arrays_) {
     arrays.clear();
   }
+  payload_roots_ = PayloadRoots{};
+  compacted_view_payload_bytes_ = 0;
   return chunks;
 }
 
-arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool) {
-  if (rows == nullptr || rows->num_rows() == 0) {
+arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool,
+                              const std::shared_ptr<arrow::BooleanArray>& selection) {
+  if (selection != nullptr && (rows == nullptr || selection->length() != rows->num_rows())) {
+    return arrow::Status::Invalid("sort selection length differs from its batch");
+  }
+  if (rows == nullptr || rows->num_rows() == 0 ||
+      (selection != nullptr && selection->true_count() == 0)) {
     return arrow::Status::OK();
+  }
+  const bool view_payload = HasBinaryViews(*rows->schema());
+  const bool selected = selection != nullptr && selection->true_count() != rows->num_rows();
+  const bool fuse_selection = view_payload || (selected && threshold_.has_value());
+  if (fuse_selection && pool == nullptr) {
+    return arrow::Status::Invalid("sort selection and view payloads need a memory pool");
+  }
+  if (!fuse_selection && selection != nullptr) {
+    ARROW_ASSIGN_OR_RAISE(rows, Materialize(Batch{.data = rows, .selection = selection}, pool));
   }
   if (!rows->schema()->Equals(*comparator_.schema(), /*check_metadata=*/false)) {
     return arrow::Status::Invalid("sort input with another schema");
   }
-  if (!TryNarrow<std::uint32_t>(rows->num_rows()).has_value() ||
+  if ((!fuse_selection && !TryNarrow<std::uint32_t>(rows->num_rows()).has_value()) ||
       !TryNarrow<std::uint32_t>(chunks_.size() + 1).has_value()) {
     return arrow::Status::CapacityError("too many rows to sort in memory");
   }
   sorted_ = false;
   RowComparator::KeyArrays keys = comparator_.KeysOf(*rows);
-  if (threshold_.has_value()) {
+  bool view_payload_retained = false;
+  if (fuse_selection && (selected || threshold_.has_value())) {
+    // Keep original row order and apply both predicates before copying any columns. Indices
+    // grow in the query pool only as survivors arrive; an entirely rejected batch allocates none.
+    arrow::Int64Builder indices(pool);
+    for (int64_t i = 0; i < rows->num_rows(); ++i) {
+      if (selected && (selection->IsNull(i) || !selection->Value(i))) {
+        continue;
+      }
+      if (threshold_.has_value() &&
+          comparator_.Compare(keys, i, chunk_keys_[threshold_->chunk], threshold_->row) >= 0) {
+        continue;
+      }
+      ARROW_RETURN_NOT_OK(indices.Append(i));
+    }
+    if (indices.length() == 0) {
+      return arrow::Status::OK();
+    }
+    if (!TryNarrow<std::uint32_t>(indices.length()).has_value()) {
+      return arrow::Status::CapacityError("too many rows to sort in memory");
+    }
+    if (indices.length() < rows->num_rows()) {
+      ARROW_ASSIGN_OR_RAISE(const auto index_array, indices.Finish());
+      if (view_payload) {
+        ARROW_ASSIGN_OR_RAISE(rows,
+                              TakeViewBatch(rows, index_array, pool, BinaryViewRetention::kHybrid));
+        view_payload_retained = true;
+      } else {
+        arrow::compute::ExecContext kernels(pool);
+        ARROW_ASSIGN_OR_RAISE(
+            const arrow::Datum taken,
+            arrow::compute::Take(rows, index_array, arrow::compute::TakeOptions::NoBoundsCheck(),
+                                 &kernels));
+        rows = taken.record_batch();
+      }
+      keys = comparator_.KeysOf(*rows);
+    }
+  } else if (threshold_.has_value()) {
     // Only rows before the last kept one can still be among the first `keep` rows; a row that ties
     // with it comes later in the input, so it loses the tie.
     const RowComparator::KeyArrays& last = chunk_keys_[threshold_->chunk];
@@ -363,13 +560,38 @@ arrow::Status SortBuffer::Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::M
       keys = comparator_.KeysOf(*rows);
     }
   }
+  if (fuse_selection && !TryNarrow<std::uint32_t>(rows->num_rows()).has_value()) {
+    return arrow::Status::CapacityError("too many rows to sort in memory");
+  }
+  if (rows->num_rows() > std::numeric_limits<int64_t>::max() - rows_) {
+    return arrow::Status::CapacityError("sort retained row count overflow");
+  }
+  if (view_payload) {
+    // Decide after numeric pruning: share a dense root when its full capacity costs no more
+    // than copying the surviving values, and copy sparse payload without sorting byte ranges.
+    if (!view_payload_retained) {
+      ARROW_ASSIGN_OR_RAISE(rows, RetainBinaryViewPayload(rows, pool));
+      keys = comparator_.KeysOf(*rows);
+    }
+    ARROW_RETURN_NOT_OK(payload_roots_.Add(*rows, pool));
+  }
   rows_ += rows->num_rows();
   PushChunk(std::move(rows), std::move(keys));
   // Compact once the rows beyond `keep` outgrow `keep` (and a minimum, so that a small `keep` does
   // not sort every batch).
   constexpr int64_t kMinSlack = 4096;
-  if (keep_.has_value() && rows_ > SaturatingAdd(*keep_, std::max(*keep_, kMinSlack))) {
-    return Compact(pool);
+  if (keep_.has_value()) {
+    // Long payloads can exhaust memory before the row slack is reached. Rebuild after distinct
+    // root capacities exceed 8 MiB or twice the last compacted size, whichever is larger. Do not
+    // rebuild merely because necessary survivors exceed 8 MiB, or when no row can be dropped.
+    constexpr int64_t kMinPayloadSlack = int64_t{8} * 1024 * 1024;
+    const int64_t payload_threshold =
+        std::max(kMinPayloadSlack,
+                 SaturatingAdd(compacted_view_payload_bytes_, compacted_view_payload_bytes_));
+    if (rows_ > SaturatingAdd(*keep_, std::max(*keep_, kMinSlack)) ||
+        (rows_ > *keep_ && payload_roots_.bytes() > payload_threshold)) {
+      return Compact(pool);
+    }
   }
   return arrow::Status::OK();
 }
@@ -492,11 +714,15 @@ arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {
   ARROW_RETURN_NOT_OK(sorted);
   const int64_t limit = keep.value_or(rows_);
   const int64_t kept = std::min(rows_, limit);
-  ARROW_ASSIGN_OR_RAISE(auto first, Slice(0, kept, pool));
+  ARROW_ASSIGN_OR_RAISE(auto first, GatherSlice(0, kept, pool, true));
+  PayloadRoots retained_roots;
+  ARROW_RETURN_NOT_OK(retained_roots.Add(*first, pool));
   ClearChunks();
   order_.clear();
   threshold_.reset();
   rows_ = kept;
+  payload_roots_ = std::move(retained_roots);
+  compacted_view_payload_bytes_ = payload_roots_.bytes();
   if (kept > 0) {
     RowComparator::KeyArrays keys = comparator_.KeysOf(*first);
     PushChunk(std::move(first), std::move(keys));
@@ -513,6 +739,11 @@ arrow::Status SortBuffer::Compact(arrow::MemoryPool* pool) {
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::Slice(
     int64_t begin, int64_t end, arrow::MemoryPool* pool) const {
+  return GatherSlice(begin, end, pool, false);
+}
+
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::GatherSlice(
+    int64_t begin, int64_t end, arrow::MemoryPool* pool, bool retain_view_payload) const {
   if (!sorted_) {
     return arrow::Status::Invalid("sort buffer read before Sort()");
   }
@@ -526,6 +757,14 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> SortBuffer::Slice(
   for (int c = 0; c < schema.num_fields(); ++c) {
     const std::vector<const arrow::Array*>& arrays = column_arrays_[Narrow<std::size_t>(c)];
     ANTB1_CHECK(arrays.size() == chunks_.size());
+    if (schema.field(c)->type()->id() == arrow::Type::BINARY_VIEW) {
+      ARROW_ASSIGN_OR_RAISE(auto column, GatherBinaryViews<RowRef>(
+                                             arrays, refs, pool,
+                                             retain_view_payload ? BinaryViewRetention::kHybrid
+                                                                 : BinaryViewRetention::kShare));
+      columns.push_back(std::move(column));
+      continue;
+    }
     ARROW_ASSIGN_OR_RAISE(auto builder, arrow::MakeBuilder(schema.field(c)->type(), pool));
     ARROW_RETURN_NOT_OK((GatherRows<false, RowRef>(arrays, refs, *builder)));
     ARROW_ASSIGN_OR_RAISE(auto column, builder->Finish());
@@ -548,6 +787,11 @@ arrow::Status SortOperator::Open(ExecContext& ctx) {
     return arrow::Status::Invalid("negative LIMIT or OFFSET");
   }
   pool_ = ctx.pool;
+  selection_before_gather_ =
+      ctx.sort_selection_before_gather && limit_.has_value() &&
+      std::ranges::any_of(input_->output_schema()->fields(), [](const auto& field) {
+        return field->type()->id() == arrow::Type::BINARY;
+      });
   memory_.Reset(ctx.budget);
   batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
   ARROW_ASSIGN_OR_RAISE(RowComparator comparator,
@@ -571,8 +815,22 @@ arrow::Result<Batch> SortOperator::Next() {
       if (in.end()) {
         break;
       }
-      ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
-      ARROW_RETURN_NOT_OK(buffer_->Add(std::move(rows), pool_));
+      const bool view_payload = HasBinaryViews(*in.data->schema());
+      if (view_payload || selection_before_gather_) {
+        ARROW_RETURN_NOT_OK(buffer_->Add(in.data, pool_, in.selection));
+        if (!view_payload && selection_before_gather_ && profile() != nullptr &&
+            in.selection != nullptr && in.selection->true_count() > 0 &&
+            in.selection->true_count() < in.data->num_rows()) {
+          profile()->Add("selection_before_gather_batches", MetricUnit::kCount, 1);
+          profile()->Add("selection_before_gather_input_rows", MetricUnit::kCount,
+                         in.data->num_rows());
+          profile()->Add("selection_before_gather_selected_rows", MetricUnit::kCount,
+                         in.selection->true_count());
+        }
+      } else {
+        ARROW_ASSIGN_OR_RAISE(auto rows, Materialize(in, pool_));
+        ARROW_RETURN_NOT_OK(buffer_->Add(std::move(rows), pool_));
+      }
       ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage()));
     }
     ARROW_RETURN_NOT_OK(memory_.Resize(buffer_->memory_usage() + buffer_->sort_memory()));

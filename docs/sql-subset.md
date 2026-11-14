@@ -1202,6 +1202,32 @@ Project x, tag
 `--build-side-ratio` and `--join-order`, and cannot be given together with `--analyze`; its errors and exit codes
 are those of `antb1 query`.
 
+`--binary-view-payload` is an opt-in execution experiment on `query`, `explain` and `bench`
+([ADR 0027](adr/0027-string-views.md)). It carries owned string views through eligible integer-key INNER
+join payloads, numeric selection and top-N, then restores ordinary Binary result columns. The physical
+plan shows a `BinaryOutput` root when the complete path qualifies. Ineligible plans use the ordinary
+path. The chosen join's inputs may contain ordinary joins or aggregation; only its selected build
+payloads become views. String sort keys remain Binary, including every projected alias of a key,
+while unrelated payload columns may use views. Residual join predicates, string expressions over
+the output, subsequent joins and shared subplans still exclude this path. With `--analyze`, the output
+adapter reports view values, descriptor bytes and backing-buffer bytes; backing bytes can count
+shared storage more than once and are not a distinct-allocation memory measurement.
+The option is off by default and changes neither SQL types nor answers. Streaming views share
+their immutable payload owners. For each view column after pruning, top-N shares a backing allocation
+whose capacity does not exceed the bytes needed to copy its selected long values, including repeats;
+otherwise it copies those values. It reapplies this choice when rebuilding survivors at row and
+distinct backing-allocation byte thresholds. This is not an exact distinct-live-byte ratio. All
+retained allocations and temporary copies remain within the query memory budget.
+
+`--sort-selection-before-gather` is an independent, opt-in execution experiment on `query`,
+`explain` and `bench`. A TopN operator carrying ordinary Binary strings can combine its input
+selection with the current threshold before gathering surviving rows. It is off by default and
+changes neither the logical or physical plan nor the answers. It does not enable string views.
+With `--analyze`, `selection_before_gather_batches`, `selection_before_gather_input_rows` and
+`selection_before_gather_selected_rows` count partial input selections forwarded to eligible
+TopN buffers before gathering. These counters include batches arriving before a threshold exists;
+they do not count rows rejected by the threshold.
+
 It shows what no logical plan holds, because the physical planner is what decides it:
 
 - part pipelines and the operators that consume them (`PartUnion`, `PartAggregate`, `PartGroupAggregate`,

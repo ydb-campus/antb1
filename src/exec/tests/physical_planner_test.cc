@@ -21,6 +21,7 @@
 #include "antb1/exec/sort.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
+#include "antb1/plan/types.h"
 
 #include "../hash_join.h"
 #include "../parallel_compute.h"
@@ -120,6 +121,81 @@ class PhysicalPlannerTest : public testing::ExecTest {
     return plan;
   }
 
+  static plan::LogicalNodePtr PayloadScan(bool right) {
+    const auto schema =
+        arrow::schema({arrow::field("x", arrow::int64()), arrow::field("p", arrow::binary())});
+    const auto rows = arrow::RecordBatch::Make(
+        schema, 4,
+        {right ? Int64s({2, 2, 4, 5}) : Int64s({1, 2, 2, 4}),
+         right ? testing::Strings(
+                     {std::string(13, 'b'), std::string(12, 'c'), std::nullopt, "unused"})
+               : testing::Strings(
+                     {"", std::string(13, 'a'), std::nullopt, std::string("\xFF\0z", 3)})});
+    auto table = std::make_shared<MemoryTable>(
+        schema, arrow::RecordBatchVector{rows->Slice(0, 2), rows->Slice(2, 2)}, true);
+    return Node(plan::ScanNode{
+        .table = std::move(table), .table_name = right ? "r" : "l", .fields = {0, 1}});
+  }
+
+  static plan::LogicalNodePtr PayloadJoin(plan::BuildSide build = plan::BuildSide::kRight) {
+    const auto key = Column(0, "x", LogicalType::kBigInt);
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                               .left = PayloadScan(false),
+                               .right = PayloadScan(true),
+                               .keys = {{.left = key, .right = key}},
+                               .build = build});
+  }
+
+  static plan::LogicalNodePtr WidePayloadJoin(plan::BuildSide build) {
+    const auto scan = [](bool right) {
+      const auto schema =
+          arrow::schema({arrow::field("x", arrow::int64()), arrow::field("order", arrow::binary()),
+                         arrow::field("payload", arrow::binary())});
+      const auto rows = arrow::RecordBatch::Make(
+          schema, 4,
+          {right ? Int64s({2, 2, 4, 5}) : Int64s({1, 2, 2, 4}),
+           right ? testing::Strings({"z", std::nullopt, "", "unused"})
+                 : testing::Strings({"unused", std::string("\xFF\0z", 3), std::nullopt, "a"}),
+           right ? testing::Strings(
+                       {std::string(80, 'r'), std::string(37, 's'), std::nullopt, "unused"})
+                 : testing::Strings({"unused", std::string(41, 'l'),
+                                     std::string("\0", 1) + std::string(65, 'm'), ""})});
+      auto table = std::make_shared<MemoryTable>(
+          schema, arrow::RecordBatchVector{rows->Slice(0, 2), rows->Slice(2, 2)}, true);
+      return Node(plan::ScanNode{
+          .table = std::move(table), .table_name = right ? "r" : "l", .fields = {0, 1, 2}});
+    };
+    const auto key = Column(0, "x", LogicalType::kBigInt);
+    return Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                               .left = scan(false),
+                               .right = scan(true),
+                               .keys = {{.left = key, .right = key}},
+                               .build = build});
+  }
+
+  static plan::LogicalNodePtr PayloadTop(plan::LogicalNodePtr input, int64_t limit = 4,
+                                         int64_t offset = 0, int key = 0) {
+    return Node(plan::LimitNode{
+        .input = Node(plan::SortNode{.input = std::move(input),
+                                     .keys = {{.column = Column(key, "x", LogicalType::kBigInt)}}}),
+        .limit = limit,
+        .offset = offset});
+  }
+
+  static plan::ExprPtr ColumnValue(int column, LogicalType type) {
+    return std::make_shared<const plan::Expr>(
+        plan::Expr{.node = plan::ColumnExpr{.index = column}, .type = type, .name = "value"});
+  }
+
+  static int64_t MetricValue(const ProfileNode& profile, std::string_view name) {
+    for (const ProfileMetric& metric : profile.metrics()) {
+      if (metric.name == name) {
+        return metric.value;
+      }
+    }
+    return 0;
+  }
+
   static std::shared_ptr<arrow::Table> Run(const plan::LogicalPlan& plan, int64_t batch_size = 3) {
     auto op = BuildPhysicalPlan(plan);
     EXPECT_TRUE(op.ok()) << op.status().ToString();
@@ -187,6 +263,351 @@ TEST_F(PhysicalPlannerTest, LimitOverSortIsATopN) {
   EXPECT_EQ(root(3, 2)->output_schema()->num_fields(), 2);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(0, 0).get()), nullptr);
   EXPECT_NE(dynamic_cast<const LimitOperator*>(root(std::nullopt, 4).get()), nullptr);
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotKeepsBinaryResultsThroughNumericConsumers) {
+  for (const plan::BuildSide build : {plan::BuildSide::kLeft, plan::BuildSide::kRight}) {
+    const int payload = build == plan::BuildSide::kLeft ? 1 : 3;
+    const auto computed = Node(plan::ComputeNode{.input = PayloadJoin(build),
+                                                 .exprs = {ColumnValue(0, LogicalType::kBigInt)}});
+    const auto filter = Node(
+        plan::FilterNode{.input = computed,
+                         .predicates = {testing::Compare(Column(4, "value", LogicalType::kBigInt),
+                                                         plan::CompareOp::kLt, BigInt(4))}});
+    const auto projected =
+        Node(plan::ProjectNode{.input = filter,
+                               .columns = {Column(payload, "payload", LogicalType::kVarchar),
+                                           Column(4, "value", LogicalType::kBigInt),
+                                           Column(payload, "again", LogicalType::kVarchar),
+                                           Column(0, "constant", LogicalType::kVarchar)},
+                               .constants = {std::nullopt, std::nullopt, std::nullopt,
+                                             plan::Constant{.type = LogicalType::kVarchar,
+                                                            .value = std::string("fixed")}}});
+    for (const int64_t offset : {1, 20}) {
+      const auto plan =
+          PlanOf(Node(plan::ProjectNode{.input = PayloadTop(projected, 4, offset, 1),
+                                        .columns = {Column(1, "value", LogicalType::kBigInt),
+                                                    Column(0, "payload", LogicalType::kVarchar),
+                                                    Column(2, "again", LogicalType::kVarchar),
+                                                    Column(3, "constant", LogicalType::kVarchar)}}),
+                 4);
+      for (const int64_t batch_size : {1, 3, 64}) {
+        const auto ordinary = Run(plan, batch_size);
+        ASSERT_NE(ordinary, nullptr);
+        ProfileNode profile;
+        auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+        ASSERT_TRUE(op.ok()) << op.status().ToString();
+        EXPECT_EQ(profile.name(), "BinaryOutput");
+        EXPECT_TRUE((*op)->output_schema()->Equals(*ordinary->schema()));
+        EXPECT_EQ((*op)->output_schema()->field(1)->type()->id(), arrow::Type::BINARY);
+        for (int run = 0; run < 2; ++run) {
+          ExecContext ctx{.batch_size = batch_size};
+          const auto result = Drain(**op, ctx);
+          ASSERT_TRUE(result.ok()) << result.status().ToString();
+          ASSERT_TRUE((*result)->ValidateFull().ok());
+          EXPECT_TRUE((*result)->Equals(*ordinary));
+          EXPECT_EQ((*result)->num_rows(), offset == 1 ? 3 : 0);
+          EXPECT_TRUE((*result)->column(1)->Equals((*result)->column(2)));
+        }
+      }
+    }
+  }
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotHandlesEmptyInputAndSimpleInputPipelines) {
+  auto join = std::get<plan::JoinNode>(*PayloadJoin());
+  join.left = Node(plan::ProjectNode{
+      .input = Node(plan::ComputeNode{
+          .input = Node(
+              plan::FilterNode{.input = join.left,
+                               .predicates = {testing::Compare(Column(0, "x", LogicalType::kBigInt),
+                                                               plan::CompareOp::kGe, BigInt(0))}}),
+          .exprs = {ColumnValue(0, LogicalType::kBigInt)}}),
+      .columns = {Column(2, "x", LogicalType::kBigInt), Column(1, "p", LogicalType::kVarchar)}});
+  for (const bool empty : {false, true}) {
+    auto input = Node(join);
+    if (empty) {
+      input = Node(
+          plan::FilterNode{.input = input,
+                           .predicates = {testing::Compare(Column(0, "x", LogicalType::kBigInt),
+                                                           plan::CompareOp::kLt, BigInt(0))}});
+    }
+    const auto plan = PlanOf(PayloadTop(input), 4);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    EXPECT_EQ(profile.name(), "BinaryOutput");
+    ExecContext ctx{.batch_size = 1};
+    const auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ((*result)->num_rows(), empty ? 0 : 4);
+    EXPECT_EQ(MetricValue(profile, "view_values"), empty ? 0 : 4);
+    if (empty) {
+      EXPECT_EQ(MetricValue(profile, "view_descriptor"), 0);
+      EXPECT_EQ(MetricValue(profile, "view_backing"), 0);
+    }
+    const auto ordinary = Run(plan, 1);
+    ASSERT_NE(ordinary, nullptr);
+    EXPECT_TRUE((*result)->Equals(*ordinary));
+  }
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotAcceptsHugeIntKeysInDecimalStorage) {
+  const auto schema = arrow::schema({arrow::field("x", plan::ToArrow(LogicalType::kHugeInt)),
+                                     arrow::field("p", arrow::binary())});
+  const auto rows = arrow::RecordBatch::Make(
+      schema, 3,
+      {testing::Decimals(LogicalType::kHugeInt, {"18446744073709551616", "2", std::nullopt}),
+       testing::Strings({std::string(13, 'a'), std::string(12, 'b'), "null key"})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{rows}, true);
+  const auto scan = [&] {
+    return Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  };
+  const auto key = Column(0, "x", LogicalType::kHugeInt);
+  const auto join = Node(plan::JoinNode{.kind = plan::JoinKind::kInner,
+                                        .left = scan(),
+                                        .right = scan(),
+                                        .keys = {{.left = key, .right = key}},
+                                        .build = plan::BuildSide::kRight});
+  const auto plan = PlanOf(
+      Node(plan::LimitNode{.input = Node(plan::SortNode{.input = join, .keys = {{.column = key}}}),
+                           .limit = 2}),
+      4);
+  ProfileNode profile;
+  auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+  ASSERT_TRUE(op.ok()) << op.status().ToString();
+  EXPECT_EQ(profile.name(), "BinaryOutput");
+  ExecContext ctx{.batch_size = 1};
+  const auto result = Drain(**op, ctx);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_EQ((*result)->num_rows(), 2);
+  const auto ordinary = Run(plan, 1);
+  ASSERT_NE(ordinary, nullptr);
+  EXPECT_TRUE((*result)->Equals(*ordinary));
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotKeepsStringSortKeysBinaryAndOtherPayloadsAsViews) {
+  for (const plan::BuildSide build : {plan::BuildSide::kLeft, plan::BuildSide::kRight}) {
+    const int build_order = build == plan::BuildSide::kLeft ? 1 : 4;
+    const int probe_order = build == plan::BuildSide::kLeft ? 4 : 1;
+    const auto computed = Node(plan::ComputeNode{.input = WidePayloadJoin(build),
+                                                 .exprs = {ColumnValue(0, LogicalType::kBigInt)}});
+    const auto filtered = Node(
+        plan::FilterNode{.input = computed,
+                         .predicates = {testing::Compare(Column(6, "value", LogicalType::kBigInt),
+                                                         plan::CompareOp::kLt, BigInt(5))}});
+    const auto sort = Node(plan::SortNode{
+        .input = filtered,
+        .keys = {{.column = Column(build_order, "build order", LogicalType::kVarchar)},
+                 {.column = Column(probe_order, "probe order", LogicalType::kVarchar),
+                  .descending = true},
+                 {.column = Column(6, "value", LogicalType::kBigInt)}}});
+    const auto plan = PlanOf(Node(plan::LimitNode{.input = sort, .limit = 3, .offset = 1}), 7);
+    for (const int64_t batch_size : {1, 3}) {
+      ProfileNode ordinary_profile;
+      auto ordinary_op = BuildPhysicalPlan(plan, &ordinary_profile);
+      ASSERT_TRUE(ordinary_op.ok()) << ordinary_op.status().ToString();
+      ExecContext ordinary_ctx{.batch_size = batch_size};
+      const auto ordinary_result = Drain(**ordinary_op, ordinary_ctx);
+      ASSERT_TRUE(ordinary_result.ok()) << ordinary_result.status().ToString();
+      const auto& ordinary = *ordinary_result;
+      EXPECT_EQ(MetricValue(ordinary_profile, "view_values"), 0);
+      EXPECT_EQ(MetricValue(ordinary_profile, "view_descriptor"), 0);
+      EXPECT_EQ(MetricValue(ordinary_profile, "view_backing"), 0);
+      ProfileNode profile;
+      auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      EXPECT_EQ(profile.name(), "BinaryOutput");
+      EXPECT_TRUE(profile.detail().contains("columns=1"));
+      EXPECT_TRUE((*op)->output_schema()->Equals(*ordinary->schema()));
+      for (const int c : {1, 2, 4, 5}) {
+        EXPECT_EQ((*op)->output_schema()->field(c)->type()->id(), arrow::Type::BINARY);
+      }
+      for (int run = 0; run < 2; ++run) {
+        ExecContext ctx{.batch_size = batch_size};
+        const auto result = Drain(**op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE((*result)->ValidateFull().ok());
+        EXPECT_TRUE((*result)->Equals(*ordinary));
+        EXPECT_EQ((*result)->num_rows(), 3);
+        EXPECT_EQ(MetricValue(profile, "view_values"), 3 * (run + 1));
+        EXPECT_GT(MetricValue(profile, "view_descriptor"), 0);
+        EXPECT_GT(MetricValue(profile, "view_backing"), 0);
+      }
+    }
+  }
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotDemotesEveryAliasOfASortKeyAndIgnoresConstants) {
+  for (const plan::BuildSide build : {plan::BuildSide::kLeft, plan::BuildSide::kRight}) {
+    const int order = build == plan::BuildSide::kLeft ? 1 : 4;
+    const int payload = order + 1;
+    const auto projected = Node(plan::ProjectNode{
+        .input = WidePayloadJoin(build),
+        .columns = {Column(order, "order", LogicalType::kVarchar),
+                    Column(payload, "payload", LogicalType::kVarchar),
+                    Column(order, "order again", LogicalType::kVarchar),
+                    Column(payload, "constant", LogicalType::kVarchar),
+                    Column(0, "x", LogicalType::kBigInt)},
+        .constants = {std::nullopt, std::nullopt, std::nullopt,
+                      plan::Constant{.type = LogicalType::kVarchar, .value = std::string("fixed")},
+                      std::nullopt}});
+    const auto reordered =
+        Node(plan::ProjectNode{.input = projected,
+                               .columns = {Column(1, "payload", LogicalType::kVarchar),
+                                           Column(2, "order again", LogicalType::kVarchar),
+                                           Column(0, "order", LogicalType::kVarchar),
+                                           Column(3, "constant", LogicalType::kVarchar),
+                                           Column(4, "x", LogicalType::kBigInt)}});
+    // The first case retains a payload. The others leave no view field in the public result:
+    // either its only unsorted payload is projected away, or both build strings are sort keys.
+    for (const int mode : {0, 1, 2}) {
+      std::vector<plan::SortKey> keys = {
+          {.column = Column(1, "order again", LogicalType::kVarchar)},
+          {.column = Column(3, "constant", LogicalType::kVarchar)},
+          {.column = Column(4, "x", LogicalType::kBigInt)}};
+      if (mode == 2) {
+        keys.push_back({.column = Column(0, "payload", LogicalType::kVarchar)});
+      }
+      auto root = Node(plan::LimitNode{
+          .input = Node(plan::SortNode{.input = reordered, .keys = std::move(keys)}), .limit = 4});
+      if (mode == 1) {
+        root = Node(plan::ProjectNode{.input = root,
+                                      .columns = {Column(1, "order again", LogicalType::kVarchar),
+                                                  Column(2, "order", LogicalType::kVarchar),
+                                                  Column(3, "constant", LogicalType::kVarchar)}});
+      }
+      const auto plan = PlanOf(root, mode == 1 ? std::size_t{3} : std::size_t{5});
+      const auto ordinary = Run(plan, 2);
+      ASSERT_NE(ordinary, nullptr);
+      ProfileNode profile;
+      auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      EXPECT_EQ(profile.name() == "BinaryOutput", mode == 0);
+      EXPECT_TRUE((*op)->output_schema()->Equals(*ordinary->schema()));
+      ExecContext ctx{.batch_size = 2};
+      const auto result = Drain(**op, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_TRUE((*result)->ValidateFull().ok());
+      EXPECT_TRUE((*result)->Equals(*ordinary));
+    }
+  }
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotLeavesComplexJoinInputsOrdinary) {
+  for (const plan::BuildSide build : {plan::BuildSide::kLeft, plan::BuildSide::kRight}) {
+    for (const bool nested_join : {false, true}) {
+      auto join = std::get<plan::JoinNode>(*PayloadJoin(build));
+      if (nested_join) {
+        join.left = PayloadJoin();
+      } else {
+        plan::SortNode sorted{.input = join.left, .keys = {}};
+        const plan::SortKey key{.column = Column(1, "p", LogicalType::kVarchar)};
+        sorted.keys.push_back(key);
+        join.left = Node(std::move(sorted));
+      }
+      const auto plan =
+          PlanOf(PayloadTop(Node(join)), nested_join ? std::size_t{6} : std::size_t{4});
+      for (const int64_t batch_size : {1, 3}) {
+        const auto ordinary = Run(plan, batch_size);
+        ASSERT_NE(ordinary, nullptr);
+        ProfileNode profile;
+        auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+        ASSERT_TRUE(op.ok()) << op.status().ToString();
+        EXPECT_EQ(profile.name(), "BinaryOutput");
+        EXPECT_TRUE((*op)->output_schema()->Equals(*ordinary->schema()));
+        ExecContext ctx{.batch_size = batch_size};
+        const auto result = Drain(**op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE((*result)->ValidateFull().ok());
+        EXPECT_TRUE((*result)->Equals(*ordinary));
+        EXPECT_GT((*result)->num_rows(), 0);
+      }
+    }
+  }
+}
+
+TEST_F(PhysicalPlannerTest, BinaryViewPilotFallsBackBeforeUnsupportedConsumers) {
+  const auto join = PayloadJoin();
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto payload = Column(3, "p", LogicalType::kVarchar);
+  const auto sort = Node(plan::SortNode{.input = join, .keys = {{.column = x}}});
+  const auto string_filter = [&](int column) {
+    return Node(plan::FilterNode{
+        .input = join,
+        .predicates = {testing::Compare(
+            Column(column, "p", LogicalType::kVarchar), plan::CompareOp::kEq,
+            plan::Constant{.type = LogicalType::kVarchar, .value = std::string(13, 'b')})}});
+  };
+  const auto strlen = std::make_shared<const plan::Expr>(
+      plan::Expr{.node = plan::FunctionExpr{.function = plan::Function::kStrlen,
+                                            .args = {ColumnValue(3, LogicalType::kVarchar)}},
+                 .type = LogicalType::kBigInt,
+                 .name = "length"});
+  struct Case {
+    std::string_view name;
+    plan::LogicalNodePtr root;
+    std::size_t width;
+  };
+  std::vector<Case> cases{
+      {.name = "no top-N", .root = join, .width = 4},
+      {.name = "full sort", .root = sort, .width = 4},
+      {.name = "zero limit", .root = PayloadTop(join, 0), .width = 4},
+      {.name = "offset only",
+       .root = Node(plan::LimitNode{.input = sort, .limit = {}, .offset = 1}),
+       .width = 4},
+      {.name = "nested top-N", .root = PayloadTop(PayloadTop(join)), .width = 4},
+      {.name = "all build payloads are sort keys",
+       .root = Node(plan::LimitNode{
+           .input = Node(plan::SortNode{.input = join, .keys = {{.column = payload}}}),
+           .limit = 4}),
+       .width = 4},
+      {.name = "build string predicate", .root = PayloadTop(string_filter(3)), .width = 4},
+      {.name = "probe string predicate", .root = PayloadTop(string_filter(1)), .width = 4},
+      {.name = "string expression",
+       .root = PayloadTop(Node(
+           plan::ComputeNode{.input = join, .exprs = {ColumnValue(3, LogicalType::kVarchar)}})),
+       .width = 5},
+      {.name = "numeric expression reading string",
+       .root = PayloadTop(Node(plan::ComputeNode{.input = join, .exprs = {strlen}})),
+       .width = 5},
+      {.name = "no payload output",
+       .root = Node(plan::ProjectNode{.input = PayloadTop(join), .columns = {x}}),
+       .width = 1},
+      {.name = "aggregate consumer",
+       .root = Node(plan::AggregateNode{.input = PayloadTop(join),
+                                        .aggregates = {{.kind = plan::AggKind::kCountStar,
+                                                        .arg = {},
+                                                        .type = LogicalType::kBigInt}}}),
+       .width = 1},
+      {.name = "no producer", .root = PayloadTop(PayloadScan(false)), .width = 2}};
+  auto changed = std::get<plan::JoinNode>(*join);
+  changed.kind = plan::JoinKind::kLeft;
+  cases.push_back({.name = "outer join", .root = PayloadTop(Node(changed)), .width = 4});
+  changed = std::get<plan::JoinNode>(*join);
+  changed.keys = {{.left = Column(1, "p", LogicalType::kVarchar),
+                   .right = Column(1, "p", LogicalType::kVarchar)}};
+  cases.push_back({.name = "string join key", .root = PayloadTop(Node(changed)), .width = 4});
+  changed = std::get<plan::JoinNode>(*join);
+  changed.residual = {std::make_shared<const plan::Expr>(plan::Expr{
+      .node = plan::PredicateExpr{.predicate = testing::Compare(x, plan::CompareOp::kGe, BigInt(0)),
+                                  .operands = {ColumnValue(0, LogicalType::kBigInt)}},
+      .type = LogicalType::kBoolean})};
+  cases.push_back({.name = "join residual", .root = PayloadTop(Node(changed)), .width = 4});
+  for (const Case& item : cases) {
+    SCOPED_TRACE(item.name);
+    const auto plan = PlanOf(item.root, item.width);
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(plan, &profile, {.binary_view_payload = true});
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    EXPECT_NE(profile.name(), "BinaryOutput");
+    ExecContext ctx{.batch_size = 2};
+    const auto result = Drain(**op, ctx);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    const auto ordinary = Run(plan, 2);
+    ASSERT_NE(ordinary, nullptr);
+    EXPECT_TRUE((*result)->Equals(*ordinary));
+  }
 }
 
 // A global aggregation of only COUNT(DISTINCT) of one column over a scan is planned as COUNT over a
@@ -1261,12 +1682,16 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   const auto width_of = [](const plan::LogicalNodePtr& root) { return WidthOf(root); };
   const auto expect_invalid = [&](const plan::LogicalNodePtr& root, std::string_view what) {
     for (const bool profiled : {false, true}) {
-      ProfileNode profile;
-      const auto status =
-          BuildPhysicalPlan(PlanOf(root, width_of(root)), profiled ? &profile : nullptr).status();
-      EXPECT_TRUE(status.IsInvalid())
-          << what << (profiled ? ", profiled" : "") << ": " << status.ToString();
-      EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
+      for (const bool views : {false, true}) {
+        ProfileNode profile;
+        const auto status =
+            BuildPhysicalPlan(PlanOf(root, width_of(root)), profiled ? &profile : nullptr,
+                              {.binary_view_payload = views})
+                .status();
+        EXPECT_TRUE(status.IsInvalid())
+            << what << (profiled ? ", profiled" : "") << ": " << status.ToString();
+        EXPECT_EQ(plan::GetSqlError(status), nullptr) << what << ": a malformed plan is a bug";
+      }
     }
   };
   expect_invalid(Node(plan::JoinNode{}), "no inputs");

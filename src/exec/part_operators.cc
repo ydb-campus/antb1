@@ -44,7 +44,8 @@ ExecContext PartContext(const ExecContext& ctx) {
                      .executor = nullptr,
                      .threads = 1,
                      .budget = ctx.budget,
-                     .scans = ctx.scans};
+                     .scans = ctx.scans,
+                     .sort_selection_before_gather = ctx.sort_selection_before_gather};
 }
 
 int64_t PartWindow(const ExecContext& ctx) {

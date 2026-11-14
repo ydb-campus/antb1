@@ -14,6 +14,7 @@
 
 #include <arrow/api.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/compute.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
@@ -34,6 +35,7 @@
 #include "antb1/plan/sql_status.h"
 #include "antb1/plan/types.h"
 
+#include "binary_view.h"
 #include "hash_join.h"
 #include "materialized_table.h"
 #include "parallel_compute.h"
@@ -48,6 +50,65 @@ namespace antb1::exec {
 namespace {
 
 using OperatorResult = arrow::Result<std::unique_ptr<Operator>>;
+
+// Only this join may produce views. Part factories own the configuration and their logical tree.
+struct ViewPayloadPath {
+  const plan::JoinNode* join = nullptr;
+  std::vector<bool> build_columns;
+};
+using ViewPath = std::shared_ptr<const ViewPayloadPath>;
+
+// The public result boundary has its own Binary schema even when its input carries owned views.
+class BinaryOutputOperator final : public Operator {
+ public:
+  explicit BinaryOutputOperator(std::unique_ptr<Operator> input) : input_(std::move(input)) {
+    arrow::FieldVector fields = input_->output_schema()->fields();
+    for (auto& field : fields) {
+      if (field->type()->id() == arrow::Type::BINARY_VIEW) {
+        field = field->WithType(arrow::binary());
+      }
+    }
+    schema_ = arrow::schema(std::move(fields), input_->output_schema()->metadata());
+  }
+  const std::shared_ptr<arrow::Schema>& output_schema() const override { return schema_; }
+  arrow::Status Open(ExecContext& ctx) override {
+    pool_ = ctx.pool;
+    return input_->Open(ctx);
+  }
+  arrow::Result<Batch> Next() override {
+    ARROW_ASSIGN_OR_RAISE(Batch batch, input_->Next());
+    if (batch.end()) {
+      return batch;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto selected, Materialize(batch, pool_));
+    if (profile() != nullptr) {
+      for (const auto& column : selected->columns()) {
+        if (column->type_id() != arrow::Type::BINARY_VIEW) {
+          continue;
+        }
+        profile()->Add("view_values", MetricUnit::kCount, column->length());
+        if (column->data()->buffers[1] != nullptr) {
+          profile()->Add("view_descriptor", MetricUnit::kBytes, column->data()->buffers[1]->size());
+        }
+        // A diagnostic of the actual output representation, not a distinct-allocation memory
+        // measurement: aliases and buffers shared between columns can be counted more than once.
+        for (std::size_t b = 2; b < column->data()->buffers.size(); ++b) {
+          if (column->data()->buffers[b] != nullptr) {
+            profile()->Add("view_backing", MetricUnit::kBytes, column->data()->buffers[b]->size());
+          }
+        }
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto output, MaterializeBinaryViews(selected, pool_));
+    return Batch{.data = std::move(output), .selection = {}};
+  }
+  arrow::Status Close() override { return input_->Close(); }
+
+ private:
+  std::unique_ptr<Operator> input_;
+  std::shared_ptr<arrow::Schema> schema_;
+  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
+};
 
 // The joins whose probes run in one part pipeline, and their builds, outermost join first: the
 // order in which the operator that runs the pipeline prepares them (PrepareBuilds). Made once per
@@ -98,7 +159,7 @@ struct AggregateFilter {
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part = std::nullopt,
                      ProfileNode* slot = nullptr, const LateScan* late = nullptr,
                      const PartitionTopN* top_n = nullptr, const PipelineBuilds* builds = nullptr,
-                     const AggregateFilter* above = nullptr);
+                     const AggregateFilter* above = nullptr, const ViewPath& views = nullptr);
 // The operator profiled into `slot` (with the node's EXPLAIN line when it has no detail yet); the
 // operator itself without a slot.
 OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, ProfileNode* slot);
@@ -299,7 +360,8 @@ struct Parts {
 arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
                              ProfileNode* consumer = nullptr,
                              const std::shared_ptr<const LateScan>& late = nullptr,
-                             const AggregateFilter* above = nullptr);
+                             const AggregateFilter* above = nullptr,
+                             const ViewPath& views = nullptr);
 
 // The build of a join of shape `shape`, profiled into `slot` (nullptr: not profiled): keyless for
 // a one-row join, which keeps every column, and for a nested loop (ADR 0040), which keeps those
@@ -421,7 +483,7 @@ arrow::Result<std::shared_ptr<const PipelineBuilds>> PipelineBuildsOf(
 // its row-id column), every part's scan is narrow (LateScan), numbered by the part's number.
 arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
                              ProfileNode* consumer, const std::shared_ptr<const LateScan>& late,
-                             const AggregateFilter* above) {
+                             const AggregateFilter* above, const ViewPath& views) {
   // Copied into the factory: the aggregate above outlives no part task, so the pointer must not.
   const std::optional<AggregateFilter> inherited =
       above == nullptr ? std::nullopt : std::optional<AggregateFilter>(*above);
@@ -443,13 +505,13 @@ arrow::Result<Parts> PartsOf(const plan::LogicalNodePtr& node, const plan::ScanN
     ++sample;
   }
   return Parts{.pipeline =
-                   [node, kept, pipeline, late, builds, inherited](int64_t i) {
+                   [node, kept, pipeline, late, builds, inherited, views](int64_t i) {
                      // Past the kept parts only for the schema sample, which is never opened.
                      const int64_t part =
                          std::cmp_less(i, kept->size()) ? (*kept)[static_cast<std::size_t>(i)] : i;
                      if (late == nullptr) {
                        return Build(node, part, pipeline, nullptr, nullptr, builds.get(),
-                                    inherited.has_value() ? &*inherited : nullptr);
+                                    inherited.has_value() ? &*inherited : nullptr, views);
                      }
                      LateScan numbered = *late;
                      numbered.ordinal = i;
@@ -476,13 +538,14 @@ std::unique_ptr<Operator> WithBuilds(std::unique_ptr<PartSink> sink,
 
 // A part pipeline's batches in part order, at most row_cap selected rows per part.
 OperatorResult BuildPartUnion(const plan::LogicalNodePtr& node, const plan::ScanNode& scan,
-                              std::optional<int64_t> row_cap, ProfileNode* slot) {
+                              std::optional<int64_t> row_cap, ProfileNode* slot,
+                              const ViewPath& views = nullptr) {
   if (slot != nullptr) {
     slot->set_name("PartUnion");
     slot->set_detail(row_cap.has_value() ? std::format("at most {} rows per part", *row_cap)
                                          : std::string("in part order"));
   }
-  ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node, scan, slot));
+  ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(node, scan, slot, nullptr, nullptr, views));
   ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));  // for the output schema; never opened
   return WithBuilds(std::make_unique<PartUnionOperator>(std::move(parts.pipeline), parts.count,
                                                         sample->output_schema(), row_cap),
@@ -1048,6 +1111,7 @@ struct Builder {
   // nodes that keep every row carry it on: a Filter as it is, a Project and a Compute with the key
   // remapped, and every other node drops it.
   const AggregateFilter* above = nullptr;
+  ViewPath views;
 
   // The profile node of the operator's input `k` (per part as the operator is). A node's name,
   // detail and per-part flag are written by the first build of its plan (at planning time, before
@@ -1245,7 +1309,7 @@ struct Builder {
     // the joins of the scan's own pipeline -- which is why an offer does not reach a scan whose
     // predicates are pushed. Not the filter slot: a scan applies the conjunction of the two.
     ARROW_ASSIGN_OR_RAISE(auto input,
-                          Build(node.input, part, Input(), late, nullptr, builds, above));
+                          Build(node.input, part, Input(), late, nullptr, builds, above, views));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
@@ -1257,7 +1321,7 @@ struct Builder {
       carried = nullptr;
     }
     ARROW_ASSIGN_OR_RAISE(auto input,
-                          Build(node.input, part, Input(), late, nullptr, builds, carried));
+                          Build(node.input, part, Input(), late, nullptr, builds, carried, views));
     if (!part.has_value()) {  // over a whole input (an aggregation, a sort): batches in parallel
       return std::make_unique<ParallelComputeOperator>(std::move(input), node.exprs);
     }
@@ -1279,8 +1343,8 @@ struct Builder {
         }
       }
     }
-    ARROW_ASSIGN_OR_RAISE(auto input,
-                          Build(node.input, part, Input(), nullptr, nullptr, builds, carried));
+    ARROW_ASSIGN_OR_RAISE(
+        auto input, Build(node.input, part, Input(), nullptr, nullptr, builds, carried, views));
     std::vector<int> columns;
     std::vector<std::shared_ptr<arrow::Scalar>> constants;
     columns.reserve(node.columns.size());
@@ -1411,7 +1475,8 @@ struct Builder {
       if (const plan::ScanNode* scan = PipelineScan(sort->input)) {
         // Every part keeps its own first rows, merged in part order.
         Name("PartTopN", detail);
-        ARROW_ASSIGN_OR_RAISE(Parts parts, PartsOf(sort->input, *scan, slot));
+        ARROW_ASSIGN_OR_RAISE(Parts parts,
+                              PartsOf(sort->input, *scan, slot, nullptr, nullptr, views));
         ARROW_ASSIGN_OR_RAISE(auto sample, parts.pipeline(0));
         int64_t keep = 0;
         if (__builtin_add_overflow(*node.limit, node.offset, &keep)) {
@@ -1472,7 +1537,8 @@ struct Builder {
         return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit,
                                               node.offset);
       }
-      ARROW_ASSIGN_OR_RAISE(auto input, Build(sort->input, std::nullopt, Input()));
+      ARROW_ASSIGN_OR_RAISE(auto input, Build(sort->input, std::nullopt, Input(), nullptr, nullptr,
+                                              nullptr, nullptr, views));
       return std::make_unique<SortOperator>(std::move(input), sort->keys, node.limit, node.offset);
     }
     std::unique_ptr<Operator> input;
@@ -1535,8 +1601,10 @@ struct Builder {
     }
     ARROW_ASSIGN_OR_RAISE(
         std::unique_ptr<HashJoinOperator> join,
-        HashJoinOperator::Make(std::move(probe), std::move(build), std::move(shape.probe_keys),
-                               node.build, node.residual, /*prepares=*/!part.has_value()));
+        HashJoinOperator::Make(
+            std::move(probe), std::move(build), std::move(shape.probe_keys), node.build,
+            node.residual, /*prepares=*/!part.has_value(),
+            views != nullptr && views->join == &node ? views->build_columns : std::vector<bool>{}));
     return join;
   }
   OperatorResult operator()(const plan::DependentJoinNode& node) const {
@@ -1646,7 +1714,8 @@ OperatorResult Profiled(OperatorResult op, const plan::LogicalNodePtr& node, Pro
 
 OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> part,
                      ProfileNode* slot, const LateScan* late, const PartitionTopN* top_n,
-                     const PipelineBuilds* builds, const AggregateFilter* above) {
+                     const PipelineBuilds* builds, const AggregateFilter* above,
+                     const ViewPath& views) {
   if (node == nullptr) {
     return arrow::Status::Invalid("logical plan node without its input");
   }
@@ -1676,7 +1745,7 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
   }
   if (!part.has_value()) {
     if (const plan::ScanNode* scan = PipelineScan(node)) {
-      return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot), node, slot);
+      return Profiled(BuildPartUnion(node, *scan, std::nullopt, slot, views), node, slot);
     }
   }
   return Profiled(std::visit(Builder{.part = part,
@@ -1684,7 +1753,8 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
                                      .late = late,
                                      .top_n = top_n,
                                      .builds = builds,
-                                     .above = above},
+                                     .above = above,
+                                     .views = views},
                              *node),
                   node, slot);
 }
@@ -1782,10 +1852,157 @@ plan::LogicalNodePtr Substituted(
   return changed ? plan::WithInputs(*root, std::move(inputs)) : root;
 }
 
+// Prove the entire producer/consumer chain before changing a physical schema. Track positions
+// through projections, including duplicated columns and constants; never infer eligibility from
+// the first batch's values. Nothing in this walk opens an input.
+struct ViewShape {
+  const plan::JoinNode* join = nullptr;
+  std::vector<bool> strings;
+  // Build-column origin for each potential view, or -1 for an ordinary column. A sort key demotes
+  // its origin globally, including every projected alias, before the producer schema is built.
+  std::vector<int> view_columns;
+  std::vector<bool> build_columns;
+  bool top_n = false;
+};
+
+std::optional<ViewShape> ViewShapeOf(const plan::LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return std::nullopt;
+  }
+  if (const auto* join = std::get_if<plan::JoinNode>(node.get())) {
+    if (join->kind != plan::JoinKind::kInner || !join->residual.empty() || join->keys.empty() ||
+        std::ranges::any_of(join->keys, [](const plan::JoinKey& key) {
+          return !plan::IsInteger(key.left.type) || !plan::IsInteger(key.right.type);
+        })) {
+      return std::nullopt;
+    }
+    // Both inputs are built without the view configuration, just as the chosen join's runtime
+    // build and probe inputs are. They may contain joins or aggregation but emit ordinary Binary.
+    const auto left = Build(join->left);
+    const auto right = Build(join->right);
+    if (!left.ok() || !right.ok()) {
+      return std::nullopt;  // The ordinary planner reports the original error.
+    }
+    const auto& build_schema = join->build == plan::BuildSide::kLeft ? (*left)->output_schema()
+                                                                     : (*right)->output_schema();
+    ViewShape shape{
+        .join = join,
+        .strings = {},
+        .view_columns = {},
+        .build_columns = std::vector<bool>(Narrow<std::size_t>(build_schema->num_fields()), false)};
+    for (const bool is_left : {true, false}) {
+      const auto& schema = is_left ? (*left)->output_schema() : (*right)->output_schema();
+      const bool build = is_left == (join->build == plan::BuildSide::kLeft);
+      for (int c = 0; c < schema->num_fields(); ++c) {
+        const auto& field = schema->field(c);
+        const bool string = field->type()->id() == arrow::Type::BINARY;
+        shape.strings.push_back(string);
+        shape.view_columns.push_back(build && string ? c : -1);
+        if (build && string) {
+          shape.build_columns[Narrow<std::size_t>(c)] = true;
+        }
+      }
+    }
+    return shape;
+  }
+  const auto inputs = plan::InputsOf(*node);
+  if (inputs.size() != 1) {
+    return std::nullopt;
+  }
+  if (const auto* limit = std::get_if<plan::LimitNode>(node.get())) {
+    const auto* sort =
+        inputs.front() == nullptr ? nullptr : std::get_if<plan::SortNode>(inputs.front().get());
+    if (sort == nullptr || !limit->limit.has_value() || *limit->limit <= 0 || limit->offset < 0 ||
+        sort->keys.empty()) {
+      return std::nullopt;
+    }
+    auto shape = ViewShapeOf(sort->input);
+    if (!shape.has_value() || shape->top_n) {
+      return std::nullopt;
+    }
+    for (const plan::SortKey& key : sort->keys) {
+      if (key.column.index < 0 ||
+          std::cmp_greater_equal(key.column.index, shape->view_columns.size())) {
+        return std::nullopt;
+      }
+      const int origin = shape->view_columns[Narrow<std::size_t>(key.column.index)];
+      if (origin >= 0) {
+        shape->build_columns[Narrow<std::size_t>(origin)] = false;
+      }
+    }
+    shape->top_n = true;
+    return shape;
+  }
+  if (!std::holds_alternative<plan::FilterNode>(*node) &&
+      !std::holds_alternative<plan::ComputeNode>(*node) &&
+      !std::holds_alternative<plan::ProjectNode>(*node)) {
+    return std::nullopt;
+  }
+  auto shape = ViewShapeOf(inputs.front());
+  if (!shape.has_value()) {
+    return std::nullopt;
+  }
+  const auto ordinary_number = [&](int column) {
+    return column >= 0 && std::cmp_less(column, shape->strings.size()) &&
+           !shape->strings[static_cast<std::size_t>(column)];
+  };
+  if (const auto* filter = std::get_if<plan::FilterNode>(node.get())) {
+    if (std::ranges::any_of(filter->predicates, [&](const plan::Predicate& predicate) {
+          return (predicate.column && !ordinary_number(predicate.column->index)) ||
+                 (predicate.other && !ordinary_number(predicate.other->index));
+        })) {
+      return std::nullopt;
+    }
+  } else if (const auto* compute = std::get_if<plan::ComputeNode>(node.get())) {
+    for (const auto& expr : compute->exprs) {
+      if (expr == nullptr || expr->type == plan::LogicalType::kVarchar) {
+        return std::nullopt;
+      }
+      std::vector<int> columns;
+      plan::CollectColumns(*expr, columns);
+      if (!std::ranges::all_of(columns, ordinary_number)) {
+        return std::nullopt;
+      }
+    }
+    shape->strings.resize(shape->strings.size() + compute->exprs.size(), false);
+    shape->view_columns.resize(shape->view_columns.size() + compute->exprs.size(), -1);
+  } else if (const auto* project = std::get_if<plan::ProjectNode>(node.get())) {
+    if (!project->constants.empty() && project->constants.size() != project->columns.size()) {
+      return std::nullopt;
+    }
+    std::vector<bool> strings;
+    std::vector<int> view_columns;
+    for (std::size_t c = 0; c < project->columns.size(); ++c) {
+      const plan::Constant* constant = nullptr;
+      if (!project->constants.empty()) {
+        const auto& value = project->constants[c];
+        if (value.has_value()) {
+          constant = &*value;
+        }
+      }
+      if (constant != nullptr) {
+        strings.push_back(constant->type == plan::LogicalType::kVarchar);
+        view_columns.push_back(-1);
+      } else {
+        const int column = project->columns[c].index;
+        if (column < 0 || std::cmp_greater_equal(column, shape->strings.size())) {
+          return std::nullopt;
+        }
+        strings.push_back(shape->strings[static_cast<std::size_t>(column)]);
+        view_columns.push_back(shape->view_columns[static_cast<std::size_t>(column)]);
+      }
+    }
+    shape->strings = std::move(strings);
+    shape->view_columns = std::move(view_columns);
+  }
+  return shape;
+}
+
 }  // namespace
 
 arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPlan& plan,
-                                                           ProfileNode* profile) {
+                                                           ProfileNode* profile,
+                                                           PhysicalPlanOptions options) {
   if (!plan.root || plan.output.empty()) {
     return arrow::Status::Invalid("empty logical plan");
   }
@@ -1831,7 +2048,41 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
 
   const plan::LogicalNodePtr root_node =
       replacements.empty() ? plan.root : Substituted(plan.root, replacements);
-  ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, profile));
+  ViewPath views;
+  if (options.binary_view_payload && shared.empty()) {
+    const auto shape = ViewShapeOf(root_node);
+    if (shape.has_value() && shape->top_n) {
+      // Only payloads that reach the public output are useful to this narrow experiment. A
+      // projected-away origin or one used as a sort key keeps its ordinary Binary representation.
+      std::vector<bool> build_columns(shape->build_columns.size(), false);
+      for (const int origin : shape->view_columns) {
+        if (origin >= 0) {
+          const auto at = Narrow<std::size_t>(origin);
+          build_columns[at] = shape->build_columns[at];
+        }
+      }
+      if (std::ranges::any_of(build_columns, [](bool view) { return view; })) {
+        views = std::make_shared<const ViewPayloadPath>(
+            ViewPayloadPath{.join = shape->join, .build_columns = std::move(build_columns)});
+      }
+    }
+  }
+  ProfileNode* root_profile = profile;
+  if (views != nullptr && profile != nullptr) {
+    profile->set_name("BinaryOutput");
+    profile->set_detail(std::format("owned view payloads to Binary columns={}",
+                                    std::ranges::count(views->build_columns, true)));
+    root_profile = profile->Child(0);
+  }
+  ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, root_profile, nullptr, nullptr,
+                                         nullptr, nullptr, views));
+  if (views != nullptr) {
+    root = std::make_unique<BinaryOutputOperator>(std::move(root));
+    if (profile != nullptr) {
+      root->set_profile(profile);
+      root = std::make_unique<ProfiledOperator>(std::move(root), profile);
+    }
+  }
   if (std::cmp_not_equal(root->output_schema()->num_fields(), plan.output.size())) {
     return arrow::Status::Invalid("the physical plan has ", root->output_schema()->num_fields(),
                                   " columns, the logical plan ", plan.output.size());

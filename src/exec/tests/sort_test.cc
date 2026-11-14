@@ -12,14 +12,18 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/util/binary_view_util.h>
 #include <gtest/gtest.h>
 
+#include "antb1/common/narrow.h"
 #include "antb1/exec/limit.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/operator.h"
+#include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
+#include "../part_operators.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -79,6 +83,781 @@ std::shared_ptr<arrow::RecordBatch> WithIds(
 }
 
 using Ids = std::vector<std::optional<int64_t>>;
+
+std::shared_ptr<arrow::Array> ViewPayloads(const std::vector<std::optional<std::string>>& values) {
+  return testing::ArrayOf<arrow::BinaryViewBuilder>(arrow::binary_view(), values);
+}
+
+std::shared_ptr<arrow::Buffer> PayloadOwner(int64_t bytes, char value, arrow::MemoryPool* pool) {
+  std::shared_ptr<arrow::Buffer> owner = arrow::AllocateBuffer(bytes, pool).ValueOrDie();
+  std::fill_n(owner->mutable_data_as<char>(), Narrow<std::size_t>(bytes), value);
+  return owner;
+}
+
+// Foreign descriptors can repeat the same value and refer to a slice of an allocation. Retention
+// must account for that allocation's full capacity, not just this owner's visible window.
+std::shared_ptr<arrow::Array> RepeatedViewPayload(const std::shared_ptr<arrow::Buffer>& owner,
+                                                  int32_t length, int64_t rows = 1) {
+  std::shared_ptr<arrow::Buffer> descriptors =
+      arrow::AllocateBuffer(rows * arrow::BinaryViewType::kSize).ValueOrDie();
+  auto* values = descriptors->mutable_data_as<arrow::BinaryViewType::c_type>();
+  for (int64_t row = 0; row < rows; ++row) {
+    values[row] = arrow::util::ToBinaryView(owner->data(), length, 0, 0);
+  }
+  auto result = std::make_shared<arrow::BinaryViewArray>(arrow::binary_view(), rows, descriptors,
+                                                         arrow::BufferVector{owner});
+  EXPECT_TRUE(result->ValidateFull().ok());
+  return result;
+}
+
+std::vector<std::optional<std::string>> ViewValues(const arrow::Array& values) {
+  EXPECT_EQ(values.type_id(), arrow::Type::BINARY_VIEW);
+  const auto& views = static_cast<const arrow::BinaryViewArray&>(values);
+  std::vector<std::optional<std::string>> out;
+  out.reserve(Narrow<std::size_t>(views.length()));
+  for (int64_t row = 0; row < views.length(); ++row) {
+    out.push_back(views.IsNull(row) ? std::nullopt : std::optional(views.GetString(row)));
+  }
+  return out;
+}
+
+TEST_F(SortTest, BinaryViewPayloadsSurviveTopNSelectionCompactionAndMerge) {
+  arrow::MemoryPool* pool = arrow::default_memory_pool();
+  const auto schema =
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("key", arrow::int64()),
+                     arrow::field("payload", arrow::binary_view())});
+  const auto make_buffer = [&] {
+    return SortBuffer(RowComparator::Make(schema, {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 3);
+  };
+  std::shared_ptr<arrow::RecordBatch> retained;
+  {
+    auto first = arrow::RecordBatch::Make(
+        schema, 4,
+        {Int64s({0, 1, 2, 3}), Int64s({3, std::nullopt, 1, 3}),
+         ViewPayloads({std::string(13, 'a'), std::nullopt, "", std::string("x\0\xFF", 3)})});
+    auto second = arrow::RecordBatch::Make(
+        schema, 5,
+        {Int64s({4, 5, 6, 7, 8}), Int64s({2, 5, 1, std::nullopt, 3}),
+         ViewPayloads({std::string(32, 'z'), "outside", std::nullopt, "null key", "ties later"})});
+    SortBuffer merged = make_buffer();
+    ASSERT_TRUE(merged.Add(first, pool).ok());
+    ASSERT_TRUE(merged.Tighten(pool).ok());
+    EXPECT_EQ(merged.ThresholdKey(), Int128{3});
+    SortBuffer part = make_buffer();
+    ASSERT_TRUE(part.Add(second, pool).ok());
+    ASSERT_TRUE(part.Sort(pool).ok());
+    first.reset();
+    second.reset();
+    // The merged part's key 3 ties the current threshold and is dropped. Its other two rows
+    // exercise view-aware Take before the final multichunk gather.
+    ASSERT_TRUE(merged.Merge(part, pool).ok());
+    EXPECT_EQ(part.num_rows(), 0);
+    ASSERT_TRUE(merged.Sort(pool).ok());
+    const auto rows = merged.Slice(0, 3, pool);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    retained = *rows;
+    ASSERT_TRUE(retained->schema()->Equals(*schema));
+    ASSERT_TRUE(retained->ValidateFull().ok());
+  }
+  const auto table = arrow::Table::FromRecordBatches({retained}).ValueOrDie();
+  EXPECT_EQ(Int64Column(*table), (Ids{2, 6, 4}));
+  EXPECT_EQ(ViewValues(*retained->column(2)),
+            (std::vector<std::optional<std::string>>{"", std::nullopt, std::string(32, 'z')}));
+}
+
+TEST_F(SortTest, BinaryViewPayloadsKeepNumericNullOrderAndStableTies) {
+  const auto batch =
+      WithIds({Int64s({2, std::nullopt, 1, 2}),
+               ViewPayloads({std::string(12, 'a'), std::string(13, 'b'), "", std::nullopt})});
+  EXPECT_EQ(SortedIds(batch, {Key(1, LogicalType::kBigInt)}), (Ids{2, 0, 3, 1}));
+  EXPECT_EQ(SortedIds(batch, {Key(1, LogicalType::kBigInt, true, true)}), (Ids{1, 0, 3, 2}));
+  EXPECT_TRUE(
+      RowComparator::Make(batch->schema(), {Key(2, LogicalType::kVarchar)}).status().IsInvalid());
+}
+
+TEST_F(SortTest, BinaryViewTopNSelectionsOffsetsEmptyOutputAndReopen) {
+  const auto batch = WithIds({Int64s({8, 4, 1, 6, 2, 2, std::nullopt, 0}),
+                              ViewPayloads({"eight", std::string(13, 'x'), "one", "six",
+                                            std::nullopt, "", "null", "zero"})});
+  const auto selected = std::static_pointer_cast<arrow::BooleanArray>(
+      testing::Bools({false, true, true, std::nullopt, true, true, true, true, true, false})
+          ->Slice(1, 8));
+  const auto rejected = testing::Bools(std::vector<std::optional<bool>>(8, false));
+  for (const auto& [limit, offset] : {std::pair<int64_t, int64_t>{3, 1}, {0, 0}, {3, 20}}) {
+    SCOPED_TRACE(std::to_string(limit) + "/" + std::to_string(offset));
+    auto source = std::make_unique<ScriptedSource>(
+        batch->schema(), std::vector<Batch>{{.data = batch, .selection = rejected},
+                                            {.data = batch, .selection = selected}});
+    SortOperator op(std::move(source), {Key(1, LogicalType::kBigInt)}, limit, offset);
+    ExecContext ctx{.batch_size = 1};
+    for (int run = 0; run < 2; ++run) {
+      const auto result = Drain(op, ctx);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_TRUE((*result)->schema()->Equals(*batch->schema()));
+      EXPECT_EQ(Int64Column(**result), limit == 3 && offset == 1 ? Ids({4, 5, 1}) : Ids{});
+      ASSERT_TRUE((*result)->ValidateFull().ok());
+      if ((*result)->num_rows() > 0) {
+        ASSERT_EQ((*result)->column(2)->num_chunks(), 3);
+        EXPECT_EQ(ViewValues(*(*result)->column(2)->chunk(0)),
+                  (std::vector<std::optional<std::string>>{std::nullopt}));
+        EXPECT_EQ(ViewValues(*(*result)->column(2)->chunk(1)),
+                  (std::vector<std::optional<std::string>>{""}));
+        EXPECT_EQ(ViewValues(*(*result)->column(2)->chunk(2)),
+                  (std::vector<std::optional<std::string>>{std::string(13, 'x')}));
+      }
+    }
+  }
+  auto source = std::make_unique<ScriptedSource>(batch->schema(), std::vector<Batch>{});
+  SortOperator empty(std::move(source), {Key(1, LogicalType::kBigInt)}, 2);
+  ExecContext ctx;
+  const auto result = Drain(empty, ctx);
+  ASSERT_TRUE(result.ok()) << result.status().ToString();
+  EXPECT_EQ((*result)->num_rows(), 0);
+  EXPECT_TRUE((*result)->schema()->Equals(*batch->schema()));
+}
+
+TEST_F(SortTest, MaskedAdmissionMatchesMaterializationWithThresholdsAndStableTies) {
+  auto* pool = arrow::default_memory_pool();
+  const std::vector<std::optional<std::string>> payloads = {
+      "masked",        std::string(13, 'a'), std::nullopt,
+      "threshold tie", "null key",           std::string("x\0\xFF", 3)};
+  const std::vector<std::optional<std::string>> initial = {"first tie", "second tie", "bound"};
+  const auto sliced = std::static_pointer_cast<arrow::BooleanArray>(
+      testing::Bools({false, false, true, true, true, true, std::nullopt, false})->Slice(1, 6));
+  const std::vector<std::shared_ptr<arrow::BooleanArray>> masks = {
+      nullptr, testing::Bools(std::vector<std::optional<bool>>(6, true)),
+      testing::Bools(std::vector<std::optional<bool>>(6, false)), sliced};
+  for (const bool views : {false, true}) {
+    const auto next = WithIds({Int64s({0, 2, 2, 4, std::nullopt, 1}),
+                               Strings({"masked", "b", "b", "a", std::nullopt, "z"}),
+                               views ? ViewPayloads(payloads) : Strings(payloads)});
+    const auto seed = WithIds({Int64s({2, 2, 4}), Strings({"b", "b", "a"}),
+                               views ? ViewPayloads(initial) : Strings(initial)});
+    for (const bool threshold : {false, true}) {
+      for (const bool nulls_first : {false, true}) {
+        for (const auto& mask : masks) {
+          const auto comparator =
+              RowComparator::Make(next->schema(), {Key(1, LogicalType::kBigInt, false, nulls_first),
+                                                   Key(2, LogicalType::kVarchar)})
+                  .ValueOrDie();
+          SortBuffer fused(comparator, 3);
+          SortBuffer reference(comparator, 3);
+          if (threshold) {
+            ASSERT_TRUE(fused.Add(seed, pool).ok());
+            ASSERT_TRUE(reference.Add(seed, pool).ok());
+            ASSERT_TRUE(fused.Tighten(pool).ok());
+            ASSERT_TRUE(reference.Tighten(pool).ok());
+          }
+          const auto materialized = Materialize(Batch{.data = next, .selection = mask}, pool);
+          ASSERT_TRUE(materialized.ok()) << materialized.status().ToString();
+          ASSERT_TRUE(reference.Add(*materialized, pool).ok());
+          ASSERT_TRUE(fused.Add(next, pool, mask).ok());
+          ASSERT_TRUE(reference.Sort(pool).ok());
+          ASSERT_TRUE(fused.Sort(pool).ok());
+          const auto expected = reference.Slice(0, 3, pool).ValueOrDie();
+          const auto actual = fused.Slice(0, 3, pool).ValueOrDie();
+          ASSERT_TRUE(actual->ValidateFull().ok());
+          EXPECT_TRUE(actual->Equals(*expected));
+        }
+      }
+    }
+  }
+}
+
+TEST_F(SortTest, MaskedViewAdmissionChecksBoundsAndRejectsAllRowsWithoutAllocating) {
+  const auto input = WithIds({Int64s({2, 1}), ViewPayloads({std::string(13, 'a'), "b"})});
+  MemoryBudget no_memory(0);
+  SortBuffer buffer(
+      RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+  auto* pool = arrow::default_memory_pool();
+  EXPECT_TRUE(buffer.Add(input, pool, testing::Bools({true})).IsInvalid());
+  EXPECT_TRUE(buffer.Add(input->Slice(0, 0), pool, testing::Bools({true})).IsInvalid());
+  EXPECT_TRUE(buffer.Add(input, nullptr).IsInvalid());
+  EXPECT_EQ(buffer.num_rows(), 0);
+  EXPECT_TRUE(buffer.Add(input, &no_memory, testing::Bools({false, std::nullopt})).ok());
+  EXPECT_TRUE(buffer.Add(input->Slice(0, 0), &no_memory, testing::Bools({})).ok());
+  EXPECT_EQ(buffer.num_rows(), 0);
+  EXPECT_EQ(no_memory.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, MaskedViewAdmissionRetainsOnlySelectedRowsBeforeTheThreshold) {
+  MemoryBudget budget(16 * 1024);
+  std::shared_ptr<arrow::RecordBatch> output;
+  std::weak_ptr<arrow::Buffer> source_owner;
+  const std::string kept(13, 'k');
+  {
+    auto first =
+        WithIds({Int64s({10, 9}), ViewPayloads({std::string(13, 'a'), std::string(13, 'b')})});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    ASSERT_TRUE(buffer.Tighten(&budget).ok());
+    arrow::BinaryViewBuilder builder;
+    builder.SetBlockSize(int64_t{1024} * 1024);
+    ASSERT_TRUE(builder.Append(std::string(std::size_t{128} * 1024, 'm')).ok());
+    ASSERT_TRUE(builder.Append(std::string(std::size_t{128} * 1024, 'r')).ok());
+    ASSERT_TRUE(builder.Append(kept).ok());
+    ASSERT_TRUE(builder.AppendNull().ok());
+    auto payload = builder.Finish().ValueOrDie();
+    source_owner = payload->data()->buffers.at(2);
+    auto next = WithIds({Int64s({0, 20, 5, 4}), payload});
+    payload.reset();
+    // The best key is masked out; another selected row loses to the old threshold. Neither
+    // large payload may be copied under this admission budget.
+    ASSERT_TRUE(buffer.Add(next, &budget, testing::Bools({false, true, true, true})).ok());
+    first.reset();
+    next.reset();
+    EXPECT_TRUE(source_owner.expired());
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    const auto result = buffer.Slice(0, 2, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    output = *result;
+  }
+  EXPECT_EQ(ViewValues(*output->column(2)),
+            (std::vector<std::optional<std::string>>{std::nullopt, kept}));
+  ASSERT_TRUE(output->ValidateFull().ok());
+  output.reset();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, MaskedBinaryAdmissionCopiesOnlySelectedRowsBeforeTheThreshold) {
+  MemoryBudget budget(16 * 1024);
+  std::shared_ptr<arrow::RecordBatch> output;
+  std::weak_ptr<arrow::Buffer> source_owner;
+  const std::string kept(13, 'k');
+  {
+    auto first = WithIds({Int64s({10, 9}), Strings({"first", "second"})});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    ASSERT_TRUE(buffer.Tighten(&budget).ok());
+    std::vector<std::optional<std::string>> values = {
+        std::string(std::size_t{128} * 1024, 'm'), std::string(std::size_t{128} * 1024, 'r'), kept,
+        std::nullopt, std::string(std::size_t{128} * 1024, 't')};
+    Ids keys{0, 20, 5, 4, 10};
+    std::vector<std::optional<bool>> selected{false, true, true, true, true};
+    // Arrow Take reserves payload capacity from the input's mean string length. Empty losing
+    // rows keep that estimate within this budget; eager materialization must still copy the
+    // two selected large strings, which cannot fit. The test checks copying, not exact capacity.
+    for (int row = 0; row < 128; ++row) {
+      values.emplace_back("");
+      keys.emplace_back(20);
+      selected.emplace_back(true);
+    }
+    auto payload = Strings(values);
+    source_owner = payload->data()->buffers.at(2);
+    auto next = WithIds({Int64s(keys), payload});
+    payload.reset();
+    const auto mask = testing::Bools(selected);
+    {
+      MemoryBudget eager_budget(16 * 1024);
+      const auto filtered = Materialize(Batch{.data = next, .selection = mask}, &eager_budget);
+      EXPECT_TRUE(filtered.status().IsOutOfMemory()) << filtered.status().ToString();
+      EXPECT_EQ(eager_budget.bytes_allocated(), 0);
+    }
+    EXPECT_TRUE(buffer.Add(next, nullptr, mask).IsInvalid());
+    EXPECT_EQ(buffer.num_rows(), 2);
+    EXPECT_EQ(buffer.ThresholdKey(), Int128{10});
+    // Masked, worse and threshold-tied rows all carry large strings. Only the two winners
+    // fit; filtering the selected strings before applying the threshold failed above.
+    const auto admitted = buffer.Add(next, &budget, mask);
+    ASSERT_TRUE(admitted.ok()) << admitted.ToString();
+    first.reset();
+    next.reset();
+    EXPECT_TRUE(source_owner.expired());
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    const auto result = buffer.Slice(0, 2, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    output = *result;
+  }
+  EXPECT_TRUE(output->column(2)->Equals(*Strings({std::nullopt, kept})));
+  ASSERT_TRUE(output->ValidateFull().ok());
+  output.reset();
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, MaskedAdmissionFailuresPreserveThresholdAndPermitRetry) {
+  const std::string kept(17, 'k');
+  const std::vector<std::optional<std::string>> initial = {std::string(13, 'a'),
+                                                           std::string(13, 'b')};
+  const std::vector<std::optional<std::string>> payloads = {std::string(81, 'x'), kept, "masked",
+                                                            std::nullopt, "threshold tie"};
+  const std::vector<std::optional<std::string>> expected = {std::nullopt, kept};
+  const auto mask = testing::Bools({true, true, std::nullopt, true, true});
+  for (const bool views : {false, true}) {
+    SCOPED_TRACE(views);
+    const auto seed = WithIds({Int64s({10, 9}), views ? ViewPayloads(initial) : Strings(initial)});
+    const auto next =
+        WithIds({Int64s({20, 8, 7, 6, 10}), views ? ViewPayloads(payloads) : Strings(payloads)});
+    int failures = 0;
+    int successes = 0;
+    for (int64_t headroom = 0; headroom <= 4096; headroom += 64) {
+      SCOPED_TRACE(headroom);
+      constexpr int64_t kLimit = int64_t{64} * 1024;
+      MemoryBudget budget(kLimit);
+      {
+        SortBuffer buffer(
+            RowComparator::Make(seed->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+        ASSERT_TRUE(buffer.Add(seed, &budget).ok());
+        ASSERT_TRUE(buffer.Tighten(&budget).ok());
+        const int64_t held = kLimit - budget.bytes_allocated() - headroom;
+        ASSERT_GE(held, 0);
+        ASSERT_TRUE(budget.Reserve(held).ok());
+        const int64_t before = budget.bytes_allocated();
+        const auto status = buffer.Add(next, &budget, mask);
+        if (status.IsOutOfMemory()) {
+          ++failures;
+          EXPECT_EQ(buffer.num_rows(), 2);
+          EXPECT_EQ(buffer.ThresholdKey(), Int128{10});
+          EXPECT_EQ(budget.bytes_allocated(), before);
+        } else {
+          ASSERT_TRUE(status.ok()) << status.ToString();
+          ++successes;
+          EXPECT_EQ(buffer.num_rows(), 4);
+        }
+        budget.Release(held);
+        if (!status.ok()) {
+          ASSERT_TRUE(buffer.Add(next, &budget, mask).ok());
+        }
+        ASSERT_TRUE(buffer.Sort(&budget).ok());
+        const auto result = buffer.Slice(0, 2, &budget).ValueOrDie();
+        const auto expected_payload = views ? ViewPayloads(expected) : Strings(expected);
+        EXPECT_TRUE(result->column(2)->Equals(*expected_payload));
+        EXPECT_EQ(buffer.num_rows(), 2);
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+    }
+    EXPECT_GT(failures, 0);
+    EXPECT_GT(successes, 0);
+  }
+}
+
+TEST_F(SortTest, OrdinarySelectionBeforeGatherKeepsTopNResultsAcrossReopen) {
+  // The first batch exceeds keep + 4096, establishing a threshold before the selected batch.
+  constexpr int64_t kInitialRows = 4200;
+  Ids keys;
+  for (int64_t row = 0; row < kInitialRows; ++row) {
+    keys.emplace_back(100 + row);
+  }
+  const auto mask = std::static_pointer_cast<arrow::BooleanArray>(
+      testing::Bools({true, false, true, std::nullopt, true, true, true, true, false, true})
+          ->Slice(1, 8));
+  for (const bool binary : {false, true}) {
+    SCOPED_TRACE(binary);
+    arrow::ArrayVector initial_columns{Int64s(keys)};
+    arrow::ArrayVector next_columns{Int64s({4200, 4201, 4202, 4203, 4204, 4205, 4206, 4207}),
+                                    Int64s({0, 100, 101, 99, 102, std::nullopt, 98, 97})};
+    arrow::ArrayVector expected_columns{Int64s({4203, 0}), Int64s({99, 100})};
+    if (binary) {
+      initial_columns.push_back(Strings(
+          std::vector<std::optional<std::string>>(Narrow<std::size_t>(kInitialRows), "old")));
+      next_columns.push_back(Strings({"masked", "late tie", "null selection", "lower",
+                                      "threshold tie", "null key", "lowest", "masked"}));
+      expected_columns.push_back(Strings({"lower", "old"}));
+    }
+    const auto first = WithIds(initial_columns);
+    const auto next = arrow::RecordBatch::Make(first->schema(), 8, next_columns);
+    const auto expected_batch = arrow::RecordBatch::Make(first->schema(), 2, expected_columns);
+    const auto expected = arrow::Table::FromRecordBatches({expected_batch}).ValueOrDie();
+    for (const bool enabled : {false, true}) {
+      SCOPED_TRACE(enabled);
+      auto source = std::make_unique<ScriptedSource>(
+          first->schema(), std::vector<Batch>{{.data = first}, {.data = next, .selection = mask}});
+      ProfileNode profile;
+      SortOperator op(std::move(source), {Key(1, LogicalType::kBigInt)}, 2, 1);
+      op.set_profile(&profile);
+      ExecContext ctx{.batch_size = 1};
+      ctx.sort_selection_before_gather = enabled;
+      for (int64_t run = 0; run < 2; ++run) {
+        const auto result = Drain(op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        ASSERT_TRUE((*result)->ValidateFull().ok());
+        EXPECT_TRUE((*result)->Equals(*expected));
+        int64_t batches = 0;
+        int64_t input_rows = 0;
+        int64_t selected_rows = 0;
+        for (const auto& metric : profile.metrics()) {
+          if (metric.name == "selection_before_gather_batches") {
+            batches = metric.value;
+          } else if (metric.name == "selection_before_gather_input_rows") {
+            input_rows = metric.value;
+          } else if (metric.name == "selection_before_gather_selected_rows") {
+            selected_rows = metric.value;
+          }
+        }
+        const int64_t forwarded = binary && enabled ? run + 1 : 0;
+        EXPECT_EQ(batches, forwarded);
+        EXPECT_EQ(input_rows, 8 * forwarded);
+        EXPECT_EQ(selected_rows, 5 * forwarded);
+      }
+    }
+  }
+}
+
+TEST_F(SortTest, PartContextPreservesOrdinarySelectionBeforeGather) {
+  ExecContext ctx;
+  EXPECT_FALSE(PartContext(ctx).sort_selection_before_gather);
+  ctx.sort_selection_before_gather = true;
+  EXPECT_TRUE(PartContext(ctx).sort_selection_before_gather);
+}
+
+TEST_F(SortTest, BinaryViewTopNCompactsSparseOwnersBeforeRetainingInput) {
+  MemoryBudget budget(std::nullopt);
+  {
+    arrow::BinaryViewBuilder builder(&budget);
+    builder.SetBlockSize(int64_t{256} * 1024);
+    ASSERT_TRUE(builder.Append(std::string(13, 'q')).ok());
+    ASSERT_TRUE(builder.Append(std::string(std::size_t{200} * 1024, 'r')).ok());
+    auto payload = builder.Finish().ValueOrDie();
+    std::weak_ptr<arrow::Buffer> old_owner = payload->data()->buffers.at(2);
+    auto batch = WithIds({Int64s({1, 2}), payload})->Slice(0, 1);
+    payload.reset();
+    SortBuffer buffer(
+        RowComparator::Make(batch->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(batch, &budget).ok());
+    batch.reset();
+    EXPECT_TRUE(old_owner.expired()) << "a tiny retained slice must not pin the whole source";
+    EXPECT_LT(budget.bytes_allocated(), 64 * 1024);
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    const auto result = buffer.Slice(0, 1, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(ViewValues(*(*result)->column(2)),
+              (std::vector<std::optional<std::string>>{std::string(13, 'q')}));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewDenseOwnerSurvivesMoveMergeAndConsumerLifetimes) {
+  MemoryBudget source_memory(std::nullopt);
+  MemoryBudget retention_memory(4096);
+  MemoryBudget output_memory(4096);
+  std::weak_ptr<arrow::Buffer> original;
+  std::shared_ptr<arrow::RecordBatch> result;
+  {
+    auto owner = PayloadOwner(8192, 'd', &source_memory);
+    original = owner;
+    auto input = WithIds({Int64s({4, 1, 3, 2}), RepeatedViewPayload(owner, 8192, 4)});
+    const auto comparator =
+        RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie();
+    SortBuffer part(comparator, 2);
+    // One payload copy would exceed this budget. Dense repeated views must borrow the root.
+    ASSERT_TRUE(part.Add(input, &retention_memory).ok());
+    input.reset();
+    owner.reset();
+    ASSERT_FALSE(original.expired());
+    ASSERT_TRUE(part.Sort(&retention_memory).ok());
+    SortBuffer moved(std::move(part));
+    SortBuffer merged(comparator, 2);
+    ASSERT_TRUE(merged.Merge(moved, &retention_memory).ok());
+    EXPECT_EQ(moved.num_rows(), 0);
+    ASSERT_TRUE(merged.Sort(&retention_memory).ok());
+    result = merged.Slice(0, 2, &output_memory).ValueOrDie();
+  }
+  EXPECT_EQ(retention_memory.bytes_allocated(), 0);
+  EXPECT_FALSE(original.expired());
+  ASSERT_TRUE(result->ValidateFull().ok());
+  EXPECT_EQ(ViewValues(*result->column(2)), (std::vector<std::optional<std::string>>{
+                                                std::string(8192, 'd'), std::string(8192, 'd')}));
+  result.reset();
+  EXPECT_TRUE(original.expired());
+  EXPECT_EQ(source_memory.bytes_allocated(), 0);
+  EXPECT_EQ(output_memory.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewPruningCopiesASparseSurvivorAndReleasesItsRoot) {
+  MemoryBudget source_memory(std::nullopt);
+  MemoryBudget retention_memory(32 * 1024);
+  std::weak_ptr<arrow::Buffer> original;
+  {
+    auto owner = PayloadOwner(int64_t{16} * 1024, 's', &source_memory);
+    original = owner;
+    auto input = WithIds({Int64s({2, 1}), RepeatedViewPayload(owner, 8192, 2)});
+    SortBuffer buffer(
+        RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(input, &retention_memory).ok());
+    input.reset();
+    owner.reset();
+    EXPECT_FALSE(original.expired()) << "two repeated values make sharing cheaper at admission";
+    ASSERT_TRUE(buffer.Sort(&retention_memory).ok());
+    EXPECT_TRUE(original.expired()) << "one surviving value is now cheaper to copy";
+    EXPECT_EQ(source_memory.bytes_allocated(), 0);
+    const auto result = buffer.Slice(0, 1, &retention_memory).ValueOrDie();
+    EXPECT_EQ(ViewValues(*result->column(2)),
+              (std::vector<std::optional<std::string>>{std::string(8192, 's')}));
+  }
+  EXPECT_EQ(retention_memory.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewAliasedRootsCountOnceAcrossColumnsAndChunksForCleanup) {
+  constexpr int64_t kMiB = int64_t{1024} * 1024;
+  MemoryBudget budget(32 * kMiB);
+  std::weak_ptr<arrow::Buffer> old_root;
+  {
+    auto owner = PayloadOwner(6 * kMiB, 'a', &budget);
+    old_root = owner;
+    auto first = WithIds({Int64s({2}),
+                          RepeatedViewPayload(arrow::SliceBuffer(owner, 0, owner->size()),
+                                              Narrow<int32_t>(owner->size())),
+                          RepeatedViewPayload(arrow::SliceBuffer(owner, 0, owner->size()),
+                                              Narrow<int32_t>(owner->size()))});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    auto second = WithIds({Int64s({1}), first->column(2), first->column(3)});
+    ASSERT_TRUE(buffer.Add(second, &budget).ok());
+    first.reset();
+    second.reset();
+    owner.reset();
+    // Four owners across two columns and two chunks retain one 6 MiB allocation, not 24 MiB.
+    EXPECT_EQ(buffer.num_rows(), 2);
+    EXPECT_FALSE(buffer.ThresholdKey().has_value());
+    EXPECT_FALSE(old_root.expired());
+
+    auto replacement = PayloadOwner(3 * kMiB, 'b', &budget);
+    auto third = WithIds({Int64s({0}), RepeatedViewPayload(replacement, 3 * Narrow<int32_t>(kMiB)),
+                          RepeatedViewPayload(replacement, 3 * Narrow<int32_t>(kMiB))});
+    ASSERT_TRUE(buffer.Add(third, &budget).ok());
+    third.reset();
+    replacement.reset();
+    // A genuinely different root takes retained capacity past 8 MiB and triggers cleanup.
+    EXPECT_EQ(buffer.num_rows(), 1);
+    EXPECT_EQ(buffer.ThresholdKey(), Int128{0});
+    EXPECT_TRUE(old_root.expired());
+    EXPECT_LT(budget.bytes_allocated(), 4 * kMiB);
+    const auto result = buffer.Slice(0, 1, &budget).ValueOrDie();
+    EXPECT_EQ(
+        ViewValues(*result->column(2)),
+        (std::vector<std::optional<std::string>>{std::string(Narrow<std::size_t>(3 * kMiB), 'b')}));
+    EXPECT_TRUE(result->column(2)->Equals(*result->column(3)));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewRetentionFailureLeavesExistingRowsUsable) {
+  auto first = WithIds({Int64s({5}), ViewPayloads({std::string(13, 'a')})});
+  SortBuffer buffer(
+      RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 2);
+  ASSERT_TRUE(buffer.Add(first, arrow::default_memory_pool()).ok());
+  MemoryBudget no_memory(0);
+  arrow::BinaryViewBuilder builder;
+  builder.SetBlockSize(int64_t{256} * 1024);
+  ASSERT_TRUE(builder.Append(std::string(13, 'b')).ok());
+  ASSERT_TRUE(builder.Append(std::string(std::size_t{200} * 1024, 'c')).ok());
+  auto next = WithIds({Int64s({1, 2}), builder.Finish().ValueOrDie()})->Slice(0, 1);
+  EXPECT_TRUE(buffer.Add(next, &no_memory).IsOutOfMemory());
+  EXPECT_EQ(no_memory.bytes_allocated(), 0);
+  EXPECT_EQ(buffer.num_rows(), 1);
+  ASSERT_TRUE(buffer.Sort(arrow::default_memory_pool()).ok());
+  const auto rows = buffer.Slice(0, 2, arrow::default_memory_pool());
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ(ViewValues(*(*rows)->column(2)),
+            (std::vector<std::optional<std::string>>{std::string(13, 'a')}));
+}
+
+TEST_F(SortTest, BinaryViewAdmissionBudgetFailuresPreserveRootsAndAllowRetry) {
+  std::vector<std::shared_ptr<arrow::RecordBatch>> inputs;
+  for (int i = 0; i < 5; ++i) {
+    auto owner = PayloadOwner(64, "abcde"[i], arrow::default_memory_pool());
+    inputs.push_back(WithIds({Int64s({4 - i}), RepeatedViewPayload(owner, 64)}));
+  }
+  int failures = 0;
+  int successes = 0;
+  // Sweep available capacity through the allocations of admission, including growth of the
+  // distinct-root table. Every failed attempt must preserve the old rows and release scratch.
+  for (int64_t headroom = 0; headroom <= 4096; headroom += 64) {
+    SCOPED_TRACE(headroom);
+    constexpr int64_t kLimit = int64_t{64} * 1024;
+    MemoryBudget budget(kLimit);
+    {
+      SortBuffer buffer(
+          RowComparator::Make(inputs.front()->schema(), {Key(1, LogicalType::kBigInt)})
+              .ValueOrDie(),
+          8);
+      for (std::size_t i = 0; i < 4; ++i) {
+        ASSERT_TRUE(buffer.Add(inputs[i], &budget).ok());
+      }
+      const int64_t held = kLimit - budget.bytes_allocated() - headroom;
+      ASSERT_GE(held, 0);
+      ASSERT_TRUE(budget.Reserve(held).ok());
+      const int64_t before = budget.bytes_allocated();
+      const auto status = buffer.Add(inputs.back(), &budget);
+      if (status.IsOutOfMemory()) {
+        ++failures;
+        EXPECT_EQ(buffer.num_rows(), 4);
+        EXPECT_EQ(budget.bytes_allocated(), before);
+      } else {
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ++successes;
+        EXPECT_EQ(buffer.num_rows(), 5);
+      }
+      budget.Release(held);
+      if (!status.ok()) {
+        ASSERT_TRUE(buffer.Add(inputs.back(), &budget).ok());
+      }
+      ASSERT_TRUE(buffer.Sort(&budget).ok());
+      const auto result = buffer.Slice(0, 5, &budget).ValueOrDie();
+      EXPECT_EQ(ViewValues(*result->column(2)),
+                (std::vector<std::optional<std::string>>{std::string(64, 'e'), std::string(64, 'd'),
+                                                         std::string(64, 'c'), std::string(64, 'b'),
+                                                         std::string(64, 'a')}));
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+  EXPECT_GT(failures, 0);
+  EXPECT_GT(successes, 0);
+}
+
+TEST_F(SortTest, BinaryViewRetentionCopiesOnlyRowsThatBeatTheThreshold) {
+  MemoryBudget budget(16 * 1024);
+  {
+    auto first = WithIds({Int64s({10}), ViewPayloads({std::string(13, 'a')})});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    ASSERT_TRUE(buffer.Tighten(&budget).ok());
+    auto next =
+        WithIds({Int64s({20, 5}),
+                 ViewPayloads({std::string(std::size_t{128} * 1024, 'x'), std::string(13, 'b')})});
+    // Copying the rejected row's payload would exceed this budget. The two descriptors can be
+    // inspected and selected cheaply before the buffering boundary owns only the surviving row.
+    ASSERT_TRUE(buffer.Add(next, &budget).ok());
+    first.reset();
+    next.reset();
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    const auto result = buffer.Slice(0, 1, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(ViewValues(*(*result)->column(2)),
+              (std::vector<std::optional<std::string>>{std::string(13, 'b')}));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewPayloadBytesTriggerCleanupBeforeTheRowSlack) {
+  constexpr int64_t kMiB = int64_t{1024} * 1024;
+  MemoryBudget budget(32 * kMiB);
+  {
+    auto first =
+        WithIds({Int64s({4, 3}), ViewPayloads({std::string(Narrow<std::size_t>(5 * kMiB), 'a'),
+                                               std::string(Narrow<std::size_t>(5 * kMiB), 'b')})});
+    SortBuffer buffer(
+        RowComparator::Make(first->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(first, &budget).ok());
+    first.reset();
+    // Two rows are far below the row slack, but their owned payload exceeds 8 MiB. Rebuilding
+    // keeps the better row and frees the other's copy without waiting for thousands of rows.
+    EXPECT_EQ(buffer.num_rows(), 1);
+    EXPECT_LT(budget.bytes_allocated(), 6 * kMiB);
+    EXPECT_EQ(buffer.ThresholdKey(), Int128{3});
+
+    auto second =
+        WithIds({Int64s({2}), ViewPayloads({std::string(Narrow<std::size_t>(4 * kMiB), 'c')})});
+    ASSERT_TRUE(buffer.Add(second, &budget).ok());
+    second.reset();
+    // The new threshold is twice the last kept payload (10 MiB). Retaining 9 MiB does not
+    // repeatedly rebuild just because the necessary payload had already been large.
+    EXPECT_EQ(buffer.num_rows(), 2);
+
+    auto third =
+        WithIds({Int64s({1}), ViewPayloads({std::string(Narrow<std::size_t>(2 * kMiB), 'd')})});
+    ASSERT_TRUE(buffer.Add(third, &budget).ok());
+    third.reset();
+    EXPECT_EQ(buffer.num_rows(), 1);
+    EXPECT_LT(budget.bytes_allocated(), 3 * kMiB);
+    const auto result = buffer.Slice(0, 1, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(
+        ViewValues(*(*result)->column(2)),
+        (std::vector<std::optional<std::string>>{std::string(Narrow<std::size_t>(2 * kMiB), 'd')}));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewPayloadRebuildFailureCanBeRetriedWithoutLosingRows) {
+  constexpr int64_t kLimit = int64_t{64} * 1024;
+  MemoryBudget budget(kLimit);
+  {
+    const auto input =
+        WithIds({Int64s({2, 1}), ViewPayloads({std::string(8192, 'a'), std::string(8192, 'b')})});
+    SortBuffer buffer(
+        RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(input, &budget).ok());
+    const int64_t held = kLimit - budget.bytes_allocated() - 4096;
+    ASSERT_GT(held, 0);
+    ASSERT_TRUE(budget.Reserve(held).ok());
+    const int64_t before = budget.bytes_allocated();
+    // There is space for descriptors and key arrays but not for the replacement payload while
+    // the old copies are still alive. Failure releases temporaries and keeps both source rows.
+    EXPECT_TRUE(buffer.Sort(&budget).IsOutOfMemory());
+    EXPECT_EQ(buffer.num_rows(), 2);
+    EXPECT_EQ(budget.bytes_allocated(), before);
+    budget.Release(held);
+    ASSERT_TRUE(buffer.Sort(&budget).ok());
+    EXPECT_EQ(buffer.num_rows(), 1);
+    const auto result = buffer.Slice(0, 1, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(ViewValues(*(*result)->column(2)),
+              (std::vector<std::optional<std::string>>{std::string(8192, 'b')}));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewMergeLeavesSourceWithAFreshPayloadCleanupThreshold) {
+  constexpr int64_t kMiB = int64_t{1024} * 1024;
+  MemoryBudget budget(32 * kMiB);
+  {
+    const auto input =
+        WithIds({Int64s({2, 1}), ViewPayloads({std::string(Narrow<std::size_t>(5 * kMiB), 'a'),
+                                               std::string(Narrow<std::size_t>(5 * kMiB), 'b')})});
+    const auto make_buffer = [&] {
+      return SortBuffer(
+          RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    };
+    SortBuffer source = make_buffer();
+    ASSERT_TRUE(source.Add(input, &budget).ok());
+    ASSERT_EQ(source.num_rows(), 1);
+    SortBuffer target = make_buffer();
+    ASSERT_TRUE(target.Merge(source, &budget).ok());
+    EXPECT_EQ(source.num_rows(), 0);
+    // Merge empties the source's retained payload and its prior-compaction history. Its new
+    // 10 MiB input must trigger the initial 8 MiB cleanup rather than inherit the old 10 MiB cap.
+    ASSERT_TRUE(source.Add(input, &budget).ok());
+    EXPECT_EQ(source.num_rows(), 1);
+    ASSERT_TRUE(target.Sort(&budget).ok());
+    const auto result = target.Slice(0, 1, &budget);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(
+        ViewValues(*(*result)->column(2)),
+        (std::vector<std::optional<std::string>>{std::string(Narrow<std::size_t>(5 * kMiB), 'b')}));
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(SortTest, BinaryViewOutputSharesOwnedPayloadAfterTheSortBufferDies) {
+  MemoryBudget storage(std::nullopt);
+  MemoryBudget output_budget(4096);
+  std::shared_ptr<arrow::RecordBatch> result;
+  {
+    auto input =
+        WithIds({Int64s({2, 1}), ViewPayloads({std::string(8192, 'a'), std::string(8192, 'b')})});
+    SortBuffer buffer(
+        RowComparator::Make(input->schema(), {Key(1, LogicalType::kBigInt)}).ValueOrDie(), 1);
+    ASSERT_TRUE(buffer.Add(input, &storage).ok());
+    input.reset();
+    ASSERT_TRUE(buffer.Sort(&storage).ok());
+    // The final view output needs only descriptors and buffer owners. Copying the long payload
+    // into this smaller pool would fail, and the retained source pool must outlive the result.
+    auto output = buffer.Slice(0, 1, &output_budget);
+    ASSERT_TRUE(output.ok()) << output.status().ToString();
+    result = *output;
+  }
+  EXPECT_GT(storage.bytes_allocated(), 0);
+  ASSERT_TRUE(result->ValidateFull().ok());
+  EXPECT_EQ(ViewValues(*result->column(2)),
+            (std::vector<std::optional<std::string>>{std::string(8192, 'b')}));
+  result.reset();
+  EXPECT_EQ(storage.bytes_allocated(), 0);
+  EXPECT_EQ(output_budget.bytes_allocated(), 0);
+}
 
 TEST_F(SortTest, NullsLastByDefaultInBothDirections) {
   const auto batch = WithIds({Int64s({2, std::nullopt, 1, 3})});

@@ -65,6 +65,99 @@ TEST_F(SessionTest, CountStarFromRegisteredTable) {
   EXPECT_EQ(result->names, std::vector<std::string>{"count_star()"});
 }
 
+TEST_F(SessionTest, OwnedViewPayloadReturnsBinaryThatOutlivesSession) {
+  const auto build_path = (dir_ / "payload.parquet").string();
+  arrow::Int16Builder keys;
+  arrow::BinaryBuilder payload;
+  const std::string bytes = std::string("\xff\0", 2) + std::string(40, 'z');
+  ASSERT_TRUE(keys.AppendValues({0, 1, 2}).ok());
+  ASSERT_TRUE(payload.Append(bytes).ok());
+  ASSERT_TRUE(payload.AppendNull().ok());
+  ASSERT_TRUE(payload.Append("").ok());
+  const auto build = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("payload", arrow::binary())}),
+      {keys.Finish().ValueOrDie(), payload.Finish().ValueOrDie()});
+  const auto out = arrow::io::FileOutputStream::Open(build_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*build, arrow::default_memory_pool(), out, 1).ok());
+  ASSERT_TRUE(out->Close().ok());
+  constexpr std::string_view kSql =
+      "SELECT x.AdvEngineID, b.payload FROM events x JOIN b ON x.AdvEngineID = b.k "
+      "ORDER BY x.AdvEngineID LIMIT 3";
+  std::optional<QueryResult> ordinary;
+  for (const bool views : {false, true}) {
+    auto session = Session::Make({.batch_size = 2, .binary_view_payload = views}).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+    ASSERT_TRUE(session->RegisterParquet("b", {build_path}).ok());
+    const auto physical = session->ExplainPhysical(kSql);
+    ASSERT_TRUE(physical.ok()) << physical.status().ToString();
+    EXPECT_EQ(physical->contains("BinaryOutput"), views);
+    auto result = session->Execute(kSql);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    session.reset();
+    ASSERT_EQ(result->table->num_rows(), 3);
+    ASSERT_EQ(result->table->schema()->field(1)->type()->id(), arrow::Type::BINARY);
+    ASSERT_TRUE(result->table->ValidateFull().ok());
+    const auto combined = result->table->CombineChunks().ValueOrDie();
+    const auto& values = static_cast<const arrow::BinaryArray&>(*combined->column(1)->chunk(0));
+    EXPECT_EQ(values.GetView(0), bytes);
+    EXPECT_TRUE(values.IsNull(1));
+    EXPECT_EQ(values.GetView(2), "");
+    if (ordinary.has_value()) {
+      EXPECT_TRUE(result->table->Equals(*ordinary->table));
+    } else {
+      ordinary = std::move(*result);
+    }
+  }
+}
+
+TEST_F(SessionTest, SelectionBeforeGatherPreservesTopNPlanAndResults) {
+  const auto payload_path = (dir_ / "payload.parquet").string();
+  arrow::Int16Builder keys;
+  arrow::BinaryBuilder payload;
+  ASSERT_TRUE(keys.AppendValues({0, 1, 2, 3, 4, 5}).ok());
+  ASSERT_TRUE(payload.Append(std::string(40, 'z')).ok());
+  ASSERT_TRUE(payload.AppendNull().ok());
+  ASSERT_TRUE(payload.Append("").ok());
+  ASSERT_TRUE(payload.Append(std::string("a\0\xff", 3)).ok());
+  ASSERT_TRUE(payload.Append("same").ok());
+  ASSERT_TRUE(payload.Append("same").ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int16()), arrow::field("payload", arrow::binary())}),
+      {keys.Finish().ValueOrDie(), payload.Finish().ValueOrDie()});
+  const auto out = arrow::io::FileOutputStream::Open(payload_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 3).ok());
+  ASSERT_TRUE(out->Close().ok());
+  constexpr std::string_view kSql =
+      "SELECT a.AdvEngineID, b.payload FROM events a JOIN b ON a.AdvEngineID = b.k "
+      "WHERE a.EventDate + b.k > 19001 ORDER BY b.payload, a.AdvEngineID LIMIT 3 OFFSET 1";
+  std::optional<QueryResult> reference;
+  std::string reference_plan;
+  for (const bool enabled : {false, true}) {
+    auto session =
+        Session::Make({.batch_size = 2, .sort_selection_before_gather = enabled}).ValueOrDie();
+    ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+    ASSERT_TRUE(session->RegisterParquet("b", {payload_path}).ok());
+    const auto physical = session->ExplainPhysical(kSql);
+    ASSERT_TRUE(physical.ok()) << physical.status().ToString();
+    auto result = session->Execute(kSql);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    const auto profile = session->ExplainAnalyze(kSql);
+    ASSERT_TRUE(profile.ok()) << profile.status().ToString();
+    EXPECT_EQ(profile->rows, result->table->num_rows());
+    session.reset();
+    ASSERT_EQ(result->table->num_rows(), 3);
+    ASSERT_EQ(result->table->schema()->field(1)->type()->id(), arrow::Type::BINARY);
+    ASSERT_TRUE(result->table->ValidateFull().ok());
+    if (reference.has_value()) {
+      EXPECT_EQ(*physical, reference_plan);
+      EXPECT_TRUE(result->table->Equals(*reference->table));
+    } else {
+      reference = std::move(*result);
+      reference_plan = *physical;
+    }
+  }
+}
+
 // A union whose first block the condition on it rules out (ADR 0036's X7a) names and types its
 // columns as that first block does: the block left, which calls its column z, does not rename it.
 TEST_F(SessionTest, AUnionPrunedOfItsFirstBlockKeepsItsNamesAndTypes) {

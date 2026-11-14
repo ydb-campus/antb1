@@ -33,6 +33,7 @@
 #include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "binary_view.h"
 #include "gather.h"
 #include "part_operators.h"
 #include "part_scheduler.h"
@@ -719,13 +720,33 @@ arrow::Status PartRightJoinOperator::Close() {
 
 arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build, std::vector<int> probe_keys,
-    plan::BuildSide build_side, std::vector<plan::ExprPtr> residual, bool prepares) {
+    plan::BuildSide build_side, std::vector<plan::ExprPtr> residual, bool prepares,
+    std::vector<bool> binary_view_columns) {
   if (probe == nullptr || build == nullptr) {
     return arrow::Status::Invalid("a hash join without its inputs");
   }
   const plan::JoinKind kind = build->kind();
   const std::string_view kind_name = plan::ToString(kind);
   const JoinBuildSpec& spec = *build->spec();
+  if (!binary_view_columns.empty() &&
+      (kind != plan::JoinKind::kInner || !residual.empty() || spec.keys().empty() ||
+       std::ranges::any_of(
+           spec.keys(), [](const plan::BoundColumn& key) { return !plan::IsInteger(key.type); }))) {
+    return arrow::Status::Invalid(
+        "view payloads require an integer-key inner join without residuals");
+  }
+  if (!binary_view_columns.empty()) {
+    if (std::cmp_not_equal(binary_view_columns.size(), spec.schema()->num_fields())) {
+      return arrow::Status::Invalid("a view payload mask has ", binary_view_columns.size(),
+                                    " entries for ", spec.schema()->num_fields(), " build fields");
+    }
+    for (std::size_t c = 0; c < binary_view_columns.size(); ++c) {
+      if (binary_view_columns[c] &&
+          spec.schema()->fields()[c]->type()->id() != arrow::Type::BINARY) {
+        return arrow::Status::Invalid("a view payload mask selects a non-BINARY build field");
+      }
+    }
+  }
   const plan::JoinKindTraits traits = plan::Traits(kind);
   const bool emits_build = EmitsBuildRows(kind, build_side);
   const bool emits_unmatched = EmitsUnmatchedBuildRows(kind, build_side);
@@ -826,15 +847,27 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
       return arrow::Status::Invalid("a hash join residual reads a column outside the join");
     }
   }
-  return std::unique_ptr<HashJoinOperator>(
-      new HashJoinOperator(std::move(probe), std::move(build), std::move(probe_keys), build_side,
-                           std::move(residual), prepares, std::move(schema)));
+  if (!binary_view_columns.empty()) {
+    arrow::FieldVector fields = schema->fields();
+    const int offset = build_side == plan::BuildSide::kLeft ? 0 : probe_schema.num_fields();
+    for (int c = 0; c < spec.schema()->num_fields(); ++c) {
+      if (binary_view_columns[Narrow<std::size_t>(c)]) {
+        const auto at = Narrow<std::size_t>(offset) + Narrow<std::size_t>(c);
+        fields[at] = fields[at]->WithType(arrow::binary_view());
+      }
+    }
+    schema = arrow::schema(std::move(fields));
+  }
+  return std::unique_ptr<HashJoinOperator>(new HashJoinOperator(
+      std::move(probe), std::move(build), std::move(probe_keys), build_side, std::move(residual),
+      prepares, std::move(schema), std::move(binary_view_columns)));
 }
 
 HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
                                    std::shared_ptr<JoinBuild> build, std::vector<int> probe_keys,
                                    plan::BuildSide build_side, std::vector<plan::ExprPtr> residual,
-                                   bool prepares, std::shared_ptr<arrow::Schema> schema)
+                                   bool prepares, std::shared_ptr<arrow::Schema> schema,
+                                   std::vector<bool> binary_view_columns)
     : input_(std::move(probe)),
       build_(std::move(build)),
       probe_keys_(std::move(probe_keys)),
@@ -842,6 +875,7 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       residual_(std::move(residual)),
       prepares_(prepares),
       schema_(std::move(schema)),
+      binary_view_columns_(std::move(binary_view_columns)),
       kind_(build_->kind()),
       emits_build_(EmitsBuildRows(build_->kind(), build_side)) {
   if (prepares_ && plan::EmitsProbeAndBuildRows(kind_, build_side)) {
@@ -1738,12 +1772,22 @@ arrow::Result<arrow::ArrayVector> HashJoinOperator::GatherBuild(int64_t rows) {
   arrow::ArrayVector columns;
   columns.reserve(static_cast<std::size_t>(schema.num_fields()));
   for (int c = 0; c < schema.num_fields(); ++c) {
+    const bool view = !binary_view_columns_.empty() && binary_view_columns_[Narrow<std::size_t>(c)];
     // As in the sink above: a dropped column is NULLs of its type, which is what nothing above the
     // join reading it means.
     if (!table_->spec().retains(c)) {
-      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> null,
-                            arrow::MakeArrayOfNull(schema.field(c)->type(), rows, ctx_.pool));
+      ARROW_ASSIGN_OR_RAISE(
+          std::shared_ptr<arrow::Array> null,
+          arrow::MakeArrayOfNull(view ? arrow::binary_view() : schema.field(c)->type(), rows,
+                                 ctx_.pool));
       columns.push_back(std::move(null));
+      continue;
+    }
+    if (view) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto column, GatherBinaryViews<JoinRowRef>(columns_->arrays.column(c), refs, ctx_.pool,
+                                                     BinaryViewRetention::kShare));
+      columns.push_back(std::move(column));
       continue;
     }
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<arrow::ArrayBuilder> builder,

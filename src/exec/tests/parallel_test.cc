@@ -1686,9 +1686,132 @@ TEST_F(PartOperatorsTest, TopNKeepsEachPartsFirstRows) {
       }
     }
   }
+  // The owned-view pilot uses this same scheduler and pool: top-N merges payloads retained by
+  // separate probe parts, then the output adapter restores ordinary Binary columns.
+  const auto payload_schema =
+      arrow::schema({arrow::field("x", arrow::int64()), arrow::field("p", arrow::binary())});
+  arrow::RecordBatchVector payload_batches;
+  for (int64_t part = 0; part < kParts; ++part) {
+    std::vector<std::optional<int64_t>> ids;
+    std::vector<std::optional<std::string>> payloads;
+    for (int64_t row = 0; row < kRows; ++row) {
+      const int64_t id = (part * kRows) + row;
+      ids.emplace_back(id);
+      payloads.push_back(id % 3 == 0 ? std::nullopt
+                                     : std::optional(std::string(
+                                           id % 2 == 0 ? std::size_t{12} : std::size_t{32}, 'p')));
+    }
+    payload_batches.push_back(
+        arrow::RecordBatch::Make(payload_schema, kRows, {Int64s(ids), testing::Strings(payloads)}));
+  }
+  const auto payload_table =
+      std::make_shared<MemoryTable>(payload_schema, std::move(payload_batches), true);
+  const auto payload_join = Node(plan::JoinNode{
+      .kind = plan::JoinKind::kInner,
+      .left = Scan(Table()),
+      .right = Node(plan::ScanNode{.table = payload_table, .table_name = "p", .fields = {0, 1}}),
+      .keys = {{.left = Column(0, "x", LogicalType::kBigInt),
+                .right = Column(0, "x", LogicalType::kBigInt)}},
+      .build = plan::BuildSide::kRight});
+  const auto payload_top = [&](plan::LogicalNodePtr input) {
+    return Node(plan::LimitNode{
+        .input = Node(plan::SortNode{.input = std::move(input), .keys = keys(true, true)}),
+        .limit = 40,
+        .offset = 20});
+  };
+  const auto payload_plan =
+      PlanOf(Node(plan::ComputeNode{.input = payload_top(payload_join),
+                                    .exprs = {std::make_shared<const plan::Expr>(
+                                        plan::Expr{.node = plan::ColumnExpr{.index = 0},
+                                                   .type = LogicalType::kBigInt,
+                                                   .name = "copy"})}}),
+             6);
+  const auto ordinary_payloads = Run(payload_plan, nullptr);
+  ASSERT_TRUE(ordinary_payloads.ok()) << ordinary_payloads.status().ToString();
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
         static_cast<arrow::internal::Executor*>(pool.get())}) {
+    MemoryBudget memory(std::nullopt);
+    {
+      ProfileNode profile;
+      auto op = BuildPhysicalPlan(payload_plan, &profile, {.binary_view_payload = true});
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      EXPECT_EQ(profile.name(), "BinaryOutput");
+      ExecContext ctx{.pool = &memory,
+                      .batch_size = 3,
+                      .executor = executor,
+                      .threads = executor == nullptr ? 1 : kThreads,
+                      .budget = &memory};
+      ASSERT_TRUE((*op)->Open(ctx).ok());
+      {
+        const auto first = (*op)->Next();
+        ASSERT_TRUE(first.ok()) << first.status().ToString();
+        ASSERT_FALSE(first->end());
+        // Closing early waits for prefetched numeric computations and releases their views.
+        ASSERT_TRUE((*op)->Close().ok());
+        EXPECT_TRUE(first->data->ValidateFull().ok());
+        EXPECT_EQ(first->data->column(4)->type()->id(), arrow::Type::BINARY);
+      }
+      for (int run = 0; run < 2; ++run) {
+        const auto result = Drain(**op, ctx);
+        ASSERT_TRUE(result.ok()) << result.status().ToString();
+        EXPECT_TRUE(SameRows(**result, **ordinary_payloads));
+        EXPECT_EQ((*result)->column(4)->type()->id(), arrow::Type::BINARY);
+      }
+    }
+    EXPECT_EQ(memory.bytes_allocated(), 0);
+
+    {
+      auto failed_join = std::get<plan::JoinNode>(*payload_join);
+      const auto failed_probe = Table();
+      failed_probe->FailPart(4);
+      failed_join.left = Scan(failed_probe);
+      auto op = BuildPhysicalPlan(PlanOf(payload_top(Node(failed_join)), 5), nullptr,
+                                  {.binary_view_payload = true});
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      ExecContext ctx{.pool = &memory,
+                      .batch_size = 3,
+                      .executor = executor,
+                      .threads = executor == nullptr ? 1 : kThreads,
+                      .budget = &memory};
+      const auto failed = Drain(**op, ctx);
+      EXPECT_TRUE(failed.status().IsIOError()) << failed.status().ToString();
+    }
+    EXPECT_EQ(memory.bytes_allocated(), 0);
+
+    constexpr int64_t kMemoryLimit = int64_t{1024} * 1024;
+    MemoryBudget limited(kMemoryLimit);
+    {
+      const auto plan = PlanOf(payload_top(payload_join), 5);
+      auto op = BuildPhysicalPlan(plan, nullptr, {.binary_view_payload = true});
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      ExecContext limited_ctx{.pool = &limited,
+                              .batch_size = 3,
+                              .executor = executor,
+                              .threads = executor == nullptr ? 1 : kThreads,
+                              .budget = &limited};
+      ASSERT_TRUE((*op)->Open(limited_ctx).ok());
+      {
+        const auto first = (*op)->Next();
+        ASSERT_TRUE(first.ok()) << first.status().ToString();
+        ASSERT_FALSE(first->end());
+        // The blocking top-N has finished its workers and holds views from real join output.
+        // Reserve the remaining finite budget so its next gather must fail without racing a
+        // worker's allocations. A retained public result must stay valid through that failure.
+        const int64_t held = kMemoryLimit - limited.bytes_allocated();
+        ASSERT_TRUE(limited.Reserve(held).ok());
+        const auto exhausted = (*op)->Next();
+        EXPECT_TRUE(exhausted.status().IsOutOfMemory()) << exhausted.status().ToString();
+        limited.Release(held);
+        EXPECT_TRUE((*op)->Close().ok());
+        EXPECT_TRUE(first->data->ValidateFull().ok());
+      }
+      const auto retry = Drain(**op, limited_ctx);
+      ASSERT_TRUE(retry.ok()) << retry.status().ToString();
+      EXPECT_EQ((*retry)->num_rows(), 40);
+    }
+    EXPECT_EQ(limited.bytes_allocated(), 0);
+
     const auto table = Table();
     table->FailPart(4);
     // Without statistics no part is skipped, so part 4 is read and its error is the query's. With

@@ -46,6 +46,12 @@ struct SessionOptions {
   // Which search chooses a block's join order (docs/adr/0026-join-performance.md, C5).
   // std::nullopt: the planner's own default. It changes which plan a query gets, never the answer.
   std::optional<plan::JoinOrderSearch> join_order;
+  // Opt-in ADR 0027 experiment: owned BinaryView payloads through an eligible join/top-N path.
+  // The SQL types and returned arrays remain unchanged. Disabled until end-to-end acceptance.
+  bool binary_view_payload = false;
+  // Opt-in TopN experiment: combine selection and the current threshold before gathering
+  // ordinary Binary payloads. It changes neither the selected plan nor the returned rows.
+  bool sort_selection_before_gather = false;
   // Column type overrides applied to every table opened by this session, e.g. {"EventDate", kDate}
   // for ClickBench (`antb1 --clickbench`).
   std::vector<std::pair<std::string, plan::LogicalType>> default_overrides;

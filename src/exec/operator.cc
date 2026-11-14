@@ -13,6 +13,7 @@
 
 #include "antb1/plan/table.h"
 
+#include "binary_view.h"
 #include "part_scheduler.h"
 
 namespace antb1::exec {
@@ -32,6 +33,9 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> Materialize(const Batch& batc
   if (batch.data->num_columns() == 0) {
     return arrow::RecordBatch::Make(batch.data->schema(), batch.selected_rows(),
                                     arrow::ArrayVector{});
+  }
+  if (HasBinaryViews(*batch.data->schema())) {
+    return FilterViewBatch(batch.data, batch.selection, pool, BinaryViewRetention::kShare);
   }
   arrow::compute::ExecContext kernels(pool);
   ARROW_ASSIGN_OR_RAISE(

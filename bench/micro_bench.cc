@@ -38,6 +38,7 @@
 #include "antb1/plan/types.h"
 #include "antb1/sql/parser.h"
 
+#include "binary_view_pipeline_bench.h"
 #include "group_loops.h"
 #include "key_table.h"
 #include <unistd.h>
@@ -1366,6 +1367,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   antb1::bench::RegisterStringKeyTables();
+  antb1::bench::view_pipeline::Register();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
@@ -1379,6 +1381,7 @@ int main(int argc, char** argv) {
   benchmark::AddCustomContext("antb1_build_type", std::string(antb1::BuildType()));
   benchmark::RunSpecifiedBenchmarks();
   benchmark::Shutdown();
+  antb1::bench::view_pipeline::Cleanup();
   std::error_code ec;
   std::filesystem::remove(antb1::bench::ScanFilePath(), ec);  // if BM_ScanColumn wrote it
   std::filesystem::remove(antb1::bench::UrlFilePath(), ec);   // if the string filters wrote it

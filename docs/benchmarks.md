@@ -50,6 +50,7 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_StringFilterInScan` | the same filter pushed into the scan as a `plan::ScanFilter`, matched on views into the decoded pages (ADR 0020) |
 | `BM_SortRows` | `ORDER BY` a random BIGINT over 1Mi rows with a VARCHAR payload, no `LIMIT`: a full sort and the gather of its output (`exec::SortOperator`) |
 | `BM_TopNRows` | the same with `LIMIT 10`: the top-N path, which keeps only the best rows while it reads |
+| `BM_BinaryViewPayloadPipeline` | ADR 0027's opt-in owned-payload pilot versus ordinary Binary: Parquet decoding, an integer join, numeric selection and top-N, final Binary output, reading every output byte and destruction. Twelve independent shapes vary string length, selection density, fanout and output size |
 | `BM_JoinTableBuild` | building a join hash table (`exec::JoinTableBuilder`, no executor) of 1Mi rows with a BIGINT key and a BIGINT payload in 16 parts: `/0` dense keys (the direct layout), `/1` random keys (the hashed layout); the `direct` counter shows the layout |
 | `BM_JoinTableProbe` | `exec::JoinTable::Find` over that table with 1Mi probe keys in 64Ki-row batches, every other one absent: `/0` direct, `/1` hashed; the `matches` counter counts the matches |
 | `BM_GroupInt64`, `BM_GroupInt64Int32`, `BM_GroupString`, `BM_GroupInt64String` | grouping every batch with one grouper, as `GroupTable::Consume` does per part, for the four key shapes of ADR 0019's gates (BIGINT; BIGINT and INT; VARCHAR; BIGINT and VARCHAR) at 1000 to 16Mi groups; the `groups` counter shows the count |
@@ -62,6 +63,30 @@ keep building and running:
 - on every PR, in the `ci-release` preset (`pixi run release`, the `macos-release` CI leg);
 - every night, in `static-test`;
 - every night on all three static targets: the `static-cold` jobs run `pixi run bench --benchmark_dry_run=true`.
+
+The owned-payload pipeline benchmark uses 262,144 probe rows in sixteen Parquet row groups and 4,096
+build keys. It holds the logical plan fixed; physical planning is timed, while fixture generation,
+registration, SQL parsing and optimization are excluded. Each arm checks its output against an
+independent row model before timing. The `pool_peak_bytes`, `pool_live_with_result`, `pool_allocations`
+and `pool_total_bytes` counters come from a separate untimed execution; `view_path` confirms eligibility.
+Run it with `pixi run bench --benchmark_filter=BM_BinaryViewPayloadPipeline`. Set
+`ANTB1_VIEW_BENCH_DATA` to a local directory to retain its synthetic Parquet inputs for complete CLI
+runs with and without `--binary-view-payload`; otherwise it removes its temporary fixtures at exit.
+This serial execution benchmark is diagnostic: ADR 0027 also requires complete 16-thread query runs,
+interleaved repetitions, memory measurements and final output costs before production adoption.
+The retention experiment compares ordinary Binary, the saved exact-range pilot, the saved eager-copy
+policy and allocation-capacity sharing. Streaming gathers share payload buffers. After pruning,
+top-N shares a backing allocation when its full capacity does not exceed that view column's selected
+values' copy volume, including duplicate references; other values are copied into compact buffers.
+Rebuilding repeats this choice. Include sparse inputs, aliases and dense duplicate fanout, and measure both copy
+volume and peak memory. Keep build identities and measurement scopes separate across all four arms.
+
+For the follow-up on complete queries, compare the same executable with the option on and off so
+code placement cannot explain an apparent gain. The terminal join may build ordinary output from a
+complex subtree; string sort keys stay Binary and only payload columns that reach the public output
+become views. Verify the `BinaryOutput` plan and positive view metrics in a separate profiled run
+before timing. Include ordinary string keys, projected aliases and cases where no payload qualifies.
+Do not disable existing partitioned top-N pruning or change join order to manufacture more view work.
 
 `build/static` is shared with `pixi run static` and `static-test`. Every new commit relinks `antb1` and
 `antb1-bench-micro` with ThinLTO, and a `static-test` run after it relinks its 20 test executables too. Never run two

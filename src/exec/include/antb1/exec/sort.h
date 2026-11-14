@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -86,8 +87,11 @@ class SortBuffer {
 
   SortBuffer(RowComparator comparator, std::optional<int64_t> keep);
 
-  // Rows with the comparator's schema, without a selection.
-  arrow::Status Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool);
+  // Rows with the comparator's schema. An optional selection drops false and NULL entries.
+  // Combine selection with the current threshold before gathering (and view payload retention);
+  // the stored chunks own fully materialized rows and never borrow the selection.
+  arrow::Status Add(std::shared_ptr<arrow::RecordBatch> rows, arrow::MemoryPool* pool,
+                    const std::shared_ptr<arrow::BooleanArray>& selection = nullptr);
   // Moves the rows of `other` (another buffer of the same schema and keep) behind this buffer's
   // rows. `other` is left empty and unsorted, like a new buffer, also when adding its rows fails; a
   // merge it refuses (of a buffer into itself, or of another schema or keep) changes neither.
@@ -122,10 +126,40 @@ class SortBuffer {
  private:
   // Sorts and, with `keep`, keeps only the first rows (as one chunk) and remembers the last one.
   arrow::Status Compact(arrow::MemoryPool* pool);
+  // Retained compaction chooses between sharing dense roots and copying sparse payload; public
+  // output shares the kept blocks. Both preserve the BinaryView schema and numeric sort order.
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> GatherSlice(int64_t begin, int64_t end,
+                                                                 arrow::MemoryPool* pool,
+                                                                 bool retain_view_payload) const;
   // The only places chunks_, chunk_keys_ and column_arrays_ change, so that they stay in step.
   // ClearChunks empties all three and returns the chunks it took.
   void PushChunk(std::shared_ptr<arrow::RecordBatch> rows, RowComparator::KeyArrays keys);
   std::vector<std::shared_ptr<arrow::RecordBatch>> ClearChunks();
+
+  // Distinct allocation roots retained by the chunks, rather than one capacity per alias or
+  // row. The pointer table is allocated from the query pool; chunk ownership keeps its borrowed
+  // identities alive. Add commits only after all allocations and overflow checks succeed.
+  class PayloadRoots {
+   public:
+    PayloadRoots() = default;
+    PayloadRoots(const PayloadRoots&) = delete;
+    PayloadRoots& operator=(const PayloadRoots&) = delete;
+    PayloadRoots(PayloadRoots&& other) noexcept;
+    PayloadRoots& operator=(PayloadRoots&& other) noexcept;
+
+    arrow::Status Add(const arrow::RecordBatch& rows, arrow::MemoryPool* pool);
+    [[nodiscard]] int64_t bytes() const { return bytes_; }
+
+   private:
+    [[nodiscard]] bool Contains(const arrow::Buffer* root) const;
+    void Insert(const arrow::Buffer* root);
+    arrow::Status Reserve(std::size_t roots, arrow::MemoryPool* pool);
+
+    std::shared_ptr<arrow::Buffer> slots_;
+    std::size_t num_slots_ = 0;
+    std::size_t roots_ = 0;
+    int64_t bytes_ = 0;
+  };
 
   RowComparator comparator_;
   std::optional<int64_t> keep_;
@@ -136,6 +170,10 @@ class SortBuffer {
   // asking every chunk for every column again (a lock and a reference count each).
   std::vector<std::vector<const arrow::Array*>> column_arrays_;
   int64_t rows_ = 0;
+  // The unique retained root capacities guide cleanup; the pool enforces the query budget.
+  // Its pointer table is already pool-charged, so memory_usage() does not count it again.
+  PayloadRoots payload_roots_;
+  int64_t compacted_view_payload_bytes_ = 0;
   std::vector<RowRef> order_;        // after Sort
   std::optional<RowRef> threshold_;  // with keep: the last kept row after a compaction
   bool sorted_ = false;
@@ -168,6 +206,7 @@ class SortOperator final : public Operator {
   int64_t next_ = 0;  // the next sorted row to emit
   int64_t end_ = 0;   // one past the last sorted row to emit
   bool sorted_ = false;
+  bool selection_before_gather_ = false;
 };
 
 }  // namespace antb1::exec

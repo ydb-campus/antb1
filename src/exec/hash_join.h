@@ -342,12 +342,13 @@ class HashJoinOperator final : public Operator {
   // one-row join; for probe keys (columns of the probe's output, one per build key) outside the
   // probe's output or of another type than their build key; and for a residual that is not BOOLEAN
   // or reads a column outside the probe's and the build's columns.
-  static arrow::Result<std::unique_ptr<HashJoinOperator>> Make(std::unique_ptr<Operator> probe,
-                                                               std::shared_ptr<JoinBuild> build,
-                                                               std::vector<int> probe_keys,
-                                                               plan::BuildSide build_side,
-                                                               std::vector<plan::ExprPtr> residual,
-                                                               bool prepares);
+  // A nonempty binary_view_columns mask selects build-side BINARY payload columns to emit as
+  // owned views. It must have the build schema's width and may select only BINARY fields, on an
+  // integer-key inner join without residuals. Other build columns retain their ordinary type.
+  static arrow::Result<std::unique_ptr<HashJoinOperator>> Make(
+      std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build,
+      std::vector<int> probe_keys, plan::BuildSide build_side, std::vector<plan::ExprPtr> residual,
+      bool prepares, std::vector<bool> binary_view_columns = {});
   ~HashJoinOperator() override;
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& output_schema() const override {
@@ -373,7 +374,7 @@ class HashJoinOperator final : public Operator {
   HashJoinOperator(std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build,
                    std::vector<int> probe_keys, plan::BuildSide build_side,
                    std::vector<plan::ExprPtr> residual, bool prepares,
-                   std::shared_ptr<arrow::Schema> schema);
+                   std::shared_ptr<arrow::Schema> schema, std::vector<bool> binary_view_columns);
 
   // Takes the table (prepared first when prepares_) and opens the input unless the table empties
   // the join.
@@ -461,6 +462,7 @@ class HashJoinOperator final : public Operator {
   std::vector<plan::ExprPtr> residual_;
   bool prepares_;
   std::shared_ptr<arrow::Schema> schema_;
+  std::vector<bool> binary_view_columns_;
   plan::JoinKind kind_;  // the build's
   // A semi, anti or left join with residuals: the columns they read, the probe's, then the build's,
   // each in order, are the columns of a batch of candidate pairs (pair_schema_), which
