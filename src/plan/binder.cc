@@ -4292,11 +4292,12 @@ class Binder {
     std::optional<std::size_t> on_position;
   };
   std::vector<BoundValue> values_;
-  // The marks and the correlated values (ADR 0041's SQ7a, SQ5b) the select list plants, which bind
-  // before WHERE and HAVING do: each slot's tail, assembled above the slot's own entries, so a mark
-  // computes its probe, and a correlated value's join back its maps, only over the rows that
-  // WHERE's and HAVING's filters keep. A later clause that reads one moves it to the end of its
-  // slot's own entries (TakeFromTail), below that clause's own entry.
+  // The marks and the correlated values (ADR 0041's SQ7a, SQ5b) the select list plants -- its bare
+  // aggregate items bind before WHERE, its other items after WHERE and GROUP BY, all before HAVING:
+  // each slot's tail, assembled above the slot's own entries, so a mark computes its probe, and a
+  // correlated value's join back its maps, only over the rows that WHERE's and HAVING's filters
+  // keep. A later clause that reads one moves it to the end of its slot's own entries
+  // (TakeFromTail), below that clause's own entry.
   std::vector<SlotEntry> row_tail_;
   std::vector<SlotEntry> group_tail_;
   bool deferring_ = false;  // while the select list binds
@@ -7139,10 +7140,10 @@ arrow::Result<Typed> Binder::SubqueryValue(const sql::SubqueryExpr& s, bool grou
                                                   bound.on_position == on_position_;
                                          });
       same != nullptr) {
-    // A dry run returns before Admit, as below. No refusal is left for one to meet here since
-    // SQ5b: a value is remembered only where Admit let it plant, never inside a padded unit's left
-    // input; a dry run binds no conjunct that reads an enclosing block; and a correlated EXISTS is
-    // never remembered.
+    // A dry run returns before Admit, as below. Since SQ5b no refusal is left for one to meet here:
+    // in_correlated_ is set only inside BindCorrelatedConjunct, which no dry run enters; a value is
+    // remembered inside a padded unit's left input only by a bind that is then refused; and a
+    // correlated EXISTS is never remembered.
     if (!dry_run_) {
       ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(s));
     }

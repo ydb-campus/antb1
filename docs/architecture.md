@@ -174,9 +174,10 @@ steps (only step 7 uses more than one thread):
    twice reads one join, and the conjunct is a `Compute` of what it computes and a `Filter` after that join, in the
    order written. An `IN` subquery inside such a conjunct (SQ7a) is a null-aware mark join in the same slot, its
    BOOLEAN read like a value, bound once per slot by its set and its bound probe, so `IN` and `NOT IN` share it; one
-   the select list binds, before `WHERE` and `HAVING`, waits in the slot's tail above their filters, as does a
-   correlated value's dependent join the select list binds (SQ5b), until a later clause that reads it moves it below
-   that clause's own entry. A join graph no key connects is a cross product
+   the select list binds (its bare aggregate items before `WHERE`, its other items after `WHERE` and `GROUP BY`, all
+   before `HAVING`) waits in the slot's tail above the filters of `WHERE` and `HAVING`, as does a correlated value's
+   dependent join the select list binds (SQ5b), until a later clause that reads it moves it below that clause's own
+   entry. A join graph no key connects is a cross product
    ([ADR 0040](adr/0040-nested-loop-joins.md)): a relation the keys leave out that is a sub-plan of exactly one
    row (an aggregate without groups) that no key, no residual and no conjunct of its own branch reads joins above the
    others as a one-row join, and the parts the keys connect are crossed left-deep, each the build of an inner join
