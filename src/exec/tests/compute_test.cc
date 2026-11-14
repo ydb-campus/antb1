@@ -2407,43 +2407,14 @@ TEST_F(ComputeTest, ANarrowDecimalCaseScattersIntoItsResult) {
   EXPECT_EQ(UnscaledText(**out), "DECIMAL(15,2): 1700 null -25 null null 13");
 }
 
-// Arrow 25's replace_with_mask, the kernel under Scatter, reads a BOOLEAN input's values from the
-// first bit of its buffer, not from the input's offset (apache/arrow GH-51223); the mask, and every
-// validity bitmap, it reads at the offset. So it reads each value of a slice as many rows early as
-// the slice's offset: the three FALSE values from row 3 come out as the three TRUE values of rows 0
-// to 2, as the values it scatters and as the array it scatters into alike. Scatter copies a sliced
-// BOOLEAN to offset 0 first (the case below). When this case fails, the Arrow in use reads the
-// offset, and that copy can go, with this case.
-TEST_F(ComputeTest, ArrowsReplaceWithMaskReadsASlicedBooleanFromItsBuffersFirstBit) {
-  const auto rows = Bools({true, true, true, false, false, false});
-  const auto from_row_3 = rows->Slice(3);  // false, false, false
-  const auto rows_0_to_2 = rows->Slice(0, 3);
-  const auto nulls = arrow::MakeArrayOfNull(arrow::boolean(), 3).ValueOrDie();
-  const auto every_row = arrow::MakeArrayFromScalar(arrow::BooleanScalar(true), 3).ValueOrDie();
-  const auto no_row = arrow::MakeArrayFromScalar(arrow::BooleanScalar(false), 3).ValueOrDie();
-  const char* const fixed =
-      "replace_with_mask reads a sliced BOOLEAN at its offset now (GH-51223 is fixed in this "
-      "Arrow): Scatter's copy of one to offset 0 can go, and so can this case";
-  auto scattered =
-      arrow::compute::CallFunction("replace_with_mask", {nulls, every_row, from_row_3});
-  ASSERT_TRUE(scattered.ok()) << scattered.status().ToString();
-  EXPECT_TRUE(scattered->make_array()->Equals(*rows_0_to_2))
-      << scattered->make_array()->ToString() << "\n"
-      << fixed;
-  auto kept = arrow::compute::CallFunction("replace_with_mask", {from_row_3, no_row, Bools({})});
-  ASSERT_TRUE(kept.ok()) << kept.status().ToString();
-  EXPECT_TRUE(kept->make_array()->Equals(*rows_0_to_2)) << kept->make_array()->ToString() << "\n"
-                                                        << fixed;
-}
-
 // A BOOLEAN column of a sliced batch is read at its own rows wherever a CASE or an AND/OR scatters
 // it -- a mark join's mark under a LIMIT's OFFSET, which slices the batch the join emits (the shape
 // of `SELECT ..., CASE WHEN x IN (SELECT ...) THEN 1 ELSE 0 END FROM t OFFSET 2`). Each of these
 // hands the column over whole while every row is still open, and Scatter puts it in place through
-// replace_with_mask, which alone would read each value as many rows early as the slice's offset
-// (the case above): a WHEN, a later WHEN, IS TRUE of the column as a WHEN, a THEN, an ELSE, a
-// COALESCE argument, and an AND or an OR argument after the first. A first argument of OR and a NOT
-// reach Arrow's boolean kernels instead, which read the offset; they stay here as the contrast.
+// replace_with_mask, which before Arrow 26 read each value as many rows early as the slice's offset
+// (apache/arrow GH-51223): a WHEN, a later WHEN, IS TRUE of the column as a WHEN, a THEN, an ELSE,
+// a COALESCE argument, and an AND or an OR argument after the first. A first argument of OR and a
+// NOT reach Arrow's boolean kernels instead, which read the offset; they stay here as the contrast.
 // Every offset from 1 to 9 (within a byte and across one), with NULLs among the values and without:
 // each answer must be the one over the same rows as a batch of their own.
 TEST_F(ComputeTest, ABooleanOfASlicedBatchIsScatteredFromItsOwnRows) {

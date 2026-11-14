@@ -187,7 +187,7 @@ parquet::ArrowReaderProperties ReaderProperties(bool use_threads = false) {
 arrow::Result<std::shared_ptr<arrow::Buffer>> FooterBytes(arrow::io::RandomAccessFile& file,
                                                           int64_t size,
                                                           const parquet::FileMetaData& metadata) {
-  const int64_t bytes = int64_t{metadata.size()} + 8;
+  const int64_t bytes = metadata.size() + 8;
   return file.ReadAt(size - bytes, bytes);
 }
 
