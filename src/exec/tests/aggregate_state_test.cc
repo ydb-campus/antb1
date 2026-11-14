@@ -398,7 +398,7 @@ TEST_F(AggregateStateTest, MinMaxOfDatesUnsignedDoublesAndHugeInts) {
   EXPECT_EQ(Text(*huge), "-99999999999999999999");
 }
 
-// The ungrouped MIN and MAX of a narrow DECIMAL. Arrow 25 has no min_max kernel for decimal64, so
+// The ungrouped MIN and MAX of a narrow DECIMAL. Arrow 26 has no min_max kernel for decimal64, so
 // this state widens for the kernel and narrows the answer back; what the case pins is that the
 // answer and its type are the ones the caller asked for, and that SUM and COUNT(DISTINCT) over the
 // same column -- which take other paths entirely -- agree with their wide arms too.

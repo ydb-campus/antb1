@@ -634,7 +634,7 @@ class ScanReader final : public arrow::RecordBatchReader {
     properties.set_pre_buffer(false);
     ARROW_ASSIGN_OR_RAISE(file_reader_, builder.properties(properties)->Build());
     const auto& top_level = file_reader_->manifest().schema_fields;
-    std::vector<int> leaves;  // named: a braced list would pick a deprecated overload
+    std::vector<int> leaves;
     for (const Column& column : columns_) {
       const auto field = Narrow<std::size_t>(column.field);
       CollectLeaves(top_level.at(field), leaves);  // the manifest of the footer read at Open

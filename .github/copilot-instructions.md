@@ -3,7 +3,7 @@
 [AGENTS.md](../AGENTS.md) is the canonical guide (commands, module boundaries, conventions, "Ask a human first",
 Code Review Rules). Read it before you change anything; these lines only repeat the most important rules.
 
-antb1 is an experimental C++23 analytics engine over local Parquet files (Apache Arrow 25). Clang 23 is the primary
+antb1 is an experimental C++23 analytics engine over local Parquet files (Apache Arrow 26). Clang 23 is the primary
 compiler; GCC 15 runs a compatibility leg.
 
 ## The five commands
