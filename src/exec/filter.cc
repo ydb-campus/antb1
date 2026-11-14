@@ -214,12 +214,13 @@ arrow::Result<arrow::Datum> PredicateEvaluator::Evaluate(const arrow::RecordBatc
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr converted, DecimalToDouble(*batch.column(column_), pool));
     column = arrow::Datum(converted);
   } else if (mode_ == Mode::kNarrowAsInteger) {
-    // Arrow 25 compares a decimal64 array about 2.8x slower than a decimal128 one and 27x slower
-    // than an int64 one -- it has no specialised kernel for the newer type and falls back to a
-    // byte-wise comparator. A decimal64's eight bytes ARE its unscaled int64, and both sides of
-    // this comparison carry the same scale, so Array::View hands the same buffers to int64 and the
-    // integer kernel answers the same thing: 0.13 ns a row against 1.24 for decimal128, measured
-    // on this environment's Arrow (ADR 0021's decimal64 item). Nothing is copied or converted.
+    // Arrow 25 compared a decimal64 array about 2.8x slower than a decimal128 one and 27x slower
+    // than an int64 one -- it has no specialised kernel for the newer type, nor has 26, and falls
+    // back to a byte-wise comparator. A decimal64's eight bytes ARE its unscaled int64, and both
+    // sides of this comparison carry the same scale, so Array::View hands the same buffers to int64
+    // and the integer kernel answers the same thing: 0.13 ns a row against 1.24 for decimal128,
+    // measured on this environment's Arrow (ADR 0021's decimal64 item). Nothing is copied or
+    // converted.
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr integers, batch.column(column_)->View(arrow::int64()));
     column = arrow::Datum(integers);
   }

@@ -50,3 +50,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0039](0039-set-operations.md) | Set operations: UNION, INTERSECT and EXCEPT in one n-ary node | Proposed |
 | [0040](0040-nested-loop-joins.md) | Nested-loop joins and cross products | Accepted |
 | [0041](0041-subqueries-and-decorrelation.md) | Subqueries and full decorrelation | Proposed |
+| [0042](0042-arrow-26.md) | Apache Arrow 26 | Proposed |

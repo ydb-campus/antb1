@@ -5,7 +5,7 @@ coding agents, and both describe one workflow.
 
 ## Setup
 
-The whole toolchain (Clang 23, GCC 15, CMake, Ninja, ccache, Arrow 25, GoogleTest, DuckDB for tests, and every
+The whole toolchain (Clang 23, GCC 15, CMake, Ninja, ccache, Arrow 26, GoogleTest, DuckDB for tests, and every
 formatter and linter) comes from [pixi](https://pixi.prefix.dev) and conda-forge. You do not need system packages, root
 access or a container, and you should not use host compilers or host CMake.
 

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,28 @@ TEST(PartitionLanesTest, EveryLaneMergesThePartsInOrder) {
       }
     }
   }
+}
+
+// A worker that Arrow's pool cannot start (an UnknownError from Submit since Arrow 26) fails a
+// lane's Add and ForEach as an ExecutionError, exit code 1, not as a bug (SubmitStatus).
+TEST(PartitionLanesTest, AWorkerThePoolCannotStartIsAnExecutionError) {
+  const auto pool = Pool();
+  const auto refusal = arrow::Status::UnknownError("Failed to launch worker thread");
+  {
+    testing::RefusingExecutor executor(pool.get(), 0, refusal);
+    PartitionLanes lanes(4, &executor, 3);
+    const arrow::Status added = lanes.Add(0, [](std::size_t) { return arrow::Status::OK(); });
+    const arrow::Status failure = added.ok() ? lanes.Finish() : added;
+    EXPECT_TRUE(failure.IsExecutionError()) << failure.ToString();
+    EXPECT_NE(failure.message().find("could not start a worker thread"), std::string::npos);
+  }
+  {
+    testing::RefusingExecutor executor(pool.get(), 1, refusal);
+    const arrow::Status done =
+        ForEach(&executor, 4, [](std::size_t) { return arrow::Status::OK(); });
+    EXPECT_TRUE(done.IsExecutionError()) << done.ToString();
+  }
+  pool->WaitForIdle();
 }
 
 // Without an executor a part merges into lane 0, 1, ... before Add returns.

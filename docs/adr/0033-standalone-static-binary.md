@@ -45,6 +45,11 @@ Proposed
   - Gates check the prefix before it is used (`scripts/static_gates.py prefix`): static archives only, every C and
     C++ file at `-O3` with `-flto=thin`, no header of a bundled library from the environment, every download a local
     file, Arrow's option set, and a report of bitcode and native archive members.
+  - Update (2026-11-14, [ADR 0042](0042-arrow-26.md)): Apache Arrow 26.0.1 and the 12 dependencies it bundles for
+    these features. Arrow 26 requires uriparser (Arrow core) and simdjson (Parquet), which the gates count among the
+    compiled dependencies, and no longer needs RapidJSON or a patched Thrift. uriparser's pin is the first
+    `.tar.bz2`, and simdjson's notices of code it took from PyTorch and Grisu2 are kept in
+    `cmake/static/licenses/simdjson-NOTICES.txt`.
 - **antb1 in preset `static`:** Release, `-O3`, ThinLTO against that prefix (`ANTB1_ARROW_LINKAGE=static` switches every
   target from `Arrow::arrow_shared` to `Arrow::arrow_static`, and the same for ArrowCompute and Parquet).
   - **Linux:** fully static and non-PIE, on the locked glibc 2.28 sysroot: no loader, no dynamic section, any

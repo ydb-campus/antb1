@@ -1,6 +1,7 @@
 # Arrow's options in the static build (docs/adr/0033-standalone-static-binary.md), loaded with `cmake -C` by
 # scripts/static-arrow.sh. Only what antb1 uses: Arrow core, compute and Parquet with five codecs, RE2 (regexp_replace),
-# utf8proc and mimalloc. Every dependency is BUNDLED, built from the local copies of cmake/static/arrow-sources.lock,
+# utf8proc and mimalloc, plus what Arrow 26 requires of them: uriparser (Arrow core) and simdjson (Parquet). Every
+# dependency is BUNDLED, built from the local copies of cmake/static/arrow-sources.lock,
 # except Boost's headers (Thrift needs no Boost library), which come from the environment. Leaving the rest out also
 # keeps every user of NSS and dlopen (glog, the filesystems, HDFS, OpenTelemetry, backtrace) out of the static link.
 set(CMAKE_BUILD_TYPE "Release" CACHE STRING "")
@@ -77,8 +78,15 @@ set(ARROW_RUNTIME_SIMD_LEVEL "MAX" CACHE STRING "")
 set(ARROW_C_FLAGS_RELEASE "-O3" CACHE STRING "")
 set(ARROW_CXX_FLAGS_RELEASE "-O3" CACHE STRING "")
 
+# uriparser, which Arrow 26 builds with FetchContent in this same configure, finds reallocarray by linking
+# (check_function_exists) and then defines only _DEFAULT_SOURCE to have it declared, as glibc does from 2.29 on. The
+# Linux sysroot is glibc 2.28, which declares it under _GNU_SOURCE alone, so with uriparser's -std=c99 the call would
+# be an undeclared function, an error. Its fallback, realloc with an overflow check, does the same; macOS has no
+# reallocarray and takes it already.
+set(HAVE_REALLOCARRAY 0 CACHE INTERNAL "")
+
 # Build identity, read back through arrow::GetBuildInfo() (`antb1 version --verbose`). Without ARROW_GIT_ID, Arrow
 # runs `git log` in whatever repository encloses its source tree.
-set(ARROW_GIT_ID "59bea6ec485e7fe351d1aa6753f964f6a6bc353a" CACHE STRING "") # tag apache-arrow-25.0.0
-set(ARROW_GIT_DESCRIPTION "apache-arrow-25.0.0" CACHE STRING "")
+set(ARROW_GIT_ID "9e5d6978e9acf372cc989aaaf94e863fe8582c90" CACHE STRING "") # tag apache-arrow-26.0.1
+set(ARROW_GIT_DESCRIPTION "apache-arrow-26.0.1" CACHE STRING "")
 set(ARROW_PACKAGE_KIND "antb1-static" CACHE STRING "")

@@ -16,6 +16,8 @@
 
 #include "antb1/exec/memory_budget.h"
 
+#include "submit_status.h"
+
 namespace antb1::exec {
 
 arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
@@ -55,7 +57,7 @@ arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
       if (task.ok()) {
         tasks.push_back(*std::move(task));  // reserved: nothing allocated, nothing thrown
       } else {
-        submitted = std::move(task).status();
+        submitted = SubmitStatus(std::move(task).status());
       }
     } catch (const std::bad_alloc&) {
       submitted = arrow::Status::OutOfMemory("out of memory while submitting a parallel task");
@@ -180,7 +182,7 @@ arrow::Status PartitionLanes::Queue(std::size_t lane, const std::shared_ptr<Part
   // that fails. The task waits for mu_, held here, so the lane is marked running before it runs.
   arrow::Status submitted;
   try {
-    submitted = executor_->Submit([this, lane] { Drain(lane); }).status();
+    submitted = SubmitStatus(executor_->Submit([this, lane] { Drain(lane); }).status());
   } catch (const std::bad_alloc&) {
     submitted = arrow::Status::OutOfMemory("out of memory while starting a partition lane");
   }

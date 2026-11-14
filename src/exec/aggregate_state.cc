@@ -573,7 +573,7 @@ class MinMaxState final : public AggregateState {
  public:
   MinMaxState(bool min, std::shared_ptr<arrow::DataType> type, arrow::MemoryPool* pool)
       : min_(min), type_(std::move(type)), pool_(pool) {
-    // Arrow 25 has no min_max kernel for a decimal narrower than 128 bits -- probed, not assumed --
+    // Arrow 26, like 25, has no min_max kernel for a decimal narrower than 128 bits (probed) --
     // so a narrow column is widened for the kernel and the answer narrowed back at Finalize. One
     // cast a batch, on the ungrouped MIN/MAX path; the grouped one reads the bytes itself and needs
     // none (ADR 0021's decimal64 item).

@@ -83,6 +83,23 @@ def test_macos_notices_carry_libcxx_and_no_glibc(box: Box) -> None:
     assert LGPL_NOTICE_START not in text and "GNU C Library" not in text
 
 
+def test_notices_label_a_libraries_extra_notices_by_its_pin(box: Box) -> None:
+    """A cmake/static/licenses/<library>-NOTICES.txt (simdjson's, of code it took from elsewhere) follows the
+    prefix's licences, labelled by the library's pin."""
+    (box.root / "cmake" / "static" / "licenses" / "thrift-NOTICES.txt").write_text("thrift extra notices\n")
+    result = box.notices("darwin-arm64")
+    assert result.returncode == 0, result.stderr
+    text = (box.tmp / "notices-darwin-arm64" / "THIRD_PARTY_NOTICES.txt").read_text()
+    expected = [
+        *PREFIX_SECTIONS[:4],
+        ("Apache Thrift 0.22.0: NOTICES.txt", "thrift extra notices"),
+        *PREFIX_SECTIONS[4:],
+        ("libc++ 23.1.3: LICENSE.TXT", "libc++ licence"),
+    ]
+    assert labels(text) == [label for label, _ in expected]
+    assert text.endswith(sections(expected))
+
+
 def test_notices_refuse_a_sysroot_build_without_a_pinned_source(box: Box) -> None:
     box.write_glibc_lock("sysroot_linux-64-2.28-hother_9")
     result = box.notices()

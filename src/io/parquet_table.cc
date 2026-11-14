@@ -39,6 +39,7 @@
 
 #include "filtered_scan.h"
 #include "scan_segment.h"
+#include "unfit_annotation.h"
 #include <sys/stat.h>
 
 namespace antb1::io {
@@ -187,7 +188,7 @@ parquet::ArrowReaderProperties ReaderProperties(bool use_threads = false) {
 arrow::Result<std::shared_ptr<arrow::Buffer>> FooterBytes(arrow::io::RandomAccessFile& file,
                                                           int64_t size,
                                                           const parquet::FileMetaData& metadata) {
-  const int64_t bytes = int64_t{metadata.size()} + 8;
+  const int64_t bytes = metadata.size() + 8;
   return file.ReadAt(size - bytes, bytes);
 }
 
@@ -214,6 +215,14 @@ arrow::Result<FileInfo> ReadFooter(const std::string& path) {
   } catch (const std::exception& e) {
     return arrow::Status::IOError("cannot read '", path, "': ", e.what());
   }
+}
+
+// Whether a column override (--column-type) names `field`: the override decides its type.
+bool Overridden(const arrow::Field& field, const ParquetTableOptions& options) {
+  const std::string lower = plan::AsciiLower(field.name());
+  return std::ranges::any_of(options.overrides, [&lower](const ColumnOverride& ov) {
+    return plan::AsciiLower(ov.column) == lower;
+  });
 }
 
 std::shared_ptr<arrow::Field> EngineField(const std::shared_ptr<arrow::Field>& storage,
@@ -634,7 +643,7 @@ class ScanReader final : public arrow::RecordBatchReader {
     properties.set_pre_buffer(false);
     ARROW_ASSIGN_OR_RAISE(file_reader_, builder.properties(properties)->Build());
     const auto& top_level = file_reader_->manifest().schema_fields;
-    std::vector<int> leaves;  // named: a braced list would pick a deprecated overload
+    std::vector<int> leaves;
     for (const Column& column : columns_) {
       const auto field = Narrow<std::size_t>(column.field);
       CollectLeaves(top_level.at(field), leaves);  // the manifest of the footer read at Open
@@ -838,12 +847,7 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
   for (const auto& ov : options.overrides) {
     ARROW_RETURN_NOT_OK(ValidateOverride(ov, *table->storage_schema_));
   }
-  arrow::FieldVector fields;
-  for (const auto& f : table->storage_schema_->fields()) {
-    fields.push_back(EngineField(f, options));
-  }
-  table->schema_ = arrow::schema(std::move(fields));
-  table->leaf_of_field_.assign(Narrow<std::size_t>(table->schema_->num_fields()), -1);
+  table->leaf_of_field_.assign(Narrow<std::size_t>(table->storage_schema_->num_fields()), -1);
   if (!table->metadata_.empty()) {
     const auto& first = table->metadata_.front();
     parquet::arrow::SchemaManifest manifest;
@@ -858,6 +862,26 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
       }
     }
   }
+  arrow::FieldVector fields;
+  for (int i = 0; i < table->storage_schema_->num_fields(); ++i) {
+    const std::shared_ptr<arrow::Field>& f = table->storage_schema_->field(i);
+    const int leaf = table->leaf_of_field_[Narrow<std::size_t>(i)];
+    // A leaf whose logical type Arrow dropped as unfit in any of the files (UnfitAnnotationType):
+    // with it dropped, a file's storage type is the physical type and equals that of a file whose
+    // column carries no annotation at all, so the first file alone does not tell. The storage
+    // schemas are equal, so the leaf is the same column of every file.
+    const auto unfit_in = [leaf](const std::shared_ptr<parquet::FileMetaData>& metadata) {
+      return leaf < metadata->num_columns() &&
+             metadata->schema()->Column(leaf)->logical_type()->is_invalid();
+    };
+    if (leaf >= 0 && !Overridden(*f, options) && std::ranges::any_of(table->metadata_, unfit_in)) {
+      fields.push_back(
+          arrow::field(f->name(), std::make_shared<UnfitAnnotationType>(f->type()), f->nullable()));
+    } else {
+      fields.push_back(EngineField(f, options));
+    }
+  }
+  table->schema_ = arrow::schema(std::move(fields));
   return table;
 }
 

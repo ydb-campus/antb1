@@ -1,5 +1,5 @@
 # AGENTS.md: antb1
-antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++ 25
+antb1 is an experimental C++23 analytics engine: SQL-like queries over local Parquet files, built on Apache Arrow C++ 26
 (conda-forge). Namespace `antb1`, CLI `antb1`. It answers global and grouped aggregates, expressions, sorting, top-N and
 inner and left outer joins: all 43 ClickBench queries, all 22 from TPC-H. This file is the canonical guide for every
 agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subset.md) · [testing](docs/testing.md) ·
@@ -24,7 +24,7 @@ agent. Maps: [architecture](docs/architecture.md) · [SQL subset](docs/sql-subse
 - Linux: `bash scripts/agent-setup.sh` installs pixi 0.81.0 if missing and the locked `default` and `lint` envs
   (add `--envs "default lint gcc"` for the GCC leg); put `pixi` on `PATH`, then run `pixi run doctor`. macOS (Apple
   silicon): install pixi 0.81.0 or newer from <https://pixi.prefix.dev>. Installed environments work offline.
-- Environments: `default` (Clang 23, libstdc++ 15 on Linux, libc++ on macOS, Arrow 25, CLI11, GoogleTest, DuckDB for
+- Environments: `default` (Clang 23, libstdc++ 15 on Linux, libc++ on macOS, Arrow 26, CLI11, GoogleTest, DuckDB for
   tests), `gcc` (GCC 15, linux-64: `ci-gcc`, `codeql-build`), `lint` (linters), `static` (own static Arrow, ADR 0033).
 
 ## Commands
@@ -71,9 +71,9 @@ Every CI job name contains the command that reproduces it (docs/ci.md). SQL cont
   `std::make_unsigned` or `TryNarrow` on it; use `src/common/include/antb1/common/int128.h`, `__builtin_*_overflow`
   and `std::format`. Integer SUM and AVG accumulate in `Int128` (Arrow's `sum` wraps at int64).
 - Arrow: `arrow::compute::Initialize()` runs in `engine::Session::Make`; tests that call compute kernels without a
-  `Session` must call it too. Pass a named `std::vector<int>` to `GetRecordBatchReader` (a braced `{0}` picks a
-  deprecated overload). The `parquet::arrow::FileReader` must outlive its `RecordBatchReader` (declare it first).
-  Parquet column indices are leaf indices, not top-level field indices.
+  `Session` must call it too. Pass a named `std::vector<int>` to `ReadTable` and `ReadRowGroup(s)` (a braced `{0}`
+  picks a deprecated overload). The `parquet::arrow::FileReader` must outlive its `RecordBatchReader` (declare it
+  first). Parquet column indices are leaf indices, not top-level field indices.
 - Never `_GLIBCXX_DEBUG` (it breaks the ABI with the prebuilt Arrow; Debug already uses `_GLIBCXX_ASSERTIONS`) and
   never `-stdlib=libc++` on Linux (conda Arrow is built against libstdc++). CMake rejects both in `CMAKE_CXX_FLAGS`.
 
@@ -122,8 +122,8 @@ P1 missing tests, boundary violations; P2 performance. Never quote ClickBench da
 - Integer SUM/AVG not accumulated in `Int128`; integer SUM not returned as HUGEINT; `std::in_range` on `Int128`.
 - NULL, literal-folding or identifier semantics that differ from docs/sql-subset.md and ADR 0004.
 - Wrong exit code: 4 only for `SqlErrorDetail` kind `kUnsupported`; any other `NotImplemented` must map to 70.
-- `GetRecordBatchReader` with a braced list; a `FileReader` that does not outlive its reader; leaf vs top-level index
-  confusion; `ParquetException` escaping `io`; compute kernels used without `arrow::compute::Initialize()`.
+- `ReadTable` or `ReadRowGroup(s)` with a braced list; a `FileReader` that does not outlive its reader; leaf vs
+  top-level index confusion; `ParquetException` escaping `io`; compute kernels without `arrow::compute::Initialize()`.
 - Narrowing between Arrow `int` and `int64_t` without `TryNarrow`/`Narrow`; signed overflow; `_GLIBCXX_DEBUG`.
 
 ### Architecture

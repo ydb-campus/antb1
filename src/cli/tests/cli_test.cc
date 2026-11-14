@@ -268,7 +268,7 @@ TEST_F(CliTest, ExplainAndVersion) {
   EXPECT_NE(r.out.find("RowCount table=t"), std::string::npos);
   r = Invoke({"version"});
   EXPECT_EQ(r.code, kExitOk);
-  EXPECT_NE(r.out.find("Apache Arrow 25."), std::string::npos) << r.out;
+  EXPECT_NE(r.out.find("Apache Arrow 26."), std::string::npos) << r.out;
 }
 
 TEST_F(CliTest, VersionVerboseNamesTheBuild) {

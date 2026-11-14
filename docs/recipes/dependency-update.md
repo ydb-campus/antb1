@@ -27,7 +27,7 @@ Continue only with explicit approval, and only with the approved change.
 - Other compiler-specific tools: the environment's own feature (`clang` for `default`, `gcc` for `gcc`, `static`).
 - Formatters and linters: the `lint` feature (no C++ dependencies there).
 - DuckDB is a test oracle only (never linked into `src/`); new test-only packages follow the same rule.
-- Pin the minor version, for example `"25.0.*"`, and keep lockstep groups together:
+- Pin the minor version, for example `"26.0.*"`, and keep lockstep groups together:
   - `libarrow`, `libarrow-compute` and `libparquet` (always the CPU builds), and with them the static build's pins:
     an Arrow upgrade replaces every line of `cmake/static/arrow-sources.lock`, then `pixi run static` must pass.
     - The pins come only from the ASF release. Check `apache-arrow-<v>.tar.gz` against its `.sha512` and run

@@ -182,6 +182,21 @@ TEST_F(ParallelComputeTest, ClosesWithBatchesInFlight) {
   EXPECT_FALSE(again.status.ok());
 }
 
+// A worker that Arrow's pool cannot start (an UnknownError from Submit since Arrow 26) fails Next
+// as an ExecutionError, exit code 1, not as a bug (SubmitStatus).
+TEST_F(ParallelComputeTest, AWorkerThePoolCannotStartIsAnExecutionError) {
+  auto pool = arrow::internal::ThreadPool::Make(4);
+  ASSERT_TRUE(pool.ok());
+  {
+    testing::RefusingExecutor executor(
+        pool->get(), 2, arrow::Status::UnknownError("Failed to launch worker thread"));
+    ParallelComputeOperator op(std::make_unique<ScriptedSource>(Schema(), Batches(10)), PlusOne());
+    const Output run = Drain(op, &executor);  // closes the operator
+    EXPECT_TRUE(run.status.IsExecutionError()) << run.status.ToString();
+  }
+  (*pool)->WaitForIdle();
+}
+
 // Under memory pressure one batch is computed at a time; the output is the same.
 TEST_F(ParallelComputeTest, ComputesOneBatchAtATimeUnderPressure) {
   auto pool = arrow::internal::ThreadPool::Make(4);

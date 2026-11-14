@@ -83,28 +83,6 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
   return cast.make_array();
 }
 
-// `values` itself, except a BOOLEAN that starts inside its buffers (a column of a sliced batch),
-// which becomes a copy of its bitmaps from its first row, at offset 0. Arrow 25's replace_with_mask
-// reads a BOOLEAN input's values from the first bit of its buffer, not at its offset (apache/arrow
-// GH-51223), so Scatter hands it no BOOLEAN at another offset.
-arrow::Result<ArrayPtr> UnsliceBoolean(const ArrayPtr& values, arrow::MemoryPool* pool) {
-  if (values->type_id() != arrow::Type::BOOL || values->offset() == 0) {
-    return values;
-  }
-  const arrow::ArrayData& data = *values->data();
-  arrow::BufferVector buffers;  // the validity (or none) and the values
-  for (const std::shared_ptr<arrow::Buffer>& bits : data.buffers) {
-    std::shared_ptr<arrow::Buffer> copy;
-    if (bits != nullptr) {
-      ARROW_ASSIGN_OR_RAISE(
-          copy, arrow::internal::CopyBitmap(pool, bits->data(), data.offset, data.length));
-    }
-    buffers.push_back(std::move(copy));
-  }
-  return arrow::MakeArray(arrow::ArrayData::Make(values->type(), data.length, std::move(buffers),
-                                                 values->null_count()));
-}
-
 // // and % of two arrays of one type, as DuckDB computes them. A DOUBLE % gives NaN for a zero
 // divisor, or NULL with null_for_zero (DuckDB's % of DECIMALs beyond 38 digits, computed in
 // DOUBLE).
@@ -2303,16 +2281,9 @@ struct Evaluator {
           arrow::compute::CallFunction("replace_with_mask", {into_bytes, mask, value_bytes}, ctx));
       return out.make_array()->View(into->type());
     }
-    // The kernel reads a BOOLEAN's values from the first bit of its buffer (UnsliceBoolean), so a
-    // BOOLEAN of a sliced batch -- a mark under a LIMIT's OFFSET, handed over whole by a WHEN, a
-    // THEN, an ELSE, a COALESCE or an AND/OR argument while every row is open -- would have each
-    // value read as many rows early as its offset. It goes in from its first row; the mask is read
-    // right.
-    ARROW_ASSIGN_OR_RAISE(const ArrayPtr whole_into, UnsliceBoolean(into, pool));
-    ARROW_ASSIGN_OR_RAISE(const ArrayPtr whole_values, UnsliceBoolean(values, pool));
     ARROW_ASSIGN_OR_RAISE(
         const arrow::Datum out,
-        arrow::compute::CallFunction("replace_with_mask", {whole_into, mask, whole_values}, ctx));
+        arrow::compute::CallFunction("replace_with_mask", {into, mask, values}, ctx));
     return out.make_array();
   }
 

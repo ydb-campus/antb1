@@ -137,7 +137,7 @@ build in `build/static` too ([benchmarks.md](benchmarks.md)). The licence texts 
 go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
 
 - `pixi run static-arrow` (network on the first run) downloads the sources pinned in
-  `cmake/static/arrow-sources.lock` and builds Arrow 25 and the dependencies it bundles as static `-O3` ThinLTO
+  `cmake/static/arrow-sources.lock` and builds Arrow 26 and the dependencies it bundles as static `-O3` ThinLTO
   libraries into `$ANTB1_ARROW_DIR/<key>/prefix` (default `~/.cache/antb1/arrow`). A prefix whose key matches is
   reused; `--print-key` prints the key (the cache key below).
   - Every pinned file lists byte-identical copies of at least two operators: an uploaded GitHub release asset first

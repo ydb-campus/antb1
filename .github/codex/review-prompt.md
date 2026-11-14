@@ -1,7 +1,7 @@
 # Codex harness audit: instructions
 
 You are auditing one pull request of antb1, an experimental C++23 analytics engine (SQL-like queries over local
-Parquet files, Apache Arrow 25; Clang 23 primary, GCC 15 compatibility leg; every command is a `pixi run` task).
+Parquet files, Apache Arrow 26; Clang 23 primary, GCC 15 compatibility leg; every command is a `pixi run` task).
 The workflow `.github/workflows/codex-review.yml` builds this prompt from the BASE commit: the "Inputs" section at
 the end names the base and head commits, and "Review rules" holds AGENTS.md as it is on the base commit.
 
