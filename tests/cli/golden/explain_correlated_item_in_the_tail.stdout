@@ -1,0 +1,14 @@
+Output: s:HUGEINT
+Aggregate SUM("(c.ct_id * count_star())")
+  Compute (c.ct_id * count_star())
+    Compute COALESCE(count_star(), 0)
+      Join LEFT build=right keys=["c.ct_id" = "r.rd_city"] carries 3 of 5 unread above
+        Filter "(max(r.rd_row) + 0)" > 0
+          Join INNER build=left keys=["c.ct_id" = "r.rd_city"] carries 1 of 3 unread above
+            Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]
+            GroupAggregate keys=["r.rd_city"] MAX(rd_row)
+              Scan table=riders source=parquet(files=1, rows=240) columns=[rd_row, rd_city]  [shared #2 of 2, 2 fields]
+        GroupAggregate keys=["r.rd_city"] COUNT(*)
+          Join SEMI build=right keys=["r.rd_city" = "c.ct_id"]
+            Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]  [shared #2 of 2, 2 fields]
+            Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]  [shared #1 of 2, 1 field]

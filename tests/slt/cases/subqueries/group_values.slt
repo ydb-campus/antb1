@@ -2879,11 +2879,10 @@ NULL	16
 6	8
 12	8
 
-# ---- pending: a correlated value as a GROUP BY key or in an aggregate's argument (ADR 0041; roadmap PR SQ5b) ----
+# ---- a correlated value as a GROUP BY key or in an aggregate's argument (ADR 0041's SQ5b) ----
 
 # A correlated value as a GROUP BY key, and in an aggregate's argument with a column.
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS k, COUNT(*) AS c FROM cities c GROUP BY 1 ORDER BY 1
 ----
@@ -2892,7 +2891,6 @@ BIGINT	BIGINT
 7	2
 8	3
 
-pending SQ5b
 query I nosort
 SELECT SUM(ct_id * (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id)) AS s FROM cities c
 ----

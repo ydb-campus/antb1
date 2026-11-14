@@ -3062,6 +3062,204 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- SQ5b's correlated values outside conditions (ADR 0041) ----
+  // SQ5a's block as a value in a select item, ORDER BY, a GROUP BY key and an aggregate's argument:
+  // its join back is LEFT, so every outer row comes out, and one without a match reads the
+  // block's value over no rows, COUNT 0, SUM NULL. The star schema as above.
+  {
+    const slt::FeatureSet values = {
+        kColumns,    kCountStar,      kIntegerColumns, kTableName, kQualifiedName,
+        kTableAlias, kIntegerLiteral, kMultipleItems,  kAlias,     kCorrelatedItemValue};
+    // The value as a LEFT JOIN of the inner groups reads it: a COUNT through a COALESCE to 0, a SUM
+    // as it is (NULL over no rows); an item, a GROUP BY key's groups and an aggregate's argument
+    // alike, NULL-equal keys included, at any batch size.
+    struct Grouped {
+      std::string_view name;
+      std::string_view outer;  // read as `o`
+      std::string_view row;    // a column of `o` that tells its rows apart
+      std::string_view outer_key;
+      std::string_view inner;
+      std::string_view inner_key;
+      std::string_view key_op;  // = or IS NOT DISTINCT FROM
+      std::string_view call;    // the block's aggregate over the inner table
+      std::string_view padded;  // what the LEFT JOIN's `g.n` is in place of the value
+      slt::FeatureSet features;
+    };
+    constexpr std::string_view kCoalesced = "COALESCE(g.n, 0)";
+    const auto grouped = std::to_array<Grouped>({
+        {.name = "count",
+         .outer = "cities",
+         .row = "ct_id",
+         .outer_key = "ct_id",
+         .inner = "riders",
+         .inner_key = "rd_city",
+         .key_op = "=",
+         .call = "COUNT(*)",
+         .padded = kCoalesced,
+         .features = {}},
+        {.name = "sum",
+         .outer = "cities",
+         .row = "ct_id",
+         .outer_key = "ct_id",
+         .inner = "riders",
+         .inner_key = "rd_city",
+         .key_op = "=",
+         .call = "SUM(riders.rd_row)",
+         .padded = "g.n",
+         .features = {kSum}},
+        {.name = "riders_and_trips",
+         .outer = "riders",
+         .row = "rd_row",
+         .outer_key = "rd_id",
+         .inner = "trips",
+         .inner_key = "tr_rider",
+         .key_op = "=",
+         .call = "COUNT(*)",
+         .padded = kCoalesced,
+         .features = {}},
+        {.name = "null_equal",
+         .outer = "riders",
+         .row = "rd_row",
+         .outer_key = "rd_city",
+         .inner = "drivers",
+         .inner_key = "dv_city",
+         .key_op = "IS NOT DISTINCT FROM",
+         .call = "COUNT(*)",
+         .padded = kCoalesced,
+         .features = {kNullEqualKeys}},
+    });
+    for (const Grouped& g : grouped) {
+      const std::string value = std::format("(SELECT {} FROM {} WHERE {}.{} {} o.{})", g.call,
+                                            g.inner, g.inner, g.inner_key, g.key_op, g.outer_key);
+      const std::string joined = std::format(
+          "{} AS o LEFT JOIN (SELECT {} AS k, {} AS n FROM {} GROUP BY {}) AS g ON g.k {} o.{}",
+          g.outer, g.inner_key, g.call, g.inner, g.inner_key, g.key_op, g.outer_key);
+      slt::FeatureSet features = SetWith(values, kLeftJoin, kDerivedTable, kGroupBy);
+      features.Add(g.features);
+      struct Place {
+        std::string_view name;
+        std::string correlated;
+        std::string left_join;
+        slt::FeatureSet features;
+      };
+      const auto places = std::to_array<Place>({
+          {.name = "item",
+           .correlated = std::format("SELECT o.{}, {} AS v FROM {} AS o", g.row, value, g.outer),
+           .left_join = std::format("SELECT o.{}, {} AS v FROM {}", g.row, g.padded, joined),
+           .features = {}},
+          {.name = "key",
+           .correlated =
+               std::format("SELECT {} AS v, COUNT(*) AS c FROM {} AS o GROUP BY 1", value, g.outer),
+           .left_join =
+               std::format("SELECT {} AS v, COUNT(*) AS c FROM {} GROUP BY 1", g.padded, joined),
+           .features = {}},
+          {.name = "argument",
+           .correlated =
+               std::format("SELECT SUM(o.{} * {}) AS s FROM {} AS o", g.row, value, g.outer),
+           .left_join = std::format("SELECT SUM(o.{} * {}) AS s FROM {}", g.row, g.padded, joined),
+           .features = {kSum, kArithmetic}},
+      });
+      for (const Place& place : places) {
+        slt::FeatureSet place_features = features;
+        place_features.Add(place.features);
+        r.push_back({.name = std::format("correlated_{}_equals_a_left_join_of_its_groups_{}",
+                                         place.name, g.name),
+                     .features = place_features,
+                     .probes = {Q(place.correlated), Q(place.left_join), Q(place.correlated, 1),
+                                Q(place.correlated, 7)},
+                     .check = AllEqual()});
+      }
+    }
+    // The self-check of ADR 0041's decision 28 for SQ5b's places: an item's rows, an ORDER BY's
+    // order and an aggregate argument's sum are those of the subquery with each city written as a
+    // literal (cities 1 to 6, none NULL), which needs no DuckDB; and the same at any batch size.
+    // `{0}` stands for the outer city's id.
+    struct SelfCheck {
+      std::string_view name;
+      std::string_view value;
+      slt::FeatureSet features;
+    };
+    const auto self_checks = std::to_array<SelfCheck>({
+        {.name = "count",
+         .value = "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = {0})",
+         .features = {}},
+        {.name = "sum_plus_column",
+         .value = "(SELECT SUM(riders.rd_row) FROM riders WHERE riders.rd_city = {0}) + "
+                  "cities.ct_id",
+         .features = {kSum, kArithmetic}},
+        {.name = "under_case",
+         .value =
+             "CASE WHEN (SELECT COUNT(*) FROM drivers WHERE drivers.dv_city = {0}) > 22 THEN 1 "
+             "ELSE 0 END",
+         .features = {kCase}},
+    });
+    for (const SelfCheck& check : self_checks) {
+      const auto at = [&check](const auto& binding) {
+        return std::vformat(check.value, std::make_format_args(binding));
+      };
+      slt::FeatureSet features = SetWith(values, kWhere, kOrderBy, kUncorrelatedValue, kItemValue);
+      features.Add(check.features);
+      const std::string item = std::format("SELECT ct_id, {} AS v FROM cities", at("cities.ct_id"));
+      std::vector<Probe> items = {Q(item)};
+      std::string order_case = "CASE";
+      std::vector<Probe> arguments = {
+          Q(std::format("SELECT SUM(cities.ct_id * ({})) FROM cities", at("cities.ct_id")))};
+      for (int id = 1; id <= 6; ++id) {
+        items.push_back(
+            Q(std::format("SELECT ct_id, {} AS v FROM cities WHERE ct_id = {}", at(id), id)));
+        order_case += std::format(" WHEN ct_id = {} THEN {}", id, at(id));
+        arguments.push_back(Q(std::format(
+            "SELECT SUM(cities.ct_id * ({})) FROM cities WHERE ct_id = {}", at(id), id)));
+      }
+      order_case += " END";
+      const std::string ordered =
+          std::format("SELECT ct_id FROM cities ORDER BY {}, ct_id", at("cities.ct_id"));
+      r.push_back(
+          {.name = std::format("correlated_item_{}_is_its_bindings_as_literals", check.name),
+           .features = features,
+           .probes = std::move(items),
+           .check = FirstIsUnionOfRest()});
+      r.push_back(
+          {.name = std::format("correlated_order_by_{}_is_its_bindings_as_literals", check.name),
+           .features = SetWith(features, kCase),
+           .probes = {Q(ordered),
+                      Q(std::format("SELECT ct_id FROM cities ORDER BY {}, ct_id", order_case)),
+                      Q(ordered, 1), Q(ordered, 7)},
+           .check = AllEqualInOrder()});
+      r.push_back(
+          {.name = std::format("correlated_argument_{}_is_its_bindings_as_literals", check.name),
+           .features = SetWith(features, kSum, kArithmetic),
+           .probes = std::move(arguments),
+           .check = FirstEqualsSumOfRest()});
+      r.push_back({.name = std::format("correlated_item_{}_batch_size_invariance", check.name),
+                   .features = features,
+                   .probes = {Q(item), Q(item, 1), Q(item, 7)},
+                   .check = AllEqual()});
+    }
+    // A value the select list binds waits in the slot's tail, above WHERE's filters, until a later
+    // clause reads it: the tail changes no answer. A bare aggregate item's value, the same read by
+    // WHERE too (which moves it below WHERE's filter) and the value as a derived table's item
+    // agree.
+    {
+      constexpr std::string_view kRiders =
+          "(SELECT COUNT(*) FROM riders WHERE riders.rd_city = o.ct_id)";
+      const std::string tail = std::format(
+          "SELECT SUM(o.ct_id * {}) AS s FROM cities AS o WHERE o.ct_pop > 5000", kRiders);
+      r.push_back(
+          {.name = "correlated_item_in_the_tail_changes_no_answer",
+           .features = SetWith(values, kWhere, kWhereAnd, kSum, kArithmetic, kDerivedTable),
+           .probes = {Q(tail),
+                      Q(std::format("SELECT SUM(o.ct_id * {0}) AS s FROM cities AS o WHERE "
+                                    "o.ct_pop > 5000 AND {0} >= 0",
+                                    kRiders)),
+                      Q(std::format("SELECT SUM(x.ct_id * x.n) AS s FROM (SELECT o.ct_id, {} AS n "
+                                    "FROM cities AS o WHERE o.ct_pop > 5000) AS x",
+                                    kRiders)),
+                      Q(tail, 1), Q(tail, 7)},
+           .check = AllEqual()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.

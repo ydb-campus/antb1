@@ -780,6 +780,12 @@ constexpr uint64_t kEmptyValueStreamSalt = 0x656D7074792D7661ULL;
 // this seed generated before the SQ5a PR.
 constexpr unsigned kConditionCorrelatedPercent = 75;
 constexpr uint64_t kConditionCorrelatedStreamSalt = 0x636F72722D636E64ULL;
+// The same for SQ5b's correlated values outside conditions (ADR 0041): SQ6's block as a value in a
+// select item, an ORDER BY item, a GROUP BY key or an aggregate's argument, drawn after SQ5a's
+// values where none was written, so on the 25% of their queries they leave. Its stream is its own,
+// so a query without one is the query this seed generated before the SQ5b PR.
+constexpr unsigned kItemCorrelatedPercent = 90;
+constexpr uint64_t kItemCorrelatedStreamSalt = 0x636F72722D69746DULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1086,7 +1092,7 @@ class Builder {
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
           Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, Rng& empty_value_rng,
-          Rng& condition_correlated_rng, FeatureSet allowed)
+          Rng& condition_correlated_rng, Rng& item_correlated_rng, FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1115,6 +1121,7 @@ class Builder {
         in_form_rng_(in_form_rng),
         empty_value_rng_(empty_value_rng),
         condition_correlated_rng_(condition_correlated_rng),
+        item_correlated_rng_(item_correlated_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -1919,6 +1926,7 @@ class Builder {
     constant_positions_.clear();
     aggregate_emitted_ = false;
     starred_ = false;
+    select_items_ = 0;
     EmitWith(from);
     // Now and then the keys are a ROLLUP (ADR 0037's RU3), from a stream of its own: all of them,
     // or the second after the first one plain, and now and then the last one twice (a duplicate
@@ -1982,6 +1990,7 @@ class Builder {
         allowed_.Has(Feature::kMultipleItems) && rollup_rng_.Percent(kGroupingPercent)) {
       used_.Add(Feature::kGroupingFunction);
       used_.Add(Feature::kMultipleItems);
+      ++select_items_;
       Symbol(",");
       Keyword(rollup_rng_.Percent(20) ? "GROUPING_ID" : "GROUPING");
       Symbol("(");
@@ -2089,6 +2098,7 @@ class Builder {
       Keyword("BY");
       Position(rng_.Pick(constant_positions_));
     }
+    const std::size_t group_end = tokens_.size();
     const bool having = Having(shape, from.rows, cols, numeric, aggs, keys);
     const std::size_t having_end = tokens_.size();
     distinct_ = distinct;  // set here: a block built for FROM may have changed it
@@ -2096,6 +2106,7 @@ class Builder {
     const MarkSlots slots{.select_end = select_end,
                           .where_end = where_end,
                           .where_written = where_written,
+                          .group_end = group_end,
                           .having_end = having_end,
                           .having = having,
                           .constant_group = constant_group,
@@ -2107,6 +2118,10 @@ class Builder {
     CorrelatedEmptyValue(slots);
     // Where none of the three wrote anything, and only there: the slots stand.
     CorrelatedConditionValue(slots);
+    // Where none of the four wrote anything, and only there: the slots stand. A GROUP BY key it
+    // writes makes the block grouped, whatever it was.
+    bool value_grouped = false;
+    CorrelatedItemValue(slots, shape, keys, ordered, value_grouped);
     // Any star of the select list over more than kStarMaxRows rows takes a LIMIT, as a lone one
     // does: the guard is FROM's bound, even for a qualified star of a smaller binding.
     const bool limited = Limit(starred_ && from.rows > kStarMaxRows);
@@ -2123,7 +2138,7 @@ class Builder {
     // A select list of constants only (no aggregate emitted) has a row per table row, unless HAVING
     // makes the query aggregate.
     const bool rows = shape != Shape::kAggregates || !keys.empty() || constant_group ||
-                      (!aggregate_emitted_ && !having);
+                      value_grouped || (!aggregate_emitted_ && !having);
     q.sort = rows && !ordered ? SortMode::kRowSort : SortMode::kNoSort;
     q.unordered_limit = rows && !ordered && (limited || offset);
     return q;
@@ -2141,11 +2156,13 @@ class Builder {
         star_ok && allowed_.Has(Feature::kStarItems) && allowed_.Has(Feature::kMultipleItems);
     if (shape == Shape::kStar) {
       Star(from);
+      select_items_ = 1;
       if (star_items && star_rng_.Percent(kSecondStarPercent)) {
         used_.Add(Feature::kStarItems);
         used_.Add(Feature::kMultipleItems);
         Symbol(",");
         Star(from);
+        select_items_ = 2;
       }
       return;
     }
@@ -2285,6 +2302,7 @@ class Builder {
     if (!keys_first) {
       emit_keys();
     }
+    select_items_ = emitted;
   }
 
   // One star of the select list: `*`, which reads every FROM item, or now and then `<name>.*`,
@@ -3223,11 +3241,12 @@ class Builder {
   }
 
   // Where InMark may write in the block QueryFrom has just written: the token positions where its
-  // select list, its WHERE and its HAVING end, and what the block holds.
+  // select list, its WHERE, its GROUP BY and its HAVING end, and what the block holds.
   struct MarkSlots {
     std::size_t select_end = 0;
     std::size_t where_end = 0;
     bool where_written = false;  // WHERE holds something: a mark there is one more AND conjunct
+    std::size_t group_end = 0;   // where HAVING starts (a GROUP BY key goes before it)
     std::size_t having_end = 0;
     bool having = false;          // HAVING was written
     bool constant_group = false;  // GROUP BY a constant's position
@@ -4436,6 +4455,540 @@ class Builder {
     }
     std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.where_end),
                 tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+  }
+
+  // Where SQ5b's correlated value stands (CorrelatedItemValue lists them): one more select item, an
+  // ORDER BY item, a GROUP BY key, or an aggregate's argument; and where that aggregate stands.
+  enum class ItemPlace : std::uint8_t { kItem, kOrderBy, kGroupBy, kArgument };
+  enum class ArgumentPlace : std::uint8_t { kItem, kHaving, kOrderBy };
+
+  // The expression of SQ5b's value item, ORDER BY item or GROUP BY key (ItemExpression).
+  enum class ItemForm : std::uint8_t { kAlone, kAdded, kCase, kCoalesce };
+
+  // The alias of SQ5b's value item: no column of the tables is named so, and the select list's own
+  // aliases are a1 to a3.
+  static constexpr std::string_view kValueAlias = "cv";
+
+  // Whether `form` can hold the block's value (the features it needs are allowed: the forms are
+  // drawn among those). `exact`: the value is a sort key, a key or a SELECT DISTINCT item, which a
+  // DOUBLE (AVG, the variance family) is not: the engines may tell two of its values apart, or
+  // order them, otherwise; a CASE compares it with 0 alone, which is exact.
+  static bool AdmitsItem(const ConditionBlock& d, ItemForm form, bool exact) {
+    switch (form) {
+      case ItemForm::kAlone:
+        return !exact || !d.value.real;
+      case ItemForm::kAdded:
+        return !d.addends.empty();
+      case ItemForm::kCase:
+        return d.compare;
+      case ItemForm::kCoalesce:
+        return (!exact || !d.value.real) && d.block.item == EmptyItem::kCall &&
+               Coalescible(d.block.call);
+    }
+    return false;
+  }
+
+  // The block's value as `form` writes it, every draw from `rng`: `(q)`; `(q) + o.x` either way
+  // round (an addend whose sum with the value stays within its type, DrawConditionBlock);
+  // `CASE WHEN (q) <op> k THEN 1 ELSE 0 END` (the variance family by > or = only); or
+  // `COALESCE((q), k)` over a call NULL over no rows.
+  void ItemExpression(Rng& rng, const ConditionBlock& d, ItemForm form) {
+    const EmptyBlock& b = d.block;
+    switch (form) {
+      case ItemForm::kAlone:
+        EmptyBlockText(rng, b);
+        break;
+      case ItemForm::kAdded: {
+        const GenColumn& addend = *d.addends[rng.Below(d.addends.size())];
+        used_.Add(Feature::kArithmetic);
+        if (rng.Percent(50)) {
+          EmptyBlockText(rng, b);
+          Symbol("+");
+          OuterValue(*b.c, addend);
+        } else {
+          OuterValue(*b.c, addend);
+          Symbol("+");
+          EmptyBlockText(rng, b);
+        }
+        break;
+      }
+      case ItemForm::kCase: {
+        std::string_view op = rng.Pick(kOps);
+        if (b.item == EmptyItem::kVariance) {
+          op = rng.Percent(50) ? ">" : "=";
+        }
+        used_.Add(Feature::kCase);
+        used_.Add(Feature::kIntegerLiteral);
+        Keyword("CASE");
+        Keyword("WHEN");
+        EmptyBlockText(rng, b);
+        Symbol(op);
+        used_.Add(d.lit.features);
+        Emit(d.lit.tokens);
+        Keyword("THEN");
+        ValueNumber(1);
+        Keyword("ELSE");
+        ValueNumber(0);
+        Keyword("END");
+        break;
+      }
+      case ItemForm::kCoalesce: {
+        Literal fallback;
+        if (b.call.arg->kind == ValueKind::kVarchar) {
+          fallback = MakeLiteral(rng, *b.call.arg);
+        } else {
+          static constexpr auto kFallbacks = std::to_array<int64_t>({0, 1, -1, 100});
+          fallback = SmallLiteral(rng.Pick(kFallbacks));
+        }
+        if (!allowed_.Contains(fallback.features)) {
+          fallback = SmallLiteral(0);
+        }
+        Keyword("COALESCE");
+        Symbol("(");
+        EmptyBlockText(rng, b);
+        Symbol(",");
+        used_.Add(fallback.features);
+        Emit(fallback.tokens);
+        Symbol(")");
+        break;
+      }
+    }
+  }
+
+  // An aggregate's argument over the block's value (CorrelatedItemValue): `o.x * (q)` or
+  // `o.x + (q)` over an integer column of the binding the block reads out to, and the bounds of
+  // its values.
+  struct ValueArgument {
+    const GenColumn* column = nullptr;
+    bool product = false;
+    std::pair<Int128, Int128> values;
+  };
+
+  // The bounds of every product of a value within `a` and one within `b`; std::nullopt where one
+  // leaves Int128.
+  static std::optional<std::pair<Int128, Int128>> ProductBounds(std::pair<Int128, Int128> a,
+                                                                std::pair<Int128, Int128> b) {
+    std::optional<std::pair<Int128, Int128>> out;
+    for (const Int128 x : {a.first, a.second}) {
+      for (const Int128 y : {b.first, b.second}) {
+        Int128 product = 0;
+        if (__builtin_mul_overflow(x, y, &product)) {
+          return std::nullopt;
+        }
+        out = out.has_value()
+                  ? std::pair(std::min(out->first, product), std::max(out->second, product))
+                  : std::pair(product, product);
+      }
+    }
+    return out;
+  }
+
+  // Whether a SUM of at most `rows` values within `values` stays within HUGEINT's 38 digits, the
+  // bound antb1 keeps (DuckDB's is wider), whatever the order of the additions.
+  static bool SumTotalFits(std::pair<Int128, Int128> values, int64_t rows) {
+    const Int128 largest = std::max(values.first < 0 ? -values.first : values.first,
+                                    values.second < 0 ? -values.second : values.second);
+    Int128 total = 0;
+    return !__builtin_mul_overflow(largest, Int128{std::max<int64_t>(rows, 1)}, &total) &&
+           total <= MaxOfDigits(kMaxDecimalDigits);
+  }
+
+  // The arguments the block's value admits (pure: no draw): every integer column of the binding it
+  // reads out to whose sum with the value, or product, stays within the value's type for every pair
+  // of values the two can take. The result's type is the wider of the two, so the value's own holds
+  // it wherever it holds the result.
+  [[nodiscard]] std::vector<ValueArgument> ValueArguments(const ConditionBlock& d) const {
+    std::vector<ValueArgument> out;
+    if (!d.value.integer.has_value()) {
+      return out;
+    }
+    const IntegerRange& range = *d.value.integer;
+    for (const GenColumn& column : d.block.c->outer->columns) {
+      if (column.kind != ValueKind::kInteger || !Usable(column, from_->any_path)) {
+        continue;
+      }
+      const std::pair<Int128, Int128> bounds = IntegerBounds(column);
+      if (SumFits(range.type, range.values, bounds)) {
+        out.push_back(ValueArgument{
+            .column = &column,
+            .product = false,
+            .values = {range.values.first + bounds.first, range.values.second + bounds.second}});
+      }
+      const std::optional<std::pair<Int128, Int128>> product = ProductBounds(range.values, bounds);
+      if (product.has_value() && product->first >= range.type.first &&
+          product->second <= range.type.second) {
+        out.push_back(ValueArgument{.column = &column, .product = true, .values = *product});
+      }
+    }
+    return out;
+  }
+
+  // The columns of `outer` that break the ties of an ORDER BY over a value read out to it: a column
+  // a ref's statistics prove unique and never NULL, else all of them, so that over one table the
+  // order is total (pure: no draw).
+  [[nodiscard]] std::vector<const GenColumn*> TieBreakers(const Binding& outer) const {
+    for (const Edge& edge : edges_) {
+      if (edge.child_columns.size() != 1) {
+        continue;
+      }
+      for (const bool as_child : {true, false}) {
+        const GenTable& table = tables_[as_child ? edge.child : edge.parent];
+        const GenKeyStats& stats = as_child ? edge.child_stats : edge.parent_stats;
+        const std::size_t index = as_child ? edge.child_columns[0] : edge.parent_columns[0];
+        if (SameName(table.name, outer.table->name) && index < outer.columns.size() &&
+            table.rows > 0 && stats.non_null == table.rows && stats.distinct == table.rows &&
+            stats.max_multiplicity == 1 && Usable(outer.columns[index], from_->any_path)) {
+          return {&outer.columns[index]};
+        }
+      }
+    }
+    std::vector<const GenColumn*> all;
+    for (const GenColumn& column : outer.columns) {
+      if (Usable(column, from_->any_path)) {
+        all.push_back(&column);
+      }
+    }
+    return all;
+  }
+
+  // An ORDER BY item's direction, drawn from `rng`: DESC, ASC or neither, and now and then NULLS
+  // FIRST or LAST.
+  void SortDirection(Rng& rng) {
+    const std::size_t direction = rng.Below(10);
+    if (direction < 3) {
+      Keyword("DESC");
+    } else if (direction < 5) {
+      Keyword("ASC");
+    }
+    if (allowed_.Has(Feature::kNullsOrder) && rng.Percent(20)) {
+      used_.Add(Feature::kNullsOrder);
+      Keyword("NULLS");
+      Keyword(rng.Percent(50) ? "FIRST" : "LAST");
+    }
+  }
+
+  // One more ORDER BY item, after the keys the block's ORDER BY has: `ORDER BY` first where it has
+  // none, which `ordered` then records.
+  void NextOrderItem(bool& ordered) {
+    if (ordered) {
+      Symbol(",");
+      return;
+    }
+    used_.Add(Feature::kOrderBy);
+    Keyword("ORDER");
+    Keyword("BY");
+    ordered = true;
+  }
+
+  // SQ5b's correlated values outside conditions (ADR 0041's SQ5b), where the query holds no other
+  // subquery and SQ5a's wrote none: drawn after them, from a stream of its own, so that a query
+  // without one is the query its seed gave before. SQ6's block q (DrawConditionBlock), correlated
+  // to a FROM binding o, stands as a value in one of four places, each drawn as often as the others
+  // the block and the allowed features admit (its pieces written at the end and moved to their
+  // places):
+  //   - one more select item of a block that does not aggregate: `(q)`, `(q) + o.x` either way
+  //     round (an integer value whose type holds every sum), `CASE WHEN (q) <op> k THEN 1 ELSE 0
+  //     END`, or `COALESCE((q), k)` over a call NULL over no rows (ItemExpression);
+  //   - an ORDER BY item of such a block, after the keys its ORDER BY has: one of those
+  //     expressions, or such a select item (aliased `cv` or not) ordered by its alias or position
+  //     (a position before any star), the only form under SELECT DISTINCT; then, but under
+  //     DISTINCT, o's columns that make the order total over one table (TieBreakers). `ordered`
+  //     records the ORDER BY, so the answer is compared in order (CompareOrdered);
+  //   - a GROUP BY key of a block that aggregates without grouping sets: such a select item,
+  //     grouped by its alias or position, and now and then ordered by its position too; `grouped`
+  //     records that the block now groups;
+  //   - an aggregate's argument beside an integer column of o, `AGG(o.x * (q))` or `AGG(o.x + (q))`
+  //     either way round (SUM, MIN, MAX or COUNT [DISTINCT]), whose type holds every value it can
+  //     take, a SUM's total within HUGEINT's 38 digits too, as one more select item, or in HAVING
+  //     (against a literal) or ORDER BY of a block that groups or aggregates already.
+  // Never: a correlated value above an aggregation (a grouped or global block's select item or
+  // ORDER BY item that is no GROUP BY key and holds it outside an aggregate, HAVING over it; SQ13),
+  // an aggregate's argument of the value alone or with literals only, a value inside ROLLUP, CUBE
+  // or GROUPING SETS; a DOUBLE value (AVG, the variance family) as a sort key, a key or a SELECT
+  // DISTINCT item but in a CASE that compares it with 0; an ORDER BY expression over the alias of
+  // the value's item (D37: only the alias alone or the item's position); a key written again (D38:
+  // the select list holds the value once, GROUP BY reads its alias or position); and no map that
+  // can fail, whose error would depend on the plan (D16, D24, D32): no CAST, no division,
+  // arithmetic only where the result's type holds every value. The block keeps SQ6's never-list: no
+  // constant item or HAVING over calls that are all NULL over no rows (decision 29's family), no
+  // correlation of two types. An inner aggregate needs a select list that settles the row shape
+  // (InnerAggregateFits), which a GROUP BY key and an aggregate of the block settle themselves.
+  void CorrelatedItemValue(const MarkSlots& slots, Shape shape,
+                           const std::vector<const GenColumn*>& keys, bool& ordered,
+                           bool& grouped) {
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
+        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
+        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
+        used_.Has(Feature::kInForm) || used_.Has(Feature::kCorrelatedEmptyValue) ||
+        used_.Has(Feature::kCorrelatedConditionValue);
+    if (other_subquery || !allowed_.Has(Feature::kCorrelatedItemValue) ||
+        !allowed_.Has(Feature::kIntegerLiteral)) {
+      return;
+    }
+    Rng& rng = item_correlated_rng_;
+    const std::vector<CorrelatedCandidate> candidates = CorrelatedCandidates();
+    if (candidates.empty() || !rng.Percent(kItemCorrelatedPercent)) {
+      return;
+    }
+    const bool aggregate = shape == Shape::kAggregates;
+    // One more select item makes a list of several items, after a lone star a star among items.
+    const bool new_item = allowed_.Has(Feature::kMultipleItems) &&
+                          (!slots.lone_star || allowed_.Has(Feature::kStarItems));
+    // What reads that item again: its alias, or its position where no star stands before it.
+    const bool alias = allowed_.Has(Feature::kAlias);
+    const bool position = allowed_.Has(Feature::kPosition) && !starred_;
+    // A block that does not aggregate, whose select list settles the row shape.
+    const bool projection = !aggregate && InnerAggregateFits();
+    const bool grouping_sets = used_.Has(Feature::kRollup) || used_.Has(Feature::kGroupingSets) ||
+                               used_.Has(Feature::kCube);
+    // The block groups or aggregates already, so a HAVING or an ORDER BY aggregate keeps its shape.
+    const bool aggregated =
+        aggregate && (aggregate_emitted_ || !keys.empty() || slots.constant_group || slots.having);
+    const bool order_ok = allowed_.Has(Feature::kOrderBy);
+    std::vector<ArgumentPlace> argument_places;
+    if (new_item) {
+      argument_places.push_back(ArgumentPlace::kItem);
+    }
+    if (aggregated && allowed_.Has(Feature::kHaving)) {
+      argument_places.push_back(ArgumentPlace::kHaving);
+    }
+    if (aggregated && order_ok && !distinct_) {
+      argument_places.push_back(ArgumentPlace::kOrderBy);
+    }
+    std::vector<Agg> aggs;
+    for (const Agg agg : {Agg::kSum, Agg::kMin, Agg::kMax, Agg::kCount, Agg::kCountDistinct}) {
+      if (allowed_.Has(AggFeature(agg))) {
+        aggs.push_back(agg);
+      }
+    }
+    std::vector<ItemPlace> places;
+    if (projection && new_item) {
+      places.push_back(ItemPlace::kItem);
+    }
+    if (projection && order_ok && (!distinct_ || (new_item && (alias || position)))) {
+      places.push_back(ItemPlace::kOrderBy);
+    }
+    if (aggregate && !grouping_sets && allowed_.Has(Feature::kGroupBy) && new_item &&
+        (alias || position)) {
+      places.push_back(ItemPlace::kGroupBy);
+    }
+    if (aggregate && allowed_.Has(Feature::kArithmetic) && !argument_places.empty() &&
+        !aggs.empty()) {
+      places.push_back(ItemPlace::kArgument);
+    }
+    if (places.empty()) {
+      return;
+    }
+    const ItemPlace place = places[rng.Below(places.size())];
+    ItemForm form = ItemForm::kAlone;
+    if (place != ItemPlace::kArgument) {
+      std::vector<ItemForm> forms = {ItemForm::kAlone, ItemForm::kCoalesce};
+      if (allowed_.Has(Feature::kArithmetic)) {
+        forms.push_back(ItemForm::kAdded);
+      }
+      if (allowed_.Has(Feature::kCase)) {
+        forms.push_back(ItemForm::kCase);
+      }
+      form = forms[rng.Below(forms.size())];
+    }
+    const bool exact = place != ItemPlace::kItem || distinct_;
+    const auto suits = [&](const ConditionBlock& d) {
+      return place == ItemPlace::kArgument ? !ValueArguments(d).empty()
+                                           : AdmitsItem(d, form, exact);
+    };
+    // Blocks are drawn until one suits the place (8 at most); a value expression then falls back to
+    // the value alone, or to a CASE (a DOUBLE compared with 0), one of which suits every block.
+    std::optional<ConditionBlock> drawn;
+    for (int attempt = 0; attempt < 8 && !(drawn.has_value() && suits(*drawn)); ++attempt) {
+      if (std::optional<ConditionBlock> next =
+              DrawConditionBlock(rng, candidates[rng.Below(candidates.size())])) {
+        drawn = std::move(next);
+      }
+    }
+    if (!drawn.has_value()) {
+      return;  // no inner table offers a call
+    }
+    const ConditionBlock& d = *drawn;
+    const CorrelatedCandidate& c = *d.block.c;
+    if (place != ItemPlace::kArgument && !AdmitsItem(d, form, exact)) {
+      if (AdmitsItem(d, ItemForm::kAlone, exact)) {
+        form = ItemForm::kAlone;
+      } else if (allowed_.Has(Feature::kCase) && AdmitsItem(d, ItemForm::kCase, exact)) {
+        form = ItemForm::kCase;
+      } else {
+        return;
+      }
+    }
+    // The value as one more select item, last in the list, with its alias where `aliased`.
+    const auto value_item = [&](bool aliased) {
+      const std::size_t end = tokens_.size();
+      used_.Add(Feature::kMultipleItems);
+      if (slots.lone_star) {
+        used_.Add(Feature::kStarItems);
+      }
+      Symbol(",");
+      ItemExpression(rng, d, form);
+      if (aliased) {
+        used_.Add(Feature::kAlias);
+        if (rng.Percent(50)) {
+          Keyword("AS");
+        }
+        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::string(kValueAlias)});
+      }
+      std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.select_end),
+                  tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+    };
+    // The item `value_item` writes, read by its alias or its position.
+    const auto item_reference = [&](bool aliased) {
+      if (aliased) {
+        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::string(kValueAlias)});
+      } else {
+        Position(select_items_ + 1);
+      }
+    };
+    switch (place) {
+      case ItemPlace::kItem:
+        used_.Add(Feature::kCorrelatedItemValue);
+        value_item(/*aliased=*/false);
+        return;
+      case ItemPlace::kOrderBy: {
+        // The ORDER BY first, at the end of the block; then the item, before the FROM.
+        const bool by_item = distinct_ || (new_item && (alias || position) && rng.Percent(50));
+        const bool aliased = by_item && alias && (!position || rng.Percent(50));
+        used_.Add(Feature::kCorrelatedItemValue);
+        NextOrderItem(ordered);
+        if (by_item) {
+          item_reference(aliased);
+        } else {
+          ItemExpression(rng, d, form);
+        }
+        SortDirection(rng);
+        // A SELECT DISTINCT orders by its items alone.
+        if (!distinct_) {
+          for (const GenColumn* column : TieBreakers(*c.outer)) {
+            Symbol(",");
+            OuterValue(c, *column);
+          }
+        }
+        if (by_item) {
+          value_item(aliased);
+        }
+        return;
+      }
+      case ItemPlace::kGroupBy: {
+        // The ORDER BY first, at the end of the block; then the key, before HAVING; then the item.
+        const bool aliased = alias && (!position || rng.Percent(50));
+        used_.Add(Feature::kCorrelatedItemValue);
+        used_.Add(Feature::kGroupBy);
+        if (order_ok && position && rng.Percent(35)) {
+          NextOrderItem(ordered);
+          item_reference(/*aliased=*/false);
+          SortDirection(rng);
+        }
+        const std::size_t end = tokens_.size();
+        if (!keys.empty() || slots.constant_group) {
+          Symbol(",");
+        } else {
+          Keyword("GROUP");
+          Keyword("BY");
+        }
+        item_reference(aliased);
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.group_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        value_item(aliased);
+        grouped = true;
+        return;
+      }
+      case ItemPlace::kArgument:
+        break;
+    }
+    const std::vector<ValueArgument> arguments = ValueArguments(d);
+    if (arguments.empty()) {
+      return;  // no block of the 8 admits one
+    }
+    const ValueArgument& argument = arguments[rng.Below(arguments.size())];
+    std::vector<Agg> fitting;
+    for (const Agg agg : aggs) {
+      if (agg != Agg::kSum || SumTotalFits(argument.values, rows_)) {
+        fitting.push_back(agg);
+      }
+    }
+    if (fitting.empty()) {
+      return;
+    }
+    const Agg agg = fitting[rng.Below(fitting.size())];
+    const ArgumentPlace where = argument_places[rng.Below(argument_places.size())];
+    // `AGG(o.x * (q))`, `AGG((q) + o.x)` and their kin.
+    const auto call = [&] {
+      used_.Add(AggFeature(agg));
+      used_.Add(Feature::kArithmetic);
+      Keyword(AggName(agg));
+      Symbol("(");
+      if (agg == Agg::kCountDistinct) {
+        Keyword("DISTINCT");
+      }
+      const std::string_view op = argument.product ? "*" : "+";
+      if (rng.Percent(50)) {
+        EmptyBlockText(rng, d.block);
+        Symbol(op);
+        OuterValue(c, *argument.column);
+      } else {
+        OuterValue(c, *argument.column);
+        Symbol(op);
+        EmptyBlockText(rng, d.block);
+      }
+      Symbol(")");
+    };
+    used_.Add(Feature::kCorrelatedItemValue);
+    switch (where) {
+      case ArgumentPlace::kItem: {
+        const std::size_t end = tokens_.size();
+        used_.Add(Feature::kMultipleItems);
+        aggregate_emitted_ = true;
+        Symbol(",");
+        call();
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.select_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ArgumentPlace::kHaving: {
+        // The aggregate's values, for a literal of them: a count's, a SUM's of at most the rows
+        // the block reads, MIN's and MAX's its argument's.
+        std::pair<Int128, Int128> values = argument.values;
+        if (agg == Agg::kSum) {
+          values = {std::min<Int128>(0, argument.values.first * rows_),
+                    std::max<Int128>(0, argument.values.second * rows_)};
+        } else if (agg == Agg::kCount || agg == Agg::kCountDistinct) {
+          values = {0, rows_};
+        }
+        Literal bound = MakeLiteral(rng, GenColumn{.name = {},
+                                                   .kind = ValueKind::kInteger,
+                                                   .min = ClampToBigint(values.first),
+                                                   .max = ClampToBigint(values.second)});
+        if (!allowed_.Contains(bound.features)) {
+          bound = SmallLiteral(0);
+        }
+        const std::string_view op = rng.Pick(kOps);
+        const std::size_t end = tokens_.size();
+        used_.Add(Feature::kHaving);
+        Keyword(slots.having ? "AND" : "HAVING");
+        call();
+        Symbol(op);
+        used_.Add(bound.features);
+        Emit(bound.tokens);
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(slots.having_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ArgumentPlace::kOrderBy:
+        NextOrderItem(ordered);
+        call();
+        SortDirection(rng);
+        return;
+    }
   }
 
   // A mark over candidate `c` in one of four places of the block QueryFrom has just written,
@@ -6760,6 +7313,7 @@ class Builder {
   Rng& in_form_rng_;               // the draws that only SQ7b's IN forms need
   Rng& empty_value_rng_;           // the draws that only SQ6's empty values need
   Rng& condition_correlated_rng_;  // the draws that only SQ5a's correlated values need
+  Rng& item_correlated_rng_;       // the draws that only SQ5b's correlated values need
   // The stream of the mark being written: in_mark_rng_ or in_form_rng_ (PlaceMark).
   Rng* mark_rng_ = nullptr;
   // What InForm drew for the mark being written; std::nullopt while InMark writes one.
@@ -6795,6 +7349,8 @@ class Builder {
   std::vector<std::size_t> constant_positions_;  // positions of constant items
   bool aggregate_emitted_ = false;  // the select list has an aggregate (constants alone: rows)
   bool starred_ = false;            // the select list has a star: positions stop there
+  // The items of the select list, a star counted as one (a position past a star is unknown).
+  std::size_t select_items_ = 0;
 };
 
 }  // namespace
@@ -7002,11 +7558,12 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng in_form_rng(Mix(seed ^ kInFormStreamSalt));
   Rng empty_value_rng(Mix(seed ^ kEmptyValueStreamSalt));
   Rng condition_correlated_rng(Mix(seed ^ kConditionCorrelatedStreamSalt));
+  Rng item_correlated_rng(Mix(seed ^ kItemCorrelatedStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
                having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
-               empty_value_rng, condition_correlated_rng, options.supported)
+               empty_value_rng, condition_correlated_rng, item_correlated_rng, options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -7047,6 +7604,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng in_form_rng(Mix(state ^ kInFormStreamSalt));
   Rng empty_value_rng(Mix(state ^ kEmptyValueStreamSalt));
   Rng condition_correlated_rng(Mix(state ^ kConditionCorrelatedStreamSalt));
+  Rng item_correlated_rng(Mix(state ^ kItemCorrelatedStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
@@ -7055,7 +7613,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
               having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
-              empty_value_rng, condition_correlated_rng, allowed)
+              empty_value_rng, condition_correlated_rng, item_correlated_rng, allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

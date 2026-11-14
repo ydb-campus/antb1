@@ -613,6 +613,10 @@ together with ADRs 0013, 0021 and 0022, once all 22 queries pass (decision C14).
   subqueries may be compared. Its dependent join stands in the block's slot with the uncorrelated values, and the
   consumer proof passes the conditions and joins between it and the condition that rejects its value over no rows
   (ADR 0041's SQ5a update). A select item, `ORDER BY`, a `GROUP BY` key and an aggregate's argument wait for SQ5b.
+- Update (2026-11-14, ADR 0041's SQ5b): **and in a select item, `ORDER BY`, a `GROUP BY` key and an aggregate's
+  argument** that reads a column, in any block. The select list's dependent joins wait in the slot's tail above
+  `WHERE`'s filters until a later clause reads them, and the consumer proof joins them back `LEFT` unless a condition
+  that rejects the value reads it too; neither the unnesting nor the optimizer changed (ADR 0041's SQ5b update).
 
 ## Alternatives considered
 

@@ -122,7 +122,8 @@ bool HasSubquery(const GeneratedQuery& q) {
          q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue) ||
          q.features.Has(Feature::kGroupValue) || q.features.Has(Feature::kInMark) ||
          q.features.Has(Feature::kInForm) || q.features.Has(Feature::kCorrelatedEmptyValue) ||
-         q.features.Has(Feature::kCorrelatedConditionValue);
+         q.features.Has(Feature::kCorrelatedConditionValue) ||
+         q.features.Has(Feature::kCorrelatedItemValue);
 }
 
 bool UsesRefs(const GeneratedQuery& q) { return Joins(q) || HasSubquery(q); }
@@ -1262,7 +1263,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
       if (c == nullptr) {
         return;
       }
-      static const std::regex select_alias("a[1-3]");
+      // The select list's own aliases, and that of SQ5b's correlated value item.
+      static const std::regex select_alias("a[1-3]|cv");
       if (c->qualifier.empty() && std::ranges::none_of(items, [&](const Item& i) {
             return HasColumn(*i.table, c->name);
           })) {
@@ -1576,7 +1578,8 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             qualified || q.features.Has(Feature::kCorrelatedExists) ||
                 q.features.Has(Feature::kCorrelatedAggregate) ||
                 q.features.Has(Feature::kCorrelatedEmptyValue) ||
-                q.features.Has(Feature::kCorrelatedConditionValue));
+                q.features.Has(Feature::kCorrelatedConditionValue) ||
+                q.features.Has(Feature::kCorrelatedItemValue));
   EXPECT_EQ(q.features.Has(Feature::kTablePath), any_path);
   // A subquery's block always names its one table, so it records kTableName even where every FROM
   // item is read by a path; a correlated block also qualifies both ends of its key, so it records
@@ -2469,11 +2472,13 @@ TEST(QueryGenerator, StarsFollowTheirRules) {
 // the query it did before ADR 0023's T3, SQL and features alike.
 TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
   // kCorrelatedExists gates the candidate list, so removing it removes both correlated forms; and
-  // SQ6's empty values (kCorrelatedEmptyValue) and SQ5a's values in conditions
-  // (kCorrelatedConditionValue), which read the same list, go too.
-  const FeatureSet with_corr = Union(kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue,
-                                                               Feature::kCorrelatedConditionValue}),
-                                     {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
+  // SQ6's empty values (kCorrelatedEmptyValue), SQ5a's values in conditions
+  // (kCorrelatedConditionValue) and SQ5b's values outside them (kCorrelatedItemValue), which read
+  // the same list, go too.
+  const FeatureSet with_corr = Union(
+      kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue,
+                                Feature::kCorrelatedItemValue}),
+      {Feature::kCorrelatedExists, Feature::kCorrelatedAggregate});
   const auto with = MakeOver(JoinTables(), 71, {.supported = with_corr, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 71,
@@ -3370,10 +3375,12 @@ TEST(QueryGenerator, GroupValuesChangeOnlyTheirQueries) {
 // stream of its own, only where the query holds no other subquery, so declaring it changes the
 // queries that take one and no others, and every other subquery feature keeps its queries.
 TEST(QueryGenerator, InMarksChangeOnlyTheirQueries) {
-  // Without kInForm, kCorrelatedEmptyValue and kCorrelatedConditionValue, drawn after a mark only
-  // where none fired, so that a query a mark leaves out holds no subquery at all.
-  const FeatureSet supported = kSupportedFeatures.Minus(
-      {Feature::kInForm, Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue});
+  // Without kInForm, kCorrelatedEmptyValue, kCorrelatedConditionValue and kCorrelatedItemValue,
+  // drawn after a mark only where none fired, so that a query a mark leaves out holds no subquery
+  // at all.
+  const FeatureSet supported =
+      kSupportedFeatures.Minus({Feature::kInForm, Feature::kCorrelatedEmptyValue,
+                                Feature::kCorrelatedConditionValue, Feature::kCorrelatedItemValue});
   const auto with = MakeOver(JoinTables(), 97, {.supported = supported, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 97, {.supported = supported.Minus({Feature::kInMark}), .target_percent = 0});
@@ -3587,10 +3594,11 @@ TEST(QueryGenerator, InMarksAreConditionsOverUncorrelatedSets) {
 // the query holds no other subquery and no mark, so declaring them changes the queries that take
 // one and no others.
 TEST(QueryGenerator, InFormsChangeOnlyTheirQueries) {
-  // Without kCorrelatedEmptyValue and kCorrelatedConditionValue, drawn after the forms only where
-  // none fired, so that a query a form leaves out holds no subquery at all.
-  const FeatureSet supported = kSupportedFeatures.Minus(
-      {Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue});
+  // Without kCorrelatedEmptyValue, kCorrelatedConditionValue and kCorrelatedItemValue, drawn after
+  // the forms only where none fired, so that a query a form leaves out holds no subquery at all.
+  const FeatureSet supported =
+      kSupportedFeatures.Minus({Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue,
+                                Feature::kCorrelatedItemValue});
   const auto with = MakeOver(JoinTables(), 103, {.supported = supported, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 103, {.supported = supported.Minus({Feature::kInForm}), .target_percent = 0});
@@ -3942,9 +3950,10 @@ TEST(QueryGenerator, InFormsAreQuantifiedLiteralOrSetOperationSets) {
 // where the query holds no other subquery, so declaring them changes the queries that take one and
 // no others.
 TEST(QueryGenerator, CorrelatedEmptyValuesChangeOnlyTheirQueries) {
-  // Without kCorrelatedConditionValue, drawn after the empty values only where none fired, so that
-  // a query an empty value leaves out holds no subquery at all.
-  const FeatureSet supported = kSupportedFeatures.Minus({Feature::kCorrelatedConditionValue});
+  // Without kCorrelatedConditionValue and kCorrelatedItemValue, drawn after the empty values only
+  // where none fired, so that a query an empty value leaves out holds no subquery at all.
+  const FeatureSet supported =
+      kSupportedFeatures.Minus({Feature::kCorrelatedConditionValue, Feature::kCorrelatedItemValue});
   const auto with = MakeOver(JoinTables(), 109, {.supported = supported, .target_percent = 0});
   const auto without = MakeOver(
       JoinTables(), 109,
@@ -4298,12 +4307,13 @@ TEST(QueryGenerator, CorrelatedEmptyValuesAreAggregatesOverEveryRow) {
 // their own, only where the query holds no other subquery, so declaring them changes the queries
 // that take one and no others.
 TEST(QueryGenerator, CorrelatedConditionValuesChangeOnlyTheirQueries) {
-  const auto with =
-      MakeOver(JoinTables(), 127, {.supported = kSupportedFeatures, .target_percent = 0});
-  const auto without =
-      MakeOver(JoinTables(), 127,
-               {.supported = kSupportedFeatures.Minus({Feature::kCorrelatedConditionValue}),
-                .target_percent = 0});
+  // Without kCorrelatedItemValue, drawn after these values only where none fired, so that a query
+  // a value leaves out holds no subquery at all.
+  const FeatureSet supported = kSupportedFeatures.Minus({Feature::kCorrelatedItemValue});
+  const auto with = MakeOver(JoinTables(), 127, {.supported = supported, .target_percent = 0});
+  const auto without = MakeOver(
+      JoinTables(), 127,
+      {.supported = supported.Minus({Feature::kCorrelatedConditionValue}), .target_percent = 0});
   int took = 0;
   int same = 0;
   for (uint64_t i = 0; i < 12000; ++i) {
@@ -4937,6 +4947,493 @@ TEST(QueryGenerator, CorrelatedConditionValuesAreBlocksInsideConditions) {
   EXPECT_GT(null_equal, 208);
   EXPECT_GT(havings, 316);
   EXPECT_GT(ordered, 99);
+}
+
+// SQ5b's correlated values outside conditions (ADR 0041): drawn after SQ5a's, from a stream of
+// their own, only where the query holds no other subquery, so declaring them changes the queries
+// that take one and no others. Such a query keeps the other's table, row bound and features (the
+// lexical ones aside, which Render draws per token).
+TEST(QueryGenerator, CorrelatedItemValuesChangeOnlyTheirQueries) {
+  const auto with =
+      MakeOver(JoinTables(), 139, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without =
+      MakeOver(JoinTables(), 139,
+               {.supported = kSupportedFeatures.Minus({Feature::kCorrelatedItemValue}),
+                .target_percent = 0});
+  const FeatureSet lexical = {Feature::kKeywordCase, Feature::kIdentifierCase,
+                              Feature::kQuotedIdentifier, Feature::kLayout};
+  int took = 0;
+  int same = 0;
+  for (uint64_t i = 0; i < 12000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    EXPECT_FALSE(plain.features.Has(Feature::kCorrelatedItemValue)) << plain.sql;
+    if (!q.features.Has(Feature::kCorrelatedItemValue)) {
+      ++same;
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++took;
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(HasSubquery(plain)) << "it displaces no other subquery: " << plain.sql;
+    EXPECT_EQ(q.table, plain.table);
+    EXPECT_EQ(q.row_bound, plain.row_bound);
+    EXPECT_TRUE(q.features.Contains(plain.features.Minus(lexical)))
+        << "it takes nothing away: " << plain.features.Minus(lexical).Minus(q.features).Names();
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    for (const Feature other :
+         {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedExists,
+          Feature::kCorrelatedAggregate, Feature::kUncorrelatedValue, Feature::kConditionValue,
+          Feature::kHavingValue, Feature::kItemValue, Feature::kGroupValue, Feature::kInMark,
+          Feature::kInForm, Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue}) {
+      EXPECT_FALSE(q.features.Has(other)) << FeatureName(other);
+    }
+  }
+  // Measured: 73 of the 12000 take one.
+  EXPECT_GT(took, 58) << "correlated values outside conditions: " << took;
+  EXPECT_GT(same, 6000);
+}
+
+// Checks a select item, ORDER BY item or GROUP BY key that holds a correlated value outside an
+// aggregate (SQ5b's ItemExpression) against the block's value, and sets `form`: "alone"; "added",
+// plus a qualified integer column of the value's binding, whose type holds every sum; "case",
+// `CASE WHEN (q) <op> k THEN 1 ELSE 0 END`, a DOUBLE against 0 alone and the variance family by >
+// or = only; or "coalesce", COALESCE over a call that is NULL over no rows and a literal.
+void CheckValueExpression(const sql::Expr& e, const EmptyBlockInfo& value, std::string& form) {
+  if (AsSubquery(e) != nullptr) {
+    form = "alone";
+    return;
+  }
+  if (const auto* sum = std::get_if<sql::BinaryExpr>(&e)) {
+    form = "added";
+    ASSERT_EQ(sum->op, sql::BinaryOp::kAdd) << sql::ToSql(e);
+    const bool block_first = AsSubquery(*sum->left) != nullptr;
+    EXPECT_NE(AsSubquery(block_first ? *sum->left : *sum->right), nullptr);
+    const auto* addend = std::get_if<sql::ColumnRef>(block_first ? &*sum->right : &*sum->left);
+    ASSERT_NE(addend, nullptr) << sql::ToSql(e);
+    EXPECT_EQ(Lower(addend->qualifier), Lower(value.outer_name));
+    const GenColumn* column = ColumnNamed(value.outer, addend->name);
+    ASSERT_NE(column, nullptr) << addend->name;
+    ASSERT_EQ(column->kind, ValueKind::kInteger);
+    ASSERT_TRUE(value.integer.has_value()) << "an integer of a known type";
+    const IntegerRange range = value.integer.value_or(IntegerRange{});
+    const auto [type_low, type_high] = range.type;
+    const auto [low, high] = range.values;
+    const auto [added_low, added_high] = BoundsOf(*column);
+    EXPECT_TRUE(low + added_low >= type_low && high + added_high <= type_high)
+        << "never past its type";
+    return;
+  }
+  if (const auto* when = std::get_if<sql::CaseExpr>(&e)) {
+    form = "case";
+    EXPECT_FALSE(when->operand.has_value());
+    ASSERT_EQ(when->branches.size(), 1U);
+    const sql::BinaryExpr* test = ValueComparison(*when->branches.front().when);
+    ASSERT_NE(test, nullptr) << "a comparison of the value with a literal";
+    if (value.real) {
+      const auto* zero = std::get_if<sql::Literal>(&*test->right);
+      EXPECT_TRUE(zero != nullptr && zero->text == "0" && !zero->negative)
+          << "a DOUBLE against 0 alone";
+    }
+    if (value.variance) {
+      EXPECT_TRUE(test->op == sql::BinaryOp::kGt || test->op == sql::BinaryOp::kEq);
+    }
+    EXPECT_EQ(sql::ToSql(*when->branches.front().then), "1");
+    EXPECT_TRUE(when->otherwise.has_value() && sql::ToSql(**when->otherwise) == "0");
+    return;
+  }
+  if (const auto* fn = std::get_if<sql::FunctionCall>(&e)) {
+    form = "coalesce";
+    EXPECT_EQ(Lower(fn->name), "coalesce");
+    ASSERT_EQ(fn->args.size(), 2U);
+    const sql::SubqueryExpr* sub = AsSubquery(fn->args[0]);
+    ASSERT_NE(sub, nullptr);
+    EXPECT_TRUE(std::holds_alternative<sql::Literal>(fn->args[1]));
+    const auto* call = std::get_if<sql::AggregateCall>(sub->query->items.front().expr());
+    ASSERT_NE(call, nullptr) << "COALESCE over a call";
+    EXPECT_TRUE(call->kind != sql::AggKind::kCountStar && call->kind != sql::AggKind::kCount &&
+                call->kind < sql::AggKind::kStddevSamp)
+        << "a call NULL over no rows";
+    return;
+  }
+  ADD_FAILURE() << "an expression of no known form: " << sql::ToSql(e);
+}
+
+// What a correlated value outside a condition writes (ADR 0041's SQ5b): SQ6's block
+// (CheckEmptyBlock), once, in one of four places, never in WHERE, an ON or GROUP BY. One more
+// select item, last, of a block that does not aggregate (CheckValueExpression's forms). An ORDER
+// BY item of such a block: one of those expressions, after the keys its ORDER BY had and followed
+// by its binding's qualified columns that break ties; or such an item read by its alias or
+// position (no star before it), with those columns after it but under SELECT DISTINCT. A GROUP BY
+// key: such an item of a block that aggregates without grouping sets, read by its alias or
+// position as the last key, and now and then by its position as the last ORDER BY item. An
+// aggregate's argument (SUM, MIN, MAX, COUNT [DISTINCT]), `o.x * (q)` or `o.x + (q)` over a
+// qualified integer column of the value's binding, never past the value's type (a SUM's total
+// within 38 digits), in the select list, HAVING or ORDER BY. Never a DOUBLE sort key, key or SELECT
+// DISTINCT item but in a CASE, an ORDER BY expression over the item's alias (D37), the value's text
+// in GROUP BY (D38), a value above the aggregation (SQ13), a division, a subtraction or a CAST.
+// Floors per place and form at about 80% of the measured counts.
+TEST(QueryGenerator, CorrelatedItemValuesAreBlocksInTheirPlaces) {
+  std::vector<GenTable> tables = JoinTables();
+  // Data well inside every INTEGER column's type, as the files' statistics give it, so that the
+  // arithmetic over the value, which needs it, is written too; the BIGINT columns keep their
+  // type's range, so that arithmetic over them, which could leave the type, is refused.
+  for (GenTable& table : tables) {
+    for (GenColumn& column : table.columns) {
+      if (column.kind == ValueKind::kInteger && column.min == std::numeric_limits<int32_t>::min()) {
+        column.data_min = -1000;
+        column.data_max = 1000;
+      }
+    }
+  }
+  // The other subquery features off: the value is drawn only where none of them fired. Correlated
+  // EXISTS stays, whose candidates the value reads (CorrelatedCandidates).
+  const auto gen =
+      MakeOver(tables, 137,
+               {.supported = kSupportedFeatures.Minus(
+                    {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedAggregate,
+                     Feature::kUncorrelatedValue, Feature::kConditionValue, Feature::kHavingValue,
+                     Feature::kItemValue, Feature::kGroupValue, Feature::kInMark, Feature::kInForm,
+                     Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue}),
+                .target_percent = 0});
+  std::map<std::string, int> places;
+  std::map<std::string, int> forms;  // by place: of an expression outside an aggregate
+  std::map<std::string, int> calls;  // of an aggregate over the value
+  int queries = 0;
+  int real = 0;      // a DOUBLE value
+  int distinct = 0;  // a SELECT DISTINCT item
+  int starred = 0;   // an item after a star
+  int aliases = 0;   // an item read by its alias
+  int positions = 0;
+  int key_ordered = 0;  // a key ordered by its position too
+  int unique_keys = 0;  // ties broken by a key a ref proves unique
+  int all_columns = 0;  // by every column of the binding
+  int products = 0;
+  int sums = 0;
+  const auto is_comparison = [](sql::BinaryOp op) {
+    return op >= sql::BinaryOp::kEq && op <= sql::BinaryOp::kGe;
+  };
+  const auto holds = [](const sql::Expr& e) {
+    std::vector<const sql::SubqueryExpr*> inside;
+    DeepSubqueries(e, inside);
+    return !inside.empty();
+  };
+  const auto aggregates = [](const sql::Expr& e) {
+    bool found = false;
+    ForEachNode(e, [&](const sql::Expr& node) {
+      found = found || std::holds_alternative<sql::AggregateCall>(node);
+    });
+    return found;
+  };
+  const sql::Expr no_expr{sql::Literal{}};
+  for (uint64_t i = 0; i < 2200; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedItemValue)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const sql::SelectStatement& stmt = *parsed;
+    ++queries;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(stmt, all);
+    ASSERT_EQ(all.size(), 1U) << "one block";
+    EmptyBlockInfo value;
+    ASSERT_NO_FATAL_FAILURE(CheckEmptyBlock(*all.front(), stmt, tables, value));
+    real += value.real ? 1 : 0;
+    for (const sql::Expr& e : stmt.where) {
+      EXPECT_FALSE(holds(e)) << "in WHERE";
+    }
+    for (const sql::FromItem& item : stmt.from) {
+      for (const sql::Expr& e : item.on) {
+        EXPECT_FALSE(holds(e)) << "in an ON";
+      }
+    }
+    for (const sql::Expr& e : stmt.group_by) {
+      EXPECT_FALSE(holds(e)) << "the value's text as a key (D38)";
+    }
+    for (const sql::Expr* e : sql::GroupingExprs(stmt.grouping)) {
+      EXPECT_FALSE(holds(*e)) << "in a grouping set";
+    }
+    // No ORDER BY expression reads the value item's alias (D37): only the alias alone.
+    for (const sql::OrderItem& item : stmt.order_by) {
+      if (AsColumn(item.expr) != nullptr) {
+        continue;
+      }
+      ForEachNode(item.expr, [](const sql::Expr& node) {
+        const sql::ColumnRef* c = AsColumn(node);
+        EXPECT_FALSE(c != nullptr && c->qualifier.empty() && Lower(c->name) == "cv")
+            << "an ORDER BY expression over the value item's alias (D37)";
+      });
+    }
+    // The block groups or aggregates: a key, a HAVING or an aggregate outside a subquery.
+    bool grouped = !stmt.group_by.empty() || !stmt.grouping.empty() || !stmt.having.empty();
+    for (const sql::SelectItem& item : stmt.items) {
+      grouped = grouped || (item.expr() != nullptr && aggregates(*item.expr()));
+    }
+    for (const sql::OrderItem& item : stmt.order_by) {
+      grouped = grouped || aggregates(item.expr);
+    }
+    // The one place that holds it, among the select items, HAVING and ORDER BY: the clause, the
+    // position in it, and the expression there.
+    struct Holder {
+      std::string clause;
+      std::size_t at = 0;
+      const sql::Expr* expr = nullptr;
+    };
+    std::vector<Holder> holders;
+    for (std::size_t n = 0; n < stmt.items.size(); ++n) {
+      if (stmt.items[n].expr() != nullptr && holds(*stmt.items[n].expr())) {
+        holders.push_back({.clause = "item", .at = n, .expr = stmt.items[n].expr()});
+      }
+    }
+    for (std::size_t n = 0; n < stmt.having.size(); ++n) {
+      if (holds(stmt.having[n])) {
+        holders.push_back({.clause = "having", .at = n, .expr = &stmt.having[n]});
+      }
+    }
+    for (std::size_t n = 0; n < stmt.order_by.size(); ++n) {
+      if (holds(stmt.order_by[n].expr)) {
+        holders.push_back({.clause = "order_by", .at = n, .expr = &stmt.order_by[n].expr});
+      }
+    }
+    ASSERT_EQ(holders.size(), 1U) << "one place";
+    const std::string& clause = holders.front().clause;
+    const std::size_t at = holders.front().at;
+    const sql::Expr& holder = *holders.front().expr;
+    // Nothing that can fail where it stands: no division, subtraction or CAST but a typed literal.
+    ForEachNode(holder, [&](const sql::Expr& node) {
+      if (const auto* bin = std::get_if<sql::BinaryExpr>(&node)) {
+        EXPECT_TRUE(bin->op == sql::BinaryOp::kAdd || bin->op == sql::BinaryOp::kMultiply ||
+                    is_comparison(bin->op))
+            << "no division and no subtraction: " << sql::ToSql(node);
+      }
+      if (const auto* cast = std::get_if<sql::CastExpr>(&node)) {
+        EXPECT_TRUE(std::holds_alternative<sql::Literal>(*cast->operand)) << "no CAST";
+      }
+    });
+    // An aggregate's argument: the value beside a column, never past its type.
+    const sql::AggregateCall* call = nullptr;
+    const sql::Expr* argument = nullptr;  // the call's
+    ForEachNode(holder, [&](const sql::Expr& node) {
+      if (const auto* c = std::get_if<sql::AggregateCall>(&node);
+          c != nullptr && c->arg.has_value() && holds(**c->arg)) {
+        call = c;
+        argument = &**c->arg;
+      }
+    });
+    if (call != nullptr && argument != nullptr) {
+      ++places["argument"];
+      ++places["argument_" + clause];
+      EXPECT_FALSE(clause == "order_by" && stmt.distinct) << "SELECT DISTINCT orders by items";
+      EXPECT_TRUE(clause != "having" || std::holds_alternative<sql::BinaryExpr>(holder));
+      const bool counts = call->kind == sql::AggKind::kCount;
+      EXPECT_TRUE(counts || call->kind == sql::AggKind::kSum || call->kind == sql::AggKind::kMin ||
+                  call->kind == sql::AggKind::kMax)
+          << sql::ToSql(holder);
+      EXPECT_TRUE(!call->distinct || counts);
+      std::string call_name = "max";
+      if (counts) {
+        call_name = call->distinct ? "count distinct" : "count";
+      } else if (call->kind == sql::AggKind::kSum) {
+        call_name = "sum";
+      } else if (call->kind == sql::AggKind::kMin) {
+        call_name = "min";
+      }
+      ++calls[call_name];
+      const auto* arg = std::get_if<sql::BinaryExpr>(argument);
+      ASSERT_NE(arg, nullptr) << "never the value alone";
+      ASSERT_TRUE(arg->op == sql::BinaryOp::kAdd || arg->op == sql::BinaryOp::kMultiply);
+      const bool block_first = AsSubquery(*arg->left) != nullptr;
+      EXPECT_NE(AsSubquery(block_first ? *arg->left : *arg->right), nullptr);
+      const auto* other = std::get_if<sql::ColumnRef>(block_first ? &*arg->right : &*arg->left);
+      ASSERT_NE(other, nullptr) << "beside a column, never literals alone";
+      EXPECT_EQ(Lower(other->qualifier), Lower(value.outer_name));
+      const GenColumn* column = ColumnNamed(value.outer, other->name);
+      ASSERT_NE(column, nullptr) << other->name;
+      ASSERT_EQ(column->kind, ValueKind::kInteger);
+      ASSERT_TRUE(value.integer.has_value()) << "an integer of a known type";
+      const IntegerRange range = value.integer.value_or(IntegerRange{});
+      const auto [type_low, type_high] = range.type;
+      const auto [low, high] = range.values;
+      const auto [column_low, column_high] = BoundsOf(*column);
+      std::pair<Int128, Int128> result = {low + column_low, high + column_high};
+      if (arg->op == sql::BinaryOp::kMultiply) {
+        ++products;
+        const auto corners = std::to_array<Int128>(
+            {low * column_low, low * column_high, high * column_low, high * column_high});
+        result = {std::ranges::min(corners), std::ranges::max(corners)};
+      } else {
+        ++sums;
+      }
+      EXPECT_TRUE(result.first >= type_low && result.second <= type_high) << "never past its type";
+      if (call->kind == sql::AggKind::kSum) {
+        const Int128 largest = std::max(result.first < 0 ? -result.first : result.first,
+                                        result.second < 0 ? -result.second : result.second);
+        Int128 hugeint = 1;  // HUGEINT's bound in antb1: 10^38 - 1
+        for (int digit = 0; digit < 38; ++digit) {
+          hugeint *= 10;
+        }
+        EXPECT_TRUE(largest * std::max<int64_t>(q.row_bound, 1) < hugeint)
+            << "a SUM within 38 digits";
+      }
+      continue;
+    }
+    ASSERT_NE(clause, "having") << "HAVING over the value outside an aggregate (SQ13)";
+    std::string form;
+    ASSERT_NO_FATAL_FAILURE(CheckValueExpression(holder, value, form));
+    const bool exact = !value.real || form == "case";
+    // The qualified columns of the value's binding after ORDER BY item `k`, which end the list.
+    const auto tie_breakers = [&](std::size_t k) {
+      const std::size_t count = stmt.order_by.size() - k - 1;
+      for (std::size_t n = k + 1; n < stmt.order_by.size(); ++n) {
+        const sql::ColumnRef* c = AsColumn(stmt.order_by[n].expr);
+        ASSERT_NE(c, nullptr) << "a column breaks the ties";
+        EXPECT_EQ(Lower(c->qualifier), Lower(value.outer_name));
+        EXPECT_NE(ColumnNamed(value.outer, c->name), nullptr) << c->name;
+      }
+      unique_keys += count == 1 ? 1 : 0;
+      all_columns += count > 1 ? 1 : 0;
+    };
+    if (clause == "order_by") {
+      ++places["order_by"];
+      ++forms["order_by " + form];
+      EXPECT_FALSE(grouped) << "an ORDER BY item above an aggregation (SQ13)";
+      EXPECT_FALSE(stmt.distinct) << "SELECT DISTINCT orders by items";
+      EXPECT_TRUE(exact) << "a DOUBLE sort key";
+      EXPECT_GT(stmt.order_by.size(), at + 1) << "the columns that break ties follow";
+      ASSERT_NO_FATAL_FAILURE(tie_breakers(at));
+      continue;
+    }
+    // A select item, the last one, and what reads it: its alias, or its position.
+    const sql::SelectItem& item = stmt.items[at];
+    EXPECT_EQ(at + 1, stmt.items.size()) << "the last select item";
+    EXPECT_TRUE(!item.alias.has_value() || *item.alias == "cv");
+    const auto reads = [&](const sql::Expr& e) {
+      if (const sql::ColumnRef* c = AsColumn(e)) {
+        return c->qualifier.empty() && item.alias.has_value() && c->name == *item.alias;
+      }
+      const auto* lit = std::get_if<sql::Literal>(&e);
+      return lit != nullptr && lit->kind == sql::Literal::Kind::kInteger && !lit->negative &&
+             lit->text == std::to_string(at + 1);
+    };
+    std::vector<std::size_t> readers;
+    for (std::size_t n = 0; n < stmt.order_by.size(); ++n) {
+      if (reads(stmt.order_by[n].expr)) {
+        readers.push_back(n);
+      }
+    }
+    ASSERT_LE(readers.size(), 1U);
+    const sql::Expr& reader = readers.empty() ? no_expr : stmt.order_by[readers.front()].expr;
+    if (grouped) {
+      ++places["group_by"];
+      ++forms["group_by " + form];
+      EXPECT_TRUE(stmt.grouping.empty()) << "a key next to grouping sets";
+      ASSERT_FALSE(stmt.group_by.empty()) << "a value item above an aggregation, no key (SQ13)";
+      EXPECT_TRUE(reads(stmt.group_by.back())) << "the last key reads the item";
+      EXPECT_TRUE(exact) << "a DOUBLE key";
+      (AsColumn(stmt.group_by.back()) != nullptr ? aliases : positions) += 1;
+      if (!readers.empty()) {
+        ++key_ordered;
+        EXPECT_TRUE(std::holds_alternative<sql::Literal>(reader)) << "ordered by its position";
+        EXPECT_EQ(readers.front() + 1, stmt.order_by.size()) << "after the keys ORDER BY had";
+      }
+      continue;
+    }
+    const bool star = std::ranges::any_of(
+        stmt.items, [](const sql::SelectItem& s) { return s.star() != nullptr; });
+    starred += star ? 1 : 0;
+    distinct += stmt.distinct ? 1 : 0;
+    EXPECT_TRUE(!stmt.distinct || exact) << "a DOUBLE SELECT DISTINCT item";
+    if (readers.empty()) {
+      ++places["item"];
+      ++forms["item " + form];
+      continue;
+    }
+    ++places["ordered_item"];
+    ++forms["ordered_item " + form];
+    EXPECT_TRUE(exact) << "a DOUBLE sort key";
+    if (AsColumn(reader) != nullptr) {
+      ++aliases;
+    } else {
+      ++positions;
+      EXPECT_FALSE(star) << "a position past a star";
+    }
+    if (stmt.distinct) {
+      EXPECT_EQ(readers.front() + 1, stmt.order_by.size()) << "SELECT DISTINCT orders by items";
+    } else {
+      EXPECT_GT(stmt.order_by.size(), readers.front() + 1) << "the columns that break ties follow";
+      ASSERT_NO_FATAL_FAILURE(tie_breakers(readers.front()));
+    }
+  }
+  std::string counted;
+  for (const auto& [name, n] : places) {
+    counted += std::format(" {} {},", name, n);
+  }
+  for (const auto& [name, n] : forms) {
+    counted += std::format(" {} {},", name, n);
+  }
+  for (const auto& [name, n] : calls) {
+    counted += std::format(" {} {},", name, n);
+  }
+  // Measured: 961 queries of the 2200; places: an argument 375 (in the select list 132, in HAVING
+  // 131, in ORDER BY 112), a GROUP BY key 255, an item 164, an ORDER BY item 66, an item ordered
+  // by 101; forms: of a key alone 86, added 78, case 57, coalesce 34; of an item alone 50, added
+  // 51, case 32, coalesce 31; of an ORDER BY item alone 22, added 17, case 16, coalesce 11; of an
+  // item ordered by alone 21, added 29, case 33, coalesce 18; calls: COUNT 83, COUNT DISTINCT 76,
+  // MAX 81, MIN 61, SUM 74; a DOUBLE value 45, a DISTINCT item 58, after a star 103, read by an
+  // alias 210 and by a position 146, a key ordered too 77, ties broken by a unique key 48 and by
+  // every column 96, products 183 and sums 192.
+  const std::string measured = std::format(
+      "values outside conditions: {};{} DOUBLE {}, DISTINCT {}, after a star {}, "
+      "aliases {}, positions {}, keys ordered {}, unique keys {}, all columns {}, "
+      "products {}, sums {}",
+      queries, counted, real, distinct, starred, aliases, positions, key_ordered, unique_keys,
+      all_columns, products, sums);
+  SCOPED_TRACE(measured);
+  EXPECT_GT(queries, 767);
+  EXPECT_GT(places["argument"], 300);
+  EXPECT_GT(places["argument_item"], 105);
+  EXPECT_GT(places["argument_having"], 105);
+  EXPECT_GT(places["argument_order_by"], 88);
+  EXPECT_GT(places["group_by"], 204);
+  EXPECT_GT(places["item"], 130);
+  EXPECT_GT(places["order_by"], 52);
+  EXPECT_GT(places["ordered_item"], 80);
+  EXPECT_GT(forms["group_by alone"], 68);
+  EXPECT_GT(forms["group_by added"], 62);
+  EXPECT_GT(forms["group_by case"], 45);
+  EXPECT_GT(forms["group_by coalesce"], 27);
+  EXPECT_GT(forms["item alone"], 40);
+  EXPECT_GT(forms["item added"], 40);
+  EXPECT_GT(forms["item case"], 24);
+  EXPECT_GT(forms["item coalesce"], 24);
+  EXPECT_GT(forms["order_by alone"], 17);
+  EXPECT_GT(forms["order_by added"], 12);
+  EXPECT_GT(forms["order_by case"], 12);
+  EXPECT_GT(forms["order_by coalesce"], 8);
+  EXPECT_GT(forms["ordered_item alone"], 16);
+  EXPECT_GT(forms["ordered_item added"], 23);
+  EXPECT_GT(forms["ordered_item case"], 26);
+  EXPECT_GT(forms["ordered_item coalesce"], 14);
+  EXPECT_GT(calls["count"], 66);
+  EXPECT_GT(calls["count distinct"], 61);
+  EXPECT_GT(calls["max"], 65);
+  EXPECT_GT(calls["min"], 48);
+  EXPECT_GT(calls["sum"], 58);
+  EXPECT_GT(real, 36) << "a DOUBLE value";
+  EXPECT_GT(distinct, 46) << "a SELECT DISTINCT item";
+  EXPECT_GT(starred, 82) << "an item after a star";
+  EXPECT_GT(aliases, 168);
+  EXPECT_GT(positions, 116);
+  EXPECT_GT(key_ordered, 61);
+  EXPECT_GT(unique_keys, 38);
+  EXPECT_GT(all_columns, 76);
+  EXPECT_GT(products, 149);
+  EXPECT_GT(sums, 150);
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {

@@ -223,7 +223,7 @@ wrong answers, not divergences: antb1 answers them right, or refuses them (exit 
   The PR of each [ADR 0041](adr/0041-subqueries-and-decorrelation.md) item whose generator Feature could write a member
   of this family adds it to the generator's list of shapes it never writes. SQ6's `correlated_empty_value` writes a
   constant item or a `HAVING` only in a block that holds a `COUNT`, which DuckDB joins `LEFT` and answers right, and
-  SQ5a's `correlated_condition_value` draws the same blocks.
+  SQ5a's `correlated_condition_value` and SQ5b's `correlated_item_value` draw the same blocks.
 - **A correlated scalar subquery in an `ON` that also reads a comma sibling** (`FROM a, b JOIN c ON ...`, the `ON`
   reading `a` as well): DuckDB can drop every row there, or fail with an internal error, where antb1 answers, so no
   record of `tests/slt/cases/subqueries/scalar.slt` has that shape.
@@ -253,7 +253,12 @@ value under `CASE`, `NOT` and `OR`, in arithmetic and two compared (`correlated_
 with a constant over `ORDER BY MAX` under `OR`, which DuckDB answers wrongly), and holds a value under `OR` to the union
 of its branches (`correlated_value_under_or_is_the_union_of_its_branches_*`), two values compared and the NULL rows to
 a partition of the outer rows (`correlated_values_compared_partition_the_outer_rows_*`) and `BETWEEN` to its two
-comparisons (`correlated_between_equals_two_comparisons_*`). A null-aware mark (ADR 0041's SQ7a) is
+comparisons (`correlated_between_equals_two_comparisons_*`). SQ5b adds the self-check for an item, an `ORDER BY`'s
+order and an aggregate argument's sum (`correlated_{item,order_by,argument}_*_is_its_bindings_as_literals`), holds an
+item, a `GROUP BY` key's groups and an aggregate argument to a `LEFT JOIN` of the inner groups
+(`correlated_{item,key,argument}_equals_a_left_join_of_its_groups_*`, NULL-equal keys included), and a value in the
+slot's tail to the same value read by `WHERE` and to a derived table's item
+(`correlated_item_in_the_tail_changes_no_answer`). A null-aware mark (ADR 0041's SQ7a) is
 checked against operators that existed before it too: `in_mark_is_its_three_valued_composition_*` classifies each row
 as TRUE, FALSE or NULL from a `LEFT JOIN` to the set's distinct values and a `CROSS JOIN` to its row and NULL counts,
 over sets with a NULL, without one, of NULLs alone and empty. SQ7b's forms are held to the same composition

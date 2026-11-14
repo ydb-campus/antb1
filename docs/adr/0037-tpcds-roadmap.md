@@ -193,7 +193,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ0 | One rule table for the unnesting in place of ADR 0023's Path 1 and Path 2, substitution its only terminal step, and the consumer proof; no answer and no plan of a shape answered today changes | | Built |
 | SQ6 | Correlated static aggregates of any kind, COUNT included, with any select item, a HAVING and an uncorrelated value inside, joined back LEFT with their empty values where the consumer proof fails; lands before SQ5, whose correlated aggregates of any kind need its LEFT join back | 41 | Built |
 | SQ5a | Correlated aggregates as values in any expression of a condition of WHERE or an inner ON, under the consumer proof, whose walk passes the conditions and joins between | 6 | Built |
-| SQ5b | Correlated aggregates as values in select items, ORDER BY, GROUP BY keys and aggregate arguments, planted in the slot's tail | | Planned |
+| SQ5b | Correlated aggregates as values in select items, ORDER BY, GROUP BY keys and aggregate arguments, planted in the slot's tail | | Built |
 | SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Planned |
 | **Phase 9** | **Window functions** | | |
 | W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
@@ -913,6 +913,10 @@ completes Q41, and the ratchet goes from 80 to 81. Q41 is the only TPC-H or TPC-
 Update (2026-11-13, SQ5a): SQ5 splits again, at the maintainer's request: SQ5a answers correlated values in conditions
 and completes Q6, and the ratchet goes from 81 to 82; SQ5b answers them in select items, ORDER BY, GROUP BY keys and
 aggregate arguments and completes no query (ADR 0041's SQ5a update). Q6 is the only TPC-H or TPC-DS plan that changes.
+
+Update (2026-11-14, SQ5b): SQ5b, built, answers correlated values in select items, ORDER BY, GROUP BY keys and
+aggregate arguments (ADR 0041's SQ5b update). As planned, it completes no query: the ratchet stays at 82, and no TPC-H
+or TPC-DS plan changes.
 
 ## Alternatives considered
 
