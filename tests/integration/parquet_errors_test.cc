@@ -277,5 +277,24 @@ TEST_F(ParquetErrors, LogicalTypeThatDoesNotFitItsColumn) {
       << read.status().ToString();
 }
 
+// A file whose column carries an unfit annotation makes the column unsupported for the whole table,
+// also behind a file whose column carries none: with the annotation dropped, both columns are INT32
+// to Arrow, so the schemas agree and the first file alone cannot tell.
+TEST_F(ParquetErrors, LogicalTypeThatDoesNotFitItsColumnInALaterFile) {
+  const std::string plain = WriteColumn("plain.parquet", ArrayOf<arrow::Int32Builder>({4, 5, 6}));
+  const std::string unfit = WriteColumn("unfit.parquet", ArrayOf<arrow::Date32Builder>({1, 2, 3}));
+  ASSERT_NO_FATAL_FAILURE(Patch(unfit, Bytes({0x18, 0x01, 'c', 0x25, 0x0c, 0x4c, 0x6c}),
+                                Bytes({0x18, 0x01, 'c', 0x25, 0x0c, 0x4c, 0x1c})));
+  ASSERT_TRUE(session_->RegisterParquet("t", {plain, unfit}).ok());
+  const auto rows = Count(*session_, "SELECT COUNT(*) FROM t");  // reads no column
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ(*rows, 6);
+  const auto read = Count(*session_, "SELECT COUNT(*) FROM t WHERE c = 2");
+  ASSERT_FALSE(read.ok());
+  const auto detail = plan::GetSqlError(read.status());
+  ASSERT_NE(detail, nullptr) << read.status().ToString();
+  EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << read.status().ToString();
+}
+
 }  // namespace
 }  // namespace antb1::integration

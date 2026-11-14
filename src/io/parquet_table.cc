@@ -866,10 +866,15 @@ arrow::Result<std::shared_ptr<ParquetTable>> ParquetTable::Open(
   for (int i = 0; i < table->storage_schema_->num_fields(); ++i) {
     const std::shared_ptr<arrow::Field>& f = table->storage_schema_->field(i);
     const int leaf = table->leaf_of_field_[Narrow<std::size_t>(i)];
-    // A leaf whose logical type Arrow dropped as unfit (UnfitAnnotationType): the first file's
-    // annotations, as the storage schema is the first file's.
-    if (leaf >= 0 && !Overridden(*f, options) &&
-        table->metadata_.front()->schema()->Column(leaf)->logical_type()->is_invalid()) {
+    // A leaf whose logical type Arrow dropped as unfit in any of the files (UnfitAnnotationType):
+    // with it dropped, a file's storage type is the physical type and equals that of a file whose
+    // column carries no annotation at all, so the first file alone does not tell. The storage
+    // schemas are equal, so the leaf is the same column of every file.
+    const auto unfit_in = [leaf](const std::shared_ptr<parquet::FileMetaData>& metadata) {
+      return leaf < metadata->num_columns() &&
+             metadata->schema()->Column(leaf)->logical_type()->is_invalid();
+    };
+    if (leaf >= 0 && !Overridden(*f, options) && std::ranges::any_of(table->metadata_, unfit_in)) {
       fields.push_back(
           arrow::field(f->name(), std::make_shared<UnfitAnnotationType>(f->type()), f->nullable()));
     } else {
