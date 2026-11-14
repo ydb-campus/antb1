@@ -4669,7 +4669,17 @@ TEST(QueryGenerator, CorrelatedConditionValuesAreBlocksInsideConditions) {
       }
     }
   }
-  const auto gen = MakeOver(tables, 131, {.supported = kSupportedFeatures, .target_percent = 0});
+  // The other subquery features off: the value is drawn only where none of them fired, so with
+  // them on 1 query in 70 takes it, and 40000 queries outlast the ASan leg's timeout. Correlated
+  // EXISTS stays, whose candidates the value reads (CorrelatedCandidates).
+  const auto gen =
+      MakeOver(tables, 131,
+               {.supported = kSupportedFeatures.Minus(
+                    {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedAggregate,
+                     Feature::kUncorrelatedValue, Feature::kConditionValue, Feature::kHavingValue,
+                     Feature::kItemValue, Feature::kGroupValue, Feature::kInMark, Feature::kInForm,
+                     Feature::kCorrelatedEmptyValue}),
+                .target_percent = 0});
   std::map<std::string, int> forms;
   std::map<std::string, int> items;
   int queries = 0;
@@ -4685,7 +4695,7 @@ TEST(QueryGenerator, CorrelatedConditionValuesAreBlocksInsideConditions) {
     const auto* lit = std::get_if<sql::Literal>(&e);
     return lit != nullptr && lit->text == "0" && !lit->negative;
   };
-  for (uint64_t i = 0; i < 40000; ++i) {
+  for (uint64_t i = 0; i < 3000; ++i) {
     const auto q = gen.Generate(i);
     if (!q.features.Has(Feature::kCorrelatedConditionValue)) {
       continue;
@@ -4895,37 +4905,38 @@ TEST(QueryGenerator, CorrelatedConditionValuesAreBlocksInsideConditions) {
   for (const auto& [name, n] : items) {
     counted += std::format(" item {} {},", name, n);
   }
-  // Measured: 561 queries; or 67, not 63, case 47, scaled 26, added 27, coalesce 35, is_null 35,
-  // is_not_null 33, between 29, not_between 25, in 48, not_in 12, pair 50, twice 64; items (both
-  // blocks of a pair or of the text twice) call 238, case 122, coalesce 62, constant 113, plus
-  // 117, variance 23; a DOUBLE against 0 41, NULL-equal keys 146, HAVING 189, ORDER BY 67.
-  EXPECT_GT(queries, 448) << "values in conditions: " << queries << ";" << counted << " DOUBLE "
+  // Measured: 1088 queries of the 3000; or 108, not 97, case 111, scaled 47, added 51, coalesce
+  // 81, is_null 70, is_not_null 96, between 74, not_between 36, in 70, not_in 34, pair 96, twice
+  // 117; items (both blocks of a pair or of the text twice) call 468, case 199, coalesce 143,
+  // constant 201, plus 243, variance 47; a DOUBLE against 0 69, NULL-equal keys 261, HAVING 396,
+  // ORDER BY 124.
+  EXPECT_GT(queries, 870) << "values in conditions: " << queries << ";" << counted << " DOUBLE "
                           << real << ", variance " << variances << ", NULL-equal keys "
                           << null_equal << ", HAVING " << havings << ", ORDER BY " << ordered;
-  EXPECT_GT(forms["or"], 53);
-  EXPECT_GT(forms["not"], 50);
-  EXPECT_GT(forms["case"], 37);
-  EXPECT_GT(forms["scaled"], 20);
-  EXPECT_GT(forms["added"], 21);
-  EXPECT_GT(forms["coalesce"], 28);
-  EXPECT_GT(forms["is_null"], 28);
-  EXPECT_GT(forms["is_not_null"], 26);
-  EXPECT_GT(forms["between"], 23);
-  EXPECT_GT(forms["not_between"], 20);
-  EXPECT_GT(forms["in"], 38);
-  EXPECT_GT(forms["not_in"], 9);
-  EXPECT_GT(forms["pair"], 40);
-  EXPECT_GT(forms["twice"], 51);
-  EXPECT_GT(items["call"], 190);
-  EXPECT_GT(items["case"], 97);
-  EXPECT_GT(items["coalesce"], 49);
-  EXPECT_GT(items["constant"], 90);
-  EXPECT_GT(items["plus"], 93);
-  EXPECT_GT(items["variance"], 18);
-  EXPECT_GT(real, 32) << "a DOUBLE against 0";
-  EXPECT_GT(null_equal, 116);
-  EXPECT_GT(havings, 151);
-  EXPECT_GT(ordered, 53);
+  EXPECT_GT(forms["or"], 86);
+  EXPECT_GT(forms["not"], 77);
+  EXPECT_GT(forms["case"], 88);
+  EXPECT_GT(forms["scaled"], 37);
+  EXPECT_GT(forms["added"], 40);
+  EXPECT_GT(forms["coalesce"], 64);
+  EXPECT_GT(forms["is_null"], 56);
+  EXPECT_GT(forms["is_not_null"], 76);
+  EXPECT_GT(forms["between"], 59);
+  EXPECT_GT(forms["not_between"], 28);
+  EXPECT_GT(forms["in"], 56);
+  EXPECT_GT(forms["not_in"], 27);
+  EXPECT_GT(forms["pair"], 76);
+  EXPECT_GT(forms["twice"], 93);
+  EXPECT_GT(items["call"], 374);
+  EXPECT_GT(items["case"], 159);
+  EXPECT_GT(items["coalesce"], 114);
+  EXPECT_GT(items["constant"], 160);
+  EXPECT_GT(items["plus"], 194);
+  EXPECT_GT(items["variance"], 37);
+  EXPECT_GT(real, 55) << "a DOUBLE against 0";
+  EXPECT_GT(null_equal, 208);
+  EXPECT_GT(havings, 316);
+  EXPECT_GT(ordered, 99);
 }
 
 TEST(QueryGenerator, DeclaredJoinFeaturesAppearInSupportedQueries) {
