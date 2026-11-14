@@ -1020,11 +1020,10 @@ statement error out of range for the destination type UINT16
 SELECT c.ct_id FROM cities c WHERE CAST(3 - c.ct_id AS USMALLINT) + (SELECT MIN(ct_id) FROM cities) > 0
 AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
 
-# ---- pending: select items (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- select items (ADR 0041's SQ5b) ----
 
 # Every outer row comes out, so the join back is LEFT and cities 4 to 6 read the value over no rows: COUNT 0, SUM
 # NULL, a constant over ORDER BY COUNT(*) its value, a HAVING that rejects the empty row NULL.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY 1
 ----
@@ -1036,7 +1035,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS s FROM cities c ORDER BY 1
 ----
@@ -1048,7 +1046,6 @@ SMALLINT	HUGEINT
 5	NULL
 6	NULL
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) FROM cities c ORDER BY 1
 ----
@@ -1060,7 +1057,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COALESCE(SUM(r.rd_row), 0) + COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS s
 FROM cities c ORDER BY 1
@@ -1073,7 +1069,6 @@ SMALLINT	HUGEINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT 42 FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) AS k FROM cities c ORDER BY 1
 ----
@@ -1085,7 +1080,6 @@ SMALLINT	INTEGER
 5	42
 6	42
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT 7 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) >= 0) AS k FROM cities c ORDER BY 1
 ----
@@ -1097,7 +1091,6 @@ SMALLINT	INTEGER
 5	7
 6	7
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0) AS n FROM cities c
 ORDER BY 1
@@ -1110,7 +1103,6 @@ SMALLINT	BIGINT
 5	NULL
 6	NULL
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) < 78) AS n FROM cities c
 ORDER BY 1
@@ -1123,7 +1115,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id,
 (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0 OR EXISTS (SELECT 1 FROM promos)) AS n
@@ -1137,7 +1128,6 @@ SMALLINT	BIGINT
 5	NULL
 6	NULL
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) + (SELECT MIN(ct_id) FROM cities) FROM riders r WHERE r.rd_city = c.ct_id) AS n
 FROM cities c ORDER BY 1
@@ -1150,7 +1140,6 @@ SMALLINT	BIGINT
 5	1
 6	1
 
-pending SQ5b
 query IT nosort
 SELECT c.ct_id, (SELECT CASE WHEN COUNT(*) > 77 THEN 'many' WHEN COUNT(*) > 0 THEN 'some' ELSE 'none' END
 FROM riders r WHERE r.rd_city = c.ct_id) AS k FROM cities c ORDER BY 1
@@ -1163,7 +1152,6 @@ SMALLINT	VARCHAR
 5	none
 6	none
 
-pending SQ5b
 query III nosort
 SELECT c.ct_id,
 (SELECT CASE WHEN VAR_POP(r.rd_row) > 4780 THEN 1 ELSE 0 END FROM riders r WHERE r.rd_city = c.ct_id) AS v,
@@ -1179,7 +1167,6 @@ SMALLINT	INTEGER	BIGINT
 
 # AVG of zone ids is exact here (n / 8 or n / 7 with no remainder past halves). SUM - 120 * COUNT stays a HUGEINT;
 # 100 % 0 is NULL in both engines.
-pending SQ5b
 query IR nosort
 SELECT c.ct_id, (SELECT AVG(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id) AS a FROM cities c ORDER BY 1
 ----
@@ -1191,7 +1178,6 @@ SMALLINT	DOUBLE
 5	22.5
 6	NULL
 
-pending SQ5b
 query III nosort
 SELECT c.ct_id, (SELECT SUM(r.rd_row) - 120 * COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS a,
 (SELECT 100 % COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c ORDER BY 1
@@ -1204,7 +1190,6 @@ SMALLINT	HUGEINT	BIGINT
 5	NULL	NULL
 6	NULL	NULL
 
-pending SQ5b
 query ITT nosort
 SELECT c.ct_id, (SELECT MIN(r.rd_joined) FROM riders r WHERE r.rd_city = c.ct_id) AS j,
 (SELECT COALESCE(MAX(r.rd_tier), 'none') FROM riders r WHERE r.rd_city = c.ct_id) AS t FROM cities c ORDER BY 1
@@ -1218,7 +1203,6 @@ SMALLINT	DATE	VARCHAR
 6	NULL	none
 
 # The value inside an item's arithmetic, CASE and cast, next to a star, written twice, and also in WHERE.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + (SELECT COUNT(*) FROM promos) + 1 AS k
 FROM cities c ORDER BY 1
@@ -1231,7 +1215,6 @@ SMALLINT	BIGINT
 5	1
 6	1
 
-pending SQ5b
 query IT nosort
 SELECT c.ct_id, CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 THEN 'y' ELSE 'n' END AS k
 FROM cities c ORDER BY 1
@@ -1244,7 +1227,6 @@ SMALLINT	VARCHAR
 5	n
 6	n
 
-pending SQ5b
 query IITII nosort
 SELECT c.*, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY c.ct_id
 ----
@@ -1256,7 +1238,6 @@ INTEGER	SMALLINT	VARCHAR	INTEGER	BIGINT
 4	5	old town	8000	0
 5	6	outskirts	2500	0
 
-pending SQ5b
 query III nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS a,
 (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2 AS b FROM cities c ORDER BY 1
@@ -1269,7 +1250,6 @@ SMALLINT	BIGINT	BIGINT
 5	0	0
 6	0	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78 ORDER BY 1
@@ -1281,7 +1261,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE c.ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 35) ORDER BY 1
@@ -1292,7 +1271,6 @@ SMALLINT	BIGINT
 5	0
 
 # Over riders and trips (riders 237 to 240 have no trip), and an outer side that is a join.
-pending SQ5b
 query IID nosort
 SELECT r.rd_id, (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) AS n,
 (SELECT MAX(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id) AS m FROM riders r WHERE r.rd_id > 232 ORDER BY 1
@@ -1307,7 +1285,6 @@ BIGINT	BIGINT	DECIMAL(9,2)
 239	0	NULL
 240	0	NULL
 
-pending SQ5b
 query III nosort
 SELECT r.rd_id, (SELECT COUNT(*) - COUNT(t.tr_promo) FROM trips t WHERE t.tr_rider = r.rd_id) AS a,
 (SELECT COUNT(t.tr_promo) FROM trips t WHERE t.tr_rider = r.rd_id) AS b FROM riders r WHERE r.rd_id > 228 ORDER BY 1
@@ -1326,7 +1303,6 @@ BIGINT	BIGINT	BIGINT
 239	0	0
 240	0	0
 
-pending SQ5b
 query II nosort
 SELECT r.rd_id, (SELECT COUNT(DISTINCT t.tr_pickup) FROM trips t WHERE t.tr_rider = r.rd_id) AS n FROM riders r
 ORDER BY n, r.rd_id LIMIT 6
@@ -1339,7 +1315,6 @@ BIGINT	BIGINT
 46	10
 53	10
 
-pending SQ5b
 query III nosort
 SELECT z.zn_id, c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n
 FROM zones z JOIN cities c ON c.ct_id = z.zn_city WHERE z.zn_id < 9 ORDER BY 1
@@ -1355,7 +1330,6 @@ INTEGER	SMALLINT	BIGINT
 8	3	78
 
 # Other key types: a DECIMAL sum by a BIGINT key, VARCHAR and DATE keys, and a DECIMAL key.
-pending SQ5b
 query IDI nosort
 SELECT d.id, (SELECT SUM(d2.d9_2) FROM decimals d2 WHERE d2.b = d.b) AS s,
 (SELECT COUNT(*) FROM decimals d2 WHERE d2.b = d.b) AS n FROM decimals d ORDER BY 1 LIMIT 12
@@ -1374,7 +1348,6 @@ INTEGER	DECIMAL(38,2)	BIGINT
 10	5.00	3
 11	NULL	0
 
-pending SQ5b
 query TI nosort
 SELECT f.tf_code, (SELECT COUNT(*) FROM trips t WHERE t.tr_tariff = f.tf_code) AS n FROM tariffs f ORDER BY f.tf_row
 ----
@@ -1389,7 +1362,6 @@ XL\x20	285
 NULL	0
 POOL	284
 
-pending SQ5b
 query TI nosort
 SELECT y.dy_day, (SELECT COUNT(*) FROM shifts s WHERE s.sh_day = y.dy_day) AS n FROM days y
 WHERE y.dy_day BETWEEN DATE '2026-02-26' AND DATE '2026-03-03' ORDER BY 1
@@ -1402,7 +1374,6 @@ DATE	BIGINT
 2026-03-02	11
 2026-03-03	17
 
-pending SQ5b
 query II nosort
 SELECT d.id, (SELECT COUNT(*) FROM decimals d2 WHERE d2.q = d.p) AS n FROM decimals d ORDER BY 1 LIMIT 12
 ----
@@ -1420,21 +1391,18 @@ INTEGER	BIGINT
 10	1
 11	1
 
-# ---- pending: select item errors (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- select item errors (ADR 0041's SQ5b) ----
 
 # An overflow in an item over a real group, and one only over the empty value: the NULL i32 keys of rows 5 and 9 match
 # no row, and 0 - 1 + min overflows, which an item moved above the LEFT join back computes too.
-pending SQ5b
 statement error Overflow in addition of
 SELECT e.id, (SELECT MAX(e2.i64) + 1 FROM edge e2 WHERE e2.id = e.id) AS v FROM edge e ORDER BY 1
 
-pending SQ5b
 statement error Overflow in addition of
 SELECT e.id, (SELECT COUNT(*) - 1 + (-9223372036854775807 - 1) FROM edge e2 WHERE e2.i32 = e.i32) AS v FROM edge e
 ORDER BY 1
 
 # A value under an untaken CASE branch is computed for every outer row (D16): its cast fails for cities 4 to 6.
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT c.ct_id,
 CASE WHEN c.ct_id < 4 THEN (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) END AS v
@@ -1442,14 +1410,12 @@ FROM cities c ORDER BY 1
 
 # An aggregate that overflows for cities 1 to 3, over an outer side that turns out empty: no row in both engines.
 # antb1's answer depends on its plan: the reduction leaves the join back's aggregation no row to compute (D35).
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c
 WHERE c.ct_id IN (SELECT rd_city FROM riders WHERE rd_row < 0) ORDER BY 1
 ----
 SMALLINT	BIGINT
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c
 WHERE c.ct_id > 100 ORDER BY 1
@@ -1458,17 +1424,15 @@ SMALLINT	BIGINT
 
 # A bind error after an item whose subquery the unnesting refuses (a non-equality correlation): the unnesting runs
 # after all binding, so both engines report the bind error.
-pending SQ5b
 statement error nope
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city < c.ct_id) AS n FROM cities c ORDER BY nope
 
-# ---- pending: select items under LIMIT (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- select items under LIMIT (ADR 0041's SQ5b) ----
 
 # Without ORDER BY the LIMIT keeps two rows, and both engines compute the items only for those (DuckDB at one thread,
 # as the runner runs it), so the casts that would fail for later cities are never computed. Which rows a LIMIT without
 # ORDER BY keeps depends on the plan (the outer side's order through a LEFT join back, which keeps it; an INNER one
 # built on its left does not), hence rowsort. With ORDER BY every row's item is computed, and both engines fail.
-pending SQ5b
 query II rowsort
 SELECT c.ct_id, CAST((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) - 1 AS USMALLINT) FROM cities c LIMIT 2
 ----
@@ -1476,7 +1440,6 @@ SMALLINT	USMALLINT
 1	76
 2	76
 
-pending SQ5b
 query II rowsort
 SELECT c.ct_id, CAST((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) - 1 AS USMALLINT) FROM cities c
 WHERE c.ct_id <= 3 OR c.ct_id = 6 LIMIT 2
@@ -1487,7 +1450,6 @@ SMALLINT	USMALLINT
 
 # The item reads WHERE's value, whose INNER join back is built on its left, so the LIMIT may keep other cities than
 # DuckDB's: every city WHERE keeps casts, and every projected row is alike, so the answer is the same either way.
-pending SQ5b
 query II rowsort
 SELECT c.ct_id * 0 AS z, CAST((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) - 77 AS USMALLINT) * 0 AS v
 FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 LIMIT 2
@@ -1496,7 +1458,6 @@ SMALLINT	USMALLINT
 0	0
 0	0
 
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT c.ct_id, CAST((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) - 1 AS USMALLINT) FROM cities c
 ORDER BY c.ct_id LIMIT 2
@@ -1516,10 +1477,9 @@ NULL
 4
 5
 
-# ---- pending: SELECT DISTINCT items (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- SELECT DISTINCT items (ADR 0041's SQ5b) ----
 
 # The value as a DISTINCT item, alone, next to a column and under CASE.
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY 1
 ----
@@ -1528,7 +1488,6 @@ BIGINT
 77
 78
 
-pending SQ5b
 query II nosort
 SELECT DISTINCT c.ct_id % 2 AS p, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 ORDER BY 1, 2
@@ -1540,7 +1499,6 @@ SMALLINT	BIGINT
 1	77
 1	78
 
-pending SQ5b
 query T nosort
 SELECT DISTINCT
 CASE WHEN (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) IS NULL THEN 'none' ELSE 'some' END AS k
@@ -1550,11 +1508,10 @@ VARCHAR
 none
 some
 
-# ---- pending: ORDER BY (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- ORDER BY (ADR 0041's SQ5b) ----
 
 # The value as a sort key, alone, by the alias or position of an item that holds it, in an expression, with NULLS
 # FIRST, and under a LIMIT (the rows are fully ordered, so no tie stands at the limit).
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c ORDER BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) DESC, c.ct_id
 ----
@@ -1566,7 +1523,6 @@ SMALLINT
 5
 6
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c ORDER BY (SELECT COALESCE(SUM(r.rd_row), 0) FROM riders r WHERE r.rd_city = c.ct_id),
 c.ct_id DESC LIMIT 3
@@ -1576,7 +1532,6 @@ SMALLINT
 5
 4
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c WHERE c.ct_id > 0
 ORDER BY n, 1
@@ -1589,7 +1544,6 @@ SMALLINT	BIGINT
 2	77
 3	78
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS s FROM cities c ORDER BY 2 DESC, 1
 ----
@@ -1601,7 +1555,6 @@ SMALLINT	HUGEINT
 5	NULL
 6	NULL
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 ORDER BY (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) NULLS FIRST, c.ct_id
@@ -1614,7 +1567,6 @@ SMALLINT
 2
 3
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 ORDER BY c.ct_id % 2 - (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id), c.ct_id
@@ -1627,7 +1579,6 @@ SMALLINT
 6
 5
 
-pending SQ5b
 query I nosort
 SELECT r.rd_id FROM riders r ORDER BY (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id), r.rd_id LIMIT 5
 ----
@@ -1638,7 +1589,6 @@ BIGINT
 240
 46
 
-pending SQ5b
 query I nosort
 SELECT z.zn_id FROM zones z WHERE z.zn_id < 12
 ORDER BY CASE WHEN (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) > 1
@@ -1657,11 +1607,10 @@ INTEGER
 9
 10
 
-# ---- pending: GROUP BY keys (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- GROUP BY keys (ADR 0041's SQ5b) ----
 
 # The value as a key, written alike in the select list (by alias, position or the same text), next to a column key,
 # with HAVING over the groups' aggregates, and with the value in WHERE as well. Keys bind below the aggregation.
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c GROUP BY n ORDER BY n
 ----
@@ -1670,7 +1619,6 @@ BIGINT	BIGINT
 77	2
 78	1
 
-pending SQ5b
 query II nosort
 SELECT (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c GROUP BY 1
 ORDER BY 1 NULLS FIRST
@@ -1681,7 +1629,6 @@ NULL	3
 9260	1
 9411	1
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) % 2 AS k, COUNT(*) AS c FROM cities c
 GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) % 2 ORDER BY 1
@@ -1690,7 +1637,6 @@ BIGINT	BIGINT
 0	4
 1	2
 
-pending SQ5b
 query TII nosort
 SELECT CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 THEN 'y' ELSE 'n' END AS k, COUNT(*),
 SUM(c.ct_id) FROM cities c GROUP BY 1 ORDER BY 1
@@ -1699,7 +1645,6 @@ VARCHAR	BIGINT	HUGEINT
 n	3	15
 y	3	6
 
-pending SQ5b
 query III nosort
 SELECT c.ct_id % 2 AS p, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c
 GROUP BY 1, 2 ORDER BY 1, 2
@@ -1711,7 +1656,6 @@ SMALLINT	BIGINT	BIGINT
 1	77	1
 1	78	1
 
-pending SQ5b
 query IT nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, MIN(c.label) AS l FROM cities c GROUP BY 1
 HAVING COUNT(*) > 1 ORDER BY 1
@@ -1720,7 +1664,6 @@ BIGINT	VARCHAR
 0	airport
 77	center
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) AS n, COUNT(*) AS k FROM riders r GROUP BY 1 ORDER BY 1
 ----
@@ -1731,7 +1674,6 @@ BIGINT	BIGINT
 12	124
 13	62
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78 GROUP BY 1 ORDER BY 1
@@ -1740,7 +1682,6 @@ BIGINT	BIGINT
 0	3
 77	2
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) AS b, COUNT(*) AS k FROM zones z
 GROUP BY 1 ORDER BY COUNT(*) DESC, 1
@@ -1751,7 +1692,6 @@ BIGINT	BIGINT
 1	7
 
 # An inner ON's value in an expression read again as a key, and a key next to ROLLUP.
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) AS k, COUNT(*) AS n FROM cities a
 JOIN zones z ON z.zn_city = a.ct_id AND (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) + 0 > 0
@@ -1761,7 +1701,6 @@ BIGINT	BIGINT
 69	5
 70	33
 
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, c.ct_id % 2 AS p, COUNT(*) AS k FROM cities c
 GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id), ROLLUP (c.ct_id % 2) ORDER BY 1, 2 NULLS FIRST
@@ -1776,12 +1715,11 @@ BIGINT	SMALLINT	BIGINT
 78	NULL	1
 78	1	1
 
-# ---- pending: aggregate arguments with a column (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- aggregate arguments with a column (ADR 0041's SQ5b) ----
 
 # A value inside an aggregate's argument that also reads a column is computed per row, below the aggregation: in the
 # select list, in HAVING and in ORDER BY, global and grouped, and in an EXISTS block's dropped item, whose aggregate
 # is computed anyway.
-pending SQ5b
 query II nosort
 SELECT MAX(c.ct_id + (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)),
 MIN(c.ct_id + (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) FROM cities c
@@ -1789,7 +1727,6 @@ MIN(c.ct_id + (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) FROM ci
 BIGINT	BIGINT
 81	4
 
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
@@ -1797,14 +1734,12 @@ WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0
 HUGEINT
 465
 
-pending SQ5b
 query I nosort
 SELECT COUNT(DISTINCT c.ct_id % 2 + (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS n FROM cities c
 ----
 BIGINT
 5
 
-pending SQ5b
 query II nosort
 SELECT z.zn_city, SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) AS s FROM zones z
 GROUP BY z.zn_city HAVING SUM(z.zn_id + (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) > 300 ORDER BY 1
@@ -1816,7 +1751,6 @@ SMALLINT	HUGEINT
 4	9276
 5	12525
 
-pending SQ5b
 query I nosort
 SELECT z.zn_city FROM zones z GROUP BY z.zn_city
 ORDER BY SUM(z.zn_id + (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)), 1 NULLS FIRST
@@ -1830,7 +1764,6 @@ NULL
 2
 5
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE EXISTS (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) FROM zones z
@@ -1846,7 +1779,6 @@ SMALLINT
 
 # The same in an EXISTS block's dropped item inside an expression; and an aggregate argument's value read again by an
 # inner ON, an IN probe and a mark under OR, which stand below the aggregation.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE EXISTS (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) + 1 FROM zones z
@@ -1860,7 +1792,6 @@ SMALLINT
 5
 6
 
-pending SQ5b
 query I nosort
 SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 77
@@ -1868,7 +1799,6 @@ JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.r
 HUGEINT
 9828
 
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities)
@@ -1876,7 +1806,6 @@ WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FR
 HUGEINT
 231
 
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE c.ct_id = 5 OR (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities)
@@ -2008,11 +1937,10 @@ SMALLINT
 4
 5
 
-# ---- pending: in the select items of other query blocks (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- in the select items of other query blocks (ADR 0041's SQ5b) ----
 
 # A derived table's and a CTE's select item, read by a filter and a join; a UNION ALL arm; a correlated value in the
 # select item of a correlated scalar subquery, and the other way round.
-pending SQ5b
 query II nosort
 SELECT * FROM (SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c) x
 WHERE x.n = 0 ORDER BY 1
@@ -2022,7 +1950,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query III nosort
 WITH x AS (SELECT c.ct_id, (SELECT COALESCE(SUM(r.rd_row), 0) FROM riders r WHERE r.rd_city = c.ct_id) AS s
 FROM cities c) SELECT x.ct_id, x.s, z.zn_id FROM x JOIN zones z ON z.zn_city = x.ct_id WHERE z.zn_id < 6 ORDER BY 1, 3
@@ -2034,7 +1961,6 @@ SMALLINT	HUGEINT	INTEGER
 4	0	4
 5	0	5
 
-pending SQ5b
 query IIII nosort
 WITH x AS (SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c)
 SELECT a.ct_id, a.n, b.ct_id, b.n FROM x a JOIN x b ON b.ct_id = a.ct_id + 1 ORDER BY 1
@@ -2046,7 +1972,6 @@ SMALLINT	BIGINT	SMALLINT	BIGINT
 4	0	5	0
 5	0	6	0
 
-pending SQ5b
 query II nosort
 SELECT * FROM (SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 UNION ALL SELECT 0, 0 FROM cities WHERE ct_id = 1) u ORDER BY 1, 2
@@ -2060,7 +1985,6 @@ INTEGER	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
 AND (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) = 0) AS n FROM cities c ORDER BY 1
@@ -2073,7 +1997,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id
 AND ((SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) = 0 OR z.zn_id < 3)) AS n
@@ -2087,7 +2010,6 @@ SMALLINT	BIGINT
 5	3
 6	0
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE (SELECT MAX(z.zn_id + (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) FROM zones z
@@ -2124,10 +2046,9 @@ INTEGER
 5
 8
 
-# ---- pending: NULL keys and NULL-equal keys in items and keys (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- NULL keys and NULL-equal keys in items and keys (ADR 0041's SQ5b) ----
 
 # The same as select items and as a GROUP BY key.
-pending SQ5b
 query II nosort
 SELECT e.id, (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 = e.i32) AS n FROM edge e ORDER BY 1
 ----
@@ -2145,7 +2066,6 @@ INTEGER	BIGINT
 10	1
 11	1
 
-pending SQ5b
 query II nosort
 SELECT e.id, (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 IS NOT DISTINCT FROM e.i32) AS n FROM edge e ORDER BY 1
 ----
@@ -2163,7 +2083,6 @@ INTEGER	BIGINT
 10	1
 11	1
 
-pending SQ5b
 query II nosort
 SELECT e.id, (SELECT SUM(e2.id) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16) AS s FROM edge e ORDER BY 1
 ----
@@ -2181,7 +2100,6 @@ INTEGER	HUGEINT
 10	10
 11	11
 
-pending SQ5b
 query II nosort
 SELECT r.rd_city, (SELECT COUNT(*) FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city) AS n FROM riders r
 WHERE r.rd_row < 3 OR r.rd_city IS NULL ORDER BY r.rd_row
@@ -2199,7 +2117,6 @@ NULL	8
 NULL	8
 NULL	8
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16) AS n, COUNT(*) AS k FROM edge e GROUP BY 1
 ORDER BY 1
@@ -2218,11 +2135,10 @@ WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day
 BIGINT
 62
 
-# ---- pending: several keys in items, keys and arguments (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- several keys in items, keys and arguments (ADR 0041's SQ5b) ----
 
 # Trips by driver and day for each shift (a shift with no trip that day counts 0) as an item, a key and an aggregate
 # argument; keys from both inputs of a join; edge's keys with one NULL-equal.
-pending SQ5b
 query II nosort
 SELECT s.sh_row, (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day = s.sh_day) AS n
 FROM shifts s WHERE s.sh_row < 10 ORDER BY 1
@@ -2239,7 +2155,6 @@ INTEGER	BIGINT
 8	1
 9	1
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day = s.sh_day) AS n, COUNT(*) AS k
 FROM shifts s GROUP BY 1 ORDER BY 1
@@ -2248,7 +2163,6 @@ BIGINT	BIGINT
 0	53
 1	447
 
-pending SQ5b
 query D nosort
 SELECT SUM(s.sh_hours * (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_day = s.sh_day)) AS h
 FROM shifts s
@@ -2256,7 +2170,6 @@ FROM shifts s
 DECIMAL(38,1)
 3394.8
 
-pending SQ5b
 query III nosort
 SELECT s.sh_row, z.zn_id, (SELECT COUNT(*) FROM trips t WHERE t.tr_driver = s.sh_driver AND t.tr_pickup = z.zn_id) AS n
 FROM shifts s JOIN zones z ON z.zn_id = s.sh_row % 40 + 1 WHERE s.sh_row < 8 ORDER BY 1
@@ -2271,7 +2184,6 @@ INTEGER	INTEGER	BIGINT
 6	7	0
 7	8	1
 
-pending SQ5b
 query II nosort
 SELECT e.id, (SELECT COUNT(*) FROM edge e2 WHERE e2.i16 IS NOT DISTINCT FROM e.i16 AND e2.i64 = e.i64) AS n FROM edge e
 ORDER BY 1
@@ -2311,10 +2223,9 @@ SELECT COUNT(*) FROM zones z WHERE NOT ((SELECT SUM(p.pm_id) FROM promos p WHERE
 BIGINT
 40
 
-# ---- pending: an empty inner table in items and keys (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- an empty inner table in items and keys (ADR 0041's SQ5b) ----
 
 # The same as select items, in COALESCE beside a column, and as a GROUP BY key.
-pending SQ5b
 query IID nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM promos p WHERE p.pm_id = c.ct_row) AS n,
 (SELECT MAX(p.pm_discount) FROM promos p WHERE p.pm_id = c.ct_row) AS m FROM cities c ORDER BY 1
@@ -2327,7 +2238,6 @@ SMALLINT	BIGINT	DECIMAL(4,2)
 5	0	NULL
 6	0	NULL
 
-pending SQ5b
 query ID nosort
 SELECT c.ct_id, COALESCE((SELECT SUM(p.pm_discount) FROM promos p WHERE p.pm_id = c.ct_row), 0) + c.ct_id AS v
 FROM cities c ORDER BY 1
@@ -2340,7 +2250,6 @@ SMALLINT	DECIMAL(38,2)
 5	5.00
 6	6.00
 
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM promos p WHERE p.pm_id = z.zn_id) AS n, COUNT(*) AS k FROM zones z GROUP BY 1 ORDER BY 1
 ----
@@ -2358,11 +2267,10 @@ SMALLINT	INTEGER
 1	1
 6	NULL
 
-# ---- pending: outer joins with padded keys, in items (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- outer joins with padded keys, in items (ADR 0041's SQ5b) ----
 
 # The same with keys from the padded and the preserved side, in select items, COALESCE, a GROUP BY key and an
 # aggregate argument, and over a FULL JOIN.
-pending SQ5b
 query III nosort
 SELECT c.ct_id, z.zn_id, (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) AS n FROM cities c
 LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 7 ORDER BY 1, 2
@@ -2376,7 +2284,6 @@ SMALLINT	INTEGER	BIGINT
 5	5	70
 6	NULL	0
 
-pending SQ5b
 query III nosort
 SELECT c.ct_id, z.zn_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 7 ORDER BY 1, 2
@@ -2390,7 +2297,6 @@ SMALLINT	INTEGER	BIGINT
 5	5	0
 6	NULL	0
 
-pending SQ5b
 query IID nosort
 SELECT c.ct_id, z.zn_id, COALESCE((SELECT SUM(t.tr_fare) FROM trips t WHERE t.tr_pickup = z.zn_id), -1) AS f
 FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 7 ORDER BY 1, 2
@@ -2404,7 +2310,6 @@ SMALLINT	INTEGER	DECIMAL(38,2)
 5	5	1031.50
 6	NULL	-1.00
 
-pending SQ5b
 query II nosort
 SELECT CASE WHEN (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) > 0 THEN 1 ELSE 0 END AS k, COUNT(*) AS n
 FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 7 GROUP BY 1 ORDER BY 1
@@ -2413,7 +2318,6 @@ INTEGER	BIGINT
 0	1
 1	6
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, SUM(c.ct_id + (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) AS s FROM cities c
 LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id < 7 GROUP BY c.ct_id ORDER BY 1
@@ -2426,7 +2330,6 @@ SMALLINT	HUGEINT
 5	75
 6	6
 
-pending SQ5b
 query IIII nosort
 SELECT c.ct_id, z.zn_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) AS n,
 (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) AS m FROM cities c
@@ -2480,11 +2383,10 @@ INTEGER	SMALLINT	INTEGER	SMALLINT
 0	1	2	3
 1	2	2	3
 
-# ---- pending: an aggregate item's value read again later (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- an aggregate item's value read again later (ADR 0041's SQ5b) ----
 
 # A bare aggregate item binds with the select list, before WHERE, ON and GROUP BY, so its value waits in the tail and a
 # later reader of the same value must move it below itself. DuckDB: (0, 0), (77, 231), (78, 234). LEFT join back.
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n,
 SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c GROUP BY 1 ORDER BY 1
@@ -2495,7 +2397,6 @@ BIGINT	HUGEINT
 78	234
 
 # Read again by WHERE inside arithmetic (0 + 0 < 78 keeps the empty value: LEFT). DuckDB: 231.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 < 78
@@ -2504,7 +2405,6 @@ HUGEINT
 231
 
 # Read again by WHERE under NOT. DuckDB: 234.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE NOT ((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78)
@@ -2514,7 +2414,6 @@ HUGEINT
 
 # Read again by an inner ON inside arithmetic (the general path; the direct operand is in correlated_values.slt).
 # DuckDB: 9828.
-pending SQ5b
 query I nosort
 SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2 > 154
@@ -2523,7 +2422,6 @@ HUGEINT
 9828
 
 # Read again as a NOT IN probe (a null-aware anti join). DuckDB: 234.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) NOT IN (SELECT 77 FROM cities)
@@ -2532,7 +2430,6 @@ HUGEINT
 234
 
 # Read again by WHERE and by a GROUP BY key, three readers of one value. DuckDB: (0, 15, 3), (77, 157, 2).
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n,
 SUM(c.ct_id + (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s, COUNT(*) AS k FROM cities c
@@ -2544,7 +2441,6 @@ BIGINT	HUGEINT	BIGINT
 
 # A mark inside the aggregate argument whose probe is the value, then the same mark under OR in WHERE: both the value
 # and the mark move, the value first. DuckDB: 3.
-pending SQ5b
 query I nosort
 SELECT SUM(CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities)
 THEN c.ct_id ELSE 0 END) AS s FROM cities c
@@ -2555,7 +2451,6 @@ HUGEINT
 
 # Read again by an ORDER BY aggregate's argument of a grouped block. DuckDB: 9 2691, NULL 2622, 4 9276, 3 8820,
 # 5 12525, 2 10883, 1 10324.
-pending SQ5b
 query II nosort
 SELECT z.zn_city, SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) AS s FROM zones z
 GROUP BY z.zn_city ORDER BY SUM((SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) - z.zn_id), 1 NULLS FIRST
@@ -2571,7 +2466,6 @@ NULL	2622
 
 # Read again by the ON of the second comma group, which resolves names in its own group first but reads the same
 # d.ct_id: one value. DuckDB: 147.
-pending SQ5b
 query I nosort
 SELECT SUM(r2.rd_row * (SELECT COUNT(*) FROM zones z WHERE z.zn_city = d.ct_id)) AS s
 FROM riders r1 JOIN cities b ON r1.rd_city = b.ct_id,
@@ -2581,10 +2475,9 @@ WHERE r1.rd_row < 3 AND r2.rd_row < 6
 HUGEINT
 147
 
-# ---- pending: one value as an item and in ORDER BY (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- one value as an item and in ORDER BY (ADR 0041's SQ5b) ----
 
 # ORDER BY the item's text, and an expression over it: one join. DuckDB: 3 78, 1 77, 2 77, 4 0, 5 0, 6 0.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 ORDER BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) DESC, 1
@@ -2598,7 +2491,6 @@ SMALLINT	BIGINT
 6	0
 
 # DuckDB: 3 156, 1 154, 2 154, 4 0, 5 0, 6 0.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2 AS d FROM cities c
 ORDER BY 100 - (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id), c.ct_id
@@ -2612,7 +2504,6 @@ SMALLINT	BIGINT
 6	0
 
 # SELECT DISTINCT ordered by its item's text. DuckDB: 78, 77, 0.
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 ORDER BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) DESC
@@ -2623,7 +2514,6 @@ BIGINT
 0
 
 # A mark in ORDER BY whose probe is the value. DuckDB: 2, 1, 6, 5, 4, 3.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 ORDER BY CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) THEN 0
@@ -2639,7 +2529,6 @@ SMALLINT
 
 # A select item's mark whose probe is the value: both wait in the tail, the value below the mark. DuckDB: 1 in, 2 in,
 # 3 to 6 out.
-pending SQ5b
 query IT nosort
 SELECT c.ct_id, CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities)
 THEN 'in' ELSE 'out' END AS k FROM cities c ORDER BY 1
@@ -2652,11 +2541,10 @@ SMALLINT	VARCHAR
 5	out
 6	out
 
-# ---- pending: GROUP BY keys read by ORDER BY, HAVING and items (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- GROUP BY keys read by ORDER BY, HAVING and items (ADR 0041's SQ5b) ----
 
 # ORDER BY the key's text, which the select list does not hold: it matches the key, as a select item does.
 # DuckDB: 1, 2, 3.
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 ORDER BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) DESC
@@ -2667,7 +2555,6 @@ BIGINT
 3
 
 # Items that are expressions over the key. DuckDB: (1, 0, 3), (78, 154, 2), (79, 156, 1).
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 1 AS n1,
 (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2 AS n2, COUNT(*) AS k FROM cities c
@@ -2680,7 +2567,6 @@ BIGINT	BIGINT	BIGINT
 
 # Two keys of two subqueries, written in the select list in the other order. DuckDB: (0, 0, 2), (22, 0, 1),
 # (22, 77, 1), (22, 78, 1), (23, 77, 1).
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) AS m,
 (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c
@@ -2695,7 +2581,6 @@ BIGINT	BIGINT	BIGINT
 23	77	1
 
 # One key over two subqueries; the item matches it whole. DuckDB: (-22, 1), (0, 2), (54, 1), (55, 1), (56, 1).
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 - (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) AS d, COUNT(*) AS k FROM cities c
@@ -2710,7 +2595,6 @@ BIGINT	BIGINT
 56	1
 
 # HAVING by the alias of a key that holds the value reads the key, not a correlated value. DuckDB: (77, 2), (78, 1).
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c GROUP BY 1
 HAVING n > 0 ORDER BY 1
@@ -2721,7 +2605,6 @@ BIGINT	BIGINT
 
 # HAVING over the key's text inside an expression and under OR: BindOutput matches the key, as for ORDER BY above
 # (a direct comparison, HAVING (q) > 0, binds its subquery at group level instead: extra.slt). DuckDB: 1, 2; then 1, 3.
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 > 0 ORDER BY 1
@@ -2730,7 +2613,6 @@ BIGINT
 1
 2
 
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) = 0 OR COUNT(*) = 1 ORDER BY 1
@@ -2741,7 +2623,6 @@ BIGINT
 
 # ORDER BY expressions over the alias of a key and of an aggregate over the value, which DuckDB answers (unlike a
 # plain item's alias, divergence D37). DuckDB: (78, 1), (77, 2), (0, 3); then (1, 311), (0, 154).
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c GROUP BY 1
 ORDER BY 100 - n
@@ -2751,7 +2632,6 @@ BIGINT	BIGINT
 77	2
 0	3
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id % 2 AS p, SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 GROUP BY 1 ORDER BY 0 - s
@@ -2761,7 +2641,6 @@ SMALLINT	HUGEINT
 0	154
 
 # A CASE over the key and an aggregate. DuckDB: (0, -1), (77, 3), (78, 3).
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n,
 CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 THEN SUM(c.ct_id) ELSE -1 END AS s
@@ -2773,7 +2652,6 @@ BIGINT	HUGEINT
 78	3
 
 # A mark as the key, its probe the value. DuckDB: (0, 4), (1, 2).
-pending SQ5b
 query II nosort
 SELECT CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) THEN 1 ELSE 0 END
 AS k, COUNT(*) AS n FROM cities c GROUP BY 1 ORDER BY 1
@@ -2783,7 +2661,6 @@ INTEGER	BIGINT
 1	2
 
 # A VARCHAR key, NULL over no rows. DuckDB: (NULL, 3), (gold, 1), (plus, 2).
-pending SQ5b
 query TI nosort
 SELECT (SELECT MAX(r.rd_tier) FROM riders r WHERE r.rd_city = c.ct_id) AS t, COUNT(*) AS k FROM cities c GROUP BY 1
 ORDER BY 1 NULLS FIRST
@@ -2795,7 +2672,6 @@ plus	2
 
 # The alias of a value item inside ROLLUP and CUBE (a plain key there, which sql-subset.md admits for an uncorrelated
 # value). DuckDB: (NULL, 6), (0, 3), (77, 2), (78, 1); then 11 rows, the grand total (NULL, NULL, 6) first.
-pending SQ5b
 query II nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c GROUP BY ROLLUP (n)
 ORDER BY 1 NULLS FIRST
@@ -2806,7 +2682,6 @@ NULL	6
 77	2
 78	1
 
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, c.ct_id % 2 AS p, COUNT(*) AS k FROM cities c
 GROUP BY CUBE (n, p) ORDER BY 1 NULLS FIRST, 2 NULLS FIRST
@@ -2824,11 +2699,10 @@ NULL	1	3
 78	NULL	1
 78	1	1
 
-# ---- pending: aggregate arguments over values NULL over no rows (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- aggregate arguments over values NULL over no rows (ADR 0041's SQ5b) ----
 
 # COUNT, SUM and AVG of arguments over SUM, MAX and MIN values: cities 4 to 6 add NULL. DuckDB: 3, 720,
 # 2.6666666666666665.
-pending SQ5b
 query IIR nosort
 SELECT COUNT(c.ct_id + (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id)) AS n,
 SUM(c.ct_id + (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id)) AS s,
@@ -2838,7 +2712,6 @@ BIGINT	HUGEINT	DOUBLE
 3	720	2.6666666666666665
 
 # A CASE over the value in the argument. DuckDB: -9.
-pending SQ5b
 query I nosort
 SELECT SUM(CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 THEN c.ct_id ELSE -c.ct_id END) AS s
 FROM cities c
@@ -2847,7 +2720,6 @@ HUGEINT
 -9
 
 # A global block's ORDER BY aggregate over the value: dropped, its join left in the slot unread. DuckDB: 21.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id) AS s FROM cities c ORDER BY SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id))
 ----
@@ -2856,7 +2728,6 @@ HUGEINT
 
 # An uncorrelated EXISTS block's dropped aggregate whose argument holds the value its WHERE also holds: computed (D32),
 # and read again by that WHERE. DuckDB: 1 to 6.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE EXISTS (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) FROM zones z
@@ -2870,10 +2741,9 @@ SMALLINT
 5
 6
 
-# ---- pending: values in derived tables, CTEs and other blocks (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- values in derived tables, CTEs and other blocks (ADR 0041's SQ5b) ----
 
 # A derived SUM value read by IS NULL outside: the walk stops at the derived block, so LEFT. DuckDB: 4, 5, 6.
-pending SQ5b
 query I nosort
 SELECT x.ct_id FROM (SELECT c.ct_id, (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS s
 FROM cities c) x WHERE x.s IS NULL ORDER BY 1
@@ -2885,7 +2755,6 @@ SMALLINT
 
 # Aggregates of the outer block over a derived COUNT value, read through COALESCE over the LEFT join back, which no
 # aggregate placement may cross (#363). DuckDB: 0, 78, 232, 6, 6.
-pending SQ5b
 query IIIII nosort
 SELECT MIN(x.n), MAX(x.n), SUM(x.n), COUNT(x.n), COUNT(*)
 FROM (SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c) x
@@ -2894,7 +2763,6 @@ BIGINT	BIGINT	HUGEINT	BIGINT	BIGINT
 0	78	232	6	6
 
 # The outer block groups by a derived SUM value. DuckDB: (-1, 3), (9093, 1), (9260, 1), (9411, 1).
-pending SQ5b
 query II nosort
 SELECT COALESCE(x.s, -1) AS s, COUNT(*) AS k
 FROM (SELECT c.ct_id, (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS s FROM cities c) x
@@ -2907,7 +2775,6 @@ HUGEINT	BIGINT
 9411	1
 
 # The outer block joins on a derived value (BIGINT against INTEGER). DuckDB: (1, 8), (2, 8), (3, 7), (4, 7), (5, 8).
-pending SQ5b
 query II nosort
 SELECT x.ct_id, z.zn_id
 FROM (SELECT c.ct_id, (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) AS n FROM cities c) x
@@ -2922,7 +2789,6 @@ SMALLINT	INTEGER
 
 # A LEFT JOIN to a derived table that holds a COUNT value: the padded city 6 reads NULL, not 0. DuckDB: (1, 1, 2),
 # (1, 6, 2), (2, 2, 2), (3, 3, 2), (4, 4, 2), (5, 5, 1), (6, NULL, NULL).
-pending SQ5b
 query III nosort
 SELECT c.ct_id, x.zn_id, x.n FROM cities c LEFT JOIN (SELECT z.zn_city, z.zn_id,
 (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) AS n FROM zones z) x
@@ -2938,7 +2804,6 @@ SMALLINT	INTEGER	BIGINT
 6	NULL	NULL
 
 # A CTE's value read by a filter and an aggregate outside. DuckDB: 3, 27764.
-pending SQ5b
 query II nosort
 WITH x AS (SELECT c.ct_id, (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) AS s FROM cities c)
 SELECT COUNT(*), SUM(x.s) FROM x WHERE x.s IS NOT NULL
@@ -2947,7 +2812,6 @@ BIGINT	HUGEINT
 3	27764
 
 # A CTE's value read by an IN subquery's WHERE. DuckDB: the 15 zones of cities 4 and 5 (4, 5, 9, ..., 40).
-pending SQ5b
 query I nosort
 WITH x AS (SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c)
 SELECT z.zn_id FROM zones z WHERE z.zn_city IN (SELECT x.ct_id FROM x WHERE x.n = 0) ORDER BY 1
@@ -2970,7 +2834,6 @@ INTEGER
 40
 
 # A derived table's key read by an outer filter. DuckDB: (77, 2), (78, 1).
-pending SQ5b
 query II nosort
 SELECT * FROM (SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n, COUNT(*) AS k FROM cities c
 GROUP BY 1) x WHERE x.n > 0 ORDER BY 1
@@ -2980,7 +2843,6 @@ BIGINT	BIGINT
 78	1
 
 # A derived table's ORDER BY over the value, under its LIMIT. DuckDB: 1, 3.
-pending SQ5b
 query I nosort
 SELECT x.ct_id FROM (SELECT c.ct_id FROM cities c
 ORDER BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) DESC, c.ct_id LIMIT 2) x ORDER BY 1
@@ -2991,7 +2853,6 @@ SMALLINT
 
 # The item of an IN set, and of a mark's set under OR (the IN block itself is uncorrelated). DuckDB: 2, 3; then
 # 2, 3, 6.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id + 20 IN (SELECT (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = z.zn_city) FROM zones z) ORDER BY 1
@@ -3000,7 +2861,6 @@ SMALLINT
 2
 3
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id = 6 OR c.ct_id + 20 IN (SELECT (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = z.zn_city) FROM zones z)
@@ -3012,7 +2872,6 @@ SMALLINT
 6
 
 # The aggregate argument of an uncorrelated scalar subquery's block. DuckDB: (1, 210), (2, 210).
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) FROM zones z
 WHERE z.zn_id < 3) AS s FROM cities c WHERE c.ct_id < 3 ORDER BY 1
@@ -3022,7 +2881,6 @@ SMALLINT	HUGEINT
 2	210
 
 # An EXCEPT arm's item. DuckDB: 77, 78.
-pending SQ5b
 query I nosort
 SELECT * FROM (SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 EXCEPT SELECT 0 FROM cities WHERE ct_id = 1) x ORDER BY 1
@@ -3033,7 +2891,6 @@ BIGINT
 
 # A correlated EXISTS block's ORDER BY, by the value's text and by the alias of an item that holds it: the sort goes,
 # the value's join stays in the block. DuckDB: 1 to 5, both.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id
 ORDER BY (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) ORDER BY 1
@@ -3045,7 +2902,6 @@ SMALLINT
 4
 5
 
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) AS n
 FROM zones z WHERE z.zn_city = c.ct_id ORDER BY n) ORDER BY 1
@@ -3058,7 +2914,6 @@ SMALLINT
 5
 
 # The same item also in the EXISTS block's WHERE, which binds first: the item reads WHERE's value. DuckDB: 1, 2, 4, 5.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) AS n
 FROM zones z WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) < 70 ORDER BY n)
@@ -3072,7 +2927,6 @@ SMALLINT
 
 # The outer side a derived table, and a UNION ALL. DuckDB: (3, 78), (4, 0), (5, 0), (6, 0); then (1, 77), (2, 77),
 # (5, 0), (6, 0).
-pending SQ5b
 query II nosort
 SELECT x.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = x.ct_id) AS n
 FROM (SELECT ct_id FROM cities WHERE ct_id > 2) x ORDER BY 1
@@ -3083,7 +2937,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT u.k, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = u.k) AS n
 FROM (SELECT ct_id AS k FROM cities WHERE ct_id > 4 UNION ALL SELECT zn_city FROM zones WHERE zn_id < 3) u ORDER BY 1
@@ -3096,7 +2949,6 @@ SMALLINT	BIGINT
 
 # The subquery over a join, a derived table and a UNION ALL (the semi-join reduction restricts its groups).
 # DuckDB: 915, 914, 915, 0, 0, 0; then 1641, 1604, 1579, NULL x3; then 100, 99, 100, 22, 0, 0.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r JOIN trips t ON t.tr_rider = r.rd_id WHERE r.rd_city = c.ct_id) AS n
 FROM cities c ORDER BY 1
@@ -3109,7 +2961,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT SUM(x.rd_row) FROM (SELECT rd_city, rd_row FROM riders WHERE rd_row < 100) x
 WHERE x.rd_city = c.ct_id) AS s FROM cities c ORDER BY 1
@@ -3122,7 +2973,6 @@ SMALLINT	HUGEINT
 5	NULL
 6	NULL
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM (SELECT rd_city AS k FROM riders UNION ALL SELECT dv_city FROM drivers) u
 WHERE u.k = c.ct_id) AS n FROM cities c ORDER BY 1
@@ -3135,10 +2985,9 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-# ---- pending: values beside other correlated subqueries (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- values beside other correlated subqueries (ADR 0041's SQ5b) ----
 
 # An item's value above another value's INNER join back in WHERE (a stack of two). DuckDB: (1, 77), (2, 77), (5, 0).
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id) > 7 ORDER BY 1
@@ -3149,7 +2998,6 @@ SMALLINT	BIGINT
 5	0
 
 # Above a correlated EXISTS and NOT EXISTS conjunct. DuckDB: 1 77, 2 77, 3 78, 4 0, 5 0; then 6 0.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
@@ -3161,7 +3009,6 @@ SMALLINT	BIGINT
 4	0
 5	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id) ORDER BY 1
@@ -3171,7 +3018,6 @@ SMALLINT	BIGINT
 
 # Two values in one item, and one value three times in a CASE (one join). DuckDB: 54, 55, 56, -22, 0, 0; then 77, 77,
 # 156, 0, 0, 0.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 - (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) AS d FROM cities c ORDER BY 1
@@ -3184,7 +3030,6 @@ SMALLINT	BIGINT
 5	0
 6	0
 
-pending SQ5b
 query II nosort
 SELECT c.ct_id, CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 77
 THEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2
@@ -3200,7 +3045,6 @@ SMALLINT	BIGINT
 
 # Two comma items, each with its own value, and one value keyed on both of them. DuckDB: (1, 77, 2, 77),
 # (2, 77, 3, 78), (3, 78, 4, 0), (4, 0, 5, 0), (5, 0, 6, 0); then (1, 1, 77), (1, 2, 0), (2, 1, 0), (2, 2, 77).
-pending SQ5b
 query IIII nosort
 SELECT b.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = b.ct_id) AS nb, d.ct_id AS dct,
 (SELECT COUNT(*) FROM riders r WHERE r.rd_city = d.ct_id) AS nd FROM cities b, cities d WHERE b.ct_id + 1 = d.ct_id
@@ -3213,7 +3057,6 @@ SMALLINT	BIGINT	SMALLINT	BIGINT
 4	0	5	0
 5	0	6	0
 
-pending SQ5b
 query III nosort
 SELECT a.ct_id, b.ct_id AS bct, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = a.ct_id AND r.rd_city = b.ct_id) AS n
 FROM cities a, cities b WHERE a.ct_id < 3 AND b.ct_id < 3 ORDER BY 1, 2
@@ -3224,10 +3067,9 @@ SMALLINT	SMALLINT	BIGINT
 2	1	0
 2	2	77
 
-# ---- pending: DISTINCT, LIMIT and OFFSET over values (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- DISTINCT, LIMIT and OFFSET over values (ADR 0041's SQ5b) ----
 
 # A DISTINCT item that WHERE reads too (INNER). DuckDB: 77, 78.
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
@@ -3238,7 +3080,6 @@ BIGINT
 
 # LIMIT and OFFSET without ORDER BY over rows whose answers are all alike, so whichever rows a plan keeps the result
 # is the same. DuckDB: 0, 0; then 4, 4; then 0.
-pending SQ5b
 query I rowsort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c WHERE c.ct_id > 3 LIMIT 2 OFFSET 1
 ----
@@ -3246,7 +3087,6 @@ BIGINT
 0
 0
 
-pending SQ5b
 query II nosort
 SELECT COUNT(*), COUNT(x.n) FROM (SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c
 LIMIT 4 OFFSET 1) x
@@ -3254,27 +3094,13 @@ LIMIT 4 OFFSET 1) x
 BIGINT	BIGINT
 4	4
 
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c WHERE c.ct_id > 3 LIMIT 1
 ----
 BIGINT
 0
 
-# The same over an INNER join back, whose rows come out in its aggregation's order in antb1 (cities 3, 1, 2) and in
-# the outer order in DuckDB at one thread; every row WHERE keeps casts, and all projected rows are alike, so the
-# answer does not depend on which two rows a plan keeps (it replaces correlated_values.slt:1489). DuckDB: (0, 0) twice.
-pending SQ5b
-query II rowsort
-SELECT c.ct_id * 0 AS z, CAST((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) - 77 AS USMALLINT) * 0 AS v
-FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 LIMIT 2
-----
-SMALLINT	USMALLINT
-0	0
-0	0
-
 # ORDER BY the value with OFFSET. DuckDB: (6, 0), (1, 77).
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY 2, 1
 LIMIT 2 OFFSET 2
@@ -3283,11 +3109,10 @@ SMALLINT	BIGINT
 6	0
 1	77
 
-# ---- pending: NULL and NULL-equal keys, an empty inner table (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- NULL and NULL-equal keys, an empty inner table (ADR 0041's SQ5b) ----
 
 # ORDER BY a NULL-equal value: the NULL i32 rows 5 and 9 read the NULL group (2). DuckDB: 5, 9, 0, 1, 2, 3, 4, 6, 7, 8,
 # 10, 11.
-pending SQ5b
 query I nosort
 SELECT e.id FROM edge e ORDER BY (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 IS NOT DISTINCT FROM e.i32) DESC, e.id
 ----
@@ -3306,7 +3131,6 @@ INTEGER
 11
 
 # Aggregate arguments over = and IS NOT DISTINCT FROM keys. DuckDB: 52, 80.
-pending SQ5b
 query II nosort
 SELECT SUM(e.id * (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 = e.i32)) AS a,
 SUM(e.id * (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 IS NOT DISTINCT FROM e.i32)) AS b FROM edge e
@@ -3315,7 +3139,6 @@ HUGEINT	HUGEINT
 52	80
 
 # DISTINCT over a value whose NULL keys match nothing. DuckDB: 0, 1.
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM edge e2 WHERE e2.i32 = e.i32) AS n FROM edge e ORDER BY 1
 ----
@@ -3325,7 +3148,6 @@ BIGINT
 
 # promos has no row: ORDER BY, aggregate arguments and DISTINCT over its values. DuckDB: 6, 5, 4, 3, 2, 1; then
 # (21, 0); then 0.
-pending SQ5b
 query I nosort
 SELECT c.ct_id FROM cities c
 ORDER BY (SELECT MAX(p.pm_id) FROM promos p WHERE p.pm_id = c.ct_row) NULLS FIRST, c.ct_id DESC
@@ -3338,7 +3160,6 @@ SMALLINT
 2
 1
 
-pending SQ5b
 query II nosort
 SELECT SUM(c.ct_id + (SELECT COUNT(*) FROM promos p WHERE p.pm_id = c.ct_row)) AS s,
 COUNT(c.ct_id + (SELECT MAX(p.pm_id) FROM promos p WHERE p.pm_id = c.ct_row)) AS n FROM cities c
@@ -3346,7 +3167,6 @@ COUNT(c.ct_id + (SELECT MAX(p.pm_id) FROM promos p WHERE p.pm_id = c.ct_row)) AS
 HUGEINT	BIGINT
 21	0
 
-pending SQ5b
 query I nosort
 SELECT DISTINCT (SELECT COUNT(*) FROM promos p WHERE p.pm_id = z.zn_id) AS n FROM zones z
 ----
@@ -3355,58 +3175,50 @@ BIGINT
 
 # An item whose value WHERE rejects for every row: the INNER join back over an aggregation with no group. DuckDB: no
 # row.
-pending SQ5b
 query II nosort
 SELECT c.ct_id, (SELECT COUNT(*) FROM promos p WHERE p.pm_id = c.ct_row) AS n FROM cities c
 WHERE (SELECT COUNT(*) FROM promos p WHERE p.pm_id = c.ct_row) > 0 ORDER BY 1
 ----
 SMALLINT	BIGINT
 
-# ---- pending: errors of values in the new places (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- errors of values in the new places (ADR 0041's SQ5b) ----
 
 # A cast that fails only over the empty value, which the LEFT join back computes for cities 4 to 6: in ORDER BY, a
 # GROUP BY key, an aggregate argument and a DISTINCT item. DuckDB: the conversion error, all four.
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT c.ct_id FROM cities c
 ORDER BY (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id), 1
 
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) AS v, COUNT(*) FROM cities c
 GROUP BY 1
 
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) FROM cities c
 
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT DISTINCT (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) AS v FROM cities c
 
 # The same aggregate argument read again by WHERE's > 0: the proof folds no constant, so the join back stays LEFT and
 # the cast fails for cities 4 to 6, as in DuckDB (a later proof that folds it would make this a D24 member).
 # DuckDB: the conversion error.
-pending SQ5b
 statement error out of range for the destination type UINT16
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) FROM cities c
 WHERE (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) > 0
 
 # A dropped ORDER BY aggregate of a global block, and a correlated EXISTS block's ORDER BY: their values' joins stay,
 # so an overflowing aggregate fails (D32). DuckDB: Overflow in addition of INT64, both.
-pending SQ5b
 statement error Overflow in addition of
 SELECT SUM(c.ct_id) AS s FROM cities c
 ORDER BY MAX(c.ct_id + (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = c.ct_id))
 
-pending SQ5b
 statement error Overflow in addition of
 SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id
 ORDER BY (SELECT MAX(t.tr_rider + 9223372036854775807) FROM trips t WHERE t.tr_pickup = z.zn_id)) ORDER BY 1
 
 # The failing cast of an item over the empty value next to an IN that turns out empty: no outer row reaches the
-# item, whatever the plan (no reduction has to empty anything, unlike correlated_values.slt:1446). DuckDB: no row.
-pending SQ5b
+# item, whatever the plan (no reduction has to empty anything, unlike the empty IN among the select item errors).
+# DuckDB: no row.
 query II nosort
 SELECT c.ct_id, (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) AS v FROM cities c
 WHERE c.ct_id IN (SELECT pm_id FROM promos) ORDER BY 1
@@ -3415,16 +3227,14 @@ SMALLINT	USMALLINT
 
 # A bind error in WHERE after an aggregate item that holds a correlated value: the item binds first, and both engines
 # then report WHERE's bind error.
-pending SQ5b
 statement error nope
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c WHERE nope > 0
 
-# ---- pending: the tail and its promotion (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- the tail and its promotion (ADR 0041's SQ5b) ----
 
 # A bare aggregate item's value waits in the tail, above WHERE's filters: the subquery's item, a cast that fails over no
 # rows, is computed only for the cities WHERE keeps (MAX over no rows is NULL, so cities 4 to 6 go). Planted below
 # WHERE's filter, it would fail.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) AS s
 FROM cities c
@@ -3435,7 +3245,6 @@ HUGEINT
 
 # The same value in two aggregate items: the second binding is a memo hit while the select list binds, which must not
 # move the value out of the tail.
-pending SQ5b
 query II nosort
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) AS s,
 MAX(c.ct_id + (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) AS m FROM cities c
@@ -3445,7 +3254,6 @@ HUGEINT	BIGINT
 459	80
 
 # The value inside an OR branch that factoring drops, a dry run: it must not move the value out of the tail either.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) AS s
 FROM cities c
@@ -3456,7 +3264,6 @@ HUGEINT
 459
 
 # Three values wait in the tail; WHERE reads the middle one, and only that one moves below WHERE's filter.
-pending SQ5b
 query III nosort
 SELECT SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS a,
 SUM(c.ct_id * (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id)) AS b,
@@ -3467,7 +3274,6 @@ HUGEINT	HUGEINT	HUGEINT
 465	221	73
 
 # A SUM the rewrite binds twice (RewritableSum), over a tail value, with a value filter in WHERE.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id + (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) + 1) AS s
 FROM cities c WHERE (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) + 0 > 0
@@ -3477,7 +3283,6 @@ HUGEINT
 
 # WHERE's second conjunct reads the tail value, which moves to the end of the slot, above the first conjunct's filter:
 # its cast is computed only for the cities that filter keeps. At the slot's front it would fail for cities 4 to 6.
-pending SQ5b
 query I nosort
 SELECT SUM(c.ct_id * (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id)) AS s
 FROM cities c
@@ -3487,11 +3292,10 @@ AND (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct
 HUGEINT
 459
 
-# ---- pending: the passes over SQ5b's plans (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- the optimizer's passes over these plans (ADR 0041's SQ5b) ----
 
 # A LIMIT without ORDER BY under a derived table's correlated item, over the parts of trips: whichever rows it keeps,
 # they are 1500 distinct ones.
-pending SQ5b
 query II nosort
 SELECT COUNT(*), COUNT(DISTINCT x.tr_row) FROM (SELECT t.tr_row, (SELECT COUNT(*) FROM zones z
 WHERE z.zn_id = t.tr_pickup) AS n FROM trips t LIMIT 1500) x
@@ -3500,7 +3304,6 @@ BIGINT	BIGINT
 1500	1500
 
 # A correlated GROUP BY key valued by a SUM, which aggregate placement may group early below the join back.
-pending SQ5b
 query IDII nosort
 SELECT COUNT(*) AS g, SUM(x.f) AS f, SUM(x.c) AS c, COUNT(x.k) AS keyed FROM (SELECT (SELECT SUM(z.zn_row)
 FROM zones z WHERE z.zn_id = t.tr_pickup) AS k, SUM(t.tr_fare) AS f, COUNT(*) AS c FROM trips t GROUP BY 1) x
@@ -3509,7 +3312,6 @@ BIGINT	DECIMAL(38,2)	HUGEINT	BIGINT
 41	44992.50	3000	40
 
 # A key and the key plus 1: one key is grouped and the other computed above the aggregation (DependentKeys).
-pending SQ5b
 query III nosort
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS k, (SELECT COUNT(*) FROM riders r
 WHERE r.rd_city = c.ct_id) + 1 AS k1, COUNT(*) AS n FROM cities c GROUP BY 1, 2 ORDER BY 1
@@ -3519,11 +3321,10 @@ BIGINT	BIGINT	BIGINT
 77	78	2
 78	79	1
 
-# ---- pending: HAVING over a correlated GROUP BY key (ADR 0041; roadmap PR SQ5b removes these guards) ----
+# ---- HAVING over a correlated GROUP BY key (ADR 0041's SQ5b) ----
 
 # HAVING reads the key's value directly, in an IN subquery, an IN list and BETWEEN, and against an aggregate. The direct
 # form binds through the general path, so that the key's value is read rather than bound again over the groups.
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > 0 ORDER BY 1
@@ -3532,7 +3333,6 @@ BIGINT
 1
 2
 
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) ORDER BY 1
@@ -3540,7 +3340,6 @@ HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 F
 BIGINT
 2
 
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (0, 78) ORDER BY 1
@@ -3549,7 +3348,6 @@ BIGINT
 1
 3
 
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) BETWEEN 1 AND 77 ORDER BY 1
@@ -3557,7 +3355,6 @@ HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) BETWEEN 1 AND 7
 BIGINT
 2
 
-pending SQ5b
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) > COUNT(*) ORDER BY 1
@@ -3583,6 +3380,147 @@ statement error [Oo]verflow
 SELECT x.ct_id FROM (SELECT ct_id FROM cities ORDER BY ct_id DESC LIMIT 2) x
 WHERE (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = x.ct_id)
 IS NULL ORDER BY 1
+
+# ---- divergence D24: under LIMIT, the subquery's own item over its join back (ADR 0041's SQ5b) ----
+
+# antb1 computes the subquery's item, a cast that fails over no rows, above the LEFT join back, and the LIMIT without
+# ORDER BY moves below it: the cast runs only for the two cities kept, and antb1 answers. DuckDB computes the item for
+# every binding of the subquery before its LIMIT, and fails for cities 4 to 6. The cities kept are the first two of
+# the outer side, whose order the LEFT join back keeps, hence rowsort.
+onlyif antb1
+query II rowsort
+SELECT c.ct_id, (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) AS v FROM cities c
+LIMIT 2
+----
+SMALLINT	USMALLINT
+1	76
+2	76
+
+onlyif duckdb
+statement error out of range for the destination type UINT16
+SELECT c.ct_id, (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct_id) AS v FROM cities c
+LIMIT 2
+
+# ---- divergence D24: a direct operand whose value an aggregate item holds (ADR 0041's SQ5b) ----
+
+# A bare aggregate item binds before WHERE, so WHERE's comparison reads the item's value rather than being a direct
+# operand: over SUM its join back is INNER, and the cast is computed only for cities 1 to 3, which have riders. antb1
+# answers; DuckDB fails for cities 4 to 6. With the aggregate inside an expression item, which binds after WHERE, the
+# comparison stays a direct operand, and both engines fail.
+onlyif antb1
+query I nosort
+SELECT SUM(c.ct_id * (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
+WHERE (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > CAST(3 - c.ct_id AS USMALLINT)
+----
+HUGEINT
+55846
+
+onlyif duckdb
+statement error out of range for the destination type UINT16
+SELECT SUM(c.ct_id * (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
+WHERE (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > CAST(3 - c.ct_id AS USMALLINT)
+
+statement error out of range for the destination type UINT16
+SELECT SUM(c.ct_id * (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id)) + 0 AS s FROM cities c
+WHERE (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > CAST(3 - c.ct_id AS USMALLINT)
+
+# ---- divergence D24: a select item's value over keys no outer row binds (ADR 0041's SQ5b) ----
+
+# The IN leaves no trip, but antb1's aggregation computes MAX for every zone and overflows: the semi-join reduction
+# would restrict it to the zones the trips WHERE keeps bind, but declines over an outer side not much smaller than
+# zones. DuckDB keeps D, the keys the outer rows bind (the outer side has a filter of its own), and answers no row.
+onlyif antb1
+statement error Overflow in addition of
+SELECT t.tr_row, (SELECT MAX(z.zn_id + 2147483647) FROM zones z WHERE z.zn_id = t.tr_pickup) AS m FROM trips t
+WHERE t.tr_rider IN (SELECT rd_id FROM riders WHERE rd_row < 0) ORDER BY 1
+
+onlyif duckdb
+query II nosort
+SELECT t.tr_row, (SELECT MAX(z.zn_id + 2147483647) FROM zones z WHERE z.zn_id = t.tr_pickup) AS m FROM trips t
+WHERE t.tr_rider IN (SELECT rd_id FROM riders WHERE rd_row < 0) ORDER BY 1
+----
+INTEGER	INTEGER
+
+# ---- divergence D32: a correlated value's item that nothing reads (ADR 0041's SQ5b) ----
+
+# antb1 computes every select item of a derived table, so the unread MAX + 9223372036854775807 overflows for cities 1
+# to 3. DuckDB drops the column nothing reads and answers 1 to 6.
+onlyif antb1
+statement error Overflow in addition of
+SELECT x.ct_id FROM (SELECT c.ct_id,
+(SELECT MAX(r.rd_id) + 9223372036854775807 FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c) x ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT x.ct_id FROM (SELECT c.ct_id,
+(SELECT MAX(r.rd_id) + 9223372036854775807 FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c) x ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# A global block's ORDER BY is dropped with its aggregate, but the value's join back, which the aggregate's argument
+# planted, stays. Nothing reads the subquery's item, MAX + 9223372036854775807 above that join back, so antb1 drops it
+# unread and answers 6; DuckDB computes it and fails. The same in a correlated EXISTS block's ORDER BY: antb1 answers
+# 1 to 5, DuckDB fails. Where the subquery's aggregate overflows (the errors of values in the new places) and where the
+# EXISTS block's subquery is uncorrelated, both engines fail.
+onlyif antb1
+query I nosort
+SELECT COUNT(*) FROM cities c
+ORDER BY SUM(c.ct_id + (SELECT MAX(r.rd_id) + 9223372036854775807 FROM riders r WHERE r.rd_city = c.ct_id))
+----
+BIGINT
+6
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT COUNT(*) FROM cities c
+ORDER BY SUM(c.ct_id + (SELECT MAX(r.rd_id) + 9223372036854775807 FROM riders r WHERE r.rd_city = c.ct_id))
+
+onlyif antb1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id
+ORDER BY (SELECT MAX(t.tr_rider) + 9223372036854775807 FROM trips t WHERE t.tr_pickup = z.zn_id)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id
+ORDER BY (SELECT MAX(t.tr_rider) + 9223372036854775807 FROM trips t WHERE t.tr_pickup = z.zn_id)) ORDER BY 1
+
+statement error Overflow in addition of
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id
+ORDER BY (SELECT MAX(t.tr_rider) + 9223372036854775807 FROM trips t)) ORDER BY 1
+
+# ---- divergence D37: an ORDER BY expression over the alias of a correlated value item (ADR 0041's SQ5b) ----
+
+# antb1 binds the item's expression again, which reads the same value, and answers: cities 4 to 6 (0), then 1, 2 (77)
+# and 3 (78). DuckDB refuses an alias whose item holds a subquery inside an ORDER BY expression.
+onlyif antb1
+query II nosort
+SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY n + 1, 1
+----
+SMALLINT	BIGINT
+4	0
+5	0
+6	0
+1	77
+2	77
+3	78
+
+onlyif duckdb
+statement error Alias "n" referenced in a SELECT clause - but the expression has a subquery
+SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n FROM cities c ORDER BY n + 1, 1
 
 # ---- pending: a correlated value above an aggregation (ADR 0041; roadmap PR SQ13 removes these guards) ----
 
