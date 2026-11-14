@@ -595,5 +595,34 @@ TEST(AggregatePlacementTest, Refusals) {
   }
 }
 
+// ADR 0041's SQ5b: an aggregation over a correlated value's LEFT join back. An aggregate whose
+// argument reads the value reads both sides of the join, so nothing groups below it; a COUNT(*)
+// alone has nothing to group below either. A key that is the value is a column of the join's right
+// side: a COUNT-valued one is never grouped below the left (its padded rows are 0, which no key of
+// the left gives); a SUM-valued one, NULL where the join pads, is, by the join key the value is a
+// function of.
+TEST(AggregatePlacementTest, ValuesOverAJoinBack) {
+  const std::string argument =
+      GatePlan("SELECT SUM(f.v * (SELECT COUNT(*) FROM wide w WHERE w.dk = f.few)) FROM facts f");
+  EXPECT_EQ(argument.find("GroupAggregate keys=[\"f.few\"]"), std::string::npos) << argument;
+  EXPECT_EQ(argument.find("groupable"), std::string::npos) << argument;
+  const std::string count_star = GatePlan(
+      "SELECT (SELECT COUNT(*) FROM wide w WHERE w.dk = f.few) AS k, COUNT(*) FROM facts f GROUP "
+      "BY 1");
+  EXPECT_EQ(count_star.find("groupable"), std::string::npos) << count_star;
+  const std::string count_key = GatePlan(
+      "SELECT (SELECT COUNT(*) FROM wide w WHERE w.dk = f.few) AS k, SUM(f.v) FROM facts f GROUP "
+      "BY 1");
+  EXPECT_EQ(count_key.find("GroupAggregate keys=[\"f.few\"]"), std::string::npos) << count_key;
+  const std::string sum_key = GatePlan(
+      "SELECT (SELECT SUM(w.dk) FROM wide w WHERE w.dk = f.few) AS k, SUM(f.v) FROM facts f GROUP "
+      "BY 1");
+  EXPECT_NE(sum_key.find("    Join LEFT build=right keys=[\"f.few\" = \"w.dk\"] carries 2 of 4 "
+                         "unread above\n"
+                         "      GroupAggregate keys=[\"f.few\"] SUM(v)\n"),
+            std::string::npos)
+      << sum_key;
+}
+
 }  // namespace
 }  // namespace antb1::plan
