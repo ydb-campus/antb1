@@ -365,6 +365,21 @@ whose type holds every value), in `COALESCE` (a call that is NULL over no rows),
 literals, an element of an outer column's `[NOT] IN` list, two such blocks of one type compared, or one block written
 twice, `(q) > k AND (q) < k2`. A DOUBLE value is compared with 0 alone, and SQ6's never-list holds.
 
+The correlated values of ADR 0041's SQ5b (feature `correlated_item_value`) are drawn right after SQ5a's, from a
+random stream of their own and only where the query holds no other subquery. The same block stands as a value in one
+of four places: one more select item of a block that does not aggregate (alone, plus an outer integer column whose
+type holds every sum, `CASE WHEN (q) <op> k THEN 1 ELSE 0 END`, or `COALESCE((q), k)` over a call that is NULL over no
+rows); an `ORDER BY` item of such a block, after the keys its `ORDER BY` has, written there or as such an item ordered
+by its alias or position (the only form under `SELECT DISTINCT`), then, but under `DISTINCT`, the outer binding's
+columns that make the order total over one table (a key its refs prove unique and never NULL, else all of them); a
+`GROUP BY` key, such an item of a block that aggregates without grouping sets, grouped by its alias or position and
+now and then ordered by its position; or an aggregate's argument beside an outer integer column, `SUM`, `MIN`, `MAX`
+or `COUNT [DISTINCT]` of `o.x * (q)` or `o.x + (q)` whose type holds every value (a `SUM`'s total within 38 digits
+too), in the select list, or in `HAVING` or `ORDER BY` of a block that groups or aggregates already. A sort key, a key
+and a `SELECT DISTINCT` item are never a DOUBLE but in a `CASE` that compares it with 0; no `ORDER BY` expression reads
+the value item's alias (D37), the value's text is written once (D38), nothing above the aggregation reads it (SQ13),
+nothing divides, subtracts or casts, and SQ6's never-list holds.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count
