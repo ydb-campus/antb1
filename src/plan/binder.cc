@@ -3783,6 +3783,9 @@ class Binder {
   [[nodiscard]] const BoundValue* FindValue(
       const sql::SubqueryExpr& s, bool group,
       const std::function<bool(const BoundValue&)>& also = nullptr) const;
+  // A value or mark read by a clause after the select list: from its slot's tail to the end of the
+  // slot's own entries (ADR 0041's SQ7a); nothing for one that is not in the tail.
+  void TakeFromTail(BoundValue& known, bool group);
   // Where a correlated value may stand (ADR 0041's SQ5): OK, or the refusal of this place -- a
   // padded unit's left input, a conjunct that reads an enclosing block itself, an EXISTS (a mark,
   // SQ8), or a clause other than a condition of WHERE or an inner ON (SQ5b).
@@ -4275,8 +4278,10 @@ class Binder {
     std::optional<std::size_t> block;  // the block whose per-row slot holds it; none: HAVING's
     sql::SubqueryExpr written;         // a copy: the first binding is often of a temporary
     Typed value;
-    ExprPtr probe;          // a mark's bound probe; null for a value
-    bool deferred = false;  // a mark in its slot's tail (row_tail_, group_tail_)
+    ExprPtr probe;  // a mark's bound probe; null for a value
+    // Its join's sub-plan, by which TakeFromTail finds the join in its slot's tail.
+    const LogicalNode* right = nullptr;
+    bool deferred = false;  // in its slot's tail (row_tail_, group_tail_)
     // A correlated value (ADR 0041's SQ5): the ids its block reads from the enclosing blocks, by
     // which the memo knows it, and the inner ON it was bound in (none: where the whole FROM is
     // visible), whose names an occurrence elsewhere may resolve differently. Empty for an
@@ -6796,6 +6801,7 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
           .written = *form.subquery,
           .value = ColumnLeaf(column.id, block.type, column.name, column.stored_as_float),
           .probe = nullptr,
+          .right = join.right.get(),
           .deferred = false,
           .free = block.free,
           .on_position = on_position_});
@@ -7143,6 +7149,7 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
   // A correlated block is a dependent join (ADR 0041's SQ5), which the unnesting replaces by its
   // join back, still defining this column; an uncorrelated one a one-row join (SQ1).
   const bool dependent = block.correlated;
+  const LogicalNode* const right = block.right.get();  // before it moves into the join
   (group ? group_slot_ : RowSlot())
       .emplace_back(SubqueryJoin{.kind = JoinKind::kOneRow,
                                  .dependent = dependent,
@@ -7158,10 +7165,30 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
                                .written = s,
                                .value = value,
                                .probe = nullptr,
+                               .right = right,
                                .deferred = false,
                                .free = std::move(block.free),
                                .on_position = dependent ? on_position_ : std::nullopt});
   return value;
+}
+
+void Binder::TakeFromTail(BoundValue& known, bool group) {
+  // Read by a clause after the select list: from the slot's tail to the end of its own entries,
+  // below the reader, which plants its own entry after it. Never while the select list binds, nor
+  // in a dry run, which plants nothing.
+  if (!known.deferred || deferring_ || dry_run_) {
+    return;
+  }
+  ANTB1_CHECK(known.right != nullptr);
+  std::vector<SlotEntry>& tail = group ? group_tail_ : row_tail_;
+  const auto entry = std::ranges::find_if(tail, [&](const SlotEntry& e) {
+    const auto* join = std::get_if<SubqueryJoin>(&e);
+    return join != nullptr && join->right.get() == known.right;
+  });
+  ANTB1_CHECK(entry != tail.end());
+  (group ? group_slot_ : RowSlot()).push_back(std::move(*entry));
+  tail.erase(entry);
+  known.deferred = false;
 }
 
 void Binder::PromoteTailMarks(const Expr& expr) {
@@ -7228,19 +7255,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                    sql::EqualIgnoringSpans(*bound.written.query, *written.query);
           });
       known != values_.end()) {
-    // Read by a clause after the select list: from the slot's tail to the end of its own entries.
-    if (known->deferred && !deferring_ && !dry_run_) {
-      std::vector<SlotEntry>& tail = group ? group_tail_ : row_tail_;
-      const ColumnId mark = std::get<ColumnExpr>(known->value.expr->node).id;
-      const auto entry = std::ranges::find_if(tail, [&](const SlotEntry& e) {
-        const auto* join = std::get_if<SubqueryJoin>(&e);
-        return join != nullptr && join->mark == mark;
-      });
-      ANTB1_CHECK(entry != tail.end());
-      (group ? group_slot_ : RowSlot()).push_back(std::move(*entry));
-      tail.erase(entry);
-      known->deferred = false;
-    }
+    TakeFromTail(*known, group);
     return known->value;
   }
   if (lookup_only_) {
@@ -7275,6 +7290,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                     .mark = ids_.Next()};
   InKeys(join, typed, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
+  const LogicalNode* const right = join.right.get();  // after InKeys, before the join moves
   if (deferring_) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON
     (group ? group_tail_ : row_tail_).emplace_back(std::move(join));
@@ -7285,6 +7301,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
                                .written = std::move(written),
                                .value = value,
                                .probe = probe.expr,
+                               .right = right,
                                .deferred = deferring_,
                                .free = {},
                                .on_position = std::nullopt});
