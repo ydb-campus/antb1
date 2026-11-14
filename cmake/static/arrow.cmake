@@ -78,6 +78,13 @@ set(ARROW_RUNTIME_SIMD_LEVEL "MAX" CACHE STRING "")
 set(ARROW_C_FLAGS_RELEASE "-O3" CACHE STRING "")
 set(ARROW_CXX_FLAGS_RELEASE "-O3" CACHE STRING "")
 
+# uriparser, which Arrow 26 builds with FetchContent in this same configure, finds reallocarray by linking
+# (check_function_exists) and then defines only _DEFAULT_SOURCE to have it declared, as glibc does from 2.29 on. The
+# Linux sysroot is glibc 2.28, which declares it under _GNU_SOURCE alone, so with uriparser's -std=c99 the call would
+# be an undeclared function, an error. Its fallback, realloc with an overflow check, does the same; macOS has no
+# reallocarray and takes it already.
+set(HAVE_REALLOCARRAY 0 CACHE INTERNAL "")
+
 # Build identity, read back through arrow::GetBuildInfo() (`antb1 version --verbose`). Without ARROW_GIT_ID, Arrow
 # runs `git log` in whatever repository encloses its source tree.
 set(ARROW_GIT_ID "9e5d6978e9acf372cc989aaaf94e863fe8582c90" CACHE STRING "") # tag apache-arrow-26.0.1
