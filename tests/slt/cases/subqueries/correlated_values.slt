@@ -3047,7 +3047,7 @@ SMALLINT	BIGINT
 # (2, 77, 3, 78), (3, 78, 4, 0), (4, 0, 5, 0), (5, 0, 6, 0); then (1, 1, 77), (1, 2, 0), (2, 1, 0), (2, 2, 77).
 query IIII nosort
 SELECT b.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = b.ct_id) AS nb, d.ct_id AS dct,
-(SELECT COUNT(*) FROM riders r WHERE r.rd_city = d.ct_id) AS nd FROM cities b, cities d WHERE b.ct_id + 1 = d.ct_id
+(SELECT COUNT(*) FROM riders r WHERE r.rd_city = d.ct_id) AS n_d FROM cities b, cities d WHERE b.ct_id + 1 = d.ct_id
 ORDER BY 1
 ----
 SMALLINT	BIGINT	SMALLINT	BIGINT
