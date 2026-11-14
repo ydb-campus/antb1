@@ -2387,7 +2387,7 @@ TEST(OptimizerTest, ATailValuesReductionClonesWhatWhereKeeps) {
       "FROM st WHERE st.i16 = ok.i16) > 0"));
   EXPECT_NE(stacked.find("GroupAggregate keys=[\"t.i16\"] COUNT(*)\n"), std::string::npos)
       << stacked;
-  const std::size_t semi = stacked.find("Join SEMI build=right keys=[\"t.i16\" = \"ok.i16\"]");
+  const std::size_t semi = stacked.find(R"(Join SEMI build=right keys=["t.i16" = "ok.i16"])");
   ASSERT_NE(semi, std::string::npos) << stacked;
   // The clone, its build: the bare scan of ok.
   const std::size_t clone = stacked.find("Scan table=ok", semi);

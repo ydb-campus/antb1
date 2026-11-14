@@ -7193,7 +7193,8 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
   if (deferred) {
     // The select list binds per row (BindSubqueryBlock refuses one above the aggregation), outside
     // every ON.
-    ANTB1_CHECK(!group && !padded_unit_.has_value());
+    ANTB1_CHECK(!group);
+    ANTB1_CHECK(!padded_unit_.has_value());
     row_tail_.emplace_back(std::move(join));
   } else {
     (group ? group_slot_ : RowSlot()).emplace_back(std::move(join));
