@@ -322,9 +322,12 @@ before the consumer waits for them to merge, and they finish merging before a pa
 `std::bad_alloc` from a container (outside the budget's view) is caught in the part tasks, in `exec::ForEach` (in
 its tasks and around each `Submit`), in `PartitionLanes::Add` (queuing a part, starting a lane's task), around the
 part scheduler's `Submit`, in `Drain`, in every call of the join hash table, in a join build's `Prepare` and in
-making a GROUP BY's key table and its calls, and becomes `OutOfMemory` too. Four places in Arrow still end the
-process on one: its thread pool's `Spawn`, where an OpenTelemetry call allocates in a `noexcept` function, a compute
-function's call, which allocates its tracing span where an exception cannot pass, the making of an `arrow::Result`
+making a GROUP BY's key table and its calls, and becomes `OutOfMemory` too. A worker thread that Arrow's pool cannot
+start (the operating system refuses one, or `std::bad_alloc` while starting it) comes back from `Submit` as an
+`UnknownError` since Arrow 26, which exec reports as an `ExecutionError`, exit code 1 (`SubmitStatus`, at every
+`Submit`). Four places in Arrow still end the process on one: its thread pool's `Spawn`, where an OpenTelemetry call
+allocates in a `noexcept` function, a compute function's call, which allocates its tracing span where an exception
+cannot pass, the making of an `arrow::Result`
 from a `Status`, whose `noexcept` constructor copies it, and the Grouper's `GetUniques` (reached by a `GroupTable`'s
 `Merge`, `Partition`, `PrefixHashes` and `uniques()`), which cannot unwind out of its own `noexcept` frames.
 

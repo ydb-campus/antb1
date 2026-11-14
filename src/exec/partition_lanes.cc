@@ -16,6 +16,8 @@
 
 #include "antb1/exec/memory_budget.h"
 
+#include "submit_status.h"
+
 namespace antb1::exec {
 
 arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
@@ -55,7 +57,7 @@ arrow::Status ForEach(arrow::internal::Executor* executor, std::size_t n,
       if (task.ok()) {
         tasks.push_back(*std::move(task));  // reserved: nothing allocated, nothing thrown
       } else {
-        submitted = std::move(task).status();
+        submitted = SubmitStatus(std::move(task).status());
       }
     } catch (const std::bad_alloc&) {
       submitted = arrow::Status::OutOfMemory("out of memory while submitting a parallel task");

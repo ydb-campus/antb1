@@ -18,6 +18,8 @@
 
 #include "antb1/exec/memory_budget.h"
 
+#include "submit_status.h"
+
 namespace antb1::exec {
 
 // Runs a task for every part 0 .. num_parts - 1 of a table and hands the results back strictly in
@@ -213,7 +215,7 @@ class PartScheduler {
         });
         if (!future.ok()) {
           in_flight_.pop_back();
-          return std::move(future).status();
+          return SubmitStatus(std::move(future).status());
         }
         in_flight_.back() = *std::move(future);  // a move: nothing allocated, nothing thrown
       } catch (const std::bad_alloc&) {

@@ -1361,6 +1361,12 @@ Project RegionID, c  [rows=3 batches=1 time=38.946ms self=0.007ms]
 | – | timestamp[us] | TIMESTAMP | only computed (`toDateTime`, `date_trunc`) or a literal; a Parquet timestamp column is unsupported |
 | anything else | – | unsupported | `antb1 schema` shows `unsupported(<type>)`; a query that uses the column is rejected |
 
+A logical type that does not fit its physical type (a STRING annotation on an INT32 column, say) is dropped, as Arrow
+26 reads it (apache/arrow GH-50910): the column reads by its converted type, or as its physical type where it has
+none, where Arrow 25 refused the file (exit code 3). A schema nested deeper than 100 levels is an I/O error when the
+file is registered (GH-51238), and so is a column chunk of a compression codec that Parquet does not define, when a
+scan reads it (GH-53518).
+
 `--column-type COL=DATE` reinterprets a USMALLINT or INTEGER column as days since 1970-01-01; `--clickbench` is a
 shortcut for `EventDate`. Both apply to every table (registered or opened with `FROM 'path'`) that has a column with
 that name, matched ASCII case-insensitively like every column name (all columns it matches must be readable as DATE),
@@ -1700,9 +1706,9 @@ formatter:
 | Code | Meaning | Examples |
 | --- | --- | --- |
 | 0 | success | |
-| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; an aggregate in a subquery's `WHERE` that belongs to the subquery's own block (`WHERE clause cannot contain aggregates!`), and one of an enclosing block whose subquery stands in its `GROUP BY` or an aggregate's argument; a query that needs more memory than `--memory-limit` |
+| 1 | query error: syntax, bind, execution or memory error | `SELECT COUNT(*) FORM t`; `FROM t semi` (a word that is never a table alias); an unknown table or column; `SUM` of a VARCHAR column; a `SUM`, or arithmetic on a `SUM`, outside HUGEINT's range; an invalid `regexp_replace` pattern; `UNION ALL` blocks of different column counts; a scalar subquery that returns more than one row; an aggregate in a subquery's `WHERE` that belongs to the subquery's own block (`WHERE clause cannot contain aggregates!`), and one of an enclosing block whose subquery stands in its `GROUP BY` or an aggregate's argument; a query that needs more memory than `--memory-limit`; a worker thread the operating system refuses to start |
 | 2 | usage error | unknown option; neither or both of `-c` and `-f`; a malformed `--table`, `--column-type` or `--memory-limit`; a column that `--column-type` cannot read as DATE; a table name registered twice |
-| 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing |
+| 3 | I/O error | a missing or unreadable file; not a Parquet file; schemas that differ; a glob that matches nothing; a schema nested deeper than 100 levels; a column chunk of a compression codec Parquet does not define |
 | 4 | unsupported: valid-looking SQL outside the supported subset | `row_number() OVER ()`; `IS TRUE`; an unknown function; `SELECT 1e3`; `SUM(DISTINCT ...)`; `CAST(a AS FLOAT)`; a string literal as a DECIMAL `CASE` value; a column of an unsupported type; `FROM a RIGHT JOIN b ON a.k = b.k`; `FROM t semi JOIN u ON ...`; `a IN (SELECT ...)` outside a top-level `AND` conjunct; `EXISTS (SELECT ...)` and `(SELECT ...)` outside a condition of `WHERE`, of an inner `ON` or of `HAVING` and outside the select items, `GROUP BY` keys, aggregate arguments and `ORDER BY` of a block (`EXISTS` there only in a `CASE WHEN`), so in `LIMIT`, in a `LEFT JOIN`'s `ON` and in a `ROLLUP`, `CUBE` or `GROUPING SETS` element; `SUM((SELECT ...))`, an aggregate of subquery values alone; an `IN` over the aggregate of a correlated subquery; a correlated `(SELECT ...)` outside a condition of `WHERE` or an inner `ON`, and a correlated `EXISTS` other than a top-level conjunct; an aggregate of an enclosing block's columns inside a subquery in that block's `HAVING`, select list or `ORDER BY`, and any aggregate in the `WHERE` or `ON` of a derived table or a CTE body within such a subquery; more than 256 relations; `UNION` without `ALL`; `ORDER BY` on a `UNION ALL`; a `UNION ALL` of INTEGER and VARCHAR values ([ADR 0036](adr/0036-union-all.md)) |
 | 70 | internal error: anything else, which is a bug | an uncaught exception; an Arrow `NotImplemented` or type error without SQL context; a one-row join whose right input is not one row |
 
