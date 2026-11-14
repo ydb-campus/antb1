@@ -2412,8 +2412,8 @@ WHERE NOT ((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) < 78)
 HUGEINT
 234
 
-# Read again by an inner ON inside arithmetic (the general path; the direct operand is in correlated_values.slt).
-# DuckDB: 9828.
+# Read again by an inner ON inside arithmetic (the general path; the direct operand, `ON ... AND (q) > 77`, is among the
+# aggregate arguments with a column). DuckDB: 9828.
 query I nosort
 SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
 JOIN zones z ON z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) * 2 > 154
@@ -2603,8 +2603,9 @@ BIGINT	BIGINT
 77	2
 78	1
 
-# HAVING over the key's text inside an expression and under OR: BindOutput matches the key, as for ORDER BY above
-# (a direct comparison, HAVING (q) > 0, binds its subquery at group level instead: extra.slt). DuckDB: 1, 2; then 1, 3.
+# HAVING over the key's text inside an expression and under OR: BindOutput matches the key, as for ORDER BY above (a
+# direct comparison, HAVING (q) > 0, reads the key the same way: HAVING over a correlated GROUP BY key, below).
+# DuckDB: 1, 2; then 1, 3.
 query I nosort
 SELECT COUNT(*) AS k FROM cities c GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
 HAVING (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) + 0 > 0 ORDER BY 1
@@ -3292,6 +3293,27 @@ AND (SELECT CAST(COUNT(*) - 1 AS USMALLINT) FROM riders r WHERE r.rd_city = c.ct
 HUGEINT
 459
 
+# A GROUP BY key that is a mark over the value an aggregate item holds: the mark's probe reads the value, so the key
+# moves it from the tail below the mark join, by its position and by its text. DuckDB: (0, 234), (1, 231), twice.
+query II nosort
+SELECT CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) THEN 1 ELSE 0
+END AS k, SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c GROUP BY 1
+ORDER BY 1
+----
+INTEGER	HUGEINT
+0	234
+1	231
+
+query II nosort
+SELECT CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) THEN 1 ELSE 0
+END AS k, SUM(c.ct_id * (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)) AS s FROM cities c
+GROUP BY CASE WHEN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) IN (SELECT 77 FROM cities) THEN 1 ELSE 0
+END ORDER BY 1
+----
+INTEGER	HUGEINT
+0	234
+1	231
+
 # ---- the optimizer's passes over these plans (ADR 0041's SQ5b) ----
 
 # A LIMIT without ORDER BY under a derived table's correlated item, over the parts of trips: whichever rows it keeps,
@@ -3320,6 +3342,16 @@ BIGINT	BIGINT	BIGINT
 0	1	3
 77	78	2
 78	79	1
+
+# A SUM-valued key next to a key computed over the outer side: aggregate placement admits grouping trips early by
+# rider, but the computed key is read above the partial too, so the exchange declines. DuckDB: (58, 3000, 44992.50).
+query IID nosort
+SELECT COUNT(*) AS g, SUM(x.c) AS c, SUM(x.f) AS f FROM (SELECT (SELECT SUM(b.bk_vehicles) FROM bookings b
+WHERE b.bk_rider = t.tr_rider) AS k, t.tr_rider % 2 AS p, COUNT(*) AS c, SUM(t.tr_fare) AS f FROM trips t
+GROUP BY 1, 2) x
+----
+BIGINT	HUGEINT	DECIMAL(38,2)
+58	3000	44992.50
 
 # ---- HAVING over a correlated GROUP BY key (ADR 0041's SQ5b) ----
 
@@ -3440,6 +3472,23 @@ SELECT t.tr_row, (SELECT MAX(z.zn_id + 2147483647) FROM zones z WHERE z.zn_id = 
 WHERE t.tr_rider IN (SELECT rd_id FROM riders WHERE rd_row < 0) ORDER BY 1
 ----
 INTEGER	INTEGER
+
+# ---- divergence D35: a select item's value next to an IN that turns out empty (ADR 0041's SQ5b) ----
+
+# The IN keeps no city. antb1's semi-join reduction restricts the value's aggregation to the cities the IN keeps, so the
+# MAX that overflows for cities 1 to 3 is never computed: no row. DuckDB removes D here (neither the outer side nor the
+# IN's query has a filter of its own), computes the MAX for every city, and fails.
+onlyif antb1
+query II nosort
+SELECT c.ct_id, (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c
+WHERE c.ct_id IN (SELECT pm_id FROM promos) ORDER BY 1
+----
+SMALLINT	BIGINT
+
+onlyif duckdb
+statement error Overflow in addition of
+SELECT c.ct_id, (SELECT MAX(r.rd_id + 9223372036854775807) FROM riders r WHERE r.rd_city = c.ct_id) AS m FROM cities c
+WHERE c.ct_id IN (SELECT pm_id FROM promos) ORDER BY 1
 
 # ---- divergence D32: a correlated value's item that nothing reads (ADR 0041's SQ5b) ----
 
@@ -3582,16 +3631,29 @@ SELECT COUNT(*), (SELECT SUM(d.dv_row) FROM drivers d WHERE d.dv_city = MIN(r.rd
 BIGINT	HUGEINT
 240	1092
 
-# A GROUP BY key written again with another spelling of its alias (divergence D38): the item is another expression,
-# which reads the ungrouped ct_id, DuckDB's bind error. antb1 refuses the item with this section's message, and SQ13
+# A GROUP BY key written again with another spelling of the subquery's alias: the item is another expression, which
+# reads the ungrouped ct_id, DuckDB's bind error too. antb1 refuses the item with this section's message, and SQ13
 # makes it antb1's bind error.
 pending SQ13
 statement error
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS k, COUNT(*) AS n FROM cities c
 GROUP BY (SELECT COUNT(*) FROM riders R WHERE R.rd_city = c.ct_id) ORDER BY 1
 
+# Divergence D38: the key spells a column name in another case, which DuckDB ignores, and answers. antb1 refuses the
+# item with this section's message; SQ13 makes it antb1's bind error, the other expression reading the ungrouped ct_id.
+pending SQ13
+query II nosort
+SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS k, COUNT(*) AS n FROM cities c
+GROUP BY (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.CT_ID) ORDER BY 1
+----
+BIGINT	BIGINT
+0	3
+77	2
+78	1
+
 # A select item that is no key, written like an aggregate argument's value that waits in the tail: DuckDB's bind error
-# (ct_id is not grouped); antb1 refuses it with SQ13's message, before and after SQ5b.
+# (ct_id is not grouped). antb1 refuses it (exit 4): before SQ5b at the aggregate's argument, since SQ5b with SQ13's
+# message at the item.
 pending SQ13
 statement error must appear in the GROUP BY clause
 SELECT (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) AS n,

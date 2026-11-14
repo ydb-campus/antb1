@@ -8762,10 +8762,12 @@ TEST(BinderTest, ACorrelatedValueInTheSelectListStandsInTheTail) {
 
 // A later clause that reads a select-list value moves it from the tail to the end of its slot's
 // own entries, below that clause's own filter, join or mark (TakeFromTail): a WHERE condition, a
-// BETWEEN, an IN conjunct's probe, a mark's probe under OR, an inner ON, a GROUP BY key, the other
-// side of a direct pair, and the probe of an ORDER BY or a HAVING mark. Left in the tail, the
-// value's join would stand above its reader, which would read a column nothing defines there. It
-// stays one join, and it stands above the filters of the conjuncts written before its reader.
+// BETWEEN, an IN conjunct's probe, a mark's probe under OR, an inner ON, the other side of a
+// direct pair, and the probe of a GROUP BY key's, an ORDER BY's or a HAVING's mark. Left in the
+// tail, the value's join would stand above its reader, which would read a column nothing defines
+// there. (A plain GROUP BY key reads the value above the tail anyway, in the aggregation's input,
+// so the move only reorders.) It stays one join, and it stands above the filters of the conjuncts
+// written before its reader.
 TEST(BinderTest, ACorrelatedTailValueIsPromotedByItsReaders) {
   const Catalog catalog = MakeCatalog();
   constexpr std::string_view kCount = "(SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)";
@@ -8801,8 +8803,10 @@ TEST(BinderTest, ACorrelatedTailValueIsPromotedByItsReaders) {
                     "SELECT SUM(ok.i16 * {0}) FROM t JOIN ok ON ok.i16 = t.i16 AND {0} > 77",
                     kCount),
                 .reader = "Filter \"count_star()\" > 77"},
-           Case{.sql = std::format("SELECT {0} AS k, SUM(i32 * {0}) FROM t GROUP BY 1", kCount),
-                .reader = "GroupAggregate keys=[\"count_star()\"]"},
+           Case{.sql = std::format("SELECT CASE WHEN {0} IN (SELECT i16 FROM ok) THEN 1 ELSE 0 END "
+                                   "AS k, SUM(i32 * {0}) FROM t GROUP BY 1",
+                                   kCount),
+                .reader = "Join NULL-AWARE MARK"},
            Case{.sql = std::format("SELECT SUM(i32 * {0}), SUM(i32 * {1}) FROM t WHERE {0} >= {1}",
                                    kCount, kOther),
                 .reader = "Filter \"count_star()\" >= \"count_star()\"",
@@ -8900,6 +8904,25 @@ TEST(BinderTest, TheGroupBySpeculationReadsTheKeysValue) {
     const LogicalPlan optimized = Optimized(*plan);
     EXPECT_NE(optimized.root, nullptr) << sql;
   }
+}
+
+// HAVING's direct comparison over a GROUP BY key reads a correlated key's value as the key (ADR
+// 0041's SQ5b), but an uncorrelated one keeps SQ2b's plan: the comparison's own one-row join over
+// the aggregation, next to the key's below it, which compute the same one row.
+TEST(BinderTest, HavingsDirectFormOverAnUncorrelatedKeyKeepsItsPlan) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT (SELECT MIN(i16) FROM ok) AS k, COUNT(*) FROM t GROUP BY 1 HAVING (SELECT MIN(i16) "
+      "FROM ok) > 0",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string text = Explain(*plan);
+  const std::size_t above = text.find("Join ONE-ROW");
+  const std::size_t group = text.find("GroupAggregate");
+  ASSERT_NE(above, std::string::npos) << text;
+  ASSERT_NE(group, std::string::npos) << text;
+  EXPECT_LT(above, group) << "HAVING's join stands over the aggregation\n" << text;
+  EXPECT_NE(text.find("Join ONE-ROW", group), std::string::npos) << "the key's, below it\n" << text;
 }
 
 // Decision 10 across clauses (ADR 0041's SQ5b): a select item, ORDER BY or GROUP BY key written

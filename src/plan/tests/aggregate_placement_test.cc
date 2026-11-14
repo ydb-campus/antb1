@@ -622,6 +622,14 @@ TEST(AggregatePlacementTest, ValuesOverAJoinBack) {
                          "      GroupAggregate keys=[\"f.few\"] SUM(v)\n"),
             std::string::npos)
       << sum_key;
+  // Next to a key computed over the left side, the exchange declines: that key's Compute is read
+  // above the partial too, which a partial below it would not carry (the read-above refusal).
+  const std::string computed_key = GatePlan(
+      "SELECT (SELECT SUM(w.dk) FROM wide w WHERE w.dk = f.few) AS k, f.few % 2 AS p, SUM(f.v) "
+      "FROM facts f GROUP BY 1, 2");
+  EXPECT_EQ(computed_key.find("GroupAggregate keys=[\"f.few\"]"), std::string::npos)
+      << computed_key;
+  EXPECT_NE(computed_key.find("Compute (f.few % 2)"), std::string::npos) << computed_key;
 }
 
 }  // namespace
