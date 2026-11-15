@@ -858,9 +858,8 @@ onlyif duckdb
 statement error Overflow in addition
 SELECT COUNT(*) FROM cities WHERE EXISTS (SELECT * FROM edge WHERE id = ct_id ORDER BY i32 + 2147483647)
 
-# ---- DuckDB only until mark joins get a PR (ADR 0023: EXISTS under OR exits 4) ----
+# ---- a correlated EXISTS under OR: a mark join (ADR 0041's SQ8a; exists_marks.slt holds the rest) ----
 
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE tr_fare > 25 OR EXISTS (SELECT * FROM riders WHERE rd_id = tr_rider AND rd_tier = 'gold')
 ----

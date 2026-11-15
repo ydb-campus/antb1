@@ -1919,7 +1919,7 @@ follows.
 | Q7 | pass | answered when the ratchet was added |
 | Q8 | pass | `INTERSECT` (X4c) |
 | Q9 | pass | scalar subqueries in a select list's CASE (SQ2a) |
-| Q10 | unsupported | needs correlated EXISTS under OR (SQ8) |
+| Q10 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
 | Q11 | pass | `UNION ALL` (ADR 0036) |
 | Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
 | Q13 | pass | answered when the ratchet was added |
@@ -1944,7 +1944,7 @@ follows.
 | Q32 | pass | answered when the ratchet was added |
 | Q33 | pass | `UNION ALL` (ADR 0036) |
 | Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q35 | unsupported | needs correlated EXISTS under OR (SQ8) |
+| Q35 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
 | Q36 | unsupported | needs rank() and window partition expressions (phase 9) |
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | pass | `INTERSECT` (X4c) |

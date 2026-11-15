@@ -1032,6 +1032,70 @@ antb1_add_cli_golden(
     --table
     "riders=${_f}/star/riders.parquet"
 )
+# A correlated EXISTS under OR (ADR 0041's SQ8a) is a mark: the dependent mark is lifted into a MARK join keyed on the
+# correlation, its block's own conjunct below it, and the Filter reads the mark under the OR.
+antb1_add_cli_golden(
+  explain_exists_mark_under_or
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE c.ct_id = 1 OR EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_id < 5) ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A top-level correlated EXISTS beside an OR of two (ADR 0041's SQ8a): the conjunct stays a semi join, and each EXISTS
+# under the OR is a mark of its own, above it.
+antb1_add_cli_golden(
+  explain_exists_marks_beside_a_semi_join
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id) AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) OR EXISTS (SELECT 1 FROM drivers d WHERE d.dv_city = c.ct_id)) ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "zones=${_f}/star/zones.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+    --table
+    "drivers=${_f}/star/drivers.parquet"
+)
+# NOT EXISTS under OR (ADR 0041's SQ8a): a NOT over the mark, whose IS NOT DISTINCT FROM correlation is a NULL-equal key
+# and whose comparison of both sides a residual.
+antb1_add_cli_golden(
+  explain_not_exists_mark_with_a_residual
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id AND r.rd_id > c.ct_pop) OR c.ct_id = 2 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
+# A select item's mark (ADR 0041's SQ8a) waits in the slot's tail, above WHERE's filter, so the mark join probes only the
+# cities WHERE keeps.
+antb1_add_cli_golden(
+  explain_exists_mark_in_the_tail
+  ARGS
+    explain
+    --threads
+    1
+    -c
+    "SELECT c.ct_id, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) THEN 'y' ELSE 'n' END AS m FROM cities c WHERE c.ct_id > 2 ORDER BY 1"
+    --table
+    "cities=${_f}/star/cities.parquet"
+    --table
+    "riders=${_f}/star/riders.parquet"
+)
 # An unaliased select item holding a value is named by antb1's own text of the item (divergence D8).
 antb1_add_cli_golden(
   query_select_value_names
