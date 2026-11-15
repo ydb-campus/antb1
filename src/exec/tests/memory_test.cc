@@ -365,8 +365,10 @@ class MemoryLimitTest : public testing::ExecTest {
   // anti joins on x over the rows x >= 500, and one-row joins of SUM(x) and of MAX(s), whose
   // VARCHAR value every probe row gets, over about half of the rows. Then a left join on x over the
   // rows x >= 500 (the 1:1 path, half of the rows padded), and a left and a semi join on x % 50
-  // whose residual (the build's x above the probe's) the candidate pairs meet. Then inner, left
-  // and full nested loops (ADR 0040) with that residual and no key. Each under a projection.
+  // whose residual (the build's x above the probe's) the candidate pairs meet. Then mark joins
+  // (ADR 0041's decision 12): a null-aware one and a two-valued one on x over the rows x >= 500,
+  // and a two-valued one on x % 50 with that residual. Then inner, left and full nested loops
+  // (ADR 0040) with that residual and no key. Each under a projection.
   static std::vector<plan::LogicalPlan> JoinPlans(const std::shared_ptr<MemoryTable>& table) {
     const auto x = Column(0, "x", LogicalType::kBigInt);
     const auto s = Column(1, "s", LogicalType::kVarchar);
@@ -484,6 +486,16 @@ class MemoryLimitTest : public testing::ExecTest {
         Node(plan::ProjectNode{.input = join_of(plan::JoinKind::kSemi, residues, e0, above, scan),
                                .columns = {x, s}}),
         2));
+    // The probe's x and the mark.
+    const auto marked = [&](plan::LogicalNodePtr joined) {
+      return PlanOf(
+          Node(plan::ProjectNode{.input = std::move(joined),
+                                 .columns = {x, Column(2, "mark", LogicalType::kBoolean)}}),
+          2);
+    };
+    plans.push_back(marked(join_of(plan::JoinKind::kNullAwareMark, upper, x, {}, scan)));
+    plans.push_back(marked(join_of(plan::JoinKind::kMark, upper, x, {}, scan)));
+    plans.push_back(marked(join_of(plan::JoinKind::kMark, residues, e0, above, scan)));
     // Nested loops (ADR 0040): inner, left and full joins without keys of every row with the 20
     // rows x >= 980, whose x is above the probe's -- about 19,800 pairs pass of 20,000.
     const auto top = Node(plan::FilterNode{

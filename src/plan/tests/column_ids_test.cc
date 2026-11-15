@@ -321,10 +321,12 @@ TEST(ColumnIdsTest, OutputIdsOfEveryJoinKind) {
   EXPECT_EQ(OutputIds(Join(JoinKind::kSemi)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kAnti)), left);
   EXPECT_EQ(OutputIds(Join(JoinKind::kNullAwareAnti)), left);
-  // A mark join: the left input's ids, then its mark (ADR 0041's decision 13).
-  JoinNode mark = Join(JoinKind::kNullAwareMark);
-  mark.mark = ColumnId{9};
-  EXPECT_EQ(OutputIds(mark), (std::vector<ColumnId>{kA, kB, kC, ColumnId{9}}));
+  // A mark join, null-aware or not: the left input's ids, then its mark (ADR 0041's decision 13).
+  for (const JoinKind kind : {JoinKind::kNullAwareMark, JoinKind::kMark}) {
+    JoinNode mark = Join(kind);
+    mark.mark = ColumnId{9};
+    EXPECT_EQ(OutputIds(mark), (std::vector<ColumnId>{kA, kB, kC, ColumnId{9}})) << ToString(kind);
+  }
 }
 
 // A dependent join outputs its inputs' ids by its kind's rule, exactly as the join of that kind.
@@ -336,6 +338,26 @@ TEST(ColumnIdsTest, OutputIdsOfEveryDependentJoinKind) {
   EXPECT_EQ(OutputIds(dependent(JoinKind::kAnti)), (std::vector<ColumnId>{kA, kB, kC}));
   EXPECT_EQ(OutputIds(dependent(JoinKind::kOneRow)),
             (std::vector<ColumnId>{kA, kB, kC, kD, kE, kF}));
+  DependentJoinNode mark = dependent(JoinKind::kMark);
+  mark.mark = ColumnId{12};
+  EXPECT_EQ(OutputIds(mark), (std::vector<ColumnId>{kA, kB, kC, ColumnId{12}}));
+}
+
+// A dependent join has its own column exactly where its kind appends a mark (ADR 0041's SQ8): a
+// correlated EXISTS under OR, NOT or CASE is a dependent kMark, which defines its mark; a semi join
+// with one, a mark without one, and a kind the binder never plans dependent are malformed.
+TEST(ColumnIdsTest, ADependentJoinHasAMarkExactlyWhereItsKindAppendsOne) {
+  const auto dependent = [](JoinKind kind, ColumnId mark) {
+    return Plan(Node(DependentJoinNode{
+        .kind = kind, .left = Scan(), .right = Scan({kD, kE, kF}), .mark = mark, .span = {}}));
+  };
+  EXPECT_EQ(PositionMismatch(dependent(JoinKind::kMark, ColumnId{12})), std::nullopt);
+  EXPECT_EQ(PositionMismatch(dependent(JoinKind::kMark, kNoColumnId)),
+            "DependentJoin: MARK dependent join without a mark");
+  EXPECT_EQ(PositionMismatch(dependent(JoinKind::kSemi, ColumnId{12})),
+            "DependentJoin: SEMI dependent join with a mark");
+  EXPECT_EQ(PositionMismatch(dependent(JoinKind::kNullAwareMark, ColumnId{12})),
+            "DependentJoin: a NULL-AWARE MARK dependent join");
 }
 
 // A plan's free variables (ADR 0023): the ids it reads that none of its own nodes defines. A
@@ -433,7 +455,8 @@ TEST(ColumnIdsTest, ResolvePositionsBindsLeftIdsInsideTheRightInput) {
 }
 
 // The second shape of the output-id contract (ADR 0023): a two-input node may also define a column
-// of its own, which goes last. No kind sets `mark` yet, so only a hand-built plan has one.
+// of its own, which goes last -- a dependent kMark's mark (ADR 0041's SQ8); OutputIds reads it for
+// any kind, the resolver checks which kinds may have one.
 TEST(ColumnIdsTest, OutputIdsOfADependentJoinEndWithItsOwnColumn) {
   const ColumnId mark{12};
   const auto marked = [](JoinKind kind) {
@@ -491,7 +514,7 @@ TEST(ColumnIdsTest, ResolvePositionsResolvesJoinKeysPerInputAndResidualsOverBoth
 TEST(ColumnIdsTest, EveryJoinKindResolves) {
   for (const JoinKind kind :
        {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-        JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark}) {
+        JoinKind::kNullAwareAnti, JoinKind::kFull, JoinKind::kNullAwareMark, JoinKind::kMark}) {
     JoinNode join = Join(kind);
     if (Traits(kind).residuals) {
       join.residual = {Residual(kC, kF)};
@@ -522,6 +545,15 @@ TEST(ColumnIdsTest, PositionMismatchNamesBrokenJoins) {
   mark.build = BuildSide::kLeft;
   EXPECT_EQ(PositionMismatch(Plan(Node(mark))),
             "Join: NULL-AWARE MARK join builds on its left input");
+  JoinNode two_valued = Join(JoinKind::kMark);
+  EXPECT_EQ(PositionMismatch(Plan(Node(two_valued))), "Join: MARK join without a mark");
+  two_valued.mark = ColumnId{9};
+  two_valued.build = BuildSide::kLeft;
+  EXPECT_EQ(PositionMismatch(Plan(Node(two_valued))), "Join: MARK join builds on its left input");
+  two_valued.build = BuildSide::kRight;
+  two_valued.keys[0].null_equal = true;  // the two-valued mark takes NULL-equal keys and residuals
+  two_valued.residual = {Residual(kC, kF)};
+  EXPECT_EQ(PositionMismatch(ResolvePositions(Plan(Node(two_valued)))), std::nullopt);
   JoinNode marked_semi = Join(JoinKind::kSemi);
   marked_semi.mark = ColumnId{9};
   EXPECT_EQ(PositionMismatch(Plan(Node(marked_semi))), "Join: SEMI join with a mark");
@@ -688,8 +720,8 @@ TEST(ColumnIdsTest, AClonePassesThroughAProjectsOwnPassThroughIds) {
 // A mark join defines its mark (ADR 0041's decision 13), so a clone mints it again and the reads
 // above follow: a clone that kept it would define the original's column a second time wherever
 // the two meet, which ADR 0023's Path 2 makes when it clones an outer side holding a mark.
-TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
-  JoinNode mark = Join(JoinKind::kNullAwareMark);
+void CloneMintsTheMarkOf(JoinKind kind) {
+  JoinNode mark = Join(kind);
   mark.keys = {JoinKey{.left = Column(kB, 1), .right = Column(kE, 1)}};  // at their positions
   mark.mark = ColumnId{9};
   const LogicalNodePtr reader =
@@ -706,6 +738,13 @@ TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
   ASSERT_EQ(cloned.size(), 4U);
   EXPECT_GT(std::to_underlying(cloned.back()), std::to_underlying(before)) << "not a fresh mark";
   EXPECT_EQ(Explain(Plan(clone)), Explain(Plan(reader)));
+}
+
+TEST(ColumnIdsTest, ACloneMintsAMarkJoinsMark) {
+  for (const JoinKind kind : {JoinKind::kNullAwareMark, JoinKind::kMark}) {
+    SCOPED_TRACE(ToString(kind));
+    CloneMintsTheMarkOf(kind);
+  }
 }
 
 // An id the subtree reads but does not define is read from outside it, so it is left alone: that is

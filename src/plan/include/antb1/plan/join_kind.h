@@ -24,9 +24,12 @@ enum class JoinKind : std::uint8_t {
   kNullAwareMark,  // each left row once, then its mark (ADR 0041's decisions 12 and 13): TRUE on a
                    // match; else FALSE when the right is empty, even for a NULL key; else NULL when
                    // the left key is NULL or the right holds a NULL key; else FALSE
+  kMark,  // each left row once, then its mark (ADR 0041's decision 12, SQ8): TRUE when some right
+          // row matches its keys and passes every residual, else FALSE -- never NULL
 };
 
-// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW", "FULL", "NULL-AWARE MARK".
+// "INNER", "LEFT", "SEMI", "ANTI", "NULL-AWARE ANTI", "ONE-ROW", "FULL", "NULL-AWARE MARK",
+// "MARK".
 std::string_view ToString(JoinKind kind);
 
 // The input a join builds its hash table on; the other is probed.
@@ -98,6 +101,8 @@ constexpr JoinKindTraits Traits(JoinKind kind) {
               .residuals = true};
     case JoinKind::kNullAwareMark:
       return {.null_aware = true, .appends_mark = true};
+    case JoinKind::kMark:
+      return {.residuals = true, .appends_mark = true};
   }
   return {};
 }

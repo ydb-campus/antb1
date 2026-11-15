@@ -733,8 +733,8 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
     // A kind the operator cannot build on its left input (plan::JoinKindTraits::may_build_left). A
     // null-aware anti join would have to suppress every row once any probe key is NULL, a left
     // outer join emits matched pairs during the probe as well as padded rows after it -- neither
-    // of which this operator does -- and a one-row join builds its single row. Semi is ADR 0026's
-    // C2b, anti its C2c.
+    // of which this operator does -- a one-row join builds its single row, and a mark join marks
+    // the rows it probes (ADR 0041's decision 13). Semi is ADR 0026's C2b, anti its C2c.
     return arrow::Status::Invalid("a ", kind_name,
                                   " hash join that builds on its left input is not implemented");
   }
@@ -806,7 +806,8 @@ arrow::Result<std::unique_ptr<HashJoinOperator>> HashJoinOperator::Make(
   } else if (pass_through) {
     schema = probe->output_schema();
   } else if (traits.appends_mark) {
-    // The probe's columns, then its three-valued mark (ADR 0041's decision 13).
+    // The probe's columns, then its mark (ADR 0041's decision 13), nullable for either kind: only
+    // a null-aware mark's values are ever NULL.
     arrow::FieldVector fields = probe_schema.fields();
     fields.push_back(arrow::field("mark", arrow::boolean(), /*nullable=*/true));
     schema = arrow::schema(std::move(fields));
@@ -903,7 +904,7 @@ HashJoinOperator::HashJoinOperator(std::unique_ptr<Operator> probe,
       return plan::ColumnExpr{.index = Narrow<int>(at), .id = column.id};
     }));
   }
-  if (traits.filters_left && !traits.null_aware) {
+  if ((traits.filters_left || traits.appends_mark) && !traits.null_aware) {
     const std::vector<plan::BoundColumn>& keys = build_->spec()->keys();
     const auto is_key = [&keys](int column) {
       return std::ranges::any_of(
@@ -1002,6 +1003,14 @@ arrow::Status HashJoinOperator::Start() {
       }
       keep_ = mark_mode_ == MarkMode::kLookup ? Keep::kMatched : Keep::kAll;  // kAll: no lookup
       break;
+    case plan::JoinKind::kMark:
+      // Every row is marked and none dropped, two-valued (ADR 0041's decision 12): FALSE for every
+      // row over a build that holds no row (num_rows() == 0: an empty build input, or one whose
+      // `=` keys are all NULL, which no probe row matches; NULL keys a NULL-equal key holds are
+      // rows), else a lookup: TRUE when a candidate passes every residual, else FALSE.
+      mark_mode_ = table_->num_rows() == 0 ? MarkMode::kFalse : MarkMode::kLookup;
+      keep_ = mark_mode_ == MarkMode::kLookup ? Keep::kMatched : Keep::kAll;
+      break;
     // Listed rather than left to a `default:` so that a new kind, or a build-side direction that
     // outputs the build's rows (ADR 0026's C2b and C2c), does not compile until it is handled here.
     case plan::JoinKind::kInner:
@@ -1058,6 +1067,11 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextOutput() {
     case plan::JoinKind::kOneRow:
       return NextOneRow();
     case plan::JoinKind::kNullAwareMark:
+      return NextMarked();
+    case plan::JoinKind::kMark:
+      if (!residual_.empty() && keep_ != Keep::kAll && !evaluated_) {
+        ARROW_RETURN_NOT_OK(EvaluatePairs());  // before the batch's first window, as semi's
+      }
       return NextMarked();
     // Semi, anti and null-aware anti, which output the probe's rows and none of the build's. Listed
     // rather than left to a `default:`: this is the arm a build-side direction (ADR 0026's C2b and
@@ -1184,13 +1198,7 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextSelected() {
     }
     return Batch{.data = batch_.data->Slice(begin, rows), .selection = std::move(selection)};
   };
-  const auto matched = [this](int64_t row) {
-    if (evaluated_) {  // with residuals: one of its pairs passed them all
-      return passed_[static_cast<std::size_t>(row)] != 0;
-    }
-    const JoinMatches& m = matches_[static_cast<std::size_t>(row)];
-    return m.end > m.begin;
-  };
+  const auto matched = [this](int64_t row) { return Matched(row); };
   switch (keep_) {
     case Keep::kMatched:  // Find gives no match to a row that is not selected
       return window(matched);
@@ -1249,25 +1257,27 @@ arrow::Result<std::optional<Batch>> HashJoinOperator::NextMarked() {
       break;
     }
     case MarkMode::kLookup: {
-      // TRUE on a match; else NULL where the key is NULL or the build holds a NULL key; else
-      // FALSE. Find gives a NULL key, and a row that is not selected, no match. So the values are
-      // the matches, written a byte at a time; and the validity, where the build holds a NULL key,
-      // is the matches too (every other row NULL), else the key's own (a NULL key never matches).
+      // TRUE on a match (with residuals: a candidate that passed them all, Matched); a mark join
+      // (kMark) is FALSE otherwise. A null-aware one is NULL where the key is NULL or the build
+      // holds a NULL key, else FALSE. Find gives a NULL key, and a row that is not selected, no
+      // match. So the values are the matches, written a byte at a time; and a null-aware mark's
+      // validity, where the build holds a NULL key, is the matches too (every other row NULL),
+      // else the key's own (a NULL key never matches).
       ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
                             arrow::AllocateEmptyBitmap(rows, ctx_.pool));
-      auto next = static_cast<std::size_t>(begin);
-      arrow::internal::GenerateBitsUnrolled(values->mutable_data(), 0, rows, [this, &next] {
-        const JoinMatches& m = matches_[next++];
-        return m.end > m.begin;
-      });
+      auto next = begin;
+      arrow::internal::GenerateBitsUnrolled(values->mutable_data(), 0, rows,
+                                            [this, &next] { return Matched(next++); });
       std::shared_ptr<arrow::Buffer> validity;
-      const arrow::Array& key = *keys_[0];
-      if (table_->has_null()) {
-        validity = values;
-      } else if (key.null_count() > 0) {
-        ARROW_ASSIGN_OR_RAISE(validity,
-                              arrow::internal::CopyBitmap(ctx_.pool, key.null_bitmap_data(),
-                                                          key.offset() + begin, rows));
+      if (plan::Traits(kind_).null_aware) {
+        const arrow::Array& key = *keys_[0];
+        if (table_->has_null()) {
+          validity = values;
+        } else if (key.null_count() > 0) {
+          ARROW_ASSIGN_OR_RAISE(validity,
+                                arrow::internal::CopyBitmap(ctx_.pool, key.null_bitmap_data(),
+                                                            key.offset() + begin, rows));
+        }
       }
       const int64_t nulls =
           validity == nullptr ? 0 : rows - arrow::internal::CountSetBits(validity->data(), 0, rows);

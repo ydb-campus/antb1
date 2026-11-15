@@ -39,8 +39,8 @@ using testing::MemoryTable;
 
 // The number of columns `node` returns if it is planned, for the scans, sorts and joins that the
 // malformed-join cases build: a semi, anti or null-aware anti join returns its probe input's
-// columns, any other join both inputs' columns. A missing input counts as the 2-column scan that
-// it stands in for.
+// columns, a mark join those and its mark, any other join both inputs' columns. A missing input
+// counts as the 2-column scan that it stands in for.
 std::size_t WidthOf(const plan::LogicalNodePtr& node) {
   if (node == nullptr) {
     return 2;
@@ -50,6 +50,9 @@ std::size_t WidthOf(const plan::LogicalNodePtr& node) {
     const bool probe_only = join->kind == plan::JoinKind::kSemi ||
                             join->kind == plan::JoinKind::kAnti ||
                             join->kind == plan::JoinKind::kNullAwareAnti;
+    if (plan::Traits(join->kind).appends_mark) {
+      return left + 1;
+    }
     return probe_only ? left : left + WidthOf(join->right);
   }
   if (const auto* sort = std::get_if<plan::SortNode>(node.get())) {
@@ -595,7 +598,9 @@ std::vector<Placement> Placements(const plan::LogicalNodePtr& join, std::size_t 
 // null-aware anti none, left matches every row; on y, anti keeps the rows of a NULL y, null-aware
 // anti none (its build has a NULL key), and left pads them. A one-row join appends the row of
 // MIN(x) and COUNT(*). The residual y > x (the right input's y) passes the rows of a non-NULL y
-// but x = 0: semi keeps them, anti the others, and left pads the others.
+// but x = 0: semi keeps them, anti the others, and left pads the others. A mark join returns every
+// row with its mark: TRUE on x; on y, FALSE for a NULL y (NULL in a null-aware mark join, whose
+// build has a NULL key); with the residual, TRUE for the rows semi keeps and FALSE for the others.
 // ADR 0026's C2b: a semi join may build on its left input, the side it preserves, instead of on
 // the subquery side. It then probes with its right input, marks the build rows that matched and
 // emits them once no part of its probe pipeline runs any more -- so it is the sink of that
@@ -1155,7 +1160,12 @@ TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
     bool residual = false;                 // y > x
     Values xs;                             // the x of the rows it returns
     Values right;  // a left join: the right input's x of each row (NULL: padded)
+    std::vector<std::optional<bool>> marks;  // a mark join's, by row
   };
+  const std::optional<bool> unknown;
+  const std::vector<std::optional<bool>> every(10, true);
+  const std::vector<std::optional<bool>> some = {false, true,  true, false, true,
+                                                 true,  false, true, true,  false};
   for (const Case& c :
        {Case{.kind = plan::JoinKind::kSemi, .key = x, .xs = all},
         Case{.kind = plan::JoinKind::kAnti, .key = x, .xs = {}},
@@ -1171,12 +1181,22 @@ TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
              .key = x,
              .residual = true,
              .xs = all,
-             .right = non_null_y}}) {
+             .right = non_null_y},
+        Case{.kind = plan::JoinKind::kNullAwareMark, .key = x, .xs = all, .marks = every},
+        Case{.kind = plan::JoinKind::kNullAwareMark,
+             .key = y,
+             .xs = all,
+             .marks = {unknown, true, true, unknown, true, true, unknown, true, true, unknown}},
+        Case{.kind = plan::JoinKind::kMark, .key = x, .xs = all, .marks = every},
+        Case{.kind = plan::JoinKind::kMark, .key = y, .xs = all, .marks = some},
+        Case{
+            .kind = plan::JoinKind::kMark, .key = x, .residual = true, .xs = all, .marks = some}}) {
     SCOPED_TRACE(std::string(plan::ToString(c.kind)) +
                  (c.key.has_value() ? " on " + c.key->name : "") +
                  (c.residual ? " with a residual" : ""));
     const bool one_row = c.kind == plan::JoinKind::kOneRow;
     const bool wide = one_row || c.kind == plan::JoinKind::kLeft;
+    const bool mark = plan::Traits(c.kind).appends_mark;
     std::vector<plan::JoinKey> keys;
     if (c.key.has_value()) {
       keys.push_back(plan::JoinKey{.left = *c.key, .right = *c.key});
@@ -1189,10 +1209,23 @@ TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
         .residual = c.residual ? std::vector<plan::ExprPtr>{greater} : std::vector<plan::ExprPtr>{},
         .build = plan::BuildSide::kRight,
         .span = {}});
-    const std::size_t width = wide ? 4 : 2;
+    std::size_t width = wide ? 4 : 2;
+    if (mark) {
+      width = 3;
+    }
     const auto rows = Run(PlanOf(join, width));
     ASSERT_NE(rows, nullptr);
     EXPECT_EQ(Int64Column(*rows, 0), c.xs);
+    if (mark) {
+      std::vector<std::optional<bool>> marks;
+      for (const std::shared_ptr<arrow::Array>& chunk : rows->column(2)->chunks()) {
+        const auto& values = static_cast<const arrow::BooleanArray&>(*chunk);
+        for (int64_t i = 0; i < values.length(); ++i) {
+          marks.push_back(values.IsNull(i) ? std::nullopt : std::optional(values.Value(i)));
+        }
+      }
+      EXPECT_EQ(marks, c.marks);
+    }
     if (c.kind == plan::JoinKind::kLeft) {
       EXPECT_EQ(Int64Column(*rows, 2), c.right);
     }
@@ -1227,11 +1260,12 @@ TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
 // keys, a key of two types, a DOUBLE or BOOLEAN key, a key outside its input on either side, a
 // residual that is missing, not BOOLEAN or outside the join; a join of another kind than inner
 // that builds on its left input, a one-row join with keys or residuals, a semi, anti, null-aware
-// anti or left join without keys, a null-aware anti join of two keys or with a residual, a semi,
-// anti or left join with a residual that is missing, not BOOLEAN or outside the join, or with a
-// key of two types; in a part pipeline and over a serial probe input alike, with and without a
-// profile (whose lines name the join by its EXPLAIN text). Each plan has its join's own width, so
-// that only the join's shape can make it Invalid.
+// anti or mark join (of either kind) without keys, a null-aware anti join of two keys or with a
+// residual, a null-aware mark join with a residual, a semi, anti, mark or left join with a residual
+// that is missing, not BOOLEAN or outside the join, or with a key of two types; in a part pipeline
+// and over a serial probe input alike, with and without a profile (whose lines name the join by its
+// EXPLAIN text). Each plan has its join's own width, so that only the join's shape can make it
+// Invalid.
 TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
@@ -1310,7 +1344,8 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     const auto boolean = expr(0, LogicalType::kBoolean);
     // A semi join (ADR 0026's C2b) and an anti join (its C2c) that build on their left input run:
     // they are the two KeepTheSameRows cases below, not malformed plans.
-    for (const plan::JoinKind kind : {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kNullAwareAnti, plan::JoinKind::kLeft,
+                                      plan::JoinKind::kNullAwareMark, plan::JoinKind::kMark}) {
       expect_invalid(kind_of(kind, key(x, x), {}, plan::BuildSide::kLeft),
                      "a join that builds on its left input and cannot emit its rows");
     }
@@ -1325,6 +1360,11 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
     expect_invalid(kind_of(plan::JoinKind::kAnti, {}, {}), "an anti join without keys");
     expect_invalid(kind_of(plan::JoinKind::kNullAwareAnti, {}, {}),
                    "a null-aware anti join without keys");
+    expect_invalid(kind_of(plan::JoinKind::kNullAwareMark, {}, {}),
+                   "a null-aware mark join without keys");
+    expect_invalid(kind_of(plan::JoinKind::kMark, {}, {}), "a mark join without keys");
+    expect_invalid(kind_of(plan::JoinKind::kNullAwareMark, key(x, x), {boolean}),
+                   "a null-aware mark join with a residual");
     // A left join without keys is a nested loop (ADR 0040), and well formed.
     expect_invalid(
         kind_of(plan::JoinKind::kNullAwareAnti,
@@ -1340,8 +1380,10 @@ TEST_F(PhysicalPlannerTest, MalformedJoinsAreInvalidNotUnsupported) {
                    "an anti join with a BIGINT residual");
     expect_invalid(kind_of(plan::JoinKind::kLeft, key(x, x), {expr(3, LogicalType::kBigInt)}),
                    "a left join with a BIGINT residual");
-    for (const plan::JoinKind kind :
-         {plan::JoinKind::kSemi, plan::JoinKind::kAnti, plan::JoinKind::kLeft}) {
+    expect_invalid(kind_of(plan::JoinKind::kMark, key(x, x), {expr(3, LogicalType::kBigInt)}),
+                   "a mark join with a BIGINT residual");
+    for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kAnti,
+                                      plan::JoinKind::kLeft, plan::JoinKind::kMark}) {
       expect_invalid(kind_of(kind, key(x, x), {expr(4, LogicalType::kBoolean)}),
                      "a residual outside the join of another kind");
     }

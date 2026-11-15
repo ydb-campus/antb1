@@ -283,12 +283,12 @@ TEST(ExplainTest, EveryDependentJoinKind) {
                   .kind = kind, .left = ScanOf("t", {0}), .right = ScanOf("t", {0}), .span = {}}),
               line);
   }
-  EXPECT_EQ(ExplainNode(DependentJoinNode{.kind = JoinKind::kSemi,
+  EXPECT_EQ(ExplainNode(DependentJoinNode{.kind = JoinKind::kMark,
                                           .left = ScanOf("t", {0}),
                                           .right = ScanOf("t", {0}),
                                           .mark = ColumnId{7},
                                           .span = {}}),
-            "DependentJoin SEMI mark=#7");
+            "DependentJoin MARK mark=#7");
 }
 
 // Both inputs are rendered, left first, as a Join's are.

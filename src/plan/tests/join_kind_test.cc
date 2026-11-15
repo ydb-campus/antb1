@@ -9,9 +9,10 @@
 namespace antb1::plan {
 namespace {
 
-constexpr std::array<JoinKind, 8> kKinds = {
-    JoinKind::kInner,         JoinKind::kLeft,   JoinKind::kSemi, JoinKind::kAnti,
-    JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull, JoinKind::kNullAwareMark};
+constexpr std::array<JoinKind, 9> kKinds = {
+    JoinKind::kInner, JoinKind::kLeft,          JoinKind::kSemi,
+    JoinKind::kAnti,  JoinKind::kNullAwareAnti, JoinKind::kOneRow,
+    JoinKind::kFull,  JoinKind::kNullAwareMark, JoinKind::kMark};
 
 // Each kind's row of the table (ADR 0037's OJ1), as its definition in join_kind.h says: what the
 // rules that read it rely on, pinned so that a change to a row is a change to this test too.
@@ -50,6 +51,7 @@ TEST(JoinKindTest, EachKindHasItsRow) {
                           .residuals = true}},
            Row{.kind = JoinKind::kNullAwareMark,
                .traits = {.null_aware = true, .appends_mark = true}},
+           Row{.kind = JoinKind::kMark, .traits = {.residuals = true, .appends_mark = true}},
        }) {
     SCOPED_TRACE(ToString(row.kind));
     const JoinKindTraits traits = Traits(row.kind);
@@ -121,8 +123,8 @@ TEST(JoinKindTest, EveryRowIsConsistent) {
 // an empty build empties inner and semi joins; a probe drops its unmatched rows -- the gate of ADR
 // 0029's dynamic filters -- for inner and semi joins built on the right, and for every keyed kind
 // but null-aware anti built on the left; only inner outputs its matches alone. A mark join (ADR
-// 0041's decision 13) emits no build row, is never emptied and takes no dynamic filter on either
-// side.
+// 0041's decision 13), null-aware or not, emits no build row, is never emptied and takes no dynamic
+// filter on either side.
 TEST(JoinKindTest, DerivedRulesKeepTheirAnswers) {
   for (const JoinKind kind : kKinds) {
     SCOPED_TRACE(ToString(kind));
@@ -131,7 +133,7 @@ TEST(JoinKindTest, DerivedRulesKeepTheirAnswers) {
     const bool keyless = kind == JoinKind::kOneRow;
     const bool null_aware = kind == JoinKind::kNullAwareAnti;
     const bool full = kind == JoinKind::kFull;
-    const bool mark = kind == JoinKind::kNullAwareMark;
+    const bool mark = kind == JoinKind::kNullAwareMark || kind == JoinKind::kMark;
     EXPECT_EQ(EmitsBuildRows(kind, BuildSide::kLeft), !inner && !keyless && !mark);
     EXPECT_EQ(EmitsBuildRows(kind, BuildSide::kRight), full) << "only FULL pads a right build";
     EXPECT_EQ(EmitsUnmatchedBuildRows(kind, BuildSide::kLeft),
@@ -158,6 +160,8 @@ TEST(JoinKindTest, PaddedJoinRowsBoundTheOutput) {
   // A mark join outputs each left row exactly once, whatever matches (ADR 0041's decision 13).
   EXPECT_EQ(PaddedJoinRows(JoinKind::kNullAwareMark, 5, 100, 7), 100);
   EXPECT_EQ(PaddedJoinRows(JoinKind::kNullAwareMark, 500, 100, 7), 100);
+  EXPECT_EQ(PaddedJoinRows(JoinKind::kMark, 5, 100, 7), 100);
+  EXPECT_EQ(PaddedJoinRows(JoinKind::kMark, 500, 100, 7), 100);
 }
 
 // Traits is constexpr, so a rule may read it where only a constant will do.
