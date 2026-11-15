@@ -197,6 +197,17 @@ enum class Feature : std::uint8_t {
   // feature of their own; its CASE, arithmetic, alias, position, ORDER BY, NULLS order, GROUP BY,
   // HAVING, aggregates and literals record theirs, its block as kCorrelatedEmptyValue's does.
   kCorrelatedItemValue,  // SELECT o.x, (SELECT COUNT(*) FROM i WHERE i.k = o.k) FROM o
+  // SQ8a's correlated EXISTS marks (ADR 0041): [NOT] EXISTS over a plain block (one named table, an
+  // equality key of one type, `=` or IS NOT DISTINCT FROM, an optional comparison of an inner
+  // column with a literal and an optional residual over an inner and an outer column of one type)
+  // under OR, NOT or a CASE WHEN: in one more conjunct of WHERE or of an inner JOIN's ON, in a
+  // select item or ORDER BY item of a block that does not aggregate, as a CASE that is a GROUP BY
+  // key, or in an aggregate's argument beside an outer column; now and then next to a top-level
+  // [NOT] EXISTS conjunct over such a block, which records no kCorrelatedExists. Its blocks' WHERE
+  // and `*` record no feature of their own; its OR, NOT, CASE, literals, qualified columns, IS NOT
+  // DISTINCT FROM, residual (kCompareColumns), alias, positions, ORDER BY, GROUP BY, HAVING and
+  // aggregates record theirs.
+  kCorrelatedExistsMark,  // WHERE o.x > 5 OR EXISTS (SELECT * FROM i WHERE i.k = o.k)
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -385,6 +396,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_condition_value";
     case Feature::kCorrelatedItemValue:
       return "correlated_item_value";
+    case Feature::kCorrelatedExistsMark:
+      return "correlated_exists_mark";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -554,6 +567,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedEmptyValue,
     Feature::kCorrelatedConditionValue,
     Feature::kCorrelatedItemValue,
+    Feature::kCorrelatedExistsMark,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,
