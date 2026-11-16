@@ -2967,7 +2967,7 @@ struct SubqueryJoin {
   std::vector<ExprPtr> exprs;
   std::vector<ColumnId> ids;  // per expression: its column
   std::vector<Predicate> filter;
-  SourceSpan span;              // the [NOT] IN, or the comparison's operator
+  SourceSpan span;  // the [NOT] IN, or the comparison's operator
   // A mark join's BOOLEAN: a null-aware one's (ADR 0041's SQ7), a correlated EXISTS's (SQ8a).
   ColumnId mark = kNoColumnId;
 
