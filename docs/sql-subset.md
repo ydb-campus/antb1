@@ -1053,7 +1053,9 @@ The relations then join in the order and tree shape a cost search chooses from f
 each key's domain from the parts' integer ranges capped at
 their non-NULL rows, else their distinct-count hints; "Join order and build sides" under Semantics): every edge between
 the two inputs of a join is a key of it, so the edge that closes a cycle becomes a second key, and a join builds on its
-right input unless that input is estimated at more than `--build-side-ratio` times its left. A block of more than 12
+right input unless that input is estimated at more than `--build-side-ratio` times its left. The default is `1`,
+so the smaller estimated input is built; ties and unknown estimates retain the right input.
+An explicit `--build-side-ratio 4` restores the previous threshold. A block of more than 12
 relations, or any block under `--join-order greedy`, joins left-deep instead: the relation with the most rows (an
 unknown count counts as the most) is probed first, then the connected relation with the smallest estimate joins next.
 Because the order reads metadata alone, a plan does not depend on the thread count. The executor runs every kind as a
@@ -1662,7 +1664,7 @@ The semantics follow DuckDB ([ADR 0004](adr/0004-types-null-overflow-semantics.m
   cannot measure. Each join condition narrows by the larger of its two columns' distinct-value estimates; two
   conditions between the same pair of relations narrow only once, being one composite key, while conditions to
   different relations narrow in turn. A join builds its hash table on its right input and probes with its left; it
-  builds on the left instead when the right is estimated at more than `--build-side-ratio` times it (default 4; `1`
+  builds on the left instead when the right is estimated at more than `--build-side-ratio` times it (default 1; `1`
   always builds on the smaller side). The ratio changes which plan a query gets, never its answer, and an estimate
   nothing knows never moves a build -- a relation of unknown size is probed, never built. Estimates are integer
   arithmetic over footer metadata alone, so a plan is the same on every host and for any number of threads; `explain`

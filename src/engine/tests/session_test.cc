@@ -587,6 +587,16 @@ TEST_F(SessionTest, TheBuildSideRatioReachesTheJoinOrderAndKeepsEveryAnswer) {
   // OrderJoins -- so stubbing any link of it out fails this.
   EXPECT_GT(left_builds[100], 0U);
   EXPECT_EQ(left_builds[1'000'000], 0U);
+  auto implicit = Session::Make();
+  ASSERT_TRUE(implicit.ok()) << implicit.status().ToString();
+  ASSERT_TRUE((*implicit)->RegisterParquet("t", {path_}).ok());
+  const auto default_plan = (*implicit)->Explain(sql);
+  ASSERT_TRUE(default_plan.ok()) << default_plan.status().ToString();
+  EXPECT_EQ(lefts(*default_plan), left_builds[100]);
+  const auto default_result = (*implicit)->Execute(sql);
+  ASSERT_TRUE(default_result.ok()) << default_result.status().ToString();
+  ASSERT_TRUE(expected.has_value());
+  EXPECT_EQ(Rows(*default_result), *expected);
 }
 
 // The thread count is checked; the row groups of a query run on the session's threads, and the

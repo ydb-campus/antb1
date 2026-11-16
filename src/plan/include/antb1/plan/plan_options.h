@@ -27,8 +27,8 @@ enum class JoinOrderSearch : std::uint8_t {
 
 struct BindOptions {
   // How much larger a join's build side must be than the side that probes it before the join builds
-  // on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 400,
-  // the default, flips only a decisive difference; 100 is ADR 0022's rule, the smaller side always.
+  // on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 100,
+  // the default, builds on the smaller estimated side. Ties and unknown estimates keep the right.
   // Below 100 is invalid.
   int64_t build_side_ratio = kBuildSideRatio;
   // Which search chooses a block's join order. The greedy rule is what every plan used before C5;

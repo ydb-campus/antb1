@@ -4354,8 +4354,9 @@ TEST(BinderTest, AFactPairClosedByACycleMeetsOnTwoKeysAfterTheSalesSideShrinks) 
   }
 }
 
-// The control: the greedy rule (above 12 relations, or --join-order greedy) probes from the
-// snapshot and builds the whole sales fact, unreduced, keyed on the product and `sold`'s day.
+// The control: the greedy rule (above 12 relations, or --join-order greedy) joins the snapshot
+// with the whole sales fact before reducing sales, keyed on the product and `sold`'s day.
+// The default ratio builds the smaller snapshot side even though the order is still greedy.
 TEST(BinderTest, TheGreedyRuleMeetsTheFactPairWithTheSalesFactWhole) {
   const Catalog catalog = FactPairCatalog();
   auto stmt = sql::Parse(kFactPair);
@@ -4368,7 +4369,8 @@ TEST(BinderTest, TheGreedyRuleMeetsTheFactPairWithTheSalesFactWhole) {
   const LogicalNode& sales = sales_left ? *meet->left : *meet->right;
   const LogicalNode& stock = sales_left ? *meet->right : *meet->left;
   EXPECT_EQ(ScannedTables(sales), std::set<std::string>{"sales"}) << Explain(*plan);
-  EXPECT_EQ(&BuildOf(*meet), &sales) << "the sales fact is built\n" << Explain(*plan);
+  EXPECT_EQ(&BuildOf(*meet), &stock) << "the smaller snapshot is built\n" << Explain(*plan);
+  EXPECT_EQ(&ProbeOf(*meet), &sales) << "the unreduced sales fact probes\n" << Explain(*plan);
   EXPECT_TRUE(FilteredColumns(sales).empty()) << "the sales fact meets the snapshot whole";
   EXPECT_TRUE(FilteredColumns(stock).contains("c_year")) << Explain(*plan);
   EXPECT_EQ(KeyNames(*meet),

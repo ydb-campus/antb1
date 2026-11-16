@@ -167,7 +167,9 @@ TEST(Session, ErrorKindsAtTheBoundary) {
 // is worth the most on, every plan still printed the same, every answer was right, and 2,887 tests
 // passed. A query of three relations is the smallest shape that has a nested join at all.
 TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
-  auto session = engine::Session::Make().ValueOrDie();
+  // Keep the build orientation this pruning regression exercises; default-ratio selection is
+  // covered separately by the planner, session and CLI tests.
+  auto session = engine::Session::Make({.build_side_ratio = 400}).ValueOrDie();
   // One fixture under three names: a self-join needs no second file and the shape is what matters.
   for (const std::string_view name : {"a", "b", "c"}) {
     ASSERT_TRUE(session->RegisterParquet(std::string(name), {Fixture("hits_like.parquet")}).ok())

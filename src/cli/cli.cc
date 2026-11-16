@@ -139,7 +139,8 @@ struct Inputs {
   int threads = 1;                      // --threads (query and bench)
   // --memory-limit (query and bench); std::nullopt for commands that run no query.
   std::optional<std::string> memory_limit;
-  double build_side_ratio = 4.0;    // --build-side-ratio (query, explain and bench)
+  double build_side_ratio = static_cast<double>(plan::kBuildSideRatio) /
+                            100.0;  // --build-side-ratio (query, explain and bench)
   std::string join_order = "cost";  // --join-order (query, explain and bench)
   BenchSettings bench;
   bool verbose = false;  // version --verbose
@@ -173,9 +174,9 @@ void AddMemoryLimitOption(CLI::App* cmd, Inputs& in) {
 void AddBuildSideRatioOption(CLI::App* cmd, Inputs& in) {
   cmd->add_option("--build-side-ratio", in.build_side_ratio,
                   "How many times larger a join's build side must be than the side probing it "
-                  "before the join builds on the probe side instead (default: 4; 1 always builds "
+                  "before the join builds on the probe side instead (default: 1; 1 always builds "
                   "on the smaller side). Changes the plan, never the answer")
-      ->default_val(4.0)
+      ->default_val(in.build_side_ratio)
       ->check(CLI::Range(1.0, 1'000'000.0));
 }
 
