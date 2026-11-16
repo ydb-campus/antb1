@@ -14,3 +14,7 @@ IsArtifical = "IsArtifical"
 TraficSourceID = "TraficSourceID"
 # Deliberate misspelling in lexer/parser/session negative tests.
 SELEC = "SELEC"
+# C++ ABI symbols in the Darwin compatibility baseline.
+__ZTIPn = "__ZTIPn"
+__ZTIy = "__ZTIy"
+__ZTSPn = "__ZTSPn"
