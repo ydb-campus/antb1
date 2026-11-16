@@ -54,7 +54,7 @@ jobs:
           cache: true
           cache-key: pixi-${{ hashFiles('pixi.lock') }}-
           cache-write: false
-      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -62,7 +62,7 @@ jobs:
       - name: Traced GCC build (the commands of pixi run codeql-build)
         if: matrix.build-mode == 'manual'
         run: cmake -E rm -rf build/codeql && cmake --workflow --preset codeql
-      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}
           upload: never
@@ -72,7 +72,7 @@ jobs:
       # on compiled languages, so the results are filtered here before the upload.
       - name: Drop results in third-party code (tools/ci/filter_sarif.py)
         run: python3 tools/ci/filter_sarif.py sarif-results --exclude '.pixi/*' --exclude 'build/*'
-      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: sarif-results
           category: /language:${{ matrix.language }}
