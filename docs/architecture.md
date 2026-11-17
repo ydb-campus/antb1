@@ -179,7 +179,12 @@ steps (only step 7 uses more than one thread):
    dependent join the select list binds (SQ5b), until a later clause that reads it moves it below that clause's own
    entry. A correlated `EXISTS` under `OR`, `NOT` or `CASE` (SQ8a) is a dependent mark join in the slot, its BOOLEAN
    mark read like a value and bound once per slot as a correlated value is; the unnesting lifts it into a mark join
-   keyed on its correlation, as it lifts a top-level `EXISTS` into a semi join. A join graph no key connects is a cross
+   keyed on its correlation, as it lifts a top-level `EXISTS` into a semi join. SQ8b carries the correlation
+   representatives through grouping and DISTINCT, and counts surviving rows per binding for OFFSET. A static
+   aggregate uses the existing LEFT join and empty values, with a constant presence value that HAVING makes NULL
+   when it rejects the row; EXISTS tests that presence, not whether an aggregate result is NULL. HAVING membership
+   joins become marks before this step, so they also evaluate the aggregate row over empty input.
+   A join graph no key connects is a cross
    product ([ADR 0040](adr/0040-nested-loop-joins.md)): a relation the keys leave out that is a sub-plan of exactly one
    row (an aggregate without groups) that no key, no residual and no conjunct of its own branch reads joins above the
    others as a one-row join, and the parts the keys connect are crossed left-deep, each the build of an inner join

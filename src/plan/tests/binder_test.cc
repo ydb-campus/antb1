@@ -1164,38 +1164,24 @@ INSTANTIATE_TEST_SUITE_P(
         // condition every EXISTS keeps the static refusal, before any name resolves.
         ErrorCase{"SELECT EXISTS (SELECT i16 FROM u) FROM t", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE "
-                  "u.i32 = t.i32 GROUP BY u.i16)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE (EXISTS (SELECT i16 FROM u)) IS NOT NULL", kUnsupported,
                   "EXISTS", "EXISTS (subqueries) is not supported here"},
         ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
-        // Path 1 takes a plain block only: every clause that would have to act per binding is
-        // refused at the EXISTS before any clause of its block binds (the binder's gate), even one
-        // that would be a bind error; an uncorrelated EXISTS reads any block.
+        // SQ8b binds grouped EXISTS blocks fully, including their grouping errors.
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i32 FROM u WHERE u.i32 = t.i32 "
                   "GROUP BY u.i16)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
+                  kBind, "u.i32", "column 'u.i32' must appear in the GROUP BY clause"},
         ErrorCase{"SELECT nope FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
                   "GROUP BY u.i16)",
                   kBind, "nope", "column 'nope' does not exist"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
-                  "GROUP BY u.i16)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
-                  "LIMIT 1)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
-                  kUnsupported, "EXISTS",
-                  "EXISTS over a subquery with an aggregate is not supported"},
         ErrorCase{"SELECT i32, COUNT(*) FROM t GROUP BY i32 HAVING EXISTS "
                   "(SELECT u.i16 FROM u WHERE u.i32 = t.i32)",
                   kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
-        // The gate comes before the block's own bind errors, which binding it would meet first...
+        // The block's own bind errors are no longer hidden by its shape...
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT nope FROM u WHERE u.i32 = t.i32 "
                   "GROUP BY u.i16)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
+                  kBind, "nope", "column 'nope' does not exist"},
         // ... and after the enclosing block's grouping errors, which come before its HAVING binds,
         // as DuckDB, which answers the EXISTS, reports them.
         ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i32 HAVING EXISTS "
@@ -1217,8 +1203,8 @@ INSTANTIATE_TEST_SUITE_P(
         // A GROUP BY position that falls in such a star exits 4, as an ORDER BY one does.
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT * FROM ok GROUP BY 1, 2)", kUnsupported,
                   "1", "GROUP BY position 1 over a '*' of an EXISTS subquery is not supported"},
-        // What binds before the gate: the EXISTS block's FROM list, and the enclosing conjuncts
-        // written before the EXISTS; a later conjunct's bind error comes after its refusal.
+        // FROM errors and errors in conjuncts before or after a supported EXISTS remain bind
+        // errors.
         ErrorCase{
             "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM nope WHERE nope.x = t.i16 LIMIT 1)",
             kBind, "nope", "table 'nope' does not exist"},
@@ -1227,7 +1213,7 @@ INSTANTIATE_TEST_SUITE_P(
                   kBind, "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 LIMIT 1) "
                   "AND nope = 1",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
+                  kBind, "nope", "column 'nope' does not exist"},
         // A DOUBLE has no join key, by decision (ADR 0022), and a DECIMAL(38,0) with a
         // DECIMAL(38,10) would need 48 digits: a semi join needs one type for its key, so neither
         // exits past 4.
@@ -3123,19 +3109,27 @@ TEST(BinderTest, GroupingCallsAreColumnsOfTheNode) {
 // BY, with the same message at the same span, and an uncorrelated one is answered alike.
 TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
   const Catalog catalog = MakeCatalog();
-  // Correlated, a grouped block stays refused, with the same message at the same place.
-  for (const std::string_view outer : {
-           "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 GROUP BY {})",
-           "SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM u WHERE u.i16 = t.i16 GROUP BY {})",
-       }) {
-    const std::string plain = std::vformat(outer, std::make_format_args("u.i32"));
-    const std::string rollup = std::vformat(outer, std::make_format_args("ROLLUP (u.i32)"));
-    const auto expected = BindSql(plain, catalog);
-    const auto bound = BindSql(rollup, catalog);
-    ASSERT_FALSE(expected.ok()) << plain;
-    ASSERT_FALSE(bound.ok()) << rollup;
-    EXPECT_EQ(bound.status().message(), expected.status().message()) << rollup;
-    EXPECT_EQ(SpanText(rollup, bound.status()), SpanText(plain, expected.status())) << rollup;
+  // SQ8b answers plain grouping; a ROLLUP's empty set remains SQ16. Scalar grouped
+  // subqueries still require SQ4b.
+  const auto grouped_exists =
+      BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 GROUP BY u.i32)",
+              catalog);
+  ASSERT_TRUE(grouped_exists.ok()) << grouped_exists.status();
+  EXPECT_TRUE(Optimize(*grouped_exists).ok());
+  const auto rollup_exists = BindSql(
+      "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 GROUP BY ROLLUP(u.i32))",
+      catalog);
+  ASSERT_TRUE(rollup_exists.ok()) << rollup_exists.status();
+  const auto rollup_plan = Optimize(*rollup_exists);
+  ASSERT_FALSE(rollup_plan.ok());
+  EXPECT_EQ(GetSqlError(rollup_plan.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+  for (const char* keys : {"u.i32", "ROLLUP(u.i32)"}) {
+    const auto scalar = BindSql(std::format("SELECT i16 FROM t WHERE i16 = (SELECT COUNT(*) FROM u "
+                                            "WHERE u.i16 = t.i16 GROUP BY {})",
+                                            keys),
+                                catalog);
+    ASSERT_FALSE(scalar.ok());
+    EXPECT_EQ(GetSqlError(scalar.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
   }
   // Correlated through the grouping keys alone, every spelling of them is correlated alike: the
   // gate reads a grouping set's keys as it reads a GROUP BY list's.
@@ -3146,10 +3140,8 @@ TEST(BinderTest, GroupingSetsMakeAGroupedBlock) {
                      std::make_format_args(keys));
     const auto bound = BindSql(sql, catalog);
     ASSERT_FALSE(bound.ok()) << sql;
-    EXPECT_TRUE(bound.status().message().starts_with(
-        "EXISTS over a subquery with GROUP BY is not supported"))
-        << sql << ": " << bound.status().message();
-    EXPECT_EQ(SpanText(sql, bound.status()), "EXISTS") << sql;
+    EXPECT_EQ(GetSqlError(bound.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(SpanText(sql, bound.status()), "t.i32") << sql;
   }
   // Uncorrelated, any block is answered (ADR 0041's SQ4a), a grouping set's as a GROUP BY's.
   for (const std::string_view outer : {
@@ -3216,15 +3208,12 @@ TEST(BinderTest, SelectDistinct) {
     const auto& below = std::get<GroupAggregateNode>(Nth(*ordered, 1));
     EXPECT_TRUE(std::ranges::contains(below.key_ids, above.keys[0].column.id)) << sql;
   }
-  // A correlated EXISTS takes a plain block (ADR 0023's Path 1), so DISTINCT there is refused.
+  // SQ8b preserves each binding through DISTINCT.
   const auto exists =
       BindSql("SELECT i16 FROM t WHERE EXISTS (SELECT DISTINCT s FROM t AS u WHERE u.i32 = t.i32)",
               catalog);
-  ASSERT_FALSE(exists.ok());
-  ASSERT_NE(GetSqlError(exists.status()), nullptr);
-  EXPECT_EQ(GetSqlError(exists.status())->kind(), SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_TRUE(exists.status().message().contains("EXISTS over a subquery with DISTINCT"))
-      << exists.status().ToString();
+  ASSERT_TRUE(exists.ok()) << exists.status();
+  EXPECT_TRUE(Optimize(*exists).ok());
   const auto refused = BindSql("SELECT DISTINCT i16 FROM t ORDER BY s", catalog);
   ASSERT_FALSE(refused.ok());
   ASSERT_NE(GetSqlError(refused.status()), nullptr);
@@ -6991,24 +6980,31 @@ TEST(BinderTest, AnExistsBlocksAliasIsNoEnclosingColumn) {
     ASSERT_FALSE(bound.ok()) << sql;
     EXPECT_TRUE(bound.status().IsInvalid()) << sql << ": " << bound.status();
   }
-  // A name only the enclosing block has stays an enclosing column, and so does an alias's name in
-  // an ON, a GROUP BY expression and the argument of an aggregate or of GROUPING(): correlated, and
-  // refused at the EXISTS.
-  for (const char* sql : {
-           "SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT ok.s AS i64 FROM ok JOIN dec ON dec.b = i64 "
-           "LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING MAX(i32) > 0 "
-           "LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32 + 1, s LIMIT 1)",
-           "SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY ROLLUP (s) HAVING "
-           "GROUPING(i32) = 0)",
-       }) {
-    const auto correlated = BindSql(sql, catalog);
-    ASSERT_FALSE(correlated.ok()) << sql;
-    EXPECT_TRUE(correlated.status().IsNotImplemented()) << sql << ": " << correlated.status();
-    EXPECT_TRUE(correlated.status().message().starts_with("EXISTS over a subquery with"))
-        << sql << ": " << correlated.status().message();
+  // With SQ8b the block binds and reports each clause's own error; aliases still do
+  // not become outer correlations in the places that forbid alias resolution.
+  const std::vector<std::pair<std::string_view, std::string_view>> errors = {
+      {"SELECT i16 FROM t WHERE EXISTS (SELECT s FROM ok ORDER BY i32 LIMIT 1)",
+       "a column of an enclosing query block is supported only in WHERE"},
+      {"SELECT i16 FROM t WHERE EXISTS (SELECT ok.s AS i64 FROM ok JOIN dec ON dec.b = i64 LIMIT "
+       "1)",
+       "column 'i64' does not exist"},
+      {"SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY s HAVING MAX(i32) > 0 "
+       "LIMIT 1)",
+       "column 'i32' does not exist"},
+      {"SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY i32 + 1, s LIMIT 1)",
+       "column 'i32' does not exist"},
+      {"SELECT i16 FROM t WHERE EXISTS (SELECT s AS i32 FROM ok GROUP BY ROLLUP (s) HAVING "
+       "GROUPING(i32) = 0)",
+       "GROUPING child \"i32\" must be a grouping column"},
+  };
+  for (const auto& [sql, message] : errors) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_FALSE(bound.ok()) << sql;
+    EXPECT_EQ(bound.status().message(), message) << sql;
+    EXPECT_EQ(GetSqlError(bound.status())->kind(), message.starts_with("a column")
+                                                       ? SqlErrorDetail::Kind::kUnsupported
+                                                       : SqlErrorDetail::Kind::kBind)
+        << sql;
   }
 }
 
@@ -9163,19 +9159,13 @@ TEST(BinderTest, TheGroupBySpeculationReadsAKeysMark) {
   }
 }
 
-// What SQ8a leaves refused, each in its words: a mark's block of another shape (SQ8b), a mark in
+// What SQ8b leaves refused, each in its words: a mark in
 // HAVING or over the block's aggregates (SQ13), in a conjunct that reads an enclosing block (SQ8c),
 // inside a padded unit's ON, keyless (SQ11, the unnesting's refusal), in a LEFT JOIN's ON and as a
 // BOOLEAN value (decision 3).
 INSTANTIATE_TEST_SUITE_P(
     CorrelatedExistsMarks, BindErrorTest,
     ::testing::Values(
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 "
-                  "LIMIT 1)",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT DISTINCT u.i16 FROM u WHERE u.i64 = "
-                  "t.i64) OR i16 > 0",
-                  kUnsupported, "EXISTS", "EXISTS over a subquery with DISTINCT is not supported"},
         ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) > 1 OR EXISTS (SELECT "
                   "1 FROM u WHERE u.i16 = t.i16)",
                   kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
@@ -9202,6 +9192,29 @@ TEST(BinderTest, AKeylessMarkIsTheUnnestingsRefusal) {
   ASSERT_NE(GetSqlError(optimized.status()), nullptr) << optimized.status().ToString();
   EXPECT_EQ(SpanText(kSql, optimized.status()), "EXISTS") << optimized.status().ToString();
   EXPECT_EQ(optimized.status().message(), "a correlated EXISTS without a key is not supported");
+}
+
+TEST(BinderTest, CorrelatedExistsBlocksBindAndUnnest) {
+  const Catalog catalog = MakeCatalog();
+  for (
+      const std::string_view sql : {
+          "SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 "
+          "GROUP BY u.i16)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 GROUP BY u.i16)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT u.i16 FROM u WHERE u.i32 = t.i32 LIMIT 1)",
+          "SELECT i16 FROM t WHERE EXISTS (SELECT MIN(u.i16) FROM u WHERE u.i32 = t.i32)",
+          "SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 LIMIT 1)",
+          "SELECT i16 FROM t WHERE NOT EXISTS (SELECT DISTINCT u.i16 FROM u WHERE u.i64 = t.i64) "
+          "OR i16 > 0",
+      }) {
+    const auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << sql << ": " << bound.status();
+    EXPECT_EQ(PositionMismatch(*bound), std::nullopt) << sql;
+    const auto optimized = Optimize(*bound);
+    ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status();
+    EXPECT_EQ(PositionMismatch(*optimized), std::nullopt) << sql;
+    EXPECT_TRUE(FreeVariables(*optimized->root).empty()) << sql;
+  }
 }
 
 }  // namespace

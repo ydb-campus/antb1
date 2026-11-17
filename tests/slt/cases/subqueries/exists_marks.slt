@@ -2523,19 +2523,10 @@ SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM promos p WHERE p.pm_id 
 AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
 AND r.rd_id + 9223372036854775807 > r.rd_row)) ORDER BY 1
 
-# ---- boundaries of correlated EXISTS marks (ADR 0041's SQ8a) ----
+# ---- SQ8b: a mark over a block that groups, limits or aggregates ----
 
-# SQ8a answers a correlated EXISTS that is no top-level conjunct as a two-valued mark join, over a block of FROM and
-# WHERE alone that is correlated through an equality. The shapes below stay exit code 4 after it, each until the item
-# its heading names: pending on a roadmap PR, or in DuckDB alone where no PR plans them yet. Then the bind errors inside
-# a mark's block, and the order of a bind error and a mark.
-
-# ---- pending: a mark over a block that groups, limits or aggregates (ADR 0041; roadmap PR SQ8b) ----
-
-# antb1 refuses each at the EXISTS gate ("EXISTS over a subquery with <clause> is not supported"), before it asks where
-# the EXISTS stands, and they stay exit 4 after SQ8a. GROUP BY under OR: a city with riders has a group. With a HAVING
+# SQ8b answers these shapes in every placement SQ8a opened. GROUP BY under OR: a city with riders has a group. With a HAVING
 # under NOT: cities 2 and 3 have 39 gold riders. DuckDB: cities 1, 2, 3 and 6; then 1, 4, 5 and 6.
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id = 6 OR EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
@@ -2546,7 +2537,6 @@ SMALLINT
 3
 6
 
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier
@@ -2559,7 +2549,6 @@ SMALLINT
 6
 
 # DISTINCT under OR. DuckDB: cities 2, 3 and 6.
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id = 6 OR EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
@@ -2572,7 +2561,6 @@ SMALLINT
 
 # HAVING without GROUP BY, in a CASE: the block has a row where the city has more than 77 riders, city 3 alone.
 # DuckDB: cities 1, 2, 4, 5 and 6.
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 77) THEN 1 ELSE 0 END = 0
@@ -2587,7 +2575,6 @@ SMALLINT
 
 # LIMIT 1 under OR in an inner ON, and LIMIT 0 under NOT, which holds for every city. DuckDB: city 1 eight zones from
 # zone 1, city 2 eight from 2, city 3 seven from 3, city 5 zone 40 alone; then cities 1 to 6.
-pending SQ8b
 query III nosort
 SELECT c.ct_id, COUNT(*), MIN(z.zn_id) FROM cities c JOIN zones z ON z.zn_city = c.ct_id
 AND (z.zn_id > 35 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id LIMIT 1)) GROUP BY 1 ORDER BY 1
@@ -2598,7 +2585,6 @@ SMALLINT	BIGINT	INTEGER
 3	7	3
 5	1	40
 
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id LIMIT 0) ORDER BY 1
 ----
@@ -2612,7 +2598,6 @@ SMALLINT
 
 # OFFSET 77 in a select item's CASE: more than 77 riders, city 3 alone. DuckDB: 'more' for city 3, 'fewer' for the
 # others.
-pending SQ8b
 query IT nosort
 SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id OFFSET 77) THEN 'more'
 ELSE 'fewer' END AS m FROM cities c ORDER BY 1
@@ -2627,7 +2612,6 @@ SMALLINT	VARCHAR
 
 # An aggregate over every row has one row over no row too: under OR every city passes, and in an ORDER BY CASE the NOT
 # EXISTS is never true. DuckDB: cities 1 to 6; then 6 down to 1.
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id = 6 OR EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
@@ -2640,7 +2624,6 @@ SMALLINT
 5
 6
 
-pending SQ8b
 query I nosort
 SELECT c.ct_id FROM cities c
 ORDER BY CASE WHEN NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) THEN 0 ELSE 1 END, 1 DESC
@@ -2655,7 +2638,6 @@ SMALLINT
 
 # DISTINCT in a GROUP BY key's CASE, and GROUP BY with a HAVING in an aggregate's argument (cities 1, 2 and 3 each have
 # a tier of more than 38 riders). DuckDB: n 8 (the riders without a city) and y 232; then 6.
-pending SQ8b
 query TI nosort
 SELECT CASE WHEN EXISTS (SELECT DISTINCT d.dv_city FROM drivers d WHERE d.dv_city = r.rd_city) THEN 'y' ELSE 'n' END
 AS k, COUNT(*) FROM riders r GROUP BY 1 ORDER BY 1
@@ -2664,7 +2646,6 @@ VARCHAR	BIGINT
 n	8
 y	232
 
-pending SQ8b
 query I nosort
 SELECT SUM(c.ct_id * CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier
 HAVING COUNT(*) > 38) THEN 1 ELSE 0 END) AS s FROM cities c
@@ -2675,10 +2656,13 @@ HUGEINT
 # A star over a grouped block is DuckDB's bind error, which antb1 raises for an uncorrelated block today and for a
 # correlated one once SQ8b binds it (ADR 0041's decision 23). DuckDB: column "rd_row" must appear in the GROUP BY
 # clause.
-pending SQ8b
 statement error must appear in the GROUP BY clause
 SELECT c.ct_id FROM cities c
 WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
+
+# ---- boundaries retained after SQ8b ----
+
+# These shapes remain Unsupported until their named roadmap item, or are DuckDB-only where no item plans them.
 
 # ---- pending: a correlated EXISTS above the aggregation (ADR 0041; roadmap PR SQ13) ----
 

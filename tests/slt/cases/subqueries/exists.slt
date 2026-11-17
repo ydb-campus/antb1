@@ -165,10 +165,9 @@ BIGINT
 statement error
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT * FROM zones AS z, cities AS z WHERE z.zn_id = tr_pickup AND z.zn_city = z.ct_id)
 
-# ---- DuckDB only until the general domain join gets a PR (ADR 0023: an aggregate inside EXISTS exits 4) ----
+# ---- SQ8b: an aggregate inside a correlated EXISTS ----
 
 # An aggregate returns a row even over no input, so this EXISTS keeps every trip.
-onlyif duckdb
 query I nosort
 SELECT COUNT(*) FROM trips WHERE EXISTS (SELECT COUNT(*) FROM promos WHERE pm_id = tr_promo)
 ----
