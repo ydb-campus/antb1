@@ -105,7 +105,8 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
     if constexpr (std::is_floating_point_v<T>) {
       if (y == 0 && (op != plan::ArithOp::kModulo || error_for_zero)) {
         return arrow::Status::ExecutionError("Division by zero");
-      } else if (op == plan::ArithOp::kModulo) {
+      }
+      if (op == plan::ArithOp::kModulo) {
         builder.UnsafeAppend(std::fmod(x, y));  // NaN for a zero divisor, as in DuckDB
       } else {
         builder.UnsafeAppend(x / y);

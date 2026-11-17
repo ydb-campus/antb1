@@ -580,7 +580,7 @@ TEST_F(GroupedAggregateTest, VarianceFamilyAsDuckDb) {
       const auto result = scalar_of(kind, LogicalType::kDouble, *DoubleColumn(input));
       ASSERT_TRUE(result.ok()) << result.status();
       ASSERT_TRUE(result->has_value());
-      EXPECT_FALSE(std::isfinite(**result));
+      EXPECT_FALSE(std::isfinite(result->value_or(0.0)));
       auto grouped = MakeGrouped(call);
       grouped->Resize(2);
       ASSERT_TRUE(

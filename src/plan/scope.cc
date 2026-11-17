@@ -435,7 +435,7 @@ arrow::Result<std::optional<Scope::OuterStar>> Scope::LookUpOuterStar(std::strin
     const Scope& scope = *inner->outer_;
     const std::size_t end = std::min(inner->outer_visible_.end, scope.bindings_.size());
     const std::size_t middle = std::min(inner->outer_visible_.inner_begin, end);
-    for (const auto [first, last] : {std::pair{middle, end}, std::pair{std::size_t{0}, middle}}) {
+    for (const auto& [first, last] : {std::pair{middle, end}, std::pair{std::size_t{0}, middle}}) {
       std::optional<OuterStar> found;
       for (std::size_t b = first; b < last; ++b) {
         if (scope.bindings_[b].Named(qualifier)) {

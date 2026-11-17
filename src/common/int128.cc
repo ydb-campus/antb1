@@ -151,8 +151,8 @@ Real DuckDbDecimalToReal(Int128 unscaled, int width, int scale) {
   char* begin = end - 4;
   begin[0] = 'e';
   begin[1] = '-';
-  begin[2] = static_cast<char>('0' + scale / 10);
-  begin[3] = static_cast<char>('0' + scale % 10);
+  begin[2] = static_cast<char>('0' + (scale / 10));
+  begin[3] = static_cast<char>('0' + (scale % 10));
   UInt128 magnitude =
       unscaled < 0 ? UInt128{0} - static_cast<UInt128>(unscaled) : static_cast<UInt128>(unscaled);
   do {

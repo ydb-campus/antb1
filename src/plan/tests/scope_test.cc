@@ -965,13 +965,14 @@ TEST(ScopeTest, OuterStarsRespectVisibilityShadowingAndAmbiguity) {
   const auto a = visible.LookUpOuterStar("A", {});
   ASSERT_TRUE(a.ok()) << a.status();
   ASSERT_TRUE(a->has_value());
-  EXPECT_EQ((*a)->scope, &outer);
-  EXPECT_EQ((*a)->binding, 0U);
+  const auto a_star = a->value_or(Scope::OuterStar{});
+  EXPECT_EQ(a_star.scope, &outer);
+  EXPECT_EQ(a_star.binding, 0U);
   Scope nearest({}, &outer, Visibility{.inner_begin = 2, .end = 3});
   const auto last = nearest.LookUpOuterStar("a", {});
   ASSERT_TRUE(last.ok()) << last.status();
   ASSERT_TRUE(last->has_value());
-  EXPECT_EQ((*last)->binding, 2U);
+  EXPECT_EQ(last->value_or(Scope::OuterStar{}).binding, 2U);
   Scope ambiguous({}, &outer);
   EXPECT_FALSE(ambiguous.LookUpOuterStar("a", {}).ok());
   Scope hidden({}, &outer, Visibility{.end = 1});
@@ -992,7 +993,7 @@ TEST(ScopeTest, OuterStarsRespectVisibilityShadowingAndAmbiguity) {
   const auto farther = invisible_column.LookUpOuterStar("a", {});
   ASSERT_TRUE(farther.ok()) << farther.status();
   ASSERT_TRUE(farther->has_value());
-  EXPECT_EQ((*farther)->scope, &outer);
+  EXPECT_EQ(farther->value_or(Scope::OuterStar{}).scope, &outer);
   auto bound = BindSql(
       "SELECT i16 FROM ok WHERE EXISTS "
       "(SELECT ok.* FROM u WHERE u.i16 = ok.i16)",
