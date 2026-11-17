@@ -1,0 +1,1099 @@
+# SQ8b: correlated EXISTS blocks, including NULL keys, empty inputs and repeated bindings.
+
+# Hash large results while keeping small boundary-case answers readable.
+# The digest checks every value and its order; result types are checked separately.
+hash-threshold 16
+
+# groups; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# groups; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# having; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# having; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# distinct_offset; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city OFFSET 1) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# distinct_offset; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city OFFSET 1) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# group_offset; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# group_offset; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# offset; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) ORDER BY 1
+----
+INTEGER
+78 values hashing to 2d9b229af571d257e9368b3949e61cdde3334435d5bb9831a54c9ef1980c4bdf
+
+# offset; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) ORDER BY 1
+----
+INTEGER
+162 values hashing to 64a5dfb4ed53fbd5ff21b61199c053ec8b84f933efd32a0f853e8d3eb8ae1959
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 290d9b3a6a86b2d51534e24abba51d930a07f27a46ef7dacfdac3eb35a6e5198
+
+# empty_limit; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city LIMIT 0 OFFSET 2) ORDER BY 1
+----
+INTEGER
+
+# empty_limit; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city LIMIT 0 OFFSET 2) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city LIMIT 0 OFFSET 2) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# static; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# static; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# empty_count; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+# empty_count; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9f47c78d7d235fb51fde85bf697acf89a8463af81d10d0808ac5eac1a0656f7d
+
+# null_sum; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city HAVING SUM(r.rd_id) IS NULL) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+# null_sum; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city HAVING SUM(r.rd_id) IS NULL) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city = c.rd_city HAVING SUM(r.rd_id) IS NULL) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9f47c78d7d235fb51fde85bf697acf89a8463af81d10d0808ac5eac1a0656f7d
+
+# static_having_offset; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+
+# static_having_offset; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# nonempty_sets; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# nonempty_sets; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# constant_group; =; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city GROUP BY 1) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# constant_group; =; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city GROUP BY 1) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.rd_city GROUP BY 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# groups; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# groups; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# having; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# having; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 38) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 1379d7b6da288d252d51c190d2b73ffc1d9a0e25e5e04ced2196517dc3c84867
+
+# distinct_offset; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city OFFSET 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# distinct_offset; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city OFFSET 1) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# group_offset; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# group_offset; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY r.rd_tier HAVING COUNT(*) > 0 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# offset; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) ORDER BY 1
+----
+INTEGER
+78 values hashing to 2d9b229af571d257e9368b3949e61cdde3334435d5bb9831a54c9ef1980c4bdf
+
+# offset; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) ORDER BY 1
+----
+INTEGER
+162 values hashing to 64a5dfb4ed53fbd5ff21b61199c053ec8b84f933efd32a0f853e8d3eb8ae1959
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city ORDER BY r.rd_id LIMIT 1 OFFSET 77) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 290d9b3a6a86b2d51534e24abba51d930a07f27a46ef7dacfdac3eb35a6e5198
+
+# empty_limit; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city LIMIT 0 OFFSET 2) ORDER BY 1
+----
+INTEGER
+
+# empty_limit; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city LIMIT 0 OFFSET 2) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city LIMIT 0 OFFSET 2) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# static; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# static; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# empty_count; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0) ORDER BY 1
+----
+INTEGER
+
+# empty_count; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# null_sum; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING SUM(r.rd_id) IS NULL) ORDER BY 1
+----
+INTEGER
+
+# null_sum; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING SUM(r.rd_id) IS NULL) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT SUM(r.rd_id) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING SUM(r.rd_id) IS NULL) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# static_having_offset; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+
+# static_having_offset; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city HAVING COUNT(*) = 0 LIMIT 1 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to 9607145eeef7b0ab97501387df8aa1cf988d264d6f100767da78e4df4fcb52d6
+
+# nonempty_sets; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# nonempty_sets; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY GROUPING SETS ((r.rd_tier), (r.rd_city, r.rd_tier)) HAVING GROUPING(r.rd_city) = 1 OFFSET 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# constant_group; IS NOT DISTINCT FROM; EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY 1) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# constant_group; IS NOT DISTINCT FROM; NOT EXISTS, including NULL and repeated outer keys.
+query I nosort
+SELECT c.rd_row FROM riders c WHERE NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY 1) ORDER BY 1
+----
+INTEGER
+
+query IT nosort
+SELECT c.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.rd_city GROUP BY 1) THEN 'yes' ELSE 'no' END AS flag FROM riders c ORDER BY 1
+----
+INTEGER	VARCHAR
+480 values hashing to d7bba41a9ab95eb301a81b9071170924e182d51ee342dfc153f98cb11a5b6d52
+
+# A grouped aggregate over no rows has no group, unlike a static aggregate.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_city > 0 GROUP BY r.rd_tier HAVING COUNT(*) = 0) ORDER BY 1
+----
+SMALLINT
+
+# Empty input under DISTINCT and OFFSET.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0 OFFSET 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# A positive limit keeps the plain residual-correlation path.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < c.ct_pop LIMIT 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# Two outer columns share one representative.
+query I nosort
+SELECT c.ct_id FROM cities c JOIN cities d ON d.ct_id = c.ct_id WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_city = d.ct_id GROUP BY r.rd_tier OFFSET 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# An uncorrelated value in grouped HAVING.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) > (SELECT COUNT(*) FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# An uncorrelated value in static HAVING.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > (SELECT COUNT(*) FROM promos)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING NOT IN, static aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT zn_city FROM zones)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# HAVING NOT IN, grouped aggregate; NULL and empty membership sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+6
+
+
+# An IN mark in static HAVING is evaluated over the empty aggregate row too.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT zn_city FROM zones) OR COUNT(*) = 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# A single empty grouping set has the static aggregate empty-row semantics.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY ()) ORDER BY 1
+----
+SMALLINT
+
+
+# A single empty grouping set has the static aggregate empty-row semantics.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () OFFSET 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# A single empty grouping set has the static aggregate empty-row semantics.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () HAVING COUNT(*) = 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# A single empty grouping set has the static aggregate empty-row semantics.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () HAVING COUNT(*) = 0 OFFSET 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT 0 FROM cities)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT 0 FROM cities)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) IN (SELECT 0 FROM cities)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) NOT IN (SELECT 0 FROM cities)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) NOT IN (SELECT pm_id FROM promos)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Membership over a static aggregate: positive zero matches, NULL probes and empty sets.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT SUM(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id HAVING SUM(r.rd_row) NOT IN (SELECT rd_city FROM riders)) ORDER BY 1
+----
+SMALLINT
+
+
+# The normalized GROUP BY () tree must remain alive while a positive LIMIT is removed.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () LIMIT 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id)
+----
+BIGINT
+6
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) = 0)
+----
+BIGINT
+3
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) = 0 OFFSET 1)
+----
+BIGINT
+0
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id ORDER BY 1 LIMIT 1)
+----
+BIGINT
+6
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) > 1 OFFSET 1)
+----
+BIGINT
+2
+
+
+# Combined grouping, DISTINCT, ordering and limits.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier HAVING COUNT(*) > 1 LIMIT 1 OFFSET 1)
+----
+BIGINT
+3
+
+
+# GROUP BY () retains static semantics with DISTINCT and ordering.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () )
+----
+BIGINT
+6
+
+
+# GROUP BY () retains static semantics with DISTINCT and ordering.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () HAVING COUNT(*) = 0)
+----
+BIGINT
+3
+
+
+# GROUP BY () retains static semantics with DISTINCT and ordering.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () ORDER BY 1 LIMIT 1)
+----
+BIGINT
+6
+
+
+# GROUP BY () retains static semantics with DISTINCT and ordering.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () HAVING COUNT(*) = 0 ORDER BY 1 LIMIT 1)
+----
+BIGINT
+3
+
+
+# GROUP BY () retains static semantics with DISTINCT and ordering.
+query I nosort
+SELECT COUNT(*) FROM cities c WHERE EXISTS (SELECT DISTINCT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY () ORDER BY 1 OFFSET 1)
+----
+BIGINT
+0

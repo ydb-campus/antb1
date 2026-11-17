@@ -400,6 +400,12 @@ such block. A mark is never in `HAVING` or over a block's aggregates outside an 
 literals, and no key computes or compares two types; the item's text is written once (D38), no `ORDER BY` expression
 reads its alias (D37), and nothing computes, so nothing can fail (D35).
 
+SQ8b (`correlated_exists_block`) also draws keyed blocks with `DISTINCT`, `GROUP BY`, aggregate `HAVING`,
+`LIMIT 0`, `LIMIT 1` and offsets, in the same placements. These blocks read only the outer correlation key, so
+substitution gives every outer reference an inner representative. Their clauses and constants are part of this
+feature; the plain SQ8a blocks retain their residual comparisons. `subqueries/exists_blocks.slt` checks the wider
+combinations, including NULL-equal keys, repeated bindings, empty groups and nonempty grouping sets.
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

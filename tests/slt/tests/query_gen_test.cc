@@ -5531,23 +5531,26 @@ struct MarkBlockInfo {
 // which DuckDB answers wrongly under a mark. Nothing else: no GROUP BY, HAVING, DISTINCT, ORDER BY,
 // LIMIT, OFFSET, WITH or set operation, no arithmetic, no other binding.
 void CheckMarkBlock(const sql::SubqueryExpr& sub, const sql::SelectStatement& outer,
-                    const std::vector<GenTable>& tables, MarkBlockInfo& info) {
+                    const std::vector<GenTable>& tables, MarkBlockInfo& info,
+                    bool broader_block = false) {
   SCOPED_TRACE(sql::ToSql(*sub.query));
   ASSERT_EQ(sub.kind, sql::SubqueryExpr::Kind::kExists);
   const sql::SelectStatement& block = *sub.query;
   EXPECT_TRUE(block.with.empty());
   EXPECT_TRUE(block.set_operation.empty());
-  EXPECT_FALSE(block.distinct);
-  EXPECT_TRUE(block.group_by.empty());
   EXPECT_TRUE(block.grouping.empty());
-  EXPECT_TRUE(block.having.empty());
   EXPECT_TRUE(block.order_by.empty());
-  EXPECT_FALSE(block.limit.has_value());
-  EXPECT_FALSE(block.offset.has_value());
   ASSERT_EQ(block.items.size(), 1U);
-  const sql::SelectStar* star = block.items.front().star();
-  ASSERT_NE(star, nullptr) << "SELECT *";
-  EXPECT_TRUE(star->qualifier.empty());
+  if (!broader_block) {
+    EXPECT_FALSE(block.distinct);
+    EXPECT_TRUE(block.group_by.empty());
+    EXPECT_TRUE(block.having.empty());
+    EXPECT_FALSE(block.limit.has_value());
+    EXPECT_FALSE(block.offset.has_value());
+    const sql::SelectStar* star = block.items.front().star();
+    ASSERT_NE(star, nullptr) << "SELECT *";
+    EXPECT_TRUE(star->qualifier.empty());
+  }
   ASSERT_EQ(block.from.size(), 1U);
   const sql::TableRef* ref = block.from.front().table();
   ASSERT_NE(ref, nullptr);
@@ -5805,6 +5808,78 @@ void CheckMarkCall(const sql::AggregateCall& call, const sql::SelectStatement& s
   }
 }
 
+// SQ8b's seven block shapes retain SQ8a's keyed correlation and expose their feature tag.
+TEST(QueryGenerator, CorrelatedExistsBlocksDrawEveryShape) {
+  const std::vector<GenTable> tables = JoinTables();
+  const auto gen =
+      MakeOver(tables, 157,
+               {.supported = kSupportedFeatures.Minus(
+                    {Feature::kInSubquery, Feature::kScalarSubquery, Feature::kCorrelatedAggregate,
+                     Feature::kUncorrelatedValue, Feature::kConditionValue, Feature::kHavingValue,
+                     Feature::kItemValue, Feature::kGroupValue, Feature::kInMark, Feature::kInForm,
+                     Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue,
+                     Feature::kCorrelatedItemValue}),
+                .target_percent = 0});
+  std::map<std::string, int> shapes;
+  for (uint64_t i = 0; i < 2000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedExistsMark)) {
+      EXPECT_FALSE(q.features.Has(Feature::kCorrelatedExistsBlock));
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    std::vector<const sql::SubqueryExpr*> all;
+    DeepSubqueries(*parsed, all);
+    bool broader = false;
+    for (const sql::SubqueryExpr* sub : all) {
+      const sql::SelectStatement& block = *sub->query;
+      std::string shape;
+      if (block.distinct) {
+        shape = "distinct_offset";
+        EXPECT_TRUE(block.offset.has_value());
+        EXPECT_TRUE(block.group_by.empty());
+        EXPECT_TRUE(block.having.empty());
+      } else if (!block.group_by.empty()) {
+        shape = block.having.empty() ? "group_offset" : "group_having";
+        ASSERT_EQ(block.group_by.size(), 1U);
+        EXPECT_NE(AsColumn(block.group_by.front()), nullptr);
+        EXPECT_EQ(block.offset.has_value(), block.having.empty());
+      } else if (!block.having.empty()) {
+        shape = "static_having";
+        ASSERT_EQ(block.items.size(), 1U);
+        ASSERT_NE(block.items.front().expr(), nullptr);
+        const auto* call = std::get_if<sql::AggregateCall>(block.items.front().expr());
+        ASSERT_NE(call, nullptr);
+        EXPECT_EQ(call->kind, sql::AggKind::kCountStar);
+        EXPECT_FALSE(block.offset.has_value());
+      } else if (block.limit.has_value()) {
+        EXPECT_TRUE(*block.limit == 0 || *block.limit == 1);
+        shape = *block.limit == 0 ? "limit_zero" : "limit_one";
+        EXPECT_FALSE(block.offset.has_value());
+      } else if (block.offset.has_value()) {
+        shape = "offset";
+      }
+      const bool wider = !shape.empty();
+      MarkBlockInfo info;
+      ASSERT_NO_FATAL_FAILURE(CheckMarkBlock(*sub, *parsed, tables, info, wider));
+      if (wider) {
+        ++shapes[shape];
+        EXPECT_EQ(info.keys, 1);
+        EXPECT_FALSE(info.residual) << "every outer reference has an inner representative";
+        broader = true;
+      }
+    }
+    EXPECT_EQ(q.features.Has(Feature::kCorrelatedExistsBlock), broader);
+  }
+  for (const char* shape : {"distinct_offset", "group_offset", "group_having", "static_having",
+                            "limit_zero", "limit_one", "offset"}) {
+    EXPECT_GT(shapes[shape], 0) << shape;
+  }
+}
+
 // What a correlated EXISTS mark writes (ADR 0041's SQ8a): every subquery an EXISTS over the plain
 // block (CheckMarkBlock), the marks inside one condition of their forms (MarkForm), in one place:
 // one more conjunct of WHERE (MarkFilterForm), or of the ON of an inner JOIN with no comma before
@@ -5828,7 +5903,7 @@ TEST(QueryGenerator, CorrelatedExistsMarksAreBlocksInTheirPlaces) {
                      Feature::kUncorrelatedValue, Feature::kConditionValue, Feature::kHavingValue,
                      Feature::kItemValue, Feature::kGroupValue, Feature::kInMark, Feature::kInForm,
                      Feature::kCorrelatedEmptyValue, Feature::kCorrelatedConditionValue,
-                     Feature::kCorrelatedItemValue}),
+                     Feature::kCorrelatedItemValue, Feature::kCorrelatedExistsBlock}),
                 .target_percent = 0});
   std::map<std::string, int> places;
   std::map<std::string, int> forms;  // of a filter's conjunct, and of a CASE's condition

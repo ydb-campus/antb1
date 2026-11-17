@@ -409,6 +409,8 @@ enum class Mode : std::uint8_t {
   // A join that appends its right input's one row (one-row): a static aggregate grouped by the
   // representatives of the outer columns, by substitution, as ADR 0023's Path 2 has it.
   kValue,
+  // EXISTS whose grouping or offset must run separately for each binding (SQ8b).
+  kExists,
 };
 
 // std::nullopt where the pass answers no correlated subquery of the kind: a null-aware anti join
@@ -449,9 +451,7 @@ struct Correlation {
                     what),
         join.span);
   }
-  // A node on the way to the correlated filter that the mode has no rule for. An aggregate, GROUP
-  // BY, HAVING, LIMIT or OFFSET leaves one; the binder refuses those statically, so this is the
-  // backstop for a shape it has not met.
+  // A node on the way to the correlated filter that this mode has no rule for.
   [[nodiscard]] arrow::Status RefuseShape() const {
     return Refuse(mode == Mode::kValue
                       ? "over a block that is not an ungrouped aggregate over its correlation"
@@ -466,7 +466,10 @@ enum class Role : std::uint8_t {
   kStatic,   // value: the ungrouped Aggregate, grouped by the representatives
   kArguments,  // value: the Compute of the aggregate's arguments, substituted
   kHaving,     // value: a HAVING over the static aggregate, a CASE above it (decision 17)
-  kOneRow,     // value: an uncorrelated one-row join over it, which moves up with the maps
+  kJoin,       // a join with an independent right input; 1:1 above a static aggregate
+  kGroup,      // EXISTS: append the representatives to the grouping keys
+  kSets,       // EXISTS: append them to every nonempty grouping set
+  kLimit,      // EXISTS: count surviving rows per binding for OFFSET
 };
 
 struct Step {
@@ -493,6 +496,8 @@ struct Descent {
   enum class Next : std::uint8_t { kInput, kFound, kDeclined };
 
   Mode mode;
+  const std::set<ColumnId>& outer;
+  bool exists_value = false;
   Stage stage = Stage::kAbove;
   Spine spine;
   LogicalNodePtr node;  // the node the rule is called on
@@ -504,7 +509,7 @@ struct Descent {
   // A correlated filter where the stage admits one: lift mode above everything, value mode under
   // the static aggregate.
   Next Filter(const FilterNode& filter) {
-    const bool admitted = mode == Mode::kLift ? stage == Stage::kAbove : stage != Stage::kAbove;
+    const bool admitted = mode != Mode::kValue ? stage == Stage::kAbove : stage != Stage::kAbove;
     const auto* computed = std::get_if<ComputeNode>(filter.input.get());
     if (!admitted || computed == nullptr) {
       return Next::kDeclined;
@@ -519,18 +524,38 @@ struct Descent {
   // maps above it, never a filter (decision 17's Filter row): a binding whose group it rejects
   // still reads the subquery's value, NULL.
   Next operator()(const FilterNode& filter) {
+    if (mode != Mode::kValue) {
+      const auto* computed = std::get_if<ComputeNode>(filter.input.get());
+      const bool correlated =
+          computed != nullptr &&
+          std::ranges::any_of(filter.predicates, [&](const Predicate& predicate) {
+            const ExprPtr* expr =
+                predicate.column.has_value() ? DefinedBy(*computed, predicate.column->id) : nullptr;
+            return expr != nullptr && SidesOf(**expr, outer).outer;
+          });
+      if (correlated) {
+        return Filter(filter);
+      }
+      return mode == Mode::kExists ? Record(Role::kHaving) : Next::kDeclined;
+    }
     if (mode == Mode::kValue && stage == Stage::kAbove) {
       return Record(Role::kHaving);
     }
     return Filter(filter);
   }
   Next operator()(const ProjectNode& /*project*/) {
+    if (mode == Mode::kExists) {
+      return Record(Role::kMap);
+    }
     if (stage != Stage::kAbove) {
       return Next::kDeclined;
     }
     return Record(mode == Mode::kLift ? Role::kDropped : Role::kMap);
   }
   Next operator()(const ComputeNode& /*compute*/) {
+    if (mode == Mode::kExists) {
+      return Record(Role::kMap);
+    }
     switch (stage) {
       case Stage::kAbove:
         return Record(mode == Mode::kLift ? Role::kDropped : Role::kMap);
@@ -545,11 +570,15 @@ struct Descent {
   // An ORDER BY nothing limits orders rows no semi or anti join reads in order. A scalar block's
   // ORDER BY over one aggregated row is one the binder never leaves.
   Next operator()(const SortNode& /*sort*/) {
-    return mode == Mode::kLift && stage == Stage::kAbove ? Record(Role::kDropped) : Next::kDeclined;
+    return mode != Mode::kValue && stage == Stage::kAbove ? Record(Role::kDropped)
+                                                          : Next::kDeclined;
   }
   // The static aggregate of a scalar subquery (decision 17's "Aggregate (static)" row); an EXISTS
   // over one is SQ8's.
   Next operator()(const AggregateNode& /*aggregate*/) {
+    if (mode == Mode::kExists) {
+      return Record(Role::kStatic);
+    }
     if (mode != Mode::kValue || stage != Stage::kAbove) {
       return Next::kDeclined;
     }
@@ -559,22 +588,36 @@ struct Descent {
   // SQ8 and SQ14 (LIMIT), SQ8 and SQ4b (GROUP BY), SQ16 (grouping sets), SQ15 (set operations),
   // SQ8 and SQ10 (joins on the way, decision 17's join rule), and the leaves and a nested dependent
   // join, which stand below a correlated filter, never above one.
-  Next operator()(const LimitNode& /*limit*/) { return Next::kDeclined; }
-  Next operator()(const GroupAggregateNode& /*group*/) { return Next::kDeclined; }
-  Next operator()(const GroupingSetsNode& /*sets*/) { return Next::kDeclined; }
+  Next operator()(const LimitNode& /*limit*/) {
+    return mode == Mode::kExists ? Record(Role::kLimit) : Next::kDeclined;
+  }
+  Next operator()(const GroupAggregateNode& /*group*/) {
+    return mode == Mode::kExists ? Record(Role::kGroup) : Next::kDeclined;
+  }
+  Next operator()(const GroupingSetsNode& sets) {
+    return mode == Mode::kExists &&
+                   std::ranges::none_of(sets.sets, [](const auto& set) { return set.empty(); })
+               ? Record(Role::kSets)
+               : Next::kDeclined;
+  }
   Next operator()(const UnionAllNode& /*union_all*/) { return Next::kDeclined; }
   Next operator()(const SetOperationNode& /*set_operation*/) { return Next::kDeclined; }
   // Decision 17's Join rule, the one piece SQ6 needs: an uncorrelated value's one-row join over the
   // static aggregate, from the slot after the aggregation, moves up with the select list, so that a
   // binding without rows reads the empty value combined with the value. It appends to each row of
   // its left input and pads none, and its right input reads no outer column, so the descent goes on
-  // into its left. Every other join is SQ8's and SQ10's.
+  // into its left. SQ8b also carries EXISTS through left-preserving joins with an independent
+  // right input, and moves HAVING marks above a static aggregate's empty-value join back.
   Next operator()(const JoinNode& join) {
-    if (mode != Mode::kValue || stage != Stage::kAbove || !Traits(join.kind).one_row ||
+    const JoinKindTraits traits = Traits(join.kind);
+    const bool allowed = mode == Mode::kExists
+                             ? !traits.pads_left
+                             : traits.one_row || (exists_value && traits.appends_mark);
+    if (mode == Mode::kLift || stage != Stage::kAbove || !allowed ||
         !FreeVariables(*join.right).empty()) {
       return Next::kDeclined;
     }
-    return Record(Role::kOneRow);
+    return Record(Role::kJoin);
   }
   Next operator()(const DependentJoinNode& /*join*/) { return Next::kDeclined; }
   Next operator()(const ScanNode& /*scan*/) { return Next::kDeclined; }
@@ -583,8 +626,14 @@ struct Descent {
 
 // The spine of `root`, a dependent join's right input, or std::nullopt where a rule declines, the
 // node it declined at in `declined`.
-std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root, LogicalNodePtr* declined) {
-  Descent descent{.mode = mode, .stage = Descent::Stage::kAbove, .spine = {}, .node = root};
+std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root, LogicalNodePtr* declined,
+                             const std::set<ColumnId>& outer, bool exists_value = false) {
+  Descent descent{.mode = mode,
+                  .outer = outer,
+                  .exists_value = exists_value,
+                  .stage = Descent::Stage::kAbove,
+                  .spine = {},
+                  .node = root};
   while (descent.node != nullptr) {
     switch (std::visit(descent, *descent.node)) {
       case Descent::Next::kFound:
@@ -596,7 +645,7 @@ std::optional<Spine> Descend(Mode mode, const LogicalNodePtr& root, LogicalNodeP
         break;
     }
     if (const auto* join = std::get_if<JoinNode>(descent.node.get())) {
-      descent.node = join->left;  // a one-row join's left input: the spine goes on through it
+      descent.node = join->left;  // the admitted join's correlated input
       continue;
     }
     const std::vector<LogicalNodePtr> inputs = InputsOf(*descent.node);
@@ -1312,7 +1361,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   // over the group: above a LEFT join back, and wherever a HAVING is a CASE over them.
   const bool rebuilt =
       join_back == JoinBack::kLeft || having ||
-      std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kOneRow; });
+      std::ranges::any_of(spine.steps, [](const Step& step) { return step.role == Role::kJoin; });
   std::vector<const Step*> maps;
   for (const Step& step : std::ranges::reverse_view(spine.steps)) {
     switch (step.role) {
@@ -1334,7 +1383,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         break;
       }
       case Role::kHaving:
-      case Role::kOneRow:
+      case Role::kJoin:
         ANTB1_CHECK(rebuilt);
         maps.push_back(&step);
         break;
@@ -1368,6 +1417,9 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         break;
       }
       case Role::kDropped:
+      case Role::kGroup:
+      case Role::kSets:
+      case Role::kLimit:
         ANTB1_CHECK(false);  // lift mode's only
         break;
     }
@@ -1434,7 +1486,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
                .name = std::move(name)});
     };
     for (const Step* step : maps) {
-      if (step->role == Role::kOneRow) {
+      if (step->role == Role::kJoin) {
         // Its right input reads no column below it, so it stands over the new top as it stood.
         top = WithInputs(*step->node, {std::move(top), std::get<JoinNode>(*step->node).right});
         continue;
@@ -1582,6 +1634,385 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
   return Rewritten{.node = rebuild(std::move(top)), .right = std::move(right)};
 }
 
+// Apply an existence value to the outer rows. A mark is two-valued; semi/anti consumers filter
+// that same value. In particular, a static aggregate's absent HAVING row is FALSE, never NULL.
+LogicalNodePtr ExistenceValue(const Correlation& correlation, LogicalNodePtr input, ExprPtr value) {
+  const DependentJoinNode& join = correlation.join;
+  if (join.kind == JoinKind::kAnti) {
+    value = std::make_shared<const Expr>(
+        Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {std::move(value)}},
+             .type = LogicalType::kBoolean,
+             .name = "NOT EXISTS"});
+  }
+  const ColumnId id =
+      join.mark != kNoColumnId ? join.mark : ColumnId{std::to_underlying(correlation.last_id) + 1};
+  if (join.mark == kNoColumnId) {
+    correlation.last_id = id;
+  }
+  LogicalNodePtr out = Make(ComputeNode{
+      .input = std::move(input), .exprs = {std::move(value)}, .ids = {id}, .span = join.span});
+  if (join.mark == kNoColumnId) {
+    out = Make(FilterNode{
+        .input = std::move(out),
+        .predicates = {Predicate{
+            .kind = Predicate::Kind::kIsTrue,
+            .column = BoundColumn{.id = id, .name = "EXISTS", .type = LogicalType::kBoolean}}},
+        .span = join.span});
+  }
+  return out;
+}
+
+LogicalNodePtr EmptyExistence(const Correlation& correlation) {
+  // IS NULL of a non-NULL constant is a non-nullable BOOLEAN FALSE.
+  const BoundColumn column{.name = "1", .type = LogicalType::kInteger};
+  const ExprPtr one = std::make_shared<const Expr>(Expr{
+      .node = ConstantExpr{.value = Constant{.type = LogicalType::kInteger, .value = Int128{1}}},
+      .type = LogicalType::kInteger,
+      .name = "1"});
+  const ExprPtr no = std::make_shared<const Expr>(Expr{
+      .node =
+          PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kIsNull, .column = column},
+                        .operands = {one}},
+      .type = LogicalType::kBoolean,
+      .name = "EXISTS"});
+  return ExistenceValue(correlation, correlation.join.left, no);
+}
+
+// Normalize the operators above an EXISTS block's static aggregate. DISTINCT and
+// ORDER BY cannot change its one row per binding, including after GROUP BY ().
+// A static aggregate has a row even over empty input. Its HAVING's IN/NOT IN must
+// therefore be decided after the empty-value join back, as a mark followed by a
+// HAVING condition, rather than filtering away an outer row before EXISTS reads it.
+LogicalNodePtr StaticExistenceInput(const LogicalNodePtr& node, ColumnId& last_id) {
+  if (std::holds_alternative<AggregateNode>(*node)) {
+    return node;
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  if (inputs.empty()) {
+    return node;
+  }
+  inputs.front() = StaticExistenceInput(inputs.front(), last_id);
+  LogicalNodePtr rewritten = WithInputs(*node, std::move(inputs));
+  if (const auto* sort = std::get_if<SortNode>(rewritten.get())) {
+    return sort->input;
+  }
+  if (const auto* group = std::get_if<GroupAggregateNode>(rewritten.get());
+      group != nullptr && group->aggregates.empty()) {
+    return Make(ProjectNode{.input = group->input,
+                            .columns = group->keys,
+                            .constants = {},
+                            .ids = group->key_ids,
+                            .span = group->span});
+  }
+  const auto* join = std::get_if<JoinNode>(rewritten.get());
+  if (join == nullptr || !Traits(join->kind).filters_left || !FreeVariables(*join->right).empty()) {
+    return rewritten;
+  }
+  JoinNode marked = *join;
+  marked.kind = join->kind == JoinKind::kNullAwareAnti ? JoinKind::kNullAwareMark : JoinKind::kMark;
+  marked.mark = ColumnId{std::to_underlying(last_id) + 1};
+  last_id = marked.mark;
+  marked.build = BuildSide::kRight;
+  BoundColumn condition{.id = marked.mark, .name = "HAVING", .type = LogicalType::kBoolean};
+  LogicalNodePtr top = Make(std::move(marked));
+  if (!Traits(join->kind).drops_unmatched_left) {
+    const ExprPtr mark = std::make_shared<const Expr>(Expr{
+        .node = ColumnExpr{.id = condition.id}, .type = condition.type, .name = condition.name});
+    condition.id = ColumnId{std::to_underlying(last_id) + 1};
+    last_id = condition.id;
+    top = Make(ComputeNode{.input = std::move(top),
+                           .exprs = {std::make_shared<const Expr>(
+                               Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {mark}},
+                                    .type = condition.type,
+                                    .name = condition.name})},
+                           .ids = {condition.id},
+                           .span = join->span});
+  }
+  return Make(
+      FilterNode{.input = std::move(top),
+                 .predicates = {Predicate{.kind = Predicate::Kind::kIsTrue, .column = condition}},
+                 .span = join->span});
+}
+
+// SQ8b's static aggregate uses the existing empty-value rule. Append a constant 1 instead of
+// reading an aggregate result: HAVING changes it to NULL exactly when it rejects the aggregate's
+// row. A NULL aggregate value itself says nothing about whether that row exists.
+arrow::Result<Rewritten> StaticExistence(const Correlation& correlation,
+                                         const LogicalNodePtr& input) {
+  ColumnId& last_id = correlation.last_id;
+  const ColumnId present{std::to_underlying(last_id) + 1};
+  last_id = present;
+  const BoundColumn column{.id = present, .name = "exists_row", .type = LogicalType::kInteger};
+  DependentJoinNode scalar = correlation.join;
+  scalar.kind = JoinKind::kOneRow;
+  scalar.mark = kNoColumnId;
+  scalar.right = Make(
+      ProjectNode{.input = StaticExistenceInput(input, last_id),
+                  .columns = {BoundColumn{.index = -1, .name = column.name, .type = column.type}},
+                  .constants = {Constant{.type = column.type, .value = Int128{1}}},
+                  .ids = {present},
+                  .span = scalar.span});
+  LogicalNodePtr declined;
+  const std::optional<Spine> spine =
+      Descend(Mode::kValue, scalar.right, &declined, correlation.outer, true);
+  if (!spine.has_value()) {
+    return correlation.RefuseShape();
+  }
+  const Correlation value{.join = scalar,
+                          .mode = Mode::kLift,
+                          .outer = correlation.outer,
+                          .last_id = last_id,
+                          .build_side_ratio = correlation.build_side_ratio,
+                          .above = {},
+                          .report = correlation.report};
+  ARROW_ASSIGN_OR_RAISE(Rewritten out, ValueJoin(value, *spine));
+  const ExprPtr missing = std::make_shared<const Expr>(Expr{
+      .node =
+          PredicateExpr{
+              .predicate = Predicate{.kind = Predicate::Kind::kIsNull, .column = column},
+              .operands = {std::make_shared<const Expr>(Expr{
+                  .node = ColumnExpr{.id = present}, .type = column.type, .name = column.name})}},
+      .type = LogicalType::kBoolean,
+      .name = "EXISTS"});
+  const ExprPtr exists =
+      std::make_shared<const Expr>(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {missing}},
+                                        .type = LogicalType::kBoolean,
+                                        .name = "EXISTS"});
+  out.node = ExistenceValue(correlation, std::move(out.node), exists);
+  return out;
+}
+
+// A grouped EXISTS (or an OFFSET) keeps its rows partitioned by the representatives, through
+// every Project and aggregation. The correlation filter is substituted below them, so HAVING
+// and DISTINCT operate on the same rows as a separately evaluated block for each outer binding.
+arrow::Result<Rewritten> GroupedExistence(const Correlation& correlation, const Spine& spine) {
+  ColumnId& last_id = correlation.last_id;
+  const auto fresh = [&last_id] {
+    last_id = ColumnId{std::to_underlying(last_id) + 1};
+    return last_id;
+  };
+  ARROW_ASSIGN_OR_RAISE(Equivalences equivalences, EquivalencesOf(correlation, spine));
+  ARROW_ASSIGN_OR_RAISE(const Representatives representatives,
+                        RepresentativesOf(correlation, spine, equivalences));
+  std::map<ColumnId, BoundColumn> carried;  // outer id -> its representative at this step
+  for (const auto& [outer, inner] : representatives.of) {
+    const auto found = equivalences.described.find(inner);
+    if (found == equivalences.described.end()) {
+      return correlation.Refuse("whose correlated key the pass cannot name");
+    }
+    carried.emplace(outer, found->second);
+  }
+  const auto substitute = [&representatives](const ExprPtr& expr) {
+    return MapColumns(expr, [&representatives](ColumnExpr column) {
+      if (const auto found = representatives.of.find(column.id);
+          found != representatives.of.end()) {
+        column.id = found->second;
+      }
+      return column;
+    });
+  };
+  LogicalNodePtr right = spine.below;
+  for (const Expr* expr : equivalences.kept) {
+    const ColumnId id = fresh();
+    right = Make(ComputeNode{.input = std::move(right),
+                             .exprs = {substitute(std::make_shared<const Expr>(*expr))},
+                             .ids = {id},
+                             .span = spine.computed->span});
+    right = Make(FilterNode{
+        .input = std::move(right),
+        .predicates = {Predicate{
+            .kind = Predicate::Kind::kIsTrue,
+            .column = BoundColumn{.id = id, .name = expr->name, .type = LogicalType::kBoolean}}},
+        .span = spine.filter->span});
+  }
+  const auto group_keys = [&](auto& node) {
+    for (auto& [outer, column] : carried) {
+      const auto at = std::ranges::find(node.keys, column.id, &BoundColumn::id);
+      if (at == node.keys.end()) {
+        node.keys.push_back(column);
+        node.key_ids.push_back(fresh());
+        column.id = node.key_ids.back();
+      } else {
+        column.id = node.key_ids.at(Narrow<std::size_t>(at - node.keys.begin()));
+      }
+    }
+  };
+  for (const Step& step : std::ranges::reverse_view(spine.steps)) {
+    switch (step.role) {
+      case Role::kDropped:
+        break;  // existence, including OFFSET, does not depend on row order
+      case Role::kMap:
+        if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
+          ProjectNode out = *project;
+          out.input = std::move(right);
+          for (const auto& [outer, column] : carried) {
+            if (std::ranges::contains(out.ids, column.id)) {
+              continue;
+            }
+            out.columns.push_back(column);
+            out.ids.push_back(column.id);
+            if (!out.constants.empty()) {
+              out.constants.emplace_back(std::nullopt);
+            }
+          }
+          right = Make(std::move(out));
+        } else {
+          ComputeNode out = std::get<ComputeNode>(*step.node);
+          out.input = std::move(right);
+          for (ExprPtr& expr : out.exprs) {
+            expr = substitute(expr);
+          }
+          right = Make(std::move(out));
+        }
+        break;
+      case Role::kHaving:
+        right = WithInputs(*step.node, {std::move(right)});
+        break;
+      case Role::kJoin:
+        right = WithInputs(*step.node, {std::move(right), std::get<JoinNode>(*step.node).right});
+        break;
+      case Role::kGroup: {
+        GroupAggregateNode out = std::get<GroupAggregateNode>(*step.node);
+        out.input = std::move(right);
+        group_keys(out);
+        right = Make(std::move(out));
+        break;
+      }
+      case Role::kSets: {
+        GroupingSetsNode out = std::get<GroupingSetsNode>(*step.node);
+        // A set may pad the written key. Carry a separate copy that every set groups by, so
+        // neither the written key's NULL padding nor GROUPING() changes.
+        ComputeNode copies{.input = std::move(right), .exprs = {}, .ids = {}, .span = out.span};
+        std::map<ColumnId, ColumnId> copied;
+        for (auto& [outer, column] : carried) {
+          auto [at, inserted] = copied.try_emplace(column.id, kNoColumnId);
+          if (inserted) {
+            at->second = fresh();
+            copies.exprs.push_back(std::make_shared<const Expr>(Expr{
+                .node = ColumnExpr{.id = column.id}, .type = column.type, .name = column.name}));
+            copies.ids.push_back(at->second);
+          }
+          column.id = at->second;
+        }
+        out.input = Make(std::move(copies));
+        const std::size_t first = out.keys.size();
+        group_keys(out);
+        for (auto& set : out.sets) {
+          for (std::size_t i = first; i < out.keys.size(); ++i) {
+            set.push_back(i);
+          }
+        }
+        right = Make(std::move(out));
+        break;
+      }
+      case Role::kLimit: {
+        const auto& limit = std::get<LimitNode>(*step.node);
+        if (limit.offset == 0) {
+          break;
+        }
+        const BoundColumn count{
+            .id = fresh(), .name = "exists_count", .type = LogicalType::kBigInt};
+        GroupAggregateNode out{.input = std::move(right),
+                               .keys = {},
+                               .key_ids = {},
+                               .aggregates = {AggregateCall{.kind = AggKind::kCountStar,
+                                                            .arg = std::nullopt,
+                                                            .type = count.type,
+                                                            .id = count.id,
+                                                            .span = limit.span}},
+                               .span = limit.span};
+        group_keys(out);
+        right = Make(std::move(out));
+        right = Make(FilterNode{
+            .input = std::move(right),
+            .predicates = {Predicate{
+                .kind = Predicate::Kind::kCompare,
+                .column = count,
+                .op = CompareOp::kGt,
+                .constant = Constant{.type = LogicalType::kBigInt, .value = Int128{limit.offset}}}},
+            .span = limit.span});
+        break;
+      }
+      case Role::kStatic:
+      case Role::kArguments:
+        return correlation.RefuseShape();
+    }
+  }
+  std::vector<JoinKey> keys;
+  keys.reserve(carried.size());
+  for (const auto& [outer, inner] : carried) {
+    keys.push_back(JoinKey{.left = equivalences.described.at(outer),
+                           .right = inner,
+                           .null_equal = representatives.null_equal.contains(outer)});
+  }
+  LogicalNodePtr node = Make(JoinNode{.kind = correlation.join.kind,
+                                      .left = correlation.join.left,
+                                      .right = right,
+                                      .keys = std::move(keys),
+                                      .residual = {},
+                                      .mark = correlation.join.mark,
+                                      .build = BuildSide::kRight,
+                                      .estimate = EstimateRows(*correlation.join.left),
+                                      .span = correlation.join.span});
+  return Rewritten{.node = std::move(node), .right = std::move(right)};
+}
+
+// GROUP BY () is the single empty grouping set, hence a static aggregate. Mixed
+// grouping sets that include () still need SQ16's empty-binding rows.
+LogicalNodePtr StaticGrouping(const LogicalNodePtr& node) {
+  if (const auto* sets = std::get_if<GroupingSetsNode>(node.get());
+      sets != nullptr && sets->sets.size() == 1 && sets->sets.front().empty() &&
+      sets->keys.empty() && sets->grouping.empty()) {
+    return Make(
+        AggregateNode{.input = sets->input, .aggregates = sets->aggregates, .span = sets->span});
+  }
+  if (std::holds_alternative<AggregateNode>(*node)) {
+    return node;
+  }
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  if (inputs.empty()) {
+    return node;
+  }
+  const LogicalNodePtr input = StaticGrouping(inputs.front());
+  if (input == inputs.front()) {
+    return node;
+  }
+  inputs.front() = input;
+  return WithInputs(*node, std::move(inputs));
+}
+
+arrow::Result<Rewritten> ExistsJoin(const Correlation& correlation) {
+  LogicalNodePtr input = StaticGrouping(correlation.join.right);
+  const auto* limit = std::get_if<LimitNode>(input.get());
+  const int64_t offset = limit == nullptr ? 0 : limit->offset;
+  if (limit != nullptr && limit->limit == 0) {
+    return Rewritten{.node = EmptyExistence(correlation), .right = nullptr};
+  }
+  // A positive LIMIT without OFFSET is transparent even with residual correlations that have
+  // no representative; retain the existing candidate-pair algorithm for that plain shape.
+  if (limit != nullptr && limit->offset == 0) {
+    input = limit->input;
+  }
+  LogicalNodePtr declined;
+  if (const auto plain = Descend(Mode::kLift, input, &declined, correlation.outer)) {
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr node, LiftJoin(correlation, *plain));
+    const LogicalNodePtr right = std::get<JoinNode>(*node).right;
+    return Rewritten{.node = std::move(node), .right = right};
+  }
+  const auto spine = Descend(Mode::kExists, input, &declined, correlation.outer);
+  if (!spine.has_value()) {
+    return correlation.RefuseShape();
+  }
+  if (std::ranges::any_of(spine->steps,
+                          [](const Step& step) { return step.role == Role::kStatic; })) {
+    if (offset > 0) {
+      return Rewritten{.node = EmptyExistence(correlation), .right = nullptr};
+    }
+    return StaticExistence(correlation, input);
+  }
+  return GroupedExistence(correlation, *spine);
+}
+
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
 arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
                                          int64_t build_side_ratio, std::span<const Ancestor> above,
@@ -1604,22 +2035,20 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
                                 .build_side_ratio = build_side_ratio,
                                 .above = above,
                                 .report = report};
-  LogicalNodePtr declined;
-  const std::optional<Spine> spine = Descend(*mode, join.right, &declined);
-  if (!spine.has_value()) {
-    // In value mode, a join over the static aggregate that filters its one row is an IN or NOT IN
-    // conjunct of the block's HAVING: no rule takes it, where a one-row join moves up (SQ6).
-    if (const auto* filter = declined == nullptr ? nullptr : std::get_if<JoinNode>(declined.get());
-        *mode == Mode::kValue && filter != nullptr && Traits(filter->kind).filters_left) {
-      return correlation.Refuse("whose HAVING holds an IN subquery");
-    }
-    return correlation.RefuseShape();
-  }
   Rewritten out;
   if (*mode == Mode::kLift) {
-    ARROW_ASSIGN_OR_RAISE(out.node, LiftJoin(correlation, *spine));
-    out.right = std::get<JoinNode>(*out.node).right;
+    ARROW_ASSIGN_OR_RAISE(out, ExistsJoin(correlation));
   } else {
+    LogicalNodePtr declined;
+    const std::optional<Spine> spine = Descend(*mode, join.right, &declined, correlation.outer);
+    if (!spine.has_value()) {
+      if (const auto* filter =
+              declined == nullptr ? nullptr : std::get_if<JoinNode>(declined.get());
+          filter != nullptr && Traits(filter->kind).filters_left) {
+        return correlation.Refuse("whose HAVING holds an IN subquery");
+      }
+      return correlation.RefuseShape();
+    }
     ARROW_ASSIGN_OR_RAISE(out, ValueJoin(correlation, *spine));
   }
   // Lemma 3.1: the rewrite is legal only when the new join's right input has no free variables
@@ -1628,7 +2057,7 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
   // process rather than fail the query.
   const std::vector<ColumnId> free_before = FreeVariables(LogicalNode{join});
   const std::vector<ColumnId> free_after = FreeVariables(*out.node);
-  if (!FreeVariables(*out.right).empty() ||
+  if ((out.right != nullptr && !FreeVariables(*out.right).empty()) ||
       !std::ranges::all_of(free_after, [&free_before](ColumnId id) {
         return std::ranges::find(free_before, id) != free_before.end();
       })) {

@@ -5491,6 +5491,13 @@ class Builder {
       residual_op = rng.Pick(kResidualOps);
       residual_outer_first = rng.Percent(30);
     }
+    // SQ8b shapes correlate through the key alone; general residual bindings need SQ9.
+    const std::size_t shape =
+        allowed_.Has(Feature::kCorrelatedExistsBlock) && rng.Percent(35) ? 1 + rng.Below(7) : 0;
+    if (shape != 0) {
+      used_.Add(Feature::kCorrelatedExistsBlock);
+      residual = nullptr;
+    }
     const bool filter_first = filtered != nullptr && rng.Percent(30);
     const bool outer_first = rng.Percent(25);
     // Drawn whether or not NULL-equal keys are allowed, so that ruling them out changes only the
@@ -5504,7 +5511,19 @@ class Builder {
     };
     Symbol("(");
     Keyword("SELECT");
-    Symbol("*");
+    if (shape == 1) {
+      Keyword("DISTINCT");
+      InnerColumn(c, *c.inner_key);
+    } else if (shape == 2 || shape == 7) {
+      InnerColumn(c, *c.inner_key);
+    } else if (shape == 3) {
+      Keyword("COUNT");
+      Symbol("(");
+      Symbol("*");
+      Symbol(")");
+    } else {
+      Symbol("*");
+    }
     Keyword("FROM");
     used_.Add(Feature::kTableName);
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
@@ -5544,6 +5563,28 @@ class Builder {
         Symbol(residual_op);
         OuterValue(c, *residual->second);
       }
+    }
+    if (shape == 2 || shape == 7) {
+      Keyword("GROUP");
+      Keyword("BY");
+      InnerColumn(c, *c.inner_key);
+    }
+    if (shape == 2 || shape == 3) {
+      Keyword("HAVING");
+      Keyword("COUNT");
+      Symbol("(");
+      Symbol("*");
+      Symbol(")");
+      Symbol(shape == 2 ? ">" : "=");
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = shape == 2 ? "1" : "0"});
+    }
+    if (shape == 4 || shape == 5) {
+      Keyword("LIMIT");
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = shape == 4 ? "0" : "1"});
+    }
+    if (shape == 1 || shape == 6 || shape == 7) {
+      Keyword("OFFSET");
+      tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::to_string(rng.Below(4))});
     }
     Symbol(")");
   }

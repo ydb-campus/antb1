@@ -506,7 +506,13 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   ([ADR 0023](adr/0023-unnesting.md)).
   `EXISTS` and `NOT EXISTS` become a semi or anti join, keyed on the equality they correlate through (or on an `IS NOT
   DISTINCT FROM`, a NULL-equal key: an outer NULL has the inner NULLs, OJ5b), over a block of
-  `FROM` and `WHERE` alone. Under `OR`, `NOT` or `CASE`, and in the select items, `ORDER BY`, `GROUP BY` keys and
+  `FROM` and `WHERE`. SQ8b also answers correlated blocks with `GROUP BY`, `HAVING`, `DISTINCT`,
+  `LIMIT`, `OFFSET` and ungrouped aggregates. Grouping preserves the correlation keys; an ungrouped aggregate
+  has one row even over empty input, which its `HAVING` may reject. A positive `LIMIT` does not change existence,
+  `LIMIT 0` gives FALSE, and `OFFSET n` tests whether more than n rows survive per binding (after grouping,
+  `HAVING` and `DISTINCT`). Grouping and a nonzero offset require an inner equivalent of every outer column
+  the block reads, as correlated scalar aggregates do. Grouping sets containing an empty set among other sets
+  remain SQ16. Under `OR`, `NOT` or `CASE`, and in the select items, `ORDER BY`, `GROUP BY` keys and
   aggregate arguments where a correlated value stands, a correlated `EXISTS` over such a block is a mark join on the
   same keys (ADR 0041's SQ8a), two-valued: TRUE where the block has a row that passes its keys and its other conjuncts,
   else FALSE -- a NULL key, a conjunct that is NULL and a block without rows all give FALSE, never NULL, so `NOT EXISTS`
@@ -529,8 +535,8 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   in the block's item moves above the join with it, so a binding without rows reads `0 + value`. An equality of outer
   columns stays in the subquery when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not
   true), and a correlated `SUM(x + c)` keeps its form, as in DuckDB (no `COUNT`, below). Every other correlated shape
-  is exit code 4: a block with `GROUP BY`, `DISTINCT`, `HAVING`, `LIMIT`, `OFFSET` or an aggregate inside `EXISTS`, a
-  correlated `EXISTS` without a key, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
+  is exit code 4: a correlated `EXISTS` without a key or whose grouping or offset needs an outer column
+  without an inner equivalent, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
   column has no inner equivalent, an `IN` or `NOT IN` conjunct in a correlated scalar subquery's `HAVING`, a compound
   with an arm that reads an enclosing block, and at the `IN` a correlated `IN` or `NOT IN`; at the subquery
   for one in `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the `IN`
@@ -560,10 +566,9 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   block's aggregates (SQ13 too), and a correlated subquery in a conjunct that reads the enclosing block itself (SQ8c)
   exit 4 once their blocks bind; the unnesting's refusals (an outer column without an inner equivalent, such as a
   correlation of two types or a non-equality one) come once the whole query is bound, after every bind error. A
-  correlated `EXISTS` whose block has a shape the unnesting does not take (until SQ8b) is refused at the `EXISTS` once
-  its block's FROM list is bound and
-  before any other clause of the block binds, so the bind errors of those clauses never show (a compound's arms all bind
-  before a correlated arm is refused). What the enclosing block binds before the subquery comes first. A block binds its
+  correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
+  (including an ungrouped select column) precede an unsupported-shape error. A compound's arms all bind
+  before a correlated arm is refused. What the enclosing block binds before the subquery comes first. A block binds its
   FROM list; then its select list's stars, columns, literals and bare aggregate items, their arguments included; then
   every `ON`, in FROM order, and `WHERE`; then `GROUP BY`; then its other select items; then `HAVING` and `ORDER BY`. A
   conjunct written after the subquery in its clause is never reached. A scalar subquery's shape is checked once its

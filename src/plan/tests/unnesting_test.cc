@@ -312,11 +312,10 @@ TEST(UnnestingTest, EachModeRefusesTheNodesItHasNoRuleFor) {
       "over a block that is not an ungrouped aggregate over its correlation";
   for (const auto& [name, make] : nodes) {
     SCOPED_TRACE(name);
-    // Lift mode drops a Sort above the filter, as it drops the select list; anything else above
-    // it is refused.
+    // SQ8b also answers LIMIT and grouped EXISTS; scalar values keep their narrower rules.
     const std::string exists = RefusalOf(kExists, over(make));
     const std::string not_exists = RefusalOf(kNotExists, over(make));
-    if (name == "a Sort") {
+    if (name == "a Sort" || name == "a Limit" || name == "a GroupAggregate") {
       EXPECT_EQ(exists, "");
       EXPECT_EQ(not_exists, "");
     } else {

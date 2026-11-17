@@ -194,7 +194,7 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ6 | Correlated static aggregates of any kind, COUNT included, with any select item, a HAVING and an uncorrelated value inside, joined back LEFT with their empty values where the consumer proof fails; lands before SQ5, whose correlated aggregates of any kind need its LEFT join back | 41 | Built |
 | SQ5a | Correlated aggregates as values in any expression of a condition of WHERE or an inner ON, under the consumer proof, whose walk passes the conditions and joins between | 6 | Built |
 | SQ5b | Correlated aggregates as values in select items, ORDER BY, GROUP BY keys and aggregate arguments, planted in the slot's tail | | Built |
-| SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Planned |
+| SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Partly built (SQ8a: EXISTS marks under OR, NOT and CASE; SQ8b: grouping, HAVING, DISTINCT, static aggregates and LIMIT/OFFSET inside EXISTS); correlated IN and NOT IN conjuncts and nested correlated conjuncts remain planned |
 | **Phase 9** | **Window functions** | | |
 | W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
 | **Phase 10** | **Full decorrelation ([ADR 0041](0041-subqueries-and-decorrelation.md)), of which phase 8 is a subset; the ids name items, not yet an order (the phase 8 update below)** | | |
@@ -917,6 +917,16 @@ aggregate arguments and completes no query (ADR 0041's SQ5a update). Q6 is the o
 Update (2026-11-14, SQ5b): SQ5b, built, answers correlated values in select items, ORDER BY, GROUP BY keys and
 aggregate arguments (ADR 0041's SQ5b update). As planned, it completes no query: the ratchet stays at 82, and no TPC-H
 or TPC-DS plan changes.
+
+Update (2026-11-17, SQ8a and SQ8b): SQ8a, built in #374, answers keyed correlated EXISTS under OR, NOT and CASE
+through a two-valued mark, in the placements already open to correlated values. It completes Q10 and Q35, bringing
+the ratchet to 84. SQ8b, built in #378, extends those EXISTS blocks with GROUP BY, HAVING, DISTINCT, static aggregates,
+LIMIT and OFFSET. Grouping carries the correlation representatives, OFFSET counts surviving rows per binding, and
+static aggregates retain their empty-input row unless HAVING rejects it. A single empty grouping set, GROUP BY (),
+uses the static rule; grouping sets that mix it with other sets remain SQ16. SQ8b completes no additional query, so
+the ratchet stays at 84. SQ8 remains partly built: correlated IN and NOT IN conjuncts and nested correlated
+conjuncts remain planned (SQ8c). Keyless correlations, correlation above the enclosing aggregation, and other
+phase 10 shapes retain their existing roadmap items.
 
 ## Alternatives considered
 

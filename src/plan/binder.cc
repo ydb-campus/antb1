@@ -7210,7 +7210,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
     // No GROUP BY key holds this mark (a key's is bound first): the speculation fails.
     return BindError("an IN subquery that no GROUP BY key holds", s.op_span);
   }
-  if (group && Correlated() && !dry_run_) {
+  if (group && Correlated() && exists_ == nullptr && !dry_run_) {
     // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look.
     return Reject(Rejection{.span = s.op_span,
                             .message = "an IN subquery over the aggregate of a correlated "
@@ -8433,25 +8433,6 @@ arrow::Status Binder::GateCorrelatedExists() const {
   }
   if (!correlated) {
     return arrow::Status::OK();
-  }
-  std::string_view clause;
-  if (HasGroupBy(stmt_)) {
-    clause = "GROUP BY";
-  } else if (stmt_.distinct) {
-    clause = "DISTINCT";  // a GROUP BY of its select list (ADR 0037's AG3)
-  } else if (!stmt_.having.empty()) {
-    clause = "HAVING";
-  } else if (stmt_.limit.has_value()) {
-    clause = "LIMIT";
-  } else if (stmt_.offset.has_value()) {
-    clause = "OFFSET";
-  } else if (IsAggregateQuery(stmt_)) {
-    clause = "an aggregate";
-  }
-  if (!clause.empty()) {
-    return Reject(Rejection{
-        .span = exists_->op_span,
-        .message = std::format("EXISTS over a subquery with {} is not supported", clause)});
   }
   if (exists_->having) {
     return Reject(Rejection{.span = exists_->op_span,
