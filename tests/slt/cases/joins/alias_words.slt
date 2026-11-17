@@ -131,7 +131,7 @@ statement error ^Parser Error: syntax error at or near "semi"
 SELECT COUNT(*) FROM trips AS semi
 
 onlyif duckdb
-statement error ^Parser Error: syntax error at end of input
+statement error ^Parser Error: syntax error at or near "semi"
 SELECT COUNT(*) FROM trips semi
 
 # A semi join returns the left side's columns only.

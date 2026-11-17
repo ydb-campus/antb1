@@ -477,9 +477,9 @@ bool IsNestedQuery(const SelectStatement& query);
 // DuckDB's tree of a compound (ADR 0039's tree rule). INTERSECT [ALL] binds tighter than UNION and
 // EXCEPT, which associate to the left; a chain of one operator and quantifier is one run of two or
 // more operands, in written order. A branch that is a parenthesized compound without a WITH list or
-// tail of its own is a subtree, spliced into its parent when both are runs of UNION, or both of
-// UNION ALL (DuckDB folds the types of such a run as one list); a left operand that is a run of the
-// same operator and quantifier merges, which is the same left fold.
+// tail of its own is a subtree. DuckDB 2.0 folds a right subtree's types independently before
+// combining it with its parent; a left operand that is a run of the same operator and quantifier
+// merges, which preserves the same left fold.
 struct SetTree {
   // A leaf: a branch's query, a block or a parenthesized query with its own WITH list or tail.
   const SelectStatement* leaf = nullptr;

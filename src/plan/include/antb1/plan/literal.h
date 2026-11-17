@@ -49,26 +49,25 @@ struct DecimalLiteral {
 };
 std::optional<DecimalLiteral> ParseDecimalLiteral(std::string_view text, bool negative);
 
-// The FLOAT that DuckDB (1.5.5) turns a numeric literal into when it compares the literal with a
-// FLOAT column, or std::nullopt when DuckDB types the literal as DOUBLE (compared in DOUBLE, as
-// antb1 does for every DOUBLE column). DuckDB types an integer by value (INTEGER, BIGINT, HUGEINT
-// or UHUGEINT; outside -2^127 to 2^128 - 1 DOUBLE) and a decimal as DECIMAL(digits, fraction
-// digits), and it casts with its own arithmetic: BIGINT exactly rounded, HUGEINT and UHUGEINT
-// through a double, a DECIMAL as unscaled / 10^scale in float or, when the unscaled value is
-// beyond 2^24, as div + mod / 10^scale. The result can be +-inf and is not always the FLOAT
-// nearest to the literal (docs/sql-subset.md, "Binding"). `text` is written without its sign.
+// The FLOAT DuckDB 2.0 converts an exact numeric literal to. DECIMAL values round directly
+// to FLOAT, while HUGEINT/UHUGEINT retain DuckDB's integer conversion. std::nullopt for DOUBLE
+// literals (compared in DOUBLE) and BIGNUM literals (DuckDB has no BIGNUM-to-FLOAT cast).
+// `text` is written without its sign.
 std::optional<float> DuckDbFloatOf(std::string_view text, bool negative);
 
-// Whether DuckDB (1.5.5) types a numeric literal as DOUBLE: it has an exponent, it is a decimal of
-// more than 38 digits, or it is an integer outside -2^127 to 2^128 - 1 (beyond HUGEINT and
-// UHUGEINT). `text` is written without its sign.
+// Whether DuckDB types a numeric literal as DOUBLE: an exponent, or a decimal with more
+// than 38 digits. Integer literals outside its 128-bit ranges are BIGNUM instead.
 bool DuckDbTypesAsDouble(std::string_view text, bool negative);
 
-// The double DuckDB (1.5.5) converts a numeric literal to when it compares it in DOUBLE: a literal
+// DuckDB 2.0 uses BIGNUM for integer literals beyond HUGEINT/UHUGEINT, not DOUBLE.
+bool DuckDbTypesAsBigNum(std::string_view text, bool negative);
+
+// The double DuckDB 2.0 converts a numeric literal to when it compares it in DOUBLE: a literal
 // it types as DOUBLE (DuckDbTypesAsDouble) is the nearest double, a decimal literal converts as its
 // DECIMAL does (DuckDbDecimalToDouble, ADR 0021 rule 8), an INTEGER or BIGINT is the nearest
 // double, a HUGEINT goes through DuckDB's 128-bit formula and a UHUGEINT through its own.
-// std::nullopt if the text is not a number. `text` is written without its sign.
+// std::nullopt for a BIGNUM literal or text that is not a number. `text` is written without its
+// sign.
 std::optional<double> DuckDbDoubleOf(std::string_view text, bool negative);
 
 // The exact value of a double: +-inf and magnitudes of 10^38 or more are huge; NaN is zero.

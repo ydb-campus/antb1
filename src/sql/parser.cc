@@ -334,10 +334,10 @@ constexpr auto kJoinKinds =
 constexpr auto kJoinStarts =
     std::to_array<std::string_view>({"CROSS", "FULL", "INNER", "JOIN", "LEFT", "NATURAL", "RIGHT"});
 
-// The reserved words that DuckDB 1.5.5 also takes as function names (sorted; checked below): where
+// The reserved words that DuckDB 2.0 also takes as function names (sorted; checked below): where
 // a FROM item starts, one before '(' calls a table function (FROM t, left(1)).
 constexpr auto kFunctionKeywords =
-    std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
+    std::to_array<std::string_view>({"BY", "CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
                                      "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
 
 // The first words of a query in parentheses in FROM (a derived table), as DuckDB parses them; a
@@ -974,10 +974,7 @@ class Parser {
   Status ParseWith(SelectStatement& stmt) {
     stmt.with_span = Take().span;
     if (Peek().IsKeyword("RECURSIVE")) {
-      const Token& next = PeekAt(1);
-      if (!next.IsKeyword("AS") && next.kind != TokenKind::kLeftParen && !next.IsKeyword("USING")) {
-        return Unsupported(Peek().span, "WITH RECURSIVE is not supported");
-      }
+      return Unsupported(Peek().span, "WITH RECURSIVE is not supported");
     }
     std::unordered_set<std::string> names;  // ASCII upper-cased
     while (true) {
@@ -990,6 +987,9 @@ class Parser {
         return {};
       }
       Take();
+      if (Peek().IsKeyword("SELECT")) {
+        return {};  // DuckDB 2.0 permits a trailing comma in a WITH list.
+      }
     }
   }
 
@@ -2955,6 +2955,19 @@ class Parser {
                                    .span = path.span});
       }
       case TokenKind::kLeftParen: {
+        if (!PeekAt(1).IsKeyword("PIVOT") &&
+            (IsName(PeekAt(1)) || PeekAt(1).kind == TokenKind::kString) &&
+            PeekAt(2).kind == TokenKind::kRightParen) {
+          const SourceSpan open = Take().span;
+          Token name = Take();
+          const SourceSpan close = Take().span;
+          return FromSource(TableRef{.kind = name.kind == TokenKind::kString
+                                                 ? TableRef::Kind::kPath
+                                                 : TableRef::Kind::kName,
+                                     .name = std::move(name.text),
+                                     .quoted = name.kind == TokenKind::kQuotedIdentifier,
+                                     .span = Cover(open, close)});
+        }
         // A query (a derived table: a query other than SELECT or WITH is unsupported at its first
         // token), else DuckDB's joins in parentheses, also in a second pair of them when a table
         // or a path follows both (FROM ((t JOIN u ON ...)); three tokens do not show whether
@@ -3032,6 +3045,10 @@ class Parser {
     if (token.IsKeyword("AS")) {
       const SourceSpan as = Take().span;
       const Token& name = Peek();
+      if (name.IsKeyword("B") && PeekAt(1).kind == TokenKind::kString) {
+        return Unsupported(name.span,
+                           "bit-string aliases are not supported; use a quoted identifier");
+      }
       if (name.kind == TokenKind::kString && name.text.empty()) {  // DuckDB allows it
         return Unsupported(name.span, "an empty table alias ('') is not supported");
       }
@@ -3251,20 +3268,17 @@ class Parser {
                            .span = span};
   }
 
-  // '(' at a grouping element, one level down as any parenthesis: the empty set `()` (not inside
-  // ROLLUP or CUBE, where DuckDB's grammar has none), a composite `(a, b)`, or an expression whose
+  // '(' at a grouping element, one level down as any parenthesis: the empty set `()` (inside
+  // ROLLUP or CUBE too in DuckDB 2.0), a composite `(a, b)`, or an expression whose
   // first operand is parenthesized, `(a)` or `(a) + 1`, which the operators after the ')' extend
   // as they extend a parenthesized prefix.
-  Expected<GroupingElement> ParseParenthesizedElement(ElementPlace place) {
+  Expected<GroupingElement> ParseParenthesizedElement(ElementPlace /*place*/) {
     if (auto error = Deeper(); error.has_value()) {
       return std::unexpected(std::move(*error));
     }
     peak_ = depth_;
     const SourceSpan open = Take().span;
     if (Peek().kind == TokenKind::kRightParen) {
-      if (place == ElementPlace::kRollup) {
-        return Syntax(Peek().span, "expected an expression or a list in (), found ')'");
-      }
       const SourceSpan close = Take().span;
       return GroupingElement{.kind = GroupingElement::Kind::kEmpty,
                              .exprs = {},

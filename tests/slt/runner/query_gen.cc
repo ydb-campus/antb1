@@ -7717,9 +7717,14 @@ class Builder {
     Symbol("(");
     Column(c);
     Symbol(",");
-    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kPatterns))});
+    const std::string_view pattern = rng_.Pick(kPatterns);
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(pattern)});
     Symbol(",");
-    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = SqlString(rng_.Pick(kReplacements))});
+    const std::string_view replacement = rng_.Pick(kReplacements);
+    // The answer generator emits valid replacements; negative cases live in strings.slt.
+    tokens_.push_back(
+        {.kind = Token::Kind::kLiteral,
+         .text = SqlString(replacement == "\\1" && !pattern.contains('(') ? "\\0" : replacement)});
     Symbol(")");
     return ValueKind::kVarchar;
   }

@@ -180,7 +180,7 @@ query I rowsort
 SELECT id FROM floats WHERE f = 16777217.5
 ----
 INTEGER
-8
+9
 
 query I rowsort
 SELECT id FROM floats WHERE f < 16777217.5
@@ -197,6 +197,7 @@ INTEGER
 5
 6
 7
+8
 
 query I rowsort
 SELECT id FROM floats WHERE f = 16777216.5
@@ -208,13 +209,13 @@ query I rowsort
 SELECT id FROM floats WHERE f = 0.100000000000000000000000
 ----
 INTEGER
-1
+0
 
 query I rowsort
 SELECT id FROM floats WHERE f = 0.1000000000000000
 ----
 INTEGER
-1
+0
 
 query I rowsort
 SELECT id FROM floats WHERE f = 0.10000000149011612

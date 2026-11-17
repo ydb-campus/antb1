@@ -167,9 +167,9 @@ namespace {
 
 // A numeric literal as DuckDB types it: a decimal (a point, no exponent, at most 38 digits), an
 // integer by value (INTEGER or BIGINT, HUGEINT from -2^127 to 2^127 - 1, UHUGEINT up to
-// 2^128 - 1), or else DOUBLE.
+// 2^128 - 1), or BIGNUM beyond those integer limits.
 struct DuckDbNumber {
-  enum class Kind : std::uint8_t { kDouble, kDecimal, kBigInt, kHugeInt, kUHugeInt };
+  enum class Kind : std::uint8_t { kDouble, kDecimal, kBigInt, kHugeInt, kUHugeInt, kBigNum };
   Kind kind = Kind::kDouble;
   DecimalLiteral decimal;  // kDecimal
   int64_t bigint = 0;      // kBigInt (INTEGER too)
@@ -193,7 +193,7 @@ std::optional<DuckDbNumber> ClassifyNumber(std::string_view text, bool negative)
   for (const char c : text) {
     if (__builtin_mul_overflow(magnitude, UInt128{10}, &magnitude) ||
         __builtin_add_overflow(magnitude, static_cast<UInt128>(c - '0'), &magnitude)) {
-      return DuckDbNumber{};  // beyond UHUGEINT
+      return DuckDbNumber{.kind = DuckDbNumber::Kind::kBigNum};
     }
   }
   constexpr UInt128 kHugeIntLimit = UInt128{1} << 127U;  // |HUGEINT min|
@@ -201,7 +201,7 @@ std::optional<DuckDbNumber> ClassifyNumber(std::string_view text, bool negative)
     return DuckDbNumber{.kind = DuckDbNumber::Kind::kUHugeInt, .uhugeint = magnitude};
   }
   if (negative && magnitude > kHugeIntLimit) {
-    return DuckDbNumber{};  // below HUGEINT's minimum
+    return DuckDbNumber{.kind = DuckDbNumber::Kind::kBigNum};
   }
   const auto value =
       negative ? static_cast<Int128>(UInt128{0} - magnitude) : static_cast<Int128>(magnitude);
@@ -219,6 +219,7 @@ std::optional<float> DuckDbFloatOf(std::string_view text, bool negative) {
     return std::nullopt;
   }
   switch (number->kind) {
+    case DuckDbNumber::Kind::kBigNum:
     case DuckDbNumber::Kind::kDouble:
       break;  // compared in DOUBLE
     case DuckDbNumber::Kind::kDecimal:
@@ -239,12 +240,19 @@ bool DuckDbTypesAsDouble(std::string_view text, bool negative) {
   return number.has_value() && number->kind == DuckDbNumber::Kind::kDouble;
 }
 
+bool DuckDbTypesAsBigNum(std::string_view text, bool negative) {
+  const auto number = ClassifyNumber(text, negative);
+  return number.has_value() && number->kind == DuckDbNumber::Kind::kBigNum;
+}
+
 std::optional<double> DuckDbDoubleOf(std::string_view text, bool negative) {
   const auto number = ClassifyNumber(text, negative);
   if (!number.has_value()) {
     return std::nullopt;
   }
   switch (number->kind) {
+    case DuckDbNumber::Kind::kBigNum:
+      return std::nullopt;
     case DuckDbNumber::Kind::kDouble:
       return ParseDoubleLiteral(text, negative);
     case DuckDbNumber::Kind::kDecimal:

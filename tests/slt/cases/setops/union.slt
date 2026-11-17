@@ -433,16 +433,22 @@ DOUBLE
 -0
 
 # ---- divergence D30: which error a UNION reports when several blocks fail ----
-# antb1 reports the first failing block in written order, the addition; DuckDB, under its deduplication, reads the
-# first block and then the others from the last back, and reports the multiplication.
+# antb1 reports the first failing block in written order. DuckDB 2.0 may report either failing block even at one
+# thread, so pin antb1's order in both directions and check each error against both engines with one failing block.
 
 onlyif antb1
 statement error Overflow in addition
 SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 + 1 FROM edge UNION SELECT i16 * 2 FROM edge) AS u
 
-onlyif duckdb
+onlyif antb1
 statement error Overflow in multiplication
-SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 + 1 FROM edge UNION SELECT i16 * 2 FROM edge) AS u
+SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 * 2 FROM edge UNION SELECT i16 + 1 FROM edge) AS u
+
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT CAST(i16 AS INTEGER) + 1 FROM edge UNION SELECT i16 * 2 FROM edge) AS u
+
+statement error Overflow in addition
+SELECT COUNT(*) FROM (SELECT i16 FROM edge UNION SELECT i16 + 1 FROM edge UNION SELECT CAST(i16 AS INTEGER) * 2 FROM edge) AS u
 
 # ---- divergence D27: a condition above a UNION stays above it ----
 # antb1 runs every block in full, so the second block's overflow fails the query although the condition keeps only the

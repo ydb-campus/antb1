@@ -97,7 +97,7 @@ ExprPtr Item(std::string_view item) {
   return compute->exprs.front();
 }
 
-// DuckDB 1.5.6's ConstantOrderNormalization, ConstantFolding and ArithmeticSimplification, each
+// DuckDB 2.0's ConstantOrderNormalization, ConstantFolding and ArithmeticSimplification, each
 // case checked against the plan DuckDB's EXPLAIN shows for the same expression over columns of the
 // same types: the same operations and operands in the same order, where DuckDB also shows the casts
 // antb1's executor makes, and constant_or_null(0, x) and NULL for x * 0 and x // 0, which antb1
@@ -113,7 +113,7 @@ TEST(ArithmeticRewriteTest, IntegerChainsAsDuckDbComputesThem) {
            Case{.item = "1 + i32 + 2", .shape = "(3 + i32)"},
            Case{.item = "1 + i32 + 2 + i32 + 3", .shape = "((6 + i32) + i32)"},
            Case{.item = "i32 * 2 * 3", .shape = "(6 * i32)"},
-           Case{.item = "i32 + (1 + 2) + i32", .shape = "((3 + i32) + i32)"},
+           Case{.item = "i32 + (1 + 2) + i32", .shape = "((i32 + 3) + i32)"},
            // A * inside a + chain is an operand of it, folded where it stands.
            Case{.item = "i32 + (1 * 2) + i32", .shape = "((i32 + 2) + i32)"},
            // Constants that lead the chain stay apart, and fold only among themselves.
@@ -152,8 +152,7 @@ TEST(ArithmeticRewriteTest, IntegerChainsAsDuckDbComputesThem) {
            // and which no chain of * reads through; x // 0 computes x, then NULL.
            Case{.item = "i32 * 2 * 0", .shape = "constant_or_null(0, i32)"},
            Case{.item = "i32 * 0", .shape = "constant_or_null(0, i32)"},
-           Case{.item = "(i32 * 2147483640 + 0) * 0",
-                .shape = "constant_or_null(0, (i32 * 2147483640))"},
+           Case{.item = "(i32 * 2147483640 + 0) * 0", .shape = "constant_or_null(0, i32)"},
            Case{.item = "i32 // 0", .shape = "(i32 // 0)"},
            // // and % of constants fold, with a divisor that is no zero.
            Case{.item = "i32 + (4 // 2) + 1", .shape = "(3 + i32)"},
@@ -172,7 +171,7 @@ TEST(ArithmeticRewriteTest, IntegerChainsAsDuckDbComputesThem) {
            Case{.item = "CAST(i32 + 2147483647 AS INTEGER) + 1",
                 .shape = "((2147483647 + 1) + i32)"},
            Case{.item = "i32 + 2147483647 + CAST(1 + -1 AS INTEGER)",
-                .shape = "(((2147483647 + 1) + -1) + i32)"},
+                .shape = "(2147483647 + i32)"},
            Case{.item = "CAST(i32 * 2 AS INTEGER) * 0", .shape = "constant_or_null(0, i32)"},
            Case{.item = "CAST(i32 + 1 AS BIGINT) + -1",
                 .shape = "(CAST((i32 + 1) AS BIGINT) + -1)"},

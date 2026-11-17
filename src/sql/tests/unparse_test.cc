@@ -149,7 +149,7 @@ TEST(UnparseTest, CanonicalForms) {
                 .canonical = R"(SELECT * FROM (SELECT a FROM t), (WITH "w" AS (SELECT 1 FROM u) )"
                              R"(SELECT * FROM w) AS "q"("z", "a""b") INNER JOIN (SELECT c FROM v) )"
                              R"(AS "over" ON z = c)"},
-           Case{.input = "with recursive as (select a from t) select a from recursive",
+           Case{.input = "with \"recursive\" as (select a from t) select a from recursive",
                 .canonical = R"(WITH "recursive" AS (SELECT a FROM t) SELECT a FROM recursive)"},
            // A minus over a number is part of the literal, through parentheses and other minuses;
            // one over a cast of a number stays an operator.
@@ -164,6 +164,19 @@ TEST(UnparseTest, CanonicalForms) {
        }) {
     EXPECT_EQ(Canonical(c.input), c.canonical) << c.input;
     ExpectRoundTrip(c.input);
+  }
+}
+
+TEST(UnparseTest, DuckDbTwoGrammarRoundTrips) {
+  for (const std::string_view text :
+       {"WITH c AS (SELECT a FROM t), SELECT a FROM c", "SELECT a FROM (events)",
+        "SELECT a FROM (values)", "SELECT a FROM ('events.parquet')",
+        "SELECT 1 FROM t GROUP BY ROLLUP (a, ())", "SELECT 1 FROM t GROUP BY CUBE (a, ())"}) {
+    const auto parsed = Parse(text);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const auto reparsed = Parse(ToSql(*parsed));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*parsed, *reparsed)) << text;
   }
 }
 

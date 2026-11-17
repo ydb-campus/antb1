@@ -2948,8 +2948,17 @@ SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND tr_row > 5 AND (tr_
 BIGINT	HUGEINT
 0	NULL
 
+# Divergence D35: an empty probe still prepares the scalar subquery in the mark's build.
+onlyif antb1
 statement error More than one row returned by a subquery used as an expression
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND (tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3)
+
+onlyif duckdb
+query II rowsort
+SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_row < 0 AND (tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = (SELECT ct_id FROM cities)) OR tr_row < 3)
+----
+BIGINT	HUGEINT
+0	NULL
 
 # ---- divergence D32: a mark's probe keys over an empty set ----
 

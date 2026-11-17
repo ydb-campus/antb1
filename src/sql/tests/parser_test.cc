@@ -918,8 +918,8 @@ TEST(ParserTest, SetOperationTreeFollowsDuckDb) {
       {"SELECT x FROM c EXCEPT ALL SELECT x FROM a INTERSECT ALL SELECT x FROM b",
        "(EXCEPT ALL c (INTERSECT ALL a b))"},
       {"SELECT x FROM a UNION ALL (SELECT x FROM b UNION ALL SELECT x FROM c)",
-       "(UNION ALL a b c)"},
-      {"SELECT x FROM a UNION (SELECT x FROM b UNION SELECT x FROM c)", "(UNION a b c)"},
+       "(UNION ALL a (UNION ALL b c))"},
+      {"SELECT x FROM a UNION (SELECT x FROM b UNION SELECT x FROM c)", "(UNION a (UNION b c))"},
       {"SELECT x FROM a UNION ALL (SELECT x FROM b UNION SELECT x FROM c)",
        "(UNION ALL a (UNION b c))"},
       {"SELECT x FROM a INTERSECT (SELECT x FROM b INTERSECT SELECT x FROM c)",
@@ -953,10 +953,11 @@ TEST(ParserTest, SetOperationTreeFollowsDuckDb) {
   auto stmt = Parse(kSql);
   ASSERT_TRUE(stmt.has_value());
   const SetTree tree = SetOperationTree(*stmt);
-  ASSERT_EQ(tree.operands.size(), 3U);
+  ASSERT_EQ(tree.operands.size(), 2U);
+  ASSERT_EQ(tree.operands[1].operands.size(), 2U);
   EXPECT_EQ(tree.operands[0].op_span, SourceSpan{});
   EXPECT_EQ(At(kSql, tree.operands[1].op_span), "UNION ALL");
-  EXPECT_EQ(tree.operands[2].op_span.offset, kSql.find("UNION ALL SELECT x FROM c"));
+  EXPECT_EQ(tree.operands[1].operands[1].op_span.offset, kSql.find("UNION ALL SELECT x FROM c"));
   EXPECT_EQ(tree.op_span.offset, kSql.find("UNION ALL"));
 }
 
@@ -1373,10 +1374,10 @@ TEST(ParserTest, WithRecursiveOrACteNamedRecursive) {
     EXPECT_EQ(result.error().span, (SourceSpan{.offset = 5, .length = 9})) << sql;
     EXPECT_TRUE(result.error().message.starts_with("WITH RECURSIVE is not supported")) << sql;
   }
-  auto named = Parse("WITH recursive AS (SELECT a FROM t) SELECT a FROM recursive");
+  auto named = Parse("WITH \"recursive\" AS (SELECT a FROM t) SELECT a FROM recursive");
   ASSERT_TRUE(named.has_value()) << named.error().message;
   EXPECT_EQ(named->with.at(0).name, "recursive");
-  auto listed = Parse("WITH Recursive(x) AS (SELECT a FROM t) SELECT x FROM recursive");
+  auto listed = Parse("WITH \"Recursive\"(x) AS (SELECT a FROM t) SELECT x FROM recursive");
   ASSERT_TRUE(listed.has_value()) << listed.error().message;
   EXPECT_EQ(listed->with.at(0).name, "Recursive");
   EXPECT_EQ(listed->with.at(0).columns, std::vector<std::string>{"x"});
@@ -1385,10 +1386,10 @@ TEST(ParserTest, WithRecursiveOrACteNamedRecursive) {
   EXPECT_EQ(later->with.at(1).name, "recursive");
   // USING KEY after a CTE named recursive is unsupported at USING, not at the name.
   auto keyed =
-      Parse("WITH recursive USING KEY (x) AS (SELECT a AS x FROM t) SELECT x FROM recursive");
+      Parse("WITH \"recursive\" USING KEY (x) AS (SELECT a AS x FROM t) SELECT x FROM recursive");
   ASSERT_FALSE(keyed.has_value());
   EXPECT_EQ(keyed.error().kind, ParseError::Kind::kUnsupported);
-  EXPECT_EQ(keyed.error().span, (SourceSpan{.offset = 15, .length = 9}));
+  EXPECT_EQ(keyed.error().span, (SourceSpan{.offset = 17, .length = 9}));
   EXPECT_TRUE(keyed.error().message.starts_with("USING KEY is not supported"));
 }
 
@@ -3128,8 +3129,6 @@ INSTANTIATE_TEST_SUITE_P(
         // Grouping-set forms DuckDB's grammar does not have (ADR 0038): syntax errors, as there.
         RejectCase{"EmptyRollup", "SELECT 1 FROM t GROUP BY ROLLUP (^)", kSyntax, 1,
                    "expected an element in ROLLUP (...), found ')'"},
-        RejectCase{"EmptySetInRollup", "SELECT 1 FROM t GROUP BY ROLLUP (a, (^))", kSyntax, 1,
-                   "expected an expression or a list in (), found ')'"},
         RejectCase{"EmptyGroupingSets", "SELECT 1 FROM t GROUP BY GROUPING SETS (^)", kSyntax, 1,
                    "expected an element in GROUPING SETS (...), found ')'"},
         RejectCase{"GroupByAllList", "SELECT 1 FROM t GROUP BY ALL^, ROLLUP (a)", kSyntax, 1,
@@ -4595,8 +4594,8 @@ INSTANTIATE_TEST_SUITE_P(
                    "expected a table alias after AS, found parameter"},
         RejectCase{"EscapeStringAfterSpace", "SELECT a FROM events AS E ^'x'", kSyntax, 3,
                    "unexpected string literal"},
-        RejectCase{"BitStringAlias", "SELECT a FROM events AS B^'1'", kSyntax, 3,
-                   "unexpected string literal"},
+        RejectCase{"BitStringAlias", "SELECT a FROM events AS ^B'1'", kUnsupported, 1,
+                   "bit-string aliases are not supported"},
         RejectCase{"ImplicitDollarQuotedAlias", "SELECT a FROM events ^$$x$$", kSyntax, 1,
                    "unexpected parameter"},
         RejectCase{"ReservedAliasAfterAs", "SELECT a FROM events AS ^select", kSyntax, 6,
@@ -4629,8 +4628,6 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"CommaBeforeInto", "SELECT 1 FROM events, ^into x", kSyntax, 4,
                    "expected a table name or a quoted file path, found keyword INTO"},
         RejectCase{"PathQualified", "SELECT a FROM 'x.parquet'^.y", kSyntax, 1, "unexpected '.'"},
-        RejectCase{"TableInParentheses", "SELECT a FROM (events^)", kSyntax, 1,
-                   "expected a join after the table in parentheses, found ')'"},
         RejectCase{"CommaInParentheses", "SELECT a FROM ('e.parquet'^, users)", kSyntax, 1,
                    "expected a join after the table in parentheses, found ','"},
         RejectCase{"UnclosedParentheses", "SELECT a FROM (events^", kSyntax, 0,
@@ -4706,8 +4703,6 @@ INSTANTIATE_TEST_SUITE_P(
                    "unexpected ';'; expected LIMIT, OFFSET or ')'"},
         RejectCase{"SubqueryEmptyWith", "SELECT a FROM (WITH c AS (SELECT a FROM t)^)", kSyntax, 1,
                    "expected SELECT, found ')'"},
-        RejectCase{"ValuesInParentheses", "SELECT a FROM (values^)", kSyntax, 1,
-                   "expected a join after the table in parentheses, found ')'"},
         RejectCase{"SubqueryColumnsWithoutAlias", "SELECT a FROM (SELECT a FROM t) ^(x)", kSyntax,
                    1, "unexpected '('; expected WHERE"},
         RejectCase{"SubqueryAsColumns", "SELECT a FROM (SELECT a FROM t) AS ^(x)", kSyntax, 1,
@@ -4759,8 +4754,6 @@ INSTANTIATE_TEST_SUITE_P(
                    kSyntax, 5, "expected AS in the WITH list, found keyword USING"},
         RejectCase{"WithNameThenString", "WITH c ^'x' AS (SELECT a FROM t) SELECT a FROM c",
                    kSyntax, 3, "expected AS in the WITH list, found string literal"},
-        RejectCase{"WithTrailingComma", "WITH c AS (SELECT a FROM t), ^SELECT a FROM c", kSyntax, 6,
-                   "expected a CTE name, found keyword SELECT"},
         RejectCase{"WithAfterWith",
                    "WITH c AS (SELECT a FROM t) ^WITH d AS (SELECT a FROM t) SELECT a FROM c",
                    kSyntax, 4, "expected SELECT, found keyword WITH"},
@@ -4881,7 +4874,7 @@ TEST(ParserTest, EveryReservedWordAfterAsInFrom) {
 
 // The reserved words that DuckDB 1.5.5 takes as function names (probed on DuckDB).
 constexpr auto kFunctionWords =
-    std::to_array<std::string_view>({"CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
+    std::to_array<std::string_view>({"BY", "CROSS", "FULL", "ILIKE", "INNER", "IS", "JOIN", "LEFT",
                                      "LIKE", "NATURAL", "OUTER", "OVER", "RIGHT", "SIMILAR"});
 
 // Where a FROM item starts, the reserved words of kFunctionWords call table functions before '(',

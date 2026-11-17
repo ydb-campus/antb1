@@ -59,5 +59,8 @@ NULL	49.33575490563677
 statement error
 SELECT stddev_samp(s) FROM edge
 
-statement error VARPOP is out of range
+query R rowsort
 SELECT var_pop(d * 1e300) FROM edge
+----
+DOUBLE
+nan

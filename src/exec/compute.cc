@@ -84,12 +84,12 @@ arrow::Result<ArrayPtr> CastTo(const ArrayPtr& values, const std::shared_ptr<arr
 }
 
 // // and % of two arrays of one type, as DuckDB computes them. A DOUBLE % gives NaN for a zero
-// divisor, or NULL with null_for_zero (DuckDB's % of DECIMALs beyond 38 digits, computed in
+// divisor, or an error with error_for_zero (DuckDB's % of DECIMALs beyond 38 digits, computed in
 // DOUBLE).
 template <class ArrayType, class BuilderType>
 arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Array& right,
-                                       plan::ArithOp op, plan::LogicalType type, bool null_for_zero,
-                                       arrow::MemoryPool* pool) {
+                                       plan::ArithOp op, plan::LogicalType type,
+                                       bool error_for_zero, arrow::MemoryPool* pool) {
   using T = ArrayType::value_type;
   const auto& l = static_cast<const ArrayType&>(left);
   const auto& r = static_cast<const ArrayType&>(right);
@@ -103,17 +103,17 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
     const T x = l.Value(i);
     const T y = r.Value(i);
     if constexpr (std::is_floating_point_v<T>) {
-      if (y == 0 && (op != plan::ArithOp::kModulo || null_for_zero)) {
-        builder.UnsafeAppendNull();
-      } else if (op == plan::ArithOp::kModulo) {
+      if (y == 0 && (op != plan::ArithOp::kModulo || error_for_zero)) {
+        return arrow::Status::ExecutionError("Division by zero");
+      }
+      if (op == plan::ArithOp::kModulo) {
         builder.UnsafeAppend(std::fmod(x, y));  // NaN for a zero divisor, as in DuckDB
       } else {
         builder.UnsafeAppend(x / y);
       }
     } else {
       if (y == 0) {
-        builder.UnsafeAppendNull();
-        continue;
+        return arrow::Status::ExecutionError("Division by zero");
       }
       if constexpr (std::is_signed_v<T>) {
         if (x == std::numeric_limits<T>::min() && y == -1) {
@@ -129,24 +129,24 @@ arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Ar
 }
 
 arrow::Result<ArrayPtr> DivideOrModulo(const arrow::Array& left, const arrow::Array& right,
-                                       plan::ArithOp op, plan::LogicalType type, bool null_for_zero,
-                                       arrow::MemoryPool* pool) {
+                                       plan::ArithOp op, plan::LogicalType type,
+                                       bool error_for_zero, arrow::MemoryPool* pool) {
   switch (left.type_id()) {
     case arrow::Type::INT16:
       return DivideOrModulo<arrow::Int16Array, arrow::Int16Builder>(left, right, op, type,
-                                                                    null_for_zero, pool);
+                                                                    error_for_zero, pool);
     case arrow::Type::INT32:
       return DivideOrModulo<arrow::Int32Array, arrow::Int32Builder>(left, right, op, type,
-                                                                    null_for_zero, pool);
+                                                                    error_for_zero, pool);
     case arrow::Type::INT64:
       return DivideOrModulo<arrow::Int64Array, arrow::Int64Builder>(left, right, op, type,
-                                                                    null_for_zero, pool);
+                                                                    error_for_zero, pool);
     case arrow::Type::UINT16:
       return DivideOrModulo<arrow::UInt16Array, arrow::UInt16Builder>(left, right, op, type,
-                                                                      null_for_zero, pool);
+                                                                      error_for_zero, pool);
     case arrow::Type::DOUBLE:
       return DivideOrModulo<arrow::DoubleArray, arrow::DoubleBuilder>(left, right, op, type,
-                                                                      null_for_zero, pool);
+                                                                      error_for_zero, pool);
     default:
       break;
   }
@@ -514,10 +514,9 @@ arrow::Result<ArrayPtr> DecimalArith(const DecimalOperand& left, const DecimalOp
         overflow = __builtin_mul_overflow(x, y, &value);
         break;
       case plan::ArithOp::kModulo:
-        // The dividend's sign, NULL for a zero divisor (rule 9); |value| < |y| always fits.
+        // The dividend's sign; |value| < |y| always fits for a nonzero divisor.
         if (y == 0) {
-          builder.UnsafeAppendNull();
-          continue;
+          return arrow::Status::ExecutionError("Division by zero");
         }
         value = x % y;
         break;
@@ -808,8 +807,7 @@ arrow::Result<ArrayPtr> RunProgramInto(const DecimalProgram& program, int64_t ro
           break;
         default:  // kModulo
           if (y == 0) {
-            null = true;
-            break;
+            return arrow::Status::ExecutionError("Division by zero");
           }
           value = x % y;
           break;
@@ -1721,7 +1719,8 @@ struct Evaluator {
     ARROW_ASSIGN_OR_RAISE(const arrow::Datum utf8, arrow::compute::Cast(text, to_utf8, ctx));
     // The pattern alone first: an invalid one fails as in DuckDB, and a valid one cannot close
     // the group it is wrapped in.
-    const arrow::compute::ReplaceSubstringOptions check(pattern, "", /*max_replacements=*/-1);
+    const arrow::compute::ReplaceSubstringOptions check(pattern, replacement,
+                                                        /*max_replacements=*/-1);
     // (Over one value: Arrow compiles no pattern for an empty input.)
     ARROW_ASSIGN_OR_RAISE(const ArrayPtr one,
                           arrow::MakeArrayFromScalar(arrow::StringScalar(""), 1, pool));
@@ -1777,11 +1776,6 @@ struct Evaluator {
     const arrow::compute::ReplaceSubstringOptions options = options_for(body);
     auto replaced = arrow::compute::CallFunction("replace_substring_regex",
                                                  {dictionary.dictionary()}, &options, ctx);
-    if (!replaced.ok() && replaced.status().message().starts_with("Invalid replacement string")) {
-      // A replacement RE2 rejects (\1 without a group, a lone backslash): DuckDB ignores
-      // RE2::Replace's failure and returns the text unchanged.
-      return text;
-    }
     if (!replaced.ok()) {
       // An invalid pattern: a query error, as in DuckDB (Invalid Input Error). Running out of
       // memory stays a memory error.
@@ -2026,11 +2020,11 @@ struct Evaluator {
     ARROW_ASSIGN_OR_RAISE(left, CastTo(left, type, ctx));
     ARROW_ASSIGN_OR_RAISE(right, CastTo(right, type, ctx));
     if (arith.op == plan::ArithOp::kIntegerDivide || arith.op == plan::ArithOp::kModulo) {
-      // DuckDB computes % of DECIMALs beyond 38 digits in DOUBLE, NULL for a zero divisor; NaN
+      // DuckDB computes % of DECIMALs beyond 38 digits in DOUBLE, an error for a zero divisor; NaN
       // only with a DOUBLE operand.
-      const bool null_for_zero = arith.left->type != plan::LogicalType::kDouble &&
-                                 arith.right->type != plan::LogicalType::kDouble;
-      return DivideOrModulo(*left, *right, arith.op, e.type, null_for_zero, pool);
+      const bool error_for_zero = arith.left->type != plan::LogicalType::kDouble &&
+                                  arith.right->type != plan::LogicalType::kDouble;
+      return DivideOrModulo(*left, *right, arith.op, e.type, error_for_zero, pool);
     }
     if (e.type == plan::LogicalType::kHugeInt) {
       return HugeIntArith(*left, right.get(), arith.op, pool);
@@ -2229,14 +2223,17 @@ struct Evaluator {
     return Convert(values, expr, target);
   }
 
-  // A join key's cast (ADR 0022): an exact widening, by Convert. A value beyond its own declared
-  // width (a file can hold one) still fails a DECIMAL cast, with DuckDB's conversion error; any
-  // other cast is a malformed plan.
+  // Internal casts for join keys and arithmetic rewrites, by Convert. A value beyond its own
+  // declared width (a file can hold one) still fails a DECIMAL cast. Numeric-to-DOUBLE casts
+  // may also be synthesized by DuckDB 2.0's arithmetic simplifications.
   arrow::Result<ArrayPtr> Evaluate(const plan::CastExpr& cast, const plan::Expr& e) const {
     if (cast.operand == nullptr) {
       return arrow::Status::Invalid("a cast without an operand");
     }
-    if (!plan::IsExecutableCast(cast.operand->type, e.type)) {
+    if (!plan::IsExecutableCast(cast.operand->type, e.type) &&
+        !(e.type == plan::LogicalType::kDouble &&
+          (plan::IsInteger(cast.operand->type) ||
+           cast.operand->type == plan::LogicalType::kDecimal))) {
       return arrow::Status::Invalid("a cast of ", plan::ToString(cast.operand->type), " to ",
                                     plan::ToString(e.type), " is not one the executor runs");
     }

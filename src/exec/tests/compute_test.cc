@@ -110,21 +110,23 @@ TEST_F(ComputeTest, IntegerArithmeticIsCheckedInItsType) {
             "Overflow in negation of SMALLINT");
 }
 
-// // truncates and % takes the sign of the dividend; both are NULL for a zero divisor, and the
-// minimum divided by -1 overflows (DuckDB 1.5.5).
+// // truncates and % takes the sign of the dividend; both fail for a zero divisor, and the
+// minimum divided by -1 overflows (DuckDB 2.0). NULL operands still propagate.
 TEST_F(ComputeTest, IntegerDivisionAndModulo) {
   const auto l = Int64s({7, -7, 7, -7, 5, std::nullopt});
-  const auto r = Int64s({2, 2, -3, -3, 0, 1});
+  const auto r = Int64s({2, 2, -3, -3, 2, 0});
   const auto divide = Arith(ArithOp::kIntegerDivide, ColumnAt(0, LogicalType::kBigInt),
                             ColumnAt(1, LogicalType::kBigInt), LogicalType::kBigInt);
   const auto modulo = Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kBigInt),
                             ColumnAt(1, LogicalType::kBigInt), LogicalType::kBigInt);
   auto quotient = Eval(divide, {l, r});
   ASSERT_TRUE(quotient.ok()) << quotient.status().ToString();
-  EXPECT_EQ((*quotient)->ToString(), "[\n  3,\n  -3,\n  -2,\n  2,\n  null,\n  null\n]");
+  EXPECT_EQ((*quotient)->ToString(), "[\n  3,\n  -3,\n  -2,\n  2,\n  2,\n  null\n]");
   auto remainder = Eval(modulo, {l, r});
   ASSERT_TRUE(remainder.ok()) << remainder.status().ToString();
-  EXPECT_EQ((*remainder)->ToString(), "[\n  1,\n  -1,\n  1,\n  -1,\n  null,\n  null\n]");
+  EXPECT_EQ((*remainder)->ToString(), "[\n  1,\n  -1,\n  1,\n  -1,\n  1,\n  null\n]");
+  EXPECT_TRUE(Eval(divide, {Int64s({1}), Int64s({0})}).status().IsExecutionError());
+  EXPECT_TRUE(Eval(modulo, {Int64s({1}), Int64s({0})}).status().IsExecutionError());
   const auto min = Int64s({std::numeric_limits<int64_t>::min()});
   const auto minus_one = Int64s({-1});
   EXPECT_TRUE(Eval(divide, {min, minus_one}).status().IsExecutionError());
@@ -139,7 +141,7 @@ TEST_F(ComputeTest, IntegerDivisionAndModulo) {
   EXPECT_EQ((*unsigned_div)->ToString(), "[\n  32767\n]");
 }
 
-// / is DOUBLE division (IEEE: x / 0 is +-inf, 0 / 0 NaN); on DOUBLE, // divides but is NULL for a
+// / is DOUBLE division (IEEE: x / 0 is +-inf, 0 / 0 NaN); on DOUBLE, // divides but fails for a
 // zero divisor and % is fmod (NaN for a zero divisor).
 TEST_F(ComputeTest, DoubleDivision) {
   const auto ints = Int64s({1, -1, 0, 7});
@@ -158,8 +160,12 @@ TEST_F(ComputeTest, DoubleDivision) {
   auto quotient = Eval(Arith(ArithOp::kIntegerDivide, ColumnAt(0, LogicalType::kDouble),
                              ColumnAt(1, LogicalType::kDouble), LogicalType::kDouble),
                        {x, y});
-  ASSERT_TRUE(quotient.ok());
-  EXPECT_EQ((*quotient)->ToString(), "[\n  null,\n  0.75,\n  null\n]");
+  EXPECT_TRUE(quotient.status().IsExecutionError());
+  auto nonzero = Eval(Arith(ArithOp::kIntegerDivide, ColumnAt(0, LogicalType::kDouble),
+                            ColumnAt(1, LogicalType::kDouble), LogicalType::kDouble),
+                      {x, Doubles({2.0, 2.0, 0.0})});
+  ASSERT_TRUE(nonzero.ok()) << nonzero.status().ToString();
+  EXPECT_EQ((*nonzero)->ToString(), "[\n  0.75,\n  0.75,\n  null\n]");
   auto remainder = Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kDouble),
                               ColumnAt(1, LogicalType::kDouble), LogicalType::kDouble),
                         {x, y});
@@ -497,9 +503,9 @@ TEST_F(ComputeTest, DecimalOperandsInDuckDbOrder) {
 }
 
 // / and // of a DECIMAL are DOUBLE (ADR 0021 rule 8): the DECIMAL converts as DuckDB converts it
-// (beyond 2^53 div + mod / 10^s, not the nearest double), / follows IEEE and // is NULL for a zero
+// (correctly rounded for a scaled DECIMAL), / follows IEEE and // fails for a zero
 // divisor. % computes in the common DECIMAL (rule 9): the operands rescaled to its scale, the
-// dividend's sign, NULL for a zero divisor.
+// dividend's sign, an error for a zero divisor.
 TEST_F(ComputeTest, DecimalDivisionAndModulo) {
   const LogicalType p = LogicalType::Decimal(15, 2);
   const auto price = Decimals(p, {"1700", "-25", std::nullopt, "0", "-725"});
@@ -517,16 +523,20 @@ TEST_F(ComputeTest, DecimalDivisionAndModulo) {
   auto quotient = Eval(Arith(ArithOp::kIntegerDivide, ColumnAt(0, p),
                              ColumnAt(1, LogicalType::kBigInt), LogicalType::kDouble),
                        {price, divisor});
-  ASSERT_TRUE(quotient.ok()) << quotient.status().ToString();
-  EXPECT_EQ((*quotient)->ToString(),
-            "[\n  5.666666666666667,\n  null,\n  null,\n  null,\n  -3.625\n]");
+  EXPECT_TRUE(quotient.status().IsExecutionError());
+  auto nonzero = Eval(Arith(ArithOp::kIntegerDivide, ColumnAt(0, p),
+                            ColumnAt(1, LogicalType::kBigInt), LogicalType::kDouble),
+                      {price, Int64s({3, 2, 0, 2, 2})});
+  ASSERT_TRUE(nonzero.ok()) << nonzero.status().ToString();
+  EXPECT_EQ((*nonzero)->ToString(),
+            "[\n  5.666666666666667,\n  -0.125,\n  null,\n  0,\n  -3.625\n]");
   // DuckDB's conversion, not the nearest double (1.99489722791017e+16).
   const LogicalType wide = LogicalType::Decimal(18, 1);
   auto converted = Eval(Arith(ArithOp::kDivide, ColumnAt(0, wide),
                               ConstantOf(1, LogicalType::kInteger), LogicalType::kDouble),
                         {Decimals(wide, {"199489722791016982"})});
   ASSERT_TRUE(converted.ok()) << converted.status().ToString();
-  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**converted).Value(0), 1.9948972279101696e+16);
+  EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**converted).Value(0), 1.99489722791017e+16);
   // A HUGEINT (an integer SUM) converts through DuckDB's 128-bit formula too: 2^64 + 2^63 + 2049
   // is 2^64 + 2^63, where the nearest double is 2^64 + 2^63 + 4096 (ADR 0021 rule 13's value).
   auto huge = Eval(Arith(ArithOp::kDivide, ColumnAt(0, LogicalType::kHugeInt),
@@ -538,8 +548,12 @@ TEST_F(ComputeTest, DecimalDivisionAndModulo) {
   auto remainder = Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, LogicalType::kBigInt),
                               LogicalType::Decimal(21, 2)),
                         {price, divisor});
-  ASSERT_TRUE(remainder.ok()) << remainder.status().ToString();
-  EXPECT_EQ(UnscaledText(**remainder), "DECIMAL(21,2): 200 null null null -125");
+  EXPECT_TRUE(remainder.status().IsExecutionError());
+  auto nonzero_mod = Eval(Arith(ArithOp::kModulo, ColumnAt(0, p), ColumnAt(1, LogicalType::kBigInt),
+                                LogicalType::Decimal(21, 2)),
+                          {price, Int64s({3, 2, 0, 2, 2})});
+  ASSERT_TRUE(nonzero_mod.ok()) << nonzero_mod.status().ToString();
+  EXPECT_EQ(UnscaledText(**nonzero_mod), "DECIMAL(21,2): 200 -25 null 0 -125");
   // Scales differ: 17.00 % 0.0005 and -0.25 % -0.0003 in DECIMAL(17,4) (p % r).
   const LogicalType r = LogicalType::Decimal(9, 4);
   auto mixed =
@@ -853,10 +867,8 @@ TEST_F(ComputeTest, StringFunctions) {
   ASSERT_TRUE(newline.ok());
   EXPECT_EQ(values(*newline)[2], "a\nb") << "`.` does not match a newline";
   for (const char* invalid : {"\\1", "x\\", "\\q"}) {
-    auto unchanged = replace("a", invalid);
-    ASSERT_TRUE(unchanged.ok()) << invalid << ": " << unchanged.status().ToString();
-    EXPECT_EQ(values(*unchanged), (Values{"h\xC3\xA9llo", std::nullopt, "a\nb", "", "abab"}))
-        << "DuckDB leaves the text unchanged for the replacement " << invalid;
+    auto rejected = replace("a", invalid);
+    EXPECT_TRUE(rejected.status().IsExecutionError()) << invalid << ": " << rejected.status();
   }
   // Divergence D15: RE2 never matches a byte that is not UTF-8, which DuckDB cannot read at all.
   auto invalid_utf8 =
@@ -1502,7 +1514,7 @@ TEST_F(ComputeTest, RoundOfADoubleAsDuckDb) {
 
 // % of DECIMALs beyond 38 digits is DOUBLE, as DuckDB computes it: fmod of the operands converted
 // by rule 8 (a BIGINT to its nearest double, a HUGEINT by DuckDB's 128-bit formula), with the
-// dividend's sign (-0.0 too) and NULL for a zero divisor; with a DOUBLE operand a zero divisor
+// dividend's sign (-0.0 too) and fails for a zero divisor; with a DOUBLE operand a zero divisor
 // gives NaN, as for any DOUBLE %.
 TEST_F(ComputeTest, DecimalModuloBeyond38DigitsIsDouble) {
   const LogicalType h = LogicalType::Decimal(38, 0);
@@ -1510,14 +1522,14 @@ TEST_F(ComputeTest, DecimalModuloBeyond38DigitsIsDouble) {
   auto wide =
       Eval(Arith(ArithOp::kModulo, ColumnAt(0, h), ColumnAt(1, half), LogicalType::kDouble),
            {Decimals(h, {"-4", "7", std::nullopt, "3", "99999999999999999999999999999999999999"}),
-            Decimals(half, {"5", "25", "5", "0", "25"})});
+            Decimals(half, {"5", "25", "0", "20", "25"})});
   ASSERT_TRUE(wide.ok()) << wide.status().ToString();
   const auto& w = static_cast<const arrow::DoubleArray&>(**wide);
   EXPECT_EQ(w.Value(0), 0.0);
   EXPECT_TRUE(std::signbit(w.Value(0)));  // -4 % 0.5 is -0.0
   EXPECT_EQ(w.Value(1), 2.0);
   EXPECT_TRUE(w.IsNull(2));
-  EXPECT_TRUE(w.IsNull(3));  // a zero divisor: NULL, not NaN
+  EXPECT_EQ(w.Value(3), 1.0);
   EXPECT_EQ(w.Value(4), std::fmod(DuckDbDecimalToDouble(PowerOfTen(38) - 1, 38, 0), 2.5));
   // HUGEINT: 2^64 + 2^63 + 2049 converts to 2^64 + 2^63 (DuckDB's formula).
   auto huge =
@@ -1528,14 +1540,18 @@ TEST_F(ComputeTest, DecimalModuloBeyond38DigitsIsDouble) {
   EXPECT_EQ(static_cast<const arrow::DoubleArray&>(**huge).Value(0), std::fmod(0x1.8p64, 2.5));
   // BIGINT % DECIMAL(38,30): 2^53 + 1 converts to 2^53.
   const LogicalType n = LogicalType::Decimal(38, 30);
-  auto bigint =
-      Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kBigInt), ColumnAt(1, n),
-                 LogicalType::kDouble),
-           {Int64s({9007199254740993, 5}), Decimals(n, {"1500000000000000000000000000000", "0"})});
+  auto bigint = Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kBigInt), ColumnAt(1, n),
+                           LogicalType::kDouble),
+                     {Int64s({9007199254740993, std::nullopt}),
+                      Decimals(n, {"1500000000000000000000000000000", "0"})});
   ASSERT_TRUE(bigint.ok()) << bigint.status().ToString();
   const auto& b = static_cast<const arrow::DoubleArray&>(**bigint);
   EXPECT_EQ(b.Value(0), std::fmod(0x1p53, 1.5));
   EXPECT_TRUE(b.IsNull(1));
+  EXPECT_TRUE(Eval(Arith(ArithOp::kModulo, ColumnAt(0, h), ColumnAt(1, half), LogicalType::kDouble),
+                   {Decimals(h, {"3"}), Decimals(half, {"0"})})
+                  .status()
+                  .IsExecutionError());
   // With a DOUBLE operand: NaN for a zero divisor.
   const LogicalType p = LogicalType::Decimal(15, 2);
   auto with_double = Eval(Arith(ArithOp::kModulo, ColumnAt(0, LogicalType::kDouble), ColumnAt(1, p),

@@ -334,6 +334,10 @@ void CheckTokensAccountedFor(const std::string& sql, const SelectStatement& stmt
       case TokenKind::kEnd:
         break;
       case TokenKind::kComma:
+        // DuckDB 2.0 accepts a trailing comma between the WITH list and SELECT.
+        if (i + 1 < tokens->size() && (*tokens)[i + 1].IsKeyword("SELECT")) {
+          break;
+        }
         ++seen.commas;
         break;
       case TokenKind::kEqual:

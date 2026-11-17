@@ -265,7 +265,7 @@ INTEGER	DECIMAL(14,5)
 query ID nosort
 SELECT id, d9_2 + (SELECT d18_4 FROM decimals WHERE id = 1) AS v FROM decimals WHERE id < 4 ORDER BY id
 ----
-INTEGER	DECIMAL(18,4)
+INTEGER	DECIMAL(19,4)
 0	-7.2501
 1	9999998.9899
 2	-10000000.9901
@@ -967,8 +967,14 @@ SELECT id, i16 + (SELECT i16 FROM edge WHERE id = 4) AS v FROM edge WHERE id IN 
 statement error Overflow in subtraction of
 SELECT id, i64 - (SELECT i64 FROM edge WHERE id = 4) AS v FROM edge WHERE id IN (0, 2) ORDER BY id
 
-statement error Overflow in addition of
+query ID rowsort
 SELECT id, d9_2 + (SELECT MAX(d18_4) FROM decimals) AS v FROM decimals WHERE id < 4 ORDER BY id
+----
+INTEGER	DECIMAL(19,4)
+0	99999999999993.7499
+1	100000009999999.9899
+2	99999990000000.0099
+3	NULL
 
 statement error Overflow in addition of
 SELECT DISTINCT i32 + (SELECT MAX(i32) FROM edge) AS v FROM edge WHERE id IN (1, 2, 4)

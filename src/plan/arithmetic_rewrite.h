@@ -2,7 +2,7 @@
 
 #include "antb1/plan/logical_plan.h"
 
-// Integer arithmetic as DuckDB 1.5.6 computes it, so that an overflow fails the same queries
+// Integer arithmetic as DuckDB 2.0.0 computes it, so that an overflow fails the same queries
 // (docs/sql-subset.md's rewrites of DuckDB's optimizer). Private to the plan module: the optimizer
 // runs it over every expression a plan computes, and the binder over the operand of a comparison
 // and the argument of a SUM before it moves their constants (MoveConstants, the sum rewrite), as
@@ -10,10 +10,11 @@
 namespace antb1::plan {
 
 // `expr` rewritten by the three rules of DuckDB's expression rewriter that decide which integer
-// additions and multiplications it computes, applied as it applies them: top down, a node's rules
-// in this order until none fires before its children, and passes until no rule fires anywhere. They
-// read no cast of an integer value to its own type, which DuckDB's binder never writes (it returns
-// the value itself) and antb1's keeps for GROUP BY to match: such a cast is its operand.
+// additions and multiplications it computes, applied as it applies them: bottom up, children first,
+// then the node's rules in this order; a parent rewrite revisits its children, until no rule fires
+// anywhere. They read no cast of an integer value to its own type, which DuckDB's binder never
+// writes (it returns the value itself) and antb1's keeps for GROUP BY to match: such a cast is its
+// operand.
 //  1. ConstantOrderNormalization: a chain of `+` (or of `*`) of an integer type -- the nodes of one
 //     operator and one type that are operands of each other; every other node is an operand of the
 //     chain, as are those of another type, which DuckDB reaches through a cast -- with at least two
@@ -34,18 +35,13 @@ namespace antb1::plan {
 //     become x (cast to the expression's type where x is of another one), so x + 1 + -1 computes
 //     nothing: (1 + -1) + x, then 0 + x, then x. x * 0 and 0 * x become DuckDB's
 //     constant_or_null(0, x), which computes x and is NULL for a NULL x, and which no chain of *
-//     reads through. Its x // 0, NULL without computing x, and its rule for a NULL constant operand
-//     are not reproduced: antb1 computes x // 0, to NULL, and folds no constant to NULL, so that
-//     (x + 1) // 0, or an operation with 2 // 0 as an operand, computes its other operand where
-//     DuckDB does not.
+//     reads through. Division by zero is an execution error, as in DuckDB 2.0.
 // The result keeps `expr`'s name, type and values; only the rows an overflow fails on can differ,
 // and they become DuckDB's. The same pointer where no rule fires.
 ExprPtr RewriteArithmetic(const ExprPtr& expr);
 
-// One top-down pass of RewriteArithmetic: each node's rules until none fires, then its children.
-// What DuckDB's rewriter gives a comparison's operand between two of its constant moves, since its
-// MoveConstants changes the comparison in place and ends the pass before the operand is visited
-// (Binder::MoveConstants). Keeps `expr`'s name and type; the same pointer where no rule fires.
+// One bottom-up pass, revisiting children after a parent rewrite. Keeps the expression's
+// name and type, and returns the same pointer when no rule fires.
 ExprPtr RewriteArithmeticPass(const ExprPtr& expr);
 
 }  // namespace antb1::plan

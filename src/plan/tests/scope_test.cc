@@ -957,5 +957,49 @@ TEST(ScopeTest, AnAliasHidesACtesNameAndADerivedTableHasNone) {
   EXPECT_EQ(plain.message().find("hides it"), std::string::npos) << plain.message();
 }
 
+TEST(ScopeTest, OuterStarsRespectVisibilityShadowingAndAmbiguity) {
+  ColumnIdSource ids;
+  Scope outer({TableBinding("a", OkSchema(), ids), TableBinding("b", OkSchema(), ids),
+               TableBinding("a", OkSchema(), ids)});
+  Scope visible({}, &outer, Visibility{.inner_begin = 1, .end = 2});
+  const auto a = visible.LookUpOuterStar("A", {});
+  ASSERT_TRUE(a.ok()) << a.status();
+  ASSERT_TRUE(a->has_value());
+  const auto a_star = a->value_or(Scope::OuterStar{});
+  EXPECT_EQ(a_star.scope, &outer);
+  EXPECT_EQ(a_star.binding, 0U);
+  Scope nearest({}, &outer, Visibility{.inner_begin = 2, .end = 3});
+  const auto last = nearest.LookUpOuterStar("a", {});
+  ASSERT_TRUE(last.ok()) << last.status();
+  ASSERT_TRUE(last->has_value());
+  EXPECT_EQ(last->value_or(Scope::OuterStar{}).binding, 2U);
+  Scope ambiguous({}, &outer);
+  EXPECT_FALSE(ambiguous.LookUpOuterStar("a", {}).ok());
+  Scope hidden({}, &outer, Visibility{.end = 1});
+  const auto b = hidden.LookUpOuterStar("b", {});
+  ASSERT_TRUE(b.ok());
+  EXPECT_FALSE(b->has_value());
+  Scope shadow({TableBinding("a", OkSchema(), ids)}, &outer);
+  const auto local = shadow.LookUpOuterStar("a", {});
+  ASSERT_TRUE(local.ok());
+  EXPECT_FALSE(local->has_value());
+  Scope nearer_column({TableBinding("c", arrow::schema({arrow::field("a", arrow::int32())}), ids)},
+                      &outer, Visibility{.end = 1});
+  Scope nested({}, &nearer_column);
+  const auto blocked = nested.LookUpOuterStar("a", {});
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_NE(blocked.status().message().find("enclosing name is a column"), std::string::npos);
+  Scope invisible_column({}, &nearer_column, Visibility{.end = 0});
+  const auto farther = invisible_column.LookUpOuterStar("a", {});
+  ASSERT_TRUE(farther.ok()) << farther.status();
+  ASSERT_TRUE(farther->has_value());
+  EXPECT_EQ(farther->value_or(Scope::OuterStar{}).scope, &outer);
+  auto bound = BindSql(
+      "SELECT i16 FROM ok WHERE EXISTS "
+      "(SELECT ok.* FROM u WHERE u.i16 = ok.i16)",
+      MakeCatalog());
+  EXPECT_TRUE(bound.ok()) << bound.status();
+}
+
 }  // namespace
 }  // namespace antb1::plan

@@ -392,8 +392,17 @@ BIGINT
 
 # All three values compare in DuckDB's common type: with a DOUBLE bound the operand's sum is computed as written (DuckDB
 # keeps its cast to DOUBLE) and overflows; with an INTEGER bound the constant moves and nothing overflows.
-statement error Overflow in addition
+query I rowsort
 SELECT id FROM edge WHERE i32 + 1 BETWEEN (SELECT MIN(d) FROM edge) AND 100
+----
+INTEGER
+0
+11
+2
+3
+4
+7
+8
 
 query I nosort
 SELECT id FROM edge WHERE i32 + 1 BETWEEN (SELECT MIN(i32) FROM edge) AND 100 ORDER BY id

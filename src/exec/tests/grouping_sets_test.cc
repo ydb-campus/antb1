@@ -633,26 +633,31 @@ TEST_F(GroupingSetsTest, TheEmptySetHasARowOverNoInput) {
   }
 }
 
-// A finalize error of a later set (the variance of the whole input overflows; one value per
-// group has none) fails the first Next(), before any row of an earlier set.
+// A finalize error of a later set (the DECIMAL sum of the whole input exceeds its precision;
+// each individual group fits) fails the first Next(), before any row of an earlier set.
 TEST_F(GroupingSetsTest, EverySetsFinalizeErrorsComeFirst) {
   const auto pool = Pool();
-  const auto schema = Table(false, 0)->schema();
+  const LogicalType wide = LogicalType::Decimal(38, 0);
+  const auto schema =
+      Table(false, 0)->schema()->SetField(3, arrow::field("p", plan::ToArrow(wide))).ValueOrDie();
   arrow::DoubleBuilder x;
   ASSERT_TRUE(x.AppendValues({1e308, -1e308}).ok());
   const auto batch = arrow::RecordBatch::Make(
       schema, 2,
       {testing::Int64s({1, 2}), testing::Strings({"a", "b"}), testing::Dates({0, 0}),
-       testing::Decimals(LogicalType::Decimal(10, 2), {"1", "2"}), x.Finish().ValueOrDie(),
-       testing::Int64s({1, 2})});
+       testing::Decimals(wide, {"60000000000000000000000000000000000000",
+                                "60000000000000000000000000000000000000"}),
+       x.Finish().ValueOrDie(), testing::Int64s({1, 2})});
+  auto column = ColM();
+  column.type = wide;
   const std::vector<plan::AggregateCall> calls = {
-      {.kind = AggKind::kStddevSamp, .arg = ColX(), .type = LogicalType::kDouble}};
+      {.kind = AggKind::kSum, .arg = column, .type = wide}};
   for (const bool split : {false, true}) {
     const auto table =
         std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, split);
     const auto serial = RunSerial(table, {ColA()}, {{0}, {}}, calls, {});
     EXPECT_FALSE(serial.ok());
-    EXPECT_TRUE(serial.status().message().contains("out of range")) << serial.status().ToString();
+    EXPECT_TRUE(serial.status().message().contains("SUM overflow")) << serial.status().ToString();
     for (arrow::internal::Executor* executor :
          {static_cast<arrow::internal::Executor*>(nullptr),
           static_cast<arrow::internal::Executor*>(pool.get())}) {
@@ -665,7 +670,7 @@ TEST_F(GroupingSetsTest, EverySetsFinalizeErrorsComeFirst) {
       ASSERT_TRUE((*op)->Open(ctx).ok());
       const auto first = (*op)->Next();
       EXPECT_FALSE(first.ok());
-      EXPECT_TRUE(first.status().message().contains("out of range")) << first.status().ToString();
+      EXPECT_TRUE(first.status().message().contains("SUM overflow")) << first.status().ToString();
       ASSERT_TRUE((*op)->Close().ok());
     }
   }

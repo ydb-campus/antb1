@@ -2472,17 +2472,9 @@ SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z 
 AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
 
 onlyif duckdb
-query I nosort
+statement error
 SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
 AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
-----
-SMALLINT
-1
-2
-3
-4
-5
-6
 
 onlyif antb1
 statement error out of range for the destination type UINT16
@@ -2526,12 +2518,10 @@ AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
 AND r.rd_id + 9223372036854775807 > r.rd_row)) ORDER BY 1
 
 onlyif duckdb
-query I nosort
+statement error [Oo]verflow
 SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id)
 AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
 AND r.rd_id + 9223372036854775807 > r.rd_row)) ORDER BY 1
-----
-SMALLINT
 
 # ---- boundaries of correlated EXISTS marks (ADR 0041's SQ8a) ----
 
@@ -2909,9 +2899,18 @@ HUGEINT
 
 # One that reads the left input.
 onlyif duckdb
-statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+query II rowsort
 SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30
 AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	NULL
+2	32
+2	37
+3	33
+4	NULL
+5	NULL
+6	NULL
 
 # ---- a mark in an inner ON inside a LEFT JOIN's left input (ADR 0041's SQ8a) ----
 

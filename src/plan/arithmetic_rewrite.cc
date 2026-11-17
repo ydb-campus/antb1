@@ -121,8 +121,8 @@ bool Foldable(const Expr& expr) {
 // The value of an integer expression that reads no column, in its type, as DuckDB's
 // ConstantFolding computes it: an operation's operands cast to its type, the operation checked in
 // it, // truncating and % with the dividend's sign. std::nullopt where that fails (an overflow, or
-// a cast of a value its type cannot hold), for a zero divisor (DuckDB's NULL, which this does not
-// fold: it is computed instead, to NULL) and for anything but literals and + - * // %, negation,
+// a cast of a value its type cannot hold), for a zero divisor (computed later to report the
+// execution error) and for anything but literals and + - * // %, negation,
 // casts and abs over them.
 std::optional<Int128> Evaluate(const Expr& expr) {
   if (!IsInteger(expr.type)) {
@@ -359,10 +359,12 @@ ExprPtr Simplify(const ExprPtr& expr) {
       Expr{.node = CastExpr{.operand = kept}, .type = expr->type, .name = std::move(name)});
 }
 
-// One top-down pass: the node's rules until none fires, then its children; `changed` is set when
-// a rule fires anywhere. `level` is the node's in its expression, 1 at the top.
+// DuckDB 2.0 rewrites children before their parent, revisiting children after every parent
+// replacement. In particular, comparisons must see fully simplified arithmetic operands.
 ExprPtr Pass(ExprPtr expr, bool& changed, std::size_t level) {
   for (;;) {
+    expr = MapChildren(
+        expr, [&changed, level](const ExprPtr& child) { return Pass(child, changed, level + 1); });
     ExprPtr next = OrderConstants(expr, level);
     if (next == nullptr) {
       next = FoldConstant(expr);
@@ -376,8 +378,7 @@ ExprPtr Pass(ExprPtr expr, bool& changed, std::size_t level) {
     expr = std::move(next);
     changed = true;
   }
-  return MapChildren(
-      expr, [&changed, level](const ExprPtr& child) { return Pass(child, changed, level + 1); });
+  return expr;
 }
 
 // `expr` without its casts of an integer value to the value's own type, which DuckDB's binder never

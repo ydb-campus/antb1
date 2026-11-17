@@ -6,6 +6,8 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -219,8 +221,67 @@ TEST(Session, ANestedJoinsBuildDropsWhatNothingReadsAboveIt) {
 // dictionary-encoded and proves it from that optional field alone, so its own door declines here
 // and `io` decides from the required `encodings` instead.
 //
-// Arrow's writer always emits `encoding_stats`, so the file is written by the test oracle, which
-// never does -- the same way scripts/static_gates.py makes its smoke-test files.
+// DuckDB 2.0 also emits this optional metadata. Clear only the encoding statistics of our
+// generated fixture, preserving its pages, required encoding list and all other metadata.
+void ClearEncodingStats(const std::string& path) {
+  const auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+  const auto metadata = reader->metadata();
+  std::string footer = metadata->SerializeToString();
+  const auto varint = [](std::string& bytes, std::uint32_t value) {
+    while (value >= 128) {
+      bytes.push_back(static_cast<char>((value & 127U) | 128U));
+      value >>= 7U;
+    }
+    bytes.push_back(static_cast<char>(value));
+  };
+  for (int r = 0; r < metadata->num_row_groups(); ++r) {
+    const auto group = metadata->RowGroup(r);
+    for (int c = 0; c < group->num_columns(); ++c) {
+      const auto chunk = group->ColumnChunk(c);
+      const auto& stats = chunk->encoding_stats();
+      ASSERT_FALSE(stats.empty());
+      ASSERT_LT(stats.size(), 15U);
+      // Compact Thrift: field 13 follows statistics (12), LIST<STRUCT>, then each
+      // PageEncodingStats' three i32 fields (page_type, encoding, count) and STOP.
+      std::string encoded{char{0x19}, static_cast<char>((stats.size() << 4U) | 12U)};
+      for (const auto& stat : stats) {
+        for (const int value :
+             {static_cast<int>(stat.page_type), static_cast<int>(stat.encoding), stat.count}) {
+          ASSERT_GE(value, 0);
+          encoded.push_back(char{0x15});
+          varint(encoded, static_cast<std::uint32_t>(value) << 1U);
+        }
+        encoded.push_back(char{0});
+      }
+      const std::size_t at = footer.find(encoded);
+      ASSERT_NE(at, std::string::npos) << "the generated metadata has the expected compact fields";
+      footer.replace(at, encoded.size(), std::string{char{0x19}, char{0x0c}});
+    }
+  }
+  std::ifstream input(path, std::ios::binary);
+  std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  ASSERT_TRUE(input.good());
+  ASSERT_GE(bytes.size(), 8U);
+  std::uint32_t old_size = 0;
+  for (unsigned i = 0; i < 4; ++i) {
+    old_size |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[bytes.size() - 8 + i]))
+                << (8U * i);
+  }
+  ASSERT_LE(old_size, bytes.size() - 8);
+  bytes.resize(bytes.size() - 8 - old_size);
+  bytes += footer;
+  const auto size = static_cast<std::uint32_t>(footer.size());
+  ASSERT_EQ(size, footer.size());
+  for (unsigned i = 0; i < 4; ++i) {
+    bytes.push_back(static_cast<char>((size >> (8U * i)) & 255U));
+  }
+  bytes += "PAR1";
+  input.close();
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  ASSERT_TRUE(output.good());
+}
+
 TEST(Session, ADictionaryPredicateOnAFileWithNoEncodingStats) {
   const auto dir = std::filesystem::path(::testing::TempDir()) / "antb1_no_encoding_stats";
   std::filesystem::remove_all(dir);
@@ -245,12 +306,14 @@ TEST(Session, ADictionaryPredicateOnAFileWithNoEncodingStats) {
     duckdb_close(&db);
     ASSERT_EQ(state, DuckDBSuccess) << "the oracle writes the file";
   }
+  ASSERT_NO_FATAL_FAILURE(ClearEncodingStats(path));
   // The situation, asserted rather than assumed: no encoding_stats, so Arrow's door declines.
   {
     auto reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
     ASSERT_GT(reader->metadata()->num_row_groups(), 0);
     const auto chunk = reader->metadata()->RowGroup(0)->ColumnChunk(0);
-    EXPECT_TRUE(chunk->encoding_stats().empty()) << "this writer emits none";
+    EXPECT_TRUE(chunk->encoding_stats().empty())
+        << "the fixture deliberately omits these statistics";
     auto group = reader->RowGroup(0);
     EXPECT_NE(group->ColumnWithExposeEncoding(0, parquet::ExposedEncoding::DICTIONARY)
                   ->GetExposedEncoding(),

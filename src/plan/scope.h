@@ -256,6 +256,15 @@ class Scope {
   [[nodiscard]] arrow::Result<std::size_t> StarBinding(std::string_view qualifier,
                                                        SourceSpan span) const;
 
+  struct OuterStar {
+    const Scope* scope = nullptr;
+    std::size_t binding = 0;
+  };
+  // The nearest enclosing table named by a qualified star, respecting the visibility of
+  // each enclosing ON clause. Local table or column names shadow outer stars.
+  [[nodiscard]] arrow::Result<std::optional<OuterStar>> LookUpOuterStar(std::string_view qualifier,
+                                                                        SourceSpan span) const;
+
   // Where column `id` is, if it is a binding's column (and not a computed one).
   [[nodiscard]] std::optional<ColumnLocation> Find(ColumnId id) const;
 
