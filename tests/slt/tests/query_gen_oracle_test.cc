@@ -17,9 +17,11 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "antb1/sql/lexer.h"
 #include "antb1/sql/parser.h"
 #include "antb1/sql/unparse.h"
 
@@ -72,7 +74,49 @@ std::expected<std::string, std::string> DuckDbReading(DuckDbEngine& duckdb,
   if (!value.has_value()) {
     return std::unexpected("json_deserialize_sql gave NULL");
   }
-  return *value;
+  // DuckDB 2.0's PEG parser preserves type-name case, even through JSON round trips.
+  // Normalize only DATE in the type slot of a CAST; identifiers and literal bytes stay intact.
+  auto tokens = sql::Tokenize(*value);
+  if (!tokens.has_value()) {
+    return std::unexpected(tokens.error().message);
+  }
+  std::string normalized = *value;
+  std::vector<bool> casts;
+  for (std::size_t i = 0; i < tokens->size(); ++i) {
+    const sql::Token& token = (*tokens)[i];
+    if (token.kind == sql::TokenKind::kLeftParen) {
+      casts.push_back(i > 0 && (*tokens)[i - 1].IsKeyword("CAST"));
+    } else if (token.kind == sql::TokenKind::kRightParen) {
+      if (!casts.empty()) {
+        casts.pop_back();
+      }
+    } else if (!casts.empty() && casts.back() && token.IsKeyword("DATE") && i > 0 &&
+               (*tokens)[i - 1].IsKeyword("AS")) {
+      normalized.replace(token.span.offset, token.span.length, "DATE");
+    }
+  }
+  return normalized;
+}
+
+TEST(QueryGenOracle, DateTypeNormalizationPreservesIdentifiersAndLiterals) {
+  const std::filesystem::path dir =
+      std::filesystem::path(::testing::TempDir()) / "query_gen_date_oracle";
+  std::filesystem::create_directories(dir);
+  auto duckdb = DuckDbEngine::Make({}, dir, dir);
+  ASSERT_TRUE(duckdb.has_value()) << duckdb.error();
+  const auto lower =
+      DuckDbReading(**duckdb, "SELECT CAST('2020-01-01' AS date), 'date', date FROM t");
+  const auto upper_type =
+      DuckDbReading(**duckdb, "SELECT CAST('2020-01-01' AS DATE), 'date', date FROM t");
+  const auto upper_value =
+      DuckDbReading(**duckdb, "SELECT CAST('2020-01-01' AS DATE), 'DATE', DATE FROM t");
+  ASSERT_TRUE(lower.has_value()) << lower.error();
+  ASSERT_TRUE(upper_type.has_value()) << upper_type.error();
+  ASSERT_TRUE(upper_value.has_value()) << upper_value.error();
+  EXPECT_EQ(*lower, *upper_type);
+  EXPECT_NE(*lower, *upper_value);
+  EXPECT_NE(lower->find("'date'"), std::string::npos);
+  EXPECT_NE(lower->find(", date FROM"), std::string::npos);
 }
 
 TEST(QueryGenOracle, DuckDbReadsEveryGeneratedJoinAndItsCanonicalFormAlike) {

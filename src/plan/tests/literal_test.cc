@@ -307,9 +307,9 @@ TEST(LiteralTest, FoldIntegerComparisonTable) {
   EXPECT_EQ(fold(CompareOp::kLe, "1e50", false).kind, kIsNotNull);
 }
 
-// Expected values from DuckDB 1.5.5 (`SELECT CAST(<literal> AS FLOAT)::DOUBLE`), compared bit for
-// bit. They include DuckDB's own rounding: 16777217.5 and 0.1 written with 16 or 24 decimals are
-// not the FLOAT nearest to the literal, and a HUGEINT literal is rounded through a double.
+// Expected values from DuckDB 2.0.0 (`SELECT CAST(<literal> AS FLOAT)::DOUBLE`), compared bit for
+// bit. They include DuckDB's own rounding: scaled DECIMAL values round directly to FLOAT, and a
+// HUGEINT literal is rounded through a double.
 TEST(DuckDbFloatOf, MatchesDuckDbCasts) {
   constexpr double kInf = std::numeric_limits<double>::infinity();
   struct Case {
@@ -362,13 +362,13 @@ TEST(DuckDbFloatOf, MatchesDuckDbCasts) {
       {.text = "0.3", .negative = false, .expected = 0.30000001192092896},
       {.text = "1234.5", .negative = false, .expected = 1234.5},
       {.text = "99.99", .negative = false, .expected = 99.98999786376953},
-      {.text = "16777217.5", .negative = false, .expected = 16777216.0},
-      {.text = "16777217.5", .negative = true, .expected = -16777216.0},
+      {.text = "16777217.5", .negative = false, .expected = 16777218.0},
+      {.text = "16777217.5", .negative = true, .expected = -16777218.0},
       {.text = "16777217.0", .negative = false, .expected = 16777216.0},
       {.text = "16777216.5", .negative = false, .expected = 16777216.0},
-      {.text = "0.100000000000000000000000", .negative = false, .expected = 0.09999999403953552},
-      {.text = "0.100000000000000000000000", .negative = true, .expected = -0.09999999403953552},
-      {.text = "0.1000000000000000", .negative = false, .expected = 0.09999999403953552},
+      {.text = "0.100000000000000000000000", .negative = false, .expected = 0.10000000149011612},
+      {.text = "0.100000000000000000000000", .negative = true, .expected = -0.10000000149011612},
+      {.text = "0.1000000000000000", .negative = false, .expected = 0.10000000149011612},
       {.text = "123456789.123456789", .negative = false, .expected = 123456792.0},
       {.text = "12345678901234567890.5", .negative = false, .expected = 1.2345679395506094e+19},
       {.text = "99999999999999999999999999999999999999",
@@ -404,8 +404,8 @@ TEST(DuckDbFloatOf, DoubleLiteralsAreNotConverted) {
   EXPECT_FALSE(DuckDbFloatOf("abc", false).has_value());
 }
 
-// DuckDB 1.5.5's typeof: an exponent, more than 38 digits with a point (leading zeros count) and an
-// integer outside -2^127 to 2^128 - 1 are DOUBLE; 2^127 to 2^128 - 1 is UHUGEINT, not DOUBLE.
+// DuckDB 2.0's typeof: an exponent or more than 38 digits with a point (leading zeros count)
+// is DOUBLE. Integers beyond signed HUGEINT and positive UHUGEINT are BIGNUM, not DOUBLE.
 TEST(DuckDbTypesAsDouble, MatchesDuckDbTypeof) {
   struct Case {
     std::string_view text;
@@ -440,16 +440,16 @@ TEST(DuckDbTypesAsDouble, MatchesDuckDbTypeof) {
                 .is_double = false},
            Case{.text = "340282366920938463463374607431768211456",
                 .negative = false,
-                .is_double = true},
+                .is_double = false},
            Case{.text = "170141183460469231731687303715884105728",
                 .negative = true,
                 .is_double = false},
            Case{.text = "170141183460469231731687303715884105729",
                 .negative = true,
-                .is_double = true},
+                .is_double = false},
            Case{.text = "1000000000000000000000000000000000000000",
                 .negative = false,
-                .is_double = true},
+                .is_double = false},
        }) {
     EXPECT_EQ(DuckDbTypesAsDouble(c.text, c.negative), c.is_double)
         << (c.negative ? "-" : "") << c.text;
@@ -457,8 +457,8 @@ TEST(DuckDbTypesAsDouble, MatchesDuckDbTypeof) {
   EXPECT_FALSE(DuckDbTypesAsDouble("abc", false));
 }
 
-// The double DuckDB 1.5.5 compares a literal as in DOUBLE (checked with CAST(<literal> AS DOUBLE)):
-// a decimal converts as its DECIMAL does (rule 8, not always the nearest double), a HUGEINT through
+// The double DuckDB 2.0 compares a literal as in DOUBLE (checked with CAST(<literal> AS DOUBLE)):
+// a scaled decimal converts to the nearest double, a HUGEINT through
 // the 128-bit formula and a UHUGEINT through its own, and a DOUBLE literal is the nearest double.
 TEST(DuckDbDoubleOf, MatchesDuckDbCasts) {
   struct Case {
@@ -467,8 +467,8 @@ TEST(DuckDbDoubleOf, MatchesDuckDbCasts) {
     double expected;
   };
   for (const Case& c : {
-           Case{.text = "9007199254740993.5", .negative = false, .expected = 0x1p53},
-           Case{.text = "9007199254740993.5", .negative = true, .expected = -0x1p53},
+           Case{.text = "9007199254740993.5", .negative = false, .expected = 9007199254740994.0},
+           Case{.text = "9007199254740993.5", .negative = true, .expected = -9007199254740994.0},
            Case{.text = "0.1", .negative = false, .expected = 0.1},
            Case{.text = "2.5", .negative = true, .expected = -2.5},
            Case{.text = "9007199254740993", .negative = false, .expected = 0x1p53},
@@ -486,9 +486,6 @@ TEST(DuckDbDoubleOf, MatchesDuckDbCasts) {
            Case{.text = "1.00000000000000000000000000000000000001",
                 .negative = false,
                 .expected = 1.0},
-           Case{.text = "340282366920938463463374607431768211457",
-                .negative = false,
-                .expected = 0x1p128},
        }) {
     const auto value = DuckDbDoubleOf(c.text, c.negative);
     if (!value.has_value()) {
@@ -497,6 +494,8 @@ TEST(DuckDbDoubleOf, MatchesDuckDbCasts) {
     }
     EXPECT_EQ(*value, c.expected) << (c.negative ? "-" : "") << c.text;
   }
+  EXPECT_FALSE(DuckDbDoubleOf("340282366920938463463374607431768211457", false).has_value());
+  EXPECT_TRUE(DuckDbTypesAsBigNum("340282366920938463463374607431768211457", false));
   EXPECT_FALSE(DuckDbDoubleOf("abc", false).has_value());
   EXPECT_FALSE(DuckDbDoubleOf("1.2.3", false).has_value());
 }

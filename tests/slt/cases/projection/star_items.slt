@@ -356,9 +356,18 @@ SELECT cities.* FROM cities AS c
 statement error
 SELECT t.* FROM cities AS t JOIN drivers AS t ON t.ct_id = t.dv_city
 
-statement error
+query I rowsort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.* FROM zones WHERE zones.zn_city = cities.ct_id)
+----
+SMALLINT
+1
+2
+3
+4
+5
 
+# Outer projection stars require lateral execution, outside the supported subset.
+onlyif duckdb
 statement error
 SELECT * FROM cities JOIN (SELECT cities.* FROM zones) AS d ON cities.ct_id = d.zn_id
 
@@ -424,8 +433,15 @@ statement error Ambiguous reference to table "t"
 SELECT t.* FROM cities AS t JOIN drivers AS t ON t.ct_id = t.dv_city
 
 onlyif duckdb
-statement error Referenced table "cities" not found
+query I rowsort
 SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.* FROM zones WHERE zones.zn_city = cities.ct_id)
+----
+SMALLINT
+1
+2
+3
+4
+5
 
 # ---- DuckDB only: the star forms antb1 refuses with exit code 4 ----
 # A star's modifiers, an alias after a star (DuckDB gives it to every column), a qualified star inside an
@@ -520,3 +536,34 @@ SMALLINT
 3
 4
 5
+
+# DuckDB 2.0 expands outer stars before discarding an EXISTS projection. Outer columns
+# are constants within the inner grouping, while a nearer column shadows a farther table.
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.*, COUNT(*) FROM zones)
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I rowsort
+SELECT ct_id FROM cities WHERE EXISTS (SELECT cities.* FROM zones GROUP BY zn_city)
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+statement error
+SELECT COUNT(*) FROM cities AS zn_city WHERE EXISTS (SELECT 1 FROM zones WHERE EXISTS (SELECT zn_city.* FROM drivers))
+
+onlyif duckdb
+statement error
+SELECT COUNT(*) FROM cities HAVING EXISTS (SELECT cities.* FROM zones)

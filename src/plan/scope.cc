@@ -424,6 +424,50 @@ arrow::Result<std::size_t> Scope::StarBinding(std::string_view qualifier, Source
       std::format("no FROM item is named '{}'", qualifier) + AliasHint(bindings_, qualifier), span);
 }
 
+arrow::Result<std::optional<Scope::OuterStar>> Scope::LookUpOuterStar(std::string_view qualifier,
+                                                                      SourceSpan span) const {
+  for (const Binding& binding : bindings_) {
+    if (binding.Named(qualifier) || binding.Match(qualifier).first.has_value()) {
+      return std::nullopt;
+    }
+  }
+  for (const Scope* inner = this; inner->outer_ != nullptr; inner = inner->outer_) {
+    const Scope& scope = *inner->outer_;
+    const std::size_t end = std::min(inner->outer_visible_.end, scope.bindings_.size());
+    const std::size_t middle = std::min(inner->outer_visible_.inner_begin, end);
+    for (const auto [first, last] : {std::pair{middle, end}, std::pair{std::size_t{0}, middle}}) {
+      std::optional<OuterStar> found;
+      for (std::size_t b = first; b < last; ++b) {
+        if (scope.bindings_[b].Named(qualifier)) {
+          if (found.has_value()) {
+            return BindError(std::format("'{}.*' is ambiguous in the enclosing block", qualifier),
+                             span);
+          }
+          found = OuterStar{.scope = &scope, .binding = b};
+        }
+      }
+      if (found.has_value()) {
+        return found;
+      }
+      // A column at this visibility level shadows tables in more distant scopes, too.
+      // A STRUCT would expand its fields, which remains outside the supported subset.
+      for (std::size_t b = first; b < last; ++b) {
+        const NameMatches matches = scope.bindings_[b].Match(qualifier);
+        if (matches.first.has_value()) {
+          if (!matches.second.has_value() &&
+              scope.bindings_[b].columns()[*matches.first].is_struct) {
+            return UnsupportedError(
+                std::format("'{}.*' over a STRUCT column is not supported", qualifier), span);
+          }
+          return BindError(
+              std::format("cannot expand '{}.*': the enclosing name is a column", qualifier), span);
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<ColumnLocation> Scope::Find(ColumnId id) const {
   for (std::size_t b = 0; b < bindings_.size(); ++b) {
     const std::vector<BindingColumn>& columns = bindings_[b].columns();

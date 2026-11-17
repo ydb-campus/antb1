@@ -204,8 +204,8 @@ TEST(DuckDbEngineOptimizersTest, RetriesRunFewerOptimizers) {
       "EXPLAIN SELECT COUNT(*) FROM range(5) AS a(i), range(5) AS b(j) WHERE i = j";
   for (DuckDbEngine* engine : {oracle->get(), (*retries)[0].get(), (*retries)[1].get()}) {
     const std::string text = run(*engine, plan);
-    EXPECT_TRUE(text.contains("HASH_JOIN")) << text;
-    EXPECT_FALSE(text.contains("CROSS_PRODUCT")) << text;
+    EXPECT_TRUE(text.contains("Hash Join")) << text;
+    EXPECT_FALSE(text.contains("Cross Product")) << text;
   }
 }
 
@@ -235,8 +235,8 @@ std::string RunInNewDatabase(const std::string& sql) {
 
 // DuckDB 1.5.6 fails a join of three tables with an OR across two of them under a GROUP BY with an
 // internal error, as in a nightly differential test of 2026-11-02, while its retries answer it.
-// When the oracle answers too, DuckDB has fixed the bug: drop the first expectation.
-TEST(DuckDbEngineOptimizersTest, RetriesAnswerAQueryTheOracleFailsWithAnInternalError) {
+// DuckDB 2.0 fixes the bug: the oracle and both retry configurations must agree.
+TEST(DuckDbEngineOptimizersTest, OracleAndRetriesAnswerTheFormerInternalError) {
   const std::filesystem::path dir = TestDir("duckdb_engine_retries");
   std::vector<TableDef> tables;
   for (const auto& [name, rows] :
@@ -255,9 +255,7 @@ TEST(DuckDbEngineOptimizersTest, RetriesAnswerAQueryTheOracleFailsWithAnInternal
       "(c.label <> 'x' OR z.zn_city > 2) GROUP BY c.label ORDER BY c.label";
   auto oracle = DuckDbEngine::Make(tables, dir, dir);
   ASSERT_TRUE(oracle.has_value()) << oracle.error();
-  const ExecResult failed = (*oracle)->Execute(sql);
-  ASSERT_FALSE(failed.has_value()) << "DuckDB answers: drop this expectation";
-  EXPECT_EQ(failed.error().kind, "INTERNAL Error") << failed.error().message;
+  EXPECT_EQ(Cells((*oracle)->Execute(sql), sql), "l0\n640\nl1\n640\nl2\n640\n");
   auto retries = DuckDbEngine::MakeRetries(tables, dir, dir);
   ASSERT_TRUE(retries.has_value()) << retries.error();
   for (const auto& retry : *retries) {

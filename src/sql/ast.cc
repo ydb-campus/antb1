@@ -562,8 +562,7 @@ SetTree Operand(const SetBranch& branch) {
 }
 
 // `left` op `right`: a run of one operator and quantifier. A left operand that is such a run takes
-// the right operand (a left fold either way); a right operand that is such a run is spliced only
-// for UNION, whose run DuckDB types as one list (ADR 0039's Types rule).
+// the right operand (a left fold either way); a right run keeps its independently folded type.
 SetTree Combine(SetTree left, SetTree right, const SetBranch& branch) {
   const auto same = [&](const SetTree& t) {
     return t.leaf == nullptr && t.op == branch.op && t.all == branch.all;
@@ -575,13 +574,8 @@ SetTree Combine(SetTree left, SetTree right, const SetBranch& branch) {
     run = SetTree{.op = branch.op, .all = branch.all, .op_span = branch.op_span};
     run.operands.push_back(std::move(left));
   }
-  if (branch.op == SetOp::kUnion && same(right)) {
-    for (SetTree& operand : right.operands) {
-      run.operands.push_back(std::move(operand));
-    }
-  } else {
-    run.operands.push_back(std::move(right));
-  }
+  // DuckDB 2.0 binds a parenthesized right operand before folding its type into the parent.
+  run.operands.push_back(std::move(right));
   return run;
 }
 

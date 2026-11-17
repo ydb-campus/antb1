@@ -104,14 +104,14 @@ TEST_F(DecimalTest, DecimalToDoubleIsDuckDbsConversion) {
   auto converted = DecimalToDouble(*wide, arrow::default_memory_pool());
   ASSERT_TRUE(converted.ok()) << converted.status().ToString();
   const auto& doubles = static_cast<const arrow::DoubleArray&>(**converted);
-  EXPECT_EQ(doubles.Value(0), 0x1p53);
+  EXPECT_EQ(doubles.Value(0), 9007199254740994.0);
   EXPECT_TRUE(doubles.IsNull(1));
   EXPECT_EQ(doubles.Value(2), 1.5);
   const auto narrow = Decimals(18, 1, {Int128{199489722791016982}});
   EXPECT_EQ(static_cast<const arrow::DoubleArray&>(
                 **DecimalToDouble(*narrow, arrow::default_memory_pool()))
                 .Value(0),
-            1.9948972279101696e+16);
+            1.99489722791017e+16);
   const auto hugeint = Decimals(38, 0, {Int128{-9007199254740994}, Int128{9007199254740994}});
   auto halves = DecimalToDouble(*hugeint, arrow::default_memory_pool());
   ASSERT_TRUE(halves.ok()) << halves.status().ToString();
@@ -199,7 +199,7 @@ TEST_F(DecimalTest, PredicateEvaluatorComparesColumnsOfMixedTypes) {
   // 19948972279101700); DECIMAL(38,10) 9007199254740993.5 to 2^53.
   const auto narrow = Decimals(18, 1, {Int128{199489722791016982}, std::nullopt});
   const auto wide = Decimals(38, 10, {Int128{90071992547409935} * 1'000'000'000, 0});
-  const auto doubles = Doubles({1.9948972279101696e+16, 0x1p53});
+  const auto doubles = Doubles({1.99489722791017e+16, 0x1p53});
   const auto batch = BatchOf({narrow, wide, doubles});
   const auto n = Column(0, "n", LogicalType::Decimal(18, 1));
   const auto w = Column(1, "w", LogicalType::Decimal(38, 10));
@@ -256,11 +256,11 @@ TEST_F(DecimalTest, PredicateEvaluatorComparesDecimalsWithDoubles) {
     return Evaluated(testing::Compare(w, op, Double(constant)), *batch);
   };
   EXPECT_EQ(compare(CompareOp::kEq, 0x1p53),
-            (std::vector<std::optional<bool>>{true, false, kNull, false}));
-  EXPECT_EQ(compare(CompareOp::kGt, 0x1p53),
             (std::vector<std::optional<bool>>{false, false, kNull, false}));
+  EXPECT_EQ(compare(CompareOp::kGt, 0x1p53),
+            (std::vector<std::optional<bool>>{true, false, kNull, false}));
   EXPECT_EQ(compare(CompareOp::kEq, -0x1p53),
-            (std::vector<std::optional<bool>>{false, true, kNull, false}));
+            (std::vector<std::optional<bool>>{false, false, kNull, false}));
   EXPECT_EQ(compare(CompareOp::kLe, 1.5),
             (std::vector<std::optional<bool>>{false, true, kNull, true}));
   const auto in = [&](bool negated) {
@@ -268,8 +268,8 @@ TEST_F(DecimalTest, PredicateEvaluatorComparesDecimalsWithDoubles) {
     p.values = {Double(0x1p53), Double(1.5)};
     return Evaluated(p, *batch);
   };
-  EXPECT_EQ(in(false), (std::vector<std::optional<bool>>{true, false, kNull, true}));
-  EXPECT_EQ(in(true), (std::vector<std::optional<bool>>{false, true, kNull, false}));
+  EXPECT_EQ(in(false), (std::vector<std::optional<bool>>{false, false, kNull, true}));
+  EXPECT_EQ(in(true), (std::vector<std::optional<bool>>{true, true, kNull, false}));
   // HUGEINT never gets a DOUBLE constant from the binder (divergence D7 folds it exactly).
   const auto hugeint = Column(1, "h", LogicalType::kHugeInt);
   EXPECT_TRUE(PredicateEvaluator::Make(testing::Compare(hugeint, CompareOp::kEq, Double(1.0)),

@@ -129,22 +129,8 @@ x\x7fy	x\x7fy	x\x7fy	x\x7fy	|x\x7fy	x\x7fy
 
 # A replacement RE2 rejects (a group the pattern does not have, a lone or unknown backslash) leaves
 # the text unchanged, as in DuckDB; \\ is one backslash.
-query TTTTT rowsort
+statement error Invalid replacement string
 SELECT u, regexp_replace(u, 'a', '\1'), regexp_replace(u, '(a)', '\2'), regexp_replace(u, 'a', 'x\'), regexp_replace(u, 'a', '[\\]') FROM edge
-----
-VARCHAR	VARCHAR	VARCHAR	VARCHAR	VARCHAR
-(empty)	(empty)	(empty)	(empty)	(empty)
-NULL	NULL	NULL	NULL	NULL
-NULL	NULL	NULL	NULL	NULL
-\x28empty)	\x28empty)	\x28empty)	\x28empty)	\x28empty)
-a	a	a	a	[\\]
-back\\slash	back\\slash	back\\slash	back\\slash	b[\\]ck\\slash
-line\nbreak	line\nbreak	line\nbreak	line\nbreak	line\nbre[\\]k
-tab\there	tab\there	tab\there	tab\there	t[\\]b\there
-trailing space\x20	trailing space\x20	trailing space\x20	trailing space\x20	tr[\\]iling space\x20
-x\x7fy	x\x7fy	x\x7fy	x\x7fy	x\x7fy
-Привет, мир	Привет, мир	Привет, мир	Привет, мир	Привет, мир
-日本語	日本語	日本語	日本語	日本語
 
 statement error
 SELECT regexp_replace(u, '(', 'x') FROM edge
@@ -328,3 +314,30 @@ SELECT substring(u, 4294967296, 1) FROM edge
 
 statement error
 SELECT substring(u, 1, 4294967296) FROM edge
+
+# Replacement validity does not depend on whether the pattern matches the input.
+statement error Invalid replacement string
+SELECT regexp_replace(s, 'nomatch', '\1') FROM edge WHERE id = 2
+
+statement error Invalid replacement string
+SELECT regexp_replace(s, '(a)', '\2') FROM edge
+
+statement error Invalid replacement string
+SELECT regexp_replace(s, 'a', 'x\') FROM edge
+
+query T rowsort
+SELECT regexp_replace(s, 'a', '[\\]') FROM edge
+----
+VARCHAR
+(empty)
+NULL
+NULL
+[\\]
+\x20le[\\]ding space
+\x4eULL
+b[\\]ck\\slash
+line\nbre[\\]k
+n[\\]ïve café
+t[\\]b\there
+x\x01y
+Привет, мир

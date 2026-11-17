@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -137,17 +138,34 @@ Real DuckDbDecimalToReal(Int128 unscaled, int width, int scale) {
   constexpr auto kMaxExact =
       static_cast<Int128>(UInt128{1} << static_cast<unsigned>(std::numeric_limits<Real>::digits));
   const auto power = static_cast<Real>(kDoublePowersOfTen.at(static_cast<std::size_t>(scale)));
-  // int16 storage (width <= 4) is always "representable exactly" in DuckDB.
-  if (width <= 4 || scale == 0 || (unscaled <= kMaxExact && unscaled >= -kMaxExact)) {
+  constexpr int kMaxExactScale = std::numeric_limits<Real>::digits == 24 ? 10 : 22;
+  if (scale == 0 || (scale <= kMaxExactScale && unscaled <= kMaxExact && unscaled >= -kMaxExact)) {
     return DuckDbStorageToReal<Real>(unscaled, width) / power;
   }
-  Int128 pow10 = 1;
-  for (int i = 0; i < scale; ++i) {
-    pow10 *= 10;
+  // DuckDB 2.0 rounds the exact decimal to the destination floating type. Parse its
+  // scientific spelling directly, avoiding an intermediate DOUBLE for FLOAT and avoiding
+  // the old separately rounded integer/fractional parts. The hot path above allocates nothing;
+  // this slow path uses only a stack buffer too (39 digits, sign and a two-digit exponent).
+  std::array<char, 48> buffer{};
+  char* const end = buffer.data() + buffer.size();
+  char* begin = end - 4;
+  begin[0] = 'e';
+  begin[1] = '-';
+  begin[2] = static_cast<char>('0' + scale / 10);
+  begin[3] = static_cast<char>('0' + scale % 10);
+  UInt128 magnitude =
+      unscaled < 0 ? UInt128{0} - static_cast<UInt128>(unscaled) : static_cast<UInt128>(unscaled);
+  do {
+    *--begin = static_cast<char>('0' + static_cast<unsigned>(magnitude % 10));
+    magnitude /= 10;
+  } while (magnitude != 0);
+  if (unscaled < 0) {
+    *--begin = '-';
   }
-  const Int128 div = unscaled / pow10;  // truncating, as in C++ and DuckDB
-  const Int128 mod = unscaled % pow10;
-  return DuckDbStorageToReal<Real>(div, width) + (DuckDbStorageToReal<Real>(mod, width) / power);
+  Real result = 0;
+  const auto parsed = std::from_chars(begin, end, result, std::chars_format::scientific);
+  ANTB1_CHECK(parsed.ec == std::errc{} && parsed.ptr == end);
+  return result;
 }
 
 }  // namespace

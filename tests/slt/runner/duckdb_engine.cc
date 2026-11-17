@@ -581,8 +581,9 @@ std::expected<std::unique_ptr<DuckDbEngine>, std::string> DuckDbEngine::Make(
   //
   // DuckDB 1.5.6 also fails some joins of three tables with an OR across two of them under a GROUP
   // BY, with `INTERNAL Error: Failed to bind column reference` (a nightly differential test of
-  // 2026-11-02), unless its join_order optimizer is off. The differential test asks such a query
-  // again of the oracles MakeRetries makes (difftest.h).
+  // 2026-11-02), unless its join_order optimizer is off. DuckDB 2.0 fixes that regression, now
+  // checked in duckdb_engine_test.cc. Retries remain available for other optimizer discrepancies
+  // (difftest.h); late_materialization stays off to preserve the evaluation policy above.
   std::string disabled = "late_materialization";
   switch (optimizers) {
     case Optimizers::kAll:

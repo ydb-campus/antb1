@@ -52,18 +52,6 @@ arrow::Result<std::optional<double>> FinalizeVariance(plan::AggKind kind, const 
       result = std::sqrt(result);
     }
   }
-  if (!std::isfinite(result)) {
-    switch (kind) {
-      case plan::AggKind::kStddevSamp:
-        return arrow::Status::ExecutionError("STDDEV_SAMP is out of range!");
-      case plan::AggKind::kStddevPop:
-        return arrow::Status::ExecutionError("STDDEV_POP is out of range!");
-      case plan::AggKind::kVarSamp:
-        return arrow::Status::ExecutionError("VARSAMP is out of range!");
-      default:
-        return arrow::Status::ExecutionError("VARPOP is out of range!");
-    }
-  }
   return result;
 }
 

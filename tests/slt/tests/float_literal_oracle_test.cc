@@ -115,8 +115,14 @@ TEST(FloatLiteralOracle, MatchesDuckDbOnRandomLiterals) {
       const std::string written = (lit.negative ? "-" : "") + lit.text;
       const auto ours = plan::DuckDbFloatOf(lit.text, lit.negative);
       const bool duckdb_double = row[2 * i] == "DOUBLE";
-      ASSERT_EQ(!ours.has_value(), duckdb_double)
+      const bool duckdb_bignum = row[2 * i] == "BIGNUM";
+      EXPECT_EQ(plan::DuckDbTypesAsDouble(lit.text, lit.negative), duckdb_double) << written;
+      EXPECT_EQ(plan::DuckDbTypesAsBigNum(lit.text, lit.negative), duckdb_bignum) << written;
+      ASSERT_EQ(!ours.has_value(), duckdb_double || duckdb_bignum)
           << written << " is " << row[2 * i].value_or("NULL");
+      if (duckdb_bignum) {
+        EXPECT_FALSE(row[(2 * i) + 1].has_value()) << written;
+      }
       if (ours.has_value()) {
         EXPECT_EQ(CanonicalDouble(static_cast<double>(*ours)), row[(2 * i) + 1].value_or("NULL"))
             << written;

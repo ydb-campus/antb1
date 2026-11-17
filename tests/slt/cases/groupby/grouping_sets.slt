@@ -1238,8 +1238,25 @@ NULL	NULL	5
 statement error
 SELECT COUNT(*) FROM zones GROUP BY ROLLUP ()
 
-statement error
+query I rowsort
 SELECT COUNT(*) FROM zones GROUP BY ROLLUP (zn_city, ())
+----
+BIGINT
+1
+1
+1
+1
+40
+7
+7
+7
+7
+8
+8
+8
+8
+8
+8
 
 statement error
 SELECT COUNT(*) FROM zones GROUP BY GROUPING SETS ()

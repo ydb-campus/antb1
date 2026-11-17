@@ -386,7 +386,7 @@ query R rowsort
 SELECT d * 0 FROM edge WHERE i16 = 7 INTERSECT ALL SELECT d * 0 FROM edge WHERE i16 = 7
 ----
 DOUBLE
-0
+-0
 
 # Below a DISTINCT root, antb1 keeps the value first seen among the starters, -0.0; DuckDB passes an INTERSECT ALL's rows
 # on normalized, 0.0.
@@ -403,7 +403,7 @@ query R rowsort
 (SELECT d * 0 FROM edge WHERE i16 = 7 INTERSECT ALL SELECT d * 0 FROM edge WHERE i16 = 7) UNION SELECT d FROM edge WHERE i16 = 2
 ----
 DOUBLE
-0
+-0
 
 # ---- divergence D30: which error an INTERSECT reports when both operands fail ----
 # antb1 reads the operands in written order and reports the left one's, the addition; DuckDB builds the right operand

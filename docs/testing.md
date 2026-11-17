@@ -7,6 +7,10 @@ strategy and the data policy are decided in [ADR 0006](adr/0006-test-strategy-an
 internals are described next to the code in [tests/README.md](../tests/README.md),
 [tests/slt/README.md](../tests/slt/README.md) and [fuzz/regressions/README.md](../fuzz/regressions/README.md).
 
+The DuckDB test oracle and CLI are pinned to 2.0.0 in `pixi.toml`. On Linux, the TPC-H and TPC-DS extensions use
+the same version and resolve against the same `libduckdb` build. These dependencies belong to the `base` feature,
+shared by the `default`, `gcc` and `static` environments; DuckDB is never linked into the engine.
+
 ## Test layers
 
 | Layer | Where | What it checks | Status |
@@ -198,12 +202,13 @@ ADRs 0022 and 0023 this way; its rules are in [tests/slt/README.md](../tests/slt
 `onlyif antb1` is for antb1's own error texts and for registered divergences
 ([sql-subset.md](sql-subset.md#divergences-from-duckdb)).
 
-### Wrong answers of DuckDB 1.5.6
+### Oracle exclusions inherited from DuckDB 1.5.6
 
 `slt-complete` writes DuckDB's answers into the records, and the oracle and differential tests take them as right, so
-a shape that DuckDB 1.5.6 answers wrongly is kept out of both: no record is written over it (a record tests the same
-rule over a shape DuckDB answers right, or splits it), and the random generator never writes it. These are DuckDB's
-wrong answers, not divergences: antb1 answers them right, or refuses them (exit code 4). The known ones:
+the shapes below, observed to fail or return wrong answers in DuckDB 1.5.6, remain outside generated oracle
+comparisons. The 2.0 upgrade retains these conservative generator constraints; this historical list does not assert
+that every bug persists in 2.0. Metamorphic tests independently check antb1's answers for the supported shapes.
+Antb1 answers them correctly or refuses them (exit code 4). The original observations were:
 
 - **Correlated subqueries for an outer row that matches no inner row: one family.** A correlated block that aggregates
   without `GROUP BY`, or with a grouping set `()`, returns one row over no input, its aggregates at their empty values.

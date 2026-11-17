@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -8,7 +9,7 @@
 
 #include "antb1/plan/logical_plan.h"
 
-// The variance family (ADR 0037's AG2) as DuckDB 1.5.6 computes it, STDDevBaseOperation: a running
+// The variance family (ADR 0037's AG2) as DuckDB 2.0 computes it, STDDevBaseOperation: a running
 // count, mean and sum of squared deviations (Welford's update per value), partial states combined
 // by Chan's formula, and one finalization per function. The arithmetic follows DuckDB's operation
 // for operation, so a single-threaded run in the same order gives DuckDB's bits; the merge order of
@@ -45,8 +46,8 @@ inline void Combine(const Moments& source, Moments& target) {
   const auto target_count = static_cast<double>(target.count);
   const auto source_count = static_cast<double>(source.count);
   const auto total_count = static_cast<double>(count);
-  const double mean = ((source_count * source.mean) + (target_count * target.mean)) / total_count;
   const double delta = source.mean - target.mean;
+  const double mean = std::fma(source_count / total_count, delta, target.mean);
   target.dsquared = source.dsquared + target.dsquared +
                     (delta * delta * source_count * target_count / total_count);
   target.mean = mean;
@@ -57,7 +58,7 @@ inline void Combine(const Moments& source, Moments& target) {
 bool IsVarianceKind(plan::AggKind kind);
 
 // The result of `kind` over `state`: std::nullopt for NULL (no value; one for the sample forms),
-// or DuckDB's OutOfRange error (an ExecutionError) when the result is not finite.
+// otherwise the value, including NaN or infinity as DuckDB 2.0 propagates them.
 arrow::Result<std::optional<double>> FinalizeVariance(plan::AggKind kind, const Moments& state);
 
 // `values` (an integer, HUGEINT, DECIMAL or DOUBLE column) as DuckDB casts it to DOUBLE, NULLs

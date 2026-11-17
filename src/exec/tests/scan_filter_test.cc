@@ -362,12 +362,12 @@ TEST_F(ScanFilterTest, DecimalsComparedInDouble) {
     }
   };
   same_as_filter(testing::Compare(w, CompareOp::kEq, Double(0x1p53)),
-                 {true, false, false, false, false}, "= 2^53");
+                 {false, false, false, false, false}, "= 2^53");
   same_as_filter(testing::Compare(w, CompareOp::kLt, Double(1.5)),
                  {false, false, false, true, true}, "< 1.5");
-  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, false), {true, false, false, true, false},
+  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, false), {false, false, false, true, false},
                  "IN");
-  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, true), {false, false, true, false, true},
+  same_as_filter(In(w, {Double(0x1p53), Double(-1.0)}, true), {true, false, true, false, true},
                  "NOT IN");
 }
 

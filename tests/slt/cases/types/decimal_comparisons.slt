@@ -167,7 +167,6 @@ query I rowsort
 SELECT id FROM decimals WHERE b + 0.5 = b * 1e0 AND (id < 4 OR id = 12)
 ----
 INTEGER
-12
 2
 3
 
@@ -242,11 +241,8 @@ INTEGER
 35
 38
 
-query I nosort
+statement error
 SELECT COUNT(*) FROM decimals WHERE d38_0 < 340282366920938463463374607431768211456
-----
-BIGINT
-33
 
 # 9999999999999999999999999999.9999999999 becomes 10^28 in DOUBLE.
 query I rowsort

@@ -41,12 +41,18 @@ onlyif duckdb
 statement error ^Parser Error:
 WITH c AS SELECT COUNT(*) FROM trips
 
-statement error
+query I rowsort
 WITH c AS (SELECT tr_row FROM trips), SELECT COUNT(*) FROM c
+----
+BIGINT
+3000
 
 onlyif duckdb
-statement error ^Parser Error:
+query I rowsort
 WITH c AS (SELECT tr_row FROM trips), SELECT COUNT(*) FROM c
+----
+BIGINT
+3000
 
 statement error
 WITH c AS (SELECT tr_row FROM trips) WITH d AS (SELECT tr_row FROM trips) SELECT COUNT(*) FROM c
@@ -250,7 +256,7 @@ statement error
 SELECT COUNT(*) FROM (values)
 
 onlyif duckdb
-statement error ^Parser Error:
+statement error ^Catalog Error: Table
 SELECT COUNT(*) FROM (values)
 
 # After a derived table the words that are never aliases: time travel (AT) reads a table only.

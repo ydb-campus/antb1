@@ -574,26 +574,20 @@ TEST_F(GroupedAggregateTest, VarianceFamilyAsDuckDb) {
     const std::optional<double> scalar_value = scalar.ValueOr(std::nullopt);
     ASSERT_TRUE(scalar_value.has_value());
     EXPECT_NEAR(scalar_value.value_or(std::nan("")), want, std::abs(want) * 1e-12);
-    // Out of range: a result that is not finite, from huge values or a NaN.
-    const auto message_of = [](AggKind k) -> std::string {
-      if (k == AggKind::kStddevSamp) {
-        return "STDDEV_SAMP is out of range!";
-      }
-      if (k == AggKind::kStddevPop) {
-        return "STDDEV_POP is out of range!";
-      }
-      return k == AggKind::kVarSamp ? "VARSAMP is out of range!" : "VARPOP is out of range!";
-    };
-    const std::string message = message_of(kind);
-    for (const auto& bad : {std::vector<std::optional<double>>{1e308, -1e308},
-                            std::vector<std::optional<double>>{std::nan(""), 1.0}}) {
-      const auto failed = scalar_of(kind, LogicalType::kDouble, *DoubleColumn(bad));
-      EXPECT_TRUE(failed.status().IsExecutionError()) << failed.status().ToString();
-      EXPECT_EQ(failed.status().message(), message);
+    // DuckDB 2.0 propagates non-finite variance results from huge values or NaNs.
+    for (const auto& input : {std::vector<std::optional<double>>{1e308, -1e308},
+                              std::vector<std::optional<double>>{std::nan(""), 1.0}}) {
+      const auto result = scalar_of(kind, LogicalType::kDouble, *DoubleColumn(input));
+      ASSERT_TRUE(result.ok()) << result.status();
+      ASSERT_TRUE(result->has_value());
+      EXPECT_FALSE(std::isfinite(**result));
       auto grouped = MakeGrouped(call);
       grouped->Resize(2);
-      ASSERT_TRUE(grouped->Consume(DoubleColumn(bad).get(), std::vector<std::uint32_t>{1, 1}).ok());
-      EXPECT_EQ(grouped->CheckFinalize().message(), message) << "group 1, never read first";
+      ASSERT_TRUE(
+          grouped->Consume(DoubleColumn(input).get(), std::vector<std::uint32_t>{1, 1}).ok());
+      EXPECT_TRUE(grouped->CheckFinalize().ok());
+      EXPECT_FALSE(
+          std::isfinite(static_cast<const arrow::DoubleArray&>(*Finalized(*grouped)).Value(1)));
     }
   }
   // Every number type, cast to DOUBLE as DuckDB casts it: 1, 2 and 4 in each give DuckDB 1.5.6's
