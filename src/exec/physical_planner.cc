@@ -157,6 +157,34 @@ const plan::ScanNode* PipelineScan(const plan::LogicalNodePtr& node,
   return nullptr;
 }
 
+// Resolve the existing semi/anti fallback before a consumer asks PipelineScan about its input.
+// Otherwise that consumer sees a left-building sink, chooses a serial implementation, and only
+// later discovers that Build turned the join into a streaming right build. Resolve children first:
+// a child falling back can restore the probe pipeline of its parent too. Shared producers are
+// normalized separately from the substituted consumer tree, after sharing has chosen its scans.
+plan::LogicalNodePtr NormalizeBuildSides(const plan::LogicalNodePtr& node) {
+  if (node == nullptr) {
+    return node;
+  }
+  std::vector<plan::LogicalNodePtr> inputs = plan::InputsOf(*node);
+  bool changed = false;
+  for (auto& input : inputs) {
+    auto normalized = NormalizeBuildSides(input);
+    changed = changed || normalized != input;
+    input = std::move(normalized);
+  }
+  auto current = changed ? plan::WithInputs(*node, std::move(inputs)) : node;
+  if (const auto* join = std::get_if<plan::JoinNode>(current.get());
+      join != nullptr && join->build == plan::BuildSide::kLeft &&
+      plan::Traits(join->kind).may_build_left && plan::Traits(join->kind).filters_left &&
+      PipelineScan(current, /*through_right_join=*/true) == nullptr) {
+    plan::JoinNode right = *join;
+    right.build = plan::BuildSide::kRight;
+    return std::make_shared<const plan::LogicalNode>(std::move(right));
+  }
+  return current;
+}
+
 // The predicates of the Filters directly on the scan of the part pipeline whose top is `node`
 // (below any other node of it: a Compute, a Project, a join): their columns are the scan's output
 // columns. A Filter above a join reads the join's columns, so it is never one of them.
@@ -1808,7 +1836,8 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
       continue;
     }
     const plan::LogicalNodePtr& widest = group.members[group.widest];
-    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op, Build(widest, std::nullopt, nullptr));
+    ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op,
+                          Build(NormalizeBuildSides(widest), std::nullopt, nullptr));
     if (!WorthSharing(*widest)) {
       continue;
     }
@@ -1830,7 +1859,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   }
 
   const plan::LogicalNodePtr root_node =
-      replacements.empty() ? plan.root : Substituted(plan.root, replacements);
+      NormalizeBuildSides(replacements.empty() ? plan.root : Substituted(plan.root, replacements));
   ARROW_ASSIGN_OR_RAISE(auto root, Build(root_node, std::nullopt, profile));
   if (std::cmp_not_equal(root->output_schema()->num_fields(), plan.output.size())) {
     return arrow::Status::Invalid("the physical plan has ", root->output_schema()->num_fields(),

@@ -1,6 +1,7 @@
 #include "antb1/plan/binder.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -4406,16 +4407,6 @@ TEST(BinderTest, Path2ChoosesItsBuildSideFromTheEstimates) {
   EXPECT_EQ(side(kSmallOuter, 1'000'000), BuildSide::kRight);
 }
 
-// Only an inner join may build on its left input: every other kind outputs or preserves the rows of
-// one specific input, and src/exec/hash_join.cc has no right-semi, right-anti or right-outer
-// implementation (ADR 0026's C2b and C2c). The binder must therefore never produce
-// BuildSide::kLeft for a non-inner kind, however the estimates fall.
-//
-// Nothing but this test checks that at test time. ResolvePositions fails on the combination and
-// hash_join.cc's Make rejects it, but the first is an internal check that aborts, so a later change
-// to join-order rule 5 that reached a LEFT JOIN unit or a subquery join would crash rather than
-// fail a test. C1 made BuildSide::kLeft reachable from real SQL, which is what makes that worth
-// pinning.
 // A LEFT JOIN unit that is one relation of an inner join is estimated like any relation (ADR 0022's
 // join-order rule 3: an inner join of its inputs, never below its left input), so the unit
 // `ok LEFT JOIN st` (35 rows: 7 x 5, no key domain known) is built and `t` (100) probes. Its blocks
@@ -4568,7 +4559,83 @@ TEST(BinderTest, AKeyOverAPaddedSideIsComputedAboveTheUnit) {
   }
 }
 
-TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
+TEST(BinderTest, AnInSubqueryChoosesItsBuildSideFromTheEstimates) {
+  struct Case {
+    std::optional<int64_t> left;
+    std::optional<int64_t> right;
+    int64_t ratio;
+    BuildSide build;
+  };
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  for (const Case& c : {
+           Case{.left = 7, .right = 100, .ratio = 100, .build = BuildSide::kLeft},
+           Case{.left = 100, .right = 7, .ratio = 100, .build = BuildSide::kRight},
+           Case{.left = 7, .right = 7, .ratio = 100, .build = BuildSide::kRight},
+           Case{.left = 25, .right = 100, .ratio = 400, .build = BuildSide::kRight},
+           Case{.left = 24, .right = 100, .ratio = 400, .build = BuildSide::kLeft},
+           Case{.left = 7, .right = 100, .ratio = 1'000'000, .build = BuildSide::kRight},
+           Case{.left = 0, .right = 100, .ratio = 100, .build = BuildSide::kRight},
+           Case{.left = 100, .right = 0, .ratio = 100, .build = BuildSide::kRight},
+           Case{.left = std::nullopt, .right = 100, .ratio = 100, .build = BuildSide::kRight},
+           Case{.left = 7, .right = std::nullopt, .ratio = 100, .build = BuildSide::kRight},
+       }) {
+    SCOPED_TRACE(c.left.value_or(-1));
+    SCOPED_TRACE(c.right.value_or(-1));
+    SCOPED_TRACE(c.ratio);
+    Catalog catalog;
+    ASSERT_TRUE(catalog.Register("a", std::make_shared<FakeTable>(schema, c.left)).ok());
+    ASSERT_TRUE(catalog.Register("b", std::make_shared<FakeTable>(schema, c.right)).ok());
+    for (const std::string_view sql : {
+             "SELECT a.k FROM a WHERE a.k IN (SELECT b.k FROM b)",
+             "SELECT a.k FROM a WHERE a.k = ANY (SELECT b.k FROM b)",
+         }) {
+      SCOPED_TRACE(sql);
+      const auto stmt = sql::Parse(sql);
+      ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+      const auto bound = Bind(*stmt, catalog, {.build_side_ratio = c.ratio});
+      ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+      const JoinNode* join = testing::FirstJoin(*bound);
+      ASSERT_NE(join, nullptr);
+      EXPECT_EQ(join->kind, JoinKind::kSemi);
+      EXPECT_EQ(join->build, c.build);
+    }
+  }
+}
+
+TEST(BinderTest, TheSubqueryBuildSideRatioReachesEverySlot) {
+  constexpr std::string_view kNestedJoin =
+      "SELECT a.k FROM a JOIN a c ON a.k = c.k AND a.k IN (SELECT b.k FROM b) "
+      "LEFT JOIN a d ON c.k = d.k";
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  Catalog catalog;
+  ASSERT_TRUE(catalog.Register("a", std::make_shared<FakeTable>(schema, 2)).ok());
+  ASSERT_TRUE(catalog.Register("b", std::make_shared<FakeTable>(schema, 2'000)).ok());
+  for (const std::string_view sql : std::array<std::string_view, 5>{
+           "SELECT a.k FROM a WHERE a.k IN (SELECT b.k FROM b)",
+           "SELECT a.k FROM a WHERE a.k + 0 IN (SELECT b.k FROM b)",
+           "SELECT a.k FROM a, b c WHERE a.k = c.k AND a.k IN (SELECT b.k FROM b)",
+           "SELECT a.k FROM a GROUP BY a.k HAVING a.k IN (SELECT b.k FROM b)",
+           kNestedJoin,
+       }) {
+    SCOPED_TRACE(sql);
+    const auto stmt = sql::Parse(sql);
+    ASSERT_TRUE(stmt.has_value()) << stmt.error().message;
+    for (const int64_t ratio : {int64_t{100}, int64_t{1'000'000}}) {
+      const auto bound = Bind(*stmt, catalog, {.build_side_ratio = ratio});
+      ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+      const std::vector<const JoinNode*> joins = JoinsOf(*bound->root);
+      const auto semi = std::ranges::find_if(
+          joins, [](const JoinNode* join) { return join->kind == JoinKind::kSemi; });
+      ASSERT_NE(semi, joins.end());
+      EXPECT_EQ((*semi)->build, ratio == 100 ? BuildSide::kLeft : BuildSide::kRight)
+          << Explain(*bound);
+    }
+  }
+}
+
+// Join kinds without a left-build implementation must keep their required direction, including
+// NULL-aware membership and mark joins even when the preserved input is much smaller.
+TEST(BinderTest, OnlyEligibleJoinKindsBuildOnTheirLeftInput) {
   const Catalog catalog = MakeCatalog();
   // Every join of a plan, both inputs of each, however deeply nested.
   const auto joins = [](const LogicalNode& root) {
@@ -4602,6 +4669,8 @@ TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
            // rule would have every reason to want the other side.
            "SELECT i16 FROM ok WHERE i16 IN (SELECT i16 FROM t)",
            "SELECT i16 FROM ok WHERE i16 NOT IN (SELECT i16 FROM t)",
+           "SELECT i16 FROM ok WHERE i16 = 0 OR i16 IN (SELECT i16 FROM t)",
+           "SELECT CASE WHEN i16 IN (SELECT i16 FROM t) THEN 1 ELSE 0 END FROM ok",
            // The ADR 0023 unnesting rewrites, which Optimize produces: a correlated EXISTS and a
            // correlated scalar aggregate.
            "SELECT i16 FROM t WHERE EXISTS (SELECT i16 FROM ok WHERE ok.i16 = t.i16)",
@@ -4614,7 +4683,7 @@ TEST(BinderTest, OnlyAnInnerJoinEverBuildsOnItsLeftInput) {
     const std::vector<const JoinNode*> all = joins(*plan.root);
     EXPECT_FALSE(all.empty()) << sql << ": no join to check";
     for (const JoinNode* join : all) {
-      if (join->kind != JoinKind::kInner) {
+      if (!Traits(join->kind).may_build_left) {
         EXPECT_EQ(join->build, BuildSide::kRight)
             << sql << ": a " << ToString(join->kind) << " join builds on its left input";
       }
@@ -8170,7 +8239,7 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
       "Aggregate COUNT(*)\n"
       "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
       "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-      R"(    Join SEMI build=right keys=["ok.i16" = i16])"
+      R"(    Join SEMI build=left keys=["ok.i16" = i16])"
       "\n"
       "      Scan table=ok source=fake columns=[i16]\n"
       "      Project i16\n"
@@ -8244,9 +8313,9 @@ TEST(BinderTest, ASemiJoinOverOneRelationRunsOnItsBranch) {
             "Aggregate COUNT(*)\n"
             "  Join INNER build=right keys=[t.i16 = ok.i16]\n"
             "    Scan table=t source=fake columns=[i16]  [shared #1 of 2, 1 field]\n"
-            R"(    Join SEMI build=right keys=["ok.i16" = s16])"
+            R"(    Join SEMI build=left keys=["ok.i16" = s16])"
             "\n"
-            R"(      Join SEMI build=right keys=["ok.i16" = i16])"
+            R"(      Join SEMI build=left keys=["ok.i16" = i16])"
             "\n"
             "        Scan table=ok source=fake columns=[i16]\n"
             "        Project i16\n"

@@ -5,6 +5,8 @@
 // derived from the ColumnIds the binder mints. A hand-built plan leaves them unset, so nothing
 // would ever be found to share and the test would pass while testing nothing.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -258,6 +260,80 @@ plan::LogicalPlan Joined(const plan::LogicalNodePtr& left, const plan::LogicalNo
       plan::LogicalPlan{.root = count,
                         .output = {plan::OutputColumn{
                             .name = "n", .type = plan::LogicalType::kBigInt, .id = Id(900)}}});
+}
+
+TEST_F(SharedBuildsTest, ASharedAggregateProbeKeepsASemiOrAntiJoinsLeftBuild) {
+  for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+    SCOPED_TRACE(static_cast<int>(kind));
+    const auto table = KeyedTable();
+    table->set_claimed_rows(20'000'000);  // sharing is worth it, while the fixture holds 60 rows
+    const auto schema =
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+    const auto outer = std::make_shared<MemoryTable>(
+        schema, arrow::RecordBatchVector{arrow::RecordBatch::Make(
+                    schema, 5,
+                    arrow::ArrayVector{testing::Int64s({0, 0, 6, 7, std::nullopt}),
+                                       testing::Int64s({10, 11, 60, 70, 99})})});
+    const auto scan = Node(plan::ScanNode{
+        .table = outer, .table_name = "outer", .fields = {0, 1}, .ids = {Id(100), Id(101)}});
+    const auto join = [kind](const plan::LogicalNodePtr& input, const plan::LogicalNodePtr& probe) {
+      return Node(
+          plan::JoinNode{.kind = kind,
+                         .left = input,
+                         .right = probe,
+                         .keys = {plan::JoinKey{.left = Bigint(Id(100)),
+                                                .right = Bigint(plan::OutputIds(*probe).front())}},
+                         .build = plan::BuildSide::kLeft});
+    };
+    const auto root = join(join(scan, Grouped(table, 1)), Grouped(table, 11));
+    const auto logical_plan = plan::ResolvePositions(plan::LogicalPlan{
+        .root = root,
+        .output = {{.name = "k", .type = plan::LogicalType::kBigInt, .id = Id(100)},
+                   {.name = "v", .type = plan::LogicalType::kBigInt, .id = Id(101)}}});
+    ProfileNode profile;
+    auto op = BuildPhysicalPlan(logical_plan, &profile);
+    ASSERT_TRUE(op.ok()) << op.status().ToString();
+    int left_builds = 0;
+    const auto inspect = [&left_builds](const ProfileNode& node, auto&& self) -> void {
+      if (node.name() == "RightJoin") {
+        EXPECT_TRUE(node.detail().contains("build=left"));
+        ++left_builds;
+      }
+      for (const ProfileNode* child : node.children()) {
+        self(*child, self);
+      }
+    };
+    inspect(profile, inspect);
+    EXPECT_EQ(left_builds, 2) << "normalize after aggregation probes become shared scans";
+
+    MemoryBudget budget(int64_t{1024} * 1024 * 1024);
+    ExecContext ctx{.pool = arrow::default_memory_pool(), .budget = &budget};
+    const auto rows = Drain(**op, ctx);
+    ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+    std::optional<int64_t> shared_rows;
+    for (const ProfileMetric& metric : profile.metrics()) {
+      if (metric.name == "shared_rows") {
+        shared_rows = metric.value;
+      }
+    }
+    EXPECT_EQ(shared_rows, 7);
+    EXPECT_EQ(table->scanned_parts().size(), 3U) << "the repeated aggregation is computed once";
+
+    const auto keys = testing::Int64Column(**rows, 0);
+    const auto values = testing::Int64Column(**rows, 1);
+    using Row = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
+    std::vector<Row> actual;
+    actual.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      actual.emplace_back(keys[i], values[i]);
+    }
+    std::vector<Row> expected = kind == plan::JoinKind::kSemi
+                                    ? std::vector<Row>{{0, 10}, {0, 11}, {6, 60}}
+                                    : std::vector<Row>{{7, 70}, {std::nullopt, 99}};
+    std::ranges::sort(actual);
+    std::ranges::sort(expected);
+    EXPECT_EQ(actual, expected);
+  }
 }
 
 // **Nothing under a union is held** (ADR 0036). A union repeated whole is one group, which the gate

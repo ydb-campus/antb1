@@ -823,7 +823,7 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
     steps.push_back(JoinStep{.left = left,
                              .right = ordered[p].root,
                              .edges = {},
-                             .build = BuildSide::kRight,
+                             .build = ChooseBuildSide(left_rows, ordered[p].rows, build_side_ratio),
                              .estimate = rows});
     left = JoinOperand{.step = true, .index = steps.size() - 1};
     left_rows = rows;
