@@ -22,8 +22,8 @@
 #include "part_operators.h"
 
 // The hash joins (docs/adr/0022-joins-and-query-blocks.md, "Execution"): inner, left, semi, anti,
-// null-aware anti and one-row joins. A join's build side (JoinBuild, a JoinTable of its input), the
-// operator that prepares a probe pipeline's builds before any part of the pipeline runs
+// null-aware anti, one-row, full and mark joins. A join's build side (JoinBuild, a JoinTable of its
+// input), the operator that prepares a probe pipeline's builds before any part of the pipeline runs
 // (BuildsFirstOperator), and the probe (HashJoinOperator), a streaming operator of the probe side's
 // part pipeline or one over a serial input.
 //
@@ -303,6 +303,14 @@ class BuildRowEmitter {
 //   Left evaluates each batch of slots before it emits it: the pairs that pass, and one padded row
 //   right after the last candidate of a row none of whose candidates passed (whether one passed
 //   carries over to the next batch of slots).
+// - Mark (ADR 0041's decisions 12 and 13; on a right build only). Output: the probe's columns, then
+//   one nullable BOOLEAN, its mark; each window of a probe batch is a slice of it with its
+//   selection. The null-aware mark (an IN under OR, NOT or CASE) is TRUE on a match; else FALSE
+//   over an empty build input, a NULL key's too; else NULL where the row's key is NULL or the build
+//   holds a NULL key; else FALSE; it has one key and no residual. The mark (kMark, a correlated
+//   EXISTS) is two-valued, never NULL: TRUE when a candidate passes every residual (they are
+//   evaluated as a semi join's, alike candidates included), else FALSE, and FALSE for every row
+//   over a build that holds no row.
 // - One-row (a keyless build of one row, on the right). Output: the probe's columns, then the
 //   build row's values (nullable); each window of a probe batch is a slice of it with its
 //   selection, the values sliced from the build's OneRowValues, so a window has at most their
@@ -364,10 +372,11 @@ class HashJoinOperator final : public Operator {
   // build row; null-aware anti over an empty build input) or none (null-aware anti over a build
   // input with a NULL key). An inner or a left probe looks up as kMatched does.
   enum class Keep : std::uint8_t { kMatched, kUnmatched, kUnmatchedNotNull, kAll, kNone };
-  // What a null-aware mark join marks every row with, decided per run from the build (Start, ADR
-  // 0041's decision 12): FALSE over an empty build input, a NULL key included; NULL over a build
-  // input of NULL keys alone; else a lookup: TRUE on a match, else NULL where the row's key is NULL
-  // or the build holds a NULL key, else FALSE.
+  // What a mark join marks every row with, decided per run from the build (Start, ADR 0041's
+  // decision 12). Null-aware: FALSE over an empty build input, a NULL key included; NULL over a
+  // build input of NULL keys alone; else a lookup: TRUE on a match, else NULL where the row's key
+  // is NULL or the build holds a NULL key, else FALSE. Two-valued (kMark): FALSE over a build that
+  // holds no row; else a lookup: TRUE on a match that passes every residual, else FALSE.
   enum class MarkMode : std::uint8_t { kFalse, kNull, kLookup };
 
   HashJoinOperator(std::unique_ptr<Operator> probe, std::shared_ptr<JoinBuild> build,
@@ -384,8 +393,9 @@ class HashJoinOperator final : public Operator {
   // The next output of the current probe batch, by the join's kind: on the 1:1 path or the 1:N
   // path of an inner join, on the 1:1 path (NextLeftWindow) or the other one (NextPadded) of a
   // left join, of a semi, anti or null-aware anti join (NextSelected, after EvaluatePairs when it
-  // has residuals) or of a one-row join: a batch, or nothing (no row came out of a window, a batch
-  // of slots or the residuals; batch_ is cleared at its end).
+  // has residuals), of a mark join (NextMarked, after EvaluatePairs for a kMark with residuals) or
+  // of a one-row join: a batch, or nothing (no row came out of a window, a batch of slots or the
+  // residuals; batch_ is cleared at its end).
   arrow::Result<std::optional<Batch>> NextOutput();
   arrow::Result<std::optional<Batch>> NextWindow();
   // The matched rows of a window most of whose rows found nothing, gathered alone: NextWindow's
@@ -397,8 +407,17 @@ class HashJoinOperator final : public Operator {
                                                     std::span<const JoinRowRef> table_rows);
   arrow::Result<std::optional<Batch>> NextPairs();
   arrow::Result<std::optional<Batch>> NextSelected();
+  // Whether row `row` of the current probe batch matched: one of its pairs passed every residual
+  // where EvaluatePairs ran (passed_), else it has a candidate (matches_).
+  [[nodiscard]] bool Matched(int64_t row) const {
+    if (evaluated_) {
+      return passed_[static_cast<std::size_t>(row)] != 0;
+    }
+    const JoinMatches& m = matches_[static_cast<std::size_t>(row)];
+    return m.end > m.begin;
+  }
   arrow::Result<std::optional<Batch>> NextOneRow();
-  // A null-aware mark join's window: the probe's columns and selection, then the mark.
+  // A mark join's window (null-aware or not): the probe's columns and selection, then the mark.
   arrow::Result<std::optional<Batch>> NextMarked();
   // A join that emits its build rows: marks the build rows the current probe batch matched, the
   // whole batch at once, and returns no batch. With residuals it walks the batch's candidate pairs
@@ -432,8 +451,8 @@ class HashJoinOperator final : public Operator {
   // The batch (pair_schema_) of the pairs pair_rows_ and pair_builds_ [0, pairs): the probe's
   // columns that the residuals read, taken, then the build's, gathered.
   arrow::Result<std::shared_ptr<arrow::RecordBatch>> PairBatch(int64_t pairs);
-  // A semi or anti join with residuals: passed_ of the current probe batch, from all its pairs (a
-  // pair per row with alike candidates).
+  // A semi, anti or mark join with residuals: passed_ of the current probe batch, from all its
+  // pairs (a pair per row with alike candidates).
   arrow::Status EvaluatePairs();
   // A left join with residuals: slots [0, count) without the pairs that failed, but for the last
   // candidate of a row none of whose pairs passed, which becomes a padded row; `passing` passing
@@ -479,13 +498,13 @@ class HashJoinOperator final : public Operator {
   std::vector<int> pair_build_;  // columns of the build's schema
   std::shared_ptr<arrow::Schema> pair_schema_;
   std::vector<plan::ExprPtr> pair_residual_;
-  // A semi or anti join whose residuals read no build column but its keys, over keys that compare
-  // by bytes, with deterministic residuals (ADR 0022's E2c): a probe row's candidates are the rows
-  // of its key, which hold its key bytes in every key column, and each pair carries the row's own
-  // probe columns, so every pair gives the residuals the same values -- and the same true, false,
-  // NULL or error -- as the first. NextSlots gives such a row one slot, its first candidate;
-  // MarkMatches marks the row's whole range when that pair passes. A fact of the plan, the same in
-  // every part's probe.
+  // A semi, anti or mark join whose residuals read no build column but its keys, over keys that
+  // compare by bytes, with deterministic residuals (ADR 0022's E2c): a probe row's candidates are
+  // the rows of its key, which hold its key bytes in every key column, and each pair carries the
+  // row's own probe columns, so every pair gives the residuals the same values -- and the same
+  // true, false, NULL or error -- as the first. NextSlots gives such a row one slot, its first
+  // candidate; MarkMatches marks the row's whole range when that pair passes. A fact of the plan,
+  // the same in every part's probe.
   bool candidates_alike_ = false;
 
   ExecContext ctx_;  // a copy: the context of the first Next of a probe that prepares its build
@@ -505,7 +524,7 @@ class HashJoinOperator final : public Operator {
   int64_t row_ = 0;                   // 1:N and slots: the next probe row,
   std::uint32_t taken_ = 0;           // and how many of its matches were emitted
   int64_t window_ = 0;  // 1:1, semi, anti, null-aware anti, one-row: the next window's first row
-  bool evaluated_ = false;   // a semi or anti join: passed_ holds batch_'s rows
+  bool evaluated_ = false;   // a semi, anti or mark join: passed_ holds batch_'s rows
   bool row_passed_ = false;  // a left join with residuals: a pair of row_ passed in earlier slots
   std::vector<std::uint32_t> probe_rows_;  // an output batch's probe rows, or the slots'
   std::vector<JoinRowRef> build_rows_;     // and build rows

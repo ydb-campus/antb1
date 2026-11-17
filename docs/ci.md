@@ -159,6 +159,10 @@ go with it are [ADR 0034](adr/0034-licence-and-static-sources.md).
   sysroot build that has no line in `cmake/static/glibc-source.lock`. The smoke tests query the smoke kit in
   `build/static/smoke-kit`: Parquet files that DuckDB writes from `range()` with each codec, a truncated copy, and
   `kit.json` with their digests and DuckDB's own answer (`scripts/static_gates.py kit`). It holds no other data.
+  On macOS, libc++abi imports must belong to `tools/ci/macos_libcxxabi_symbols.txt`, the frozen import set of a
+  conda-forge libc++ build supporting macOS 11.0 (below our 13.0 floor). Its provenance and hashes are in the file.
+  The currently installed libc++ is not a compatibility baseline: whole-library re-exports can remove symbols
+  from its import table. Extending the baseline requires evidence of availability at our macOS floor.
 - `pixi run static-sources` (network once, Linux; after `pixi run static`) writes
   `build/static/sources/antb1-<target>.sources.tar` and its `.sha256`: the sources that go with the Linux package
   (LGPL-2.1 section 6). It holds glibc's source RPM by `cmake/static/glibc-source.lock` (the AlmaLinux vault, then a

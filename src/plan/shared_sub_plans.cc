@@ -219,16 +219,7 @@ class Origins {
   void Define(const FilterNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const SortNode& /*node*/, const LogicalNode& /*at*/) {}
   void Define(const LimitNode& /*node*/, const LogicalNode& /*at*/) {}
-  // A join passes its inputs' columns through; a mark join also mints its mark, which depends on
-  // its probe key and its set's key (ADR 0041's decision 13), so that two marks of one subtree over
-  // other keys stay apart.
-  void Define(const JoinNode& node, const LogicalNode& at) {
-    std::string origin = "mark(";
-    for (const JoinKey& key : node.keys) {
-      origin += Key(key.left, at) + '=' + Key(key.right, at) + ',';
-    }
-    Set(node.mark, origin + ')');
-  }
+  void Define(const JoinNode& node, const LogicalNode& at);
 
   // A call's origin: what it computes over which argument. COUNT(*) has none, so every COUNT(*) of
   // the plan has one origin whatever it counts -- and a read of one is told from a read of another
@@ -328,6 +319,24 @@ void Origins::Define(const ComputeNode& node, const LogicalNode& at) {
   for (std::size_t i = 0; i < node.ids.size() && i < node.exprs.size(); ++i) {
     Set(node.ids[i], std::format("e{}", ExprKey(node.exprs[i], *this, at)));
   }
+}
+
+// A join passes its inputs' columns through; a mark join also mints its mark, which depends on its
+// kind (a null-aware mark is three-valued, the other two-valued), its probe keys and its set's keys
+// (ADR 0041's decision 13), and a mark's residuals (its SQ8), so that two marks of one subtree over
+// other kinds, keys or conditions stay apart. Their subtrees' keys tell them apart already; this
+// keeps the mark's own origin from resting on that.
+void Origins::Define(const JoinNode& node, const LogicalNode& at) {
+  std::string origin = std::format("mark({},", static_cast<int>(node.kind));
+  for (const JoinKey& key : node.keys) {
+    origin += Key(key.left, at) + (key.null_equal ? "<=>" : "=") + Key(key.right, at) + ',';
+  }
+  origin += ';';
+  for (const ExprPtr& expr : node.residual) {
+    origin += ExprKey(expr, *this, at);
+    origin += ';';
+  }
+  Set(node.mark, origin + ')');
 }
 
 // One node's own content as a key, or none when a sub-plan holding it is not shareable.

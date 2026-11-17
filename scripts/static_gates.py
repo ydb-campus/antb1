@@ -343,16 +343,24 @@ def gate_macos_linkage(env: Path, binary: str) -> None:
     if codesign:
         out = run([codesign, "--verify", "--strict", binary])
         check(out.returncode == 0, "the signature verifies (codesign --verify --strict)", out.stderr.strip())
-    # The libc++abi symbols antb1 imports must also be imported by conda's libc++.1.dylib, whose macOS floor
-    # conda-forge already guarantees.
+    # Preserve the known-compatible ABI set independently of the installed libc++. Its undefined symbol table
+    # shrank when conda-forge switched to re-exporting all of libc++abi (LC_REEXPORT_DYLIB); symbols absent from
+    # that table are not necessarily unavailable on older macOS. The snapshot records its provenance and floor.
+    baseline = Path(__file__).resolve().parents[1] / "tools/ci/macos_libcxxabi_symbols.txt"
+    compatible = {line for line in baseline.read_text().splitlines() if line and not line.startswith("#")}
     nm = tool(env, "llvm-nm")
-
-    def abi_imports(path: str) -> set[str]:
-        out = run([nm, "-m", "-u", path]).stdout
-        return {ln.split()[-3] for ln in out.splitlines() if "(from libc++abi)" in ln}
-
-    ours, conda = abi_imports(binary), abi_imports(str(env / "lib" / "libc++.1.dylib"))
-    check(ours <= conda, "libc++abi imports within those of conda's libc++", ", ".join(sorted(ours - conda)[:6]))
+    out = run([nm, "-m", "-u", binary])
+    ours = {ln.split()[-3] for ln in out.stdout.splitlines() if "(from libc++abi)" in ln}
+    check(
+        out.returncode == 0 and bool(ours),
+        "read libc++abi imports",
+        out.stderr.strip() or "no libc++abi symbols found",
+    )
+    check(
+        ours <= compatible,
+        "libc++abi imports within the macOS compatibility baseline",
+        ", ".join(sorted(ours - compatible)[:6]),
+    )
     # The static libc++ must be the only one this binary calls. Every macOS process also loads the system's
     # libc++ with the same std::__1 names, and any bind of one of them (regular, lazy, weak or a chained fixup)
     # lets dyld resolve it there: an iostream built by one libc++ and freed by the other aborts at start.

@@ -786,6 +786,17 @@ constexpr uint64_t kConditionCorrelatedStreamSalt = 0x636F72722D636E64ULL;
 // so a query without one is the query this seed generated before the SQ5b PR.
 constexpr unsigned kItemCorrelatedPercent = 90;
 constexpr uint64_t kItemCorrelatedStreamSalt = 0x636F72722D69746DULL;
+// The same for SQ8a's correlated EXISTS marks (ADR 0041): [NOT] EXISTS under OR, NOT or a CASE WHEN
+// in a condition, a select item, an ORDER BY item, a GROUP BY key or an aggregate's argument, drawn
+// after SQ5b's values where none was written, so on the queries they leave. Its stream is its own,
+// so a query without one is the query this seed generated before the SQ8a PR. Then the share of
+// them that take a top-level [NOT] EXISTS conjunct beside the mark, and the shares of the blocks
+// that compare an inner column with a literal and that hold a residual.
+constexpr unsigned kExistsMarkPercent = 90;
+constexpr unsigned kExistsBesidePercent = 25;
+constexpr unsigned kMarkFilterPercent = 35;
+constexpr unsigned kMarkResidualPercent = 30;
+constexpr uint64_t kExistsMarkStreamSalt = 0x65786973742D6D6BULL;
 // Salt of the fifth random stream, which every draw that only a subquery needs takes, so that a
 // query without one is the query this seed generated before the subquery PR.
 constexpr uint64_t kSubqueryStreamSalt = 0x7375622D71756572ULL;
@@ -1092,7 +1103,8 @@ class Builder {
           Rng& operator_rng, Rng& full_rng, Rng& cross_rng, Rng& keyless_rng, Rng& null_equal_rng,
           Rng& value_rng, Rng& condition_value_rng, Rng& having_value_rng, Rng& item_value_rng,
           Rng& group_value_rng, Rng& in_mark_rng, Rng& in_form_rng, Rng& empty_value_rng,
-          Rng& condition_correlated_rng, Rng& item_correlated_rng, FeatureSet allowed)
+          Rng& condition_correlated_rng, Rng& item_correlated_rng, Rng& exists_mark_rng,
+          FeatureSet allowed)
       : tables_(tables),
         rng_(rng),
         join_rng_(join_rng),
@@ -1122,6 +1134,7 @@ class Builder {
         empty_value_rng_(empty_value_rng),
         condition_correlated_rng_(condition_correlated_rng),
         item_correlated_rng_(item_correlated_rng),
+        exists_mark_rng_(exists_mark_rng),
         allowed_(allowed),
         edges_(UsableEdges(tables)) {}
 
@@ -2122,6 +2135,9 @@ class Builder {
     // writes makes the block grouped, whatever it was.
     bool value_grouped = false;
     CorrelatedItemValue(slots, shape, keys, ordered, value_grouped);
+    // Where none of the five wrote anything, and only there: the slots, and the ends of the inner
+    // ONs EmitFrom recorded, stand. A GROUP BY key it writes makes the block grouped, as SQ5b's.
+    CorrelatedExistsMark(slots, shape, keys, ordered, value_grouped);
     // Any star of the select list over more than kStarMaxRows rows takes a LIMIT, as a lone one
     // does: the guard is FROM's bound, even for a qualified star of a smaller binding.
     const bool limited = Limit(starred_ && from.rows > kStarMaxRows);
@@ -4991,6 +5007,713 @@ class Builder {
     }
   }
 
+  // An inner JOIN's ON as EmitFrom wrote it: the FROM position of its item, and the token position
+  // where the ON ends.
+  struct OnSlot {
+    std::size_t item = 0;
+    std::size_t end = 0;
+  };
+
+  // Where SQ8a's mark stands (CorrelatedExistsMark lists them).
+  enum class ExistsPlace : std::uint8_t { kWhere, kOn, kItem, kOrderBy, kGroupBy, kArgument };
+
+  // The forms of a condition that holds SQ8a's marks (ExistsCondition lists them).
+  enum class ExistsForm : std::uint8_t { kAlone, kOr, kTwo, kNotAnd, kNotOr };
+
+  // The alias of SQ8a's mark item: no column of the tables is named so, the select list's own
+  // aliases are a1 to a3, and SQ5b's value item's is cv.
+  static constexpr std::string_view kMarkAlias = "cm";
+
+  // An aggregate over SQ8a's CASE (MarkCalls): the call, the column of the mark's binding that its
+  // THEN reads, and whether it has ELSE 0.
+  struct MarkCall {
+    Agg agg = Agg::kCount;
+    const GenColumn* column = nullptr;
+    bool otherwise = false;
+  };
+
+  // SQ8a's correlated EXISTS marks (ADR 0041's SQ8a), where the query holds no other subquery:
+  // drawn after SQ5b's values, from a stream of its own, so that a query without one is the query
+  // its seed gave before. A mark is `[NOT] EXISTS (q)` over ExistsMarkBlock's plain block,
+  // correlated to a FROM binding o, TRUE or FALSE and never NULL. It stands inside a condition of
+  // ExistsCondition's forms, never as a conjunct by itself (a semi or an anti join), in one of six
+  // places, each drawn as often as the others the block and the allowed features admit (WHERE
+  // twice as often), its pieces written at the end and moved to their places:
+  //   - one more top-level conjunct of WHERE (ExistsFilter);
+  //   - one more conjunct of the ON of an inner JOIN with no comma before it, outside a FULL JOIN's
+  //     left input (MarkOns), whose marks read the FROM items up to that JOIN alone;
+  //   - one more select item of a block that does not aggregate, `CASE WHEN <condition> THEN v
+  //     ELSE w END` (ExistsCase), now and then aliased cm;
+  //   - an ORDER BY item of such a block, after the keys its ORDER BY has: that CASE, or such an
+  //     item read by its alias or position (no star before it), the only form under SELECT
+  //     DISTINCT; `ordered` records the ORDER BY;
+  //   - a GROUP BY key of a block that aggregates without grouping sets: such an item, grouped by
+  //     its alias or position, now and then ordered by its position too; `grouped` records that
+  //     the block now groups;
+  //   - an aggregate's argument that reads a column of o beside the marks, `AGG(CASE WHEN
+  //     <condition> THEN o.x [ELSE 0] END)` (MarkCalls), as one more select item, or in HAVING
+  //     (against a literal) or ORDER BY of a block that groups or aggregates already.
+  // A quarter of them take one more top-level WHERE conjunct beside, `[NOT] EXISTS (q)`: a semi or
+  // an anti join next to the mark. Never: a mark in HAVING, or in a select item or ORDER BY item
+  // of a block that aggregates, outside an aggregate's argument (SQ13); an aggregate over marks and
+  // literals alone; EXISTS as a value (`SELECT EXISTS (q)`, `EXISTS (q) = TRUE`); a mark in a LEFT
+  // or FULL JOIN's ON, inside a FULL JOIN's left input, or in an ON that reads a comma sibling
+  // (DuckDB answers a correlated subquery there wrongly, docs/testing.md); a residual by <> or !=
+  // (DuckDB answers it wrongly under a mark, ExistsMarkBlock); the mark item's text written again
+  // (D38) or an ORDER BY expression over its alias (D37); and no arithmetic, so that nothing can
+  // fail (D35).
+  void CorrelatedExistsMark(const MarkSlots& slots, Shape shape,
+                            const std::vector<const GenColumn*>& keys, bool& ordered,
+                            bool& grouped) {
+    const bool other_subquery =
+        used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
+        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
+        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
+        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
+        used_.Has(Feature::kInForm) || used_.Has(Feature::kCorrelatedEmptyValue) ||
+        used_.Has(Feature::kCorrelatedConditionValue) || used_.Has(Feature::kCorrelatedItemValue);
+    if (other_subquery || !allowed_.Has(Feature::kCorrelatedExistsMark)) {
+      return;
+    }
+    Rng& rng = exists_mark_rng_;
+    const std::vector<CorrelatedCandidate> candidates = CorrelatedCandidates();
+    if (candidates.empty() || !rng.Percent(kExistsMarkPercent)) {
+      return;
+    }
+    // The candidate whose binding the marks' other branches and an aggregate's argument read.
+    const CorrelatedCandidate& home = candidates[rng.Below(candidates.size())];
+    const bool booleans = allowed_.Has(Feature::kBooleanExpressions);
+    const bool cases = MarkCases();
+    const bool filters = allowed_.Has(Feature::kWhere) && (booleans || cases);
+    const bool aggregate = shape == Shape::kAggregates;
+    // One more select item makes a list of several items, after a lone star a star among items.
+    const bool new_item = allowed_.Has(Feature::kMultipleItems) &&
+                          (!slots.lone_star || allowed_.Has(Feature::kStarItems));
+    // What reads that item again: its alias, or its position where no star stands before it.
+    const bool alias = allowed_.Has(Feature::kAlias);
+    const bool position = allowed_.Has(Feature::kPosition) && !starred_;
+    const bool grouping_sets = used_.Has(Feature::kRollup) || used_.Has(Feature::kGroupingSets) ||
+                               used_.Has(Feature::kCube);
+    // The block groups or aggregates already, so a HAVING or an ORDER BY aggregate keeps its shape.
+    const bool aggregated =
+        aggregate && (aggregate_emitted_ || !keys.empty() || slots.constant_group || slots.having);
+    const bool order_ok = allowed_.Has(Feature::kOrderBy);
+    // The ONs a mark may join that reach the home binding.
+    std::vector<OnSlot> ons;
+    if (filters) {
+      const std::size_t home_at = BindingPosition(*home.outer);
+      for (const OnSlot& slot : MarkOns()) {
+        if (slot.item >= home_at) {
+          ons.push_back(slot);
+        }
+      }
+    }
+    std::vector<ArgumentPlace> argument_places;
+    if (new_item) {
+      argument_places.push_back(ArgumentPlace::kItem);
+    }
+    if (aggregated && allowed_.Has(Feature::kHaving)) {
+      argument_places.push_back(ArgumentPlace::kHaving);
+    }
+    if (aggregated && order_ok && !distinct_) {
+      argument_places.push_back(ArgumentPlace::kOrderBy);
+    }
+    const std::vector<MarkCall> calls = MarkCalls(home);
+    std::vector<ExistsPlace> places;
+    if (filters) {
+      places.push_back(ExistsPlace::kWhere);
+      places.push_back(ExistsPlace::kWhere);
+    }
+    if (!ons.empty()) {
+      places.push_back(ExistsPlace::kOn);
+    }
+    if (!aggregate && cases && new_item) {
+      places.push_back(ExistsPlace::kItem);
+    }
+    if (!aggregate && cases && order_ok && (!distinct_ || (new_item && (alias || position)))) {
+      places.push_back(ExistsPlace::kOrderBy);
+    }
+    if (aggregate && cases && !grouping_sets && allowed_.Has(Feature::kGroupBy) && new_item &&
+        (alias || position)) {
+      places.push_back(ExistsPlace::kGroupBy);
+    }
+    if (aggregate && allowed_.Has(Feature::kCase) && !argument_places.empty() && !calls.empty()) {
+      places.push_back(ExistsPlace::kArgument);
+    }
+    if (places.empty()) {
+      return;
+    }
+    const ExistsPlace place = places[rng.Below(places.size())];
+    // The candidates the marks may read: in an ON, those whose binding the ON reaches.
+    OnSlot on;
+    std::vector<CorrelatedCandidate> scope = candidates;
+    if (place == ExistsPlace::kOn) {
+      on = ons[rng.Below(ons.size())];
+      std::erase_if(
+          scope, [&](const CorrelatedCandidate& c) { return BindingPosition(*c.outer) > on.item; });
+    }
+    // A top-level [NOT] EXISTS conjunct beside the mark, now and then: first in WHERE, its tokens
+    // moved there, where the slots after it shift by their count. WHERE's mark writes it itself.
+    MarkSlots at = slots;
+    const bool beside = allowed_.Has(Feature::kWhere) && rng.Percent(kExistsBesidePercent);
+    used_.Add(Feature::kCorrelatedExistsMark);
+    if (beside && place != ExistsPlace::kWhere) {
+      const std::size_t end = tokens_.size();
+      used_.Add(Feature::kWhere);
+      Keyword(at.where_written ? "AND" : "WHERE");
+      ExistsMark(rng, candidates, nullptr);
+      const std::size_t written = tokens_.size() - end;
+      std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.where_end),
+                  tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+      at.where_end += written;
+      at.group_end += written;
+      at.having_end += written;
+      at.where_written = true;
+    }
+    // The mark as one more select item, last in the list, with its alias where `aliased`.
+    const auto mark_item = [&](bool aliased) {
+      const std::size_t end = tokens_.size();
+      used_.Add(Feature::kMultipleItems);
+      if (at.lone_star) {
+        used_.Add(Feature::kStarItems);
+      }
+      Symbol(",");
+      ExistsCase(rng, scope, home);
+      if (aliased) {
+        used_.Add(Feature::kAlias);
+        if (rng.Percent(50)) {
+          Keyword("AS");
+        }
+        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::string(kMarkAlias)});
+      }
+      std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.select_end),
+                  tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+    };
+    // The item `mark_item` writes, read by its alias or its position.
+    const auto item_reference = [&](bool aliased) {
+      if (aliased) {
+        tokens_.push_back({.kind = Token::Kind::kAlias, .text = std::string(kMarkAlias)});
+      } else {
+        Position(select_items_ + 1);
+      }
+    };
+    switch (place) {
+      case ExistsPlace::kWhere: {
+        const std::size_t end = tokens_.size();
+        const bool beside_first = beside && rng.Percent(50);
+        used_.Add(Feature::kWhere);
+        Keyword(at.where_written ? "AND" : "WHERE");
+        if (beside_first) {
+          ExistsMark(rng, candidates, nullptr);
+          Keyword("AND");
+        }
+        ExistsFilter(rng, scope, home);
+        if (beside && !beside_first) {
+          Keyword("AND");
+          ExistsMark(rng, candidates, nullptr);
+        }
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.where_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ExistsPlace::kOn: {
+        const std::size_t end = tokens_.size();
+        used_.Add(Feature::kWhere);  // as for any condition of an ON beyond its keys
+        Keyword("AND");
+        ExistsFilter(rng, scope, home);
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(on.end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ExistsPlace::kItem:
+        mark_item(alias && rng.Percent(30));
+        return;
+      case ExistsPlace::kOrderBy: {
+        // The ORDER BY first, at the end of the block; then the item, before the FROM.
+        const bool by_item = distinct_ || (new_item && (alias || position) && rng.Percent(50));
+        const bool aliased = by_item && alias && (!position || rng.Percent(50));
+        NextOrderItem(ordered);
+        if (by_item) {
+          item_reference(aliased);
+        } else {
+          ExistsCase(rng, scope, home);
+        }
+        SortDirection(rng);
+        if (by_item) {
+          mark_item(aliased);
+        }
+        return;
+      }
+      case ExistsPlace::kGroupBy: {
+        // The ORDER BY first, at the end of the block; then the key, before HAVING; then the item.
+        const bool aliased = alias && (!position || rng.Percent(50));
+        used_.Add(Feature::kGroupBy);
+        if (order_ok && position && rng.Percent(35)) {
+          NextOrderItem(ordered);
+          item_reference(/*aliased=*/false);
+          SortDirection(rng);
+        }
+        const std::size_t end = tokens_.size();
+        if (!keys.empty() || at.constant_group) {
+          Symbol(",");
+        } else {
+          Keyword("GROUP");
+          Keyword("BY");
+        }
+        item_reference(aliased);
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.group_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        mark_item(aliased);
+        grouped = true;
+        return;
+      }
+      case ExistsPlace::kArgument:
+        break;
+    }
+    const MarkCall& call = calls[rng.Below(calls.size())];
+    switch (argument_places[rng.Below(argument_places.size())]) {
+      case ArgumentPlace::kItem: {
+        const std::size_t end = tokens_.size();
+        used_.Add(Feature::kMultipleItems);
+        aggregate_emitted_ = true;
+        Symbol(",");
+        MarkCallText(rng, call, scope, home);
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.select_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ArgumentPlace::kHaving: {
+        const Literal bound = MarkCallLiteral(rng, call);
+        const std::string_view op = rng.Pick(kOps);
+        const std::size_t end = tokens_.size();
+        used_.Add(Feature::kHaving);
+        Keyword(at.having ? "AND" : "HAVING");
+        MarkCallText(rng, call, scope, home);
+        if (allowed_.Contains(bound.features)) {
+          Symbol(op);
+          used_.Add(bound.features);
+          Emit(bound.tokens);
+        } else {
+          Keyword("IS");
+          Keyword("NOT");
+          Keyword("NULL");
+        }
+        std::rotate(tokens_.begin() + static_cast<std::ptrdiff_t>(at.having_end),
+                    tokens_.begin() + static_cast<std::ptrdiff_t>(end), tokens_.end());
+        return;
+      }
+      case ArgumentPlace::kOrderBy:
+        NextOrderItem(ordered);
+        MarkCallText(rng, call, scope, home);
+        SortDirection(rng);
+        return;
+    }
+  }
+
+  // Whether SQ8a's CASE can be written: kCase, and the literals of its values, 1 and 0 or 'y' and
+  // 'n'.
+  [[nodiscard]] bool MarkCases() const {
+    return allowed_.Has(Feature::kCase) &&
+           (allowed_.Has(Feature::kIntegerLiteral) || allowed_.Has(Feature::kStringLiteral));
+  }
+
+  // The FROM position of binding `b`, or the number of bindings.
+  [[nodiscard]] std::size_t BindingPosition(const Binding& b) const {
+    for (std::size_t k = 0; k < from_->bindings.size(); ++k) {
+      if (&from_->bindings[k] == &b) {
+        return k;
+      }
+    }
+    return from_->bindings.size();
+  }
+
+  // The inner ONs SQ8a's mark may join (pure: no draw): those of a JOIN with no comma before it,
+  // so that the ON reads its own join group alone, and outside a FULL JOIN's left input (a FULL
+  // JOIN after it, no comma between), which the binder refuses a correlated subquery in.
+  [[nodiscard]] std::vector<OnSlot> MarkOns() const {
+    std::vector<OnSlot> out;
+    for (const OnSlot& slot : on_slots_) {
+      if (GroupStart(*from_, slot.item) != 0) {
+        continue;
+      }
+      bool padded = false;
+      for (std::size_t p = slot.item + 1; p < from_->bindings.size(); ++p) {
+        const FromConnector connector = from_->bindings[p].connector;
+        if (connector == FromConnector::kComma) {
+          break;
+        }
+        if (connector == FromConnector::kFull) {
+          padded = true;
+          break;
+        }
+      }
+      if (!padded) {
+        out.push_back(slot);
+      }
+    }
+    return out;
+  }
+
+  // The columns of `home`'s binding that a mark's other branch compares with a literal (pure: no
+  // draw).
+  [[nodiscard]] std::vector<const GenColumn*> BranchColumns(const CorrelatedCandidate& home) const {
+    std::vector<const GenColumn*> out;
+    for (const GenColumn& column : home.outer->columns) {
+      if (Usable(column, from_->any_path) && CanLiteral(column.kind)) {
+        out.push_back(&column);
+      }
+    }
+    return out;
+  }
+
+  // Whether two columns are of one SQL type, not merely one ValueKind, and neither DOUBLE nor read
+  // otherwise than the other: a residual of SQ8a's block compares them in that type in both
+  // engines.
+  static bool OneSqlType(const GenColumn& a, const GenColumn& b) {
+    if (a.kind != b.kind || a.kind == ValueKind::kDouble || a.via_override != b.via_override) {
+      return false;
+    }
+    switch (a.kind) {
+      case ValueKind::kInteger:
+        return a.min == b.min && a.max == b.max;
+      case ValueKind::kDecimal:
+        return a.precision == b.precision && a.scale == b.scale;
+      case ValueKind::kDouble:
+      case ValueKind::kVarchar:
+      case ValueKind::kDate:
+        break;
+    }
+    return true;
+  }
+
+  // The pairs of an inner and an outer column that a residual of SQ8a's block over `c` compares
+  // (pure: no draw): both usable, of one SQL type (OneSqlType), the key's own two among them.
+  [[nodiscard]] std::vector<std::pair<const GenColumn*, const GenColumn*>> ResidualPairs(
+      const CorrelatedCandidate& c) const {
+    std::vector<std::pair<const GenColumn*, const GenColumn*>> out;
+    if (!allowed_.Has(Feature::kCompareColumns)) {
+      return out;
+    }
+    for (const GenColumn& inner : c.inner->columns) {
+      for (const GenColumn& outer : c.outer->columns) {
+        if (OneSqlType(inner, outer) && Usable(inner, from_->any_path) &&
+            Usable(outer, from_->any_path)) {
+          out.emplace_back(&inner, &outer);
+        }
+      }
+    }
+    return out;
+  }
+
+  // The aggregates over SQ8a's CASE that the columns of `home`'s binding admit (pure: no draw):
+  // COUNT of any usable column; COUNT DISTINCT, MIN and MAX of one that is not DOUBLE (whose NaN
+  // and -0.0 the engines need not tell apart alike); SUM of an integer whose total over the rows
+  // stays within HUGEINT's 38 digits, with and without ELSE 0.
+  [[nodiscard]] std::vector<MarkCall> MarkCalls(const CorrelatedCandidate& home) const {
+    std::vector<MarkCall> out;
+    for (const GenColumn& column : home.outer->columns) {
+      if (!Usable(column, from_->any_path)) {
+        continue;
+      }
+      if (allowed_.Has(Feature::kCountColumn)) {
+        out.push_back(MarkCall{.agg = Agg::kCount, .column = &column, .otherwise = false});
+      }
+      if (column.kind == ValueKind::kDouble) {
+        continue;
+      }
+      for (const Agg agg : {Agg::kCountDistinct, Agg::kMin, Agg::kMax}) {
+        if (allowed_.Has(AggFeature(agg))) {
+          out.push_back(MarkCall{.agg = agg, .column = &column, .otherwise = false});
+        }
+      }
+      if (column.kind == ValueKind::kInteger && allowed_.Has(Feature::kSum)) {
+        const auto [low, high] = IntegerBounds(column);
+        if (SumTotalFits({std::min<Int128>(0, low), std::max<Int128>(0, high)}, rows_)) {
+          out.push_back(MarkCall{.agg = Agg::kSum, .column = &column, .otherwise = false});
+          if (allowed_.Has(Feature::kIntegerLiteral)) {
+            out.push_back(MarkCall{.agg = Agg::kSum, .column = &column, .otherwise = true});
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // `[NOT] EXISTS (q)` over `c`, or over a candidate of `scope` without one, NOT EXISTS 40% of the
+  // time (ExistsMarkBlock writes q).
+  void ExistsMark(Rng& rng, const std::vector<CorrelatedCandidate>& scope,
+                  const CorrelatedCandidate* c) {
+    const CorrelatedCandidate& over = c != nullptr ? *c : scope[rng.Below(scope.size())];
+    if (rng.Percent(kNotExistsPercent)) {
+      Keyword("NOT");
+    }
+    Keyword("EXISTS");
+    ExistsMarkBlock(rng, over);
+  }
+
+  // SQ8a's plain block over `c`, every draw from `rng`: `(SELECT * FROM inner WHERE <key> [AND
+  // inner.x <op> k] [AND inner.y <op> o.z])`. The key is `inner.k = o.k`, or now and then IS NOT
+  // DISTINCT FROM, either way round, over the candidate's two columns of one SQL type; the inner
+  // conjunct compares a column of the inner table with a literal of it, before or after the key;
+  // the residual compares an inner and an outer column of one SQL type (ResidualPairs) by =, <, <=,
+  // > or >=, either way round. Nothing in it groups, orders, limits, aggregates, computes or reads
+  // a block two levels out, and its select list `*` and its clauses record no feature of their own.
+  void ExistsMarkBlock(Rng& rng, const CorrelatedCandidate& c) {
+    std::vector<const GenColumn*> literal_columns;
+    for (const GenColumn& column : c.inner->columns) {
+      if (Usable(column, from_->any_path) && CanLiteral(column.kind)) {
+        literal_columns.push_back(&column);
+      }
+    }
+    const GenColumn* filtered = nullptr;
+    Literal filter;
+    std::string_view filter_op = "=";
+    if (!literal_columns.empty() && rng.Percent(kMarkFilterPercent)) {
+      filtered = literal_columns[rng.Below(literal_columns.size())];
+      filter = MakeLiteral(rng, *filtered);
+      filter_op = rng.Pick(kOps);
+      if (!allowed_.Contains(filter.features)) {
+        filtered = nullptr;
+      }
+    }
+    // Never <> or !=: under a mark DuckDB 1.5 takes `inner.x <> o.y` for true where o.y is NULL
+    // (but over a filter of the outer rows first), so it answers such a block wrongly; its semi
+    // join and every other comparison it answers right.
+    static constexpr auto kResidualOps =
+        std::to_array<std::string_view>({"=", "<", "<=", ">", ">="});
+    const std::vector<std::pair<const GenColumn*, const GenColumn*>> pairs = ResidualPairs(c);
+    const std::pair<const GenColumn*, const GenColumn*>* residual = nullptr;
+    std::string_view residual_op = "<";
+    bool residual_outer_first = false;
+    if (!pairs.empty() && rng.Percent(kMarkResidualPercent)) {
+      residual = &pairs[rng.Below(pairs.size())];
+      residual_op = rng.Pick(kResidualOps);
+      residual_outer_first = rng.Percent(30);
+    }
+    const bool filter_first = filtered != nullptr && rng.Percent(30);
+    const bool outer_first = rng.Percent(25);
+    // Drawn whether or not NULL-equal keys are allowed, so that ruling them out changes only the
+    // queries that write one.
+    const bool null_equal = rng.Percent(kNullEqualPercent) && allowed_.Has(Feature::kNullEqualKeys);
+    const auto inner_filter = [&] {
+      InnerColumn(c, *filtered);
+      Symbol(filter_op);
+      used_.Add(filter.features);
+      Emit(filter.tokens);
+    };
+    Symbol("(");
+    Keyword("SELECT");
+    Symbol("*");
+    Keyword("FROM");
+    used_.Add(Feature::kTableName);
+    tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
+    Keyword("WHERE");
+    if (filter_first) {
+      inner_filter();
+      Keyword("AND");
+    }
+    if (outer_first) {
+      OuterColumn(c);
+    } else {
+      InnerColumn(c, *c.inner_key);
+    }
+    if (null_equal) {
+      NotDistinctFrom();
+    } else {
+      Symbol("=");
+    }
+    if (outer_first) {
+      InnerColumn(c, *c.inner_key);
+    } else {
+      OuterColumn(c);
+    }
+    if (filtered != nullptr && !filter_first) {
+      Keyword("AND");
+      inner_filter();
+    }
+    if (residual != nullptr) {
+      used_.Add(Feature::kCompareColumns);
+      Keyword("AND");
+      if (residual_outer_first) {
+        OuterValue(c, *residual->second);
+        Symbol(residual_op);
+        InnerColumn(c, *residual->first);
+      } else {
+        InnerColumn(c, *residual->first);
+        Symbol(residual_op);
+        OuterValue(c, *residual->second);
+      }
+    }
+    Symbol(")");
+  }
+
+  // A condition that holds SQ8a's marks over `scope`, every draw from `rng`, in one of these forms,
+  // each drawn as often as the others the allowed features and `home`'s binding admit: the mark
+  // alone, where `alone` admits it (a CASE WHEN's condition; a conjunct by itself would be a semi
+  // or an anti join), `(mark OR o.x <op> k)` either way round, `(mark OR mark)`, and `NOT (mark AND
+  // o.x <op> k)` or `NOT (mark OR o.x <op> k)` either way round. The first mark reads `home`, the
+  // other branch a column of its binding (BranchComparison). Callers without `alone` allow
+  // kBooleanExpressions, which `(mark OR mark)` needs alone.
+  void ExistsCondition(Rng& rng, const std::vector<CorrelatedCandidate>& scope,
+                       const CorrelatedCandidate& home, bool alone) {
+    std::vector<ExistsForm> forms;
+    if (alone) {
+      forms.push_back(ExistsForm::kAlone);
+    }
+    if (allowed_.Has(Feature::kBooleanExpressions)) {
+      forms.push_back(ExistsForm::kTwo);
+      if (!BranchColumns(home).empty()) {
+        forms.insert(forms.end(), {ExistsForm::kOr, ExistsForm::kNotAnd, ExistsForm::kNotOr});
+      }
+    }
+    const ExistsForm form = forms[rng.Below(forms.size())];
+    if (form == ExistsForm::kAlone) {
+      ExistsMark(rng, scope, &home);
+      return;
+    }
+    used_.Add(Feature::kBooleanExpressions);
+    if (form == ExistsForm::kTwo) {
+      Symbol("(");
+      ExistsMark(rng, scope, &home);
+      Keyword("OR");
+      ExistsMark(rng, scope, nullptr);
+      Symbol(")");
+      return;
+    }
+    const bool mark_first = rng.Percent(50);
+    if (form != ExistsForm::kOr) {
+      Keyword("NOT");
+    }
+    Symbol("(");
+    if (mark_first) {
+      ExistsMark(rng, scope, &home);
+    } else {
+      BranchComparison(rng, home);
+    }
+    Keyword(form == ExistsForm::kNotAnd ? "AND" : "OR");
+    if (mark_first) {
+      BranchComparison(rng, home);
+    } else {
+      ExistsMark(rng, scope, &home);
+    }
+    Symbol(")");
+  }
+
+  // `o.x <op> k`, a column of `home`'s binding (BranchColumns, which the caller found one in)
+  // against a literal of it, or `o.x IS NULL` where the literal's features are not allowed.
+  void BranchComparison(Rng& rng, const CorrelatedCandidate& home) {
+    const std::vector<const GenColumn*> columns = BranchColumns(home);
+    const GenColumn& column = *columns[rng.Below(columns.size())];
+    const Literal lit = MakeLiteral(rng, column);
+    const std::string_view op = rng.Pick(kOps);
+    OuterValue(home, column);
+    if (!allowed_.Contains(lit.features)) {
+      Keyword("IS");
+      Keyword("NULL");
+      return;
+    }
+    used_.Add(lit.features);
+    Symbol(op);
+    Emit(lit.tokens);
+  }
+
+  // One more conjunct of a filter (WHERE or an inner ON) over SQ8a's marks: one of
+  // ExistsCondition's conditions but the mark alone, or `CASE WHEN <condition> THEN v ELSE w END =
+  // v` (ExistsCase), whichever the allowed features admit (the caller's admit one).
+  void ExistsFilter(Rng& rng, const std::vector<CorrelatedCandidate>& scope,
+                    const CorrelatedCandidate& home) {
+    if (MarkCases() && (!allowed_.Has(Feature::kBooleanExpressions) || rng.Percent(30))) {
+      const bool strings = ExistsCase(rng, scope, home);
+      Symbol("=");
+      MarkValue(strings, rng.Percent(60));
+      return;
+    }
+    ExistsCondition(rng, scope, home, /*alone=*/false);
+  }
+
+  // `CASE WHEN <condition> THEN v ELSE w END` over one of ExistsCondition's conditions, the mark
+  // alone too: v and w 1 and 0, or now and then the strings 'y' and 'n', either way round. Returns
+  // whether they are strings.
+  bool ExistsCase(Rng& rng, const std::vector<CorrelatedCandidate>& scope,
+                  const CorrelatedCandidate& home) {
+    const bool strings = allowed_.Has(Feature::kStringLiteral) &&
+                         (!allowed_.Has(Feature::kIntegerLiteral) || rng.Percent(30));
+    const bool yes_first = rng.Percent(75);
+    used_.Add(Feature::kCase);
+    used_.Add(strings ? Feature::kStringLiteral : Feature::kIntegerLiteral);
+    Keyword("CASE");
+    Keyword("WHEN");
+    ExistsCondition(rng, scope, home, /*alone=*/true);
+    Keyword("THEN");
+    MarkValue(strings, yes_first);
+    Keyword("ELSE");
+    MarkValue(strings, !yes_first);
+    Keyword("END");
+    return strings;
+  }
+
+  // A value of SQ8a's CASE: 1 or 0, or the string 'y' or 'n'.
+  void MarkValue(bool strings, bool yes) {
+    std::string text;
+    if (strings) {
+      text = yes ? "'y'" : "'n'";
+    } else {
+      text = yes ? "1" : "0";
+    }
+    tokens_.push_back({.kind = Token::Kind::kLiteral, .text = std::move(text)});
+  }
+
+  // `AGG([DISTINCT] CASE WHEN <condition> THEN o.x [ELSE 0] END)` over one of ExistsCondition's
+  // conditions, the mark alone too: an aggregate's argument that reads a column of `home`'s binding
+  // beside the marks, computed per row.
+  void MarkCallText(Rng& rng, const MarkCall& call, const std::vector<CorrelatedCandidate>& scope,
+                    const CorrelatedCandidate& home) {
+    used_.Add(AggFeature(call.agg));
+    used_.Add(Feature::kCase);
+    Keyword(AggName(call.agg));
+    Symbol("(");
+    if (call.agg == Agg::kCountDistinct) {
+      Keyword("DISTINCT");
+    }
+    Keyword("CASE");
+    Keyword("WHEN");
+    ExistsCondition(rng, scope, home, /*alone=*/true);
+    Keyword("THEN");
+    OuterValue(home, *call.column);
+    if (call.otherwise) {
+      used_.Add(Feature::kIntegerLiteral);
+      Keyword("ELSE");
+      ValueNumber(0);
+    }
+    Keyword("END");
+    Symbol(")");
+  }
+
+  // A literal of the values of `call` over at most rows_ rows, for HAVING: a count's 0 to rows_
+  // (CountLiteral), MIN's and MAX's their column's (ValuesOf), and a SUM's between 0 and its
+  // column's bounds times the rows.
+  Literal MarkCallLiteral(Rng& rng, const MarkCall& call) {
+    switch (call.agg) {
+      case Agg::kCountStar:
+      case Agg::kCount:
+      case Agg::kCountDistinct:
+        return CountLiteral(rng, rows_);
+      case Agg::kSum: {
+        const auto [low, high] = IntegerBounds(*call.column);
+        return MakeLiteral(rng, GenColumn{.name = {},
+                                          .kind = ValueKind::kInteger,
+                                          .min = ClampToBigint(std::min<Int128>(0, low * rows_)),
+                                          .max = ClampToBigint(std::max<Int128>(0, high * rows_))});
+      }
+      case Agg::kAvg:
+      case Agg::kMin:
+      case Agg::kMax:
+        break;
+    }
+    return MakeLiteral(rng, ValuesOf(rows_, call.agg, call.column));
+  }
+
   // A mark over candidate `c` in one of four places of the block QueryFrom has just written,
   // recording `feature` (kInMark or kInForm), every draw from mark_rng_: one more WHERE conjunct;
   // one more select item, a projection's CASE, or in a block that aggregates a CASE over a GROUP
@@ -6048,6 +6771,7 @@ class Builder {
   }
 
   void EmitFrom(const FromList& from) {
+    on_slots_.clear();
     if (from.crossed) {
       used_.Add(Feature::kCrossJoin);
     }
@@ -6133,6 +6857,9 @@ class Builder {
           Condition();
         }
         comparable_ = std::move(all);
+      }
+      if (b.connector == FromConnector::kJoin) {
+        on_slots_.push_back(OnSlot{.item = k, .end = tokens_.size()});
       }
     }
   }
@@ -7314,6 +8041,7 @@ class Builder {
   Rng& empty_value_rng_;           // the draws that only SQ6's empty values need
   Rng& condition_correlated_rng_;  // the draws that only SQ5a's correlated values need
   Rng& item_correlated_rng_;       // the draws that only SQ5b's correlated values need
+  Rng& exists_mark_rng_;           // the draws that only SQ8a's correlated EXISTS marks need
   // The stream of the mark being written: in_mark_rng_ or in_form_rng_ (PlaceMark).
   Rng* mark_rng_ = nullptr;
   // What InForm drew for the mark being written; std::nullopt while InMark writes one.
@@ -7351,6 +8079,9 @@ class Builder {
   bool starred_ = false;            // the select list has a star: positions stop there
   // The items of the select list, a star counted as one (a position past a star is unknown).
   std::size_t select_items_ = 0;
+  // The inner JOINs of the FROM list EmitFrom wrote last, in FROM order: where SQ8a's mark may
+  // join one more conjunct of an ON (CorrelatedExistsMark).
+  std::vector<OnSlot> on_slots_;
 };
 
 }  // namespace
@@ -7559,11 +8290,13 @@ std::expected<QueryGenerator, std::string> QueryGenerator::Make(std::vector<GenT
   Rng empty_value_rng(Mix(seed ^ kEmptyValueStreamSalt));
   Rng condition_correlated_rng(Mix(seed ^ kConditionCorrelatedStreamSalt));
   Rng item_correlated_rng(Mix(seed ^ kItemCorrelatedStreamSalt));
+  Rng exists_mark_rng(Mix(seed ^ kExistsMarkStreamSalt));
   if (!Builder(tables, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,
                union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
                full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
                having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
-               empty_value_rng, condition_correlated_rng, item_correlated_rng, options.supported)
+               empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
+               options.supported)
            .Build()
            .has_value()) {
     return std::unexpected(
@@ -7605,6 +8338,7 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng empty_value_rng(Mix(state ^ kEmptyValueStreamSalt));
   Rng condition_correlated_rng(Mix(state ^ kConditionCorrelatedStreamSalt));
   Rng item_correlated_rng(Mix(state ^ kItemCorrelatedStreamSalt));
+  Rng exists_mark_rng(Mix(state ^ kExistsMarkStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
@@ -7613,7 +8347,8 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
               union_rng, star_rng, variance_rng, distinct_rng, rollup_rng, setop_rng, operator_rng,
               full_rng, cross_rng, keyless_rng, null_equal_rng, value_rng, condition_value_rng,
               having_value_rng, item_value_rng, group_value_rng, in_mark_rng, in_form_rng,
-              empty_value_rng, condition_correlated_rng, item_correlated_rng, allowed)
+              empty_value_rng, condition_correlated_rng, item_correlated_rng, exists_mark_rng,
+              allowed)
           .Build()
           .value_or(GeneratedQuery{});
   q.index = index;

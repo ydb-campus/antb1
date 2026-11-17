@@ -1210,20 +1210,23 @@ TEST(OptimizerTest, TheUnnestingPassRejectsWhatNeitherPathFits) {
             "a correlated scalar subquery over a block that is not an ungrouped aggregate over "
             "its correlation is not supported");
 
-  // Path 1 takes a semi or anti one, and declines a right input that is not a block it knows:
-  // a bare Scan has no filter of correlated conjuncts.
-  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
-    const auto status =
-        Optimize(PlanOver(Node(DependentJoinNode{
-                     .kind = kind, .left = FourFields(1), .right = FourFields(11), .span = span})))
-            .status();
+  // Path 1 takes a semi, anti or mark one, and declines a right input that is not a block it
+  // knows: a bare Scan has no filter of correlated conjuncts. A mark's refusal is an EXISTS's.
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kMark}) {
+    const auto status = Optimize(PlanOver(Node(DependentJoinNode{
+                                     .kind = kind,
+                                     .left = FourFields(1),
+                                     .right = FourFields(11),
+                                     .mark = kind == JoinKind::kMark ? ColumnId{90} : kNoColumnId,
+                                     .span = span})))
+                            .status();
     ASSERT_NE(GetSqlError(status), nullptr) << ToString(kind) << ": " << status.ToString();
     EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
     EXPECT_EQ(GetSqlError(status)->span(), span);
     EXPECT_EQ(status.message(),
               std::format("a correlated {} over a block that is not a plain FROM and WHERE is not "
                           "supported",
-                          kind == JoinKind::kSemi ? "EXISTS" : "NOT EXISTS"));
+                          kind == JoinKind::kAnti ? "NOT EXISTS" : "EXISTS"));
   }
 }
 
@@ -1336,6 +1339,7 @@ TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery)
                      .right = CorrelatedBlockOver(
                          FourFieldsRows(11, inner),
                          {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50),
+                     .mark = kind == JoinKind::kMark ? ColumnId{90} : kNoColumnId,
                      .span = {}})),
                  BindOptions{.build_side_ratio = ratio});
     EXPECT_TRUE(plan.ok()) << plan.status().ToString();
@@ -1361,24 +1365,31 @@ TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery)
   EXPECT_EQ(side(JoinKind::kAnti, 41, 400), BuildSide::kLeft);
   EXPECT_EQ(side(JoinKind::kAnti, 4000, kBuildSideRatio), BuildSide::kLeft);
   EXPECT_EQ(side(JoinKind::kAnti, 1, kBuildSideRatio), BuildSide::kRight);
-  // A null-aware anti join never reaches this rule at all: the pass admits only semi, anti and
-  // one-row kinds and refuses a correlated NOT IN outright, so where it still may not build on its
-  // left input is HashJoinOperator::Make (exec.HashJoinTest.MisuseIsInvalid).
+  // A mark never moves (ADR 0041's decision 13): it marks every outer row, so it probes them.
+  EXPECT_EQ(side(JoinKind::kMark, 4000, kBuildSideRatio), BuildSide::kRight);
+  EXPECT_EQ(side(JoinKind::kMark, 11, 100), BuildSide::kRight);
+  // A null-aware anti join never reaches this rule at all: the pass admits only semi, anti, mark
+  // and one-row kinds and refuses a correlated NOT IN outright, so where it still may not build on
+  // its left input is HashJoinOperator::Make (exec.HashJoinTest.MisuseIsInvalid).
 }
 
-// The pull-up: the block's conjunct becomes the join's key, the dependent join becomes a semi or
-// anti join building on the subquery, and the block's own nodes below the filter are kept.
+// The pull-up: the block's conjunct becomes the join's key, the dependent join becomes a semi,
+// anti or mark join building on the subquery, and the block's own nodes below the filter are kept.
+// A mark keeps its id.
 TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
-  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kMark}) {
+    const ColumnId mark = kind == JoinKind::kMark ? ColumnId{90} : kNoColumnId;
     // t11.i32 = t1.i32: one type on both sides, so the key needs no cast.
     const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
         .kind = kind,
         .left = FourFields(1),
         .right = CorrelatedBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq)}, 50),
+        .mark = mark,
         .span = {}})));
     const auto* join = std::get_if<JoinNode>(plan.root.get());
     ASSERT_NE(join, nullptr) << Explain(plan);
     EXPECT_EQ(join->kind, kind);
+    EXPECT_EQ(join->mark, mark);
     EXPECT_EQ(join->build, BuildSide::kRight) << "the subquery builds (ADR 0022)";
     ASSERT_EQ(join->keys.size(), 1U) << Explain(plan);
     EXPECT_EQ(join->keys[0].left.id, FieldOf(1, 1).id) << "the outer side";
@@ -1394,7 +1405,7 @@ TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
 // column is NULL has the inner rows whose column is NULL. Next to an `=` correlation each key keeps
 // its own comparison; IS DISTINCT FROM is a residual.
 TEST(OptimizerTest, Path1KeysANullEqualCorrelationNullEqual) {
-  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kMark}) {
     const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
         .kind = kind,
         .left = FourFields(1),
@@ -1403,6 +1414,7 @@ TEST(OptimizerTest, Path1KeysANullEqualCorrelationNullEqual) {
              Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kEq),
              Compare(FieldOf(11, 0), FieldOf(1, 0), CompareOp::kEq, Predicate::Kind::kIsDistinct)},
             50),
+        .mark = kind == JoinKind::kMark ? ColumnId{90} : kNoColumnId,
         .span = {}})));
     const auto* join = std::get_if<JoinNode>(plan.root.get());
     ASSERT_NE(join, nullptr) << Explain(plan);
@@ -1453,19 +1465,21 @@ TEST(OptimizerTest, Path1CastsAKeyOfTwoTypes) {
   EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
 }
 
-// An outer-only conjunct is a residual, in both polarities. For an anti join that is required:
+// An outer-only conjunct is a residual, in every polarity. For an anti join that is required:
 // where the conjunct is false or NULL the subquery has no row, so NOT EXISTS must keep the outer
-// row, which a filter on the outer rows would drop. For a semi join a residual gives the same
-// answer as the filter ADR 0023 suggests, and keeps the join's output columns, which a computed
-// probe-side column would widen.
+// row, which a filter on the outer rows would drop; a mark (ADR 0041's SQ8) must keep that row too,
+// marked FALSE. For a semi join a residual gives the same answer as the filter ADR 0023 suggests,
+// and keeps the join's output columns, which a computed probe-side column would widen.
 TEST(OptimizerTest, Path1MakesAnOuterOnlyConjunctAResidual) {
-  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti, JoinKind::kMark}) {
+    const bool mark = kind == JoinKind::kMark;
     const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
         .kind = kind,
         .left = FourFields(1),
         .right = CorrelatedBlock({Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kEq),
                                   Compare(FieldOf(1, 2), FieldOf(1, 3), CompareOp::kLt)},
                                  50),
+        .mark = mark ? ColumnId{90} : kNoColumnId,
         .span = {}})));
     const auto* join = std::get_if<JoinNode>(plan.root.get());
     ASSERT_NE(join, nullptr) << Explain(plan);
@@ -1474,24 +1488,29 @@ TEST(OptimizerTest, Path1MakesAnOuterOnlyConjunctAResidual) {
     EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->left))
         << "no filter and no compute on the outer side: " << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
-    // The pass keeps the plan's output columns, which a probe-side computed column would widen.
-    EXPECT_EQ(OutputIds(*plan.root).size(), 4U) << Explain(plan);
+    // The pass keeps the plan's output columns, which a probe-side computed column would widen: a
+    // mark's are the outer ones and the mark.
+    EXPECT_EQ(OutputIds(*plan.root).size(), mark ? 5U : 4U) << Explain(plan);
   }
 }
 
-// Without a key the pass refuses: the hash table and the candidate pairs need one (ADR 0023).
+// Without a key the pass refuses: the hash table and the candidate pairs need one (ADR 0023). A
+// mark is refused in the same words (keyless marks are SQ11's).
 TEST(OptimizerTest, Path1RefusesABlockWithoutAKey) {
-  const auto status =
-      Optimize(PlanOver(Node(DependentJoinNode{
-                   .kind = JoinKind::kSemi,
-                   .left = FourFields(1),
-                   .right = CorrelatedBlock(
-                       {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 50),
-                   .span = {}})))
-          .status();
-  ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
-  EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_EQ(status.message(), "a correlated EXISTS without a key is not supported");
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kMark}) {
+    const auto status =
+        Optimize(PlanOver(Node(DependentJoinNode{
+                     .kind = kind,
+                     .left = FourFields(1),
+                     .right = CorrelatedBlock(
+                         {Compare(FieldOf(11, 1), FieldOf(1, 1), CompareOp::kLt)}, 50),
+                     .mark = kind == JoinKind::kMark ? ColumnId{90} : kNoColumnId,
+                     .span = {}})))
+            .status();
+    ASSERT_NE(GetSqlError(status), nullptr) << status.ToString();
+    EXPECT_EQ(GetSqlError(status)->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_EQ(status.message(), "a correlated EXISTS without a key is not supported");
+  }
 }
 
 // ---- ADR 0023's Path 2 (roadmap id U3) ----

@@ -63,7 +63,7 @@ jobs:
             echo "a maintainer reviews the diff, approves and squash-merges."
           } >>"$body"
       # Not `gh pr create`: the action signs the commit through the API and reuses, updates or closes one PR branch.
-      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1 # zizmor: ignore[superfluous-actions]
+      - uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.1 # zizmor: ignore[superfluous-actions]
         with:
           token: ${{ steps.app-token.outputs.token }}
           branch: bot/pixi-lock-update

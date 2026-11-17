@@ -1,0 +1,9 @@
+Output: ct_id:SMALLINT
+Project ct_id
+  Sort ct_id ASC NULLS LAST
+    Filter "((c.ct_id = 1) OR EXISTS (SELECT 1 FROM riders AS ""r"" WHERE r.rd_city = c.ct_id AND r.rd_id < 5))"
+      Compute ((c.ct_id = 1) OR EXISTS (SELECT 1 FROM riders AS "r" WHERE r.rd_city = c.ct_id AND r.rd_id < 5))
+        Join MARK build=right keys=["c.ct_id" = "r.rd_city"]
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+          Filter rd_id < 5
+            Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id, rd_city]

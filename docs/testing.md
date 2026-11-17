@@ -237,6 +237,12 @@ wrong answers, not divergences: antb1 answers them right, or refuses them (exit 
   `d / CAST(-(0) AS DOUBLE)`): DuckDB's elimination of common subexpressions computes them once, as one expression, so
   the second column repeats the first (with `SET disabled_optimizers = 'common_subexpressions'` it answers right);
   `tests/slt/cases/types/casts.slt` writes them in two records.
+- **A correlated `EXISTS` under `OR`, `NOT` or `CASE` whose residual is `<>` against an outer column that is NULL**
+  (`CASE WHEN EXISTS (SELECT * FROM zones WHERE zones.zn_id = trips.tr_pickup AND zones.zn_id <> trips.tr_driver)`):
+  `zn_id <> NULL` is NULL, so the trip has no match and its mark is FALSE, but DuckDB's mark join takes it for TRUE;
+  its semi join, the same block as a top-level `EXISTS`, answers right, and so do `=`, `<`, `<=`, `>` and `>=`. No
+  record of `tests/slt/cases/subqueries/exists_marks.slt` has that shape, and SQ8a's `correlated_exists_mark` writes
+  no `<>` residual.
 
 A self-check that needs no DuckDB covers the correlated shapes above in antb1 from ADR 0041's SQ4a on (its decision
 28): for each binding of a small outer table, a correlated subquery's value equals the uncorrelated subquery with the
@@ -258,7 +264,12 @@ order and an aggregate argument's sum (`correlated_{item,order_by,argument}_*_is
 item, a `GROUP BY` key's groups and an aggregate argument to a `LEFT JOIN` of the inner groups
 (`correlated_{item,key,argument}_equals_a_left_join_of_its_groups_*`, NULL-equal keys included), and a value in the
 slot's tail to the same value read by `WHERE` and to a derived table's item
-(`correlated_item_in_the_tail_changes_no_answer`). A null-aware mark (ADR 0041's SQ7a) is
+(`correlated_item_in_the_tail_changes_no_answer`). SQ8a holds a correlated `EXISTS`'s mark to the semi and anti joins
+of the same block: a `CASE` over it splits the rows as they do (`exists_mark_in_case_is_its_semi_and_anti_joins_*`),
+it is never NULL (`exists_mark_or_its_negation_keeps_every_row_*`), two `NOT`s over it are the semi join and under
+`OR` it is the union of its branches; `E1 AND (E2 OR E3)` distributes (`exists_marks_beside_a_semi_join_distribute`),
+and an item's mark, an `ORDER BY`'s order and an aggregate argument's sum are their bindings written as literals
+(`exists_mark_{item,order_by,argument}_is_its_bindings_as_literals`). A null-aware mark (ADR 0041's SQ7a) is
 checked against operators that existed before it too: `in_mark_is_its_three_valued_composition_*` classifies each row
 as TRUE, FALSE or NULL from a `LEFT JOIN` to the set's distinct values and a `CROSS JOIN` to its row and NULL counts,
 over sets with a NULL, without one, of NULLs alone and empty. SQ7b's forms are held to the same composition

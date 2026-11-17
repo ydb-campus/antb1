@@ -455,6 +455,8 @@ std::string_view ToString(JoinKind kind) {
       return "FULL";
     case JoinKind::kNullAwareMark:
       return "NULL-AWARE MARK";
+    case JoinKind::kMark:
+      return "MARK";
   }
   return "?";
 }
@@ -1317,16 +1319,21 @@ class Resolver {
       case JoinKind::kSemi:
       case JoinKind::kAnti:
       case JoinKind::kOneRow:
+      case JoinKind::kMark:
         break;
       case JoinKind::kInner:
       case JoinKind::kLeft:
       case JoinKind::kNullAwareAnti:
       case JoinKind::kFull:
       case JoinKind::kNullAwareMark:
-        // Only the three kinds the binder plans (ADR 0023): a correlation is a predicate of the
-        // right input, so there is nothing for the other kinds to match on.
+        // Only the four kinds the binder plans (ADR 0023, ADR 0041's SQ8): a correlation is a
+        // predicate of the right input, so there is nothing for the other kinds to match on.
         Fail(std::format("DependentJoin: a {} dependent join", ToString(join.kind)));
         break;
+    }
+    if ((join.mark != kNoColumnId) != Traits(join.kind).appends_mark) {
+      Fail(std::format("DependentJoin: {} dependent join {} a mark", ToString(join.kind),
+                       Traits(join.kind).appends_mark ? "without" : "with"));
     }
     Resolved left = Walk(join.left);
     // The left input's columns are the right input's free variables, bound for that subtree only:

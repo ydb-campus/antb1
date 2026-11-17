@@ -1,0 +1,3005 @@
+# Correlated EXISTS as a two-valued mark (ADR 0041's SQ8a) over the star schema: TRUE where its block has a row that
+# passes its keys and its other conjuncts, else FALSE, never NULL. Under OR, NOT and CASE in WHERE and in inner ONs; in
+# select items, ORDER BY, GROUP BY keys and aggregate arguments; its residuals and keys (NULL-equal ones, NULL outer
+# and inner keys, empty and all-NULL inner sides); a top-level EXISTS beside an OR of two more; one EXISTS as a semi
+# join, an anti join and a mark (the memo and the order); marks nested in other blocks; the shapes of a mark's block;
+# the divergences a mark takes part in (D16, D23, D35); and the boundaries SQ8a keeps. Before SQ8a every record that
+# a mark answers exited 4 with "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an inner ON".
+
+# ---- the inputs, one table at a time ----
+
+# 80 riders per tier, 78 distinct keys in each. DuckDB: (basic, 80, 78, 9400), (gold, 80, 78, 9720), (plus, 80, 78,
+# 9560).
+query TIII nosort
+SELECT rd_tier, COUNT(*), COUNT(DISTINCT rd_id), SUM(rd_row) FROM riders GROUP BY rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	BIGINT	HUGEINT
+basic	80	78	9400
+gold	80	78	9720
+plus	80	78	9560
+
+# The calendar: 52 weeks a year. DuckDB: (2026, 364, 1, 52), (2027, 364, 53, 104), (2028, 364, 105, 156), (2029, 364,
+# 157, 208).
+query IIII nosort
+SELECT dy_year, COUNT(*), MIN(dy_week), MAX(dy_week) FROM days GROUP BY dy_year ORDER BY 1
+----
+SMALLINT	BIGINT	INTEGER	INTEGER
+2026	364	1	52
+2027	364	53	104
+2028	364	105	156
+2029	364	157	208
+
+# The trips fall in weeks 9 to 14 of 2026, the bookings in 2027 and 2028. DuckDB: (3000, 2869, 243, 2026-03-01,
+# 2026-03-31); (1800, 1721, 236, 2026-12-28, 2028-12-24).
+query IIITT nosort
+SELECT COUNT(*), COUNT(tr_rider), COUNT(DISTINCT tr_rider), MIN(tr_day), MAX(tr_day) FROM trips
+----
+BIGINT	BIGINT	BIGINT	DATE	DATE
+3000	2869	243	2026-03-01	2026-03-31
+
+query IIITT nosort
+SELECT COUNT(*), COUNT(bk_rider), COUNT(DISTINCT bk_rider), MIN(bk_day), MAX(bk_day) FROM bookings
+----
+BIGINT	BIGINT	BIGINT	DATE	DATE
+1800	1721	236	2026-12-28	2028-12-24
+
+# The NIGHT trips. DuckDB: (284, 119, 274).
+query III nosort
+SELECT COUNT(*), COUNT(DISTINCT tr_rider), COUNT(tr_fare) FROM trips WHERE tr_tariff = 'NIGHT'
+----
+BIGINT	BIGINT	BIGINT
+284	119	274
+
+# ---- a correlated EXISTS under OR in WHERE (ADR 0041's SQ8a) ----
+
+# E OR p: cities 1 to 3 have riders, 4 to 6 none. DuckDB: 1, 2, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_id = 6
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+# p OR E, the key written outer = inner: drivers in cities 1 to 4. DuckDB: 1 to 5.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 5 OR EXISTS (SELECT * FROM drivers d WHERE c.ct_id = d.dv_city)
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+# NOT E under OR, with unqualified names. DuckDB: 1, 4, 5, 6.
+query I nosort
+SELECT ct_id FROM cities WHERE NOT EXISTS (SELECT * FROM riders WHERE rd_city = ct_id) OR ct_id = 1 ORDER BY 1
+----
+SMALLINT
+1
+4
+5
+6
+
+# The other branch is NULL for city 4 (ct_pop): FALSE OR NULL drops the city (no riders), TRUE OR NULL keeps it
+# (drivers). DuckDB: 1, 2, 3, 6; then 1, 2, 3, 4, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_pop < 5000
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) OR c.ct_pop < 5000
+ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+6
+
+# Over 3000 trips: each trip counts once, although riders 47 and 167 have two gold rows each, and the 60 trips over
+# 27 pass both ways. DuckDB: 950 trips (row sum 1418377); 2110 trips (row sum 3168226).
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_id = t.tr_rider AND r.rd_tier = 'gold') OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+950	1418377
+
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_id = t.tr_rider AND r.rd_tier = 'gold') OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+2110	3168226
+
+# Two marks under one OR, one block selecting a column: basic riders in cities 1 and 2, drivers who started after
+# 2025-12-07 in cities 2 to 4. DuckDB: 1, 2, 3, 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'basic')
+OR EXISTS (SELECT d.dv_id FROM drivers d WHERE d.dv_city = c.ct_id AND d.dv_since > DATE '2025-12-07') ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+
+# Three under one OR, the third a NOT EXISTS over the trips of the zone itself. DuckDB: 33 zones, 1 to 37.
+query III nosort
+SELECT COUNT(*), MIN(z.zn_id), MAX(z.zn_id) FROM zones z
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city AND r.rd_tier = 'gold')
+OR EXISTS (SELECT * FROM drivers d WHERE d.dv_city = z.zn_city AND d.dv_since < DATE '2025-01-09')
+OR NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27)
+----
+BIGINT	INTEGER	INTEGER
+33	1	37
+
+# AND branches with nothing in common, so no semi join can be pulled out of the OR. DuckDB: 1, 2, 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) AND c.ct_pop > 40000)
+OR (EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) AND c.ct_id > 3) ORDER BY 1
+----
+SMALLINT
+1
+2
+4
+
+# One block in both branches, once under NOT: neither branch holds for city 4 (NULL ct_pop). DuckDB: 3, 5.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) AND c.ct_pop < 40000)
+OR (NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) AND c.ct_pop > 5000) ORDER BY 1
+----
+SMALLINT
+3
+5
+
+# A top-level EXISTS conjunct (a semi join) beside a mark in another conjunct. DuckDB: 1, 4.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id)
+AND (NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_id = 1) ORDER BY 1
+----
+SMALLINT
+1
+4
+
+# Beside an uncorrelated EXISTS (SQ4a), an uncorrelated IN mark (SQ7a) and a correlated value (SQ5a) under the same
+# OR. DuckDB: 1, 2, 3; 2, 3, 5; 2 to 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM promos) OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+OR c.ct_id IN (SELECT zn_city FROM zones WHERE zn_id > 38) ORDER BY 1
+----
+SMALLINT
+2
+3
+5
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)
+OR (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) < 23 ORDER BY 1
+----
+SMALLINT
+2
+3
+4
+5
+6
+
+# The WHERE of a block that groups. DuckDB: (2, 77), (3, 78), (NULL, 2).
+query II nosort
+SELECT r.rd_city, COUNT(*) FROM riders r
+WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city AND d.dv_since > DATE '2025-12-20')
+OR r.rd_tier = 'gold' GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+2	77
+3	78
+NULL	2
+
+# A mark in the WHERE of a correlated EXISTS block that is itself a semi join: zones 22 and 33 have no trip under
+# 4.5, zone 40 is in city 5. DuckDB: 2, 3, 5.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND (NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare < 4.5) OR z.zn_id > 38)) ORDER BY 1
+----
+SMALLINT
+2
+3
+5
+
+# A join inside the EXISTS block. DuckDB: 1, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM riders r JOIN trips t ON t.tr_rider = r.rd_id
+WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus' AND t.tr_fare > 27) OR c.ct_id = 6 ORDER BY 1
+----
+SMALLINT
+1
+3
+6
+
+# A join outside: the keys come from two FROM items of the enclosing block, one of them BIGINT = INTEGER. DuckDB: 463
+# trips (row sum 693259).
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t JOIN zones z ON z.zn_id = t.tr_pickup
+WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_id = t.tr_driver AND d.dv_city = z.zn_city) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+463	693259
+
+# ---- a correlated EXISTS under NOT in WHERE (ADR 0041's SQ8a) ----
+
+# NOT (p OR E). DuckDB: 4, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT (c.ct_id = 1 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id))
+ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT (E AND p): city 4 has drivers and a NULL ct_pop, so NOT (TRUE AND NULL) drops it. DuckDB: 3, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT (EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) AND c.ct_pop > 40000) ORDER BY 1
+----
+SMALLINT
+3
+5
+6
+
+# NOT (NOT E OR p). DuckDB: 3.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT (NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) OR c.ct_pop > 40000) ORDER BY 1
+----
+SMALLINT
+3
+
+# NOT over an OR of two marks: the zones of cities 5 and 9, and zone 38 without a city. DuckDB: 5, 10, 15, 20, 25,
+# 30, 35, 38, 39, 40.
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT (EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city)
+OR EXISTS (SELECT * FROM drivers d WHERE d.dv_city = z.zn_city)) ORDER BY 1
+----
+INTEGER
+5
+10
+15
+20
+25
+30
+35
+38
+39
+40
+
+# NOT NOT E as a whole conjunct, and NOT NOT over NOT E beside another conjunct. DuckDB: 1, 2, 3; 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT (NOT (NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id))) AND c.ct_id > 1 ORDER BY 1
+----
+SMALLINT
+5
+6
+
+# ---- a correlated EXISTS in CASE, COALESCE and IN lists in WHERE (ADR 0041's SQ8a) ----
+
+# CASE WHEN E compared with a constant. DuckDB: 4, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1 ELSE 0 END = 0 ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# CASE WHEN NOT E whose THEN reads the outer row. DuckDB: 5.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN c.ct_pop ELSE 0 END > 5000
+ORDER BY 1
+----
+SMALLINT
+5
+
+# The mark in a second WHEN, after one that reads the outer row. DuckDB: 1, 2, 3, 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN c.ct_pop IS NULL THEN 2 WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1
+ELSE 0 END > 0 ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+
+# Two-valued: WHEN E and WHEN NOT E cover every row, NULL keys too, so ELSE 2 never wins. DuckDB: the 8 riders
+# without a city (14, 43, 72, 101, 130, 159, 188, 217).
+query I nosort
+SELECT r.rd_id FROM riders r
+WHERE CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city) THEN 1
+WHEN NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city) THEN 0 ELSE 2 END = 0 ORDER BY 1
+----
+BIGINT
+14
+43
+72
+101
+130
+159
+188
+217
+
+# A nested CASE, the inner block selecting a constant. DuckDB: 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id)
+THEN CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) THEN 2 ELSE 1 END ELSE 0 END = 1 ORDER BY 1
+----
+SMALLINT
+4
+
+# Under COALESCE: the CASE is NULL where E is FALSE and for city 4's NULL ct_pop; then the mark fills city 4's NULL.
+# DuckDB: 1, 2, 4, 5, 6; 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE COALESCE(CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN c.ct_pop END, 50000) > 40000
+ORDER BY 1
+----
+SMALLINT
+1
+2
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE COALESCE(c.ct_pop, CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN 1 ELSE 0 END) = 1
+ORDER BY 1
+----
+SMALLINT
+4
+
+# As an IN list value, and in the probe of a NOT IN list. DuckDB: 1, 2, 6; 14 zones of cities 3 and 4 (sum 259).
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id IN (2, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1 ELSE 6 END) ORDER BY 1
+----
+SMALLINT
+1
+2
+6
+
+query II nosort
+SELECT COUNT(*), SUM(z.zn_id) FROM zones z
+WHERE CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = z.zn_city) THEN z.zn_city ELSE 0 END NOT IN (0, 1, 2)
+----
+BIGINT	HUGEINT
+14	259
+
+# ---- residuals of a correlated EXISTS mark in WHERE (ADR 0041's SQ8a) ----
+
+# A residual that compares the two blocks: a driver of the city who started after the rider joined. DuckDB: 184
+# riders, 1 to 236; 60 riders, 1 to 240.
+query III nosort
+SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id) FROM riders r
+WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city AND d.dv_since > r.rd_joined) OR r.rd_id < 5
+----
+BIGINT	BIGINT	BIGINT
+184	1	236
+
+query III nosort
+SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id) FROM riders r
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city AND d.dv_since > r.rd_joined) OR r.rd_id < 5
+----
+BIGINT	BIGINT	BIGINT
+60	1	240
+
+# DECIMALs compared across VARCHAR keys (NULL, '' and a trailing space among them). DuckDB: 962 trips (row sum
+# 1439722).
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE EXISTS (SELECT * FROM tariffs f WHERE f.tf_code = t.tr_tariff AND f.tf_rate > t.tr_rate) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+962	1439722
+
+# A residual over the same table: no other trip of the driver has a higher fare. DuckDB: 301 trips (row sum 443020).
+query II nosort
+SELECT COUNT(*), SUM(a.tr_row) FROM trips a
+WHERE NOT EXISTS (SELECT * FROM trips b WHERE b.tr_driver = a.tr_driver AND b.tr_fare > a.tr_fare) OR a.tr_row < 3
+----
+BIGINT	HUGEINT
+301	443020
+
+# A residual that reads the outer row only: NULL for city 4, so no driver passes it there and NOT EXISTS keeps city
+# 4. DuckDB: 1, 2, 6; 1, 3, 4, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND c.ct_pop > 40000) OR c.ct_id = 6 ORDER BY 1
+----
+SMALLINT
+1
+2
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND c.ct_pop > 40000) OR c.ct_id = 1 ORDER BY 1
+----
+SMALLINT
+1
+3
+4
+5
+6
+
+# An outer-only residual that holds for the NULL alone. DuckDB: 1, 4.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND c.ct_pop IS NULL) OR c.ct_id = 1 ORDER BY 1
+----
+SMALLINT
+1
+4
+
+# The two-valued CASE over the outer-only residual: city 4 is 0, not 2. DuckDB: 3, 4, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND c.ct_pop > 40000) THEN 1
+WHEN NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND c.ct_pop > 40000) THEN 0 ELSE 2 END = 0
+ORDER BY 1
+----
+SMALLINT
+3
+4
+5
+6
+
+# A residual that reads the inner block only. DuckDB: 1, 5; 1, 2, 4, 5, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus'
+AND r.rd_joined > DATE '2026-03-15') OR c.ct_id = 5 ORDER BY 1
+----
+SMALLINT
+1
+5
+
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR c.ct_id = 2 ORDER BY 1
+----
+SMALLINT
+1
+2
+4
+5
+6
+
+# A residual that is an OR of a two-sided and an outer-only comparison. DuckDB: 43 riders, 14 to 240.
+query III nosort
+SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id) FROM riders r
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city
+AND (d.dv_since > r.rd_joined OR r.rd_tier = 'gold')) OR r.rd_id > 238
+----
+BIGINT	BIGINT	BIGINT
+43	14	240
+
+# A residual whose inner-only arithmetic overflows on the rows the key matches: both engines fail.
+# DuckDB: Overflow in multiplication of INT32.
+statement error Overflow in multiplication
+SELECT COUNT(*) FROM edge a
+WHERE EXISTS (SELECT * FROM edge b WHERE b.id = a.id AND b.i32 * b.i32 > 0) OR a.id = 5
+
+# ---- keys of a correlated EXISTS mark in WHERE (ADR 0041's SQ8a) ----
+
+# IS NOT DISTINCT FROM: zone 38's NULL city meets the riders without a city; = does not. DuckDB: 31, 32, 33, 36, 37,
+# 38, 40; the same without 38.
+query I nosort
+SELECT z.zn_id FROM zones z
+WHERE z.zn_id > 30 AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM z.zn_city) OR z.zn_id = 40)
+ORDER BY 1
+----
+INTEGER
+31
+32
+33
+36
+37
+38
+40
+
+query I nosort
+SELECT z.zn_id FROM zones z
+WHERE z.zn_id > 30 AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city) OR z.zn_id = 40) ORDER BY 1
+----
+INTEGER
+31
+32
+33
+36
+37
+40
+
+# NOT EXISTS over IS NOT DISTINCT FROM: zone 38 meets the drivers without a city, so it is not kept. DuckDB: 1, 5, 10,
+# 15, 20, 25, 30, 35, 39, 40.
+query I nosort
+SELECT z.zn_id FROM zones z
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM z.zn_city) OR z.zn_id = 1 ORDER BY 1
+----
+INTEGER
+1
+5
+10
+15
+20
+25
+30
+35
+39
+40
+
+# An = key and an IS NOT DISTINCT FROM key: 4 trips without a day meet a shift without one. Then two = keys.
+# DuckDB: 501 trips (row sum 746214); 2562 trips (row sum 3840671).
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE EXISTS (SELECT * FROM shifts s WHERE s.sh_driver = t.tr_driver AND s.sh_day IS NOT DISTINCT FROM t.tr_day)
+OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+501	746214
+
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE NOT EXISTS (SELECT * FROM shifts s WHERE s.sh_driver = t.tr_driver AND s.sh_day = t.tr_day) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+2562	3840671
+
+# NULL outer keys: a rider without a city meets no driver through =, so NOT EXISTS keeps it; through IS NOT DISTINCT
+# FROM it meets the drivers without a city. DuckDB: 1, 2 and the 8 riders without a city; 1, 2.
+query I nosort
+SELECT r.rd_id FROM riders r
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city) OR r.rd_id < 3 ORDER BY 1
+----
+BIGINT
+1
+2
+14
+43
+72
+101
+130
+159
+188
+217
+
+query I nosort
+SELECT r.rd_id FROM riders r
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city) OR r.rd_id < 3 ORDER BY 1
+----
+BIGINT
+1
+2
+
+# NULL inner keys: the 131 trips without a rider meet no rider, and the driver without an id meets no trip (a BIGINT
+# key against an INTEGER one). DuckDB: 1, 2, 237, 238, 239, 240; 475 trips (row sum 708360).
+query I nosort
+SELECT r.rd_id FROM riders r
+WHERE NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id) OR r.rd_id < 3 ORDER BY 1
+----
+BIGINT
+1
+2
+237
+238
+239
+240
+
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_id = t.tr_driver) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+475	708360
+
+# An empty inner table. DuckDB: the 60 trips over 27 (row sum 88103); all 3000 trips.
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE EXISTS (SELECT * FROM promos p WHERE p.pm_id = t.tr_promo) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+60	88103
+
+query II nosort
+SELECT COUNT(*), SUM(t.tr_row) FROM trips t
+WHERE NOT EXISTS (SELECT * FROM promos p WHERE p.pm_id = t.tr_promo) OR t.tr_fare > 27
+----
+BIGINT	HUGEINT
+3000	4498500
+
+# An inner whose keys are all NULL: = meets nothing, IS NOT DISTINCT FROM zone 38 alone. DuckDB: 1; 1, 38.
+query I nosort
+SELECT z.zn_id FROM zones z
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city AND r.rd_city IS NULL) OR z.zn_id = 1 ORDER BY 1
+----
+INTEGER
+1
+
+query I nosort
+SELECT z.zn_id FROM zones z
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM z.zn_city AND r.rd_city IS NULL)
+OR z.zn_id = 1 ORDER BY 1
+----
+INTEGER
+1
+38
+
+# Duplicates in the inner: up to 9 trips over 26 a rider, 35 riders with more than one, each rider once.
+# DuckDB: 143 riders, 3 to 236.
+query III nosort
+SELECT COUNT(*), MIN(r.rd_id), MAX(r.rd_id) FROM riders r
+WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_fare > 26) OR r.rd_city IS NULL
+----
+BIGINT	BIGINT	BIGINT
+143	3	236
+
+# Duplicates in the outer: riders 7 and 47 have two rows each, and each row comes out. DuckDB: (7, 1), (7, 2),
+# (47, 2), (47, 3), (237, 3), (238, 1), (239, 2), (240, 3).
+query II nosort
+SELECT r.rd_id, r.rd_city FROM riders r
+WHERE NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id) OR r.rd_id IN (7, 47) ORDER BY 1, 2
+----
+BIGINT	SMALLINT
+7	1
+7	2
+47	2
+47	3
+237	3
+238	1
+239	2
+240	3
+
+# ---- marks in an inner ON (ADR 0041's SQ8a) ----
+
+# A mark under OR in an inner ON, correlated to the left input: cities 2 and 3 have a gold rider and join all their
+# zones, cities 1, 4 and 5 their zones below 10 only. DuckDB: (1, 2, 1, 6), (2, 8, 2, 37), (3, 7, 3, 33),
+# (4, 2, 4, 9), (5, 1, 5, 5).
+query IIII nosort
+SELECT c.ct_id, COUNT(*) AS n, MIN(z.zn_id) AS lo, MAX(z.zn_id) AS hi
+FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR z.zn_id < 10)
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT	INTEGER	INTEGER
+1	2	1	6
+2	8	2	37
+3	7	3	33
+4	2	4	9
+5	1	5	5
+
+# Correlated to the right input, NOT EXISTS: the zones without a pickup above 27, and every zone of city 5.
+# DuckDB: (1, 31), (3, 8), (4, 9), (4, 19) and city 5's eight zones, 5 to 40.
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) OR c.ct_id = 5) ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	31
+3	8
+4	9
+4	19
+5	5
+5	10
+5	15
+5	20
+5	25
+5	30
+5	35
+5	40
+
+# Keyed on the right input, with a residual that reads the left one. DuckDB: (1, 8), (2, 8), (3, 6), (4, 5), (5, 5).
+query II nosort
+SELECT c.ct_id, COUNT(*) AS n FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 26 + c.ct_id * 0.25) OR z.zn_id > 35)
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	6
+4	5
+5	5
+
+# Keyed on both inputs: the driver from the left one, the day from the right one. DuckDB: (695, 680).
+query II nosort
+SELECT COUNT(*) AS n, COUNT(t.tr_fare) AS f FROM trips t JOIN days d ON d.dy_day = t.tr_day
+AND (EXISTS (SELECT * FROM shifts s WHERE s.sh_driver = t.tr_driver AND s.sh_day = d.dy_day) OR t.tr_fare > 25)
+----
+BIGINT	BIGINT
+695	680
+
+# NOT over an AND that holds the mark: cities 1 and 3 have a plus rider and keep their zones up to 5 only.
+# DuckDB: (25, 1, 40).
+query III nosort
+SELECT COUNT(*) AS n, MIN(z.zn_id) AS lo, MAX(z.zn_id) AS hi FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND NOT (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') AND z.zn_id > 5)
+----
+BIGINT	INTEGER	INTEGER
+25	1	40
+
+# A CASE in an ON: cities with drivers keep their odd zones, city 5 all of its zones. DuckDB: (1, 4), (2, 4), (3, 4),
+# (4, 3), (5, 8).
+query II nosort
+SELECT c.ct_id, COUNT(*) AS n FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN z.zn_id % 2 ELSE 1 END = 1
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+1	4
+2	4
+3	4
+4	3
+5	8
+
+# Two marks under one OR, correlated to different inputs. DuckDB: (1, 2), (2, 8), (3, 7), (5, 2).
+query II nosort
+SELECT c.ct_id, COUNT(*) AS n FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27 AND t.tr_dropoff < 5))
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+1	2
+2	8
+3	7
+5	2
+
+# The later ON of three tables, keyed on the first table and on its own right input: a rider's trip from the zone.
+# DuckDB: (287, 193, 23).
+query III nosort
+SELECT COUNT(*) AS n, COUNT(DISTINCT r.rd_row) AS rs, COUNT(DISTINCT z.zn_id) AS zs
+FROM riders r JOIN cities c ON c.ct_id = r.rd_city JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_pickup = z.zn_id AND t.tr_fare > 20)
+OR z.zn_id < 3)
+----
+BIGINT	BIGINT	BIGINT
+287	193	23
+
+# A self join, keyed on both copies: a trip from the child zone to its parent. DuckDB: (1, 6), (2, 7), (3, 7), (4, 7),
+# (5, 6).
+query II nosort
+SELECT z1.zn_id, COUNT(*) AS n FROM zones z1 JOIN zones z2 ON z2.zn_parent = z1.zn_id
+AND (EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z2.zn_id AND t.tr_dropoff = z1.zn_id) OR z2.zn_id > 35)
+GROUP BY z1.zn_id ORDER BY 1
+----
+INTEGER	BIGINT
+1	6
+2	7
+3	7
+4	7
+5	6
+
+# A NULL-equal key: zone 38 has no city and matches driver 10, who has none either. DuckDB: (36, 2), (37, 2),
+# (38, 69), (39, 2), (40, 1).
+query II nosort
+SELECT z.zn_id, COUNT(*) AS n FROM zones z JOIN trips t ON t.tr_pickup = z.zn_id
+AND (EXISTS (SELECT * FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM z.zn_city AND d.dv_row = 10)
+OR t.tr_fare > 27) WHERE z.zn_id > 35 GROUP BY z.zn_id ORDER BY 1
+----
+INTEGER	BIGINT
+36	2
+37	2
+38	69
+39	2
+40	1
+
+# An empty inner table: EXISTS is false and NOT EXISTS true for every row, also where the key is NULL.
+# DuckDB: (59, 1, 10).
+query III nosort
+SELECT COUNT(*) AS n, COUNT(t.tr_promo) AS p, MIN(t.tr_row) AS lo FROM zones z JOIN trips t ON t.tr_pickup = z.zn_id
+AND (EXISTS (SELECT * FROM promos p WHERE p.pm_id = t.tr_promo) OR t.tr_fare > 27)
+----
+BIGINT	BIGINT	INTEGER
+59	1	10
+
+# DuckDB: (2793, 55).
+query II nosort
+SELECT COUNT(*) AS n, COUNT(t.tr_promo) AS p FROM zones z JOIN trips t ON t.tr_pickup = z.zn_id
+AND (NOT EXISTS (SELECT * FROM promos p WHERE p.pm_id = t.tr_promo) OR t.tr_fare > 27)
+----
+BIGINT	BIGINT
+2793	55
+
+# The ON of a join that a LEFT JOIN follows: fleet has rows for zones 1 to 3 only. DuckDB: (1, 2, 2), (2, 2, 2),
+# (3, 1, 1), (5, 1, 0).
+query III nosort
+SELECT c.ct_id, COUNT(*) AS n, COUNT(d.dv_row) AS ds FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM fleet f WHERE f.fl_zone = z.zn_id AND f.fl_available > 47) OR z.zn_id > 36)
+LEFT JOIN drivers d ON d.dv_city = c.ct_id AND d.dv_row > 90 GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT	BIGINT
+1	2	2
+2	2	2
+3	1	1
+5	1	0
+
+# An ON in a comma list whose mark reads a comma sibling before its join group: zn_id is zones'. Zones 1 to 3 keep
+# all 89 drivers with a city, the other 37 zones drivers 0 to 2. DuckDB: (378, 40).
+query II nosort
+SELECT COUNT(*) AS n, COUNT(DISTINCT a.zn_id) AS zs FROM zones AS a, drivers JOIN cities ON ct_id = dv_city
+AND (EXISTS (SELECT * FROM fleet WHERE fl_zone = zn_id AND fl_available > 47) OR dv_row < 3)
+----
+BIGINT	BIGINT
+378	40
+
+# One EXISTS in both branches of an OR is factored out into a top-level conjunct of the ON, a semi join, no
+# mark. DuckDB: (1, 1), (1, 6), (1, 36), (3, 3), (3, 33).
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND ((EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') AND z.zn_id < 7)
+OR (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') AND z.zn_id > 32)) ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	1
+1	6
+1	36
+3	3
+3	33
+
+# ---- one EXISTS text in an ON and WHERE, and in an ON and the select list (ADR 0041's SQ8a) ----
+
+# The ON's mark and the same text in WHERE, which reads the same c.ct_id: one EXISTS, under OR in the ON and an anti
+# join in WHERE. DuckDB: (1, 1), (1, 6), (4, 4), (5, 5).
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR z.zn_id < 7)
+WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	1
+1	6
+4	4
+5	5
+
+# ... and under OR in both. DuckDB: (1, 1, 1), (2, 8, 37), (3, 7, 33).
+query III nosort
+SELECT c.ct_id, COUNT(*) AS n, MAX(z.zn_id) AS hi FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR z.zn_id < 7)
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR z.zn_id = 1
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT	INTEGER
+1	1	1
+2	8	37
+3	7	33
+
+# The ON's mark and a select item's of the same text. DuckDB: (plus, 1, 1), (plus, 1, 6), (plus, 1, 11), (-, 2, 2),
+# (plus, 3, 3), (plus, 3, 8), (-, 4, 4), (-, 5, 5).
+query TII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') THEN 'plus' ELSE '-'
+END AS k, c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') OR z.zn_id < 6)
+WHERE z.zn_id < 12 ORDER BY 2, 3
+----
+VARCHAR	SMALLINT	INTEGER
+plus	1	1
+plus	1	6
+plus	1	11
+-	2	2
+plus	3	3
+plus	3	8
+-	4	4
+-	5	5
+
+# An aggregate's argument binds before the ON, which reads the same mark under OR and must move it below its own
+# filter. DuckDB: (1, 0, 2), (2, 156, 8), (3, 126, 7), (4, 0, 2), (5, 0, 1).
+query III nosort
+SELECT c.ct_id, SUM(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+THEN z.zn_id ELSE 0 END) AS s, COUNT(*) AS n FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR z.zn_id < 10)
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	HUGEINT	BIGINT
+1	0	2
+2	156	8
+3	126	7
+4	0	2
+5	0	1
+
+# ---- marks in select items (ADR 0041's SQ8a) ----
+
+# Two-valued: cities 2 and 3 have a gold rider. DuckDB: gold for 2 and 3, none for 1, 4, 5 and 6.
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN 'gold'
+ELSE 'none' END AS k FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	none
+2	gold
+3	gold
+4	none
+5	none
+6	none
+
+# Never NULL: a NULL key (zone 38), a dangling one (39) and a NULL residual (city 4's population) are all false, so
+# the third branch never shows. DuckDB: 1 for zones 31, 32, 33, 36 and 37, 0 for 34, 35, 38, 39 and 40.
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT * FROM cities c WHERE c.ct_id = z.zn_city AND c.ct_pop > 20000) THEN 1
+WHEN NOT EXISTS (SELECT * FROM cities c WHERE c.ct_id = z.zn_city AND c.ct_pop > 20000) THEN 0 ELSE 2 END AS k
+FROM zones z WHERE z.zn_id > 30 ORDER BY 1
+----
+INTEGER	INTEGER
+31	1
+32	1
+33	1
+34	0
+35	0
+36	1
+37	1
+38	0
+39	0
+40	0
+
+# The key comes from a LEFT JOIN's padded row: NULL, so the mark is false. DuckDB: (y, 1, 36), (y, 2, 37),
+# (n, 3, NULL), (y, 4, 34), (y, 5, 35), (y, 5, 40), (n, 6, NULL).
+query TII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+AS k, c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 33 ORDER BY 2, 3
+----
+VARCHAR	SMALLINT	INTEGER
+y	1	36
+y	2	37
+n	3	NULL
+y	4	34
+y	5	35
+y	5	40
+n	6	NULL
+
+# NOT EXISTS with a residual that reads both blocks; zone 13 has no radius and matches nothing. DuckDB: some for zones
+# 1 to 11, none for 12 and 13.
+query IT nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > z.zn_radius * 9)
+THEN 'none' ELSE 'some' END AS k FROM zones z WHERE z.zn_id < 14 ORDER BY 1
+----
+INTEGER	VARCHAR
+1	some
+2	some
+3	some
+4	some
+5	some
+6	some
+7	some
+8	some
+9	some
+10	some
+11	some
+12	none
+13	none
+
+# A mark under OR inside the WHEN. DuckDB: y for 1, 3 and 6, n for 2, 4 and 5.
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus')
+OR c.ct_pop < 5000 THEN 'y' ELSE 'n' END AS k FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	y
+2	n
+3	y
+4	n
+5	n
+6	y
+
+# Three marks in one CASE. DuckDB: (1, rider), (2, gold), (3, gold), (4, driver), (5, none), (6, none).
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN 'gold'
+WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 'rider'
+WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN 'driver' ELSE 'none' END AS k
+FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	rider
+2	gold
+3	gold
+4	driver
+5	none
+6	none
+
+# Marks inside a THEN and an ELSE branch. DuckDB: (1, d), (2, d), (3, zone), (4, zone), (5, zone), (6, no zone).
+query IT nosort
+SELECT c.ct_id, CASE WHEN c.ct_id < 3 THEN CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id)
+THEN 'd' ELSE '-' END ELSE CASE WHEN NOT EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id) THEN 'no zone'
+ELSE 'zone' END END AS k FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	d
+2	d
+3	zone
+4	zone
+5	zone
+6	no zone
+
+# Over an inner join, keyed on both of its inputs. DuckDB: on shift for trips 0, 1, 8, 10 and 11, off for the other
+# seven.
+query IT nosort
+SELECT t.tr_row, CASE WHEN EXISTS (SELECT * FROM shifts s WHERE s.sh_driver = t.tr_driver AND s.sh_day = d.dy_day)
+THEN 'on shift' ELSE 'off' END AS k FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_row < 12
+ORDER BY 1
+----
+INTEGER	VARCHAR
+0	on shift
+1	on shift
+2	off
+3	off
+4	off
+5	off
+6	off
+7	off
+8	on shift
+9	off
+10	on shift
+11	on shift
+
+# A block that joins two tables. DuckDB: y for zones 1, 3, 4, 5 and 9, n for 2, 6, 7 and 8.
+query IT nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT * FROM trips t JOIN tariffs f ON f.tf_code = t.tr_tariff
+WHERE t.tr_pickup = z.zn_id AND f.tf_rate > 2 AND t.tr_fare > 26) THEN 'y' ELSE 'n' END AS k
+FROM zones z WHERE z.zn_id < 10 ORDER BY 1
+----
+INTEGER	VARCHAR
+1	y
+2	n
+3	y
+4	y
+5	y
+6	n
+7	n
+8	n
+9	y
+
+# A mark that chooses a correlated value. DuckDB: (1, -1), (2, 22), (3, 22), (4, -1), (5, -1), (6, -1).
+query II nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+THEN (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) ELSE -1 END AS k FROM cities c ORDER BY 1
+----
+SMALLINT	BIGINT
+1	-1
+2	22
+3	22
+4	-1
+5	-1
+6	-1
+
+# ---- marks in select items under DISTINCT and LIMIT (ADR 0041's SQ8a) ----
+
+# SELECT DISTINCT over the mark alone. DuckDB: n, y.
+query T nosort
+SELECT DISTINCT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y'
+ELSE 'n' END AS k FROM zones z ORDER BY 1
+----
+VARCHAR
+n
+y
+
+# ... and next to a column. DuckDB: (NULL, 0), (1, 0), (1, 1), (2, 0), (3, 0), (3, 1), (4, 0), (4, 1), (5, 0), (5, 1),
+# (9, 0).
+query II nosort
+SELECT DISTINCT z.zn_city, CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27)
+THEN 1 ELSE 0 END AS k FROM zones z ORDER BY 1 NULLS FIRST, 2
+----
+SMALLINT	INTEGER
+NULL	0
+1	0
+1	1
+2	0
+3	0
+3	1
+4	0
+4	1
+5	0
+5	1
+9	0
+
+# ORDER BY a column and LIMIT; riders 237 to 240 (rows 236 to 239) have no trip. DuckDB: (239, n), (238, n),
+# (237, n), (236, n), (235, y), (234, y).
+query IT nosort
+SELECT r.rd_row, CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_fare > 26) THEN 'y'
+ELSE 'n' END AS k FROM riders r ORDER BY r.rd_row DESC LIMIT 6
+----
+INTEGER	VARCHAR
+239	n
+238	n
+237	n
+236	n
+235	y
+234	y
+
+# ORDER BY the mark's alias, then a unique column, with LIMIT and OFFSET. DuckDB: (6, y), (7, y), (10, y), (11, y).
+query IT nosort
+SELECT r.rd_row, CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_fare > 26) THEN 'y'
+ELSE 'n' END AS k FROM riders r ORDER BY k DESC, r.rd_row LIMIT 4 OFFSET 2
+----
+INTEGER	VARCHAR
+6	y
+7	y
+10	y
+11	y
+
+# ---- marks in ORDER BY (ADR 0041's SQ8a) ----
+
+# A CASE sort key that the select list does not hold: cities 1 and 3 have a plus rider. DuckDB: 3, 1, 6, 5, 4, 2.
+query I nosort
+SELECT c.ct_id FROM cities c
+ORDER BY CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'plus') THEN 0 ELSE 1 END,
+c.ct_id DESC
+----
+SMALLINT
+3
+1
+6
+5
+4
+2
+
+# With LIMIT: the seven zones without a pickup above 27 come first. DuckDB: 8, 9, 10, 19, 20, 30, 31, 1.
+query I nosort
+SELECT z.zn_id FROM zones z
+ORDER BY CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 0 ELSE 1 END,
+z.zn_id LIMIT 8
+----
+INTEGER
+8
+9
+10
+19
+20
+30
+31
+1
+
+# By the position of a select item that holds the mark: the zones whose parent has fleet. DuckDB: busy for 6, 7, 8,
+# 11, 12 and 13, then idle for 1 to 5, 9, 10 and 14.
+query IT nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT * FROM fleet f WHERE f.fl_zone = z.zn_parent AND f.fl_available > 47)
+THEN 'busy' ELSE 'idle' END AS k FROM zones z WHERE z.zn_id < 15 ORDER BY 2, 1
+----
+INTEGER	VARCHAR
+6	busy
+7	busy
+8	busy
+11	busy
+12	busy
+13	busy
+1	idle
+2	idle
+3	idle
+4	idle
+5	idle
+9	idle
+10	idle
+14	idle
+
+# By the item's own text: one mark. DuckDB: (1, 1), (3, 1), (4, 1), (2, 0), (5, 0), (6, 0).
+query II nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND d.dv_row > 93) THEN 1 ELSE 0 END
+AS k FROM cities c
+ORDER BY CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND d.dv_row > 93) THEN 1 ELSE 0 END DESC,
+c.ct_id
+----
+SMALLINT	INTEGER
+1	1
+3	1
+4	1
+2	0
+5	0
+6	0
+
+# SELECT DISTINCT ordered by the mark's alias. DuckDB: (NULL, -), (1, -), (4, -), (5, -), (9, -), (2, gold),
+# (3, gold).
+query IT nosort
+SELECT DISTINCT z.zn_city, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city AND r.rd_tier = 'gold')
+THEN 'gold' ELSE '-' END AS k FROM zones z ORDER BY k, 1 NULLS FIRST
+----
+SMALLINT	VARCHAR
+NULL	-
+1	-
+4	-
+5	-
+9	-
+2	gold
+3	gold
+
+# ---- marks in GROUP BY keys (ADR 0041's SQ8a) ----
+
+# The key written as the item's CASE text. DuckDB: (n, 7, 127), (y, 33, 693).
+query TII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+AS k, COUNT(*) AS n, SUM(z.zn_id) AS s FROM zones z
+GROUP BY CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+n	7	127
+y	33	693
+
+# By its alias. DuckDB: (none, 3, 4, 8000), (riders, 3, 1, 120000).
+query TIII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 'riders' ELSE 'none' END AS k,
+COUNT(*) AS n, MIN(c.ct_id) AS lo, MAX(c.ct_pop) AS hi FROM cities c GROUP BY k ORDER BY k
+----
+VARCHAR	BIGINT	SMALLINT	INTEGER
+none	3	4	8000
+riders	3	1	120000
+
+# By its position. DuckDB: (0, 105), (1, 135).
+query II nosort
+SELECT CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_fare > 26) THEN 0 ELSE 1 END
+AS k, COUNT(*) AS n FROM riders r GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	105
+1	135
+
+# Next to a column key, with HAVING over the groups' aggregates. DuckDB: (1, 1, 7), (2, 1, 8), (3, 1, 6), (4, 0, 2),
+# (4, 1, 5), (5, 0, 3), (5, 1, 5).
+query III nosort
+SELECT z.zn_city, CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 1
+ELSE 0 END AS k, COUNT(*) AS n FROM zones z GROUP BY 1, 2 HAVING COUNT(*) > 1 ORDER BY 1, 2
+----
+SMALLINT	INTEGER	BIGINT
+1	1	7
+2	1	8
+3	1	6
+4	0	2
+4	1	5
+5	0	3
+5	1	5
+
+# By its position inside ROLLUP. DuckDB: (NULL, 40), (n, 7), (y, 33).
+query TI nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+AS k, COUNT(*) AS n FROM zones z GROUP BY ROLLUP (1) ORDER BY 1 NULLS FIRST
+----
+VARCHAR	BIGINT
+NULL	40
+n	7
+y	33
+
+# A key the select list does not hold, and ORDER BY its text, which reads the key. Cities 1 to 4 have drivers.
+# DuckDB: 4, 2.
+query I nosort
+SELECT COUNT(*) AS n FROM cities c
+GROUP BY CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN 1 ELSE 0 END
+ORDER BY CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) THEN 1 ELSE 0 END DESC
+----
+BIGINT
+4
+2
+
+# NULL keys: `=` never matches the 8 riders without a city; IS NOT DISTINCT FROM matches them with driver 87, who has
+# none either. DuckDB: (n, 8), (y, 232).
+query TI nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city AND d.dv_row > 80) THEN 'y' ELSE 'n' END
+AS k, COUNT(*) AS n FROM riders r GROUP BY 1 ORDER BY 1
+----
+VARCHAR	BIGINT
+n	8
+y	232
+
+# DuckDB: (y, 240).
+query TI nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city IS NOT DISTINCT FROM r.rd_city AND d.dv_row > 80)
+THEN 'y' ELSE 'n' END AS k, COUNT(*) AS n FROM riders r GROUP BY 1 ORDER BY 1
+----
+VARCHAR	BIGINT
+y	240
+
+# The same mark in WHERE under OR and as the key: WHERE binds first, the key reads its mark. DuckDB: (n, 3, 10),
+# (y, 33, 40).
+query TII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+AS k, COUNT(*) AS n, MAX(z.zn_id) AS hi FROM zones z
+WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) OR z.zn_id < 15 GROUP BY 1
+ORDER BY 1
+----
+VARCHAR	BIGINT	INTEGER
+n	3	10
+y	33	40
+
+# ---- marks in aggregate arguments with a column (ADR 0041's SQ8a) ----
+
+# A global SUM and COUNT over the cities with a gold rider. DuckDB: (75000, 2).
+query II nosort
+SELECT SUM(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN c.ct_pop
+ELSE 0 END) AS s, COUNT(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+THEN c.ct_id END) AS n FROM cities c
+----
+HUGEINT	BIGINT
+75000	2
+
+# Per group, COUNT of a column under NOT EXISTS, and MIN. DuckDB: (NULL, 0, 38, 38), (1, 1, 1, 36), (2, 0, 2, 37),
+# (3, 1, 3, 33), (4, 2, 4, 34), (5, 3, 5, 40), (9, 0, 39, 39).
+query IIII nosort
+SELECT z.zn_city, COUNT(CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27)
+THEN z.zn_id END) AS n, MIN(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27)
+THEN z.zn_id END) AS lo, MAX(z.zn_id) AS hi FROM zones z GROUP BY z.zn_city ORDER BY 1 NULLS FIRST
+----
+SMALLINT	BIGINT	INTEGER	INTEGER
+NULL	0	38	38
+1	1	1	36
+2	0	2	37
+3	1	3	33
+4	2	4	34
+5	3	5	40
+9	0	39	39
+
+# A DECIMAL SUM, and COUNT DISTINCT. DuckDB: (13803.75, 43).
+query DI nosort
+SELECT SUM(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_id = t.tr_rider AND r.rd_tier = 'gold') THEN t.tr_fare
+ELSE 0 END) AS s, COUNT(DISTINCT CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_id = t.tr_rider
+AND r.rd_tier = 'gold') THEN t.tr_pickup END) AS n FROM trips t
+----
+DECIMAL(38,2)	BIGINT
+13803.75	43
+
+# In HAVING of a grouped block: the cities with a zone that has no pickup above 27. DuckDB: (1, 8), (3, 7), (4, 7),
+# (5, 8).
+query II nosort
+SELECT z.zn_city, COUNT(*) AS n FROM zones z GROUP BY z.zn_city
+HAVING SUM(CASE WHEN NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN z.zn_id
+ELSE 0 END) > 0 ORDER BY 1
+----
+SMALLINT	BIGINT
+1	8
+3	7
+4	7
+5	8
+
+# In ORDER BY of a grouped block. DuckDB: (2, 8), (1, 8), (3, 7), (4, 7), (5, 8), (NULL, 1), (9, 1).
+query II nosort
+SELECT z.zn_city, COUNT(*) AS n FROM zones z GROUP BY z.zn_city
+ORDER BY COUNT(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN z.zn_id END)
+DESC, 1 NULLS FIRST
+----
+SMALLINT	BIGINT
+2	8
+1	8
+3	7
+4	7
+5	8
+NULL	1
+9	1
+
+# A two-column key: per tariff, the fares of trips on a day their driver has a shift. DuckDB: 11 groups, the NULL
+# tariff's 340.50 over 158 trips among them.
+query TDI rowsort
+SELECT t.tr_tariff, SUM(CASE WHEN EXISTS (SELECT * FROM shifts s WHERE s.sh_driver = t.tr_driver
+AND s.sh_day = t.tr_day) THEN t.tr_fare ELSE 0 END) AS s, COUNT(*) AS n FROM trips t GROUP BY t.tr_tariff
+----
+VARCHAR	DECIMAL(38,2)	BIGINT
+(empty)	561.50	284
+AIRPORT	608.75	285
+NIGHT	651.00	284
+NULL	340.50	158
+POOL	724.00	284
+STD	554.25	284
+Std	698.00	284
+XL	582.50	284
+XL\x20	601.50	285
+std	604.25	284
+Ж-1	676.50	284
+
+# The aggregate item binds first, before WHERE, which reads the same mark under OR and must move it below its own
+# filter: cities 2 and 3 pass by the mark, 5 and 6 by the other branch. DuckDB: (5, 4).
+query II nosort
+SELECT SUM(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN c.ct_id
+ELSE 0 END) AS s, COUNT(*) AS n FROM cities c
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR c.ct_id > 4
+----
+HUGEINT	BIGINT
+5	4
+
+# The same in a grouped block whose key holds the mark too, and WHERE under NOT: three readers of one mark.
+# DuckDB: (n, 0, 7), (y, 324, 9).
+query TII nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN 'y' ELSE 'n' END
+AS k, SUM(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN z.zn_id
+ELSE 0 END) AS s, COUNT(*) AS n FROM zones z
+WHERE NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) OR z.zn_id > 30
+GROUP BY 1 ORDER BY 1
+----
+VARCHAR	HUGEINT	BIGINT
+n	0	7
+y	324	9
+
+# ---- a select item's mark and WHERE's of one text (ADR 0041's SQ8a) ----
+
+# WHERE binds before the item, which reads WHERE's mark: cities 2 and 3 pass by the mark, 6 by its population.
+# DuckDB: (2, gold), (3, gold), (6, none).
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN 'gold'
+ELSE 'none' END AS k FROM cities c
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') OR c.ct_pop < 5000 ORDER BY 1
+----
+SMALLINT	VARCHAR
+2	gold
+3	gold
+6	none
+
+# WHERE's top-level conjunct is a semi join and the item's EXISTS a mark, true for every row WHERE keeps.
+# DuckDB: (2, gold), (3, gold).
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN 'gold'
+ELSE 'none' END AS k FROM cities c
+WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') ORDER BY 1
+----
+SMALLINT	VARCHAR
+2	gold
+3	gold
+
+# ---- marks in the select items of other blocks (ADR 0041's SQ8a) ----
+
+# A derived table's item, grouped by the enclosing block. DuckDB: (-, 37), (fleet, 3).
+query TI nosort
+SELECT s.k, COUNT(*) AS n FROM (SELECT CASE WHEN EXISTS (SELECT * FROM fleet f WHERE f.fl_zone = z.zn_id) THEN 'fleet'
+ELSE '-' END AS k FROM zones z) AS s GROUP BY s.k ORDER BY 1
+----
+VARCHAR	BIGINT
+-	37
+fleet	3
+
+# An IN block's item: the cities of the zones without a pickup above 27, and NULL for the others. DuckDB: 1, 3, 4, 5.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CASE WHEN NOT EXISTS (SELECT * FROM trips t
+WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) THEN z.zn_city END FROM zones z) ORDER BY 1
+----
+SMALLINT
+1
+3
+4
+5
+
+# ---- a top-level EXISTS beside an OR of two more, each over a join of two tables ----
+
+# Riders with a trip in week 9 (89 riders), and with a trip in week 14 that cost more than 20 (54) or a booking in weeks
+# 60 to 62 (37): of the 89, 13 have only the second, 12 only the third and 2 both. The trips join the calendar with ON,
+# the bookings with a comma; each block is correlated through the rider's key alone.
+
+# The three as top-level conjuncts, three semi joins, no mark. DuckDB: (gold, 1, 154), (plus, 1, 189).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+AND EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62)
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+gold	1	154
+plus	1	189
+
+# The first stays a semi join, the OR of the other two is an OR of two marks. DuckDB: (basic, 7, 1040), (gold, 7, 764),
+# (plus, 13, 1407).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+basic	7	1040
+gold	7	764
+plus	13	1407
+
+# The OR written first. DuckDB: (basic, 7, 1040), (gold, 7, 764), (plus, 13, 1407), the same.
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+AND EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+basic	7	1040
+gold	7	764
+plus	13	1407
+
+# NOT over the OR: the 62 riders of week 9 with neither. DuckDB: (basic, 21, 2447), (gold, 23, 2864), (plus, 18, 2547).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND NOT (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+basic	21	2447
+gold	23	2864
+plus	18	2547
+
+# NOT EXISTS in both branches: all but the 2 riders with both, 87. DuckDB: (basic, 28, 3487), (gold, 29, 3474), (plus,
+# 30, 3765).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND (NOT EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR NOT EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+basic	28	3487
+gold	29	3474
+plus	30	3765
+
+# The first as NOT EXISTS, an anti join, beside the OR of marks: the 58 riders without a trip in week 9 that have
+# either of the other two. DuckDB: (basic, 20,
+# 1859), (gold, 22, 2679), (plus, 16, 1845).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, SUM(r.rd_row) AS s FROM riders r
+WHERE NOT EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	HUGEINT
+basic	20	1859
+gold	22	2679
+plus	16	1845
+
+# The same three in an inner ON, grouped by the city. DuckDB: (1, 11, 1431), (2, 5, 656), (3, 10, 908).
+query III nosort
+SELECT c.ct_id, COUNT(*) AS n, SUM(r.rd_row) AS s FROM cities c JOIN riders r ON r.rd_city = c.ct_id
+AND EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62))
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT	HUGEINT
+1	11	1431
+2	5	656
+3	10	908
+
+# The riders joined to their city, and the bookings of more vehicles than the city's id: a residual of the mark that
+# reads the other FROM item. DuckDB: (1, 11), (2, 4), (3, 9).
+query II nosort
+SELECT r.rd_city, COUNT(*) AS n FROM riders r JOIN cities c ON c.ct_id = r.rd_city
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+AND (EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62 AND b.bk_vehicles > c.ct_id))
+GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	11
+2	4
+3	9
+
+# The OR of marks in an aggregate's argument, the semi join in WHERE: per tier, the riders of week 9 and how many of
+# them have either. DuckDB: (basic, 28, 7), (gold, 30, 7), (plus, 31, 13).
+query TII nosort
+SELECT r.rd_tier, COUNT(*) AS n, COUNT(CASE WHEN EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62) THEN r.rd_row END) AS m FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+GROUP BY r.rd_tier ORDER BY 1
+----
+VARCHAR	BIGINT	BIGINT
+basic	28	7
+gold	30	7
+plus	31	13
+
+# The OR of marks as a GROUP BY key. DuckDB: (0, 62), (1, 27).
+query II nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62) THEN 1 ELSE 0 END AS k, COUNT(*) AS n FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	62
+1	27
+
+# The OR of marks as the first ORDER BY key, the row as the second. DuckDB: (2, plus), (5, gold), (29, gold), (32,
+# plus), (40, gold), (51, plus), (56, plus), (67, basic).
+query IT nosort
+SELECT r.rd_row, r.rd_tier FROM riders r
+WHERE EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day WHERE t.tr_rider = r.rd_id AND d.dy_week = 9)
+ORDER BY CASE WHEN EXISTS (SELECT * FROM trips t JOIN days d ON d.dy_day = t.tr_day
+WHERE t.tr_rider = r.rd_id AND d.dy_week = 14 AND t.tr_fare > 20)
+OR EXISTS (SELECT * FROM bookings b, days d WHERE d.dy_day = b.bk_day AND b.bk_rider = r.rd_id
+AND d.dy_week BETWEEN 60 AND 62) THEN 0 ELSE 1 END, r.rd_row LIMIT 8
+----
+INTEGER	VARCHAR
+2	plus
+5	gold
+29	gold
+32	plus
+40	gold
+51	plus
+56	plus
+67	basic
+
+# ---- one EXISTS as a semi join, an anti join and a mark: the memo and the order ----
+
+# E is a NIGHT trip of the rider (113 of the 240 riders), p a gold rider (80) and q a rider of city 1 (77, NULL for the
+# 8 riders without a city). Each record counts the riders it keeps and sums their rows.
+
+# E OR E and (E AND p) OR (E AND q): OR factoring makes E a top-level conjunct, a semi join, and binds the dropped OR
+# only for its errors, so neither is a mark. DuckDB: (113, 13449); (74, 8734).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+113	13449
+
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') AND r.rd_tier = 'gold')
+OR (EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') AND r.rd_city = 1)
+----
+BIGINT	HUGEINT
+74	8734
+
+# The same EXISTS twice under one OR that nothing factors: E OR q OR E, one mark read twice. DuckDB: (153, 18210).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') OR r.rd_city = 1
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+153	18210
+
+# (E AND p) OR q OR (E AND city 3): the same EXISTS in two AND branches of one OR. DuckDB: (114, 13495).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') AND r.rd_tier = 'gold')
+OR r.rd_city = 1
+OR (EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') AND r.rd_city = 3)
+----
+BIGINT	HUGEINT
+114	13495
+
+# (p OR E) AND E, and E AND (p OR E): the top-level E is a semi join of its own, the E under OR a mark; both keep E's
+# riders. DuckDB: (113, 13449), twice.
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+113	13449
+
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+AND (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+113	13449
+
+# (p OR E) AND NOT E: an anti join and a mark over one EXISTS, the gold riders without E. DuckDB: (43, 5318).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+43	5318
+
+# (p OR E) AND (q OR NOT E): one mark read twice, once under NOT; q is NULL for a rider without a city, so such a rider
+# with E is dropped. DuckDB: (80, 9650).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND (r.rd_city = 1 OR NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+80	9650
+
+# A mark in WHERE under OR and in an aggregate's argument. DuckDB: (156, 113).
+query II nosort
+SELECT COUNT(*), COUNT(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+THEN r.rd_row END) AS m FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	BIGINT
+156	113
+
+# A mark in WHERE under OR and in an ORDER BY item: of rows 0 to 7, E's first, then the plus row without E. DuckDB: (1,
+# basic), (3, plus), (5, gold), (2, plus).
+query IT nosort
+SELECT r.rd_row, r.rd_tier FROM riders r
+WHERE r.rd_row < 8
+AND (r.rd_tier = 'plus' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+ORDER BY CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 0
+ELSE 1 END, r.rd_row
+----
+INTEGER	VARCHAR
+1	basic
+3	plus
+5	gold
+2	plus
+
+# A mark in an inner ON under OR and in WHERE under OR, over one binding. DuckDB: (1, 37), (2, 37), (3, 35).
+query II nosort
+SELECT c.ct_id, COUNT(*) AS n FROM cities c JOIN riders r ON r.rd_city = c.ct_id
+AND (c.ct_pop > 100000 OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	37
+3	35
+
+# A semi join in WHERE and a mark in an aggregate's argument over the same EXISTS: every rider kept counts. DuckDB: (1,
+# 37, 37), (2, 37, 37), (3, 35, 35), (NULL, 4, 4).
+query III nosort
+SELECT r.rd_city, COUNT(*) AS n,
+COUNT(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN r.rd_row END)
+AS m FROM riders r WHERE EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT	BIGINT
+1	37	37
+2	37	37
+3	35	35
+NULL	4	4
+
+# An anti join in WHERE and a mark in an aggregate's argument over the same EXISTS: never TRUE. DuckDB: (1, 40, -1), (2,
+# 40, -1), (3, 43, -1), (NULL, 4, -1).
+query III nosort
+SELECT r.rd_city, COUNT(*) AS n,
+MAX(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN r.rd_row
+ELSE -1 END) AS m FROM riders r
+WHERE NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT	INTEGER
+1	40	-1
+2	40	-1
+3	43	-1
+NULL	4	-1
+
+# The memo is keyed by binding, not by text: in the ONs of two comma groups ct_id names b.ct_id and then d.ct_id, two
+# marks over one text. Zones above 35 lie in cities 1, 2, 5 and 9, so the first ON keeps cities 1 and 2 and the second
+# cities 3 to 6, of which only city 3 has riders. DuckDB: (0, 1, 2, 3), (0, 1, 5, 3), (1, 2, 2, 3), (1, 2, 5, 3), (3, 1,
+# 2, 3), (3, 1, 5, 3), (4, 2, 2, 3), (4, 2, 5, 3).
+query IIII nosort
+SELECT r1.rd_row, b.ct_id, r2.rd_row AS r2row, d.ct_id AS dct
+FROM riders r1 JOIN cities b ON r1.rd_city = b.ct_id
+AND (b.ct_pop > 100000 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = ct_id AND z.zn_id > 35)),
+riders r2 JOIN cities d ON r2.rd_city = d.ct_id
+AND (d.ct_pop < 40000 OR NOT EXISTS (SELECT * FROM zones z WHERE z.zn_city = ct_id AND z.zn_id > 35))
+WHERE r1.rd_row < 6 AND r2.rd_row < 6 ORDER BY 1, 3
+----
+INTEGER	SMALLINT	INTEGER	SMALLINT
+0	1	2	3
+0	1	5	3
+1	2	2	3
+1	2	5	3
+3	1	2	3
+3	1	5	3
+4	2	2	3
+4	2	5	3
+
+# Two marks whose blocks differ only in the key's operator, = and IS NOT DISTINCT FROM: only the second matches the
+# drivers without a city, so the plus riders without one stay and the gold ones do not. DuckDB: (1, plus, 39), (2, gold,
+# 39), (3, gold, 39), (3, plus, 39), (NULL, plus, 2).
+query ITI nosort
+SELECT r.rd_city, r.rd_tier, COUNT(*) AS n FROM riders r
+WHERE (r.rd_tier = 'gold' AND EXISTS (SELECT * FROM drivers v WHERE v.dv_city = r.rd_city AND v.dv_row < 40))
+OR (r.rd_tier = 'plus' AND EXISTS (SELECT * FROM drivers v WHERE v.dv_city IS NOT DISTINCT FROM r.rd_city
+AND v.dv_row < 40)) GROUP BY r.rd_city, r.rd_tier ORDER BY 1, 2
+----
+SMALLINT	VARCHAR	BIGINT
+1	plus	39
+2	gold	39
+3	gold	39
+3	plus	39
+NULL	plus	2
+
+# One text at two levels: the outer block's r and the inner block's r are two bindings, so two marks. Of the inner
+# block's riders (rows 0 to 2, one per city), row 2 is plus and has no NIGHT trip, so city 3 drops. DuckDB: (1, 37), (2,
+# 75).
+query II nosort
+SELECT r.rd_city, COUNT(*) AS n FROM riders r JOIN cities c ON c.ct_id = r.rd_city
+WHERE (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 3
+AND (r.rd_tier = 'basic' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')))
+GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	75
+
+# In the first ON zn_id names z.zn_id; in WHERE, after z2 joins, it is ambiguous: a bind error in both engines (antb1:
+# column name 'zn_id' is ambiguous), which a memo hit by text on the ON's mark would answer.
+statement error [Aa]mbiguous
+SELECT a.ct_id FROM cities a JOIN zones z ON z.zn_city = a.ct_id
+AND (a.ct_pop > 100000 OR EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = zn_id AND t.tr_fare > 27))
+JOIN zones z2 ON z2.zn_id = z.zn_id
+WHERE a.ct_pop > 100000 OR EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = zn_id AND t.tr_fare > 27)
+
+# The dry run: OR factoring drops an OR one of whose branches keeps only the shared conjuncts, and binds it only for its
+# errors. A mark that binding makes must not stay behind for a later conjunct with the same EXISTS under OR, nor an
+# EXISTS that the later conjunct binds first.
+
+# (p OR (p AND E)) AND (q OR E): p is shared and the OR drops, so E is only in the dry run before (q OR E); the gold
+# riders with E (no gold rider lives in city 1). DuckDB: (37, 4402).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (r.rd_tier = 'gold' OR (r.rd_tier = 'gold'
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')))
+AND (r.rd_city = 1 OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+37	4402
+
+# ((E AND p) OR E) AND (q OR E): E is shared, a semi join, and the dropped OR holds it twice. DuckDB: (113, 13449), E's
+# riders.
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE ((EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') AND r.rd_tier = 'gold')
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND (r.rd_city = 1 OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+113	13449
+
+# The later conjunct written first: (q OR E) AND (p OR (p AND E)). DuckDB: (37, 4402).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (r.rd_city = 1 OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+AND (r.rd_tier = 'gold' OR (r.rd_tier = 'gold'
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')))
+----
+BIGINT	HUGEINT
+37	4402
+
+# In an inner ON. DuckDB: (2, 39), (3, 35).
+query II nosort
+SELECT c.ct_id, COUNT(*) AS n FROM cities c JOIN riders r ON r.rd_city = c.ct_id
+AND (r.rd_tier = 'gold' OR (r.rd_tier = 'gold'
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')))
+AND (c.ct_pop > 40000 OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+2	39
+3	35
+
+# The dropped OR in WHERE, the mark in a GROUP BY key. DuckDB: (0, 43), (1, 37).
+query II nosort
+SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1 ELSE 0
+END AS k, COUNT(*) AS n FROM riders r
+WHERE r.rd_tier = 'gold' OR (r.rd_tier = 'gold'
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	43
+1	37
+
+# The dropped OR in WHERE, the mark in a projection's select item and then in an ORDER BY item. DuckDB: (0, 0), (1, 1),
+# (2, 0), (3, 1), (4, 0), (5, 1); 1, 3, 5, 0, 2, 4, 6, 7.
+query II nosort
+SELECT r.rd_row, CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+THEN 1 ELSE 0 END AS m FROM riders r
+WHERE r.rd_row < 6
+OR (r.rd_row < 6 AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+ORDER BY 1
+----
+INTEGER	INTEGER
+0	0
+1	1
+2	0
+3	1
+4	0
+5	1
+
+query I nosort
+SELECT r.rd_row FROM riders r
+WHERE r.rd_row < 8
+OR (r.rd_row < 8 AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+ORDER BY CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 0
+ELSE 1 END, r.rd_row
+----
+INTEGER
+1
+3
+5
+0
+2
+4
+6
+7
+
+# The select list of a correlated EXISTS block is dropped unbound, so a correlated EXISTS there plants nothing.
+# DuckDB: 1, 2, 3.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE EXISTS (SELECT CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+THEN 1 ELSE 0 END FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# ---- marks nested in other blocks ----
+
+# E is again a NIGHT trip of the rider; F a NIGHT trip that cost 27.50, which riders of cities 2 and 3 have (two and
+# one) and no rider of city 1. Rider row 2 lives in city 3.
+
+# In a derived table's WHERE. DuckDB: (1, 37), (2, 75), (3, 39), (NULL, 5).
+query II nosort
+SELECT x.rd_city, COUNT(*) AS n FROM (SELECT r.rd_city FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) x
+GROUP BY x.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	75
+3	39
+NULL	5
+
+# A star over a derived table whose block holds a mark: the mark adds no column. DuckDB: (1, 2, 2, basic, 2025-01-14),
+# (3, 4, 1, plus, 2025-02-09), (4, 5, 2, gold, 2025-02-22), (5, 6, 3, gold, 2025-03-07), (9, 10, 1, plus, 2025-04-28).
+query IIITT nosort
+SELECT x.* FROM (SELECT * FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT 1 FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) x
+ORDER BY x.rd_row LIMIT 5
+----
+INTEGER	BIGINT	SMALLINT	VARCHAR	DATE
+1	2	2	basic	2025-01-14
+3	4	1	plus	2025-02-09
+4	5	2	gold	2025-02-22
+5	6	3	gold	2025-03-07
+9	10	1	plus	2025-04-28
+
+# In a derived table's select item, which a filter outside reads. DuckDB: (1, 37), (2, 37), (3, 35), (NULL, 4).
+query II nosort
+SELECT x.rd_city, COUNT(*) AS n FROM (SELECT r.rd_city,
+CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1 ELSE 0 END AS m
+FROM riders r) x WHERE x.m = 1 GROUP BY x.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	37
+3	35
+NULL	4
+
+# In a select item under DISTINCT, inside a derived table: 232 distinct keys. DuckDB: (0, 121), (1, 111).
+query II nosort
+SELECT x.m, COUNT(*) AS n FROM (SELECT DISTINCT r.rd_id,
+CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1 ELSE 0 END AS m
+FROM riders r) x GROUP BY x.m ORDER BY 1
+----
+INTEGER	BIGINT
+0	121
+1	111
+
+# In a derived table's aggregate argument, filtered outside. DuckDB: (1, 37), (2, 37), (3, 35).
+query II nosort
+SELECT x.rd_city, x.n FROM (SELECT r.rd_city,
+COUNT(CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN r.rd_row END)
+AS n FROM riders r GROUP BY r.rd_city) x WHERE x.n > 30 ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	37
+3	35
+
+# On the right of a LEFT JOIN, inside a derived table: cities 4 to 6 keep a padded row. DuckDB: (1, 37), (2, 75), (3,
+# 39), (4, 0), (5, 0), (6, 0).
+query II nosort
+SELECT c.ct_id, COUNT(x.rd_city) AS n FROM cities c LEFT JOIN (SELECT r.rd_city FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) x
+ON x.rd_city = c.ct_id GROUP BY c.ct_id ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	75
+3	39
+4	0
+5	0
+6	0
+
+# In a CTE read once. DuckDB: (1, 37), (2, 75), (3, 39), (NULL, 5).
+query II nosort
+WITH x AS (SELECT r.rd_city, r.rd_id FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+SELECT x.rd_city, COUNT(*) AS n FROM x GROUP BY x.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	75
+3	39
+NULL	5
+
+# In a CTE read twice, joined to itself on the rider's key, which 8 riders repeat. DuckDB: (1, 19, 8), (2, 49, 9), (3,
+# 50, 35), (NULL, 2, 1).
+query III nosort
+WITH x AS (SELECT r.rd_city, r.rd_id,
+CASE WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1 ELSE 0 END AS m
+FROM riders r WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_fare > 27))
+SELECT a.rd_city, COUNT(*) AS n, SUM(b.m) AS m FROM x a JOIN x b ON b.rd_id = a.rd_id GROUP BY a.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT	HUGEINT
+1	19	8
+2	49	9
+3	50	35
+NULL	2	1
+
+# In both arms of a UNION ALL, the same EXISTS under another OR in each. DuckDB: (1, 114), (2, 115), (3, 82), (NULL, 9).
+query II nosort
+SELECT u.k, COUNT(*) AS n FROM (SELECT r.rd_city AS k FROM riders r
+WHERE r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+UNION ALL SELECT r.rd_city FROM riders r
+WHERE r.rd_city = 1 OR NOT EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) u
+GROUP BY u.k ORDER BY 1
+----
+SMALLINT	BIGINT
+1	114
+2	115
+3	82
+NULL	9
+
+# In the WHERE of an IN subquery: F's riders and rider row 2. DuckDB: 2, 3.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50))
+ORDER BY 1
+----
+SMALLINT
+2
+3
+
+# The same IN under OR, a null-aware mark whose set holds a mark. DuckDB: 2, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_pop < 5000 OR c.ct_id IN (SELECT r.rd_city FROM riders r
+WHERE r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50))
+ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# In the select item of an IN subquery. DuckDB: 2, 3.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CASE
+WHEN EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50)
+THEN r.rd_city ELSE 0 END FROM riders r) ORDER BY 1
+----
+SMALLINT
+2
+3
+
+# In the WHERE of a correlated scalar subquery, a count per city. DuckDB: (1, 37), (2, 75), (3, 39), (4, 0), (5, 0), (6,
+# 0).
+query II nosort
+SELECT c.ct_id, (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+AND (r.rd_tier = 'gold' OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))) AS n
+FROM cities c ORDER BY 1
+----
+SMALLINT	BIGINT
+1	37
+2	75
+3	39
+4	0
+5	0
+6	0
+
+# The same count compared in WHERE: cities with more than one such rider. DuckDB: 2, 3.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id
+AND (r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50))) > 1
+ORDER BY 1
+----
+SMALLINT
+2
+3
+
+# In the WHERE of a correlated EXISTS that is a top-level conjunct: the mark is correlated to the middle block. DuckDB:
+# 2, 3; 1, 4, 5, 6 with NOT EXISTS.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND (r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50)))
+ORDER BY 1
+----
+SMALLINT
+2
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND (r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50)))
+ORDER BY 1
+----
+SMALLINT
+1
+4
+5
+6
+
+# Inside another mark's block, under OR and in a select item's CASE. DuckDB: 2, 3, 6; (1, 0), (2, 1), (3, 1), (4, 0),
+# (5, 0), (6, 0).
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_pop < 5000
+OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND (r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50)))
+ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+query II nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND (r.rd_row = 2
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT' AND t.tr_fare = 27.50)))
+THEN 1 ELSE 0 END AS m FROM cities c ORDER BY 1
+----
+SMALLINT	INTEGER
+1	0
+2	1
+3	1
+4	0
+5	0
+6	0
+
+# A semi join inside a mark's block: of riders rows 0 to 4, the NIGHT ones live in cities 1 and 2. DuckDB: 1, 2, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_pop < 5000
+OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 5
+AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) ORDER BY 1
+----
+SMALLINT
+1
+2
+6
+
+# Beside an uncorrelated IN under one OR, a null-aware mark: zones above 35 lie in cities 1, 2, 5, 9 and NULL, so the IN
+# is TRUE for cities 1 and 2 and NULL for the others, and E decides the rest. DuckDB: (193, 23020).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r WHERE r.rd_city IN (SELECT z.zn_city FROM zones z WHERE z.zn_id > 35)
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+193	23020
+
+# The three values of that OR as a GROUP BY key (1 TRUE, 0 FALSE, 2 NULL): a NULL IN with E is TRUE, without E NULL,
+# never FALSE. DuckDB: (1, 193), (2, 47).
+query II nosort
+SELECT CASE WHEN r.rd_city IN (SELECT z.zn_city FROM zones z WHERE z.zn_id > 35)
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1
+WHEN NOT (r.rd_city IN (SELECT z.zn_city FROM zones z WHERE z.zn_id > 35)
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) THEN 0 ELSE 2 END AS k,
+COUNT(*) AS n FROM riders r GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+1	193
+2	47
+
+# NOT over the same OR with a set without NULL: the riders of city 3 without E; a rider without a city has a NULL IN and
+# drops. DuckDB: (43, 5144).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE NOT (r.rd_city IN (SELECT z.zn_city FROM zones z WHERE z.zn_id > 35 AND z.zn_city < 9)
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+43	5144
+
+# Beside a correlated value under one OR: more than 12 trips (62 riders, 35 of them without E), or E. DuckDB: (148,
+# 17506).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id) > 12
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')
+----
+BIGINT	HUGEINT
+148	17506
+
+# The three values of a MAX over no rows OR E as a GROUP BY key: the riders with keys 237 to 240 have no trip, so their
+# MAX is NULL and E FALSE. DuckDB: (0, 97), (1, 139), (2, 4).
+query II nosort
+SELECT CASE WHEN (SELECT MAX(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id) > 27
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') THEN 1
+WHEN NOT ((SELECT MAX(t.tr_fare) FROM trips t WHERE t.tr_rider = r.rd_id) > 27
+OR EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT')) THEN 0 ELSE 2 END AS k,
+COUNT(*) AS n FROM riders r GROUP BY 1 ORDER BY 1
+----
+INTEGER	BIGINT
+0	97
+1	139
+2	4
+
+# A value and a mark over one block: more than one NIGHT trip, or a gold rider with one. DuckDB: (105, 12805).
+query II nosort
+SELECT COUNT(*), SUM(r.rd_row) FROM riders r
+WHERE (SELECT COUNT(*) FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT') > 1
+OR (r.rd_tier = 'gold' AND EXISTS (SELECT * FROM trips t WHERE t.tr_rider = r.rd_id AND t.tr_tariff = 'NIGHT'))
+----
+BIGINT	HUGEINT
+105	12805
+
+# ---- the shapes of a mark's block and of its outer side (ADR 0041's SQ8a) ----
+
+# A key in the ON of the block's own join, not in its WHERE: only zones 1 to 3 have fleet. DuckDB: 1, 2, 3, 6; then
+# fleet for cities 1, 2 and 3, none for 4, 5 and 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z JOIN fleet f
+ON f.fl_zone = z.zn_id AND z.zn_city = c.ct_id WHERE f.fl_available > 47) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+query IT nosort
+SELECT c.ct_id, CASE WHEN NOT EXISTS (SELECT * FROM zones z JOIN fleet f ON f.fl_zone = z.zn_id AND z.zn_city = c.ct_id)
+THEN 'none' ELSE 'fleet' END AS k FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	fleet
+2	fleet
+3	fleet
+4	none
+5	none
+6	none
+
+# The key in both branches of an OR inside the block, one key once factored: rider rows 1 and 2 live in cities 2 and
+# 3. DuckDB: 2, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r
+WHERE (r.rd_city = c.ct_id AND r.rd_row = 1) OR (r.rd_city = c.ct_id AND r.rd_row = 2)) ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# Keyed on a derived table's GROUP BY output, the NULL group included: no driver of city 1 started after 2025-12-07,
+# and the NULL key meets no driver. DuckDB: (2, 77), (3, 78), (NULL, 8).
+query II nosort
+SELECT s.c, s.n FROM (SELECT r.rd_city AS c, COUNT(*) AS n FROM riders r GROUP BY r.rd_city) AS s
+WHERE s.n < 10 OR EXISTS (SELECT * FROM drivers d WHERE d.dv_city = s.c AND d.dv_since > DATE '2025-12-07') ORDER BY 1
+----
+SMALLINT	BIGINT
+2	77
+3	78
+NULL	8
+
+# NOT EXISTS keyed on a LEFT JOIN's padded column: TRUE for a padded row, so WHERE keeps cities 3 and 6 (no outer join
+# simplification may turn the LEFT JOIN inner). DuckDB: (1, 36), (3, NULL), (6, NULL).
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 33
+WHERE NOT EXISTS (SELECT * FROM trips t WHERE t.tr_pickup = z.zn_id AND t.tr_fare > 27) OR c.ct_id = 1 ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	36
+3	NULL
+6	NULL
+
+# A star next to a select item's mark: the mark's column is not one of the star's. DuckDB: the six cities, gold for 2
+# and 3.
+query IITIT nosort
+SELECT *, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') THEN 'gold'
+ELSE '-' END AS k FROM cities c ORDER BY 2
+----
+INTEGER	SMALLINT	VARCHAR	INTEGER	VARCHAR
+0	1	center	120000	-
+1	2	harbor	45000	gold
+2	3	hills	30000	gold
+3	4	airport	NULL	-
+4	5	old town	8000	-
+5	6	outskirts	2500	-
+
+# An uncorrelated value in the mark's residual: rider rows 238 and 239 live in cities 2 and 3. DuckDB: 2, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_row > (SELECT MAX(d.dv_row) FROM drivers d) + 141) ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# An ORDER BY inside the mark's block, which the unnesting drops. DuckDB: 2, 3, 6.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold' ORDER BY r.rd_row)
+ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# A select item's mark over the empty promos: FALSE for every row, and no row is lost. DuckDB: trips 0 to 3, all '-'.
+query IT nosort
+SELECT t.tr_row, CASE WHEN EXISTS (SELECT * FROM promos p WHERE p.pm_id = t.tr_promo) THEN 'promo' ELSE '-' END AS k
+FROM trips t WHERE t.tr_row < 4 ORDER BY 1
+----
+INTEGER	VARCHAR
+0	-
+1	-
+2	-
+3	-
+
+# A WHERE mark over a comma join, keyed on both comma items: drivers' rows 1 to 40 meet the zones of their own city.
+# DuckDB: (14, 323).
+query II nosort
+SELECT COUNT(*) AS n, SUM(z.zn_id) AS s FROM cities c, zones z WHERE z.zn_city = c.ct_id
+AND (EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND d.dv_row = z.zn_id) OR c.ct_id = 5)
+----
+BIGINT	HUGEINT
+14	323
+
+# ---- the order of a mark's evaluation (D16, D23) ----
+
+# D16: a WHERE conjunct that holds a subquery computes its operands only for the rows the conjuncts written before it
+# keep, a mark's as a value's. The mark's residual overflows on city 1's pairs, and the value rejects city 1: the value
+# written first answers, the mark written first fails. DuckDB: cities 2, 3 and 6; then Overflow in multiplication.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) < 23
+AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + c.ct_pop * 100000000000000 > 0)) ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+statement error Overflow in multiplication
+SELECT c.ct_id FROM cities c WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + c.ct_pop * 100000000000000 > 0))
+AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) < 23 ORDER BY 1
+
+# The value's operand overflows for city 1, and the mark rejects city 1 (no gold rider): the mark written first
+# answers, the value written first fails. DuckDB: cities 2, 3 and 6; then Overflow in multiplication.
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold'))
+AND (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) + c.ct_pop * 100000000000000 > 0 ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+statement error Overflow in multiplication
+SELECT c.ct_id FROM cities c
+WHERE (SELECT COUNT(*) FROM drivers d WHERE d.dv_city = c.ct_id) + c.ct_pop * 100000000000000 > 0
+AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')) ORDER BY 1
+
+# D23: a conjunct of a mark's block that reads both blocks, or the outer block alone, is a residual, computed only over
+# the candidate pairs, so neither fails for a key no city binds, nor for a city without riders: both engines agree.
+# DuckDB: cities 1 to 6; then 1, 2, 3 and 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND CAST(c.ct_id + 7 - 2 * z.zn_city AS USMALLINT) >= 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND CAST(3 - c.ct_id AS USMALLINT) >= 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+# ---- divergences a mark takes part in, with both engines' outcomes (D23, D35) ----
+
+# D23: a conjunct over the mark's block alone filters its build input, computed for every inner row, the zone of city
+# 9, which no city binds, included: the cast fails there in antb1, where DuckDB computes it only for the keys the
+# cities bind and answers cities 1 to 6. The top-level semi join's form fails the same way.
+onlyif antb1
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+onlyif antb1
+statement error out of range for the destination type UINT16
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND CAST(8 - z.zn_city AS USMALLINT) >= 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+
+# D35: a mark never empties its join, and the builds of a slot are prepared outermost first, the conjunct written last
+# outermost. The mark's block overflows on every rider; the EXISTS over the empty promos table is a semi join that
+# empties its join. Written last, the semi join is prepared first and the mark's build never runs: antb1 answers no row,
+# where DuckDB fails. DuckDB: Overflow in addition.
+onlyif antb1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + 9223372036854775807 > r.rd_row)) AND EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+onlyif duckdb
+statement error Overflow in addition
+SELECT c.ct_id FROM cities c WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + 9223372036854775807 > r.rd_row)) AND EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id) ORDER BY 1
+
+# ... and the other way round: written last, the mark's build is prepared first and fails, where DuckDB computes the
+# mark's block only for the cities the semi join keeps, none, and answers no row.
+onlyif antb1
+statement error Overflow in addition
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id)
+AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + 9223372036854775807 > r.rd_row)) ORDER BY 1
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT * FROM promos p WHERE p.pm_id = c.ct_id)
+AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id
+AND r.rd_id + 9223372036854775807 > r.rd_row)) ORDER BY 1
+----
+SMALLINT
+
+# ---- boundaries of correlated EXISTS marks (ADR 0041's SQ8a) ----
+
+# SQ8a answers a correlated EXISTS that is no top-level conjunct as a two-valued mark join, over a block of FROM and
+# WHERE alone that is correlated through an equality. The shapes below stay exit code 4 after it, each until the item
+# its heading names: pending on a roadmap PR, or in DuckDB alone where no PR plans them yet. Then the bind errors inside
+# a mark's block, and the order of a bind error and a mark.
+
+# ---- pending: a mark over a block that groups, limits or aggregates (ADR 0041; roadmap PR SQ8b) ----
+
+# antb1 refuses each at the EXISTS gate ("EXISTS over a subquery with <clause> is not supported"), before it asks where
+# the EXISTS stands, and they stay exit 4 after SQ8a. GROUP BY under OR: a city with riders has a group. With a HAVING
+# under NOT: cities 2 and 3 have 39 gold riders. DuckDB: cities 1, 2, 3 and 6; then 1, 4, 5 and 6.
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier
+HAVING COUNT(*) >= 39 AND r.rd_tier = 'gold') ORDER BY 1
+----
+SMALLINT
+1
+4
+5
+6
+
+# DISTINCT under OR. DuckDB: cities 2, 3 and 6.
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT DISTINCT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold')
+ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# HAVING without GROUP BY, in a CASE: the block has a row where the city has more than 77 riders, city 3 alone.
+# DuckDB: cities 1, 2, 4, 5 and 6.
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 77) THEN 1 ELSE 0 END = 0
+ORDER BY 1
+----
+SMALLINT
+1
+2
+4
+5
+6
+
+# LIMIT 1 under OR in an inner ON, and LIMIT 0 under NOT, which holds for every city. DuckDB: city 1 eight zones from
+# zone 1, city 2 eight from 2, city 3 seven from 3, city 5 zone 40 alone; then cities 1 to 6.
+pending SQ8b
+query III nosort
+SELECT c.ct_id, COUNT(*), MIN(z.zn_id) FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (z.zn_id > 35 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id LIMIT 1)) GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT	INTEGER
+1	8	1
+2	8	2
+3	7	3
+5	1	40
+
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id LIMIT 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# OFFSET 77 in a select item's CASE: more than 77 riders, city 3 alone. DuckDB: 'more' for city 3, 'fewer' for the
+# others.
+pending SQ8b
+query IT nosort
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id OFFSET 77) THEN 'more'
+ELSE 'fewer' END AS m FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	fewer
+2	fewer
+3	more
+4	fewer
+5	fewer
+6	fewer
+
+# An aggregate over every row has one row over no row too: under OR every city passes, and in an ORDER BY CASE the NOT
+# EXISTS is never true. DuckDB: cities 1 to 6; then 6 down to 1.
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT MAX(r.rd_id) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+pending SQ8b
+query I nosort
+SELECT c.ct_id FROM cities c
+ORDER BY CASE WHEN NOT EXISTS (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) THEN 0 ELSE 1 END, 1 DESC
+----
+SMALLINT
+6
+5
+4
+3
+2
+1
+
+# DISTINCT in a GROUP BY key's CASE, and GROUP BY with a HAVING in an aggregate's argument (cities 1, 2 and 3 each have
+# a tier of more than 38 riders). DuckDB: n 8 (the riders without a city) and y 232; then 6.
+pending SQ8b
+query TI nosort
+SELECT CASE WHEN EXISTS (SELECT DISTINCT d.dv_city FROM drivers d WHERE d.dv_city = r.rd_city) THEN 'y' ELSE 'n' END
+AS k, COUNT(*) FROM riders r GROUP BY 1 ORDER BY 1
+----
+VARCHAR	BIGINT
+n	8
+y	232
+
+pending SQ8b
+query I nosort
+SELECT SUM(c.ct_id * CASE WHEN EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier
+HAVING COUNT(*) > 38) THEN 1 ELSE 0 END) AS s FROM cities c
+----
+HUGEINT
+6
+
+# A star over a grouped block is DuckDB's bind error, which antb1 raises for an uncorrelated block today and for a
+# correlated one once SQ8b binds it (ADR 0041's decision 23). DuckDB: column "rd_row" must appear in the GROUP BY
+# clause.
+pending SQ8b
+statement error must appear in the GROUP BY clause
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
+
+# ---- pending: a correlated EXISTS above the aggregation (ADR 0041; roadmap PR SQ13) ----
+
+# antb1 refuses these with "EXISTS in HAVING is not supported" or "a correlated EXISTS over a query block's aggregates
+# is not supported"; SQ8a answers marks in the places per row alone. In HAVING, correlated through a GROUP BY key: a
+# conjunct, under OR, and NOT EXISTS. DuckDB: rider cities 1, 2 and 3 (77, 77 and 78 riders); 1, 2 and the riders
+# without a city (77, 77 and 8); driver city 4 and the drivers without a city (22 and 8).
+pending SQ13
+query II nosort
+SELECT r.rd_city, COUNT(*) FROM riders r GROUP BY r.rd_city
+HAVING EXISTS (SELECT * FROM drivers d WHERE d.dv_city = r.rd_city) ORDER BY 1
+----
+SMALLINT	BIGINT
+1	77
+2	77
+3	78
+
+pending SQ13
+query II nosort
+SELECT r.rd_city, COUNT(*) FROM riders r GROUP BY r.rd_city
+HAVING COUNT(*) < 10 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = r.rd_city AND z.zn_id > 35) ORDER BY 1
+----
+SMALLINT	BIGINT
+1	77
+2	77
+NULL	8
+
+pending SQ13
+query II nosort
+SELECT d.dv_city, COUNT(*) FROM drivers d GROUP BY d.dv_city
+HAVING NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = d.dv_city) ORDER BY 1
+----
+SMALLINT	BIGINT
+4	22
+NULL	8
+
+# A grouped block's select item over COUNT(*), and its ORDER BY. DuckDB: 1 77, 2 77, 3 0 and NULL 0; then the driver
+# cities without riders first (4, then NULL), then 1, 2 and 3.
+pending SQ13
+query II nosort
+SELECT r.rd_city, CASE WHEN EXISTS (SELECT * FROM zones z WHERE z.zn_city = r.rd_city AND z.zn_id > 35)
+THEN COUNT(*) ELSE 0 END AS n FROM riders r GROUP BY r.rd_city ORDER BY 1
+----
+SMALLINT	BIGINT
+1	77
+2	77
+3	0
+NULL	0
+
+pending SQ13
+query II nosort
+SELECT d.dv_city, COUNT(*) FROM drivers d GROUP BY d.dv_city
+ORDER BY CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = d.dv_city) THEN 1 ELSE 0 END, 1
+----
+SMALLINT	BIGINT
+4	22
+NULL	8
+1	23
+2	22
+3	22
+
+# An aggregate of the enclosing block inside the mark's block, in a global block's select item. DuckDB: 240 and y.
+pending SQ13
+query IT nosort
+SELECT COUNT(*), CASE WHEN EXISTS (SELECT * FROM drivers d WHERE d.dv_city = MAX(r.rd_city)) THEN 'y' ELSE 'n' END AS e
+FROM riders r
+----
+BIGINT	VARCHAR
+240	y
+
+# ---- DuckDB only until keyless marks get a PR (ADR 0041's SQ11) ----
+
+# A correlation with no equality, under OR and in a select item's CASE. SQ8a's marks are keyed (ADR 0040's decision 3
+# stands), as the semi join of a top-level conjunct is, so antb1 refuses both without a key ("a correlated EXISTS
+# without a key"). DuckDB: cities 1, 2 and 6; then 'some' for cities 1 to 4, 'none' for 5 and 6.
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city > c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+6
+
+onlyif duckdb
+query IT nosort
+SELECT c.ct_id, CASE WHEN NOT EXISTS (SELECT * FROM drivers d WHERE d.dv_city >= c.ct_id AND d.dv_city <> 3)
+THEN 'none' ELSE 'some' END AS m FROM cities c ORDER BY 1
+----
+SMALLINT	VARCHAR
+1	some
+2	some
+3	some
+4	some
+5	none
+6	none
+
+# An equality over an expression of the inner column is no key, so the mark stays keyless (ADR 0041's SQ10 and SQ11).
+# DuckDB: 2, 3, 4, 6.
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city + 1 = c.ct_id)
+ORDER BY 1
+----
+SMALLINT
+2
+3
+4
+6
+
+# ---- DuckDB only until correlated set operations get a PR (ADR 0041's SQ15) ----
+
+# A UNION ALL of two correlated arms under OR, and NOT EXISTS over an EXCEPT whose right arm is uncorrelated. antb1
+# refuses both at the compound ("a correlated subquery over a UNION ALL", "over an EXCEPT"). DuckDB: cities 1, 2, 3, 4
+# and 6; then 3, 4, 5 and 6 (city 3's riders are all gold or plus).
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT r.rd_id FROM riders r WHERE r.rd_city = c.ct_id
+UNION ALL SELECT d.dv_id FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+6
+
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT r.rd_tier FROM riders r WHERE r.rd_city = c.ct_id
+EXCEPT SELECT g.rd_tier FROM riders g WHERE g.rd_tier <> 'basic') ORDER BY 1
+----
+SMALLINT
+3
+4
+5
+6
+
+# ---- DuckDB only until references two blocks out get a PR (ADR 0041's SQ9) ----
+
+# The innermost block reads c.ct_pop, which the middle block does not equate. antb1 refuses it at that reference ("a
+# qualified column of a query block further out than the enclosing one"). DuckDB: cities 2, 3 and 6 (no rider of city 1
+# has rd_row * 500 above 120000).
+onlyif duckdb
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_parent AND r.rd_row * 500 > c.ct_pop)) ORDER BY 1
+----
+SMALLINT
+2
+3
+6
+
+# Its control without that reference: a mark whose block holds a semi join of its own, which SQ8a answers.
+# DuckDB: cities 1, 2, 3 and 6.
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones z WHERE z.zn_city = c.ct_id
+AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_parent)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+# ---- DuckDB only until BOOLEAN values and subqueries in a LEFT JOIN's ON get a PR (ADR 0041's decision 3) ----
+
+# EXISTS as a value of its own, a select item and a GROUP BY key (antb1: "EXISTS (subqueries) is not supported here").
+# DuckDB: true for cities 1, 2 and 3, false for 4, 5 and 6; then groups of 2 and 4 cities.
+onlyif duckdb
+query IT nosort
+SELECT c.ct_id, EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) AS e FROM cities c ORDER BY 1
+----
+SMALLINT	BOOLEAN
+1	true
+2	true
+3	true
+4	false
+5	false
+6	false
+
+onlyif duckdb
+query I nosort
+SELECT COUNT(*) AS n FROM cities c GROUP BY EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id) ORDER BY n
+----
+BIGINT
+2
+4
+
+# A correlated EXISTS in a LEFT JOIN's ON that reads the right input alone. DuckDB: zones 32 and 37 for city 2 and zone
+# 33 for city 3; cities 1, 4, 5 and 6 padded.
+onlyif duckdb
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30
+AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = z.zn_city AND r.rd_tier = 'gold') ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+1	NULL
+2	32
+2	37
+3	33
+4	NULL
+5	NULL
+6	NULL
+
+# ---- DuckDB only until constant aggregate arguments get a PR (ADR 0041: SUM((q)) exits 4) ----
+
+# A mark's CASE as the whole of an aggregate's argument, which reads no column of the block (antb1: "an aggregate of
+# subquery values alone is not supported"). DuckDB: 3.
+onlyif duckdb
+query I nosort
+SELECT SUM(CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1 ELSE 0 END) AS n FROM cities c
+----
+HUGEINT
+3
+
+# ---- DuckDB only, for good: DuckDB's refusal of a correlated EXISTS in a LEFT JOIN's ON ----
+
+# One that reads the left input.
+onlyif duckdb
+statement error ^Not implemented Error: Cannot perform non-inner join on subquery
+SELECT c.ct_id, z.zn_id FROM cities c LEFT JOIN zones z ON z.zn_city = c.ct_id AND z.zn_id > 30
+AND EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold') ORDER BY 1, 2
+
+# ---- a mark in an inner ON inside a LEFT JOIN's left input (ADR 0041's SQ8a) ----
+
+# A LEFT JOIN pads no row of its left input, so a mark stands in an inner ON there as it does in WHERE.
+# (Inside a FULL JOIN's left input every correlated subquery stays refused, a top-level conjunct too, with a message of
+# its own.) DuckDB: city 1 one zone and one driver, 2 eight and eight, 3 seven and seven, 5 one zone and no driver.
+query III nosort
+SELECT c.ct_id, COUNT(*), COUNT(d.dv_id) FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (z.zn_id > 35 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_tier = 'gold'))
+LEFT JOIN drivers d ON d.dv_city = c.ct_id AND d.dv_row < 3 GROUP BY 1 ORDER BY 1
+----
+SMALLINT	BIGINT	BIGINT
+1	1	1
+2	8	8
+3	7	7
+5	1	0
+
+# ---- bind errors inside a mark's block (ADR 0041's SQ8a) ----
+
+# A mark's block binds before the mark is planted, so antb1 reports these, as DuckDB does: a missing column, an
+# ambiguous one, a DATE compared with a number, an aggregate of the enclosing block in the block's WHERE (the mark
+# stands in WHERE, where DuckDB raises its bind error: ADR 0041's decision 23), and a star over two FROM items of one
+# name. DuckDB: the bind error, each.
+statement error nope
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND nope = 1) THEN 1 ELSE 0 END
+AS m FROM cities c ORDER BY 1
+
+statement error [Aa]mbiguous
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR NOT EXISTS (SELECT * FROM zones z JOIN cities c2 ON c2.ct_id = z.zn_city WHERE z.zn_city = c.ct_id
+AND label = 'park') ORDER BY 1
+
+statement error [Cc]annot compare
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_joined > 5) ORDER BY 1
+
+statement error aggregate
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row > MAX(c.ct_pop)) ORDER BY 1
+
+statement error [Aa]mbiguous
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM zones AS z, cities AS z WHERE z.zn_city = c.ct_id) ORDER BY 1
+
+# ---- the order of a bind error and a mark (ADR 0041's SQ8a) ----
+
+# A bind error that binds before the mark: in an earlier WHERE conjunct, and in WHERE under a select item's CASE, which
+# binds after WHERE. DuckDB: the bind error, both.
+statement error nope
+SELECT c.ct_id FROM cities c
+WHERE nope > 0 AND (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)) ORDER BY 1
+
+statement error nope
+SELECT c.ct_id, CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1 ELSE 0 END AS m
+FROM cities c WHERE nope > 0 ORDER BY 1
+
+# A bind error that binds after the mark: both engines report it. In a later WHERE conjunct; in WHERE under a bare
+# aggregate item, which binds before WHERE; in ORDER BY; in a second mark's block; in GROUP BY; in WHERE after an inner
+# ON; in HAVING; and a type error. DuckDB: the bind error, each.
+statement error nope
+SELECT c.ct_id FROM cities c
+WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)) AND nope > 0 ORDER BY 1
+
+statement error nope
+SELECT SUM(c.ct_id * CASE WHEN EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) THEN 1 ELSE 0 END) AS s
+FROM cities c WHERE nope > 0
+
+statement error nope
+SELECT c.ct_id FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY nope
+
+statement error nope
+SELECT c.ct_id FROM cities c WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)
+OR EXISTS (SELECT * FROM drivers d WHERE d.dv_city = c.ct_id AND nope = 1) ORDER BY 1
+
+statement error nope
+SELECT COUNT(*) FROM cities c
+WHERE c.ct_id = 6 OR NOT EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) GROUP BY nope
+
+statement error nope
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id
+AND (z.zn_id > 35 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)) WHERE z.nope > 0 ORDER BY 1, 2
+
+statement error nope
+SELECT c.ct_id % 2 AS g, COUNT(*) FROM cities c
+WHERE c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id) GROUP BY 1 HAVING MAX(nope) > 0
+
+statement error [Cc]annot compare
+SELECT c.ct_id FROM cities c
+WHERE (c.ct_id = 6 OR EXISTS (SELECT * FROM riders r WHERE r.rd_city = c.ct_id)) AND c.ct_id > DATE '2020-01-01'
+ORDER BY 1

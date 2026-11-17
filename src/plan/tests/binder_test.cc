@@ -1153,17 +1153,15 @@ INSTANTIATE_TEST_SUITE_P(
                   kBind, "nope", "column 'nope' does not exist"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(i16), MAX(i32) FROM u)", kBind, "(",
                   "a subquery of a comparison must have one column, not 2"},
-        // A top-level conjunct is the one placement a correlated EXISTS is answered in (ADR 0023's
-        // U2), refused elsewhere once its block binds; an uncorrelated one is answered under OR,
-        // NOT and CASE too (ADR 0041's SQ1). Outside a condition every EXISTS keeps the static
-        // refusal, before any name resolves.
+        // A correlated EXISTS is a semi or anti join as a top-level conjunct (ADR 0023's U2) and a
+        // mark under OR, NOT and CASE (ADR 0041's SQ8a), over the blocks the gate below admits in
+        // either place; an uncorrelated one is answered under OR, NOT and CASE too (SQ1). Outside a
+        // condition every EXISTS keeps the static refusal, before any name resolves.
         ErrorCase{"SELECT EXISTS (SELECT i16 FROM u) FROM t", kUnsupported, "EXISTS",
                   "EXISTS (subqueries) is not supported here"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT u.i16 FROM u WHERE "
-                  "u.i32 = t.i32)",
-                  kUnsupported, "EXISTS",
-                  "a correlated EXISTS is supported only as a top-level conjunct of WHERE or an "
-                  "inner ON"},
+                  "u.i32 = t.i32 GROUP BY u.i16)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with GROUP BY is not supported"},
         ErrorCase{"SELECT i16 FROM t WHERE (EXISTS (SELECT i16 FROM u)) IS NOT NULL", kUnsupported,
                   "EXISTS", "EXISTS (subqueries) is not supported here"},
         ErrorCase{"SELECT i16 FROM t ORDER BY EXISTS (SELECT i16 FROM u)", kUnsupported, "EXISTS",
@@ -1536,11 +1534,17 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT (SELECT ok.i16 FROM ok WHERE ok.i16 = "
                   "u.i32) FROM u)",
                   kUnsupported, "(", "other than an aggregate over every row"},
-        // A correlated EXISTS outside a top-level conjunct (SQ8); a correlated value stands in a
-        // select item (CorrelatedSelectValuePlacements, ADR 0041's SQ5b).
-        ErrorCase{"SELECT CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END "
-                  "FROM t",
-                  kUnsupported, "EXISTS", "a correlated EXISTS"},
+        // A correlated EXISTS's mark stands in a select item as a correlated value does (ADR
+        // 0041's SQ8a, SQ5b), but not over the block's aggregates (SQ13), nor alone in an
+        // aggregate's argument (as `SUM((q))`).
+        ErrorCase{"SELECT i64, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE "
+                  "0 END FROM t GROUP BY i64",
+                  kUnsupported, "EXISTS", "over a query block's aggregates"},
+        ErrorCase{"SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 "
+                  "END) FROM t",
+                  kUnsupported,
+                  "CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64) THEN 1 ELSE 0 END",
+                  "an aggregate of subquery values alone is not supported"},
         // An IN subquery outside a condition, a BOOLEAN value (ADR 0041's decision 3); in a CASE
         // WHEN it is a mark, of any probe but a NULL literal.
         ErrorCase{"SELECT i16 IN (SELECT i16 FROM u) FROM t", kUnsupported, "IN",
@@ -8944,6 +8948,244 @@ TEST(BinderTest, ACorrelatedValueIsReadThroughOneJoin) {
     EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
     EXPECT_EQ(DependentJoins(*plan), 1U) << sql << "\n" << Explain(*plan);
   }
+}
+
+// ---- ADR 0041's SQ8a: a correlated EXISTS under OR, NOT or CASE is a mark ----
+
+constexpr std::string_view kExistsMark = "EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64)";
+
+// The dependent marks of a bound plan, as EXPLAIN shows them, and its dependent semi joins.
+std::size_t DependentMarks(const LogicalPlan& plan) {
+  const std::string text = Explain(plan);
+  std::size_t found = 0;
+  for (std::size_t at = text.find("DependentJoin MARK"); at != std::string::npos;
+       at = text.find("DependentJoin MARK", at + 1)) {
+    ++found;
+  }
+  return found;
+}
+
+// Every place SQ5b admits a correlated value takes a correlated EXISTS's mark: a condition of WHERE
+// or an inner ON under OR, NOT or CASE, a select item (also under DISTINCT and LIMIT), an ORDER BY
+// item, a GROUP BY key and an aggregate's argument that reads a column, in any block -- a derived
+// table, a CTE, a UNION ALL arm, an IN subquery's or a correlated subquery's own block. Each plan
+// holds its mark, resolves, and unnests.
+TEST(BinderTest, CorrelatedExistsMarkPlacements) {
+  const Catalog catalog = MakeCatalog();
+  const std::string e(kExistsMark);
+  for (const std::string& sql : {
+           std::format("SELECT i16 FROM t WHERE i32 = 1 OR {}", e),
+           std::format("SELECT i16 FROM t WHERE NOT {} OR i16 > 0", e),
+           std::format("SELECT i16 FROM t WHERE NOT ({} AND i16 > 0)", e),
+           std::format("SELECT i16 FROM t WHERE NOT NOT {}", e),
+           std::format("SELECT i16 FROM t WHERE CASE WHEN {} THEN 1 ELSE 0 END = 1", e),
+           std::format("SELECT i16 FROM t WHERE COALESCE(CASE WHEN {} THEN i32 END, 0) > 0", e),
+           std::format("SELECT t.i16 FROM t JOIN ok ON ok.i16 = t.i16 AND ({} OR ok.i16 > 0)", e),
+           std::format("SELECT i16, CASE WHEN {} THEN 1 ELSE 0 END FROM t", e),
+           std::format("SELECT DISTINCT CASE WHEN {} THEN 1 ELSE 0 END FROM t", e),
+           std::format("SELECT i16, CASE WHEN {} THEN 1 ELSE 0 END FROM t LIMIT 2", e),
+           std::format("SELECT i16 FROM t ORDER BY CASE WHEN {} THEN 0 ELSE 1 END, i16", e),
+           std::format("SELECT CASE WHEN {} THEN 1 ELSE 0 END AS k, COUNT(*) FROM t GROUP BY 1", e),
+           std::format("SELECT SUM(CASE WHEN {} THEN i32 ELSE 0 END) FROM t", e),
+           std::format("SELECT x.m FROM (SELECT CASE WHEN {} THEN 1 ELSE 0 END AS m FROM t) x", e),
+           std::format("WITH c AS (SELECT i16 FROM t WHERE {} OR i16 > 0) SELECT a.i16 FROM c AS "
+                       "a JOIN c AS b ON a.i16 = b.i16",
+                       e),
+           std::format("SELECT i16 FROM t WHERE {} OR i16 > 0 UNION ALL SELECT i16 FROM ok", e),
+           std::format("SELECT i16 FROM ok WHERE i16 IN (SELECT t.i16 FROM t WHERE {} OR t.i32 > "
+                       "0)",
+                       e),
+           std::string("SELECT i16, (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64 AND (EXISTS "
+                       "(SELECT 1 FROM ok WHERE ok.i16 = u.i16) OR u.i32 > 0)) FROM t"),
+           std::string("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 AND "
+                       "(EXISTS (SELECT 1 FROM ok WHERE ok.i16 = u.i16) OR u.i32 > 0))"),
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_GE(DependentMarks(*plan), 1U) << sql << "\n" << Explain(*plan);
+    const LogicalPlan optimized = Optimized(*plan);
+    ASSERT_NE(optimized.root, nullptr) << sql;
+    EXPECT_EQ(PositionMismatch(optimized), std::nullopt) << sql << "\n" << Explain(optimized);
+  }
+}
+
+// The mark is a dependent mark join under the conjunct's filter, which reads it as a condition
+// (IS TRUE), and the unnesting lifts it into a mark join keyed on the correlation.
+TEST(BinderTest, ACorrelatedExistsUnderOrIsAMarkJoin) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(std::format("SELECT i16 FROM t WHERE i32 = 1 OR {}", kExistsMark), catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const std::string text = Explain(*plan);
+  const std::size_t filter = text.find("Filter");
+  const std::size_t mark = text.find("DependentJoin MARK mark=#");
+  ASSERT_NE(filter, std::string::npos) << text;
+  ASSERT_NE(mark, std::string::npos) << text;
+  EXPECT_LT(filter, mark) << text;
+  const LogicalPlan optimized = Optimized(*plan);
+  ASSERT_NE(optimized.root, nullptr);
+  const std::string lifted = Explain(optimized);
+  EXPECT_NE(lifted.find("Join MARK build=right keys=[\"t.i64\" = \"u.i64\"]"), std::string::npos)
+      << lifted;
+  EXPECT_EQ(lifted.find("DependentJoin"), std::string::npos) << lifted;
+}
+
+// Decision 10 for a mark: a correlated EXISTS written alike in one slot is one mark, under OR and
+// NOT, in a CASE, in a select item that WHERE's mark holds, in WHERE after an inner ON's. A dry
+// run (OR factoring's dropped branch) plants none. A top-level conjunct that repeats a mark plants
+// its own semi or anti join, in either order: the memo holds a mark for the places a value
+// stands, and a top-level EXISTS keeps its join (your choice in the SQ8 plan).
+TEST(BinderTest, ACorrelatedExistsIsOneMarkPerSlot) {
+  const Catalog catalog = MakeCatalog();
+  const auto bound = [&catalog](const std::string& sql) {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (plan.ok()) {
+      EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    }
+    return plan.ok() ? *plan : LogicalPlan{};
+  };
+  const std::string e(kExistsMark);
+  for (const std::string& sql : {
+           std::format("SELECT i16 FROM t WHERE ({0} OR i16 > 0) AND (NOT {0} OR i32 > 0)", e),
+           std::format("SELECT i16 FROM t WHERE CASE WHEN {0} THEN 1 WHEN NOT {0} THEN 2 END = 1",
+                       e),
+           std::format("SELECT CASE WHEN {0} THEN 1 ELSE 0 END FROM t WHERE {0} OR i16 > 0", e),
+           std::format("SELECT t.i16 FROM t JOIN ok ON ok.i16 = t.i16 AND ({0} OR ok.i16 > 0) "
+                       "WHERE {0} OR t.i32 > 0",
+                       e),
+       }) {
+    const LogicalPlan plan = bound(sql);
+    EXPECT_EQ(DependentJoins(plan), 1U) << sql << "\n" << Explain(plan);
+    EXPECT_EQ(DependentMarks(plan), 1U) << sql << "\n" << Explain(plan);
+  }
+  EXPECT_EQ(DependentJoins(bound(
+                std::format("SELECT i16 FROM t WHERE (i32 = 1 AND {}) OR i32 = 1", kExistsMark))),
+            0U);
+  for (const std::string& sql : {
+           std::format("SELECT i16 FROM t WHERE ({0} OR i16 > 0) AND {0}", e),
+           std::format("SELECT i16 FROM t WHERE {0} AND ({0} OR i16 > 0)", e),
+           std::format("SELECT i16 FROM t WHERE ({0} OR i16 > 0) AND NOT {0}", e),
+       }) {
+    const LogicalPlan plan = bound(sql);
+    EXPECT_EQ(DependentJoins(plan), 2U) << sql << "\n" << Explain(plan);
+    EXPECT_EQ(DependentMarks(plan), 1U) << sql << "\n" << Explain(plan);
+    EXPECT_NE(Optimized(plan).root, nullptr) << sql;
+  }
+}
+
+// A mark the select list binds waits in the slot's tail, above WHERE's filters, as a correlated
+// value does (ACorrelatedValueInTheSelectListStandsInTheTail); a later clause that reads it moves
+// it below its own entry (TakeFromTail), and a dry run moves nothing.
+TEST(BinderTest, ACorrelatedExistsMarkInTheSelectListStandsInTheTail) {
+  const Catalog catalog = MakeCatalog();
+  const auto text_of = [&catalog](const std::string& sql) -> std::string {
+    auto plan = BindSql(sql, catalog);
+    EXPECT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    if (!plan.ok()) {
+      return "";
+    }
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(DependentJoins(*plan), 1U) << sql << "\n" << Explain(*plan);
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+    return Explain(*plan);
+  };
+  const std::string e(kExistsMark);
+  // In the tail: above WHERE's filter.
+  for (const std::string& sql : {
+           std::format("SELECT i16, CASE WHEN {} THEN 1 ELSE 0 END FROM t WHERE i16 > 3", e),
+           std::format("SELECT SUM(CASE WHEN {} THEN i32 ELSE 0 END) FROM t WHERE i16 > 3", e),
+       }) {
+    const std::string text = text_of(sql);
+    const std::size_t mark = text.find("DependentJoin MARK");
+    const std::size_t filter = text.find("Filter i16 > 3");
+    ASSERT_NE(mark, std::string::npos) << sql << "\n" << text;
+    ASSERT_NE(filter, std::string::npos) << sql << "\n" << text;
+    EXPECT_LT(mark, filter) << sql << "\n" << text;
+  }
+  // Promoted by WHERE's reader, an inner ON's, an ORDER BY's: below the reader's filter.
+  for (const std::string& sql : {
+           std::format("SELECT SUM(CASE WHEN {0} THEN i32 ELSE 0 END) FROM t WHERE {0} OR i16 > 3",
+                       e),
+           std::format("SELECT SUM(CASE WHEN {0} THEN ok.i16 ELSE 0 END) FROM t JOIN ok ON ok.i16 "
+                       "= t.i16 AND ({0} OR ok.i16 > 3)",
+                       e),
+       }) {
+    const std::string text = text_of(sql);
+    const std::size_t mark = text.find("DependentJoin MARK");
+    const std::size_t reader = text.find("Filter \"(EXISTS");
+    ASSERT_NE(mark, std::string::npos) << sql << "\n" << text;
+    ASSERT_NE(reader, std::string::npos) << sql << "\n" << text;
+    EXPECT_LT(reader, mark) << sql << "\n" << text;
+  }
+  // A dry run promotes nothing: the mark stays above the filter of the value conjunct written after
+  // the branch OR factoring drops.
+  const std::string text = text_of(std::format(
+      "SELECT SUM(CASE WHEN {0} THEN i32 ELSE 0 END) FROM t WHERE ((i16 < 9 AND {0}) OR i16 < 9) "
+      "AND (SELECT MAX(i16) FROM ok) + 0 > 0",
+      e));
+  const std::size_t later = text.find("Filter \"(max(i16) + 0)\" > 0");
+  ASSERT_NE(later, std::string::npos) << text;
+  EXPECT_LT(text.find("DependentJoin MARK"), later) << text;
+}
+
+// The GROUP BY speculation reads a key's mark: a select item, HAVING and ORDER BY written as the
+// key read it through its one join, by position, alias or text.
+TEST(BinderTest, TheGroupBySpeculationReadsAKeysMark) {
+  const Catalog catalog = MakeCatalog();
+  const std::string k = std::format("CASE WHEN {} THEN 1 ELSE 0 END", kExistsMark);
+  for (const std::string& sql : {
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY 1", k),
+           std::format("SELECT {0} AS k, COUNT(*) FROM t GROUP BY k ORDER BY {0}", k),
+           std::format("SELECT {0}, COUNT(*) FROM t GROUP BY {0} HAVING {0} > 0", k),
+       }) {
+    auto plan = BindSql(sql, catalog);
+    ASSERT_TRUE(plan.ok()) << sql << ": " << plan.status().ToString();
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt) << sql << "\n" << Explain(*plan);
+    EXPECT_EQ(DependentJoins(*plan), 1U) << sql << "\n" << Explain(*plan);
+    EXPECT_NE(Optimized(*plan).root, nullptr) << sql;
+  }
+}
+
+// What SQ8a leaves refused, each in its words: a mark's block of another shape (SQ8b), a mark in
+// HAVING or over the block's aggregates (SQ13), in a conjunct that reads an enclosing block (SQ8c),
+// inside a padded unit's ON, keyless (SQ11, the unnesting's refusal), in a LEFT JOIN's ON and as a
+// BOOLEAN value (decision 3).
+INSTANTIATE_TEST_SUITE_P(
+    CorrelatedExistsMarks, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 "
+                  "LIMIT 1)",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with LIMIT is not supported"},
+        ErrorCase{"SELECT i16 FROM t WHERE NOT EXISTS (SELECT DISTINCT u.i16 FROM u WHERE u.i64 = "
+                  "t.i64) OR i16 > 0",
+                  kUnsupported, "EXISTS", "EXISTS over a subquery with DISTINCT is not supported"},
+        ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) > 1 OR EXISTS (SELECT "
+                  "1 FROM u WHERE u.i16 = t.i16)",
+                  kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
+        ErrorCase{
+            "SELECT i16 FROM ok WHERE EXISTS (SELECT 1 FROM t WHERE t.i16 = ok.i16 AND (EXISTS "
+            "(SELECT 1 FROM u WHERE u.i64 = t.i64) OR t.i32 > ok.i16))",
+            kUnsupported, "EXISTS",
+            "a correlated subquery in a conjunct that also reads a column of an enclosing "
+            "query block is not supported"},
+        ErrorCase{"SELECT t.i16 FROM t LEFT JOIN ok ON ok.i16 = t.i16 AND (EXISTS (SELECT 1 FROM u "
+                  "WHERE u.i64 = t.i64) OR ok.i16 > 0)",
+                  kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported here"}));
+
+// A keyless mark is the unnesting's refusal, in an EXISTS's words, as a top-level one's is: the
+// binder answers it, and Optimize refuses it at the EXISTS (SQ11).
+TEST(BinderTest, AKeylessMarkIsTheUnnestingsRefusal) {
+  const Catalog catalog = MakeCatalog();
+  constexpr std::string_view kSql =
+      "SELECT i16 FROM t WHERE i32 = 1 OR EXISTS (SELECT 1 FROM u WHERE u.i64 < t.i64)";
+  auto plan = BindSql(kSql, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const auto optimized = Optimize(*plan);
+  ASSERT_FALSE(optimized.ok()) << Explain(*optimized);
+  ASSERT_NE(GetSqlError(optimized.status()), nullptr) << optimized.status().ToString();
+  EXPECT_EQ(SpanText(kSql, optimized.status()), "EXISTS") << optimized.status().ToString();
+  EXPECT_EQ(optimized.status().message(), "a correlated EXISTS without a key is not supported");
 }
 
 }  // namespace

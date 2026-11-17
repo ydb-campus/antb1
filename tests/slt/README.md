@@ -380,6 +380,26 @@ and a `SELECT DISTINCT` item are never a DOUBLE but in a `CASE` that compares it
 the value item's alias (D37), the value's text is written once (D38), nothing above the aggregation reads it (SQ13),
 nothing divides, subtracts or casts, and SQ6's never-list holds.
 
+The correlated `EXISTS` marks of ADR 0041's SQ8a (feature `correlated_exists_mark`) are drawn right after SQ5b's
+values, from a random stream of their own and only where the query holds no other subquery, so a query without one is
+the query its seed gave before. A mark is `[NOT] EXISTS` over a plain block: `SELECT *` from one named table, an
+equality key between an inner and an outer column of one type (`=` or `IS NOT DISTINCT FROM`, either way round), now
+and then a comparison of an inner column with a literal, and now and then a residual that compares an inner and an
+outer column of one type by `=`, `<`, `<=`, `>` or `>=` -- never `<>` or `!=`, which DuckDB 1.5 takes for true under a
+mark where the outer column is NULL, a wrong answer. It stands inside a condition, never alone as a conjunct (a semi or
+an anti join): `(mark OR o.x <op> k)` in either order, `(mark OR mark)`, `NOT (mark AND o.x <op> k)`, `NOT (mark OR
+o.x <op> k)`, or a `CASE WHEN` over the mark or one of those. It is one more conjunct of `WHERE`, or of the `ON` of an
+inner `JOIN` with no comma before it and outside a `FULL JOIN`'s left input (its marks read the `FROM` items up to that
+`JOIN` only); a `CASE` select item or `ORDER BY` item of a block that does not aggregate, or such an item ordered by its
+alias or position (the only form under `SELECT DISTINCT`); a `CASE` that is a `GROUP BY` key, grouped by its alias or
+position; or an aggregate's argument that reads an outer column beside the marks, `COUNT [DISTINCT]`, `MIN`, `MAX` or
+`SUM` of `CASE WHEN <condition> THEN o.x [ELSE 0] END`, in the select list, or in `HAVING` or `ORDER BY` of a block
+that aggregates already. A quarter of them stand next to a top-level `[NOT] EXISTS` conjunct of `WHERE` over another
+such block. A mark is never in `HAVING` or over a block's aggregates outside an aggregate's argument (SQ13), never
+`EXISTS` as a value, never in a `LEFT` or `FULL JOIN`'s `ON`, never the only thing an aggregate's argument reads besides
+literals, and no key computes or compares two types; the item's text is written once (D38), no `ORDER BY` expression
+reads its alias (D37), and nothing computes, so nothing can fail (D35).
+
 Nested blocks carry compounds too (ADR 0036): 30% of the time a nested block is written as two or three copies of
 itself joined by `UNION ALL`, from an eighth random stream, so that a query without one is the query its seed gave
 before. The copies read the same columns of the same table, so their types agree, and the query's row guards count

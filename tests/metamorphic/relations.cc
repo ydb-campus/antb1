@@ -3260,6 +3260,170 @@ std::vector<Relation> AllRelations() {
     }
   }
 
+  // ---- SQ8a's correlated EXISTS under OR, NOT and CASE (ADR 0041) ----
+  // A correlated EXISTS in a condition of WHERE or an inner ON, a select item, ORDER BY, a GROUP BY
+  // key or an aggregate's argument is a two-valued mark: TRUE where its block has a row for the
+  // outer row, else FALSE, never NULL. A top-level EXISTS is a semi join and NOT EXISTS an anti
+  // join, so each relation below pits the mark against them. The star schema as above: cities 1 to
+  // 3 have riders, 4 to 6 none; drivers are in cities 1 to 4; riders, drivers and zones have NULL
+  // cities, which only IS NOT DISTINCT FROM matches.
+  {
+    const slt::FeatureSet marks = {kColumns,          kCountStar,           kIntegerColumns,
+                                   kTableName,        kQualifiedName,       kWhere,
+                                   kTableAlias,       kIntegerLiteral,      kBooleanExpressions,
+                                   kCorrelatedExists, kCorrelatedExistsMark};
+    struct Mark {
+      std::string_view name;
+      std::string_view from;    // the outer table, read as `o`
+      std::string_view key;     // a column of `o` that tells its rows apart
+      std::string_view exists;  // the correlated EXISTS
+      std::string_view other;   // a condition over `o` alone
+      slt::FeatureSet features;
+    };
+    const auto mark_list = std::to_array<Mark>({
+        {.name = "riders",
+         .from = "cities",
+         .key = "ct_id",
+         .exists = "EXISTS (SELECT 1 FROM riders WHERE riders.rd_city = o.ct_id AND riders.rd_row "
+                   "> 200)",
+         .other = "o.ct_pop < 10000",
+         .features = {kCompareColumns}},
+        {.name = "residual",
+         .from = "cities",
+         .key = "ct_id",
+         .exists = "EXISTS (SELECT 1 FROM drivers WHERE drivers.dv_city = o.ct_id AND "
+                   "drivers.dv_row > o.ct_id * 20)",
+         .other = "o.ct_id >= 4",
+         .features = {kArithmetic, kCompareColumns}},
+        {.name = "riders_and_trips",
+         .from = "riders",
+         .key = "rd_row",
+         .exists = "EXISTS (SELECT 1 FROM trips WHERE trips.tr_rider = o.rd_id AND trips.tr_row "
+                   "% 3 = 0)",
+         .other = "o.rd_tier = 'gold'",
+         .features = {kVarcharColumns, kStringLiteral, kArithmetic}},
+        {.name = "null_equal",
+         .from = "riders",
+         .key = "rd_row",
+         .exists = "EXISTS (SELECT 1 FROM drivers WHERE drivers.dv_city IS NOT DISTINCT FROM "
+                   "o.rd_city)",
+         .other = "o.rd_row < 40",
+         .features = {kNullEqualKeys}},
+    });
+    for (const Mark& m : mark_list) {
+      const auto block = [&](std::string_view where) {
+        return std::format("SELECT o.{} FROM {} AS o WHERE {}", m.key, m.from, where);
+      };
+      slt::FeatureSet features = marks;
+      features.Add(m.features);
+      // `E OR p` keeps the rows of `E` and of `p` together: the UNION of the two (a semi join and
+      // a filter), and the DISTINCT keys of their UNION ALL, at any batch size.
+      const std::string either = block(std::format("{} OR {}", m.exists, m.other));
+      r.push_back(
+          {.name = std::format("exists_mark_under_or_is_the_union_of_its_branches_{}", m.name),
+           .features = SetWith(features, kUnion, kUnionAll, kSelectDistinct, kDerivedTable),
+           .probes = {Q(either), Q(std::format("{} UNION {}", block(m.exists), block(m.other))),
+                      Q(std::format("SELECT DISTINCT u.{0} FROM ({1} UNION ALL {2}) AS u", m.key,
+                                    block(m.exists), block(m.other))),
+                      Q(either, 1), Q(either, 7)},
+           .check = AllEqual()});
+      // `E OR NOT E` is TRUE for every row: a two-valued mark is never NULL.
+      const std::string every = std::format("SELECT COUNT(*) FROM {} AS o WHERE {} OR NOT {}",
+                                            m.from, m.exists, m.exists);
+      r.push_back({.name = std::format("exists_mark_or_its_negation_keeps_every_row_{}", m.name),
+                   .features = features,
+                   .probes = {Q(every), Q(std::format("SELECT COUNT(*) FROM {} AS o", m.from)),
+                              Q(every, 1)},
+                   .check = AllEqual()});
+      // A CASE over the mark splits the rows as the semi and the anti join do.
+      const std::string marked = std::format(
+          "SELECT o.{}, CASE WHEN {} THEN 1 ELSE 0 END AS m FROM {} AS o", m.key, m.exists, m.from);
+      r.push_back({.name = std::format("exists_mark_in_case_is_its_semi_and_anti_joins_{}", m.name),
+                   .features = SetWith(features, kCase, kMultipleItems, kAlias),
+                   .probes = {Q(marked),
+                              Q(std::format("SELECT o.{}, 1 AS m FROM {} AS o WHERE {}", m.key,
+                                            m.from, m.exists)),
+                              Q(std::format("SELECT o.{}, 0 AS m FROM {} AS o WHERE NOT {}", m.key,
+                                            m.from, m.exists))},
+                   .check = FirstIsUnionOfRest()});
+      // NOT NOT over the mark is the semi join.
+      const std::string twice = block(std::format("NOT NOT {}", m.exists));
+      r.push_back({.name = std::format("exists_mark_under_two_nots_is_the_semi_join_{}", m.name),
+                   .features = features,
+                   .probes = {Q(twice), Q(block(m.exists)), Q(twice, 1), Q(twice, 7)},
+                   .check = AllEqual()});
+    }
+    // E1 AND (E2 OR E3) is (E1 AND E2) UNION (E1 AND E3): a semi join with two marks above it, as
+    // two semi joins each.
+    {
+      constexpr std::string_view kZones =
+          "EXISTS (SELECT 1 FROM zones WHERE zones.zn_city = o.ct_id)";
+      constexpr std::string_view kRiders =
+          "EXISTS (SELECT 1 FROM riders WHERE riders.rd_city = o.ct_id AND riders.rd_row > 100)";
+      constexpr std::string_view kDrivers =
+          "EXISTS (SELECT 1 FROM drivers WHERE drivers.dv_city = o.ct_id AND drivers.dv_row < 30)";
+      const std::string marked = std::format(
+          "SELECT o.ct_id FROM cities AS o WHERE {} AND ({} OR {})", kZones, kRiders, kDrivers);
+      r.push_back(
+          {.name = "exists_marks_beside_a_semi_join_distribute",
+           .features = SetWith(marks, kWhereAnd, kUnion, kCompareColumns),
+           .probes = {Q(marked),
+                      Q(std::format("SELECT o.ct_id FROM cities AS o WHERE {0} AND {1} UNION "
+                                    "SELECT o.ct_id FROM cities AS o WHERE {0} AND {2}",
+                                    kZones, kRiders, kDrivers)),
+                      Q(marked, 1), Q(marked, 7)},
+           .check = AllEqual()});
+    }
+    // The self-check of ADR 0041's decision 28 for SQ8a's places: an item's mark, an ORDER BY's
+    // order and an aggregate argument's sum are those of the EXISTS with each city written as a
+    // literal (cities 1 to 6, none NULL), an uncorrelated EXISTS, which needs no DuckDB.
+    {
+      static constexpr std::string_view kExists =
+          "EXISTS (SELECT 1 FROM riders WHERE riders.rd_city = {0} AND riders.rd_row % 2 = 0)";
+      const auto at = [](const auto& binding) {
+        return std::vformat(kExists, std::make_format_args(binding));
+      };
+      const slt::FeatureSet features =
+          SetWith(marks, kCase, kOrderBy, kMultipleItems, kAlias, kArithmetic);
+      const std::string item = std::format(
+          "SELECT ct_id, CASE WHEN {} THEN 1 ELSE 0 END AS m FROM cities", at("cities.ct_id"));
+      std::vector<Probe> items = {Q(item)};
+      std::string order_case = "CASE";
+      const std::string argument = std::format(
+          "SELECT SUM(CASE WHEN {} THEN ct_id ELSE 0 END) FROM cities", at("cities.ct_id"));
+      std::vector<Probe> arguments = {Q(argument)};
+      for (int id = 1; id <= 6; ++id) {
+        items.push_back(Q(std::format(
+            "SELECT ct_id, CASE WHEN {} THEN 1 ELSE 0 END AS m FROM cities WHERE ct_id = {}",
+            at(id), id)));
+        order_case +=
+            std::format(" WHEN ct_id = {} THEN CASE WHEN {} THEN 0 ELSE 1 END", id, at(id));
+        arguments.push_back(Q(std::format(
+            "SELECT SUM(CASE WHEN {} THEN ct_id ELSE 0 END) FROM cities WHERE ct_id = {}", at(id),
+            id)));
+      }
+      order_case += " END";
+      const std::string ordered =
+          std::format("SELECT ct_id FROM cities ORDER BY CASE WHEN {} THEN 0 ELSE 1 END, ct_id",
+                      at("cities.ct_id"));
+      r.push_back({.name = "exists_mark_item_is_its_bindings_as_literals",
+                   .features = features,
+                   .probes = std::move(items),
+                   .check = FirstIsUnionOfRest()});
+      r.push_back(
+          {.name = "exists_mark_order_by_is_its_bindings_as_literals",
+           .features = features,
+           .probes = {Q(ordered),
+                      Q(std::format("SELECT ct_id FROM cities ORDER BY {}, ct_id", order_case)),
+                      Q(ordered, 1), Q(ordered, 7)},
+           .check = AllEqualInOrder()});
+      r.push_back({.name = "exists_mark_argument_is_its_bindings_as_literals",
+                   .features = SetWith(features, kSum),
+                   .probes = std::move(arguments),
+                   .check = FirstEqualsSumOfRest()});
+    }
+  }
+
   // ---- UNION ALL (ADR 0036) ----
   // A UNION ALL of two blocks has exactly their rows together, in a derived table and in a CTE,
   // whichever block comes first and at any batch size; its COUNT(*) is the sum of theirs.
