@@ -1,0 +1,8 @@
+Output: ct_id:SMALLINT
+Project ct_id
+  Sort ct_id ASC NULLS LAST
+    Filter "((NOT EXISTS (SELECT 1 FROM riders AS ""r"" WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id AND r.rd_id > c.ct_pop)) OR (c.ct_id = 2))"
+      Compute ((NOT EXISTS (SELECT 1 FROM riders AS "r" WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id AND r.rd_id > c.ct_pop)) OR (c.ct_id = 2))
+        Join MARK build=right keys=["c.ct_id" IS NOT DISTINCT FROM "r.rd_city"] residual=[(r.rd_id > c.ct_pop)] carries 1 of 3 unread above
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id, ct_pop]
+          Scan table=riders source=parquet(files=1, rows=240) columns=[rd_id, rd_city]

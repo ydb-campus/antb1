@@ -1,0 +1,8 @@
+Output: ct_id:SMALLINT m:VARCHAR
+Project ct_id, m
+  Sort ct_id ASC NULLS LAST
+    Compute CASE  WHEN (EXISTS (SELECT 1 FROM riders AS "r" WHERE r.rd_city = c.ct_id)) THEN ('y') ELSE 'n' END
+      Join MARK build=right keys=["c.ct_id" = "r.rd_city"]
+        Filter ct_id > 2
+          Scan table=cities source=parquet(files=1, rows=6) columns=[ct_id]
+        Scan table=riders source=parquet(files=1, rows=240) columns=[rd_city]

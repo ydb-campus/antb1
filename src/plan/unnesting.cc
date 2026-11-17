@@ -400,10 +400,9 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
 
 // How a dependent join's kind is unnested, read from its traits, never from its name (decision 16).
 enum class Mode : std::uint8_t {
-  // A join that keeps or drops left rows and reads none of its right input's columns, and that can
-  // evaluate the correlated conjuncts over candidate pairs (semi and anti): they move into it, as
-  // ADR
-  // 0023's Path 1 has it.
+  // A join that keeps, drops or marks left rows and reads none of its right input's columns, and
+  // that can evaluate the correlated conjuncts over candidate pairs (semi, anti and mark joins):
+  // they move into it, as ADR 0023's Path 1 has it.
   kLift,
   // A join that appends its right input's one row (one-row): a static aggregate grouped by the
   // representatives of the outer columns, by substitution, as ADR 0023's Path 2 has it.
@@ -411,14 +410,14 @@ enum class Mode : std::uint8_t {
 };
 
 // std::nullopt where the pass answers no correlated subquery of the kind: a null-aware anti join
-// and a mark take no residual, so their correlation cannot move into them (SQ8 and SQ12), and the
-// binder makes no dependent inner, LEFT or FULL join.
+// and a null-aware mark take no residual, so their correlation cannot move into them (SQ12), and
+// the binder makes no dependent inner, LEFT or FULL join.
 std::optional<Mode> ModeOf(JoinKind kind) {
   const JoinKindTraits traits = Traits(kind);
   if (traits.one_row) {
     return Mode::kValue;
   }
-  if (traits.filters_left && traits.residuals) {
+  if ((traits.filters_left || traits.appends_mark) && traits.residuals) {
     return Mode::kLift;
   }
   return std::nullopt;
@@ -434,15 +433,18 @@ struct Correlation {
   std::span<const Ancestor> above;  // the plan's root down to the join's parent
   UnnestReport* report = nullptr;
 
-  // The refusal of a shape, in the wording each mode has always had, at the subquery's span.
+  // The refusal of a shape, in the wording each mode has always had, at the subquery's span: a
+  // mark's is an EXISTS's, whose NOT, where it has one, stands above the mark.
   [[nodiscard]] arrow::Status Refuse(std::string_view what) const {
     if (mode == Mode::kValue) {
       return UnsupportedError(std::format("a correlated scalar subquery {} is not supported", what),
                               join.span);
     }
+    const JoinKindTraits traits = Traits(join.kind);
     return UnsupportedError(
         std::format("a correlated {} {} is not supported",
-                    Traits(join.kind).drops_unmatched_left ? "EXISTS" : "NOT EXISTS", what),
+                    traits.drops_unmatched_left || traits.appends_mark ? "EXISTS" : "NOT EXISTS",
+                    what),
         join.span);
   }
   // A node on the way to the correlated filter that the mode has no rule for. An aggregate, GROUP
@@ -844,7 +846,8 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
       // ADR 0023: an outer-only conjunct must not become a filter on the outer rows of an anti
       // join -- where it is false or NULL the subquery has no row, so NOT EXISTS keeps the outer
       // row that a filter would drop. A residual gets that right: the pair does not match, and
-      // the anti join keeps the row.
+      // the anti join keeps the row. A mark keeps every outer row, so there a filter would lose
+      // the row whose mark is FALSE; the residual marks it so.
       //
       // The ADR puts an EXISTS's outer-only conjunct in a filter below the semi join instead,
       // which is the same answer and drops the rows earlier. A residual is used for both here:
@@ -911,10 +914,11 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
                        .right = std::move(right),
                        .keys = std::move(keys),
                        .residual = std::move(residual),
+                       .mark = join.mark,  // the id the binder gave it, which the plan reads above
                        .build = build,
-                       // A semi or an anti join keeps a subset of its left input, so that is an
-                       // upper bound: without it every join above this rewrite would read its own
-                       // left input as unknown.
+                       // A semi or an anti join keeps a subset of its left input, and a mark join
+                       // every row of it, so that is an upper bound: without it every join above
+                       // this rewrite would read its own left input as unknown.
                        .estimate = left_rows,
                        .span = join.span});
 }
@@ -1584,6 +1588,12 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
   if (!mode.has_value()) {
     return UnsupportedError("a correlated subquery is not supported", join.span);
   }
+  if ((join.mark != kNoColumnId) != Traits(join.kind).appends_mark) {
+    // A binder bug: ResolvePositions would abort the process over it rather than fail the query.
+    return arrow::Status::NotImplemented(
+        std::format("the unnesting pass met a {} dependent join {} a mark", ToString(join.kind),
+                    join.mark == kNoColumnId ? "without" : "with"));
+  }
   const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
   const Correlation correlation{.join = join,
                                 .mode = *mode,
@@ -1622,6 +1632,14 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
       })) {
     return arrow::Status::NotImplemented(
         "the unnesting pass left a free variable in a rewritten join's right input");
+  }
+  // Nor may the rewrite lose a column the dependent join output, a mark included: the nodes above
+  // read them.
+  const std::vector<ColumnId> outputs = OutputIds(*out.node);
+  for (const ColumnId id : OutputIds(LogicalNode{join})) {
+    if (std::ranges::find(outputs, id) == outputs.end()) {
+      return arrow::Status::NotImplemented("the unnesting pass lost an output of a rewritten join");
+    }
   }
   return out.node;
 }

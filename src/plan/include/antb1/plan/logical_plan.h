@@ -527,7 +527,8 @@ struct JoinNode {
   // position in that concatenation); every one must be true for a match.
   std::vector<ExprPtr> residual;
   // The column this join defines where its kind `appends_mark` (ADR 0041's decision 13): a
-  // nullable BOOLEAN after the left input's columns; kNoColumnId for every other kind.
+  // nullable BOOLEAN after the left input's columns (never NULL for kMark); kNoColumnId for every
+  // other kind.
   ColumnId mark = kNoColumnId;
   BuildSide build = BuildSide::kRight;
   // The rows this join outputs, as the join order estimated them (join_order.h's rule 3, which
@@ -556,9 +557,10 @@ struct JoinNode {
 // A correlated subquery before unnesting (ADR 0023), the formalization's dependent join: for each
 // row of the left input, the right input evaluated with its free variables (the ids its expressions
 // read and none of its own nodes outputs) bound to that row's values. Its kind is semi (EXISTS),
-// anti (NOT EXISTS) or one-row (a scalar subquery, whose single value it appends to each left row);
-// it has no keys, because a correlation is a predicate of the right input, not a pair of columns.
-// Output: as a join of the same kind, and then `mark` where that is set.
+// anti (NOT EXISTS), one-row (a scalar subquery, whose single value it appends to each left row) or
+// mark (an EXISTS under OR, NOT or CASE, whose two-valued mark it appends: ADR 0041's SQ8); it has
+// no keys, because a correlation is a predicate of the right input, not a pair of columns. Output:
+// as a join of the same kind, and then `mark` where that is set.
 //
 // The first pass of plan::Optimize replaces every dependent join with ordinary joins or rejects the
 // query (exit code 4), so no session executes one and no later pass meets one; EXPLAIN renders it
@@ -567,10 +569,10 @@ struct DependentJoinNode {
   JoinKind kind = JoinKind::kSemi;
   LogicalNodePtr left;
   LogicalNodePtr right;  // reads columns of the left input as free variables
-  // A column this node defines that neither input has: a mark join's three-valued marker, as
-  // JoinNode::mark is for the uncorrelated kNullAwareMark (ADR 0041's SQ7). No dependent kind
-  // defines one yet (SQ8 and SQ12), so every bound plan leaves it unset (ADR 0023, "One output-id
-  // contract for two shapes").
+  // A column this node defines that neither input has, set exactly where its kind `appends_mark`:
+  // the mark of a correlated EXISTS (kMark, ADR 0041's SQ8), as JoinNode::mark is for the joins
+  // the unnesting makes of it; the correlated three-valued mark is SQ12's (ADR 0023, "One
+  // output-id contract for two shapes").
   ColumnId mark = kNoColumnId;
   SourceSpan span;  // the subquery in the query
 };

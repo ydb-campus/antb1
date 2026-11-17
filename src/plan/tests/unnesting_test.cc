@@ -18,6 +18,7 @@
 #include "antb1/plan/plan_options.h"
 #include "antb1/plan/sql_status.h"
 
+#include "../join_order.h"
 #include "plan_test_util.h"
 
 namespace antb1::plan {
@@ -44,21 +45,28 @@ LogicalNodePtr WithRight(const LogicalNodePtr& node,
   return node;
 }
 
-// The first dependent join of `node`, its kind replaced.
-LogicalNodePtr WithKind(const LogicalNodePtr& node, JoinKind kind) {
+// The first dependent join of `node`, its kind replaced, and its mark (none by default).
+LogicalNodePtr WithKind(const LogicalNodePtr& node, JoinKind kind, ColumnId mark = kNoColumnId) {
   if (const auto* dependent = std::get_if<DependentJoinNode>(node.get())) {
     DependentJoinNode out = *dependent;
     out.kind = kind;
+    out.mark = mark;
     return std::make_shared<const LogicalNode>(std::move(out));
   }
   std::vector<LogicalNodePtr> inputs = InputsOf(*node);
   for (LogicalNodePtr& input : inputs) {
     if (input != nullptr && FirstDependentJoin(input) != nullptr) {
-      input = WithKind(input, kind);
+      input = WithKind(input, kind, mark);
       return WithInputs(*node, std::move(inputs));
     }
   }
   return node;
+}
+
+// The first dependent join of `node` made a mark (ADR 0041's SQ8), under a fresh id: the dependent
+// join the binder plants for a correlated EXISTS under OR, NOT or CASE.
+LogicalNodePtr AsMark(const LogicalNodePtr& node) {
+  return WithKind(node, JoinKind::kMark, ColumnId{std::to_underlying(MaxColumnId(*node)) + 1});
 }
 
 // `node`'s correlated filter -- the first Filter over a Compute -- rewritten by `f`.
@@ -131,28 +139,97 @@ std::string RefusalOf(std::string_view sql,
   return out.status().message();
 }
 
-// ADR 0041's decision 16: a dependent join is unnested by its kind's traits. A semi or anti join
-// takes its correlated conjuncts (lift mode), a one-row join appends a static aggregate's row
+// ADR 0041's decision 16: a dependent join is unnested by its kind's traits. A semi, anti or mark
+// join takes its correlated conjuncts (lift mode), a one-row join appends a static aggregate's row
 // (value mode), and every other kind -- one whose join takes no residual, or that the binder never
 // makes dependent -- keeps the one refusal it has always had.
-TEST(UnnestingTest, EveryKindButSemiAntiAndOneRowIsRefused) {
-  for (const JoinKind kind :
-       {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-        JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull, JoinKind::kNullAwareMark}) {
+TEST(UnnestingTest, EveryKindButSemiAntiMarkAndOneRowIsRefused) {
+  for (const JoinKind kind : {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
+                              JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kFull,
+                              JoinKind::kNullAwareMark, JoinKind::kMark}) {
     SCOPED_TRACE(ToString(kind));
-    const std::string refusal =
-        RefusalOf(kind == JoinKind::kOneRow ? kScalar : kExists,
-                  [kind](const LogicalNodePtr& root) { return WithKind(root, kind); });
+    const std::string refusal = RefusalOf(
+        kind == JoinKind::kOneRow ? kScalar : kExists, [kind](const LogicalNodePtr& root) {
+          return kind == JoinKind::kMark ? AsMark(root) : WithKind(root, kind);
+        });
     switch (kind) {
       case JoinKind::kSemi:
       case JoinKind::kAnti:
       case JoinKind::kOneRow:
+      case JoinKind::kMark:
         EXPECT_EQ(refusal, "");
         break;
       default:
         EXPECT_EQ(refusal, "a correlated subquery is not supported");
     }
   }
+}
+
+// ADR 0041's SQ8: a dependent mark is lifted as a semi join is -- an `=` key, an IS NOT DISTINCT
+// FROM key (NULL-equal), a residual over both sides and an outer-only one (a residual, never a
+// filter on the outer rows, whose marks it would lose), the inner-only conjunct left below -- into
+// a mark join building on its right input. It keeps the mark's id, so that what reads the mark
+// above still finds it, and every left row: its estimate is the left input's.
+TEST(UnnestingTest, ALiftedMarkKeepsItsIdKeysAndResiduals) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(
+      "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+      "u.i64 IS NOT DISTINCT FROM t.i64 AND u.i32 > t.i32 AND t.i32 > 0 AND u.i32 < 9)",
+      catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const LogicalNodePtr marked = AsMark(plan->root);
+  const ColumnId mark = FirstDependentJoin(marked)->mark;
+  const arrow::Result<LogicalNodePtr> out = Unnest(marked, kBuildSideRatio);
+  ASSERT_TRUE(out.ok()) << out.status().ToString();
+  EXPECT_EQ(TreeText(*out),
+            "Project i16\n"
+            "  Join MARK build=right keys=[\"t.i16\" = \"u.i16\", \"t.i64\" IS NOT DISTINCT FROM "
+            "\"u.i64\"] residual=[(u.i32 > t.i32), (t.i32 > 0)]\n"
+            "    Scan table=t source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+            "Case\", from]\n"
+            "    Filter i32 < 9\n"
+            "      Scan table=u source=fake columns=[i16, i32, i64, u16, h, d, s, dt, bad, \"Mixed "
+            "Case\", from]\n");
+  const auto* project = std::get_if<ProjectNode>(out->get());
+  ASSERT_NE(project, nullptr);
+  const auto* join = std::get_if<JoinNode>(project->input.get());
+  ASSERT_NE(join, nullptr);
+  EXPECT_NE(mark, kNoColumnId);
+  EXPECT_EQ(join->mark, mark);
+  ASSERT_EQ(join->keys.size(), 2U);
+  EXPECT_FALSE(join->keys[0].null_equal);
+  EXPECT_TRUE(join->keys[1].null_equal);
+  EXPECT_EQ(join->build, BuildSide::kRight);
+  EXPECT_EQ(join->estimate, EstimateRows(*join->left));
+  const std::vector<ColumnId> outputs = OutputIds(*project->input);
+  EXPECT_EQ(outputs.back(), mark);
+}
+
+// A dependent mark is refused where a semi join is, in an EXISTS's words: without a key.
+TEST(UnnestingTest, AMarkWithoutAKeyIsRefusedAsAnExists) {
+  EXPECT_EQ(
+      RefusalOf("SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i32 > t.i32)", AsMark),
+      "a correlated EXISTS without a key is not supported");
+}
+
+// A dependent join whose mark disagrees with its kind is a binder bug, which the pass reports as an
+// internal error (exit 70) rather than leave to ResolvePositions, which would abort the process: a
+// mark without its id, and a semi join with one.
+TEST(UnnestingTest, ADependentJoinWhoseMarkDisagreesWithItsKindIsAnInternalError) {
+  const Catalog catalog = MakeCatalog();
+  auto plan = BindSql(kExists, catalog);
+  ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+  const arrow::Result<LogicalNodePtr> without =
+      Unnest(WithKind(plan->root, JoinKind::kMark), kBuildSideRatio);
+  ASSERT_TRUE(without.status().IsNotImplemented()) << without.status().ToString();
+  EXPECT_EQ(GetSqlError(without.status()), nullptr);
+  EXPECT_EQ(without.status().message(),
+            "the unnesting pass met a MARK dependent join without a mark");
+  const arrow::Result<LogicalNodePtr> with =
+      Unnest(WithKind(plan->root, JoinKind::kSemi, FirstDependentJoin(AsMark(plan->root))->mark),
+             kBuildSideRatio);
+  ASSERT_TRUE(with.status().IsNotImplemented()) << with.status().ToString();
+  EXPECT_EQ(with.status().message(), "the unnesting pass met a SEMI dependent join with a mark");
 }
 
 // Decision 17: the descent has a rule per node type, and each mode declines the nodes it has no
@@ -501,7 +578,7 @@ TEST(UnnestingTest, TheProofPassesAFilterThatDecidesNothing) {
 TEST(UnnestingTest, TheProofPassesAJoinReachedFromItsLeft) {
   for (const JoinKind kind :
        {JoinKind::kInner, JoinKind::kLeft, JoinKind::kSemi, JoinKind::kAnti,
-        JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kNullAwareMark}) {
+        JoinKind::kNullAwareAnti, JoinKind::kOneRow, JoinKind::kNullAwareMark, JoinKind::kMark}) {
     SCOPED_TRACE(ToString(kind));
     for (const bool key : {false, true}) {
       EXPECT_EQ(Proof(std::vector<Above>{{.node = FilterOf({Compare(kValue, CompareOp::kGt, 0)}),

@@ -430,6 +430,26 @@ TEST(SharedSubPlansTest, AMarkIsOneColumnOnlyOverTheSameKeys) {
       << "only the set's sub-plan, read by both marks, is one";
 }
 
+// A correlated EXISTS's mark (ADR 0041's SQ8a) has its origin in the mark join's kind, keys and
+// residuals: a CTE that computes over one, referenced twice, is one sub-plan up to its Project,
+// while two marks of one subtree whose residuals differ are not one column, so what reads them is
+// not shared.
+TEST(SharedSubPlansTest, ACorrelatedMarkIsOneColumnOnlyOverTheSameResiduals) {
+  EXPECT_EQ(
+      Groups("WITH g AS (SELECT i64, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 AND "
+             "u.i32 > t.i32) THEN 1 ELSE 0 END AS m FROM t) SELECT COUNT(*) FROM g AS a, g AS b "
+             "WHERE a.i64 = b.i64 AND a.m = b.m"),
+      (std::vector<std::string>{"Project 2x4"}))
+      << "the CTE's Project heads it, its mark join and the Compute that reads the mark inside";
+  EXPECT_EQ(
+      Groups("SELECT COUNT(*) FROM (SELECT i64, CASE WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = "
+             "t.i64 AND u.i32 > t.i32) THEN 1 ELSE 0 END AS m FROM t) AS a, (SELECT i64, CASE "
+             "WHEN EXISTS (SELECT 1 FROM u WHERE u.i64 = t.i64 AND u.i32 < t.i32) THEN 1 ELSE 0 "
+             "END AS m FROM t) AS b WHERE a.i64 = b.i64 AND a.m = b.m"),
+      (std::vector<std::string>{"Scan 2x2", "Scan 2x2"}))
+      << "only the scans under the two marks are one";
+}
+
 // The same plan gives the same groups in the same order, which EXPLAIN's goldens depend on.
 TEST(SharedSubPlansTest, IsDeterministic) {
   static constexpr std::string_view kSql =

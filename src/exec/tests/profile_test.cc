@@ -337,17 +337,18 @@ TEST_F(ProfileTest, JoinsShowBuildAndProbeLines) {
   }
 }
 
-// Semi, anti, null-aware anti, left and one-row joins show the lines of an inner join, HashJoin for
-// the probe and HashBuild for the build, with the same counts on 1 and 4 threads: the probe's rows
-// are the rows it returns, the build's those its table holds (a one-row join's single row). A
-// probe that looks keys up has find; one that keeps every row without a lookup (an anti join over
-// no build row) has none. A one-row probe has gather, and so does a left probe (window_rows on its
-// 1:1 path) or one with residuals (residual). Over t's 140 rows (g = x % 5) and the dimension's
-// keys 0..9 (v = 100 + k): a semi join on g keeps every row, an anti or null-aware anti join on x
-// keeps the 130 rows of x >= 10, and an anti join over the dimension's keys above 100 every row:
-// there are none, so statistics skip both of the build's parts. A left join on x pads those 130
-// rows; with the residual v > 102 on g, a left join pads the rows of g < 3 and a semi join keeps
-// the 56 others.
+// Semi, anti, null-aware anti, left, one-row and mark joins show the lines of an inner join,
+// HashJoin for the probe and HashBuild for the build, with the same counts on 1 and 4 threads: the
+// probe's rows are the rows it returns, the build's those its table holds (a one-row join's single
+// row). A probe that looks keys up has find; one that keeps or marks every row without a lookup (an
+// anti or a mark join over no build row) has none. A one-row probe has gather, and so does a left
+// probe (window_rows on its 1:1 path) or one with residuals (residual). Over t's 140 rows (g = x %
+// 5) and the dimension's keys 0..9 (v = 100 + k): a semi join on g keeps every row, an anti or
+// null-aware anti join on x keeps the 130 rows of x >= 10, and an anti join over the dimension's
+// keys above 100 every row: there are none, so statistics skip both of the build's parts. A left
+// join on x pads those 130 rows; with the residual v > 102 on g, a left join pads the rows of g < 3
+// and a semi join keeps the 56 others. A mark join of either kind returns all 140 rows, each with
+// its mark.
 TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
   auto pool = arrow::internal::ThreadPool::Make(4);
   ASSERT_TRUE(pool.ok());
@@ -443,6 +444,19 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
                  "    Filter rows=0 runs=0 per_part\n"
                  "      Scan rows=0 runs=0 per_part\n",
        .find = false},
+      {.name = "null-aware mark",
+       .join = join_of(plan::JoinKind::kNullAwareMark, t, d, on(x)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension},
+      {.name = "mark",
+       .join = join_of(plan::JoinKind::kMark, t, d, on(x)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension},
+      {.name = "mark over no build row",
+       .join = join_of(plan::JoinKind::kMark, t, none, on(x)),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines +
+                 "  HashBuild rows=0 runs=1 parts=0 skipped=2\n"
+                 "    Filter rows=0 runs=0 per_part\n"
+                 "      Scan rows=0 runs=0 per_part\n",
+       .find = false},
       {.name = "one-row",
        .join = join_of(plan::JoinKind::kOneRow, t, row, {}),
        .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines +
@@ -464,6 +478,11 @@ TEST_F(ProfileTest, JoinsOfOtherKindsShowBuildAndProbeLines) {
       {.name = "semi with a residual",
        .join = join_of(plan::JoinKind::kSemi, t, d, on(g), above),
        .counts = "  HashJoin rows=56 runs=20 per_part\n" + scan_lines + dimension,
+       .gather = true,
+       .pairs = 140},
+      {.name = "mark with a residual",
+       .join = join_of(plan::JoinKind::kMark, t, d, on(g), above),
+       .counts = "  HashJoin rows=140 runs=20 per_part\n" + scan_lines + dimension,
        .gather = true,
        .pairs = 140},
       // The build's keys filter d's scan to its 5 rows of k 0 to 4.
