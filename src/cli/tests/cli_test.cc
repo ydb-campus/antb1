@@ -144,6 +144,39 @@ TEST_F(CliTest, QueryCountStarJson) {
   EXPECT_EQ(r.out, "[\n {\"count_star()\": 3}\n]\n");
 }
 
+TEST_F(CliTest, DefaultBuildSideRatioMatchesOneAndAllowsThePreviousThreshold) {
+  const auto join_path = (dir_ / "join-ratio.parquet").string();
+  arrow::Int64Builder keys;
+  ASSERT_TRUE(keys.AppendValues({0, 1, 2}).ok());
+  const auto table = arrow::Table::Make(arrow::schema({arrow::field("k", arrow::int64())}),
+                                        {keys.Finish().ValueOrDie()});
+  const auto output = arrow::io::FileOutputStream::Open(join_path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), output, 3).ok());
+  ASSERT_TRUE(output->Close().ok());
+  const std::string sql =
+      "SELECT COUNT(*) FROM t a, t b, t c "
+      "WHERE a.k = b.k AND b.k = c.k AND a.k = 1";
+  for (const bool physical : {false, true}) {
+    std::vector<std::string> args = {"explain", "--threads", "1",       "--join-order",  "greedy",
+                                     "-c",      sql,         "--table", "t=" + join_path};
+    if (physical) {
+      args.emplace_back("--physical");
+    }
+    const auto implicit = Invoke(args);
+    ASSERT_EQ(implicit.code, kExitOk) << implicit.err;
+    args.insert(args.end(), {"--build-side-ratio", "1"});
+    const auto one = Invoke(args);
+    ASSERT_EQ(one.code, kExitOk) << one.err;
+    EXPECT_EQ(implicit.out, one.out);
+    args.back() = "4";
+    const auto previous = Invoke(args);
+    ASSERT_EQ(previous.code, kExitOk) << previous.err;
+    EXPECT_NE(implicit.out, previous.out);
+    EXPECT_NE(implicit.out.find("build=left"), std::string::npos);
+    EXPECT_EQ(previous.out.find("build=left"), std::string::npos);
+  }
+}
+
 TEST_F(CliTest, SqlFromStdinAndFile) {
   auto r = Invoke({"query", "-c", "-", "--table", "t=" + path_, "--format", "csv"},
                   "SELECT COUNT(*) FROM t");

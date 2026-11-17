@@ -1351,8 +1351,8 @@ TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery)
     return join == nullptr ? BuildSide::kRight : join->build;
   };
   // Exactly the ratio is not more than it, so the boundary keeps the side every join had before.
-  EXPECT_EQ(side(JoinKind::kSemi, 40, kBuildSideRatio), BuildSide::kRight);
-  EXPECT_EQ(side(JoinKind::kSemi, 41, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kSemi, 40, 400), BuildSide::kRight);
+  EXPECT_EQ(side(JoinKind::kSemi, 41, 400), BuildSide::kLeft);
   EXPECT_EQ(side(JoinKind::kSemi, 4000, kBuildSideRatio), BuildSide::kLeft);
   // A ratio of 1 builds on the smaller side whenever it is smaller at all (ADR 0022's rule).
   EXPECT_EQ(side(JoinKind::kSemi, 11, 100), BuildSide::kLeft);
@@ -1361,8 +1361,8 @@ TEST(OptimizerTest, Path1BuildsOnTheOuterSideOfASemiJoinOverAMuchLargerSubquery)
   EXPECT_EQ(side(JoinKind::kSemi, 1, kBuildSideRatio), BuildSide::kRight);
   // An anti join moves by the same rule (ADR 0026's C2c): a correlated NOT EXISTS over a much
   // larger subquery built the whole of it to probe it with far fewer rows, exactly as EXISTS did.
-  EXPECT_EQ(side(JoinKind::kAnti, 40, kBuildSideRatio), BuildSide::kRight);
-  EXPECT_EQ(side(JoinKind::kAnti, 41, kBuildSideRatio), BuildSide::kLeft);
+  EXPECT_EQ(side(JoinKind::kAnti, 40, 400), BuildSide::kRight);
+  EXPECT_EQ(side(JoinKind::kAnti, 41, 400), BuildSide::kLeft);
   EXPECT_EQ(side(JoinKind::kAnti, 4000, kBuildSideRatio), BuildSide::kLeft);
   EXPECT_EQ(side(JoinKind::kAnti, 1, kBuildSideRatio), BuildSide::kRight);
   // A mark never moves (ADR 0041's decision 13): it marks every outer row, so it probes them.

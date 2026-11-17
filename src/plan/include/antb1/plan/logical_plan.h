@@ -495,11 +495,10 @@ struct RowCountNode {
 };
 
 // How much larger a join's build side must be than the side that probes it before the join builds
-// on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor: 400,
-// the default, flips only a decisive difference and leaves every near-tie as it was, so an estimate
-// that is wrong cannot move a join that is already right; 100 is ADR 0022's original rule, the
-// smaller side always. Below 100 is invalid.
-inline constexpr int64_t kBuildSideRatio = 400;
+// on the probe side instead (docs/adr/0026-join-performance.md), in hundredths of a factor.
+// The default 100 builds on the smaller estimated side; ties and unknown estimates keep the
+// right side. Larger explicit ratios require a more decisive difference. Below 100 is invalid.
+inline constexpr int64_t kBuildSideRatio = 100;
 
 // One key of a join: a column of the left input and one of the right input, of one type. A key
 // compares `=` (a NULL on either side matches nothing) unless `null_equal`, where it compares IS

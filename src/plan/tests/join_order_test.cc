@@ -606,13 +606,13 @@ TEST(JoinOrderTest, TheBuildSideIsTheAddedRelationUnlessItIsDecisivelyLarger) {
 // them the probe, so the relation each step adds is already the smaller one. Here 1000 probes, a
 // relation of 10 rows joins it down to an estimate of 10, and the last relation is compared against
 // that 10 -- which is how a join of a shrinking pipeline to a whole table arises in a real query.
-TEST(JoinOrderTest, TheBuildSideKeepsTheAddedRelationOnANearTie) {
+TEST(JoinOrderTest, AnExplicitBuildSideRatioKeepsTheAddedRelationOnANearTie) {
   const std::vector<JoinEdge> edges = {Edge(0, 1, 1000, 1000), Edge(0, 2, 1000, 1000)};
   const auto last = [&edges](int64_t rows, int64_t ratio = kBuildSideRatio) {
     return Builds(GreedyOrder(Relations({1000, 10, rows}), edges, ratio)).back();
   };
-  EXPECT_EQ(last(40), BuildSide::kRight);  // 40 against 10 is 4.0x: not more than the ratio
-  EXPECT_EQ(last(41), BuildSide::kLeft);   // 4.1x is
+  EXPECT_EQ(last(40, 400), BuildSide::kRight);  // 40 against 10 is 4.0x: not more than the ratio
+  EXPECT_EQ(last(41, 400), BuildSide::kLeft);   // 4.1x is
   // At a ratio of 100 hundredths the smaller side always builds, which is ADR 0022's own rule.
   EXPECT_EQ(last(11, 100), BuildSide::kLeft);
   EXPECT_EQ(last(10, 100), BuildSide::kRight);  // equal rows are no reason to move the build
@@ -641,9 +641,19 @@ TEST(JoinOrderDeathTest, TheBuildSideRatioIsAtLeastOne) {
 
 // The build-side rule itself (ADR 0026), which both the join order and the unnesting pass call so
 // that they cannot drift. The left input is the side already joined, the right the side added.
-TEST(JoinOrderTest, ChooseBuildSideFlipsOnlyOnADecisiveDifference) {
-  EXPECT_EQ(ChooseBuildSide(100, 399), BuildSide::kRight);  // 3.99x: not more than the default 4
+TEST(JoinOrderTest, TheDefaultBuildSideRatioBuildsTheSmallerEstimatedSide) {
+  EXPECT_EQ(kBuildSideRatio, 100);
+  EXPECT_EQ(ChooseBuildSide(100, 101), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(100, 399), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(100, 400), BuildSide::kLeft);
   EXPECT_EQ(ChooseBuildSide(100, 401), BuildSide::kLeft);
+  EXPECT_EQ(ChooseBuildSide(100, 100), BuildSide::kRight);
+  EXPECT_EQ(ChooseBuildSide(101, 100), BuildSide::kRight);
+}
+
+TEST(JoinOrderTest, ChooseBuildSideFlipsOnlyOnADecisiveDifference) {
+  EXPECT_EQ(ChooseBuildSide(100, 399, 400), BuildSide::kRight);  // explicit 4 keeps 3.99x
+  EXPECT_EQ(ChooseBuildSide(100, 401, 400), BuildSide::kLeft);
   EXPECT_EQ(ChooseBuildSide(100, 100), BuildSide::kRight);
   EXPECT_EQ(ChooseBuildSide(400, 100), BuildSide::kRight);  // a smaller right never moves a build
   // At 100 hundredths the smaller side always builds, which is ADR 0022's own rule; a larger ratio
