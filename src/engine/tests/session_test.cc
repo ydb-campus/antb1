@@ -595,8 +595,11 @@ TEST_F(SessionTest, TheBuildSideRatioReachesTheJoinOrderAndKeepsEveryAnswer) {
   EXPECT_EQ(lefts(*default_plan), left_builds[100]);
   const auto default_result = (*implicit)->Execute(sql);
   ASSERT_TRUE(default_result.ok()) << default_result.status().ToString();
-  ASSERT_TRUE(expected.has_value());
-  EXPECT_EQ(Rows(*default_result), *expected);
+  if (expected.has_value()) {
+    EXPECT_EQ(Rows(*default_result), *expected);
+  } else {
+    FAIL() << "No expected result was collected from the explicit-ratio sessions";
+  }
 }
 
 // The thread count is checked; the row groups of a query run on the session's threads, and the
