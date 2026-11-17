@@ -271,9 +271,9 @@ LogicalNodePtr DomainBase(const LogicalNodePtr& outer, const std::vector<ColumnI
 //
 // **A semi join rather than an inner join to a de-duplicated domain**, and each reason earned its
 // place in the measurements: it cannot multiply its probe's rows, so duplicate-freeness needs
-// neither an argument nor a GROUP BY to enforce it; ADR 0022 fixes its build side to its right
-// input, so the outer side is built whatever the estimates say, which is the difference between
-// 179 MB and 5.5 GB on the query this is for; and it outputs its probe's columns alone, so the
+// neither an argument nor a GROUP BY to enforce it; the restriction gate requires the outer
+// domain to be smaller, so ChooseBuildSide keeps that domain on the build side; and it outputs
+// only its preserved input's columns, so the
 // grouping above it reads exactly what it read before.
 //
 // The domain is a **clone** of the outer side, not the outer side: a plan is a tree, and the same
@@ -286,7 +286,8 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
                                       const std::map<ColumnId, ColumnId>& equivalent,
                                       const std::set<ColumnId>& null_equal,
                                       const std::map<ColumnId, BoundColumn>& described,
-                                      JoinBack join_back, ColumnId& last_id) {
+                                      JoinBack join_back, ColumnId& last_id,
+                                      int64_t build_side_ratio) {
   // **One correlated column over a bare scan is ADR 0029's D5 to restrict, not this -- under an
   // INNER join back.** D5 publishes the join's key set to the aggregation's own scan, which costs a
   // filter rather than a build and a probe, and it takes exactly one key. Where it can apply, this
@@ -386,12 +387,13 @@ LogicalNodePtr RestrictToTheOuterKeys(LogicalNodePtr input, const DependentJoinN
     return input;
   }
   const std::optional<int64_t> rows = EstimateRows(*input);
+  const BuildSide build = ChooseBuildSide(rows, EstimateRows(*domain), build_side_ratio);
   return Make(JoinNode{.kind = JoinKind::kSemi,
                        .left = std::move(input),
                        .right = domain,
                        .keys = std::move(keys),
                        .residual = {},
-                       .build = BuildSide::kRight,
+                       .build = build,
                        .estimate = rows,  // a semi join keeps a subset of its probe
                        .span = join.span});
 }
@@ -1327,7 +1329,7 @@ arrow::Result<Rewritten> ValueJoin(const Correlation& correlation, const Spine& 
         GroupAggregateNode node = grouped;  // the one static step
         node.input =
             RestrictToTheOuterKeys(std::move(right), join, equivalent, representatives.null_equal,
-                                   described, join_back, last_id);
+                                   described, join_back, last_id, correlation.build_side_ratio);
         right = Make(std::move(node));
         break;
       }

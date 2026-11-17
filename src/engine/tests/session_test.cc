@@ -602,6 +602,65 @@ TEST_F(SessionTest, TheBuildSideRatioReachesTheJoinOrderAndKeepsEveryAnswer) {
   }
 }
 
+TEST_F(SessionTest, AnInSubqueryKeepsDuplicateRowsAndNullSemanticsWithEitherBuildSide) {
+  const auto left_path = dir_ / "left.parquet";
+  const auto right_path = dir_ / "right.parquet";
+  arrow::Int32Builder left_keys;
+  arrow::Int64Builder payload;
+  ASSERT_TRUE(left_keys.AppendValues({1, 1, 2, 4}).ok());
+  ASSERT_TRUE(left_keys.AppendNull().ok());
+  ASSERT_TRUE(payload.AppendValues({10, 11, 20, 40, 50}).ok());
+  const auto left = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int32()), arrow::field("v", arrow::int64())}),
+      {left_keys.Finish().ValueOrDie(), payload.Finish().ValueOrDie()});
+  arrow::Int64Builder right_keys;
+  ASSERT_TRUE(right_keys.AppendValues({1, 1, 3}).ok());
+  for (int64_t key = 10; key < 40; ++key) {
+    ASSERT_TRUE(right_keys.Append(key).ok());
+  }
+  ASSERT_TRUE(right_keys.AppendNull().ok());
+  const auto right = arrow::Table::Make(arrow::schema({arrow::field("k", arrow::int64())}),
+                                        {right_keys.Finish().ValueOrDie()});
+  for (const auto& [path, table] : {std::pair{left_path, left}, std::pair{right_path, right}}) {
+    const auto output = arrow::io::FileOutputStream::Open(path.string()).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), output, 2).ok());
+    ASSERT_TRUE(output->Close().ok());
+  }
+  constexpr std::string_view kIn =
+      "SELECT a.v FROM a WHERE a.k IN (SELECT b.k FROM b) ORDER BY a.v";
+  for (const int64_t ratio : {int64_t{100}, int64_t{1'000'000}}) {
+    auto session = Session::Make({.build_side_ratio = ratio});
+    ASSERT_TRUE(session.ok()) << session.status().ToString();
+    ASSERT_TRUE((*session)->RegisterParquet("a", {left_path.string()}).ok());
+    ASSERT_TRUE((*session)->RegisterParquet("b", {right_path.string()}).ok());
+    const auto plan = (*session)->Explain(kIn);
+    ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+    EXPECT_EQ(plan->contains("SEMI build=left"), ratio == 100);
+    for (const std::string_view sql : std::vector<std::string_view>{
+             kIn,
+             "SELECT a.v FROM a WHERE a.k + 0 IN (SELECT b.k FROM b) ORDER BY a.v",
+             "SELECT a.v FROM a WHERE a.k = ANY (SELECT b.k FROM b) ORDER BY a.v",
+         }) {
+      const auto result = (*session)->Execute(sql);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_EQ(Rows(*result), (std::vector<std::vector<std::string>>{{"10"}, {"11"}}));
+    }
+    for (const std::string_view sql : {
+             "SELECT a.v FROM a WHERE a.k IN (SELECT b.k FROM b WHERE b.k < 0)",
+             "SELECT a.v FROM a WHERE a.k NOT IN (SELECT b.k FROM b)",
+         }) {
+      const auto result = (*session)->Execute(sql);
+      ASSERT_TRUE(result.ok()) << result.status().ToString();
+      EXPECT_TRUE(Rows(*result).empty());
+    }
+    const auto result = (*session)->Execute(
+        "SELECT a.v FROM a WHERE a.k NOT IN (SELECT b.k FROM b WHERE b.k < 0) ORDER BY a.v");
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    EXPECT_EQ(Rows(*result),
+              (std::vector<std::vector<std::string>>{{"10"}, {"11"}, {"20"}, {"40"}, {"50"}}));
+  }
+}
+
 // The thread count is checked; the row groups of a query run on the session's threads, and the
 // result is the same for any number of them.
 TEST_F(SessionTest, ThreadsDoNotChangeResults) {

@@ -1126,6 +1126,37 @@ TEST_F(PhysicalPlannerTest, ASemiJoinWithoutAProbePipelineBuildsOnItsRightInputI
             "RightJoin/HashJoin/Scan/HashBuild/Scan/");
 }
 
+TEST_F(PhysicalPlannerTest, ABuildSideFallbackKeepsTheConsumersPartPipeline) {
+  const auto table = Table(/*split=*/true);
+  const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});
+  const auto x = Column(0, "x", LogicalType::kBigInt);
+  const auto sorted = Node(plan::SortNode{.input = scan, .keys = {plan::SortKey{.column = x}}});
+  const auto grouped = Node(plan::GroupAggregateNode{.input = scan, .keys = {x}});
+  for (const auto& probe : {sorted, grouped}) {
+    for (const plan::JoinKind kind : {plan::JoinKind::kSemi, plan::JoinKind::kAnti}) {
+      const auto join = Node(plan::JoinNode{.kind = kind,
+                                            .left = scan,
+                                            .right = probe,
+                                            .keys = {plan::JoinKey{.left = x, .right = x}},
+                                            .build = plan::BuildSide::kLeft});
+      const auto plan = PlanOf(Node(plan::GroupAggregateNode{.input = join, .keys = {x}}));
+      ProfileNode profile;
+      const auto op = BuildPhysicalPlan(plan, &profile);
+      ASSERT_TRUE(op.ok()) << op.status().ToString();
+      EXPECT_EQ(profile.name(), "PartGroupAggregate");
+      const auto result = Run(plan);
+      ASSERT_NE(result, nullptr);
+      auto values = Int64Column(*result, 0);
+      std::ranges::sort(values);
+      const std::vector<std::optional<int64_t>> expected =
+          kind == plan::JoinKind::kSemi
+              ? std::vector<std::optional<int64_t>>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+              : std::vector<std::optional<int64_t>>{};
+      EXPECT_EQ(values, expected);
+    }
+  }
+}
+
 TEST_F(PhysicalPlannerTest, EveryJoinKindRunsEverywhere) {
   const auto table = Table(/*split=*/true);
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}});

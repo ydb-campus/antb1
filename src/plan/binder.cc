@@ -6790,7 +6790,7 @@ void Binder::InKeys(SubqueryJoin& join, const Typed& probe, const SubqueryBlock&
 }
 
 // One subquery conjunct's join over `node`.
-LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join) {
+LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t build_side_ratio) {
   if (!join.exprs.empty()) {
     node = Make(ComputeNode{.input = std::move(node),
                             .exprs = std::move(join.exprs),
@@ -6818,16 +6818,19 @@ LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join) {
     // Without it every pass above reads this join's rows as unknown, which is what kept ADR
     // 0023's semi-join reduction from seeing the one query it gains most on.
     const std::optional<int64_t> left_rows = EstimateRows(*node);
-    node = Make(JoinNode{
-        .kind = join.kind,
-        .left = std::move(node),
-        .right = std::move(join.right),
-        .keys = std::move(keys),
-        .residual = {},
-        .mark = join.mark,
-        .build = BuildSide::kRight,  // the side whose rows the join does not keep, or the one row
-        .estimate = left_rows,
-        .span = join.span});
+    const BuildSide build =
+        Traits(join.kind).may_build_left
+            ? ChooseBuildSide(left_rows, EstimateRows(*join.right), build_side_ratio)
+            : BuildSide::kRight;
+    node = Make(JoinNode{.kind = join.kind,
+                         .left = std::move(node),
+                         .right = std::move(join.right),
+                         .keys = std::move(keys),
+                         .residual = {},
+                         .mark = join.mark,
+                         .build = build,
+                         .estimate = left_rows,
+                         .span = join.span});
   }
   if (!join.filter.empty()) {
     node = Make(FilterNode{
@@ -6837,19 +6840,21 @@ LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join) {
 }
 
 // The subquery conjuncts' joins over `node`, in the order they were written.
-LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins) {
+LogicalNodePtr SubqueryJoins(LogicalNodePtr node, std::vector<SubqueryJoin>& joins,
+                             int64_t build_side_ratio) {
   for (SubqueryJoin& join : joins) {
-    node = SubqueryJoinNode(std::move(node), join);
+    node = SubqueryJoinNode(std::move(node), join, build_side_ratio);
   }
   return node;
 }
 
 // A slot's entries over `node`, in the order they were bound: each join, and each filter as what
 // it computes, then its predicates.
-LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot) {
+LogicalNodePtr SlotNodes(LogicalNodePtr node, std::vector<SlotEntry>& slot,
+                         int64_t build_side_ratio) {
   for (SlotEntry& entry : slot) {
     if (auto* join = std::get_if<SubqueryJoin>(&entry)) {
-      node = SubqueryJoinNode(std::move(node), *join);
+      node = SubqueryJoinNode(std::move(node), *join, build_side_ratio);
       continue;
     }
     auto& filter = std::get<SlotFilter>(entry);
@@ -8513,7 +8518,7 @@ LogicalNodePtr Binder::RelationNode(std::size_t r) {
   // Above this relation's own filters, so the semi join sees the fewest rows, and below the join
   // keys computed for the joins it now runs under.
   if (!relation.semi_joins.empty()) {
-    node = SubqueryJoins(std::move(node), relation.semi_joins);
+    node = SubqueryJoins(std::move(node), relation.semi_joins, options_.build_side_ratio);
     relation.semi_joins.clear();  // moved from: this relation's branch is built once (JoinTree)
   }
   if (!relation.join_key_exprs.empty()) {
@@ -8531,14 +8536,15 @@ LogicalNodePtr Binder::UnitNode(std::size_t u) {
   Unit& unit = units_[u];
   // Its left input's slot inside that input, below the unit, which pads what the slot's filters
   // keep (ADR 0041's decision 9).
-  return Make(JoinNode{.kind = unit.kind,
-                       .left = SlotNodes(JoinTree(unit.left), blocks_[unit.left].slot),
-                       .right = JoinTree(unit.right),
-                       .keys = std::move(unit.keys),
-                       .residual = std::move(unit.residual),
-                       .build = BuildSide::kRight,
-                       .estimate = UnitEstimate(u),
-                       .span = unit.span});
+  return Make(JoinNode{
+      .kind = unit.kind,
+      .left = SlotNodes(JoinTree(unit.left), blocks_[unit.left].slot, options_.build_side_ratio),
+      .right = JoinTree(unit.right),
+      .keys = std::move(unit.keys),
+      .residual = std::move(unit.residual),
+      .build = BuildSide::kRight,
+      .estimate = UnitEstimate(u),
+      .span = unit.span});
 }
 
 LogicalNodePtr Binder::JoinTree(std::size_t b) {
@@ -8723,8 +8729,8 @@ LogicalPlan Binder::Assemble() {
   const bool distinct = stmt_.distinct && shape_ != Shape::kGlobal;
   PushSemiJoinsDown();
   LogicalNodePtr node = JoinTree(0);
-  node = SlotNodes(std::move(node), blocks_.front().slot);
-  node = SlotNodes(std::move(node), row_tail_);
+  node = SlotNodes(std::move(node), blocks_.front().slot, options_.build_side_ratio);
+  node = SlotNodes(std::move(node), row_tail_, options_.build_side_ratio);
   // The correlated conjuncts of this block, above all of its joins and below its aggregation, in
   // one filter (ADR 0023): where the unnesting pass finds them, and where the free variables they
   // read are bound by the dependent join this block's plan becomes the right input of.
@@ -8767,8 +8773,8 @@ LogicalPlan Binder::Assemble() {
     }
     // HAVING's subquery conjuncts after its others, as in DuckDB: each join computes what it reads
     // in a layer of its own, from the aggregation's columns.
-    node = SlotNodes(std::move(node), group_slot_);
-    node = SlotNodes(std::move(node), group_tail_);
+    node = SlotNodes(std::move(node), group_slot_, options_.build_side_ratio);
+    node = SlotNodes(std::move(node), group_tail_, options_.build_side_ratio);
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});

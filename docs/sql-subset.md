@@ -1686,7 +1686,8 @@ are not prerequisites for using the 2.0 oracle. Intentional differences are regi
   eighth of `--memory-limit`, is all a sparser one costs ([ADR 0026](adr/0026-join-performance.md)). A query near its
   limit is hashed rather than failed, so the limit changes how a join is laid out, never its answer; `explain
   --analyze` prints `direct=1` on a build the array serves.
-- A semi join of a correlated `EXISTS`, and an anti join of a correlated `NOT EXISTS`, build on the side they
+- A semi join of an uncorrelated `IN` or `= ANY` conjunct or a correlated `EXISTS`, and an anti join of a
+  correlated `NOT EXISTS`, build on the side they
   preserve -- the outer one -- when the subquery's side is estimated at more than the same ratio times it
   ([ADR 0026](adr/0026-join-performance.md)): such a subquery over a large table otherwise builds the whole of that
   table to probe it with far fewer rows. The estimate reads through a dependent join to its outer side, so the outer
@@ -1697,7 +1698,8 @@ are not prerequisites for using the 2.0 oracle. Intentional differences are regi
   without `ORDER BY`. An anti join returns the rows a semi join over the same condition drops, the rows whose key is
   NULL among them, so the two partition the side they preserve. A plan whose probe side is not a chain of streaming
   nodes over a scan -- a sorted or aggregated subquery, say -- keeps building on its right input, since there is no
-  pipeline for the join to be the sink of; a probe scan whose row groups the statistics all prune does take this
+  pipeline for the join to be the sink of. This fallback is resolved before planning its consumers, so they can
+  retain their part pipelines. A probe scan whose row groups the statistics all prune does take this
   plan, and returns the whole preserved side for `NOT EXISTS` and no row for `EXISTS`. An `EXISTS` or `NOT EXISTS`
   that is not correlated, a `NOT IN`, a `LEFT JOIN` and a `FULL JOIN` always build on their right input.
 - Execution: the row groups of a query run on `--threads` threads (default: the hardware threads), 64Ki-row
