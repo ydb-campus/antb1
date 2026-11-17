@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794925217244,
+  "lastUpdate": 1794945319761,
   "repoUrl": "https://github.com/ydb-campus/antb1",
   "entries": {
     "antb1 micro benchmarks (static build)": [
@@ -66840,6 +66840,1254 @@ window.BENCHMARK_DATA = {
             "value": 0.8209584982371371,
             "unit": "ms/iter",
             "extra": "iterations: 851\ncpu: 0.8209035534664839 ms\nthreads: 1"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hor911@ydb.tech",
+            "name": "Aleksandr Khoroshilov",
+            "username": "Hor911"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "46564bdf60b9b67e1002056f597b122ce017ae2b",
+          "message": "feat(sql): support broader correlated exists blocks (SQ8b) (#378)\n\n## Summary\n\nImplements SQ8b from docs/adr/0037-tpcds-roadmap.md: keyed correlated\nEXISTS and NOT EXISTS now accept GROUP BY, HAVING, DISTINCT, static\naggregates, LIMIT and OFFSET in their existing condition and CASE\nplacements.\n\nCarry correlation representatives through grouping and DISTINCT, count\nsurviving rows per binding for OFFSET, and preserve static aggregates'\nempty-input row through a presence marker and the existing LEFT\njoin-back rules. HAVING membership predicates evaluate over that row\ntoo. GROUP BY () combinations preserve output identities when redundant\nDISTINCT and sorting are removed.\n\nAdds 131 DuckDB-generated SQL logic cases, enables the existing SQ8b\ncases, extends randomized generation with seven block shapes, and\nupdates binder/planner tests and SQL documentation. Results larger than\n16 cells use the existing full-result SHA-256 checks, reducing the new\nSLT file from 12,493 to 1,099 lines without removing queries or\nassertions. ADR 0037 records the built SQ8a/SQ8b scope and the remaining\nSQ8 work. Keyless correlations, correlated IN/NOT IN, nested correlated\nconjuncts, outer HAVING correlations, and grouping sets mixing an empty\nset with other sets remain later roadmap work.\n\n## Type of change\n\n- [x] feat: new SQL, CLI or engine capability\n- [ ] fix: bug fix\n- [ ] perf: performance improvement\n- [ ] refactor, test, docs, build, ci or chore\n- [ ] Breaking change (CLI, output format or semantics)\n\n## Verification\n\nLocal Apple silicon, pixi 0.81.0:\n\n```text\n$ SHELLCHECK_OPTS='--exclude=SC2218' pixi run check\nlint: PASS\n100% tests passed out of 4263\n(existing window-function canary skipped)\n\n$ SHELLCHECK_OPTS='--exclude=SC2218' pixi run lint\nPASS after the roadmap update.\n\n$ pixi run tidy\nPASS\n\n$ pixi run slt-complete\nCompleted expectations from DuckDB 2.0.0.\n\n$ pixi run test -R '^(slt|oracle|parallel)\\.subqueries\\.exists_blocks$'\n100% tests passed out of 4\n131 cases passed with antb1, DuckDB and the parallel antb1 runner.\n\n$ pixi run test -R '^harness\\.QueryGenerator\\.CorrelatedExists'\n100% tests passed out of 4\n\n$ ANTB1_DIFF_SEED=80802 ANTB1_DIFF_COUNT=2000 pixi run diff-random\nDIFF: PASS seed=80802 queries=2000 failed=0 unsupported=0\n\n$ pixi run asan\nBuild succeeded; test discovery failed before tests ran.\nLeakSanitizer: 64 bytes leaked in one allocation during macOS libdispatch/\nCoreFoundation initialization through libcurl/libazure global initialization.\n```\n\nSC2218 is the previously approved local ShellCheck exception; repository\nlint settings are unchanged. ASan reproduced outside the sandbox without\nadding a sanitizer suppression.\n\n## Checklist\n\n- [x] `pixi run check` passes locally with the approved SC2218 exception\n- [x] Tests cover the change\n- [x] SQL and architecture documentation updated\n- [x] No ClickBench-derived data is committed\n- [x] Nothing derived from TPC-H or TPC-DS is committed\n- [x] Governance-path approval: maintainer explicitly requested the ADR\n0037 status and scope update\n\n## AI assistance\n\n- [ ] No AI assistance\n- [x] AI-assisted. OpenAI Codex implemented the planner/binder changes,\ngenerated synthetic regression queries with DuckDB-derived expectations,\nran validation, and performed an additional agent review.\n- Accountable human: pending maintainer review.",
+          "timestamp": "2026-11-17T22:43:28+03:00",
+          "tree_id": "79451cd1e5811e8e4998cb87815a47926fb40cae",
+          "url": "https://github.com/ydb-campus/antb1/commit/46564bdf60b9b67e1002056f597b122ce017ae2b"
+        },
+        "date": 1794945318200,
+        "tool": "googlecpp",
+        "benches": [
+          {
+            "name": "BM_ParseSmallAggQuery",
+            "value": 3456.987821961369,
+            "unit": "ns/iter",
+            "extra": "iterations: 202742\ncpu: 3456.864310305708 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_Exact",
+            "value": 40329.93356381658,
+            "unit": "ns/iter",
+            "extra": "iterations: 17355\ncpu: 40327.75188706424 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_SumInt16_ArrowKernel",
+            "value": 75895.21655636693,
+            "unit": "ns/iter",
+            "extra": "iterations: 9217\ncpu: 75892.2077682543 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_NotEqualTrueCount",
+            "value": 202169.14809510417,
+            "unit": "ns/iter",
+            "extra": "iterations: 3491\ncpu: 202159.96533944437 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_Int128AvgAccumulate",
+            "value": 366010.0558292224,
+            "unit": "ns/iter",
+            "extra": "iterations: 1827\ncpu: 366000.67925561033 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_ScanColumn",
+            "value": 1048978.354260073,
+            "unit": "ns/iter",
+            "extra": "iterations: 669\ncpu: 1048939.4723467866 ns\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterAfterScan",
+            "value": 33.950088949995916,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 33.948484250000014 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_StringFilterInScan",
+            "value": 34.784243050000896,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 34.77196119999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_SortRows",
+            "value": 134.07671625000717,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 134.07009174999996 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_TopNRows",
+            "value": 10.472029925372837,
+            "unit": "ms/iter",
+            "extra": "iterations: 67\ncpu: 10.471614910447752 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/0",
+            "value": 16.993017560976778,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 16.99206675609757 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableBuild/1",
+            "value": 28.194183916667725,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.193016583333286 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/0",
+            "value": 1.949837657381526,
+            "unit": "ms/iter",
+            "extra": "iterations: 359\ncpu: 1.949770295264626 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_JoinTableProbe/1",
+            "value": 31.405290499998788,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.404186090909114 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1000",
+            "value": 8.928346894736562,
+            "unit": "ms/iter",
+            "extra": "iterations: 76\ncpu: 8.928039421052645 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16384",
+            "value": 10.263646191176308,
+            "unit": "ms/iter",
+            "extra": "iterations: 68\ncpu: 10.263404014705875 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/262144",
+            "value": 31.679904347826145,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 31.678888434782642 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/1048576",
+            "value": 53.288383363627126,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 53.28532854545448 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/4194304",
+            "value": 156.97188999999412,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 156.9688632499995 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64/16777216",
+            "value": 844.3972049999502,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 844.3680429999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1000",
+            "value": 11.616793379309048,
+            "unit": "ms/iter",
+            "extra": "iterations: 58\ncpu: 11.616427913793114 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16384",
+            "value": 14.03832378000061,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.037782159999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/262144",
+            "value": 32.85830809523932,
+            "unit": "ms/iter",
+            "extra": "iterations: 21\ncpu: 32.85707657142856 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/1048576",
+            "value": 64.46711769999638,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 64.4653673999997 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/4194304",
+            "value": 192.82439366664525,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 192.8157913333332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32/16777216",
+            "value": 1046.850242000005,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1046.8189129999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1000",
+            "value": 39.843367888888935,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 39.842666166666675 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16384",
+            "value": 41.050621411767786,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.048700058823535 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/262144",
+            "value": 68.64594250000664,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 68.6436104000002 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/1048576",
+            "value": 112.80028933331702,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 112.79923949999984 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/4194304",
+            "value": 303.12944050001533,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 303.11907099999934 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupString/16777216",
+            "value": 1532.4949979999474,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1532.4336030000013 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1000",
+            "value": 46.72180799999902,
+            "unit": "ms/iter",
+            "extra": "iterations: 15\ncpu: 46.72099179999994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16384",
+            "value": 49.163821615383526,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 49.16268976923058 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/262144",
+            "value": 81.10996725000064,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 81.10853325000011 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/1048576",
+            "value": 133.04017279999698,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 133.03737640000008 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/4194304",
+            "value": 344.95822650001173,
+            "unit": "ms/iter",
+            "extra": "iterations: 2\ncpu: 344.9452870000016 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64String/16777216",
+            "value": 1817.991978000009,
+            "unit": "ms/iter",
+            "extra": "iterations: 1\ncpu: 1817.9349210000028 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1000",
+            "value": 9.03460838356152,
+            "unit": "ms/iter",
+            "extra": "iterations: 73\ncpu: 9.030641684931537 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/16384",
+            "value": 10.367549500000278,
+            "unit": "ms/iter",
+            "extra": "iterations: 66\ncpu: 10.367162984848433 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/262144",
+            "value": 31.891714272727643,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 31.890601818181867 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/1048576",
+            "value": 53.243792699993264,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 53.24151650000033 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Budget/4194304",
+            "value": 160.02125374998855,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 160.01036175000038 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1000",
+            "value": 11.678559568965424,
+            "unit": "ms/iter",
+            "extra": "iterations: 58\ncpu: 11.677914603448231 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/16384",
+            "value": 14.034783839999818,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 14.03384114000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/262144",
+            "value": 32.58432199999623,
+            "unit": "ms/iter",
+            "extra": "iterations: 22\ncpu: 32.582894590909135 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/1048576",
+            "value": 63.70636030000014,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 63.703569399999786 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32Budget/4194304",
+            "value": 197.0221080000177,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 197.01080000000104 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1000",
+            "value": 9.004963465753937,
+            "unit": "ms/iter",
+            "extra": "iterations: 73\ncpu: 9.004570931506857 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/16384",
+            "value": 10.649176169230346,
+            "unit": "ms/iter",
+            "extra": "iterations: 65\ncpu: 10.648637230769308 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/262144",
+            "value": 38.464718500001204,
+            "unit": "ms/iter",
+            "extra": "iterations: 18\ncpu: 38.46362822222223 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/1048576",
+            "value": 63.52070011111108,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 63.51698788888882 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64BudgetRandom/4194304",
+            "value": 117.63632439999583,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 117.6306803999992 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1000",
+            "value": 11.700918655172888,
+            "unit": "ms/iter",
+            "extra": "iterations: 58\ncpu: 11.70028672413794 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/16384",
+            "value": 15.61640406666811,
+            "unit": "ms/iter",
+            "extra": "iterations: 45\ncpu: 15.615648555555595 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/262144",
+            "value": 41.7449285294103,
+            "unit": "ms/iter",
+            "extra": "iterations: 17\ncpu: 41.742150235294126 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/1048576",
+            "value": 75.50675866665794,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 75.50035544444475 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_GroupInt64Int32BudgetRandom/4194304",
+            "value": 136.65333000001283,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 136.64627680000052 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1000",
+            "value": 11.862207288135385,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.861329644067771 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/16384",
+            "value": 12.864990962961437,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 12.864494370370258 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/262144",
+            "value": 20.021274571429007,
+            "unit": "ms/iter",
+            "extra": "iterations: 35\ncpu: 20.020585914285707 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/1048576",
+            "value": 29.00028816666615,
+            "unit": "ms/iter",
+            "extra": "iterations: 24\ncpu: 28.998426166666928 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Presized/4194304",
+            "value": 60.416319555555575,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 60.41422633333424 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1000",
+            "value": 11.789968033334238,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.78951908333327 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/16384",
+            "value": 12.993967296295152,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 12.993387703703684 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/262144",
+            "value": 22.363174741936717,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.361990096774132 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/1048576",
+            "value": 40.87236071428281,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 40.86998428571422 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate/4194304",
+            "value": 159.57222350002098,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 159.56461424999802 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1000",
+            "value": 11.62632583333334,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.626068566666703 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/16384",
+            "value": 13.04433790740918,
+            "unit": "ms/iter",
+            "extra": "iterations: 54\ncpu: 13.043528925925962 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/262144",
+            "value": 22.656939225806774,
+            "unit": "ms/iter",
+            "extra": "iterations: 31\ncpu: 22.6564292580647 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/1048576",
+            "value": 44.085393562504294,
+            "unit": "ms/iter",
+            "extra": "iterations: 16\ncpu: 44.08260087500082 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate/4194304",
+            "value": 155.09386950000703,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 155.08889799999892 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1000",
+            "value": 11.750484728813486,
+            "unit": "ms/iter",
+            "extra": "iterations: 59\ncpu: 11.745183322033855 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/16384",
+            "value": 14.476527750000892,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.475906979166453 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/262144",
+            "value": 35.12075895000066,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 35.119007950000025 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/1048576",
+            "value": 48.80888857142703,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 48.806452428571845 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_Indirect_Estimate_Random/4194304",
+            "value": 93.82051516666934,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 93.81685450000059 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 11.597897299998294,
+            "unit": "ms/iter",
+            "extra": "iterations: 60\ncpu: 11.59704960000004 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 14.553388875000906,
+            "unit": "ms/iter",
+            "extra": "iterations: 48\ncpu: 14.552204166666508 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 36.15316734999965,
+            "unit": "ms/iter",
+            "extra": "iterations: 20\ncpu: 36.15221465000005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 52.53829679999171,
+            "unit": "ms/iter",
+            "extra": "iterations: 10\ncpu: 52.53481710000045 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 107.0371345000088,
+            "unit": "ms/iter",
+            "extra": "iterations: 6\ncpu: 107.02970716666727 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1000",
+            "value": 13.518665705882817,
+            "unit": "ms/iter",
+            "extra": "iterations: 51\ncpu: 13.517991431372673 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/16384",
+            "value": 14.936042586958079,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 14.934984173912987 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/262144",
+            "value": 26.04617142856926,
+            "unit": "ms/iter",
+            "extra": "iterations: 28\ncpu: 26.045099857142873 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/1048576",
+            "value": 47.03540892307081,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 47.03272261538416 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Presized/4194304",
+            "value": 88.81071928570756,
+            "unit": "ms/iter",
+            "extra": "iterations: 7\ncpu: 88.80738314285809 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1000",
+            "value": 13.672698559998935,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.671745359999932 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/16384",
+            "value": 15.076164456522054,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.07520119565203 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/262144",
+            "value": 30.112200217390836,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 30.109384043478332 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/1048576",
+            "value": 69.6695295555527,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 69.66553122222132 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate/4194304",
+            "value": 208.80399099996794,
+            "unit": "ms/iter",
+            "extra": "iterations: 3\ncpu: 208.78770900000157 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1000",
+            "value": 13.48745344230906,
+            "unit": "ms/iter",
+            "extra": "iterations: 52\ncpu: 13.486885192307614 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/16384",
+            "value": 15.088352891303241,
+            "unit": "ms/iter",
+            "extra": "iterations: 46\ncpu: 15.087733326086797 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/262144",
+            "value": 29.58969547826299,
+            "unit": "ms/iter",
+            "extra": "iterations: 23\ncpu: 29.58776765217346 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/1048576",
+            "value": 60.378477999999326,
+            "unit": "ms/iter",
+            "extra": "iterations: 9\ncpu: 60.376080000000655 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate/4194304",
+            "value": 180.56452524999145,
+            "unit": "ms/iter",
+            "extra": "iterations: 4\ncpu: 180.55510299999966 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1000",
+            "value": 13.925269540000045,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.925039419999905 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/16384",
+            "value": 17.096117999998814,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 17.095358073170704 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/262144",
+            "value": 43.62889171428768,
+            "unit": "ms/iter",
+            "extra": "iterations: 14\ncpu: 43.626583785714345 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/1048576",
+            "value": 65.69963025000902,
+            "unit": "ms/iter",
+            "extra": "iterations: 8\ncpu: 65.69346374999974 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_Indirect_Estimate_Random/4194304",
+            "value": 155.67188039999564,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 155.6608796000006 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1000",
+            "value": 13.903052580001258,
+            "unit": "ms/iter",
+            "extra": "iterations: 50\ncpu: 13.90244518000003 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/16384",
+            "value": 17.168241317072322,
+            "unit": "ms/iter",
+            "extra": "iterations: 41\ncpu: 17.167078463414878 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/262144",
+            "value": 45.19172592307978,
+            "unit": "ms/iter",
+            "extra": "iterations: 13\ncpu: 45.18998946153811 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/1048576",
+            "value": 61.87956409091426,
+            "unit": "ms/iter",
+            "extra": "iterations: 11\ncpu: 61.87512809090895 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_S0Int64Int32_IndirectSlotOrder_Estimate_Random/4194304",
+            "value": 146.22233179998148,
+            "unit": "ms/iter",
+            "extra": "iterations: 5\ncpu: 146.21606999999983 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:1/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.8496068390501061,
+            "unit": "ms/iter",
+            "extra": "iterations: 379\ncpu: 1.8489827862796548 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:1/input_groups:8/batch:65536/shuffled/string",
+            "value": 0.6991366337325542,
+            "unit": "ms/iter",
+            "extra": "iterations: 1002\ncpu: 0.6989871866267463 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:1/input_groups:64/batch:65536/shuffled/string",
+            "value": 2.160544123456618,
+            "unit": "ms/iter",
+            "extra": "iterations: 324\ncpu: 2.1598630956789737 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:1/input_groups:64/batch:65536/shuffled/string",
+            "value": 0.9045766950903765,
+            "unit": "ms/iter",
+            "extra": "iterations: 774\ncpu: 0.9043567997415998 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.7974866323906786,
+            "unit": "ms/iter",
+            "extra": "iterations: 389\ncpu: 1.7968909434447393 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:65536/shuffled/string",
+            "value": 0.8944876248399416,
+            "unit": "ms/iter",
+            "extra": "iterations: 781\ncpu: 0.894285034571056 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:32768/batch:65536/shuffled/string",
+            "value": 3.884954788888864,
+            "unit": "ms/iter",
+            "extra": "iterations: 180\ncpu: 3.8843832666666835 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:32768/batch:65536/shuffled/string",
+            "value": 2.2458298102890786,
+            "unit": "ms/iter",
+            "extra": "iterations: 311\ncpu: 2.2451431446945147 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.8143516528495116,
+            "unit": "ms/iter",
+            "extra": "iterations: 386\ncpu: 1.8134129974093252 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.2595410718132032,
+            "unit": "ms/iter",
+            "extra": "iterations: 557\ncpu: 1.2594998150807895 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:32768/batch:65536/shuffled/string",
+            "value": 3.8833658500000943,
+            "unit": "ms/iter",
+            "extra": "iterations: 180\ncpu: 3.8830132611111248 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:32768/batch:65536/shuffled/string",
+            "value": 2.6886125769229134,
+            "unit": "ms/iter",
+            "extra": "iterations: 260\ncpu: 2.688478696153851 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:8/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.7946175230769348,
+            "unit": "ms/iter",
+            "extra": "iterations: 390\ncpu: 1.7945036410256494 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:8/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.8005232519279484,
+            "unit": "ms/iter",
+            "extra": "iterations: 389\ncpu: 1.8004459074550165 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:8/input_groups:32768/batch:65536/shuffled/string",
+            "value": 3.866988355555476,
+            "unit": "ms/iter",
+            "extra": "iterations: 180\ncpu: 3.8662597555555873 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:8/input_groups:32768/batch:65536/shuffled/string",
+            "value": 3.895890494444782,
+            "unit": "ms/iter",
+            "extra": "iterations: 180\ncpu: 3.8954878777777444 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:24/input_groups:8/batch:65536/shuffled/string",
+            "value": 2.1585010769229904,
+            "unit": "ms/iter",
+            "extra": "iterations: 325\ncpu: 2.158411116923057 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:24/input_groups:8/batch:65536/shuffled/string",
+            "value": 2.1310459725611963,
+            "unit": "ms/iter",
+            "extra": "iterations: 328\ncpu: 2.130013405487834 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:24/input_groups:32768/batch:65536/shuffled/string",
+            "value": 4.953533907801199,
+            "unit": "ms/iter",
+            "extra": "iterations: 141\ncpu: 4.953482751773007 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:24/input_groups:32768/batch:65536/shuffled/string",
+            "value": 4.966534553191937,
+            "unit": "ms/iter",
+            "extra": "iterations: 141\ncpu: 4.966345517730471 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:1/input_groups:8/batch:65536/clustered/string",
+            "value": 2.146487852760778,
+            "unit": "ms/iter",
+            "extra": "iterations: 326\ncpu: 2.14639709202457 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:1/input_groups:8/batch:65536/clustered/string",
+            "value": 0.7207338381442814,
+            "unit": "ms/iter",
+            "extra": "iterations: 970\ncpu: 0.7207238701030948 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:65536/clustered/string",
+            "value": 1.8131168056995848,
+            "unit": "ms/iter",
+            "extra": "iterations: 386\ncpu: 1.8130287797926896 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:65536/clustered/string",
+            "value": 0.9082325077920891,
+            "unit": "ms/iter",
+            "extra": "iterations: 770\ncpu: 0.9082106246753424 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:8/batch:65536/clustered/string",
+            "value": 2.0807753988094646,
+            "unit": "ms/iter",
+            "extra": "iterations: 336\ncpu: 2.080692979166629 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:8/batch:65536/clustered/string",
+            "value": 1.2803463424907373,
+            "unit": "ms/iter",
+            "extra": "iterations: 546\ncpu: 1.2803217087912386 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:32768/batch:65536/clustered/string",
+            "value": 5.193532582089276,
+            "unit": "ms/iter",
+            "extra": "iterations: 134\ncpu: 5.193411828358095 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:32768/batch:65536/clustered/string",
+            "value": 4.049610563954026,
+            "unit": "ms/iter",
+            "extra": "iterations: 172\ncpu: 4.049476645348829 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:1/shuffled/string",
+            "value": 0.03188062038560162,
+            "unit": "ms/iter",
+            "extra": "iterations: 21888\ncpu: 0.0318799460434938 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:1/shuffled/string",
+            "value": 0.04182889481115708,
+            "unit": "ms/iter",
+            "extra": "iterations: 16998\ncpu: 0.041828096599600274 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:16/shuffled/string",
+            "value": 0.048593445205476885,
+            "unit": "ms/iter",
+            "extra": "iterations: 14454\ncpu: 0.04859229216825778 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:16/shuffled/string",
+            "value": 0.04595357368012045,
+            "unit": "ms/iter",
+            "extra": "iterations: 15418\ncpu: 0.045952538591258044 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:255/shuffled/string",
+            "value": 0.17823018006101699,
+            "unit": "ms/iter",
+            "extra": "iterations: 3932\ncpu: 0.17822211469989968 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:255/shuffled/string",
+            "value": 0.12002101308089252,
+            "unit": "ms/iter",
+            "extra": "iterations: 5810\ncpu: 0.12001937624784882 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:256/shuffled/string",
+            "value": 0.1716305287778761,
+            "unit": "ms/iter",
+            "extra": "iterations: 4083\ncpu: 0.17162287999020143 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:256/shuffled/string",
+            "value": 0.11239427274188765,
+            "unit": "ms/iter",
+            "extra": "iterations: 6222\ncpu: 0.1123914631951112 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:257/shuffled/string",
+            "value": 0.15610256721092788,
+            "unit": "ms/iter",
+            "extra": "iterations: 4471\ncpu: 0.15609811876538027 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:257/shuffled/string",
+            "value": 0.10843315182029939,
+            "unit": "ms/iter",
+            "extra": "iterations: 6455\ncpu: 0.10842898497289019 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/string",
+            "value": 2.464604579505046,
+            "unit": "ms/iter",
+            "extra": "iterations: 283\ncpu: 2.4645613674911404 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/string",
+            "value": 1.8538207957560047,
+            "unit": "ms/iter",
+            "extra": "iterations: 377\ncpu: 1.8537724960212087 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/binary",
+            "value": 2.57466908888891,
+            "unit": "ms/iter",
+            "extra": "iterations: 270\ncpu: 2.5745885296295774 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/binary",
+            "value": 1.8536396366048526,
+            "unit": "ms/iter",
+            "extra": "iterations: 377\ncpu: 1.853611193633948 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3_to24/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.7966129048843653,
+            "unit": "ms/iter",
+            "extra": "iterations: 389\ncpu: 1.7965825861182558 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3_to24/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.3740448408645163,
+            "unit": "ms/iter",
+            "extra": "iterations: 509\ncpu: 1.3739668624754389 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:65536/shuffled/string/shrinking",
+            "value": 0.45280293911918107,
+            "unit": "ms/iter",
+            "extra": "iterations: 1544\ncpu: 0.4527864391191688 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:65536/shuffled/string/shrinking",
+            "value": 0.22854723342000957,
+            "unit": "ms/iter",
+            "extra": "iterations: 3076\ncpu: 0.22854391547464017 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:1/len:3/input_groups:8/batch:65536/shuffled/string/mixed_1_256_65536_16_257_256",
+            "value": 0.4599179303090616,
+            "unit": "ms/iter",
+            "extra": "iterations: 1521\ncpu: 0.45990154306377795 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:1/len:3/input_groups:8/batch:65536/shuffled/string/mixed_1_256_65536_16_257_256",
+            "value": 0.2323183546569457,
+            "unit": "ms/iter",
+            "extra": "iterations: 3017\ncpu: 0.23219171826317708 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:1/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.7225669095744975,
+            "unit": "ms/iter",
+            "extra": "iterations: 188\ncpu: 3.7223784095745103 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:1/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.237679778761105,
+            "unit": "ms/iter",
+            "extra": "iterations: 565\ncpu: 1.237619215929203 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:1/input_groups:4096/batch:65536/shuffled/string",
+            "value": 4.675052826666312,
+            "unit": "ms/iter",
+            "extra": "iterations: 150\ncpu: 4.674707940000076 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:1/input_groups:4096/batch:65536/shuffled/string",
+            "value": 1.780786597964487,
+            "unit": "ms/iter",
+            "extra": "iterations: 393\ncpu: 1.7806908320611021 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.5757818877552188,
+            "unit": "ms/iter",
+            "extra": "iterations: 196\ncpu: 3.5755269234694165 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:65536/shuffled/string",
+            "value": 1.6116590461893903,
+            "unit": "ms/iter",
+            "extra": "iterations: 433\ncpu: 1.611581392609721 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:32768/batch:65536/shuffled/string",
+            "value": 6.559805785046575,
+            "unit": "ms/iter",
+            "extra": "iterations: 107\ncpu: 6.5592170093457005 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:32768/batch:65536/shuffled/string",
+            "value": 3.5069828449996976,
+            "unit": "ms/iter",
+            "extra": "iterations: 200\ncpu: 3.5067538750000438 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.6126507268041332,
+            "unit": "ms/iter",
+            "extra": "iterations: 194\ncpu: 3.6124629793813927 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:8/batch:65536/shuffled/string",
+            "value": 2.3642918237286166,
+            "unit": "ms/iter",
+            "extra": "iterations: 295\ncpu: 2.364157681355957 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:32768/batch:65536/shuffled/string",
+            "value": 6.487129861110613,
+            "unit": "ms/iter",
+            "extra": "iterations: 108\ncpu: 6.486823611111098 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:32768/batch:65536/shuffled/string",
+            "value": 4.3569618074538345,
+            "unit": "ms/iter",
+            "extra": "iterations: 161\ncpu: 4.356629975155317 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:8/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.5826052051281576,
+            "unit": "ms/iter",
+            "extra": "iterations: 195\ncpu: 3.5824419333333677 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:8/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.618405840206458,
+            "unit": "ms/iter",
+            "extra": "iterations: 194\ncpu: 3.6182318556700994 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:8/input_groups:32768/batch:65536/shuffled/string",
+            "value": 6.516827157407045,
+            "unit": "ms/iter",
+            "extra": "iterations: 108\ncpu: 6.516410574073882 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:8/input_groups:32768/batch:65536/shuffled/string",
+            "value": 6.678920876189902,
+            "unit": "ms/iter",
+            "extra": "iterations: 105\ncpu: 6.678427647619044 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:24/input_groups:8/batch:65536/shuffled/string",
+            "value": 4.280476116564861,
+            "unit": "ms/iter",
+            "extra": "iterations: 163\ncpu: 4.2803376564417555 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:24/input_groups:8/batch:65536/shuffled/string",
+            "value": 4.274621457316992,
+            "unit": "ms/iter",
+            "extra": "iterations: 164\ncpu: 4.2744672439024445 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:24/input_groups:32768/batch:65536/shuffled/string",
+            "value": 8.966105846153683,
+            "unit": "ms/iter",
+            "extra": "iterations: 78\ncpu: 8.965937141025593 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:24/input_groups:32768/batch:65536/shuffled/string",
+            "value": 8.947237679487548,
+            "unit": "ms/iter",
+            "extra": "iterations: 78\ncpu: 8.946990487179582 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:1/input_groups:8/batch:65536/clustered/string",
+            "value": 3.7488338770050604,
+            "unit": "ms/iter",
+            "extra": "iterations: 187\ncpu: 3.7485979679144097 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:1/input_groups:8/batch:65536/clustered/string",
+            "value": 1.4972834420600638,
+            "unit": "ms/iter",
+            "extra": "iterations: 466\ncpu: 1.497214980686719 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:65536/clustered/string",
+            "value": 3.9851694742856125,
+            "unit": "ms/iter",
+            "extra": "iterations: 175\ncpu: 3.984954331428493 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:65536/clustered/string",
+            "value": 1.6348041103285094,
+            "unit": "ms/iter",
+            "extra": "iterations: 426\ncpu: 1.6347284436619702 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:8/batch:65536/clustered/string",
+            "value": 3.637266549738209,
+            "unit": "ms/iter",
+            "extra": "iterations: 191\ncpu: 3.6371166753925723 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:8/batch:65536/clustered/string",
+            "value": 2.624136048872091,
+            "unit": "ms/iter",
+            "extra": "iterations: 266\ncpu: 2.6240025563910483 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:32768/batch:65536/clustered/string",
+            "value": 7.443119117021012,
+            "unit": "ms/iter",
+            "extra": "iterations: 94\ncpu: 7.442785627659685 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:32768/batch:65536/clustered/string",
+            "value": 5.8933714957262975,
+            "unit": "ms/iter",
+            "extra": "iterations: 117\ncpu: 5.89326655555548 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:1/shuffled/string",
+            "value": 0.03752839243435545,
+            "unit": "ms/iter",
+            "extra": "iterations: 18584\ncpu: 0.03752733894748159 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:1/shuffled/string",
+            "value": 0.04982025600114578,
+            "unit": "ms/iter",
+            "extra": "iterations: 14039\ncpu: 0.04981833478167959 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:16/shuffled/string",
+            "value": 0.06967354440232049,
+            "unit": "ms/iter",
+            "extra": "iterations: 10022\ncpu: 0.06967060217521383 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:16/shuffled/string",
+            "value": 0.05726974196949507,
+            "unit": "ms/iter",
+            "extra": "iterations: 12328\ncpu: 0.05726700316353001 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:255/shuffled/string",
+            "value": 0.3009975132819207,
+            "unit": "ms/iter",
+            "extra": "iterations: 2334\ncpu: 0.3009843744644336 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:255/shuffled/string",
+            "value": 0.17314541823588483,
+            "unit": "ms/iter",
+            "extra": "iterations: 4036\ncpu: 0.17313552626363 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:256/shuffled/string",
+            "value": 0.29257367459321476,
+            "unit": "ms/iter",
+            "extra": "iterations: 2397\ncpu: 0.2925613007926681 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:256/shuffled/string",
+            "value": 0.16606060303174547,
+            "unit": "ms/iter",
+            "extra": "iterations: 4222\ncpu: 0.16605426077688606 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:257/shuffled/string",
+            "value": 0.2774527795400762,
+            "unit": "ms/iter",
+            "extra": "iterations: 2522\ncpu: 0.27743570420301544 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:257/shuffled/string",
+            "value": 0.17038692416483345,
+            "unit": "ms/iter",
+            "extra": "iterations: 4101\ncpu: 0.1703758083394253 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/string",
+            "value": 5.142092426470079,
+            "unit": "ms/iter",
+            "extra": "iterations: 136\ncpu: 5.141732389705859 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/string",
+            "value": 3.391766256038464,
+            "unit": "ms/iter",
+            "extra": "iterations: 207\ncpu: 3.3916296086955926 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/binary",
+            "value": 5.132079301470285,
+            "unit": "ms/iter",
+            "extra": "iterations: 136\ncpu: 5.131718441176377 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:7/input_groups:64/batch:65536/shuffled/null_empty/sliced/binary",
+            "value": 3.426912250000223,
+            "unit": "ms/iter",
+            "extra": "iterations: 204\ncpu: 3.4267432990196096 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3_to24/input_groups:8/batch:65536/shuffled/string",
+            "value": 3.593074907692029,
+            "unit": "ms/iter",
+            "extra": "iterations: 195\ncpu: 3.5929027999999654 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3_to24/input_groups:8/batch:65536/shuffled/string",
+            "value": 2.856568469387732,
+            "unit": "ms/iter",
+            "extra": "iterations: 245\ncpu: 2.856403457142812 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:65536/shuffled/string/shrinking",
+            "value": 0.8833865157630085,
+            "unit": "ms/iter",
+            "extra": "iterations: 793\ncpu: 0.8833518625473 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:65536/shuffled/string/shrinking",
+            "value": 0.41535021046373677,
+            "unit": "ms/iter",
+            "extra": "iterations: 1682\ncpu: 0.4153437633769342 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTableGrouper/keys:2/len:3/input_groups:8/batch:65536/shuffled/string/mixed_1_256_65536_16_257_256",
+            "value": 0.8966222944943059,
+            "unit": "ms/iter",
+            "extra": "iterations: 781\ncpu: 0.8965934750320043 ms\nthreads: 1"
+          },
+          {
+            "name": "BM_KeyTablePacked/keys:2/len:3/input_groups:8/batch:65536/shuffled/string/mixed_1_256_65536_16_257_256",
+            "value": 0.4223970164133302,
+            "unit": "ms/iter",
+            "extra": "iterations: 1645\ncpu: 0.4223773094224898 ms\nthreads: 1"
           }
         ]
       }
