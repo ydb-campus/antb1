@@ -9273,12 +9273,13 @@ TEST(BinderTest, CorrelatedExistsBlocksBindAndUnnest) {
 
 TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
   const Catalog catalog = MakeCatalog();
+  constexpr const char* kJoinedMembership =
+      "SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
+      "u.i16 = ok.i16 AND ok.i16 = t.i64)";
   for (const char* sql :
        {"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
         "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
-        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
-        "SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
-        "u.i16 = ok.i16 AND ok.i16 = t.i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)", kJoinedMembership,
         "SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u WHERE u.i16 = t.i16)"}) {
     SCOPED_TRACE(sql);
     auto bound = BindSql(sql, catalog);
