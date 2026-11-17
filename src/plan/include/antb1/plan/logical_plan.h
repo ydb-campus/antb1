@@ -558,7 +558,8 @@ struct JoinNode {
 // read and none of its own nodes outputs) bound to that row's values. Its kind is semi (EXISTS),
 // anti (NOT EXISTS), one-row (a scalar subquery, whose single value it appends to each left row) or
 // mark (an EXISTS under OR, NOT or CASE, whose two-valued mark it appends: ADR 0041's SQ8); it has
-// no keys, because a correlation is a predicate of the right input, not a pair of columns. Output:
+// no correlation keys, because correlation stays in the right input. An IN/NOT IN also carries
+// its membership pair, separately from that correlation. Output:
 // as a join of the same kind, and then `mark` where that is set.
 //
 // The first pass of plan::Optimize replaces every dependent join with ordinary joins or rejects the
@@ -573,6 +574,10 @@ struct DependentJoinNode {
   // the unnesting makes of it; the correlated three-valued mark is SQ12's (ADR 0023, "One
   // output-id contract for two shapes").
   ColumnId mark = kNoColumnId;
+  // SQ8c: the membership pair of an IN (semi) or NOT IN (anti) conjunct. It compares the
+  // probe with the completed right block's item, after its grouping and HAVING. The correlation
+  // remains in the right input; NOT IN adds the pair's NULL checks only when unnested.
+  std::optional<JoinKey> membership;
   SourceSpan span;  // the subquery in the query
 };
 

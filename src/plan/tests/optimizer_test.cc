@@ -446,7 +446,10 @@ struct MapReferences {
     return std::make_shared<const LogicalNode>(std::move(node));
   }
   LogicalNodePtr operator()(DependentJoinNode node) const {
-    // No keys and no residual to map: a dependent join holds only its two inputs.
+    if (node.membership.has_value()) {
+      Column(node.membership->left);
+      Column(node.membership->right);
+    }
     node.left = Map(node.left);
     node.right = Map(node.right);
     return std::make_shared<const LogicalNode>(std::move(node));
@@ -1398,6 +1401,52 @@ TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
     // The block's filter and compute are gone; its scan is the join's right input.
     EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->right)) << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+}
+
+TEST(OptimizerTest, CorrelatedMembershipUsesKeysOrANullBlockingResidual) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    const JoinKey pair{.left = FieldOf(1, 0), .right = FieldOf(11, 0)};
+    const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+        .kind = kind,
+        .left = FourFields(1),
+        .right = CorrelatedBlock({NotDistinct(FieldOf(11, 1), FieldOf(1, 1))}, 50),
+        .membership = pair})));
+    const auto* join = std::get_if<JoinNode>(plan.root.get());
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(join->kind, kind);
+    EXPECT_EQ(join->keys.size(), kind == JoinKind::kSemi ? 2U : 1U);
+    EXPECT_TRUE(join->keys.front().null_equal);
+    EXPECT_EQ(join->residual.size(), kind == JoinKind::kSemi ? 0U : 1U);
+    if (kind == JoinKind::kSemi) {
+      EXPECT_FALSE(join->keys.back().null_equal);
+    } else {
+      const auto* condition = std::get_if<BoolExpr>(&join->residual.front()->node);
+      ASSERT_NE(condition, nullptr);
+      EXPECT_EQ(condition->op, BoolOp::kOr);
+      EXPECT_EQ(condition->args.size(), 3U);
+    }
+    EXPECT_TRUE(FreeVariables(*plan.root).empty());
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  }
+}
+
+TEST(OptimizerTest, CorrelatedMembershipRefusesUnimplementedShapes) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u)",
+        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE u.i64 < t.i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE u.i64 = t.i64 LIMIT 1)",
+        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE u.i64 = t.i64 OFFSET 1)"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok());
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << optimized.status();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_FALSE(testing::SpanText(sql, optimized.status()).empty());
   }
 }
 

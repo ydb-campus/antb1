@@ -902,7 +902,13 @@ struct IdsOfNode {
     }
     Define(node.mark);
   }
-  void operator()(const DependentJoinNode& node) const { Define(node.mark); }
+  void operator()(const DependentJoinNode& node) const {
+    if (node.membership.has_value()) {
+      Read(node.membership->left);
+      Read(node.membership->right);
+    }
+    Define(node.mark);
+  }
   void operator()(const UnionAllNode& node) const {
     for (const std::vector<BoundColumn>& input : node.columns) {
       for (const BoundColumn& column : input) {
@@ -1345,7 +1351,14 @@ class Resolver {
       Define("DependentJoin", join.mark);
     }
     DependentJoinNode out = join;
-    const bool changed = left.node != join.left || right.node != join.right;
+    bool changed = left.node != join.left || right.node != join.right;
+    if (out.membership.has_value()) {
+      if (join.kind != JoinKind::kSemi && join.kind != JoinKind::kAnti) {
+        Fail("DependentJoin: membership requires a semi or anti join");
+      }
+      changed |= Resolve("DependentJoin membership probe", out.membership->left, left.ids);
+      changed |= Resolve("DependentJoin membership item", out.membership->right, right.ids);
+    }
     out.left = left.node;
     out.right = right.node;
     return {.node = changed ? MakeNode(std::move(out)) : self,
@@ -1595,6 +1608,10 @@ struct FreshIds {
     return node;
   }
   LogicalNode operator()(DependentJoinNode node) const {
+    if (node.membership.has_value()) {
+      Rename(node.membership->left);
+      Rename(node.membership->right);
+    }
     node.mark = Mint(node.mark);
     return node;
   }

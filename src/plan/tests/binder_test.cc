@@ -1243,19 +1243,9 @@ INSTANTIATE_TEST_SUITE_P(
         // One column, as in DuckDB, which reports a bind error for two.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16, i32 FROM u)", kBind, "IN",
                   "a subquery of IN must have one column, not 2"},
-        // A correlated IN is refused by its shape, at the IN, not at the reference: its NULL
-        // semantics need the set's NULL and empty flags for each binding (ADR 0023).
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
-                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
-                  kUnsupported, "NOT IN", "a correlated subquery of NOT IN is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
-                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
         // ADR 0023 answers an outer reference only in a WHERE conjunct of its own block, an inner
         // join's ON included, and only one block out. Every other placement exits 4 at the
         // reference, with the rule it broke, and never reports a missing column.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u)", kUnsupported, "t.i64",
-                  "a qualified column of an enclosing query block is supported only in WHERE"},
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u GROUP BY i16, t.i64)",
                   kUnsupported, "t.i64",
                   "a qualified column of an enclosing query block is supported only in WHERE"},
@@ -1270,11 +1260,6 @@ INSTANTIATE_TEST_SUITE_P(
                   "u.i16 = ok.i16 AND ok.i16 = t.i64)",
                   kUnsupported, "t.i64",
                   "a qualified column of an enclosing query block is supported only in WHERE"},
-        // An inner join's ON is a WHERE conjunct (rule 10), so the reference is answered and the
-        // refusal is the correlated IN's, at the IN.
-        ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
-                  "u.i16 = ok.i16 AND ok.i16 = t.i64)",
-                  kUnsupported, "IN", "a correlated subquery of IN is not supported"},
         // Two blocks out: the subquery may name only the block that directly encloses it.
         ErrorCase{"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i32 IN "
                   "(SELECT i16 FROM ok WHERE i16 = t.i64))",
@@ -9283,6 +9268,34 @@ TEST(BinderTest, CorrelatedExistsBlocksBindAndUnnest) {
     ASSERT_TRUE(optimized.ok()) << sql << ": " << optimized.status();
     EXPECT_EQ(PositionMismatch(*optimized), std::nullopt) << sql;
     EXPECT_TRUE(FreeVariables(*optimized->root).empty()) << sql;
+  }
+}
+
+TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE i64 = t.i64)",
+        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE i64 = t.i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM ok WHERE i16 = i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT u.i16 FROM u JOIN ok ON "
+        "u.i16 = ok.i16 AND ok.i16 = t.i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u WHERE u.i16 = t.i16)"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    EXPECT_EQ(PositionMismatch(*bound), std::nullopt);
+    EXPECT_TRUE(FreeVariables(*bound->root).empty());
+    EXPECT_TRUE(Explain(*bound).contains("membership=["));
+    ColumnId last = MaxColumnId(*bound->root);
+    LogicalPlan clone = *bound;
+    clone.root = CloneWithFreshIds(bound->root, last);
+    clone.output.front().id = OutputIds(*clone.root).front();
+    EXPECT_TRUE(FreeVariables(*clone.root).empty());
+    EXPECT_EQ(PositionMismatch(clone), std::nullopt);
+    auto original = Optimize(*bound);
+    ASSERT_TRUE(original.ok()) << original.status();
+    EXPECT_FALSE(Explain(*original).contains("DependentJoin"));
+    EXPECT_EQ(PositionMismatch(*original), std::nullopt);
   }
 }
 

@@ -440,6 +440,11 @@ struct Correlation {
   // The refusal of a shape, in the wording each mode has always had, at the subquery's span: a
   // mark's is an EXISTS's, whose NOT, where it has one, stands above the mark.
   [[nodiscard]] arrow::Status Refuse(std::string_view what) const {
+    if (join.membership.has_value()) {
+      return UnsupportedError(std::format("a correlated {} {} is not supported",
+                                          join.kind == JoinKind::kAnti ? "NOT IN" : "IN", what),
+                              join.span);
+    }
     if (mode == Mode::kValue) {
       return UnsupportedError(std::format("a correlated scalar subquery {} is not supported", what),
                               join.span);
@@ -872,6 +877,111 @@ arrow::Result<std::vector<const ExprPtr*>> ConjunctsOf(const Correlation& correl
 //         Compute <their expressions>
 //           Filter t.z = 1
 //             Scan t
+ExprPtr ColumnValue(const BoundColumn& column) {
+  return std::make_shared<const Expr>(
+      Expr{.node = ColumnExpr{.id = column.id}, .type = column.type, .name = column.name});
+}
+
+ExprPtr IsNullValue(const BoundColumn& column) {
+  BoundColumn operand = column;
+  operand.index = 0;
+  operand.id = kNoColumnId;
+  return std::make_shared<const Expr>(Expr{
+      .node =
+          PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kIsNull, .column = operand},
+                        .operands = {ColumnValue(column)}},
+      .type = LogicalType::kBoolean,
+      .name = "IS NULL"});
+}
+
+ExprPtr MembershipMatch(const JoinKey& pair, bool nulls_match) {
+  BoundColumn left = pair.left;
+  left.index = 0;
+  left.id = kNoColumnId;
+  BoundColumn right = pair.right;
+  right.index = 1;
+  right.id = kNoColumnId;
+  ExprPtr equality = std::make_shared<const Expr>(
+      Expr{.node = PredicateExpr{.predicate = Predicate{.kind = Predicate::Kind::kCompareColumns,
+                                                        .column = left,
+                                                        .other = right,
+                                                        .op = CompareOp::kEq},
+                                 .operands = {ColumnValue(pair.left), ColumnValue(pair.right)}},
+           .type = LogicalType::kBoolean,
+           .name = "IN"});
+  if (!nulls_match) {
+    return equality;
+  }
+  return std::make_shared<const Expr>(Expr{
+      .node =
+          BoolExpr{.op = BoolOp::kOr,
+                   .args = {std::move(equality), IsNullValue(pair.left), IsNullValue(pair.right)}},
+      .type = LogicalType::kBoolean,
+      .name = "NOT IN match"});
+}
+
+void AddMembership(const DependentJoinNode& join, std::vector<JoinKey>& keys,
+                   std::vector<ExprPtr>& residual, bool outer_item = false) {
+  if (!join.membership.has_value()) {
+    return;
+  }
+  if (join.kind == JoinKind::kSemi && !outer_item) {
+    keys.push_back(*join.membership);
+  } else {
+    residual.push_back(MembershipMatch(*join.membership, join.kind == JoinKind::kAnti));
+  }
+}
+
+// The selected IN value is read after the correlation. Preserve its maps, and implement
+// Projects as maps so the correlation keys and residual columns remain available to the join.
+arrow::Result<std::pair<LogicalNodePtr, LogicalNodePtr>> MembershipMaps(
+    const Correlation& correlation, const Spine& spine) {
+  LogicalNodePtr left = correlation.join.left;
+  LogicalNodePtr input = spine.below;
+  std::set<ColumnId> outer = correlation.outer;
+  for (const Step& step : std::ranges::reverse_view(spine.steps)) {
+    ComputeNode maps{.input = input, .exprs = {}, .ids = {}, .span = correlation.join.span};
+    if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
+      maps.span = project->span;
+      for (std::size_t i = 0; i < project->ids.size(); ++i) {
+        const std::optional<Constant> constant =
+            i < project->constants.size() ? project->constants[i] : std::nullopt;
+        if (!constant.has_value() && project->ids[i] == project->columns[i].id) {
+          continue;
+        }
+        maps.ids.push_back(project->ids[i]);
+        maps.exprs.push_back(constant.has_value() ? std::make_shared<const Expr>(Expr{
+                                                        .node = ConstantExpr{.value = *constant},
+                                                        .type = project->columns[i].type,
+                                                        .name = project->columns[i].name})
+                                                  : ColumnValue(project->columns[i]));
+      }
+    } else if (const auto* compute = std::get_if<ComputeNode>(step.node.get())) {
+      maps = *compute;
+      maps.input = input;
+    }
+    ComputeNode inner{.input = input, .exprs = {}, .ids = {}, .span = maps.span};
+    ComputeNode moved{.input = left, .exprs = {}, .ids = {}, .span = maps.span};
+    for (std::size_t i = 0; i < maps.exprs.size(); ++i) {
+      const Sides sides = SidesOf(*maps.exprs[i], outer);
+      if (sides.both()) {
+        return correlation.Refuse("whose selected expression mixes inner and outer columns");
+      }
+      ComputeNode& target = sides.outer ? moved : inner;
+      target.exprs.push_back(maps.exprs[i]);
+      target.ids.push_back(maps.ids[i]);
+    }
+    outer.insert(moved.ids.begin(), moved.ids.end());
+    if (!moved.exprs.empty()) {
+      left = Make(std::move(moved));
+    }
+    if (!inner.exprs.empty()) {
+      input = Make(std::move(inner));
+    }
+  }
+  return std::pair{std::move(left), std::move(input)};
+}
+
 arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spine& spine) {
   const DependentJoinNode& join = correlation.join;
   ColumnId& last_id = correlation.last_id;
@@ -881,11 +991,15 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
   std::vector<ColumnId> inner_cast_ids;
   std::vector<ExprPtr> outer_casts;  // and its outer side
   std::vector<ColumnId> outer_cast_ids;
+  std::vector<ExprPtr> inner_keys;
+  std::vector<ColumnId> inner_key_ids;
+  std::vector<ExprPtr> outer_keys;
+  std::vector<ColumnId> outer_key_ids;
 
   ARROW_ASSIGN_OR_RAISE(const std::vector<const ExprPtr*> conjuncts,
                         ConjunctsOf(correlation, spine));
   for (const ExprPtr* defined : conjuncts) {
-    const ExprPtr& expr = *defined;
+    ExprPtr expr = *defined;
     const Sides sides = SidesOf(*expr, correlation.outer);
     if (!sides.outer) {
       // An inner-only conjunct stays where the binder put it; one can only reach the block's top
@@ -909,7 +1023,40 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
       residual.push_back(expr);
       continue;
     }
-    if (const std::optional<KeyParts> key = AsKey(*expr, correlation.outer)) {
+    // Membership needs a correlation key even when its NOT IN comparison is a residual.
+    // Materialize a computed side only for an equality between independent inputs; a mixed
+    // expression remains a residual. The ordinary EXISTS/value rules keep their existing scope.
+    if (join.membership.has_value()) {
+      const auto* predicate = std::get_if<PredicateExpr>(&expr->node);
+      if (predicate != nullptr && predicate->operands.size() == 2 &&
+          (predicate->predicate.kind == Predicate::Kind::kIsNotDistinct ||
+           (predicate->predicate.kind == Predicate::Kind::kCompareColumns &&
+            predicate->predicate.op == CompareOp::kEq)) &&
+          KeyType(predicate->operands[0]->type, predicate->operands[1]->type).has_value()) {
+        const Sides a = SidesOf(*predicate->operands[0], correlation.outer);
+        const Sides b = SidesOf(*predicate->operands[1], correlation.outer);
+        if ((a.outer_only() && b.inner && !b.outer) || (b.outer_only() && a.inner && !a.outer)) {
+          PredicateExpr keyed = *predicate;
+          for (ExprPtr& operand : keyed.operands) {
+            if (std::holds_alternative<ColumnExpr>(operand->node)) {
+              continue;
+            }
+            const bool outer = SidesOf(*operand, correlation.outer).outer_only();
+            last_id = ColumnId{std::to_underlying(last_id) + 1};
+            (outer ? outer_keys : inner_keys).push_back(operand);
+            (outer ? outer_key_ids : inner_key_ids).push_back(last_id);
+            operand = ColumnValue(
+                BoundColumn{.id = last_id, .name = operand->name, .type = operand->type});
+          }
+          Expr changed = *expr;
+          changed.node = std::move(keyed);
+          expr = std::make_shared<const Expr>(std::move(changed));
+        }
+      }
+    }
+    std::set<ColumnId> key_outer = correlation.outer;
+    key_outer.insert(outer_key_ids.begin(), outer_key_ids.end());
+    if (const std::optional<KeyParts> key = AsKey(*expr, key_outer)) {
       // Both sides cast to the common type, as ADR 0022's keys are, each in a layer of its own on
       // its side of the join: ResolvePositions requires a key's two sides to have one type, and
       // exec compares that type against the column's own.
@@ -935,18 +1082,35 @@ arrow::Result<LogicalNodePtr> LiftJoin(const Correlation& correlation, const Spi
     residual.push_back(expr);  // reads both sides and is no key: a residual over candidate pairs
   }
 
+  LogicalNodePtr left = join.left;
+  LogicalNodePtr right = spine.below;
+  bool outer_item = false;
+  if (join.membership.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(auto mapped, MembershipMaps(correlation, spine));
+    left = std::move(mapped.first);
+    right = std::move(mapped.second);
+    const std::vector<ColumnId> left_ids = OutputIds(*left);
+    outer_item = std::ranges::find(left_ids, join.membership->right.id) != left_ids.end();
+  }
+  AddMembership(join, keys, residual, outer_item);
   if (keys.empty()) {
     // ADR 0023: as a LEFT JOIN without one does in ADR 0022, since the hash table and the
     // candidate pairs need a key (ADR 0040's decision 3).
     return correlation.Refuse("without a key");
   }
 
-  LogicalNodePtr left = join.left;
+  if (!outer_keys.empty()) {
+    left = Make(ComputeNode{
+        .input = std::move(left), .exprs = outer_keys, .ids = outer_key_ids, .span = join.span});
+  }
   if (!outer_casts.empty()) {
     left = Make(ComputeNode{
         .input = std::move(left), .exprs = outer_casts, .ids = outer_cast_ids, .span = join.span});
   }
-  LogicalNodePtr right = spine.below;
+  if (!inner_keys.empty()) {
+    right = Make(ComputeNode{
+        .input = std::move(right), .exprs = inner_keys, .ids = inner_key_ids, .span = join.span});
+  }
   if (!inner_casts.empty()) {
     right = Make(ComputeNode{
         .input = std::move(right), .exprs = inner_casts, .ids = inner_cast_ids, .span = join.span});
@@ -1746,12 +1910,23 @@ arrow::Result<Rewritten> StaticExistence(const Correlation& correlation,
   DependentJoinNode scalar = correlation.join;
   scalar.kind = JoinKind::kOneRow;
   scalar.mark = kNoColumnId;
-  scalar.right = Make(
-      ProjectNode{.input = StaticExistenceInput(input, last_id),
-                  .columns = {BoundColumn{.index = -1, .name = column.name, .type = column.type}},
-                  .constants = {Constant{.type = column.type, .value = Int128{1}}},
-                  .ids = {present},
-                  .span = scalar.span});
+  scalar.membership.reset();
+  std::vector<BoundColumn> columns;
+  std::vector<std::optional<Constant>> constants;
+  std::vector<ColumnId> ids;
+  if (correlation.join.membership.has_value()) {
+    columns.push_back(correlation.join.membership->right);
+    constants.emplace_back(std::nullopt);
+    ids.push_back(columns.back().id);
+  }
+  columns.push_back(BoundColumn{.index = -1, .name = column.name, .type = column.type});
+  constants.emplace_back(Constant{.type = column.type, .value = Int128{1}});
+  ids.push_back(present);
+  scalar.right = Make(ProjectNode{.input = StaticExistenceInput(input, last_id),
+                                  .columns = std::move(columns),
+                                  .constants = std::move(constants),
+                                  .ids = std::move(ids),
+                                  .span = scalar.span});
   LogicalNodePtr declined;
   const std::optional<Spine> spine =
       Descend(Mode::kValue, scalar.right, &declined, correlation.outer, true);
@@ -1774,10 +1949,19 @@ arrow::Result<Rewritten> StaticExistence(const Correlation& correlation,
                   .node = ColumnExpr{.id = present}, .type = column.type, .name = column.name})}},
       .type = LogicalType::kBoolean,
       .name = "EXISTS"});
-  const ExprPtr exists =
+  ExprPtr exists =
       std::make_shared<const Expr>(Expr{.node = BoolExpr{.op = BoolOp::kNot, .args = {missing}},
                                         .type = LogicalType::kBoolean,
                                         .name = "EXISTS"});
+  if (correlation.join.membership.has_value()) {
+    exists = std::make_shared<const Expr>(
+        Expr{.node = BoolExpr{.op = BoolOp::kAnd,
+                              .args = {std::move(exists),
+                                       MembershipMatch(*correlation.join.membership,
+                                                       correlation.join.kind == JoinKind::kAnti)}},
+             .type = LogicalType::kBoolean,
+             .name = "IN row match"});
+  }
   out.node = ExistenceValue(correlation, std::move(out.node), exists);
   return out;
 }
@@ -1802,11 +1986,10 @@ arrow::Result<Rewritten> GroupedExistence(const Correlation& correlation, const 
     }
     carried.emplace(outer, found->second);
   }
-  const auto substitute = [&representatives](const ExprPtr& expr) {
-    return MapColumns(expr, [&representatives](ColumnExpr column) {
-      if (const auto found = representatives.of.find(column.id);
-          found != representatives.of.end()) {
-        column.id = found->second;
+  const auto substitute = [&carried](const ExprPtr& expr) {
+    return MapColumns(expr, [&carried](ColumnExpr column) {
+      if (const auto found = carried.find(column.id); found != carried.end()) {
+        column.id = found->second.id;
       }
       return column;
     });
@@ -1845,6 +2028,11 @@ arrow::Result<Rewritten> GroupedExistence(const Correlation& correlation, const 
         if (const auto* project = std::get_if<ProjectNode>(step.node.get())) {
           ProjectNode out = *project;
           out.input = std::move(right);
+          for (BoundColumn& column : out.columns) {
+            if (const auto found = carried.find(column.id); found != carried.end()) {
+              column.id = found->second.id;
+            }
+          }
           for (const auto& [outer, column] : carried) {
             if (std::ranges::contains(out.ids, column.id)) {
               continue;
@@ -1945,11 +2133,13 @@ arrow::Result<Rewritten> GroupedExistence(const Correlation& correlation, const 
                            .right = inner,
                            .null_equal = representatives.null_equal.contains(outer)});
   }
+  std::vector<ExprPtr> residual;
+  AddMembership(correlation.join, keys, residual);
   LogicalNodePtr node = Make(JoinNode{.kind = correlation.join.kind,
                                       .left = correlation.join.left,
                                       .right = right,
                                       .keys = std::move(keys),
-                                      .residual = {},
+                                      .residual = std::move(residual),
                                       .mark = correlation.join.mark,
                                       .build = BuildSide::kRight,
                                       .estimate = EstimateRows(*correlation.join.left),
@@ -2013,6 +2203,33 @@ arrow::Result<Rewritten> ExistsJoin(const Correlation& correlation) {
   return GroupedExistence(correlation, *spine);
 }
 
+arrow::Result<Rewritten> MembershipJoin(const Correlation& correlation) {
+  const LogicalNodePtr input = StaticGrouping(correlation.join.right);
+  LogicalNodePtr declined;
+  if (const auto plain = Descend(Mode::kLift, input, &declined, correlation.outer)) {
+    ARROW_ASSIGN_OR_RAISE(LogicalNodePtr node, LiftJoin(correlation, *plain));
+    const LogicalNodePtr right = std::get<JoinNode>(*node).right;
+    return Rewritten{.node = std::move(node), .right = right};
+  }
+  const auto spine = Descend(Mode::kExists, input, &declined, correlation.outer);
+  if (!spine.has_value()) {
+    return correlation.RefuseShape();
+  }
+  for (const Step& step : spine->steps) {
+    if (step.role == Role::kLimit) {
+      if (std::get<LimitNode>(*step.node).limit == 0) {
+        return Rewritten{.node = EmptyExistence(correlation), .right = nullptr};
+      }
+      return correlation.Refuse("with LIMIT or OFFSET");
+    }
+  }
+  if (std::ranges::any_of(spine->steps,
+                          [](const Step& step) { return step.role == Role::kStatic; })) {
+    return StaticExistence(correlation, input);
+  }
+  return GroupedExistence(correlation, *spine);
+}
+
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
 arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
                                          int64_t build_side_ratio, std::span<const Ancestor> above,
@@ -2036,7 +2253,9 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
                                 .above = above,
                                 .report = report};
   Rewritten out;
-  if (*mode == Mode::kLift) {
+  if (join.membership.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(out, MembershipJoin(correlation));
+  } else if (*mode == Mode::kLift) {
     ARROW_ASSIGN_OR_RAISE(out, ExistsJoin(correlation));
   } else {
     LogicalNodePtr declined;

@@ -2646,10 +2646,10 @@ class Builder {
     // Only where the query holds no other subquery, as a value inside a WHERE condition.
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
-        used_.Has(Feature::kInForm);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm);
     if (const std::vector<SubqueryCandidate> values = HavingValueCandidates(keys);
         !other_subquery && !values.empty() && having_value_rng_.Percent(kHavingValuePercent)) {
       Keyword("AND");
@@ -2904,14 +2904,30 @@ class Builder {
   // 0023's Path 1: a plain block, at least one key, and an optional non-equality residual. The
   // select list is `*`, which U2 checks but does not expand, and records no shape feature.
   void CorrelatedExists(const CorrelatedCandidate& c) {
-    used_.Add(Feature::kCorrelatedExists);
+    const bool membership = allowed_.Has(Feature::kCorrelatedIn) && corr_rng_.Percent(25);
+    used_.Add(membership ? Feature::kCorrelatedIn : Feature::kCorrelatedExists);
+    const GenColumn* item = c.inner_key;
+    const GenColumn* probe = c.outer_key;
+    if (membership) {
+      const auto pairs = ResidualPairs(c);
+      if (!pairs.empty()) {
+        const auto& pair = pairs[corr_rng_.Below(pairs.size())];
+        item = pair.first;
+        probe = pair.second;
+      }
+      OuterValue(c, *probe);
+    }
     if (corr_rng_.Percent(kNotExistsPercent)) {
       Keyword("NOT");
     }
-    Keyword("EXISTS");
+    Keyword(membership ? "IN" : "EXISTS");
     Symbol("(");
     Keyword("SELECT");
-    Symbol("*");
+    if (membership) {
+      InnerColumn(c, *item);
+    } else {
+      Symbol("*");
+    }
     Keyword("FROM");
     used_.Add(Feature::kTableName);
     tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.inner->name});
@@ -3163,9 +3179,10 @@ class Builder {
   void ItemValue(std::size_t at, bool lone_star) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kInMark) ||
+        used_.Has(Feature::kInForm);
     if (other_subquery || !allowed_.Has(Feature::kItemValue) ||
         !allowed_.Has(Feature::kMultipleItems) ||
         (lone_star && !allowed_.Has(Feature::kStarItems))) {
@@ -3214,9 +3231,10 @@ class Builder {
   void GroupValue(std::size_t at) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kInMark) ||
+        used_.Has(Feature::kInForm);
     if (other_subquery || !allowed_.Has(Feature::kGroupValue) ||
         !allowed_.Has(Feature::kMultipleItems)) {
       return;
@@ -3281,10 +3299,11 @@ class Builder {
               bool& ordered) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInForm);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInForm);
     if (other_subquery || !allowed_.Has(Feature::kInMark)) {
       return;
     }
@@ -3332,10 +3351,11 @@ class Builder {
               bool& ordered) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark);
     if (other_subquery || !allowed_.Has(Feature::kInForm)) {
       return;
     }
@@ -3792,11 +3812,11 @@ class Builder {
   void CorrelatedEmptyValue(const MarkSlots& slots) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
-        used_.Has(Feature::kInForm);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm);
     // An inner aggregate needs a select list that settles the row shape (InnerAggregateFits).
     if (other_subquery || !allowed_.Has(Feature::kCorrelatedEmptyValue) ||
         !allowed_.Has(Feature::kWhere) || !allowed_.Has(Feature::kIntegerLiteral) ||
@@ -4166,11 +4186,12 @@ class Builder {
   void CorrelatedConditionValue(const MarkSlots& slots) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
-        used_.Has(Feature::kInForm) || used_.Has(Feature::kCorrelatedEmptyValue);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm) ||
+        used_.Has(Feature::kCorrelatedEmptyValue);
     // An inner aggregate needs a select list that settles the row shape (InnerAggregateFits).
     if (other_subquery || !allowed_.Has(Feature::kCorrelatedConditionValue) ||
         !allowed_.Has(Feature::kWhere) || !allowed_.Has(Feature::kIntegerLiteral) ||
@@ -4734,12 +4755,12 @@ class Builder {
                            bool& grouped) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
-        used_.Has(Feature::kInForm) || used_.Has(Feature::kCorrelatedEmptyValue) ||
-        used_.Has(Feature::kCorrelatedConditionValue);
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm) ||
+        used_.Has(Feature::kCorrelatedEmptyValue) || used_.Has(Feature::kCorrelatedConditionValue);
     if (other_subquery || !allowed_.Has(Feature::kCorrelatedItemValue) ||
         !allowed_.Has(Feature::kIntegerLiteral)) {
       return;
@@ -5067,11 +5088,12 @@ class Builder {
                             bool& grouped) {
     const bool other_subquery =
         used_.Has(Feature::kInSubquery) || used_.Has(Feature::kScalarSubquery) ||
-        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedAggregate) ||
-        used_.Has(Feature::kUncorrelatedValue) || used_.Has(Feature::kConditionValue) ||
-        used_.Has(Feature::kHavingValue) || used_.Has(Feature::kItemValue) ||
-        used_.Has(Feature::kGroupValue) || used_.Has(Feature::kInMark) ||
-        used_.Has(Feature::kInForm) || used_.Has(Feature::kCorrelatedEmptyValue) ||
+        used_.Has(Feature::kCorrelatedExists) || used_.Has(Feature::kCorrelatedIn) ||
+        used_.Has(Feature::kCorrelatedAggregate) || used_.Has(Feature::kUncorrelatedValue) ||
+        used_.Has(Feature::kConditionValue) || used_.Has(Feature::kHavingValue) ||
+        used_.Has(Feature::kItemValue) || used_.Has(Feature::kGroupValue) ||
+        used_.Has(Feature::kInMark) || used_.Has(Feature::kInForm) ||
+        used_.Has(Feature::kCorrelatedEmptyValue) ||
         used_.Has(Feature::kCorrelatedConditionValue) || used_.Has(Feature::kCorrelatedItemValue);
     if (other_subquery || !allowed_.Has(Feature::kCorrelatedExistsMark)) {
       return;

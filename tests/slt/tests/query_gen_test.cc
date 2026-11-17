@@ -116,7 +116,7 @@ bool Joins(const GeneratedQuery& q) {
 // no second FROM item, so CheckJoin (which requires two) must not see one.
 bool HasSubquery(const GeneratedQuery& q) {
   return q.features.Has(Feature::kInSubquery) || q.features.Has(Feature::kScalarSubquery) ||
-         q.features.Has(Feature::kCorrelatedExists) ||
+         q.features.Has(Feature::kCorrelatedExists) || q.features.Has(Feature::kCorrelatedIn) ||
          q.features.Has(Feature::kCorrelatedAggregate) ||
          q.features.Has(Feature::kUncorrelatedValue) || q.features.Has(Feature::kConditionValue) ||
          q.features.Has(Feature::kHavingValue) || q.features.Has(Feature::kItemValue) ||
@@ -915,6 +915,7 @@ TEST(QueryGenerator, NullEqualKeysChangeOnlyTheirQueries) {
     if (q.features.Has(Feature::kNullEqualKeys)) {
       ++null_equal;
       correlated += q.features.Has(Feature::kCorrelatedExists) ||
+                            q.features.Has(Feature::kCorrelatedIn) ||
                             q.features.Has(Feature::kCorrelatedAggregate)
                         ? 1
                         : 0;
@@ -1579,6 +1580,7 @@ void CheckJoin(const GeneratedQuery& q, const std::vector<GenTable>& tables, Joi
             std::ranges::any_of(items, [](const Item& i) { return i.aliased; }));
   EXPECT_EQ(q.features.Has(Feature::kQualifiedName),
             qualified || q.features.Has(Feature::kCorrelatedExists) ||
+                q.features.Has(Feature::kCorrelatedIn) ||
                 q.features.Has(Feature::kCorrelatedAggregate) ||
                 q.features.Has(Feature::kCorrelatedEmptyValue) ||
                 q.features.Has(Feature::kCorrelatedConditionValue) ||
@@ -2494,7 +2496,7 @@ TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
     const auto q = with.Generate(i);
     const auto plain = without.Generate(i);
     const auto correlated = [](const GeneratedQuery& g) {
-      return g.features.Has(Feature::kCorrelatedExists) ||
+      return g.features.Has(Feature::kCorrelatedExists) || g.features.Has(Feature::kCorrelatedIn) ||
              g.features.Has(Feature::kCorrelatedAggregate);
     };
     EXPECT_FALSE(correlated(plain)) << plain.sql;
@@ -2518,8 +2520,9 @@ TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
 // What it writes: both polarities, a qualified key on each side, the inner table named and never
 // the outer binding's name, and an optional non-equality over the same pair.
 TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
-  const FeatureSet plain = Union(kSupportedFeatures, {Feature::kCorrelatedExists})
-                               .Minus({Feature::kLayout, Feature::kKeywordCase});
+  const FeatureSet plain =
+      Union(kSupportedFeatures, {Feature::kCorrelatedExists})
+          .Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kCorrelatedIn});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
   int exists = 0;
   int negated = 0;
@@ -5806,6 +5809,38 @@ void CheckMarkCall(const sql::AggregateCall& call, const sql::SelectStatement& s
       name = call.kind == sql::AggKind::kMin ? "min" : "max";
       return;
   }
+}
+
+TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {
+  const auto gen =
+      MakeOver(JoinTables(), 71,
+               {.supported = kSupportedFeatures.Minus({Feature::kLayout, Feature::kKeywordCase}),
+                .target_percent = 0});
+  int positive = 0;
+  int negative = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kCorrelatedIn)) {
+      continue;
+    }
+    SCOPED_TRACE(q.sql);
+    EXPECT_FALSE(q.features.Has(Feature::kCorrelatedExists));
+    ASSERT_NO_FATAL_FAILURE(CheckRowShape(q));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    std::vector<const sql::SubqueryExpr*> blocks;
+    DeepSubqueries(*parsed, blocks);
+    ASSERT_EQ(blocks.size(), 1U);
+    EXPECT_EQ(blocks.front()->query->items.size(), 1U);
+    EXPECT_FALSE(blocks.front()->query->where.empty());
+    if (q.sql.contains("NOT IN")) {
+      ++negative;
+    } else {
+      ++positive;
+    }
+  }
+  EXPECT_GT(positive, 10);
+  EXPECT_GT(negative, 10);
 }
 
 // SQ8b's seven block shapes retain SQ8a's keyed correlation and expose their feature tag.

@@ -2930,13 +2930,14 @@ enum class Clause : std::uint8_t {
 // The clauses whose outer references ADR 0023 answers.
 bool WhereClause(Clause clause) { return clause == Clause::kWhere || clause == Clause::kInnerOn; }
 
-// The EXISTS conjunct a block is bound for: its operator, at which a refusal of the block points,
-// and whether it is a HAVING conjunct. Such a block's select list is checked but its stars are not
-// expanded (ADR 0023's Path 1 drops the list, and so does ADR 0041's uncorrelated EXISTS, but
+// The subquery a block is bound for: its operator, at which a refusal of the block points,
+// and whether it is a HAVING conjunct. An EXISTS block's select list is checked but its stars are
+// not expanded (ADR 0023's Path 1 drops the list, and so does ADR 0041's uncorrelated EXISTS, but
 // under a DISTINCT), and when the block is correlated it must be one Path 1 takes
 // (Binder::GateCorrelatedExists).
-struct ExistsConjunct {
+struct SubqueryContext {
   SourceSpan op_span;
+  bool membership = false;      // an IN/NOT IN set, rather than an EXISTS block
   bool having = false;          // above the aggregation of the block that holds it
   bool outside_having = false;  // there, in its select list or ORDER BY (ADR 0041's SQ2b)
 };
@@ -2945,9 +2946,9 @@ struct ExistsConjunct {
 // seen in the given visibility: the clause the subquery is written in (rule 10's for an ON).
 // A Binder has no catalog and no CTE frame -- both belong to BindBlock, which binds the FROM list
 // before the Binder exists -- so BindBlock hands it this to reach them for a subquery's query.
-// `exists` is null except for the block of an EXISTS conjunct.
+// The context is absent for scalar subqueries.
 using BindBlockFn = std::function<arrow::Result<BoundBlock>(
-    const sql::SelectStatement&, const Scope*, Visibility, const ExistsConjunct* exists)>;
+    const sql::SelectStatement&, const Scope*, Visibility, const SubqueryContext* exists)>;
 
 // One subquery conjunct's join (ADR 0022's J5): above its block's inner joins for a WHERE or
 // inner-ON conjunct, above its aggregation and the filter of HAVING's other conjuncts for a HAVING
@@ -2961,9 +2962,9 @@ struct SubqueryJoin {
   JoinKind kind = JoinKind::kSemi;
   // The sub-plan is correlated: it reads columns of the tree below as free variables, so the join
   // is a DependentJoin, which the unnesting pass of plan::Optimize replaces or rejects (ADR 0023).
-  // A dependent join has no keys: a correlation is a predicate of the sub-plan, not a pair of
-  // columns, so `left_key` and `right_key` stay empty and `exprs` holds only what the comparison
-  // computes on the outer side.
+  // A dependent join keeps correlation in its sub-plan. IN/NOT IN carries a membership pair
+  // in `left_key` and `right_key`; other dependent joins leave them empty. `exprs` holds what the
+  // comparison computes on the outer side.
   bool dependent = false;
   LogicalNodePtr right;   // the sub-plan, its column cast to the key type
   BoundColumn left_key;   // of the tree below (the IN forms)
@@ -3007,11 +3008,12 @@ class Binder {
   Binder(const sql::SelectStatement& stmt, std::vector<Binding> bindings, ColumnIdSource& ids,
          const BindOptions& options, const Scope* outer = nullptr,
          const BindBlockFn* bind_block = nullptr, bool outer_encloses = false,
-         const ExistsConjunct* exists = nullptr, Visibility outer_visible = {})
+         const SubqueryContext* exists = nullptr, Visibility outer_visible = {})
       : stmt_(stmt),
         scope_(std::move(bindings), outer, outer_visible),
         outer_encloses_(outer_encloses),
-        exists_(exists),
+        membership_block_(exists != nullptr && exists->membership),
+        exists_(exists != nullptr && !exists->membership ? exists : nullptr),
         ids_(ids),
         options_(options),
         bind_block_(bind_block),
@@ -4042,7 +4044,10 @@ class Binder {
       // lateral reference, which ADR 0022 refuses and no PR of ADR 0023 answers.
       return Scope::CorrelationError(ref, Scope::Refusal::kLateral);
     }
-    if (!WhereClause(clause_)) {
+    const bool membership_item = membership_block_ && clause_ == Clause::kSelect &&
+                                 !aggregate_argument_ && !HasGroupBy(stmt_) &&
+                                 !IsAggregateQuery(stmt_);
+    if (!WhereClause(clause_) && !membership_item) {
       return Scope::CorrelationError(ref, Scope::Refusal::kClause);
     }
     if (outer->distance > 1) {
@@ -4135,13 +4140,14 @@ class Binder {
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
+  bool membership_block_ = false;
   // The EXISTS conjunct this block is bound for, if any. ADR 0023's Path 1 and ADR 0041's
   // uncorrelated EXISTS drop its select list, so a star here, `*` or `t.*`, is checked by name (ADR
   // 0022's rule 5, or its one FROM item) and against the block's grouping (CheckGrouped), but
   // neither expanded into columns nor type-checked, except under a DISTINCT: a table with a column
   // antb1 cannot read still works inside EXISTS, as it does in DuckDB. The other select items bind
   // as usual.
-  const ExistsConjunct* exists_ = nullptr;
+  const SubqueryContext* exists_ = nullptr;
   ColumnIdSource& ids_;
   const BindOptions& options_;  // one per query, and the caller outlives the binder
   const BindBlockFn* bind_block_ = nullptr;
@@ -6462,9 +6468,10 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // enclosing block has is a correlation that exits 4 rather than a missing column -- which is
   // what keeps a correlated subquery an Unsupported failure and not a bind error. An EXISTS
   // block's binder gates a correlated block itself (GateCorrelatedExists).
-  const ExistsConjunct exists{.op_span = form.subquery->op_span,
-                              .having = having,
-                              .outside_having = having && clause_ != Clause::kHaving};
+  const SubqueryContext exists{.op_span = form.subquery->op_span,
+                               .membership = !form.exists() && !form.scalar(),
+                               .having = having,
+                               .outside_having = having && clause_ != Clause::kHaving};
   // ADR 0041's decision 23
   if (aggregate_argument_) {
     scope_.set_subquery_place(Scope::SubqueryPlace::kAggregateArgument);
@@ -6476,7 +6483,7 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
     scope_.set_subquery_place(Scope::SubqueryPlace::kOther);
   }
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound, (*bind_block_)(*form.subquery->query, &scope_, visible_,
-                                                         form.exists() ? &exists : nullptr));
+                                                         !form.scalar() ? &exists : nullptr));
   // A subquery whose plan reads ids its own nodes do not define is correlated, and becomes a
   // dependent join over the block's plan at this point, which defines them (ADR 0023). An
   // uncorrelated one keeps ADR 0022's direct join, so an IN subquery with GROUP BY or HAVING stays
@@ -6577,13 +6584,6 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
                                            ? "a correlated subquery in HAVING is not supported"
                                            : "a correlated subquery over a query block's "
                                              "aggregates is not supported"});
-  }
-  if (correlated && !form.scalar()) {
-    // Correlated IN and NOT IN need the set's NULL and empty flags for each binding, which a semi
-    // or null-aware anti join cannot carry (ADR 0023's exit-4 list).
-    return Reject(Rejection{.span = form.subquery->op_span,
-                            .message = std::format("a correlated subquery of {} is not supported",
-                                                   form.negated ? "NOT IN" : "IN")});
   }
   LogicalNodePtr right = bound.plan.root;
   if (form.scalar() && !correlated && !ExactlyOneRow(*right)) {
@@ -6713,7 +6713,10 @@ arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConj
   ARROW_ASSIGN_OR_RAISE(Typed bound, bind(*form.other));
   ARROW_ASSIGN_OR_RAISE(const Typed probe, TypeInProbe(*form.other, std::move(bound), block.type));
   ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(probe, block.type, *form.subquery));
-  join.kind = form.negated ? JoinKind::kNullAwareAnti : JoinKind::kSemi;
+  join.kind = JoinKind::kSemi;
+  if (form.negated) {
+    join.kind = block.correlated ? JoinKind::kAnti : JoinKind::kNullAwareAnti;
+  }
   InKeys(join, probe, block, type, form.subquery->span);
   (having ? group_slot_ : RowSlot()).emplace_back(std::move(join));
   return arrow::Status::OK();
@@ -6806,11 +6809,15 @@ LogicalNodePtr SubqueryJoinNode(LogicalNodePtr node, SubqueryJoin& join, int64_t
     keys.push_back(JoinKey{.left = join.left_key, .right = join.right_key});
   }
   if (join.dependent) {
-    node = Make(DependentJoinNode{.kind = join.kind,
-                                  .left = std::move(node),
-                                  .right = std::move(join.right),
-                                  .mark = join.mark,  // a correlated EXISTS's (SQ8a), else none
-                                  .span = join.span});
+    node = Make(DependentJoinNode{
+        .kind = join.kind,
+        .left = std::move(node),
+        .right = std::move(join.right),
+        .mark = join.mark,  // a correlated EXISTS's (SQ8a), else none
+        .membership = join.left_key.id != kNoColumnId
+                          ? std::optional(JoinKey{.left = join.left_key, .right = join.right_key})
+                          : std::nullopt,
+        .span = join.span});
   } else {
     // A semi or anti join keeps a subset of its left input and a one-row join pairs each of its
     // rows with the subquery's single row, so the left input's estimate is an upper bound for
@@ -7210,7 +7217,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
     // No GROUP BY key holds this mark (a key's is bound first): the speculation fails.
     return BindError("an IN subquery that no GROUP BY key holds", s.op_span);
   }
-  if (group && Correlated() && exists_ == nullptr && !dry_run_) {
+  if (group && Correlated() && exists_ == nullptr && !membership_block_ && !dry_run_) {
     // A join above a correlated block's aggregation stands where ADR 0023's Path 2 does not look.
     return Reject(Rejection{.span = s.op_span,
                             .message = "an IN subquery over the aggregate of a correlated "
@@ -7218,6 +7225,11 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   }
   const SubqueryConjunct form{.subquery = &s, .other = &operand, .negated = s.negated};
   ARROW_ASSIGN_OR_RAISE(SubqueryBlock bound, BindSubqueryBlock(form, group));
+  if (bound.correlated) {
+    return Reject(Rejection{.span = s.op_span,
+                            .message = std::format("a correlated subquery of {} is not supported",
+                                                   s.negated ? "NOT IN" : "IN")});
+  }
   ARROW_ASSIGN_OR_RAISE(const Typed typed, TypeInProbe(operand, probe, bound.type));
   ARROW_ASSIGN_OR_RAISE(const LogicalType type, InKeyType(typed, bound.type, s));
   const std::string name = ExprName(sql::Expr(written));
@@ -9298,7 +9310,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer,
                                     bool outer_encloses = false,
-                                    const ExistsConjunct* exists = nullptr,
+                                    const SubqueryContext* exists = nullptr,
                                     Visibility outer_visible = {});
 BoundBlock BoundBlockOf(LogicalPlan plan);
 
@@ -9768,7 +9780,7 @@ BoundBlock BoundBlockOf(LogicalPlan plan) {
 arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Catalog& catalog,
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
-                                    const ExistsConjunct* exists, Visibility outer_visible) {
+                                    const SubqueryContext* exists, Visibility outer_visible) {
   static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
@@ -9817,7 +9829,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
   // count is taken there, and against this block's scope, which the binder passes.
   const BindBlockFn bind_sub =
       [&](const sql::SelectStatement& block, const Scope* scope, Visibility scope_visible,
-          const ExistsConjunct* exists_block) -> arrow::Result<BoundBlock> {
+          const SubqueryContext* exists_block) -> arrow::Result<BoundBlock> {
     // A subquery expression's block is the one case whose enclosing scope is a query block's, so
     // an outer reference in it may be answered (ADR 0023). A derived table and a CTE get the scope
     // of the preceding FROM items or of the declaring block instead, where a reference out is a

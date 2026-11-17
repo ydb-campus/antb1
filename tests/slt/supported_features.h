@@ -210,6 +210,8 @@ enum class Feature : std::uint8_t {
   kCorrelatedExistsMark,  // WHERE o.x > 5 OR EXISTS (SELECT * FROM i WHERE i.k = o.k)
   // SQ8b: correlated EXISTS with grouping, DISTINCT, HAVING, static aggregates or limits.
   kCorrelatedExistsBlock,
+  // SQ8c: keyed correlated IN and NOT IN conjuncts over a plain set.
+  kCorrelatedIn,
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -402,6 +404,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_exists_mark";
     case Feature::kCorrelatedExistsBlock:
       return "correlated_exists_block";
+    case Feature::kCorrelatedIn:
+      return "correlated_in";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -573,6 +577,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedItemValue,
     Feature::kCorrelatedExistsMark,
     Feature::kCorrelatedExistsBlock,
+    Feature::kCorrelatedIn,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

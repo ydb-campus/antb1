@@ -1,0 +1,841 @@
+# SQ8c: correlated membership conjuncts; synthetic fixtures and DuckDB expectations.
+
+hash-threshold 16
+
+# IN: =; projected item r.rd_city
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: =; projected item r.rd_city + 1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city + 1 FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+# IN: =; projected item CAST(r.rd_city AS BIGINT)
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: =; projected item CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+2
+3
+
+# IN: nullable probes and per-binding sets; =
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# IN: nullable probes and per-binding sets; = AND i.rd_row < 0
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+
+# IN: nullable probes and per-binding sets; = AND i.rd_city IS NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_city IS NULL) ORDER BY 1
+----
+INTEGER
+
+# IN: nullable probes and per-binding sets; = AND i.rd_city IS NOT NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_city IS NOT NULL) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# IN: IS NOT DISTINCT FROM; projected item r.rd_city
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: IS NOT DISTINCT FROM; projected item r.rd_city + 1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city + 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+# IN: IS NOT DISTINCT FROM; projected item CAST(r.rd_city AS BIGINT)
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: IS NOT DISTINCT FROM; projected item CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+2
+3
+
+# IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_row < 0
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+
+# IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_city IS NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_city IS NULL) ORDER BY 1
+----
+INTEGER
+
+# IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_city IS NOT NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_city IS NOT NULL) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT DISTINCT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city HAVING COUNT(*) > 20) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT COALESCE(SUM(r.rd_city), 0) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) = 0) ORDER BY 1
+----
+SMALLINT
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY ()) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id LIMIT 0) ORDER BY 1
+----
+SMALLINT
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row > c.ct_pop) ORDER BY 1
+----
+SMALLINT
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id AND c.ct_pop > 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id ORDER BY r.rd_row) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# IN: zero probe and empty static aggregates
+query I nosort
+SELECT c.ct_id FROM cities c WHERE 0 IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# IN: NULL static item
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT MIN(i.rd_city) FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+
+# IN: rejected static row
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city IN (SELECT MIN(i.rd_city) FROM riders i WHERE i.rd_tier = o.rd_tier HAVING COUNT(*) < 0) ORDER BY 1
+----
+INTEGER
+
+# IN: multiple keys
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_id IN (SELECT i.rd_id FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND i.rd_tier IS NOT DISTINCT FROM o.rd_tier) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# IN: inner ON
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id AND c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+46 values hashing to 8e5f4e05a025014002602f3d3872919e573a3dfc7e4e0a3a672da2c091f75de0
+
+# IN: VARCHAR membership
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_tier IN (SELECT i.rd_tier FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# NOT IN: =; projected item r.rd_city
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: =; projected item r.rd_city + 1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city + 1 FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: =; projected item CAST(r.rd_city AS BIGINT)
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: =; projected item CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: nullable probes and per-binding sets; =
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: nullable probes and per-binding sets; = AND i.rd_row < 0
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# NOT IN: nullable probes and per-binding sets; = AND i.rd_city IS NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_city IS NULL) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: nullable probes and per-binding sets; = AND i.rd_city IS NOT NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_city IS NOT NULL) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: IS NOT DISTINCT FROM; projected item r.rd_city
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: IS NOT DISTINCT FROM; projected item r.rd_city + 1
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city + 1 FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: IS NOT DISTINCT FROM; projected item CAST(r.rd_city AS BIGINT)
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: IS NOT DISTINCT FROM; projected item CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CASE WHEN r.rd_row % 3 = 0 THEN NULL ELSE r.rd_city END FROM riders r WHERE r.rd_city IS NOT DISTINCT FROM c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_row < 0
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# NOT IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_city IS NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_city IS NULL) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: nullable probes and per-binding sets; IS NOT DISTINCT FROM AND i.rd_city IS NOT NULL
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT i.rd_city FROM riders i WHERE i.rd_tier IS NOT DISTINCT FROM o.rd_tier AND i.rd_city IS NOT NULL) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT DISTINCT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city HAVING COUNT(*) > 20) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_tier) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT COALESCE(SUM(r.rd_city), 0) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) = 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY ()) ORDER BY 1
+----
+SMALLINT
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id LIMIT 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row > c.ct_pop) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id AND c.ct_pop > 0) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: set shape
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CAST(r.rd_city AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id ORDER BY r.rd_row) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+# NOT IN: zero probe and empty static aggregates
+query I nosort
+SELECT c.ct_id FROM cities c WHERE 0 NOT IN (SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# NOT IN: NULL static item
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT MIN(i.rd_city) FROM riders i WHERE i.rd_tier = o.rd_tier AND i.rd_row < 0) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: rejected static row
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_city NOT IN (SELECT MIN(i.rd_city) FROM riders i WHERE i.rd_tier = o.rd_tier HAVING COUNT(*) < 0) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+# NOT IN: multiple keys
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_id NOT IN (SELECT i.rd_id FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND i.rd_tier IS NOT DISTINCT FROM o.rd_tier) ORDER BY 1
+----
+INTEGER
+
+# NOT IN: inner ON
+query II nosort
+SELECT c.ct_id, z.zn_id FROM cities c JOIN zones z ON z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1, 2
+----
+SMALLINT	INTEGER
+30 values hashing to 76180cade24d98c9dc070476367e83e9615f0009eb1e62c682dc30a20834ceb8
+
+# NOT IN: VARCHAR membership
+query I nosort
+SELECT o.rd_row FROM riders o WHERE o.rd_tier NOT IN (SELECT i.rd_tier FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city) ORDER BY 1
+----
+INTEGER
+
+# ANY spelling
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id = ANY (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+# ALL spelling
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id <> ALL (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT c.ct_id + 1 FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT CAST(c.ct_id AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE CAST(c.ct_id + 1 AS SMALLINT) = r.rd_row) ORDER BY 1
+----
+SMALLINT
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE CAST(r.rd_city + 1 AS SMALLINT) = CAST(c.ct_id AS BIGINT)) ORDER BY 1
+----
+SMALLINT
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0 OR COUNT(*) IN (SELECT CAST(ct_id AS BIGINT) FROM cities)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city HAVING COUNT(*) > 0 OR COUNT(*) IN (SELECT CAST(ct_id AS BIGINT) FROM cities)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY GROUPING SETS ((r.rd_city), (r.rd_city, r.rd_tier))) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT c.ct_id + 1 FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT CAST(c.ct_id AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE CAST(c.ct_id + 1 AS SMALLINT) = r.rd_row) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE CAST(r.rd_city + 1 AS SMALLINT) = CAST(c.ct_id AS BIGINT)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT MIN(r.rd_city) FROM riders r WHERE r.rd_city = c.ct_id HAVING COUNT(*) > 0 OR COUNT(*) IN (SELECT CAST(ct_id AS BIGINT) FROM cities)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city HAVING COUNT(*) > 0 OR COUNT(*) IN (SELECT CAST(ct_id AS BIGINT) FROM cities)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT r.rd_city FROM riders r WHERE r.rd_city = c.ct_id GROUP BY GROUPING SETS ((r.rd_city), (r.rd_city, r.rd_tier))) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT DISTINCT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT DISTINCT CAST(c.ct_id AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT c.ct_id + COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT DISTINCT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT DISTINCT CAST(c.ct_id AS BIGINT) FROM riders r WHERE r.rd_city = c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT c.ct_id + COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id GROUP BY r.rd_city) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Outer select items above aggregation remain SQ10.
+pending SQ10
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT c.ct_id FROM riders r WHERE r.rd_city = c.ct_id ORDER BY COUNT(*)) ORDER BY 1
+----
+SMALLINT
+
