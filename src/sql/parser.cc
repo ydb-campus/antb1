@@ -146,9 +146,8 @@ constexpr auto kOtherStatements = std::to_array<std::string_view>({
 constexpr auto kUnsupportedClauses = std::to_array<Construct>({
     {.keyword = "FETCH", .message = "FETCH is not supported"},
     {.keyword = "FOR", .message = "FOR UPDATE/SHARE is not supported"},
-    {.keyword = "QUALIFY", .message = "QUALIFY is not supported"},
+    {.keyword = "QUALIFY", .message = "WX1: QUALIFY is not supported"},
     {.keyword = "USING", .message = "USING SAMPLE is not supported"},
-    {.keyword = "WINDOW", .message = "WINDOW is not supported"},
 });
 
 // Keywords that start an expression outside the subset.
@@ -172,7 +171,6 @@ constexpr auto kUnsupportedOperatorKeywords = std::to_array<Construct>({
     {.keyword = "ILIKE", .message = "ILIKE is not supported"},
     {.keyword = "ISNULL", .message = "ISNULL is not supported"},
     {.keyword = "NOTNULL", .message = "NOTNULL is not supported"},
-    {.keyword = "OVER", .message = "window functions (OVER) are not supported"},
     {.keyword = "SIMILAR", .message = "SIMILAR TO is not supported"},
 });
 
@@ -953,7 +951,7 @@ class Parser {
 
   // The block fields of `stmt` (SELECT through HAVING), moved into a statement of their own.
   static SelectStatement TakeBlock(SelectStatement& stmt) {
-    static_assert(kSelectStatementFields == 20, "revisit this walk");
+    static_assert(kSelectStatementFields == 21, "revisit this walk");
     SelectStatement block;
     block.distinct = std::exchange(stmt.distinct, false);
     block.distinct_span = std::exchange(stmt.distinct_span, {});
@@ -965,6 +963,7 @@ class Parser {
     block.group_by_span = std::exchange(stmt.group_by_span, {});
     block.having = std::exchange(stmt.having, {});
     block.having_span = std::exchange(stmt.having_span, {});
+    block.windows = std::exchange(stmt.windows, {});
     block.span = std::exchange(stmt.span, {});
     return block;
   }
@@ -1154,6 +1153,36 @@ class Parser {
         return status;
       }
       stmt.having_span = SourceSpan{.offset = having_begin, .length = last_end_ - having_begin};
+    }
+    if (Peek().IsKeyword("WINDOW")) {
+      Take();
+      while (true) {
+        if (!IsName(Peek())) {
+          return Syntax(Peek().span, "expected a window name");
+        }
+        const Token name = Take();
+        if (auto status = WindowKeyword("AS"); !status) {
+          return status;
+        }
+        if (Peek().kind != TokenKind::kLeftParen) {
+          return Syntax(Peek().span, "expected '(' in window definition");
+        }
+        auto spec = ParseWindowSpec();
+        if (!spec) {
+          return std::unexpected(std::move(spec.error()));
+        }
+        stmt.windows.push_back(NamedWindow{
+            .name = name.text,
+            .quoted = name.kind == TokenKind::kQuotedIdentifier,
+            .specification = std::move(*spec),
+            .name_span = name.span,
+            .span =
+                SourceSpan{.offset = name.span.offset, .length = last_end_ - name.span.offset}});
+        if (Peek().kind != TokenKind::kComma) {
+          break;
+        }
+        Take();
+      }
     }
     stmt.span = SourceSpan{.offset = begin, .length = last_end_ - begin};
     return {};
@@ -1892,7 +1921,7 @@ class Parser {
           return ParseQualifiedColumn();
         }
         if (PeekAt(1).kind == TokenKind::kLeftParen) {
-          return ParseFunction(context);
+          return CallHasWindow() ? ParseWindowCall(context) : ParseFunction(context);
         }
         // A string after a quoted name makes a typed literal of a quoted type in DuckDB ("integer"
         // '5', "DATE" E'2020-01-01'): unsupported, as typed literals are.
@@ -2020,6 +2049,18 @@ class Parser {
     const bool function_like =
         !IsReservedKeyword(keyword) || keyword == "LEFT" || keyword == "RIGHT";
     if (next.kind == TokenKind::kLeftParen && function_like) {
+      if (keyword == "VALUE_OF") {
+        return Unsupported(token.span, "W12: VALUE_OF row access");
+      }
+      if (keyword == "ROW_NUMBER" &&
+          (PeekAt(2).IsKeyword("BEGIN_PARTITION") || PeekAt(2).IsKeyword("END_PARTITION") ||
+           PeekAt(2).IsKeyword("BEGIN_FRAME") || PeekAt(2).IsKeyword("END_FRAME") ||
+           PeekAt(2).IsKeyword("CURRENT_ROW"))) {
+        return Unsupported(PeekAt(2).span, "W12: nested window row markers are not supported");
+      }
+      if (CallHasWindow()) {
+        return ParseWindowCall(context);
+      }
       if (auto agg_kind = AggregateOf(token); agg_kind.has_value()) {
         switch (context) {
           case Context::kOn:
@@ -2044,12 +2085,7 @@ class Parser {
           case Context::kGroupBy:
             return Syntax(token.span, "aggregate functions are not allowed in GROUP BY");
           case Context::kAggregateArg:
-            // Valid DuckDB only when the enclosing call is a window function (SUM(SUM(x)) OVER ()),
-            // whose OVER is refused after the call, as every OVER is.
-            if (!OverAfterAggregate()) {
-              return Syntax(token.span, "aggregate function calls cannot be nested");
-            }
-            break;
+            return Syntax(token.span, "aggregate function calls cannot be nested");
           case Context::kSelect:
           case Context::kHaving:
           case Context::kOrderBy:
@@ -2140,6 +2176,325 @@ class Parser {
     return PrefixedString::kNone;
   }
 
+  Status WindowKeyword(std::string_view keyword) {
+    if (!Peek().IsKeyword(keyword)) {
+      return Syntax(Peek().span, "expected " + std::string(keyword) + " in window specification");
+    }
+    Take();
+    return {};
+  }
+
+  Expected<Expr> ParseWindowOperand() {
+    auto expression = ParseExpr(Context::kSelect);
+    if (!expression && expression.error().kind == ParseError::Kind::kUnsupported) {
+      auto& error = expression.error();
+      if (!error.message.starts_with('W')) {
+        std::string owner = "W11e";
+        if (error.message.contains("NULL literal")) {
+          owner = "W11a";
+        }
+        if (error.message.contains("boolean literal")) {
+          owner = "W11b";
+        }
+        if (error.message.contains("INTERVAL")) {
+          owner = "W11c";
+        }
+        if (error.message.contains("COLLATE")) {
+          owner = "W11d";
+        }
+        error.message = owner + ": " + error.message;
+      }
+    }
+    return expression;
+  }
+
+  Expected<WindowBound> ParseWindowBound() {
+    const SourceSpan begin = Peek().span;
+    WindowBound bound;
+    if (Peek().IsKeyword("UNBOUNDED")) {
+      Take();
+      if (!Peek().IsKeyword("PRECEDING") && !Peek().IsKeyword("FOLLOWING")) {
+        return Syntax(Peek().span, "expected PRECEDING or FOLLOWING after UNBOUNDED");
+      }
+      bound.kind = Peek().IsKeyword("PRECEDING") ? WindowBoundKind::kUnboundedPreceding
+                                                 : WindowBoundKind::kUnboundedFollowing;
+      Take();
+    } else if (Peek().IsKeyword("CURRENT")) {
+      Take();
+      if (auto status = WindowKeyword("ROW"); !status) {
+        return std::unexpected(status.error());
+      }
+    } else {
+      auto offset = ParseWindowOperand();
+      if (!offset) {
+        return std::unexpected(std::move(offset.error()));
+      }
+      bound.offset.emplace(std::move(*offset));
+      if (!Peek().IsKeyword("PRECEDING") && !Peek().IsKeyword("FOLLOWING")) {
+        return Syntax(Peek().span, "expected PRECEDING or FOLLOWING after window offset");
+      }
+      bound.kind =
+          Peek().IsKeyword("PRECEDING") ? WindowBoundKind::kPreceding : WindowBoundKind::kFollowing;
+      Take();
+    }
+    bound.span = SourceSpan{.offset = begin.offset, .length = last_end_ - begin.offset};
+    return bound;
+  }
+
+  Expected<WindowSpec> ParseWindowSpec() {
+    WindowSpec spec;
+    const SourceSpan begin = Peek().span;
+    if (Peek().kind != TokenKind::kLeftParen) {
+      if (!IsName(Peek())) {
+        return Syntax(Peek().span, "expected window name or '('");
+      }
+      const Token name = Take();
+      spec.kind = WindowSpec::Kind::kNamed;
+      spec.name = name.text;
+      spec.quoted = name.kind == TokenKind::kQuotedIdentifier;
+      spec.name_span = spec.span = name.span;
+      return spec;
+    }
+    Take();
+    const Token& after_name = PeekAt(1);
+    const bool inherited = after_name.kind == TokenKind::kRightParen ||
+                           after_name.IsKeyword("PARTITION") || after_name.IsKeyword("ORDER") ||
+                           after_name.IsKeyword("ROWS") || after_name.IsKeyword("RANGE") ||
+                           after_name.IsKeyword("GROUPS");
+    const auto pattern = [&] {
+      return Peek().IsKeyword("MEASURES") || Peek().IsKeyword("PATTERN") ||
+             Peek().IsKeyword("DEFINE") || Peek().IsKeyword("SUBSET") ||
+             Peek().IsKeyword("AFTER") || Peek().IsKeyword("INITIAL") || Peek().IsKeyword("SEEK");
+    };
+    if (pattern() && !inherited) {
+      return Unsupported(Peek().span, "W13: window row-pattern recognition");
+    }
+    const bool clause_word = Peek().IsKeyword("PARTITION") || Peek().IsKeyword("ROWS") ||
+                             Peek().IsKeyword("RANGE") || Peek().IsKeyword("GROUPS");
+    if (IsName(Peek()) && (!clause_word || inherited)) {
+      const Token name = Take();
+      spec.kind = WindowSpec::Kind::kInherited;
+      spec.name = name.text;
+      spec.quoted = name.kind == TokenKind::kQuotedIdentifier;
+      spec.name_span = name.span;
+    }
+    if (Peek().IsKeyword("PARTITION")) {
+      Take();
+      if (auto status = WindowKeyword("BY"); !status) {
+        return std::unexpected(status.error());
+      }
+      while (true) {
+        auto expr = ParseWindowOperand();
+        if (!expr) {
+          return std::unexpected(std::move(expr.error()));
+        }
+        spec.partition_by.push_back(std::move(*expr));
+        if (Peek().kind != TokenKind::kComma) {
+          break;
+        }
+        Take();
+      }
+    }
+    if (Peek().IsKeyword("ORDER")) {
+      Take();
+      if (auto status = WindowKeyword("BY"); !status) {
+        return std::unexpected(status.error());
+      }
+      while (true) {
+        auto expr = ParseWindowOperand();
+        if (!expr) {
+          return std::unexpected(std::move(expr.error()));
+        }
+        const SourceSpan start = expr->span();
+        WindowOrder key{.expr = Box<Expr>(std::move(*expr))};
+        if (Peek().IsKeyword("ASC") || Peek().IsKeyword("DESC")) {
+          key.direction = Peek().IsKeyword("ASC") ? WindowOrder::Direction::kAsc
+                                                  : WindowOrder::Direction::kDesc;
+          Take();
+        }
+        if (Peek().IsKeyword("NULLS")) {
+          Take();
+          if (!Peek().IsKeyword("FIRST") && !Peek().IsKeyword("LAST")) {
+            return Syntax(Peek().span, "expected FIRST or LAST after NULLS");
+          }
+          key.nulls =
+              Peek().IsKeyword("FIRST") ? WindowOrder::Nulls::kFirst : WindowOrder::Nulls::kLast;
+          Take();
+        }
+        key.span = SourceSpan{.offset = start.offset, .length = last_end_ - start.offset};
+        spec.order_by.push_back(std::move(key));
+        if (Peek().kind != TokenKind::kComma) {
+          break;
+        }
+        Take();
+      }
+    }
+    if (Peek().IsKeyword("ROWS") || Peek().IsKeyword("RANGE") || Peek().IsKeyword("GROUPS")) {
+      const Token unit = Take();
+      WindowFrame frame;
+      frame.unit = WindowFrameUnit::kRows;
+      if (unit.IsKeyword("RANGE")) {
+        frame.unit = WindowFrameUnit::kRange;
+      } else if (unit.IsKeyword("GROUPS")) {
+        frame.unit = WindowFrameUnit::kGroups;
+      }
+      const bool between = Peek().IsKeyword("BETWEEN");
+      if (between) {
+        Take();
+      }
+      auto start = ParseWindowBound();
+      if (!start) {
+        return std::unexpected(std::move(start.error()));
+      }
+      frame.start = std::move(*start);
+      if (between) {
+        if (auto status = WindowKeyword("AND"); !status) {
+          return std::unexpected(status.error());
+        }
+        auto end = ParseWindowBound();
+        if (!end) {
+          return std::unexpected(std::move(end.error()));
+        }
+        frame.end = std::move(*end);
+      }
+      if ((frame.end && frame.start.kind > frame.end->kind) ||
+          frame.start.kind == WindowBoundKind::kUnboundedFollowing ||
+          (frame.end && frame.end->kind == WindowBoundKind::kUnboundedPreceding) ||
+          (!frame.end && frame.start.kind == WindowBoundKind::kFollowing)) {
+        return Syntax(frame.start.span, "invalid window frame bounds");
+      }
+      if (Peek().IsKeyword("EXCLUDE")) {
+        const SourceSpan exclude = Take().span;
+        if (Peek().IsKeyword("CURRENT")) {
+          Take();
+          if (auto status = WindowKeyword("ROW"); !status) {
+            return std::unexpected(status.error());
+          }
+          frame.exclusion = WindowExclusion::kCurrentRow;
+        } else if (Peek().IsKeyword("GROUP")) {
+          Take();
+          frame.exclusion = WindowExclusion::kGroup;
+        } else if (Peek().IsKeyword("TIES")) {
+          Take();
+          frame.exclusion = WindowExclusion::kTies;
+        } else {
+          if (auto status = WindowKeyword("NO"); !status) {
+            return std::unexpected(status.error());
+          }
+          if (auto status = WindowKeyword("OTHERS"); !status) {
+            return std::unexpected(status.error());
+          }
+          frame.exclusion = WindowExclusion::kNoOthers;
+        }
+        frame.exclusion_span =
+            SourceSpan{.offset = exclude.offset, .length = last_end_ - exclude.offset};
+      }
+      frame.span = SourceSpan{.offset = unit.span.offset, .length = last_end_ - unit.span.offset};
+      spec.frame = std::move(frame);
+    }
+    if (pattern()) {
+      return Unsupported(Peek().span, "W13: window row-pattern recognition");
+    }
+    if (Peek().kind != TokenKind::kRightParen) {
+      return Syntax(Peek().span, "expected ')' to close window specification");
+    }
+    spec.span = Cover(begin, Take().span);
+    return spec;
+  }
+
+  Expected<Expr> ParseWindowCall(Context context) {
+    if (context != Context::kSelect && context != Context::kOrderBy) {
+      return Syntax(Peek().span, "window functions are only allowed in SELECT and ORDER BY");
+    }
+    const Token name = Take();
+    Take();
+    WindowCall call{.name = name.text,
+                    .quoted = name.kind == TokenKind::kQuotedIdentifier,
+                    .name_span = name.span};
+    if (Peek().IsKeyword("ALL") || Peek().IsKeyword("DISTINCT")) {
+      call.quantifier =
+          Peek().IsKeyword("ALL") ? WindowQuantifier::kAll : WindowQuantifier::kDistinct;
+      call.quantifier_span = Take().span;
+    }
+    if (Peek().kind == TokenKind::kStar) {
+      if (call.quantifier != WindowQuantifier::kOmitted) {
+        return Syntax(Peek().span, "a window quantifier requires an argument, not '*'");
+      }
+      call.star = true;
+      Take();
+    } else if (Peek().kind != TokenKind::kRightParen) {
+      while (true) {
+        auto arg = ParseWindowOperand();
+        if (!arg) {
+          return arg;
+        }
+        call.args.push_back(std::move(*arg));
+        if (Peek().kind != TokenKind::kComma) {
+          break;
+        }
+        Take();
+      }
+    }
+    if (Peek().IsKeyword("ORDER")) {
+      return Unsupported(Peek().span, "WX2: function-argument ORDER BY");
+    }
+    if (Peek().IsKeyword("IGNORE") || Peek().IsKeyword("RESPECT")) {
+      return Unsupported(Peek().span, "WX4: in-call null treatment spelling");
+    }
+    if (Peek().kind != TokenKind::kRightParen) {
+      return Syntax(Peek().span, "expected ')' to close window call");
+    }
+    Take();
+    if (Peek().IsKeyword("FILTER")) {
+      const SourceSpan start = Take().span;
+      if (Peek().kind != TokenKind::kLeftParen) {
+        return Syntax(Peek().span, "expected '(' after FILTER");
+      }
+      Take();
+      if (auto status = WindowKeyword("WHERE"); !status) {
+        return std::unexpected(status.error());
+      }
+      auto filter = ParseWindowOperand();
+      if (!filter) {
+        return filter;
+      }
+      call.filter.emplace(std::move(*filter));
+      if (Peek().kind != TokenKind::kRightParen) {
+        return Syntax(Peek().span, "expected ')' after FILTER");
+      }
+      call.filter_span = Cover(start, Take().span);
+    }
+    if (Peek().IsKeyword("FROM")) {
+      const SourceSpan start = Take().span;
+      if (!Peek().IsKeyword("FIRST") && !Peek().IsKeyword("LAST")) {
+        return Syntax(Peek().span, "expected FIRST or LAST in NTH_VALUE direction");
+      }
+      call.direction = Peek().IsKeyword("FIRST") ? WindowDirection::kFirst : WindowDirection::kLast;
+      call.direction_span = Cover(start, Take().span);
+    }
+    if (Peek().IsKeyword("RESPECT") || Peek().IsKeyword("IGNORE")) {
+      const Token treatment = Take();
+      call.null_treatment = treatment.IsKeyword("RESPECT") ? WindowNullTreatment::kRespect
+                                                           : WindowNullTreatment::kIgnore;
+      if (auto status = WindowKeyword("NULLS"); !status) {
+        return std::unexpected(status.error());
+      }
+      call.null_treatment_span =
+          SourceSpan{.offset = treatment.span.offset, .length = last_end_ - treatment.span.offset};
+    }
+    call.over_span = Peek().span;
+    if (auto status = WindowKeyword("OVER"); !status) {
+      return std::unexpected(status.error());
+    }
+    auto spec = ParseWindowSpec();
+    if (!spec) {
+      return std::unexpected(std::move(spec.error()));
+    }
+    call.specification = std::move(*spec);
+    call.span = SourceSpan{.offset = name.span.offset, .length = last_end_ - name.span.offset};
+    return Expr(std::move(call));
+  }
+
   // agg_call, positioned at the function name (the next token is '(').
   Expected<AggregateCall> ParseAggregate(AggKind kind) {
     const Token name = Take();
@@ -2174,11 +2529,7 @@ class Parser {
       }
       return Syntax(arg.span, "expected a column in " + std::string(ToString(kind)) + "()");
     } else {
-      const std::size_t outer_parens = std::exchange(aggregate_parens_, open_parens_);
-      const std::optional<bool> outer_over = std::exchange(over_after_aggregate_, std::nullopt);
       auto expr = ParseExpr(Context::kAggregateArg);
-      aggregate_parens_ = outer_parens;
-      over_after_aggregate_ = outer_over;
       if (!expr) {
         return std::unexpected(std::move(expr.error()));
       }
@@ -3581,7 +3932,7 @@ class Parser {
   // still come -- the rest of `block`, the query's last block, a UNION ALL, and the rest of
   // `query`'s ORDER BY, LIMIT and OFFSET.
   Status ParseBlockEnd(const SelectStatement* block, const SelectStatement& query, BlockEnd end) {
-    static_assert(kSelectStatementFields == 20, "revisit this walk");
+    static_assert(kSelectStatementFields == 21, "revisit this walk");
     const Token& token = Peek();
     if (end == BlockEnd::kParenthesis && token.kind == TokenKind::kRightParen) {
       return {};
@@ -3657,7 +4008,11 @@ class Parser {
         tokens_.push_back(Token{.kind = TokenKind::kEnd, .text = {}, .span = at});
       }
     }
-    return ahead < tokens_.size() ? tokens_[ahead] : tokens_.back();
+    const Token& token = ahead < tokens_.size() ? tokens_[ahead] : tokens_.back();
+    if (token.kind == TokenKind::kEnd && lookahead_error_) {
+      lex_error_ = std::exchange(lookahead_error_, std::nullopt);
+    }
+    return token;
   }
 
   const Token& Peek() { return PeekAt(0); }
@@ -3687,48 +4042,66 @@ class Parser {
     });
   }
 
-  // Inside the argument of an aggregate call: whether OVER follows the ')' that closes that call,
-  // found by lookahead once per call (nothing is consumed). False if the text ends first, also at
-  // a lexer error, which is dropped: the caller then fails before it consumes that far.
-  bool OverAfterAggregate() {
-    if (!over_after_aggregate_.has_value()) {
-      const bool had_lex_error = lex_error_.has_value();
-      over_after_aggregate_ = LookAheadForOver();
-      if (!had_lex_error && lex_error_.has_value()) {
-        lex_error_.reset();
-        over_after_aggregate_ = false;
-      }
+  // Classify a call before parsing its arguments: window arguments may themselves contain
+  // ordinary aggregates. Only balanced parentheses and the conventional modifiers are scanned.
+  bool CallHasWindow() {
+    const bool had_error = lex_error_.has_value();
+    const bool result = LookAheadForWindow();
+    if (!had_error && lex_error_) {
+      // Classification must not replace an earlier argument error with a later lexer error.
+      // Keep the error with its buffered end token so actual consumption still reports it.
+      lookahead_error_ = std::exchange(lex_error_, std::nullopt);
+      return false;
     }
-    return *over_after_aggregate_;
+    return result;
   }
 
-  bool LookAheadForOver() {
-    std::size_t open = open_parens_;
-    for (std::size_t ahead = 0;; ++ahead) {
-      const Token& token = PeekAt(ahead);
-      if (token.kind == TokenKind::kEnd) {
+  bool LookAheadForWindow() {
+    std::size_t ahead = 1;
+    const auto skip_parens = [&] {
+      std::size_t open = 0;
+      do {
+        const Token& token = PeekAt(ahead++);
+        if (token.kind == TokenKind::kEnd) {
+          return false;
+        }
+        if (token.kind == TokenKind::kLeftParen) {
+          ++open;
+        }
+        if (token.kind == TokenKind::kRightParen) {
+          --open;
+        }
+      } while (open != 0);
+      return true;
+    };
+    if (!skip_parens()) {
+      return false;
+    }
+    if (PeekAt(ahead).IsKeyword("FILTER") && PeekAt(ahead + 1).kind == TokenKind::kLeftParen) {
+      ++ahead;
+      if (!skip_parens()) {
         return false;
       }
-      if (token.kind == TokenKind::kLeftParen) {
-        ++open;
-      } else if (token.kind == TokenKind::kRightParen) {
-        if (open == aggregate_parens_) {
-          return PeekAt(ahead + 1).IsKeyword("OVER");
-        }
-        --open;
-      }
     }
+    if (PeekAt(ahead).IsKeyword("FROM") &&
+        (PeekAt(ahead + 1).IsKeyword("FIRST") || PeekAt(ahead + 1).IsKeyword("LAST"))) {
+      ahead += 2;
+    }
+    if ((PeekAt(ahead).IsKeyword("RESPECT") || PeekAt(ahead).IsKeyword("IGNORE")) &&
+        PeekAt(ahead + 1).IsKeyword("NULLS")) {
+      ahead += 2;
+    }
+    return PeekAt(ahead).IsKeyword("OVER");
   }
 
   Lexer lexer_;
   std::deque<Token> tokens_;
   std::optional<ParseError> lex_error_;
+  std::optional<ParseError> lookahead_error_;
   std::size_t last_end_ = 0;
-  std::size_t open_parens_ = 0;               // '(' consumed minus ')' consumed
-  std::size_t aggregate_parens_ = 0;          // open_parens_ inside the aggregate call being parsed
-  std::optional<bool> over_after_aggregate_;  // OverAfterAggregate() of that call, once known
-  std::size_t depth_ = 0;  // levels of the nested queries and the expression being parsed
-  std::size_t peak_ = 0;   // the deepest level reached, with the levels the canonical form adds
+  std::size_t open_parens_ = 0;  // '(' consumed minus ')' consumed
+  std::size_t depth_ = 0;        // levels of the nested queries and the expression being parsed
+  std::size_t peak_ = 0;  // the deepest level reached, with the levels the canonical form adds
   // The clause each open subquery expression stands in, outermost first (ADR 0041's decision 23).
   std::vector<Context> subquery_contexts_;
   // How many derived tables and CTE bodies being parsed stand inside a subquery in HAVING, the

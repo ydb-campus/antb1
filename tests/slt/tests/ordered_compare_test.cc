@@ -31,6 +31,18 @@ constexpr auto kR = ColumnClass::kReal;
 constexpr auto kT = ColumnClass::kText;
 constexpr auto kD = ColumnClass::kDecimal;
 
+TEST(MakeOrderedQuery, PreservesWindowDefinitionsAndFrames) {
+  const auto query = MakeOrderedQuery(
+      "SELECT SUM(a) OVER (w ROWS UNBOUNDED PRECEDING) AS s FROM t "
+      "WINDOW w AS (PARTITION BY b ORDER BY a) ORDER BY s LIMIT 2");
+  ASSERT_TRUE(query.has_value());
+  const auto ordered = query.value_or(OrderedQuery{});
+  EXPECT_NE(ordered.augmented_sql.find("ROWS UNBOUNDED PRECEDING"), std::string::npos);
+  EXPECT_NE(ordered.augmented_sql.find("WINDOW w AS (PARTITION BY b ORDER BY a)"),
+            std::string::npos);
+  EXPECT_EQ(ordered.augmented_sql.find("LIMIT"), std::string::npos);
+}
+
 TEST(MakeOrderedQuery, AppendsTheKeysAndDropsLimitAndOffset) {
   const auto q = MakeOrderedQuery(
       "select a as k, count(*) as c from t group by a order by c desc, K nulls first, max(b) "

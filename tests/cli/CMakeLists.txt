@@ -1240,13 +1240,29 @@ antb1_add_cli_golden(
   unsupported
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT CounterID, row_number() OVER (ORDER BY CounterID) FROM u" --table "${_t}"
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM u LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown"
+    --table
+    "${_t}"
 )
 antb1_add_cli_golden(
   unsupported_json
   EXIT_CODE 4
   STDERR
-  ARGS query --threads 1 -c "SELECT SUM(AdvEngineID) OVER () FROM u" --table "${_t}" --format json
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM u LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown"
+    --table
+    "${_t}"
+    --format
+    json
 )
 antb1_add_cli_golden(
   unsupported_explain

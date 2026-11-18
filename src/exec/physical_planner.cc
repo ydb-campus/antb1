@@ -1276,6 +1276,9 @@ struct Builder {
                           Build(node.input, part, Input(), late, nullptr, builds, above));
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
+  OperatorResult operator()(const plan::WindowNode& node) const {
+    return plan::UnsupportedError("W2/W3/W4: window execution is not supported", node.span);
+  }
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");
     // A Compute appends, so its input's ids are its own: the key passes through unchanged unless it

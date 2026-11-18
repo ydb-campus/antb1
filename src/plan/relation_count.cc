@@ -65,6 +65,11 @@ struct SubqueryWalk {
 
   void operator()(const sql::ColumnRef& /*c*/) const {}
   void operator()(const sql::Literal& /*l*/) const {}
+  void operator()(const sql::WindowCall& call) const {
+    for (const sql::Expr* child : sql::WindowOperands(call)) {
+      Of(*child);
+    }
+  }
   void operator()(const sql::AggregateCall& a) const { Of(a.arg); }
   void operator()(const sql::UnaryExpr& u) const { Of(*u.operand); }
   void operator()(const sql::BinaryExpr& b) const {
@@ -157,8 +162,13 @@ namespace {
 // BY.
 template <class Fn>
 void EachSubqueryIn(const sql::SelectStatement& block, Fn fn) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
+  for (const auto& window : block.windows) {
+    for (const sql::Expr* expr : sql::WindowOperands(window.specification)) {
+      EachSubqueryOf(*expr, fn);
+    }
+  }
   for (const sql::SelectItem& item : block.items) {
     if (const sql::SelectExpr* expr = item.expr()) {  // a star holds no subquery
       EachSubqueryOf(*expr, fn);
@@ -191,7 +201,7 @@ class Counter {
   // The relations `block` expands to, saturated; `outer` is the frame around it. A compound's are
   // its branches', each a block in the compound's frame (ADR 0036).
   std::size_t Count(const sql::SelectStatement& block, const CteFrame* outer) {
-    static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, outer);
     std::size_t total = 0;
     for (const sql::SetBranch& branch : block.set_operation) {
@@ -221,7 +231,7 @@ class Counter {
   // subquery that carries it past the limit -- by span, the outermost block having no item of its
   // own to index.
   std::optional<RelationOverflow> Top(const sql::SelectStatement& block) {
-    static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, nullptr);
     std::size_t total = 0;
     for (const sql::SetBranch& branch : block.set_operation) {
@@ -351,7 +361,7 @@ namespace {
 class Reach {
  public:
   void Walk(const sql::SelectStatement& block, const CteFrame* outer) {
-    static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
     const CteFrame& frame = MakeFrame(block, outer);
     if (!block.set_operation.empty()) {
       // A compound's branches are blocks of their own, in its frame, and they come before it: its

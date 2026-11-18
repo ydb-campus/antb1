@@ -425,13 +425,15 @@ TEST_F(SessionTest, FloatColumnsCompareLikeDuckDb) {
 }
 
 TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
+  constexpr auto kRecursive =
+      "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM t LIMIT 3) AS seed "
+      "UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown";
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   // Column nope does not exist (SUM(nope) below is a bind error), but unsupported SQL is
   // rejected before any name is resolved, and so are the join kinds that still parse and wait
   // (table nope is not registered either; a LEFT JOIN is answered from roadmap PR J6 on).
-  for (const char* sql : {"SELECT nope, row_number() OVER () FROM t",
-                          "SELECT AdvEngineID FROM t ORDER BY md5(AdvEngineID)",
+  for (const char* sql : {kRecursive, "SELECT AdvEngineID FROM t ORDER BY md5(AdvEngineID)",
                           "SELECT SUM(DISTINCT AdvEngineID) FROM t",
                           "SELECT DISTINCT ON (AdvEngineID) AdvEngineID FROM t",
                           "SELECT COUNT(*) FROM t semi JOIN nope ON t.AdvEngineID = nope.x",
@@ -834,6 +836,38 @@ TEST_F(SessionTest, SkippedRowGroupsDoNotChangeAnswers) {
     EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE v = 3"), (R{{"129"}}));
     EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE v >= 7"), (R{{"0"}}));
     EXPECT_EQ(rows("SELECT COUNT(*) FROM s WHERE id + v > 5 AND id < 50"), (R{{"47"}}));
+  }
+}
+
+TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
+  constexpr auto kUnusedDeferred =
+      "WITH unused AS (SELECT SUM(AdvEngineID) OVER (ORDER BY AdvEngineID) FROM t) SELECT "
+      "COUNT(*) FROM t";
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  for (const char* text :
+       {"SELECT COUNT(*) OVER () FROM t", "SELECT RANK() OVER () FROM t LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
+        "SELECT COUNT(*) FROM t ORDER BY COUNT(*) OVER () LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()",
+        "SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
+        "SELECT COUNT(*) FROM (SELECT COUNT(*) OVER () AS x FROM t) AS q",
+        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT COUNT(*) OVER () FROM t)",
+        "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE RANK() OVER () END FROM t",
+        "WITH unused AS (SELECT RANK() OVER () FROM no_such_table) SELECT COUNT(*) FROM t",
+        kUnusedDeferred,
+        "WITH unused AS (SELECT AdvEngineID FROM t WINDOW w AS ()) SELECT COUNT(*) FROM t",
+        "SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) OVER () FROM t"}) {
+    SCOPED_TRACE(text);
+    for (const arrow::Status& status :
+         {session->Execute(text).status(), session->Explain(text).status(),
+          session->ExplainPhysical(text).status(), session->ExplainAnalyze(text).status()}) {
+      ASSERT_FALSE(status.ok());
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << status;
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << status;
+      EXPECT_NE(status.message().find('W'), std::string::npos) << status;
+    }
   }
 }
 

@@ -351,11 +351,12 @@ struct JoinNode;
 struct DependentJoinNode;
 struct UnionAllNode;
 struct SetOperationNode;
+struct WindowNode;
 
 using LogicalNode =
     std::variant<ScanNode, FilterNode, ComputeNode, ProjectNode, AggregateNode, GroupAggregateNode,
                  SortNode, LimitNode, RowCountNode, JoinNode, DependentJoinNode, UnionAllNode,
-                 GroupingSetsNode, SetOperationNode>;
+                 GroupingSetsNode, SetOperationNode, WindowNode>;
 using LogicalNodePtr = std::shared_ptr<const LogicalNode>;
 
 // Reads top-level fields of a table. Output: the fields, in this order.
@@ -467,6 +468,31 @@ struct SortKey {
   BoundColumn column;
   bool descending = false;
   bool nulls_first = false;  // DuckDB's default: NULLS LAST for ASC and DESC
+};
+
+// W1 binds these calls internally; Session and physical planning refuse their execution.
+struct WindowCall {
+  enum class Kind : std::uint8_t { kAggregate, kRank };
+  enum class Frame : std::uint8_t { kWholePartition, kRowsPrefix };
+  Kind kind = Kind::kAggregate;
+  AggKind aggregate = AggKind::kCountStar;
+  std::vector<BoundColumn> arguments;
+  std::vector<BoundColumn> partition_by;
+  std::vector<SortKey> order_by;
+  std::optional<Frame> frame;  // RANK has no aggregate frame
+  bool frame_omitted = true;
+  LogicalType type = LogicalType::kBigInt;
+  std::string name;
+  ColumnId id = kNoColumnId;
+  SourceSpan span;
+  SourceSpan over_span;
+};
+
+// Preserves input rows and cardinality, appending one result per call. A rewrite barrier.
+struct WindowNode {
+  LogicalNodePtr input;
+  std::vector<WindowCall> calls;
+  SourceSpan span;
 };
 
 // Output: the input rows ordered by the keys (the first key first). Rows with equal keys keep no

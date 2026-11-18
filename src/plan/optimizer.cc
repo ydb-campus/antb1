@@ -286,6 +286,23 @@ struct Pruner {
   }
 
   // Keeps the needed expressions; the input keeps the needed columns and what they read.
+  LogicalNodePtr operator()(const WindowNode& window) const {
+    // Keep every call, including unused results, and all dependencies. W1 windows are barriers.
+    for (const WindowCall& call : window.calls) {
+      needed.erase(call.id);
+      for (const BoundColumn& arg : call.arguments) {
+        Need(needed, arg);
+      }
+      for (const BoundColumn& key : call.partition_by) {
+        Need(needed, key);
+      }
+      for (const SortKey& key : call.order_by) {
+        Need(needed, key.column);
+      }
+    }
+    return Over(std::move(needed));
+  }
+
   LogicalNodePtr operator()(const ComputeNode& compute) const {
     ComputeNode out{.input = nullptr, .exprs = {}, .ids = {}, .span = compute.span};
     for (std::size_t k = 0; k < compute.exprs.size(); ++k) {

@@ -145,7 +145,9 @@ TEST(Session, ErrorKindsAtTheBoundary) {
   EXPECT_EQ(kind("SELECT COUNT(*) FROM no_such_table"), plan::SqlErrorDetail::Kind::kBind);
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY md5(URL)"),
             plan::SqlErrorDetail::Kind::kUnsupported);
-  EXPECT_EQ(kind("SELECT row_number() OVER () FROM no_such_table"),
+  EXPECT_EQ(kind("WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM "
+                 "no_such_table LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > "
+                 "0) SELECT COUNT(*) FROM countdown"),
             plan::SqlErrorDetail::Kind::kUnsupported)
       << "unsupported SQL is rejected before any name is resolved";
   EXPECT_EQ(kind("SELECT SUM(AdvEngineID) FROM hits_like GROUP BY 1"),

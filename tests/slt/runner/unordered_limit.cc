@@ -10,6 +10,7 @@
 namespace antb1::slt {
 
 std::optional<std::string> UnlimitedSql(std::string_view sql) {
+  static_assert(sql::kSelectStatementFields == 21, "revisit statement rewrite");
   auto stmt = sql::Parse(sql);
   if (!stmt.has_value() || !stmt->order_by.empty() ||
       (!stmt->limit.has_value() && !stmt->offset.has_value())) {

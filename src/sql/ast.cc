@@ -20,9 +20,9 @@ namespace {
   [[maybe_unused]] const auto& [with, with_span, distinct, distinct_span, items, from, where,
                                 group_by, grouping, group_by_span, having, having_span, order_by,
                                 order_by_span, limit, limit_span, offset, offset_span, span,
-                                set_operation] = stmt;
+                                set_operation, windows] = stmt;
 }
-static_assert(kSelectStatementFields == 20, "name every field in CheckSelectStatementFields");
+static_assert(kSelectStatementFields == 21, "name every field in CheckSelectStatementFields");
 // Likewise kSetBranchFields for SetBranch.
 [[maybe_unused]] void CheckSetBranchFields(const SetBranch& branch) {
   [[maybe_unused]] const auto& [query, op, all, op_span] = branch;
@@ -93,6 +93,41 @@ bool Eq(const std::vector<Expr>& a, const std::vector<Expr>& b) {
 
 bool Eq(const AggregateCall& a, const AggregateCall& b) {
   return a.kind == b.kind && a.distinct == b.distinct && Eq(a.arg, b.arg);
+}
+
+bool Eq(const WindowBound& a, const WindowBound& b) {
+  return a.kind == b.kind && Eq(a.offset, b.offset);
+}
+
+bool Eq(const WindowSpec& a, const WindowSpec& b) {
+  if (a.kind != b.kind || a.name != b.name || a.quoted != b.quoted ||
+      !Eq(a.partition_by, b.partition_by) || a.order_by.size() != b.order_by.size() ||
+      a.frame.has_value() != b.frame.has_value()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.order_by.size(); ++i) {
+    const auto& x = a.order_by[i];
+    const auto& y = b.order_by[i];
+    if (!Eq(*x.expr, *y.expr) || x.direction != y.direction || x.nulls != y.nulls) {
+      return false;
+    }
+  }
+  if (a.frame) {
+    const auto& x = *a.frame;
+    const auto& y = *b.frame;
+    if (x.unit != y.unit || x.exclusion != y.exclusion || !Eq(x.start, y.start) ||
+        x.end.has_value() != y.end.has_value() || (x.end && !Eq(*x.end, *y.end))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Eq(const WindowCall& a, const WindowCall& b) {
+  return a.name == b.name && a.quoted == b.quoted && a.star == b.star &&
+         a.quantifier == b.quantifier && Eq(a.args, b.args) && Eq(a.filter, b.filter) &&
+         a.null_treatment == b.null_treatment && a.direction == b.direction &&
+         Eq(a.specification, b.specification);
 }
 
 bool Eq(const UnaryExpr& a, const UnaryExpr& b) {
@@ -208,13 +243,21 @@ bool Eq(const SelectItem& a, const SelectItem& b) {
 }
 
 bool Eq(const SelectStatement& a, const SelectStatement& b) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
-  if (a.distinct != b.distinct || a.with.size() != b.with.size() ||
-      a.items.size() != b.items.size() || a.order_by.size() != b.order_by.size() ||
-      a.limit != b.limit || a.offset != b.offset || a.from.size() != b.from.size() ||
-      !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) || !Eq(a.having, b.having) ||
-      a.grouping.size() != b.grouping.size() || a.set_operation.size() != b.set_operation.size()) {
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
+  if (a.windows.size() != b.windows.size() || a.distinct != b.distinct ||
+      a.with.size() != b.with.size() || a.items.size() != b.items.size() ||
+      a.order_by.size() != b.order_by.size() || a.limit != b.limit || a.offset != b.offset ||
+      a.from.size() != b.from.size() || !Eq(a.where, b.where) || !Eq(a.group_by, b.group_by) ||
+      !Eq(a.having, b.having) || a.grouping.size() != b.grouping.size() ||
+      a.set_operation.size() != b.set_operation.size()) {
     return false;
+  }
+  for (std::size_t i = 0; i < a.windows.size(); ++i) {
+    const auto& x = a.windows[i];
+    const auto& y = b.windows[i];
+    if (x.name != y.name || x.quoted != y.quoted || !Eq(x.specification, y.specification)) {
+      return false;
+    }
   }
   for (std::size_t i = 0; i < a.grouping.size(); ++i) {
     if (!Eq(a.grouping[i], b.grouping[i])) {
@@ -533,7 +576,7 @@ std::string_view ToString(SetOp op) {
 }
 
 bool IsNestedQuery(const SelectStatement& query) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   return !query.with.empty() || !query.set_operation.empty() || !query.order_by.empty() ||
          query.limit.has_value() || query.offset.has_value();
 }
@@ -693,6 +736,13 @@ struct DepthOf {
   std::size_t operator()(const ColumnRef& /*c*/) const { return 1; }
   std::size_t operator()(const Literal& /*l*/) const { return 1; }
   std::size_t operator()(const AggregateCall& a) const { return 1 + Of(a.arg); }
+  std::size_t operator()(const WindowCall& call) const {
+    std::size_t deepest = 0;
+    for (const Expr* child : WindowOperands(call)) {
+      deepest = std::max(deepest, Of(*child));
+    }
+    return 1 + deepest;
+  }
   std::size_t operator()(const UnaryExpr& u) const { return 1 + Of(*u.operand); }
   std::size_t operator()(const BinaryExpr& b) const {
     return 1 + std::max(Of(*b.left), Of(*b.right));
@@ -764,9 +814,14 @@ std::size_t Depth(const GroupingElement& element) {
 }  // namespace
 
 std::size_t Depth(const SelectStatement& stmt) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   std::size_t deepest = 0;
+  for (const NamedWindow& window : stmt.windows) {
+    for (const Expr* child : WindowOperands(window.specification)) {
+      deepest = std::max(deepest, Depth(*child));
+    }
+  }
   for (const CommonTableExpr& cte : stmt.with) {
     deepest = std::max(deepest, 1 + Depth(*cte.query));
   }
@@ -808,6 +863,185 @@ std::vector<const Expr*> GroupingExprs(const std::vector<GroupingElement>& eleme
     CollectGroupingExprs(element, out);
   }
   return out;
+}
+
+std::vector<const Expr*> WindowOperands(const WindowSpec& specification) {
+  std::vector<const Expr*> out;
+  out.reserve(specification.partition_by.size() + specification.order_by.size() + 2);
+  for (const Expr& expr : specification.partition_by) {
+    out.push_back(&expr);
+  }
+  for (const WindowOrder& order : specification.order_by) {
+    out.push_back(&*order.expr);
+  }
+  if (specification.frame) {
+    const WindowFrame& frame = *specification.frame;
+    if (frame.start.offset) {
+      out.push_back(&**frame.start.offset);
+    }
+    if (frame.end && frame.end->offset) {
+      out.push_back(&**frame.end->offset);
+    }
+  }
+  return out;
+}
+
+std::vector<const Expr*> WindowOperands(const WindowCall& call) {
+  std::vector<const Expr*> out;
+  const auto keys = WindowOperands(call.specification);
+  out.reserve(call.args.size() + keys.size() + 1);
+  for (const Expr& arg : call.args) {
+    out.push_back(&arg);
+  }
+  if (call.filter) {
+    out.push_back(&**call.filter);
+  }
+  out.insert(out.end(), keys.begin(), keys.end());
+  return out;
+}
+
+std::vector<const Expr*> ChildExpressions(const Expr& expression) {
+  return std::visit(
+      [](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        std::vector<const Expr*> out;
+        if constexpr (std::is_same_v<T, WindowCall>) {
+          return WindowOperands(node);
+        } else if constexpr (std::is_same_v<T, AggregateCall>) {
+          if (node.arg) {
+            out.push_back(&**node.arg);
+          }
+        } else if constexpr (std::is_same_v<T, CaseExpr>) {
+          if (node.operand) {
+            out.push_back(&**node.operand);
+          }
+          for (const auto& branch : node.branches) {
+            out.push_back(&*branch.when);
+            out.push_back(&*branch.then);
+          }
+          if (node.otherwise) {
+            out.push_back(&**node.otherwise);
+          }
+        } else if constexpr (std::is_same_v<T, SubqueryExpr>) {
+          if (node.operand) {
+            out.push_back(&**node.operand);
+          }
+        } else if constexpr (std::is_same_v<T, FunctionCall>) {
+          for (const auto& arg : node.args) {
+            out.push_back(&arg);
+          }
+        } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, DistinctFromExpr>) {
+          out.push_back(&*node.left);
+          out.push_back(&*node.right);
+        } else if constexpr (std::is_same_v<T, ExtractExpr>) {
+          out.push_back(&*node.source);
+        } else if constexpr (std::is_same_v<T, UnaryExpr> || std::is_same_v<T, CastExpr> ||
+                             std::is_same_v<T, IsNullExpr> || std::is_same_v<T, LikeExpr> ||
+                             std::is_same_v<T, InExpr> || std::is_same_v<T, BetweenExpr>) {
+          out.push_back(&*node.operand);
+          if constexpr (std::is_same_v<T, LikeExpr>) {
+            out.push_back(&*node.pattern);
+          }
+          if constexpr (std::is_same_v<T, InExpr>) {
+            for (const auto& value : node.list) {
+              out.push_back(&value);
+            }
+          }
+          if constexpr (std::is_same_v<T, BetweenExpr>) {
+            out.push_back(&*node.low);
+            out.push_back(&*node.high);
+          }
+        } else {
+          static_assert(std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal>);
+        }
+        return out;
+      },
+      static_cast<const ExprNode&>(expression));
+}
+
+std::vector<const Expr*> BlockExpressions(const SelectStatement& statement) {
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
+  std::vector<const Expr*> out;
+  for (const auto& item : statement.items) {
+    if (item.expr() != nullptr) {
+      out.push_back(item.expr());
+    }
+  }
+  for (const auto& item : statement.from) {
+    for (const auto& expr : item.on) {
+      out.push_back(&expr);
+    }
+  }
+  for (const auto* list : {&statement.where, &statement.group_by, &statement.having}) {
+    for (const auto& expr : *list) {
+      out.push_back(&expr);
+    }
+  }
+  for (const Expr* expr : GroupingExprs(statement.grouping)) {
+    out.push_back(expr);
+  }
+  for (const auto& key : statement.order_by) {
+    out.push_back(&key.expr);
+  }
+  for (const auto& window : statement.windows) {
+    for (const Expr* expr : WindowOperands(window.specification)) {
+      out.push_back(expr);
+    }
+  }
+  return out;
+}
+
+bool ContainsWindow(const Expr& expression) {
+  if (std::holds_alternative<WindowCall>(expression)) {
+    return true;
+  }
+  return std::ranges::any_of(ChildExpressions(expression),
+                             [](const Expr* child) { return ContainsWindow(*child); });
+}
+
+std::optional<SourceSpan> WindowSpan(const SelectStatement& statement) {
+  if (!statement.windows.empty()) {
+    return statement.windows.front().span;
+  }
+  for (const auto& cte : statement.with) {
+    if (auto span = WindowSpan(*cte.query)) {
+      return span;
+    }
+  }
+  for (const auto& branch : statement.set_operation) {
+    if (auto span = WindowSpan(*branch.query)) {
+      return span;
+    }
+  }
+  for (const auto& item : statement.from) {
+    if (const auto* derived = std::get_if<DerivedTable>(&item.source)) {
+      if (auto span = WindowSpan(*derived->query)) {
+        return span;
+      }
+    }
+  }
+  const auto find = [](this const auto& self, const Expr& expr) -> std::optional<SourceSpan> {
+    if (const auto* window = std::get_if<WindowCall>(&expr)) {
+      return window->over_span;
+    }
+    if (const auto* subquery = std::get_if<SubqueryExpr>(&expr)) {
+      if (auto span = WindowSpan(*subquery->query)) {
+        return span;
+      }
+    }
+    for (const Expr* child : ChildExpressions(expr)) {
+      if (auto span = self(*child)) {
+        return span;
+      }
+    }
+    return std::nullopt;
+  };
+  for (const Expr* expression : BlockExpressions(statement)) {
+    if (auto span = find(*expression)) {
+      return span;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace antb1::sql

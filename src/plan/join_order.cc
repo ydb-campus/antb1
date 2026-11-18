@@ -542,6 +542,7 @@ struct RowsOf {
     return node.table->exact_row_count();
   }
   std::optional<int64_t> operator()(const FilterNode& node) const { return Input(node); }
+  std::optional<int64_t> operator()(const WindowNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const ComputeNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const ProjectNode& node) const { return Input(node); }
   std::optional<int64_t> operator()(const AggregateNode& /*node*/) const { return 1; }

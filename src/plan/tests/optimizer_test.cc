@@ -396,6 +396,20 @@ struct MapReferences {
     }
     return Over(std::move(node));
   }
+  LogicalNodePtr operator()(WindowNode node) const {
+    for (WindowCall& call : node.calls) {
+      for (BoundColumn& arg : call.arguments) {
+        arg.index = -1;
+      }
+      for (BoundColumn& key : call.partition_by) {
+        key.index = -1;
+      }
+      for (SortKey& key : call.order_by) {
+        key.column.index = -1;
+      }
+    }
+    return Over(std::move(node));
+  }
   LogicalNodePtr operator()(ComputeNode node) const {
     for (ExprPtr& expr : node.exprs) {
       expr = Expression(expr);

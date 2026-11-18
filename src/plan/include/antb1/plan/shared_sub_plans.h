@@ -67,10 +67,11 @@ struct SharedSubPlan {
 // outer group leaves that outside member duplicating work the report would otherwise hide. Three
 // scans of one table where two of them sit under equivalent filters is exactly that shape.
 //
-// A sub-plan that holds a Sort, a Limit, a RowCount or a dependent join is never a member. Order
-// and row limits are not properties a shared result can hand to two consumers without deciding
-// whose order wins, a metadata row count is not worth sharing, and a dependent join cannot reach
-// here (plan::Optimize removes every one). Refusing is always safe: it reports less.
+// A sub-plan that holds a Sort, a Limit, a Window, a RowCount or a dependent join is never a
+// member. Order and row limits are not properties a shared result can hand to two consumers without
+// deciding whose order wins; windows may depend on that order. A metadata row count is not worth
+// sharing, and a dependent join cannot reach here (plan::Optimize removes every one). Refusing is
+// always safe: it reports less.
 //
 // A UnionAll is compared like any node, its inputs in order, since its rows come in that order: a
 // union repeated whole -- a CTE referenced twice -- is one group when it has a key, which exec

@@ -514,6 +514,7 @@ std::string FunctionNameOpening(const sql::FunctionCall& call);
 // DuckDB's name of an expression of the binder's subset: (a + 1), -(a), sum((a + 1)); conditions
 // as ((a = 1) OR (b != 2) OR (c IN (1, 2))).
 struct ExprNameOf {
+  std::string operator()(const sql::WindowCall& call) const { return sql::ToSql(sql::Expr(call)); }
   std::string operator()(const sql::ColumnRef& ref) const { return RefName(ref); }
   std::string operator()(const sql::Literal& lit) const {
     if (lit.kind == sql::Literal::Kind::kDate) {
@@ -876,6 +877,7 @@ std::string FunctionNameOpening(const sql::FunctionCall& call) {
 }
 
 struct ReadsColumnOf {
+  bool operator()(const sql::WindowCall& /*call*/) const { return true; }
   bool aggregates = false;
   bool subqueries = false;
 
@@ -954,6 +956,11 @@ bool IsGroupingCall(const sql::FunctionCall& call);
 // one only where the block groups by that alias as a bare key (a GROUPING() of an alias, which
 // antb1 refuses in any case).
 struct CollectRefsOf {
+  void operator()(const sql::WindowCall& call) const {
+    for (const sql::Expr* child : sql::WindowOperands(call)) {
+      CollectRefs(*child, out);
+    }
+  }
   std::vector<const sql::ColumnRef*>& out;
   bool aggregate_args_only = false;
 
@@ -1060,7 +1067,157 @@ bool IsGroupingCall(const sql::FunctionCall& call) {
   return name == "grouping" || name == "grouping_id";
 }
 
+std::optional<sql::AggKind> WindowAggregate(const sql::WindowCall& call) {
+  for (const sql::AggKind kind :
+       {sql::AggKind::kCount, sql::AggKind::kSum, sql::AggKind::kAvg, sql::AggKind::kMin,
+        sql::AggKind::kMax, sql::AggKind::kStddevSamp, sql::AggKind::kStddev,
+        sql::AggKind::kStddevPop, sql::AggKind::kVarSamp, sql::AggKind::kVariance,
+        sql::AggKind::kVarPop}) {
+    if (AsciiLower(call.name) == AsciiLower(sql::ToString(kind))) {
+      return kind == sql::AggKind::kCount && call.star ? sql::AggKind::kCountStar : kind;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<Rejection> DeferredWindow(const sql::WindowCall& call) {
+  const auto refuse = [](SourceSpan span, std::string message) {
+    return Rejection{.span = span, .message = std::move(message)};
+  };
+  if (call.quantifier != sql::WindowQuantifier::kOmitted) {
+    return refuse(call.quantifier_span, "W10a: window ALL/DISTINCT is not supported");
+  }
+  if (call.filter) {
+    return refuse(call.filter_span, "W10b: window FILTER is not supported");
+  }
+  if (call.direction != sql::WindowDirection::kOmitted) {
+    return refuse(call.direction_span, "W9d: NTH_VALUE direction is not supported");
+  }
+  if (call.null_treatment != sql::WindowNullTreatment::kOmitted) {
+    return refuse(call.null_treatment_span, "W9c: window null treatment is not supported");
+  }
+  const sql::WindowSpec& spec = call.specification;
+  if (spec.kind != sql::WindowSpec::Kind::kInline) {
+    return refuse(spec.name_span, "W7: named window resolution and inheritance is not supported");
+  }
+  const std::string name = AsciiLower(call.name);
+  if (name == "row_number" || name == "dense_rank" || name == "percent_rank" ||
+      name == "cume_dist" || name == "ntile") {
+    return refuse(call.name_span, "W5: this ranking function is not supported");
+  }
+  if (name == "lead" || name == "lag") {
+    return refuse(call.name_span, "W9a: navigation windows are not supported");
+  }
+  if (name == "first_value" || name == "last_value" || name == "nth_value") {
+    return refuse(call.name_span, "W9b: frame value functions are not supported");
+  }
+  if (name == "fill") {
+    return refuse(call.name_span, "WX3: fill is not supported");
+  }
+  if (name != "rank" && !WindowAggregate(call)) {
+    return refuse(call.name_span, "W11h: this window function is not supported");
+  }
+  // An ordinary aggregate retains its existing input stage and argument capabilities. Only a
+  // subquery evaluated as a window operand itself needs the new W11f position.
+  const auto direct_subquery = [](this const auto& self,
+                                  const sql::Expr& expr) -> std::optional<SourceSpan> {
+    if (std::holds_alternative<sql::AggregateCall>(expr)) {
+      return std::nullopt;
+    }
+    if (std::holds_alternative<sql::SubqueryExpr>(expr)) {
+      return expr.span();
+    }
+    for (const sql::Expr* child : sql::ChildExpressions(expr)) {
+      if (auto found = self(*child)) {
+        return found;
+      }
+    }
+    return std::nullopt;
+  };
+  for (const sql::Expr* child : sql::WindowOperands(call)) {
+    if (auto span = direct_subquery(*child)) {
+      return refuse(*span, "W11f: subqueries in window operands are not supported");
+    }
+  }
+  if (spec.frame) {
+    const sql::WindowFrame& frame = *spec.frame;
+    if (frame.exclusion != sql::WindowExclusion::kOmitted) {
+      return refuse(frame.exclusion_span, "W8d: window frame exclusions are not supported");
+    }
+    const bool prefix = frame.start.kind == sql::WindowBoundKind::kUnboundedPreceding &&
+                        (!frame.end || frame.end->kind == sql::WindowBoundKind::kCurrentRow);
+    if (frame.unit == sql::WindowFrameUnit::kGroups) {
+      return refuse(frame.span, "W8c: GROUPS frames are not supported");
+    }
+    if (frame.unit == sql::WindowFrameUnit::kRange) {
+      return refuse(frame.span, prefix ? "W6: RANGE peer prefixes are not supported"
+                                       : "W8b: general RANGE frames are not supported");
+    }
+    if (!prefix || name == "rank") {
+      return refuse(frame.span, "W8a: this ROWS frame is not supported");
+    }
+  } else if (name != "rank" && !spec.order_by.empty()) {
+    return refuse(spec.order_by.front().span,
+                  "W6: ordered aggregates with omitted frames require RANGE peers");
+  }
+  if (WindowAggregate(call) && !call.star && call.args.size() == 1 &&
+      !ReadsColumn(call.args.front(), /*aggregates=*/true)) {
+    return refuse(call.args.front().span(),
+                  "W11a: constant window aggregate arguments are not supported");
+  }
+  return std::nullopt;
+}
+
+// Invalid placement/nesting wins over deferred support, including programmatically built ASTs.
+arrow::Status ValidateWindows(const sql::Expr& expr, bool allowed, bool aggregate = false,
+                              bool window = false) {
+  const auto* call = std::get_if<sql::WindowCall>(&expr);
+  if (call != nullptr) {
+    if (!allowed || aggregate || window) {
+      return BindError(
+          "window functions are only allowed in SELECT and ORDER BY and cannot be nested",
+          call->span);
+    }
+    const std::string name = AsciiLower(call->name);
+    const bool value_function = name == "lead" || name == "lag" || name == "first_value" ||
+                                name == "last_value" || name == "nth_value";
+    if ((call->direction != sql::WindowDirection::kOmitted && name != "nth_value") ||
+        (call->null_treatment != sql::WindowNullTreatment::kOmitted && !value_function) ||
+        ((call->filter || call->quantifier != sql::WindowQuantifier::kOmitted) &&
+         (name == "rank" || name == "row_number" || value_function))) {
+      return BindError("invalid modifier on window function " + call->name, call->span);
+    }
+    const auto kind = WindowAggregate(*call);
+    if ((kind && ((call->star && *kind != sql::AggKind::kCountStar) ||
+                  (!call->star && call->args.size() != 1))) ||
+        (AsciiLower(call->name) == "rank" && (call->star || !call->args.empty()))) {
+      return BindError("invalid arguments to window function " + call->name, call->span);
+    }
+  }
+  const bool ordinary = std::holds_alternative<sql::AggregateCall>(expr);
+  for (const sql::Expr* child : sql::ChildExpressions(expr)) {
+    ARROW_RETURN_NOT_OK(
+        ValidateWindows(*child, allowed, aggregate || ordinary, window || call != nullptr));
+  }
+  return arrow::Status::OK();
+}
+
 struct FirstUnsupportedOf {
+  std::optional<Rejection> operator()(const sql::WindowCall& call) const {
+    if (auto refusal = DeferredWindow(call)) {
+      return refusal;
+    }
+    for (const sql::Expr* child : sql::WindowOperands(call)) {
+      if (auto refusal = FirstUnsupported(*child, values, where)) {
+        if (!refusal->message.starts_with('W')) {
+          const std::string owner = refusal->message.contains("conditions") ? "W11b" : "W11e";
+          refusal->message = owner + ": " + refusal->message;
+        }
+        return refusal;
+      }
+    }
+    return std::nullopt;
+  }
   bool values = false;  // see FirstUnsupported
   bool where = false;   // see FirstUnsupported
 
@@ -1432,6 +1589,9 @@ constexpr std::string_view kThisCondition = "this condition is not supported";
 // Why a WHERE (or, with `having`, HAVING) condition is not one the binder answers, or std::nullopt
 // when it is (AsComparison / AsHavingComparison accept it, or a conjunction of such).
 struct RejectConditionOf {
+  std::optional<Rejection> operator()(const sql::WindowCall& call) const {
+    return Rejection{.span = call.span, .message = "window result is not a condition"};
+  }
   const sql::Expr& expr;  // the condition
   bool having = false;
   bool values = false;  // see RejectCondition
@@ -2230,6 +2390,10 @@ arrow::Result<std::pair<Constant, std::string>> BindConstant(const sql::Literal&
 bool ContainsAggregate(const sql::Expr& expr);
 
 struct ContainsAggregateOf {
+  bool operator()(const sql::WindowCall& call) const {
+    return std::ranges::any_of(sql::WindowOperands(call),
+                               [](const sql::Expr* child) { return ContainsAggregate(*child); });
+  }
   bool operator()(const sql::ColumnRef& /*column*/) const { return false; }
   bool operator()(const sql::Literal& /*lit*/) const { return false; }
   bool operator()(const sql::AggregateCall& /*call*/) const { return true; }
@@ -3020,7 +3184,7 @@ class Binder {
         relations_(scope_.bindings().size()) {
     // One block: BindBlock binds a compound by its leaves (BindSetOperation), each of which comes
     // here. Bound here, a UNION ALL would read as a block with no select list.
-    static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+    static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
     ANTB1_CHECK(stmt.set_operation.empty());
     // Relations 0 to bindings - 1 are the bindings, in FROM order, which is the invariant
     // OnVisibility and Scope::Find share; BuildBlocks adds one relation per outer join unit after
@@ -3039,6 +3203,9 @@ class Binder {
   // ---- the input scope: the bindings' columns, and computed columns over them ----
 
   struct BindInputOf {
+    arrow::Result<Typed> operator()(const sql::WindowCall& call) const {
+      return binder.BindWindow(call);
+    }
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
@@ -3368,6 +3535,69 @@ class Binder {
     return bound;
   }
 
+  arrow::Result<Typed> BindWindow(const sql::WindowCall& call) {
+    if (clause_ != Clause::kSelect && clause_ != Clause::kOrderBy) {
+      return BindError("window functions are only allowed in SELECT and ORDER BY", call.span);
+    }
+    if (aggregate_argument_ || window_input_) {
+      return BindError("window functions cannot be nested or occur inside an aggregate", call.span);
+    }
+    for (std::size_t i = 0; i < window_written_.size(); ++i) {
+      if (sql::EqualIgnoringSpans(sql::Expr(window_written_[i]), sql::Expr(call))) {
+        const WindowCall& known = windows_[i];
+        return ColumnLeaf(known.id, known.type, known.name, false);
+      }
+    }
+    WindowCall bound{.kind = AsciiLower(call.name) == "rank" ? WindowCall::Kind::kRank
+                                                             : WindowCall::Kind::kAggregate,
+                     .frame_omitted = !call.specification.frame,
+                     .name = sql::ToSql(sql::Expr(call)),
+                     .span = call.span,
+                     .over_span = call.over_span};
+    const auto operand = [&](const sql::Expr& expr) -> arrow::Result<BoundColumn> {
+      const bool previous = std::exchange(window_input_, true);
+      auto value = BindScoped(expr);
+      window_input_ = previous;
+      ARROW_ASSIGN_OR_RAISE(Typed typed, std::move(value));
+      return ComputedColumn(typed, window_exprs_, window_ids_);
+    };
+    for (const sql::Expr& arg : call.args) {
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, operand(arg));
+      bound.arguments.push_back(std::move(column));
+    }
+    if (bound.kind == WindowCall::Kind::kAggregate) {
+      const sql::AggKind kind = WindowAggregate(call).value_or(sql::AggKind::kCountStar);
+      bound.aggregate = ToPlan(kind);
+      if (kind != sql::AggKind::kCountStar) {
+        sql::AggregateCall aggregate{.kind = kind, .span = call.span};
+        ARROW_ASSIGN_OR_RAISE(bound.type, AggregateType(aggregate, bound.arguments.at(0)));
+      }
+      bound.frame = call.specification.frame ? WindowCall::Frame::kRowsPrefix
+                                             : WindowCall::Frame::kWholePartition;
+    }
+    for (const sql::Expr& expr : call.specification.partition_by) {
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, operand(expr));
+      if (column.type == LogicalType::kBoolean) {
+        return UnsupportedError("W11b: BOOLEAN window keys are not supported", expr.span());
+      }
+      bound.partition_by.push_back(std::move(column));
+    }
+    for (const sql::WindowOrder& key : call.specification.order_by) {
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, operand(*key.expr));
+      if (column.type == LogicalType::kBoolean) {
+        return UnsupportedError("W11b: BOOLEAN window ordering is not supported", key.span);
+      }
+      bound.order_by.push_back(
+          SortKey{.column = std::move(column),
+                  .descending = key.direction == sql::WindowOrder::Direction::kDesc,
+                  .nulls_first = key.nulls == sql::WindowOrder::Nulls::kFirst});
+    }
+    bound.id = ids_.Next();
+    windows_.push_back(bound);
+    window_written_.push_back(call);
+    return ColumnLeaf(bound.id, bound.type, bound.name, false);
+  }
+
   // ---- the output scope: the aggregation's keys and aggregates ----
 
   struct SumRewrite {
@@ -3572,6 +3802,9 @@ class Binder {
 
   // An expression over the aggregation's output that is no GROUP BY key (see BindOutput).
   struct BindOutputOf {
+    arrow::Result<Typed> operator()(const sql::WindowCall& call) const {
+      return binder.BindWindow(call);
+    }
     Binder& binder;
 
     arrow::Result<Typed> operator()(const sql::ColumnRef& ref) const {
@@ -3639,7 +3872,8 @@ class Binder {
     // A GROUP BY key that holds a subquery's value has bound it per row before (ADR 0041's SQ2b),
     // so the speculation only looks values up: binding one as an input would plant its join per
     // row, below the aggregation. Saved and restored, so that a nested speculation cannot end it.
-    if (!ContainsAggregate(expr) && !std::holds_alternative<sql::Literal>(expr)) {
+    if (!sql::ContainsWindow(expr) && !ContainsAggregate(expr) &&
+        !std::holds_alternative<sql::Literal>(expr)) {
       const bool lookup_only = std::exchange(lookup_only_, true);
       auto input = BindInput(expr);
       lookup_only_ = lookup_only;
@@ -3702,7 +3936,7 @@ class Binder {
   }
 
   BoundColumn ScopedColumn(const Typed& t) {
-    return shape_ == Shape::kProjection ? InputColumn(t) : OutputColumn(t);
+    return shape_ == Shape::kProjection && !PostWindow() ? InputColumn(t) : OutputColumn(t);
   }
 
   // ---- clauses ----
@@ -3975,7 +4209,7 @@ class Binder {
   std::optional<arrow::Result<Typed>> AliasFallback(const sql::ColumnRef& ref,
                                                     const arrow::Status& resolved) {
     const auto detail = GetSqlError(resolved);
-    if (!alias_fallback_ || !ref.qualifier.empty() || detail == nullptr ||
+    if (window_input_ || !alias_fallback_ || !ref.qualifier.empty() || detail == nullptr ||
         detail->kind() != SqlErrorDetail::Kind::kBind) {
       return std::nullopt;
     }
@@ -4260,6 +4494,22 @@ class Binder {
   }
   std::vector<SlotEntry>& RowSlot() { return blocks_[RowBlock()].slot; }
 
+  std::vector<WindowCall> windows_;
+  std::vector<sql::WindowCall> window_written_;
+  std::vector<ExprPtr> window_exprs_;
+  std::vector<ColumnId> window_ids_;
+  std::vector<SlotEntry> window_slot_;
+  bool PostWindow() const {
+    return has_windows_ && !aggregate_argument_ && !window_input_ && !lookup_only_ &&
+           (clause_ == Clause::kSelect || clause_ == Clause::kOrderBy);
+  }
+  std::vector<SlotEntry>& ValueSlot(bool group) {
+    if (PostWindow()) {
+      return window_slot_;
+    }
+    return group ? group_slot_ : RowSlot();
+  }
+
   std::vector<ExprPtr> input_exprs_;  // computed above the joins, on computed columns
   std::vector<ColumnId> input_ids_;   // per input expression: its column
   std::vector<BoundColumn> keys_;     // GROUP BY keys, as columns of the input
@@ -4270,8 +4520,10 @@ class Binder {
   std::vector<std::vector<std::size_t>> grouping_sets_;
   std::vector<GroupingCall> grouping_calls_;  // GROUPING(...) calls, in the order first bound
   bool constant_group_item_ = false;          // a plain GROUP BY item that is a constant (no key)
-  std::vector<ExprPtr> post_exprs_;           // computed over the aggregation's output
-  std::vector<ColumnId> post_ids_;            // per post expression: its column
+  bool window_input_ = false;
+  bool has_windows_ = false;
+  std::vector<ExprPtr> post_exprs_;  // computed over the aggregation's output
+  std::vector<ColumnId> post_ids_;   // per post expression: its column
   // What HAVING's conditions compute, below their filter and so below post_exprs_: DuckDB filters
   // HAVING before it computes the select list.
   std::vector<ExprPtr> having_exprs_;
@@ -4292,7 +4544,8 @@ class Binder {
   // and NOT IN share it.
   struct BoundValue {
     std::optional<std::size_t> block;  // the block whose per-row slot holds it; none: HAVING's
-    sql::SubqueryExpr written;         // a copy: the first binding is often of a temporary
+    bool post_window = false;
+    sql::SubqueryExpr written;  // a copy: the first binding is often of a temporary
     Typed value;
     ExprPtr probe;  // a mark's bound probe; null for a value
     // Its join's sub-plan, by which TakeFromTail finds the join in its slot's tail.
@@ -4828,6 +5081,9 @@ arrow::Result<Predicate> Binder::BindCondition(const sql::Expr& conjunct, bool h
 // [NOT] IN and the comparisons) as predicates. Any other kind of node is no leaf.
 template <class BindFn, class ColumnOf>
 struct Binder::BindConditionOf {
+  arrow::Result<Predicate> operator()(const sql::WindowCall& /*call*/) const {
+    ConditionAsOperand();
+  }
   Binder& binder;
   const BindFn& bind;
   const ColumnOf& column_of;
@@ -6497,6 +6753,10 @@ arrow::Result<Binder::SubqueryBlock> Binder::BindSubqueryBlock(const SubqueryCon
   // the unnesting pass then rewrites it or rejects the query.
   std::vector<ColumnId> free = FreeVariables(*bound.plan.root);
   const bool correlated = !free.empty();
+  if (correlated && (PostWindow() || window_input_ || sql::WindowSpan(*form.subquery->query))) {
+    return UnsupportedError("W11g/SQ17: correlated window compositions are not supported",
+                            form.subquery->op_span);
+  }
   const sql::SelectStatement& query = *form.subquery->query;
   const auto correlated_compound = [&] -> std::optional<Rejection> {
     if (!correlated || query.set_operation.empty()) {
@@ -6979,7 +7239,8 @@ Binder::BoundValue* Binder::FindValue(const sql::SubqueryExpr& s, bool group,
                                       const std::function<bool(const BoundValue&)>& also) {
   const std::optional<std::size_t> block = group ? std::nullopt : std::optional(RowBlock());
   const auto found = std::ranges::find_if(values_, [&](const BoundValue& bound) {
-    return bound.block == block && SameSubquery(bound.written, s) && (!also || also(bound));
+    return bound.post_window == PostWindow() && bound.block == block &&
+           SameSubquery(bound.written, s) && (!also || also(bound));
   });
   return found == values_.end() ? nullptr : &*found;
 }
@@ -7119,9 +7380,10 @@ Typed Binder::PlantValue(const sql::SubqueryExpr& s, SubqueryBlock block, bool g
     ANTB1_CHECK(!padded_unit_.has_value());
     row_tail_.emplace_back(std::move(join));
   } else {
-    (group ? group_slot_ : RowSlot()).emplace_back(std::move(join));
+    ValueSlot(group).emplace_back(std::move(join));
   }
   values_.push_back(BoundValue{.block = group ? std::nullopt : std::optional(RowBlock()),
+                               .post_window = PostWindow(),
                                .written = s,
                                .value = value,
                                .probe = nullptr,
@@ -7146,7 +7408,7 @@ void Binder::TakeFromTail(BoundValue& known, bool group) {
     return join != nullptr && join->right.get() == known.right;
   });
   ANTB1_CHECK(entry != tail.end());
-  (group ? group_slot_ : RowSlot()).push_back(std::move(*entry));
+  ValueSlot(group).push_back(std::move(*entry));
   tail.erase(entry);
   known.deferred = false;
 }
@@ -7224,8 +7486,8 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   if (const auto known = std::ranges::find_if(
           values_,
           [&](const BoundValue& bound) {
-            return bound.block == block && bound.probe != nullptr &&
-                   SameExpr(*bound.probe, *probe.expr) &&
+            return bound.post_window == PostWindow() && bound.block == block &&
+                   bound.probe != nullptr && SameExpr(*bound.probe, *probe.expr) &&
                    sql::EqualIgnoringSpans(*bound.written.query, *written.query);
           });
       known != values_.end()) {
@@ -7270,18 +7532,20 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   InKeys(join, typed, bound, type, s.span);
   Typed value = ColumnLeaf(join.mark, LogicalType::kBoolean, name, /*stored_as_float=*/false);
   const LogicalNode* const right = join.right.get();  // after InKeys, before the join moves
-  if (deferring_) {
+  const bool deferred = deferring_ && !PostWindow();
+  if (deferred) {
     ANTB1_CHECK(!padded_unit_.has_value());  // the select list binds outside every ON
     (group ? group_tail_ : row_tail_).emplace_back(std::move(join));
   } else {
-    (group ? group_slot_ : RowSlot()).emplace_back(std::move(join));
+    ValueSlot(group).emplace_back(std::move(join));
   }
   values_.push_back(BoundValue{.block = block,
+                               .post_window = PostWindow(),
                                .written = std::move(written),
                                .value = value,
                                .probe = probe.expr,
                                .right = right,
-                               .deferred = deferring_,
+                               .deferred = deferred,
                                .free = {},
                                .on_position = std::nullopt});
   return value;
@@ -7376,7 +7640,7 @@ arrow::Status Binder::BindValueConjunct(const sql::Expr& conjunct, SourceSpan el
   }();
   in_slot_ = nullptr;  // restored on the error path too, before the status propagates
   ARROW_RETURN_NOT_OK(status);
-  (group ? group_slot_ : RowSlot()).emplace_back(std::move(filter));
+  ValueSlot(group).emplace_back(std::move(filter));
   return arrow::Status::OK();
 }
 
@@ -8160,6 +8424,17 @@ arrow::Result<std::optional<Typed>> Binder::ResolveHavingName(const sql::ColumnR
   if (select_.items[*alias].first == ItemKind::kConstant) {
     return UnsupportedError("HAVING on a constant select item is not supported", ref.span);
   }
+  if (has_windows_ && select_.items[*alias].first == ItemKind::kExpression) {
+    // SELECT values stand after the windows. HAVING must bind an alias in its own earlier stage,
+    // including a separate subquery memo entry, and may never read a window result.
+    const sql::Expr& written = *select_.exprs[select_.items[*alias].second];
+    ARROW_RETURN_NOT_OK(ValidateWindows(written, /*allowed=*/false));
+    const bool fallback = std::exchange(alias_fallback_, false);
+    auto rebound = BindScoped(written);
+    alias_fallback_ = fallback;
+    ARROW_ASSIGN_OR_RAISE(Typed value, std::move(rebound));
+    return std::optional(std::move(value));
+  }
   ARROW_ASSIGN_OR_RAISE(auto item, ItemOutput(*alias));
   if (item.has_value() && select_.items[*alias].first == ItemKind::kAggregate) {
     // DuckDB's MIN and MAX of a FLOAT column are FLOAT.
@@ -8345,9 +8620,10 @@ arrow::Status Binder::BindOrderBy() {
     } else {
       // A global aggregate's only row needs no sort: its ORDER BY items are checked, and computed
       // or hidden aggregates for them dropped again -- unless the item planted a mark (ADR 0041's
-      // SQ7a), whose join reads its probe's aggregates; they stay, computed with the one row, and
-      // nothing reads the mark.
+      // SQ7a), or a window, whose inputs read those aggregates. They stay, computed with the one
+      // row, even though nothing reads the mark or window result.
       const std::size_t aggregates = select_.aggregates.size();
+      const std::size_t windows = windows_.size();
       const std::size_t posts = post_exprs_.size();
       const std::size_t bound = values_.size();
       ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(item.expr));
@@ -8355,7 +8631,7 @@ arrow::Status Binder::BindOrderBy() {
         const bool marked =
             std::ranges::any_of(std::span(values_).subspan(bound),
                                 [](const BoundValue& value) { return value.probe != nullptr; });
-        if (!marked) {
+        if (!marked && windows_.size() == windows) {
           select_.aggregates.resize(aggregates);
         }
         post_exprs_.resize(posts);
@@ -8459,6 +8735,10 @@ arrow::Status Binder::GateCorrelatedExists() const {
   if (!correlated) {
     return arrow::Status::OK();
   }
+  if (sql::WindowSpan(stmt_)) {
+    return UnsupportedError("W11g/SQ17: window-containing correlated subplans are not supported",
+                            exists_->op_span);
+  }
   if (exists_->having) {
     return Reject(Rejection{.span = exists_->op_span,
                             .message = exists_->outside_having
@@ -8470,6 +8750,9 @@ arrow::Status Binder::GateCorrelatedExists() const {
 }
 
 arrow::Result<LogicalPlan> Binder::Bind() {
+  has_windows_ = std::ranges::any_of(sql::BlockExpressions(stmt_), [](const sql::Expr* expr) {
+    return sql::ContainsWindow(*expr);
+  });
   ARROW_RETURN_NOT_OK(GateCorrelatedExists());
   BuildBlocks();
   deferring_ = true;
@@ -8781,6 +9064,17 @@ LogicalPlan Binder::Assemble() {
     // in a layer of its own, from the aggregation's columns.
     node = SlotNodes(std::move(node), group_slot_, options_.build_side_ratio);
     node = SlotNodes(std::move(node), group_tail_, options_.build_side_ratio);
+    if (!window_exprs_.empty()) {
+      node = Make(ComputeNode{.input = std::move(node),
+                              .exprs = window_exprs_,
+                              .ids = window_ids_,
+                              .span = select_.span});
+    }
+    if (!windows_.empty()) {
+      node = Make(WindowNode{
+          .input = std::move(node), .calls = windows_, .span = windows_.front().over_span});
+    }
+    node = SlotNodes(std::move(node), window_slot_, options_.build_side_ratio);
     if (!post_exprs_.empty()) {
       node = Make(ComputeNode{
           .input = std::move(node), .exprs = post_exprs_, .ids = post_ids_, .span = select_.span});
@@ -8873,9 +9167,9 @@ LogicalPlan Binder::Assemble() {
       above();
       // A Project restores the select list when the Aggregate's output is not it (constants,
       // expressions, hidden aggregates, or columns computed for HAVING -- its own, or a subquery
-      // conjunct's probe cast).
+      // conjunct's probe cast -- or appended by the window stage).
       if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty() ||
-          !having_exprs_.empty() || having_join_columns) {
+          !having_exprs_.empty() || having_join_columns || !windows_.empty()) {
         project([](ColumnId column) { return column; });
       } else {
         for (std::size_t i = 0; i < select_.items.size(); ++i) {
@@ -8949,7 +9243,33 @@ std::optional<sql::Literal> DateLiteralOf(const sql::CastExpr& cast) {
 void FoldDateCasts(sql::Expr& expr);
 void FoldDateCastsInBlock(sql::SelectStatement& stmt);  // a subquery folds its own block
 
+void FoldWindowSpec(sql::WindowSpec& spec) {
+  for (sql::Expr& expr : spec.partition_by) {
+    FoldDateCasts(expr);
+  }
+  for (auto& key : spec.order_by) {
+    FoldDateCasts(*key.expr);
+  }
+  if (spec.frame) {
+    if (spec.frame->start.offset) {
+      FoldDateCasts(**spec.frame->start.offset);
+    }
+    if (spec.frame->end && spec.frame->end->offset) {
+      FoldDateCasts(**spec.frame->end->offset);
+    }
+  }
+}
+
 struct FoldDateCastsOf {
+  void operator()(sql::WindowCall& call) const {
+    for (sql::Expr& arg : call.args) {
+      FoldDateCasts(arg);
+    }
+    if (call.filter) {
+      FoldDateCasts(**call.filter);
+    }
+    FoldWindowSpec(call.specification);
+  }
   void operator()(sql::ColumnRef& /*column*/) const {}
   void operator()(sql::Literal& /*lit*/) const {}
   void operator()(sql::AggregateCall& call) const {
@@ -9026,8 +9346,11 @@ void FoldDateCasts(sql::Expr& expr) {
 // nested CAST('YYYY-MM-DD' AS DATE) is a date literal there too (the binder holds a reference to
 // the folded statement, so folding per level would fold a copy nothing reads).
 void FoldDateCastsInBlock(sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
+  for (auto& window : stmt.windows) {
+    FoldWindowSpec(window.specification);
+  }
   for (sql::CommonTableExpr& cte : stmt.with) {
     FoldDateCastsInBlock(*cte.query);
   }
@@ -9206,7 +9529,7 @@ arrow::Status CheckGroupingElement(const sql::GroupingElement& element, bool ins
 }
 
 arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
   if (!stmt.set_operation.empty()) {
     // A compound keeps its clauses in its branches, which ReachableBlocks lists before it, so what
@@ -9217,6 +9540,31 @@ arrow::Status CheckBlock(const sql::SelectStatement& stmt) {
       return Reject(*r);
     }
     return arrow::Status::OK();
+  }
+  for (const auto& item : stmt.items) {
+    if (item.expr() != nullptr) {
+      ARROW_RETURN_NOT_OK(ValidateWindows(*item.expr(), true));
+    }
+  }
+  for (const auto& item : stmt.order_by) {
+    ARROW_RETURN_NOT_OK(ValidateWindows(item.expr, true));
+  }
+  for (const auto* clause : {&stmt.where, &stmt.group_by, &stmt.having}) {
+    for (const auto& expr : *clause) {
+      ARROW_RETURN_NOT_OK(ValidateWindows(expr, false));
+    }
+  }
+  for (const auto* expr : sql::GroupingExprs(stmt.grouping)) {
+    ARROW_RETURN_NOT_OK(ValidateWindows(*expr, false));
+  }
+  for (const auto& item : stmt.from) {
+    for (const auto& expr : item.on) {
+      ARROW_RETURN_NOT_OK(ValidateWindows(expr, false));
+    }
+  }
+  if (!stmt.windows.empty()) {
+    return UnsupportedError("W7: named WINDOW definitions are not supported",
+                            stmt.windows.front().span);
   }
   // A select item, a plain GROUP BY key, an ORDER BY item and an aggregate's argument may hold a
   // subquery's value (ADR 0041's SQ2).
@@ -9765,7 +10113,7 @@ arrow::Result<BoundBlock> BindSetOperation(const sql::SelectStatement& stmt, con
                                            const BindOptions& options, ColumnIdSource& ids,
                                            const CteFrame& own, const Scope* outer,
                                            bool outer_encloses, Visibility outer_visible) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   ANTB1_CHECK(stmt.set_operation.size() >= 2);
   // CheckBlock refused the compound's own ORDER BY, LIMIT and OFFSET (ADR 0036's X5).
   ANTB1_CHECK(stmt.order_by.empty());
@@ -9794,7 +10142,7 @@ arrow::Result<BoundBlock> BindBlock(const sql::SelectStatement& stmt, const Cata
                                     const BindOptions& options, ColumnIdSource& ids,
                                     const CteFrame* ctes, const Scope* outer, bool outer_encloses,
                                     const SubqueryContext* exists, Visibility outer_visible) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   // The frames of this block: one per CTE holding the CTEs before it, then the block's own.
   std::deque<CteFrame> frames;
   std::vector<const sql::CommonTableExpr*> visible;
@@ -9868,6 +10216,47 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
   ARROW_ASSIGN_OR_RAISE(BoundBlock bound, BindBlock(folded, catalog, options, ids, /*ctes=*/nullptr,
                                                     /*outer=*/nullptr));
   return ResolvePositions(bound.plan);  // the binder refers to columns by id (ADR 0022)
+}
+
+arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement) {
+  if (!statement.windows.empty()) {
+    return UnsupportedError("W7: named WINDOW definitions are not supported",
+                            statement.windows.front().span);
+  }
+  for (const auto& cte : statement.with) {
+    ARROW_RETURN_NOT_OK(RefuseWindowExecution(*cte.query));
+  }
+  for (const auto& branch : statement.set_operation) {
+    ARROW_RETURN_NOT_OK(RefuseWindowExecution(*branch.query));
+  }
+  for (const auto& item : statement.from) {
+    if (const auto* derived = std::get_if<sql::DerivedTable>(&item.source)) {
+      ARROW_RETURN_NOT_OK(RefuseWindowExecution(*derived->query));
+    }
+  }
+  const auto refuse = [](this const auto& self, const sql::Expr& expr) -> arrow::Status {
+    if (const auto* call = std::get_if<sql::WindowCall>(&expr)) {
+      if (auto deferred = DeferredWindow(*call)) {
+        return Reject(*deferred);
+      }
+      std::string owner = call->specification.frame ? "W4" : "W2";
+      if (AsciiLower(call->name) == "rank") {
+        owner = "W3";
+      }
+      return UnsupportedError(owner + ": window execution is not supported", call->over_span);
+    }
+    if (const auto* sub = std::get_if<sql::SubqueryExpr>(&expr)) {
+      ARROW_RETURN_NOT_OK(RefuseWindowExecution(*sub->query));
+    }
+    for (const sql::Expr* child : sql::ChildExpressions(expr)) {
+      ARROW_RETURN_NOT_OK(self(*child));
+    }
+    return arrow::Status::OK();
+  };
+  for (const sql::Expr* expr : sql::BlockExpressions(statement)) {
+    ARROW_RETURN_NOT_OK(refuse(*expr));
+  }
+  return arrow::Status::OK();
 }
 
 }  // namespace antb1::plan

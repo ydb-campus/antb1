@@ -1037,7 +1037,11 @@ void ForEachNode(const sql::Expr& e, const F& f) {
   std::visit(
       [&f](const auto& node) {
         using Node = std::remove_cvref_t<decltype(node)>;
-        if constexpr (std::is_same_v<Node, sql::AggregateCall>) {
+        if constexpr (std::is_same_v<Node, sql::WindowCall>) {
+          for (const sql::Expr* child : sql::WindowOperands(node)) {
+            ForEachNode(*child, f);
+          }
+        } else if constexpr (std::is_same_v<Node, sql::AggregateCall>) {
           if (node.arg.has_value()) {
             ForEachNode(**node.arg, f);
           }
@@ -1710,8 +1714,13 @@ void DeepSubqueries(const sql::Expr& e, std::vector<const sql::SubqueryExpr*>& o
 }
 
 void DeepSubqueries(const sql::SelectStatement& stmt, std::vector<const sql::SubqueryExpr*>& out) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   static_assert(sql::kSelectItemKinds == 2, "revisit this walk");
+  for (const auto& window : stmt.windows) {
+    for (const sql::Expr* expr : sql::WindowOperands(window.specification)) {
+      DeepSubqueries(*expr, out);
+    }
+  }
   for (const sql::CommonTableExpr& cte : stmt.with) {
     DeepSubqueries(*cte.query, out);
   }
@@ -2829,7 +2838,7 @@ struct ValueCoverage {
 // aggregate without GROUP BY (a HAVING may drop its one row), or an INTERSECT or EXCEPT of such
 // blocks -- never a UNION, whose rows add up.
 bool AtMostOneRow(const sql::SelectStatement& block) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   if (!block.set_operation.empty()) {
     for (std::size_t i = 0; i < block.set_operation.size(); ++i) {
       const sql::SetBranch& branch = block.set_operation[i];
@@ -2852,7 +2861,7 @@ bool AtMostOneRow(const sql::SelectStatement& block) {
 // Every column a block names, in each of its branches: unqualified, of its one table, which it
 // names (never a path), so that the block reads nothing of the enclosing query.
 void CheckOwnColumns(const sql::SelectStatement& block, const std::vector<GenTable>& tables) {
-  static_assert(sql::kSelectStatementFields == 20, "revisit this walk");
+  static_assert(sql::kSelectStatementFields == 21, "revisit this walk");
   if (!block.set_operation.empty()) {
     for (const sql::SetBranch& branch : block.set_operation) {
       CheckOwnColumns(*branch.query, tables);
@@ -2860,6 +2869,7 @@ void CheckOwnColumns(const sql::SelectStatement& block, const std::vector<GenTab
     return;
   }
   EXPECT_TRUE(block.with.empty());
+  EXPECT_TRUE(block.windows.empty());
   EXPECT_TRUE(block.where.empty());
   ASSERT_EQ(block.from.size(), 1U);
   const sql::TableRef* ref = block.from.front().table();

@@ -148,6 +148,82 @@ std::string Element(const GroupingElement& element) {
   return {};
 }
 
+std::string BoundSql(const WindowBound& bound) {
+  switch (bound.kind) {
+    case WindowBoundKind::kUnboundedPreceding:
+      return "UNBOUNDED PRECEDING";
+    case WindowBoundKind::kUnboundedFollowing:
+      return "UNBOUNDED FOLLOWING";
+    case WindowBoundKind::kCurrentRow:
+      return "CURRENT ROW";
+    case WindowBoundKind::kPreceding:
+      ANTB1_CHECK(bound.offset.has_value());
+      return Sql(**bound.offset) + " PRECEDING";
+    case WindowBoundKind::kFollowing:
+      ANTB1_CHECK(bound.offset.has_value());
+      return Sql(**bound.offset) + " FOLLOWING";
+  }
+  return {};
+}
+
+std::string WindowSql(const WindowSpec& spec) {
+  if (spec.kind == WindowSpec::Kind::kNamed) {
+    return Name(spec.name, spec.quoted);
+  }
+  std::string out;
+  const auto append = [&out](const std::string& text) { out += (out.empty() ? "" : " ") + text; };
+  if (spec.kind == WindowSpec::Kind::kInherited) {
+    append(Name(spec.name, spec.quoted));
+  }
+  if (!spec.partition_by.empty()) {
+    append("PARTITION BY " + List(spec.partition_by));
+  }
+  for (std::size_t i = 0; i < spec.order_by.size(); ++i) {
+    const auto& key = spec.order_by[i];
+    std::string text = Sql(*key.expr);
+    if (key.direction != WindowOrder::Direction::kOmitted) {
+      text += key.direction == WindowOrder::Direction::kAsc ? " ASC" : " DESC";
+    }
+    if (key.nulls != WindowOrder::Nulls::kOmitted) {
+      text += key.nulls == WindowOrder::Nulls::kFirst ? " NULLS FIRST" : " NULLS LAST";
+    }
+    if (i == 0) {
+      append("ORDER BY " + text);
+    } else {
+      out += ", " + text;
+    }
+  }
+  if (spec.frame) {
+    const auto& frame = *spec.frame;
+    std::string text = "ROWS ";
+    if (frame.unit == WindowFrameUnit::kRange) {
+      text = "RANGE ";
+    } else if (frame.unit == WindowFrameUnit::kGroups) {
+      text = "GROUPS ";
+    }
+    text += frame.end ? "BETWEEN " + BoundSql(frame.start) + " AND " + BoundSql(*frame.end)
+                      : BoundSql(frame.start);
+    switch (frame.exclusion) {
+      case WindowExclusion::kOmitted:
+        break;
+      case WindowExclusion::kCurrentRow:
+        text += " EXCLUDE CURRENT ROW";
+        break;
+      case WindowExclusion::kGroup:
+        text += " EXCLUDE GROUP";
+        break;
+      case WindowExclusion::kTies:
+        text += " EXCLUDE TIES";
+        break;
+      case WindowExclusion::kNoOthers:
+        text += " EXCLUDE NO OTHERS";
+        break;
+    }
+    append(text);
+  }
+  return "(" + out + ")";
+}
+
 struct SqlOf {
   std::string operator()(const ColumnRef& column) const { return Column(column); }
   std::string operator()(const Literal& lit) const { return LiteralSql(lit); }
@@ -157,6 +233,24 @@ struct SqlOf {
     }
     return std::string(ToString(agg.kind)) + "(" + (agg.distinct ? "DISTINCT " : "") +
            (agg.arg.has_value() ? Sql(**agg.arg, kOr) : "") + ")";
+  }
+  std::string operator()(const WindowCall& call) const {
+    std::string out = Name(call.name, call.quoted) + "(";
+    if (call.quantifier != WindowQuantifier::kOmitted) {
+      out += call.quantifier == WindowQuantifier::kAll ? "ALL " : "DISTINCT ";
+    }
+    out += (call.star ? "*" : List(call.args)) + ")";
+    if (call.filter) {
+      out += " FILTER (WHERE " + Sql(**call.filter) + ")";
+    }
+    if (call.direction != WindowDirection::kOmitted) {
+      out += call.direction == WindowDirection::kFirst ? " FROM FIRST" : " FROM LAST";
+    }
+    if (call.null_treatment != WindowNullTreatment::kOmitted) {
+      out +=
+          call.null_treatment == WindowNullTreatment::kRespect ? " RESPECT NULLS" : " IGNORE NULLS";
+    }
+    return out + " OVER " + WindowSql(call.specification);
   }
   std::string operator()(const UnaryExpr& unary) const {
     if (unary.op == UnaryOp::kNot) {
@@ -301,7 +395,7 @@ std::string FromList(const std::vector<FromItem>& from) {
 
 // A block: SELECT through HAVING.
 std::string BlockSql(const SelectStatement& block) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   std::string sql = block.distinct ? "SELECT DISTINCT " : "SELECT ";
   for (std::size_t i = 0; i < block.items.size(); ++i) {
@@ -337,6 +431,11 @@ std::string BlockSql(const SelectStatement& block) {
   if (!block.having.empty()) {
     sql += " HAVING " + Conjuncts(block.having);
   }
+  for (std::size_t i = 0; i < block.windows.size(); ++i) {
+    const auto& window = block.windows[i];
+    sql += (i == 0 ? " WINDOW " : ", ") + Name(window.name, window.quoted) + " AS " +
+           WindowSql(window.specification);
+  }
   return sql;
 }
 
@@ -344,7 +443,7 @@ std::string BlockSql(const SelectStatement& block) {
 // or a compound's branches joined by their operators, then ORDER BY, LIMIT and OFFSET, which are
 // the compound's.
 std::string StatementSql(const SelectStatement& stmt) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   std::string sql;
   for (std::size_t i = 0; i < stmt.with.size(); ++i) {
     const CommonTableExpr& cte = stmt.with[i];

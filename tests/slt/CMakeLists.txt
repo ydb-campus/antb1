@@ -570,11 +570,14 @@ if(ANTB1_HAVE_DUCKDB)
 
   # `antb1-slt tpch` (runner/ratchet.h; the ratchet of the queries derived from TPC-H, tests/tpch) on our own numbered
   # queries over the canary table marked `redact`, written into the build tree (lint R009). Each case is a directory
-  # of queries and a ratchet: a window function is the standard unsupported query, so all-unsupported passes; and an
+  # of queries and a ratchet: a recursive CTE is the standard unsupported query, so all-unsupported passes; and an
   # unexpected pass, an unexpected fail, a wrong answer (--mutate canary), and a parse, bind or execution error (only
   # Unsupported is a clean failure for this workload) each fail with a redacted report.
   set(_tpch_selftest "${CMAKE_CURRENT_BINARY_DIR}/tpch-selftest")
-  set(_unsupported "SELECT ROW_NUMBER() OVER () FROM antb1_canary_table;\n")
+  set(
+    _unsupported
+    "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM antb1_canary_table LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown;\n"
+  )
   set(_answered "SELECT COUNT(*) FROM antb1_canary_table;\n")
   set(_q1_pass "${_unsupported}")
   set(_q1_unexpected_pass "${_answered}")
