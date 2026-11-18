@@ -2565,8 +2565,12 @@ LogicalNodePtr RewriteOuterMembership(const LogicalNodePtr& node, LogicalNodePtr
   LogicalNodePtr inner = join->left;
   const auto* compute = std::get_if<ComputeNode>(inner.get());
   const ExprPtr* defined = compute == nullptr ? nullptr : DefinedBy(*compute, probe);
-  const ExprPtr expr = outer_ids.contains(probe) ? ColumnValue(join->keys.front().left)
-                                                 : (defined == nullptr ? nullptr : *defined);
+  ExprPtr expr;
+  if (outer_ids.contains(probe)) {
+    expr = ColumnValue(join->keys.front().left);
+  } else if (defined != nullptr) {
+    expr = *defined;
+  }
   if (expr == nullptr || !SidesOf(*expr, outer_ids).outer_only()) {
     return current;
   }
