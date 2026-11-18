@@ -51,3 +51,4 @@ may land first, in a docs-only PR (0013, 0019, 0021-0025).
 | [0040](0040-nested-loop-joins.md) | Nested-loop joins and cross products | Accepted |
 | [0041](0041-subqueries-and-decorrelation.md) | Subqueries and full decorrelation | Proposed |
 | [0042](0042-arrow-26.md) | Apache Arrow 26 | Proposed |
+| [0043](0043-window-functions.md) | Window functions: phase 9 and the remaining standard SQL syntax | Proposed |
