@@ -82,6 +82,7 @@ arrow::Result<plan::LogicalPlan> ParseAndBind(std::string_view sql, const plan::
   }
   auto bound = plan::Bind(*stmt, catalog, options);
   if (bound.ok()) {
+    ARROW_RETURN_NOT_OK(plan::RefuseWindowExecution(*stmt));
     // Optimize can fail (ADR 0023's unnesting pass), and every caller of ParseAndBind propagates
     // it, so `explain` and `explain --analyze` reject exactly what `query` rejects.
     bound = plan::Optimize(*bound, options);

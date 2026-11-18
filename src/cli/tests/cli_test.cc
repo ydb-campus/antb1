@@ -190,9 +190,12 @@ TEST_F(CliTest, SqlFromStdinAndFile) {
 }
 
 TEST_F(CliTest, UnsupportedQueryExits4WithCaret) {
+  constexpr auto kRecursive =
+      "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM u LIMIT 3) AS seed "
+      "UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown";
   // Exit code 4, not 1: unsupported SQL is rejected before any name is resolved, and table u
   // is not registered.
-  auto r = Invoke({"query", "-c", "SELECT row_number() OVER () FROM u", "--table", "t=" + path_});
+  auto r = Invoke({"query", "-c", kRecursive, "--table", "t=" + path_});
   EXPECT_EQ(r.code, kExitUnsupported);
   EXPECT_NE(r.err.find("unsupported error"), std::string::npos) << r.err;
   EXPECT_NE(r.err.find("^^^^"), std::string::npos) << r.err;
@@ -355,7 +358,9 @@ TEST_F(CliTest, BenchWritesClickBenchJson) {
   const auto queries =
       WriteFile("q.sql",
                 "SELECT COUNT(*) FROM t;\n\n  SELECT MIN(EventDate) FROM t WHERE EventDate > DATE "
-                "'2000-01-01'\r\nSELECT row_number() OVER () FROM u;\n");
+                "'2000-01-01'\r\nWITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * "
+                "FROM u LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT "
+                "COUNT(*) FROM countdown;\n");
   const auto out = (dir_ / "result.json").string();
   const auto drops = std::make_shared<int>(0);
   std::vector<std::string> args{"bench",      "--clickbench",   "--queries", queries,  "--table",
@@ -526,6 +531,20 @@ TEST(RunCommandTest, ExitStatusAndErrors) {
   EXPECT_NE(killed.message().find("was killed"), std::string::npos) << killed.ToString();
   EXPECT_TRUE(RunCommand({"antb1-no-such-program-anywhere"}).IsIOError());
   EXPECT_TRUE(RunCommand({}).IsInvalid());
+}
+
+TEST_F(CliTest, WindowDiagnosticsKeepExitCodes) {
+  for (const auto& [text, code] : std::vector<std::pair<std::string, int>>{
+           {"SELECT COUNT(*) OVER () FROM t", kExitUnsupported},
+           {"SELECT RANK() OVER (ORDER BY EventDate) FROM t LIMIT 0", kExitUnsupported},
+           {"SELECT COUNT(*) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+            kExitUnsupported},
+           {"SELECT COUNT(*) OVER (ORDER BY EventDate) FROM t", kExitUnsupported},
+           {"SELECT RANK(EventDate) OVER () FROM t", kExitQueryError},
+           {"SELECT COUNT(*) OVER (PARTITION EventDate) FROM t", kExitQueryError}}) {
+    const auto result = Invoke({"query", "-c", text, "--table", "t=" + path_});
+    EXPECT_EQ(result.code, code) << text << ": " << result.err;
+  }
 }
 
 }  // namespace

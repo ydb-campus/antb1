@@ -147,10 +147,16 @@ TEST(RunFile, RedactedErrorsPrintOnlyTheKind) {
 
 TEST(RunFile, UnsupportedIsAFailureEvenForStatementError) {
   FakeEngine engine("antb1");
-  engine.Answer("SELECT row_number() OVER () FROM t", std::unexpected(Unsupported()));
+  engine.Answer(
+      "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM t LIMIT 3) AS seed "
+      "UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM countdown",
+      std::unexpected(Unsupported()));
   const auto o = RunText(
-      "statement error\nSELECT row_number() OVER () FROM t\n\nquery I\nSELECT row_number() OVER () "
-      "FROM t\n----\n1\n",
+      "statement error\nWITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM t "
+      "LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM "
+      "countdown\n\nquery I\nWITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM (SELECT * FROM t "
+      "LIMIT 3) AS seed UNION ALL SELECT n - 1 FROM countdown WHERE n > 0) SELECT COUNT(*) FROM "
+      "countdown\n----\n1\n",
       engine);
   EXPECT_EQ(o.stats.failed, 2);
   EXPECT_EQ(o.stats.unsupported, 2);

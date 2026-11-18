@@ -47,7 +47,7 @@ SELECT date_trunc('month', tr_day) AS m, MIN(tr_fare) FROM trips GROUP BY 1 ORDE
   (no data page is read); under `WHERE` it counts the rows the filter selects without copying them.
 - Result names and types follow DuckDB ([Binding](#binding)); values follow the [Semantics](#semantics) below.
 - `--` line comments, `/* block */` comments and one trailing `;` are allowed.
-- SQL outside the grammar (a window function such as `row_number() OVER ()`, `IS TRUE`, other functions, ...) fails
+- SQL outside the grammar (`IS TRUE`, other functions, ...) fails
   with exit code 4 and points at the first unsupported token. A `FROM` list of tables and paths, joined by commas,
   `CROSS JOIN`, `[INNER] JOIN ... ON`, `LEFT [OUTER] JOIN ... ON` or `FULL [OUTER] JOIN ... ON`, with aliases and
   qualified names, is answered. Relations that no join key connects are a cross product
@@ -131,8 +131,8 @@ expand to a sorted file list. All files of a table must have the same schema (di
 
 ## Grammar
 
-The parser accepts this grammar; the binder answers the part of it described below and checks it against the tables,
-and the executor runs it. Keywords are case-insensitive.
+The parser accepts this grammar; the binder checks the subset described below against the tables. Internal window
+binding is available to plan tests, while Session refuses all window execution. Keywords are case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
@@ -143,7 +143,8 @@ query       = [ "WITH" , cte , { "," , cte } ] , primary ,
 primary     = block | "(" , query , ")" ;
 cte         = identifier , [ columns ] , "AS" , "(" , query , ")" ;
 block       = "SELECT" , [ "DISTINCT" ] , select_list , "FROM" , from_list , [ "WHERE" , expr ] ,
-              [ "GROUP" , "BY" , group_item , { "," , group_item } ] , [ "HAVING" , expr ] ;
+              [ "GROUP" , "BY" , group_item , { "," , group_item } ] , [ "HAVING" , expr ] ,
+              [ "WINDOW" , window_def , { "," , window_def } ] ;
 group_item  = expr | grouping ;   (* grouping elements parse, and are refused: see below *)
 grouping    = "(" , ")" | "(" , expr , "," , expr , { "," , expr } , ")"
             | ( "ROLLUP" | "CUBE" ) , "(" , rollup_item , { "," , rollup_item } , ")"
@@ -175,7 +176,7 @@ sum         = sum , ( "+" | "-" ) , product | product ;
 product     = product , ( "*" | "/" | "//" | "%" ) , unary | unary ;
 unary       = "-" , unary | postfix ;
 postfix     = primary , { "::" , type } ;
-primary     = column_ref | literal | "(" , expr , ")" | "(" , query , ")" | agg_call
+primary     = column_ref | literal | "(" , expr , ")" | "(" , query , ")" | agg_call | window_call
             | identifier , "(" , [ expr , { "," , expr } ] , ")"
             | "CASE" , [ expr ] , "WHEN" , expr , "THEN" , ( "NULL" | expr ) ,
               { "WHEN" , expr , "THEN" , ( "NULL" | expr ) } , [ "ELSE" , ( "NULL" | expr ) ] , "END"
@@ -207,8 +208,58 @@ rules) counts one level, as a parenthesis does, unless it stands directly before
 `- -1` as `(1)` and `-(1)` as `((1))`. The canonical form writes an `ON`, `WHERE` or `HAVING` predicate with a
 top-level `OR` without parentheses, so it reads back as it was parsed. Aggregates are allowed in the select list,
 `HAVING` and `ORDER BY`, and cannot be nested; one in `ON`, `WHERE` or `GROUP BY` is a syntax error.
-A nested call is unsupported rather than a syntax error when `OVER` follows the outer call (`SUM(SUM(a)) OVER ()`,
-a window function over an aggregate, as DuckDB takes it).
+A window aggregate may consume an ordinary aggregate (`SUM(SUM(a)) OVER ()`). The inner aggregate belongs to
+the query block; the outer window does not itself make the block aggregate.
+
+### Window syntax and binding (W1)
+
+Window execution is disabled. Parsing, internal binding and executable support are separate contracts:
+
+```ebnf
+window_call = identifier , "(" , [ "ALL" | "DISTINCT" ] ,
+              [ "*" | expr , { "," , expr } ] , ")" ,
+              [ "FILTER" , "(" , "WHERE" , expr , ")" ] ,
+              [ "FROM" , ( "FIRST" | "LAST" ) ] , [ ( "RESPECT" | "IGNORE" ) , "NULLS" ] ,
+              "OVER" , ( identifier | window_spec ) ;
+window_def  = identifier , "AS" , window_spec ;
+window_spec = "(" , [ identifier ] , [ "PARTITION" , "BY" , expr , { "," , expr } ] ,
+              [ "ORDER" , "BY" , order_item , { "," , order_item } ] , [ frame ] , ")" ;
+frame       = ( "ROWS" | "RANGE" | "GROUPS" ) ,
+              ( bound | "BETWEEN" , bound , "AND" , bound ) ,
+              [ "EXCLUDE" , ( "CURRENT ROW" | "GROUP" | "TIES" | "NO OTHERS" ) ] ;
+bound       = "CURRENT ROW" | ( "UNBOUNDED" | expr ) , ( "PRECEDING" | "FOLLOWING" ) ;
+```
+
+`window_call` is an expression in SELECT and final ORDER BY. Modifier eligibility, argument rules and legal frame
+bound combinations further restrict this structure. Window keywords stay contextual, including inherited names
+such as `OVER (rows)`.
+
+| Slice | Parsed structure | Internal binding | Execution owner |
+| --- | --- | --- | --- |
+| W2 | Existing aggregate calls with inline partition expressions and no ordering or frame | Whole-partition WindowNode | W2 |
+| W3 | RANK with inline partition/order expressions and omitted frame | BIGINT WindowNode result | W3 |
+| W4 | Aggregate with explicit ROWS UNBOUNDED PRECEDING, or BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | ROWS-prefix WindowNode | W4 |
+| W5–W7 | Ranking functions, implicit ordered RANGE, named references/definitions and inheritance | Unsupported with owner | W5–W7 |
+| W8a–d | ROWS/RANGE/GROUPS bounds, shorthand/BETWEEN, exclusions | Unsupported with owner | W8a–d |
+| W9a–d | Navigation/value calls, RESPECT/IGNORE NULLS, NTH_VALUE FROM FIRST/LAST | Unsupported with owner | W9a–d |
+| W10a–b | Explicit ALL/DISTINCT and FILTER (WHERE condition) | Unsupported with owner | W10a–b |
+
+Window calls retain their function spelling, quoted names, modifiers, named versus inherited specifications,
+ordering modifiers, frame bounds and source spans. Omitted frames remain omitted. An ordered aggregate with
+an omitted frame belongs to W6 and never becomes a ROWS prefix. Window keys bind as expressions, without final
+ORDER BY alias or ordinal interpretation. Named-window resolution and inheritance remain W7.
+
+The internal stages are input/grouping/HAVING, window inputs, WindowNode, post-window subqueries and consuming
+expressions, then projection/DISTINCT/final ordering/limit. Existing aggregate types and argument rules apply;
+new operand capabilities remain W11. Direct subqueries in window operands/specifications remain W11f and
+correlated compositions remain W11g/SQ17. Windows are barriers to decorrelation and optimizer movement.
+
+Malformed grammar, illegal placement (WHERE, ON, GROUP BY or HAVING), ordinary nested windows, windows inside
+ordinary aggregates, and invalid core arguments are syntax/bind errors (exit 1). Valid deferred constructs are
+Unsupported (exit 4), with their W/WX owner and source span. W12 row-marker/VALUE_OF and W13 pattern constructs
+receive targeted refusals; their detailed grammar is deferred. Optional dialect forms retain WX ownership.
+Every Session query and EXPLAIN mode refuses window constructs after binding and before optimization, including
+unused CTE bodies. There is no execution switch. Workload support remains 84/99 for the queries derived from TPC-DS.
 
 The FROM list is flat ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each item after the first records how it joins
 the items before it. A `JOIN` binds tighter than a comma and associates to the left, as in DuckDB, so `a, b JOIN c ON
@@ -664,7 +715,7 @@ error as in DuckDB), `t.*` inside an expression, `DISTINCT ON`, `ILIKE`, `GLOB`,
 a whole `CASE` value: `THEN NULL`, `ELSE NULL END`, a whole select item of a `UNION ALL` block, and a side of `IS [NOT]
 DISTINCT FROM`), `IS` but `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM` (`IS TRUE`), `ISNULL`, `NOTNULL`, a condition as
 a select item (`SELECT a IS NULL`), `AT TIME
-ZONE`, `||`, window functions, unary `+`, and in casts quoted or qualified type names, type names of several words
+ZONE`, `||`, unary `+`, and in casts quoted or qualified type names, type names of several words
 (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`), array types, `INTERVAL` and `UNION` types and type parameters other
 than integers. After `LIMIT` and `OFFSET`: expressions such as `LIMIT 1 + 1`, `LIMIT '5'` and `LIMIT (5)`, calls and
 typed literals, also of quoted and qualified names of at most three parts (`LIMIT abs(5)`, `LIMIT main.abs(5)`, `LIMIT

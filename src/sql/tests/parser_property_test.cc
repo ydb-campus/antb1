@@ -113,6 +113,15 @@ void CountElement(const GroupingElement& element, const std::string& sql, Counts
   c.parens += element.kind == GroupingElement::Kind::kExpr ? 0U : 1U;
 }
 
+void CountWindow(const WindowSpec& spec, const std::string& sql, Counts& c) {
+  c.parens += spec.kind == WindowSpec::Kind::kNamed ? 0U : 1U;
+  c.commas += Separators(spec.partition_by.size()) + Separators(spec.order_by.size());
+  c.and_count += spec.frame && spec.frame->end ? 1U : 0U;
+  for (const Expr* child : WindowOperands(spec)) {
+    Count(*child, sql, c);
+  }
+}
+
 struct CountOf {
   const std::string& sql;
   Counts& c;
@@ -126,6 +135,19 @@ struct CountOf {
       c.number_literals.push_back(&lit);
     }
     (numeric ? c.numbers : c.strings) += 1;
+  }
+  void operator()(const WindowCall& call) const {
+    ++c.parens;
+    c.stars += call.star ? 1U : 0U;
+    c.commas += Separators(call.args.size());
+    for (const Expr& arg : call.args) {
+      Count(arg, sql, c);
+    }
+    if (call.filter) {
+      ++c.parens;
+      Count(**call.filter, sql, c);
+    }
+    CountWindow(call.specification, sql, c);
   }
   void operator()(const AggregateCall& agg) const {
     ++c.parens;
@@ -238,11 +260,15 @@ void Count(const Expr& expr, const std::string& sql, Counts& c) {
 // nested query and of a column alias list, the commas between CTEs and between column aliases, and
 // a string alias (its last byte a quote).
 void CountStatement(const SelectStatement& stmt, const std::string& sql, Counts& want) {
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
   for (const SetBranch& branch : stmt.set_operation) {
     want.parens += IsNestedQuery(*branch.query) ? 1U : 0U;  // a nested branch's own (ADR 0039)
     CountStatement(*branch.query, sql, want);
+  }
+  want.commas += Separators(stmt.windows.size());
+  for (const auto& window : stmt.windows) {
+    CountWindow(window.specification, sql, want);
   }
   want.numbers += (stmt.limit.has_value() ? 1U : 0U) + (stmt.offset.has_value() ? 1U : 0U);
   want.commas += Separators(stmt.items.size()) + Separators(stmt.order_by.size()) +
@@ -446,6 +472,14 @@ void CheckSpans(const Expr& expr, const std::string& sql) {
       ASSERT_TRUE(text.starts_with(column->qualifier)) << text;
     }
   }
+  if (const auto* call = std::get_if<WindowCall>(&expr)) {
+    ASSERT_TRUE(Within(call->over_span, call->span));
+    ASSERT_TRUE(Within(call->name_span, call->span));
+    ASSERT_TRUE(Within(call->specification.span, call->span));
+    for (const Expr* child : WindowOperands(*call)) {
+      CheckSpans(*child, sql);
+    }
+  }
   if (const auto* binary = std::get_if<BinaryExpr>(&expr)) {
     ASSERT_TRUE(SpanInside(binary->op_span, sql));
     CheckSpans(*binary->left, sql);
@@ -556,8 +590,15 @@ void CheckStatement(const SelectStatement& stmt, const std::string& sql) {
   // A compound (ADR 0036, ADR 0039) holds its branches, two or more, each in the compound's span
   // after the operator that joins it: a block, or a parenthesized query with its own WITH list,
   // compound or tail. Its own block fields are empty.
-  static_assert(kSelectStatementFields == 20, "revisit this walk");
+  static_assert(kSelectStatementFields == 21, "revisit this walk");
   static_assert(kSelectItemKinds == 2, "revisit this walk");
+  for (const auto& window : stmt.windows) {
+    ASSERT_TRUE(Within(window.span, stmt.span));
+    for (const Expr* child : WindowOperands(window.specification)) {
+      CheckSpans(*child, sql);
+    }
+  }
+  ASSERT_TRUE(stmt.windows.empty() || stmt.set_operation.empty());
   ASSERT_NE(stmt.set_operation.size(), 1U) << context;
   ASSERT_EQ(stmt.from.empty(), !stmt.set_operation.empty()) << context;
   // Grouping elements and plain GROUP BY items never mix, and a compound's are its blocks'
@@ -1576,7 +1617,7 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   // the WITH list and the tail, and one or two more follow under random operators, each a random
   // query -- in parentheses when it has a WITH list, a compound or a tail of its own.
   if (blocks > 0 && rng.Percent(15)) {
-    static_assert(kSelectStatementFields == 20, "revisit this walk");
+    static_assert(kSelectStatementFields == 21, "revisit this walk");
     static constexpr auto kOps =
         std::to_array<SetOp>({SetOp::kUnion, SetOp::kIntersect, SetOp::kExcept});
     SelectStatement first;
@@ -1587,6 +1628,7 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
     first.group_by = std::exchange(stmt.group_by, {});
     first.grouping = std::exchange(stmt.grouping, {});
     first.having = std::exchange(stmt.having, {});
+    first.windows = std::exchange(stmt.windows, {});
     stmt.set_operation.push_back(SetBranch{.query = Box<SelectStatement>(std::move(first))});
     for (std::size_t n = 1 + rng.Below(2); n > 0; --n) {
       stmt.set_operation.push_back(
@@ -1772,6 +1814,33 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<LastBlockCase>& param_info) {
       return std::string(param_info.param.name);
     });
+
+TEST(ParserProperty, IndependentWindowGrammar) {
+  constexpr auto kFunctions = std::to_array<std::string_view>(
+      {"SUM(a)", "COUNT(*)", "RANK()", "LEAD(a, 2, b)", "NTH_VALUE(a, 2) FROM LAST",
+       "SUM(DISTINCT a) FILTER (WHERE b > 0)"});
+  constexpr auto kPartitions = std::to_array<std::string_view>(
+      {"", "PARTITION BY a", "PARTITION BY a + 1, CASE WHEN b > 0 THEN a ELSE b END"});
+  constexpr auto kOrders = std::to_array<std::string_view>(
+      {"", "ORDER BY b", "ORDER BY b DESC NULLS FIRST, a ASC NULLS LAST"});
+  constexpr auto kFrames = std::to_array<std::string_view>(
+      {"", "ROWS UNBOUNDED PRECEDING", "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
+       "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+       "GROUPS BETWEEN 1 PRECEDING AND 2 FOLLOWING EXCLUDE TIES",
+       "ROWS CURRENT ROW EXCLUDE NO OTHERS"});
+  for (const auto seed : kSeeds) {
+    Rng rng(seed);
+    for (int i = 0; i < 150; ++i) {
+      const std::string spec =
+          std::format("({} {} {})", rng.Pick(kPartitions), rng.Pick(kOrders), rng.Pick(kFrames));
+      const std::string call = std::string(rng.Pick(kFunctions));
+      const std::string text =
+          rng.Percent(50) ? std::format("SELECT {} OVER {} FROM t", call, spec)
+                          : std::format("SELECT {} OVER w FROM t WINDOW w AS {}", call, spec);
+      ASSERT_NO_FATAL_FAILURE(CheckParse(text)) << seed << ": " << i;
+    }
+  }
+}
 
 }  // namespace
 }  // namespace antb1::sql

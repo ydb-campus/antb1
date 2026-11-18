@@ -188,6 +188,83 @@ struct FunctionCall {
   SourceSpan span;
 };
 
+// Window syntax is preserved independently of the executable subset (ADR 0043).
+enum class WindowQuantifier : std::uint8_t { kOmitted, kAll, kDistinct };
+enum class WindowNullTreatment : std::uint8_t { kOmitted, kRespect, kIgnore };
+enum class WindowDirection : std::uint8_t { kOmitted, kFirst, kLast };
+enum class WindowFrameUnit : std::uint8_t { kRows, kRange, kGroups };
+enum class WindowBoundKind : std::uint8_t {
+  kUnboundedPreceding,
+  kPreceding,
+  kCurrentRow,
+  kFollowing,
+  kUnboundedFollowing
+};
+enum class WindowExclusion : std::uint8_t { kOmitted, kCurrentRow, kGroup, kTies, kNoOthers };
+
+struct WindowBound {
+  WindowBoundKind kind = WindowBoundKind::kCurrentRow;
+  std::optional<Box<Expr>> offset;
+  SourceSpan span;
+};
+
+struct WindowFrame {
+  WindowFrameUnit unit = WindowFrameUnit::kRows;
+  WindowBound start;
+  std::optional<WindowBound> end;  // absent: single-bound spelling
+  WindowExclusion exclusion = WindowExclusion::kOmitted;
+  SourceSpan exclusion_span;
+  SourceSpan span;
+};
+
+struct WindowOrder {
+  Box<Expr> expr;
+  enum class Direction : std::uint8_t { kOmitted, kAsc, kDesc };
+  Direction direction = Direction::kOmitted;
+  enum class Nulls : std::uint8_t { kOmitted, kFirst, kLast };
+  Nulls nulls = Nulls::kOmitted;
+  SourceSpan span;
+};
+
+struct WindowSpec {
+  enum class Kind : std::uint8_t { kInline, kNamed, kInherited };
+  Kind kind = Kind::kInline;
+  std::string name;
+  bool quoted = false;
+  SourceSpan name_span;
+  std::vector<Expr> partition_by;
+  std::vector<WindowOrder> order_by;
+  std::optional<WindowFrame> frame;  // absence is meaningful, never a ROWS prefix
+  SourceSpan span;
+};
+
+struct WindowCall {
+  std::string name;
+  bool quoted = false;
+  std::vector<Expr> args;
+  bool star = false;
+  WindowQuantifier quantifier = WindowQuantifier::kOmitted;
+  SourceSpan quantifier_span;
+  std::optional<Box<Expr>> filter;
+  SourceSpan filter_span;
+  WindowNullTreatment null_treatment = WindowNullTreatment::kOmitted;
+  SourceSpan null_treatment_span;
+  WindowDirection direction = WindowDirection::kOmitted;
+  SourceSpan direction_span;
+  WindowSpec specification;
+  SourceSpan name_span;
+  SourceSpan over_span;
+  SourceSpan span;
+};
+
+struct NamedWindow {
+  std::string name;
+  bool quoted = false;
+  WindowSpec specification;
+  SourceSpan name_span;
+  SourceSpan span;
+};
+
 struct CaseBranch {
   Box<Expr> when;
   Box<Expr> then;
@@ -242,7 +319,7 @@ struct SubqueryExpr {
 
 using ExprNode = std::variant<ColumnRef, Literal, AggregateCall, UnaryExpr, BinaryExpr, LikeExpr,
                               InExpr, BetweenExpr, FunctionCall, CaseExpr, ExtractExpr, CastExpr,
-                              SubqueryExpr, IsNullExpr, DistinctFromExpr>;
+                              SubqueryExpr, IsNullExpr, DistinctFromExpr, WindowCall>;
 
 template <class T>
 concept ExprNodeKind =
@@ -252,7 +329,7 @@ concept ExprNodeKind =
     std::is_same_v<T, BetweenExpr> || std::is_same_v<T, FunctionCall> ||
     std::is_same_v<T, CaseExpr> || std::is_same_v<T, ExtractExpr> || std::is_same_v<T, CastExpr> ||
     std::is_same_v<T, SubqueryExpr> || std::is_same_v<T, IsNullExpr> ||
-    std::is_same_v<T, DistinctFromExpr>;
+    std::is_same_v<T, DistinctFromExpr> || std::is_same_v<T, WindowCall>;
 
 // An expression: a variant of its node kinds (std::get, std::get_if and std::visit apply). It
 // converts only from its node kinds: variant's catch-all converting constructor would make every
@@ -456,12 +533,23 @@ struct SelectStatement {
   // LIMIT and OFFSET belong to the compound. A walk of a statement that reads those fields must
   // also walk the branches (kSelectStatementFields).
   std::vector<SetBranch> set_operation;
+  std::vector<NamedWindow> windows;
 };
 
 // The number of fields of SelectStatement. ast.cc checks it against the struct, and every walk of a
 // statement asserts the number it was written for: a new field fails the build at each of them,
 // which is the only way a walk that forgets it can be found, the compiler checking nothing else.
-inline constexpr std::size_t kSelectStatementFields = 20;
+inline constexpr std::size_t kSelectStatementFields = 21;
+
+// Direct expression children, including frame offsets and FILTER, in source order.
+std::vector<const Expr*> WindowOperands(const WindowSpec& specification);
+std::vector<const Expr*> WindowOperands(const WindowCall& call);
+// Direct children only: a subquery's body belongs to another query block.
+std::vector<const Expr*> ChildExpressions(const Expr& expression);
+std::vector<const Expr*> BlockExpressions(const SelectStatement& statement);
+bool ContainsWindow(const Expr& expression);
+// Includes derived queries, subqueries, set branches and unused CTE bodies.
+std::optional<SourceSpan> WindowSpan(const SelectStatement& statement);
 
 std::string_view ToString(AggKind kind);
 std::string_view ToString(CompareOp op);

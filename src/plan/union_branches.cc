@@ -226,7 +226,7 @@ std::optional<Constant> ConstantColumn(const LogicalNodePtr& node, ColumnId id) 
                              std::is_same_v<T, RowCountNode> || std::is_same_v<T, JoinNode> ||
                              std::is_same_v<T, DependentJoinNode> ||
                              std::is_same_v<T, UnionAllNode> ||
-                             std::is_same_v<T, SetOperationNode>) {
+                             std::is_same_v<T, SetOperationNode> || std::is_same_v<T, WindowNode>) {
           return std::nullopt;
         } else {
           static_assert(false, "a node ConstantColumn does not know whether it keeps a constant");

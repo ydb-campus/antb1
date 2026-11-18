@@ -165,6 +165,17 @@ TEST(UnnestingTest, EveryKindButSemiAntiMarkAndOneRowIsRefused) {
   }
 }
 
+TEST(UnnestingTest, WindowInCorrelatedInputIsAlwaysABarrier) {
+  for (const std::string_view text : {kExists, kNotExists, kScalar}) {
+    const std::string refusal = RefusalOf(text, [](const LogicalNodePtr& root) {
+      return WithRight(root, [](const LogicalNodePtr& input) {
+        return std::make_shared<const LogicalNode>(WindowNode{.input = input});
+      });
+    });
+    EXPECT_NE(refusal.find("W11g/SQ17"), std::string::npos) << refusal;
+  }
+}
+
 // ADR 0041's SQ8: a dependent mark is lifted as a semi join is -- an `=` key, an IS NOT DISTINCT
 // FROM key (NULL-equal), a residual over both sides and an outer-only one (a residual, never a
 // filter on the outer rows, whose marks it would lose), the inner-only conjunct left below -- into

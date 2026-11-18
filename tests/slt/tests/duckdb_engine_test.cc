@@ -107,6 +107,23 @@ TEST_F(DuckDbEngineTest, DecimalTextIsDuckDbsVarcharText) {
   }
 }
 
+TEST_F(DuckDbEngineTest, RecursiveCanaryCountsDownWithinFourRows) {
+  for (const std::size_t rows : {0U, 1U, 2U, 3U, 10U}) {
+    const std::string recursive = std::format(
+        "WITH RECURSIVE countdown(n) AS (SELECT COUNT(*) FROM "
+        "(SELECT * FROM range({}) AS fixture LIMIT 3) AS seed UNION ALL "
+        "SELECT n - 1 FROM countdown WHERE n > 0) ",
+        rows);
+    const auto result = Run(recursive + "SELECT n FROM countdown ORDER BY n DESC");
+    ASSERT_EQ(result.rows.size(), (rows < 3 ? rows : 3) + 1);
+    for (std::size_t i = 0; i < result.rows.size(); ++i) {
+      EXPECT_EQ(result.rows[i], (Row{std::to_string(result.rows.size() - i - 1)}));
+    }
+    EXPECT_EQ(Run(recursive + "SELECT COUNT(*) FROM countdown").rows,
+              Run(recursive + "SELECT MAX(n) + 1 FROM countdown").rows);
+  }
+}
+
 // A directory of its own under TempDir() for each test: ctest runs them in parallel.
 std::filesystem::path TestDir(std::string_view name) {
   const std::filesystem::path dir = std::filesystem::path(::testing::TempDir()) / name;

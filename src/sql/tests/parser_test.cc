@@ -3832,24 +3832,10 @@ INSTANTIATE_TEST_SUITE_P(
                    kUnsupported, 1, "qualified table names are not supported"},
         RejectCase{"UnquotedPath", "SELECT a FROM data^.parquet", kUnsupported, 1,
                    "qualified table names are not supported"},
-        RejectCase{"Window", "SELECT COUNT(*) ^OVER (PARTITION BY a) FROM events", kUnsupported, 4,
-                   "window functions (OVER) are not supported"},
         // A window aggregate over an aggregate is valid DuckDB: unsupported, not a syntax error.
-        RejectCase{"WindowOverAggregate", "SELECT SUM(COUNT(a)) ^OVER () FROM events GROUP BY b",
-                   kUnsupported, 4, "window functions (OVER) are not supported"},
-        RejectCase{"WindowOverAggregateInArithmetic",
-                   "SELECT b, SUM(a) * 100 / SUM(SUM(a)) ^OVER (PARTITION BY b) FROM events GROUP "
-                   "BY b",
-                   kUnsupported, 4, "window functions (OVER) are not supported"},
         RejectCase{"WindowOverAggregateWithUnsupportedArgument",
                    "SELECT SUM(AVG(^DISTINCT a)) OVER () FROM events GROUP BY b", kUnsupported, 8,
-                   "AVG(DISTINCT ...) is not supported (only COUNT(DISTINCT column))"},
-        RejectCase{"WindowOverParenthesizedAggregate",
-                   "SELECT SUM((COUNT(a))) ^OVER () FROM events GROUP BY b", kUnsupported, 4,
-                   "window functions (OVER) are not supported"},
-        RejectCase{"WindowOverNestedAggregateExpression",
-                   "SELECT AVG(1 + SUM(a)) ^OVER (ORDER BY b) FROM events GROUP BY b", kUnsupported,
-                   4, "window functions (OVER) are not supported"},
+                   "W11e: AVG(DISTINCT ...) is not supported (only COUNT(DISTINCT column))"},
         RejectCase{"Filter", "SELECT COUNT(*) ^FILTER (WHERE a = 1) FROM events", kUnsupported, 6,
                    "aggregate FILTER clauses are not supported"},
         // A star stands anywhere among the items, but its modifiers and an alias after it, which
@@ -3906,9 +3892,7 @@ INSTANTIATE_TEST_SUITE_P(
         RejectCase{"Collate", "SELECT a FROM events WHERE a = 'x' ^COLLATE nocase", kUnsupported, 7,
                    "COLLATE is not supported"},
         RejectCase{"Qualify", "SELECT a FROM events ^QUALIFY a = 1", kUnsupported, 7,
-                   "QUALIFY is not supported"},
-        RejectCase{"WindowClause", "SELECT a FROM events ^WINDOW w AS ()", kUnsupported, 6,
-                   "WINDOW is not supported"},
+                   "WX1: QUALIFY is not supported"},
         RejectCase{"Fetch", "SELECT a FROM events ^FETCH FIRST 1 ROWS ONLY", kUnsupported, 5,
                    "FETCH is not supported"},
         RejectCase{"ForUpdate", "SELECT a FROM events ^FOR UPDATE", kUnsupported, 3,
@@ -4266,7 +4250,7 @@ INSTANTIATE_TEST_SUITE_P(
                    "SELECT SUM(^COUNT(a) FROM events WHERE a = 1_000", kSyntax, 5,
                    "aggregate function calls cannot be nested"},
         RejectCase{"WindowInsideAggregate", "SELECT SUM(^COUNT(a) OVER ()) FROM events", kSyntax, 5,
-                   "aggregate function calls cannot be nested"},
+                   "window functions are only allowed in SELECT and ORDER BY"},
         RejectCase{"NestedAggregateBeforeLaterArgument",
                    "SELECT SUM(^COUNT(a)), MAX(b) FROM events", kSyntax, 5,
                    "aggregate function calls cannot be nested"},
@@ -4781,9 +4765,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST(ParserTest, ExactMessages) {
   auto window_function = Parse("SELECT row_number() OVER () FROM events");
-  ASSERT_FALSE(window_function.has_value());
-  EXPECT_EQ(window_function.error().message,
-            "window functions (OVER) are not supported; see docs/sql-subset.md");
+  ASSERT_TRUE(window_function.has_value());
+  EXPECT_TRUE(std::holds_alternative<WindowCall>(*window_function->items.front().expr()));
   auto limit = Parse("SELECT a FROM events LIMIT 9223372036854775808");
   ASSERT_FALSE(limit.has_value());
   EXPECT_EQ(limit.error().message,
@@ -5445,6 +5428,224 @@ TEST(ParserRobustnessTest, EveryByteAloneAndAfterAValidQuery) {
       EXPECT_LE(result.error().span.offset + result.error().span.length, after.size()) << byte;
     }
   }
+}
+
+TEST(WindowSyntax, ConventionalFormsRoundTrip) {
+  constexpr auto kRank =
+      "SELECT RANK() OVER (PARTITION BY CASE WHEN a > 1 THEN b ELSE a END ORDER BY SUM(b) DESC "
+      "NULLS FIRST) FROM t GROUP BY a, b";
+  constexpr auto kRows =
+      "SELECT SUM(a) OVER (ORDER BY b ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t";
+  constexpr auto kRange =
+      "SELECT SUM(a) OVER (RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM t";
+  for (const std::string text :
+       {"SELECT COUNT(*) OVER (PARTITION BY a) FROM events",
+        "SELECT SUM(COUNT(a)) OVER () FROM events GROUP BY b",
+        "SELECT b, SUM(a) * 100 / SUM(SUM(a)) OVER (PARTITION BY b) FROM events GROUP BY b",
+        "SELECT SUM((COUNT(a))) OVER () FROM events GROUP BY b",
+        "SELECT AVG(1 + SUM(a)) OVER (ORDER BY b) FROM events GROUP BY b",
+        "SELECT a FROM events WINDOW w AS ()",
+        kRank,
+        "SELECT SUM(a) OVER (ROWS UNBOUNDED PRECEDING) FROM t",
+        kRows,
+        "SELECT SUM(a) OVER (ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING EXCLUDE NO OTHERS) FROM t",
+        kRange,
+        "SELECT SUM(a) OVER (GROUPS 2 PRECEDING EXCLUDE TIES) FROM t",
+        "SELECT SUM(a) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING EXCLUDE CURRENT ROW) FROM t",
+        "SELECT COUNT(DISTINCT a) FILTER (WHERE b > 1) OVER () FROM t",
+        "SELECT SUM(ALL a) OVER () FROM t",
+        "SELECT LEAD(a, 2, b) RESPECT NULLS OVER (ORDER BY b) FROM t",
+        "SELECT NTH_VALUE(a, 2) FROM LAST IGNORE NULLS OVER (ORDER BY b) FROM t",
+        "SELECT NTH_VALUE(a, 2) FROM FIRST OVER () FROM t",
+        R"(SELECT "SUM"(a) OVER "w" FROM t WINDOW "w" AS (PARTITION BY b))",
+        "SELECT SUM(a) OVER (w ORDER BY b) FROM t WINDOW w AS (PARTITION BY a)",
+        "SELECT RANK() OVER (rows) FROM t WINDOW rows AS ()",
+        "SELECT RANK() OVER (range ORDER BY a) FROM t WINDOW range AS ()",
+        "SELECT RANK() OVER (groups PARTITION BY a) FROM t WINDOW groups AS ()",
+        "SELECT RANK() OVER (partition) FROM t WINDOW partition AS ()",
+        "SELECT RANK() OVER (pattern ORDER BY a) FROM t WINDOW pattern AS ()",
+        "SELECT SUM(a) OVER () FROM t UNION ALL SELECT SUM(a) OVER w FROM t WINDOW w AS ()",
+        "SELECT rows, range, groups, respect, ignore, first, last, filter, partition FROM t"}) {
+    SCOPED_TRACE(text);
+    const auto parsed = Parse(text);
+    ASSERT_TRUE(parsed) << parsed.error().message;
+    const auto again = Parse(ToSql(*parsed));
+    ASSERT_TRUE(again) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*parsed, *again)) << ToSql(*parsed);
+  }
+}
+
+TEST(WindowSyntax, ModifiersStayContextualWithoutOver) {
+  for (const char* text : {"SELECT SUM(a) FROM first", "SELECT SUM(a) FROM last",
+                           "SELECT SUM(a) respect FROM t", "SELECT SUM(a) ignore FROM t"}) {
+    const auto parsed = Parse(text);
+    ASSERT_TRUE(parsed) << text << ": " << parsed.error().message;
+    EXPECT_TRUE(std::holds_alternative<AggregateCall>(*parsed->items.front().expr()));
+    const auto again = Parse(ToSql(*parsed));
+    ASSERT_TRUE(again) << again.error().message;
+    EXPECT_TRUE(EqualIgnoringSpans(*parsed, *again));
+  }
+}
+
+TEST(WindowSyntax, PreservesModifiersAndSpans) {
+  const std::string text =
+      "SELECT SUM(ALL a) FILTER (WHERE b > 0) OVER (ORDER BY b ASC NULLS LAST ROWS UNBOUNDED "
+      "PRECEDING EXCLUDE NO OTHERS) FROM t";
+  const auto parsed = Parse(text);
+  ASSERT_TRUE(parsed) << parsed.error().message;
+  const auto& call = std::get<WindowCall>(*parsed->items.front().expr());
+  EXPECT_EQ(At(text, call.name_span), "SUM");
+  EXPECT_EQ(At(text, call.quantifier_span), "ALL");
+  EXPECT_EQ(At(text, call.filter_span), "FILTER (WHERE b > 0)");
+  EXPECT_EQ(At(text, call.over_span), "OVER");
+  ASSERT_TRUE(call.specification.frame.has_value());
+  const auto frame = call.specification.frame.value_or(WindowFrame{});
+  EXPECT_FALSE(frame.end);
+  EXPECT_EQ(frame.exclusion, WindowExclusion::kNoOthers);
+  auto changed = *parsed;
+  std::get<WindowCall>(*changed.items.front().expr()).specification.order_by[0].direction =
+      WindowOrder::Direction::kOmitted;
+  EXPECT_FALSE(EqualIgnoringSpans(*parsed, changed));
+  changed = *parsed;
+  std::get<WindowCall>(*changed.items.front().expr()).specification.frame.reset();
+  EXPECT_FALSE(EqualIgnoringSpans(*parsed, changed));
+}
+
+TEST(WindowSyntax, EqualityDistinguishesExplicitModifiersAndSpecifications) {
+  for (const auto& [left, right] : std::vector<std::pair<std::string, std::string>>{
+           {"SUM(a) OVER ()", "SUM(ALL a) OVER ()"},
+           {"SUM(ALL a) OVER ()", "SUM(DISTINCT a) OVER ()"},
+           {"SUM(a) OVER ()", "SUM(a) FILTER (WHERE b > 0) OVER ()"},
+           {"SUM(a) FILTER (WHERE b > 0) OVER ()", "SUM(a) FILTER (WHERE b > 1) OVER ()"},
+           {"LEAD(a) OVER ()", "LEAD(a) RESPECT NULLS OVER ()"},
+           {"LEAD(a) RESPECT NULLS OVER ()", "LEAD(a) IGNORE NULLS OVER ()"},
+           {"NTH_VALUE(a, 2) OVER ()", "NTH_VALUE(a, 2) FROM FIRST OVER ()"},
+           {"NTH_VALUE(a, 2) FROM FIRST OVER ()", "NTH_VALUE(a, 2) FROM LAST OVER ()"},
+           {"SUM(a) OVER (ORDER BY b)", "SUM(a) OVER (ORDER BY b NULLS LAST)"},
+           {"SUM(a) OVER (ORDER BY b NULLS FIRST)", "SUM(a) OVER (ORDER BY b NULLS LAST)"},
+           {"SUM(a) OVER w", "SUM(a) OVER (w)"},
+           {"SUM(a) OVER w", "SUM(a) OVER other"},
+           {"SUM(a) OVER (PARTITION BY a)", "SUM(a) OVER (PARTITION BY b)"},
+           {"SUM(a) OVER ()", "SUM(a) OVER (ORDER BY b)"},
+           {"SUM(a) OVER (ROWS 2 PRECEDING)", "SUM(a) OVER (ROWS 3 PRECEDING)"},
+           {"SUM(a) OVER (ROWS 2 PRECEDING)", "SUM(a) OVER (RANGE 2 PRECEDING)"},
+           {"SUM(a) OVER (ROWS UNBOUNDED PRECEDING)",
+            "SUM(a) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"},
+           {"SUM(a) OVER (ROWS CURRENT ROW)", "SUM(a) OVER (ROWS CURRENT ROW EXCLUDE NO OTHERS)"},
+           {"SUM(a) OVER ()", "SUM(b) OVER ()"},
+           {"SUM(a) OVER ()", "\"SUM\"(a) OVER ()"},
+           {"SUM(a) OVER ()", "AVG(a) OVER ()"},
+           {"COUNT(*) OVER ()", "COUNT(a) OVER ()"}}) {
+    const auto a = Parse(std::format("SELECT {} FROM t", left));
+    const auto b = Parse(std::format("SELECT {} FROM t", right));
+    ASSERT_TRUE(a) << left << ": " << a.error().message;
+    ASSERT_TRUE(b) << right << ": " << b.error().message;
+    EXPECT_FALSE(EqualIgnoringSpans(*a, *b)) << left << " versus " << right;
+  }
+}
+
+TEST(WindowSyntax, MalformedStructureAndIllegalPlacement) {
+  for (const char* text :
+       {"SELECT SUM(a) OVER (PARTITION a) FROM t",
+        "SELECT SUM(a) OVER (ORDER a) FROM t",
+        "SELECT SUM(a) OVER (ROWS BETWEEN 1 PRECEDING CURRENT ROW) FROM t",
+        "SELECT SUM(a) OVER (ROWS UNBOUNDED FOLLOWING) FROM t",
+        "SELECT SUM(a) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t",
+        "SELECT SUM(a) OVER (ROWS UNBOUNDED SIDEWAYS) FROM t",
+        "SELECT SUM(a) OVER (ROWS CURRENT TUPLE) FROM t",
+        "SELECT SUM(a) OVER (ROWS 1 + ) FROM t",
+        "SELECT SUM(a) OVER (ROWS 2) FROM t",
+        "SELECT SUM(a) OVER (ROWS BETWEEN 2 PRECEDING AND ) FROM t",
+        "SELECT SUM(a) OVER (ROWS BETWEEN 2 PRECEDING AND UNBOUNDED PRECEDING) FROM t",
+        "SELECT SUM(a) OVER (ROWS 2 FOLLOWING) FROM t",
+        "SELECT SUM(a) OVER (ROWS CURRENT ROW EXCLUDE CURRENT TUPLE) FROM t",
+        "SELECT SUM(a) OVER (ROWS CURRENT ROW EXCLUDE NO ROWS) FROM t",
+        "SELECT SUM(a) OVER 1 FROM t",
+        "SELECT SUM(a) OVER (PARTITION BY ) FROM t",
+        "SELECT SUM(a) OVER (ORDER BY ) FROM t",
+        "SELECT SUM(a) OVER (ORDER BY a UNKNOWN) FROM t",
+        "SELECT SUM(a) OVER (ROWS CURRENT ROW EXCLUDE NOTHING) FROM t",
+        "SELECT SUM(a) OVER (ORDER BY a NULLS MIDDLE) FROM t",
+        "SELECT SUM(a) FILTER (a > 0) OVER () FROM t",
+        "SELECT a FROM t WINDOW w ()",
+        "SELECT COUNT(DISTINCT *) OVER () FROM t",
+        "SELECT COUNT(ALL *) OVER () FROM t",
+        "SELECT SUM(a,) OVER () FROM t",
+        "SELECT SUM(a) FILTER (WHERE ) OVER () FROM t",
+        "SELECT SUM(a) FILTER (WHERE a > 1 EXTRA) OVER () FROM t",
+        "SELECT SUM(a) OVER () FROM t WINDOW w AS w",
+        "SELECT SUM(a) OVER () FROM t WINDOW w ()",
+        "SELECT SUM(a) OVER () FROM t WINDOW 1 AS ()",
+        "SELECT a FROM t WHERE RANK() OVER () > 1",
+        "SELECT a FROM t GROUP BY RANK() OVER ()",
+        "SELECT SUM(RANK() OVER ()) FROM t"}) {
+    SCOPED_TRACE(text);
+    auto parsed = Parse(text);
+    ASSERT_FALSE(parsed);
+    EXPECT_EQ(parsed.error().kind, ParseError::Kind::kSyntax) << parsed.error().message;
+  }
+}
+
+TEST(WindowSyntax, AdvancedOwnersAndDepth) {
+  for (const auto& [text, owner] : std::vector<std::pair<std::string, std::string>>{
+           {"SELECT VALUE_OF(a) OVER () FROM t", "W12"},
+           {"SELECT ROW_NUMBER(BEGIN_FRAME) OVER () FROM t", "W12"},
+           {"SELECT MAX(ROW_NUMBER(BEGIN_FRAME)) OVER () FROM t", "W12"},
+           {"SELECT SUM(NULL) OVER () FROM t", "W11a"},
+           {"SELECT RANK() OVER (ORDER BY TRUE) FROM t", "W11b"},
+           {"SELECT RANK() OVER (ORDER BY a COLLATE x) FROM t", "W11d"},
+           {"SELECT SUM(a) OVER (RANGE INTERVAL '1' DAY PRECEDING) FROM t", "W11c"},
+           {"SELECT SUM(a) OVER (PATTERN (A)) FROM t", "W13"},
+           {"SELECT SUM(a) OVER (PARTITION BY a ORDER BY b ROWS CURRENT ROW PATTERN (A)) FROM t",
+            "W13"},
+           {"SELECT a FROM t QUALIFY a > 1", "WX1"},
+           {"SELECT SUM(a ORDER BY b) OVER () FROM t", "WX2"},
+           {"SELECT FIRST_VALUE(a IGNORE NULLS) OVER () FROM t", "WX4"}}) {
+    auto parsed = Parse(text);
+    ASSERT_FALSE(parsed) << text;
+    EXPECT_EQ(parsed.error().kind, ParseError::Kind::kUnsupported);
+    EXPECT_NE(parsed.error().message.find(owner), std::string::npos);
+  }
+  std::string value = "a";
+  for (std::size_t i = 0; i < kMaxExpressionDepth + 2; ++i) {
+    value = std::format("ABS({})", value);
+  }
+  EXPECT_FALSE(Parse(std::format("SELECT SUM({}) OVER () FROM t", value)));
+  EXPECT_FALSE(Parse(std::format("SELECT SUM(a) OVER (PARTITION BY {}) FROM t", value)));
+  EXPECT_FALSE(Parse(std::format("SELECT a FROM t WINDOW w AS (ORDER BY {})", value)));
+}
+
+TEST(WindowSyntax, LookaheadPreservesConsumedLexerErrors) {
+  for (const char* text : {"SELECT SUM(a + 0x10) FROM t", "SELECT SUM(a + 0x10) OVER () FROM t"}) {
+    auto parsed = Parse(text);
+    ASSERT_FALSE(parsed);
+    EXPECT_EQ(parsed.error().kind, ParseError::Kind::kUnsupported);
+    EXPECT_EQ(parsed.error().span.offset, std::string_view(text).find("0x10"));
+  }
+}
+
+TEST(WindowSyntax, WindowDiscoveryIncludesEveryQueryBlock) {
+  for (const char* text :
+       {"SELECT a FROM t WINDOW w AS (PARTITION BY a ORDER BY b ROWS 2 PRECEDING)",
+        "WITH q AS (SELECT RANK() OVER () FROM t) SELECT a FROM t",
+        "SELECT a FROM t UNION ALL SELECT RANK() OVER () FROM t",
+        "SELECT a FROM (SELECT RANK() OVER () AS a FROM t) q",
+        "SELECT (SELECT RANK() OVER () FROM t) FROM t",
+        "SELECT CASE WHEN a > 0 THEN 1 + RANK() OVER () ELSE 0 END FROM t"}) {
+    const auto parsed = Parse(text);
+    ASSERT_TRUE(parsed) << text << ": " << parsed.error().message;
+    const auto found = WindowSpan(*parsed);
+    ASSERT_TRUE(found.has_value()) << text;
+    const auto span = found.value_or(SourceSpan{});
+    EXPECT_GT(span.length, 0U);
+    EXPECT_LE(span.offset + span.length, std::string_view(text).size());
+    if (!parsed->windows.empty()) {
+      EXPECT_EQ(BlockExpressions(*parsed).size(), 4U);
+    }
+  }
+  const auto plain = Parse("WITH q AS (SELECT a FROM t) SELECT a + 1 FROM q");
+  ASSERT_TRUE(plain);
+  EXPECT_FALSE(WindowSpan(*plain));
 }
 
 }  // namespace

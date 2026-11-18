@@ -26,6 +26,17 @@ ResultSet Result(std::vector<ColumnClass> classes, std::vector<Row> rows) {
 
 std::vector<ColumnClass> TwoInts() { return {ColumnClass::kInteger, ColumnClass::kInteger}; }
 
+TEST(UnlimitedSql, PreservesWindowDefinitionsAndFrames) {
+  const auto query = UnlimitedSql(
+      "SELECT SUM(a) OVER (w ROWS UNBOUNDED PRECEDING) FROM t "
+      "WINDOW w AS (PARTITION BY b ORDER BY a) LIMIT 2");
+  ASSERT_TRUE(query.has_value());
+  const auto sql = query.value_or("");
+  EXPECT_NE(sql.find("ROWS UNBOUNDED PRECEDING"), std::string::npos);
+  EXPECT_NE(sql.find("WINDOW w AS (PARTITION BY b ORDER BY a)"), std::string::npos);
+  EXPECT_EQ(sql.find("LIMIT"), std::string::npos);
+}
+
 TEST(CompareSubset, AnyRowsOfTheUnlimitedAnswerAreRight) {
   const auto unlimited = Result(TwoInts(), {{"1", "10"}, {"2", "20"}, {"3", "30"}, {"3", "30"}});
   const auto oracle = Result(TwoInts(), {{"1", "10"}, {"2", "20"}});

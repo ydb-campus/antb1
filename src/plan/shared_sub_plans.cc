@@ -139,6 +139,11 @@ class Origins {
       Set(node.ids[i], std::format("{}#{}", node.table_name, node.fields[i]));
     }
   }
+  void Define(const WindowNode& node, const LogicalNode& /*at*/) {
+    for (const WindowCall& call : node.calls) {
+      Set(call.id, std::format("window#{}", std::to_underlying(call.id)));
+    }
+  }
   void Define(const ComputeNode& node, const LogicalNode& at);
   void Define(const ProjectNode& node, const LogicalNode& at) {
     for (std::size_t i = 0; i < node.ids.size(); ++i) {
@@ -442,7 +447,7 @@ std::optional<std::string> NodeKey(const LogicalNode& node, const Origins& origi
         } else if constexpr (std::is_same_v<T, SortNode> || std::is_same_v<T, LimitNode> ||
                              std::is_same_v<T, RowCountNode> ||
                              std::is_same_v<T, DependentJoinNode> ||
-                             std::is_same_v<T, GroupingSetsNode>) {
+                             std::is_same_v<T, GroupingSetsNode> || std::is_same_v<T, WindowNode>) {
           // Not shareable, so no sub-plan holding one is a candidate (shared_sub_plans.h).
           return std::nullopt;
         } else {

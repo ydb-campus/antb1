@@ -130,6 +130,18 @@ struct NodeLine {
   std::string operator()(const FilterNode& node) const {
     return "Filter " + Join(node.predicates, PredicateText, " AND ");
   }
+  std::string operator()(const WindowNode& node) const {
+    std::string out = "Window [";
+    for (std::size_t i = 0; i < node.calls.size(); ++i) {
+      const WindowCall& call = node.calls[i];
+      out += (i == 0 ? "" : ", ") + call.name;
+      if (call.frame) {
+        out += *call.frame == WindowCall::Frame::kWholePartition ? " {whole partition}"
+                                                                 : " {ROWS prefix}";
+      }
+    }
+    return out + "]";
+  }
   std::string operator()(const ComputeNode& node) const {
     return "Compute " +
            Join(node.exprs, [](const ExprPtr& e) { return EscapeText(e->name, '\0'); }, ", ");

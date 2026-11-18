@@ -76,6 +76,7 @@ arrow::Result<std::shared_ptr<arrow::Scalar>> DecimalScalar(Int128 value, Logica
 struct NodeNameOf {
   std::string_view operator()(const ScanNode& /*node*/) const { return "Scan"; }
   std::string_view operator()(const FilterNode& /*node*/) const { return "Filter"; }
+  std::string_view operator()(const WindowNode& /*node*/) const { return "Window"; }
   std::string_view operator()(const ComputeNode& /*node*/) const { return "Compute"; }
   std::string_view operator()(const ProjectNode& /*node*/) const { return "Project"; }
   std::string_view operator()(const AggregateNode& /*node*/) const { return "Aggregate"; }
@@ -93,6 +94,7 @@ struct NodeNameOf {
 struct InputsOfNode {
   std::vector<LogicalNodePtr> operator()(const ScanNode& /*node*/) const { return {}; }
   std::vector<LogicalNodePtr> operator()(const FilterNode& node) const { return {node.input}; }
+  std::vector<LogicalNodePtr> operator()(const WindowNode& node) const { return {node.input}; }
   std::vector<LogicalNodePtr> operator()(const ComputeNode& node) const { return {node.input}; }
   std::vector<LogicalNodePtr> operator()(const ProjectNode& node) const { return {node.input}; }
   std::vector<LogicalNodePtr> operator()(const AggregateNode& node) const { return {node.input}; }
@@ -129,6 +131,7 @@ struct WithInputsOfNode {
     return std::make_shared<const LogicalNode>(node);
   }
   LogicalNodePtr operator()(const FilterNode& node) const { return Single(node); }
+  LogicalNodePtr operator()(const WindowNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const ComputeNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const ProjectNode& node) const { return Single(node); }
   LogicalNodePtr operator()(const AggregateNode& node) const { return Single(node); }
@@ -777,6 +780,13 @@ std::vector<ColumnId> JoinIds(JoinKind kind, std::vector<ColumnId> left,
 struct OutputIdsOf {
   std::vector<ColumnId> operator()(const ScanNode& node) const { return node.ids; }
   std::vector<ColumnId> operator()(const FilterNode& node) const { return OutputIds(*node.input); }
+  std::vector<ColumnId> operator()(const WindowNode& node) const {
+    std::vector<ColumnId> ids = OutputIds(*node.input);
+    for (const WindowCall& call : node.calls) {
+      ids.push_back(call.id);
+    }
+    return ids;
+  }
   std::vector<ColumnId> operator()(const ComputeNode& node) const {
     std::vector<ColumnId> ids = OutputIds(*node.input);
     ids.insert(ids.end(), node.ids.begin(), node.ids.end());
@@ -854,6 +864,20 @@ struct IdsOfNode {
     for (const Predicate& predicate : node.predicates) {
       Read(predicate.column);
       Read(predicate.other);
+    }
+  }
+  void operator()(const WindowNode& node) const {
+    for (const WindowCall& call : node.calls) {
+      for (const BoundColumn& arg : call.arguments) {
+        Read(arg);
+      }
+      for (const BoundColumn& key : call.partition_by) {
+        Read(key);
+      }
+      for (const SortKey& key : call.order_by) {
+        Read(key.column);
+      }
+      Define(call.id);
     }
   }
   void operator()(const ComputeNode& node) const {
@@ -1091,6 +1115,28 @@ class Resolver {
       }
     }
     return {.node = changed ? MakeNode(std::move(out)) : self, .ids = std::move(input.ids)};
+  }
+
+  Resolved Visit(const LogicalNodePtr& self, const WindowNode& window) {
+    Resolved input = Walk(window.input);
+    WindowNode out = window;
+    bool changed = input.node != window.input;
+    out.input = input.node;
+    std::vector<ColumnId> ids = input.ids;
+    for (WindowCall& call : out.calls) {
+      for (BoundColumn& arg : call.arguments) {
+        changed = Resolve("Window", arg, input.ids) || changed;
+      }
+      for (BoundColumn& key : call.partition_by) {
+        changed = Resolve("Window", key, input.ids) || changed;
+      }
+      for (SortKey& key : call.order_by) {
+        changed = Resolve("Window", key.column, input.ids) || changed;
+      }
+      Define("Window", call.id);
+      ids.push_back(call.id);
+    }
+    return {.node = changed ? MakeNode(std::move(out)) : self, .ids = std::move(ids)};
   }
 
   Resolved Visit(const LogicalNodePtr& self, const ComputeNode& compute) {
@@ -1544,6 +1590,21 @@ struct FreshIds {
     // Prune records it again for whatever plan the clone ends up in. Nothing clones after Prune
     // today, so this is the hazard the field's own comment names rather than one in flight.
     node.needed_above.reset();
+    return node;
+  }
+  LogicalNode operator()(WindowNode node) const {
+    for (WindowCall& call : node.calls) {
+      for (BoundColumn& arg : call.arguments) {
+        Rename(arg);
+      }
+      for (BoundColumn& key : call.partition_by) {
+        Rename(key);
+      }
+      for (SortKey& key : call.order_by) {
+        Rename(key.column);
+      }
+      call.id = Mint(call.id);
+    }
     return node;
   }
   LogicalNode operator()(ComputeNode node) const {

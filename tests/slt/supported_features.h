@@ -214,15 +214,30 @@ enum class Feature : std::uint8_t {
   kCorrelatedIn,
   // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
   kNestedCorrelation,
+  kWindowWholePartition,  // W2: parsed, execution and independent generator pending
+  kWindowRank,            // W3: parsed, execution and independent generator pending
+  kWindowRowsPrefix,      // W4: parsed, execution and independent generator pending
+  kWindowRanking,         // W5: parsed, execution and independent generator pending
+  kWindowRangePrefix,     // W6: parsed, execution and independent generator pending
+  kWindowNamed,           // W7: parsed, execution and independent generator pending
+  kWindowRows,            // W8a: parsed, execution and independent generator pending
+  kWindowRange,           // W8b: parsed, execution and independent generator pending
+  kWindowGroups,          // W8c: parsed, execution and independent generator pending
+  kWindowExclusion,       // W8d: parsed, execution and independent generator pending
+  kWindowNavigation,      // W9a: parsed, execution and independent generator pending
+  kWindowValue,           // W9b: parsed, execution and independent generator pending
+  kWindowNullTreatment,   // W9c: parsed, execution and independent generator pending
+  kWindowDirection,       // W9d: parsed, execution and independent generator pending
+  kWindowQuantifier,      // W10a: parsed, execution and independent generator pending
+  kWindowFilter,          // W10b: parsed, execution and independent generator pending
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
-  kWindowFunctions,  // f(...) OVER (...), out of scope for good
+  kRecursiveCte,  // WITH RECURSIVE: permanently unsupported canary
 };
 
 // The number of features: the marker is the last one (checked below FeatureName()).
-inline constexpr std::size_t kFeatureCount =
-    static_cast<std::size_t>(Feature::kWindowFunctions) + 1;
+inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(Feature::kRecursiveCte) + 1;
 
 constexpr std::string_view FeatureName(Feature feature) {
   switch (feature) {
@@ -410,8 +425,40 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_in";
     case Feature::kNestedCorrelation:
       return "nested_correlation";
-    case Feature::kWindowFunctions:
-      return "window_functions";
+    case Feature::kWindowWholePartition:
+      return "window_whole_partition";
+    case Feature::kWindowRank:
+      return "window_rank";
+    case Feature::kWindowRowsPrefix:
+      return "window_rows_prefix";
+    case Feature::kWindowRanking:
+      return "window_ranking";
+    case Feature::kWindowRangePrefix:
+      return "window_range_prefix";
+    case Feature::kWindowNamed:
+      return "window_named";
+    case Feature::kWindowRows:
+      return "window_rows";
+    case Feature::kWindowRange:
+      return "window_range";
+    case Feature::kWindowGroups:
+      return "window_groups";
+    case Feature::kWindowExclusion:
+      return "window_exclusion";
+    case Feature::kWindowNavigation:
+      return "window_navigation";
+    case Feature::kWindowValue:
+      return "window_value";
+    case Feature::kWindowNullTreatment:
+      return "window_null_treatment";
+    case Feature::kWindowDirection:
+      return "window_direction";
+    case Feature::kWindowQuantifier:
+      return "window_quantifier";
+    case Feature::kWindowFilter:
+      return "window_filter";
+    case Feature::kRecursiveCte:
+      return "recursive_cte";
   }
   return "?";
 }
@@ -419,7 +466,7 @@ constexpr std::string_view FeatureName(Feature feature) {
 // kFeatureCount counts every Feature: no enumerator follows the marker (the switch above names
 // every enumerator, -Wswitch).
 static_assert(FeatureName(static_cast<Feature>(kFeatureCount)) == "?",
-              "a Feature follows kWindowFunctions: declare new features above the marker");
+              "a Feature follows kRecursiveCte: declare new features above the marker");
 
 // A set of the values 0 .. N - 1 of the feature enum F, one bit each, for any N: FeatureSet below,
 // and a wider enum in tests/supported_features_test.cc. Names() spells a member with
@@ -478,7 +525,7 @@ class BasicFeatureSet {
 using FeatureSet = BasicFeatureSet<Feature, kFeatureCount>;
 
 // Out-of-scope markers, valid in `-- features:` tags and never generated (see the Feature enum).
-inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
+inline constexpr FeatureSet kNeverGenerated = {Feature::kRecursiveCte};
 
 // Grammar the random generator (runner/query_gen.cc) cannot write yet, which a later PR teaches it
 // and then removes from this set. Valid in `-- features:` tags, and never in kSupportedFeatures
@@ -491,7 +538,24 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kWindowFunctions};
 // taught the generator (its ninth stream).
 // ADR 0038's grammar (ADR 0037's RU1) waited here for the PRs that answered it, each teaching the
 // generator its form: ROLLUP in RU3, GROUPING() in RU4, GROUPING SETS in RU5 and CUBE in RU6.
-inline constexpr FeatureSet kGeneratorPending = {};
+inline constexpr FeatureSet kGeneratorPending = {
+    Feature::kWindowWholePartition,  // W2 supplies the independent random stream
+    Feature::kWindowRank,            // W3 supplies the independent random stream
+    Feature::kWindowRowsPrefix,      // W4 supplies the independent random stream
+    Feature::kWindowRanking,         // W5 supplies the independent random stream
+    Feature::kWindowRangePrefix,     // W6 supplies the independent random stream
+    Feature::kWindowNamed,           // W7 supplies the independent random stream
+    Feature::kWindowRows,            // W8a supplies the independent random stream
+    Feature::kWindowRange,           // W8b supplies the independent random stream
+    Feature::kWindowGroups,          // W8c supplies the independent random stream
+    Feature::kWindowExclusion,       // W8d supplies the independent random stream
+    Feature::kWindowNavigation,      // W9a supplies the independent random stream
+    Feature::kWindowValue,           // W9b supplies the independent random stream
+    Feature::kWindowNullTreatment,   // W9c supplies the independent random stream
+    Feature::kWindowDirection,       // W9d supplies the independent random stream
+    Feature::kWindowQuantifier,      // W10a supplies the independent random stream
+    Feature::kWindowFilter,          // W10b supplies the independent random stream
+};
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
 // aggregates, projections, WHERE conjunctions of column <op> literal, ORDER BY, LIMIT and OFFSET)

@@ -25,9 +25,11 @@
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/optimizer.h"
+#include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/sql_status.h"
 #include "antb1/sql/parser.h"
 
+#include "../join_order.h"
 #include "plan_test_util.h"
 
 namespace antb1::plan {
@@ -9340,6 +9342,283 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
                   "t.i32 IN (SELECT ok.i16 FROM ok WHERE ok.i16 = u.i16))",
                   kUnsupported, "IN", "a correlated subquery of IN is not supported"}));
+
+std::vector<const WindowNode*> FindWindows(const LogicalNodePtr& root) {
+  std::vector<const WindowNode*> out;
+  if (const auto* window = std::get_if<WindowNode>(root.get())) {
+    out.push_back(window);
+  }
+  for (const auto& input : InputsOf(*root)) {
+    auto children = FindWindows(input);
+    out.insert(out.end(), children.begin(), children.end());
+  }
+  return out;
+}
+
+TEST(WindowBinding, RawRowsKeepCardinalityAndAggregateTypes) {
+  for (const auto& [call, type] :
+       std::vector<std::pair<std::string, LogicalType>>{{"COUNT(*)", LogicalType::kBigInt},
+                                                        {"COUNT(i16)", LogicalType::kBigInt},
+                                                        {"SUM(i16)", LogicalType::kHugeInt},
+                                                        {"AVG(i16)", LogicalType::kDouble},
+                                                        {"MIN(s)", LogicalType::kVarchar},
+                                                        {"MAX(i32)", LogicalType::kInteger},
+                                                        {"STDDEV_SAMP(i16)", LogicalType::kDouble},
+                                                        {"STDDEV(i16)", LogicalType::kDouble},
+                                                        {"STDDEV_POP(i16)", LogicalType::kDouble},
+                                                        {"VAR_SAMP(i16)", LogicalType::kDouble},
+                                                        {"VARIANCE(i16)", LogicalType::kDouble},
+                                                        {"VAR_POP(i16)", LogicalType::kDouble}}) {
+    for (const std::string spec : {"(PARTITION BY d)", "(ORDER BY i32 ROWS UNBOUNDED PRECEDING)"}) {
+      const std::string text = std::format("SELECT i16, {} OVER {} FROM t", call, spec);
+      auto plan = BindSql(text, MakeCatalog());
+      ASSERT_TRUE(plan.ok()) << text << ": " << plan.status();
+      const auto windows = FindWindows(plan->root);
+      ASSERT_EQ(windows.size(), 1U);
+      ASSERT_EQ(windows[0]->calls.size(), 1U);
+      EXPECT_EQ(plan->output[1].type, type);
+      EXPECT_EQ(EstimateRows(*windows[0]->input), EstimateRows(LogicalNode(*windows[0])));
+      EXPECT_EQ(EstimateRows(LogicalNode(*windows[0])), 100);
+      EXPECT_TRUE(FreeVariables(*plan->root).empty());
+      EXPECT_EQ(windows[0]->calls[0].frame_omitted, !spec.contains("ROWS"));
+    }
+  }
+}
+
+TEST(WindowBinding, GroupedInputsAndStageOrder) {
+  const std::string text =
+      "SELECT SUM(SUM(i16) + 1) OVER (PARTITION BY GROUPING(i32)) + 2, "
+      "RANK() OVER (ORDER BY CASE WHEN SUM(i16) > 0 THEN MAX(i64) ELSE MIN(i64) END) "
+      "FROM t GROUP BY ROLLUP(i32) HAVING COUNT(*) > 0";
+  auto plan = BindSql(text, MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto windows = FindWindows(plan->root);
+  ASSERT_EQ(windows.size(), 1U);
+  ASSERT_EQ(windows[0]->calls.size(), 2U);
+  EXPECT_EQ(windows[0]->calls[0].type, LogicalType::kHugeInt);
+  EXPECT_EQ(windows[0]->calls[1].type, LogicalType::kBigInt);
+  EXPECT_FALSE(windows[0]->calls[1].frame);
+  EXPECT_TRUE(std::holds_alternative<ComputeNode>(*windows[0]->input));
+  const std::string explained = Explain(*plan);
+  EXPECT_NE(explained.find("GroupingSets"), std::string::npos) << explained;
+  EXPECT_NE(explained.find("Filter"), std::string::npos) << explained;
+  EXPECT_LT(explained.find("Window"), explained.find("Filter")) << explained;
+  EXPECT_LT(explained.find("Filter"), explained.find("GroupingSets")) << explained;
+  EXPECT_TRUE(FreeVariables(*plan->root).empty());
+}
+
+TEST(WindowBinding, NumericOrderKeysAreExpressionsRatherThanSelectPositions) {
+  auto plan = BindSql("SELECT i16, RANK() OVER (ORDER BY 1) FROM t", MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  const auto windows = FindWindows(plan->root);
+  ASSERT_EQ(windows.size(), 1U);
+  const auto* compute = std::get_if<ComputeNode>(windows[0]->input.get());
+  ASSERT_NE(compute, nullptr);
+  ASSERT_EQ(compute->exprs.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<ConstantExpr>(compute->exprs[0]->node));
+  EXPECT_EQ(windows[0]->calls[0].order_by[0].column.id, compute->ids[0]);
+}
+
+TEST(WindowBinding, RepeatedHiddenCallsAndQueryBlocks) {
+  for (const char* text :
+       {"SELECT RANK() OVER () + RANK() OVER () AS r FROM t ORDER BY r",
+        "SELECT i16 FROM t ORDER BY RANK() OVER (ORDER BY i32)",
+        "SELECT COUNT(*) FROM t ORDER BY SUM(SUM(i16)) OVER ()",
+        "SELECT COUNT(*) FROM t ORDER BY RANK() OVER (ORDER BY SUM(i16))",
+        "SELECT CASE WHEN RANK() OVER () > 1 THEN i16 ELSE i32 END FROM t",
+        "SELECT x FROM (SELECT SUM(i16) OVER () AS x FROM t) AS q",
+        "WITH q AS (SELECT SUM(i16) OVER () AS x FROM t) SELECT x FROM q",
+        "SELECT SUM(i16) OVER () FROM t UNION ALL SELECT SUM(i16) OVER () FROM u"}) {
+    auto plan = BindSql(text, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << text << ": " << plan.status();
+    auto windows = FindWindows(plan->root);
+    ASSERT_FALSE(windows.empty());
+    for (const auto* window : windows) {
+      EXPECT_EQ(window->calls.size(), 1U);
+    }
+    EXPECT_TRUE(FreeVariables(*plan->root).empty());
+    auto optimized = Optimize(*plan);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+    EXPECT_EQ(FindWindows(optimized->root).size(), windows.size());
+    auto twice = Optimize(*optimized);
+    ASSERT_TRUE(twice.ok()) << twice.status();
+    EXPECT_EQ(Explain(*twice), Explain(*optimized));
+  }
+}
+
+TEST(WindowBinding, SubqueryStagesAreIsolated) {
+  for (const char* text :
+       {"SELECT SUM(i16) OVER () + (SELECT MAX(i16) FROM u) FROM t",
+        "SELECT SUM(i16 + (SELECT MAX(i16) FROM u)), "
+        "SUM(SUM(i16)) OVER () + (SELECT MAX(i16) FROM u) FROM t",
+        "SELECT CASE WHEN (SELECT MAX(i16) FROM u) > 0 THEN RANK() OVER () ELSE 0 END FROM t",
+        "SELECT CASE WHEN RANK() OVER () IN (SELECT i16 FROM u) THEN 1 ELSE 0 END FROM t"}) {
+    auto plan = BindSql(text, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << text << ": " << plan.status();
+    EXPECT_TRUE(FreeVariables(*plan->root).empty());
+    const std::string explained = Explain(*plan);
+    EXPECT_LT(explained.find("Join"), explained.find("Window")) << explained;
+    auto optimized = Optimize(*plan);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+  }
+}
+
+TEST(WindowBinding, GroupKeysMatchTheirPreWindowSubqueryStage) {
+  auto plan = BindSql(
+      "SELECT i16 + (SELECT MAX(i16) FROM u), RANK() OVER () FROM t "
+      "GROUP BY i16 + (SELECT MAX(i16) FROM u)",
+      MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  EXPECT_TRUE(FreeVariables(*plan->root).empty());
+  auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+}
+
+TEST(WindowBinding, OrdinaryAggregateArgumentsKeepTheirInputSubqueryStage) {
+  for (const char* text :
+       {"SELECT SUM(SUM(i16 + (SELECT MAX(i16) FROM u))) OVER () FROM t",
+        "SELECT RANK() OVER (ORDER BY SUM(i16 + (SELECT MAX(i16) FROM u))) FROM t"}) {
+    auto plan = BindSql(text, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << text << ": " << plan.status();
+    EXPECT_TRUE(FreeVariables(*plan->root).empty());
+    const std::string explained = Explain(*plan);
+    EXPECT_LT(explained.find("Window"), explained.find("Aggregate")) << explained;
+    EXPECT_LT(explained.find("Aggregate"), explained.find("Join")) << explained;
+    auto optimized = Optimize(*plan);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+  }
+}
+
+TEST(WindowBinding, HavingAliasRebindsSubqueriesBeforeWindows) {
+  for (const char* text :
+       {"SELECT (SELECT COUNT(*) FROM u) AS n, RANK() OVER () FROM t HAVING n > 0",
+        "SELECT CASE WHEN COUNT(*) IN (SELECT i16 FROM u) THEN 1 ELSE 0 END AS n, "
+        "RANK() OVER () FROM t HAVING n > 0"}) {
+    auto plan = BindSql(text, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << text << ": " << plan.status();
+    EXPECT_TRUE(FreeVariables(*plan->root).empty());
+    const auto windows = FindWindows(plan->root);
+    ASSERT_EQ(windows.size(), 1U);
+    const std::string explained = Explain(*plan);
+    EXPECT_LT(explained.find("Join"), explained.find("Window")) << explained;
+    auto optimized = Optimize(*plan);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+  }
+}
+
+TEST(WindowBinding, InvalidCoreAndDeferredOwners) {
+  for (const auto& [text, owner] : std::vector<std::pair<std::string, std::string>>{
+           {"SELECT SUM(i16) OVER (ORDER BY i32) FROM t", "W6"},
+           {"SELECT RANK() OVER w FROM t WINDOW w AS ()", "W7"},
+           {"SELECT ROW_NUMBER() OVER () FROM t", "W5"},
+           {"SELECT SUM(i16) OVER (ROWS 1 PRECEDING) FROM t", "W8a"},
+           {"SELECT SUM(i16) OVER (RANGE 1 PRECEDING) FROM t", "W8b"},
+           {"SELECT SUM(i16) OVER (GROUPS CURRENT ROW) FROM t", "W8c"},
+           {"SELECT SUM(i16) OVER (ROWS CURRENT ROW EXCLUDE TIES) FROM t", "W8d"},
+           {"SELECT LEAD(i16) OVER () FROM t", "W9a"},
+           {"SELECT FIRST_VALUE(i16) OVER () FROM t", "W9b"},
+           {"SELECT FIRST_VALUE(i16) IGNORE NULLS OVER () FROM t", "W9c"},
+           {"SELECT NTH_VALUE(i16, 2) FROM LAST OVER () FROM t", "W9d"},
+           {"SELECT SUM(ALL i16) OVER () FROM t", "W10a"},
+           {"SELECT SUM(i16) FILTER (WHERE i16 > 0) OVER () FROM t", "W10b"},
+           {"SELECT SUM(1) OVER () FROM t", "W11a"},
+           {"SELECT RANK() OVER (ORDER BY i16 > 0) FROM t", "W11b"},
+           {"SELECT RANK() OVER (PARTITION BY i16 IS NULL) FROM t", "W11b"},
+           {"SELECT RANK() OVER (ORDER BY md5(s)) FROM t", "W11e"},
+           {"SELECT SUM(i16 + (SELECT MAX(i16) FROM u)) OVER () FROM t", "W11f"},
+           {"SELECT SUM(SUM(i16 + (SELECT MAX(u.i16) FROM u WHERE u.i16 = t.i16))) OVER () FROM t",
+            "W11g"},
+           {"SELECT RANK() OVER () + (SELECT MAX(u.i16) FROM u WHERE u.i16 = t.i16) FROM t",
+            "W11g"},
+           {"SELECT i16 FROM t WHERE EXISTS (SELECT SUM(u.i16) OVER () FROM u WHERE u.i16 = t.i16)",
+            "W11g"}}) {
+    auto result = BindSql(text, MakeCatalog());
+    ASSERT_FALSE(result.ok()) << text;
+    const auto detail = GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kUnsupported) << result.status();
+    EXPECT_NE(result.status().message().find(owner), std::string::npos) << result.status();
+  }
+  for (const char* text :
+       {"SELECT RANK(i16) OVER () FROM t", "SELECT SUM(*) OVER () FROM t",
+        "SELECT SUM(s) OVER () FROM t", "SELECT SUM(nope) OVER () FROM t",
+        "SELECT SUM(RANK() OVER ()) OVER () FROM t",
+        "SELECT i16 AS x, RANK() OVER (ORDER BY x) FROM t",
+        "SELECT SUM(i16) OVER () FROM t GROUP BY i32", "SELECT RANK() RESPECT NULLS OVER () FROM t",
+        "SELECT RANK() FILTER (WHERE i16 > 0) OVER () FROM t",
+        "SELECT RANK() OVER () AS w FROM t HAVING w > 0",
+        "SELECT SUM(SUM(i16)) OVER () AS w FROM t HAVING w > 0",
+        "SELECT RANK() OVER () AS w FROM t HAVING w + 1 > 0"}) {
+    auto result = BindSql(text, MakeCatalog());
+    ASSERT_FALSE(result.ok()) << text;
+    const auto detail = GetSqlError(result.status());
+    ASSERT_NE(detail, nullptr);
+    EXPECT_EQ(detail->kind(), kBind) << text << ": " << result.status();
+  }
+}
+
+TEST(WindowBinding, PruningCloningAndPositionRepairRetainCalls) {
+  auto plan =
+      BindSql("SELECT RANK() OVER (PARTITION BY i16 + 1 ORDER BY i32), SUM(i64) OVER () FROM t",
+              MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  ColumnId last = MaxColumnId(*plan->root);
+  auto clone = CloneWithFreshIds(plan->root, last);
+  LogicalPlan copied{.root = clone, .output = plan->output};
+  const auto cloned_ids = OutputIds(*clone);
+  for (std::size_t i = 0; i < copied.output.size(); ++i) {
+    copied.output[i].id = cloned_ids[i];
+  }
+  auto resolved = ResolvePositions(copied);
+  EXPECT_TRUE(FreeVariables(*resolved.root).empty());
+  const auto original_windows = FindWindows(plan->root);
+  const auto cloned_windows = FindWindows(resolved.root);
+  ASSERT_EQ(cloned_windows.size(), 1U);
+  EXPECT_NE(original_windows[0]->calls[0].id, cloned_windows[0]->calls[0].id);
+  auto outer =
+      BindSql("SELECT COUNT(*) FROM (SELECT SUM(i64) OVER () AS x FROM t) AS q", MakeCatalog());
+  ASSERT_TRUE(outer.ok()) << outer.status();
+  auto optimized = Optimize(*outer);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  const auto kept = FindWindows(optimized->root);
+  ASSERT_EQ(kept.size(), 1U);
+  ASSERT_EQ(kept[0]->calls.size(), 1U);
+  EXPECT_EQ(kept[0]->calls[0].arguments[0].index, 0);
+  EXPECT_EQ(OutputIds(*kept[0]->input).size(), 1U);
+}
+
+TEST(WindowBinding, OuterFiltersAndTopNStayAboveWindows) {
+  auto plan = BindSql(
+      "SELECT i16 FROM (SELECT i16, RANK() OVER (ORDER BY i32) AS r FROM t) AS q "
+      "WHERE i16 > 2 ORDER BY i16 LIMIT 2",
+      MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  const std::string explained = Explain(*optimized);
+  EXPECT_LT(explained.find("Filter"), explained.find("Window")) << explained;
+  EXPECT_LT(explained.find("Limit"), explained.find("Window")) << explained;
+  EXPECT_LT(explained.find("Sort"), explained.find("Window")) << explained;
+  const auto windows = FindWindows(optimized->root);
+  ASSERT_EQ(windows.size(), 1U);
+  EXPECT_EQ(EstimateRows(*windows[0]->input), 100);
+}
+
+TEST(WindowBinding, WindowSubplansAreNotSharedAcrossConsumers) {
+  auto plan = BindSql(
+      "WITH q AS (SELECT i16, RANK() OVER (ORDER BY i32) AS r FROM t) "
+      "SELECT a.r, b.r FROM q AS a JOIN q AS b ON a.i16 = b.i16",
+      MakeCatalog());
+  ASSERT_TRUE(plan.ok()) << plan.status();
+  auto optimized = Optimize(*plan);
+  ASSERT_TRUE(optimized.ok()) << optimized.status();
+  EXPECT_EQ(FindWindows(optimized->root).size(), 2U);
+  for (const SharedSubPlan& group : SharedSubPlans(*optimized)) {
+    for (const LogicalNodePtr& member : group.members) {
+      EXPECT_TRUE(FindWindows(member).empty());
+    }
+  }
+}
 
 }  // namespace
 }  // namespace antb1::plan

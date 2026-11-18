@@ -206,17 +206,17 @@ bool ReadsAJoinOrUnion(const LogicalNodePtr& node) {
   return std::ranges::any_of(InputsOf(*node), ReadsAJoinOrUnion);
 }
 
-// Whether a plan holds a Limit, whose clone would be computed twice and could pick other rows
-// among ties (SharedSubPlans shares no sub-plan that holds one, ADR 0030).
-bool HoldsALimit(const LogicalNodePtr& node) {
+// LIMIT and windows can choose different tied rows on a second evaluation; neither may be cloned
+// into an independently evaluated decorrelation domain (ADRs 0030 and 0043).
+bool UnsafeToClone(const LogicalNodePtr& node) {
   if (node == nullptr) {
     return false;
   }
-  if (std::holds_alternative<LimitNode>(*node)) {
+  if (std::holds_alternative<LimitNode>(*node) || std::holds_alternative<WindowNode>(*node)) {
     return true;
   }
   return std::ranges::any_of(InputsOf(*node),
-                             [](const LogicalNodePtr& input) { return HoldsALimit(input); });
+                             [](const LogicalNodePtr& input) { return UnsafeToClone(input); });
 }
 
 // The part of a dependent join's left input that the semi-join reduction clones for its domain, or
@@ -249,7 +249,7 @@ LogicalNodePtr DomainBase(const LogicalNodePtr& outer, const std::vector<ColumnI
       return nullptr;
     }
   }
-  if (node == nullptr || HoldsALimit(node)) {
+  if (node == nullptr || UnsafeToClone(node)) {
     return nullptr;
   }
   const std::vector<ColumnId> outputs = OutputIds(*node);
@@ -557,6 +557,7 @@ struct Descent {
     }
     return Record(mode == Mode::kLift ? Role::kDropped : Role::kMap);
   }
+  Next operator()(const WindowNode& /*window*/) { return Next::kDeclined; }
   Next operator()(const ComputeNode& /*compute*/) {
     if (mode == Mode::kExists) {
       return Record(Role::kMap);
@@ -967,7 +968,7 @@ LogicalNodePtr MembershipNode(const Correlation& correlation, JoinNode join,
   const auto& membership = correlation.join.membership;
   if (!membership.has_value() || join.kind != JoinKind::kAnti || deferred_item != nullptr ||
       join.keys.empty() || !join.residual.empty() || FirstDependentJoin(join.right) != nullptr ||
-      HoldsALimit(join.right) || !FreeVariables(*join.right).empty()) {
+      UnsafeToClone(join.right) || !FreeVariables(*join.right).empty()) {
     AddMembership(correlation.join, join.keys, join.residual, deferred_item);
     return Make(std::move(join));
   }
@@ -1501,7 +1502,7 @@ arrow::Result<LogicalNodePtr> RestrictMembershipInput(
   // Do not recursively clone pending dependent joins (exponential plan growth), free variables,
   // or LIMITs whose independent evaluations can pick other rows.
   if (FirstDependentJoin(outer) != nullptr || !FreeVariables(*outer).empty() ||
-      HoldsALimit(outer)) {
+      UnsafeToClone(outer)) {
     return correlation.Refuse(
         "whose selected or grouped expression needs an exact outer domain over subqueries or "
         "LIMIT");
@@ -2539,6 +2540,9 @@ std::optional<ColumnId> WidenedColumn(const Expr& expr) {
 // instead would incorrectly remove outer rows of NOT EXISTS.
 LogicalNodePtr RewriteOuterMembership(const LogicalNodePtr& node, LogicalNodePtr& outer,
                                       std::span<const KeyParts> equivalents) {
+  if (std::holds_alternative<WindowNode>(*node)) {
+    return node;
+  }
   std::vector<LogicalNodePtr> inputs = InputsOf(*node);
   if (inputs.empty() || std::holds_alternative<UnionAllNode>(*node) ||
       std::holds_alternative<SetOperationNode>(*node)) {
@@ -2624,6 +2628,13 @@ LogicalNodePtr RewriteOuterMembership(const LogicalNodePtr& node, LogicalNodePtr
 arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_id,
                                          int64_t build_side_ratio, std::span<const Ancestor> above,
                                          UnnestReport* report) {
+  const auto holds_window = [](this const auto& self, const LogicalNodePtr& node) -> bool {
+    return std::holds_alternative<WindowNode>(*node) || std::ranges::any_of(InputsOf(*node), self);
+  };
+  if (holds_window(join.right)) {
+    return UnsupportedError("W11g/SQ17: window-containing correlated subplans are not supported",
+                            join.span);
+  }
   const std::optional<Mode> mode = ModeOf(join.kind);
   if (!mode.has_value()) {
     return UnsupportedError("a correlated subquery is not supported", join.span);
