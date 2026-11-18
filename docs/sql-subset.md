@@ -536,13 +536,21 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   columns stays in the subquery when an `IS NOT DISTINCT FROM` correlates one of them (for NULLs it is NULL, not
   true), and a correlated `SUM(x + c)` keeps its form, as in DuckDB (no `COUNT`, below).
   Correlated `IN` and `NOT IN` as conjuncts of `WHERE` or an inner `ON` use the same keyed decorrelation
-  (SQ8c). `IN` is a semi join on the correlation and membership comparison. `NOT IN` is an anti join on the
-  correlation, rejecting an outer row when a surviving inner row matches its probe or either membership value
-  is NULL. An empty set therefore keeps even a NULL probe. The set may project expressions, use `DISTINCT`,
-  group or aggregate, and filter groups with `HAVING`; static aggregates preserve their empty-input row.
-  In a plain set, an item that reads only the enclosing block moves to that side and the membership
-  comparison becomes a residual; it still needs a correlation key. An equality between computed
-  expressions on separate sides can supply that key. Mixed inner/outer select expressions remain SQ10.
+  (SQ8c). `IN` is a semi join on the correlation and membership comparison. `NOT IN` rejects an outer row when
+  a surviving inner row matches its probe or either membership value is NULL. For equality-only correlations,
+  separate hash lookups test membership, NULL items and set existence; additional correlation predicates use
+  candidate-pair residuals. An empty set therefore keeps even a NULL probe. The set may project expressions,
+  use `DISTINCT`, group or aggregate, and filter groups with `HAVING`; static aggregates preserve their empty-input row.
+  In a plain set, an item that reads only the enclosing block is evaluated in the membership residual, after
+  the correlation predicates, so an empty correlated set never evaluates it. A potentially failing inner item
+  is also evaluated after correlation for IN, and after any correlation residuals for NOT IN. Plain NOT IN
+  retains DuckDB's eager evaluation of inner items. Deferred items still need a correlation key.
+  Aggregated sets and DISTINCT IN restrict potentially failing maps to actual outer bindings before evaluating
+  them; DISTINCT NOT IN retains DuckDB's eager evaluation of inner items.
+  When that restriction would clone pending correlated subqueries, free outer references or a LIMIT in the
+  outer input, the query is unsupported (SQ9's general binding domains); a nonthrowing column or exact widening
+  needs no such restriction. An equality between computed expressions on separate sides can supply that key.
+  Mixed inner/outer select expressions remain SQ10.
   A correlated membership predicate under `OR`, `NOT` or `CASE` remains SQ12, and a per-binding `LIMIT` or
   `OFFSET` that selects set values remains SQ14 (`LIMIT 0` is an empty set).
   Every other correlated shape

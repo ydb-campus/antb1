@@ -9271,6 +9271,26 @@ TEST(BinderTest, CorrelatedExistsBlocksBindAndUnnest) {
   }
 }
 
+TEST(BinderTest, CorrelatedMembershipRejectsAPaddedInputBeforeResolvingColumns) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view op : {"IN", "NOT IN"}) {
+    for (const std::string_view key : {"dec.i", "t.i32"}) {
+      const std::string sql = std::format(
+          "SELECT t.i16 FROM dec, t JOIN u ON t.i16 = u.i16 AND t.i32 {} "
+          "(SELECT o.i16 FROM ok o WHERE o.i16 = {}) FULL JOIN ok ON u.i16 = ok.i16",
+          op, key);
+      SCOPED_TRACE(sql);
+      const auto bound = BindSql(sql, catalog);
+      ASSERT_FALSE(bound.ok());
+      const auto detail = GetSqlError(bound.status());
+      ASSERT_NE(detail, nullptr) << bound.status();
+      EXPECT_EQ(detail->kind(), kUnsupported);
+      EXPECT_EQ(SpanText(sql, bound.status()), op);
+      EXPECT_TRUE(bound.status().message().contains("FULL JOIN's left input"));
+    }
+  }
+}
+
 TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
   const Catalog catalog = MakeCatalog();
   constexpr const char* kJoinedMembership =

@@ -6620,6 +6620,11 @@ arrow::Status Binder::BindSubqueryConjunct(const sql::Expr& conjunct, const Subq
 template <class BindFn>
 arrow::Status Binder::JoinSubquery(const sql::Expr& conjunct, const SubqueryConjunct& form,
                                    bool having, const BindFn& bind, SubqueryBlock block) {
+  // Surface references do not include the set's correlations. Every dependent join needs
+  // the same placement check, including membership with a local probe and an outer set.
+  if (block.correlated && padded_unit_.has_value()) {
+    ARROW_RETURN_NOT_OK(AdmitCorrelatedValue(*form.subquery));
+  }
   if (form.exists()) {
     if (block.correlated) {
       RowSlot().emplace_back(SubqueryJoin{.kind = form.negated ? JoinKind::kAnti : JoinKind::kSemi,
