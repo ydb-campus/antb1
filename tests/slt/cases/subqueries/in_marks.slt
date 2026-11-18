@@ -3347,7 +3347,6 @@ BIGINT	HUGEINT
 # A correlated IN set: as a conjunct (SQ8), under OR (SQ12), NOT IN, and correlated on the IN's own pair. Then an IN
 # inside a correlated EXISTS whose probe reads the outer block, as a conjunct and under OR (SQ12).
 
-pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_city = tr_row % 5 + 1)
 ----
@@ -3361,14 +3360,12 @@ SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zo
 BIGINT	HUGEINT
 885	1289652
 
-pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup NOT IN (SELECT zn_id FROM zones WHERE zn_city = tr_row % 5 + 1)
 ----
 BIGINT	HUGEINT
 2468	3745160
 
-pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zones WHERE zn_id = tr_pickup)
 ----

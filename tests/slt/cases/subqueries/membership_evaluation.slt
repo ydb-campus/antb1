@@ -1,0 +1,213 @@
+# Correlated membership: selected values are evaluated only for their bindings.
+
+# IN: outer item over an empty correlated set
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# IN: outer item after a false residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y < 0)
+----
+SMALLINT
+
+# IN: outer item after a NULL residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y = CASE WHEN o.k = 1 THEN NULL ELSE o.y END)
+----
+SMALLINT
+
+# IN: grouped item over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k GROUP BY i.ct_id)
+----
+SMALLINT
+
+# IN: group argument over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k GROUP BY i.ct_id)
+----
+SMALLINT
+
+# IN: grouped item after its correlation filter
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.k < 0 GROUP BY i.ct_id)
+----
+SMALLINT
+
+# IN: static aggregate preserves its empty-input NULL
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# IN: a surviving candidate must still report the outer item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k)
+
+# IN: a surviving candidate must still report the inner item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k)
+
+# IN: a surviving candidate must still report the grouped item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k GROUP BY i.ct_id)
+
+# IN: a surviving candidate must still report the group argument error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = o.k GROUP BY i.ct_id)
+
+# NOT IN: outer item over an empty correlated set
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+1
+
+# NOT IN: outer item after a false residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y < 0)
+----
+SMALLINT
+1
+
+# NOT IN: outer item after a NULL residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y = CASE WHEN o.k = 1 THEN NULL ELSE o.y END)
+----
+SMALLINT
+1
+
+# NOT IN: grouped item over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k GROUP BY i.ct_id)
+----
+SMALLINT
+1
+
+# NOT IN: group argument over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k GROUP BY i.ct_id)
+----
+SMALLINT
+1
+
+# NOT IN: grouped item after its correlation filter
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.k < 0 GROUP BY i.ct_id)
+----
+SMALLINT
+1
+
+# NOT IN: static aggregate preserves its empty-input NULL
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# NOT IN: a surviving candidate must still report the outer item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(o.y AS SMALLINT) FROM cities i WHERE i.ct_id = o.k)
+
+# NOT IN: a surviving candidate must still report the inner item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k)
+
+# NOT IN: a surviving candidate must still report the grouped item error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(MAX(i.ct_id) + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k GROUP BY i.ct_id)
+
+# NOT IN: a surviving candidate must still report the group argument error
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = o.k GROUP BY i.ct_id)
+
+# One correlation bucket with disjoint membership values: no candidate-pair scan.
+query I nosort
+SELECT COUNT(*) FROM riders o WHERE o.rd_row NOT IN (SELECT i.rd_row + 10000 FROM riders i WHERE i.rd_row // 10000 = o.rd_row // 10000)
+----
+BIGINT
+240
+
+# IN: inner selected expression after a false correlation residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y < 0)
+----
+SMALLINT
+
+# IN: inner selected expression after a NULL correlation residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y = CASE WHEN o.k = 1 THEN NULL ELSE o.y END)
+----
+SMALLINT
+
+# NOT IN: inner selected expression after a false correlation residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y < 0)
+----
+SMALLINT
+1
+
+# NOT IN: inner selected expression after a NULL correlation residual
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = o.k AND o.y = CASE WHEN o.k = 1 THEN NULL ELSE o.y END)
+----
+SMALLINT
+1
+
+# Group-domain restriction keeps correlation NULL semantics: =
+query I nosort
+SELECT o.ct_id FROM (SELECT ct_id, CASE WHEN ct_id = 1 THEN NULL ELSE ct_id END AS k FROM cities WHERE ct_id = 1) o WHERE 10 NOT IN (SELECT CAST(MAX(i.v) AS SMALLINT) FROM (SELECT ct_id, CASE WHEN ct_id = 1 THEN NULL ELSE ct_id END AS k, CASE WHEN ct_id = 1 THEN 10 ELSE 40000 END AS v FROM cities) i WHERE i.k = o.k GROUP BY i.ct_id)
+----
+SMALLINT
+1
+
+# Group-domain restriction keeps correlation NULL semantics: IS NOT DISTINCT FROM
+query I nosort
+SELECT o.ct_id FROM (SELECT ct_id, CASE WHEN ct_id = 1 THEN NULL ELSE ct_id END AS k FROM cities WHERE ct_id = 1) o WHERE 10 NOT IN (SELECT CAST(MAX(i.v) AS SMALLINT) FROM (SELECT ct_id, CASE WHEN ct_id = 1 THEN NULL ELSE ct_id END AS k, CASE WHEN ct_id = 1 THEN 10 ELSE 40000 END AS v FROM cities) i WHERE i.k IS NOT DISTINCT FROM o.k GROUP BY i.ct_id)
+----
+SMALLINT
+
+# IN: a matching first item does not hide a later item error
+statement error out of range
+SELECT o.ct_id FROM cities o WHERE o.ct_id = 1 AND 0 IN (SELECT CAST(CASE WHEN i.ct_id = 1 THEN 0 ELSE 40000 END AS SMALLINT) FROM cities i WHERE i.ct_id // 10000 = o.ct_id // 10000 AND o.ct_id > 0)
+
+# NOT IN: a matching first item does not hide a later item error
+statement error out of range
+SELECT o.ct_id FROM cities o WHERE o.ct_id = 1 AND 0 NOT IN (SELECT CAST(CASE WHEN i.ct_id = 1 THEN 0 ELSE 40000 END AS SMALLINT) FROM cities i WHERE i.ct_id // 10000 = o.ct_id // 10000 AND o.ct_id > 0)
+
+# IN: DISTINCT item over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT DISTINCT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# IN: static aggregate argument over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# NOT IN: DISTINCT retains eager inner item evaluation
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT DISTINCT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+
+# NOT IN: static aggregate argument over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT MAX(CAST(i.ct_id + 39999 AS SMALLINT)) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# NOT IN: DISTINCT outer item with a representative keeps eager evaluation
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k, ct_id + 39999 AS y FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT DISTINCT CAST(o.y AS SMALLINT) FROM (SELECT ct_id AS k, ct_id + 39998 AS y FROM cities WHERE ct_id = 2) i WHERE i.k = o.k AND i.y = o.y)
+
+# IN: plain inner item over an absent binding
+query I nosort
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)
+----
+SMALLINT
+
+# NOT IN: plain inner item keeps eager evaluation
+statement error out of range
+SELECT o.k FROM (SELECT ct_id AS k FROM cities WHERE ct_id = 1) o WHERE 0 NOT IN (SELECT CAST(i.ct_id + 39999 AS SMALLINT) FROM cities i WHERE i.ct_id = 2 AND i.ct_id = o.k)

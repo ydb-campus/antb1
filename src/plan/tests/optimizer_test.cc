@@ -446,7 +446,10 @@ struct MapReferences {
     return std::make_shared<const LogicalNode>(std::move(node));
   }
   LogicalNodePtr operator()(DependentJoinNode node) const {
-    // No keys and no residual to map: a dependent join holds only its two inputs.
+    if (node.membership.has_value()) {
+      Column(node.membership->left);
+      Column(node.membership->right);
+    }
     node.left = Map(node.left);
     node.right = Map(node.right);
     return std::make_shared<const LogicalNode>(std::move(node));
@@ -1398,6 +1401,110 @@ TEST(OptimizerTest, Path1PullsACorrelatedEqualityIntoTheJoinKey) {
     // The block's filter and compute are gone; its scan is the join's right input.
     EXPECT_TRUE(std::holds_alternative<ScanNode>(*join->right)) << Explain(plan);
     EXPECT_EQ(PositionMismatch(plan), std::nullopt) << Explain(plan);
+  }
+}
+
+TEST(OptimizerTest, CorrelatedMembershipHashesValuesAndSeparatesNullSemantics) {
+  for (const JoinKind kind : {JoinKind::kSemi, JoinKind::kAnti}) {
+    const JoinKey pair{.left = FieldOf(1, 0), .right = FieldOf(11, 0)};
+    const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+        .kind = kind,
+        .left = FourFields(1),
+        .right = CorrelatedBlock({NotDistinct(FieldOf(11, 1), FieldOf(1, 1))}, 50),
+        .membership = pair})));
+    const auto* join = std::get_if<JoinNode>(plan.root.get());
+    ASSERT_NE(join, nullptr) << Explain(plan);
+    EXPECT_EQ(join->kind, kind);
+    ASSERT_EQ(join->keys.size(), 2U);
+    EXPECT_TRUE(join->keys.front().null_equal);
+    EXPECT_FALSE(join->keys.back().null_equal);
+    EXPECT_TRUE(join->residual.empty());
+    if (kind == JoinKind::kAnti) {
+      const auto* nulls = std::get_if<JoinNode>(join->left.get());
+      ASSERT_NE(nulls, nullptr) << Explain(plan);
+      EXPECT_EQ(nulls->kind, JoinKind::kAnti);
+      EXPECT_EQ(nulls->keys.size(), 1U);
+      EXPECT_EQ(nulls->residual.size(), 1U);
+      const auto* groups = std::get_if<GroupAggregateNode>(nulls->right.get());
+      ASSERT_NE(groups, nullptr) << Explain(plan);
+      EXPECT_EQ(groups->keys.size(), 1U);
+      ASSERT_EQ(groups->aggregates.size(), 2U);
+      EXPECT_EQ(groups->aggregates[0].kind, AggKind::kCountStar);
+      EXPECT_EQ(groups->aggregates[1].kind, AggKind::kCount);
+    }
+    EXPECT_TRUE(FreeVariables(*plan.root).empty());
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+  }
+}
+
+TEST(OptimizerTest, CorrelatedMembershipKeepsResidualCorrelations) {
+  const JoinKey pair{.left = FieldOf(1, 0), .right = FieldOf(11, 0)};
+  const LogicalPlan plan = Optimized(PlanOver(Node(DependentJoinNode{
+      .kind = JoinKind::kAnti,
+      .left = FourFields(1),
+      .right = CorrelatedBlock({NotDistinct(FieldOf(11, 1), FieldOf(1, 1)),
+                                Compare(FieldOf(11, 2), FieldOf(1, 2), CompareOp::kLt)},
+                               50),
+      .membership = pair})));
+  const auto* join = std::get_if<JoinNode>(plan.root.get());
+  ASSERT_NE(join, nullptr) << Explain(plan);
+  EXPECT_EQ(join->keys.size(), 1U);
+  ASSERT_EQ(join->residual.size(), 2U);
+  const auto* membership = std::get_if<BoolExpr>(&join->residual.back()->node);
+  ASSERT_NE(membership, nullptr);
+  EXPECT_EQ(membership->op, BoolOp::kOr);
+  EXPECT_EQ(membership->args.size(), 3U);
+  EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+}
+
+TEST(OptimizerTest, CorrelatedMembershipRefusesUnimplementedShapes) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16 FROM t WHERE i32 IN (SELECT t.i64 FROM u)",
+        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE u.i64 < t.i64)",
+        "SELECT i16 FROM t WHERE i32 IN (SELECT i16 FROM u WHERE u.i64 = t.i64 LIMIT 1)",
+        "SELECT i16 FROM t WHERE i32 NOT IN (SELECT i16 FROM u WHERE u.i64 = t.i64 OFFSET 1)"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok());
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << optimized.status();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+    EXPECT_FALSE(testing::SpanText(sql, optimized.status()).empty());
+  }
+}
+
+TEST(OptimizerTest, RiskyMembershipRequiresAnExactBoundedDomain) {
+  const Catalog catalog = MakeCatalog();
+  for (const std::string_view outer :
+       {"FROM t WHERE EXISTS (SELECT 1 FROM ok WHERE ok.i16 = t.i16) AND ",
+        "FROM (SELECT i16, i32 FROM t LIMIT 1) t WHERE "}) {
+    for (const bool grouped : {false, true}) {
+      for (const bool risky : {false, true}) {
+        const std::string_view risky_item =
+            grouped ? "CAST(MAX(u.i64) AS SMALLINT)" : "MAX(CAST(u.i64 AS SMALLINT))";
+        const std::string sql = std::format(
+            "SELECT t.i16 {} t.i32 IN (SELECT {} FROM u WHERE u.i16 = t.i16 {})", outer,
+            risky ? risky_item : "MAX(CAST(u.i16 AS BIGINT))", grouped ? "GROUP BY u.i16" : "");
+        SCOPED_TRACE(sql);
+        const auto bound = BindSql(sql, catalog);
+        ASSERT_TRUE(bound.ok()) << bound.status();
+        const auto optimized = Optimize(*bound);
+        if (!risky) {
+          ASSERT_TRUE(optimized.ok()) << optimized.status();
+          EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+          continue;
+        }
+        ASSERT_FALSE(optimized.ok());
+        const auto detail = GetSqlError(optimized.status());
+        ASSERT_NE(detail, nullptr) << optimized.status();
+        EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+        EXPECT_EQ(testing::SpanText(sql, optimized.status()), "IN");
+        EXPECT_TRUE(optimized.status().message().contains("exact outer domain"));
+      }
+    }
   }
 }
 

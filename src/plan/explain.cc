@@ -206,6 +206,10 @@ struct NodeLine {
     // No build= and no keys=: a dependent join has neither (ADR 0023). Only the plan tests see
     // this line, since Optimize replaces every dependent join or rejects the query.
     std::string line = std::format("DependentJoin {}", ToString(node.kind));
+    if (node.membership.has_value()) {
+      line += std::format(" membership=[{} = {}]", ColumnName(node.membership->left),
+                          ColumnName(node.membership->right));
+    }
     if (node.mark != kNoColumnId) {
       line += std::format(" mark=#{}", std::to_underlying(node.mark));
     }

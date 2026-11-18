@@ -489,8 +489,8 @@ TEST_F(SessionTest, UnsupportedAndBindErrorsKeepTheirKinds) {
   EXPECT_EQ(Rows(*count), (std::vector<std::vector<std::string>>{{"10"}}));
 }
 
-// A correlated subquery exits 4 from every entry point, not 1 and not 70 (ADR 0023's U1). Before
-// Optimize could fail, only Execute rejected what the optimizer rejects; now `explain` and
+// An unsupported correlation exits 4 from every entry point, not 1 and not 70 (ADR 0023's U1).
+// Before Optimize could fail, only Execute rejected what the optimizer rejects; now `explain` and
 // `explain --analyze` reject exactly what `query` does, since all three bind and optimize through
 // one path.
 TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
@@ -503,7 +503,7 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
            "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
            "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID < t.AdvEngineID)",
            // The shapes the binder itself rejects, each with its own rule.
-           "SELECT COUNT(*) FROM t WHERE AdvEngineID IN "
+           "SELECT COUNT(*) FROM t WHERE AdvEngineID > 0 OR AdvEngineID IN "
            "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
            "SELECT COUNT(*) FROM t WHERE AdvEngineID IN (SELECT t.AdvEngineID FROM u)",
            // A lateral reference: the derived table's enclosing scope is the FROM items before it,
@@ -530,6 +530,10 @@ TEST_F(SessionTest, CorrelatedSubqueriesAreUnsupportedInEveryEntryPoint) {
         "(SELECT COUNT(*) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE AdvEngineID = "
         "(SELECT MIN(u.AdvEngineID) FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+        "SELECT COUNT(*) FROM t WHERE AdvEngineID IN "
+        "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
+        "SELECT COUNT(*) FROM t WHERE AdvEngineID NOT IN "
+        "(SELECT u.AdvEngineID FROM u WHERE u.AdvEngineID = t.AdvEngineID)",
         "SELECT COUNT(*) FROM t WHERE EXISTS "
         "(SELECT * FROM u WHERE u.AdvEngineID = t.AdvEngineID)"}) {
     EXPECT_TRUE(session->Execute(answered).ok()) << answered;
