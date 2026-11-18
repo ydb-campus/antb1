@@ -1950,10 +1950,12 @@ fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data a
 `tpcds.status.sf1.1of8` to `8of8` and `parallel.tpcds.status.sf0_1` enforce the ratchet. For a query that does not
 pass, the last column lists every construct it needs that antb1 does not answer yet, in the order of
 [ADR 0037](adr/0037-tpcds-roadmap.md)'s Plan, from that ADR's survey of 2026-10-31. In parentheses is the id of the Plan
-item that completes the query: the one that answers the last of them. A query that needs window functions names
-phase 9 instead, whose PRs the window ADR will number. The subquery items (SQ) and the subquery constructs listed
-below are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose phase 8 order the Plan
-follows.
+item that completes the query: the one that answers the last of them. The window items (W) are those of
+[ADR 0043](adr/0043-window-functions.md) (2026-11-18): W2 completes six queries, W3 eight and W4 one, after W1
+prepares the canary and frontend. Their implementation starts after that ADR merges; the design alone changes no
+supported syntax or pass status. ADR 0043 separately lists the broader Standard SQL window backlog. The subquery
+items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose phase 8 order the Plan
+follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
@@ -1968,7 +1970,7 @@ follows.
 | Q9 | pass | scalar subqueries in a select list's CASE (SQ2a) |
 | Q10 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
 | Q11 | pass | `UNION ALL` (ADR 0036) |
-| Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q13 | pass | answered when the ratchet was added |
 | Q14 | pass | scalar subqueries that select a CTE's column (SQ4a) |
 | Q15 | pass | answered when the ratchet was added |
@@ -1976,7 +1978,7 @@ follows.
 | Q17 | pass | stddev_samp (AG2) |
 | Q18 | pass | ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
-| Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q21 | pass | a quotient of literals folded into DOUBLE (CT4) |
 | Q22 | pass | ROLLUP (RU3) |
 | Q23 | pass | `*` next to other select items |
@@ -1992,7 +1994,7 @@ follows.
 | Q33 | pass | `UNION ALL` (ADR 0036) |
 | Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q35 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
-| Q36 | unsupported | needs rank() and window partition expressions (phase 9) |
+| Q36 | unsupported | needs rank() and window partition expressions (W3) |
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | pass | `INTERSECT` (X4c) |
 | Q39 | pass | stddev_samp (AG2) |
@@ -2000,33 +2002,33 @@ follows.
 | Q41 | pass | a correlated COUNT subquery, joined back LEFT where its comparison can pass 0 (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q44 | unsupported | needs scalar subqueries that are not aggregates, scalar subqueries inside a condition and rank() (phase 9) |
+| Q44 | unsupported | needs rank() (W3) |
 | Q45 | pass | an IN subquery under OR, through a null-aware mark join (SQ7a) |
 | Q46 | pass | constant integer expressions in IN lists |
-| Q47 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
+| Q47 | unsupported | needs window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs rank() (phase 9) |
+| Q49 | unsupported | needs rank() (W3) |
 | Q50 | pass | answered when the ratchet was added |
-| Q51 | unsupported | needs running window aggregates and windows over aggregates (phase 9); its `FULL OUTER JOIN` is answered (OJ3) |
+| Q51 | unsupported | needs running window aggregates with a ROWS frame from unbounded preceding to current row, and windows over aggregates (W4) |
 | Q52 | pass | answered when the ratchet was added |
-| Q53 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q53 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q54 | pass | scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | pass | `UNION ALL` (ADR 0036) |
-| Q57 | unsupported | needs abs, window aggregates over whole partitions, rank() and windows over aggregates (phase 9) |
+| Q57 | unsupported | needs window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
 | Q58 | pass | scalar subqueries that are not aggregates (SQ4a) |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | pass | CAST to DECIMAL(p,s) (CT2) |
 | Q62 | pass | `*` next to other select items |
-| Q63 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q63 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | pass | `UNION ALL` (ADR 0036) |
-| Q67 | unsupported | needs rank() (phase 9) |
+| Q67 | unsupported | needs rank() (W3) |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
-| Q70 | unsupported | needs rank(), windows over aggregates and window partition expressions (phase 9) |
+| Q70 | unsupported | needs rank(), window ordering over aggregates and window partition expressions (W3) |
 | Q71 | pass | `UNION ALL` (ADR 0036) |
 | Q72 | pass | DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
@@ -2042,10 +2044,10 @@ follows.
 | Q83 | pass | answered when the ratchet was added |
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
-| Q86 | unsupported | needs rank(), windows over aggregates and window partition expressions (phase 9) |
+| Q86 | unsupported | needs rank(), window ordering over aggregates and window partition expressions (W3) |
 | Q87 | pass | `EXCEPT` (X4d) |
 | Q88 | pass | cross products of one-row inputs |
-| Q89 | unsupported | needs abs, window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q89 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
@@ -2054,7 +2056,7 @@ follows.
 | Q95 | pass | answered when the ratchet was added |
 | Q96 | pass | answered when the ratchet was added |
 | Q97 | pass | `FULL OUTER JOIN` (OJ3) |
-| Q98 | unsupported | needs window aggregates over whole partitions and windows over aggregates (phase 9) |
+| Q98 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
 | Q99 | pass | lower (FN4) |
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as

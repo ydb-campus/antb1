@@ -62,6 +62,12 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    phase 8): last among the phases that complete queries. Phase 10, full decorrelation
    ([ADR 0041](0041-subqueries-and-decorrelation.md)), follows them and completes none of the 99 (the phase 8 update
    below).
+   Update (2026-11-18, phase 9): [ADR 0043](0043-window-functions.md) separates W1-W4, which complete the 99,
+   from W5-W13, its explicit backlog for Standard SQL windows and their prerequisites. ADR 0043 must merge before
+   window implementation starts. W1 replaces the pending canary with recursive CTEs before any window is answered;
+   W2-W4 complete the queries. The broader backlog does not gate phase 10 as a whole: SQ14 needs W5's ROW_NUMBER,
+   and SQ17 needs the window core and W10b, with its integration recorded by W11g. The phase 9 update below
+   records the scope and dependencies.
 5. **Every PR of the Plan** builds one feature, with:
    - `.slt` records completed from DuckDB, with result type names where a type is decided (HC2). Update
      (2026-11-01, HC2): every query record carries the type names of its result, so any change of a result type
@@ -104,6 +110,8 @@ it, in the ADR that deferred it or in a new one, and this ADR is accepted when t
    Update (2026-11-10, phase 8): SQ3 goes, absorbed into SQ4a; SQ4 becomes SQ4a in phase 8 and SQ4b in phase 10; SQ0
    is new; SQ9 to SQ17 name phase 10's items; and PF16 is a guard
    ([ADR 0041](0041-subqueries-and-decorrelation.md)).
+   Update (2026-11-18, phase 9): W1-W4 name the query-completing phase; W5-W13 and their subdivisions name the
+   broader backlog in [ADR 0043](0043-window-functions.md), with no additional query completions.
 
 ## Consequences
 
@@ -195,8 +203,11 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ5a | Correlated aggregates as values in any expression of a condition of WHERE or an inner ON, under the consumer proof, whose walk passes the conditions and joins between | 6 | Built |
 | SQ5b | Correlated aggregates as values in select items, ORDER BY, GROUP BY keys and aggregate arguments, planted in the slot's tail | | Built |
 | SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Built (SQ8a: EXISTS marks under OR, NOT and CASE; SQ8b: grouping, HAVING, DISTINCT, static aggregates and LIMIT/OFFSET inside EXISTS; SQ8c: correlated IN/NOT IN conjuncts and nested correlated predicates) |
-| **Phase 9** | **Window functions** | | |
-| W1, W2, … | An ADR of their own decides their scope and design, numbers their PRs and names the permanent canary that replaces `kWindowFunctions` | 12, 20, 36, 44, 47, 49, 51, 53, 57, 63, 67, 70, 86, 89, 98 | Planned |
+| **Phase 9** | **Window functions: the query-completing phase ([ADR 0043](0043-window-functions.md); implementation starts after that ADR merges)** | | |
+| W1 | Replace `kWindowFunctions` with the recursive-CTE pending canary; window syntax, AST and binding stages, with unsupported execution slices named by their W items; no window is answered yet | | Planned |
+| W2 | Existing non-DISTINCT aggregates over unordered whole partitions, including windows over a grouped block's aggregates; ratchet 90 | 12, 20, 53, 63, 89, 98 | Planned |
+| W3 | RANK with partition and ordering expressions, including grouped aggregates and GROUPING(); ratchet 98 | 36, 44, 47, 49, 57, 67, 70, 86 | Planned |
+| W4 | Running aggregates with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW; ratchet 99 | 51 | Planned |
 | **Phase 10** | **Full decorrelation ([ADR 0041](0041-subqueries-and-decorrelation.md)), of which phase 8 is a subset; the ids name items, not yet an order (the phase 8 update below)** | | |
 | SQ4b | The single join, `kSingle`: correlated scalar subqueries that are not aggregates, grouped ones included, checked per probe row (needs SQ0 and SQ8) | | Planned |
 | SQ9 | The domain D, the unnesting's second terminal step, for correlations that substitution cannot express: relational division (a double NOT EXISTS, or NOT EXISTS over an EXCEPT whose left arm is uncorrelated), non-equality and OR correlations below an aggregate, outer columns inside an aggregate's argument, references two blocks out that the middle block does not equate, and the input that reads no outer column of a join that must be unnested on both inputs (needs SQ0) | | Planned |
@@ -204,10 +215,10 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ11 | Keyless semi, anti and mark joins, amending [ADR 0040](0040-nested-loop-joins.md)'s decision 3: correlated EXISTS, NOT EXISTS, IN and NOT IN whose correlation has no equality (needs SQ8) | | Planned |
 | SQ12 | Correlated marks: correlated IN, NOT IN, `= ANY` and `<> ALL` under OR, NOT or CASE, three-valued, with per-binding NULL and empty flags (needs SQ8) | | Planned |
 | SQ13 | Correlation above an aggregation: free variables remapped to the GROUP BY or grouping-sets output, NULL where rolled up; correlated subqueries in HAVING and in a grouped block's select list; an aggregate of the enclosing block inside a subquery that stands in the enclosing HAVING or select list; DuckDB's bind error for one in a subquery's HAVING where the subquery stands in the enclosing WHERE, ON or GROUP BY (needs SQ0 and SQ5) | | Planned |
-| SQ14 | Per-binding LIMIT and OFFSET, a ROW_NUMBER partitioned by the representatives (needs phase 9, and SQ9 for an ORDER BY over an outer column without an equivalent) | | Planned |
+| SQ14 | Per-binding LIMIT and OFFSET, a ROW_NUMBER partitioned by the representatives (needs W5 of [ADR 0043](0043-window-functions.md), and SQ9 for an ORDER BY over an outer column without an equivalent) | | Planned |
 | SQ15 | Set operations with correlated arms: an uncorrelated right arm of EXCEPT or INTERSECT without D, a UNION arm through D or a decomposition (needs SQ9) | | Planned |
 | SQ16 | Grouping sets that mix `()` with other sets inside a correlated block, with GROUPING()'s empty value (needs SQ4b and SQ6) | | Planned |
-| SQ17 | Correlated values in an aggregate's FILTER clause and in window arguments (needs phase 9, and FILTER itself) | | Planned |
+| SQ17 | Correlated values in an aggregate's FILTER clause and in window arguments (needs the window core and W10b of [ADR 0043](0043-window-functions.md); W11g records the integration obligations) | | Planned |
 | **Guards** | **Pulled in front of the PR they protect when the budget gate or their own trigger (the updates below) fires** | | |
 | PF2 | Filters into derived tables and CTE references: through their Projects, GROUP BY keys and inner joins to the scan of the relation that defines the column | | Conditional |
 | PF3 | LEFT JOIN as INNER or anti join where WHERE rejects the padded rows | | Conditional |
@@ -932,6 +943,26 @@ correlated predicates whose containing conjunct also reads its enclosing block, 
 sets whose conjunct probe reads only that enclosing block. No additional query is completed, so the ratchet
 stays at 84. Keyless correlations, correlation above the enclosing aggregation, and other
 phase 10 shapes retain their existing roadmap items.
+
+Update (2026-11-18, phase 9): [ADR 0043](0043-window-functions.md), requested ahead of implementation, replaces
+the phase 9 placeholder with W1-W4. Phase 8 is complete after SQ8c's membership and nested-predicate changes; the
+ratchet remains at 84. The new ADR is a separate documentation commit and must merge before W1 implementation.
+
+- **Query completion.** W1 changes the canary and prepares the frontend, completing no query. W2 answers unordered
+  whole-partition windows and completes six queries, bringing the ratchet to 90. W3 adds RANK and completes eight,
+  bringing it to 98. W4 adds the running ROWS frame and completes Q51, bringing it to 99. Each count is a future
+  ratchet step, conditional on the existing oracle and SF 1 budget gates; this design changes no pass status.
+- **The canary.** W1 replaces `kWindowFunctions` with `kRecursiveCte`, using genuinely recursive, bounded queries
+  over synthetic fixtures in every pending-canary path. The marker remains unsupported and never generated.
+  The current canary stays in place until that implementation.
+- **Beyond the 99.** ADR 0043 contains the complete W5-W13 backlog, including general features needed by Standard
+  SQL windows, advanced standard features whose designs are deferred, and separately identified optional dialect
+  extensions. Those items complete no additional query of this workload. They are not a second prerequisite for
+  phase 10 as a whole; SQ14 specifically waits for W5's ROW_NUMBER, and SQ17 for the window core and W10b's FILTER.
+  W11g records SQ17's integration obligations rather than adding another prerequisite to it. Their detailed
+  dependencies and completion criteria stay in ADR 0043.
+- **Existing decisions.** The ordered phase boundary, data policy, ratchet, budget gates and open decision about
+  CL1/CL2 remain. No existing ADR changes status.
 
 ## Alternatives considered
 
