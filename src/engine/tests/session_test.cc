@@ -847,6 +847,9 @@ TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* text :
        {"SELECT COUNT(*) OVER () FROM t", "SELECT RANK() OVER () FROM t LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
+        "SELECT COUNT(*) FROM t ORDER BY COUNT(*) OVER () LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()",
         "SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
         "SELECT COUNT(*) FROM (SELECT COUNT(*) OVER () AS x FROM t) AS q",
         "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT COUNT(*) OVER () FROM t)",

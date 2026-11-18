@@ -9446,6 +9446,33 @@ TEST(WindowBinding, RepeatedHiddenCallsAndQueryBlocks) {
   }
 }
 
+TEST(WindowBinding, HiddenWindowsRestoreGlobalAggregateProjection) {
+  for (const char* call :
+       {"RANK() OVER ()", "COUNT(*) OVER ()", "SUM(COUNT(*)) OVER ()",
+        "RANK() OVER (PARTITION BY 1 ORDER BY 2)", "COUNT(*) OVER (ROWS UNBOUNDED PRECEDING)"}) {
+    const auto text = std::format("SELECT COUNT(*) FROM t ORDER BY {}", call);
+    SCOPED_TRACE(text);
+    auto plan = BindSql(text, MakeCatalog());
+    ASSERT_TRUE(plan.ok()) << plan.status();
+    ASSERT_EQ(plan->output.size(), 1U);
+    EXPECT_EQ(plan->output[0].type, LogicalType::kBigInt);
+    EXPECT_EQ(OutputIds(*plan->root), (std::vector<ColumnId>{plan->output[0].id}));
+    EXPECT_EQ(PositionMismatch(*plan), std::nullopt);
+    EXPECT_TRUE(std::holds_alternative<ProjectNode>(*plan->root));
+    const auto windows = FindWindows(plan->root);
+    ASSERT_EQ(windows.size(), 1U);
+    EXPECT_EQ(windows[0]->calls.size(), 1U);
+    EXPECT_EQ(EstimateRows(*plan->root), 1);
+    EXPECT_TRUE(FreeVariables(*plan->root).empty());
+    auto optimized = Optimize(*plan);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+    ASSERT_EQ(optimized->output.size(), 1U);
+    EXPECT_EQ(OutputIds(*optimized->root), (std::vector<ColumnId>{optimized->output[0].id}));
+    EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+    EXPECT_EQ(FindWindows(optimized->root).size(), 1U);
+  }
+}
+
 TEST(WindowBinding, SubqueryStagesAreIsolated) {
   for (const char* text :
        {"SELECT SUM(i16) OVER () + (SELECT MAX(i16) FROM u) FROM t",

@@ -9167,9 +9167,9 @@ LogicalPlan Binder::Assemble() {
       above();
       // A Project restores the select list when the Aggregate's output is not it (constants,
       // expressions, hidden aggregates, or columns computed for HAVING -- its own, or a subquery
-      // conjunct's probe cast).
+      // conjunct's probe cast -- or appended by the window stage).
       if (!select_.constants.empty() || !select_.exprs.empty() || hidden || !post_exprs_.empty() ||
-          !having_exprs_.empty() || having_join_columns) {
+          !having_exprs_.empty() || having_join_columns || !windows_.empty()) {
         project([](ColumnId column) { return column; });
       } else {
         for (std::size_t i = 0; i < select_.items.size(); ++i) {
