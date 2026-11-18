@@ -2520,9 +2520,9 @@ TEST(QueryGenerator, CorrelatedSubqueriesChangeOnlyCorrelatedQueries) {
 // What it writes: both polarities, a qualified key on each side, the inner table named and never
 // the outer binding's name, and an optional non-equality over the same pair.
 TEST(QueryGenerator, CorrelatedExistsWritesAKeyAndAnOptionalResidual) {
-  const FeatureSet plain =
-      Union(kSupportedFeatures, {Feature::kCorrelatedExists})
-          .Minus({Feature::kLayout, Feature::kKeywordCase, Feature::kCorrelatedIn});
+  const FeatureSet plain = Union(kSupportedFeatures, {Feature::kCorrelatedExists})
+                               .Minus({Feature::kLayout, Feature::kKeywordCase,
+                                       Feature::kCorrelatedIn, Feature::kNestedCorrelation});
   const auto gen = MakeOver(JoinTables(), 71, {.supported = plain, .target_percent = 0});
   int exists = 0;
   int negated = 0;
@@ -5809,6 +5809,30 @@ void CheckMarkCall(const sql::AggregateCall& call, const sql::SelectStatement& s
       name = call.kind == sql::AggKind::kMin ? "min" : "max";
       return;
   }
+}
+
+TEST(QueryGenerator, NestedCorrelationsHaveThreeQueryBlocks) {
+  const auto gen =
+      MakeOver(JoinTables(), 71, {.supported = kSupportedFeatures, .target_percent = 0});
+  int nested = 0;
+  for (uint64_t i = 0; i < 4000; ++i) {
+    const auto q = gen.Generate(i);
+    if (!q.features.Has(Feature::kNestedCorrelation)) {
+      continue;
+    }
+    ++nested;
+    SCOPED_TRACE(q.sql);
+    EXPECT_TRUE(q.features.Has(Feature::kCorrelatedExists));
+    EXPECT_TRUE(q.features.Has(Feature::kBooleanExpressions));
+    const auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    std::vector<const sql::SubqueryExpr*> blocks;
+    DeepSubqueries(*parsed, blocks);
+    ASSERT_EQ(blocks.size(), 2U);
+    EXPECT_FALSE(blocks.front()->query->where.empty());
+    EXPECT_FALSE(blocks.back()->query->where.empty());
+  }
+  EXPECT_GT(nested, 10);
 }
 
 TEST(QueryGenerator, CorrelatedMembershipDrawsBothPolarities) {

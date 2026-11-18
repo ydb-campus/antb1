@@ -3301,7 +3301,10 @@ class Binder {
   // a WHERE operand (`where`) before the WHERE filter on computed columns, anything else after it,
   // so that it is computed only for the rows WHERE keeps.
   BoundColumn InputColumn(const Typed& t, bool where = false) {
-    if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node)) {
+    // An enclosing membership mark may move to the dependent join's outer input. Keep a definition
+    // in the correlated layer so the conjunct extractor can read it as an outer-only condition.
+    if (const auto* column = std::get_if<ColumnExpr>(&t.expr->node);
+        column != nullptr && (!in_correlated_ || !outer_membership_conjunct_)) {
       // A binding's column is named as declared; a computed column (a select item) by its
       // expression.
       const std::optional<ColumnLocation> location = scope_.Find(column->id);
@@ -3795,9 +3798,8 @@ class Binder {
   void TakeFromTail(BoundValue& known, bool group);
   // Whether a GROUP BY key reads `value`'s column.
   [[nodiscard]] bool KeyReads(const Typed& value) const;
-  // Where a correlated value may stand (ADR 0041's SQ5): OK, or the refusal of this place -- a
-  // padded unit's left input, a conjunct that reads an enclosing block itself, or an EXISTS (a
-  // mark, SQ8).
+  // Where a correlated value or EXISTS mark may stand (ADR 0041's SQ5 and SQ8): OK, or the
+  // refusal of a place inside a padded unit's left input.
   [[nodiscard]] arrow::Status AdmitCorrelatedValue(const sql::SubqueryExpr& s) const;
   // An IN subquery inside a condition (ADR 0041's SQ7): the BOOLEAN column of a null-aware mark
   // join of its probe and its set, in HAVING's slot (`group`) or else the per-row slot, bound once
@@ -4140,6 +4142,7 @@ class Binder {
   // declaring one, so a name found there is a lateral reference and exits 4 (ADR 0022).
   bool outer_encloses_ = false;
   bool in_correlated_ = false;  // a correlated conjunct is binding: see InputColumn
+  bool outer_membership_conjunct_ = false;
   bool membership_block_ = false;
   // The EXISTS conjunct this block is bound for, if any. ADR 0023's Path 1 and ADR 0041's
   // uncorrelated EXISTS drop its select list, so a star here, `*` or `t.*`, is checked by name (ADR
@@ -6994,16 +6997,13 @@ arrow::Status Binder::AdmitCorrelatedValue(const sql::SubqueryExpr& s) const {
   // A correlated value stands where ADR 0041's consumer proof answers it, and a correlated EXISTS's
   // mark wherever such a value does (SQ8a): in any clause below the block's aggregation (SQ5a,
   // SQ5b; above it BindSubqueryBlock refuses both, SQ13), but never inside a padded unit's left
-  // input, nor in a conjunct that reads an enclosing block itself.
+  // input. Nested values and marks bind to this block; their containing conjunct may also
+  // read its enclosing block (SQ8c).
   std::string message;
   if (padded_unit_.has_value()) {
     message = std::format(
         "a correlated subquery in the ON of a join inside a {} JOIN's left input is not supported",
         ToString(units_[*padded_unit_].kind));
-  } else if (in_correlated_) {
-    message =
-        "a correlated subquery in a conjunct that also reads a column of an enclosing query block "
-        "is not supported";
   } else {
     return arrow::Status::OK();
   }
@@ -7186,7 +7186,7 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   ANTB1_CHECK(s.operand.has_value());  // the parser writes no kIn node without one
   const sql::Expr& operand = **s.operand;
   const auto outer_probe = [&] -> arrow::Status {
-    if (!ReadsOuterColumn(operand, visible_)) {
+    if (!ReadsOuterColumn(operand, visible_) || outer_membership_conjunct_) {
       return arrow::Status::OK();
     }
     // Its mark would stand below the correlated filter with the probe's free variable on its outer
@@ -7203,6 +7203,20 @@ arrow::Result<Typed> Binder::MarkValue(const sql::SubqueryExpr& s, const BindFn&
   ARROW_ASSIGN_OR_RAISE(const Typed probe, bind(operand));
   if (aggregate) {
     ARROW_RETURN_NOT_OK(outer_probe());
+  }
+  if (outer_membership_conjunct_) {
+    if (HoldsSubquery(operand)) {
+      return Reject(Rejection{.span = s.op_span,
+                              .message = "an IN subquery probe containing another subquery is not "
+                                         "supported"});
+    }
+    std::vector<ColumnId> reads;
+    CollectColumnIds(*probe.expr, reads);
+    if (std::ranges::any_of(reads, [this](ColumnId id) { return scope_.Find(id).has_value(); })) {
+      return Reject(Rejection{.span = s.op_span,
+                              .message = "an IN subquery probe mixing inner and enclosing columns "
+                                         "is not supported"});
+    }
   }
   sql::SubqueryExpr written = s;
   written.negated = false;
@@ -7376,15 +7390,6 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
   if (in && ContainsAggregate(*form->other)) {
     ARROW_RETURN_NOT_OK(BindInput(*form->other).status());
   }
-  // An IN whose probe reads a column of an enclosing block: its semi join would stand above this
-  // block's joins with the probe's free variable on its outer side, which neither unnesting path of
-  // ADR 0023 takes.
-  if (in && outer) {
-    return Reject(Rejection{
-        .span = form->subquery->op_span,
-        .message = "an IN subquery whose probe reads a column of an enclosing query block is not "
-                   "supported"});
-  }
   // A conjunct that reads the enclosing block goes above every join of the block, which a unit
   // that pads its join (an inner join inside a FULL JOIN's left input) must not have above it.
   if (outer && padded_unit_.has_value()) {
@@ -7402,7 +7407,10 @@ arrow::Status Binder::BindRowConjunct(const sql::Expr& conjunct, SourceSpan elem
   // their joins in the block's slot, below that filter, which reads them as a Path 1 or Path 2
   // residual does (ADR 0041's decision 8), whole: a BETWEEN with a subquery bound is not split.
   if (outer) {
-    return BindCorrelatedConjunct(conjunct);
+    outer_membership_conjunct_ = in;
+    const arrow::Status status = BindCorrelatedConjunct(conjunct);
+    outer_membership_conjunct_ = false;
+    return status;
   }
   // An IN subquery conjunct becomes a semi or null-aware anti join in the per-row slot.
   if (in) {

@@ -3372,7 +3372,6 @@ SELECT COUNT(*), SUM(tr_row) FROM trips WHERE tr_pickup IN (SELECT zn_id FROM zo
 BIGINT	HUGEINT
 2793	4187379
 
-pending SQ8
 query II rowsort
 SELECT COUNT(*), SUM(tr_row) FROM trips WHERE EXISTS (SELECT 1 FROM zones WHERE zn_id = tr_pickup AND tr_dropoff IN (SELECT zn_id FROM zones WHERE zn_city = 1))
 ----

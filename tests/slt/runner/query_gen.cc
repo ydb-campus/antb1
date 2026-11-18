@@ -2945,6 +2945,44 @@ class Builder {
       Symbol(corr_rng_.Pick(kResidualOps));
       OuterColumn(c);
     }
+    if (!membership && allowed_.Has(Feature::kNestedCorrelation) &&
+        allowed_.Has(Feature::kBooleanExpressions) && allowed_.Has(Feature::kCompareColumns) &&
+        c.outer->table->name != c.inner->name && corr_rng_.Percent(25)) {
+      const Literal literal = MakeLiteral(corr_rng_, *c.outer_key);
+      if (allowed_.Contains(literal.features)) {
+        used_.Add(Feature::kNestedCorrelation);
+        used_.Add(Feature::kBooleanExpressions);
+        used_.Add(Feature::kCompareColumns);
+        used_.Add(literal.features);
+        const auto nested_key = [&] {
+          tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer->table->name});
+          Symbol(".");
+          tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer_key->name});
+        };
+        Keyword("AND");
+        Symbol("(");
+        Keyword("EXISTS");
+        Symbol("(");
+        Keyword("SELECT");
+        Symbol("*");
+        Keyword("FROM");
+        tokens_.push_back({.kind = Token::Kind::kIdentifier, .text = c.outer->table->name});
+        Keyword("WHERE");
+        nested_key();
+        Symbol("=");
+        InnerColumn(c, *c.inner_key);
+        Keyword("AND");
+        nested_key();
+        Symbol(">");
+        Emit(literal.tokens);
+        Symbol(")");
+        Keyword("OR");
+        OuterColumn(c);
+        Symbol("<");
+        InnerColumn(c, *c.inner_key);
+        Symbol(")");
+      }
+    }
     Symbol(")");
   }
 

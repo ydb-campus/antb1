@@ -2497,8 +2497,127 @@ arrow::Result<Rewritten> MembershipJoin(const Correlation& correlation) {
   return GroupedExistence(correlation, *spine);
 }
 
+// Same-type keys in this block's own correlated filter may replace an enclosing probe below
+// that filter. A nested join's keys or a padded join's ON would not establish that equivalence.
+std::vector<KeyParts> MembershipEquivalents(const LogicalNodePtr& right,
+                                            const std::set<ColumnId>& outer) {
+  LogicalNodePtr declined;
+  const std::optional<Spine> spine = Descend(Mode::kExists, right, &declined, outer);
+  std::vector<KeyParts> keys;
+  if (!spine.has_value()) {
+    return keys;
+  }
+  for (const Predicate& predicate : spine->filter->predicates) {
+    const ExprPtr* expr =
+        predicate.column.has_value() ? DefinedBy(*spine->computed, predicate.column->id) : nullptr;
+    if (expr != nullptr) {
+      if (const auto key = AsKey(**expr, outer);
+          key.has_value() && key->inner_type == key->outer_type) {
+        keys.push_back(*key);
+      }
+    }
+  }
+  return keys;
+}
+
+// Substitution also evaluates the probe on inner keys with no matching outer row. Only a column
+// and exact widening casts are safe there; an arbitrary cast or arithmetic could newly fail.
+std::optional<ColumnId> WidenedColumn(const Expr& expr) {
+  if (const auto* column = std::get_if<ColumnExpr>(&expr.node)) {
+    return column->id;
+  }
+  if (const auto* cast = std::get_if<CastExpr>(&expr.node);
+      cast != nullptr && IsExactWidening(cast->operand->type, expr.type)) {
+    return WidenedColumn(*cast->operand);
+  }
+  return std::nullopt;
+}
+
+// Keep an enclosing probe's mark in this block when a same-type key represents its column;
+// grouping and OFFSET then consume the ordinary inner mark. Otherwise compute the three-valued
+// mark on the enclosing rows, and let the correlated filter consume it. Moving a semi/anti filter
+// instead would incorrectly remove outer rows of NOT EXISTS.
+LogicalNodePtr RewriteOuterMembership(const LogicalNodePtr& node, LogicalNodePtr& outer,
+                                      std::span<const KeyParts> equivalents) {
+  std::vector<LogicalNodePtr> inputs = InputsOf(*node);
+  if (inputs.empty() || std::holds_alternative<UnionAllNode>(*node) ||
+      std::holds_alternative<SetOperationNode>(*node)) {
+    return node;
+  }
+  if (const auto* join = std::get_if<JoinNode>(node.get());
+      join != nullptr && Traits(join->kind).pads_left) {
+    return node;
+  }
+  const LogicalNodePtr rewritten = RewriteOuterMembership(inputs.front(), outer, equivalents);
+  LogicalNodePtr current = node;
+  if (rewritten != inputs.front()) {
+    inputs.front() = rewritten;
+    current = WithInputs(*node, std::move(inputs));
+  }
+  const auto* join = std::get_if<JoinNode>(current.get());
+  if (join == nullptr || join->kind != JoinKind::kNullAwareMark || join->keys.size() != 1 ||
+      !join->residual.empty() || !FreeVariables(*join->right).empty()) {
+    return current;
+  }
+  const ColumnId probe = join->keys.front().left.id;
+  std::vector<ColumnId> available = OutputIds(*outer);
+  const std::set<ColumnId> outer_ids(available.begin(), available.end());
+  LogicalNodePtr inner = join->left;
+  const auto* compute = std::get_if<ComputeNode>(inner.get());
+  const ExprPtr* defined = compute == nullptr ? nullptr : DefinedBy(*compute, probe);
+  const ExprPtr expr = outer_ids.contains(probe) ? ColumnValue(join->keys.front().left)
+                                                 : (defined == nullptr ? nullptr : *defined);
+  if (expr == nullptr || !SidesOf(*expr, outer_ids).outer_only()) {
+    return current;
+  }
+  if (const std::optional<ColumnId> column = WidenedColumn(*expr)) {
+    const std::vector<ColumnId> inner_ids =
+        OutputIds(*(defined == nullptr ? inner : compute->input));
+    const auto equivalent = std::ranges::find_if(equivalents, [&](const KeyParts& key) {
+      return key.outer.id == *column &&
+             std::ranges::find(inner_ids, key.inner.id) != inner_ids.end();
+    });
+    if (equivalent != equivalents.end()) {
+      JoinNode kept = *join;
+      if (defined == nullptr) {
+        kept.keys.front().left.id = equivalent->inner.id;
+      } else {
+        ComputeNode mapped = *compute;
+        const auto at = std::ranges::find(mapped.ids, probe);
+        mapped.exprs.at(Narrow<std::size_t>(at - mapped.ids.begin())) =
+            MapColumns(expr, [&](ColumnExpr read) {
+              if (read.id == *column) {
+                read.id = equivalent->inner.id;
+              }
+              return read;
+            });
+        kept.left = Make(std::move(mapped));
+      }
+      return Make(std::move(kept));
+    }
+  }
+  // InKeys emits one Compute for a cast or expression probe. Move only the definition read by
+  // this mark; other definitions in that layer keep their own input and evaluation place.
+  if (!outer_ids.contains(probe)) {
+    ComputeNode kept = *compute;
+    const auto at = std::ranges::find(kept.ids, probe);
+    const auto index = at - kept.ids.begin();
+    kept.ids.erase(at);
+    kept.exprs.erase(kept.exprs.begin() + index);
+    outer = Make(ComputeNode{
+        .input = std::move(outer), .exprs = {expr}, .ids = {probe}, .span = compute->span});
+    inner = kept.exprs.empty() ? kept.input : Make(std::move(kept));
+  }
+  JoinNode lifted = *join;
+  lifted.left = std::move(outer);
+  lifted.estimate = EstimateRows(*lifted.left);
+  lifted.needed_above.clear();
+  outer = Make(std::move(lifted));
+  return inner;
+}
+
 // The dependent join's rule: its mode, the descent, the mode's rewrite, then Lemma 3.1's check.
-arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId& last_id,
+arrow::Result<LogicalNodePtr> UnnestJoin(DependentJoinNode join, ColumnId& last_id,
                                          int64_t build_side_ratio, std::span<const Ancestor> above,
                                          UnnestReport* report) {
   const std::optional<Mode> mode = ModeOf(join.kind);
@@ -2511,6 +2630,10 @@ arrow::Result<LogicalNodePtr> UnnestJoin(const DependentJoinNode& join, ColumnId
         std::format("the unnesting pass met a {} dependent join {} a mark", ToString(join.kind),
                     join.mark == kNoColumnId ? "without" : "with"));
   }
+  const std::vector<ColumnId> initial_ids = OutputIds(*join.left);
+  const std::vector<KeyParts> equivalents =
+      MembershipEquivalents(join.right, std::set<ColumnId>(initial_ids.begin(), initial_ids.end()));
+  join.right = RewriteOuterMembership(join.right, join.left, equivalents);
   const std::vector<ColumnId> outer_ids = OutputIds(*join.left);
   const Correlation correlation{.join = join,
                                 .mode = *mode,

@@ -1333,35 +1333,7 @@ INSTANTIATE_TEST_SUITE_P(
                   kBind, "MAX(u.i16)", "aggregate function calls cannot be nested"},
         ErrorCase{"SELECT (SELECT COUNT(*) FROM u WHERE u.i32 < SUM(1)) FROM t", kBind, "SUM(1)",
                   "WHERE clause cannot contain aggregates!"},
-        // An IN conjunct whose probe reads an enclosing block's column: its semi join would stand
-        // above this block's joins with the probe's free variable on its outer side, which neither
-        // unnesting path of ADR 0023 takes (a value in such a conjunct is a residual: ADR 0041's
-        // decision 8, ValuePlacements).
-        ErrorCase{"SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE "
-                  "t.i64 IN (SELECT ok.i16 FROM ok))",
-                  kUnsupported, "IN",
-                  "an IN subquery whose probe reads a column of an enclosing query block"},
-        // A correlated subquery in a conjunct that reads the enclosing block itself (decision 8
-        // answers an uncorrelated value there; SQ8), and a correlated value inside a FULL JOIN's
-        // left input, each named for what refuses it. A value of the block remembered from an
-        // earlier conjunct does not carry the conjunct past the first refusal (ADR 0041's SQ5).
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 > "
-                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
-                  kUnsupported, "(",
-                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
-                  "query block is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
-                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16) > 0 AND t.i32 > "
-                  "(SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
-                  kUnsupported, "(",
-                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
-                  "query block is not supported"},
-        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
-                  "COALESCE((SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16), 0) >= 0 AND "
-                  "t.i32 > (SELECT MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
-                  kUnsupported, "(",
-                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
-                  "query block is not supported"},
+        // A correlated value inside a FULL JOIN's left input remains unsupported.
         ErrorCase{"SELECT t.i16 FROM t JOIN u ON t.i16 = u.i16 AND u.i32 > (SELECT MIN(dec.i) FROM "
                   "dec WHERE dec.i = u.i32) + 1 FULL JOIN ok ON u.i16 = ok.i16",
                   kUnsupported, "(",
@@ -8733,9 +8705,8 @@ TEST(BinderTest, CorrelatedSelectValuePlacements) {
 }
 
 // What SQ5b leaves refused, and the errors that come first: a correlated value above the
-// aggregation (SQ13), a GROUP BY key spelled otherwise among them (D38); a value in a conjunct that
-// reads an enclosing block itself; and the bind errors of a later clause, which come before the
-// unnesting's refusal of an item's subquery.
+// aggregation (SQ13), a GROUP BY key spelled otherwise among them (D38); the bind errors of a
+// later clause come before the unnesting's refusal of an item's subquery.
 INSTANTIATE_TEST_SUITE_P(
     CorrelatedSelectValues, BindErrorTest,
     ::testing::Values(
@@ -8750,12 +8721,6 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16 % 2, SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t "
                   "GROUP BY 1 HAVING (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64) > 0",
                   kUnsupported, "(", "a correlated subquery in HAVING is not supported"},
-        ErrorCase{"SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16)) "
-                  "FROM u WHERE u.i64 = t.i64 AND (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16) > "
-                  "t.i32) FROM t",
-                  kUnsupported, "(",
-                  "a correlated subquery in a conjunct that also reads a column of an enclosing "
-                  "query block is not supported"},
         ErrorCase{
             "SELECT SUM(i32 * (SELECT COUNT(*) FROM u WHERE u.i64 = t.i64)) FROM t WHERE nope "
             "> 0",
@@ -9214,7 +9179,7 @@ TEST(BinderTest, TheGroupBySpeculationReadsAKeysMark) {
 }
 
 // What SQ8b leaves refused, each in its words: a mark in
-// HAVING or over the block's aggregates (SQ13), in a conjunct that reads an enclosing block (SQ8c),
+// HAVING or over the block's aggregates (SQ13),
 // inside a padded unit's ON, keyless (SQ11, the unnesting's refusal), in a LEFT JOIN's ON and as a
 // BOOLEAN value (decision 3).
 INSTANTIATE_TEST_SUITE_P(
@@ -9223,12 +9188,6 @@ INSTANTIATE_TEST_SUITE_P(
         ErrorCase{"SELECT i16, COUNT(*) FROM t GROUP BY i16 HAVING COUNT(*) > 1 OR EXISTS (SELECT "
                   "1 FROM u WHERE u.i16 = t.i16)",
                   kUnsupported, "EXISTS", "EXISTS in HAVING is not supported"},
-        ErrorCase{
-            "SELECT i16 FROM ok WHERE EXISTS (SELECT 1 FROM t WHERE t.i16 = ok.i16 AND (EXISTS "
-            "(SELECT 1 FROM u WHERE u.i64 = t.i64) OR t.i32 > ok.i16))",
-            kUnsupported, "EXISTS",
-            "a correlated subquery in a conjunct that also reads a column of an enclosing "
-            "query block is not supported"},
         ErrorCase{"SELECT t.i16 FROM t LEFT JOIN ok ON ok.i16 = t.i16 AND (EXISTS (SELECT 1 FROM u "
                   "WHERE u.i64 = t.i64) OR ok.i16 > 0)",
                   kUnsupported, "EXISTS", "EXISTS (subqueries) is not supported here"}));
@@ -9319,6 +9278,68 @@ TEST(BinderTest, CorrelatedMembershipKeepsItsPairAndColumnIds) {
     EXPECT_EQ(PositionMismatch(*original), std::nullopt);
   }
 }
+
+TEST(BinderTest, NestedCorrelatedPredicatesMayReadTheEnclosingBlock) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 > (SELECT "
+        "MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16))",
+        "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND (SELECT "
+        "MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16) > 0 AND t.i32 > (SELECT MIN(ok.i16) FROM ok "
+        "WHERE ok.i16 = u.i16))",
+        "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND COALESCE((SELECT "
+        "MIN(ok.i16) FROM ok WHERE ok.i16 = u.i16), 0) >= 0 AND t.i32 > (SELECT MIN(ok.i16) FROM "
+        "ok WHERE ok.i16 = u.i16))",
+        "SELECT i16 FROM ok WHERE EXISTS (SELECT 1 FROM t WHERE t.i16 = ok.i16 AND (EXISTS (SELECT "
+        "1 FROM u WHERE u.i64 = t.i64) OR t.i32 > ok.i16))",
+        "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 IN "
+        "(SELECT ok.i16 FROM ok))",
+        "SELECT i16 FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND t.i32 + 1 "
+        "NOT IN (SELECT ok.i16 FROM ok))",
+        "SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+        "CAST(t.i32 AS BIGINT) IN (SELECT ok.i16 FROM ok))"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    EXPECT_EQ(PositionMismatch(*bound), std::nullopt);
+    auto optimized = Optimize(*bound);
+    ASSERT_TRUE(optimized.ok()) << optimized.status();
+    EXPECT_EQ(PositionMismatch(*optimized), std::nullopt);
+    EXPECT_TRUE(FreeVariables(*optimized->root).empty());
+    EXPECT_FALSE(Explain(*optimized).contains("DependentJoin"));
+  }
+}
+
+TEST(BinderTest, NestedCorrelationsWithoutRepresentativesRemainUnsupported) {
+  const Catalog catalog = MakeCatalog();
+  for (const char* sql :
+       {"SELECT i16, (SELECT SUM(u.i32 * (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16)) FROM u "
+        "WHERE u.i64 = t.i64 AND (SELECT COUNT(*) FROM ok WHERE ok.i16 = u.i16) > t.i32) FROM t",
+        "SELECT i16 FROM t WHERE i32 = (SELECT MIN(u.i16) FROM u WHERE t.i64 IN (SELECT ok.i16 "
+        "FROM ok))"}) {
+    SCOPED_TRACE(sql);
+    auto bound = BindSql(sql, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status();
+    auto optimized = Optimize(*bound);
+    ASSERT_FALSE(optimized.ok());
+    const auto detail = GetSqlError(optimized.status());
+    ASSERT_NE(detail, nullptr) << optimized.status();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EnclosingMembershipProbes, BindErrorTest,
+    ::testing::Values(
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+                  "t.i32 + u.i32 IN (SELECT ok.i16 FROM ok))",
+                  kUnsupported, "IN", "an IN subquery probe mixing inner and enclosing columns"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+                  "t.i32 + (SELECT MIN(ok.i16) FROM ok) NOT IN (SELECT ok.i16 FROM ok))",
+                  kUnsupported, "NOT IN", "an IN subquery probe containing another subquery"},
+        ErrorCase{"SELECT i16 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.i16 = t.i16 AND "
+                  "t.i32 IN (SELECT ok.i16 FROM ok WHERE ok.i16 = u.i16))",
+                  kUnsupported, "IN", "a correlated subquery of IN is not supported"}));
 
 }  // namespace
 }  // namespace antb1::plan
