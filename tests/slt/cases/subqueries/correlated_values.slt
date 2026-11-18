@@ -3844,11 +3844,9 @@ NULL	7
 NULL	8
 NULL	9
 
-# ---- pending: a correlated value in a conjunct that also reads an enclosing block (ADR 0041; roadmap PR SQ8) ----
+# ---- SQ8c: a correlated value in a conjunct that also reads an enclosing block ----
 
-# SQ5a and SQ5b keep these at exit 4: the second conjunct of each EXISTS block reads z, a column of the enclosing
-# block.
-pending SQ8
+# The second conjunct of each EXISTS block reads z, a column of the enclosing block.
 query I nosort
 SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city
 AND (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > 0
@@ -3879,7 +3877,6 @@ INTEGER
 36
 37
 
-pending SQ8
 query I nosort
 SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city
 AND COALESCE((SELECT COUNT(*) FROM riders r WHERE r.rd_city = c.ct_id), 0) >= 0
@@ -3903,9 +3900,7 @@ INTEGER
 40
 
 # The inner block's aggregate argument plants its value in the tail first; its WHERE conjunct that reads c and the same
-# value must still be refused (the place's refusals come before the memo), now at that conjunct instead of at the
-# argument.
-pending SQ8
+# value reuses the same nested join below the correlated filter.
 query II nosort
 SELECT c.ct_id, (SELECT SUM(z.zn_id * (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id)) FROM zones z
 WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM trips t WHERE t.tr_pickup = z.zn_id) > c.ct_id + 68) AS s

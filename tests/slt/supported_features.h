@@ -212,6 +212,8 @@ enum class Feature : std::uint8_t {
   kCorrelatedExistsBlock,
   // SQ8c: keyed correlated IN and NOT IN conjuncts over a plain set.
   kCorrelatedIn,
+  // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
+  kNestedCorrelation,
   // Out-of-scope marker, the last Feature (new ones go above it): never in kSupportedFeatures and
   // never generated. The harness self-tests tag their "pending" canary query with it, so that path
   // stays tested.
@@ -406,6 +408,8 @@ constexpr std::string_view FeatureName(Feature feature) {
       return "correlated_exists_block";
     case Feature::kCorrelatedIn:
       return "correlated_in";
+    case Feature::kNestedCorrelation:
+      return "nested_correlation";
     case Feature::kWindowFunctions:
       return "window_functions";
   }
@@ -578,6 +582,7 @@ inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kCorrelatedExistsMark,
     Feature::kCorrelatedExistsBlock,
     Feature::kCorrelatedIn,
+    Feature::kNestedCorrelation,
     Feature::kUnionAll,
     Feature::kSetOpParentheses,
     Feature::kUnion,

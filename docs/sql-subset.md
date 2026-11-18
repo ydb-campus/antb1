@@ -558,13 +558,19 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   without an inner equivalent, a correlated scalar subquery with `GROUP BY`, `LIMIT` or `OFFSET` or whose outer
   column has no inner equivalent, an `IN` or `NOT IN` conjunct in a correlated scalar subquery's `HAVING`, a compound
   with an arm that reads an enclosing block; at the subquery
-  for one in `HAVING`, whose outer references would read the outer block's groups and not its rows; and at the `IN`
-  for an `IN` conjunct whose probe reads an enclosing block's column, which neither unnesting path handles. A conjunct
-  of a correlated block that reads the enclosing block and holds an uncorrelated value is answered: the value's join
-  stands in the block's slot, below the filter of its correlated conjuncts, and the conjunct is a residual of the
-  unnesting (ADR 0041's decision 8). A correlated scalar subquery compared with an uncorrelated one, directly or in an
-  expression, is answered too, the uncorrelated one a value whose join stands below the dependent join. A correlated
-  value is answered in any expression of a condition of `WHERE` or of an inner `ON` (ADR 0041's SQ5a): under `OR`, `NOT`
+  for one in `HAVING`, whose outer references would read the outer block's groups and not its rows.
+  An `IN`/`NOT IN` conjunct whose probe reads only the enclosing block and whose set is independent is answered:
+  a column probe (possibly widened exactly) uses an equivalent inner column when a same-type correlation key
+  supplies one, including inside grouped or static aggregates and EXISTS with OFFSET. Otherwise its three-valued
+  mark is computed on the enclosing rows and consumed by the correlated filter, under the existing representative
+  requirements. Both preserve the outer rows of `NOT EXISTS` when the condition has no match. A probe mixing local and enclosing
+  columns, a probe containing another subquery, and an enclosing-block probe under `OR` or `CASE` remain unsupported.
+  A conjunct of a correlated block that reads the enclosing block and holds an uncorrelated value is answered:
+  the value's join stands in the block's slot, below the filter of its correlated conjuncts, and the conjunct is a
+  residual of the unnesting (ADR 0041's decision 8). A correlated scalar subquery compared with an uncorrelated one,
+  directly or in an expression, is answered too, the uncorrelated one a value whose join stands below the dependent
+  join. A correlated value is answered in any expression of a condition of `WHERE` or of an inner `ON`
+  (ADR 0041's SQ5a): under `OR`, `NOT`
   and `CASE`, in arithmetic, `COALESCE`, `BETWEEN`, an `IN` list or a function, as an `IN` subquery's probe, and two
   different correlated subqueries compared, each its block's dependent join in the slot, joined back inner where the
   consumer proof shows the condition rejects its value over no rows, and `LEFT` otherwise. It is answered in a select
@@ -582,9 +588,12 @@ of `EXTRACT` are unquoted and case-insensitive (`date` is `DATE`); a type's para
   sees more FROM items than an inner `ON`, binds again and reports its own bind errors (an ambiguous name). A correlated
   value above a block's aggregation -- in `HAVING`, where it is no `GROUP BY` key's value, and in a grouped or global
   block's select item or `ORDER BY` item that is no key (SQ13) --, a correlated `EXISTS` in `HAVING` or over a
-  block's aggregates (SQ13 too), and a correlated subquery in a conjunct that reads the enclosing block itself (SQ8c)
-  exit 4 once their blocks bind; the unnesting's refusals (an outer column without an inner equivalent, such as a
-  correlation of two types or a non-equality one) come once the whole query is bound, after every bind error. A
+  block's aggregates (SQ13 too) exit 4 once their blocks bind. SQ8c also answers a nested correlated scalar value
+  or EXISTS in a conjunct that reads the enclosing block itself: each nested subquery binds to its immediate
+  enclosing block, and the outer reference stays in the containing block's correlated filter. The existing key
+  and representative requirements still apply; a reference two blocks out remains unsupported. The unnesting's
+  refusals (an outer column without an inner equivalent, such as a correlation of two types or a non-equality one)
+  come once the whole query is bound, after every bind error. A
   correlated `EXISTS` block binds its clauses before the unnesting checks its shape, so its own bind errors
   (including an ungrouped select column) precede an unsupported-shape error. A compound's arms all bind
   before a correlated arm is refused. What the enclosing block binds before the subquery comes first. A block binds its

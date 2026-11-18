@@ -1,0 +1,752 @@
+# SQ8c: nested predicates over synthetic fixtures; expectations from DuckDB.
+
+hash-threshold 16
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > z.zn_id) ORDER BY 1
+----
+INTEGER
+23 values hashing to 1f1ca65db29ffd6df8fd75b0467fee3e6aecea36d49225b2cf8648485b8fb7c3
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to e61294c9933b0a62b7929554e9d686e8b28cbc4ded1af28d115d80e7f59a9313
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND COALESCE((SELECT MIN(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0), 0) < z.zn_id) ORDER BY 1
+----
+INTEGER
+38 values hashing to 83978cc359ee0c10a5766858eb9a7504a541d65a965c50792008dbb6ab5481f7
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND COALESCE((SELECT MIN(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0), 0) < z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 22f100417c38823ab54e97f6e5571621d130a2f33dda127a335cd458132fa81b
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_pop < z.zn_id)) ORDER BY 1
+----
+INTEGER
+23 values hashing to 1f1ca65db29ffd6df8fd75b0467fee3e6aecea36d49225b2cf8648485b8fb7c3
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_pop < z.zn_id)) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to e61294c9933b0a62b7929554e9d686e8b28cbc4ded1af28d115d80e7f59a9313
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0) AND c.ct_pop > z.zn_id)) ORDER BY 1
+----
+INTEGER
+31 values hashing to 19323a8710775763e3ee93371bd944293fec4d8dea990fd25c5f2207507ec680
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0) AND c.ct_pop > z.zn_id)) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 369265191c229a4236b8080800b10c0543532c9cf035bbc905722040b7bb273d
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 3) THEN c.ct_id ELSE c.ct_pop END > z.zn_id) ORDER BY 1
+----
+INTEGER
+5
+10
+15
+20
+25
+30
+35
+40
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 3) THEN c.ct_id ELSE c.ct_pop END > z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to f8c1430a5cedc96b072efcf606b84d2121f993076227608bd50a90db3fbed8ce
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city + 1 IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND CAST(o.rd_city AS BIGINT) IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+232 values hashing to 68d00196d2ca1a2b8f50bea2b86a923ad71cff1e87619c9de563d2a716eb0ece
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z JOIN riders r ON r.rd_city = z.zn_city AND z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city + 1 NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND CAST(o.rd_city AS BIGINT) NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z JOIN riders r ON r.rd_city = z.zn_city AND z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > z.zn_id) ORDER BY 1
+----
+INTEGER
+17 values hashing to ba65ca64b5e94228f7fc95a65ef380088e4ef7aad2330826d10fb5b57b58b45d
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (SELECT MAX(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id) > z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 5918cba27be4a9d768f09de3cc02d76f5e0b5a51290a39e48f2d3b1261caf0a9
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND COALESCE((SELECT MIN(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0), 0) < z.zn_id) ORDER BY 1
+----
+INTEGER
+38
+39
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND COALESCE((SELECT MIN(r.rd_row) FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0), 0) < z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to e24cf2893d6c90c3c044ad74cf320b5206a95b9f4d56f8a4e9054646c3e461b2
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_pop < z.zn_id)) ORDER BY 1
+----
+INTEGER
+17 values hashing to ba65ca64b5e94228f7fc95a65ef380088e4ef7aad2330826d10fb5b57b58b45d
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id) OR c.ct_pop < z.zn_id)) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 5918cba27be4a9d768f09de3cc02d76f5e0b5a51290a39e48f2d3b1261caf0a9
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0) AND c.ct_pop > z.zn_id)) ORDER BY 1
+----
+INTEGER
+4
+9
+14
+19
+24
+29
+34
+38
+39
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND (NOT EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 0) AND c.ct_pop > z.zn_id)) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 2cd587bc70c54fc2bd9457f822791b1d21380575285366c0d84a9584ded884ea
+
+
+query I nosort
+SELECT z.zn_id FROM zones z WHERE NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 3) THEN c.ct_id ELSE c.ct_pop END > z.zn_id) ORDER BY 1
+----
+INTEGER
+32 values hashing to 203a75f0df06a0c7bbb4d1e749048763c41368b6effa5897dd633e4412933a3a
+
+
+query II nosort
+SELECT z.zn_id, CASE WHEN NOT EXISTS (SELECT 1 FROM cities c WHERE c.ct_id = z.zn_city AND CASE WHEN EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = c.ct_id AND r.rd_row < 3) THEN c.ct_id ELSE c.ct_pop END > z.zn_id) THEN 1 ELSE 0 END FROM zones z ORDER BY 1
+----
+INTEGER	INTEGER
+80 values hashing to 699b2cfcca5b8446b93578c204472677e21a237cf7460a02cf5c350d254a2b40
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city + 1 IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND CAST(o.rd_city AS BIGINT) IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+13
+42
+71
+100
+129
+158
+187
+216
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z JOIN riders r ON r.rd_city = z.zn_city AND z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 0)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) ORDER BY 1
+----
+INTEGER
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_tier IS NOT NULL)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query II nosort
+SELECT o.rd_row, CASE WHEN NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_tier NOT IN (SELECT s.rd_tier FROM riders s WHERE s.rd_row < 10)) THEN 1 ELSE 0 END FROM riders o ORDER BY 1
+----
+INTEGER	INTEGER
+480 values hashing to 2ee9a3b5d7a2eeeecb5a7481f434ce6751e9ea575c4d9779c27c2c7cc3af7462
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city + 1 NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query I nosort
+SELECT o.rd_row FROM riders o WHERE NOT EXISTS (SELECT 1 FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND CAST(o.rd_city AS BIGINT) NOT IN (SELECT ct_id FROM cities)) ORDER BY 1
+----
+INTEGER
+240 values hashing to 2a16930293136fcb4d5de5dc1450ddbb0cfec59f782153a4fc63a9d76439cde7
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z JOIN riders r ON r.rd_city = z.zn_city AND z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = z.zn_city) OR z.zn_id < c.ct_id)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND z.zn_id > (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) + c.ct_id) ORDER BY 1
+----
+SMALLINT
+4
+5
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND (EXISTS (SELECT 1 FROM riders r WHERE r.rd_city = z.zn_city) OR z.zn_id < c.ct_id)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE c.ct_id NOT IN (SELECT z.zn_city FROM zones z WHERE z.zn_city = c.ct_id AND z.zn_id > (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) + c.ct_id) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) > c.ct_id GROUP BY z.zn_city HAVING COUNT(*) > 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND (SELECT COUNT(*) FROM riders r WHERE r.rd_city = z.zn_city) > c.ct_id GROUP BY z.zn_city HAVING COUNT(*) > 1) OR c.ct_id > 4 ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+5
+6
+
+
+# Enclosing probes preserve aggregate empty values, grouped blocks, row bounds and mark reuse.
+
+query II nosort
+SELECT c.ct_id, (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) FROM cities c ORDER BY 1
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	0
+5	0
+6	0
+
+query II nosort
+SELECT c.ct_id, (SELECT MIN(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) FROM cities c ORDER BY 1
+----
+SMALLINT	INTEGER
+1	1
+2	2
+3	3
+4	NULL
+5	NULL
+6	NULL
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) GROUP BY z.zn_city HAVING COUNT(*) > 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) GROUP BY z.zn_city HAVING COUNT(*) > 1) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+query II nosort
+SELECT c.ct_id, (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4)) FROM cities c ORDER BY 1
+----
+SMALLINT	BIGINT
+1	0
+2	0
+3	0
+4	7
+5	8
+6	0
+
+query II nosort
+SELECT c.ct_id, (SELECT MIN(z.zn_id) FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4)) FROM cities c ORDER BY 1
+----
+SMALLINT	INTEGER
+1	NULL
+2	NULL
+3	NULL
+4	4
+5	5
+6	NULL
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4) GROUP BY z.zn_city HAVING COUNT(*) > 1) ORDER BY 1
+----
+SMALLINT
+4
+5
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4) GROUP BY z.zn_city HAVING COUNT(*) > 1) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) LIMIT 0) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) LIMIT 1) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) LIMIT 1 OFFSET 1) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 3 UNION ALL SELECT ct_id FROM cities WHERE ct_id > 4)) ORDER BY 1
+----
+SMALLINT
+1
+2
+5
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+4
+5
+6
+
+query I nosort
+SELECT c.ct_id FROM cities c WHERE NOT EXISTS (SELECT 1 FROM zones z WHERE z.zn_city = c.ct_id AND c.ct_id IN (SELECT ct_id FROM cities WHERE ct_id < 4) AND c.ct_id NOT IN (SELECT ct_id FROM cities WHERE ct_id < 4)) ORDER BY 1
+----
+SMALLINT
+1
+2
+3
+4
+5
+6
+
+
+# Only columns and exact widenings substitute: do not evaluate a narrowing cast on unmatched inner keys.
+
+query I nosort
+SELECT o.k FROM (SELECT 1 AS k FROM cities WHERE ct_id = 1) o WHERE EXISTS (SELECT 1 FROM (SELECT 1 AS k FROM cities WHERE ct_id = 1 UNION ALL SELECT 40000 AS k FROM cities WHERE ct_id = 1) i WHERE i.k = o.k AND CAST(o.k AS SMALLINT) IN (SELECT CAST(1 AS SMALLINT) FROM cities WHERE ct_id = 1)) ORDER BY 1
+----
+INTEGER
+1
+
+query II nosort
+SELECT c.ct_id, (SELECT COUNT(*) FROM zones z WHERE z.zn_city = c.ct_id AND CAST(c.ct_id AS BIGINT) IN (SELECT ct_id FROM cities WHERE ct_id < 4)) FROM cities c ORDER BY 1
+----
+SMALLINT	BIGINT
+1	8
+2	8
+3	7
+4	0
+5	0
+6	0
+
+query II nosort
+SELECT o.rd_row, (SELECT COUNT(*) FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city NOT IN (SELECT rd_city FROM riders WHERE rd_city IS NOT NULL)) FROM riders o ORDER BY 1
+----
+INTEGER	BIGINT
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
+query II nosort
+SELECT o.rd_row, (SELECT COUNT(*) FROM riders i WHERE i.rd_city IS NOT DISTINCT FROM o.rd_city AND o.rd_city NOT IN (SELECT rd_city FROM riders WHERE rd_city IS NULL)) FROM riders o ORDER BY 1
+----
+INTEGER	BIGINT
+480 values hashing to 5401cf34d158f5d0d48c23892bbc952a26050fa3a59fe4fe368878ef97fe5e5d
+
