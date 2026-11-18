@@ -24,6 +24,23 @@ antb1_add_cli_golden(
 )
 
 # ---- results of every query shape (our own queries over the fixtures) ----
+antb1_add_cli_golden(
+  query_whole_partition_window
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT i16, COUNT(*) OVER (PARTITION BY i16) AS n FROM edge ORDER BY id LIMIT 3"
+    --table
+    "edge=${_f}/edge.parquet"
+    --format
+    csv
+)
+antb1_add_cli_golden(
+  explain_whole_partition_window
+  ARGS explain --physical -c "SELECT COUNT(*) OVER () FROM edge" --table "edge=${_f}/edge.parquet"
+)
 set(_aggregates "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM t")
 antb1_add_cli_golden(
   query_aggregates

@@ -9385,6 +9385,33 @@ TEST(WindowBinding, RawRowsKeepCardinalityAndAggregateTypes) {
   }
 }
 
+TEST(WindowBinding, MinMaxPreserveFloatProvenanceAcrossMemoizationAndQueryBlocks) {
+  Catalog catalog;
+  ASSERT_TRUE(catalog
+                  .Register("tf", std::make_shared<FakeTable>(
+                                      arrow::schema({arrow::field("f", arrow::float32())}), 10,
+                                      std::vector<int>{0}))
+                  .ok());
+  for (const char* text : {"SELECT MIN(f) OVER (), MIN(f) OVER (), MAX(f) OVER () FROM tf",
+                           "SELECT m FROM (SELECT MIN(f) OVER () AS m FROM tf) AS w",
+                           "SELECT MIN(MIN(f)) OVER () FROM tf"}) {
+    const auto bound = BindSql(text, catalog);
+    ASSERT_TRUE(bound.ok()) << text << ": " << bound.status();
+    for (const auto& column : bound->output) {
+      EXPECT_TRUE(column.stored_as_float) << text;
+    }
+  }
+  for (const char* text :
+       {"SELECT MIN(f) OVER () + 1 FROM tf", "SELECT MAX(f) OVER (), MAX(f) OVER () + 1 FROM tf",
+        "SELECT m + 1 FROM (SELECT MIN(f) OVER () AS m FROM tf) AS w"}) {
+    const auto bound = BindSql(text, catalog);
+    ASSERT_FALSE(bound.ok()) << text;
+    const auto detail = GetSqlError(bound.status());
+    ASSERT_NE(detail, nullptr) << bound.status();
+    EXPECT_EQ(detail->kind(), SqlErrorDetail::Kind::kUnsupported) << text;
+  }
+}
+
 TEST(WindowBinding, GroupedInputsAndStageOrder) {
   const std::string text =
       "SELECT SUM(SUM(i16) + 1) OVER (PARTITION BY GROUPING(i32)) + 2, "

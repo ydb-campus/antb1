@@ -1,7 +1,6 @@
-# ADR 0043 W1 parses and binds these forms; execution remains pending.
+# ADR 0043 W2 executes whole-partition aggregates; W3/W4 remain pending.
 # Expected results come only from slt-complete's DuckDB oracle.
 
-pending W2
 query III rowsort
 SELECT i16, COUNT(*) OVER (PARTITION BY i16), SUM(i32) OVER () FROM edge
 ----
@@ -19,7 +18,6 @@ SMALLINT	BIGINT	HUGEINT
 NULL	2	54320
 NULL	2	54320
 
-pending W2
 query IIR rowsort
 SELECT i16, SUM(SUM(i32)) OVER (), AVG(SUM(i32)) OVER (PARTITION BY GROUPING(i16)) FROM edge GROUP BY ROLLUP(i16)
 ----
@@ -37,7 +35,6 @@ SMALLINT	HUGEINT	DOUBLE
 NULL	108640	5432
 NULL	108640	54320
 
-pending W2
 query I nosort
 SELECT COUNT(*) OVER () FROM empty
 ----

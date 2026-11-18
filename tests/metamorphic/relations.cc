@@ -3757,6 +3757,22 @@ std::vector<Relation> AllRelations() {
          .check = AllEqual()});
   }
 
+  // A separate grouping plan is the reference for each window partition. DISTINCT removes
+  // the repeated copies, including the partition whose key is NULL; batch boundaries cannot
+  // change either its membership or its result.
+  r.push_back(
+      {.name = "whole_partition_windows_equal_grouping",
+       .features = {kWindowWholePartition, kCountStar, kSum, kColumns, kIntegerColumns,
+                    kDecimalColumns, kTableName, kMultipleItems, kSelectDistinct, kGroupBy},
+       .probes = {Q("SELECT DISTINCT tr_rider, COUNT(*) OVER (PARTITION BY tr_rider), "
+                    "SUM(tr_fare) OVER (PARTITION BY tr_rider) FROM trips",
+                    1),
+                  Q("SELECT DISTINCT tr_rider, COUNT(*) OVER (PARTITION BY tr_rider), "
+                    "SUM(tr_fare) OVER (PARTITION BY tr_rider) FROM trips",
+                    7),
+                  Q("SELECT tr_rider, COUNT(*), SUM(tr_fare) FROM trips GROUP BY tr_rider")},
+       .check = AllEqual()});
+
   // The permanently pending recursive canary: a seed in [0, 3] counts down through zero.
   // Both probes genuinely recurse for this fixture, terminate, and return at most four rows.
   r.push_back({.name = "recursive_cte_canary_stays_pending",

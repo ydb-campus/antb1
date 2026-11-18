@@ -639,7 +639,7 @@ class ScriptedSource final : public Operator {
   arrow::Result<Batch> Next() override {
     ++pulls_;
     if (fail_at_ == next_) {
-      return arrow::Status::IOError("scripted failure");
+      return failure_;
     }
     if (next_ >= batches_.size()) {
       return Batch{};
@@ -654,7 +654,11 @@ class ScriptedSource final : public Operator {
     return arrow::Status::OK();
   }
 
-  void FailAt(std::size_t index) { fail_at_ = index; }
+  void FailAt(std::size_t index,
+              arrow::Status failure = arrow::Status::IOError("scripted failure")) {
+    fail_at_ = index;
+    failure_ = std::move(failure);
+  }
   // Next() hands each batch on and keeps no reference to it (a later run ends at its first Next(),
   // since a moved-from Batch has no data): a test can then see when the consumer releases the
   // batches.
@@ -668,6 +672,7 @@ class ScriptedSource final : public Operator {
   std::vector<Batch> batches_;
   std::size_t next_ = 0;
   std::optional<std::size_t> fail_at_;
+  arrow::Status failure_;
   bool hand_over_ = false;
   int pulls_ = 0;
   int opens_ = 0;

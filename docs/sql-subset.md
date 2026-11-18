@@ -131,8 +131,8 @@ expand to a sorted file list. All files of a table must have the same schema (di
 
 ## Grammar
 
-The parser accepts this grammar; the binder checks the subset described below against the tables. Internal window
-binding is available to plan tests, while Session refuses all window execution. Keywords are case-insensitive.
+The parser accepts this grammar; the binder checks the subset described below against the tables. Window syntax,
+binding and executable support are distinguished below. Keywords are case-insensitive.
 
 ```ebnf
 statement   = query , [ ";" ] ;
@@ -211,9 +211,9 @@ top-level `OR` without parentheses, so it reads back as it was parsed. Aggregate
 A window aggregate may consume an ordinary aggregate (`SUM(SUM(a)) OVER ()`). The inner aggregate belongs to
 the query block; the outer window does not itself make the block aggregate.
 
-### Window syntax and binding (W1)
+### Window syntax, binding and execution (W1–W2)
 
-Window execution is disabled. Parsing, internal binding and executable support are separate contracts:
+Parsing, internal binding and executable support are separate contracts:
 
 ```ebnf
 window_call = identifier , "(" , [ "ALL" | "DISTINCT" ] ,
@@ -236,7 +236,7 @@ such as `OVER (rows)`.
 
 | Slice | Parsed structure | Internal binding | Execution owner |
 | --- | --- | --- | --- |
-| W2 | Existing aggregate calls with inline partition expressions and no ordering or frame | Whole-partition WindowNode | W2 |
+| W2 | Existing aggregate calls with inline partition expressions and no ordering or frame | Whole-partition WindowNode | Supported |
 | W3 | RANK with inline partition/order expressions and omitted frame | BIGINT WindowNode result | W3 |
 | W4 | Aggregate with explicit ROWS UNBOUNDED PRECEDING, or BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | ROWS-prefix WindowNode | W4 |
 | W5–W7 | Ranking functions, implicit ordered RANGE, named references/definitions and inheritance | Unsupported with owner | W5–W7 |
@@ -258,8 +258,21 @@ Malformed grammar, illegal placement (WHERE, ON, GROUP BY or HAVING), ordinary n
 ordinary aggregates, and invalid core arguments are syntax/bind errors (exit 1). Valid deferred constructs are
 Unsupported (exit 4), with their W/WX owner and source span. W12 row-marker/VALUE_OF and W13 pattern constructs
 receive targeted refusals; their detailed grammar is deferred. Optional dialect forms retain WX ownership.
-Every Session query and EXPLAIN mode refuses window constructs after binding and before optimization, including
-unused CTE bodies. There is no execution switch. Workload support remains 84/99 for the queries derived from TPC-DS.
+Every Session query and EXPLAIN mode refuses deferred window constructs after binding and before optimization,
+including unused CTE bodies. There is no switch that enables deferred execution.
+
+W2 answers the existing non-DISTINCT aggregate family over a whole partition: `COUNT(*)`, `COUNT(expr)`, `SUM`,
+`AVG`, `MIN`, `MAX`, `STDDEV_SAMP`/`STDDEV`, `STDDEV_POP`, `VAR_SAMP`/`VARIANCE`, and `VAR_POP`, with their ordinary
+argument types, result types, NULL rules and overflow checks. `OVER ()` uses all surviving rows; `OVER (PARTITION
+BY expr, ...)` groups NULL keys together and uses the same key equality as GROUP BY (including DOUBLE NaNs and
+signed zeros). Each input row receives its partition's result. Empty input produces no rows. Windows over grouped
+queries see the groups surviving HAVING, including GROUPING() results. Final DISTINCT, ordering and LIMIT consume
+the window results. No window order is implied by this execution slice.
+
+The Window operator consumes its upstream once, retains the pruned input in batches, shares grouping for calls
+with the same partition keys, and finalizes each partition once before gathering its results back to the rows.
+Evaluation is serial after upstream parallel pipelines have gathered. Its retained rows, aggregate state and
+scratch space use the query memory budget; there is no separate materialized-result size cap.
 
 The FROM list is flat ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each item after the first records how it joins
 the items before it. A `JOIN` binds tighter than a comma and associates to the left, as in DuckDB, so `a, b JOIN c ON
@@ -2002,11 +2015,11 @@ fail cleanly with exit code 4 (unsupported). `tests/tpcds/` generates the data a
 pass, the last column lists every construct it needs that antb1 does not answer yet, in the order of
 [ADR 0037](adr/0037-tpcds-roadmap.md)'s Plan, from that ADR's survey of 2026-10-31. In parentheses is the id of the Plan
 item that completes the query: the one that answers the last of them. The window items (W) are those of
-[ADR 0043](adr/0043-window-functions.md) (2026-11-18): W2 completes six queries, W3 eight and W4 one, after W1
-prepares the canary and frontend. Their implementation starts after that ADR merges; the design alone changes no
-supported syntax or pass status. ADR 0043 separately lists the broader Standard SQL window backlog. The subquery
+[ADR 0043](adr/0043-window-functions.md) (2026-11-18): W1 prepared the canary and frontend; W2 answers
+whole-partition aggregates and completes six queries, bringing the ratchet to **90/99**. W3 completes eight more
+and W4 one. ADR 0043 separately lists the broader Standard SQL window backlog. The subquery
 items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose phase 8 order the Plan
-follows; phase 8 is complete, and the 15 remaining queries need windows alone.
+follows; phase 8 is complete, and the nine remaining queries need later window slices.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
@@ -2021,7 +2034,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q9 | pass | scalar subqueries in a select list's CASE (SQ2a) |
 | Q10 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
 | Q11 | pass | `UNION ALL` (ADR 0036) |
-| Q12 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q12 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q13 | pass | answered when the ratchet was added |
 | Q14 | pass | scalar subqueries that select a CTE's column (SQ4a) |
 | Q15 | pass | answered when the ratchet was added |
@@ -2029,7 +2042,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q17 | pass | stddev_samp (AG2) |
 | Q18 | pass | ROLLUP (RU3) |
 | Q19 | pass | answered when the ratchet was added |
-| Q20 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q20 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q21 | pass | a quotient of literals folded into DOUBLE (CT4) |
 | Q22 | pass | ROLLUP (RU3) |
 | Q23 | pass | `*` next to other select items |
@@ -2062,7 +2075,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs running window aggregates with a ROWS frame from unbounded preceding to current row, and windows over aggregates (W4) |
 | Q52 | pass | answered when the ratchet was added |
-| Q53 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q53 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q54 | pass | scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | pass | `UNION ALL` (ADR 0036) |
@@ -2072,7 +2085,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q60 | pass | `UNION ALL` (ADR 0036) |
 | Q61 | pass | CAST to DECIMAL(p,s) (CT2) |
 | Q62 | pass | `*` next to other select items |
-| Q63 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q63 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | pass | `UNION ALL` (ADR 0036) |
@@ -2098,7 +2111,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q86 | unsupported | needs rank(), window ordering over aggregates and window partition expressions (W3) |
 | Q87 | pass | `EXCEPT` (X4d) |
 | Q88 | pass | cross products of one-row inputs |
-| Q89 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q89 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q90 | pass | NULL as a CASE value and CAST to DECIMAL(p,s) (CT2) |
 | Q91 | pass | answered when the ratchet was added |
 | Q92 | pass | answered when the ratchet was added |
@@ -2107,7 +2120,7 @@ follows; phase 8 is complete, and the 15 remaining queries need windows alone.
 | Q95 | pass | answered when the ratchet was added |
 | Q96 | pass | answered when the ratchet was added |
 | Q97 | pass | `FULL OUTER JOIN` (OJ3) |
-| Q98 | unsupported | needs window aggregates over whole partitions and windows over aggregates (W2) |
+| Q98 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q99 | pass | lower (FN4) |
 
 This workload is derived from the TPC-DS Benchmark and is not comparable to published TPC-DS Benchmark results, as
