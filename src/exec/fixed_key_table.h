@@ -18,6 +18,7 @@
 
 #include <arrow/array/array_primitive.h>
 #include <arrow/array/data.h>
+#include <arrow/array/util.h>
 #include <arrow/buffer.h>
 #include <arrow/compute/exec.h>
 #include <arrow/datum.h>
@@ -303,15 +304,18 @@ class FixedKeyTable final : public KeyTable {
     if (batch.length < 0 || batch.length > std::numeric_limits<std::int64_t>::max() / 4) {
       return arrow::Status::CapacityError("fixed key ID buffer size overflow");
     }
+    if (keys_.empty()) {
+      ARROW_ASSIGN_OR_RAISE(auto misses,
+                            arrow::MakeArrayOfNull(arrow::uint32(), batch.length, pool_));
+      return std::static_pointer_cast<arrow::UInt32Array>(std::move(misses));
+    }
     const auto rows = static_cast<std::size_t>(batch.length);
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> values,
                           arrow::AllocateBuffer(batch.length * 4, pool_));
     auto* ids = values->mutable_data_as<std::uint32_t>();
     std::shared_ptr<arrow::Buffer> validity;
     std::int64_t missing = 0;
-    if (rows > 0) {
-      ARROW_RETURN_NOT_OK(PrepareScratch());
-    }
+    // Consume prepared the scratch and slots before inserting the first key.
     std::array<Source, 2> sources;
     for (std::size_t c = 0; c < layout_.columns.size(); ++c) {
       ANTB1_CHECK(batch.values[c].is_array());
@@ -323,13 +327,10 @@ class FixedKeyTable final : public KeyTable {
       const std::size_t count = std::min(kChunk, rows - start);
       const bool nulls = PackAndHash({sources.data(), layout_.columns.size()}, start, count);
       for (std::size_t i = 0; i < count; ++i) {
-        std::uint32_t id = kNoGroup;
-        if (nulls && chunk_nulls_[i] != 0) {
-          id = null_group_;
-        } else if (capacity_ != 0) {
-          std::size_t empty = 0;
-          id = Find(view, chunk_keys_[i], chunk_hashes_[i], empty);
-        }
+        std::size_t empty = 0;
+        const std::uint32_t id = nulls && chunk_nulls_[i] != 0
+                                     ? null_group_
+                                     : Find(view, chunk_keys_[i], chunk_hashes_[i], empty);
         const std::size_t row = start + i;
         ids[row] = id == kNoGroup ? 0 : id;
         if (id == kNoGroup) {
@@ -573,10 +574,18 @@ class FixedKeyTable final : public KeyTable {
   }
 
   // Room for `extra` more groups without a check: the slots double until the groups fit the load
-  // factor, and the key array doubles. A new array is allocated before the one it replaces is
-  // given back, and a refused allocation leaves the table whole: at most its slots have grown.
+  // factor, and the key array doubles. Stage the replacement keys before growing the slots so
+  // a refusal releases all reservations and the pool charges both key buffers during the copy.
   arrow::Status MakeRoom(std::size_t extra) {
     const std::size_t need = keys_.size() + extra;
+    if (need <= grow_at_ && need <= keys_.capacity()) {
+      return arrow::Status::OK();
+    }
+    PoolVector<Key> grown_keys(pool_);
+    if (need > keys_.capacity()) {
+      ARROW_RETURN_NOT_OK(grown_keys.Reserve(std::max({need, 2 * keys_.capacity(), kMinCapacity})));
+      ARROW_RETURN_NOT_OK(grown_keys.Resize(keys_.size()));
+    }
     if (need > grow_at_) {
       std::size_t capacity = std::max(capacity_, kMinCapacity);
       while (capacity * kLoadNum / kLoadDen < need) {
@@ -584,8 +593,9 @@ class FixedKeyTable final : public KeyTable {
       }
       ARROW_RETURN_NOT_OK(Rehash(capacity));
     }
-    if (need > keys_.capacity()) {
-      ARROW_RETURN_NOT_OK(keys_.Reserve(std::max({need, 2 * keys_.capacity(), kMinCapacity})));
+    if (grown_keys.capacity() != 0) {
+      std::copy_n(keys_.data(), keys_.size(), grown_keys.data());
+      keys_ = std::move(grown_keys);
     }
     return arrow::Status::OK();
   }
@@ -596,17 +606,14 @@ class FixedKeyTable final : public KeyTable {
     ARROW_RETURN_NOT_OK(control.Assign(capacity + ControlGroup::kWidth, kEmpty));
     PoolVector<std::uint32_t> slots(pool_);
     ARROW_RETURN_NOT_OK(slots.Resize(capacity));
-    std::swap(control, control_);  // `control` and `slots` are the old ones from here
-    std::swap(slots, slots_);
-    const std::size_t old_capacity = capacity_;
-    capacity_ = capacity;
-    mask_ = capacity - 1;
-    grow_at_ = capacity * kLoadNum / kLoadDen;
-    const View view{
-        .control = control_.data(), .slots = slots_.data(), .keys = keys_.data(), .mask = mask_};
+    const View view{.control = control.data(),
+                    .slots = slots.data(),
+                    .keys = keys_.data(),
+                    .mask = capacity - 1};
     if constexpr (kGrowth == Growth::kSlotOrder) {
-      const std::uint8_t* const old_control = control.data();
-      const std::uint32_t* const old_slots = slots.data();
+      const std::size_t old_capacity = capacity_;
+      const std::uint8_t* const old_control = control_.data();
+      const std::uint32_t* const old_slots = slots_.data();
       for (std::size_t old = 0; old < old_capacity; ++old) {
         if (const std::size_t ahead = old + kRehashAhead;
             ahead < old_capacity && old_control[ahead] != kEmpty) {
@@ -623,7 +630,12 @@ class FixedKeyTable final : public KeyTable {
         }
       }
     }
-    return arrow::Status::OK();  // the old slots go back to the pool here
+    control_ = std::move(control);
+    slots_ = std::move(slots);
+    capacity_ = capacity;
+    mask_ = view.mask;
+    grow_at_ = capacity * kLoadNum / kLoadDen;
+    return arrow::Status::OK();
   }
 
   // Group `id` placed again in the slots of `view`, which hold no key equal to its own.
@@ -670,10 +682,9 @@ class FixedKeyTable final : public KeyTable {
     if (estimate <= keys_.size()) {
       return arrow::Status::OK();
     }
-    // The reservation is a guess about rows to come, so a budget that refuses it does not fail the
-    // table: it keeps growing as it would without the estimate. MakeRoom leaves a whole table when
-    // an allocation is refused: at most its slots have grown, and its groups are untouched.
-    const arrow::Status reserved = MakeRoom(estimate - keys_.size());
+    // A refused pool reservation or buffer object leaves the table growing as before.
+    const arrow::Status reserved =
+        KeyTableNoBadAlloc([&] { return MakeRoom(estimate - keys_.size()); });
     return reserved.IsOutOfMemory() ? arrow::Status::OK() : reserved;
   }
 

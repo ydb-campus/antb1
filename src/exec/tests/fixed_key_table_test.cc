@@ -452,6 +452,48 @@ TYPED_TEST(FixedKeyTableTest, ARefusedEstimateLeavesTheTableAsItWas) {
   EXPECT_EQ(tight.bytes_allocated(), 0);
 }
 
+// With 64 repeats, the estimate wants 39,488 keys. The budget can pay for some of the
+// replacement arrays. A later batch of known keys still needs the budget for its output IDs.
+TYPED_TEST(FixedKeyTableTest, ARefusedEstimateReleasesEverySpeculativeArray) {
+  MemoryBudget tight(470'000);
+  FixedKeyTable<8, TestFixture::kGrowth> estimating(LayoutOf({arrow::int64()}), &tight, {});
+  auto plain = this->MakeTable({.estimate = false});
+  const auto first = BatchOf({Int64s(KeysFrom(0, 1000))});
+  const auto second = BatchOf({Int64s(KeysFrom(936, 4936))});
+  const auto known = BatchOf({Int64s(std::vector<std::optional<std::int64_t>>(50'000, 42))});
+  for (const auto* batch : {&first, &second, &known}) {
+    EXPECT_EQ(IdsOf(estimating, *batch), IdsOf(*plain, *batch));
+    EXPECT_EQ(estimating.capacity(), plain->capacity());
+    EXPECT_EQ(tight.bytes_allocated(), this->budget_.bytes_allocated());
+  }
+}
+
+// After the first 256 keys, the slots have room for another key, but the key array must double.
+// A budget that fits the final buffers exactly must refuse the copy while the old keys are live.
+TYPED_TEST(FixedKeyTableTest, KeyOnlyGrowthChargesBothArrays) {
+  const auto first = BatchOf({Int64s(KeysFrom(0, 256))});
+  const auto next = BatchOf({Int64s({256})});
+  auto table = this->MakeTable({.estimate = false});
+  ASSERT_EQ(IdsOf(*table, first).size(), 256U);
+  const auto slots = table->capacity();
+  this->budget_.ResetPeak();
+  const auto grown = table->Consume(next);
+  ASSERT_TRUE(grown.ok()) << grown.status();
+  ASSERT_EQ(table->capacity(), slots);
+  const auto final_bytes = this->budget_.bytes_allocated();  // includes the output ID
+  EXPECT_GE(this->budget_.max_memory(), final_bytes + (256 * 8));
+
+  MemoryBudget tight(final_bytes);
+  FixedKeyTable<8, TestFixture::kGrowth> limited(LayoutOf({arrow::int64()}), &tight,
+                                                 {.estimate = false});
+  ASSERT_EQ(IdsOf(limited, first).size(), 256U);
+  const auto before = tight.bytes_allocated();
+  const auto refused = limited.Consume(next);
+  EXPECT_TRUE(refused.status().IsOutOfMemory()) << refused.status();
+  EXPECT_EQ(limited.num_groups(), 256U);
+  EXPECT_EQ(tight.bytes_allocated(), before);
+}
+
 // A single refused pool operation, including scratch and growth; all others still use the budget.
 class RefusingPool final : public arrow::ProxyMemoryPool {
  public:
@@ -518,6 +560,28 @@ TYPED_TEST(FixedKeyTableTest, LookupNeverInsertsAcrossCollisionsGrowthAndNulls) 
   EXPECT_EQ(retained->Value(0), 400U);
   EXPECT_TRUE(retained->IsNull(3));
   EXPECT_EQ((*found)->null_count(), 2);
+}
+
+TYPED_TEST(FixedKeyTableTest, EmptyLookupOnlyNeedsMemoryForItsResult) {
+  // Enough for four IDs and their validity bitmap, even with separate 64-byte-aligned buffers.
+  MemoryBudget tight(128);
+  std::shared_ptr<arrow::UInt32Array> misses;
+  {
+    FixedKeyTable<8, TestFixture::kGrowth> table(LayoutOf({arrow::int64()}), &tight, {});
+    const auto probe = BatchOf({Int64s({std::nullopt, 2, 0, 2})});
+    auto result = table.Lookup(probe);
+    ASSERT_TRUE(result.ok()) << result.status().ToString();
+    misses = std::move(*result);
+    EXPECT_EQ(table.num_groups(), 0U);
+  }
+  EXPECT_GT(tight.bytes_allocated(), 0);
+  ASSERT_EQ(misses->length(), 4);
+  EXPECT_EQ(misses->null_count(), 4);
+  for (std::int64_t row = 0; row < misses->length(); ++row) {
+    EXPECT_TRUE(misses->IsNull(row));
+  }
+  misses.reset();
+  EXPECT_EQ(tight.bytes_allocated(), 0);
 }
 
 TYPED_TEST(FixedKeyTableTest, FailedScratchAndGrowthAllocationsAllowRetry) {
@@ -615,21 +679,20 @@ TYPED_TEST(FixedKeyTableTest, FailedGrowthKeepsExistingIdsAndOwnedUniques) {
   EXPECT_GE(failures, 4U);
 }
 
-TYPED_TEST(FixedKeyTableTest, LookupWithPartialScratchFailureCanBeRetriedBeforeConsume) {
+TYPED_TEST(FixedKeyTableTest, EmptyLookupWithOutputFailureCanBeRetriedBeforeConsume) {
   const auto batch = BatchOf({Int64s({std::nullopt, 1, 2})});
-  for (std::size_t fail = 0; fail < 6; ++fail) {
-    RefusingPool pool(&this->budget_);
-    FixedKeyTable<8, TestFixture::kGrowth> table(LayoutOf({arrow::int64()}), &pool, {});
-    pool.RefuseAfter(fail);
-    const auto first = table.Lookup(batch);
-    EXPECT_TRUE(first.ok() || first.status().IsOutOfMemory());
-    EXPECT_EQ(table.num_groups(), 0U);
-    pool.Allow();
-    const auto retried = table.Lookup(batch);
-    ASSERT_TRUE(retried.ok()) << retried.status().ToString();
-    EXPECT_EQ((*retried)->null_count(), 3);
-    EXPECT_EQ(IdsOf(table, batch), (std::vector<std::uint32_t>{0, 1, 2}));
-  }
+  RefusingPool pool(&this->budget_);
+  FixedKeyTable<8, TestFixture::kGrowth> table(LayoutOf({arrow::int64()}), &pool, {});
+  pool.RefuseAfter(0);
+  const auto first = table.Lookup(batch);
+  EXPECT_TRUE(first.status().IsOutOfMemory()) << first.status().ToString();
+  EXPECT_EQ(table.num_groups(), 0U);
+  EXPECT_EQ(pool.bytes_allocated(), 0);
+  pool.Allow();
+  const auto retried = table.Lookup(batch);
+  ASSERT_TRUE(retried.ok()) << retried.status().ToString();
+  EXPECT_EQ((*retried)->null_count(), 3);
+  EXPECT_EQ(IdsOf(table, batch), (std::vector<std::uint32_t>{0, 1, 2}));
 }
 
 }  // namespace

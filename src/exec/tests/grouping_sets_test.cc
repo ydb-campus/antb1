@@ -845,40 +845,44 @@ TEST_F(GroupingSetsTest, ALaterBatchOutOfMemoryFailsTheQuery) {
   MemoryBudget unlimited(std::nullopt, arrow::default_memory_pool());
   std::optional<int64_t> ignored;
   ASSERT_TRUE(RunUnder(table, sets, unlimited, nullptr, ignored).ok());
-  bool found = false;
-  // Different key layouts leave different allocation gaps. A ten-percent step can miss
-  // every later-batch failure; one-percent steps preserve the failure and cleanup assertions.
-  for (int64_t limit = unlimited.max_memory(); limit > 0 && !found; limit = limit * 99 / 100) {
-    plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
-                           .output = {}};
-    plan.output.assign(OutputWidth(*plan.root),
-                       plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
-    MemoryBudget budget(limit, arrow::default_memory_pool());
-    auto op = BuildPhysicalPlan(plan);
-    ASSERT_TRUE(op.ok());
-    ExecContext ctx{.pool = &budget, .budget = &budget};
-    ASSERT_TRUE((*op)->Open(ctx).ok());
-    int64_t rows = 0;
-    arrow::Status failure;
-    while (true) {
-      auto batch = (*op)->Next();
-      if (!batch.ok()) {
-        failure = batch.status();
-        break;
+  // Try ten-percent steps first. Some layouts have a narrower interval between the first
+  // successful output and a later batch failure, so retry with one-percent steps if needed.
+  for (const int keep_percent : {90, 99}) {
+    for (int64_t limit = unlimited.max_memory(); limit > 0; limit = limit * keep_percent / 100) {
+      plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
+                             .output = {}};
+      plan.output.assign(OutputWidth(*plan.root),
+                         plan::OutputColumn{.name = "c", .type = LogicalType::kBigInt});
+      MemoryBudget budget(limit, arrow::default_memory_pool());
+      auto op = BuildPhysicalPlan(plan);
+      ASSERT_TRUE(op.ok());
+      ExecContext ctx{.pool = &budget, .budget = &budget};
+      ASSERT_TRUE((*op)->Open(ctx).ok());
+      int64_t rows = 0;
+      arrow::Status failure;
+      while (true) {
+        auto batch = (*op)->Next();
+        if (!batch.ok()) {
+          failure = batch.status();
+          break;
+        }
+        if (batch->end()) {
+          break;
+        }
+        rows += batch->data->num_rows();
       }
-      if (batch->end()) {
-        break;
+      const bool later_failure = !failure.ok() && rows > 0;
+      if (later_failure) {
+        EXPECT_TRUE(failure.IsOutOfMemory()) << failure.ToString();
+        EXPECT_FALSE((*op)->Next().ok());
       }
-      rows += batch->data->num_rows();
+      EXPECT_TRUE((*op)->Close().ok());
+      if (later_failure) {
+        return;
+      }
     }
-    if (!failure.ok() && rows > 0) {
-      found = true;
-      EXPECT_TRUE(failure.IsOutOfMemory()) << failure.ToString();
-      EXPECT_FALSE((*op)->Next().ok());
-    }
-    EXPECT_TRUE((*op)->Close().ok());
   }
-  EXPECT_TRUE(found) << "no limit failed a later batch";
+  FAIL() << "no limit failed a later batch";
 }
 
 // The tables are charged to the query's budget: a limit far below them fails, and cleanly.
