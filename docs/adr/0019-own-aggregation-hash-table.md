@@ -303,3 +303,235 @@ Proposed
     four-byte prefix in the first eight bytes, so that most comparisons never read the bytes — is the "specialize per
     key shape" of this ADR applied to a string key, and belongs to the table this ADR proposes rather than before it:
     `arrow::compute::Grouper` rejects view key types outright.
+
+## Amendment (2026-11-19): generic grouping and partitioned local tables
+
+This amendment supplies the implementation sequence requested after the local-grouping attribution experiment.
+It takes precedence over the earlier implementation order and the claim that engine tables cannot exceed the
+10⁴-10⁶ group band. The historical measurements and failure reports above remain evidence, not current limits.
+The status remains Proposed. This documentation-only PR must merge before implementation starts; its merge
+allows starting the steps below, not merging their code without validation and human review.
+
+### What the experiment established
+
+A narrow prototype supports one BIGINT key and one narrow DECIMAL SUM. It computes a content hash once per row,
+updates a checked numeric SUM directly, keeps hashes for growth and merging, and hands local tables to the existing
+32 merge lanes. It has not established a generic replacement for KeyTable or GroupTable.
+
+The attribution test compared three modes in one static Release executable: the original Arrow path with its
+adaptive local/raw routing; the numeric backend with one local table per part and a final stable partition of group
+IDs; and the same numeric backend with 32 local tables populated directly. Both numeric modes aggregate every row
+locally, share the global tables, hash algorithm, state arithmetic and merge order, and avoid Arrow key round trips.
+The experiment used partitioned DECIMAL data, 16 physical cores pinned on one socket, one warm-up per mode and
+three measured rounds with rotating mode order. All 24 native executions, including warm-ups, matched saved
+DuckDB references without background-load flags. Operator profiling ran separately after timing.
+
+TPC-H-derived Q18 native wall medians, in seconds:
+
+| Scale factor | Original path | One numeric local table | 32 local tables | Reduction from one to 32 |
+| --- | ---: | ---: | ---: | ---: |
+| 100 | 5.855 | 5.163 | 5.010 | 2.96% |
+| 1000 | 70.406 | 51.241 | 49.689 | 3.03% |
+
+The incremental CPU reduction was 3.60% and 3.41%, respectively. At SF1000 the separate profile's accumulated
+merge elapsed fell 16.3%, dispatch elapsed rose 17.9%, and one-table ID partitioning consumed 3.917 thread-seconds.
+Those timers overlap; they are neither CPU samples nor additive wall times. Peak query-tracked capacity fell from
+126.886 GB to 126.294 GB between numeric modes. This is a modest additional layout benefit, not evidence that
+partitioning explains the full improvement over the original path. The larger original-to-numeric difference
+combines a different key backend, fused SUM and always-local aggregation; those effects remain to be separated.
+Three repetitions and disjoint measured ranges do not establish a general significance or workload-wide claim.
+
+This workload is derived from the TPC-H Benchmark and is not comparable to published TPC-H Benchmark results, as
+this implementation does not comply with all requirements of the TPC-H Benchmark.
+
+The prototype and attribution control are preserved at `dbcf207` on `research/partitioned-local-grouping` and as
+local experimental changes on `research/local-grouping-attribution`, respectively. The latter's ignored report is
+`build/static/bench-results/grouping-attribution-20261119T190055Z/report.md`; it is local evidence, not a portable
+repository dependency. Raw workload inputs, plans and answers stay outside version control. Neither prototype is
+production-ready. The NDV/sparsity experiment remains on hold and is not part of this plan.
+
+### Existing work to reuse
+
+`Group-by-hash-table-handoff.md` (2026-10-24, local investigation document) records the earlier DataFusion-inspired
+attempts. Its referenced DataFusion source checkout is no longer available locally, so this review verifies the
+antb1 branches and this ADR, not a fresh upstream comparison. DataFusion's separation of key storage, group IDs and
+accumulators is a design reference; its loop shape or arithmetic is not automatically suitable for this engine.
+
+- `efa7ec4` on `perf/group-hash-table` is the early tag-probing prototype. `7862d18` contains the completed older
+  adapter; `f9879e3` is on an older base. Their lessons include stale NULL bits in reused packing scratch,
+  integration failures missed by small differential tests, and the severe cost of per-insert budget accounting.
+- `3b1f96e` on `perf/fixed-key-table` is newer than that handoff and is the starting reuse candidate. It implements
+  one/two fixed-width keys, 256-row chunks, eight-row-ahead prefetch, SWAR tags, four-byte group-ID slots,
+  pool-backed storage, slot-order growth and bounded capture-recapture sizing. Reuse its code and tests after
+  review against current main rather than restart the scalar probe design.
+- The newer branch lacks today's non-inserting `KeyTable::Lookup` and predates the merged packed-string backend.
+  It still returns row IDs for separate aggregate updates and builds Arrow uniques by copying keys. It does not
+  supply fused aggregate updates or direct merging of stored keys/states. Its growth rehashes stored keys rather
+  than retaining the prototype's full routing hash. These are integration and measurement tasks, not reasons for
+  an unconditional cherry-pick. No historical branch was rebuilt or timed in this attribution campaign.
+
+### Target architecture and invariants
+
+Keep these components private to `exec`, behind the current KeyTable and GroupTable contracts. These names
+describe responsibilities; they do not require a public API or one universal representation.
+
+- **Key layout and storage.** Select a schema-specific layout once: typed fixed-width words, owned string bytes,
+  or a column-oriented composite layout. The design must represent any currently supported key type and number
+  of columns, including mixed fixed/string keys; unsupported optimized shapes retain the Arrow fallback. Start
+  with the one/two-key fixed layouts already implemented. Own keys only when a distinct group is inserted,
+  preserve dense stable IDs through growth, and retain any first-seen representation needed for output separately
+  from normalized identity. NULL is a grouping value, including per-column NULLs in composite keys. DOUBLE
+  normalization, signed zero, NaNs and first-seen spelling remain as documented today.
+- **Group index.** Batch hash, probe and compare without per-row virtual dispatch, allocation or string copies.
+  Equal keys must remain equal across array offsets, batches and physical representations. Keep the non-inserting
+  Lookup contract, group-ID bounds and explicit error propagation. Consider fused probe/update where useful,
+  while retaining an ID-producing adapter for sets, windows and existing callers.
+- **Aggregate program.** Resolve types and operations once per query; update typed state columns in bounded
+  batches from group references. A reference identifies a local partition and group; it does not carry a copied
+  key. Dispatch per aggregate/type outside the row loop. Preserve current SUM/AVG Int128 accumulation, DECIMAL
+  width/scale and overflow rules, NULL/count behavior, MIN/MAX comparisons, empty-input results and finalization
+  errors. State layout is measured separately: do not assume that interleaving all keys and states in one row
+  beats separate typed arrays for every aggregate family.
+- **Partition policy.** Ordinary grouping retains its fixed 32 lanes and part-order merge. Partition count is not
+  derived from worker count and does not become a tuning knob. Preserve the separate two-level distinct policy,
+  prefix hashes and heavy-prefix routing; do not replace those with ordinary all-key routing. Do not add a full
+  row shuffle before local aggregation as the default: partitioned local tables dispatch rows inside each worker.
+- **Immutable handoff.** After a part finishes, freeze its owned keys, cached hashes and aggregate states. Each
+  lane reads only its partition and merges stored keys/states directly, without GetUniques/decode/re-encode.
+  Materialize any fallback Arrow scratch once before sharing; Arrow Grouper's mutable GetUniques scratch must
+  never be called concurrently. Release partition-local storage when its last reader finishes. Shared backing
+  buffers remain owned and charged until the last dependent reader releases them.
+
+A worker processes a bounded chunk of selected source rows without first gathering all key or payload columns.
+It hashes the normalized key values, computes each lane, probes that lane's local index, appends owned keys only
+for new groups, and records `(lane, group_id)` in reusable budgeted scratch when the aggregate program needs it.
+Typed aggregate loops then read the original input buffers through the selection and those references. An eligible
+fused specialization can combine probe and update without the reference array. Use either direct row dispatch or
+stable per-lane row-index buckets according to measurement; neither requires moving the complete payload. Hash
+caches and scratch are bounded by chunk or group capacity, not total input rows. At part completion, lanes merge
+immutable stored keys and states; construct Arrow output only at a consumer/output boundary that requires it.
+Result buffers must retain the necessary query/pool owner after operators close, not merely borrowed pointers.
+
+Probe hashes and routing hashes are different contracts. The probe hash is private; routing must match ordinary
+KeyHashes semantics wherever old/new tables or routed raw rows meet. Reuse a content/routing hash only after
+proving the bit domains: `hash & 31` chooses a lane, so a table confined to that lane must not use those constant
+low bits for its own buckets. The prototype shifts by five bits; a private independent probe hash is another valid
+choice. Cache any prefix/full hashes needed by two-level distinct separately. Whether caching full hashes beats
+rehashing during growth must be measured, including retained memory, rather than copied from either prototype.
+
+All persistent arrays, retained bytes, hash caches, scratch, ID arrays and ownership metadata use the query's pool
+or existing budgeted containers. Charge at capacity changes before allocation, including overlap during growth;
+never reserve once per inserted group. Optional sizing estimates fail small if refused. Required allocation
+failures return Status and clean up normally; a late fallback must not bypass the budget or repeat partially applied
+updates. Plan eligibility and backend choice are deterministic, not environment- or thread-dependent. The research
+selector does not ship: production controls, if needed, must meet [ADR 0031](0031-runtime-knobs.md).
+
+### Implementation sequence: separate, reviewable PRs
+
+Each numbered step is a logical PR. If its review becomes too large, split at a tested interface boundary and
+keep the same acceptance conditions. Do not combine backend, aggregation policy, planner estimates and view
+transport into one performance claim. Every step compares against its immediate predecessor as well as the
+original baseline, preserving an oracle/fallback and recording which path actually ran.
+
+1. **Integrate the fixed-width key backend.** Adapt `3b1f96e` to current main, add non-inserting Lookup, preserve
+   packed-string selection, and replace duplicate benchmark machinery with the engine backend where practical.
+   Establish owned stored-key access and dense-ID invariants without changing local/raw policy or aggregate
+   update order. Ship only the one/two fixed-width shapes justified by the per-shape gates; keep other types on
+   the existing path. Include DOUBLE, NULL, growth, offsets, repeated batches and allocation-failure tests.
+2. **Generalize layouts and composite keys.** Extend the same interface to additional supported fixed-width types
+   and arbitrary key counts, with a generic column-oriented fallback inside the design. Avoid one template for
+   every possible tuple of types. Keep an explicit eligibility matrix and exact output/Lookup tests across mixed
+   layouts. Existing Arrow fallback remains available until each shape is both correct and measured; no SQL type
+   becomes newly accepted merely because a storage layout can hold it.
+3. **Add batch aggregate programs and typed merge.** Support multiple aggregate calls and their current result
+   types through typed update/merge/finalize operations. First measure the new key backend with existing state
+   updates, then fused updates with the same local/raw policy. Remove avoidable row-ID materialization only for
+   callers that do not need it. Implement direct stored-key/state merging with an immutable ownership boundary;
+   preserve part-order arithmetic, dependent keys, grouping-set projection, grouping without keys and whole-input
+   finalization checks even under LIMIT/top-N. Existing DISTINCT/two-level operators remain on their tested path
+   until their prefix and merge contracts are implemented and validated explicitly.
+4. **Integrate partitioned local tables and direct dispatch.** Use fixed routing inside each worker to populate
+   per-lane tables, cache/reuse hashes where measured, and hand completed partitions to their lanes. Cover
+   multiple keys, aggregate programs, selections and NULLs without copying payload rows. Measure three policies
+   separately: the existing adaptive local/raw path, one local table, and partitioned local tables. A comparison
+   of the last two must use the same all-local/adaptive policy, hash, state arithmetic and global merge path.
+   Decide whether to retain or replace adaptive bypass only from complete-query CPU, wall and memory results;
+   the prototype's always-local choice is not an accepted heuristic. Keep skew, part-order merging, cancellation,
+   backpressure and per-partition cleanup correct at every worker count. Preserve partition top-N and the separate
+   two-level distinct path, or leave them on an explicit fallback until supported.
+5. **Add owned string and mixed-key layouts.** Hash/compare values in place and copy bytes only for new groups.
+   Support arbitrary lengths and multiple/mixed columns; preserve the current short-string packing optimization
+   for its eligible shapes. Inline prefixes may reject unequal candidates but do not replace full equality for
+   equal long values. Follow [ADR 0027](0027-string-views.md) for owned BinaryView inputs, retention/compaction and
+   public Binary output. Admit a view-producing path only with complete consumer eligibility and lifetime proof;
+   ordinary Binary remains supported independently. Dictionary-entry hashes can be cached, but raw codes are
+   comparable only within a proven common domain. Translation, owners and fallback are budgeted. Dictionary
+   grouping remains a separately measured experiment; this plan does not reverse rejected
+   [ADR 0028](0028-dictionary-group-keys.md) or require global view transport before ordinary grouping can improve.
+6. **Integrate whole-partition window grouping.** The serial window operator already uses GroupTable, so an
+   eligible new key backend can help without changing its scheduling. Explicitly preserve each input row's group
+   mapping and gather finalized results back to input order; never confuse partition-local IDs with final IDs.
+   Parallelize independent semantic window partitions only with an explicit row-to-partition/group mapping,
+   stable output placement, bounded input retention and unchanged arithmetic/error ordering. Hash lanes contain
+   many semantic partitions and are only scheduling buckets. Keep serial accumulation for cases where splitting
+   and merging partial states would change the window's defined evaluation behavior. This step implements a
+   measured slice of [ADR 0043](0043-window-functions.md)'s WP1, not all window execution.
+7. **Evaluate ordered windows separately.** RANK, peers, ROWS prefixes, navigation and ordered frames keep their
+   sort/order requirements. Reuse key storage or partition discovery only when the measured path benefits; direct
+   hash dispatch does not replace sorting, peer detection or prefix evaluation. Broader parallel window scheduling,
+   bounded buffering or spilling belongs to ADR 0043's follow-ups and needs its own evidence and design. A
+   non-beneficial experiment is recorded and stopped, not enabled to complete this checklist.
+
+Steps 1-4 form the fixed-width grouping path. Step 5 extends it to general strings; step 6 can reuse proven key
+backends independently of step 5 for eligible numeric partitions. Step 7 is a follow-up investigation, not a blocker
+for useful grouped aggregation. Each PR records what remains on fallback; optimization coverage must not silently
+change which SQL answers. No dependency, module-edge, thread-count or planner-cardinality change is part of this
+sequence without a separate justified design.
+
+### Verification and acceptance
+
+The earlier October 29 per-shape and end-to-end gates remain for replacing the grouper; this amendment does not
+waive a failed gate or claim that the narrow Q18 experiment passes them. Evaluate complete-query improvements
+separately from microbenchmarks and report CPU and memory beside wall time. Reuse existing synthetic generators
+and approved benchmark inputs; commit only synthetic tests and permitted performance summaries.
+
+- **Correctness:** differential key/ID/Lookup and aggregate tests against the existing backend, DuckDB-completed
+  SQL tests when behavior paths change, and existing serial/parallel/oracle suites. Cover composite NULLs, empty
+  input, slices/selections, scalar and array inputs where supported, multiple batches with reused scratch, growing
+  tables, collisions, duplicate keys and representation changes. Check exact DECIMAL/integer arithmetic, all
+  existing DOUBLE guarantees, first-seen keys, group-ID limits and finalization errors hidden by LIMIT/top-N.
+  Include sets, grouping sets, dependent keys and two-level distinct whenever their shared interfaces change.
+- **Ownership:** test immutable source sharing after the producing batch/operator is destroyed, independent lane
+  cleanup, retained result lifetime, denied reservations, growth overlap, cancellation and repeated Open/Close.
+  Use existing parallel harnesses; adding threads to tests still needs the repository's separate approval.
+- **Microbenchmarks:** retain 1000, 16 Ki, 256 Ki and 1 Mi groups and report 4 Mi. Add a large-global regime around
+  47 Mi groups per lane: SF1000 qualification grouping can reach that average with 32 lanes. Measure local and
+  merge paths, one/two/many keys, random versus clustered keys, duplicate rates, skew, NULLs, string lengths,
+  multiple aggregates, growth, hash reuse and budgeted allocations. Large regimes supplement the prior gates;
+  earlier claims that partitioning makes them impossible no longer apply.
+- **End to end:** retain the earlier ClickBench-derived per-shape gates and all-query regression check. Also
+  compare all 22 TPC-H-derived queries at SF100, targeted SF1000 grouping including Q18, and affected TPC-DS-derived
+  queries. Use 16 and 32 threads for the added scale comparisons; include the earlier required 8/32-thread legs
+  when evaluating its ClickBench gates. Fix CPU placement, document memory placement, watch external load,
+  warm each mode and interleave at least three measured repetitions with rotating order. Keep the same physical
+  plan when attributing runtime effects. Run DuckDB unchanged as a drift control where required by the earlier
+  gate. Publish repetitions/ranges and CPU rather than silently dropping slow observations. No new 64-thread gate
+  is inferred from these tests; high-thread/NUMA behavior is reported when relevant.
+- **Attribution and stopping:** record backend selection, input/local groups, local/raw rows, hash/dispatch time,
+  ID partitioning, merge time, waits, peak tracked capacity and process CPU. Explain overlapping profile timers.
+  Retain controls until a step's benefit is understood; do not silently retune another optimization to hide its
+  regression. A failed per-shape gate leaves that shape on fallback or prompts a separately reviewed revision.
+  Production switches need ADR 0031's answer/error neutrality proof and observable path witness.
+- **Gates:** run `pixi run check` for every PR. Key storage, state ownership, immutable handoff and parallel
+  execution changes also require `pixi run check-full`; affected workload ratchets and SF1 sanitizer validation
+  remain subject to their existing policies. No skips, timeout increases, coverage changes or status-ratchet
+  edits are authorized by this plan.
+
+### Consequences of this amendment
+
+The implementation becomes several independently measurable PRs. It reuses substantial existing key-table work,
+keeps generic key identity separate from aggregate specialization, and treats partitioned local layout as an
+incremental improvement. Larger global tables, exact arithmetic and the current window/set consumers prevent a
+blind import of an older prototype or an upstream loop. Maintaining fallback paths costs code and tests until
+coverage and performance justify consolidation. This amendment changes neither SQL semantics, ADR statuses,
+partition counts, dependencies nor runtime defaults; implementation starts after this documentation PR merges.
