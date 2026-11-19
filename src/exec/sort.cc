@@ -230,12 +230,26 @@ int64_t SaturatingAdd(int64_t a, int64_t b) {
 // ---- RowComparator ----
 
 arrow::Result<RowComparator> RowComparator::Make(std::shared_ptr<arrow::Schema> schema,
-                                                 const std::vector<plan::SortKey>& keys) {
+                                                 const std::vector<plan::SortKey>& keys,
+                                                 MemoryReservation* memory) {
   if (schema == nullptr) {
     return arrow::Status::Invalid("sort without a schema");
   }
+  const auto charge = [&](std::size_t count) {
+    if (memory == nullptr) {
+      return arrow::Status::OK();
+    }
+    const auto remaining =
+        static_cast<std::size_t>(std::numeric_limits<int64_t>::max() - memory->bytes());
+    if (count > remaining / sizeof(Key)) {
+      return arrow::Status::CapacityError("sort comparison metadata size overflow");
+    }
+    return memory->Resize(memory->bytes() + Narrow<int64_t>(count * sizeof(Key)));
+  };
+  ARROW_RETURN_NOT_OK(charge(keys.size()));
   std::vector<Key> bound;
   bound.reserve(keys.size());
+  ARROW_RETURN_NOT_OK(charge(bound.capacity() - keys.size()));
   for (const plan::SortKey& key : keys) {
     const int column = key.column.index;
     if (column < 0 || column >= schema->num_fields()) {

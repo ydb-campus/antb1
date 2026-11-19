@@ -470,7 +470,8 @@ struct SortKey {
   bool nulls_first = false;  // DuckDB's default: NULLS LAST for ASC and DESC
 };
 
-// W2 executes whole-partition aggregates. RANK and ROWS-prefix calls remain binding-only.
+// W2 executes whole-partition aggregates and W3 executes RANK. ROWS-prefix calls remain
+// binding-only.
 struct WindowCall {
   enum class Kind : std::uint8_t { kAggregate, kRank };
   enum class Frame : std::uint8_t { kWholePartition, kRowsPrefix };

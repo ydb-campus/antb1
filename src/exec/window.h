@@ -8,8 +8,8 @@
 
 namespace antb1::exec {
 
-// Whole-partition aggregates (ADR 0043, W2). One upstream execution, shared grouping for
-// compatible calls, one finalization per partition, and bounded gathers back to input row order.
+// Whole-partition aggregates and RANK (ADR 0043, W2/W3). One upstream execution, shared grouping
+// or ordered layouts for compatible calls, and results aligned with input row order.
 class WindowOperator final : public Operator {
  public:
   WindowOperator(std::unique_ptr<Operator> input, std::vector<plan::WindowCall> calls);

@@ -1280,7 +1280,11 @@ struct Builder {
   OperatorResult operator()(const plan::WindowNode& node) const {
     for (const auto& call : node.calls) {
       if (call.kind == plan::WindowCall::Kind::kRank) {
-        return plan::UnsupportedError("W3: window execution is not supported", call.over_span);
+        if (call.frame || !call.frame_omitted) {
+          return plan::UnsupportedError("W8: explicit ranking frames are not supported",
+                                        call.over_span);
+        }
+        continue;
       }
       if (call.frame != plan::WindowCall::Frame::kWholePartition || !call.frame_omitted ||
           !call.order_by.empty()) {

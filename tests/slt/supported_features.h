@@ -215,7 +215,7 @@ enum class Feature : std::uint8_t {
   // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
   kNestedCorrelation,
   kWindowWholePartition,  // W2: whole-partition aggregates over raw rows or grouped output
-  kWindowRank,            // W3: parsed, execution and independent generator pending
+  kWindowRank,            // W3: RANK over raw rows or grouped output
   kWindowRowsPrefix,      // W4: parsed, execution and independent generator pending
   kWindowRanking,         // W5: parsed, execution and independent generator pending
   kWindowRangePrefix,     // W6: parsed, execution and independent generator pending
@@ -539,7 +539,6 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kRecursiveCte};
 // ADR 0038's grammar (ADR 0037's RU1) waited here for the PRs that answered it, each teaching the
 // generator its form: ROLLUP in RU3, GROUPING() in RU4, GROUPING SETS in RU5 and CUBE in RU6.
 inline constexpr FeatureSet kGeneratorPending = {
-    Feature::kWindowRank,           // W3 supplies the independent random stream
     Feature::kWindowRowsPrefix,     // W4 supplies the independent random stream
     Feature::kWindowRanking,        // W5 supplies the independent random stream
     Feature::kWindowRangePrefix,    // W6 supplies the independent random stream
@@ -563,6 +562,7 @@ inline constexpr FeatureSet kGeneratorPending = {
 // declares it here.
 inline constexpr FeatureSet kSupportedFeatures = {
     Feature::kWindowWholePartition,
+    Feature::kWindowRank,
     Feature::kCountStar,
     Feature::kCountColumn,
     Feature::kSum,

@@ -211,7 +211,7 @@ top-level `OR` without parentheses, so it reads back as it was parsed. Aggregate
 A window aggregate may consume an ordinary aggregate (`SUM(SUM(a)) OVER ()`). The inner aggregate belongs to
 the query block; the outer window does not itself make the block aggregate.
 
-### Window syntax, binding and execution (W1–W2)
+### Window syntax, binding and execution (W1–W3)
 
 Parsing, internal binding and executable support are separate contracts:
 
@@ -237,7 +237,7 @@ such as `OVER (rows)`.
 | Slice | Parsed structure | Internal binding | Execution owner |
 | --- | --- | --- | --- |
 | W2 | Existing aggregate calls with inline partition expressions and no ordering or frame | Whole-partition WindowNode | Supported |
-| W3 | RANK with inline partition/order expressions and omitted frame | BIGINT WindowNode result | W3 |
+| W3 | RANK with inline partition/order expressions and omitted frame | BIGINT WindowNode result | Supported |
 | W4 | Aggregate with explicit ROWS UNBOUNDED PRECEDING, or BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | ROWS-prefix WindowNode | W4 |
 | W5–W7 | Ranking functions, implicit ordered RANGE, named references/definitions and inheritance | Unsupported with owner | W5–W7 |
 | W8a–d | ROWS/RANGE/GROUPS bounds, shorthand/BETWEEN, exclusions | Unsupported with owner | W8a–d |
@@ -269,10 +269,21 @@ signed zeros). Each input row receives its partition's result. Empty input produ
 queries see the groups surviving HAVING, including GROUPING() results. Final DISTINCT, ordering and LIMIT consume
 the window results. No window order is implied by this execution slice.
 
+W3 answers `RANK()` with an inline specification and no explicit frame. The result is a non-NULL BIGINT:
+each partition starts at 1, peers receive the same rank, and the next rank includes all preceding rows, including
+ties. Without window ordering every row has rank 1. Partition and ordering expressions can use CASE, ordinary
+aggregates and GROUPING() under the existing expression rules. Ordering uses the same types and comparisons as
+final ORDER BY: explicit ASC/DESC and NULLS FIRST/LAST, bytewise VARCHAR order, equal DOUBLE NaNs and equal signed
+zeros. Peers remain peers across input and output batch boundaries. Window ordering does not set final row order.
+
 The Window operator consumes its upstream once, retains the pruned input in batches, shares grouping for calls
 with the same partition keys, and finalizes each partition once before gathering its results back to the rows.
 Evaluation is serial after upstream parallel pipelines have gathered. Its retained rows, aggregate state and
-scratch space use the query memory budget; there is no separate materialized-result size cap.
+scratch space use the query memory budget; there is no separate materialized-result size cap. RANK calls with
+matching partition/order keys share a stable row permutation and rank results. Row identity breaks traversal ties
+without splitting peers; ranks are mapped back to input rows so different specifications and W2 aggregates remain
+aligned. Permutations, comparison metadata and results are charged to the same budget and released on failure,
+cancellation or Close.
 
 The FROM list is flat ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each item after the first records how it joins
 the items before it. A `JOIN` binds tighter than a comma and associates to the left, as in DuckDB, so `a, b JOIN c ON
@@ -2016,10 +2027,10 @@ pass, the last column lists every construct it needs that antb1 does not answer 
 [ADR 0037](adr/0037-tpcds-roadmap.md)'s Plan, from that ADR's survey of 2026-10-31. In parentheses is the id of the Plan
 item that completes the query: the one that answers the last of them. The window items (W) are those of
 [ADR 0043](adr/0043-window-functions.md) (2026-11-18): W1 prepared the canary and frontend; W2 answers
-whole-partition aggregates and completes six queries, bringing the ratchet to **90/99**. W3 completes eight more
-and W4 one. ADR 0043 separately lists the broader Standard SQL window backlog. The subquery
-items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose phase 8 order the Plan
-follows; phase 8 is complete, and the nine remaining queries need later window slices.
+whole-partition aggregates and completes six queries; W3 adds RANK and completes eight more, bringing the
+ratchet to **98/99**. W4 completes the remaining query. ADR 0043 separately lists the broader Standard SQL window
+backlog. The subquery items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose
+phase 8 order the Plan follows; phase 8 is complete, and the remaining query needs W4.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
@@ -2058,7 +2069,7 @@ follows; phase 8 is complete, and the nine remaining queries need later window s
 | Q33 | pass | `UNION ALL` (ADR 0036) |
 | Q34 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q35 | pass | a correlated EXISTS under OR, next to a top-level correlated EXISTS (SQ8a) |
-| Q36 | unsupported | needs rank() and window partition expressions (W3) |
+| Q36 | pass | rank() and window partition expressions (W3) |
 | Q37 | pass | answered when the ratchet was added |
 | Q38 | pass | `INTERSECT` (X4c) |
 | Q39 | pass | stddev_samp (AG2) |
@@ -2066,12 +2077,12 @@ follows; phase 8 is complete, and the nine remaining queries need later window s
 | Q41 | pass | a correlated COUNT subquery, joined back LEFT where its comparison can pass 0 (SQ6) |
 | Q42 | pass | answered when the ratchet was added |
 | Q43 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
-| Q44 | unsupported | needs rank() (W3) |
+| Q44 | pass | rank() (W3) |
 | Q45 | pass | an IN subquery under OR, through a null-aware mark join (SQ7a) |
 | Q46 | pass | constant integer expressions in IN lists |
-| Q47 | unsupported | needs window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
+| Q47 | pass | window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
 | Q48 | pass | answered when the ratchet was added |
-| Q49 | unsupported | needs rank() (W3) |
+| Q49 | pass | rank() (W3) |
 | Q50 | pass | answered when the ratchet was added |
 | Q51 | unsupported | needs running window aggregates with a ROWS frame from unbounded preceding to current row, and windows over aggregates (W4) |
 | Q52 | pass | answered when the ratchet was added |
@@ -2079,7 +2090,7 @@ follows; phase 8 is complete, and the nine remaining queries need later window s
 | Q54 | pass | scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |
 | Q55 | pass | answered when the ratchet was added |
 | Q56 | pass | `UNION ALL` (ADR 0036) |
-| Q57 | unsupported | needs window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
+| Q57 | pass | window aggregates over whole partitions, rank() and windows over aggregates (W3, after W2) |
 | Q58 | pass | scalar subqueries that are not aggregates (SQ4a) |
 | Q59 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
 | Q60 | pass | `UNION ALL` (ADR 0036) |
@@ -2089,10 +2100,10 @@ follows; phase 8 is complete, and the nine remaining queries need later window s
 | Q64 | pass | answered when the ratchet was added |
 | Q65 | pass | answered when the ratchet was added |
 | Q66 | pass | `UNION ALL` (ADR 0036) |
-| Q67 | unsupported | needs rank() (W3) |
+| Q67 | pass | rank() (W3) |
 | Q68 | pass | constant integer expressions in IN lists |
 | Q69 | pass | answered when the ratchet was added |
-| Q70 | unsupported | needs rank(), window ordering over aggregates and window partition expressions (W3) |
+| Q70 | pass | rank(), window ordering over aggregates and window partition expressions (W3) |
 | Q71 | pass | `UNION ALL` (ADR 0036) |
 | Q72 | pass | DATE plus an integer (CT5) |
 | Q73 | pass | `ELSE NULL` as a `CASE` without `ELSE` |
@@ -2108,7 +2119,7 @@ follows; phase 8 is complete, and the nine remaining queries need later window s
 | Q83 | pass | answered when the ratchet was added |
 | Q84 | pass | concat (FN5) |
 | Q85 | pass | answered when the ratchet was added |
-| Q86 | unsupported | needs rank(), window ordering over aggregates and window partition expressions (W3) |
+| Q86 | pass | rank(), window ordering over aggregates and window partition expressions (W3) |
 | Q87 | pass | `EXCEPT` (X4d) |
 | Q88 | pass | cross products of one-row inputs |
 | Q89 | pass | whole-partition window aggregates over grouped results (W2) |

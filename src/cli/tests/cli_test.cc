@@ -536,8 +536,8 @@ TEST(RunCommandTest, ExitStatusAndErrors) {
 TEST_F(CliTest, WindowDiagnosticsKeepExitCodes) {
   for (const auto& [text, code] : std::vector<std::pair<std::string, int>>{
            {"SELECT COUNT(*) OVER () FROM t", kExitOk},
-           {"SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()", kExitUnsupported},
-           {"SELECT RANK() OVER (ORDER BY EventDate) FROM t LIMIT 0", kExitUnsupported},
+           {"SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()", kExitOk},
+           {"SELECT RANK() OVER (ORDER BY EventDate) FROM t LIMIT 0", kExitOk},
            {"SELECT COUNT(*) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
             kExitUnsupported},
            {"SELECT COUNT(*) OVER (ORDER BY EventDate) FROM t", kExitUnsupported},

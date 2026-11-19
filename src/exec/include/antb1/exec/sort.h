@@ -30,8 +30,11 @@ class RowComparator {
   using KeyArrays = std::vector<const arrow::Array*>;
 
   // Fails if a key is outside the schema or its column has no engine type (plan::ToArrow).
+  // Optional metadata reservation must outlive the comparator; charges its storage before
+  // allocation.
   static arrow::Result<RowComparator> Make(std::shared_ptr<arrow::Schema> schema,
-                                           const std::vector<plan::SortKey>& keys);
+                                           const std::vector<plan::SortKey>& keys,
+                                           MemoryReservation* memory = nullptr);
 
   [[nodiscard]] const std::shared_ptr<arrow::Schema>& schema() const { return schema_; }
   [[nodiscard]] KeyArrays KeysOf(const arrow::RecordBatch& batch) const;

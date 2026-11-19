@@ -10253,9 +10253,6 @@ arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement) {
       if (auto deferred = FirstUnsupported(expr, /*values=*/true)) {
         return Reject(*deferred);
       }
-      if (AsciiLower(call->name) == "rank") {
-        return UnsupportedError("W3: window execution is not supported", call->over_span);
-      }
       if (call->specification.frame) {
         return UnsupportedError("W4: window execution is not supported", call->over_span);
       }
