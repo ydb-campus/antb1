@@ -539,7 +539,7 @@ TEST_F(CliTest, WindowDiagnosticsKeepExitCodes) {
            {"SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()", kExitOk},
            {"SELECT RANK() OVER (ORDER BY EventDate) FROM t LIMIT 0", kExitOk},
            {"SELECT COUNT(*) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-            kExitUnsupported},
+            kExitOk},
            {"SELECT COUNT(*) OVER (ORDER BY EventDate) FROM t", kExitUnsupported},
            {"SELECT RANK(EventDate) OVER () FROM t", kExitQueryError},
            {"SELECT COUNT(*) OVER (PARTITION EventDate) FROM t", kExitQueryError}}) {

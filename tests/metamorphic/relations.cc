@@ -3786,6 +3786,19 @@ std::vector<Relation> AllRelations() {
                     "b.i32 < a.i32 OR (a.i32 IS NULL AND b.i32 IS NOT NULL) GROUP BY a.id")},
        .check = AllEqual()});
 
+  // An independent join enumerates each row's prefix, without a window operator.
+  r.push_back(
+      {.name = "rows_prefix_equals_aggregate_of_preceding_rows",
+       .features = {kWindowRowsPrefix, kSum, kColumns, kIntegerColumns, kTableName, kMultipleItems,
+                    kGroupBy, kJoinOn, kTableAlias, kQualifiedName, kCompareColumns},
+       .probes = {Q("SELECT id, SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM edge", 1),
+                  Q("SELECT id, SUM(i32) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND "
+                    "CURRENT ROW) FROM edge",
+                    7),
+                  Q("SELECT a.id, SUM(b.i32) FROM edge AS a JOIN edge AS b ON b.id <= a.id GROUP "
+                    "BY a.id")},
+       .check = AllEqual()});
+
   // The permanently pending recursive canary: a seed in [0, 3] counts down through zero.
   // Both probes genuinely recurse for this fixture, terminate, and return at most four rows.
   r.push_back({.name = "recursive_cte_canary_stays_pending",

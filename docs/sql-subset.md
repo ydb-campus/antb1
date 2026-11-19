@@ -211,7 +211,7 @@ top-level `OR` without parentheses, so it reads back as it was parsed. Aggregate
 A window aggregate may consume an ordinary aggregate (`SUM(SUM(a)) OVER ()`). The inner aggregate belongs to
 the query block; the outer window does not itself make the block aggregate.
 
-### Window syntax, binding and execution (W1–W3)
+### Window syntax, binding and execution (W1–W4)
 
 Parsing, internal binding and executable support are separate contracts:
 
@@ -238,7 +238,7 @@ such as `OVER (rows)`.
 | --- | --- | --- | --- |
 | W2 | Existing aggregate calls with inline partition expressions and no ordering or frame | Whole-partition WindowNode | Supported |
 | W3 | RANK with inline partition/order expressions and omitted frame | BIGINT WindowNode result | Supported |
-| W4 | Aggregate with explicit ROWS UNBOUNDED PRECEDING, or BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | ROWS-prefix WindowNode | W4 |
+| W4 | Aggregate with explicit ROWS UNBOUNDED PRECEDING, or BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | ROWS-prefix WindowNode | Supported |
 | W5–W7 | Ranking functions, implicit ordered RANGE, named references/definitions and inheritance | Unsupported with owner | W5–W7 |
 | W8a–d | ROWS/RANGE/GROUPS bounds, shorthand/BETWEEN, exclusions | Unsupported with owner | W8a–d |
 | W9a–d | Navigation/value calls, RESPECT/IGNORE NULLS, NTH_VALUE FROM FIRST/LAST | Unsupported with owner | W9a–d |
@@ -276,14 +276,24 @@ aggregates and GROUPING() under the existing expression rules. Ordering uses the
 final ORDER BY: explicit ASC/DESC and NULLS FIRST/LAST, bytewise VARCHAR order, equal DOUBLE NaNs and equal signed
 zeros. Peers remain peers across input and output batch boundaries. Window ordering does not set final row order.
 
+W4 answers the same aggregate family as W2 with an explicit `ROWS UNBOUNDED PRECEDING` or
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` frame. Each result includes the current row and all preceding
+rows of its partition, in window order; tied rows advance the aggregate separately. Without ordering, traversal
+uses input order. SQL does not specify a tie order, so use a unique ordering key when individual prefix results
+must be reproducible. NULLs, types and overflow follow the ordinary aggregates. Integer SUM and AVG accumulate
+in Int128, and AVG does not require its intermediate sum to fit SUM's 38-digit result type. Empty input emits no
+rows. Computed keys, grouped inputs and windows in successive derived-table or CTE blocks work as for W2/W3.
+An omitted frame with ordering still requires W6; other explicit frames and exclusions remain W8.
+
 The Window operator consumes its upstream once, retains the pruned input in batches, shares grouping for calls
 with the same partition keys, and finalizes each partition once before gathering its results back to the rows.
 Evaluation is serial after upstream parallel pipelines have gathered. Its retained rows, aggregate state and
 scratch space use the query memory budget; there is no separate materialized-result size cap. RANK calls with
-matching partition/order keys share a stable row permutation and rank results. Row identity breaks traversal ties
-without splitting peers; ranks are mapped back to input rows so different specifications and W2 aggregates remain
-aligned. Permutations, comparison metadata and results are charged to the same budget and released on failure,
-cancellation or Close.
+matching partition/order keys share rank results and a stable row permutation with running ROWS calls. Row identity
+breaks traversal ties without splitting peers; results are mapped back to input rows so different specifications
+and W2 aggregates remain aligned. Running aggregates carry state across batches, reset at partition boundaries,
+and finalize through typed batch loops. All results are validated before the first output batch. Permutations,
+comparison metadata and results are charged to the same budget and released on failure, cancellation or Close.
 
 The FROM list is flat ([ADR 0022](adr/0022-joins-and-query-blocks.md)): each item after the first records how it joins
 the items before it. A `JOIN` binds tighter than a comma and associates to the left, as in DuckDB, so `a, b JOIN c ON
@@ -2027,10 +2037,10 @@ pass, the last column lists every construct it needs that antb1 does not answer 
 [ADR 0037](adr/0037-tpcds-roadmap.md)'s Plan, from that ADR's survey of 2026-10-31. In parentheses is the id of the Plan
 item that completes the query: the one that answers the last of them. The window items (W) are those of
 [ADR 0043](adr/0043-window-functions.md) (2026-11-18): W1 prepared the canary and frontend; W2 answers
-whole-partition aggregates and completes six queries; W3 adds RANK and completes eight more, bringing the
-ratchet to **98/99**. W4 completes the remaining query. ADR 0043 separately lists the broader Standard SQL window
-backlog. The subquery items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md) (2026-11-10), whose
-phase 8 order the Plan follows; phase 8 is complete, and the remaining query needs W4.
+whole-partition aggregates and completes six queries; W3 adds RANK and completes eight more; W4 adds running
+ROWS aggregates and completes Q51, bringing the ratchet to **99/99**. ADR 0043 separately lists the broader Standard
+SQL window backlog. The subquery items (SQ) are those of [ADR 0041](adr/0041-subqueries-and-decorrelation.md)
+(2026-11-10), whose phase 8 order the Plan follows; phase 8 and the workload milestone of phase 9 are complete.
 
 | Query | Status | Completed by / needs |
 | --- | --- | --- |
@@ -2084,7 +2094,7 @@ phase 8 order the Plan follows; phase 8 is complete, and the remaining query nee
 | Q48 | pass | answered when the ratchet was added |
 | Q49 | pass | rank() (W3) |
 | Q50 | pass | answered when the ratchet was added |
-| Q51 | unsupported | needs running window aggregates with a ROWS frame from unbounded preceding to current row, and windows over aggregates (W4) |
+| Q51 | pass | running ROWS window aggregates over grouped output and in successive query blocks (W4) |
 | Q52 | pass | answered when the ratchet was added |
 | Q53 | pass | whole-partition window aggregates over grouped results (W2) |
 | Q54 | pass | scalar subqueries that are not aggregates, as the bounds of a BETWEEN (SQ4a) |

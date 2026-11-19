@@ -10246,15 +10246,12 @@ arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement) {
     }
   }
   const auto refuse = [](this const auto& self, const sql::Expr& expr) -> arrow::Status {
-    if (const auto* call = std::get_if<sql::WindowCall>(&expr)) {
+    if (std::holds_alternative<sql::WindowCall>(expr)) {
       // Unused CTE bodies have not been bound. Apply the same operand capability checks as
       // reachable blocks without resolving their names; ordinary aggregate subquery values
       // keep their existing support, while direct window subqueries remain W11f.
       if (auto deferred = FirstUnsupported(expr, /*values=*/true)) {
         return Reject(*deferred);
-      }
-      if (call->specification.frame) {
-        return UnsupportedError("W4: window execution is not supported", call->over_span);
       }
     }
     if (const auto* sub = std::get_if<sql::SubqueryExpr>(&expr)) {

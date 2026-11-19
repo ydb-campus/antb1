@@ -47,6 +47,13 @@ plan::WindowCall Call(AggKind kind, LogicalType type, LogicalType result, bool p
   return call;
 }
 
+plan::WindowCall Prefix(AggKind kind, LogicalType type, LogicalType result, bool partition = true) {
+  auto call = Call(kind, type, result, partition);
+  call.frame = plan::WindowCall::Frame::kRowsPrefix;
+  call.frame_omitted = false;
+  return call;
+}
+
 plan::WindowCall Rank(LogicalType type = LogicalType::kBigInt, bool descending = false,
                       bool nulls_first = false) {
   return {.kind = plan::WindowCall::Kind::kRank,
@@ -55,6 +62,71 @@ plan::WindowCall Rank(LogicalType type = LogicalType::kBigInt, bool descending =
                         .descending = descending,
                         .nulls_first = nulls_first}},
           .name = "rank"};
+}
+
+TEST_F(WindowTest, RowsPrefixesShareRankLayoutsAndKeepInputIdentity) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 7,
+                               {testing::Int64s({1, 2, 1, 1, 2, std::nullopt, std::nullopt}),
+                                testing::Int64s({3, 8, 1, 3, std::nullopt, 9, 9})});
+  auto source = std::make_unique<ScriptedSource>(
+      schema, std::vector<Batch>{
+                  {.data = batch->Slice(0, 3), .selection = testing::Bools({true, false, true})},
+                  {.data = batch->Slice(3), .selection = {}}});
+  const auto* observed = source.get();
+  auto count = Prefix(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt);
+  count.order_by = Rank().order_by;
+  auto descending = count;
+  descending.order_by = Rank(LogicalType::kBigInt, true, true).order_by;
+  WindowOperator op(std::move(source),
+                    {count, Rank(), descending, count,
+                     Call(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt)});
+  MemoryBudget budget(1024 * 1024);
+  ExecContext ctx{.pool = &budget, .batch_size = 1, .budget = &budget};
+  for (int run = 1; run <= 2; ++run) {
+    {
+      const auto result = Drain(op, ctx);
+      ASSERT_TRUE(result.ok()) << result.status();
+      EXPECT_EQ(testing::Int64Column(**result, 2),
+                (std::vector<std::optional<int64_t>>{2, 1, 3, 1, 1, 2}));
+      EXPECT_EQ(testing::Int64Column(**result, 3),
+                (std::vector<std::optional<int64_t>>{2, 1, 2, 1, 1, 1}));
+      EXPECT_EQ(testing::Int64Column(**result, 4),
+                (std::vector<std::optional<int64_t>>{1, 3, 2, 1, 1, 2}));
+      EXPECT_EQ(testing::Int64Column(**result, 5), testing::Int64Column(**result, 2));
+      EXPECT_EQ(testing::Int64Column(**result, 6),
+                (std::vector<std::optional<int64_t>>{3, 3, 3, 1, 2, 2}));
+    }
+    EXPECT_EQ(observed->opens(), run);
+    EXPECT_EQ(observed->closes(), run);
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
+
+TEST_F(WindowTest, RowsPrefixesCarryStateAcrossChunksAndResetPartitions) {
+  constexpr int64_t kRows = 65539;
+  arrow::Int64Builder keys;
+  for (int64_t i = 0; i < kRows; ++i) {
+    ASSERT_TRUE(keys.Append(i < 65537 ? 0 : 1).ok());
+  }
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(schema, kRows, {keys.Finish().ValueOrDie()});
+  auto source = std::make_unique<ScriptedSource>(
+      schema, std::vector<Batch>{{.data = batch->Slice(0, 65535), .selection = {}},
+                                 {.data = batch->Slice(65535), .selection = {}}});
+  WindowOperator op(std::move(source),
+                    {Prefix(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt)});
+  ExecContext ctx;
+  ctx.batch_size = 65536;
+  const auto result = Drain(op, ctx);
+  ASSERT_TRUE(result.ok()) << result.status();
+  const auto counts = testing::Int64Column(**result, 1);
+  ASSERT_EQ(counts.size(), static_cast<std::size_t>(kRows));
+  for (std::size_t i = 0; i < counts.size(); ++i) {
+    EXPECT_EQ(counts[i], static_cast<int64_t>(i < 65537 ? i + 1 : i - 65536));
+  }
 }
 
 TEST_F(WindowTest, RankPeersAcrossMasksBatchesAndSpecificationsKeepRowIdentity) {
@@ -282,6 +354,55 @@ TEST_F(WindowTest, InvalidAndDeferredRankCallsAreRejectedBeforeOpeningInput) {
   }
 }
 
+TEST_F(WindowTest, InvalidRowsPrefixCallsAreRejectedBeforeOpeningInput) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::boolean()), arrow::field("v", arrow::int64())});
+  for (int variant = 0; variant < 7; ++variant) {
+    SCOPED_TRACE(variant);
+    auto call = Prefix(AggKind::kSum, LogicalType::kBigInt, LogicalType::kHugeInt, false);
+    switch (variant) {
+      case 0:
+        call.aggregate = AggKind::kSumCounts;
+        break;
+      case 1:
+        call.aggregate = AggKind::kSingleValue;
+        break;
+      case 2:
+        call.type = LogicalType::kInteger;
+        break;
+      case 3:
+        call.arguments.clear();
+        break;
+      case 4:
+        call.arguments.front().index = 2;
+        break;
+      case 5:
+        call.arguments = {Column(0, "k", LogicalType::kBoolean)};
+        break;
+      case 6:
+        call.frame_omitted = true;
+        break;
+      default:
+        FAIL() << "unhandled prefix test variant";
+    }
+    auto source = std::make_unique<ScriptedSource>(schema, std::vector<Batch>{});
+    const auto* observed = source.get();
+    WindowOperator op(std::move(source), {call});
+    ExecContext ctx;
+    const auto status = op.Open(ctx);
+    if (variant < 5) {
+      EXPECT_TRUE(status.IsInvalid()) << status;
+    } else {
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << status;
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
+      EXPECT_NE(status.message().find(variant == 5 ? "W11b" : "W6"), std::string::npos);
+    }
+    EXPECT_EQ(observed->opens(), 0);
+    EXPECT_TRUE(op.Close().ok());
+  }
+}
+
 TEST_F(WindowTest, RankLayoutAndResultsRespectBudgetAndReleaseOnFailure) {
   const auto schema = arrow::schema({arrow::field("v", arrow::int64())});
   std::vector<std::optional<int64_t>> values(257, 7);
@@ -372,7 +493,7 @@ TEST_F(WindowTest, AllAggregateTypesMatchScalarPartitionsAcrossBatchesAndMasks) 
           {.data = batch->Slice(0, 3), .selection = testing::Bools({true, false, true})},
           {.data = batch->Slice(3, 3), .selection = testing::Bools({true, true, std::nullopt})}};
       auto source = std::make_unique<ScriptedSource>(schema, std::move(batches));
-      WindowOperator op(std::move(source), {Call(kind, type, result)});
+      WindowOperator op(std::move(source), {Call(kind, type, result), Prefix(kind, type, result)});
       ExecContext ctx;
       ctx.batch_size = 1;
       auto output = Drain(op, ctx);
@@ -396,6 +517,17 @@ TEST_F(WindowTest, AllAggregateTypesMatchScalarPartitionsAcrossBatchesAndMasks) 
         const auto group = row < 2 ? 0U : static_cast<std::size_t>(row - 1);
         EXPECT_TRUE(actual->Slice(row, 1)->ApproxEquals(expected[group]))
             << actual->ToString() << " expected " << expected[group]->ToString();
+        auto prefix_expected = expected[group];
+        if (row == 0) {
+          auto first =
+              MakeAggregateState(
+                  kind, kind == AggKind::kCountStar ? std::nullopt : std::optional(type), result)
+                  .ValueOrDie();
+          ASSERT_TRUE(first->Consume(*values->Slice(0, 1), nullptr).ok());
+          prefix_expected = first->Finalize(ctx.pool).ValueOrDie();
+        }
+        EXPECT_TRUE(combined->column(3)->chunk(0)->Slice(row, 1)->ApproxEquals(prefix_expected))
+            << combined->column(3)->ToString() << " expected " << prefix_expected->ToString();
       }
     }
   }
@@ -455,7 +587,8 @@ TEST_F(WindowTest, EmptyInputHasNoGlobalRowAndFailedInputReleasesMemory) {
     }
     WindowOperator op(
         std::move(source),
-        {Call(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt, false), Rank()});
+        {Call(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt, false), Rank(),
+         Prefix(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt, false)});
     MemoryBudget budget(1024 * 1024);
     ExecContext ctx{.pool = &budget, .budget = &budget};
     ASSERT_TRUE(op.Open(ctx).ok());
@@ -486,6 +619,7 @@ TEST_F(WindowTest, ExternalRetainedBuffersAndMappingScratchRespectBudget) {
         schema, std::vector<Batch>{{.data = batch, .selection = {}}});
     WindowOperator op(std::move(source),
                       {Call(AggKind::kMin, LogicalType::kVarchar, LogicalType::kVarchar),
+                       Prefix(AggKind::kMax, LogicalType::kVarchar, LogicalType::kVarchar),
                        Rank(LogicalType::kVarchar)});
     MemoryBudget budget(limit);
     ExecContext ctx{.pool = &budget, .batch_size = 1, .budget = &budget};
@@ -553,12 +687,18 @@ TEST_F(WindowTest, FinalizeErrorsPrecedeFirstOutputAndAverageUsesItsOwnFinalizer
   const std::string large = "6" + std::string(37, '0');
   const auto batch = arrow::RecordBatch::Make(
       schema, 3, {testing::Int64s({1, 2, 2}), testing::Decimals(38, 0, {"1", large, large})});
-  for (const bool average : {false, true}) {
+  for (unsigned variant = 0; variant < 4; ++variant) {
+    const bool average = (variant & 1U) != 0;
+    const bool prefix = (variant & 2U) != 0;
     auto source = std::make_unique<ScriptedSource>(
         schema, std::vector<Batch>{{.data = batch, .selection = {}}});
-    WindowOperator op(std::move(source),
-                      {Call(average ? AggKind::kAvg : AggKind::kSum, type,
-                            average ? LogicalType::kDouble : LogicalType::kHugeInt)});
+    auto call = Call(average ? AggKind::kAvg : AggKind::kSum, type,
+                     average ? LogicalType::kDouble : LogicalType::kHugeInt);
+    if (prefix) {
+      call.frame = plan::WindowCall::Frame::kRowsPrefix;
+      call.frame_omitted = false;
+    }
+    WindowOperator op(std::move(source), {call});
     MemoryBudget budget(std::nullopt);
     ExecContext ctx{.pool = &budget, .batch_size = 1, .budget = &budget};
     ASSERT_TRUE(op.Open(ctx).ok());
@@ -575,6 +715,25 @@ TEST_F(WindowTest, FinalizeErrorsPrecedeFirstOutputAndAverageUsesItsOwnFinalizer
     ASSERT_TRUE(op.Close().ok());
     EXPECT_EQ(budget.bytes_allocated(), 0);
   }
+}
+
+TEST_F(WindowTest, RowsPrefixOverflowIsDetectedEvenWhenTheFinalSumFits) {
+  const auto type = LogicalType::kHugeInt;
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", plan::ToArrow(type))});
+  const std::string large = "6" + std::string(37, '0');
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 3,
+      {testing::Int64s({1, 1, 1}), testing::Decimals(38, 0, {large, large, "-" + large})});
+  auto source = std::make_unique<ScriptedSource>(
+      schema, std::vector<Batch>{{.data = batch, .selection = {}}});
+  WindowOperator op(std::move(source), {Prefix(AggKind::kSum, type, type)});
+  MemoryBudget budget(std::nullopt);
+  ExecContext ctx{.pool = &budget, .batch_size = 1, .budget = &budget};
+  ASSERT_TRUE(op.Open(ctx).ok());
+  EXPECT_TRUE(op.Next().status().IsExecutionError());
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+  EXPECT_TRUE(op.Close().ok());
 }
 
 }  // namespace

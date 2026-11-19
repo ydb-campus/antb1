@@ -1286,9 +1286,11 @@ struct Builder {
         }
         continue;
       }
-      if (call.frame != plan::WindowCall::Frame::kWholePartition || !call.frame_omitted ||
-          !call.order_by.empty()) {
-        return plan::UnsupportedError("W4–W8: deferred window frame", call.over_span);
+      const bool whole = call.frame == plan::WindowCall::Frame::kWholePartition &&
+                         call.frame_omitted && call.order_by.empty();
+      const bool prefix = call.frame == plan::WindowCall::Frame::kRowsPrefix && !call.frame_omitted;
+      if (!whole && !prefix) {
+        return plan::UnsupportedError("W6–W8: deferred window frame", call.over_span);
       }
       if (call.aggregate == plan::AggKind::kCountDistinct) {
         return plan::UnsupportedError("W10a: window DISTINCT is not supported", call.span);

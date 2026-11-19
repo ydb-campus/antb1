@@ -1204,6 +1204,10 @@ TEST_F(WindowBadAllocTest, OpenAndNextReleaseEveryFailedAllocation) {
   rank.kind = plan::WindowCall::Kind::kRank;
   rank.partition_by = call.partition_by;
   rank.order_by = {{.column = testing::Column(0, "k", plan::LogicalType::kBigInt)}};
+  auto prefix = call;
+  prefix.frame = plan::WindowCall::Frame::kRowsPrefix;
+  prefix.frame_omitted = false;
+  prefix.order_by = rank.order_by;
   for (const bool opening : {true, false}) {
     Sweep([&](std::int64_t skip) {
       MemoryBudget budget(std::nullopt);
@@ -1212,7 +1216,7 @@ TEST_F(WindowBadAllocTest, OpenAndNextReleaseEveryFailedAllocation) {
       {
         auto source = std::make_unique<testing::ScriptedSource>(
             schema, std::vector<Batch>{{.data = batch, .selection = {}}});
-        WindowOperator op(std::move(source), {call, rank});
+        WindowOperator op(std::move(source), {call, rank, prefix});
         if (!opening) {
           EXPECT_TRUE(op.Open(ctx).ok());
         }

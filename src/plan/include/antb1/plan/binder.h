@@ -28,7 +28,8 @@ arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog&
                                 const BindOptions& options = {});
 
 // Refuse deferred window forms in the original AST, including unused CTE bodies, after Bind
-// and before Optimize. W2 whole-partition aggregates execute; no option enables deferred forms.
+// and before Optimize. W2 whole-partition aggregates, W3 RANK and W4 ROWS prefixes execute;
+// no option enables deferred forms.
 arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement);
 
 }  // namespace antb1::plan

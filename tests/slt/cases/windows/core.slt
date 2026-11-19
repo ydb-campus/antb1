@@ -1,4 +1,4 @@
-# ADR 0043 W2/W3 execute whole-partition aggregates and RANK; W4 remains pending.
+# ADR 0043 W2–W4 execute whole-partition aggregates, RANK and running ROWS aggregates.
 # Expected results come only from slt-complete's DuckDB oracle.
 
 query III rowsort
@@ -74,7 +74,6 @@ SMALLINT	BIGINT
 NULL	1
 NULL	7
 
-pending W4
 query III rowsort
 SELECT i16, SUM(i32) OVER (ORDER BY i16, i32 ROWS UNBOUNDED PRECEDING), MAX(i32) OVER (ORDER BY i16, i32 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM edge
 ----
@@ -92,7 +91,6 @@ SMALLINT	HUGEINT	INTEGER
 NULL	54320	2147483647
 NULL	54320	2147483647
 
-pending W4
 query II rowsort
 SELECT i16, COUNT(*) OVER (PARTITION BY i16 ORDER BY i32 ROWS UNBOUNDED PRECEDING) FROM edge
 ----
