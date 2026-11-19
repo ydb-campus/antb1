@@ -839,11 +839,18 @@ TEST_F(SessionTest, SkippedRowGroupsDoNotChangeAnswers) {
   }
 }
 
-TEST_F(SessionTest, WholePartitionWindowsAcrossSessionEntryPoints) {
+TEST_F(SessionTest, SupportedWindowsAcrossSessionEntryPoints) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* text :
-       {"SELECT COUNT(*) OVER () FROM t",
+       {"SELECT RANK() OVER () FROM t LIMIT 0", "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
+        "SELECT RANK() OVER (ORDER BY AdvEngineID DESC NULLS FIRST) FROM t",
+        "SELECT COUNT(*) FROM (SELECT RANK() OVER () AS x FROM t) AS q",
+        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT RANK() OVER () FROM t)",
+        "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE RANK() OVER () END FROM t",
+        "WITH unused AS (SELECT RANK() OVER () FROM no_such_table) SELECT COUNT(*) FROM t",
+        "SELECT COUNT(*) FROM t UNION ALL SELECT RANK() OVER () FROM t",
+        "SELECT COUNT(*) OVER () FROM t",
         "SELECT COUNT(*) FROM t ORDER BY COUNT(*) OVER () LIMIT 0",
         "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()",
         "SELECT COUNT(*) FROM (SELECT COUNT(*) OVER () AS n FROM t) AS q",
@@ -872,15 +879,16 @@ TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* text :
-       {"SELECT RANK() OVER () FROM t LIMIT 0", "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
+       {"SELECT DENSE_RANK() OVER () FROM t LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY DENSE_RANK() OVER ()",
         "SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
-        "SELECT COUNT(*) FROM (SELECT RANK() OVER () AS x FROM t) AS q",
-        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT RANK() OVER () FROM t)",
-        "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE RANK() OVER () END FROM t",
-        "WITH unused AS (SELECT RANK() OVER () FROM no_such_table) SELECT COUNT(*) FROM t",
+        "SELECT COUNT(*) FROM (SELECT DENSE_RANK() OVER () AS x FROM t) AS q",
+        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT DENSE_RANK() OVER () FROM t)",
+        "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE DENSE_RANK() OVER () END FROM t",
+        "WITH unused AS (SELECT DENSE_RANK() OVER () FROM no_such_table) SELECT COUNT(*) FROM t",
         kUnusedDeferred,
         "WITH unused AS (SELECT AdvEngineID FROM t WINDOW w AS ()) SELECT COUNT(*) FROM t",
-        "SELECT COUNT(*) FROM t UNION ALL SELECT RANK() OVER () FROM t"}) {
+        "SELECT COUNT(*) FROM t UNION ALL SELECT DENSE_RANK() OVER () FROM t"}) {
     SCOPED_TRACE(text);
     for (const arrow::Status& status :
          {session->Execute(text).status(), session->Explain(text).status(),
@@ -900,7 +908,10 @@ TEST_F(SessionTest, DeferredWindowOperandsInUnusedCtesStayUnsupported) {
   const std::vector<std::pair<std::string, std::string>> operands{
       {"COUNT(AdvEngineID = 1) OVER ()", "W11b"},
       {"COUNT(*) OVER (PARTITION BY AdvEngineID = 1)", "W11b"},
-      {"SUM(sin(AdvEngineID)) OVER ()", "W11e"}};
+      {"SUM(sin(AdvEngineID)) OVER ()", "W11e"},
+      {"RANK() OVER (PARTITION BY AdvEngineID = 1)", "W11b"},
+      {"RANK() OVER (ORDER BY AdvEngineID = 1)", "W11b"},
+      {"RANK() OVER (ORDER BY sin(AdvEngineID))", "W11e"}};
   for (const auto& [expression, owner] : operands) {
     const std::string text =
         "WITH unused AS (SELECT " + expression + " FROM no_such_table) SELECT COUNT(*) FROM t";

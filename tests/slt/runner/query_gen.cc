@@ -728,6 +728,62 @@ std::optional<GeneratedQuery> WindowQuery(const std::vector<GenTable>& tables, F
   return q;
 }
 
+// W3 has a separate stream from W2 and the ordinary generator. Exact rank results are row-sorted,
+// so a peer group's unspecified traversal order never weakens the comparison.
+std::optional<GeneratedQuery> RankQuery(const std::vector<GenTable>& tables, FeatureSet allowed,
+                                        Rng& rng) {
+  const FeatureSet required = {Feature::kWindowRank, Feature::kTableName,
+                               Feature::kQuotedIdentifier, Feature::kColumns};
+  if (!allowed.Contains(required) || !rng.Percent(3)) {
+    return std::nullopt;
+  }
+  const auto& table = rng.Pick(tables);
+  if (table.rows > 10000 || table.columns.empty()) {
+    return std::nullopt;
+  }
+  const auto& key = rng.Pick(table.columns);
+  const auto& value = rng.Pick(table.columns);
+  if (!allowed.Has(TypeFeature(key.kind)) || !allowed.Has(TypeFeature(value.kind))) {
+    return std::nullopt;
+  }
+  GeneratedQuery q{.table = table.name,
+                   .row_bound = table.rows,
+                   .features = required,
+                   .sort = SortMode::kRowSort};
+  q.features.Add({TypeFeature(key.kind), TypeFeature(value.kind)});
+  std::string key_sql = QuoteIdentifier(key.name);
+  if (key.kind == ValueKind::kInteger &&
+      allowed.Contains({Feature::kArithmetic, Feature::kIntegerLiteral}) && rng.Percent(50)) {
+    key_sql += " % 3";
+    q.features.Add({Feature::kArithmetic, Feature::kIntegerLiteral});
+  }
+  const bool grouped =
+      allowed.Contains({Feature::kGroupBy, Feature::kCountStar}) && rng.Percent(35);
+  const std::string order_sql = grouped ? "COUNT(*)" : QuoteIdentifier(value.name);
+  std::string specification;
+  if (rng.Percent(60)) {
+    specification = "PARTITION BY " + key_sql + " ";
+  }
+  if (rng.Percent(90)) {
+    specification += "ORDER BY " + order_sql + (rng.Percent(50) ? " DESC" : " ASC");
+    if (allowed.Has(Feature::kNullsOrder)) {
+      specification += rng.Percent(50) ? " NULLS FIRST" : " NULLS LAST";
+      q.features.Add(Feature::kNullsOrder);
+    }
+  }
+  q.sql = "SELECT RANK() OVER (" + specification + ")";
+  if (allowed.Has(Feature::kMultipleItems) && rng.Percent(65)) {
+    q.sql += ", RANK() OVER (ORDER BY " + key_sql + " DESC), RANK() OVER (" + specification + ")";
+    q.features.Add(Feature::kMultipleItems);
+  }
+  q.sql += " FROM " + QuoteIdentifier(table.name);
+  if (grouped) {
+    q.sql += " GROUP BY " + key_sql;
+    q.features.Add({Feature::kGroupBy, Feature::kCountStar});
+  }
+  return q;
+}
+
 // Whether both engines convert the decimal text to the same double: the digits form an integer of
 // at most 2^53 and the scale is at most 22, so the value is one correctly rounded division of two
 // exact doubles (DuckDB's DECIMAL -> DOUBLE cast) and also what strtod returns.
@@ -8548,6 +8604,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
     window->index = index;
     window->target_sample = target;
     return std::move(*window);
+  }
+  Rng rank_rng(Mix(state ^ 0x77696E646F772D33ULL));
+  if (auto rank = RankQuery(tables_, allowed, rank_rng)) {
+    rank->index = index;
+    rank->target_sample = target;
+    return std::move(*rank);
   }
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q =

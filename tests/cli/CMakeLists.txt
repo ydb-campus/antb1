@@ -41,6 +41,23 @@ antb1_add_cli_golden(
   explain_whole_partition_window
   ARGS explain --physical -c "SELECT COUNT(*) OVER () FROM edge" --table "edge=${_f}/edge.parquet"
 )
+antb1_add_cli_golden(
+  query_rank_window
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT id, RANK() OVER (PARTITION BY id % 3 ORDER BY i32 DESC NULLS FIRST) AS r FROM edge ORDER BY id"
+    --table
+    "edge=${_f}/edge.parquet"
+    --format
+    csv
+)
+antb1_add_cli_golden(
+  explain_rank_window
+  ARGS explain --physical -c "SELECT RANK() OVER (ORDER BY i32) FROM edge" --table "edge=${_f}/edge.parquet"
+)
 set(_aggregates "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM t")
 antb1_add_cli_golden(
   query_aggregates

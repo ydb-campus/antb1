@@ -215,6 +215,40 @@ TEST(QueryGenerator, WholePartitionWindowsHaveAnIndependentStream) {
   EXPECT_GT(computed, 5);
 }
 
+TEST(QueryGenerator, RankWindowsHaveAnIndependentStream) {
+  const auto with = MakeOver(Tables(), 303, {.supported = kSupportedFeatures, .target_percent = 0});
+  const auto without = MakeOver(
+      Tables(), 303,
+      {.supported = kSupportedFeatures.Minus({Feature::kWindowRank}), .target_percent = 0});
+  int windows = 0;
+  int grouped = 0;
+  int multiple = 0;
+  int computed = 0;
+  for (uint64_t i = 0; i < 10000; ++i) {
+    const auto q = with.Generate(i);
+    const auto plain = without.Generate(i);
+    if (!q.features.Has(Feature::kWindowRank)) {
+      EXPECT_EQ(q.sql, plain.sql) << i;
+      EXPECT_EQ(q.features, plain.features) << i;
+      continue;
+    }
+    ++windows;
+    grouped += q.features.Has(Feature::kGroupBy) ? 1 : 0;
+    multiple += q.features.Has(Feature::kMultipleItems) ? 1 : 0;
+    computed += q.features.Has(Feature::kArithmetic) ? 1 : 0;
+    EXPECT_FALSE(plain.features.Has(Feature::kWindowRank));
+    EXPECT_TRUE(kSupportedFeatures.Contains(q.features));
+    auto parsed = sql::Parse(q.sql);
+    ASSERT_TRUE(parsed.has_value()) << q.sql;
+    EXPECT_NE(q.sql.find("RANK() OVER ("), std::string::npos);
+    EXPECT_EQ(q.sort, SortMode::kRowSort);
+  }
+  EXPECT_GT(windows, 50);
+  EXPECT_GT(grouped, 10);
+  EXPECT_GT(multiple, 10);
+  EXPECT_GT(computed, 5);
+}
+
 TEST(QueryGenerator, TargetSamplesCoverTheWholeGrammar) {
   // A Feature without generator support fails here (runner/query_gen.cc must learn it), unless it
   // waits in kGeneratorPending. The joins need tables with refs.
@@ -254,6 +288,7 @@ TEST(QueryGenerator, QueriesRespectTheSemanticsBothEnginesShare) {
     const bool rows =
         q.features.Has(Feature::kColumns) || q.features.Has(Feature::kStar) ||
         q.features.Has(Feature::kGroupBy) || q.features.Has(Feature::kWindowWholePartition) ||
+        q.features.Has(Feature::kWindowRank) ||
         ((q.features.Has(Feature::kConstant) || q.features.Has(Feature::kArithmetic) ||
           q.features.Has(Feature::kStringFunctions) || q.features.Has(Feature::kCase) ||
           q.features.Has(Feature::kTimestamps)) &&

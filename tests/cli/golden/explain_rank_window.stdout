@@ -1,0 +1,5 @@
+Output: RANK() OVER (ORDER BY i32):BIGINT
+Project "RANK() OVER (ORDER BY i32)"
+  Window [RANK() OVER (ORDER BY i32)]
+    PartUnion in part order
+      Scan table=edge source=parquet(files=1, rows=12) columns=[i32]

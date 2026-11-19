@@ -3773,6 +3773,19 @@ std::vector<Relation> AllRelations() {
                   Q("SELECT tr_rider, COUNT(*), SUM(tr_fare) FROM trips GROUP BY tr_rider")},
        .check = AllEqual()});
 
+  // Count strictly preceding rows independently with a join. NULLS LAST makes every non-NULL
+  // value precede a NULL, and tied rows never count each other.
+  r.push_back(
+      {.name = "rank_equals_count_of_preceding_rows",
+       .features = {kWindowRank, kCountColumn, kColumns, kIntegerColumns, kTableName,
+                    kMultipleItems, kGroupBy, kLeftJoin, kTableAlias, kQualifiedName,
+                    kCompareColumns, kBooleanExpressions, kArithmetic, kIntegerLiteral},
+       .probes = {Q("SELECT id, RANK() OVER (ORDER BY i32) FROM edge", 1),
+                  Q("SELECT id, RANK() OVER (ORDER BY i32) FROM edge", 7),
+                  Q("SELECT a.id, COUNT(b.id) + 1 FROM edge AS a LEFT JOIN edge AS b ON "
+                    "b.i32 < a.i32 OR (a.i32 IS NULL AND b.i32 IS NOT NULL) GROUP BY a.id")},
+       .check = AllEqual()});
+
   // The permanently pending recursive canary: a seed in [0, 3] counts down through zero.
   // Both probes genuinely recurse for this fixture, terminate, and return at most four rows.
   r.push_back({.name = "recursive_cte_canary_stays_pending",
