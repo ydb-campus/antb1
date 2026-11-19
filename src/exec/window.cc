@@ -245,11 +245,26 @@ arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::Window
   scratch.Reset(ctx.budget);
   std::vector<WindowPrefixState> states;
   std::vector<WindowPrefixState> saved;
+  std::vector<PoolVector<const arrow::Array*>> arguments;
   arrow::ArrayVector columns;
   ARROW_RETURN_NOT_OK(Reserve(states, spec.calls.size(), scratch));
   ARROW_RETURN_NOT_OK(Reserve(saved, spec.calls.size(), scratch));
+  ARROW_RETURN_NOT_OK(Reserve(arguments, spec.calls.size(), scratch));
   ARROW_RETURN_NOT_OK(Reserve(columns, spec.calls.size(), scratch));
   states.resize(spec.calls.size());
+  // Cache argument arrays once for every output range and capacity retry. The retained input
+  // owns the arrays; prefix loops avoid RecordBatch's locking, reference-counted column accessor.
+  for (const auto index : spec.calls) {
+    auto& arrays = arguments.emplace_back(ctx.pool);
+    const auto& call = calls[index];
+    if (!call.arguments.empty()) {
+      ARROW_RETURN_NOT_OK(arrays.Resize(input.size()));
+      const auto column = Narrow<std::size_t>(call.arguments.front().index);
+      for (std::size_t k = 0; k < input.size(); ++k) {
+        arrays[k] = input[k]->columns()[column].get();
+      }
+    }
+  }
   std::uint32_t chunk = 0;
   for (std::size_t begin = 0; begin < rows; ++chunk) {
     auto count = std::min<std::size_t>(kChunkRows, rows - begin);
@@ -264,7 +279,8 @@ arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::Window
           columns.push_back(nullptr);
           continue;
         }
-        auto result = WindowPrefixes(call, input, {layout.permutation.data() + begin, count},
+        auto result = WindowPrefixes(call, {arguments[i].data(), arguments[i].size()},
+                                     {layout.permutation.data() + begin, count},
                                      {layout.starts.data() + begin, count}, states[i], ctx.pool);
         if (!result.ok()) {
           status = result.status();

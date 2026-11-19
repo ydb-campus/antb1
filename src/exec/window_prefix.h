@@ -26,9 +26,11 @@ struct WindowPrefixState {
 };
 
 // Evaluate one bounded range of a sorted layout, carrying state between ranges. starts[i]
-// resets the state before row i. Dispatch is per call/range; typed loops emit one prefix per row.
+// resets the state before row i. arrays caches the argument array of each retained input chunk
+// (empty for COUNT(*)). Input chunks must outlive the state and every range. Dispatch is per
+// call/range; typed loops emit one prefix per row without accessing RecordBatch columns.
 arrow::Result<std::shared_ptr<arrow::Array>> WindowPrefixes(
-    const plan::WindowCall& call, const arrow::RecordBatchVector& input,
+    const plan::WindowCall& call, std::span<const arrow::Array* const> arrays,
     std::span<const SortBuffer::RowRef> rows, std::span<const std::uint8_t> starts,
     WindowPrefixState& state, arrow::MemoryPool* pool);
 

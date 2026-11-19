@@ -58,19 +58,16 @@ arrow::Result<std::shared_ptr<arrow::Array>> PrefixLoop(std::span<const RowRef> 
 
 template <class ArrowType>
 arrow::Result<std::shared_ptr<arrow::Array>> Extremes(const plan::WindowCall& call,
-                                                      const arrow::RecordBatchVector& input,
+                                                      std::span<const arrow::Array* const> arrays,
                                                       std::span<const RowRef> rows,
                                                       std::span<const std::uint8_t> starts,
                                                       WindowPrefixState& state,
                                                       arrow::MemoryPool* pool) {
   typename arrow::TypeTraits<ArrowType>::BuilderType builder(plan::ToArrow(call.type), pool);
-  const int column = call.arguments.front().index;
-  const auto get = [&](RowRef row) {
-    return ValueAt<ArrowType>(*input[row.chunk]->column(column), row.row);
-  };
+  const auto get = [&](RowRef row) { return ValueAt<ArrowType>(*arrays[row.chunk], row.row); };
   const bool minimum = call.aggregate == plan::AggKind::kMin;
   return PrefixLoop(rows, starts, state, builder, [&](RowRef row) -> arrow::Status {
-    if (input[row.chunk]->column(column)->IsValid(row.row)) {
+    if (arrays[row.chunk]->IsValid(row.row)) {
       bool replace = !state.best;
       if (state.best) {
         const auto value = get(row);
@@ -100,15 +97,13 @@ arrow::Result<std::shared_ptr<arrow::Array>> Extremes(const plan::WindowCall& ca
 }
 
 template <class ArrowType, class Builder, class Finalize>
-arrow::Result<std::shared_ptr<arrow::Array>> Sums(const plan::WindowCall& call,
-                                                  const arrow::RecordBatchVector& input,
+arrow::Result<std::shared_ptr<arrow::Array>> Sums(std::span<const arrow::Array* const> arrays,
                                                   std::span<const RowRef> rows,
                                                   std::span<const std::uint8_t> starts,
                                                   WindowPrefixState& state, Builder& builder,
                                                   const Finalize& finalize) {
-  const int column = call.arguments.front().index;
   return PrefixLoop(rows, starts, state, builder, [&](RowRef row) -> arrow::Status {
-    const auto& values = *input[row.chunk]->column(column);
+    const auto& values = *arrays[row.chunk];
     if (values.IsValid(row.row)) {
       if constexpr (std::is_same_v<ArrowType, arrow::DoubleType>) {
         state.sum += ValueAt<ArrowType>(values, row.row);
@@ -132,7 +127,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> Sums(const plan::WindowCall& call,
 
 template <class ArrowType>
 arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& call,
-                                                     const arrow::RecordBatchVector& input,
+                                                     std::span<const arrow::Array* const> arrays,
                                                      std::span<const RowRef> rows,
                                                      std::span<const std::uint8_t> starts,
                                                      WindowPrefixState& state,
@@ -141,7 +136,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& cal
   if (IsVarianceKind(call.aggregate)) {
     arrow::DoubleBuilder builder(pool);
     return PrefixLoop(rows, starts, state, builder, [&](RowRef row) -> arrow::Status {
-      const auto& values = *input[row.chunk]->column(call.arguments.front().index);
+      const auto& values = *arrays[row.chunk];
       if (values.IsValid(row.row)) {
         const auto value = ValueAt<ArrowType>(values, row.row);
         double number = 0;
@@ -162,12 +157,12 @@ arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& cal
   if constexpr (std::is_same_v<ArrowType, arrow::Date32Type> ||
                 std::is_same_v<ArrowType, arrow::TimestampType>) {
     arrow::TimestampBuilder builder(plan::ToArrow(call.type), pool);
-    return Sums<ArrowType>(call, input, rows, starts, state, builder, [&] {
+    return Sums<ArrowType>(arrays, rows, starts, state, builder, [&] {
       return builder.Append(AverageMicros(state.exact_sum, state.count));
     });
   } else if constexpr (std::is_same_v<ArrowType, arrow::DoubleType>) {
     arrow::DoubleBuilder builder(pool);
-    return Sums<ArrowType>(call, input, rows, starts, state, builder, [&] {
+    return Sums<ArrowType>(arrays, rows, starts, state, builder, [&] {
       return builder.Append(call.aggregate == plan::AggKind::kAvg
                                 ? state.sum / static_cast<double>(state.count)
                                 : state.sum);
@@ -175,7 +170,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& cal
   } else {
     if (call.aggregate == plan::AggKind::kAvg) {
       arrow::DoubleBuilder builder(pool);
-      return Sums<ArrowType>(call, input, rows, starts, state, builder, [&] {
+      return Sums<ArrowType>(arrays, rows, starts, state, builder, [&] {
         return builder.Append(
             type == plan::LogicalType::kDecimal
                 ? DuckDbDecimalAverage(state.exact_sum, state.count, type.width(), type.scale())
@@ -185,7 +180,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& cal
     }
     arrow::Decimal128Builder builder(plan::ToArrow(call.type), pool);
     const auto range = plan::RangeOf(call.type);
-    return Sums<ArrowType>(call, input, rows, starts, state, builder, [&] -> arrow::Status {
+    return Sums<ArrowType>(arrays, rows, starts, state, builder, [&] -> arrow::Status {
       if (state.exact_sum < range.min || state.exact_sum > range.max) {
         return arrow::Status::ExecutionError("SUM overflow: the result is outside the range of ",
                                              plan::ToString(call.type), " (38 decimal digits)");
@@ -196,60 +191,55 @@ arrow::Result<std::shared_ptr<arrow::Array>> Numbers(const plan::WindowCall& cal
 }
 
 template <class ArrowType>
-arrow::Result<std::shared_ptr<arrow::Array>> TypedPrefixes(const plan::WindowCall& call,
-                                                           const arrow::RecordBatchVector& input,
-                                                           std::span<const RowRef> rows,
-                                                           std::span<const std::uint8_t> starts,
-                                                           WindowPrefixState& state,
-                                                           arrow::MemoryPool* pool) {
+arrow::Result<std::shared_ptr<arrow::Array>> TypedPrefixes(
+    const plan::WindowCall& call, std::span<const arrow::Array* const> arrays,
+    std::span<const RowRef> rows, std::span<const std::uint8_t> starts, WindowPrefixState& state,
+    arrow::MemoryPool* pool) {
   if (call.aggregate == plan::AggKind::kMin || call.aggregate == plan::AggKind::kMax) {
-    return Extremes<ArrowType>(call, input, rows, starts, state, pool);
+    return Extremes<ArrowType>(call, arrays, rows, starts, state, pool);
   }
   if constexpr (!std::is_same_v<ArrowType, arrow::BinaryType>) {
-    return Numbers<ArrowType>(call, input, rows, starts, state, pool);
+    return Numbers<ArrowType>(call, arrays, rows, starts, state, pool);
   }
   return arrow::Status::Invalid("window: invalid VARCHAR prefix aggregate");
 }
 
 }  // namespace
 
-arrow::Result<std::shared_ptr<arrow::Array>> WindowPrefixes(const plan::WindowCall& call,
-                                                            const arrow::RecordBatchVector& input,
-                                                            std::span<const RowRef> rows,
-                                                            std::span<const std::uint8_t> starts,
-                                                            WindowPrefixState& state,
-                                                            arrow::MemoryPool* pool) {
+arrow::Result<std::shared_ptr<arrow::Array>> WindowPrefixes(
+    const plan::WindowCall& call, std::span<const arrow::Array* const> arrays,
+    std::span<const RowRef> rows, std::span<const std::uint8_t> starts, WindowPrefixState& state,
+    arrow::MemoryPool* pool) {
   if (call.aggregate == plan::AggKind::kCountStar || call.aggregate == plan::AggKind::kCount) {
     arrow::Int64Builder builder(pool);
     return PrefixLoop(rows, starts, state, builder, [&](RowRef row) {
-      if (call.arguments.empty() ||
-          input[row.chunk]->column(call.arguments.front().index)->IsValid(row.row)) {
+      if (call.arguments.empty() || arrays[row.chunk]->IsValid(row.row)) {
         ++state.count;
       }
       return builder.Append(state.count);
     });
   }
-  switch (input.front()->column(call.arguments.front().index)->type_id()) {
+  switch (arrays.front()->type_id()) {
     case arrow::Type::INT16:
-      return TypedPrefixes<arrow::Int16Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Int16Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::INT32:
-      return TypedPrefixes<arrow::Int32Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Int32Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::INT64:
-      return TypedPrefixes<arrow::Int64Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Int64Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::UINT16:
-      return TypedPrefixes<arrow::UInt16Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::UInt16Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::DOUBLE:
-      return TypedPrefixes<arrow::DoubleType>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::DoubleType>(call, arrays, rows, starts, state, pool);
     case arrow::Type::DECIMAL128:
-      return TypedPrefixes<arrow::Decimal128Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Decimal128Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::DECIMAL64:
-      return TypedPrefixes<arrow::Decimal64Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Decimal64Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::DATE32:
-      return TypedPrefixes<arrow::Date32Type>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::Date32Type>(call, arrays, rows, starts, state, pool);
     case arrow::Type::TIMESTAMP:
-      return TypedPrefixes<arrow::TimestampType>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::TimestampType>(call, arrays, rows, starts, state, pool);
     case arrow::Type::BINARY:
-      return TypedPrefixes<arrow::BinaryType>(call, input, rows, starts, state, pool);
+      return TypedPrefixes<arrow::BinaryType>(call, arrays, rows, starts, state, pool);
     default:
       return arrow::Status::Invalid("window: invalid prefix argument type");
   }

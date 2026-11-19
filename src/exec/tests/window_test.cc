@@ -108,24 +108,46 @@ TEST_F(WindowTest, RowsPrefixesShareRankLayoutsAndKeepInputIdentity) {
 TEST_F(WindowTest, RowsPrefixesCarryStateAcrossChunksAndResetPartitions) {
   constexpr int64_t kRows = 65539;
   arrow::Int64Builder keys;
+  arrow::Int64Builder values;
   for (int64_t i = 0; i < kRows; ++i) {
     ASSERT_TRUE(keys.Append(i < 65537 ? 0 : 1).ok());
+    if (i == 65535 || i == 65537) {
+      ASSERT_TRUE(values.AppendNull().ok());
+    } else {
+      ASSERT_TRUE(values.Append(i == 0 ? 7 : 3).ok());
+    }
   }
-  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
-  const auto batch = arrow::RecordBatch::Make(schema, kRows, {keys.Finish().ValueOrDie()});
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(
+      schema, kRows, {keys.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
   auto source = std::make_unique<ScriptedSource>(
       schema, std::vector<Batch>{{.data = batch->Slice(0, 65535), .selection = {}},
                                  {.data = batch->Slice(65535), .selection = {}}});
   WindowOperator op(std::move(source),
-                    {Prefix(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt)});
+                    {Prefix(AggKind::kCountStar, LogicalType::kBigInt, LogicalType::kBigInt),
+                     Prefix(AggKind::kCount, LogicalType::kBigInt, LogicalType::kBigInt),
+                     Prefix(AggKind::kMin, LogicalType::kBigInt, LogicalType::kBigInt),
+                     Prefix(AggKind::kMax, LogicalType::kBigInt, LogicalType::kBigInt)});
   ExecContext ctx;
   ctx.batch_size = 65536;
   const auto result = Drain(op, ctx);
   ASSERT_TRUE(result.ok()) << result.status();
-  const auto counts = testing::Int64Column(**result, 1);
+  const auto counts = testing::Int64Column(**result, 2);
   ASSERT_EQ(counts.size(), static_cast<std::size_t>(kRows));
   for (std::size_t i = 0; i < counts.size(); ++i) {
     EXPECT_EQ(counts[i], static_cast<int64_t>(i < 65537 ? i + 1 : i - 65536));
+  }
+  const auto valid_counts = testing::Int64Column(**result, 3);
+  const auto minima = testing::Int64Column(**result, 4);
+  const auto maxima = testing::Int64Column(**result, 5);
+  // Both input and output chunk boundaries carry argument state, including the maximum in the
+  // first input chunk. The new partition starts with NULL and resets all three aggregates.
+  for (const std::size_t i : {0U, 65534U, 65535U, 65536U, 65537U, 65538U}) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(valid_counts[i], static_cast<int64_t>(i < 65535 ? i + 1 : i < 65537 ? i : i - 65537));
+    EXPECT_EQ(minima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i == 0 ? 7 : 3));
+    EXPECT_EQ(maxima[i], i == 65537 ? std::nullopt : std::optional<int64_t>(i < 65537 ? 7 : 3));
   }
 }
 
