@@ -23,6 +23,7 @@
 #include "gather.h"
 #include "group_table.h"
 #include "pool_vector.h"
+#include "window_prefix.h"
 
 namespace antb1::exec {
 namespace {
@@ -62,7 +63,10 @@ bool SamePartition(const plan::WindowCall& a, const plan::WindowCall& b) {
 }
 
 bool SameSpecification(const plan::WindowCall& a, const plan::WindowCall& b) {
-  return a.kind == b.kind && SamePartition(a, b) &&
+  const auto whole = [](const plan::WindowCall& call) {
+    return call.frame == plan::WindowCall::Frame::kWholePartition;
+  };
+  return whole(a) == whole(b) && SamePartition(a, b) &&
          std::ranges::equal(a.order_by, b.order_by, [](const auto& x, const auto& y) {
            return x.column.index == y.column.index && x.column.type == y.column.type &&
                   x.descending == y.descending && x.nulls_first == y.nulls_first;
@@ -104,93 +108,215 @@ struct Results {
 };
 
 struct Specification {
-  explicit Specification(arrow::MemoryPool* pool) : ids(pool), groups(pool) {}
+  explicit Specification(arrow::MemoryPool* pool) : ids(pool), groups(pool), positions(pool) {}
   std::vector<std::size_t> calls;
   PoolVector<std::uint32_t> ids;  // input row -> group
   PoolVector<RowRef> groups;      // group -> finalized chunk/row
+  PoolVector<RowRef> positions;   // input row -> running result chunk/row
   std::vector<Results> results;
   std::shared_ptr<arrow::Array> ranks;  // shared by identical RANK calls, in input row order
 };
 
-arrow::Result<std::shared_ptr<arrow::Array>> RankRows(const plan::WindowCall& call,
-                                                      const arrow::RecordBatchVector& input,
-                                                      std::size_t rows, const ExecContext& ctx) {
-  if (rows > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) / sizeof(int64_t)) {
-    return arrow::Status::CapacityError("window rank result size overflow");
+struct OrderedLayout {
+  explicit OrderedLayout(arrow::MemoryPool* pool)
+      : permutation(pool), offsets(pool), starts(pool) {}
+  PoolVector<RowRef> permutation;
+  PoolVector<std::size_t> offsets;
+  PoolVector<std::uint8_t> starts;
+  std::shared_ptr<arrow::Array> ranks;
+};
+
+arrow::Result<OrderedLayout> OrderRows(const plan::WindowCall& call,
+                                       const arrow::RecordBatchVector& input, std::size_t rows,
+                                       bool rank, const ExecContext& ctx) {
+  OrderedLayout layout(ctx.pool);
+  int64_t* ranks = nullptr;
+  if (rank) {
+    if (rows > static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) / sizeof(int64_t)) {
+      return arrow::Status::CapacityError("window rank result size overflow");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto buffer,
+                          arrow::AllocateBuffer(Narrow<int64_t>(rows * sizeof(int64_t)), ctx.pool));
+    ranks = buffer->mutable_data_as<int64_t>();
+    layout.ranks = std::make_shared<arrow::Int64Array>(Narrow<int64_t>(rows), std::move(buffer));
   }
-  ARROW_ASSIGN_OR_RAISE(auto buffer,
-                        arrow::AllocateBuffer(Narrow<int64_t>(rows * sizeof(int64_t)), ctx.pool));
-  auto* ranks = buffer->mutable_data_as<int64_t>();
-  if (call.order_by.empty()) {
-    std::fill_n(ranks, rows, int64_t{1});
-  } else {
-    MemoryReservation scratch;
-    scratch.Reset(ctx.budget);
-    std::vector<plan::SortKey> keys;
-    ARROW_RETURN_NOT_OK(Reserve(keys, call.partition_by.size() + call.order_by.size(), scratch));
-    for (const auto& column : call.partition_by) {
-      keys.push_back({.column = {.index = column.index, .type = column.type}});
+  MemoryReservation scratch;
+  scratch.Reset(ctx.budget);
+  std::vector<plan::SortKey> keys;
+  ARROW_RETURN_NOT_OK(Reserve(keys, call.partition_by.size() + call.order_by.size(), scratch));
+  for (const auto& column : call.partition_by) {
+    keys.push_back({.column = {.index = column.index, .type = column.type}});
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto partition,
+                        RowComparator::Make(input.front()->schema(), keys, &scratch));
+  for (const auto& key : call.order_by) {
+    keys.push_back({.column = {.index = key.column.index, .type = key.column.type},
+                    .descending = key.descending,
+                    .nulls_first = key.nulls_first});
+  }
+  ARROW_ASSIGN_OR_RAISE(const auto order,
+                        RowComparator::Make(input.front()->schema(), keys, &scratch));
+  std::vector<RowComparator::KeyArrays> arrays;
+  ARROW_RETURN_NOT_OK(Reserve(arrays, input.size(), scratch));
+  ARROW_RETURN_NOT_OK(layout.offsets.Resize(input.size()));
+  ARROW_RETURN_NOT_OK(layout.permutation.Resize(rows));
+  ARROW_RETURN_NOT_OK(layout.starts.Resize(rows));
+  std::size_t offset = 0;
+  for (std::size_t chunk = 0; chunk < input.size(); ++chunk) {
+    const auto count = static_cast<std::size_t>(input[chunk]->num_rows());
+    const auto chunk_id = TryNarrow<std::uint32_t>(chunk);
+    if (!chunk_id || count > std::numeric_limits<std::uint32_t>::max()) {
+      return arrow::Status::CapacityError("window sort row reference overflow");
     }
-    ARROW_ASSIGN_OR_RAISE(const auto partition,
-                          RowComparator::Make(input.front()->schema(), keys, &scratch));
-    for (const auto& key : call.order_by) {
-      keys.push_back({.column = {.index = key.column.index, .type = key.column.type},
-                      .descending = key.descending,
-                      .nulls_first = key.nulls_first});
+    layout.offsets[chunk] = offset;
+    arrays.emplace_back();
+    ARROW_RETURN_NOT_OK(Reserve(arrays.back(), keys.size(), scratch));
+    for (const auto& key : keys) {
+      arrays.back().push_back(input[chunk]->column(key.column.index).get());
     }
-    ARROW_ASSIGN_OR_RAISE(const auto order,
-                          RowComparator::Make(input.front()->schema(), keys, &scratch));
-    std::vector<RowComparator::KeyArrays> arrays;
-    ARROW_RETURN_NOT_OK(Reserve(arrays, input.size(), scratch));
-    PoolVector<std::size_t> offsets(ctx.pool);
-    ARROW_RETURN_NOT_OK(offsets.Resize(input.size()));
-    PoolVector<RowRef> permutation(ctx.pool);
-    ARROW_RETURN_NOT_OK(permutation.Resize(rows));
-    std::size_t offset = 0;
-    for (std::size_t chunk = 0; chunk < input.size(); ++chunk) {
-      const auto count = static_cast<std::size_t>(input[chunk]->num_rows());
-      const auto chunk_id = TryNarrow<std::uint32_t>(chunk);
-      if (!chunk_id || count > std::numeric_limits<std::uint32_t>::max()) {
-        return arrow::Status::CapacityError("window sort row reference overflow");
-      }
-      offsets[chunk] = offset;
-      arrays.emplace_back();
-      ARROW_RETURN_NOT_OK(Reserve(arrays.back(), keys.size(), scratch));
-      for (const auto& key : keys) {
-        arrays.back().push_back(input[chunk]->column(key.column.index).get());
-      }
-      for (std::size_t row = 0; row < count; ++row) {
-        permutation[offset++] = {.chunk = *chunk_id, .row = Narrow<std::uint32_t>(row)};
-      }
+    for (std::size_t row = 0; row < count; ++row) {
+      layout.permutation[offset++] = {.chunk = *chunk_id, .row = Narrow<std::uint32_t>(row)};
     }
-    // A row identity makes traversal stable without std::stable_sort's unbudgeted heap scratch.
-    // Peer detection below deliberately uses only the SQL keys.
-    std::sort(permutation.data(), permutation.data() + rows, [&](RowRef a, RowRef b) {
+  }
+  // Row identity stabilizes traversal without stable_sort's unbudgeted allocation. It does
+  // not participate in partition/peer comparisons, including when RANK shares this layout.
+  if (!keys.empty()) {
+    std::sort(layout.permutation.data(), layout.permutation.data() + rows, [&](RowRef a, RowRef b) {
       const int compare = order.Compare(arrays[a.chunk], a.row, arrays[b.chunk], b.row);
       if (compare != 0) {
         return compare < 0;
       }
       return a.chunk < b.chunk || (a.chunk == b.chunk && a.row < b.row);
     });
-    std::size_t partition_start = 0;
-    int64_t rank = 1;
-    for (std::size_t i = 0; i < rows; ++i) {
-      const RowRef current = permutation[i];
-      if (i != 0) {
-        const RowRef previous = permutation[i - 1];
-        if (partition.Compare(arrays[previous.chunk], previous.row, arrays[current.chunk],
-                              current.row) != 0) {
-          partition_start = i;
-          rank = 1;
-        } else if (order.Compare(arrays[previous.chunk], previous.row, arrays[current.chunk],
-                                 current.row) != 0) {
-          rank = Narrow<int64_t>(i - partition_start + 1);
-        }
+  }
+  std::size_t partition_start = 0;
+  int64_t current_rank = 1;
+  for (std::size_t i = 0; i < rows; ++i) {
+    const RowRef current = layout.permutation[i];
+    bool start = i == 0;
+    if (i != 0) {
+      const RowRef previous = layout.permutation[i - 1];
+      start = partition.Compare(arrays[previous.chunk], previous.row, arrays[current.chunk],
+                                current.row) != 0;
+      if (start) {
+        partition_start = i;
+        current_rank = 1;
+      } else if (ranks != nullptr && order.Compare(arrays[previous.chunk], previous.row,
+                                                   arrays[current.chunk], current.row) != 0) {
+        current_rank = Narrow<int64_t>(i - partition_start + 1);
       }
-      ranks[offsets[current.chunk] + current.row] = rank;
+    }
+    layout.starts[i] = start ? 1 : 0;
+    if (ranks != nullptr) {
+      ranks[layout.offsets[current.chunk] + current.row] = current_rank;
     }
   }
-  return std::make_shared<arrow::Int64Array>(Narrow<int64_t>(rows), std::move(buffer));
+  return layout;
+}
+
+arrow::Status PrepareOrdered(Specification& spec, const std::vector<plan::WindowCall>& calls,
+                             const arrow::RecordBatchVector& input, std::size_t rows,
+                             MemoryReservation& memory, const ExecContext& ctx) {
+  const bool rank = std::ranges::any_of(
+      spec.calls, [&](std::size_t i) { return calls[i].kind == plan::WindowCall::Kind::kRank; });
+  const bool prefix = std::ranges::any_of(spec.calls, [&](std::size_t i) {
+    return calls[i].frame == plan::WindowCall::Frame::kRowsPrefix;
+  });
+  const auto& first = calls[spec.calls.front()];
+  if (!prefix && first.order_by.empty()) {
+    // Unordered RANK needs neither partitions nor a permutation.
+    arrow::Int64Builder builder(ctx.pool);
+    ARROW_RETURN_NOT_OK(builder.Reserve(Narrow<int64_t>(rows)));
+    for (std::size_t i = 0; i < rows; ++i) {
+      builder.UnsafeAppend(1);
+    }
+    ARROW_ASSIGN_OR_RAISE(spec.ranks, builder.Finish());
+    return arrow::Status::OK();
+  }
+  ARROW_ASSIGN_OR_RAISE(auto layout, OrderRows(first, input, rows, rank, ctx));
+  spec.ranks = std::move(layout.ranks);
+  if (!prefix) {
+    return arrow::Status::OK();
+  }
+  ARROW_RETURN_NOT_OK(spec.positions.Resize(rows));
+  ARROW_RETURN_NOT_OK(Reserve(spec.results, spec.calls.size(), memory));
+  spec.results.resize(spec.calls.size());
+  MemoryReservation scratch;
+  scratch.Reset(ctx.budget);
+  std::vector<WindowPrefixState> states;
+  std::vector<WindowPrefixState> saved;
+  std::vector<PoolVector<const arrow::Array*>> arguments;
+  arrow::ArrayVector columns;
+  ARROW_RETURN_NOT_OK(Reserve(states, spec.calls.size(), scratch));
+  ARROW_RETURN_NOT_OK(Reserve(saved, spec.calls.size(), scratch));
+  ARROW_RETURN_NOT_OK(Reserve(arguments, spec.calls.size(), scratch));
+  ARROW_RETURN_NOT_OK(Reserve(columns, spec.calls.size(), scratch));
+  states.resize(spec.calls.size());
+  // Cache argument arrays once for every output range and capacity retry. The retained input
+  // owns the arrays; prefix loops avoid RecordBatch's locking, reference-counted column accessor.
+  for (const auto index : spec.calls) {
+    auto& arrays = arguments.emplace_back(ctx.pool);
+    const auto& call = calls[index];
+    if (!call.arguments.empty()) {
+      ARROW_RETURN_NOT_OK(arrays.Resize(input.size()));
+      const auto column = Narrow<std::size_t>(call.arguments.front().index);
+      for (std::size_t k = 0; k < input.size(); ++k) {
+        arrays[k] = input[k]->columns()[column].get();
+      }
+    }
+  }
+  std::uint32_t chunk = 0;
+  for (std::size_t begin = 0; begin < rows; ++chunk) {
+    auto count = std::min<std::size_t>(kChunkRows, rows - begin);
+    saved = states;
+    while (true) {
+      columns.clear();
+      states = saved;
+      arrow::Status status;
+      for (std::size_t i = 0; i < spec.calls.size(); ++i) {
+        const auto& call = calls[spec.calls[i]];
+        if (call.kind == plan::WindowCall::Kind::kRank) {
+          columns.push_back(nullptr);
+          continue;
+        }
+        auto result = WindowPrefixes(call, {arguments[i].data(), arguments[i].size()},
+                                     {layout.permutation.data() + begin, count},
+                                     {layout.starts.data() + begin, count}, states[i], ctx.pool);
+        if (!result.ok()) {
+          status = result.status();
+          break;
+        }
+        columns.push_back(*std::move(result));
+      }
+      if (status.ok()) {
+        break;
+      }
+      if (!status.IsCapacityError() || count == 1) {
+        return status;
+      }
+      count /= 2;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      const RowRef row = layout.permutation[begin + i];
+      spec.positions[layout.offsets[row.chunk] + row.row] = {.chunk = chunk,
+                                                             .row = Narrow<std::uint32_t>(i)};
+    }
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+      if (columns[i] == nullptr) {
+        continue;
+      }
+      auto& result = spec.results[i];
+      ARROW_RETURN_NOT_OK(Reserve(result.chunks, result.chunks.size() + 1, memory));
+      ARROW_RETURN_NOT_OK(Reserve(result.arrays, result.arrays.size() + 1, memory));
+      result.arrays.push_back(columns[i].get());
+      result.chunks.push_back(std::move(columns[i]));
+    }
+    begin += count;
+    if (begin != rows && chunk == std::numeric_limits<std::uint32_t>::max()) {
+      return arrow::Status::CapacityError("window prefix result reference overflow");
+    }
+  }
+  return arrow::Status::OK();
 }
 
 }  // namespace
@@ -244,9 +370,12 @@ arrow::Status WindowOperator::Open(ExecContext& ctx) {
           return arrow::Status::Invalid("window: invalid bound RANK call");
         }
       } else {
-        if (call.frame != plan::WindowCall::Frame::kWholePartition || !call.frame_omitted ||
-            !call.order_by.empty() || call.aggregate == plan::AggKind::kCountDistinct) {
-          return plan::UnsupportedError("W4–W10: deferred window execution", call.over_span);
+        const bool whole = call.frame == plan::WindowCall::Frame::kWholePartition &&
+                           call.frame_omitted && call.order_by.empty();
+        const bool prefix =
+            call.frame == plan::WindowCall::Frame::kRowsPrefix && !call.frame_omitted;
+        if ((!whole && !prefix) || call.aggregate == plan::AggKind::kCountDistinct) {
+          return plan::UnsupportedError("W6–W10: deferred window execution", call.over_span);
         }
         if (call.arguments.size() != (call.aggregate == plan::AggKind::kCountStar ? 0U : 1U)) {
           return arrow::Status::Invalid("window: wrong aggregate argument count");
@@ -273,6 +402,18 @@ arrow::Status WindowOperator::Open(ExecContext& ctx) {
       }
       for (const auto& key : call.order_by) {
         ARROW_RETURN_NOT_OK(validate_column(key.column));
+      }
+      if (call.frame == plan::WindowCall::Frame::kRowsPrefix) {
+        if (call.aggregate == plan::AggKind::kSumCounts ||
+            call.aggregate == plan::AggKind::kSingleValue) {
+          return arrow::Status::Invalid("window: internal aggregate is not a prefix function");
+        }
+        ARROW_RETURN_NOT_OK(
+            MakeGroupedAggregateState(
+                call.aggregate,
+                call.arguments.empty() ? std::nullopt : std::optional(call.arguments.front().type),
+                call.type, ctx.pool)
+                .status());
       }
     }
     if (ctx.batch_size <= 0) {
@@ -334,8 +475,8 @@ arrow::Status WindowOperator::Prepare() {
     at->calls.push_back(i);
   }
   for (Specification& spec : s.specifications) {
-    if (const auto& call = calls_[spec.calls.front()]; call.kind == plan::WindowCall::Kind::kRank) {
-      ARROW_ASSIGN_OR_RAISE(spec.ranks, RankRows(call, s.input, s.rows, s.ctx));
+    if (calls_[spec.calls.front()].frame != plan::WindowCall::Frame::kWholePartition) {
+      ARROW_RETURN_NOT_OK(PrepareOrdered(spec, calls_, s.input, s.rows, s.memory, s.ctx));
       continue;
     }
     MemoryReservation scratch;
@@ -449,14 +590,22 @@ arrow::Result<Batch> WindowOperator::NextBatch() {
         ARROW_ASSIGN_OR_RAISE(const auto ranks, SliceColumn(*spec.ranks, Narrow<int64_t>(s.offset),
                                                             Narrow<int64_t>(count)));
         for (const auto call : spec.calls) {
-          columns[width + call] = ranks;
+          if (calls_[call].kind == plan::WindowCall::Kind::kRank) {
+            columns[width + call] = ranks;
+          }
         }
-        continue;
+        if (spec.positions.empty()) {
+          continue;
+        }
       }
       for (std::size_t i = 0; i < count; ++i) {
-        s.refs[i] = spec.groups[spec.ids[s.offset + i]];
+        s.refs[i] = spec.positions.empty() ? spec.groups[spec.ids[s.offset + i]]
+                                           : spec.positions[s.offset + i];
       }
       for (std::size_t i = 0; i < spec.calls.size(); ++i) {
+        if (calls_[spec.calls[i]].kind == plan::WindowCall::Kind::kRank) {
+          continue;
+        }
         ARROW_ASSIGN_OR_RAISE(
             auto builder,
             arrow::MakeBuilder(plan::ToArrow(calls_[spec.calls[i]].type), s.ctx.pool));

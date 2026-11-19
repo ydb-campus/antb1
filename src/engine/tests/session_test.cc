@@ -842,8 +842,20 @@ TEST_F(SessionTest, SkippedRowGroupsDoNotChangeAnswers) {
 TEST_F(SessionTest, SupportedWindowsAcrossSessionEntryPoints) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  constexpr const char* kRowsPrefixExists =
+      "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT COUNT(*) OVER (ROWS UNBOUNDED PRECEDING) "
+      "FROM t)";
+  constexpr const char* kUnusedRowsPrefix =
+      "WITH unused AS (SELECT COUNT(*) OVER (ROWS UNBOUNDED PRECEDING) FROM no_such_table) "
+      "SELECT COUNT(*) FROM t";
   for (const char* text :
-       {"SELECT RANK() OVER () FROM t LIMIT 0", "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
+       {"SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
+        "SELECT COUNT(*) OVER (ROWS UNBOUNDED PRECEDING) FROM t LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER (ROWS UNBOUNDED PRECEDING)",
+        kRowsPrefixExists,
+        kUnusedRowsPrefix,
+        "SELECT RANK() OVER () FROM t LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
         "SELECT RANK() OVER (ORDER BY AdvEngineID DESC NULLS FIRST) FROM t",
         "SELECT COUNT(*) FROM (SELECT RANK() OVER () AS x FROM t) AS q",
         "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT RANK() OVER () FROM t)",
@@ -881,7 +893,7 @@ TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
   for (const char* text :
        {"SELECT DENSE_RANK() OVER () FROM t LIMIT 0",
         "SELECT COUNT(*) FROM t ORDER BY DENSE_RANK() OVER ()",
-        "SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
+        "SELECT SUM(AdvEngineID) OVER (ROWS 1 PRECEDING) FROM t WHERE AdvEngineID < 0",
         "SELECT COUNT(*) FROM (SELECT DENSE_RANK() OVER () AS x FROM t) AS q",
         "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT DENSE_RANK() OVER () FROM t)",
         "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE DENSE_RANK() OVER () END FROM t",

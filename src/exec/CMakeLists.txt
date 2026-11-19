@@ -30,6 +30,7 @@ antb1_add_module(
     grouped_aggregate_state.cc
     group_aggregate.cc
     window.cc
+    window_prefix.cc
     grouping_sets_shape.cc
     grouping_sets.cc
     join_table.cc

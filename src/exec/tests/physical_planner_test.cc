@@ -149,7 +149,7 @@ TEST_F(PhysicalPlannerTest, DeferredWindowHasNoPhysicalExecutionPath) {
   for (const bool rank : {false, true}) {
     plan::WindowCall call;
     call.kind = rank ? plan::WindowCall::Kind::kRank : plan::WindowCall::Kind::kAggregate;
-    call.frame = plan::WindowCall::Frame::kRowsPrefix;
+    call.frame = plan::WindowCall::Frame::kWholePartition;
     call.frame_omitted = false;
     const auto window =
         Node(plan::WindowNode{.input = scan, .calls = {call}, .span = {.offset = 7, .length = 15}});
@@ -160,7 +160,7 @@ TEST_F(PhysicalPlannerTest, DeferredWindowHasNoPhysicalExecutionPath) {
       const auto detail = plan::GetSqlError(result.status());
       ASSERT_NE(detail, nullptr);
       EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
-      EXPECT_NE(result.status().message().find(rank ? "W8" : "W4"), std::string::npos);
+      EXPECT_NE(result.status().message().find(rank ? "W8" : "W6–W8"), std::string::npos);
       EXPECT_EQ(table->scans(), 0);
     }
   }

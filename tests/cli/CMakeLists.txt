@@ -58,6 +58,29 @@ antb1_add_cli_golden(
   explain_rank_window
   ARGS explain --physical -c "SELECT RANK() OVER (ORDER BY i32) FROM edge" --table "edge=${_f}/edge.parquet"
 )
+antb1_add_cli_golden(
+  query_rows_prefix_window
+  ARGS
+    query
+    --threads
+    1
+    -c
+    "SELECT id, SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS total FROM edge ORDER BY id"
+    --table
+    "edge=${_f}/edge.parquet"
+    --format
+    csv
+)
+antb1_add_cli_golden(
+  explain_rows_prefix_window
+  ARGS
+    explain
+    --physical
+    -c
+    "SELECT SUM(i32) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM edge"
+    --table
+    "edge=${_f}/edge.parquet"
+)
 set(_aggregates "SELECT COUNT(*), COUNT(Title), SUM(UserID), AVG(ResolutionWidth), MIN(EventDate), MAX(URL) FROM t")
 antb1_add_cli_golden(
   query_aggregates

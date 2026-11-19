@@ -1640,7 +1640,34 @@ SelectStatement RandomStatement(Rng& rng, std::size_t blocks = 2) {
   return stmt;
 }
 
-TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
+// Each seed is a separate CTest case so the full round-trip corpus fits the per-test timeout
+// under sanitizers, including slower runners. Keep the streams and their iteration counts intact.
+constexpr int kValidAstIterations = 300;
+class SeededParserPropertyTest : public testing::TestWithParam<std::uint64_t> {};
+
+TEST_P(SeededParserPropertyTest, RandomValidAstsRoundTrip) {
+  const std::uint64_t seed = GetParam();
+  Rng rng(seed);
+  for (int i = 0; i < kValidAstIterations; ++i) {
+    const SelectStatement stmt = RandomStatement(rng);
+    const std::string sql = ToSql(stmt);
+    auto parsed = Parse(sql);
+    ASSERT_TRUE(parsed.has_value())
+        << "seed " << seed << " iteration " << i << ": " << testing::PrintToString(sql) << ": "
+        << parsed.error().message;
+    ASSERT_TRUE(EqualIgnoringSpans(stmt, *parsed)) << testing::PrintToString(sql);
+    ASSERT_EQ(ToSql(*parsed), sql);
+    ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(Seeds, SeededParserPropertyTest, testing::ValuesIn(kSeeds),
+                         [](const testing::TestParamInfo<std::uint64_t>& param_info) {
+                           return "Seed" + std::to_string(param_info.param);
+                         });
+
+// Check the original aggregate coverage floors across all seeds, independently of round trips.
+TEST(ParserPropertyTest, RandomValidAstsCoverNestedQueries) {
   std::size_t with_lists = 0;
   std::size_t derived_tables = 0;
   std::size_t column_lists = 0;
@@ -1648,16 +1675,8 @@ TEST(ParserPropertyTest, RandomValidAstsRoundTrip) {
   std::size_t nested_branches = 0;
   for (const std::uint64_t seed : kSeeds) {
     Rng rng(seed);
-    for (int i = 0; i < 300; ++i) {
+    for (int i = 0; i < kValidAstIterations; ++i) {
       const SelectStatement stmt = RandomStatement(rng);
-      const std::string sql = ToSql(stmt);
-      auto parsed = Parse(sql);
-      ASSERT_TRUE(parsed.has_value())
-          << "seed " << seed << " iteration " << i << ": " << testing::PrintToString(sql) << ": "
-          << parsed.error().message;
-      ASSERT_TRUE(EqualIgnoringSpans(stmt, *parsed)) << testing::PrintToString(sql);
-      ASSERT_EQ(ToSql(*parsed), sql);
-      ASSERT_NO_FATAL_FAILURE(CheckParse(sql));
       with_lists += stmt.with.empty() ? 0U : 1U;
       compounds += stmt.set_operation.empty() ? 0U : 1U;
       for (const SetBranch& branch : stmt.set_operation) {

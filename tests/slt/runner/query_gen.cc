@@ -784,6 +784,88 @@ std::optional<GeneratedQuery> RankQuery(const std::vector<GenTable>& tables, Fea
   return q;
 }
 
+// W4 has its own stream. Ordering by every column makes tied rows' arguments identical, so
+// the prefix-result multiset is independent of either engine's traversal within a tie.
+std::optional<GeneratedQuery> RowsPrefixQuery(const std::vector<GenTable>& tables,
+                                              FeatureSet allowed, Rng& rng) {
+  const FeatureSet required = {Feature::kWindowRowsPrefix, Feature::kTableName,
+                               Feature::kQuotedIdentifier, Feature::kColumns, Feature::kCountStar};
+  if (!allowed.Contains(required) || !rng.Percent(3)) {
+    return std::nullopt;
+  }
+  const auto& table = rng.Pick(tables);
+  if (table.rows > 10000 || table.columns.empty()) {
+    return std::nullopt;
+  }
+  GeneratedQuery q{.table = table.name,
+                   .row_bound = table.rows,
+                   .features = required,
+                   .sort = SortMode::kRowSort};
+  const auto& key = rng.Pick(table.columns);
+  const auto& arg = rng.Pick(table.columns);
+  const bool grouped = allowed.Contains({Feature::kGroupBy, Feature::kSum}) && rng.Percent(35);
+  std::string order;
+  for (const auto& column : table.columns) {
+    if (grouped && column.name != key.name) {
+      continue;
+    }
+    if (!allowed.Has(TypeFeature(column.kind))) {
+      return std::nullopt;
+    }
+    q.features.Add(TypeFeature(column.kind));
+    if (!order.empty()) {
+      order += ", ";
+    }
+    order += QuoteIdentifier(column.name) + (rng.Percent(50) ? " DESC" : " ASC");
+    if (allowed.Has(Feature::kNullsOrder)) {
+      order += rng.Percent(50) ? " NULLS FIRST" : " NULLS LAST";
+      q.features.Add(Feature::kNullsOrder);
+    }
+  }
+  std::string value = "COUNT(*)";
+  if (grouped) {
+    value = "SUM(COUNT(*))";
+    q.features.Add({Feature::kGroupBy, Feature::kSum});
+  } else if (allowed.Has(TypeFeature(arg.kind))) {
+    std::vector<std::pair<std::string, Feature>> functions{
+        {"COUNT", Feature::kCountColumn}, {"MIN", Feature::kMin}, {"MAX", Feature::kMax}};
+    if (arg.kind == ValueKind::kInteger) {
+      functions.emplace_back("SUM", Feature::kSum);
+      functions.emplace_back("AVG", Feature::kAvg);
+      functions.emplace_back("VAR_POP", Feature::kVariance);
+    }
+    const auto& function = rng.Pick(functions);
+    if (allowed.Has(function.second)) {
+      value = function.first + "(" + QuoteIdentifier(arg.name) + ")";
+      q.features.Add({function.second, TypeFeature(arg.kind)});
+    }
+  }
+  std::string partition;
+  if (rng.Percent(65) && allowed.Has(TypeFeature(key.kind))) {
+    std::string expression = QuoteIdentifier(key.name);
+    q.features.Add(TypeFeature(key.kind));
+    if (key.kind == ValueKind::kInteger &&
+        allowed.Contains({Feature::kArithmetic, Feature::kIntegerLiteral}) && rng.Percent(50)) {
+      expression += " % 3";
+      q.features.Add({Feature::kArithmetic, Feature::kIntegerLiteral});
+    }
+    partition = "PARTITION BY " + expression + " ";
+  }
+  const std::string frame = rng.Percent(50) ? " ROWS UNBOUNDED PRECEDING"
+                                            : " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+  const std::string over = " OVER (" + partition + "ORDER BY " + order + frame + ")";
+  q.sql = "SELECT " + value + over;
+  if (allowed.Has(Feature::kMultipleItems) && rng.Percent(60)) {
+    q.sql += ", COUNT(*)" + over;
+    q.features.Add(Feature::kMultipleItems);
+  }
+  q.sql += " FROM " + QuoteIdentifier(table.name);
+  if (grouped) {
+    q.sql += " GROUP BY " + QuoteIdentifier(key.name);
+  }
+  return q;
+}
+
 // Whether both engines convert the decimal text to the same double: the digits form an integer of
 // at most 2^53 and the scale is at most 22, so the value is one correctly rounded division of two
 // exact doubles (DuckDB's DECIMAL -> DOUBLE cast) and also what strtod returns.
@@ -8610,6 +8692,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
     rank->index = index;
     rank->target_sample = target;
     return std::move(*rank);
+  }
+  Rng prefix_rng(Mix(state ^ 0x77696E646F772D34ULL));
+  if (auto prefix = RowsPrefixQuery(tables_, allowed, prefix_rng)) {
+    prefix->index = index;
+    prefix->target_sample = target;
+    return std::move(*prefix);
   }
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q =

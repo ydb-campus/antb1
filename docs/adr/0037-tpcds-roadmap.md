@@ -204,10 +204,10 @@ Queries are those a PR completes when the PRs merge in this order.
 | SQ5b | Correlated aggregates as values in select items, ORDER BY, GROUP BY keys and aggregate arguments, planted in the slot's tail | | Built |
 | SQ8 | Correlated EXISTS in any condition, through a mark join under OR, NOT or CASE, and over any block; correlated IN and NOT IN as conjuncts | 10, 35 | Built (SQ8a: EXISTS marks under OR, NOT and CASE; SQ8b: grouping, HAVING, DISTINCT, static aggregates and LIMIT/OFFSET inside EXISTS; SQ8c: correlated IN/NOT IN conjuncts and nested correlated predicates) |
 | **Phase 9** | **Window functions: the query-completing phase ([ADR 0043](0043-window-functions.md); implementation starts after that ADR merges)** | | |
-| W1 | Replace `kWindowFunctions` with the recursive-CTE pending canary; window syntax, AST and binding stages, with unsupported execution slices named by their W items; no window is answered yet | | Planned |
-| W2 | Existing non-DISTINCT aggregates over unordered whole partitions, including windows over a grouped block's aggregates; ratchet 90 | 12, 20, 53, 63, 89, 98 | Planned |
-| W3 | RANK with partition and ordering expressions, including grouped aggregates and GROUPING(); ratchet 98 | 36, 44, 47, 49, 57, 67, 70, 86 | Planned |
-| W4 | Running aggregates with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW; ratchet 99 | 51 | Planned |
+| W1 | Replace `kWindowFunctions` with the recursive-CTE pending canary; window syntax, AST and binding stages, with unsupported execution slices named by their W items; no window is answered yet | | Built |
+| W2 | Existing non-DISTINCT aggregates over unordered whole partitions, including windows over a grouped block's aggregates; ratchet 90 | 12, 20, 53, 63, 89, 98 | Built |
+| W3 | RANK with partition and ordering expressions, including grouped aggregates and GROUPING(); ratchet 98 | 36, 44, 47, 49, 57, 67, 70, 86 | Built |
+| W4 | Running aggregates with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW; ratchet 99 | 51 | Built |
 | **Phase 10** | **Full decorrelation ([ADR 0041](0041-subqueries-and-decorrelation.md)), of which phase 8 is a subset; the ids name items, not yet an order (the phase 8 update below)** | | |
 | SQ4b | The single join, `kSingle`: correlated scalar subqueries that are not aggregates, grouped ones included, checked per probe row (needs SQ0 and SQ8) | | Planned |
 | SQ9 | The domain D, the unnesting's second terminal step, for correlations that substitution cannot express: relational division (a double NOT EXISTS, or NOT EXISTS over an EXCEPT whose left arm is uncorrelated), non-equality and OR correlations below an aggregate, outer columns inside an aggregate's argument, references two blocks out that the middle block does not equate, and the input that reads no outer column of a join that must be unnested on both inputs (needs SQ0) | | Planned |
