@@ -839,6 +839,32 @@ TEST_F(SessionTest, SkippedRowGroupsDoNotChangeAnswers) {
   }
 }
 
+TEST_F(SessionTest, WholePartitionWindowsAcrossSessionEntryPoints) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  for (const char* text :
+       {"SELECT COUNT(*) OVER () FROM t",
+        "SELECT COUNT(*) FROM t ORDER BY COUNT(*) OVER () LIMIT 0",
+        "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()",
+        "SELECT COUNT(*) FROM (SELECT COUNT(*) OVER () AS n FROM t) AS q",
+        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT COUNT(*) OVER () FROM t)",
+        "SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) OVER () FROM t",
+        "WITH unused AS (SELECT COUNT(*) OVER () FROM t) SELECT COUNT(*) FROM t"}) {
+    SCOPED_TRACE(text);
+    EXPECT_TRUE(session->Execute(text).ok());
+    EXPECT_TRUE(session->Explain(text).ok());
+    EXPECT_TRUE(session->ExplainPhysical(text).ok());
+    EXPECT_TRUE(session->ExplainAnalyze(text).ok());
+  }
+  const auto output = session->Execute("SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()");
+  ASSERT_TRUE(output.ok()) << output.status();
+  EXPECT_EQ(output->table->num_columns(), 1);
+  EXPECT_EQ(output->table->num_rows(), 1);
+  const auto physical = session->ExplainPhysical("SELECT COUNT(*) OVER () FROM t");
+  ASSERT_TRUE(physical.ok()) << physical.status();
+  EXPECT_NE(physical->find("Window"), std::string::npos);
+}
+
 TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
   constexpr auto kUnusedDeferred =
       "WITH unused AS (SELECT SUM(AdvEngineID) OVER (ORDER BY AdvEngineID) FROM t) SELECT "
@@ -846,18 +872,15 @@ TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
   auto session = Session::Make().ValueOrDie();
   ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
   for (const char* text :
-       {"SELECT COUNT(*) OVER () FROM t", "SELECT RANK() OVER () FROM t LIMIT 0",
-        "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
-        "SELECT COUNT(*) FROM t ORDER BY COUNT(*) OVER () LIMIT 0",
-        "SELECT COUNT(*) FROM t ORDER BY SUM(COUNT(*)) OVER ()",
+       {"SELECT RANK() OVER () FROM t LIMIT 0", "SELECT COUNT(*) FROM t ORDER BY RANK() OVER ()",
         "SELECT SUM(AdvEngineID) OVER (ROWS UNBOUNDED PRECEDING) FROM t WHERE AdvEngineID < 0",
-        "SELECT COUNT(*) FROM (SELECT COUNT(*) OVER () AS x FROM t) AS q",
-        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT COUNT(*) OVER () FROM t)",
+        "SELECT COUNT(*) FROM (SELECT RANK() OVER () AS x FROM t) AS q",
+        "SELECT AdvEngineID FROM t WHERE EXISTS (SELECT RANK() OVER () FROM t)",
         "SELECT CASE WHEN AdvEngineID > 0 THEN 1 ELSE RANK() OVER () END FROM t",
         "WITH unused AS (SELECT RANK() OVER () FROM no_such_table) SELECT COUNT(*) FROM t",
         kUnusedDeferred,
         "WITH unused AS (SELECT AdvEngineID FROM t WINDOW w AS ()) SELECT COUNT(*) FROM t",
-        "SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) OVER () FROM t"}) {
+        "SELECT COUNT(*) FROM t UNION ALL SELECT RANK() OVER () FROM t"}) {
     SCOPED_TRACE(text);
     for (const arrow::Status& status :
          {session->Execute(text).status(), session->Explain(text).status(),
@@ -867,6 +890,29 @@ TEST_F(SessionTest, WindowExecutionBoundaryCoversAllEntryPoints) {
       ASSERT_NE(detail, nullptr) << status;
       EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << status;
       EXPECT_NE(status.message().find('W'), std::string::npos) << status;
+    }
+  }
+}
+
+TEST_F(SessionTest, DeferredWindowOperandsInUnusedCtesStayUnsupported) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path_}).ok());
+  const std::vector<std::pair<std::string, std::string>> operands{
+      {"COUNT(AdvEngineID = 1) OVER ()", "W11b"},
+      {"COUNT(*) OVER (PARTITION BY AdvEngineID = 1)", "W11b"},
+      {"SUM(sin(AdvEngineID)) OVER ()", "W11e"}};
+  for (const auto& [expression, owner] : operands) {
+    const std::string text =
+        "WITH unused AS (SELECT " + expression + " FROM no_such_table) SELECT COUNT(*) FROM t";
+    SCOPED_TRACE(text);
+    for (const arrow::Status& status :
+         {session->Execute(text).status(), session->Explain(text).status(),
+          session->ExplainPhysical(text).status(), session->ExplainAnalyze(text).status()}) {
+      ASSERT_FALSE(status.ok());
+      const auto detail = plan::GetSqlError(status);
+      ASSERT_NE(detail, nullptr) << status;
+      EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported) << status;
+      EXPECT_NE(status.message().find(owner), std::string::npos) << status;
     }
   }
 }

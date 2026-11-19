@@ -43,6 +43,7 @@
 #include "set_operation.h"
 #include "shared_builds.h"
 #include "union_all.h"
+#include "window.h"
 
 namespace antb1::exec {
 namespace {
@@ -1277,7 +1278,22 @@ struct Builder {
     return std::make_unique<FilterOperator>(std::move(input), node.predicates);
   }
   OperatorResult operator()(const plan::WindowNode& node) const {
-    return plan::UnsupportedError("W2/W3/W4: window execution is not supported", node.span);
+    for (const auto& call : node.calls) {
+      if (call.kind == plan::WindowCall::Kind::kRank) {
+        return plan::UnsupportedError("W3: window execution is not supported", call.over_span);
+      }
+      if (call.frame != plan::WindowCall::Frame::kWholePartition || !call.frame_omitted ||
+          !call.order_by.empty()) {
+        return plan::UnsupportedError("W4–W8: deferred window frame", call.over_span);
+      }
+      if (call.aggregate == plan::AggKind::kCountDistinct) {
+        return plan::UnsupportedError("W10a: window DISTINCT is not supported", call.span);
+      }
+    }
+    Name("Window");
+    // A serial boundary over a gathered upstream; runtime filters and top-N offers stop here.
+    ARROW_ASSIGN_OR_RAISE(auto input, Build(node.input, std::nullopt, Input()));
+    return std::make_unique<WindowOperator>(std::move(input), node.calls);
   }
   OperatorResult operator()(const plan::ComputeNode& node) const {
     Name("Compute");

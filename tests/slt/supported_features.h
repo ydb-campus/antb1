@@ -214,7 +214,7 @@ enum class Feature : std::uint8_t {
   kCorrelatedIn,
   // SQ8c: a keyed nested EXISTS inside a conjunct that also reads the enclosing block.
   kNestedCorrelation,
-  kWindowWholePartition,  // W2: parsed, execution and independent generator pending
+  kWindowWholePartition,  // W2: whole-partition aggregates over raw rows or grouped output
   kWindowRank,            // W3: parsed, execution and independent generator pending
   kWindowRowsPrefix,      // W4: parsed, execution and independent generator pending
   kWindowRanking,         // W5: parsed, execution and independent generator pending
@@ -539,22 +539,21 @@ inline constexpr FeatureSet kNeverGenerated = {Feature::kRecursiveCte};
 // ADR 0038's grammar (ADR 0037's RU1) waited here for the PRs that answered it, each teaching the
 // generator its form: ROLLUP in RU3, GROUPING() in RU4, GROUPING SETS in RU5 and CUBE in RU6.
 inline constexpr FeatureSet kGeneratorPending = {
-    Feature::kWindowWholePartition,  // W2 supplies the independent random stream
-    Feature::kWindowRank,            // W3 supplies the independent random stream
-    Feature::kWindowRowsPrefix,      // W4 supplies the independent random stream
-    Feature::kWindowRanking,         // W5 supplies the independent random stream
-    Feature::kWindowRangePrefix,     // W6 supplies the independent random stream
-    Feature::kWindowNamed,           // W7 supplies the independent random stream
-    Feature::kWindowRows,            // W8a supplies the independent random stream
-    Feature::kWindowRange,           // W8b supplies the independent random stream
-    Feature::kWindowGroups,          // W8c supplies the independent random stream
-    Feature::kWindowExclusion,       // W8d supplies the independent random stream
-    Feature::kWindowNavigation,      // W9a supplies the independent random stream
-    Feature::kWindowValue,           // W9b supplies the independent random stream
-    Feature::kWindowNullTreatment,   // W9c supplies the independent random stream
-    Feature::kWindowDirection,       // W9d supplies the independent random stream
-    Feature::kWindowQuantifier,      // W10a supplies the independent random stream
-    Feature::kWindowFilter,          // W10b supplies the independent random stream
+    Feature::kWindowRank,           // W3 supplies the independent random stream
+    Feature::kWindowRowsPrefix,     // W4 supplies the independent random stream
+    Feature::kWindowRanking,        // W5 supplies the independent random stream
+    Feature::kWindowRangePrefix,    // W6 supplies the independent random stream
+    Feature::kWindowNamed,          // W7 supplies the independent random stream
+    Feature::kWindowRows,           // W8a supplies the independent random stream
+    Feature::kWindowRange,          // W8b supplies the independent random stream
+    Feature::kWindowGroups,         // W8c supplies the independent random stream
+    Feature::kWindowExclusion,      // W8d supplies the independent random stream
+    Feature::kWindowNavigation,     // W9a supplies the independent random stream
+    Feature::kWindowValue,          // W9b supplies the independent random stream
+    Feature::kWindowNullTreatment,  // W9c supplies the independent random stream
+    Feature::kWindowDirection,      // W9d supplies the independent random stream
+    Feature::kWindowQuantifier,     // W10a supplies the independent random stream
+    Feature::kWindowFilter,         // W10b supplies the independent random stream
 };
 
 // What antb1 answers today: the whole slice grammar of docs/sql-subset.md (global and grouped
@@ -563,6 +562,7 @@ inline constexpr FeatureSet kGeneratorPending = {
 // added to the vocabulary for new grammar stays unsupported until the PR that implements it
 // declares it here.
 inline constexpr FeatureSet kSupportedFeatures = {
+    Feature::kWindowWholePartition,
     Feature::kCountStar,
     Feature::kCountColumn,
     Feature::kSum,

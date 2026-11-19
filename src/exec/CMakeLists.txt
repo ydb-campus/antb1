@@ -29,6 +29,7 @@ antb1_add_module(
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
+    window.cc
     grouping_sets_shape.cc
     grouping_sets.cc
     join_table.cc
@@ -61,6 +62,7 @@ if(ANTB1_BUILD_TESTS)
       tests/row_count_test.cc
       tests/physical_planner_test.cc
       tests/grouped_aggregate_test.cc
+      tests/window_test.cc
       tests/grouped_sum_alias_test.cc
       tests/grouping_sets_test.cc
       tests/sort_test.cc

@@ -143,10 +143,13 @@ TEST_F(PhysicalPlannerTest, RowCountIsAnsweredFromMetadata) {
   EXPECT_EQ(table->scans(), 0);
 }
 
-TEST_F(PhysicalPlannerTest, WindowHasNoPhysicalExecutionPath) {
+TEST_F(PhysicalPlannerTest, DeferredWindowHasNoPhysicalExecutionPath) {
   const auto table = Table();
   const auto scan = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0}});
-  const auto window = Node(plan::WindowNode{.input = scan, .span = {.offset = 7, .length = 15}});
+  plan::WindowCall rank;
+  rank.kind = plan::WindowCall::Kind::kRank;
+  const auto window =
+      Node(plan::WindowNode{.input = scan, .calls = {rank}, .span = {.offset = 7, .length = 15}});
   for (const bool profiled : {false, true}) {
     ProfileNode profile;
     auto result = BuildPhysicalPlan(PlanOf(window), profiled ? &profile : nullptr);
@@ -154,7 +157,7 @@ TEST_F(PhysicalPlannerTest, WindowHasNoPhysicalExecutionPath) {
     const auto detail = plan::GetSqlError(result.status());
     ASSERT_NE(detail, nullptr);
     EXPECT_EQ(detail->kind(), plan::SqlErrorDetail::Kind::kUnsupported);
-    EXPECT_NE(result.status().message().find("W2/W3/W4"), std::string::npos);
+    EXPECT_NE(result.status().message().find("W3"), std::string::npos);
     EXPECT_EQ(table->scans(), 0);
   }
 }

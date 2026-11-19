@@ -44,6 +44,7 @@
 #include "../key_table.h"
 #include "../part_scheduler.h"
 #include "../partition_lanes.h"
+#include "../window.h"
 #include "exec_test_util.h"
 
 namespace antb1::exec {
@@ -1189,6 +1190,45 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 // ---- a GROUP BY's key table ----
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
+
+class WindowBadAllocTest : public testing::ExecTest {};
+
+TEST_F(WindowBadAllocTest, OpenAndNextReleaseEveryFailedAllocation) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto batch = arrow::RecordBatch::Make(schema, 4, {Int64s({1, 2, 1, std::nullopt})});
+  plan::WindowCall call;
+  call.aggregate = plan::AggKind::kCountStar;
+  call.partition_by = {testing::Column(0, "k", plan::LogicalType::kBigInt)};
+  call.frame = plan::WindowCall::Frame::kWholePartition;
+  for (const bool opening : {true, false}) {
+    Sweep([&](std::int64_t skip) {
+      MemoryBudget budget(std::nullopt);
+      ExecContext ctx{.pool = &budget, .batch_size = 2, .budget = &budget};
+      bool fired = false;
+      {
+        auto source = std::make_unique<testing::ScriptedSource>(
+            schema, std::vector<Batch>{{.data = batch, .selection = {}}});
+        WindowOperator op(std::move(source), {call});
+        if (!opening) {
+          EXPECT_TRUE(op.Open(ctx).ok());
+        }
+        arrow::Status status;
+        {
+          const FailAllocations fail(skip);
+          status = opening ? op.Open(ctx) : op.Next().status();
+          fired = fail.failed() > 0;
+        }
+        if (!status.ok()) {
+          EXPECT_TRUE(status.IsOutOfMemory()) << status;
+          EXPECT_EQ(budget.bytes_allocated(), 0);
+        }
+        EXPECT_TRUE(op.Close().ok());
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      return fired;
+    });
+  }
+}
 
 // Making a key table and consuming keys (also a column of NULLs with no values buffer, which the
 // table mends first) give OutOfMemory for any heap allocation that fails in them, never an

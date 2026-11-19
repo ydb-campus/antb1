@@ -632,6 +632,102 @@ std::string QuoteIdentifier(std::string_view s) {
   return out + "\"";
 }
 
+// W2 has its own stream. Declining a window leaves every existing query and feature draw
+// untouched. These standalone cases use bounded fixture tables and never truncate an unordered
+// answer. Raw rows, grouped output, computed keys and multiple specifications are independent
+// choices; the ordinary generator continues to cover joins and the rest of the grammar.
+std::optional<GeneratedQuery> WindowQuery(const std::vector<GenTable>& tables, FeatureSet allowed,
+                                          Rng& rng) {
+  const FeatureSet required = {Feature::kWindowWholePartition, Feature::kTableName,
+                               Feature::kQuotedIdentifier, Feature::kCountStar};
+  if (!allowed.Contains(required) || !rng.Percent(3)) {
+    return std::nullopt;
+  }
+  const auto& table = rng.Pick(tables);
+  if (table.rows > 10000 || table.columns.empty()) {
+    return std::nullopt;
+  }
+  const auto& key = rng.Pick(table.columns);
+  const auto& arg = rng.Pick(table.columns);
+  const auto feature = [](ValueKind kind) {
+    switch (kind) {
+      case ValueKind::kInteger:
+        return Feature::kIntegerColumns;
+      case ValueKind::kDouble:
+        return Feature::kDoubleColumns;
+      case ValueKind::kVarchar:
+        return Feature::kVarcharColumns;
+      case ValueKind::kDate:
+        return Feature::kDateColumns;
+      case ValueKind::kDecimal:
+        return Feature::kDecimalColumns;
+    }
+    return Feature::kIntegerColumns;
+  };
+  GeneratedQuery q{.table = table.name,
+                   .row_bound = table.rows,
+                   .features = required,
+                   .sort = SortMode::kRowSort};
+  const bool grouped = allowed.Has(Feature::kGroupBy) && rng.Percent(35);
+  const bool partitioned = grouped || rng.Percent(70);
+  std::string partition;
+  std::string key_sql = QuoteIdentifier(key.name);
+  if (partitioned) {
+    if (!allowed.Has(Feature::kColumns) || !allowed.Has(feature(key.kind))) {
+      return std::nullopt;
+    }
+    q.features.Add({Feature::kColumns, feature(key.kind)});
+    if (key.kind == ValueKind::kInteger &&
+        allowed.Contains({Feature::kArithmetic, Feature::kIntegerLiteral}) && rng.Percent(35)) {
+      key_sql += " % 3";
+      q.features.Add({Feature::kArithmetic, Feature::kIntegerLiteral});
+    }
+    partition = "PARTITION BY " + key_sql;
+  }
+  std::string value = "COUNT(*)";
+  if (!grouped && allowed.Has(Feature::kColumns) && allowed.Has(feature(arg.kind)) &&
+      rng.Percent(80)) {
+    std::vector<std::pair<std::string, Feature>> functions;
+    for (const auto& f : std::vector<std::pair<std::string, Feature>>{
+             {"COUNT", Feature::kCountColumn}, {"MIN", Feature::kMin}, {"MAX", Feature::kMax}}) {
+      functions.push_back(f);
+    }
+    // Every integer sum of <= 10,000 storage-width values fits HUGEINT. Avoid unbounded DOUBLE
+    // and decimal sums here; the independent SLTs exercise their overflow and NaN behavior.
+    if (arg.kind == ValueKind::kInteger) {
+      for (const auto& f :
+           std::vector<std::pair<std::string, Feature>>{{"SUM", Feature::kSum},
+                                                        {"AVG", Feature::kAvg},
+                                                        {"VAR_POP", Feature::kVariance},
+                                                        {"STDDEV_SAMP", Feature::kVariance}}) {
+        functions.push_back(f);
+      }
+    }
+    if (!functions.empty()) {
+      const auto& f = rng.Pick(functions);
+      if (allowed.Has(f.second)) {
+        value = f.first + "(" + QuoteIdentifier(arg.name) + ")";
+        q.features.Add({f.second, Feature::kColumns, feature(arg.kind)});
+      }
+    }
+  }
+  if (grouped && allowed.Has(Feature::kSum)) {
+    value = "SUM(COUNT(*))";
+    q.features.Add(Feature::kSum);
+  }
+  q.sql = "SELECT " + value + " OVER (" + partition + ")";
+  if (allowed.Has(Feature::kMultipleItems) && rng.Percent(60)) {
+    q.sql += ", COUNT(*) OVER ()";
+    q.features.Add(Feature::kMultipleItems);
+  }
+  q.sql += " FROM " + QuoteIdentifier(table.name);
+  if (grouped) {
+    q.sql += " GROUP BY " + key_sql;
+    q.features.Add(Feature::kGroupBy);
+  }
+  return q;
+}
+
 // Whether both engines convert the decimal text to the same double: the digits form an integer of
 // at most 2^53 and the scale is at most 22, so the value is one correctly rounded division of two
 // exact doubles (DuckDB's DECIMAL -> DOUBLE cast) and also what strtod returns.
@@ -8447,6 +8543,12 @@ GeneratedQuery QueryGenerator::Generate(uint64_t index) const {
   Rng exists_mark_rng(Mix(state ^ kExistsMarkStreamSalt));
   const bool target = rng.Percent(options_.target_percent);
   const FeatureSet allowed = target ? FeatureSet::All() : options_.supported;
+  Rng window_rng(Mix(state ^ 0x77696E646F772D32ULL));
+  if (auto window = WindowQuery(tables_, allowed, window_rng)) {
+    window->index = index;
+    window->target_sample = target;
+    return std::move(*window);
+  }
   // Make() proved that the supported set admits a query over these tables; All() is a superset.
   GeneratedQuery q =
       Builder(tables_, rng, join_rng, block_rng, left_rng, sub_rng, substring_rng, corr_rng,

@@ -3545,7 +3545,7 @@ class Binder {
     for (std::size_t i = 0; i < window_written_.size(); ++i) {
       if (sql::EqualIgnoringSpans(sql::Expr(window_written_[i]), sql::Expr(call))) {
         const WindowCall& known = windows_[i];
-        return ColumnLeaf(known.id, known.type, known.name, false);
+        return ColumnLeaf(known.id, known.type, known.name, window_float_[i]);
       }
     }
     WindowCall bound{.kind = AsciiLower(call.name) == "rank" ? WindowCall::Kind::kRank
@@ -3554,15 +3554,20 @@ class Binder {
                      .name = sql::ToSql(sql::Expr(call)),
                      .span = call.span,
                      .over_span = call.over_span};
-    const auto operand = [&](const sql::Expr& expr) -> arrow::Result<BoundColumn> {
+    const auto operand = [&](const sql::Expr& expr,
+                             bool* stored_as_float = nullptr) -> arrow::Result<BoundColumn> {
       const bool previous = std::exchange(window_input_, true);
       auto value = BindScoped(expr);
       window_input_ = previous;
       ARROW_ASSIGN_OR_RAISE(Typed typed, std::move(value));
+      if (stored_as_float != nullptr) {
+        *stored_as_float = typed.stored_as_float;
+      }
       return ComputedColumn(typed, window_exprs_, window_ids_);
     };
+    bool argument_float = false;
     for (const sql::Expr& arg : call.args) {
-      ARROW_ASSIGN_OR_RAISE(BoundColumn column, operand(arg));
+      ARROW_ASSIGN_OR_RAISE(BoundColumn column, operand(arg, &argument_float));
       bound.arguments.push_back(std::move(column));
     }
     if (bound.kind == WindowCall::Kind::kAggregate) {
@@ -3595,7 +3600,10 @@ class Binder {
     bound.id = ids_.Next();
     windows_.push_back(bound);
     window_written_.push_back(call);
-    return ColumnLeaf(bound.id, bound.type, bound.name, false);
+    const bool float_result =
+        argument_float && (bound.aggregate == AggKind::kMin || bound.aggregate == AggKind::kMax);
+    window_float_.push_back(float_result);
+    return ColumnLeaf(bound.id, bound.type, bound.name, float_result);
   }
 
   // ---- the output scope: the aggregation's keys and aggregates ----
@@ -4496,6 +4504,7 @@ class Binder {
 
   std::vector<WindowCall> windows_;
   std::vector<sql::WindowCall> window_written_;
+  std::vector<bool> window_float_;  // MIN/MAX preserve their argument's FLOAT provenance (D11)
   std::vector<ExprPtr> window_exprs_;
   std::vector<ColumnId> window_ids_;
   std::vector<SlotEntry> window_slot_;
@@ -8367,6 +8376,7 @@ arrow::Status Binder::BindSelectExpressions() {
     ARROW_ASSIGN_OR_RAISE(const Typed t, BindScoped(written));
     BoundColumn column = ScopedColumn(t);
     select_.output[i].type = t.expr->type;
+    select_.output[i].stored_as_float = t.stored_as_float;
     if (!select_.aliases[i].has_value()) {
       // An item that holds a subquery is named by what is written (ADR 0041's decision 11; DuckDB
       // by a deparse of its own, divergence D8), its value's leaf by its block's column.
@@ -8388,7 +8398,8 @@ arrow::Result<std::optional<Typed>> Binder::ItemOutput(std::size_t i) {
                                       select_.output[i].name, false));
     case ItemKind::kExpression: {
       const BoundColumn& column = select_.expr_columns[index];
-      return std::optional(ColumnLeaf(column.id, column.type, column.name, false));
+      return std::optional(
+          ColumnLeaf(column.id, column.type, column.name, select_.output[i].stored_as_float));
     }
     case ItemKind::kColumn:
       break;
@@ -10236,14 +10247,18 @@ arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement) {
   }
   const auto refuse = [](this const auto& self, const sql::Expr& expr) -> arrow::Status {
     if (const auto* call = std::get_if<sql::WindowCall>(&expr)) {
-      if (auto deferred = DeferredWindow(*call)) {
+      // Unused CTE bodies have not been bound. Apply the same operand capability checks as
+      // reachable blocks without resolving their names; ordinary aggregate subquery values
+      // keep their existing support, while direct window subqueries remain W11f.
+      if (auto deferred = FirstUnsupported(expr, /*values=*/true)) {
         return Reject(*deferred);
       }
-      std::string owner = call->specification.frame ? "W4" : "W2";
       if (AsciiLower(call->name) == "rank") {
-        owner = "W3";
+        return UnsupportedError("W3: window execution is not supported", call->over_span);
       }
-      return UnsupportedError(owner + ": window execution is not supported", call->over_span);
+      if (call->specification.frame) {
+        return UnsupportedError("W4: window execution is not supported", call->over_span);
+      }
     }
     if (const auto* sub = std::get_if<sql::SubqueryExpr>(&expr)) {
       ARROW_RETURN_NOT_OK(RefuseWindowExecution(*sub->query));

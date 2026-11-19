@@ -27,8 +27,8 @@ namespace antb1::plan {
 arrow::Result<LogicalPlan> Bind(const sql::SelectStatement& stmt, const Catalog& catalog,
                                 const BindOptions& options = {});
 
-// W1 execution boundary: inspect the original AST, including unused CTE bodies, after Bind and
-// before Optimize. No runtime option bypasses this guard.
+// Refuse deferred window forms in the original AST, including unused CTE bodies, after Bind
+// and before Optimize. W2 whole-partition aggregates execute; no option enables deferred forms.
 arrow::Status RefuseWindowExecution(const sql::SelectStatement& statement);
 
 }  // namespace antb1::plan
