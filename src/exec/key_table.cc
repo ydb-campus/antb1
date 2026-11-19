@@ -25,20 +25,10 @@
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 
+#include "fixed_key_table.h"
+
 namespace antb1::exec {
 namespace {
-
-// `body()`, with a std::bad_alloc from an allocation outside the pool (Arrow's small objects) as
-// OutOfMemory: no exception leaves exec, and GroupAggregateOperator makes its table in Open, which
-// nothing converts (as join_table.cc does for the join).
-template <class Body>
-auto NoBadAlloc(const Body& body) -> decltype(body()) {
-  try {
-    return body();
-  } catch (const std::bad_alloc&) {
-    return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
-  }
-}
 
 // A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
 // only NULLs.
@@ -68,7 +58,7 @@ class GrouperKeyTable final : public KeyTable {
       : grouper_(std::move(grouper)), pool_(pool) {}
 
   arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) override {
-    return NoBadAlloc([&] -> arrow::Result<KeyIds> {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeyIds> {
       if (std::ranges::any_of(keys.values,
                               [](const arrow::Datum& key) { return LacksValues(*key.array()); })) {
         ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch with_values, WithValues(keys, pool_));
@@ -80,7 +70,7 @@ class GrouperKeyTable final : public KeyTable {
 
   arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
       const arrow::compute::ExecBatch& keys) override {
-    return NoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
       const auto lookup = [this](const arrow::compute::ExecBatch& batch)
           -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
         ARROW_ASSIGN_OR_RAISE(const arrow::Datum datum,
@@ -97,7 +87,7 @@ class GrouperKeyTable final : public KeyTable {
   }
 
   [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return NoBadAlloc([&] { return grouper_->GetUniques(); });
+    return KeyTableNoBadAlloc([&] { return grouper_->GetUniques(); });
   }
 
   [[nodiscard]] std::uint32_t num_groups() const override { return grouper_->num_groups(); }
@@ -246,7 +236,7 @@ class PackedStringKeyTable final : public KeyTable {
         scratch_(original_types_.size()) {}
 
   arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) override {
-    return NoBadAlloc([&] -> arrow::Result<KeyIds> {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeyIds> {
       if (packed_) {
         ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool(), scratch_));
         if (packed.has_value()) {
@@ -272,7 +262,7 @@ class PackedStringKeyTable final : public KeyTable {
 
   arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
       const arrow::compute::ExecBatch& keys) override {
-    return NoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<std::shared_ptr<arrow::UInt32Array>> {
       if (packed_) {
         ARROW_ASSIGN_OR_RAISE(auto packed, PackStrings(keys, ctx_->memory_pool(), scratch_));
         if (packed.has_value()) {
@@ -302,7 +292,7 @@ class PackedStringKeyTable final : public KeyTable {
   }
 
   [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return NoBadAlloc([&] -> arrow::Result<arrow::compute::ExecBatch> {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<arrow::compute::ExecBatch> {
       ARROW_ASSIGN_OR_RAISE(auto uniques, backend_->Uniques());
       if (packed_) {
         for (std::size_t column = 0; column < uniques.values.size(); ++column) {
@@ -390,17 +380,26 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options) {
   ANTB1_CHECK(!key_types.empty());
-  // Short string shapes keep the Grouper with a compact input representation; other shapes
-  // use it directly (docs/adr/0019-own-aggregation-hash-table.md).
-  const bool known_kind = options.kind == KeyTableKind::kAuto ||
-                          options.kind == KeyTableKind::kGrouper ||
-                          options.kind == KeyTableKind::kPackedStrings;
+  // Automatic selection retains the approved Grouper/packed-string paths: the fixed-width
+  // candidate missed ADR 0019's end-to-end gates. Explicit fixed kinds serve tests and benchmarks.
+  const bool known_kind =
+      options.kind == KeyTableKind::kAuto || options.kind == KeyTableKind::kGrouper ||
+      options.kind == KeyTableKind::kPackedStrings || options.kind == KeyTableKind::kFixed ||
+      options.kind == KeyTableKind::kFixedIdOrder;
   ANTB1_CHECK(known_kind);
-  return NoBadAlloc([&] -> arrow::Result<std::unique_ptr<KeyTable>> {
-    if (options.kind != KeyTableKind::kGrouper && SupportsPackedStrings(key_types)) {
+  return KeyTableNoBadAlloc([&] -> arrow::Result<std::unique_ptr<KeyTable>> {
+    if ((options.kind == KeyTableKind::kAuto || options.kind == KeyTableKind::kPackedStrings) &&
+        SupportsPackedStrings(key_types)) {
       const std::vector<arrow::TypeHolder> packed_types(key_types.size(), arrow::uint64());
       ARROW_ASSIGN_OR_RAISE(auto backend, MakeGrouper(packed_types, ctx));
       return std::make_unique<PackedStringKeyTable>(std::move(backend), key_types, ctx);
+    }
+    if (options.kind == KeyTableKind::kFixed || options.kind == KeyTableKind::kFixedIdOrder) {
+      if (auto layout = FixedKeyLayoutOf(key_types); layout.has_value()) {
+        const auto growth =
+            options.kind == KeyTableKind::kFixedIdOrder ? Growth::kIdOrder : Growth::kSlotOrder;
+        return MakeFixedKeyTable(std::move(*layout), growth, ctx->memory_pool(), options);
+      }
     }
     return MakeGrouper(key_types, ctx);
   });

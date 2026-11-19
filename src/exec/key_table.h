@@ -1,13 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <new>
 #include <span>
 #include <vector>
 
 #include <arrow/buffer.h>
 #include <arrow/compute/exec.h>
 #include <arrow/result.h>
+#include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
 namespace arrow::compute {
@@ -58,10 +61,19 @@ enum class KeyTableKind : std::uint8_t {
   kAuto,
   kGrouper,        // arrow::compute::Grouper, for every key shape
   kPackedStrings,  // short STRING/BINARY keys; unsupported shapes use kGrouper
+  kFixed,          // candidate one/two fixed-width keys, slot-order growth; tests and benchmarks
+  kFixedIdOrder,   // same keys, id-order growth; for tests and benchmarks
 };
+
+// One ID is reserved as the fixed table's missing-key marker.
+inline constexpr std::uint32_t kMaxKeyTableGroups = std::numeric_limits<std::uint32_t>::max() - 1;
 
 struct KeyTableOptions {
   KeyTableKind kind = KeyTableKind::kAuto;
+  // Estimate from the first two nonempty input batches. Disable for merged distinct groups.
+  bool estimate = true;
+  // Lower only in tests; the fixed backend rejects an additional group with OutOfMemory.
+  std::uint32_t max_groups = kMaxKeyTableGroups;
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`
@@ -69,5 +81,15 @@ struct KeyTableOptions {
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options = {});
+
+// Convert allocations of Arrow's small objects outside the query pool to the exec error model.
+template <class Body>
+auto KeyTableNoBadAlloc(const Body& body) -> decltype(body()) {
+  try {
+    return body();
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
+  }
+}
 
 }  // namespace antb1::exec

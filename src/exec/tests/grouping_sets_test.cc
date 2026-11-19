@@ -846,7 +846,9 @@ TEST_F(GroupingSetsTest, ALaterBatchOutOfMemoryFailsTheQuery) {
   std::optional<int64_t> ignored;
   ASSERT_TRUE(RunUnder(table, sets, unlimited, nullptr, ignored).ok());
   bool found = false;
-  for (int64_t limit = unlimited.max_memory(); limit > 0 && !found; limit = limit * 9 / 10) {
+  // Different key layouts leave different allocation gaps. A ten-percent step can miss
+  // every later-batch failure; one-percent steps preserve the failure and cleanup assertions.
+  for (int64_t limit = unlimited.max_memory(); limit > 0 && !found; limit = limit * 99 / 100) {
     plan::LogicalPlan plan{.root = GroupingSets(Scan(table), keys, sets, ExactCalls()),
                            .output = {}};
     plan.output.assign(OutputWidth(*plan.root),

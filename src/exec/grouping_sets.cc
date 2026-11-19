@@ -57,8 +57,10 @@ arrow::Status GroupingSetsOperator::Aggregate() {
   const int width = input_->output_schema()->num_fields();
   tables_.resize(shape.sets.size());
   for (std::size_t s = 0; s < shape.sets.size(); ++s) {
-    ARROW_ASSIGN_OR_RAISE(tables_[s], GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_,
-                                                       width, ctx_.pool, ctx_.budget));
+    ARROW_ASSIGN_OR_RAISE(
+        tables_[s], GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, width, ctx_.pool,
+                                     ctx_.budget, /*first_keys=*/true, GroupTable::kPartitions,
+                                     {.estimate = shape.root(s)}));
   }
   while (true) {
     ARROW_ASSIGN_OR_RAISE(const Batch in, input_->Next());
