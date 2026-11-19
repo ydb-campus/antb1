@@ -211,9 +211,11 @@ TEST_F(WindowTest, InvalidBoundRankColumnsAreRejectedBeforeFastPaths) {
           Column(0, "bad", LogicalType::kVarchar)}) {
       for (const bool ordered : {false, true}) {
         const auto batch = arrow::RecordBatch::Make(schema, 1, {testing::Int64s({1})});
-        auto source = std::make_unique<ScriptedSource>(
-            schema,
-            empty ? std::vector<Batch>{} : std::vector<Batch>{{.data = batch, .selection = {}}});
+        std::vector<Batch> batches;
+        if (!empty) {
+          batches.push_back({.data = batch, .selection = {}});
+        }
+        auto source = std::make_unique<ScriptedSource>(schema, std::move(batches));
         const auto* observed = source.get();
         auto call = Rank();
         call.partition_by.clear();
