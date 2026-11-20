@@ -35,7 +35,8 @@ BranchTruth TruthInBranch(const UnionAllNode& node, std::size_t branch, const Pr
 // A union none of whose branches is left becomes Filter{FALSE} over a union of its first branch:
 // above the union, which ends every part pipeline, it reads nothing. A Filter holding a FALSE, or
 // one that reads a column the union does not output, stays as it is. Reads ids, never positions;
-// running it twice changes nothing more.
-LogicalNodePtr FilterIntoUnionBranches(const LogicalNodePtr& root);
+// running it twice changes nothing more. Sets `*pruned` if any input was ruled out, including
+// in a nested union. A cost-based retry must not reintroduce that input's unevaluated expressions.
+LogicalNodePtr FilterIntoUnionBranches(const LogicalNodePtr& root, bool* pruned = nullptr);
 
 }  // namespace antb1::plan

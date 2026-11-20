@@ -38,7 +38,14 @@ namespace antb1::plan {
 //     (possibly none), and Computes keep only the expressions used. A Project and a UnionAll keep
 //     every output, so a derived table's or a union's branch computes its columns whether or not
 //     anything above reads them.
-// Rules 1 to 7 find columns by their ids and ignore the input's indices; last,
+//  8. Integer/DATE equality conditions on grouped keys move below grouping and direct-column
+//     projections; compatible join keys propagate them to matching grouped inputs. A LEFT join
+//     only propagates a preserved-side restriction to its nullable side. Limits, windows,
+//     grouping sets and potentially failing computations remain barriers. New union filters
+//     use rule 1, and rule 7 runs again to refresh the changed filters' column demand.
+// Rules 5 and 8 preserve materializable aggregates shared across consumers. A shared partial
+// aggregate can still serve those consumers after their outer groups specialize.
+// Rules 1 to 8 find columns by their ids and ignore the input's indices; last,
 // plan::ResolvePositions sets every index from the ids (ADR 0022). A plan it returns has the same
 // output columns (and column ids) and the same answer as the input plan, and holds no dependent
 // join, so no later pass and no operator meets one.

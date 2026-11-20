@@ -1281,6 +1281,15 @@ above it):
 - projection pruning: `Scan` reads only the columns that the nodes above it use (none for a bare `COUNT(*)`); each
   input of a `Join` keeps the columns used above it and the join's key and residual columns; a `UnionAll` keeps every
   column, read above it or not, and each of its inputs the columns it gives the union;
+- an integer or DATE equality on a grouping key can move below aggregation and through direct-column projections.
+  Across compatible equijoin keys, a restriction on a grouped input also restricts the matching input; for a LEFT
+  join this inference only goes from the preserved side to the nullable side. Both inputs must be safe to skip
+  before inferring a restriction, including any aggregate whose evaluation could overflow. Windows, row limits,
+  grouping sets, and computations that may fail remain barriers. New filters over `UNION ALL` use the branch rule
+  above, and projection pruning refreshes the columns needed after movement. This avoids building groups that a later key
+  condition would discard. Aggregate placement and key pushdown preserve reuse across consumers of a shared
+  aggregate, including when those consumers can share an inner partial aggregate after the rewrite. A push
+  that skips a union branch or filters out a group whose aggregation could fail takes precedence over reuse;
 - `COUNT(*)` alone without `WHERE`, over a table whose row count is known without scanning (every Parquet table),
   becomes `RowCount`, answered from the footers.
 - (execution, not a plan rule) an `ORDER BY ... LIMIT` over a table reads first only the columns its `WHERE` and its
@@ -1372,6 +1381,10 @@ Project x, tag
 `--analyze` profiles, with none of what a run measures. It takes `--threads`, `--memory-limit`,
 `--build-side-ratio` and `--join-order`, and cannot be given together with `--analyze`; its errors and exit codes
 are those of `antb1 query`.
+
+Repeated aggregate results are not shared when their estimated fixed-width storage exceeds the 256 MiB
+shared-result cap. Key domains supply the estimate where available; the runtime cap and the query memory
+budget still apply, including where statistics or variable-width sizes are unknown.
 
 It shows what no logical plan holds, because the physical planner is what decides it:
 

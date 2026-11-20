@@ -130,6 +130,77 @@ TEST_F(SharedBuildsTest, ComputesARepeatedSubPlanOnceAndKeepsTheAnswer) {
       << without->rows->ToString();
 }
 
+// A reducing shape alone does not make its output small. Sparse, multi-column key domains can
+// predict a result beyond the materialization cap, without allocating a large test table.
+TEST_F(SharedBuildsTest, RecomputesWhenTheGroupEstimateExceedsTheSharedResultCap) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  std::vector<std::optional<int64_t>> keys;
+  keys.reserve(8192);
+  for (int i = 0; i < 8192; ++i) {
+    keys.emplace_back(i % 2 == 0 ? 0 : 100'000'000);
+  }
+  auto table = std::make_shared<MemoryTable>(
+      schema,
+      arrow::RecordBatchVector{arrow::RecordBatch::Make(
+          schema, 8192, arrow::ArrayVector{testing::Int64s(keys), testing::Int64s(keys)})},
+      /*split=*/true);
+  table->set_claimed_rows(100'000'000);
+  auto run = Execute(
+      "WITH g AS (SELECT k, v, COUNT(*) AS n FROM t GROUP BY k, v) "
+      "SELECT COUNT(*) FROM g AS a, g AS b WHERE a.k = b.k AND a.v = b.v",
+      table);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->shared_rows, std::nullopt);
+  EXPECT_EQ(run->parts_scanned, 2);
+  ASSERT_NE(run->rows, nullptr);
+  ASSERT_EQ(run->rows->num_rows(), 1);
+  EXPECT_EQ(static_cast<const arrow::Int64Array&>(*run->rows->column(0)->chunk(0)).Value(0), 2);
+}
+
+TEST_F(SharedBuildsTest, SharedCostDoesNotExposeOverflowInExcludedGroups) {
+  const auto schema = arrow::schema(
+      {arrow::field("k", arrow::int64()), arrow::field("v", arrow::decimal128(38, 0))});
+  const std::string largest(38, '9');
+  const auto batch = arrow::RecordBatch::Make(
+      schema, 4,
+      arrow::ArrayVector{testing::Int64s({1, 2, 3, 3}),
+                         testing::Decimals(38, 0, {"1", "1", largest, largest})});
+  const auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch});
+  constexpr std::string_view kFiltered =
+      "WITH g AS (SELECT k, SUM(v) AS n FROM t GROUP BY k) "
+      "SELECT a.k, b.k FROM g AS a JOIN g AS b ON a.n = b.n WHERE a.k = 1 AND b.k = ";
+  for (const int64_t claimed : {4, 20'000'000}) {
+    table->set_claimed_rows(claimed);
+    auto run = Execute(std::string(kFiltered) + "2", table);
+    ASSERT_TRUE(run.ok()) << run.status().ToString();
+    ASSERT_EQ(run->rows->num_rows(), 1);
+    EXPECT_EQ(static_cast<const arrow::Int64Array&>(*run->rows->column(0)->chunk(0)).Value(0), 1);
+    EXPECT_EQ(static_cast<const arrow::Int64Array&>(*run->rows->column(1)->chunk(0)).Value(0), 2);
+    auto overflow = Execute(std::string(kFiltered) + "3", table);
+    ASSERT_FALSE(overflow.ok());
+    EXPECT_NE(overflow.status().ToString().find("overflow"), std::string::npos);
+  }
+}
+
+TEST_F(SharedBuildsTest, SharedCostDoesNotReadAPrunedUnionBranch) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto batch =
+      arrow::RecordBatch::Make(schema, 1, arrow::ArrayVector{testing::Int64s({4'000'000'000})});
+  const auto table =
+      std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, /*split=*/true);
+  table->set_claimed_rows(20'000'000);
+  auto run = Execute(
+      "WITH g AS (SELECT tag, MAX(v) AS n FROM (SELECT 1 AS tag, k AS v FROM t "
+      "UNION ALL SELECT 2 AS tag, k AS v FROM t UNION ALL SELECT 3 AS tag, k*k AS v FROM t) u "
+      "GROUP BY tag) SELECT a.tag, b.tag FROM g a JOIN g b ON a.n = b.n "
+      "WHERE a.tag = 1 AND b.tag = 2",
+      table);
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(run->rows->num_rows(), 1);
+  EXPECT_EQ(run->parts_scanned, 2) << "only the two selected constant-tag branches run";
+}
+
 // The gate's second half, which the measurement had to teach: a sub-plan must be *dear* as well as
 // reducing. Reading little is cheaper to do twice than to hold -- measured at 1.017x on the one
 // query of the workload whose shared join read about a million rows.

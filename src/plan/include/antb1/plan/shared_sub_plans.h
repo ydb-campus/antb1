@@ -9,8 +9,8 @@
 //
 // Nothing here shares anything: it reports what a later item could compute once. A plan built by
 // the binder holds a subtree per reference -- ADR 0022 binds a CTE's body once per reference, and a
-// subquery that repeats a FROM list produces the same duplication with no CTE in it -- and nothing
-// after the binder notices that two subtrees are the same.
+// subquery that repeats a FROM list produces the same duplication with no CTE in it. The optimizer
+// uses these groups to preserve reuse and the physical planner chooses which results to hold.
 //
 // Public since E2, which is what reads it from exec to decide what to materialise; E1 kept it
 // module-internal because only explain.cc and this module's tests used it (ADR 0027's S1: a
@@ -79,5 +79,12 @@ struct SharedSubPlan {
 // whatever its copies hold and in whatever order, so a union's branches are never shared one by one
 // either. A group above a union -- an aggregation of it, repeated -- is found as any other.
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan);
+
+// The cap used for both the plan-time estimate and the bytes held at execution.
+inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;
+
+// Whether the widest member's aggregate saves enough input work and fits the estimate (ADR 0030).
+// The optimizer and the physical materialization decision use the same policy.
+bool WorthSharing(const SharedSubPlan& group);
 
 }  // namespace antb1::plan

@@ -95,6 +95,118 @@ TEST_F(SessionTest, CountStarFromPath) {
       10);
 }
 
+// Filtering a derived join/group must not suppress an error in a join residual evaluated before
+// that filter. Integer multiplication overflows on the fixture's matches.
+TEST_F(SessionTest, GroupKeyPushdownKeepsJoinResidualErrors) {
+  auto session = Session::Make().ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("events", {path_}).ok());
+  for (const char* kind : {"JOIN", "LEFT JOIN"}) {
+    for (const bool grouped : {false, true}) {
+      const std::string query = std::format(
+          "SELECT k FROM (SELECT a.AdvEngineID AS k{} FROM events a {} events b "
+          "ON a.EventDate = b.EventDate AND a.AdvEngineID * b.AdvEngineID * "
+          "4611686018427387904 > b.AdvEngineID{}) g WHERE k = 0",
+          grouped ? ", COUNT(*) AS n" : "", kind, grouped ? " GROUP BY a.AdvEngineID" : "");
+      const auto result = session->Execute(query);
+      EXPECT_TRUE(result.status().IsExecutionError()) << query << "\n"
+                                                      << result.status().ToString();
+    }
+  }
+}
+
+TEST_F(SessionTest, GroupKeyInferenceDoesNotSkipFailingSourceComputations) {
+  auto session = Session::Make().ValueOrDie();
+  const auto write = [&](const std::string& name, int64_t key, int64_t rows) {
+    arrow::Int64Builder k;
+    arrow::Int64Builder j;
+    for (int64_t i = 0; i < rows; ++i) {
+      ASSERT_TRUE(k.Append(key).ok());
+      ASSERT_TRUE(j.Append(0).ok());
+    }
+    const auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("k", arrow::int64()), arrow::field("j", arrow::int64())}),
+        {k.Finish().ValueOrDie(), j.Finish().ValueOrDie()});
+    const auto path = (dir_ / (name + ".parquet")).string();
+    const auto out = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), out, 4).ok());
+    ASSERT_TRUE(out->Close().ok());
+    ASSERT_TRUE(session->RegisterParquet(name, {path}).ok());
+  };
+  ASSERT_NO_FATAL_FAILURE(write("a", 4, 2));
+  ASSERT_NO_FATAL_FAILURE(write("b", 5, 1));
+  // Two keys avoid the existing single-key aggregate runtime filter. Inferring b.k = 4 would
+  // empty the right build and skip the overflowing computation on the left entirely.
+  std::vector<std::string> queries = {
+      "SELECT g.n FROM (SELECT k, j, COUNT(*) * 4611686018427387904 AS n FROM a "
+      "WHERE k = 4 GROUP BY k, j) AS g JOIN b ON g.k = b.k AND g.j = b.j",
+      "SELECT g.n FROM (SELECT k, j, MAX(k * 4611686018427387904) AS n FROM a "
+      "GROUP BY k, j HAVING k = 4) AS g JOIN b ON g.k = b.k AND g.j = b.j",
+      // Direct movement through a derived join must preserve the same source barriers, both
+      // when inferring an empty build and when the moved predicate itself empties the build.
+      "SELECT s.n FROM (SELECT c.k, c.j, c.n FROM "
+      "(SELECT k, j, k * 4611686018427387904 AS n FROM a) c "
+      "JOIN b ON c.k = b.k AND c.j = b.j) s WHERE s.k = 4",
+      "SELECT s.n FROM (SELECT b.k, c.n FROM "
+      "(SELECT k, j, k * 4611686018427387904 AS n FROM a) c "
+      "JOIN b ON c.k = b.k AND c.j = b.j) s WHERE s.k = 4"};
+  // A new fact above an argument computation, or a sibling of a join, must retain the barrier.
+  for (const char* kind : {"JOIN", "LEFT JOIN"}) {
+    queries.push_back(
+        std::format("SELECT s.n FROM (SELECT g.k, g.j, c.n FROM "
+                    "(SELECT k, j, COUNT(*) AS q FROM a WHERE k = 4 GROUP BY k, j) g {} "
+                    "(SELECT k, j, k * 4611686018427387904 AS n FROM a) c "
+                    "ON g.k = c.k AND g.j = c.j) s JOIN b ON s.k = b.k AND s.j = b.j",
+                    kind));
+  }
+  for (const auto& query : queries) {
+    const auto result = session->Execute(query);
+    EXPECT_TRUE(result.status().IsExecutionError()) << query << "\n" << result.status().ToString();
+  }
+}
+
+TEST_F(SessionTest, InferredJoinKeysPreserveCheckedAggregateErrorsOnEitherInput) {
+  arrow::Int64Builder keys;
+  arrow::Int64Builder tags;
+  const auto type = arrow::decimal128(38, 0);
+  arrow::Decimal128Builder values(type);
+  ASSERT_TRUE(keys.AppendValues({1, 2, 2}).ok());
+  ASSERT_TRUE(tags.AppendValues({0, 0, 0}).ok());
+  ASSERT_TRUE(values.Append(arrow::Decimal128(1)).ok());
+  const auto largest = arrow::Decimal128::GetMaxValue(38);
+  ASSERT_TRUE(values.Append(largest).ok());
+  ASSERT_TRUE(values.Append(largest).ok());
+  const auto table = arrow::Table::Make(
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("j", arrow::int64()),
+                     arrow::field("v", type)}),
+      {keys.Finish().ValueOrDie(), tags.Finish().ValueOrDie(), values.Finish().ValueOrDie()});
+  const auto path = (dir_ / "wide.parquet").string();
+  const auto file = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+  ASSERT_TRUE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), file, 4).ok());
+  ASSERT_TRUE(file->Close().ok());
+
+  SessionOptions options;
+  options.build_side_ratio = 100'000;  // Build on the right; two keys avoid the runtime key filter.
+  auto session = Session::Make(options).ValueOrDie();
+  ASSERT_TRUE(session->RegisterParquet("t", {path}).ok());
+  for (const char* query :
+       {// Inferring k=2 on the right would empty the build and skip the overflowing probe.
+        "SELECT a.n FROM (SELECT k, j, SUM(v) AS n FROM t WHERE k=2 GROUP BY k,j) a "
+        "JOIN (SELECT k,j FROM t WHERE k=1) b ON a.k=b.k AND a.j=b.j",
+        // Inferring k=1 below the right aggregate would exclude its overflowing group.
+        "SELECT b.n FROM (SELECT k,j,COUNT(*) AS n FROM t WHERE k=1 GROUP BY k,j) a "
+        "JOIN (SELECT k,j,SUM(v) AS n FROM t GROUP BY k,j) b ON a.k=b.k AND a.j=b.j"}) {
+    SCOPED_TRACE(query);
+    const auto result = session->Execute(query);
+    EXPECT_TRUE(result.status().IsExecutionError()) << result.status().ToString();
+    EXPECT_NE(result.status().ToString().find("overflow"), std::string::npos);
+  }
+  // A consumer's own grouping-key predicate may still exclude that group.
+  const auto direct =
+      session->Execute("SELECT n FROM (SELECT k, SUM(v) AS n FROM t GROUP BY k) g WHERE k=1");
+  ASSERT_TRUE(direct.ok()) << direct.status().ToString();
+  EXPECT_EQ(direct->table->num_rows(), 1);
+}
+
 TEST_F(SessionTest, ClickBenchOverrideAppliesOnlyWhenColumnExists) {
   SessionOptions options;
   options.default_overrides.emplace_back("eventdate",
