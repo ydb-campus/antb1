@@ -1382,9 +1382,12 @@ Project x, tag
 `--build-side-ratio` and `--join-order`, and cannot be given together with `--analyze`; its errors and exit codes
 are those of `antb1 query`.
 
-Repeated aggregate results are not shared when their estimated fixed-width storage exceeds the 256 MiB
-shared-result cap. Key domains supply the estimate where available; the runtime cap and the query memory
-budget still apply, including where statistics or variable-width sizes are unknown.
+For repeated aggregates that would save enough input work, the planner checks the estimated fixed-width
+result size against the 256 MiB sharing cap when group-count statistics are available. If the initial
+estimate exceeds the cap, a filter on a scan can bound combinations of grouping keys. For example, if one
+branch of an OR admits four pairs and another admits one pair, their union admits at most five.
+A fixed planning budget limits this analysis. The runtime cap and query memory budget apply to
+the actual materialized result, including variable-width columns.
 
 It shows what no logical plan holds, because the physical planner is what decides it:
 

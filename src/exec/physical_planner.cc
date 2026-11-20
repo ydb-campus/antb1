@@ -1775,8 +1775,9 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   // sees a DAG -- the sharing lives entirely in a shared_ptr<Table> that ScanNode already holds.
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
+  int estimate_budget = plan::kSharingEstimateBudget;
   for (const plan::SharedSubPlan& group : plan::SharedSubPlans(plan)) {
-    if (!plan::WorthSharing(group)) {
+    if (!plan::WorthSharing(group, estimate_budget)) {
       continue;
     }
     // A group with a member inside an already-chosen one is left alone: nested sharing would have

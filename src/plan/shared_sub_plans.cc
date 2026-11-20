@@ -1,11 +1,13 @@
 #include "antb1/plan/shared_sub_plans.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <format>
 #include <functional>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -14,11 +16,11 @@
 
 #include <arrow/type.h>
 
-#include "antb1/common/int128.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
 #include "join_order.h"
+#include "predicate_domain.h"
 
 namespace antb1::plan {
 namespace {
@@ -549,7 +551,7 @@ int64_t FixedBytes(LogicalType type) {
 }
 
 struct AggregateSize {
-  std::optional<int64_t> groups;
+  const GroupAggregateNode* grouped = nullptr;  // a global aggregate has one output row
   int64_t fixed_row_bytes = 0;
 };
 
@@ -584,16 +586,12 @@ std::optional<AggregateSize> SharedAggregateSize(const LogicalNodePtr& node) {
   AggregateSize size;
   const std::vector<AggregateCall>* calls = nullptr;
   if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
-    std::vector<ColumnId> keys;
-    keys.reserve(group->keys.size());
+    size.grouped = group;
     for (const BoundColumn& key : group->keys) {
-      keys.push_back(key.id);
       size.fixed_row_bytes += FixedBytes(key.type);
     }
-    size.groups = DistinctValues(*group->input, keys);
     calls = &group->aggregates;
   } else if (const auto* global = std::get_if<AggregateNode>(node.get())) {
-    size.groups = 1;
     calls = &global->aggregates;
   } else {
     return std::nullopt;
@@ -602,6 +600,107 @@ std::optional<AggregateSize> SharedAggregateSize(const LogicalNodePtr& node) {
     size.fixed_row_bytes += FixedBytes(call.type);
   }
   return size;
+}
+
+// A filter on one scan can bound several of that scan's grouping keys together. Keys from
+// other scans keep their original estimates. Compare by division so a product cannot overflow.
+struct GroupSizeLimit {
+  std::span<const ColumnId> keys;
+  std::span<const std::optional<int64_t>> estimates;
+  std::span<const ScanKeyDomain> sources;
+  int64_t max_groups;
+  int& remaining;
+
+  bool Fits(const FilterNode& filter, const ScanNode* scan) const {
+    std::array<PredicateDomainKey, kMaxPredicateDomainKeys> local;
+    std::size_t count = 0;
+    int64_t limit = max_groups;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (sources[i].scan == scan) {
+        local[count++] = {.id = keys[i], .max_values = sources[i].max_values};
+      } else {
+        const auto& groups =
+            sources[i].max_values.has_value() ? sources[i].max_values : estimates[i];
+        if (!groups.has_value()) {
+          return false;
+        }
+        limit /= std::max<int64_t>(*groups, 1);
+      }
+    }
+    const auto bound = PredicateTupleBound(filter, std::span(local).first(count), remaining);
+    return bound.has_value() && *bound <= limit;
+  }
+};
+
+struct FilteredScan {
+  const ScanNode* scan = nullptr;  // set only for a branch over a single scan
+  bool eligible = false;
+  bool fits = false;
+};
+
+FilteredScan CheckFilteredGroups(const LogicalNode& node, const GroupSizeLimit& limit) {
+  if (limit.remaining == 0) {
+    return {};
+  }
+  --limit.remaining;
+  if (const auto* scan = std::get_if<ScanNode>(&node)) {
+    return {.scan = scan, .eligible = true};
+  }
+  if (const auto* filter = std::get_if<FilterNode>(&node)) {
+    auto child = CheckFilteredGroups(*filter->input, limit);
+    if (child.scan != nullptr && !child.fits) {
+      child.fits = limit.Fits(*filter, child.scan);
+    }
+    return child;
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(&node)) {
+    return CheckFilteredGroups(*compute->input, limit);
+  }
+  if (const auto* project = std::get_if<ProjectNode>(&node)) {
+    return CheckFilteredGroups(*project->input, limit);
+  }
+  // An inner join can repeat a filtered tuple but cannot introduce a new one. A null-extending
+  // join can introduce grouping values absent from the filtered branch.
+  if (const auto* join = std::get_if<JoinNode>(&node);
+      join != nullptr && join->kind == JoinKind::kInner) {
+    const auto left = CheckFilteredGroups(*join->left, limit);
+    if (left.eligible) {
+      const auto right = CheckFilteredGroups(*join->right, limit);
+      return {.eligible = right.eligible, .fits = right.eligible && (left.fits || right.fits)};
+    }
+  }
+  return {};
+}
+
+bool FitsSharedResult(const AggregateSize& size, int& remaining) {
+  if (size.grouped == nullptr) {
+    return size.fixed_row_bytes <= kMaxSharedResultBytes;
+  }
+  if (size.fixed_row_bytes == 0) {
+    return true;
+  }
+  const auto& group = *size.grouped;
+  std::vector<ColumnId> keys;
+  keys.reserve(group.keys.size());
+  for (const auto& key : group.keys) {
+    keys.push_back(key.id);
+  }
+  const int64_t limit = kMaxSharedResultBytes / size.fixed_row_bytes;
+  if (remaining <= 0 || keys.size() > kMaxPredicateDomainKeys) {
+    return DistinctValues(*group.input, keys).value_or(0) <= limit;
+  }
+  std::array<ScanKeyDomain, kMaxPredicateDomainKeys> storage;
+  auto sources = std::span(storage).first(keys.size());
+  const auto estimates = EachDistinctValues(*group.input, keys, sources);
+  if (GroupCountFromDomains(*group.input, estimates).value_or(0) <= limit) {
+    return true;
+  }
+  return CheckFilteredGroups(*group.input, {.keys = keys,
+                                            .estimates = estimates,
+                                            .sources = sources,
+                                            .max_groups = limit,
+                                            .remaining = remaining})
+      .fits;
 }
 
 // The group of `members`, or none when their outputs do not nest -- when no member's output columns
@@ -657,19 +756,20 @@ std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const 
 
 }  // namespace
 
-bool WorthSharing(const SharedSubPlan& group) {
+bool WorthSharing(const SharedSubPlan& group, int& remaining) {
   if (group.members.size() < 2 || group.widest >= group.members.size() ||
       group.columns.size() != group.members.size()) {
     return false;
   }
   const LogicalNodePtr& widest = group.members[group.widest];
   const auto size = SharedAggregateSize(widest);
-  if (!size.has_value() ||
-      (size->groups.has_value() &&
-       Int128{*size->groups} * size->fixed_row_bytes > kMaxSharedResultBytes)) {
-    return false;
-  }
-  return InputRows(*widest).value_or(0) >= kMinSharedRows;
+  return size.has_value() && InputRows(*widest).value_or(0) >= kMinSharedRows &&
+         FitsSharedResult(*size, remaining);
+}
+
+bool WorthSharing(const SharedSubPlan& group) {
+  int remaining = kSharingEstimateBudget;
+  return WorthSharing(group, remaining);
 }
 
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {

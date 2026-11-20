@@ -1065,11 +1065,11 @@ namespace {
 // the footers can give. Collected rather than looked up one at a time because one walk answers for
 // every column of a pre-grouping.
 void ScannedColumns(const LogicalNode& node,
-                    std::unordered_map<ColumnId, std::pair<const Table*, int>>& out) {
+                    std::unordered_map<ColumnId, std::pair<const ScanNode*, int>>& out) {
   if (const auto* scan = std::get_if<ScanNode>(&node)) {
     for (std::size_t i = 0; i < scan->ids.size() && i < scan->fields.size(); ++i) {
       if (scan->ids[i] != kNoColumnId && scan->table != nullptr) {
-        out.emplace(scan->ids[i], std::pair(scan->table.get(), scan->fields[i]));
+        out.emplace(scan->ids[i], std::pair(scan, scan->fields[i]));
       }
     }
     return;
@@ -1084,31 +1084,55 @@ void ScannedColumns(const LogicalNode& node,
 }  // namespace
 
 std::vector<std::optional<int64_t>> EachDistinctValues(const LogicalNode& node,
-                                                       std::span<const ColumnId> columns) {
+                                                       std::span<const ColumnId> columns,
+                                                       std::span<ScanKeyDomain> sources) {
+  if (!sources.empty()) {
+    ANTB1_CHECK(sources.size() == columns.size());
+  }
   std::vector<std::optional<int64_t>> out;
   out.reserve(columns.size());
   if (columns.empty()) {
     return out;
   }
-  std::unordered_map<ColumnId, std::pair<const Table*, int>> scanned;
+  std::unordered_map<ColumnId, std::pair<const ScanNode*, int>> scanned;
   ScannedColumns(node, scanned);  // once, however many columns are asked about
   for (const ColumnId column : columns) {
+    if (!sources.empty()) {
+      sources[out.size()] = {};
+    }
     const auto found = scanned.find(column);
-    if (found == scanned.end() || found->second.first == nullptr) {
+    if (found == scanned.end()) {
       out.emplace_back(std::nullopt);  // computed, or from no Scan of this subtree
       continue;
     }
-    out.push_back(KeyDomain(*found->second.first, found->second.second));
+    const auto& [scan, field] = found->second;
+    const Table& table = *scan->table;
+    const ColumnRange range = ColumnRangeOf(table, field);
+    const auto estimate = ColumnDomain(table, field, range);
+    if (!sources.empty()) {
+      auto& source = sources[out.size()];
+      source.scan = scan;
+      if (range.exact && estimate.has_value()) {
+        const bool may_have_null = table.exact_row_count() != range.non_null;
+        source.max_values = Saturated(Int128{*estimate} + (may_have_null ? 1 : 0));
+      }
+    }
+    out.push_back(estimate);
   }
   return out;
 }
 
 std::optional<int64_t> DistinctValues(const LogicalNode& node, std::span<const ColumnId> columns) {
-  if (columns.empty()) {
+  return GroupCountFromDomains(node, EachDistinctValues(node, columns));
+}
+
+std::optional<int64_t> GroupCountFromDomains(const LogicalNode& node,
+                                             std::span<const std::optional<int64_t>> domains) {
+  if (domains.empty()) {
     return std::nullopt;
   }
   Int128 product = 1;
-  for (const std::optional<int64_t>& domain : EachDistinctValues(node, columns)) {
+  for (const std::optional<int64_t>& domain : domains) {
     if (!domain.has_value()) {
       return std::nullopt;
     }
