@@ -18,6 +18,7 @@
 
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/shared_sub_plans.h"
 
 #include "plan_test_util.h"
 
@@ -51,6 +52,192 @@ std::vector<std::string> UnionConditionQueries() {
   return {std::string(kTagged) + "tag = 'a' AND x > 3", std::string(kTagged) + "tag = 'c'",
           std::string(kTagged) + "tag LIKE 'a%'", std::string(kTwoColumns),
           std::string(kTwoReferences)};
+}
+
+// Count grouped inputs whose key restriction reached the base scan. The synthetic queries
+// exercise ids remapped by both the aggregate and the derived-table projection.
+int FilteredGroupScans(const LogicalNodePtr& node) {
+  int count = 0;
+  if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
+    const auto* filter = std::get_if<FilterNode>(group->input.get());
+    if (filter != nullptr && std::holds_alternative<ScanNode>(*filter->input)) {
+      count = static_cast<int>(std::ranges::count_if(filter->predicates, [](const Predicate& p) {
+        return p.kind == Predicate::Kind::kCompare && p.op == CompareOp::kEq;
+      }));
+    }
+  }
+  for (const auto& input : InputsOf(*node)) {
+    count += FilteredGroupScans(input);
+  }
+  return count;
+}
+
+TEST(OptimizerTest, FiltersGroupingKeysBeforeAggregationThroughAliases) {
+  const auto plan = Optimized(
+      "SELECT bucket, n FROM "
+      "(SELECT i64 AS bucket, COUNT(*) AS n FROM t GROUP BY i64) AS g "
+      "WHERE bucket = 4");
+  EXPECT_EQ(FilteredGroupScans(plan.root), 1) << Explain(plan);
+  const auto again = Optimize(plan);
+  ASSERT_TRUE(again.ok()) << again.status().ToString();
+  EXPECT_EQ(Explain(*again), Explain(plan));
+  EXPECT_EQ(Explain(ResolvePositions(*again)), Explain(*again));
+}
+
+TEST(OptimizerTest, CarriesGroupedKeyEqualitiesToInnerAndLeftJoinInputs) {
+  for (const char* kind : {"JOIN", "LEFT JOIN"}) {
+    const auto plan = Optimized(
+        std::format("WITH g AS (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) "
+                    "SELECT a.k, a.n, b.n FROM g AS a {} g AS b ON a.k = b.k WHERE a.k = 4",
+                    kind));
+    EXPECT_EQ(FilteredGroupScans(plan.root), 2) << Explain(plan);
+    const auto again = Optimize(plan);
+    ASSERT_TRUE(again.ok()) << again.status().ToString();
+    EXPECT_EQ(Explain(*again), Explain(plan));
+    EXPECT_EQ(Explain(ResolvePositions(*again)), Explain(*again));
+  }
+}
+
+TEST(OptimizerTest, PreservesSharedGroupingAcrossConsumerFilters) {
+  auto catalog = MakeCatalog();
+  auto large = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 20'000'000);
+  ASSERT_TRUE(catalog.Register("large_t", std::move(large)).ok());
+  // Both consumers join on the aggregate result. Their key filters are independent. If those
+  // filters split the shared group, the distinct union beneath it must be computed twice.
+  constexpr std::string_view kQuery =
+      "WITH g AS (SELECT k, SUM(v) AS n FROM "
+      "(SELECT i64 AS k, i32 AS v FROM large_t UNION SELECT i64, i32 FROM t) AS u GROUP BY k) "
+      "SELECT a.k, b.k FROM g AS a JOIN g AS b ON a.n = b.n "
+      "JOIN (SELECT i64 AS z, COUNT(*) AS m FROM u GROUP BY i64) AS c ON a.n = c.m "
+      "WHERE a.k = 4 AND c.z = 6";
+  for (const auto& [restriction, pushed] :
+       {std::pair{" AND b.k = 5", false}, std::pair{"", false}, std::pair{" AND b.k = 4", true}}) {
+    SCOPED_TRACE(restriction);
+    const auto bound = BindSql(std::string(kQuery) + restriction, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+    const auto plan = Optimized(*bound);
+    EXPECT_EQ(FilteredGroupScans(plan.root), 1) << "the unrelated group still filters its scan";
+    const auto shared = SharedSubPlans(plan);
+    ASSERT_EQ(shared.size(), 1U) << Explain(plan);
+    ASSERT_EQ(shared.front().members.size(), 2U) << Explain(plan);
+    for (const auto& member : shared.front().members) {
+      const LogicalNode* node = member.get();
+      while (const auto* project = std::get_if<ProjectNode>(node)) {
+        node = project->input.get();
+      }
+      const auto* group = std::get_if<GroupAggregateNode>(node);
+      ASSERT_NE(group, nullptr) << Explain(plan);
+      if (pushed) {
+        const auto* filter = std::get_if<FilterNode>(group->input.get());
+        ASSERT_NE(filter, nullptr) << Explain(plan);
+        EXPECT_TRUE(std::holds_alternative<SetOperationNode>(*filter->input)) << Explain(plan);
+      } else {
+        EXPECT_TRUE(std::holds_alternative<SetOperationNode>(*group->input)) << Explain(plan);
+      }
+    }
+    EXPECT_EQ(PositionMismatch(plan), std::nullopt);
+    EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, PushesDifferentKeyFiltersWhenRepeatedAggregationIsTooSmallToShare) {
+  const auto plan = Optimized(
+      "WITH g AS (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) "
+      "SELECT a.k, b.k FROM g AS a JOIN g AS b ON a.n = b.n WHERE a.k = 4 AND b.k = 5");
+  EXPECT_EQ(FilteredGroupScans(plan.root), 2) << Explain(plan);
+}
+
+TEST(OptimizerTest, KeepsPushdownWhenConsumersStillShareThePartialAggregate) {
+  auto catalog = MakeCatalog();
+  auto facts = std::make_shared<testing::FakeTable>(testing::AllTypesSchema(), 20'000'000);
+  facts->WithDistinctCount(0, /*field=*/0, 100);
+  ASSERT_TRUE(catalog.Register("facts", std::move(facts)).ok());
+  // The fact side can be grouped once by its join key. Each consumer then restricts a
+  // different dimension label, so its final grouping has its own input.
+  const auto bound = BindSql(
+      "WITH g AS (SELECT t.i32 AS label, COUNT(facts.i32) AS n FROM facts "
+      "JOIN t ON facts.i16 = t.i16 GROUP BY t.i32) "
+      "SELECT a.n, b.n FROM g AS a JOIN g AS b ON a.n = b.n "
+      "WHERE a.label = 4 AND b.label = 5",
+      catalog);
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto plan = Optimized(*bound);
+  auto shared = SharedSubPlans(plan);
+  std::erase_if(shared, [](const SharedSubPlan& group) { return !WorthSharing(group); });
+  ASSERT_EQ(shared.size(), 1U) << Explain(plan);
+  ASSERT_EQ(shared.front().members.size(), 2U) << Explain(plan);
+  for (const auto& member : shared.front().members) {
+    const auto* partial = std::get_if<GroupAggregateNode>(member.get());
+    ASSERT_NE(partial, nullptr) << Explain(plan);
+    ASSERT_TRUE(std::holds_alternative<ScanNode>(*partial->input)) << Explain(plan);
+    EXPECT_EQ(std::get<ScanNode>(*partial->input).table_name, "facts");
+  }
+  EXPECT_EQ(Explain(Optimized(plan)), Explain(plan));
+}
+
+TEST(OptimizerTest, GroupKeyEqualitiesComposeWithoutRepeatedRewrites) {
+  for (const auto& [query, filters] : std::vector<std::pair<std::string_view, int>>{
+           {"SELECT k FROM (SELECT i64 AS k, i32 AS j, COUNT(*) AS n FROM t "
+            "GROUP BY i64, i32) AS g WHERE k = 4 AND j = 2 AND n > 0",
+            2},
+           {"WITH g AS (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) "
+            "SELECT a.k FROM g AS a LEFT JOIN g AS b ON a.k = b.k "
+            "LEFT JOIN g AS c ON a.k = c.k WHERE a.k = 4",
+            3},
+           {"SELECT k FROM (SELECT dt AS k, COUNT(*) AS n FROM t GROUP BY dt) AS g "
+            "WHERE k = DATE '2013-07-01'",
+            1},
+           {"SELECT k FROM (SELECT i64 AS k, i64 + 0 AS j, COUNT(*) AS n FROM t "
+            "GROUP BY i64) AS g WHERE k = 4",
+            1},
+           {"SELECT k FROM (SELECT i64 AS k, i64 + 1 AS j, COUNT(*) AS n FROM t "
+            "GROUP BY i64) AS g WHERE k = 4",
+            0}}) {
+    const auto plan = Optimized(query);
+    EXPECT_EQ(FilteredGroupScans(plan.root), filters) << query << "\n" << Explain(plan);
+    const auto again = Optimize(plan);
+    ASSERT_TRUE(again.ok()) << again.status().ToString();
+    EXPECT_EQ(Explain(*again), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, GroupKeyPushdownKeepsNullableOutputsAndStageBarriers) {
+  for (const char* query :
+       {"WITH g AS (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) "
+        "SELECT a.k FROM g AS a LEFT JOIN g AS b ON a.k = b.k WHERE b.k = 4",
+        "SELECT k FROM (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64 LIMIT 2) AS g "
+        "WHERE k = 4",
+        "SELECT k FROM (SELECT i64 AS k, RANK() OVER (ORDER BY i64) AS r "
+        "FROM t GROUP BY i64) AS g WHERE k = 4",
+        "SELECT k FROM (SELECT d AS k, COUNT(*) AS n FROM t GROUP BY d) AS g WHERE k = 4",
+        "SELECT k FROM (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) AS g "
+        "WHERE n = 4",
+        "SELECT k FROM (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY ROLLUP(i64)) AS g "
+        "WHERE k = 4",
+        "WITH g AS (SELECT i64 AS k, COUNT(*) AS n FROM t GROUP BY i64) "
+        "SELECT a.k FROM g AS a FULL JOIN g AS b ON a.k = b.k WHERE a.k = 4",
+        "SELECT k FROM (SELECT a.i32 AS k FROM t AS a JOIN u AS b "
+        "ON a.i64 = b.i64 AND a.i32 + b.i32 > 0) AS g WHERE k = 4"}) {
+    const auto plan = Optimized(query);
+    EXPECT_EQ(FilteredGroupScans(plan.root), 0) << query << "\n" << Explain(plan);
+    const auto again = Optimize(plan);
+    ASSERT_TRUE(again.ok()) << again.status().ToString();
+    EXPECT_EQ(Explain(*again), Explain(plan));
+  }
+}
+
+TEST(OptimizerTest, GroupKeyPushdownSettlesNewUnionFiltersInOnePass) {
+  const auto plan = Optimized(
+      "SELECT k FROM (SELECT k, COUNT(*) AS n FROM "
+      "(SELECT i64 AS k FROM t UNION ALL SELECT i64 AS k FROM u) AS v GROUP BY k) AS g "
+      "WHERE k = 4");
+  const auto again = Optimize(plan);
+  ASSERT_TRUE(again.ok()) << again.status().ToString();
+  EXPECT_EQ(Explain(*again), Explain(plan));
+  const auto text = Explain(plan);
+  const auto first = text.find("Filter i64 = 4");
+  ASSERT_NE(first, std::string::npos) << text;
+  EXPECT_NE(text.find("Filter i64 = 4", first + 1), std::string::npos) << text;
 }
 
 TEST(OptimizerTest, CountStarWithoutWhereBecomesRowCount) {

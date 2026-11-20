@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <vector>
 
@@ -160,7 +161,8 @@ std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 // is every plan the gate does not admit.
 //
 // `last_id` is the largest column id in use and is advanced for each column this mints; the caller
-// owns it because a plan's ids must stay unique across every pass that adds one.
+// owns it because a plan's ids must stay unique across every pass that adds one. The optimizer
+// can protect members of shared aggregate groups when retrying a placement that lost reuse.
 //
 // **Indices are not maintained and do not need to be.** A column this introduces carries the id of
 // the column it stands for, or a fresh one, and `plan::ResolvePositions` -- which `Optimize` runs
@@ -186,6 +188,7 @@ std::vector<AggregatePlacement> AggregatePlacements(const LogicalPlan& plan);
 //   - `kAvg`, whose partial is a (SUM, COUNT) pair and whose final divides. Decomposable, but it
 //     is the one kind whose rewrite changes the node's output arity, and no query of the 22 has an
 //     AVG in a position the gate admits.
-LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id);
+LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id,
+                                  const std::set<const LogicalNode*>& preserve = {});
 
 }  // namespace antb1::plan

@@ -827,14 +827,15 @@ std::optional<LogicalNodePtr> Exchange(const AggregatePlacement& placement, Colu
 
 }  // namespace
 
-LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id) {
-  if (root == nullptr) {
+LogicalNodePtr ExchangeAggregates(const LogicalNodePtr& root, ColumnId& last_id,
+                                  const std::set<const LogicalNode*>& preserve) {
+  if (root == nullptr || preserve.contains(root.get())) {
     return root;
   }
   std::vector<LogicalNodePtr> inputs = InputsOf(*root);
   bool changed = false;
   for (LogicalNodePtr& input : inputs) {
-    LogicalNodePtr rewritten = ExchangeAggregates(input, last_id);
+    LogicalNodePtr rewritten = ExchangeAggregates(input, last_id, preserve);
     changed = changed || rewritten != input;
     input = std::move(rewritten);
   }

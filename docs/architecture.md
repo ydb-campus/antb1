@@ -228,7 +228,16 @@ steps (only step 7 uses more than one thread):
    reads the same rewrite before it moves a comparison's constants or rewrites a `SUM`); and projection pruning (a
    `Scan` reads only the fields used above it; a `Join` asks both
    inputs for what is used above it plus its keys and residuals; a `Project`, a `UnionAll` and a `SetOperation`
-   keep every output, each asking its inputs for the columns it maps). Every rule visits every input of a node
+   keep every output, each asking its inputs for the columns it maps). Integer/DATE key equalities then move below
+   grouping and direct projections, and grouped-input restrictions propagate across compatible join keys (only
+   from the preserved side of a LEFT join). Limits, windows, grouping sets and potentially failing computations
+   remain barriers; new filters over `UNION ALL` use its branch rule. Pruning runs again to refresh column demand.
+   Aggregate placement and grouped-key pushdown check whether every consumer of a reusable aggregate still
+   shares computation after the rewrite. A shared inner partial qualifies even if the outer groups now differ.
+   When a consumer loses reuse, the optimizer retries with the affected producers protected. It keeps the original
+   pushdown when a filter eliminates a union branch or crosses an aggregate that can raise a numeric or temporal
+   range error. Both planning stages use the same input-row and result-size criteria for aggregate reuse.
+   Every rule visits every input of a node
    (`plan::InputsOf`, `plan::WithInputs`). The binder and
    every rule refer to columns by id only, and columns keep their ids through every rule. The last step of both
    `Bind` and `Optimize`, `plan::ResolvePositions`, sets every position from the ids; the executor reads positions

@@ -12,8 +12,13 @@
 #include <variant>
 #include <vector>
 
+#include <arrow/type.h>
+
+#include "antb1/common/int128.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
+
+#include "join_order.h"
 
 namespace antb1::plan {
 namespace {
@@ -519,6 +524,86 @@ int64_t FieldUnion(const std::vector<LogicalNodePtr>& members) {
   return total;
 }
 
+// ADR 0030: below this threshold, rescanning costs less than materializing a result and scanning
+// it twice. Unknown input row counts decline sharing. Saturate known totals at the threshold.
+constexpr int64_t kMinSharedRows = 10'000'000;
+
+std::optional<int64_t> InputRows(const LogicalNode& node) {
+  if (const auto* scan = std::get_if<ScanNode>(&node)) {
+    return scan->table == nullptr ? std::nullopt : scan->table->exact_row_count();
+  }
+  int64_t rows = 0;
+  for (const LogicalNodePtr& input : InputsOf(node)) {
+    const auto child = input == nullptr ? std::nullopt : InputRows(*input);
+    if (!child.has_value()) {
+      return std::nullopt;
+    }
+    rows += std::min(kMinSharedRows - rows, *child);
+  }
+  return rows;
+}
+
+int64_t FixedBytes(LogicalType type) {
+  const int64_t bits = ToArrow(type)->bit_width();
+  return bits > 0 ? (bits + 7) / 8 : 0;  // VARCHAR reports no fixed width.
+}
+
+struct AggregateSize {
+  std::optional<int64_t> groups;
+  int64_t fixed_row_bytes = 0;
+};
+
+// Only aggregate results qualify: scans, joins and set operations can produce more data than
+// they read. Look through row-preserving projects and computes, accounting for their output.
+std::optional<AggregateSize> SharedAggregateSize(const LogicalNodePtr& node) {
+  if (const auto* project = std::get_if<ProjectNode>(node.get())) {
+    auto size = SharedAggregateSize(project->input);
+    if (size.has_value()) {
+      size->fixed_row_bytes = 0;
+      for (std::size_t i = 0; i < project->columns.size(); ++i) {
+        LogicalType type = project->columns[i].type;
+        if (i < project->constants.size()) {
+          if (const auto& constant = project->constants[i]; constant.has_value()) {
+            type = constant->type;
+          }
+        }
+        size->fixed_row_bytes += FixedBytes(type);
+      }
+    }
+    return size;
+  }
+  if (const auto* compute = std::get_if<ComputeNode>(node.get())) {
+    auto size = SharedAggregateSize(compute->input);
+    if (size.has_value()) {
+      for (const ExprPtr& expr : compute->exprs) {
+        size->fixed_row_bytes += FixedBytes(expr->type);
+      }
+    }
+    return size;
+  }
+  AggregateSize size;
+  const std::vector<AggregateCall>* calls = nullptr;
+  if (const auto* group = std::get_if<GroupAggregateNode>(node.get())) {
+    std::vector<ColumnId> keys;
+    keys.reserve(group->keys.size());
+    for (const BoundColumn& key : group->keys) {
+      keys.push_back(key.id);
+      size.fixed_row_bytes += FixedBytes(key.type);
+    }
+    size.groups = DistinctValues(*group->input, keys);
+    calls = &group->aggregates;
+  } else if (const auto* global = std::get_if<AggregateNode>(node.get())) {
+    size.groups = 1;
+    calls = &global->aggregates;
+  } else {
+    return std::nullopt;
+  }
+  for (const AggregateCall& call : *calls) {
+    size.fixed_row_bytes += FixedBytes(call.type);
+  }
+  return size;
+}
+
 // The group of `members`, or none when their outputs do not nest -- when no member's output columns
 // contain every other's, so that one result could not serve them all. Overlapping-but-not-nested
 // outputs are possible in principle (two scans reading {0,1} and {1,2}) and are reported as nothing
@@ -571,6 +656,21 @@ std::optional<SharedSubPlan> GroupOf(std::vector<LogicalNodePtr> members, const 
 }
 
 }  // namespace
+
+bool WorthSharing(const SharedSubPlan& group) {
+  if (group.members.size() < 2 || group.widest >= group.members.size() ||
+      group.columns.size() != group.members.size()) {
+    return false;
+  }
+  const LogicalNodePtr& widest = group.members[group.widest];
+  const auto size = SharedAggregateSize(widest);
+  if (!size.has_value() ||
+      (size->groups.has_value() &&
+       Int128{*size->groups} * size->fixed_row_bytes > kMaxSharedResultBytes)) {
+    return false;
+  }
+  return InputRows(*widest).value_or(0) >= kMinSharedRows;
+}
 
 std::vector<SharedSubPlan> SharedSubPlans(const LogicalPlan& plan) {
   if (plan.root == nullptr) {

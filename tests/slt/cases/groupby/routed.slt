@@ -30,3 +30,50 @@ INTEGER	BIGINT	BIGINT	BIGINT
 -2147366745	2551153951090850344	1	1374480400
 -2146467647	5073986116658473423	1	1374849039
 -2144392656	-1268719675450093174	1	1372721710
+
+# Grouped-key predicates survive derived aliases and reach both grouped join inputs.
+query III rowsort
+WITH a AS (SELECT tr_pickup AS k, COUNT(*) AS n FROM trips GROUP BY tr_pickup), b AS (SELECT tr_dropoff AS k, COUNT(*) AS n FROM trips GROUP BY tr_dropoff) SELECT a.k, a.n, b.n FROM a LEFT JOIN b ON a.k = b.k WHERE a.k = 2
+----
+INTEGER	BIGINT	BIGINT
+2	70	71
+
+# A missing grouped match must still produce the preserved row with NULLs.
+query III rowsort
+WITH a AS (SELECT tr_pickup AS k, COUNT(*) AS n FROM trips GROUP BY tr_pickup), b AS (SELECT tr_dropoff AS k, COUNT(*) AS n FROM trips WHERE tr_dropoff <> 2 GROUP BY tr_dropoff) SELECT a.k, a.n, b.n FROM a LEFT JOIN b ON a.k = b.k WHERE a.k = 2
+----
+INTEGER	BIGINT	BIGINT
+2	70	NULL
+
+# A nullable-side restriction must remain above the outer join; padded rows fail it.
+query III rowsort
+WITH a AS (SELECT tr_pickup AS k, COUNT(*) AS n FROM trips GROUP BY tr_pickup), b AS (SELECT tr_dropoff AS k, COUNT(*) AS n FROM trips WHERE tr_dropoff <> 2 GROUP BY tr_dropoff) SELECT a.k, a.n, b.n FROM a LEFT JOIN b ON a.k = b.k WHERE b.k = 2
+----
+INTEGER	BIGINT	BIGINT
+
+# Both grouping keys can be restricted without moving an aggregate-result condition.
+query III rowsort
+SELECT k, d, n FROM (SELECT tr_pickup AS k, tr_dropoff AS d, COUNT(*) AS n FROM trips GROUP BY tr_pickup, tr_dropoff) AS g WHERE k = 2 AND d = 3 AND n > 0
+----
+INTEGER	INTEGER	BIGINT
+2	3	2
+
+# NULL-safe keys retain their NULL group; it is not an integer constant equality.
+query III rowsort
+WITH g AS (SELECT tr_promo AS k, COUNT(*) AS n FROM trips GROUP BY tr_promo) SELECT a.k, a.n, b.n FROM g a LEFT JOIN g b ON a.k IS NOT DISTINCT FROM b.k WHERE a.k IS NULL
+----
+INTEGER	BIGINT	BIGINT
+NULL	2940	2940
+
+# Filtering after LIMIT cannot choose a different set of groups.
+query II rowsort
+SELECT k, n FROM (SELECT tr_pickup AS k, COUNT(*) AS n FROM trips GROUP BY tr_pickup ORDER BY k NULLS LAST LIMIT 2) AS g WHERE k = 3
+----
+INTEGER	BIGINT
+
+# Filtering a grouped key after a window must preserve ranks of all input groups.
+query II rowsort
+SELECT k, r FROM (SELECT tr_pickup AS k, RANK() OVER (ORDER BY tr_pickup) AS r FROM trips GROUP BY tr_pickup) AS g WHERE k = 3
+----
+INTEGER	BIGINT
+3	3

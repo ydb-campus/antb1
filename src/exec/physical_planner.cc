@@ -1742,79 +1742,6 @@ OperatorResult Build(const plan::LogicalNodePtr& node, std::optional<int64_t> pa
                   node, slot);
 }
 
-// The least a shared sub-plan must read before holding its result is worth it. ADR 0030 asks two
-// things of the gate -- that the sub-plan be "dear enough to be worth materialising" and its result
-// "small enough to hold" -- and this is the first. Measured: a shared join reading about a million
-// rows is **1.017x**, slower than recomputing it, because recomputing something cheap costs less
-// than materialising it and scanning it twice; the one that pays reads 600,037,902.
-constexpr int64_t kMinSharedRows = 10'000'000;
-
-// The rows the scans under `node` read, which is what sharing it avoids reading twice. Unknown
-// (none) if any of them cannot say, which refuses the group: a sub-plan whose cost cannot be seen
-// is not one to hold a result for.
-std::optional<int64_t> InputRows(const plan::LogicalNode& node) {
-  if (const auto* scan = std::get_if<plan::ScanNode>(&node)) {
-    return scan->table == nullptr ? std::nullopt : scan->table->exact_row_count();
-  }
-  int64_t rows = 0;
-  for (const plan::LogicalNodePtr& input : plan::InputsOf(node)) {
-    if (input == nullptr) {
-      return std::nullopt;
-    }
-    const std::optional<int64_t> theirs = InputRows(*input);
-    if (!theirs.has_value()) {
-      return std::nullopt;
-    }
-    rows += *theirs;
-  }
-  return rows;
-}
-
-// Whether a shared sub-plan whose top is `node` is worth computing once.
-//
-// Two questions, and the measurement had to answer both. **Does it reduce?** Holding a result to
-// avoid recomputing it pays only when the result is much smaller than the work behind it. **Is the
-// work worth avoiding?** A sub-plan that reduces a little data is cheaper to run twice than to
-// hold.
-//
-// Project and Compute are looked through rather than judged: they keep every row, so whether the
-// sub-plan reduces is decided below them. That matters -- the shared sub-plan of the query this
-// item was built for is headed by a Project over a grouped aggregate, and a gate that read only the
-// top node would refuse the one case it exists to serve.
-//
-// Below them, **only an aggregate qualifies**, and that is a measurement and not a judgement about
-// shapes. An aggregate reduces by definition. A join does not reliably: the two join-topped groups
-// of this workload came out at **0.937x for 269 MB held** and **1.017x**, so one bought 30 ms with
-// a quarter of a gigabyte and the other was slower than recomputing. Carrying a path with those
-// numbers would be worse than recording them, so the join case is gone and ADR 0030 says why.
-// Anything else -- a Filter, a bare Scan -- never qualified: that is how a 379-million-row filtered
-// scan is refused by **shape**, not by an estimate that might be wrong.
-bool WorthSharing(const plan::LogicalNode& node) {
-  const plan::LogicalNode* reducing = nullptr;
-  for (const plan::LogicalNode* n = &node; n != nullptr;) {
-    if (std::holds_alternative<plan::AggregateNode>(*n) ||
-        std::holds_alternative<plan::GroupAggregateNode>(*n)) {
-      reducing = n;
-      break;
-    }
-    if (!std::holds_alternative<plan::ProjectNode>(*n) &&
-        !std::holds_alternative<plan::ComputeNode>(*n)) {
-      return false;
-    }
-    const std::vector<plan::LogicalNodePtr> inputs = plan::InputsOf(*n);
-    n = inputs.empty() ? nullptr : inputs.front().get();
-  }
-  if (reducing == nullptr) {
-    return false;
-  }
-  // The result's own size is **not** tested here, and that is deliberate rather than forgotten: the
-  // gate admits a sub-plan because it reduces, and nothing records an aggregate's output
-  // cardinality, so the size is not knowable until the rows arrive.
-  // MaterializedTable::kMaxBytes is the bound, enforced where it can be.
-  const std::optional<int64_t> rows = InputRows(node);
-  return rows.has_value() && *rows >= kMinSharedRows;
-}
-
 // `root` with every node of `replacements` replaced by its scan of a shared result.
 plan::LogicalNodePtr Substituted(
     const plan::LogicalNodePtr& root,
@@ -1849,8 +1776,7 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
   std::vector<SharedBuild> shared;
   std::unordered_map<const plan::LogicalNode*, plan::LogicalNodePtr> replacements;
   for (const plan::SharedSubPlan& group : plan::SharedSubPlans(plan)) {
-    if (group.members.size() < 2 || group.widest >= group.members.size() ||
-        group.columns.size() != group.members.size()) {
+    if (!plan::WorthSharing(group)) {
       continue;
     }
     // A group with a member inside an already-chosen one is left alone: nested sharing would have
@@ -1863,9 +1789,6 @@ arrow::Result<std::unique_ptr<Operator>> BuildPhysicalPlan(const plan::LogicalPl
     const plan::LogicalNodePtr& widest = group.members[group.widest];
     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Operator> op,
                           Build(NormalizeBuildSides(widest), std::nullopt, nullptr));
-    if (!WorthSharing(*widest)) {
-      continue;
-    }
     auto table = std::make_shared<MaterializedTable>(op->output_schema());
     for (std::size_t i = 0; i < group.members.size(); ++i) {
       const plan::LogicalNodePtr& member = group.members[i];

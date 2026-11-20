@@ -124,7 +124,7 @@ bool Movable(const FilterNode& filter, const UnionAllNode& node) {
   });
 }
 
-LogicalNodePtr IntoBranches(const FilterNode& filter, const UnionAllNode& node) {
+LogicalNodePtr IntoBranches(const FilterNode& filter, const UnionAllNode& node, bool* pruned) {
   std::vector<LogicalNodePtr> inputs;
   std::vector<std::vector<BoundColumn>> columns;
   for (std::size_t k = 0; k < node.inputs.size(); ++k) {
@@ -146,6 +146,9 @@ LogicalNodePtr IntoBranches(const FilterNode& filter, const UnionAllNode& node) 
       kept.push_back(*std::move(moved));
     }
     if (ruled_out) {
+      if (pruned != nullptr) {
+        *pruned = true;
+      }
       continue;
     }
     LogicalNodePtr input = node.inputs[k];
@@ -155,11 +158,11 @@ LogicalNodePtr IntoBranches(const FilterNode& filter, const UnionAllNode& node) 
                               .needed_above = std::nullopt,
                               .span = filter.span});
     }
-    inputs.push_back(FilterIntoUnionBranches(input));
+    inputs.push_back(FilterIntoUnionBranches(input, pruned));
     columns.push_back(node.columns[k]);
   }
   if (inputs.empty()) {
-    UnionAllNode first{.inputs = {FilterIntoUnionBranches(node.inputs.front())},
+    UnionAllNode first{.inputs = {FilterIntoUnionBranches(node.inputs.front(), pruned)},
                        .columns = {node.columns.front()},
                        .ids = node.ids,
                        .span = node.span};
@@ -259,7 +262,7 @@ BranchTruth TruthInBranch(const UnionAllNode& node, std::size_t branch,
   return TruthOver(predicate, constant_of(predicate.column), constant_of(predicate.other));
 }
 
-LogicalNodePtr FilterIntoUnionBranches(const LogicalNodePtr& root) {
+LogicalNodePtr FilterIntoUnionBranches(const LogicalNodePtr& root, bool* pruned) {
   if (root == nullptr) {
     return root;
   }
@@ -267,12 +270,14 @@ LogicalNodePtr FilterIntoUnionBranches(const LogicalNodePtr& root) {
       filter != nullptr && filter->input != nullptr) {
     if (const auto* node = std::get_if<UnionAllNode>(filter->input.get());
         node != nullptr && Movable(*filter, *node)) {
-      if (LogicalNodePtr rewritten = IntoBranches(*filter, *node); rewritten != nullptr) {
+      if (LogicalNodePtr rewritten = IntoBranches(*filter, *node, pruned); rewritten != nullptr) {
         return rewritten;
       }
     }
   }
-  return MapInputs(root, FilterIntoUnionBranches);
+  return MapInputs(root, [pruned](const LogicalNodePtr& input) {
+    return FilterIntoUnionBranches(input, pruned);
+  });
 }
 
 }  // namespace antb1::plan

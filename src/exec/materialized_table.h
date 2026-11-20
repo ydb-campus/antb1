@@ -13,6 +13,7 @@
 #include <arrow/type.h>
 
 #include "antb1/exec/memory_budget.h"
+#include "antb1/plan/shared_sub_plans.h"
 #include "antb1/plan/table.h"
 
 // A table whose rows are held in memory: a sub-plan computed once and read by several consumers
@@ -30,16 +31,8 @@ namespace antb1::exec {
 // that is small by the gate that chose it (E2 shares a sub-plan only where it reduces).
 class MaterializedTable final : public plan::Table {
  public:
-  // The most one shared result may hold. The gate that chose to share cannot predict this: it
-  // admits a sub-plan that *reduces*, and nothing records an aggregate's output cardinality, so the
-  // size is known only as the rows arrive. Hence a cap enforced here rather than a prediction made
-  // there -- and a query whose shared result passes it fails **naming the shared sub-plan**, which
-  // is a legible failure rather than the generic out-of-memory the budget alone would give.
-  //
-  // Generous against what sharing is for: the one result of this workload that is worth sharing is
-  // about 24 MB, and a reducing sub-plan that produces a thousand times that is not the case this
-  // was built for.
-  static constexpr int64_t kMaxBytes = int64_t{256} * 1024 * 1024;
+  // The planner estimates fixed-width storage. Enforce the cap on actual batches as they arrive.
+  static constexpr int64_t kMaxBytes = plan::kMaxSharedResultBytes;
 
   explicit MaterializedTable(std::shared_ptr<arrow::Schema> schema) : schema_(std::move(schema)) {}
 
