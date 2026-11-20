@@ -1472,6 +1472,31 @@ TEST_F(JoinTableTest, MarksStartClearAndRememberEveryMarkedRow) {
   }
 }
 
+TEST_F(JoinTableTest, MarkedBatchStartsPreserveSerialBatchBoundaries) {
+  const auto made = JoinMarks::Make(513, nullptr);
+  ASSERT_TRUE(made.ok()) << made.status().ToString();
+  const auto& marks = **made;
+  auto empty = marks.MarkedBatchStarts(1, arrow::default_memory_pool());
+  ASSERT_TRUE(empty.ok());
+  EXPECT_EQ((*empty)->length(), 0);
+  std::vector<int64_t> selected;
+  for (std::uint32_t row = 0; row < 513; ++row) {
+    if (row <= 65 || (row >= 255 && row % 3 == 0) || row == 512) {
+      (*made)->Mark(row);
+      selected.push_back(row);
+    }
+  }
+  for (const int64_t size : {1, 3, 63, 64, 65, 512}) {
+    auto starts = marks.MarkedBatchStarts(size, arrow::default_memory_pool());
+    ASSERT_TRUE(starts.ok()) << starts.status().ToString();
+    const auto stride = static_cast<std::size_t>(size);
+    ASSERT_EQ((*starts)->length(), (selected.size() + stride - 1) / stride);
+    for (std::size_t i = 0; i < selected.size(); i += stride) {
+      EXPECT_EQ((*starts)->Value(static_cast<int64_t>(i / stride)), selected[i]);
+    }
+  }
+}
+
 // PartScheduler may rerun a part and discard the first run, so a mark must be idempotent.
 TEST_F(JoinTableTest, MarkingTheSameRowAgainChangesNothing) {
   arrow::Result<std::unique_ptr<JoinMarks>> made = JoinMarks::Make(70, nullptr);

@@ -726,6 +726,33 @@ bool JoinMarks::marked(std::uint32_t row) const {
   return (words_[row / 64].load(kOrder) & (std::uint64_t{1} << (row % 64))) != 0;
 }
 
+arrow::Result<std::shared_ptr<arrow::Int64Array>> JoinMarks::MarkedBatchStarts(
+    int64_t batch_size, arrow::MemoryPool* pool) const {
+  ANTB1_CHECK(batch_size > 0);
+  arrow::Int64Builder starts(pool);
+  int64_t skip = 0;  // marked rows before the next batch starts
+  int64_t base = 0;
+  for (const auto& word : words_) {
+    std::uint64_t bits = word.load(kOrder);
+    int remaining = std::popcount(bits);
+    while (remaining > skip) {
+      for (int64_t i = 0; i < skip; ++i) {
+        bits &= bits - 1;
+      }
+      remaining -= Narrow<int>(skip);
+      // Subtracting one sets exactly the zero bits below the first selected row.
+      const int bit = std::popcount((bits - 1) & ~bits);
+      ARROW_RETURN_NOT_OK(starts.Append(base + bit));
+      skip = batch_size;
+    }
+    skip -= remaining;
+    base += 64;
+  }
+  std::shared_ptr<arrow::Int64Array> result;
+  ARROW_RETURN_NOT_OK(starts.Finish(&result));
+  return result;
+}
+
 JoinTable::JoinTable(std::shared_ptr<const JoinBuildSpec> spec, MemoryBudget* budget)
     : spec_(std::move(spec)), budget_(budget) {
   memory_.Reset(budget);

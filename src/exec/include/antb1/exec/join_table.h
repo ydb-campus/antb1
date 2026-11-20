@@ -277,13 +277,16 @@ class JoinMarks {
   // Whether build row `row` is marked. Only for a reader that the parts-done signal orders after
   // every Mark: a concurrent Mark races it. `row` must be below num_rows().
   [[nodiscard]] bool marked(std::uint32_t row) const;
+  // First marked build position in each serial output batch, after probing has stopped.
+  arrow::Result<std::shared_ptr<arrow::Int64Array>> MarkedBatchStarts(
+      int64_t batch_size, arrow::MemoryPool* pool) const;
   // The bits (the build's num_rows()).
   [[nodiscard]] int64_t num_rows() const { return rows_; }
 
  private:
   JoinMarks() = default;
 
-  // Relaxed throughout: a set bit must be visible to the one thread that reads the marks after the
+  // Relaxed throughout: set bits must be visible to readers of the marks after the
   // probe pipeline is done, and the parts-done signal already orders that read after every Mark.
   // Nothing reads a mark to decide anything while probes run, so no mark orders any other write.
   static constexpr std::memory_order kOrder = std::memory_order_relaxed;

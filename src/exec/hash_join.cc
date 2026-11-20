@@ -507,8 +507,8 @@ BuildRowEmitter::BuildRowEmitter(std::shared_ptr<arrow::Schema> schema, int left
                                  bool unmatched)
     : schema_(std::move(schema)), left_width_(left_width), unmatched_(unmatched) {}
 
-void BuildRowEmitter::Reset() {
-  position_ = 0;
+void BuildRowEmitter::Reset(int64_t position) {
+  position_ = position;
   null_chunk_ = 0;
   null_row_ = 0;
   rows_.clear();
@@ -611,6 +611,22 @@ arrow::Result<std::optional<Batch>> BuildRowEmitter::NextNullKeyed(const JoinTab
   return std::nullopt;
 }
 
+arrow::Result<Batch> BuildRowEmitter::MarkedBatch(JoinBuild& build,
+                                                  std::shared_ptr<arrow::Schema> schema,
+                                                  int64_t begin, int64_t end,
+                                                  const ExecContext& ctx) {
+  MemoryReservation scratch;
+  BuildRowEmitter emitter(std::move(schema), 0, false);
+  emitter.position_ = begin;
+  const int64_t capacity = std::min(end - begin, ctx.batch_size);
+  scratch.Reset(ctx.budget);
+  ARROW_RETURN_NOT_OK(scratch.Resize(capacity * static_cast<int64_t>(sizeof(JoinRowRef))));
+  emitter.rows_.reserve(Narrow<std::size_t>(capacity));
+  ARROW_ASSIGN_OR_RAISE(auto batch, emitter.Next(build, ctx.batch_size, ctx.pool, nullptr));
+  ANTB1_CHECK(batch.has_value());
+  return *std::move(batch);
+}
+
 // ---- PartRightJoinOperator ----
 
 PartRightJoinOperator::PartRightJoinOperator(PartPipeline pipeline, int64_t num_parts,
@@ -637,8 +653,8 @@ PartRightJoinOperator::~PartRightJoinOperator() = default;
 
 arrow::Status PartRightJoinOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
-  pool_ = ctx.pool;
-  batch_size_ = std::max<int64_t>(ctx.batch_size, 1);
+  context_ = ctx;
+  context_.batch_size = std::max<int64_t>(ctx.batch_size, 1);
   // The operator above prepared the build (BuildsFirstOperator) before opening this one, and no
   // part runs before the scheduler below exists, so this is the one moment at which the marks can
   // be made: every part's probe then finds them through the build they share.
@@ -667,6 +683,38 @@ arrow::Status PartRightJoinOperator::Open(ExecContext& ctx) {
   return arrow::Status::OK();
 }
 
+arrow::Status PartRightJoinOperator::StartGather() {
+  // Keep tiny inputs, tight budgets, and joins with an unmatched tail on the original path.
+  if (build_->kind() != plan::JoinKind::kSemi || context_.executor == nullptr ||
+      build_->table()->num_rows() <= context_.batch_size ||
+      (context_.budget != nullptr && context_.budget->under_pressure())) {
+    return arrow::Status::OK();
+  }
+  auto index = build_->marks()->MarkedBatchStarts(context_.batch_size, context_.pool);
+  if (!index.ok() && index.status().IsOutOfMemory()) {
+    return arrow::Status::OK();
+  }
+  ARROW_RETURN_NOT_OK(index.status());
+  if ((*index)->length() < 2) {
+    return arrow::Status::OK();
+  }
+  starts_ = *std::move(index);
+  auto task = [starts = starts_, schema = schema_, build = build_, ctx = context_,
+               profile = profile()](int64_t i,
+                                    const std::atomic<bool>& stop) -> arrow::Result<Batch> {
+    if (stop.load(std::memory_order_relaxed)) {
+      return Batch{};
+    }
+    const ProfileTimer work(profile, "gather_range_work");
+    const int64_t end =
+        i + 1 < starts->length() ? starts->Value(i + 1) : build->table()->num_rows();
+    return BuildRowEmitter::MarkedBatch(*build, schema, starts->Value(i), end, ctx);
+  };
+  gathers_ = std::make_unique<PartScheduler<Batch>>(
+      starts_->length(), std::move(task), context_.executor, context_.threads, context_.budget);
+  return arrow::Status::OK();
+}
+
 arrow::Result<Batch> PartRightJoinOperator::Next() {
   if (scheduler_ == nullptr && !probed_) {
     return arrow::Status::Invalid("right join: Next() before Open()");
@@ -680,6 +728,8 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
     if (scheduler_->done()) {
       probed_ = true;  // every part is in: no probe runs any more, so the marks are final
       scheduler_.reset();
+      const ProfileTimer emit_wall(profile(), "emit_wall");
+      ARROW_RETURN_NOT_OK(StartGather());
       break;
     }
     arrow::Result<PartBatches> part = [&] {
@@ -695,17 +745,44 @@ arrow::Result<Batch> PartRightJoinOperator::Next() {
   if (ended_) {
     return Batch{};
   }
-  ARROW_ASSIGN_OR_RAISE(std::optional<Batch> out,
-                        emitter_.Next(*build_, batch_size_, pool_, profile()));
-  if (out.has_value()) {
-    return *std::move(out);
+  const ProfileTimer emit_wall(profile(), "emit_wall");
+  if (gathers_ != nullptr && !gathers_->done()) {
+    auto batch = gathers_->Next();
+    if (batch.ok()) {
+      ++next_gather_;
+      if (profile() != nullptr) {
+        profile()->Add("emitted", MetricUnit::kCount, batch->data->num_rows());
+      }
+      return batch;
+    }
+    if (!batch.status().IsOutOfMemory()) {
+      return batch.status();
+    }
+    // The optional index and scratch must never make the query fail. Release them, then
+    // resume on the consumer at exactly the batch whose allocation failed.
+    emitter_.Reset(starts_->Value(next_gather_));
+    gathers_.reset();
+    starts_.reset();
   }
+  if (gathers_ == nullptr) {
+    ARROW_ASSIGN_OR_RAISE(auto out,
+                          emitter_.Next(*build_, context_.batch_size, context_.pool, profile()));
+    if (out.has_value()) {
+      return *std::move(out);
+    }
+  }
+  gathers_.reset();
+  starts_.reset();
   ended_ = true;
   PartsDone();  // after the last row: the callback releases the build, whose rows this just read
   return Batch{};
 }
 
 arrow::Status PartRightJoinOperator::Close() {
+  gathers_.reset();  // join workers before their build or context can be released
+  starts_.reset();
+  next_gather_ = 0;
+  context_ = {};
   scheduler_.reset();  // stops the parts still running and waits for them
   current_.reset();
   next_ = 0;
