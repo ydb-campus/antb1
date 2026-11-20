@@ -225,24 +225,77 @@ TEST_F(ColumnKeyTableTest, SchemaAndRetainedEmptyUniquesUseTheQueryBudget) {
   EXPECT_TRUE(refused.status().message().contains("--memory-limit"));
   EXPECT_EQ(tiny.bytes_allocated(), 0);
 
-  MemoryBudget budget(std::nullopt);
+  arrow::ProxyMemoryPool backend(arrow::default_memory_pool());
+  MemoryBudget budget(std::nullopt, &backend);
   arrow::compute::ExecContext ctx(&budget);
   std::shared_ptr<arrow::ArrayData> retained;
   {
     auto table = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
     ASSERT_TRUE(table.ok()) << table.status();
     const auto schema_bytes = budget.bytes_allocated();
-    const auto empty = (*table)->Uniques();
+    auto empty = (*table)->Uniques();
     ASSERT_TRUE(empty.ok()) << empty.status();
-    ASSERT_EQ(empty->values.size(), types.size());
-    EXPECT_EQ(empty->length, 0);
+    ASSERT_EQ(empty->batch.values.size(), types.size());
+    EXPECT_EQ(empty->batch.length, 0);
     EXPECT_GT(budget.bytes_allocated(), schema_bytes);
-    retained = empty->values.back().array();
+    retained = empty->batch.values.back().array();
+    empty->batch.values.clear();
+    const auto datum_bytes = empty->batch.values.capacity() * sizeof(arrow::Datum);
+    const auto handle_bytes = retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
+    EXPECT_EQ(budget.bytes_allocated() - backend.bytes_allocated(),
+              static_cast<std::int64_t>(datum_bytes + handle_bytes));
   }
-  EXPECT_GT(budget.bytes_allocated(), 0);
+  const auto handles = retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
+  EXPECT_EQ(budget.bytes_allocated() - backend.bytes_allocated(),
+            static_cast<std::int64_t>(handles));
   EXPECT_EQ(retained->length, 0);
   retained.reset();
   EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
+TEST_F(ColumnKeyTableTest, WideEmptySnapshotsRefuseOneByteBelowTheirMetadataAndAllowRetry) {
+  const std::vector<arrow::TypeHolder> types(66, arrow::boolean());
+  std::int64_t limit = 0;
+  {
+    // Count the Arrow allocations separately from the heap storage of the two vector types.
+    arrow::ProxyMemoryPool backend(arrow::default_memory_pool());
+    MemoryBudget budget(std::nullopt, &backend);
+    arrow::compute::ExecContext ctx(&budget);
+    auto table = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
+    ASSERT_TRUE(table.ok()) << table.status();
+    const auto before = backend.bytes_allocated();
+    const auto snapshot = (*table)->Uniques();
+    ASSERT_TRUE(snapshot.ok()) << snapshot.status();
+    const auto pooled = backend.bytes_allocated() - before;
+    std::size_t vectors = snapshot->batch.values.capacity() * sizeof(arrow::Datum);
+    for (const auto& value : snapshot->batch.values) {
+      vectors += value.array()->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
+    }
+    // After one live snapshot there is room for the second one's pooled allocations and all
+    // but one byte of its vectors. Omitting either kind of vector would let it succeed.
+    limit = budget.bytes_allocated() + pooled + static_cast<std::int64_t>(vectors) - 1;
+  }
+
+  MemoryBudget tight(limit);
+  arrow::ProxyMemoryPool proxy(&tight);
+  arrow::compute::ExecContext ctx(&proxy);
+  {
+    auto table = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}, &tight);
+    ASSERT_TRUE(table.ok()) << table.status();
+    const auto schema = tight.bytes_allocated();
+    {
+      const auto first = (*table)->Uniques();
+      ASSERT_TRUE(first.ok()) << first.status();
+      const auto before = tight.bytes_allocated();
+      const auto second = (*table)->Uniques();
+      EXPECT_TRUE(second.status().IsOutOfMemory()) << second.status();
+      EXPECT_EQ(tight.bytes_allocated(), before);
+      EXPECT_EQ(first->batch.values.size(), types.size());
+    }
+    EXPECT_EQ(tight.bytes_allocated(), schema);
+    ASSERT_TRUE((*table)->Uniques().ok());
+  }
+  EXPECT_EQ(tight.bytes_allocated(), 0);
 }
 
 TEST_F(ColumnKeyTableTest, EligibleSchemasAndFactorySelection) {
@@ -737,9 +790,9 @@ TEST_F(ColumnKeyTableTest, FailedGrowthCanBeRetriedAndReturnedArraysOutliveTheTa
     EXPECT_EQ((*old_lookup)->Value(0), 15U);
     EXPECT_TRUE((*old_lookup)->IsNull(1));
     const auto first = keys(0, 16);
-    ASSERT_EQ(old_uniques->values.size(), first.values.size());
+    ASSERT_EQ(old_uniques->batch.values.size(), first.values.size());
     for (std::size_t i = 0; i < first.values.size(); ++i) {
-      EXPECT_TRUE(old_uniques->values[i].Equals(first.values[i]));
+      EXPECT_TRUE(old_uniques->batch.values[i].Equals(first.values[i]));
     }
   }
   EXPECT_TRUE(finished);
@@ -870,7 +923,7 @@ TYPED_TEST(FixedKeyTableTest, FailedGrowthKeepsExistingIdsAndOwnedUniques) {
       }
       EXPECT_EQ(table.num_groups(), 900U);
       const auto retained =
-          std::static_pointer_cast<arrow::Int64Array>(early->values.front().make_array());
+          std::static_pointer_cast<arrow::Int64Array>(early->batch.values.front().make_array());
       EXPECT_EQ(retained->length(), 300);
       EXPECT_EQ(retained->Value(0), 0);
       EXPECT_EQ(retained->Value(299), 299);

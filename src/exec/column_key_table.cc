@@ -131,11 +131,34 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> CopyBytes(const std::uint8_t* sour
   return out;
 }
 
+// Arrow exposes both metadata vectors with the standard allocator. Reserve their heap bytes
+// against the query budget before allocating, even when there are no groups.
+template <class T>
+arrow::Status ReserveSnapshotVector(std::vector<T>& values, std::size_t count,
+                                    MemoryReservation& memory, MemoryBudget* budget) {
+  ANTB1_CHECK(values.capacity() == 0);
+  if (count > values.max_size()) {
+    return arrow::Status::CapacityError("unique key metadata size overflow");
+  }
+  memory.Reset(budget);
+  ARROW_RETURN_NOT_OK(memory.Resize(Narrow<std::int64_t>(count * sizeof(T))));
+  values.reserve(count);
+  // reserve() may provide extra capacity. Keep the whole allocation charged until destruction.
+  return memory.Resize(Narrow<std::int64_t>(values.capacity() * sizeof(T)));
+}
+
+// A detached array keeps the charge for its own buffer handles after the batch goes away.
+struct UniqueColumn {
+  MemoryReservation buffer_memory;
+  arrow::ArrayData data;
+};
+
 class ColumnKeyTable final : public KeyTable {
  public:
   ColumnKeyTable(const std::vector<arrow::TypeHolder>& types, arrow::MemoryPool* pool,
-                 std::uint32_t max_groups)
+                 std::uint32_t max_groups, MemoryBudget* budget)
       : pool_(pool),
+        budget_(budget),
         max_groups_(max_groups),
         columns_(arrow::stl::allocator<Column>(pool)),
         storage_(pool),
@@ -198,10 +221,11 @@ class ColumnKeyTable final : public KeyTable {
     });
   }
 
-  arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return KeyTableNoBadAlloc([&] -> arrow::Result<arrow::compute::ExecBatch> {
+  arrow::Result<KeySnapshot> Uniques() const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      MemoryReservation datum_memory;
       std::vector<arrow::Datum> out;
-      out.reserve(columns_.size());
+      ARROW_RETURN_NOT_OK(ReserveSnapshotVector(out, columns_.size(), datum_memory, budget_));
       for (const Column& col : columns_) {
         ARROW_ASSIGN_OR_RAISE(auto values, CopyBytes(col.values, col.ValueBytes(groups_), pool_));
         std::shared_ptr<arrow::Buffer> validity;
@@ -211,15 +235,19 @@ class ColumnKeyTable final : public KeyTable {
               CopyBytes(col.validity, Narrow<std::size_t>(arrow::bit_util::BytesForBits(groups_)),
                         pool_));
         }
-        // Each returned column owns a pool-backed descriptor, including at zero rows. The
-        // ExecBatch datum vector and ArrayData's vector of buffer handles are Arrow API metadata.
-        std::vector<std::shared_ptr<arrow::Buffer>> buffers = {std::move(validity),
-                                                               std::move(values)};
-        out.emplace_back(std::allocate_shared<arrow::ArrayData>(
-            arrow::stl::allocator<arrow::ArrayData>(pool_), col.type, groups_, std::move(buffers),
-            col.nulls));
+        auto column =
+            std::allocate_shared<UniqueColumn>(arrow::stl::allocator<UniqueColumn>(pool_));
+        auto& data = column->data;
+        data.type = col.type;
+        data.length = groups_;
+        data.SetNullCount(col.nulls);
+        ARROW_RETURN_NOT_OK(ReserveSnapshotVector(data.buffers, 2, column->buffer_memory, budget_));
+        data.buffers.emplace_back(std::move(validity));
+        data.buffers.emplace_back(std::move(values));
+        out.emplace_back(std::shared_ptr<arrow::ArrayData>(std::move(column), &data));
       }
-      return arrow::compute::ExecBatch(std::move(out), groups_);
+      return KeySnapshot{.datum_memory = std::move(datum_memory),
+                         .batch = {std::move(out), groups_}};
     });
   }
 
@@ -398,6 +426,7 @@ class ColumnKeyTable final : public KeyTable {
   }
 
   arrow::MemoryPool* pool_;
+  MemoryBudget* budget_;
   std::uint32_t max_groups_;
   std::vector<Column, arrow::stl::allocator<Column>> columns_;
   std::size_t row_bits_ = 0;
@@ -412,8 +441,8 @@ class ColumnKeyTable final : public KeyTable {
 
 std::unique_ptr<KeyTable> MakeColumnKeyTable(const std::vector<arrow::TypeHolder>& types,
                                              arrow::MemoryPool* pool,
-                                             const KeyTableOptions& options) {
-  return std::make_unique<ColumnKeyTable>(types, pool, options.max_groups);
+                                             const KeyTableOptions& options, MemoryBudget* budget) {
+  return std::make_unique<ColumnKeyTable>(types, pool, options.max_groups, budget);
 }
 
 }  // namespace antb1::exec

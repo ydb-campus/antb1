@@ -17,6 +17,6 @@ bool TakesColumnKeys(const std::vector<arrow::TypeHolder>& types);
 // generic index grows on insertion and rebuilds its buckets in group-ID order for either kind.
 std::unique_ptr<KeyTable> MakeColumnKeyTable(const std::vector<arrow::TypeHolder>& types,
                                              arrow::MemoryPool* pool,
-                                             const KeyTableOptions& options);
+                                             const KeyTableOptions& options, MemoryBudget* budget);
 
 }  // namespace antb1::exec

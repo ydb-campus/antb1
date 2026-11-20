@@ -112,7 +112,7 @@ class GroupTable {
   // The hash (KeyHashes) of each group's first `prefix` keys, in group order (with keys only).
   [[nodiscard]] arrow::Result<std::vector<std::uint64_t>> PrefixHashes(std::size_t prefix) const;
   // Each group's normalized keys, in group order (with keys only).
-  [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> uniques() const;
+  [[nodiscard]] arrow::Result<KeySnapshot> uniques() const;
   // The state of call `i`.
   [[nodiscard]] const GroupedAggregateState& state(std::size_t i) const { return *states_.at(i); }
   [[nodiscard]] std::size_t num_partitions() const { return partition_groups_.size(); }

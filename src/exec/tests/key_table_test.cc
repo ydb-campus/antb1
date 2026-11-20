@@ -189,8 +189,9 @@ void LookupAndCheck(KeyTable& table, const arrow::compute::ExecBatch& batch,
 
 // `uniques`: one row per group of `expected` (or its first `groups`), in id order, each its key,
 // of exactly `types`.
-void CheckUniques(const arrow::compute::ExecBatch& uniques, const Expected& expected,
+void CheckUniques(const KeySnapshot& snapshot, const Expected& expected,
                   const std::vector<std::shared_ptr<arrow::DataType>>& types, std::size_t groups) {
+  const auto& uniques = snapshot.batch;
   ASSERT_EQ(uniques.length, static_cast<std::int64_t>(groups));
   const arrow::ArrayVector columns = ArraysOf(uniques);
   ASSERT_EQ(columns.size(), types.size());
@@ -259,18 +260,18 @@ class KeyTableTest : public testing::ExecTest, public ::testing::WithParamInterf
       const std::unique_ptr<KeyTable> table = MakeTable(types);
       ASSERT_NE(table, nullptr);
       Expected expected;
-      std::optional<arrow::compute::ExecBatch> early;
+      std::optional<KeySnapshot> early;
       std::size_t early_groups = 0;
       for (std::size_t b = 0; b < batches.size(); ++b) {
         SCOPED_TRACE("batch " + std::to_string(b));
         ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, batches[b], expected));
         ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, batches[b], expected));
         ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, batches[b], expected));
-        const auto uniques = table->Uniques();
+        auto uniques = table->Uniques();
         ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
         ASSERT_NO_FATAL_FAILURE(CheckUniques(*uniques, expected, types, expected.key_of.size()));
         if (!early.has_value() && !expected.key_of.empty()) {
-          early = *uniques;
+          early.emplace(std::move(*uniques));
           early_groups = expected.key_of.size();
         }
       }
@@ -511,7 +512,7 @@ TEST_P(KeyTableTest, KeyHashesOfUniquesAreTheHashesOfTheirRows) {
   }
   const auto uniques = table->Uniques();
   ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
-  const auto group_hashes = KeyHashes(*uniques);
+  const auto group_hashes = KeyHashes(uniques->batch);
   ASSERT_TRUE(group_hashes.ok()) << group_hashes.status().ToString();
   ASSERT_EQ(group_hashes->size(), expected.key_of.size());
   for (std::size_t b = 0; b < batches.size(); ++b) {

@@ -14,6 +14,8 @@
 #include <arrow/stl_allocator.h>
 #include <arrow/type_fwd.h>
 
+#include "antb1/exec/memory_budget.h"
+
 namespace arrow::compute {
 class ExecContext;
 }  // namespace arrow::compute
@@ -26,6 +28,13 @@ struct KeyIds {
   std::span<const std::uint32_t> ids;    // one per row, valid while `owner` lives
   std::uint32_t before = 0;              // the table's groups before the call
   std::uint32_t after = 0;               // and after it: the new groups are [before, after)
+};
+
+// Keep the charge for the batch's datum vector until that vector is destroyed. Individual
+// arrays may outlive the batch and carry their own storage and metadata charges.
+struct KeySnapshot {
+  MemoryReservation datum_memory;
+  arrow::compute::ExecBatch batch;
 };
 
 // The table that numbers a GroupTable's key rows: every distinct row of key values (NULL is a
@@ -52,7 +61,7 @@ class KeyTable {
       const arrow::compute::ExecBatch& keys) = 0;
   // Every group's keys in id order, of the types the table was made for (normalized, NULLs kept).
   // It can be called again; the arrays stay valid after later calls.
-  [[nodiscard]] virtual arrow::Result<arrow::compute::ExecBatch> Uniques() const = 0;
+  [[nodiscard]] virtual arrow::Result<KeySnapshot> Uniques() const = 0;
   [[nodiscard]] virtual std::uint32_t num_groups() const = 0;
 };
 
@@ -78,10 +87,11 @@ struct KeyTableOptions {
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`
-// itself must outlive the table: arrow's Grouper keeps it.
+// itself must outlive the table: arrow's Grouper keeps it. Pass the query budget separately
+// when the pool wraps it, so heap metadata can be charged for the lifetime of returned keys.
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
-    const KeyTableOptions& options = {});
+    const KeyTableOptions& options = {}, MemoryBudget* budget = nullptr);
 
 // Preserve a query pool's allocation diagnostic and convert ordinary heap failures to Status.
 template <class Body>

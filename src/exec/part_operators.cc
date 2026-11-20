@@ -706,10 +706,9 @@ std::vector<std::uint32_t> EveryGroup(const GroupTable& table) {
 }  // namespace
 
 arrow::compute::ExecBatch PartGroupingSetsOperator::Projected(
-    const std::optional<arrow::compute::ExecBatch>& uniques, std::size_t set,
-    std::size_t groups) const {
+    const std::optional<KeySnapshot>& uniques, std::size_t set, std::size_t groups) const {
   // The projected keys of a root partition's groups, or a batch of no columns for the empty set.
-  return uniques.has_value() ? ProjectKeys(*uniques, shape_->columns[set])
+  return uniques.has_value() ? ProjectKeys(uniques->batch, shape_->columns[set])
                              : arrow::compute::ExecBatch({}, static_cast<int64_t>(groups));
 }
 
@@ -743,7 +742,7 @@ arrow::Status PartGroupingSetsOperator::Probe() {
   }
   std::vector<std::size_t> largest(sets, 0);  // per root: its largest partition
   std::vector<int64_t> root_groups(sets, 0);  // per root: its groups
-  std::vector<std::optional<arrow::compute::ExecBatch>> probe_keys(sets);
+  std::vector<std::optional<KeySnapshot>> probe_keys(sets);
   for (const std::size_t r : roots_) {
     for (std::size_t p = 0; p < tables_[r].size(); ++p) {
       root_groups[r] += tables_[r][p]->num_groups();
@@ -753,7 +752,8 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     }
     if (!shape.sets[r].empty() && tables_[r][largest[r]]->num_groups() > 0 &&
         std::ranges::any_of(probes, [&](std::size_t s) { return shape.sources[s] == r; })) {
-      ARROW_ASSIGN_OR_RAISE(probe_keys[r], tables_[r][largest[r]]->uniques());
+      ARROW_ASSIGN_OR_RAISE(auto snapshot, tables_[r][largest[r]]->uniques());
+      probe_keys[r].emplace(std::move(snapshot));
     }
   }
   ARROW_RETURN_NOT_OK(ForEach(executor_, probes.size(), [&](std::size_t i) -> arrow::Status {
@@ -838,13 +838,14 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
         continue;
       }
       const GroupTable& root = *tables_[r][p];
-      std::optional<arrow::compute::ExecBatch> uniques;
+      std::optional<KeySnapshot> uniques;
       for (const std::size_t s : batch) {
         if (shape.sources[s] != r || partial_[s][p] != nullptr) {
           continue;
         }
         if (!uniques.has_value() && !shape.sets[r].empty()) {
-          ARROW_ASSIGN_OR_RAISE(uniques, root.uniques());
+          ARROW_ASSIGN_OR_RAISE(auto snapshot, root.uniques());
+          uniques.emplace(std::move(snapshot));
         }
         if (reduce_[s] == 0) {
           ARROW_ASSIGN_OR_RAISE(buckets[s][p], SplitByKeys(Projected(uniques, s, root.num_groups()),
@@ -1203,8 +1204,8 @@ arrow::Status PartTwoLevelAggregateOperator::Outer(std::size_t partition) {
   for (std::size_t t = 0; t < tables_.size(); ++t) {
     const std::unique_ptr<GroupTable> inner = std::move(tables_[t][partition]);  // freed here
     if (t < distinct_.size()) {
-      ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, inner->uniques());
-      ARROW_RETURN_NOT_OK(outer->AddDistinct(t, uniques));
+      ARROW_ASSIGN_OR_RAISE(const auto uniques, inner->uniques());
+      ARROW_RETURN_NOT_OK(outer->AddDistinct(t, uniques.batch));
     } else {
       ARROW_RETURN_NOT_OK(outer->AddPlain(*inner));
     }

@@ -244,7 +244,7 @@ arrow::Result<std::unique_ptr<GroupTable>> GroupTable::Make(
   table->kernels_ = std::make_unique<arrow::compute::ExecContext>(pool);
   if (!table->keys_.empty()) {
     ARROW_ASSIGN_OR_RAISE(table->key_table_,
-                          MakeKeyTable(key_types, table->kernels_.get(), key_table));
+                          MakeKeyTable(key_types, table->kernels_.get(), key_table, budget));
   }
   table->first_keys_.assign(table->keys_.size(), {});
   return table;
@@ -350,12 +350,12 @@ arrow::Status GroupTable::Merge(const GroupTable& part) {
     group_map = no_keys;
   } else {
     // Part's groups in its own order, by their normalized keys: the map from its groups to ours.
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, part.key_table_->Uniques());
-    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(uniques));
+    ARROW_ASSIGN_OR_RAISE(const auto uniques, part.key_table_->Uniques());
+    ARROW_ASSIGN_OR_RAISE(ids, key_table_->Consume(uniques.batch));
     group_map = ids.ids;
     const std::uint32_t after = ids.after;
     if (after > num_groups_ && !part.keep_first_keys_) {
-      ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques, group_map, after));
+      ARROW_RETURN_NOT_OK(AddUniqueGroups(uniques.batch, group_map, after));
     } else if (after > num_groups_) {
       std::vector<std::uint32_t> every(group_map.size());
       std::ranges::iota(every, 0U);
@@ -544,9 +544,9 @@ arrow::Status GroupTable::Partition() { return Partition(keys_.size(), {}); }
 arrow::Result<std::vector<std::uint64_t>> GroupTable::PrefixHashes(std::size_t prefix) const {
   ANTB1_CHECK(key_table_ != nullptr);
   ANTB1_CHECK(prefix <= keys_.size());
-  ARROW_ASSIGN_OR_RAISE(arrow::compute::ExecBatch keys, key_table_->Uniques());
-  keys.values.resize(prefix);
-  return KeyHashes(keys);
+  ARROW_ASSIGN_OR_RAISE(auto keys, key_table_->Uniques());
+  keys.batch.values.resize(prefix);
+  return KeyHashes(keys.batch);
 }
 
 arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::RouteRows(
@@ -598,7 +598,7 @@ arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>> GroupTable::Rout
   return out;
 }
 
-arrow::Result<arrow::compute::ExecBatch> GroupTable::uniques() const {
+arrow::Result<KeySnapshot> GroupTable::uniques() const {
   ANTB1_CHECK(key_table_ != nullptr);
   return key_table_->Uniques();
 }
@@ -615,7 +615,8 @@ arrow::Status GroupTable::Partition(std::size_t prefix, std::span<const std::uin
     return arrow::Status::OK();
   }
   partition_groups_.resize(partitions_);
-  ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch uniques, key_table_->Uniques());
+  ARROW_ASSIGN_OR_RAISE(const auto snapshot, key_table_->Uniques());
+  const auto& uniques = snapshot.batch;
   arrow::compute::ExecBatch prefix_keys = uniques;
   prefix_keys.values.resize(prefix);
   ARROW_ASSIGN_OR_RAISE(std::vector<std::uint64_t> hashes, KeyHashes(prefix_keys));

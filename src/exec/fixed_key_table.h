@@ -151,9 +151,8 @@ class FixedKeyTable final : public KeyTable {
     return KeyTableNoBadAlloc([&] { return LookupRows(keys); });
   }
 
-  [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return KeyTableNoBadAlloc(
-        [&] -> arrow::Result<arrow::compute::ExecBatch> { return BuildUniques(); });
+  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const override {
+    return KeyTableNoBadAlloc([&] { return BuildUniques(); });
   }
 
   [[nodiscard]] std::uint32_t num_groups() const override {
@@ -661,7 +660,7 @@ class FixedKeyTable final : public KeyTable {
     return reserved.IsOutOfMemory() ? arrow::Status::OK() : reserved;
   }
 
-  arrow::Result<arrow::compute::ExecBatch> BuildUniques() const {
+  arrow::Result<KeySnapshot> BuildUniques() const {
     const std::size_t groups = keys_.size();
     std::vector<arrow::Datum> columns;
     columns.reserve(layout_.columns.size());
@@ -705,7 +704,8 @@ class FixedKeyTable final : public KeyTable {
                                                   {std::move(validity), std::move(values)},
                                                   static_cast<std::int64_t>(nulls)));
     }
-    return arrow::compute::ExecBatch(std::move(columns), static_cast<std::int64_t>(groups));
+    return KeySnapshot{.datum_memory = {},
+                       .batch = {std::move(columns), static_cast<std::int64_t>(groups)}};
   }
 
   FixedKeyLayout layout_;

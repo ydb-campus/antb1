@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <arrow/memory_pool.h>
 #include <arrow/status.h>
@@ -75,7 +76,8 @@ class MemoryReservation {
   MemoryReservation() = default;
   MemoryReservation(const MemoryReservation&) = delete;
   MemoryReservation& operator=(const MemoryReservation&) = delete;
-  MemoryReservation(MemoryReservation&&) = delete;
+  MemoryReservation(MemoryReservation&& other) noexcept
+      : budget_(std::exchange(other.budget_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
   MemoryReservation& operator=(MemoryReservation&&) = delete;
   ~MemoryReservation() { Release(); }
 

@@ -2253,7 +2253,7 @@ TEST_F(PartOperatorsTest, HeavyKeysSpreadOverThePartitions) {
     const auto uniques = (*table)->uniques();
     EXPECT_TRUE(uniques.ok());
     const auto values =
-        std::static_pointer_cast<arrow::Int64Array>(uniques->values[0].make_array());
+        std::static_pointer_cast<arrow::Int64Array>(uniques->batch.values[0].make_array());
     for (std::size_t p = 0; p < keys.size(); ++p) {
       for (const std::uint32_t g : (*table)->partition_groups(p)) {
         keys[p].insert(values->Value(g));

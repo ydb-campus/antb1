@@ -882,16 +882,17 @@ std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t group
     }
   }
   // Every group's uniques row is the key of the rows given its id.
-  const auto uniques = table.Uniques();
-  if (!uniques.ok()) {
-    return uniques.status().ToString();
+  const auto snapshot = table.Uniques();
+  if (!snapshot.ok()) {
+    return snapshot.status().ToString();
   }
-  if (uniques->length != table.num_groups() ||
-      uniques->values.size() != static_cast<std::size_t>(batches.front()->num_columns())) {
+  const auto& uniques = snapshot->batch;
+  if (uniques.length != table.num_groups() ||
+      uniques.values.size() != static_cast<std::size_t>(batches.front()->num_columns())) {
     return "unique keys have the wrong shape";
   }
   for (std::size_t c = 0; c < types.size(); ++c) {
-    const auto& column = *uniques->values[c].array();
+    const auto& column = *uniques.values[c].array();
     if (!column.type->Equals(*types[c].type) || (c < 2 && column.GetNullCount() != 0)) {
       return "wrong type or unexpected NULLs in unique keys";
     }
@@ -901,7 +902,7 @@ std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t group
     const arrow::compute::ExecBatch keys(*batch);
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
       const int64_t id = ours[static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode))];
-      if (KeyAt(*uniques, id) != KeyAt(keys, i)) {
+      if (KeyAt(uniques, id) != KeyAt(keys, i)) {
         return "group " + std::to_string(id) + " keeps a key other than its rows'";
       }
     }
@@ -1237,7 +1238,8 @@ arrow::Result<uint32_t> ValidateStringKeyTable(const StringKeyInput& input,
       return arrow::Status::Invalid("key-table benchmark: distinct-key count differs from oracle");
     }
   }
-  ARROW_ASSIGN_OR_RAISE(auto uniques, table->Uniques());
+  ARROW_ASSIGN_OR_RAISE(auto snapshot, table->Uniques());
+  const auto& uniques = snapshot.batch;
   if (uniques.length != Narrow<int64_t>(model.size()) ||
       uniques.values.size() != input.types.size()) {
     return arrow::Status::Invalid("key-table benchmark: wrong unique dimensions");
@@ -1283,8 +1285,8 @@ arrow::Status StringKeyTableLifecycle(const StringKeyInput& input, exec::KeyTabl
   if constexpr (kMeasureMemory) {
     memory->after_consume = ctx->memory_pool()->bytes_allocated();
   }
-  ARROW_ASSIGN_OR_RAISE(auto uniques, table->Uniques());
-  benchmark::DoNotOptimize(uniques);
+  ARROW_ASSIGN_OR_RAISE(auto snapshot, table->Uniques());
+  benchmark::DoNotOptimize(snapshot.batch);
   if constexpr (kMeasureMemory) {
     memory->with_uniques = ctx->memory_pool()->bytes_allocated();
   }
