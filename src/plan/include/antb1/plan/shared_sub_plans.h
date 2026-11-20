@@ -87,4 +87,9 @@ inline constexpr int64_t kMaxSharedResultBytes = int64_t{256} * 1024 * 1024;
 // The optimizer and the physical materialization decision use the same policy.
 bool WorthSharing(const SharedSubPlan& group);
 
+// Share one allowance across all candidates and rewrites in a planning stage. Only an otherwise
+// oversized result spends it, on plan nodes, predicates and computed-column lookups.
+inline constexpr int kSharingEstimateBudget = 256;
+bool WorthSharing(const SharedSubPlan& group, int& remaining);
+
 }  // namespace antb1::plan

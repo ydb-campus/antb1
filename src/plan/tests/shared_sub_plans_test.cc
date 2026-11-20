@@ -5,19 +5,23 @@
 #include <cstdint>
 #include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include <arrow/api.h>
 #include <gtest/gtest.h>
 
 #include "antb1/plan/catalog.h"
 #include "antb1/plan/explain.h"
 #include "antb1/plan/logical_plan.h"
+#include "antb1/plan/table.h"
 #include "antb1/plan/types.h"
 
+#include "../predicate_domain.h"
 #include "plan_test_util.h"
 
 namespace antb1::plan {
@@ -139,6 +143,85 @@ TEST(SharedSubPlansTest, GroupsEveryMemberTogether) {
                    "SELECT COUNT(*) FROM g AS a, g AS b, g AS c "
                    "WHERE a.k = b.k AND b.k = c.k"),
             (std::vector<std::string>{"Project 3x1"}));
+}
+
+TEST(SharedSubPlansTest, CostsTheJointDomainOfFilteredGroupingKeys) {
+  constexpr int64_t kTickets = kMaxSharedResultBytes / (int64_t{5} * 32);
+  auto readings =
+      std::make_shared<testing::FakeTable>(arrow::schema({arrow::field("ticket", arrow::int64()),
+                                                          arrow::field("sensor", arrow::int64())}),
+                                           2'000'000'000);
+  readings->WithStats(0, 0, PartStats{.min = 1, .max = kTickets, .rows = 2'000'000'000});
+  auto sensors = std::make_shared<testing::FakeTable>(
+      arrow::schema({arrow::field("id", arrow::int64()), arrow::field("band", arrow::int64()),
+                     arrow::field("slot", arrow::int64())}),
+      1000);
+  sensors->WithStats(0, 0, PartStats{.min = 1, .max = 1000, .rows = 1000})
+      .WithStats(0, 1, PartStats{.min = 1, .max = 100, .rows = 1000});
+  Catalog catalog;
+  ASSERT_TRUE(catalog.Register("readings", readings).ok());
+  ASSERT_TRUE(catalog.Register("sensors", sensors).ok());
+
+  // One band admits any of four slots; another admits only one. Five pairs fit the cap
+  // at 32 bytes per group. A sixth pair or one more ticket pushes the result past the cap.
+  constexpr std::string_view kFivePairs = "d.band = 2 OR (d.band = 4 AND d.slot = 3)";
+  constexpr std::string_view kInner = "readings AS r JOIN sensors AS d ON r.sensor = d.id";
+  const auto expect_sharing = [&](std::string_view from, std::string_view filter,
+                                  int64_t null_slots, bool expected) {
+    SCOPED_TRACE(std::format("{} with filter={}, NULL slots={}", from, filter, null_slots));
+    sensors->WithStats(0, 2, PartStats{.min = 1, .max = 4, .null_count = null_slots, .rows = 1000});
+    const auto bound = BindSql(
+        std::format("WITH g AS (SELECT r.ticket, d.band, d.slot, COUNT(*) AS n FROM {} AND ({}) "
+                    "GROUP BY r.ticket, d.band, d.slot) "
+                    "SELECT a.ticket, a.band, a.slot, a.n, b.n, c.n FROM g AS a "
+                    "JOIN g AS b ON a.ticket = b.ticket JOIN g AS c ON a.ticket = c.ticket",
+                    from, filter),
+        catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+    const auto groups = SharedSubPlans(*bound);
+    ASSERT_EQ(groups.size(), 1U) << Explain(*bound);
+    ASSERT_EQ(groups.front().members.size(), 3U);
+    int exhausted = 0;
+    EXPECT_FALSE(WorthSharing(groups.front(), exhausted))
+        << "the original group estimate exceeds the byte cap";
+    EXPECT_EQ(WorthSharing(groups.front()), expected) << Explain(*bound);
+  };
+  expect_sharing(kInner, kFivePairs, 0, true);
+  expect_sharing(kInner, kFivePairs, 1, false);  // NULL in the first arm admits a sixth pair.
+  expect_sharing(kInner, "d.band = 2 OR d.slot = 3", 0, false);  // Every band can match.
+  expect_sharing("readings AS r LEFT JOIN sensors AS d ON r.sensor = d.id", kFivePairs, 0, false);
+  // Padding on a sibling branch can similarly add a NULL ticket.
+  expect_sharing(
+      "sensors AS p LEFT JOIN readings AS r ON p.id = r.sensor "
+      "JOIN sensors AS d ON p.id = d.id",
+      kFivePairs, 0, false);
+  readings->WithStats(
+      0, 0, PartStats{.min = 1, .max = kTickets, .null_count = 10, .rows = 2'000'000'000});
+  expect_sharing(kInner, kFivePairs, 0, false);
+}
+
+TEST(SharedSubPlansTest, RequiresTheWholeDisjunctionWithinThePlanningBudget) {
+  const auto catalog = MakeCatalog();
+  for (const bool restrict_both_arms : {false, true}) {
+    const std::string query =
+        "SELECT i64 FROM t WHERE i64 = 17 OR " +
+        std::string(restrict_both_arms ? "(i32 IS NULL AND i64 IN (26, 27))" : "i32 IS NULL");
+    const auto bound = BindSql(query, catalog);
+    ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+    const auto* project = std::get_if<ProjectNode>(bound->root.get());
+    ASSERT_NE(project, nullptr) << Explain(*bound);
+    const auto* filter = std::get_if<FilterNode>(project->input.get());
+    ASSERT_NE(filter, nullptr) << Explain(*bound);
+    const std::vector keys{
+        PredicateDomainKey{.id = project->columns.front().id, .max_values = std::nullopt}};
+    int budget = 2;
+    EXPECT_EQ(PredicateTupleBound(*filter, keys, budget), std::nullopt);
+    EXPECT_EQ(budget, 0);
+    budget = kPredicateDomainNodeBudget;
+    EXPECT_EQ(PredicateTupleBound(*filter, keys, budget),
+              restrict_both_arms ? std::optional<int64_t>(3) : std::nullopt)
+        << Explain(*bound);
+  }
 }
 
 // A bare repeated scan is reported. Whether it is worth materialising is the cost gate's question,

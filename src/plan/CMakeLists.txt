@@ -9,6 +9,7 @@ antb1_add_module(
     key_type.cc
     type_fold.cc
     join_order.cc
+    predicate_domain.cc
     or_factoring.cc
     aggregate_placement.cc
     arithmetic_rewrite.cc

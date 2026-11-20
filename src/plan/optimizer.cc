@@ -810,10 +810,31 @@ struct ReusableAggregate {
   std::vector<std::set<ColumnId>> consumers;
 };
 
-std::vector<ReusableAggregate> ReusableAggregates(const LogicalNodePtr& root) {
+struct SharingEstimates {
+  int remaining = kSharingEstimateBudget;
+  // A rewrite often keeps its producers unchanged. Remember the decisions that spent the
+  // allowance so exhausting it later cannot make the same producer appear to have lost reuse.
+  std::map<LogicalNodePtr, bool> refined;
+
+  bool WorthHolding(const SharedSubPlan& group) {
+    const auto& producer = group.members[group.widest];
+    if (const auto found = refined.find(producer); found != refined.end()) {
+      return found->second;
+    }
+    const int before = remaining;
+    const bool worth = WorthSharing(group, remaining);
+    if (remaining < before) {
+      refined.emplace(producer, worth);
+    }
+    return worth;
+  }
+};
+
+std::vector<ReusableAggregate> ReusableAggregates(const LogicalNodePtr& root,
+                                                  SharingEstimates& estimates) {
   std::vector<ReusableAggregate> result;
   for (SharedSubPlan& group : SharedSubPlans({.root = root, .output = {}})) {
-    if (WorthSharing(group)) {
+    if (estimates.WorthHolding(group)) {
       ReusableAggregate reuse{.members = std::move(group.members), .consumers = {}};
       for (const LogicalNodePtr& member : reuse.members) {
         std::vector<ColumnId> ids;
@@ -844,7 +865,8 @@ bool StillShared(const ReusableAggregate& before, const ReusableAggregate& after
 // alike. If a materializable aggregate loses a consumer, retry from the original tree with
 // those producers as boundaries, so the consumer's restriction stays above the shared result.
 template <class Rewrite>
-LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, const Rewrite& rewrite) {
+LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, SharingEstimates& estimates,
+                                        const Rewrite& rewrite) {
   PushdownState state;
   LogicalNodePtr next = rewrite(state);
   if (next == root || state.keep_filtered_plan) {
@@ -855,9 +877,9 @@ LogicalNodePtr PreserveSharedAggregates(const LogicalNodePtr& root, const Rewrit
   if (aggregate_ids.size() < 2) {
     return next;
   }
-  const auto before = ReusableAggregates(root);
+  const auto before = ReusableAggregates(root, estimates);
   while (!before.empty()) {
-    const auto after = ReusableAggregates(next);
+    const auto after = ReusableAggregates(next, estimates);
     const auto previous = state.preserve.size();
     bool lost = false;
     for (const auto& group : before) {
@@ -896,7 +918,8 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // subquery's own aggregate is a candidate too, and before Prune, which then drops the columns
   // the aggregated side no longer has to carry.
   const ColumnId last = MaxColumnId(*root);
-  root = PreserveSharedAggregates(root, [&](const PushdownState& state) {
+  SharingEstimates estimates;
+  root = PreserveSharedAggregates(root, estimates, [&](const PushdownState& state) {
     ColumnId last_exchanged = last;
     return ExchangeAggregates(root, last_exchanged, state.preserve);
   });
@@ -910,7 +933,7 @@ arrow::Result<LogicalPlan> Optimize(const LogicalPlan& plan, const BindOptions& 
   // second Optimize could move a predicate farther than the first. Refresh pruning afterwards:
   // new filters and changed join inputs need their own needed_above sets for scan pushdown.
   root = PreserveSharedAggregates(
-      root, [&](PushdownState& state) { return PushGroupKeyEqualities(root, state); });
+      root, estimates, [&](PushdownState& state) { return PushGroupKeyEqualities(root, state); });
   root = Prune(root, Needed(output.begin(), output.end()));
   // A dependent join that Unnest left behind is a bug in the pass, never an unsupported query: no
   // SqlErrorDetail, so it exits 70 and cannot pass for a refusal (ADR 0005, ADR 0023).
