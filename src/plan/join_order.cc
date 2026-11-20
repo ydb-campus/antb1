@@ -761,8 +761,8 @@ void InferJoinEdges(std::vector<JoinEdge>& edges) {
     }
     Group& group = groups[classes.Find(edge.a_key)];
     group.null_equal = group.null_equal && edge.null_equal;
-    group.members.try_emplace(edge.a, Member{edge.a_key, edge.a_domain});
-    group.members.try_emplace(edge.b, Member{edge.b_key, edge.b_domain});
+    group.members.try_emplace(edge.a, Member{.key = edge.a_key, .domain = edge.a_domain});
+    group.members.try_emplace(edge.b, Member{.key = edge.b_key, .domain = edge.b_domain});
     group.connected.emplace(std::min(edge.a, edge.b), std::max(edge.a, edge.b));
   }
   // In an inner block every edge must hold. One ordinary equality rules out NULL throughout its
