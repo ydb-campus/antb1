@@ -29,6 +29,7 @@ class GroupedAggregateProgram {
       std::span<const std::unique_ptr<GroupedAggregateState>> states, arrow::MemoryPool* pool);
 
   [[nodiscard]] bool supports_updates() const { return supported_; }
+  [[nodiscard]] bool supports_local_dispatch() const { return supported_ && dispatch_supported_; }
 
   // The input batch and program must outlive this binding. Consume reads the original value
   // arrays at the chunk offset. All states have been resized to include the key table's IDs.
@@ -36,7 +37,12 @@ class GroupedAggregateProgram {
    public:
     arrow::Status Consume(std::size_t offset, std::span<const std::uint32_t> ids) const;
 
+    arrow::Status ConsumeSelected(std::span<const std::uint32_t> rows,
+                                  std::span<const std::uint32_t> ids) const;
+
    private:
+    arrow::Status Update(std::size_t offset, std::span<const std::uint32_t> rows,
+                         std::span<const std::uint32_t> ids) const;
     friend class GroupedAggregateProgram;
     BoundBatch(const GroupedAggregateProgram& program,
                std::span<const std::shared_ptr<arrow::Array>> columns, std::size_t rows)
@@ -65,6 +71,7 @@ class GroupedAggregateProgram {
   explicit GroupedAggregateProgram(arrow::MemoryPool* pool)
       : instructions_(arrow::stl::allocator<Instruction>(pool)) {}
   std::vector<Instruction, arrow::stl::allocator<Instruction>> instructions_;
+  bool dispatch_supported_ = true;
   bool supported_ = true;
 };
 

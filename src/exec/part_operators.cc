@@ -19,9 +19,11 @@
 #include <arrow/api.h>
 #include <arrow/array/concatenate.h>
 #include <arrow/compute/api_vector.h>
+#include <arrow/stl_allocator.h>
 #include <arrow/util/thread_pool.h>
 
 #include "antb1/common/check.h"
+#include "antb1/common/narrow.h"
 #include "antb1/exec/operator.h"
 #include "antb1/exec/profile.h"
 #include "antb1/exec/sort.h"
@@ -266,14 +268,50 @@ bool PartKeepsFirstKeys(const std::vector<plan::BoundColumn>& keys) {
       keys, [](const plan::BoundColumn& key) { return key.type == plan::LogicalType::kDouble; });
 }
 
+// Keep hashing, state arithmetic, and sizing identical in the two all-local layouts.
+constexpr KeyTableOptions kLocalFixedKeys{.kind = KeyTableKind::kFixed, .estimate = false};
+
+arrow::Result<std::unique_ptr<GroupTable>> MakePartTable(
+    const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+    int width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
+    LocalGroupLayout layout) {
+  if (layout == LocalGroupLayout::kAdaptive) {
+    return GroupTable::Make(keys, calls, width, pool, budget, first_keys, GroupTable::kPartitions,
+                            {.estimate = false});
+  }
+  return GroupTable::MakeLocal(keys, calls, width, pool, budget, first_keys,
+                               GroupTable::kPartitions, kLocalFixedKeys);
+}
+
 }  // namespace
 
 // ---- PartGrouper ----
 
 arrow::Result<PartGrouper> PartGrouper::Make(const std::vector<plan::BoundColumn>& keys,
                                              const std::vector<plan::AggregateCall>& aggregates,
-                                             int input_width, const ExecContext& part_ctx) {
+                                             int input_width, const ExecContext& part_ctx,
+                                             LocalGroupLayout layout) {
   PartGrouper grouper;
+  grouper.layout_ = layout;
+  grouper.pool_ = part_ctx.pool;
+  if (layout != LocalGroupLayout::kAdaptive) {
+    ARROW_ASSIGN_OR_RAISE(
+        grouper.groups_, KeyTableNoBadAlloc([&] -> arrow::Result<std::shared_ptr<PartGroups>> {
+          return std::allocate_shared<PartGroups>(arrow::stl::allocator<PartGroups>(part_ctx.pool));
+        }));
+    if (layout == LocalGroupLayout::kPartitioned) {
+      ARROW_ASSIGN_OR_RAISE(
+          grouper.groups_->partitioned,
+          PartitionedGroupTables::Make(keys, aggregates, input_width, part_ctx.pool,
+                                       part_ctx.budget, PartKeepsFirstKeys(keys),
+                                       GroupTable::kPartitions, kLocalFixedKeys));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(grouper.groups_->table,
+                            MakePartTable(keys, aggregates, input_width, part_ctx.pool,
+                                          part_ctx.budget, PartKeepsFirstKeys(keys), layout));
+    }
+    return grouper;
+  }
   grouper.groups_ = std::make_shared<PartGroups>();
   ARROW_ASSIGN_OR_RAISE(grouper.groups_->table,
                         GroupTable::Make(keys, aggregates, input_width, part_ctx.pool,
@@ -283,7 +321,33 @@ arrow::Result<PartGrouper> PartGrouper::Make(const std::vector<plan::BoundColumn
   return grouper;
 }
 
+arrow::Status PartGrouper::Add(const Batch& batch, ProfileNode* profile) {
+  if (layout_ == LocalGroupLayout::kAdaptive) {
+    ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, pool_));
+    return Add(*rows, profile);
+  }
+  return AddLocal(*batch.data, batch.selection.get(), profile);
+}
+
+arrow::Status PartGrouper::AddLocal(const arrow::RecordBatch& rows,
+                                    const arrow::BooleanArray* selection, ProfileNode* profile) {
+  const ProfileTimer timer(profile, "local_update");
+  if (groups_->partitioned) {
+    ARROW_RETURN_NOT_OK(groups_->partitioned->Consume(
+        rows, selection, profile != nullptr ? &dispatch_elapsed_ : nullptr));
+  } else {
+    ARROW_RETURN_NOT_OK(groups_->table->ConsumeSelected(rows, selection));
+  }
+  if (profile != nullptr) {
+    consumed_ += selection != nullptr ? selection->true_count() : rows.num_rows();
+  }
+  return arrow::Status::OK();
+}
+
 arrow::Status PartGrouper::Add(const arrow::RecordBatch& rows, ProfileNode* profile) {
+  if (layout_ != LocalGroupLayout::kAdaptive) {
+    return AddLocal(rows, nullptr, profile);
+  }
   GroupTable& table = *groups_->table;
   if (route_) {
     // Routed rows are Arrow buffers of the query's pool: the budget counts them.
@@ -317,10 +381,14 @@ arrow::Status PartGrouper::Add(const arrow::RecordBatch& rows, ProfileNode* prof
 }
 
 arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* profile) {
-  GroupTable& table = *groups_->table;
   {
-    const ProfileTimer partitioning(profile, "local_path");
-    ARROW_RETURN_NOT_OK(table.Partition());  // on the worker, not on the merging thread
+    const ProfileTimer partitioning(
+        profile, layout_ == LocalGroupLayout::kAdaptive ? "local_path" : "local_handoff");
+    if (groups_->partitioned) {
+      ARROW_RETURN_NOT_OK(groups_->partitioned->Finish());
+    } else {
+      ARROW_RETURN_NOT_OK(groups_->table->Partition());
+    }
   }
   if (profile != nullptr) {
     // What the local path bought: the rows the parts aggregated themselves and the groups they
@@ -329,7 +397,17 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
     // workers and the lanes, summed over threads -- this says which path a query should have
     // taken and why, which no single-threaded benchmark of the tables can show.
     profile->Add("local_rows", MetricUnit::kCount, consumed_);
-    profile->Add("local_groups", MetricUnit::kCount, table.num_groups());
+    const auto groups =
+        groups_->partitioned ? groups_->partitioned->num_groups() : groups_->table->num_groups();
+    profile->Add("local_groups", MetricUnit::kCount, Narrow<int64_t>(groups));
+    if (layout_ != LocalGroupLayout::kAdaptive) {
+      profile->Add(
+          layout_ == LocalGroupLayout::kSingle ? "single_local_parts" : "partitioned_local_parts",
+          MetricUnit::kCount, 1);
+    }
+    if (groups_->partitioned) {
+      profile->Add("local_hash_dispatch", MetricUnit::kNanos, dispatch_elapsed_.count());
+    }
     if (routed_ > 0) {
       profile->Add("raw_parts", MetricUnit::kCount, 1);
       profile->Add("raw_rows", MetricUnit::kCount, routed_);
@@ -340,24 +418,35 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
 
 // ---- PartGroupAggregateOperator ----
 
-PartGroupAggregateOperator::PartGroupAggregateOperator(PartPipeline pipeline, int64_t num_parts,
-                                                       int input_width,
-                                                       std::vector<plan::BoundColumn> keys,
-                                                       std::vector<plan::AggregateCall> aggregates,
-                                                       std::shared_ptr<arrow::Schema> schema,
-                                                       std::optional<PartitionTopN> top_n)
+PartGroupAggregateOperator::PartGroupAggregateOperator(
+    PartPipeline pipeline, int64_t num_parts, int input_width, std::vector<plan::BoundColumn> keys,
+    std::vector<plan::AggregateCall> aggregates, std::shared_ptr<arrow::Schema> schema,
+    std::optional<PartitionTopN> top_n, LocalGroupLayout layout)
     : pipeline_(std::make_shared<const PartPipeline>(std::move(pipeline))),
       num_parts_(num_parts),
       input_width_(input_width),
       keys_(std::move(keys)),
       aggregates_(std::move(aggregates)),
       schema_(std::move(schema)),
-      top_n_(std::move(top_n)) {}
+      top_n_(std::move(top_n)),
+      requested_layout_(layout) {}
 
 PartGroupAggregateOperator::~PartGroupAggregateOperator() = default;
 
 arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   ARROW_RETURN_NOT_OK(Close());
+  layout_ = LocalGroupLayout::kAdaptive;
+  if (num_parts_ > 0 && requested_layout_ != LocalGroupLayout::kAdaptive && !top_n_ &&
+      !keys_.empty()) {
+    ARROW_ASSIGN_OR_RAISE(const auto probe, KeyTableNoBadAlloc([&] {
+                            return GroupTable::Make(keys_, aggregates_, input_width_, ctx.pool,
+                                                    ctx.budget, false, GroupTable::kPartitions,
+                                                    kLocalFixedKeys, GroupTableMode::kBatch);
+                          }));
+    if (probe->supports_local_dispatch()) {
+      layout_ = requested_layout_;
+    }
+  }
   if (top_n_.has_value() && !comparator_.has_value()) {
     ARROW_ASSIGN_OR_RAISE(comparator_, RowComparator::Make(schema_, top_n_->keys));
   }
@@ -369,15 +458,15 @@ arrow::Status PartGroupAggregateOperator::Open(ExecContext& ctx) {
   merged_ = false;
   opened_ = true;
   auto task = [pipeline = pipeline_, part_ctx = PartContext(ctx), keys = keys_,
-               aggregates = aggregates_, width = input_width_, profile = profile()](
-                  int64_t part, const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
+               aggregates = aggregates_, width = input_width_, profile = profile(),
+               layout = layout_](int64_t part,
+                                 const std::atomic<bool>& stop) -> arrow::Result<PartTable> {
     const ProfileTimer part_time(profile, "part_time");
     ARROW_ASSIGN_OR_RAISE(PartGrouper grouper,
-                          PartGrouper::Make(keys, aggregates, width, part_ctx));
+                          PartGrouper::Make(keys, aggregates, width, part_ctx, layout));
     ARROW_RETURN_NOT_OK(
         RunPart(*pipeline, part, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
-          ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
-          ARROW_RETURN_NOT_OK(grouper.Add(*rows, profile));
+          ARROW_RETURN_NOT_OK(grouper.Add(batch, profile));
           return true;
         }));
     return grouper.Finish(profile);
@@ -408,14 +497,13 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       status = part.status();
       break;
     }
-    const std::size_t partitions = (*part)->table->num_partitions();
+    const std::size_t partitions =
+        (*part)->partitioned ? GroupTable::kPartitions : (*part)->table->num_partitions();
     if (lanes == nullptr) {
       tables_.reserve(partitions);
       for (std::size_t p = 0; p < partitions; ++p) {
-        ARROW_ASSIGN_OR_RAISE(
-            auto table,
-            GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_,
-                             /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
+        ARROW_ASSIGN_OR_RAISE(auto table, MakePartTable(keys_, aggregates_, input_width_, pool_,
+                                                        budget_, /*first_keys=*/true, layout_));
         tables_.push_back(std::move(table));
       }
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
@@ -426,8 +514,15 @@ arrow::Status PartGroupAggregateOperator::Merge() {
       // inserted here for the first time. Both add into the same metric as their part-side halves,
       // so local_path and routed_path are each one path's whole cost.
       {
-        const ProfileTimer merging(profile(), "local_path");
-        ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
+        const ProfileTimer merging(
+            profile(), layout_ == LocalGroupLayout::kAdaptive ? "local_path" : "lane_merge");
+        if (groups->partitioned) {
+          if (auto local = groups->partitioned->ReleasePartition(p)) {
+            ARROW_RETURN_NOT_OK(tables_[p]->Merge(*local));
+          }
+        } else {
+          ARROW_RETURN_NOT_OK(tables_[p]->MergePartition(*groups->table, p));
+        }
       }
       if (p < groups->rows.size()) {  // the part's other rows, after its first batch's groups
         const ProfileTimer merging(profile(), "routed_path");

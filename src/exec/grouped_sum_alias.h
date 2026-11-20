@@ -26,8 +26,8 @@ namespace antb1::exec {
 // Null when `owner` is not a state whose accumulator serves both, which is the only answer a
 // caller has to handle: it then makes a state of its own, as it did before. A temporal AVG keeps
 // its own state this way, since it holds something else entirely.
-std::unique_ptr<GroupedAggregateState> MakeSumAlias(const GroupedAggregateState& owner,
-                                                    bool average);
+arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeSumAlias(
+    const GroupedAggregateState& owner, bool average, MemoryReservation* metadata = nullptr);
 
 }  // namespace antb1::exec
 

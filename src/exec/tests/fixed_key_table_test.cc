@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/compute/api_vector.h>
 #include <arrow/compute/exec.h>
 #include <gtest/gtest.h>
 
@@ -216,6 +217,133 @@ TEST(FixedKeyLayoutTest, ExplicitFixedKindsPreserveTheAutomaticFallback) {
 }
 
 class ColumnKeyTableTest : public testing::ExecTest {};
+
+TEST_F(ColumnKeyTableTest, LocalLaneChargesItsConcreteIndexBeforeConstruction) {
+  const std::vector<arrow::TypeHolder> packed{arrow::int64(), arrow::int32()};
+  const std::vector<arrow::TypeHolder> column{arrow::int64(), arrow::int32(), arrow::boolean()};
+  constexpr std::int64_t kOtherMetadata = 64;
+  for (const auto& types : {packed, column}) {
+    std::int64_t required = 0;
+    {
+      MemoryBudget budget(std::nullopt);
+      MemoryReservation lane;
+      lane.Reset(&budget);
+      ASSERT_TRUE(lane.Resize(kOtherMetadata).ok());
+      arrow::compute::ExecContext ctx(&budget);
+      const auto table =
+          MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed, .table_metadata = &lane});
+      ASSERT_TRUE(table.ok()) << table.status();
+      required = lane.bytes();
+      EXPECT_GT(required, kOtherMetadata);
+      if (types.size() == packed.size()) {
+        using Table = FixedKeyTable<16, Growth::kSlotOrder>;
+        EXPECT_EQ(required, kOtherMetadata + static_cast<std::int64_t>(sizeof(Table)));
+        EXPECT_EQ(budget.bytes_allocated(),
+                  required);  // Both packed column descriptors are inline.
+      } else {
+        EXPECT_GT(budget.bytes_allocated(), required);  // Generic column descriptors use the pool.
+      }
+    }
+    // The first budget refuses the concrete index; the second allows its object but refuses
+    // the separate column descriptors. Either failure must preserve other lane charges.
+    for (const auto limit : {required - 1, required}) {
+      MemoryBudget budget(limit);
+      arrow::compute::ExecContext ctx(&budget);
+      MemoryReservation lane;
+      lane.Reset(&budget);
+      ASSERT_TRUE(lane.Resize(kOtherMetadata).ok());
+      const auto table =
+          MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed, .table_metadata = &lane});
+      if (types.size() == packed.size() && limit == required) {
+        EXPECT_TRUE(table.ok()) << table.status();
+      } else {
+        EXPECT_TRUE(table.status().IsOutOfMemory()) << table.status();
+        EXPECT_EQ(lane.bytes(), kOtherMetadata);
+        EXPECT_EQ(budget.bytes_allocated(), kOtherMetadata);
+      }
+    }
+  }
+}
+
+// Build one routing lane directly from indexed rows. Ordinary lookup uses the private probe
+// hash, so a destination that incorrectly probes with the lane hash cannot pass this test.
+TEST_F(ColumnKeyTableTest, SelectedRowsOfOneLaneMatchMaterializedKeys) {
+  constexpr std::uint32_t kRows = 16384;
+  auto numbers = KeysFrom(0, kRows + 3);
+  std::vector<std::optional<std::int32_t>> small;
+  std::vector<std::optional<bool>> flags;
+  for (std::size_t i = 0; i < numbers.size(); ++i) {
+    if (i % 29 == 3) {
+      numbers[i] = std::nullopt;
+    }
+    small.emplace_back(i % 5 == 3 ? std::nullopt : std::optional(static_cast<std::int32_t>(i)));
+    flags.emplace_back(i % 7 == 3 ? std::nullopt : std::optional(i % 2 == 0));
+  }
+  const auto integers = Int64s(numbers);
+  const auto narrow = Int32s(small);
+  for (const auto& input : {BatchOf({integers}), BatchOf({integers, narrow}),
+                            BatchOf({integers, narrow, testing::Bools(flags)})}) {
+    const auto batch = input.Slice(3, kRows);
+    // Start the validity/BOOLEAN bitmaps at bit three. Include the all-NULL first row's lane.
+    const auto hashes = KeyHashes(batch).ValueOrDie();
+    std::vector<std::uint32_t> rows;
+    for (std::uint32_t i = 0; i < kRows; ++i) {
+      const auto row = (137 * i) % kRows;
+      if ((hashes[row] & 31U) == (hashes.front() & 31U)) {
+        rows.push_back(row);
+        if (i % 7 == 0) {
+          rows.push_back(row);
+        }
+      }
+    }
+    ASSERT_GT(rows.size(), 256U);
+    arrow::UInt32Builder indices;
+    ASSERT_TRUE(indices.AppendValues(rows).ok());
+    const auto selected = indices.Finish().ValueOrDie();
+    std::vector<arrow::TypeHolder> types;
+    arrow::ArrayVector gathered;
+    for (const auto& col : batch.values) {
+      types.emplace_back(col.type());
+      gathered.push_back(arrow::compute::Take(col, selected).ValueOrDie().make_array());
+    }
+    const auto materialized = BatchOf(std::move(gathered));
+    arrow::compute::ExecContext ctx;
+    auto target = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}).ValueOrDie();
+    auto reference = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}).ValueOrDie();
+    auto* stored = dynamic_cast<StoredKeyTable*>(target.get());
+    ASSERT_NE(stored, nullptr);
+    const std::array<std::uint32_t, 2> invalid{0, kRows};
+    const auto no_callback = [](std::size_t, std::span<const std::uint32_t>, std::uint32_t) {
+      ADD_FAILURE() << "empty or invalid selection reached an update";
+      return arrow::Status::OK();
+    };
+    EXPECT_TRUE(stored->ConsumeSelected(batch, {}, no_callback).ok());
+    EXPECT_TRUE(stored->ConsumeSelected(batch, invalid, no_callback).IsInvalid());
+    EXPECT_EQ(stored->num_groups(), 0U);
+
+    const auto expected = IdsOf(*reference, materialized);
+    std::size_t visited = 0;
+    const auto status = stored->ConsumeSelected(
+        batch, rows,
+        [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+          EXPECT_EQ(offset, visited);
+          EXPECT_EQ(after, stored->num_groups());
+          EXPECT_TRUE(std::ranges::equal(ids, std::span(expected).subspan(offset, ids.size())));
+          visited += ids.size();
+          return arrow::Status::OK();
+        });
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(visited, expected.size());
+    const auto keys = reference->Uniques().ValueOrDie();
+    EXPECT_EQ(stored->Uniques().ValueOrDie().batch.values, keys.batch.values);
+    std::vector<std::uint64_t> stored_hashes(stored->num_groups());
+    stored->RoutingHashes(0, stored_hashes);
+    EXPECT_EQ(stored_hashes, KeyHashes(keys.batch).ValueOrDie());
+    const auto lookup = stored->Lookup(materialized).ValueOrDie();
+    ASSERT_EQ(lookup->null_count(), 0);
+    EXPECT_TRUE(std::ranges::equal(std::span(lookup->raw_values(), expected.size()), expected));
+  }
+}
 
 TEST_F(ColumnKeyTableTest, ChunkUpdatesAndStoredMergesMatchMaterializedKeys) {
   std::vector<std::optional<std::int64_t>> ints;

@@ -30,6 +30,7 @@ antb1_add_module(
     column_key_table.cc
     group_table.cc
     group_table_program.cc
+    group_table_dispatch.cc
     grouped_aggregate_state.cc
     group_aggregate.cc
     window.cc

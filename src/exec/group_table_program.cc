@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <utility>
 #include <vector>
@@ -24,31 +25,36 @@ const StoredKeyTable* GroupTable::StoredKeys() const {
 }
 
 arrow::Status GroupTable::ConsumeProgram(const arrow::RecordBatch& rows,
-                                         const arrow::compute::ExecBatch& keys) {
+                                         const arrow::compute::ExecBatch& keys,
+                                         std::span<const std::uint32_t> selection) {
   ANTB1_CHECK(program_.has_value());
   ARROW_ASSIGN_OR_RAISE(const auto bound, program_->Bind(rows));
   std::uint32_t groups = num_groups_;
   // For DOUBLE keys remember only the rows that introduced groups, so the output preserves
   // first-seen -0 and NaN payloads. Every other eligible key can be emitted from the index.
   arrow::Int64Builder first_rows(pool_);
-  ARROW_RETURN_NOT_OK(stored_keys_->ConsumeChunks(
-      keys, [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
-        if (after != groups) {
-          if (KeepsKeyChunks()) {
-            ARROW_RETURN_NOT_OK(first_rows.Reserve(after - groups));
-            for (std::size_t i = 0; i < ids.size(); ++i) {
-              if (ids[i] == groups) {
-                first_rows.UnsafeAppend(Narrow<std::int64_t>(offset + i));
-                ++groups;
-              }
-            }
-            ANTB1_DCHECK(groups == after);
+  const auto update = [&](std::size_t offset, std::span<const std::uint32_t> ids,
+                          std::uint32_t after) {
+    if (after != groups) {
+      if (KeepsKeyChunks()) {
+        ARROW_RETURN_NOT_OK(first_rows.Reserve(after - groups));
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+          if (ids[i] == groups) {
+            first_rows.UnsafeAppend(selection.empty() ? Narrow<std::int64_t>(offset + i)
+                                                      : selection[offset + i]);
+            ++groups;
           }
-          ARROW_RETURN_NOT_OK(ResizeStates(after));
-          groups = after;
         }
-        return bound.Consume(offset, ids);
-      }));
+        ANTB1_DCHECK(groups == after);
+      }
+      ARROW_RETURN_NOT_OK(ResizeStates(after));
+      groups = after;
+    }
+    return selection.empty() ? bound.Consume(offset, ids)
+                             : bound.ConsumeSelected(selection.subspan(offset, ids.size()), ids);
+  };
+  ARROW_RETURN_NOT_OK(selection.empty() ? stored_keys_->ConsumeChunks(keys, update)
+                                        : stored_keys_->ConsumeSelected(keys, selection, update));
   if (groups > num_groups_) {
     arrow::ArrayVector first;
     if (KeepsKeyChunks()) {
@@ -101,6 +107,27 @@ arrow::Status GroupTable::FreezePartitions() {
   frozen.owner = std::move(key_table_);
   frozen_.emplace(std::move(frozen));
   stored_keys_ = nullptr;
+  return arrow::Status::OK();
+}
+
+// The matched layouts use identical destination calls for each 1,024 source groups.
+// A whole lane supplies consecutive IDs, while an unsplit table supplies its frozen ID list.
+arrow::Status GroupTable::MergeStoredChunks(
+    const GroupTable& source, std::optional<std::span<const std::uint32_t>> selection) {
+  std::array<std::uint32_t, 1024> consecutive;
+  const auto length = selection ? selection->size() : source.num_groups_;
+  for (std::size_t begin = 0; begin < length; begin += consecutive.size()) {
+    const auto n = std::min(consecutive.size(), length - begin);
+    std::span<const std::uint32_t> from;
+    if (selection) {
+      from = selection->subspan(begin, n);
+    } else {
+      const auto chunk = std::span(consecutive).first(n);
+      std::ranges::iota(chunk, Narrow<std::uint32_t>(begin));
+      from = chunk;
+    }
+    ARROW_RETURN_NOT_OK(MergeStoredGroups(source, from));
+  }
   return arrow::Status::OK();
 }
 

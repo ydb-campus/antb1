@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -31,6 +33,7 @@
 #include "antb1/common/narrow.h"
 #include "antb1/exec/filter.h"
 #include "antb1/exec/group_aggregate.h"
+#include "antb1/exec/limit.h"
 #include "antb1/exec/memory_budget.h"
 #include "antb1/exec/physical_planner.h"
 #include "antb1/exec/profile.h"
@@ -1123,11 +1126,136 @@ std::shared_ptr<MemoryTable> GroupingTable(bool split) {
   return std::make_shared<MemoryTable>(schema, std::move(batches), true);
 }
 
+int64_t MetricValue(const ProfileNode& profile, std::string_view name) {
+  for (const auto& metric : profile.metrics()) {
+    if (metric.name == name) {
+      return metric.value;
+    }
+  }
+  return 0;
+}
+
+// Exercise all grouping policies with the same workers already used for the part-order test.
+void CheckLocalGroupLayouts(arrow::internal::Executor* pool) {
+  const auto table = GroupingTable(true);
+  const auto k = Column(0, "k", LogicalType::kDouble);
+  const auto g = Column(1, "g", LogicalType::kBigInt);
+  const auto str = Column(2, "s", LogicalType::kVarchar);
+  const auto v = Column(3, "v", LogicalType::kBigInt);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt},
+      {.kind = plan::AggKind::kSum, .arg = v, .type = LogicalType::kHugeInt}};
+  const PartPipeline pipeline = [table,
+                                 g](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    auto scan = std::make_unique<TableScanOperator>(table, std::vector<int>{0, 1, 2, 3}, part);
+    return std::make_unique<FilterOperator>(
+        std::move(scan),
+        std::vector<plan::Predicate>{testing::Compare(g, plan::CompareOp::kGe, BigInt(4))});
+  };
+  struct Case {
+    std::vector<plan::BoundColumn> keys;
+    std::vector<plan::AggregateCall> calls;
+    std::optional<PartitionTopN> top_n;
+    bool eligible;
+  };
+  const std::vector<Case> cases = {
+      {.keys = {g, k, v}, .calls = calls, .top_n = std::nullopt, .eligible = true},
+      {.keys = {g}, .calls = calls, .top_n = std::nullopt, .eligible = true},
+      {.keys = {str}, .calls = calls, .top_n = std::nullopt, .eligible = false},
+      {.keys = {g},
+       .calls = {{.kind = plan::AggKind::kMin, .arg = str, .type = LogicalType::kVarchar}},
+       .top_n = std::nullopt,
+       .eligible = false},
+      {.keys = {g},
+       .calls = calls,
+       .top_n =
+           PartitionTopN{.keys = {{.column = Column(0, "g", LogicalType::kBigInt)}}, .keep = 1},
+       .eligible = false}};
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.keys.front().name);
+    const GroupAggregateOperator schema_source(pipeline(0).ValueOrDie(), c.keys, c.calls);
+    const auto run = [&](LocalGroupLayout layout, arrow::internal::Executor* executor,
+                         MemoryBudget& memory, ProfileNode& profile) {
+      PartGroupAggregateOperator op(pipeline, table->num_parts(), 4, c.keys, c.calls,
+                                    schema_source.output_schema(), c.top_n, layout);
+      op.set_profile(&profile);
+      return Drain(op, {.pool = &memory,
+                        .batch_size = 4,
+                        .executor = executor,
+                        .threads = executor == nullptr ? 1 : kThreads,
+                        .budget = &memory});
+    };
+    MemoryBudget reference_memory(std::nullopt);
+    ProfileNode reference_profile;
+    const auto expected =
+        run(LocalGroupLayout::kAdaptive, nullptr, reference_memory, reference_profile);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    ASSERT_GT((*expected)->num_rows(), 0);
+    for (auto* executor : {static_cast<arrow::internal::Executor*>(nullptr), pool}) {
+      for (auto layout : {LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned}) {
+        MemoryBudget memory(std::nullopt);
+        ProfileNode profile;
+        {
+          const auto result = run(layout, executor, memory, profile);
+          // Both tables have survived Close and destruction of their producing operator.
+          ASSERT_TRUE(result.ok()) << result.status();
+          ASSERT_TRUE(SameRows(**result, **expected));
+          if (c.keys.size() == 3) {
+            const auto got = (*result)->CombineChunksToBatch().ValueOrDie()->column(1);
+            const auto wanted = (*expected)->CombineChunksToBatch().ValueOrDie()->column(1);
+            for (int64_t i = 0; i < got->length(); ++i) {
+              if (got->IsValid(i)) {
+                EXPECT_EQ(std::bit_cast<std::uint64_t>(
+                              static_cast<const arrow::DoubleArray&>(*got).Value(i)),
+                          std::bit_cast<std::uint64_t>(
+                              static_cast<const arrow::DoubleArray&>(*wanted).Value(i)));
+              }
+            }
+          }
+        }
+        EXPECT_EQ(MetricValue(profile, "single_local_parts"),
+                  c.eligible && layout == LocalGroupLayout::kSingle ? table->num_parts() : 0);
+        EXPECT_EQ(MetricValue(profile, "partitioned_local_parts"),
+                  c.eligible && layout == LocalGroupLayout::kPartitioned ? table->num_parts() : 0);
+        EXPECT_EQ(memory.bytes_allocated(), 0);
+      }
+    }
+  }
+}
+
+// PartsOf can prune every part before Open. None of the grouping policies needs an index.
+TEST_F(PartOperatorsTest, FullyPrunedGroupingNeedsNoQueryMemory) {
+  const PartPipeline pipeline = [](int64_t) -> arrow::Result<std::unique_ptr<Operator>> {
+    return arrow::Status::Invalid("unexpected scan of a pruned part");
+  };
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("n", arrow::int64())});
+  const auto key = Column(0, "k", LogicalType::kBigInt);
+  const plan::AggregateCall count{
+      .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
+  for (auto layout :
+       {LocalGroupLayout::kAdaptive, LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned}) {
+    MemoryBudget memory(0);
+    PartGroupAggregateOperator op(pipeline, 0, 1, {key}, {count}, schema, std::nullopt, layout);
+    const auto empty = Drain(op, {.pool = &memory, .budget = &memory});
+    ASSERT_TRUE(empty.ok()) << empty.status();
+    EXPECT_EQ((*empty)->num_rows(), 0);
+    EXPECT_EQ(memory.max_memory(), 0);
+    if (layout != LocalGroupLayout::kAdaptive) {
+      const auto part =
+          PartGrouper::Make({key}, {count}, 1, {.pool = &memory, .budget = &memory}, layout);
+      EXPECT_TRUE(part.status().IsOutOfMemory()) << part.status();
+      EXPECT_EQ(memory.bytes_allocated(), 0);
+    }
+  }
+}
+
 // Grouping per part and merging the parts in order gives the groups of one pass (as a set of
 // rows) for every aggregate and key type, NULL keys, no keys and empty parts; the same rows in the
 // same order on any number of threads; and a DOUBLE key keeps its spelling from the earliest part.
 TEST_F(PartOperatorsTest, GroupingPerPartMergesInPartOrder) {
   const auto pool = Pool();
+  CheckLocalGroupLayouts(pool.get());
   const auto k = Column(0, "k", LogicalType::kDouble);
   const auto g = Column(1, "g", LogicalType::kBigInt);
   const auto str = Column(2, "s", LogicalType::kVarchar);
@@ -1580,12 +1708,18 @@ TEST_F(PartOperatorsTest, GroupRangeErrorsDoNotDependOnALimit) {
         arrow::RecordBatch::Make(schema, 2, {Int64s({failing, 3}), h.Finish().ValueOrDie()}));
   }
   const auto table = std::make_shared<MemoryTable>(schema, batches, /*split=*/true);
+  const std::vector<plan::BoundColumn> keys = {Column(0, "k", LogicalType::kBigInt)};
+  const std::vector<plan::AggregateCall> calls = {{.kind = plan::AggKind::kSum,
+                                                   .arg = Column(1, "h", LogicalType::kHugeInt),
+                                                   .type = LogicalType::kHugeInt}};
   const auto aggregate = Node(plan::GroupAggregateNode{
       .input = Node(plan::ScanNode{.table = table, .table_name = "t", .fields = {0, 1}}),
-      .keys = {Column(0, "k", LogicalType::kBigInt)},
-      .aggregates = {{.kind = plan::AggKind::kSum,
-                      .arg = Column(1, "h", LogicalType::kHugeInt),
-                      .type = LogicalType::kHugeInt}}});
+      .keys = keys,
+      .aggregates = calls});
+  const PartPipeline pipeline = [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, std::vector<int>{0, 1}, part);
+  };
+  const GroupAggregateOperator schema_source(pipeline(0).ValueOrDie(), keys, calls);
   const auto plan = PlanOf(Node(plan::LimitNode{.input = aggregate, .limit = 1}), 2);
   for (arrow::internal::Executor* executor :
        {static_cast<arrow::internal::Executor*>(nullptr),
@@ -1593,6 +1727,24 @@ TEST_F(PartOperatorsTest, GroupRangeErrorsDoNotDependOnALimit) {
     const auto result = Run(plan, executor);
     EXPECT_TRUE(result.status().IsExecutionError())
         << (executor == nullptr ? "1 thread: " : "4 threads: ") << result.status().ToString();
+    for (auto layout : {LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned}) {
+      MemoryBudget memory(std::nullopt);
+      ProfileNode profile;
+      auto grouped = std::make_unique<PartGroupAggregateOperator>(
+          pipeline, table->num_parts(), 2, keys, calls, schema_source.output_schema(), std::nullopt,
+          layout);
+      grouped->set_profile(&profile);
+      LimitOperator limit(std::move(grouped), 1);
+      const auto failed = Drain(limit, {.pool = &memory,
+                                        .executor = executor,
+                                        .threads = executor == nullptr ? 1 : kThreads,
+                                        .budget = &memory});
+      EXPECT_EQ(failed.status().ToString(), result.status().ToString());
+      // Fallible wide SUM keeps its input-order diagnostics on the adaptive path.
+      EXPECT_EQ(MetricValue(profile, "single_local_parts"), 0);
+      EXPECT_EQ(MetricValue(profile, "partitioned_local_parts"), 0);
+      EXPECT_EQ(memory.bytes_allocated(), 0);
+    }
   }
 }
 

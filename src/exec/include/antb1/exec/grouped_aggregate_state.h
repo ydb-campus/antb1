@@ -27,6 +27,8 @@
 
 namespace antb1::exec {
 
+class MemoryReservation;
+
 class GroupedAggregateState {
  public:
   GroupedAggregateState() = default;
@@ -76,6 +78,6 @@ class GroupedAggregateState {
 // combination the binder never produces.
 arrow::Result<std::unique_ptr<GroupedAggregateState>> MakeGroupedAggregateState(
     plan::AggKind kind, std::optional<plan::LogicalType> input, plan::LogicalType result,
-    arrow::MemoryPool* pool = arrow::default_memory_pool());
+    arrow::MemoryPool* pool = arrow::default_memory_pool(), MemoryReservation* metadata = nullptr);
 
 }  // namespace antb1::exec

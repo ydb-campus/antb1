@@ -632,7 +632,7 @@ TEST_F(GroupedAggregateTest, IntegerAvgDividesAsDuckDb) {
     ASSERT_NE(sum, nullptr);
     sum->Resize(1);
     ASSERT_TRUE(sum->Consume(values.get(), ids).ok());
-    if (const auto alias = MakeSumAlias(*sum, /*average=*/true); alias != nullptr) {
+    if (const auto alias = MakeSumAlias(*sum, /*average=*/true).ValueOrDie(); alias != nullptr) {
       EXPECT_EQ(first(Finalized(*alias)), expected);
     }
   }

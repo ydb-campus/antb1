@@ -1063,6 +1063,8 @@ BENCHMARK(BM_KeyTable_Int64Int32Bool_Column_Random)
 // handoff (partitioning, all destination merges and releasing the tables).
 struct ProgramInput {
   arrow::RecordBatchVector batches;
+  std::vector<std::shared_ptr<arrow::BooleanArray>> selections;
+  int64_t selected_rows = 0;
   std::vector<plan::BoundColumn> keys;
   std::vector<plan::AggregateCall> calls;
   std::shared_ptr<arrow::Schema> output;
@@ -1075,7 +1077,12 @@ std::optional<int64_t> ProgramValue(int64_t row) {
   return (row % 127) - 63;
 }
 
-arrow::Result<ProgramInput> MakeProgramInput(GroupShape shape, int64_t groups, GroupIds ids) {
+std::optional<bool> ProgramSelection(int64_t row) {
+  return row % 13 == 0 ? std::nullopt : std::optional(row % 3 != 0);
+}
+
+arrow::Result<ProgramInput> MakeProgramInput(GroupShape shape, int64_t groups, GroupIds ids,
+                                             bool selected) {
   ProgramInput in;
   in.batches = GroupInput(shape, groups, GroupRowsFor(groups), ids);
   if (in.batches.empty()) {
@@ -1099,7 +1106,11 @@ arrow::Result<ProgramInput> MakeProgramInput(GroupShape shape, int64_t groups, G
   int64_t row = 0;
   for (auto& batch : in.batches) {
     arrow::Int64Builder values;
+    arrow::BooleanBuilder mask;
     ARROW_RETURN_NOT_OK(values.Reserve(batch->num_rows()));
+    if (selected) {
+      ARROW_RETURN_NOT_OK(mask.Reserve(batch->num_rows()));
+    }
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
       const auto value = ProgramValue(row);
       if (value.has_value()) {
@@ -1107,10 +1118,26 @@ arrow::Result<ProgramInput> MakeProgramInput(GroupShape shape, int64_t groups, G
       } else {
         values.UnsafeAppendNull();
       }
+      if (selected) {
+        const auto keep = ProgramSelection(row);
+        if (keep.has_value()) {
+          mask.UnsafeAppend(*keep);
+          in.selected_rows += *keep ? 1 : 0;
+        } else {
+          mask.UnsafeAppendNull();
+        }
+      }
     }
     ARROW_ASSIGN_OR_RAISE(auto data, values.Finish());
     ARROW_ASSIGN_OR_RAISE(batch,
                           batch->AddColumn(value_index, arrow::field("v", arrow::int64()), data));
+    if (selected) {
+      std::shared_ptr<arrow::BooleanArray> bits;
+      ARROW_RETURN_NOT_OK(mask.Finish(&bits));
+      in.selections.push_back(std::move(bits));
+    } else {
+      in.selected_rows += batch->num_rows();
+    }
   }
   return in;
 }
@@ -1173,21 +1200,33 @@ arrow::Status DrainProgramLane(exec::GroupTable& lane, const ProgramInput& in,
 struct ProgramTimes {
   double local_ms = 0;
   double merge_ms = 0;
+  double partition_ms = 0;
   double lane_merge_ms = 0;
   double output_ms = 0;
   double local_cpu_ms = 0;
   double merge_cpu_ms = 0;
+  double partition_cpu_ms = 0;
   double lane_merge_cpu_ms = 0;
   double output_cpu_ms = 0;
   uint64_t partial_groups = 0;
   uint64_t groups = 0;
+  uint64_t local_tables = 0;
+  int64_t local_bytes = 0;
 };
+
+enum class LocalLayout : uint8_t { kExisting, kSingle, kPartitioned };
 
 struct ProgramArm {
   const char* name;
   exec::KeyTableKind kind;
   exec::GroupTableMode mode;
   bool prefetch_merge = false;
+  LocalLayout local = LocalLayout::kExisting;
+};
+
+struct ProgramPart {
+  std::unique_ptr<exec::GroupTable> single;
+  std::unique_ptr<exec::PartitionedGroupTables> partitioned;
 };
 
 arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm arm,
@@ -1201,9 +1240,13 @@ arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm a
   const auto make = [&](bool destination) -> arrow::Result<std::unique_ptr<exec::GroupTable>> {
     exec::KeyTableOptions options{
         .kind = arm.kind,
-        .estimate = !destination,
+        .estimate = !destination && arm.local == LocalLayout::kExisting,
         .prefetch_composite_merge = destination && arm.prefetch_merge,
         .prefetched_composite_merge = destination && verify_merge ? &observed_prefetch : nullptr};
+    if (arm.local != LocalLayout::kExisting) {
+      return exec::GroupTable::MakeLocal(in.keys, in.calls, in.batches.front()->num_columns(),
+                                         &budget, &budget, destination, lanes, options);
+    }
     ARROW_ASSIGN_OR_RAISE(auto table, exec::GroupTable::Make(
                                           in.keys, in.calls, in.batches.front()->num_columns(),
                                           &budget, &budget, destination, lanes, options, arm.mode));
@@ -1214,22 +1257,47 @@ arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm a
   };
   const auto start = Clock::now();
   const auto cpu_start = std::clock();
-  std::vector<std::unique_ptr<exec::GroupTable>> parts;
+  std::vector<ProgramPart> parts;
   constexpr std::size_t kPartBatches = 4;
   for (std::size_t i = 0; i < in.batches.size(); ++i) {
     if (i % kPartBatches == 0) {
-      ARROW_ASSIGN_OR_RAISE(auto table, make(false));
-      parts.push_back(std::move(table));
+      auto& part = parts.emplace_back();
+      if (arm.local == LocalLayout::kPartitioned) {
+        ARROW_ASSIGN_OR_RAISE(part.partitioned,
+                              exec::PartitionedGroupTables::Make(
+                                  in.keys, in.calls, in.batches.front()->num_columns(), &budget,
+                                  &budget, false, lanes, {.kind = arm.kind, .estimate = false}));
+      } else {
+        ARROW_ASSIGN_OR_RAISE(part.single, make(false));
+      }
     }
-    ARROW_RETURN_NOT_OK(parts.back()->Consume(*in.batches[i]));
+    const auto* mask = in.selections.empty() ? nullptr : in.selections[i].get();
+    auto& part = parts.back();
+    if (arm.local == LocalLayout::kPartitioned) {
+      ARROW_RETURN_NOT_OK(part.partitioned->Consume(*in.batches[i], mask));
+    } else if (mask != nullptr) {
+      ARROW_RETURN_NOT_OK(part.single->ConsumeSelected(*in.batches[i], mask));
+    } else {
+      ARROW_RETURN_NOT_OK(part.single->Consume(*in.batches[i]));
+    }
   }
   const auto local_done = Clock::now();
   const auto cpu_local_done = std::clock();
+  const auto local_bytes = budget.bytes_allocated();
   uint64_t partial_groups = 0;
+  uint64_t local_tables = 0;
   for (auto& part : parts) {
-    partial_groups += part->num_groups();
-    ARROW_RETURN_NOT_OK(part->Partition());
+    if (arm.local == LocalLayout::kPartitioned) {
+      partial_groups += part.partitioned->num_groups();
+      ARROW_RETURN_NOT_OK(part.partitioned->Finish());
+    } else {
+      ++local_tables;
+      partial_groups += part.single->num_groups();
+      ARROW_RETURN_NOT_OK(part.single->Partition());
+    }
   }
+  const auto partition_done = Clock::now();
+  const auto cpu_partition_done = std::clock();
   uint64_t groups = 0;
   Clock::duration lane_merge_wall{};
   std::clock_t lane_merge_cpu = 0;
@@ -1240,8 +1308,15 @@ arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm a
     // Time all incoming parts for this destination with one pair of clock reads per clock.
     const auto lane_start = Clock::now();
     const auto cpu_lane_start = std::clock();
-    for (const auto& part : parts) {
-      ARROW_RETURN_NOT_OK(dest->MergePartition(*part, lane));
+    for (auto& part : parts) {
+      if (arm.local == LocalLayout::kPartitioned) {
+        if (auto source = part.partitioned->ReleasePartition(lane)) {
+          ++local_tables;
+          ARROW_RETURN_NOT_OK(dest->Merge(*source));
+        }
+      } else {
+        ARROW_RETURN_NOT_OK(dest->MergePartition(*part.single, lane));
+      }
     }
     const auto output_start = Clock::now();
     const auto cpu_output_start = std::clock();
@@ -1259,22 +1334,27 @@ arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm a
   return ProgramTimes{
       .local_ms = Millis(local_done - start).count(),
       .merge_ms = Millis(Clock::now() - local_done - output_wall).count(),
+      .partition_ms = Millis(partition_done - local_done).count(),
       .lane_merge_ms = Millis(lane_merge_wall).count(),
       .output_ms = Millis(output_wall).count(),
       .local_cpu_ms = 1000.0 * static_cast<double>(cpu_local_done - cpu_start) / CLOCKS_PER_SEC,
       .merge_cpu_ms =
           1000.0 * static_cast<double>(std::clock() - cpu_local_done - output_cpu) / CLOCKS_PER_SEC,
+      .partition_cpu_ms =
+          1000.0 * static_cast<double>(cpu_partition_done - cpu_local_done) / CLOCKS_PER_SEC,
       .lane_merge_cpu_ms = 1000.0 * static_cast<double>(lane_merge_cpu) / CLOCKS_PER_SEC,
       .output_cpu_ms = 1000.0 * static_cast<double>(output_cpu) / CLOCKS_PER_SEC,
       .partial_groups = partial_groups,
-      .groups = groups};
+      .groups = groups,
+      .local_tables = local_tables,
+      .local_bytes = local_bytes};
 }
 
 void GroupProgram(benchmark::State& state, GroupShape shape, ProgramArm arm, GroupIds ids,
-                  std::size_t lanes) {
+                  std::size_t lanes, bool selected) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
-  const auto in = MakeProgramInput(shape, groups, ids);
+  const auto in = MakeProgramInput(shape, groups, ids, selected);
   if (!in.ok()) {
     state.SkipWithError(in.status().ToString());
     return;
@@ -1284,6 +1364,9 @@ void GroupProgram(benchmark::State& state, GroupShape shape, ProgramArm arm, Gro
   if (std::ranges::find(checked, state.name()) == checked.end()) {
     std::vector<ExpectedGroup> expected(Narrow<std::size_t>(groups));
     for (int64_t row = 0; row < rows; ++row) {
+      if (selected && !ProgramSelection(row).value_or(false)) {
+        continue;
+      }
       auto& group = expected[GroupIdOf(row, groups, ids)];
       ++group.count;
       if (const auto value = ProgramValue(row); value.has_value()) {
@@ -1311,28 +1394,37 @@ void GroupProgram(benchmark::State& state, GroupShape shape, ProgramArm arm, Gro
     }
     times.local_ms += result->local_ms;
     times.merge_ms += result->merge_ms;
+    times.partition_ms += result->partition_ms;
     times.lane_merge_ms += result->lane_merge_ms;
     times.output_ms += result->output_ms;
     times.local_cpu_ms += result->local_cpu_ms;
     times.merge_cpu_ms += result->merge_cpu_ms;
+    times.partition_cpu_ms += result->partition_cpu_ms;
     times.lane_merge_cpu_ms += result->lane_merge_cpu_ms;
     times.output_cpu_ms += result->output_cpu_ms;
     times.partial_groups = result->partial_groups;
     times.groups = result->groups;
+    times.local_tables = result->local_tables;
+    times.local_bytes = result->local_bytes;
     benchmark::DoNotOptimize(times.groups);
   }
   state.counters["local_ms"] = {times.local_ms, benchmark::Counter::kAvgIterations};
   state.counters["merge_ms"] = {times.merge_ms, benchmark::Counter::kAvgIterations};
+  state.counters["partition_ms"] = {times.partition_ms, benchmark::Counter::kAvgIterations};
   state.counters["lane_merge_ms"] = {times.lane_merge_ms, benchmark::Counter::kAvgIterations};
   state.counters["output_ms"] = {times.output_ms, benchmark::Counter::kAvgIterations};
   state.counters["local_cpu_ms"] = {times.local_cpu_ms, benchmark::Counter::kAvgIterations};
   state.counters["merge_cpu_ms"] = {times.merge_cpu_ms, benchmark::Counter::kAvgIterations};
+  state.counters["partition_cpu_ms"] = {times.partition_cpu_ms, benchmark::Counter::kAvgIterations};
   state.counters["lane_merge_cpu_ms"] = {times.lane_merge_cpu_ms,
                                          benchmark::Counter::kAvgIterations};
   state.counters["output_cpu_ms"] = {times.output_cpu_ms, benchmark::Counter::kAvgIterations};
   state.counters["pool_peak_bytes"] = static_cast<double>(budget.max_memory());
   state.counters["partial_groups"] = static_cast<double>(times.partial_groups);
   state.counters["groups"] = static_cast<double>(times.groups);
+  state.counters["local_tables"] = static_cast<double>(times.local_tables);
+  state.counters["local_bytes"] = static_cast<double>(times.local_bytes);
+  state.counters["local_rows"] = static_cast<double>(in->selected_rows);
   state.SetItemsProcessed(state.iterations() * rows);
 }
 
@@ -1340,20 +1432,26 @@ void RegisterGroupPrograms() {
   using enum exec::KeyTableKind;
   using enum exec::GroupTableMode;
   const auto add = [](GroupShape shape, const std::string& name, GroupIds ids, std::size_t lanes,
-                      std::initializer_list<int64_t> counts) {
+                      std::initializer_list<int64_t> counts, bool selected = false) {
     const auto add_arm = [&](ProgramArm arm) {
       auto* bench = benchmark::RegisterBenchmark(
           ("BM_GroupProgram/" + name + "/" + arm.name).c_str(),
-          [=](benchmark::State& state) { GroupProgram(state, shape, arm, ids, lanes); });
+          [=](benchmark::State& state) { GroupProgram(state, shape, arm, ids, lanes, selected); });
       bench->Unit(benchmark::kMillisecond);
       for (int64_t groups : counts) {
         bench->Arg(groups);
       }
     };
-    add_arm({"Grouper", kGrouper, kSeparate});
-    add_arm({"Fixed", kFixed, kSeparate});
-    add_arm({"Batch", kFixed, kBatch});
-    if (shape == GroupShape::kInt64Int32Bool) {
+    if (!selected) {
+      add_arm({"Grouper", kGrouper, kSeparate});
+      add_arm({"Fixed", kFixed, kSeparate});
+      add_arm({"Batch", kFixed, kBatch});
+    }
+    if (lanes == exec::GroupTable::kPartitions) {
+      add_arm({"Single", kFixed, kBatch, false, LocalLayout::kSingle});
+      add_arm({"Partitioned", kFixed, kBatch, false, LocalLayout::kPartitioned});
+    }
+    if (shape == GroupShape::kInt64Int32Bool && !selected) {
       add_arm({"DensePrefetch", kFixed, kBatch, true});
     }
   };
@@ -1363,6 +1461,8 @@ void RegisterGroupPrograms() {
   add(GroupShape::kInt64, "Int64", GroupIds::kRandom, kLanes, counts);
   add(GroupShape::kInt64Int32, "Int64Int32", GroupIds::kRandom, kLanes, counts);
   add(GroupShape::kInt64Int32Bool, "Int64Int32Bool", GroupIds::kRandom, kLanes, counts);
+  add(GroupShape::kInt64Int32Bool, "Int64Int32BoolSelected", GroupIds::kRandom, kLanes,
+      {256 * 1024}, true);
   add(GroupShape::kInt64, "Int64Clustered", GroupIds::kClustered, kLanes, {256 * 1024});
   add(GroupShape::kInt64Int32Bool, "Int64Int32BoolClustered", GroupIds::kClustered, kLanes,
       {256 * 1024});

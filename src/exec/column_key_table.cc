@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <span>
@@ -26,6 +27,7 @@
 #include "antb1/common/narrow.h"
 
 #include "fold_hash.h"
+#include "group_vector.h"
 #include "key_routing_hash.h"
 #include "pool_vector.h"
 
@@ -99,10 +101,11 @@ struct Column {
 // Width is chosen once per column per chunk. A NULL skips the input payload and sets this
 // column's bit in its row's mask. HashChunk mixes the mask after each block of up to 64 columns.
 template <std::size_t kWidth>
-void HashColumn(const Source& source, std::size_t start, std::span<std::uint64_t> hashes,
-                std::span<std::uint64_t> null_masks, std::uint64_t column_bit) {
+void HashColumn(const Source& source, std::size_t start, const auto& row_at,
+                std::span<std::uint64_t> hashes, std::span<std::uint64_t> null_masks,
+                std::uint64_t column_bit) {
   for (std::size_t i = 0; i < hashes.size(); ++i) {
-    const auto row = start + i;
+    const auto row = row_at(start + i);
     if (!source.Present(row)) {
       null_masks[i] |= column_bit;
       hashes[i] = FoldHash::Mix(FoldHash::kSeed, hashes[i]);
@@ -223,7 +226,8 @@ class ColumnKeyTable final : public StoredKeyTable {
       const std::uint32_t before = groups_;
       ARROW_ASSIGN_OR_RAISE(auto owner, IdBuffer(batch));
       auto* ids = owner->mutable_data_as<std::uint32_t>();
-      ARROW_RETURN_NOT_OK(ProbeRows<true>(batch, ids, nullptr));
+      ARROW_RETURN_NOT_OK(
+          ProbeRows<true>(batch, Narrow<std::size_t>(batch.length), std::identity{}, ids, nullptr));
       return KeyIds{.owner = std::move(owner),
                     .ids = {ids, Narrow<std::size_t>(batch.length)},
                     .before = before,
@@ -235,7 +239,19 @@ class ColumnKeyTable final : public StoredKeyTable {
                               const KeyIdConsumer& consume) override {
     return KeyTableNoBadAlloc([&] {
       ARROW_RETURN_NOT_OK(CheckBatch(batch));
-      return ProbeRows<true>(batch, nullptr, &consume);
+      return ProbeRows<true>(batch, Narrow<std::size_t>(batch.length), std::identity{}, nullptr,
+                             &consume);
+    });
+  }
+
+  arrow::Status ConsumeSelected(const arrow::compute::ExecBatch& batch,
+                                std::span<const std::uint32_t> rows,
+                                const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      ARROW_RETURN_NOT_OK(CheckBatch(batch));
+      ARROW_RETURN_NOT_OK(CheckSelection(rows, Narrow<std::size_t>(batch.length)));
+      return ProbeRows<true>(
+          batch, rows.size(), [rows](std::size_t i) { return rows[i]; }, nullptr, &consume);
     });
   }
 
@@ -289,7 +305,8 @@ class ColumnKeyTable final : public StoredKeyTable {
       }
       ARROW_ASSIGN_OR_RAISE(auto owner, IdBuffer(batch));
       auto* ids = owner->mutable_data_as<std::uint32_t>();
-      ARROW_RETURN_NOT_OK(ProbeRows<false>(batch, ids, nullptr));
+      ARROW_RETURN_NOT_OK(ProbeRows<false>(batch, Narrow<std::size_t>(batch.length),
+                                           std::identity{}, ids, nullptr));
       std::shared_ptr<arrow::Buffer> validity;
       std::int64_t missing = 0;
       for (std::int64_t row = 0; row < batch.length; ++row) {
@@ -470,7 +487,7 @@ class ColumnKeyTable final : public StoredKeyTable {
     return buffer;
   }
 
-  void HashChunk(const PoolVector<Source>& sources, std::size_t start,
+  void HashChunk(const PoolVector<Source>& sources, std::size_t start, const auto& row_at,
                  std::span<std::uint64_t> hashes, std::span<std::uint64_t> null_masks) const {
     std::ranges::fill(hashes, FoldHash::kSeed);
     for (std::size_t block = 0; block < columns_.size(); block += kMaskBits) {
@@ -481,19 +498,19 @@ class ColumnKeyTable final : public StoredKeyTable {
         const auto column_bit = std::uint64_t{1} << bit;
         switch (columns_[c].width) {
           case 0:
-            HashColumn<0>(sources[c], start, hashes, null_masks, column_bit);
+            HashColumn<0>(sources[c], start, row_at, hashes, null_masks, column_bit);
             break;
           case 2:
-            HashColumn<2>(sources[c], start, hashes, null_masks, column_bit);
+            HashColumn<2>(sources[c], start, row_at, hashes, null_masks, column_bit);
             break;
           case 4:
-            HashColumn<4>(sources[c], start, hashes, null_masks, column_bit);
+            HashColumn<4>(sources[c], start, row_at, hashes, null_masks, column_bit);
             break;
           case 8:
-            HashColumn<8>(sources[c], start, hashes, null_masks, column_bit);
+            HashColumn<8>(sources[c], start, row_at, hashes, null_masks, column_bit);
             break;
           default:
-            HashColumn<16>(sources[c], start, hashes, null_masks, column_bit);
+            HashColumn<16>(sources[c], start, row_at, hashes, null_masks, column_bit);
             break;
         }
       }
@@ -504,9 +521,8 @@ class ColumnKeyTable final : public StoredKeyTable {
   }
 
   template <bool kInsert>
-  arrow::Status ProbeRows(const arrow::compute::ExecBatch& batch, std::uint32_t* output,
-                          const KeyIdConsumer* consume) {
-    const auto rows = Narrow<std::size_t>(batch.length);
+  arrow::Status ProbeRows(const arrow::compute::ExecBatch& batch, std::size_t rows,
+                          const auto& row_at, std::uint32_t* output, const KeyIdConsumer* consume) {
     if (rows == 0) {
       return arrow::Status::OK();
     }
@@ -526,10 +542,10 @@ class ColumnKeyTable final : public StoredKeyTable {
     }
     for (std::size_t start = 0; start < rows; start += kChunk) {
       std::span<std::uint64_t> hashes(chunk_.data(), std::min(kChunk, rows - start));
-      HashChunk(sources, start, hashes, {chunk_.data() + kChunk, hashes.size()});
+      HashChunk(sources, start, row_at, hashes, {chunk_.data() + kChunk, hashes.size()});
       auto* ids = consume == nullptr ? output + start : chunk_ids_.data();
       for (std::size_t i = 0; i < hashes.size(); ++i) {
-        ARROW_RETURN_NOT_OK(Probe<kInsert>(hashes[i], sources, start + i, ids[i]));
+        ARROW_RETURN_NOT_OK(Probe<kInsert>(hashes[i], sources, row_at(start + i), ids[i]));
       }
       if (consume != nullptr) {
         ARROW_RETURN_NOT_OK((*consume)(start, {ids, hashes.size()}, groups_));
@@ -653,10 +669,11 @@ class ColumnKeyTable final : public StoredKeyTable {
 
 }  // namespace
 
-std::unique_ptr<KeyTable> MakeColumnKeyTable(const std::vector<arrow::TypeHolder>& types,
-                                             arrow::MemoryPool* pool,
-                                             const KeyTableOptions& options, MemoryBudget* budget) {
-  return std::make_unique<ColumnKeyTable>(types, pool, options, budget);
+arrow::Result<std::unique_ptr<KeyTable>> MakeColumnKeyTable(
+    const std::vector<arrow::TypeHolder>& types, arrow::MemoryPool* pool,
+    const KeyTableOptions& options, MemoryBudget* budget) {
+  return MakeGroupObject<KeyTable, ColumnKeyTable>(options.table_metadata, types, pool, options,
+                                                   budget);
 }
 
 }  // namespace antb1::exec
