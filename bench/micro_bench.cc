@@ -1173,26 +1173,41 @@ arrow::Status DrainProgramLane(exec::GroupTable& lane, const ProgramInput& in,
 struct ProgramTimes {
   double local_ms = 0;
   double merge_ms = 0;
+  double lane_merge_ms = 0;
   double output_ms = 0;
   double local_cpu_ms = 0;
   double merge_cpu_ms = 0;
+  double lane_merge_cpu_ms = 0;
   double output_cpu_ms = 0;
   uint64_t partial_groups = 0;
   uint64_t groups = 0;
 };
 
-arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, exec::KeyTableKind kind,
-                                            exec::GroupTableMode mode, std::size_t lanes,
-                                            exec::MemoryBudget& budget,
+struct ProgramArm {
+  const char* name;
+  exec::KeyTableKind kind;
+  exec::GroupTableMode mode;
+  bool prefetch_merge = false;
+};
+
+arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, ProgramArm arm,
+                                            std::size_t lanes, exec::MemoryBudget& budget,
                                             std::vector<ExpectedGroup>* expected = nullptr) {
   using Clock = std::chrono::steady_clock;
   using Millis = std::chrono::duration<double, std::milli>;
+  const bool verify_merge =
+      expected != nullptr && in.keys.size() == 3 && arm.mode == exec::GroupTableMode::kBatch;
+  bool observed_prefetch = !arm.prefetch_merge;
   const auto make = [&](bool destination) -> arrow::Result<std::unique_ptr<exec::GroupTable>> {
-    ARROW_ASSIGN_OR_RAISE(
-        auto table, exec::GroupTable::Make(in.keys, in.calls, in.batches.front()->num_columns(),
-                                           &budget, &budget, destination, lanes,
-                                           {.kind = kind, .estimate = !destination}, mode));
-    if (table->uses_batch_program() != (mode == exec::GroupTableMode::kBatch)) {
+    exec::KeyTableOptions options{
+        .kind = arm.kind,
+        .estimate = !destination,
+        .prefetch_composite_merge = destination && arm.prefetch_merge,
+        .prefetched_composite_merge = destination && verify_merge ? &observed_prefetch : nullptr};
+    ARROW_ASSIGN_OR_RAISE(auto table, exec::GroupTable::Make(
+                                          in.keys, in.calls, in.batches.front()->num_columns(),
+                                          &budget, &budget, destination, lanes, options, arm.mode));
+    if (table->uses_batch_program() != (arm.mode == exec::GroupTableMode::kBatch)) {
       return arrow::Status::Invalid("aggregate benchmark selected an unexpected program");
     }
     return table;
@@ -1216,35 +1231,47 @@ arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, exec::KeyTab
     ARROW_RETURN_NOT_OK(part->Partition());
   }
   uint64_t groups = 0;
+  Clock::duration lane_merge_wall{};
+  std::clock_t lane_merge_cpu = 0;
   Clock::duration output_wall{};
   std::clock_t output_cpu = 0;
   for (std::size_t lane = 0; lane < lanes; ++lane) {
     ARROW_ASSIGN_OR_RAISE(auto dest, make(true));
+    // Time all incoming parts for this destination with one pair of clock reads per clock.
+    const auto lane_start = Clock::now();
+    const auto cpu_lane_start = std::clock();
     for (const auto& part : parts) {
       ARROW_RETURN_NOT_OK(dest->MergePartition(*part, lane));
     }
-    groups += dest->num_groups();
     const auto output_start = Clock::now();
     const auto cpu_output_start = std::clock();
+    lane_merge_wall += output_start - lane_start;
+    lane_merge_cpu += cpu_output_start - cpu_lane_start;
+    groups += dest->num_groups();
     ARROW_RETURN_NOT_OK(DrainProgramLane(*dest, in, expected));
     output_cpu += std::clock() - cpu_output_start;
     output_wall += Clock::now() - output_start;
   }
   parts.clear();
+  if (verify_merge && observed_prefetch != arm.prefetch_merge) {
+    return arrow::Status::Invalid("aggregate benchmark did not observe its composite merge");
+  }
   return ProgramTimes{
       .local_ms = Millis(local_done - start).count(),
       .merge_ms = Millis(Clock::now() - local_done - output_wall).count(),
+      .lane_merge_ms = Millis(lane_merge_wall).count(),
       .output_ms = Millis(output_wall).count(),
       .local_cpu_ms = 1000.0 * static_cast<double>(cpu_local_done - cpu_start) / CLOCKS_PER_SEC,
       .merge_cpu_ms =
           1000.0 * static_cast<double>(std::clock() - cpu_local_done - output_cpu) / CLOCKS_PER_SEC,
+      .lane_merge_cpu_ms = 1000.0 * static_cast<double>(lane_merge_cpu) / CLOCKS_PER_SEC,
       .output_cpu_ms = 1000.0 * static_cast<double>(output_cpu) / CLOCKS_PER_SEC,
       .partial_groups = partial_groups,
       .groups = groups};
 }
 
-void GroupProgram(benchmark::State& state, GroupShape shape, exec::KeyTableKind kind,
-                  exec::GroupTableMode mode, GroupIds ids, std::size_t lanes) {
+void GroupProgram(benchmark::State& state, GroupShape shape, ProgramArm arm, GroupIds ids,
+                  std::size_t lanes) {
   const int64_t groups = state.range(0);
   const int64_t rows = GroupRowsFor(groups);
   const auto in = MakeProgramInput(shape, groups, ids);
@@ -1265,7 +1292,7 @@ void GroupProgram(benchmark::State& state, GroupShape shape, exec::KeyTableKind 
       }
     }
     exec::MemoryBudget validation(std::nullopt);
-    const auto result = RunGroupProgram(*in, kind, mode, lanes, validation, &expected);
+    const auto result = RunGroupProgram(*in, arm, lanes, validation, &expected);
     if (!result.ok() || validation.bytes_allocated() != 0 ||
         std::ranges::any_of(expected, [](const auto& group) { return group.count != 0; })) {
       state.SkipWithError(result.ok() ? "unmatched group or unreleased memory"
@@ -1277,16 +1304,18 @@ void GroupProgram(benchmark::State& state, GroupShape shape, exec::KeyTableKind 
   exec::MemoryBudget budget(std::nullopt);
   ProgramTimes times;
   for (auto _ : state) {
-    const auto result = RunGroupProgram(*in, kind, mode, lanes, budget);
+    const auto result = RunGroupProgram(*in, arm, lanes, budget);
     if (!result.ok()) {
       state.SkipWithError(result.status().ToString());
       return;
     }
     times.local_ms += result->local_ms;
     times.merge_ms += result->merge_ms;
+    times.lane_merge_ms += result->lane_merge_ms;
     times.output_ms += result->output_ms;
     times.local_cpu_ms += result->local_cpu_ms;
     times.merge_cpu_ms += result->merge_cpu_ms;
+    times.lane_merge_cpu_ms += result->lane_merge_cpu_ms;
     times.output_cpu_ms += result->output_cpu_ms;
     times.partial_groups = result->partial_groups;
     times.groups = result->groups;
@@ -1294,9 +1323,12 @@ void GroupProgram(benchmark::State& state, GroupShape shape, exec::KeyTableKind 
   }
   state.counters["local_ms"] = {times.local_ms, benchmark::Counter::kAvgIterations};
   state.counters["merge_ms"] = {times.merge_ms, benchmark::Counter::kAvgIterations};
+  state.counters["lane_merge_ms"] = {times.lane_merge_ms, benchmark::Counter::kAvgIterations};
   state.counters["output_ms"] = {times.output_ms, benchmark::Counter::kAvgIterations};
   state.counters["local_cpu_ms"] = {times.local_cpu_ms, benchmark::Counter::kAvgIterations};
   state.counters["merge_cpu_ms"] = {times.merge_cpu_ms, benchmark::Counter::kAvgIterations};
+  state.counters["lane_merge_cpu_ms"] = {times.lane_merge_cpu_ms,
+                                         benchmark::Counter::kAvgIterations};
   state.counters["output_cpu_ms"] = {times.output_cpu_ms, benchmark::Counter::kAvgIterations};
   state.counters["pool_peak_bytes"] = static_cast<double>(budget.max_memory());
   state.counters["partial_groups"] = static_cast<double>(times.partial_groups);
@@ -1309,16 +1341,20 @@ void RegisterGroupPrograms() {
   using enum exec::GroupTableMode;
   const auto add = [](GroupShape shape, const std::string& name, GroupIds ids, std::size_t lanes,
                       std::initializer_list<int64_t> counts) {
-    for (const auto& [arm, kind, mode] :
-         {std::tuple{"Grouper", kGrouper, kSeparate}, std::tuple{"Fixed", kFixed, kSeparate},
-          std::tuple{"Batch", kFixed, kBatch}}) {
+    const auto add_arm = [&](ProgramArm arm) {
       auto* bench = benchmark::RegisterBenchmark(
-          ("BM_GroupProgram/" + name + "/" + arm).c_str(),
-          [=](benchmark::State& state) { GroupProgram(state, shape, kind, mode, ids, lanes); });
+          ("BM_GroupProgram/" + name + "/" + arm.name).c_str(),
+          [=](benchmark::State& state) { GroupProgram(state, shape, arm, ids, lanes); });
       bench->Unit(benchmark::kMillisecond);
       for (int64_t groups : counts) {
         bench->Arg(groups);
       }
+    };
+    add_arm({"Grouper", kGrouper, kSeparate});
+    add_arm({"Fixed", kFixed, kSeparate});
+    add_arm({"Batch", kFixed, kBatch});
+    if (shape == GroupShape::kInt64Int32Bool) {
+      add_arm({"DensePrefetch", kFixed, kBatch, true});
     }
   };
   const std::initializer_list<int64_t> counts = {1000, 16 * 1024, 256 * 1024, 1024 * 1024,

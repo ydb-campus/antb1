@@ -133,6 +133,11 @@ struct KeyTableOptions {
   bool estimate = true;
   // Lower only in tests; the fixed backend rejects an additional group with OutOfMemory.
   std::uint32_t max_groups = kMaxKeyTableGroups;
+  // Stage selected stored column keys in bounded chunks and prefetch destination probe slots.
+  bool prefetch_composite_merge = false;
+  // Optional test/benchmark witness set when a nonempty column-key merge enters its probe loop.
+  // A destination with a witness must have exclusive access to it for the table's lifetime.
+  bool* prefetched_composite_merge = nullptr;
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`

@@ -18,6 +18,7 @@
 #include <arrow/stl_allocator.h>
 #include <arrow/type.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/bitmap_generate.h>
 #include <arrow/util/bitmap_ops.h>
 #include <arrow/util/hashing.h>
 
@@ -175,20 +176,38 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> CopyValues(const Column& col, std:
   return out;
 }
 
+void GatherSelectedBits(const std::uint8_t* source, std::span<const std::uint32_t> selected,
+                        std::uint8_t* out) {
+  const auto* id = selected.data();
+  arrow::internal::GenerateBitsUnrolled(out, 0, Narrow<std::int64_t>(selected.size()),
+                                        [&] { return arrow::bit_util::GetBit(source, *id++); });
+}
+
+template <std::size_t kWidth>
+void GatherSelectedValues(const std::uint8_t* source, std::span<const std::uint32_t> selected,
+                          std::uint8_t* out) {
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    std::memcpy(out + (i * kWidth), source + (selected[i] * kWidth), kWidth);
+  }
+}
+
 class ColumnKeyTable final : public StoredKeyTable {
  public:
   ColumnKeyTable(const std::vector<arrow::TypeHolder>& types, arrow::MemoryPool* pool,
-                 std::uint32_t max_groups, MemoryBudget* budget)
+                 const KeyTableOptions& options, MemoryBudget* budget)
       : StoredKeyTable(pool, budget),
-        max_groups_(max_groups),
+        max_groups_(options.max_groups),
+        prefetch_composite_merge_(options.prefetch_composite_merge),
+        merge_witness_(options.prefetched_composite_merge),
         columns_(arrow::stl::allocator<Column>(pool)),
         storage_(pool),
         hashes_(pool),
         slots_(pool),
         chunk_(pool),
-        chunk_ids_(pool) {
-    ANTB1_CHECK(max_groups > 0);
-    ANTB1_CHECK(max_groups < kMissing);
+        chunk_ids_(pool),
+        merge_chunk_(pool) {
+    ANTB1_CHECK(max_groups_ > 0);
+    ANTB1_CHECK(max_groups_ < kMissing);
     columns_.reserve(types.size());
     for (const auto& type : types) {
       const auto width =
@@ -236,11 +255,17 @@ class ColumnKeyTable final : public StoredKeyTable {
       ARROW_RETURN_NOT_OK(CheckSelection(groups, stored->groups_));
       PoolVector<Source> sources(pool_);
       ARROW_RETURN_NOT_OK(sources.Resize(columns_.size()));
+      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
+      if (prefetch_composite_merge_) {
+        return MergePrefetched(*stored, groups, sources, consume);
+      }
       for (std::size_t c = 0; c < columns_.size(); ++c) {
         const auto& col = stored->columns_[c];
         sources[c] = {.values = col.values, .validity = col.validity, .offset = 0};
       }
-      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
+      if (merge_witness_ != nullptr) {
+        *merge_witness_ = false;
+      }
       for (std::size_t start = 0; start < groups.size(); start += kChunk) {
         const auto selected = groups.subspan(start, std::min(kChunk, groups.size() - start));
         for (std::size_t i = 0; i < selected.size(); ++i) {
@@ -329,6 +354,78 @@ class ColumnKeyTable final : public StoredKeyTable {
   std::uint32_t num_groups() const override { return groups_; }
 
  private:
+  // Stored source payloads, including those at NULL positions, are initialized by Append.
+  // The tile uses the same per-column layout as the owned store, with a capacity of kChunk.
+  void GatherColumns(const ColumnKeyTable& source, std::span<const std::uint32_t> selected,
+                     std::uint8_t* storage, PoolVector<Source>& sources) const {
+    constexpr auto kBitmapBytes = kChunk / 8;
+    for (std::size_t c = 0; c < columns_.size(); ++c) {
+      const auto& col = source.columns_[c];
+      auto* validity = storage + (col.preceding_bits * kBitmapBytes);
+      auto* values = validity + kBitmapBytes;
+      if (col.nulls == 0) {
+        std::memset(validity, 0xff, (selected.size() + 7) / 8);
+      } else {
+        GatherSelectedBits(col.validity, selected, validity);
+      }
+      switch (col.width) {
+        case 0:
+          GatherSelectedBits(col.values, selected, values);
+          break;
+        case 2:
+          GatherSelectedValues<2>(col.values, selected, values);
+          break;
+        case 4:
+          GatherSelectedValues<4>(col.values, selected, values);
+          break;
+        case 8:
+          GatherSelectedValues<8>(col.values, selected, values);
+          break;
+        default:
+          ANTB1_DCHECK(col.width == 16);
+          GatherSelectedValues<16>(col.values, selected, values);
+          break;
+      }
+      sources[c] = {.values = values, .validity = validity, .offset = 0};
+    }
+  }
+
+  arrow::Status MergePrefetched(const ColumnKeyTable& source, std::span<const std::uint32_t> groups,
+                                PoolVector<Source>& sources, const KeyIdConsumer& consume) {
+    static_assert(kChunk % kMaskBits == 0);
+    constexpr auto kWordsPerColumnBit = kChunk / kMaskBits;
+    constexpr auto kMaxWords =
+        static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) / sizeof(std::uint64_t);
+    if (row_bits_ > (kMaxWords - kChunk) / kWordsPerColumnBit) {
+      return arrow::Status::CapacityError("composite merge scratch size overflow");
+    }
+    ARROW_RETURN_NOT_OK(merge_chunk_.Resize(kChunk + (row_bits_ * kWordsPerColumnBit)));
+    if (merge_witness_ != nullptr) {
+      *merge_witness_ = true;
+    }
+    auto* hashes = merge_chunk_.data();
+    auto* ids = chunk_ids_.data();
+    const auto* stored_hashes = source.hashes_.data();
+    for (std::size_t start = 0; start < groups.size(); start += kChunk) {
+      const auto selected = groups.subspan(start, std::min(kChunk, groups.size() - start));
+      for (std::size_t i = 0; i < selected.size(); ++i) {
+        hashes[i] = stored_hashes[selected[i]];
+      }
+      GatherColumns(source, selected, reinterpret_cast<std::uint8_t*>(hashes + kChunk), sources);
+      for (std::size_t i = 0; i < selected.size(); ++i) {
+        constexpr std::size_t kAhead = 8;
+        // Probe can grow the table on any miss. Read the current base and mask for each hint.
+        if (i + kAhead < selected.size() && !slots_.empty()) {
+          const auto bucket = hashes[i + kAhead] & (slots_.size() - 1);
+          __builtin_prefetch(slots_.data() + bucket);
+        }
+        ARROW_RETURN_NOT_OK(Probe<true>(hashes[i], sources, i, ids[i]));
+      }
+      ARROW_RETURN_NOT_OK(consume(start, {ids, selected.size()}, groups_));
+    }
+    return arrow::Status::OK();
+  }
+
   // A range uses bulk byte/bitmap copies. A mixed-backend lane gathers only its own source IDs.
   arrow::Result<KeySnapshot> BuildUniques(std::uint32_t first, std::uint32_t count,
                                           std::span<const std::uint32_t> selected) const {
@@ -541,14 +638,17 @@ class ColumnKeyTable final : public StoredKeyTable {
   }
 
   std::uint32_t max_groups_;
+  bool prefetch_composite_merge_;
+  bool* merge_witness_;
   std::vector<Column, arrow::stl::allocator<Column>> columns_;
   std::size_t row_bits_ = 0;
   std::uint32_t groups_ = 0;
-  PoolVector<std::uint8_t> storage_;     // owned columns and their validity, in dense ID order
-  PoolVector<std::uint64_t> hashes_;     // group ID -> full probe hash
-  PoolVector<std::uint32_t> slots_;      // bucket -> group ID or kMissing
-  PoolVector<std::uint64_t> chunk_;      // kChunk hashes followed by kChunk column NULL masks
-  PoolVector<std::uint32_t> chunk_ids_;  // only for consumers of borrowed chunk IDs
+  PoolVector<std::uint8_t> storage_;       // owned columns and their validity, in dense ID order
+  PoolVector<std::uint64_t> hashes_;       // group ID -> full probe hash
+  PoolVector<std::uint32_t> slots_;        // bucket -> group ID or kMissing
+  PoolVector<std::uint64_t> chunk_;        // kChunk hashes followed by kChunk column NULL masks
+  PoolVector<std::uint32_t> chunk_ids_;    // only for consumers of borrowed chunk IDs
+  PoolVector<std::uint64_t> merge_chunk_;  // selected hashes followed by dense key columns
 };
 
 }  // namespace
@@ -556,7 +656,7 @@ class ColumnKeyTable final : public StoredKeyTable {
 std::unique_ptr<KeyTable> MakeColumnKeyTable(const std::vector<arrow::TypeHolder>& types,
                                              arrow::MemoryPool* pool,
                                              const KeyTableOptions& options, MemoryBudget* budget) {
-  return std::make_unique<ColumnKeyTable>(types, pool, options.max_groups, budget);
+  return std::make_unique<ColumnKeyTable>(types, pool, options, budget);
 }
 
 }  // namespace antb1::exec
