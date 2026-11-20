@@ -4259,8 +4259,10 @@ TEST(BinderTest, JoinsTheSmallEndpointsThroughAnImpliedKey) {
            {"=", "="},
            {"IS NOT DISTINCT FROM", "IS NOT DISTINCT FROM"},
            {"IS NOT DISTINCT FROM", "="}}) {
-    auto stmt = sql::Parse("SELECT COUNT(*) FROM alpha, bridge, omega WHERE alpha.k " + first +
-                           " bridge.k AND bridge.k " + second + " omega.k");
+    auto stmt =
+        sql::Parse(std::format("SELECT COUNT(*) FROM alpha, bridge, omega WHERE alpha.k {} "
+                               "bridge.k AND bridge.k {} omega.k",
+                               first, second));
     ASSERT_TRUE(stmt.has_value());
     auto plan = Bind(*stmt, catalog);
     ASSERT_TRUE(plan.ok()) << plan.status().ToString();
