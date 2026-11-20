@@ -1191,6 +1191,44 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
 
+// The second batch has 64 hits among its 128 rows. Count its required heap allocations on the
+// same fixed table with sizing disabled, then fail the first allocation made by the estimate.
+TEST_F(KeyTableBadAllocTest, NoHeapForTheFixedTableEstimateStillReturnsTheIds) {
+  std::vector<std::optional<std::int64_t>> values;
+  values.reserve(320);
+  for (std::int64_t i = 0; i < 320; ++i) {
+    values.emplace_back(i);
+  }
+  const auto keys = Int64s(values);
+  const arrow::compute::ExecBatch first({keys->Slice(0, 256)}, 256);
+  const arrow::compute::ExecBatch second({keys->Slice(192, 128)}, 128);
+  std::int64_t required = 0;
+  for (const bool estimate : {false, true}) {
+    MemoryBudget budget(std::nullopt);
+    arrow::compute::ExecContext ctx(&budget);
+    auto table =
+        MakeKeyTable({arrow::int64()}, &ctx, {.kind = KeyTableKind::kFixed, .estimate = estimate});
+    ASSERT_TRUE(table.ok()) << table.status();
+    ASSERT_TRUE((*table)->Consume(first).ok());
+    std::optional<arrow::Result<KeyIds>> ids;
+    std::int64_t failed = 0;
+    {
+      const FailAllocations fail(required, estimate ? 1 : 0);
+      ids.emplace((*table)->Consume(second));
+      required = fail.seen();
+      failed = fail.failed();
+    }
+    EXPECT_EQ(failed, estimate ? 1 : 0);
+    ASSERT_TRUE(ids->ok()) << ids->status();
+    EXPECT_EQ((*ids)->before, 256U);
+    EXPECT_EQ((*ids)->after, 320U);
+    ASSERT_EQ((*ids)->ids.size(), 128U);
+    for (std::size_t row = 0; row < (*ids)->ids.size(); ++row) {
+      EXPECT_EQ((*ids)->ids[row], 192U + row);
+    }
+  }
+}
+
 class WindowBadAllocTest : public testing::ExecTest {};
 
 TEST_F(WindowBadAllocTest, OpenAndNextReleaseEveryFailedAllocation) {

@@ -412,8 +412,10 @@ arrow::Status PartGroupAggregateOperator::Merge() {
     if (lanes == nullptr) {
       tables_.reserve(partitions);
       for (std::size_t p = 0; p < partitions; ++p) {
-        ARROW_ASSIGN_OR_RAISE(auto table,
-                              GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_));
+        ARROW_ASSIGN_OR_RAISE(
+            auto table,
+            GroupTable::Make(keys_, aggregates_, input_width_, pool_, budget_,
+                             /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
         tables_.push_back(std::move(table));
       }
       lanes = std::make_unique<PartitionLanes>(partitions, executor_, window_, budget_);
@@ -637,7 +639,8 @@ arrow::Status PartGroupingSetsOperator::Merge() {
     for (std::size_t p = 0; p < partitions; ++p) {
       ARROW_ASSIGN_OR_RAISE(
           auto table, GroupTable::Make(SetKeys(keys_, shape_->sets[r]), aggregates_, input_width_,
-                                       pool_, budget_));
+                                       pool_, budget_, /*first_keys=*/true, GroupTable::kPartitions,
+                                       {.estimate = false}));
       tables_[r].push_back(std::move(table));
     }
   }
@@ -760,8 +763,10 @@ arrow::Status PartGroupingSetsOperator::Probe() {
     if (root.num_groups() == 0) {
       return arrow::Status::OK();  // no groups: either way merges nothing
     }
-    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_,
-                                                       input_width_, pool_, budget_));
+    ARROW_ASSIGN_OR_RAISE(
+        auto table,
+        GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_, pool_, budget_,
+                         /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
     ARROW_RETURN_NOT_OK(table->MergeProjected(root, Projected(probe_keys[r], s, root.num_groups()),
                                               EveryGroup(root)));
     const int64_t groups = table->num_groups();
@@ -848,7 +853,8 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
         }
         ARROW_ASSIGN_OR_RAISE(
             auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_,
-                                         pool_, budget_));
+                                         pool_, budget_, /*first_keys=*/true,
+                                         GroupTable::kPartitions, {.estimate = false}));
         ARROW_RETURN_NOT_OK(table->MergeProjected(root, Projected(uniques, s, root.num_groups()),
                                                   EveryGroup(root)));
         ARROW_RETURN_NOT_OK(table->Partition());
@@ -874,8 +880,10 @@ arrow::Status PartGroupingSetsOperator::DeriveBatch(const std::vector<std::size_
   ARROW_RETURN_NOT_OK(ForEach(executor_, finals.size(), [&](std::size_t i) -> arrow::Status {
     const auto [s, q] = finals[i];
     const std::vector<std::unique_ptr<GroupTable>>& roots = tables_[shape.sources[s]];
-    ARROW_ASSIGN_OR_RAISE(auto table, GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_,
-                                                       input_width_, pool_, budget_));
+    ARROW_ASSIGN_OR_RAISE(
+        auto table,
+        GroupTable::Make(SetKeys(keys_, shape.sets[s]), aggregates_, input_width_, pool_, budget_,
+                         /*first_keys=*/true, GroupTable::kPartitions, {.estimate = false}));
     for (std::size_t p = 0; p < roots.size(); ++p) {
       if (partial_[s][p] != nullptr) {
         ARROW_RETURN_NOT_OK(table->MergePartition(*partial_[s][p], q));
@@ -1063,20 +1071,22 @@ struct InnerSpec {
 // their normalized keys, and no key it outputs is DOUBLE.
 arrow::Result<std::vector<std::unique_ptr<GroupTable>>> MakeInnerTables(const InnerSpec& spec,
                                                                         arrow::MemoryPool* pool,
-                                                                        MemoryBudget* budget) {
+                                                                        MemoryBudget* budget,
+                                                                        bool estimate) {
+  const KeyTableOptions key_table{.estimate = estimate};
   std::vector<std::unique_ptr<GroupTable>> tables;
   for (const plan::BoundColumn& column : spec.distinct) {
     std::vector<plan::BoundColumn> keys = spec.keys;
     keys.push_back(column);
     ARROW_ASSIGN_OR_RAISE(auto table,
                           GroupTable::Make(std::move(keys), {}, spec.width, pool, budget,
-                                           /*first_keys=*/false, kTwoLevelPartitions));
+                                           /*first_keys=*/false, kTwoLevelPartitions, key_table));
     tables.push_back(std::move(table));
   }
   if (!spec.plain.empty()) {
     ARROW_ASSIGN_OR_RAISE(auto table,
                           GroupTable::Make(spec.keys, spec.plain, spec.width, pool, budget,
-                                           /*first_keys=*/false, kTwoLevelPartitions));
+                                           /*first_keys=*/false, kTwoLevelPartitions, key_table));
     tables.push_back(std::move(table));
   }
   return tables;
@@ -1240,7 +1250,8 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
                     int64_t i, const std::atomic<bool>& stop) -> arrow::Result<PartTables> {
       const ProfileTimer part_time(profile, "part_time");
       auto part = std::make_shared<InnerPart>();
-      ARROW_ASSIGN_OR_RAISE(part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget));
+      ARROW_ASSIGN_OR_RAISE(
+          part->tables, MakeInnerTables(*spec, part_ctx.pool, part_ctx.budget, /*estimate=*/true));
       ARROW_RETURN_NOT_OK(RunPart(
           *pipeline, first + i, part_ctx, stop, [&](const Batch& batch) -> arrow::Result<bool> {
             ARROW_ASSIGN_OR_RAISE(const auto rows, Materialize(batch, part_ctx.pool));
@@ -1269,7 +1280,7 @@ arrow::Status PartTwoLevelAggregateOperator::Aggregate() {
   // Per inner table, one merged table per partition.
   tables_.clear();
   for (std::size_t p = 0; p < kTwoLevelPartitions; ++p) {
-    ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_));
+    ARROW_ASSIGN_OR_RAISE(auto made, MakeInnerTables(*spec, pool_, budget_, /*estimate=*/false));
     tables_.resize(made.size());
     for (std::size_t t = 0; t < made.size(); ++t) {
       tables_[t].push_back(std::move(made[t]));

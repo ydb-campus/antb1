@@ -42,7 +42,8 @@ using testing::Int32s;
 using testing::Int64s;
 
 constexpr std::array kKinds = {KeyTableKind::kAuto, KeyTableKind::kGrouper,
-                               KeyTableKind::kPackedStrings};
+                               KeyTableKind::kPackedStrings, KeyTableKind::kFixed,
+                               KeyTableKind::kFixedIdOrder};
 
 std::string_view KindName(KeyTableKind kind) {
   switch (kind) {
@@ -52,6 +53,10 @@ std::string_view KindName(KeyTableKind kind) {
       return "Grouper";
     case KeyTableKind::kPackedStrings:
       return "PackedStrings";
+    case KeyTableKind::kFixed:
+      return "Fixed";
+    case KeyTableKind::kFixedIdOrder:
+      return "FixedIdOrder";
   }
   return "Unknown";
 }
@@ -252,7 +257,9 @@ class KeyTableTest : public testing::ExecTest, public ::testing::WithParamInterf
       std::size_t early_groups = 0;
       for (std::size_t b = 0; b < batches.size(); ++b) {
         SCOPED_TRACE("batch " + std::to_string(b));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, batches[b], expected));
         ASSERT_NO_FATAL_FAILURE(ConsumeAndCheck(*table, batches[b], expected));
+        ASSERT_NO_FATAL_FAILURE(LookupAndCheck(*table, batches[b], expected));
         const auto uniques = table->Uniques();
         ASSERT_TRUE(uniques.ok()) << uniques.status().ToString();
         ASSERT_NO_FATAL_FAILURE(CheckUniques(*uniques, expected, types, expected.key_of.size()));
@@ -381,6 +388,16 @@ TEST_P(KeyTableTest, EveryFixedWidthKeyType) {
   for (const auto& [name, batches] : cases) {
     SCOPED_TRACE(name);
     Check(batches);
+    for (const auto& [other_name, other] : cases) {
+      SCOPED_TRACE("second key " + other_name);
+      std::vector<arrow::compute::ExecBatch> pairs;
+      for (std::size_t batch = 0; batch < batches.size(); ++batch) {
+        auto values = batches[batch].values;
+        values.push_back(other[batch].values.front());
+        pairs.emplace_back(std::move(values), batches[batch].length);
+      }
+      Check(pairs);
+    }
   }
 }
 

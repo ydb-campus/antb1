@@ -115,8 +115,9 @@ Proposed
     through `GetUniques`.
   - **Sizing:** the part tables sized from `part_rows`, the partition tables from the groups merged so far.
   - **Memory:** from the query's pool and charged to the budget, with `OutOfMemory` (not exceptions) at the limit.
-  - Update (2026-10-29, **step 0 chose the loop**; #253, `bench/group_loops.h`): before any engine change, a
-    benchmark of loops of our own against the grouper under a `MemoryBudget` picked the design for fixed-width keys:
+  - Update (2026-10-29, **step 0 chose the loop**; #253): before any engine change,
+    [the step-0 loop](https://github.com/ydb-campus/antb1/blob/2a0b083/bench/group_loops.h)
+    benchmarked loops of our own against the grouper under a `MemoryBudget` and picked the fixed-width design:
     - **A chunked pass, the fused pass the Consequences below ask for.** Each 256 rows get one room check and one
       hash pass, then the probes. Most probes prefetch the buckets of the row 8 places on; the last 8 of a chunk do
       not. Apart from the probe, the only per-row branch is that predictable prefetch check. It needed no SIMD
@@ -285,7 +286,7 @@ Proposed
     the engine runs it.
   - **Not covered by step 0:** NULL keys, DOUBLE normalization, string keys, threads sharing a cache, and the engine
     end to end. Step 1 wires the table into `GroupTable` behind an exec-private interface, under plan mode, and
-    replaces `bench/group_loops.h` with the engine's table.
+    replaces [the step-0 loop](https://github.com/ydb-campus/antb1/blob/2a0b083/bench/group_loops.h) with the engine's table.
 - **For now:** GROUP BY keeps `arrow::compute::Grouper`. The engine's other levers (partitioned merge, routing,
   partition top-N, dependent keys) stay as they are and carry over to the new table.
 - **When the work starts:** it begins with that micro benchmark and the prototype's lessons:
@@ -369,6 +370,52 @@ accumulators is a design reference; its loop shape or arithmetic is not automati
   supply fused aggregate updates or direct merging of stored keys/states. Its growth rehashes stored keys rather
   than retaining the prototype's full routing hash. These are integration and measurement tasks, not reasons for
   an unconditional cherry-pick. No historical branch was rebuilt or timed in this attribution campaign.
+
+### Step 1 candidate measurements (2026-11-19)
+
+The fixed-width implementation from `3b1f96e` has been adapted to current KeyTable, including non-inserting
+Lookup, pool-allocation failure/retry tests, NULL-payload safety and the existing packed-string backend. The
+microbenchmarks now use that implementation instead of a duplicate step-0 loop. These measurements used the
+enabled research candidate against main `2a0b083`; the implementation PR keeps automatic selection on the
+existing backends.
+
+On the Xeon Gold 6338, pinned to one physical core, the final nine-repetition micro grid (0.8 seconds minimum per
+sample, randomly interleaved) met the 1.3x gate at every required count and distribution. Speed-ups ranged from
+1.369x to 2.112x over the budgeted grouper. At 4 Mi groups, reported rather than gated, the minimum was 1.323x.
+The earlier three-repetition grid had one borderline failure, 1.287x for one BIGINT at 1 Mi groups; a longer isolated
+repeat reached 1.313x. All three runs are retained; the final grid supplies a consistent measurement depth rather
+than replacing a failed observation silently.
+
+The complete-query gates did not pass. Official single-file ClickBench input, 8/32 physical cores on one socket,
+default NUMA placement, no cache dropping, one warm-up and three rotating interleaved measurements per engine,
+with an unchanged DuckDB control, produced these native execution medians:
+
+| Query | Threads | Main seconds | Enabled candidate seconds | Wall reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Q4 | 8 | 1.113426 | 0.676172 | 39.27% |
+| Q4 | 32 | 0.516126 | 0.547976 | -6.17% |
+| Q30 | 8 | 1.106680 | 0.997589 | 9.86% |
+| Q30 | 32 | 0.897832 | 0.908398 | -1.18% |
+| Q31 | 8 | 1.378881 | 1.208633 | 12.35% |
+| Q31 | 32 | 1.234620 | 1.209247 | 2.06% |
+
+All 72 executions completed without background-load flags. Q4's measured 32-thread ranges overlap: main
+0.493393-0.590320 seconds, candidate 0.459509-0.557583 seconds. Its process CPU median fell from 11.639 to 9.653
+seconds there, despite the higher wall median. Three samples do not establish an intrinsic regression; they also
+do not justify accepting the candidate. The required 32-thread gains are absent for both key shapes, under either
+these medians or the best-of-three view.
+
+Separate cycle profiles of Q4 put about 18% of the candidate's cycles in rehashing and 36-38% in Consume, at both
+thread counts. They do not show a prominent budget-accounting hotspot or isolate the cause of the scaling loss.
+Stored-key merging, fused state updates and a different growth policy have not been demonstrated as fixes by
+these profiles. They remain independently measured work under the sequence below.
+
+Consequently, step 1 adds a tested candidate and explicit private test/benchmark selection, while `kAuto` keeps
+the Grouper for fixed-width keys and the existing packed-string path for eligible strings. It introduces no
+production override or default activation. Activation needs a subsequent PR meeting the existing gates; neither
+the gates nor this ADR's status are weakened. The full all-query timing campaign is not an activation proof for
+this PR: the targeted gates already stopped that decision. The enabled source and private evidence remain on
+`research/fixed-key-table-autoselection` and under `build/static/bench-results/fixed-key-integration` locally.
 
 ### Target architecture and invariants
 
