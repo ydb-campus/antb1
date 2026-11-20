@@ -27,11 +27,13 @@
 #include <arrow/status.h>
 #include <arrow/type.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/hashing.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/int128.h"
 
 #include "fold_hash.h"
+#include "key_routing_hash.h"
 #include "key_table.h"
 #include "pool_vector.h"
 
@@ -67,6 +69,21 @@ struct FixedKey {
   static_assert(kBytes % 8 == 0);
   std::array<std::uint64_t, kBytes / 8> words;
   friend bool operator==(const FixedKey&, const FixedKey&) = default;
+};
+
+// A read-only packed store shared by both growth policies. Its owner outlives every merge.
+template <std::size_t kBytes>
+class PackedStoredKeyTable : public StoredKeyTable {
+ public:
+  struct Rows {
+    const FixedKeyLayout& layout;
+    std::span<const FixedKey<kBytes>> keys;
+    std::uint32_t null_group;
+  };
+  [[nodiscard]] virtual Rows stored_rows() const = 0;
+
+ protected:
+  using StoredKeyTable::StoredKeyTable;
 };
 
 // How a FixedKeyTable re-places its groups when its slots double; neither changes an id.
@@ -117,16 +134,17 @@ struct ControlGroup {
 // Estimate). Every array comes from the pool, so a MemoryBudget charges each allocation before it
 // happens, never a row.
 template <std::size_t kKeyBytes, Growth kGrowth, class Hasher = FoldHash>
-class FixedKeyTable final : public KeyTable {
+class FixedKeyTable final : public PackedStoredKeyTable<kKeyBytes> {
  public:
   using Key = FixedKey<kKeyBytes>;
   static constexpr std::size_t kChunk = 256;  // rows per room check and hash pass
   static constexpr std::size_t kAhead = 8;    // how many rows ahead a probe prefetches
 
   // A table over keys of `layout` (whose key_bytes is kKeyBytes) that allocates from `pool`.
-  FixedKeyTable(FixedKeyLayout layout, arrow::MemoryPool* pool, const KeyTableOptions& options)
-      : layout_(std::move(layout)),
-        pool_(pool),
+  FixedKeyTable(FixedKeyLayout layout, arrow::MemoryPool* pool, const KeyTableOptions& options,
+                MemoryBudget* budget = nullptr)
+      : PackedStoredKeyTable<kKeyBytes>(pool, budget),
+        layout_(std::move(layout)),
         estimate_(options.estimate),
         max_groups_(options.max_groups),
         control_(pool),
@@ -134,7 +152,8 @@ class FixedKeyTable final : public KeyTable {
         keys_(pool),
         chunk_keys_(pool),
         chunk_hashes_(pool),
-        chunk_nulls_(pool) {
+        chunk_nulls_(pool),
+        chunk_ids_(pool) {
     ANTB1_CHECK(layout_.key_bytes == kKeyBytes);
     ANTB1_CHECK(!layout_.columns.empty());
     ANTB1_CHECK(layout_.columns.size() <= 2);
@@ -143,7 +162,64 @@ class FixedKeyTable final : public KeyTable {
   }
 
   arrow::Result<KeyIds> Consume(const arrow::compute::ExecBatch& keys) override {
-    return KeyTableNoBadAlloc([&] -> arrow::Result<KeyIds> { return ConsumeRows(keys); });
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeyIds> {
+      ARROW_RETURN_NOT_OK(CheckBatch(keys));
+      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> owner,
+                            arrow::AllocateBuffer(keys.length * 4, pool_));
+      auto* ids = owner->mutable_data_as<std::uint32_t>();
+      const auto before = num_groups();
+      ARROW_RETURN_NOT_OK(ConsumeRows(keys, ids, nullptr));
+      return KeyIds{.owner = std::move(owner),
+                    .ids = {ids, static_cast<std::size_t>(keys.length)},
+                    .before = before,
+                    .after = num_groups()};
+    });
+  }
+
+  arrow::Status ConsumeChunks(const arrow::compute::ExecBatch& keys,
+                              const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      ARROW_RETURN_NOT_OK(CheckBatch(keys));
+      return ConsumeRows(keys, nullptr, &consume);
+    });
+  }
+
+  arrow::Status MergeStored(const StoredKeyTable& source, std::span<const std::uint32_t> groups,
+                            const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      const auto* packed = dynamic_cast<const PackedStoredKeyTable<kKeyBytes>*>(&source);
+      if (packed == nullptr || packed == this) {
+        return arrow::Status::Invalid("incompatible stored keys in fixed key merge");
+      }
+      const auto rows = packed->stored_rows();
+      if (!std::ranges::equal(
+              layout_.columns, rows.layout.columns,
+              [](const auto& a, const auto& b) { return a.type->Equals(b.type); })) {
+        return arrow::Status::Invalid("different key types in fixed key merge");
+      }
+      if (groups.empty()) {
+        return arrow::Status::OK();
+      }
+      ARROW_RETURN_NOT_OK(this->CheckSelection(groups, source.num_groups()));
+      ARROW_RETURN_NOT_OK(PrepareScratch());
+      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
+      for (std::size_t offset = 0; offset < groups.size(); offset += kChunk) {
+        const auto selected = groups.subspan(offset, std::min(kChunk, groups.size() - offset));
+        ARROW_RETURN_NOT_OK(
+            MakeRoom(std::min<std::size_t>(selected.size(), max_groups_ - keys_.size())));
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+          const auto id = selected[i];
+          chunk_keys_[i] = rows.keys[id];
+          chunk_hashes_[i] = Hasher::Hash(rows.keys[id].words);
+          chunk_nulls_[i] = id == rows.null_group ? 1 : 0;
+        }
+        ARROW_RETURN_NOT_OK(rows.null_group == kNoGroup
+                                ? Probe<false>(selected.size(), chunk_ids_.data())
+                                : Probe<true>(selected.size(), chunk_ids_.data()));
+        ARROW_RETURN_NOT_OK(consume(offset, {chunk_ids_.data(), selected.size()}, num_groups()));
+      }
+      return arrow::Status::OK();
+    });
   }
 
   arrow::Result<std::shared_ptr<arrow::UInt32Array>> Lookup(
@@ -151,8 +227,42 @@ class FixedKeyTable final : public KeyTable {
     return KeyTableNoBadAlloc([&] { return LookupRows(keys); });
   }
 
-  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const override {
-    return KeyTableNoBadAlloc([&] { return BuildUniques(); });
+  void RoutingHashes(std::uint32_t first, std::span<std::uint64_t> out) const override {
+    ANTB1_CHECK(first <= num_groups());
+    ANTB1_CHECK(out.size() <= num_groups() - first);
+    std::ranges::fill(out, kGroupKeySeed);
+    for (std::size_t c = 0; c < layout_.columns.size(); ++c) {
+      const auto& col = layout_.columns[c];
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        const auto group = first + i;
+        const auto value = StoredNull(group, c) ? kNullGroupKeyHash
+                                                : arrow::internal::ComputeStringHash<0>(
+                                                      BytesOf(keys_[group]) + col.offset,
+                                                      static_cast<std::int64_t>(col.width));
+        out[i] = MixGroupKeyHash(out[i], value);
+      }
+    }
+    for (auto& hash : out) {
+      hash = FinishGroupKeyHash(hash);
+    }
+  }
+
+  [[nodiscard]] arrow::Result<KeySnapshot> StoredUniques(std::uint32_t first,
+                                                         std::uint32_t count) const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_RETURN_NOT_OK(this->CheckStoredRange(first, count));
+      return BuildUniques(count, [first](std::size_t i) { return first + i; });
+    });
+  }
+  [[nodiscard]] arrow::Result<KeySnapshot> GatherStored(
+      std::span<const std::uint32_t> groups) const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_RETURN_NOT_OK(this->CheckSelection(groups, num_groups()));
+      return BuildUniques(groups.size(), [groups](std::size_t i) { return groups[i]; });
+    });
+  }
+  [[nodiscard]] PackedStoredKeyTable<kKeyBytes>::Rows stored_rows() const override {
+    return {.layout = layout_, .keys = {keys_.data(), keys_.size()}, .null_group = null_group_};
   }
 
   [[nodiscard]] std::uint32_t num_groups() const override {
@@ -162,6 +272,7 @@ class FixedKeyTable final : public KeyTable {
   [[nodiscard]] std::size_t capacity() const { return capacity_; }
 
  private:
+  using PackedStoredKeyTable<kKeyBytes>::pool_;
   static constexpr std::uint8_t kEmpty = 0x80;
   static constexpr std::size_t kMinCapacity = 16;  // more than one group wide: see Find
   static constexpr std::size_t kLoadNum = 7;       // the share of slots filled before they double
@@ -219,43 +330,50 @@ class FixedKeyTable final : public KeyTable {
             !arrow::bit_util::GetBit(source.validity, source.offset + row));
   }
 
-  arrow::Result<KeyIds> ConsumeRows(const arrow::compute::ExecBatch& keys) {
+  arrow::Status CheckBatch(const arrow::compute::ExecBatch& keys) const {
     ANTB1_CHECK(keys.values.size() == layout_.columns.size());
     if (keys.length < 0 || keys.length > std::numeric_limits<std::int64_t>::max() / 4) {
       return arrow::Status::CapacityError("fixed key ID buffer size overflow");
     }
+    return arrow::Status::OK();
+  }
+
+  arrow::Status ConsumeRows(const arrow::compute::ExecBatch& keys, std::uint32_t* output,
+                            const KeyIdConsumer* consume) {
     const auto rows = static_cast<std::size_t>(keys.length);
+    if (rows == 0) {
+      return arrow::Status::OK();
+    }
     std::array<Source, 2> sources;
     for (std::size_t c = 0; c < layout_.columns.size(); ++c) {
       ANTB1_CHECK(keys.values[c].is_array());
       sources[c] = SourceOf(*keys.values[c].array(), layout_.columns[c].width);
     }
     const std::span<const Source> columns(sources.data(), layout_.columns.size());
-    KeyIds out;
-    out.before = num_groups();
-    ARROW_ASSIGN_OR_RAISE(
-        std::shared_ptr<arrow::Buffer> owner,
-        arrow::AllocateBuffer(static_cast<std::int64_t>(rows * sizeof(std::uint32_t)), pool_));
-    auto* const ids = owner->mutable_data_as<std::uint32_t>();
-    if (rows > 0) {
-      ARROW_RETURN_NOT_OK(PrepareScratch());
+    ARROW_RETURN_NOT_OK(PrepareScratch());
+    if (consume != nullptr) {
+      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
     }
+    const bool count_hits = estimate_ && calls_ == 1;
+    std::size_t hits = 0;
     for (std::size_t start = 0; start < rows; start += kChunk) {
       const std::size_t count = std::min(kChunk, rows - start);
       // Room for every row to be a new group, up to the limit that Insert enforces: a chunk of
       // known keys never fails for it.
       ARROW_RETURN_NOT_OK(MakeRoom(std::min<std::size_t>(count, max_groups_ - keys_.size())));
       const bool nulls = PackAndHash(columns, start, count);
-      ARROW_RETURN_NOT_OK(nulls ? Probe<true>(count, ids + start)
-                                : Probe<false>(count, ids + start));
+      auto* ids = consume == nullptr ? output + start : chunk_ids_.data();
+      ARROW_RETURN_NOT_OK(nulls ? Probe<true>(count, ids) : Probe<false>(count, ids));
+      if (count_hits) {
+        for (std::size_t row = 0; row < count; ++row) {
+          hits += ids[row] < first_groups_ ? 1U : 0U;
+        }
+      }
+      if (consume != nullptr) {
+        ARROW_RETURN_NOT_OK((*consume)(start, {ids, count}, num_groups()));
+      }
     }
-    out.after = num_groups();
-    if (estimate_ && rows > 0) {
-      ARROW_RETURN_NOT_OK(Estimate(rows, ids));
-    }
-    out.ids = {ids, rows};
-    out.owner = std::move(owner);
-    return out;
+    return estimate_ ? Estimate(rows, hits) : arrow::Status::OK();
   }
 
   // Each allocation may fail independently. Retrying must finish any partially prepared scratch.
@@ -272,10 +390,7 @@ class FixedKeyTable final : public KeyTable {
 
   arrow::Result<std::shared_ptr<arrow::UInt32Array>> LookupRows(
       const arrow::compute::ExecBatch& batch) {
-    ANTB1_CHECK(batch.values.size() == layout_.columns.size());
-    if (batch.length < 0 || batch.length > std::numeric_limits<std::int64_t>::max() / 4) {
-      return arrow::Status::CapacityError("fixed key ID buffer size overflow");
-    }
+    ARROW_RETURN_NOT_OK(CheckBatch(batch));
     if (keys_.empty()) {
       ARROW_ASSIGN_OR_RAISE(auto misses,
                             arrow::MakeArrayOfNull(arrow::uint32(), batch.length, pool_));
@@ -630,7 +745,7 @@ class FixedKeyTable final : public KeyTable {
   // that never repeat early, sorted or clustered keys), skew lowers the estimate (heavy groups take
   // more hits), and kMaxGrowth bounds an overestimate. It reads only the table's own input, so it
   // is the same on any number of threads.
-  arrow::Status Estimate(std::size_t rows, const std::uint32_t* ids) {
+  arrow::Status Estimate(std::size_t rows, std::size_t hits) {
     if (calls_ >= 2) {
       return arrow::Status::OK();
     }
@@ -638,10 +753,6 @@ class FixedKeyTable final : public KeyTable {
     if (calls_ == 1) {
       first_groups_ = keys_.size();
       return arrow::Status::OK();
-    }
-    std::size_t hits = 0;
-    for (std::size_t row = 0; row < rows; ++row) {
-      hits += ids[row] < first_groups_ ? 1U : 0U;
     }
     if (hits < kMinHits) {
       return arrow::Status::OK();
@@ -660,10 +771,18 @@ class FixedKeyTable final : public KeyTable {
     return reserved.IsOutOfMemory() ? arrow::Status::OK() : reserved;
   }
 
-  arrow::Result<KeySnapshot> BuildUniques() const {
-    const std::size_t groups = keys_.size();
-    std::vector<arrow::Datum> columns;
-    columns.reserve(layout_.columns.size());
+  bool StoredNull(std::size_t group, std::size_t column) const {
+    if (layout_.columns.size() == 1) {
+      return group == null_group_;
+    }
+    const auto mask = std::to_integer<unsigned>(BytesOf(keys_[group])[layout_.mask_offset]);
+    return (mask & (1U << column)) != 0;
+  }
+
+  template <class GroupAt>
+  arrow::Result<KeySnapshot> BuildUniques(std::size_t groups, const GroupAt& group_at) const {
+    ARROW_ASSIGN_OR_RAISE(auto snapshot,
+                          this->MakeSnapshot(layout_.columns.size(), Narrow<std::int64_t>(groups)));
     for (std::size_t c = 0; c < layout_.columns.size(); ++c) {
       const FixedKeyLayout::Column& column = layout_.columns[c];
       ARROW_ASSIGN_OR_RAISE(
@@ -671,19 +790,13 @@ class FixedKeyTable final : public KeyTable {
           arrow::AllocateBuffer(static_cast<std::int64_t>(groups * column.width), pool_));
       std::uint8_t* const out = values->mutable_data();
       for (std::size_t g = 0; g < groups; ++g) {
-        std::memcpy(out + (g * column.width), BytesOf(keys_[g]) + column.offset, column.width);
+        std::memcpy(out + (g * column.width), BytesOf(keys_[group_at(g)]) + column.offset,
+                    column.width);
       }
       // A group's value is NULL when it is the NULL group (one key), or by its NULL byte (two).
-      const auto is_null = [&](std::size_t g) {
-        if (layout_.columns.size() == 1) {
-          return g == null_group_;
-        }
-        const auto mask = std::to_integer<unsigned>(BytesOf(keys_[g])[layout_.mask_offset]);
-        return (mask & (1U << c)) != 0;
-      };
       std::size_t nulls = 0;
       for (std::size_t g = 0; g < groups; ++g) {
-        nulls += is_null(g) ? 1U : 0U;
+        nulls += StoredNull(group_at(g), c) ? 1U : 0U;
       }
       std::shared_ptr<arrow::Buffer> validity;
       if (nulls > 0) {
@@ -695,21 +808,18 @@ class FixedKeyTable final : public KeyTable {
         std::uint8_t* const bits = validity->mutable_data();
         std::memset(bits, 0, static_cast<std::size_t>(bytes));
         for (std::size_t g = 0; g < groups; ++g) {
-          if (!is_null(g)) {
+          if (!StoredNull(group_at(g), c)) {
             arrow::bit_util::SetBit(bits, static_cast<std::int64_t>(g));
           }
         }
       }
-      columns.emplace_back(arrow::ArrayData::Make(column.type, static_cast<std::int64_t>(groups),
-                                                  {std::move(validity), std::move(values)},
-                                                  static_cast<std::int64_t>(nulls)));
+      ARROW_RETURN_NOT_OK(this->AppendColumn(snapshot, column.type, std::move(validity),
+                                             std::move(values), Narrow<std::int64_t>(nulls)));
     }
-    return KeySnapshot{.datum_memory = {},
-                       .batch = {std::move(columns), static_cast<std::int64_t>(groups)}};
+    return snapshot;
   }
 
   FixedKeyLayout layout_;
-  arrow::MemoryPool* pool_;
   bool estimate_;
   std::uint32_t max_groups_;
   PoolVector<std::uint8_t> control_;  // capacity_ + 8 control bytes, the last 8 mirroring the first
@@ -726,11 +836,12 @@ class FixedKeyTable final : public KeyTable {
   PoolVector<Key> chunk_keys_;
   PoolVector<std::uint64_t> chunk_hashes_;
   PoolVector<std::uint8_t> chunk_nulls_;
+  PoolVector<std::uint32_t> chunk_ids_;  // only when the consumer borrows a chunk of IDs
 };
 
 // The table of `layout` (FixedKeyLayoutOf) growing by `growth`, for MakeKeyTable.
 std::unique_ptr<KeyTable> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
-                                            arrow::MemoryPool* pool,
-                                            const KeyTableOptions& options);
+                                            arrow::MemoryPool* pool, const KeyTableOptions& options,
+                                            MemoryBudget* budget);
 
 }  // namespace antb1::exec

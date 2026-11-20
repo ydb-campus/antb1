@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -63,6 +65,53 @@ class KeyTable {
   // It can be called again; the arrays stay valid after later calls.
   [[nodiscard]] virtual arrow::Result<KeySnapshot> Uniques() const = 0;
   [[nodiscard]] virtual std::uint32_t num_groups() const = 0;
+};
+
+// Called synchronously in input order, once per bounded chunk. The IDs are borrowed only for
+// this call. offset is the first row (or selection position), after is the new total group count.
+using KeyIdConsumer = std::function<arrow::Status(
+    std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after)>;
+
+// Fixed-width tables assign consecutive IDs to new groups in first-seen order, including when
+// merging a selection. They can update states from a bounded ID buffer and merge keys in their
+// stored representation. Once the owner finishes inserting, multiple destinations may read the same
+// source's stored groups concurrently. Only the destination uses mutable probe scratch.
+class StoredKeyTable : public KeyTable {
+ public:
+  virtual arrow::Status ConsumeChunks(const arrow::compute::ExecBatch& keys,
+                                      const KeyIdConsumer& consume) = 0;
+  // The source and destination must be distinct tables of the same key types. Read its groups
+  // in the supplied order. Their keys are copied into this table only when a group is new.
+  virtual arrow::Status MergeStored(const StoredKeyTable& source,
+                                    std::span<const std::uint32_t> groups,
+                                    const KeyIdConsumer& consume) = 0;
+  // The same full-key hash as GroupTable::RouteRows. The caller provides a valid consecutive
+  // range [first, first + out.size()) within num_groups().
+  virtual void RoutingHashes(std::uint32_t first, std::span<std::uint64_t> out) const = 0;
+  // Materialize a group-ID range at an output boundary. The caller owns the returned keys.
+  [[nodiscard]] virtual arrow::Result<KeySnapshot> StoredUniques(std::uint32_t first,
+                                                                 std::uint32_t count) const = 0;
+  [[nodiscard]] virtual arrow::Result<KeySnapshot> GatherStored(
+      std::span<const std::uint32_t> groups) const = 0;
+  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const final {
+    return StoredUniques(0, num_groups());
+  }
+
+ protected:
+  StoredKeyTable(arrow::MemoryPool* pool, MemoryBudget* budget)
+      : pool_(pool), budget_(budget != nullptr ? budget : dynamic_cast<MemoryBudget*>(pool)) {}
+  static arrow::Status CheckSelection(std::span<const std::uint32_t> selected,
+                                      std::uint32_t source_groups);
+  arrow::Status CheckStoredRange(std::uint32_t first, std::uint32_t count) const;
+  // Allocate and charge the batch and column descriptors with the lifetime of their owners.
+  arrow::Result<KeySnapshot> MakeSnapshot(std::size_t columns, std::int64_t length) const;
+  arrow::Status AppendColumn(KeySnapshot& snapshot, const std::shared_ptr<arrow::DataType>& type,
+                             std::shared_ptr<arrow::Buffer> validity,
+                             std::shared_ptr<arrow::Buffer> values, std::int64_t nulls) const;
+  arrow::MemoryPool* pool_;
+
+ private:
+  MemoryBudget* budget_;
 };
 
 // Which table numbers the keys. kAuto is the engine's choice, a function of the key types only

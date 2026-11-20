@@ -18,11 +18,14 @@
 #include <arrow/stl_allocator.h>
 #include <arrow/type.h>
 #include <arrow/util/bit_util.h>
+#include <arrow/util/bitmap_ops.h>
+#include <arrow/util/hashing.h>
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 
 #include "fold_hash.h"
+#include "key_routing_hash.h"
 #include "pool_vector.h"
 
 namespace antb1::exec {
@@ -131,40 +134,59 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> CopyBytes(const std::uint8_t* sour
   return out;
 }
 
-// Arrow exposes both metadata vectors with the standard allocator. Reserve their heap bytes
-// against the query budget before allocating, even when there are no groups.
-template <class T>
-arrow::Status ReserveSnapshotVector(std::vector<T>& values, std::size_t count,
-                                    MemoryReservation& memory, MemoryBudget* budget) {
-  ANTB1_CHECK(values.capacity() == 0);
-  if (count > values.max_size()) {
-    return arrow::Status::CapacityError("unique key metadata size overflow");
+arrow::Result<std::shared_ptr<arrow::Buffer>> CopyBits(const std::uint8_t* source,
+                                                       std::uint32_t first, std::uint32_t count,
+                                                       std::span<const std::uint32_t> selected,
+                                                       arrow::MemoryPool* pool) {
+  const auto bytes = arrow::bit_util::BytesForBits(count);
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> out, arrow::AllocateBuffer(bytes, pool));
+  if (!selected.empty()) {
+    std::memset(out->mutable_data(), 0, Narrow<std::size_t>(bytes));
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+      if (arrow::bit_util::GetBit(source, selected[i])) {
+        arrow::bit_util::SetBit(out->mutable_data(), Narrow<std::int64_t>(i));
+      }
+    }
+  } else if (count > 0) {
+    out->mutable_data()[bytes - 1] = 0;
+    arrow::internal::CopyBitmap(source, first, count, out->mutable_data(), 0);
   }
-  memory.Reset(budget);
-  ARROW_RETURN_NOT_OK(memory.Resize(Narrow<std::int64_t>(count * sizeof(T))));
-  values.reserve(count);
-  // reserve() may provide extra capacity. Keep the whole allocation charged until destruction.
-  return memory.Resize(Narrow<std::int64_t>(values.capacity() * sizeof(T)));
+  return out;
 }
 
-// A detached array keeps the charge for its own buffer handles after the batch goes away.
-struct UniqueColumn {
-  MemoryReservation buffer_memory;
-  arrow::ArrayData data;
-};
+arrow::Result<std::shared_ptr<arrow::Buffer>> CopyValues(const Column& col, std::uint32_t first,
+                                                         std::uint32_t count,
+                                                         std::span<const std::uint32_t> selected,
+                                                         arrow::MemoryPool* pool) {
+  if (col.width == 0) {
+    return CopyBits(col.values, first, count, selected, pool);
+  }
+  const auto bytes = col.ValueBytes(count);
+  if (selected.empty()) {
+    const auto* start = count == 0 ? nullptr : col.values + (first * col.width);
+    return CopyBytes(start, bytes, pool);
+  }
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> out,
+                        arrow::AllocateBuffer(Narrow<std::int64_t>(bytes), pool));
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    std::memcpy(out->mutable_data() + (i * col.width), col.values + (selected[i] * col.width),
+                col.width);
+  }
+  return out;
+}
 
-class ColumnKeyTable final : public KeyTable {
+class ColumnKeyTable final : public StoredKeyTable {
  public:
   ColumnKeyTable(const std::vector<arrow::TypeHolder>& types, arrow::MemoryPool* pool,
                  std::uint32_t max_groups, MemoryBudget* budget)
-      : pool_(pool),
-        budget_(budget),
+      : StoredKeyTable(pool, budget),
         max_groups_(max_groups),
         columns_(arrow::stl::allocator<Column>(pool)),
         storage_(pool),
         hashes_(pool),
         slots_(pool),
-        chunk_(pool) {
+        chunk_(pool),
+        chunk_ids_(pool) {
     ANTB1_CHECK(max_groups > 0);
     ANTB1_CHECK(max_groups < kMissing);
     columns_.reserve(types.size());
@@ -182,11 +204,52 @@ class ColumnKeyTable final : public KeyTable {
       const std::uint32_t before = groups_;
       ARROW_ASSIGN_OR_RAISE(auto owner, IdBuffer(batch));
       auto* ids = owner->mutable_data_as<std::uint32_t>();
-      ARROW_RETURN_NOT_OK(ProbeRows<true>(batch, ids));
+      ARROW_RETURN_NOT_OK(ProbeRows<true>(batch, ids, nullptr));
       return KeyIds{.owner = std::move(owner),
                     .ids = {ids, Narrow<std::size_t>(batch.length)},
                     .before = before,
                     .after = groups_};
+    });
+  }
+
+  arrow::Status ConsumeChunks(const arrow::compute::ExecBatch& batch,
+                              const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      ARROW_RETURN_NOT_OK(CheckBatch(batch));
+      return ProbeRows<true>(batch, nullptr, &consume);
+    });
+  }
+
+  arrow::Status MergeStored(const StoredKeyTable& source, std::span<const std::uint32_t> groups,
+                            const KeyIdConsumer& consume) override {
+    return KeyTableNoBadAlloc([&] {
+      const auto* stored = dynamic_cast<const ColumnKeyTable*>(&source);
+      if (stored == nullptr || stored == this ||
+          !std::ranges::equal(columns_, stored->columns_, [](const Column& a, const Column& b) {
+            return a.type->Equals(b.type);
+          })) {
+        return arrow::Status::Invalid("incompatible stored keys in column key merge");
+      }
+      if (groups.empty()) {
+        return arrow::Status::OK();
+      }
+      ARROW_RETURN_NOT_OK(CheckSelection(groups, stored->groups_));
+      PoolVector<Source> sources(pool_);
+      ARROW_RETURN_NOT_OK(sources.Resize(columns_.size()));
+      for (std::size_t c = 0; c < columns_.size(); ++c) {
+        const auto& col = stored->columns_[c];
+        sources[c] = {.values = col.values, .validity = col.validity, .offset = 0};
+      }
+      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
+      for (std::size_t start = 0; start < groups.size(); start += kChunk) {
+        const auto selected = groups.subspan(start, std::min(kChunk, groups.size() - start));
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+          const auto id = selected[i];
+          ARROW_RETURN_NOT_OK(Probe<true>(stored->hashes_[id], sources, id, chunk_ids_[i]));
+        }
+        ARROW_RETURN_NOT_OK(consume(start, {chunk_ids_.data(), selected.size()}, groups_));
+      }
+      return arrow::Status::OK();
     });
   }
 
@@ -201,7 +264,7 @@ class ColumnKeyTable final : public KeyTable {
       }
       ARROW_ASSIGN_OR_RAISE(auto owner, IdBuffer(batch));
       auto* ids = owner->mutable_data_as<std::uint32_t>();
-      ARROW_RETURN_NOT_OK(ProbeRows<false>(batch, ids));
+      ARROW_RETURN_NOT_OK(ProbeRows<false>(batch, ids, nullptr));
       std::shared_ptr<arrow::Buffer> validity;
       std::int64_t missing = 0;
       for (std::int64_t row = 0; row < batch.length; ++row) {
@@ -221,39 +284,79 @@ class ColumnKeyTable final : public KeyTable {
     });
   }
 
-  arrow::Result<KeySnapshot> Uniques() const override {
-    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
-      MemoryReservation datum_memory;
-      std::vector<arrow::Datum> out;
-      ARROW_RETURN_NOT_OK(ReserveSnapshotVector(out, columns_.size(), datum_memory, budget_));
-      for (const Column& col : columns_) {
-        ARROW_ASSIGN_OR_RAISE(auto values, CopyBytes(col.values, col.ValueBytes(groups_), pool_));
-        std::shared_ptr<arrow::Buffer> validity;
-        if (col.nulls > 0) {
-          ARROW_ASSIGN_OR_RAISE(
-              validity,
-              CopyBytes(col.validity, Narrow<std::size_t>(arrow::bit_util::BytesForBits(groups_)),
-                        pool_));
+  void RoutingHashes(std::uint32_t first, std::span<std::uint64_t> out) const override {
+    ANTB1_CHECK(first <= groups_);
+    ANTB1_CHECK(out.size() <= groups_ - first);
+    std::ranges::fill(out, kGroupKeySeed);
+    for (const auto& col : columns_) {
+      for (std::size_t i = 0; i < out.size(); ++i) {
+        const auto id = first + i;
+        auto value = kNullGroupKeyHash;
+        if (col.nulls == 0 || arrow::bit_util::GetBit(col.validity, id)) {
+          if (col.width == 0) {
+            value = arrow::bit_util::GetBit(col.values, id) ? 1U : 2U;
+          } else {
+            value = arrow::internal::ComputeStringHash<0>(col.values + (id * col.width),
+                                                          Narrow<std::int64_t>(col.width));
+          }
         }
-        auto column =
-            std::allocate_shared<UniqueColumn>(arrow::stl::allocator<UniqueColumn>(pool_));
-        auto& data = column->data;
-        data.type = col.type;
-        data.length = groups_;
-        data.SetNullCount(col.nulls);
-        ARROW_RETURN_NOT_OK(ReserveSnapshotVector(data.buffers, 2, column->buffer_memory, budget_));
-        data.buffers.emplace_back(std::move(validity));
-        data.buffers.emplace_back(std::move(values));
-        out.emplace_back(std::shared_ptr<arrow::ArrayData>(std::move(column), &data));
+        out[i] = MixGroupKeyHash(out[i], value);
       }
-      return KeySnapshot{.datum_memory = std::move(datum_memory),
-                         .batch = {std::move(out), groups_}};
+    }
+    for (auto& hash : out) {
+      hash = FinishGroupKeyHash(hash);
+    }
+  }
+
+  arrow::Result<KeySnapshot> StoredUniques(std::uint32_t first,
+                                           std::uint32_t count) const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_RETURN_NOT_OK(CheckStoredRange(first, count));
+      return BuildUniques(first, count, {});
+    });
+  }
+
+  arrow::Result<KeySnapshot> GatherStored(std::span<const std::uint32_t> groups) const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      if (groups.size() > kMaxKeyTableGroups) {
+        return arrow::Status::CapacityError("too many selected stored keys");
+      }
+      ARROW_RETURN_NOT_OK(CheckSelection(groups, groups_));
+      return BuildUniques(0, Narrow<std::uint32_t>(groups.size()), groups);
     });
   }
 
   std::uint32_t num_groups() const override { return groups_; }
 
  private:
+  // A range uses bulk byte/bitmap copies. A mixed-backend lane gathers only its own source IDs.
+  arrow::Result<KeySnapshot> BuildUniques(std::uint32_t first, std::uint32_t count,
+                                          std::span<const std::uint32_t> selected) const {
+    ARROW_ASSIGN_OR_RAISE(auto snapshot, MakeSnapshot(columns_.size(), count));
+    for (const Column& col : columns_) {
+      ARROW_ASSIGN_OR_RAISE(auto values, CopyValues(col, first, count, selected, pool_));
+      std::shared_ptr<arrow::Buffer> validity;
+      std::int64_t nulls = 0;
+      if (col.nulls > 0 && count > 0) {
+        if (!selected.empty()) {
+          nulls = std::ranges::count_if(selected, [&](std::uint32_t group) {
+            return !arrow::bit_util::GetBit(col.validity, group);
+          });
+        } else {
+          nulls = count == groups_
+                      ? col.nulls
+                      : count - arrow::internal::CountSetBits(col.validity, first, count);
+        }
+        if (nulls > 0) {
+          ARROW_ASSIGN_OR_RAISE(validity, CopyBits(col.validity, first, count, selected, pool_));
+        }
+      }
+      ARROW_RETURN_NOT_OK(
+          AppendColumn(snapshot, col.type, std::move(validity), std::move(values), nulls));
+    }
+    return snapshot;
+  }
+
   arrow::Status CheckBatch(const arrow::compute::ExecBatch& batch) const {
     ANTB1_CHECK(batch.values.size() == columns_.size());
     if (batch.length < 0 || batch.length > std::numeric_limits<std::int64_t>::max() / 4) {
@@ -304,7 +407,8 @@ class ColumnKeyTable final : public KeyTable {
   }
 
   template <bool kInsert>
-  arrow::Status ProbeRows(const arrow::compute::ExecBatch& batch, std::uint32_t* ids) {
+  arrow::Status ProbeRows(const arrow::compute::ExecBatch& batch, std::uint32_t* output,
+                          const KeyIdConsumer* consume) {
     const auto rows = Narrow<std::size_t>(batch.length);
     if (rows == 0) {
       return arrow::Status::OK();
@@ -320,33 +424,44 @@ class ColumnKeyTable final : public KeyTable {
           .offset = Narrow<std::size_t>(data.offset)};
     }
     ARROW_RETURN_NOT_OK(chunk_.Resize(2 * kChunk));
+    if (consume != nullptr) {
+      ARROW_RETURN_NOT_OK(chunk_ids_.Resize(kChunk));
+    }
     for (std::size_t start = 0; start < rows; start += kChunk) {
       std::span<std::uint64_t> hashes(chunk_.data(), std::min(kChunk, rows - start));
       HashChunk(sources, start, hashes, {chunk_.data() + kChunk, hashes.size()});
+      auto* ids = consume == nullptr ? output + start : chunk_ids_.data();
       for (std::size_t i = 0; i < hashes.size(); ++i) {
-        const auto row = start + i;
-        const auto hash = hashes[i];
-        auto slot = Find(hash, sources, row);
-        std::uint32_t id = slots_.empty() ? kMissing : slots_[slot];
-        if constexpr (kInsert) {
-          if (id == kMissing) {
-            if (groups_ >= max_groups_) {
-              return arrow::Status::OutOfMemory("a GROUP BY of more than ", max_groups_, " groups");
-            }
-            if (groups_ == hashes_.size()) {
-              ARROW_RETURN_NOT_OK(Grow());
-              slot = EmptySlot(slots_, hash);
-            }
-            id = groups_;
-            for (std::size_t c = 0; c < columns_.size(); ++c) {
-              columns_[c].Append(sources[c], row, id);
-            }
-            slots_[slot] = id;
-            hashes_[id] = hash;
-            ++groups_;
-          }
+        ARROW_RETURN_NOT_OK(Probe<kInsert>(hashes[i], sources, start + i, ids[i]));
+      }
+      if (consume != nullptr) {
+        ARROW_RETURN_NOT_OK((*consume)(start, {ids, hashes.size()}, groups_));
+      }
+    }
+    return arrow::Status::OK();
+  }
+
+  template <bool kInsert>
+  arrow::Status Probe(std::uint64_t hash, const PoolVector<Source>& sources, std::size_t row,
+                      std::uint32_t& id) {
+    auto slot = Find(hash, sources, row);
+    id = slots_.empty() ? kMissing : slots_[slot];
+    if constexpr (kInsert) {
+      if (id == kMissing) {
+        if (groups_ >= max_groups_) {
+          return arrow::Status::OutOfMemory("a GROUP BY of more than ", max_groups_, " groups");
         }
-        ids[row] = id;
+        if (groups_ == hashes_.size()) {
+          ARROW_RETURN_NOT_OK(Grow());
+          slot = EmptySlot(slots_, hash);
+        }
+        id = groups_;
+        for (std::size_t c = 0; c < columns_.size(); ++c) {
+          columns_[c].Append(sources[c], row, id);
+        }
+        slots_[slot] = id;
+        hashes_[id] = hash;
+        ++groups_;
       }
     }
     return arrow::Status::OK();
@@ -425,16 +540,15 @@ class ColumnKeyTable final : public KeyTable {
     return arrow::Status::OK();
   }
 
-  arrow::MemoryPool* pool_;
-  MemoryBudget* budget_;
   std::uint32_t max_groups_;
   std::vector<Column, arrow::stl::allocator<Column>> columns_;
   std::size_t row_bits_ = 0;
   std::uint32_t groups_ = 0;
-  PoolVector<std::uint8_t> storage_;  // owned columns and their validity, in dense ID order
-  PoolVector<std::uint64_t> hashes_;  // group ID -> full probe hash
-  PoolVector<std::uint32_t> slots_;   // bucket -> group ID or kMissing
-  PoolVector<std::uint64_t> chunk_;   // kChunk hashes followed by kChunk column NULL masks
+  PoolVector<std::uint8_t> storage_;     // owned columns and their validity, in dense ID order
+  PoolVector<std::uint64_t> hashes_;     // group ID -> full probe hash
+  PoolVector<std::uint32_t> slots_;      // bucket -> group ID or kMissing
+  PoolVector<std::uint64_t> chunk_;      // kChunk hashes followed by kChunk column NULL masks
+  PoolVector<std::uint32_t> chunk_ids_;  // only for consumers of borrowed chunk IDs
 };
 
 }  // namespace

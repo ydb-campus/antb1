@@ -38,19 +38,19 @@ bool TakesKeyType(arrow::Type::type id) {
 
 template <Growth kGrowth>
 std::unique_ptr<KeyTable> MakeGrowing(FixedKeyLayout layout, arrow::MemoryPool* pool,
-                                      const KeyTableOptions& options) {
+                                      const KeyTableOptions& options, MemoryBudget* budget) {
   switch (layout.key_bytes) {
     case 8:
-      return std::make_unique<FixedKeyTable<8, kGrowth>>(std::move(layout), pool, options);
+      return std::make_unique<FixedKeyTable<8, kGrowth>>(std::move(layout), pool, options, budget);
     case 16:
-      return std::make_unique<FixedKeyTable<16, kGrowth>>(std::move(layout), pool, options);
+      return std::make_unique<FixedKeyTable<16, kGrowth>>(std::move(layout), pool, options, budget);
     case 24:
-      return std::make_unique<FixedKeyTable<24, kGrowth>>(std::move(layout), pool, options);
+      return std::make_unique<FixedKeyTable<24, kGrowth>>(std::move(layout), pool, options, budget);
     case 32:
-      return std::make_unique<FixedKeyTable<32, kGrowth>>(std::move(layout), pool, options);
+      return std::make_unique<FixedKeyTable<32, kGrowth>>(std::move(layout), pool, options, budget);
     default:
       ANTB1_CHECK(layout.key_bytes == 40);
-      return std::make_unique<FixedKeyTable<40, kGrowth>>(std::move(layout), pool, options);
+      return std::make_unique<FixedKeyTable<40, kGrowth>>(std::move(layout), pool, options, budget);
   }
 }
 
@@ -86,11 +86,11 @@ std::optional<FixedKeyLayout> FixedKeyLayoutOf(const std::vector<arrow::TypeHold
 }
 
 std::unique_ptr<KeyTable> MakeFixedKeyTable(FixedKeyLayout layout, Growth growth,
-                                            arrow::MemoryPool* pool,
-                                            const KeyTableOptions& options) {
+                                            arrow::MemoryPool* pool, const KeyTableOptions& options,
+                                            MemoryBudget* budget) {
   return growth == Growth::kSlotOrder
-             ? MakeGrowing<Growth::kSlotOrder>(std::move(layout), pool, options)
-             : MakeGrowing<Growth::kIdOrder>(std::move(layout), pool, options);
+             ? MakeGrowing<Growth::kSlotOrder>(std::move(layout), pool, options, budget)
+             : MakeGrowing<Growth::kIdOrder>(std::move(layout), pool, options, budget);
 }
 
 }  // namespace antb1::exec

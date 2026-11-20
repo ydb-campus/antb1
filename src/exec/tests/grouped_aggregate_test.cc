@@ -31,6 +31,7 @@
 
 #include "../decimal.h"
 #include "../group_table.h"
+#include "../grouped_aggregate_program.h"
 #include "../grouped_sum_alias.h"
 #include "exec_test_util.h"
 
@@ -221,6 +222,163 @@ std::shared_ptr<arrow::Array> Finalized(const GroupedAggregateState& state) {
 }
 
 arrow::EqualOptions EqualNans() { return arrow::EqualOptions::Defaults().nans_equal(true); }
+
+// Both the original Arrow slice offset and the later ID chunk offset are nonzero. The ordinary
+// state consumes the slice in one go and supplies the oracle for updates and selected merges.
+TEST_F(GroupedAggregateTest, BatchProgramUpdatesAndMergesEveryEligibleType) {
+  constexpr std::size_t kRows = 117;
+  constexpr std::uint32_t kGroups = 8;
+  Rng rng(8291);
+  auto types = std::vector<LogicalType>(kTypes.begin(), kTypes.end());
+  types.push_back(LogicalType::Decimal(27, 4));
+  for (const auto type : types) {
+    const auto values = RandomColumn(type, kRows + 7, rng)->Slice(7, kRows);
+    const auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("v", values->type())}),
+                                                kRows, {values});
+    std::vector<std::uint32_t> ids(kRows);
+    for (auto& id : ids) {
+      id = static_cast<std::uint32_t>(rng.Below(kGroups - 1));
+    }
+    auto candidates = CallsOver(type);
+    if (type == LogicalType::kBigInt) {
+      candidates.push_back({.kind = AggKind::kSumCounts, .input = type, .result = type});
+    }
+    for (const Call& call : candidates) {
+      SCOPED_TRACE(std::string(plan::ToString(call.kind)) + " of " + plan::ToString(type));
+      const plan::AggregateCall payload{
+          .kind = call.kind,
+          .arg = call.input ? std::optional(Column(0, "v", type)) : std::nullopt,
+          .type = call.result};
+      const std::vector<plan::AggregateCall> calls = {
+          {.kind = AggKind::kCountStar, .type = LogicalType::kBigInt}, payload};
+      const auto make_states = [&] {
+        std::vector<std::unique_ptr<GroupedAggregateState>> states;
+        states.push_back(MakeGrouped(
+            {.kind = AggKind::kCountStar, .input = std::nullopt, .result = LogicalType::kBigInt}));
+        states.push_back(MakeGrouped(call));
+        return states;
+      };
+      MemoryReservation source_memory;
+      MemoryReservation target_memory;
+      auto source = make_states();
+      auto target = make_states();
+      const auto program =
+          GroupedAggregateProgram::Make(calls, source, arrow::default_memory_pool());
+      ASSERT_TRUE(program.ok()) << program.status();
+      const bool fallback = call.kind == AggKind::kCountDistinct ||
+                            (type == LogicalType::kVarchar &&
+                             (call.kind == AggKind::kMin || call.kind == AggKind::kMax));
+      ASSERT_EQ(program->supports_updates(), !fallback);
+      if (fallback) {
+        EXPECT_TRUE(program->Bind(*batch).status().IsInvalid());
+        continue;
+      }
+      ASSERT_TRUE(program->Resize(kGroups, source_memory).ok());
+      auto input = batch;
+      if (call.kind == AggKind::kSumCounts) {
+        const auto counts = testing::Int64s(std::vector<std::optional<std::int64_t>>(kRows, 3));
+        input = arrow::RecordBatch::Make(batch->schema(), kRows, {counts});
+      }
+      const auto bound = program->Bind(*input);
+      ASSERT_TRUE(bound.ok()) << bound.status();
+      for (std::size_t begin = 0; begin < kRows; begin += 19) {
+        const auto chunk = std::span(ids).subspan(begin, std::min<std::size_t>(19, kRows - begin));
+        ASSERT_TRUE(bound->Consume(begin, chunk).ok());
+      }
+      EXPECT_TRUE(bound->Consume(kRows, {}).ok());
+      EXPECT_TRUE(bound->Consume(kRows, std::span(ids).first(1)).IsInvalid());
+      constexpr auto kBad = std::to_array<std::uint32_t>({kGroups});
+      EXPECT_TRUE(bound->Consume(0, kBad).IsInvalid());
+
+      auto oracle = make_states();
+      oracle[0]->Resize(kGroups);
+      oracle[1]->Resize(kGroups);
+      ASSERT_TRUE(oracle[0]->Consume(nullptr, ids).ok());
+      ASSERT_TRUE(oracle[1]->Consume(call.input ? input->column(0).get() : nullptr, ids).ok());
+      const auto merge = GroupedAggregateProgram::Make(calls, target, arrow::default_memory_pool());
+      ASSERT_TRUE(merge.ok()) << merge.status();
+      ASSERT_TRUE(merge->Resize(3, target_memory).ok());
+      constexpr auto kFrom = std::to_array<std::uint32_t>({5, 1, 7, 4, 0, 6});
+      constexpr auto kTo = std::to_array<std::uint32_t>({2, 1, 2, 1, 2, 1});
+      ASSERT_TRUE(merge->MergeGroups(*program, kFrom, kTo).ok());
+      auto expected = make_states();
+      for (std::size_t i = 0; i < calls.size(); ++i) {
+        EXPECT_TRUE(Finalized(*source[i])->Equals(*Finalized(*oracle[i]), EqualNans()));
+        expected[i]->Resize(3);
+        ASSERT_TRUE(expected[i]->MergeGroups(*oracle[i], kFrom, kTo).ok());
+        EXPECT_TRUE(Finalized(*target[i])->Equals(*Finalized(*expected[i]), EqualNans()));
+      }
+    }
+  }
+}
+
+TEST_F(GroupedAggregateTest, BatchProgramKeepsFallibleCallOrderAndValidatesTheBoundType) {
+  const auto decimal = LogicalType::Decimal(28, 3);
+  const auto sum_type = LogicalType::Decimal(38, 3);
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = AggKind::kSum, .arg = Column(0, "d", decimal), .type = sum_type},
+      {.kind = AggKind::kAvg,
+       .arg = Column(1, "t", LogicalType::kDate),
+       .type = LogicalType::kTimestamp}};
+  std::vector<std::unique_ptr<GroupedAggregateState>> states;
+  states.push_back(MakeGrouped({.kind = AggKind::kSum, .input = decimal, .result = sum_type}));
+  states.push_back(MakeGrouped(
+      {.kind = AggKind::kAvg, .input = LogicalType::kDate, .result = LogicalType::kTimestamp}));
+  const auto both = GroupedAggregateProgram::Make(calls, states, arrow::default_memory_pool());
+  ASSERT_TRUE(both.ok()) << both.status();
+  EXPECT_FALSE(both->supports_updates());
+  const auto one = GroupedAggregateProgram::Make(
+      std::span(calls).first(1), std::span(states).first(1), arrow::default_memory_pool());
+  ASSERT_TRUE(one.ok()) << one.status();
+  ASSERT_TRUE(one->supports_updates());
+  const auto wrong = testing::Int64s({7});
+  const auto batch =
+      arrow::RecordBatch::Make(arrow::schema({arrow::field("d", wrong->type())}), 1, {wrong});
+  EXPECT_TRUE(one->Bind(*batch).status().IsInvalid());
+  MemoryBudget tiny(1);
+  EXPECT_TRUE(
+      GroupedAggregateProgram::Make(std::span(calls).first(1), std::span(states).first(1), &tiny)
+          .status()
+          .IsOutOfMemory());
+  EXPECT_EQ(tiny.bytes_allocated(), 0);
+}
+
+TEST_F(GroupedAggregateTest, BatchProgramChargesOverlappingStateVectors) {
+  const std::vector<plan::AggregateCall> calls = {
+      {.kind = AggKind::kCountStar, .type = LogicalType::kBigInt}};
+  // Four counters use 32 bytes. Six need a 48-byte replacement while the original is live.
+  for (const std::int64_t limit : {79, 80}) {
+    MemoryBudget budget(limit);
+    {
+      MemoryReservation memory;
+      memory.Reset(&budget);
+      std::vector<std::unique_ptr<GroupedAggregateState>> states;
+      states.push_back(MakeGrouped(
+          {.kind = AggKind::kCountStar, .input = std::nullopt, .result = LogicalType::kBigInt}));
+      const auto program =
+          GroupedAggregateProgram::Make(calls, states, arrow::default_memory_pool());
+      ASSERT_TRUE(program.ok()) << program.status();
+      ASSERT_TRUE(program->Resize(4, memory).ok());
+      EXPECT_EQ(budget.bytes_allocated(), 32);
+      const auto grown = program->Resize(6, memory);
+      if (limit == 79) {
+        EXPECT_TRUE(grown.IsOutOfMemory()) << grown;
+        EXPECT_EQ(budget.bytes_allocated(), 32);
+        EXPECT_EQ(states.front()->num_groups(), 4U);
+      } else {
+        ASSERT_TRUE(grown.ok()) << grown;
+        EXPECT_EQ(budget.bytes_allocated(), 48);
+        EXPECT_EQ(budget.max_memory(), 80);
+        EXPECT_EQ(states.front()->num_groups(), 6U);
+        // Publishing the first output chunk after updating later groups cannot shrink their state.
+        ASSERT_TRUE(program->Resize(4, memory).ok());
+        EXPECT_EQ(states.front()->num_groups(), 6U);
+        EXPECT_EQ(budget.bytes_allocated(), 48);
+      }
+    }
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+  }
+}
 
 // Group g of the grouped state equals the scalar state of the same aggregate fed only the rows of
 // group g (a selection), for every aggregate and input type, including a group without rows.
@@ -624,6 +782,11 @@ TEST_F(GroupedAggregateTest, RejectsBadInput) {
       {.kind = AggKind::kSum, .input = LogicalType::kBigInt, .result = LogicalType::kHugeInt});
   constexpr auto kMap = std::to_array<std::uint32_t>({0, 0});
   EXPECT_TRUE(count->Merge(*sum, kMap).IsInvalid());  // another aggregate
+  // Even when the map is invalid too, the standalone state reports the type mismatch first.
+  sum->Resize(1);
+  constexpr auto kWrongGroup = std::to_array<std::uint32_t>({2});
+  EXPECT_EQ(count->MergeGroups(*sum, kWrongGroup, kWrongGroup).message(),
+            "cannot merge states of different aggregates");
   EXPECT_FALSE(
       MakeGroupedAggregateState(AggKind::kSum, LogicalType::kVarchar, LogicalType::kDouble).ok());
 }

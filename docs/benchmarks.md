@@ -56,6 +56,7 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_GroupInt64Budget`, `BM_GroupInt64Int32Budget` (and `...BudgetRandom`) | the same grouper with its buffers from an `exec::MemoryBudget`, as the engine's are, at 1000 to 4Mi groups: the baseline of step 0 below. `Random`: ids drawn at random (splitmix64), so groups repeat early as in real data, instead of the permutation the other grouping benchmarks use |
 | `BM_KeyTable_<shape>_<growth>[_Random]` | the fixed-width candidate backend through `MakeKeyTable`, including pool-budgeted buffers and returned IDs, on the same one/two-key inputs as the budgeted grouper. `SlotOrder` is the default growth policy; `IdOrder` is the diagnostic alternative. Each name checks IDs, unique keys and refused optional sizing outside timing. Compare against `BM_Group<shape>Budget[Random]` of the same run; ADR 0019 retains the 1.3x target at 1000, 16Ki, 256Ki and 1Mi groups, with 4Mi reported. This replaces the duplicate step-0 loop; its prior variants remain in PR #253's history |
 | `BM_KeyTable_Int64Int32Bool_{Grouper,Column}[_Random]` | groups 4 Mi rows by BIGINT, INTEGER and a nullable BOOLEAN. All three columns contribute to identity. Both arms use the same KeyTable interface, data and query pool. The benchmark checks group IDs, all three output columns and backend selection outside the timed loop, and reports peak pool bytes alongside CPU and wall time. |
+| `BM_GroupProgram/<shape>/{Grouper,Fixed,Batch}` | times local grouping and aggregate updates, then partitioning and typed-state merging. Three calls share the same input. The three arms compare the Arrow baseline, the step 2 fixed backend and the step 3 batch program. |
 
 The fixed-width candidate is selected explicitly with private `KeyTableKind` options in tests and these
 microbenchmarks. Automatic query execution retains the Grouper and packed-string paths: the initial candidate
@@ -108,6 +109,91 @@ To repeat the comparison in one binary, run
 `pixi run bench --benchmark_filter=BM_KeyTable_Int64Int32Bool --benchmark_repetitions=5 --benchmark_min_time=0.5s`
 with `--benchmark_enable_random_interleaving=true`. The `Grouper` arm is the automatic backend in #389 for this
 schema. The `Column` arm explicitly selects the new layout.
+
+#### Step 3 aggregate update and merge measurements
+
+`BM_GroupProgram` runs COUNT(*) plus SUM and MAX of a nullable BIGINT payload. Its 4 Mi rows reach random
+groups drawn from 1,000, 16 Ki, 256 Ki, 1 Mi or 4 Mi target groups. The key shapes are BIGINT, BIGINT/INTEGER and
+BIGINT/INTEGER/nullable BOOLEAN. All three arms feed each batch to a local table. Four 64 Ki-row batches form a
+part. Two clustered controls visit the same BIGINT or three-column key for 16 consecutive rows at 256 Ki groups.
+A single worker merges each of 32 lanes in input-part order. Keeping this policy fixed isolates update and
+merge costs from the execution engine's adaptive decision to route raw rows.
+
+The `local_ms` counter covers table creation, insertion and updates. `merge_ms` includes freezing or partitioning
+the producers, building and merging the destination tables, and releasing them and the producers. `output_ms`
+includes checking finalization and emitting every key and aggregate through NextChunk. Each phase also reports
+process CPU milliseconds. Peak memory is the maximum charged to the query budget, with the input batches
+and validation model allocated separately. The batch program grows its state vectors by 1.5× and charges the old
+and replacement buffers together during growth. The separate-update arms use the existing vectors' resize policy.
+Before timing, each arm checks its program choice, all output keys,
+counts, exact sums, NULLs and maxima against the synthetic inputs, and verifies that all query charges are released.
+
+Run `pixi run bench --benchmark_filter=BM_GroupProgram/` for the grid. To exercise a global lane with 47 Mi groups,
+set `ANTB1_BENCH_LARGE_GROUPS=1` and use `--benchmark_filter=BM_GroupProgram/Int64LargeLane/`. That benchmark
+merges 47 Mi distinct permuted BIGINT keys into one destination. It measures a large destination's lookup and
+growth costs on one core.
+
+One static Release executable on CPU 0 of a Xeon Gold 6338 ran five randomly interleaved repetitions per arm,
+with a 0.5 s minimum benchmark time and default NUMA placement. The table gives median total wall milliseconds
+and the ratio of fixed/separate time to batch/direct time for each phase. A phase ratio above 1 favors the batch
+program. Peak MiB lists Grouper, fixed/separate and batch/direct in that order. On these inputs process CPU
+medians were within 0.06% of wall time. Sampled external load averaged 0.21 cores and peaked at 0.59.
+
+| Key | Target | Grouper ms | Fixed ms | Batch ms | Local ratio | Handoff ratio | Output ratio | Peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| BIGINT | 1,000 | 59.5 | 37.9 | 39.1 | 0.96 | 1.55 | 0.82 | 2.3 / 1.3 / 1.4 |
+| BIGINT | 16 Ki | 97.2 | 74.3 | 77.3 | 0.94 | 1.11 | 0.78 | 29.2 / 28.9 / 20.3 |
+| BIGINT | 256 Ki | 422.6 | 343.4 | 383.7 | 0.86 | 0.93 | 0.83 | 224.3 / 227.2 / 233.0 |
+| BIGINT | 1 Mi | 584.6 | 531.8 | 597.9 | 0.83 | 0.96 | 0.84 | 295.6 / 466.6 / 510.3 |
+| BIGINT | 4 Mi | 706.9 | 592.7 | 658.8 | 0.83 | 0.95 | 0.83 | 311.0 / 487.2 / 520.5 |
+| BIGINT/INT | 1,000 | 73.3 | 46.3 | 48.0 | 0.95 | 1.72 | 0.77 | 2.5 / 1.6 / 1.7 |
+| BIGINT/INT | 16 Ki | 118.1 | 86.6 | 92.5 | 0.90 | 1.23 | 0.68 | 32.4 / 34.0 / 24.3 |
+| BIGINT/INT | 256 Ki | 478.3 | 397.4 | 431.8 | 0.87 | 1.00 | 0.75 | 267.2 / 273.9 / 269.2 |
+| BIGINT/INT | 1 Mi | 651.2 | 612.0 | 627.0 | 0.91 | 1.07 | 0.72 | 342.3 / 602.0 / 631.5 |
+| BIGINT/INT | 4 Mi | 802.3 | 675.2 | 698.4 | 0.90 | 1.05 | 0.67 | 360.0 / 630.1 / 647.8 |
+| BIGINT/INT/BOOL | 1,000 | 136.3 | 188.7 | 192.4 | 0.98 | 1.70 | 0.77 | 2.5 / 1.5 / 1.6 |
+| BIGINT/INT/BOOL | 16 Ki | 191.9 | 254.0 | 260.9 | 0.96 | 1.16 | 0.85 | 32.5 / 33.2 / 23.5 |
+| BIGINT/INT/BOOL | 256 Ki | 652.4 | 714.1 | 795.1 | 0.90 | 0.88 | 1.02 | 267.9 / 240.2 / 234.7 |
+| BIGINT/INT/BOOL | 1 Mi | 901.4 | 941.4 | 1123.3 | 0.87 | 0.81 | 1.02 | 343.2 / 357.1 / 385.8 |
+| BIGINT/INT/BOOL | 4 Mi | 1031.8 | 1064.6 | 1288.7 | 0.87 | 0.79 | 1.03 | 361.0 / 373.9 / 390.5 |
+| BIGINT clustered | 256 Ki | 138.7 | 70.8 | 71.7 | 0.94 | 1.14 | 0.85 | 20.3 / 19.9 / 22.1 |
+| BIGINT/INT/BOOL clustered | 256 Ki | 292.9 | 184.0 | 181.6 | 0.97 | 1.22 | 1.21 | 23.5 / 24.3 / 25.4 |
+
+The batch program took longer than the step 2 fixed control in all 15 random cells. The geometric mean of the
+fixed/batch wall ratios was 0.925, or 8.1% more time for the batch program. Against Grouper the geometric
+mean was 1.030, with nine wins. Local updates took longer in all 15 cases. Handoff improved at 1,000 groups
+for every layout, then slowed on the three-column random keys at 256 Ki through 4 Mi. In the clustered controls,
+the three-column batch program took 1.3% less time than fixed/separate, and the single-key program took 1.3% more.
+
+The one-lane run reached 49,283,072 distinct groups on the same binary. Three interleaved single iterations per
+arm gave the following medians. Each phase median is calculated independently. Sampled external load averaged
+0.19 cores and peaked at 0.33.
+
+| Arm | Local s | Handoff s | Output s | Total wall s | CPU s | Peak query GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Grouper | 2.955 | 6.574 | 0.466 | 9.993 | 9.988 | 7.56 |
+| Fixed/separate | 2.466 | 5.534 | 0.468 | 8.443 | 8.440 | 6.82 |
+| Batch/direct | 2.736 | 6.079 | 0.627 | 9.443 | 9.440 | 7.04 |
+
+A separate `perf` capture on the same binary sampled user-space cycles at 499 Hz for ten measured iterations
+per arm. Saved return addresses distinguished the measured call from fixture construction and the oracle. The
+table gives sampled cycles per input row for the calls to Consume, Partition and MergePartition. Time spent
+releasing parts or producing final output is outside these three calls.
+
+| Random key and target | Arm | Local Consume | Producer Partition | Lane MergePartition |
+| --- | --- | ---: | ---: | ---: |
+| BIGINT, 256 Ki | Fixed/separate | 135.9 | 19.1 | 92.0 |
+| BIGINT, 256 Ki | Batch/direct | 152.1 | 10.3 | 107.8 |
+| BIGINT/INT/BOOL, 4 Mi | Fixed/separate | 294.6 | 64.8 | 376.7 |
+| BIGINT/INT/BOOL, 4 Mi | Batch/direct | 329.0 | 34.8 | 530.7 |
+
+For the three-column case, the producer saved 30.0 cycles per input row while the destination lane spent
+154.0 more. The direct `ColumnKeyTable::MergeStored` loop accounted for 108.9 cycles per row exclusive
+of callees. Samples clustered at the call site that reads the selected source group's saved hash, locates
+the destination ID scratch and calls `Probe`. Within the lane, `ColumnKeyTable::Find` rose from 86.8 to
+112.7 cycles per row. The three aggregate `MergeRange` functions together rose from 112.3 to 125.0.
+For the single BIGINT key, SUM and MAX local updates together rose from 42.8 to 50.2 cycles per row,
+and the direct packed-key merge loop took 17.0 cycles per row exclusive of callees.
 
 `bench.micro.smoke` (label `bench-smoke`) runs every benchmark for one iteration (`--benchmark_dry_run`), so they
 keep building and running:

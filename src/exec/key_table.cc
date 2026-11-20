@@ -32,6 +32,28 @@
 namespace antb1::exec {
 namespace {
 
+// Arrow exposes both metadata vectors with the standard allocator. Reserve their heap bytes
+// against the query budget before allocating, even when there are no groups.
+template <class T>
+arrow::Status ReserveSnapshotVector(std::vector<T>& values, std::size_t count,
+                                    MemoryReservation& memory, MemoryBudget* budget) {
+  ANTB1_CHECK(values.capacity() == 0);
+  if (count > values.max_size()) {
+    return arrow::Status::CapacityError("unique key metadata size overflow");
+  }
+  memory.Reset(budget);
+  ARROW_RETURN_NOT_OK(memory.Resize(Narrow<std::int64_t>(count * sizeof(T))));
+  values.reserve(count);
+  // reserve() may provide extra capacity. Keep the whole allocation charged until destruction.
+  return memory.Resize(Narrow<std::int64_t>(values.capacity() * sizeof(T)));
+}
+
+// A detached array keeps the charge for its own buffer handles after the batch goes away.
+struct UniqueColumn {
+  MemoryReservation buffer_memory;
+  arrow::ArrayData data;
+};
+
 // A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
 // only NULLs.
 bool LacksValues(const arrow::ArrayData& data) {
@@ -383,6 +405,47 @@ class PackedStringKeyTable final : public KeyTable {
 
 }  // namespace
 
+arrow::Status StoredKeyTable::CheckSelection(std::span<const std::uint32_t> selected,
+                                             std::uint32_t source_groups) {
+  if (!selected.empty() && std::ranges::max(selected) >= source_groups) {
+    return arrow::Status::Invalid("group ID outside the ", source_groups, " stored groups");
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status StoredKeyTable::CheckStoredRange(std::uint32_t first, std::uint32_t count) const {
+  const auto size = num_groups();
+  if (first > size || count > size - first) {
+    return arrow::Status::Invalid("group range outside the ", size, " stored groups");
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Result<KeySnapshot> StoredKeyTable::MakeSnapshot(std::size_t columns,
+                                                        std::int64_t length) const {
+  KeySnapshot snapshot{.datum_memory = {}, .batch = {{}, length}};
+  ARROW_RETURN_NOT_OK(
+      ReserveSnapshotVector(snapshot.batch.values, columns, snapshot.datum_memory, budget_));
+  return snapshot;
+}
+
+arrow::Status StoredKeyTable::AppendColumn(KeySnapshot& snapshot,
+                                           const std::shared_ptr<arrow::DataType>& type,
+                                           std::shared_ptr<arrow::Buffer> validity,
+                                           std::shared_ptr<arrow::Buffer> values,
+                                           std::int64_t nulls) const {
+  auto column = std::allocate_shared<UniqueColumn>(arrow::stl::allocator<UniqueColumn>(pool_));
+  auto& data = column->data;
+  data.type = type;
+  data.length = snapshot.batch.length;
+  data.SetNullCount(nulls);
+  ARROW_RETURN_NOT_OK(ReserveSnapshotVector(data.buffers, 2, column->buffer_memory, budget_));
+  data.buffers.emplace_back(std::move(validity));
+  data.buffers.emplace_back(std::move(values));
+  snapshot.batch.values.emplace_back(std::shared_ptr<arrow::ArrayData>(std::move(column), &data));
+  return arrow::Status::OK();
+}
+
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options, MemoryBudget* budget) {
@@ -405,12 +468,10 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
       if (auto layout = FixedKeyLayoutOf(key_types); layout.has_value()) {
         const auto growth =
             options.kind == KeyTableKind::kFixedIdOrder ? Growth::kIdOrder : Growth::kSlotOrder;
-        return MakeFixedKeyTable(std::move(*layout), growth, ctx->memory_pool(), options);
+        return MakeFixedKeyTable(std::move(*layout), growth, ctx->memory_pool(), options, budget);
       }
       if (TakesColumnKeys(key_types)) {
-        auto* pool = ctx->memory_pool();
-        return MakeColumnKeyTable(key_types, pool, options,
-                                  budget != nullptr ? budget : dynamic_cast<MemoryBudget*>(pool));
+        return MakeColumnKeyTable(key_types, ctx->memory_pool(), options, budget);
       }
     }
     return MakeGrouper(key_types, ctx);
