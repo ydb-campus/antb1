@@ -130,13 +130,30 @@ each worker, then hands each table to its destination lane and releases it after
 `Int64Int32BoolSelected` case uses a nullable filter mask over the original key and payload columns. The oracle
 checks output keys and aggregates from the selected rows. All synthetic workers and merge lanes run on one thread.
 
-The experimental `Hybrid` arm starts each worker with one local table. If its table has passed 32 Ki observed
-groups and there is more selected input, it migrates the existing groups and continues in per-lane tables.
-`Hybrid16K` and `Hybrid64K` vary the threshold. Read `promoted_parts`, `stayed_parts` and `promoted_groups`
-beside `parts` and `partial_groups`: the input's target distinct count and the observed count per worker can differ.
+The experimental `Hybrid` arm starts each input part with one local table. When that table exceeds 32 Ki
+distinct groups and another selected input tile arrives, the worker transfers the accumulated keys and states
+to their lanes once. DOUBLE SUM and AVG stay on one table to preserve their accumulation order.
+`Hybrid16K` and `Hybrid64K` vary the threshold. Compare `promoted_parts`, `stayed_parts` and `promoted_groups`
+with `parts` and `partial_groups`. A worker starts counting again for each new part.
 `promotion_ms` sums migration elapsed time within the local-update phase. Random targets include 32 Ki and 64 Ki.
 The sparse three-key case selects roughly one row in 17. The alternating case gives every other part only 1,000
 possible groups. The high-cardinality `LongParts` cases give each part 2 Mi input rows out of a 16 Mi-row stream.
+
+The table gives median elapsed milliseconds on one pinned physical core from five interleaved Release runs of
+the BIGINT-key benchmark. Group counts are the observed mean per part. The first three rows use four 64 Ki-row
+batches per part and the last uses 32. All arms produced identical groups and aggregates.
+
+| Groups per part | Single ms | Partitioned ms | Hybrid ms | Parts promoted |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 41.0 | 78.5 | 40.9 | 0 of 16 |
+| 64,336 | 188.0 | 210.6 | 237.6 | 16 of 16 |
+| 254,101 | 638.1 | 514.8 | 543.7 | 16 of 16 |
+| 1,650,127 | 2,445.1 | 2,001.7 | 2,014.1 | 8 of 8 |
+
+At 1,000 groups Single and Hybrid both peaked at 1.54 MB of query memory, compared with 7.18 MB for
+Partitioned. At 64,336 groups Hybrid spent 35.0 ms moving existing groups. The 64 Ki threshold kept those
+parts on one table and took 188.0 ms. Longer parts amortized migration over more subsequent input rows.
+Automatic execution retains the existing adaptive local/raw policy.
 
 The ordinary part operator also accepts these layouts internally for comparisons. It checks eligibility before
 reading input. Partition top-N, unsupported key/state combinations, and aggregates with order-sensitive update
