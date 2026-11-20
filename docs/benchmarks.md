@@ -56,7 +56,7 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_GroupInt64Budget`, `BM_GroupInt64Int32Budget` (and `...BudgetRandom`) | the same grouper with its buffers from an `exec::MemoryBudget`, as the engine's are, at 1000 to 4Mi groups: the baseline of step 0 below. `Random`: ids drawn at random (splitmix64), so groups repeat early as in real data, instead of the permutation the other grouping benchmarks use |
 | `BM_KeyTable_<shape>_<growth>[_Random]` | the fixed-width candidate backend through `MakeKeyTable`, including pool-budgeted buffers and returned IDs, on the same one/two-key inputs as the budgeted grouper. `SlotOrder` is the default growth policy; `IdOrder` is the diagnostic alternative. Each name checks IDs, unique keys and refused optional sizing outside timing. Compare against `BM_Group<shape>Budget[Random]` of the same run; ADR 0019 retains the 1.3x target at 1000, 16Ki, 256Ki and 1Mi groups, with 4Mi reported. This replaces the duplicate step-0 loop; its prior variants remain in PR #253's history |
 | `BM_KeyTable_Int64Int32Bool_{Grouper,Column}[_Random]` | groups 4 Mi rows by BIGINT, INTEGER and a nullable BOOLEAN. All three columns contribute to identity. Both arms use the same KeyTable interface, data and query pool. The benchmark checks group IDs, all three output columns and backend selection outside the timed loop, and reports peak pool bytes alongside CPU and wall time. |
-| `BM_GroupProgram/<shape>/{Grouper,Fixed,Batch}` | times local grouping and aggregate updates, then partitioning and typed-state merging. Three calls share the same input. The three arms compare the Arrow baseline, the step 2 fixed backend and the step 3 batch program. |
+| `BM_GroupProgram/<shape>/<arm>` | times local grouping, aggregate updates, partitioning and merging. Grouper, Fixed and Batch compare the Arrow baseline, the step 2 fixed backend and the step 3 batch program. DensePrefetch exercises the optional three-column merge. |
 
 The fixed-width candidate is selected explicitly with private `KeyTableKind` options in tests and these
 microbenchmarks. Automatic query execution retains the Grouper and packed-string paths: the initial candidate
@@ -114,14 +114,19 @@ schema. The `Column` arm explicitly selects the new layout.
 
 `BM_GroupProgram` runs COUNT(*) plus SUM and MAX of a nullable BIGINT payload. Its 4 Mi rows reach random
 groups drawn from 1,000, 16 Ki, 256 Ki, 1 Mi or 4 Mi target groups. The key shapes are BIGINT, BIGINT/INTEGER and
-BIGINT/INTEGER/nullable BOOLEAN. All three arms feed each batch to a local table. Four 64 Ki-row batches form a
+BIGINT/INTEGER/nullable BOOLEAN. All arms feed each batch to a local table. Four 64 Ki-row batches form a
 part. Two clustered controls visit the same BIGINT or three-column key for 16 consecutive rows at 256 Ki groups.
 A single worker merges each of 32 lanes in input-part order. Keeping this policy fixed isolates update and
 merge costs from the execution engine's adaptive decision to route raw rows.
 
+For the three-column keys, compare `Batch` with `DensePrefetch` on the same input. Both use the batch aggregate
+program. During destination merge, DensePrefetch gathers 256 selected hashes, key values and validity bits at a
+time and prefetches the destination bucket eight probes ahead. The benchmark verifies which merge loop ran.
+
 The `local_ms` counter covers table creation, insertion and updates. `merge_ms` includes freezing or partitioning
 the producers, building and merging the destination tables, and releasing them and the producers. `output_ms`
-includes checking finalization and emitting every key and aggregate through NextChunk. Each phase also reports
+includes checking finalization and emitting every key and aggregate through NextChunk. Within `merge_ms`,
+`lane_merge_ms` covers the destination calls to MergePartition across all lanes. Each phase also reports
 process CPU milliseconds. Peak memory is the maximum charged to the query budget, with the input batches
 and validation model allocated separately. The batch program grows its state vectors by 1.5× and charges the old
 and replacement buffers together during growth. The separate-update arms use the existing vectors' resize policy.

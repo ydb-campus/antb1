@@ -345,6 +345,137 @@ TEST_F(ColumnKeyTableTest, ChunkUpdatesAndStoredMergesMatchMaterializedKeys) {
   }
 }
 
+TEST_F(ColumnKeyTableTest, PrefetchedMergeMatchesMaterializedKeysAcrossChunksAndGrowth) {
+  constexpr std::uint32_t kGroups = 521;
+  std::vector<std::optional<bool>> flags;
+  std::vector<std::optional<std::int16_t>> small;
+  std::vector<std::optional<std::int32_t>> numbers;
+  std::vector<std::optional<std::string>> wide;
+  for (std::uint32_t i = 0; i < kGroups + 3; ++i) {
+    flags.emplace_back(i % 3 == 0 ? std::nullopt : std::optional(i % 3 == 1));
+    small.emplace_back(i % 7 == 0 ? std::nullopt : std::optional(static_cast<std::int16_t>(i)));
+    numbers.emplace_back(i % 11 == 0 ? std::nullopt : std::optional(-static_cast<std::int32_t>(i)));
+    wide.emplace_back(i % 5 == 0
+                          ? std::nullopt
+                          : std::optional(std::to_string(10000U + i) + "123456789012345678"));
+  }
+  const auto bits = testing::Bools(flags);
+  const auto short_keys = testing::Int16s(small);
+  // Span two 64-column NULL mask blocks. The trailing keys include a high-word DECIMAL,
+  // a bit-packed BOOLEAN and an all-valid BIGINT that makes the original rows distinct.
+  arrow::ArrayVector columns(63, bits);
+  columns.insert(columns.end(), {testing::Decimals(38, 3, wide), short_keys, bits, Int32s(numbers),
+                                 Int64s(KeysFrom(0, kGroups + 3))});
+  const auto batch = BatchOf(std::move(columns)).Slice(3, kGroups);
+  std::vector<arrow::TypeHolder> types;
+  types.reserve(batch.values.size());
+  for (const auto& value : batch.values) {
+    types.emplace_back(value.type());
+  }
+  arrow::compute::ExecContext ctx;
+  auto source = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}).ValueOrDie();
+  auto* stored = dynamic_cast<StoredKeyTable*>(source.get());
+  ASSERT_NE(stored, nullptr);
+  ASSERT_TRUE(stored->Consume(batch).ok());
+  ASSERT_EQ(stored->num_groups(), kGroups);
+
+  constexpr auto kSelections = (2 * kGroups) + 17;
+  std::vector<std::uint32_t> selected;
+  selected.reserve(kSelections);
+  for (std::uint32_t i = 0; i < kSelections; ++i) {
+    selected.push_back((137 * i) % kGroups);
+  }
+  const auto gathered = stored->GatherStored(selected).ValueOrDie();
+  const auto seed = batch.Slice(11, 23);
+  auto reference = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}).ValueOrDie();
+  const auto seed_ids = IdsOf(*reference, seed);
+  const auto expected_ids = IdsOf(*reference, gathered.batch);
+  const auto expected_keys = reference->Uniques().ValueOrDie();
+  bool observed = false;
+  std::vector<std::unique_ptr<KeyTable>> targets;
+  for (const bool prefetch : {false, true}) {
+    SCOPED_TRACE(prefetch);
+    observed = !prefetch;
+    auto target = MakeKeyTable(types, &ctx,
+                               {.kind = KeyTableKind::kFixed,
+                                .prefetch_composite_merge = prefetch,
+                                .prefetched_composite_merge = &observed})
+                      .ValueOrDie();
+    auto* destination = dynamic_cast<StoredKeyTable*>(target.get());
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(IdsOf(*destination, seed), seed_ids);
+    std::vector<std::uint32_t> actual;
+    auto status = destination->MergeStored(
+        *stored, selected,
+        [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+          EXPECT_EQ(offset, actual.size());
+          EXPECT_EQ(after, destination->num_groups());
+          actual.insert(actual.end(), ids.begin(), ids.end());
+          return arrow::Status::OK();
+        });
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(observed, prefetch);
+    EXPECT_EQ(actual, expected_ids);
+    targets.push_back(std::move(target));
+  }
+  EXPECT_EQ(stored->Uniques().ValueOrDie().batch.values, batch.values);
+  source.reset();
+  for (const auto& target : targets) {
+    EXPECT_EQ(target->Uniques().ValueOrDie().batch.values, expected_keys.batch.values);
+  }
+}
+
+TEST_F(ColumnKeyTableTest, PrefetchedMergeScratchIsBoundedAndCanRetryAfterRefusal) {
+  const auto batch = BatchOf({Int64s({1}), Int32s({2}), testing::Bools({std::nullopt})});
+  const std::vector<arrow::TypeHolder> types{arrow::int64(), arrow::int32(), arrow::boolean()};
+  arrow::compute::ExecContext source_ctx;
+  auto source = MakeKeyTable(types, &source_ctx, {.kind = KeyTableKind::kFixed}).ValueOrDie();
+  auto* stored = dynamic_cast<StoredKeyTable*>(source.get());
+  ASSERT_NE(stored, nullptr);
+  ASSERT_TRUE(stored->Consume(batch).ok());
+  const std::vector<std::uint32_t> selected(65537, 0);
+  constexpr std::int64_t kBudget = 65536;
+  MemoryBudget budget(kBudget);
+  {
+    arrow::compute::ExecContext ctx(&budget);
+    auto target =
+        MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed, .prefetch_composite_merge = true})
+            .ValueOrDie();
+    auto* destination = dynamic_cast<StoredKeyTable*>(target.get());
+    ASSERT_NE(destination, nullptr);
+    // Every selected key is already present, so a merge never needs to grow the table.
+    ASSERT_TRUE(destination->Consume(batch).ok());
+    std::size_t visited = 0;
+    const auto merge = [&] {
+      return destination->MergeStored(
+          *stored, selected,
+          [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+            EXPECT_EQ(offset, visited);
+            EXPECT_EQ(after, 1U);
+            EXPECT_TRUE(std::ranges::all_of(ids, [](std::uint32_t id) { return id == 0; }));
+            visited += ids.size();
+            return arrow::Status::OK();
+          });
+    };
+    {
+      MemoryReservation held;
+      held.Reset(&budget);
+      // The source descriptors and 256 output IDs fit. The hash and key scratch does not.
+      ASSERT_TRUE(held.Resize(kBudget - budget.bytes_allocated() - 2048).ok());
+      const auto before = budget.bytes_allocated();
+      EXPECT_TRUE(merge().IsOutOfMemory());
+      EXPECT_GT(budget.bytes_allocated(), before);  // the reusable output IDs were allocated
+      EXPECT_EQ(destination->num_groups(), 1U);
+      EXPECT_EQ(visited, 0U);
+    }
+    // A full array of selected IDs alone would exceed this budget four times over.
+    const auto merged = merge();
+    ASSERT_TRUE(merged.ok()) << merged;
+    EXPECT_EQ(visited, selected.size());
+  }
+  EXPECT_EQ(budget.bytes_allocated(), 0);
+}
+
 TEST_F(ColumnKeyTableTest, BorrowedChunkIdsFitWhenTheFullIdArrayExceedsTheBudget) {
   constexpr std::size_t kRows = 65536;
   const auto numbers = Int64s(std::vector<std::optional<std::int64_t>>(kRows, 1));
