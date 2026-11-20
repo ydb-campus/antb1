@@ -268,7 +268,7 @@ bool PartKeepsFirstKeys(const std::vector<plan::BoundColumn>& keys) {
       keys, [](const plan::BoundColumn& key) { return key.type == plan::LogicalType::kDouble; });
 }
 
-// Keep hashing, state arithmetic, and sizing identical in the two all-local layouts.
+// Keep hashing, state arithmetic, and sizing identical in the all-local layouts.
 constexpr KeyTableOptions kLocalFixedKeys{.kind = KeyTableKind::kFixed, .estimate = false};
 
 arrow::Result<std::unique_ptr<GroupTable>> MakePartTable(
@@ -299,7 +299,13 @@ arrow::Result<PartGrouper> PartGrouper::Make(const std::vector<plan::BoundColumn
         grouper.groups_, KeyTableNoBadAlloc([&] -> arrow::Result<std::shared_ptr<PartGroups>> {
           return std::allocate_shared<PartGroups>(arrow::stl::allocator<PartGroups>(part_ctx.pool));
         }));
-    if (layout == LocalGroupLayout::kPartitioned) {
+    if (layout == LocalGroupLayout::kCardinality) {
+      ARROW_ASSIGN_OR_RAISE(grouper.cardinality_,
+                            CardinalityLocalGroups::Make(
+                                keys, aggregates, input_width, part_ctx.pool, part_ctx.budget,
+                                PartKeepsFirstKeys(keys), GroupTable::kPartitions, kLocalFixedKeys,
+                                kLocalPromotionGroups));
+    } else if (layout == LocalGroupLayout::kPartitioned) {
       ARROW_ASSIGN_OR_RAISE(
           grouper.groups_->partitioned,
           PartitionedGroupTables::Make(keys, aggregates, input_width, part_ctx.pool,
@@ -332,9 +338,12 @@ arrow::Status PartGrouper::Add(const Batch& batch, ProfileNode* profile) {
 arrow::Status PartGrouper::AddLocal(const arrow::RecordBatch& rows,
                                     const arrow::BooleanArray* selection, ProfileNode* profile) {
   const ProfileTimer timer(profile, "local_update");
-  if (groups_->partitioned) {
-    ARROW_RETURN_NOT_OK(groups_->partitioned->Consume(
-        rows, selection, profile != nullptr ? &dispatch_elapsed_ : nullptr));
+  auto* dispatch = profile != nullptr ? &dispatch_elapsed_ : nullptr;
+  if (cardinality_) {
+    ARROW_RETURN_NOT_OK(cardinality_->Consume(rows, selection, dispatch,
+                                              profile != nullptr ? &promotion_elapsed_ : nullptr));
+  } else if (groups_->partitioned) {
+    ARROW_RETURN_NOT_OK(groups_->partitioned->Consume(rows, selection, dispatch));
   } else {
     ARROW_RETURN_NOT_OK(groups_->table->ConsumeSelected(rows, selection));
   }
@@ -384,7 +393,9 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
   {
     const ProfileTimer partitioning(
         profile, layout_ == LocalGroupLayout::kAdaptive ? "local_path" : "local_handoff");
-    if (groups_->partitioned) {
+    if (cardinality_) {
+      ARROW_RETURN_NOT_OK(cardinality_->Finish(groups_->table, groups_->partitioned));
+    } else if (groups_->partitioned) {
       ARROW_RETURN_NOT_OK(groups_->partitioned->Finish());
     } else {
       ARROW_RETURN_NOT_OK(groups_->table->Partition());
@@ -401,9 +412,16 @@ arrow::Result<std::shared_ptr<PartGroups>> PartGrouper::Finish(ProfileNode* prof
         groups_->partitioned ? groups_->partitioned->num_groups() : groups_->table->num_groups();
     profile->Add("local_groups", MetricUnit::kCount, Narrow<int64_t>(groups));
     if (layout_ != LocalGroupLayout::kAdaptive) {
-      profile->Add(
-          layout_ == LocalGroupLayout::kSingle ? "single_local_parts" : "partitioned_local_parts",
-          MetricUnit::kCount, 1);
+      profile->Add(groups_->partitioned ? "partitioned_local_parts" : "single_local_parts",
+                   MetricUnit::kCount, 1);
+    }
+    if (cardinality_) {
+      profile->Add("hybrid_local_parts", MetricUnit::kCount, 1);
+      if (cardinality_->promoted()) {
+        profile->Add("promoted_local_parts", MetricUnit::kCount, 1);
+        profile->Add("promoted_groups", MetricUnit::kCount, cardinality_->promoted_groups());
+        profile->Add("local_promotion", MetricUnit::kNanos, promotion_elapsed_.count());
+      }
     }
     if (groups_->partitioned) {
       profile->Add("local_hash_dispatch", MetricUnit::kNanos, dispatch_elapsed_.count());

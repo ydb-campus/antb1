@@ -179,6 +179,7 @@ class GroupTable {
 
  private:
   friend class PartitionedGroupTables;
+  friend class CardinalityLocalGroups;
   arrow::Result<arrow::compute::ExecBatch> NormalizedKeys(const arrow::RecordBatch& rows) const;
   GroupTable(std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
              arrow::MemoryPool* pool, bool first_keys);
@@ -292,6 +293,10 @@ class PartitionedGroupTables {
   std::unique_ptr<const GroupTable> ReleasePartition(std::size_t lane);
 
  private:
+  friend class CardinalityLocalGroups;
+  arrow::Status CreateLane(std::size_t lane);
+  // The frozen source's groups are disjoint and these destination lanes are empty.
+  arrow::Status Seed(const GroupTable& source);
   PartitionedGroupTables(int input_width, arrow::MemoryPool* pool, const KeyTableOptions& options,
                          MemoryReservation metadata)
       : metadata_(std::move(metadata)),
@@ -314,6 +319,51 @@ class PartitionedGroupTables {
   PoolVector<std::uint32_t> rows_;     // selected indices followed by the stable lane order
   PoolVector<std::uint64_t> hashes_;
   std::uint64_t groups_ = 0;
+  arrow::Status error_;
+};
+
+// Private observation threshold for the single-to-partitioned local layout experiment.
+inline constexpr std::uint32_t kLocalPromotionGroups = 32U * 1024;
+
+// Start one fixed local table and observe its actual distinct groups. A later nonempty input
+// tile may promote it: move the accumulated state of each group to its owning lane before
+// consuming new rows. Finish returns the same handoff as the selected local layout.
+class CardinalityLocalGroups {
+ public:
+  static arrow::Result<std::unique_ptr<CardinalityLocalGroups>> Make(
+      const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+      int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
+      std::size_t partitions, const KeyTableOptions& options, std::uint32_t threshold);
+  arrow::Status Consume(const arrow::RecordBatch& rows,
+                        const arrow::BooleanArray* selection = nullptr,
+                        std::chrono::nanoseconds* dispatch_elapsed = nullptr,
+                        std::chrono::nanoseconds* promotion_elapsed = nullptr);
+  arrow::Status Finish(std::unique_ptr<GroupTable>& single,
+                       std::unique_ptr<PartitionedGroupTables>& partitioned);
+  [[nodiscard]] bool promoted() const { return promoted_groups_ != 0; }
+  [[nodiscard]] std::uint32_t promoted_groups() const { return promoted_groups_; }
+  [[nodiscard]] std::uint64_t num_groups() const;
+
+ private:
+  CardinalityLocalGroups(MemoryReservation metadata, int input_width, KeyTableOptions options,
+                         std::uint32_t threshold, bool can_promote)
+      : metadata_(std::move(metadata)),
+        input_width_(input_width),
+        options_(options),
+        threshold_(threshold),
+        can_promote_(can_promote) {
+    options_.table_metadata = nullptr;
+  }
+  arrow::Status Promote();
+  MemoryReservation metadata_;
+  int input_width_;
+  KeyTableOptions options_;
+  std::uint32_t threshold_;
+  bool can_promote_;
+  std::uint32_t promoted_groups_ = 0;
+  std::uint64_t finished_groups_ = 0;
+  std::unique_ptr<GroupTable> single_;
+  std::unique_ptr<PartitionedGroupTables> partitioned_;
   arrow::Status error_;
 };
 

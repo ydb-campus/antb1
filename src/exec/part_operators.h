@@ -167,9 +167,9 @@ struct PartGroups {
   std::vector<std::vector<std::shared_ptr<arrow::RecordBatch>>> rows;  // per partition, or empty
 };
 
-// Internal comparison for ordinary part grouping (ADR 0019). Both explicit layouts aggregate
+// Internal comparison for ordinary part grouping (ADR 0019). The explicit layouts aggregate
 // every selected row locally and use the same stored-key backend and destination tables.
-enum class LocalGroupLayout { kAdaptive, kSingle, kPartitioned };
+enum class LocalGroupLayout { kAdaptive, kSingle, kPartitioned, kCardinality };
 
 // Makes the PartGroups of one part, batch by batch (PartGroupAggregateOperator's parts and each
 // root of PartGroupingSetsOperator's): after its first kRouteDecisionRows rows (or batch), a part
@@ -191,6 +191,7 @@ class PartGrouper {
   arrow::Status AddLocal(const arrow::RecordBatch& rows, const arrow::BooleanArray* selection,
                          ProfileNode* profile);
   std::shared_ptr<PartGroups> groups_;
+  std::unique_ptr<CardinalityLocalGroups> cardinality_;
   LocalGroupLayout layout_ = LocalGroupLayout::kAdaptive;
   arrow::MemoryPool* pool_ = nullptr;
   int64_t decide_after_ = 0;
@@ -199,6 +200,7 @@ class PartGrouper {
   int64_t consumed_ = 0;
   int64_t routed_ = 0;
   std::chrono::nanoseconds dispatch_elapsed_{};
+  std::chrono::nanoseconds promotion_elapsed_{};
 };
 
 // Grouped aggregation over a part pipeline: every part is grouped into its own GroupTable on the

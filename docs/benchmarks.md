@@ -130,6 +130,14 @@ each worker, then hands each table to its destination lane and releases it after
 `Int64Int32BoolSelected` case uses a nullable filter mask over the original key and payload columns. The oracle
 checks output keys and aggregates from the selected rows. All synthetic workers and merge lanes run on one thread.
 
+The experimental `Hybrid` arm starts each worker with one local table. If its table has passed 32 Ki observed
+groups and there is more selected input, it migrates the existing groups and continues in per-lane tables.
+`Hybrid16K` and `Hybrid64K` vary the threshold. Read `promoted_parts`, `stayed_parts` and `promoted_groups`
+beside `parts` and `partial_groups`: the input's target distinct count and the observed count per worker can differ.
+`promotion_ms` sums migration elapsed time within the local-update phase. Random targets include 32 Ki and 64 Ki.
+The sparse three-key case selects roughly one row in 17. The alternating case gives every other part only 1,000
+possible groups. The high-cardinality `LongParts` cases give each part 2 Mi input rows out of a 16 Mi-row stream.
+
 The ordinary part operator also accepts these layouts internally for comparisons. It checks eligibility before
 reading input. Partition top-N, unsupported key/state combinations, and aggregates with order-sensitive update
 errors (including AVG of DATE and wide DECIMAL or HUGEINT sums) use adaptive grouping. The query profile counts

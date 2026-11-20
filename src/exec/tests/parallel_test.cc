@@ -1192,7 +1192,8 @@ void CheckLocalGroupLayouts(arrow::internal::Executor* pool) {
     ASSERT_TRUE(expected.ok()) << expected.status();
     ASSERT_GT((*expected)->num_rows(), 0);
     for (auto* executor : {static_cast<arrow::internal::Executor*>(nullptr), pool}) {
-      for (auto layout : {LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned}) {
+      for (auto layout : {LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned,
+                          LocalGroupLayout::kCardinality}) {
         MemoryBudget memory(std::nullopt);
         ProfileNode profile;
         {
@@ -1214,12 +1215,73 @@ void CheckLocalGroupLayouts(arrow::internal::Executor* pool) {
           }
         }
         EXPECT_EQ(MetricValue(profile, "single_local_parts"),
-                  c.eligible && layout == LocalGroupLayout::kSingle ? table->num_parts() : 0);
+                  c.eligible && layout != LocalGroupLayout::kPartitioned ? table->num_parts() : 0);
         EXPECT_EQ(MetricValue(profile, "partitioned_local_parts"),
                   c.eligible && layout == LocalGroupLayout::kPartitioned ? table->num_parts() : 0);
+        EXPECT_EQ(MetricValue(profile, "hybrid_local_parts"),
+                  c.eligible && layout == LocalGroupLayout::kCardinality ? table->num_parts() : 0);
+        EXPECT_EQ(MetricValue(profile, "promoted_local_parts"), 0);
         EXPECT_EQ(memory.bytes_allocated(), 0);
       }
     }
+  }
+}
+
+// A low-cardinality part and the prefix of a promoted part share keys. Both handoffs must
+// reach the same destination partitions and retain the ordinary part order.
+void CheckMixedCardinalityParts(arrow::internal::Executor* pool) {
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  const auto output = arrow::schema({schema->field(0), arrow::field("n", arrow::int64())});
+  const auto k = Column(0, "k", LogicalType::kBigInt);
+  const plan::AggregateCall count{.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt};
+  constexpr int64_t kFirstBatch = int64_t{kLocalPromotionGroups} + 1;
+  std::vector<std::optional<int64_t>> keys;
+  keys.reserve(Narrow<std::size_t>(kFirstBatch + 2));
+  for (int64_t i = 0; i < kFirstBatch; ++i) {
+    keys.emplace_back(i);
+  }
+  keys.emplace_back(0);
+  keys.emplace_back(kFirstBatch - 1);
+  const auto table = std::make_shared<MemoryTable>(
+      schema,
+      arrow::RecordBatchVector{
+          arrow::RecordBatch::Make(schema, 3, {Int64s({0, 1, kFirstBatch - 1})}),
+          arrow::RecordBatch::Make(schema, kFirstBatch + 2, {Int64s(keys)})},
+      true);
+  const PartPipeline pipeline = [table](int64_t part) -> arrow::Result<std::unique_ptr<Operator>> {
+    return std::make_unique<TableScanOperator>(table, std::vector<int>{0}, part);
+  };
+  const auto run = [&](LocalGroupLayout layout, arrow::internal::Executor* executor,
+                       MemoryBudget& memory, ProfileNode& profile) {
+    PartGroupAggregateOperator op(pipeline, table->num_parts(), 1, {k}, {count}, output,
+                                  std::nullopt, layout);
+    op.set_profile(&profile);
+    return Drain(op, {.pool = &memory,
+                      .batch_size = kFirstBatch,
+                      .executor = executor,
+                      .threads = executor == nullptr ? 1 : kThreads,
+                      .budget = &memory});
+  };
+  MemoryBudget reference_memory(std::nullopt);
+  ProfileNode reference_profile;
+  const auto expected =
+      run(LocalGroupLayout::kSingle, nullptr, reference_memory, reference_profile);
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  ASSERT_EQ((*expected)->num_rows(), kFirstBatch);
+  for (auto* executor : {static_cast<arrow::internal::Executor*>(nullptr), pool}) {
+    MemoryBudget memory(std::nullopt);
+    ProfileNode profile;
+    {
+      const auto result = run(LocalGroupLayout::kCardinality, executor, memory, profile);
+      ASSERT_TRUE(result.ok()) << result.status();
+      EXPECT_TRUE(SameRows(**result, **expected));
+    }
+    EXPECT_EQ(MetricValue(profile, "hybrid_local_parts"), 2);
+    EXPECT_EQ(MetricValue(profile, "single_local_parts"), 1);
+    EXPECT_EQ(MetricValue(profile, "partitioned_local_parts"), 1);
+    EXPECT_EQ(MetricValue(profile, "promoted_local_parts"), 1);
+    EXPECT_EQ(MetricValue(profile, "promoted_groups"), kFirstBatch);
+    EXPECT_EQ(memory.bytes_allocated(), 0);
   }
 }
 
@@ -1233,8 +1295,8 @@ TEST_F(PartOperatorsTest, FullyPrunedGroupingNeedsNoQueryMemory) {
   const auto key = Column(0, "k", LogicalType::kBigInt);
   const plan::AggregateCall count{
       .kind = plan::AggKind::kCountStar, .arg = {}, .type = LogicalType::kBigInt};
-  for (auto layout :
-       {LocalGroupLayout::kAdaptive, LocalGroupLayout::kSingle, LocalGroupLayout::kPartitioned}) {
+  for (auto layout : {LocalGroupLayout::kAdaptive, LocalGroupLayout::kSingle,
+                      LocalGroupLayout::kPartitioned, LocalGroupLayout::kCardinality}) {
     MemoryBudget memory(0);
     PartGroupAggregateOperator op(pipeline, 0, 1, {key}, {count}, schema, std::nullopt, layout);
     const auto empty = Drain(op, {.pool = &memory, .budget = &memory});
@@ -1256,6 +1318,7 @@ TEST_F(PartOperatorsTest, FullyPrunedGroupingNeedsNoQueryMemory) {
 TEST_F(PartOperatorsTest, GroupingPerPartMergesInPartOrder) {
   const auto pool = Pool();
   CheckLocalGroupLayouts(pool.get());
+  CheckMixedCardinalityParts(pool.get());
   const auto k = Column(0, "k", LogicalType::kDouble);
   const auto g = Column(1, "g", LogicalType::kBigInt);
   const auto str = Column(2, "s", LogicalType::kVarchar);

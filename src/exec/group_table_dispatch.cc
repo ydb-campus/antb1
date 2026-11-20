@@ -239,14 +239,7 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
       }
       auto& table = lanes_[lane];
       if (!table) {
-        if (spare_) {
-          table = std::move(spare_);
-        } else {
-          ARROW_ASSIGN_OR_RAISE(
-              table, GroupTable::MakeLocal(prototype_->keys_, prototype_->aggregates_, input_width_,
-                                           prototype_->pool_, prototype_->memory_.budget(),
-                                           prototype_->keep_first_keys_, lanes_.size(), options_));
-        }
+        ARROW_RETURN_NOT_OK(CreateLane(lane));
       }
       const auto before = table->num_groups();
       ARROW_RETURN_NOT_OK(table->ConsumeProgram(rows, keys, {order + starts[lane], count}));
@@ -257,6 +250,35 @@ arrow::Status PartitionedGroupTables::Dispatch(const arrow::RecordBatch& rows,
       }
     }
   }
+  return arrow::Status::OK();
+}
+
+arrow::Status PartitionedGroupTables::CreateLane(std::size_t lane) {
+  auto& table = lanes_[lane];
+  ANTB1_DCHECK(table == nullptr);
+  if (spare_) {
+    table = std::move(spare_);
+  } else {
+    ARROW_ASSIGN_OR_RAISE(
+        table, GroupTable::MakeLocal(prototype_->keys_, prototype_->aggregates_, input_width_,
+                                     prototype_->pool_, prototype_->memory_.budget(),
+                                     prototype_->keep_first_keys_, lanes_.size(), options_));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status PartitionedGroupTables::Seed(const GroupTable& source) {
+  ANTB1_DCHECK(groups_ == 0);
+  ANTB1_DCHECK(source.num_partitions() == lanes_.size());
+  for (std::size_t lane = 0; lane < lanes_.size(); ++lane) {
+    const auto groups = source.partition_groups(lane);
+    if (!groups.empty()) {
+      ARROW_RETURN_NOT_OK(CreateLane(lane));
+      ARROW_RETURN_NOT_OK(lanes_[lane]->MergePartition(source, lane));
+      ANTB1_DCHECK(lanes_[lane]->num_groups() == groups.size());
+    }
+  }
+  groups_ = source.num_groups();
   return arrow::Status::OK();
 }
 
@@ -272,6 +294,108 @@ arrow::Status PartitionedGroupTables::Finish() {
 std::unique_ptr<const GroupTable> PartitionedGroupTables::ReleasePartition(std::size_t lane) {
   ANTB1_CHECK(prototype_ == nullptr);
   return std::move(lanes_.at(lane));
+}
+
+arrow::Result<std::unique_ptr<CardinalityLocalGroups>> CardinalityLocalGroups::Make(
+    const std::vector<plan::BoundColumn>& keys, const std::vector<plan::AggregateCall>& calls,
+    int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys,
+    std::size_t partitions, const KeyTableOptions& options, std::uint32_t threshold) {
+  return KeyTableNoBadAlloc([&] -> arrow::Result<std::unique_ptr<CardinalityLocalGroups>> {
+    if (!std::has_single_bit(partitions) || partitions > GroupTable::kPartitions) {
+      return arrow::Status::Invalid("unsupported local group partition count: ", partitions);
+    }
+    MemoryReservation metadata;
+    metadata.Reset(budget == nullptr ? dynamic_cast<MemoryBudget*>(pool) : budget);
+    ARROW_RETURN_NOT_OK(metadata.Resize(sizeof(CardinalityLocalGroups)));
+    // An extra floating-point addition during migration could change a DOUBLE sum's bits.
+    // A NULL group, integer/decimal SUM and AVG, COUNT and fixed-width extrema all transfer
+    // exactly by merging the sole source state into a new group.
+    const bool can_promote = std::ranges::none_of(calls, [](const plan::AggregateCall& call) {
+      return (call.kind == plan::AggKind::kSum || call.kind == plan::AggKind::kAvg) && call.arg &&
+             call.arg->type == plan::LogicalType::kDouble;
+    });
+    auto out = std::unique_ptr<CardinalityLocalGroups>(new CardinalityLocalGroups(
+        std::move(metadata), input_width, options, threshold, can_promote));
+    ARROW_ASSIGN_OR_RAISE(out->single_,
+                          GroupTable::MakeLocal(keys, calls, input_width, pool, budget, first_keys,
+                                                partitions, options));
+    return out;
+  });
+}
+
+arrow::Status CardinalityLocalGroups::Promote() {
+  ARROW_RETURN_NOT_OK(single_->Partition());
+  ARROW_ASSIGN_OR_RAISE(auto lanes, PartitionedGroupTables::Make(
+                                        single_->keys_, single_->aggregates_, input_width_,
+                                        single_->pool_, single_->memory_.budget(),
+                                        single_->keep_first_keys_, single_->partitions_, options_));
+  // Keep the frozen source charged and alive through the last transfer. A refusal destroys the
+  // temporary lanes and the caller retains the error instead of publishing a partial group set.
+  ARROW_RETURN_NOT_OK(lanes->Seed(*single_));
+  promoted_groups_ = single_->num_groups();
+  partitioned_ = std::move(lanes);
+  single_.reset();
+  return arrow::Status::OK();
+}
+
+arrow::Status CardinalityLocalGroups::Consume(const arrow::RecordBatch& rows,
+                                              const arrow::BooleanArray* selection,
+                                              std::chrono::nanoseconds* dispatch_elapsed,
+                                              std::chrono::nanoseconds* promotion_elapsed) {
+  ARROW_RETURN_NOT_OK(error_);
+  if (!single_ && !partitioned_) {
+    return arrow::Status::Invalid("update of a finished cardinality-based grouping");
+  }
+  error_ = KeyTableNoBadAlloc([&] {
+    return VisitInput(
+        rows, selection,
+        [&](const arrow::RecordBatch& batch, const arrow::BooleanArray* mask) -> arrow::Status {
+          if (single_ && can_promote_ && single_->num_groups() > threshold_) {
+            if (batch.num_rows() == 0) {
+              return arrow::Status::OK();
+            }
+            if (mask != nullptr) {
+              std::int64_t row = 0;
+              while (row < mask->length() && (!mask->IsValid(row) || !mask->Value(row))) {
+                ++row;
+              }
+              if (row == mask->length()) {
+                return arrow::Status::OK();
+              }
+            }
+            using Clock = std::chrono::steady_clock;
+            const auto start = promotion_elapsed != nullptr ? Clock::now() : Clock::time_point{};
+            ARROW_RETURN_NOT_OK(Promote());
+            if (promotion_elapsed != nullptr) {
+              *promotion_elapsed += Clock::now() - start;
+            }
+          }
+          return partitioned_ ? partitioned_->Consume(batch, mask, dispatch_elapsed)
+                              : single_->ConsumeSelected(batch, mask);
+        });
+  });
+  return error_;
+}
+
+std::uint64_t CardinalityLocalGroups::num_groups() const {
+  if (single_) {
+    return single_->num_groups();
+  }
+  return partitioned_ ? partitioned_->num_groups() : finished_groups_;
+}
+
+arrow::Status CardinalityLocalGroups::Finish(std::unique_ptr<GroupTable>& single,
+                                             std::unique_ptr<PartitionedGroupTables>& partitioned) {
+  ARROW_RETURN_NOT_OK(error_);
+  if (!single_ && !partitioned_) {
+    return arrow::Status::Invalid("cardinality-based grouping already finished");
+  }
+  error_ = partitioned_ ? partitioned_->Finish() : single_->Partition();
+  ARROW_RETURN_NOT_OK(error_);
+  finished_groups_ = num_groups();
+  single = std::move(single_);
+  partitioned = std::move(partitioned_);
+  return arrow::Status::OK();
 }
 
 }  // namespace antb1::exec
