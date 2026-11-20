@@ -11,7 +11,10 @@
 #include <arrow/compute/exec.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
+#include <arrow/stl_allocator.h>
 #include <arrow/type_fwd.h>
+
+#include "antb1/exec/memory_budget.h"
 
 namespace arrow::compute {
 class ExecContext;
@@ -25,6 +28,13 @@ struct KeyIds {
   std::span<const std::uint32_t> ids;    // one per row, valid while `owner` lives
   std::uint32_t before = 0;              // the table's groups before the call
   std::uint32_t after = 0;               // and after it: the new groups are [before, after)
+};
+
+// Keep the charge for the batch's datum vector until that vector is destroyed. Individual
+// arrays may outlive the batch and carry their own storage and metadata charges.
+struct KeySnapshot {
+  MemoryReservation datum_memory;
+  arrow::compute::ExecBatch batch;
 };
 
 // The table that numbers a GroupTable's key rows: every distinct row of key values (NULL is a
@@ -51,7 +61,7 @@ class KeyTable {
       const arrow::compute::ExecBatch& keys) = 0;
   // Every group's keys in id order, of the types the table was made for (normalized, NULLs kept).
   // It can be called again; the arrays stay valid after later calls.
-  [[nodiscard]] virtual arrow::Result<arrow::compute::ExecBatch> Uniques() const = 0;
+  [[nodiscard]] virtual arrow::Result<KeySnapshot> Uniques() const = 0;
   [[nodiscard]] virtual std::uint32_t num_groups() const = 0;
 };
 
@@ -61,8 +71,8 @@ enum class KeyTableKind : std::uint8_t {
   kAuto,
   kGrouper,        // arrow::compute::Grouper, for every key shape
   kPackedStrings,  // short STRING/BINARY keys; unsupported shapes use kGrouper
-  kFixed,          // candidate one/two fixed-width keys, slot-order growth; tests and benchmarks
-  kFixedIdOrder,   // same keys, id-order growth; for tests and benchmarks
+  kFixed,          // fixed-width candidates: packed one/two keys when eligible, otherwise columns
+  kFixedIdOrder,   // id-order growth for the packed layout; same column layout for other keys
 };
 
 // One ID is reserved as the fixed table's missing-key marker.
@@ -70,23 +80,26 @@ inline constexpr std::uint32_t kMaxKeyTableGroups = std::numeric_limits<std::uin
 
 struct KeyTableOptions {
   KeyTableKind kind = KeyTableKind::kAuto;
-  // Estimate from the first two nonempty input batches. Disable for merged distinct groups.
+  // Size the packed fixed-width table from its first two nonempty batches. Disable for merges.
   bool estimate = true;
   // Lower only in tests; the fixed backend rejects an additional group with OutOfMemory.
   std::uint32_t max_groups = kMaxKeyTableGroups;
 };
 
 // A table over keys of `key_types` (at least one) that allocates from `ctx`'s memory pool. `ctx`
-// itself must outlive the table: arrow's Grouper keeps it.
+// itself must outlive the table: arrow's Grouper keeps it. Pass the query budget separately
+// when the pool wraps it, so heap metadata can be charged for the lifetime of returned keys.
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
-    const KeyTableOptions& options = {});
+    const KeyTableOptions& options = {}, MemoryBudget* budget = nullptr);
 
-// Convert allocations of Arrow's small objects outside the query pool to the exec error model.
+// Preserve a query pool's allocation diagnostic and convert ordinary heap failures to Status.
 template <class Body>
 auto KeyTableNoBadAlloc(const Body& body) -> decltype(body()) {
   try {
     return body();
+  } catch (const arrow::stl::BadAlloc& error) {
+    return arrow::Status::OutOfMemory(error.what());
   } catch (const std::bad_alloc&) {
     return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
   }

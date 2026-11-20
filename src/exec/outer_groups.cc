@@ -135,8 +135,8 @@ arrow::Status OuterGroups::AddPlain(const GroupTable& plain) {
   if (grouper_ == nullptr) {
     ARROW_ASSIGN_OR_RAISE(to, GroupsOf(arrow::compute::ExecBatch({}, plain.num_groups())));
   } else {
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch keys, plain.uniques());
-    ARROW_ASSIGN_OR_RAISE(to, GroupsOf(keys));
+    ARROW_ASSIGN_OR_RAISE(const auto keys, plain.uniques());
+    ARROW_ASSIGN_OR_RAISE(to, GroupsOf(keys.batch));
   }
   std::vector<std::uint32_t> from(to.size());
   for (std::size_t i = 0; i < from.size(); ++i) {

@@ -300,9 +300,8 @@ class PartGroupingSetsOperator final : public PartSink {
   // The second level for `batch`: its sets' tables from their roots', in one pass and one barrier.
   arrow::Status DeriveBatch(const std::vector<std::size_t>& batch);
   // A root partition's groups projected to `set`'s keys.
-  [[nodiscard]] arrow::compute::ExecBatch Projected(
-      const std::optional<arrow::compute::ExecBatch>& uniques, std::size_t set,
-      std::size_t groups) const;
+  [[nodiscard]] arrow::compute::ExecBatch Projected(const std::optional<KeySnapshot>& uniques,
+                                                    std::size_t set, std::size_t groups) const;
   // Builds the rows of set `set`'s next partitions (from built_ on) in parallel.
   arrow::Status BuildRows(std::size_t set);
 

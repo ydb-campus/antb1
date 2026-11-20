@@ -387,7 +387,8 @@ arrow::Result<Batch> SetOperationOperator::NextDistinct() {
 arrow::Result<Batch> SetOperationOperator::NextRepeated() {
   const std::uint32_t groups = table_->num_groups();
   if (uniques_ == nullptr && groups > 0) {
-    ARROW_ASSIGN_OR_RAISE(const arrow::compute::ExecBatch keys, table_->uniques());
+    ARROW_ASSIGN_OR_RAISE(const auto snapshot, table_->uniques());
+    const auto& keys = snapshot.batch;
     std::vector<std::shared_ptr<arrow::Array>> arrays;
     arrays.reserve(keys.values.size());
     for (const arrow::Datum& key : keys.values) {

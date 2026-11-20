@@ -163,13 +163,14 @@ TEST_F(GroupingSetsTest, MergeProjectedFoldsManyGroupsIntoOne) {
                                 testing::Int64s({10, 20, 30, 40, 50, 60})});
   ASSERT_TRUE((*source)->Consume(*rows).ok());
   ASSERT_EQ((*source)->num_groups(), 5U);  // (1,x) (2,y) (1,z) (NULL,x) (1,NULL)
-  const auto uniques = (*source)->uniques();
-  ASSERT_TRUE(uniques.ok());
+  const auto snapshot = (*source)->uniques();
+  ASSERT_TRUE(snapshot.ok());
+  const auto& uniques = snapshot->batch;
 
   auto by_a = GroupTable::Make({a}, calls, 3, arrow::default_memory_pool(), nullptr);
   ASSERT_TRUE(by_a.ok());
   const std::vector<std::size_t> first = {0};
-  ASSERT_TRUE((*by_a)->MergeProjected(**source, ProjectKeys(*uniques, first), All(5)).ok());
+  ASSERT_TRUE((*by_a)->MergeProjected(**source, ProjectKeys(uniques, first), All(5)).ok());
   EXPECT_EQ((*by_a)->num_groups(), 3U);
   const auto chunk = (*by_a)->NextChunk(SetSchema({a, b}, {0}, calls));
   ASSERT_TRUE(chunk.ok() && *chunk != nullptr);
@@ -182,13 +183,13 @@ TEST_F(GroupingSetsTest, MergeProjectedFoldsManyGroupsIntoOne) {
   auto by_b = GroupTable::Make({b}, calls, 3, arrow::default_memory_pool(), nullptr);
   ASSERT_TRUE(by_b.ok());
   const std::vector<std::size_t> second = {1};
-  ASSERT_TRUE((*by_b)->MergeProjected(**source, ProjectKeys(*uniques, second), All(5)).ok());
+  ASSERT_TRUE((*by_b)->MergeProjected(**source, ProjectKeys(uniques, second), All(5)).ok());
   EXPECT_EQ((*by_b)->num_groups(), 4U);  // x, y, z, NULL
 
   // A subset of the source's groups, as the parallel operator merges each partition of a set: the
   // groups split by the hash of their projected keys into two tables, which together hold every
   // group once, with every row counted once.
-  const auto split = SplitByKeys(ProjectKeys(*uniques, first), 2, arrow::default_memory_pool());
+  const auto split = SplitByKeys(ProjectKeys(uniques, first), 2, arrow::default_memory_pool());
   ASSERT_TRUE(split.ok()) << split.status().ToString();
   int64_t groups = 0;
   int64_t counted = 0;
@@ -239,13 +240,14 @@ TEST_F(GroupingSetsTest, MergeProjectedAddsManyGroupsInBoundedChunks) {
                   ->Consume(*arrow::RecordBatch::Make(schema, groups,
                                                       {testing::Int64s(a), testing::Int64s(b)}))
                   .ok());
-  const auto uniques = (*source)->uniques();
-  ASSERT_TRUE(uniques.ok());
+  const auto snapshot = (*source)->uniques();
+  ASSERT_TRUE(snapshot.ok());
+  const auto& uniques = snapshot->batch;
   auto by_a = GroupTable::Make({ka}, calls, 2, arrow::default_memory_pool(), nullptr);
   ASSERT_TRUE(by_a.ok());
   const std::vector<std::size_t> first = {0};
   ASSERT_TRUE((*by_a)
-                  ->MergeProjected(**source, ProjectKeys(*uniques, first),
+                  ->MergeProjected(**source, ProjectKeys(uniques, first),
                                    All(static_cast<std::size_t>(groups)))
                   .ok());
   int64_t rows = 0;

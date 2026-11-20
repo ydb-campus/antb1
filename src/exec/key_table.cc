@@ -24,7 +24,9 @@
 
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
+#include "antb1/exec/memory_budget.h"
 
+#include "column_key_table.h"
 #include "fixed_key_table.h"
 
 namespace antb1::exec {
@@ -33,7 +35,8 @@ namespace {
 // A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
 // only NULLs.
 bool LacksValues(const arrow::ArrayData& data) {
-  return data.type->byte_width() > 0 && data.buffers.size() > 1 && data.buffers[1] == nullptr;
+  return (data.type->id() == arrow::Type::BOOL || data.type->byte_width() > 0) &&
+         data.buffers.size() > 1 && data.buffers[1] == nullptr;
 }
 
 // `keys` with every such column replaced by NULLs over a zeroed values buffer: arrow's Grouper
@@ -86,8 +89,11 @@ class GrouperKeyTable final : public KeyTable {
     });
   }
 
-  [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return KeyTableNoBadAlloc([&] { return grouper_->GetUniques(); });
+  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_ASSIGN_OR_RAISE(auto batch, grouper_->GetUniques());
+      return KeySnapshot{.datum_memory = {}, .batch = std::move(batch)};
+    });
   }
 
   [[nodiscard]] std::uint32_t num_groups() const override { return grouper_->num_groups(); }
@@ -291,9 +297,10 @@ class PackedStringKeyTable final : public KeyTable {
     });
   }
 
-  [[nodiscard]] arrow::Result<arrow::compute::ExecBatch> Uniques() const override {
-    return KeyTableNoBadAlloc([&] -> arrow::Result<arrow::compute::ExecBatch> {
-      ARROW_ASSIGN_OR_RAISE(auto uniques, backend_->Uniques());
+  [[nodiscard]] arrow::Result<KeySnapshot> Uniques() const override {
+    return KeyTableNoBadAlloc([&] -> arrow::Result<KeySnapshot> {
+      ARROW_ASSIGN_OR_RAISE(auto snapshot, backend_->Uniques());
+      auto& uniques = snapshot.batch;
       if (packed_) {
         for (std::size_t column = 0; column < uniques.values.size(); ++column) {
           ARROW_ASSIGN_OR_RAISE(
@@ -317,7 +324,7 @@ class PackedStringKeyTable final : public KeyTable {
                                            arrow::compute::TakeOptions::NoBoundsCheck(), ctx_));
         }
       }
-      return uniques;
+      return snapshot;
     });
   }
 
@@ -333,7 +340,7 @@ class PackedStringKeyTable final : public KeyTable {
     }
     ARROW_ASSIGN_OR_RAISE(const auto uniques, Uniques());
     ARROW_ASSIGN_OR_RAISE(auto replacement, MakeGrouper(original_types_, ctx_));
-    ARROW_ASSIGN_OR_RAISE(const KeyIds seed, replacement->Consume(uniques));
+    ARROW_ASSIGN_OR_RAISE(const KeyIds seed, replacement->Consume(uniques.batch));
     ANTB1_CHECK(seed.after == num_groups());
     bool identity = true;
     for (std::size_t id = 0; id < seed.ids.size(); ++id) {
@@ -378,7 +385,7 @@ class PackedStringKeyTable final : public KeyTable {
 
 arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
-    const KeyTableOptions& options) {
+    const KeyTableOptions& options, MemoryBudget* budget) {
   ANTB1_CHECK(!key_types.empty());
   // Automatic selection retains the approved Grouper/packed-string paths: the fixed-width
   // candidate missed ADR 0019's end-to-end gates. Explicit fixed kinds serve tests and benchmarks.
@@ -399,6 +406,11 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
         const auto growth =
             options.kind == KeyTableKind::kFixedIdOrder ? Growth::kIdOrder : Growth::kSlotOrder;
         return MakeFixedKeyTable(std::move(*layout), growth, ctx->memory_pool(), options);
+      }
+      if (TakesColumnKeys(key_types)) {
+        auto* pool = ctx->memory_pool();
+        return MakeColumnKeyTable(key_types, pool, options,
+                                  budget != nullptr ? budget : dynamic_cast<MemoryBudget*>(pool));
       }
     }
     return MakeGrouper(key_types, ctx);
