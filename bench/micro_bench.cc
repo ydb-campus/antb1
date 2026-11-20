@@ -5,10 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,6 +44,7 @@
 #include "antb1/plan/types.h"
 #include "antb1/sql/parser.h"
 
+#include "group_table.h"
 #include "key_table.h"
 #include <unistd.h>
 
@@ -619,9 +624,13 @@ constexpr uint64_t kGroupStride = 0x9E3779B1ULL;
 // How rows pick their group: the permutation above, or splitmix64 of the row number modulo the
 // count, where groups repeat early as in real data (and some go unseen: about 37% of them when the
 // rows equal the groups, so the `groups` counter is then below the argument).
-enum class GroupIds : std::uint8_t { kPermutation, kRandom };
+enum class GroupIds : std::uint8_t { kPermutation, kRandom, kClustered };
 
 uint64_t GroupIdOf(int64_t row, int64_t groups, GroupIds ids = GroupIds::kPermutation) {
+  if (ids == GroupIds::kClustered) {
+    return static_cast<uint64_t>(row) * static_cast<uint64_t>(groups) /
+           static_cast<uint64_t>(GroupRowsFor(groups));
+  }
   if (ids == GroupIds::kRandom) {
     uint64_t state = static_cast<uint64_t>(row);
     return SplitMix64(state) % static_cast<uint64_t>(groups);
@@ -1049,6 +1058,284 @@ BENCHMARK(BM_KeyTable_Int64Int32Bool_Column_Random)
     ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_KEY_TABLE_COUNTS
 
+// ADR 0019 step 3. Feed the same four-batch parts into each GroupTable path and merge their
+// partitions in part order. Measure building the local tables separately from the complete
+// handoff (partitioning, all destination merges and releasing the tables).
+struct ProgramInput {
+  arrow::RecordBatchVector batches;
+  std::vector<plan::BoundColumn> keys;
+  std::vector<plan::AggregateCall> calls;
+  std::shared_ptr<arrow::Schema> output;
+};
+
+std::optional<int64_t> ProgramValue(int64_t row) {
+  if (row % 11 == 0) {
+    return std::nullopt;
+  }
+  return (row % 127) - 63;
+}
+
+arrow::Result<ProgramInput> MakeProgramInput(GroupShape shape, int64_t groups, GroupIds ids) {
+  ProgramInput in;
+  in.batches = GroupInput(shape, groups, GroupRowsFor(groups), ids);
+  if (in.batches.empty()) {
+    return arrow::Status::OutOfMemory("cannot build aggregate benchmark keys");
+  }
+  auto fields = in.batches.front()->schema()->fields();
+  const std::array<plan::LogicalType, 3> types = {
+      plan::LogicalType::kBigInt, plan::LogicalType::kInteger, plan::LogicalType::kBoolean};
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    in.keys.push_back({.index = Narrow<int>(i), .name = fields[i]->name(), .type = types.at(i)});
+  }
+  const int value_index = Narrow<int>(fields.size());
+  const plan::BoundColumn v{.index = value_index, .name = "v", .type = plan::LogicalType::kBigInt};
+  in.calls = {{.kind = plan::AggKind::kCountStar, .type = plan::LogicalType::kBigInt},
+              {.kind = plan::AggKind::kSum, .arg = v, .type = plan::LogicalType::kHugeInt},
+              {.kind = plan::AggKind::kMax, .arg = v, .type = plan::LogicalType::kBigInt}};
+  fields.push_back(arrow::field("count", arrow::int64()));
+  fields.push_back(arrow::field("sum", plan::ToArrow(plan::LogicalType::kHugeInt)));
+  fields.push_back(arrow::field("max", arrow::int64()));
+  in.output = arrow::schema(std::move(fields));
+  int64_t row = 0;
+  for (auto& batch : in.batches) {
+    arrow::Int64Builder values;
+    ARROW_RETURN_NOT_OK(values.Reserve(batch->num_rows()));
+    for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
+      const auto value = ProgramValue(row);
+      if (value.has_value()) {
+        values.UnsafeAppend(*value);
+      } else {
+        values.UnsafeAppendNull();
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto data, values.Finish());
+    ARROW_ASSIGN_OR_RAISE(batch,
+                          batch->AddColumn(value_index, arrow::field("v", arrow::int64()), data));
+  }
+  return in;
+}
+
+struct ExpectedGroup {
+  int64_t count = 0;
+  int64_t sum = 0;
+  int64_t maximum = std::numeric_limits<int64_t>::min();
+};
+
+// Check output including each component of the key and NULL-only aggregate groups. Clearing a
+// matched count detects duplicates across lanes and leaves any missing group visible at the end.
+arrow::Status DrainProgramLane(exec::GroupTable& lane, const ProgramInput& in,
+                               std::vector<ExpectedGroup>* expected) {
+  ARROW_RETURN_NOT_OK(lane.CheckFinalize());
+  const auto n = Narrow<int>(in.keys.size());
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto chunk, lane.NextChunk(in.output));
+    if (chunk == nullptr) {
+      return arrow::Status::OK();
+    }
+    if (expected == nullptr) {
+      benchmark::DoNotOptimize(chunk);
+      continue;
+    }
+    ARROW_RETURN_NOT_OK(chunk->ValidateFull());
+    arrow::compute::ExecBatch keys(*chunk);
+    keys.values.resize(in.keys.size());
+    const auto& counts = static_cast<const arrow::Int64Array&>(*chunk->column(n));
+    const auto& sums = static_cast<const arrow::Decimal128Array&>(*chunk->column(n + 1));
+    const auto& maxima = static_cast<const arrow::Int64Array&>(*chunk->column(n + 2));
+    for (int64_t i = 0; i < chunk->num_rows(); ++i) {
+      const auto [k, j, b] = KeyAt(keys, i);
+      if (chunk->column(0)->IsNull(i) || k < 0 || static_cast<uint64_t>(k) >= expected->size() ||
+          (n > 1 && (chunk->column(1)->IsNull(i) || j < 0 || j >= (n == 3 ? 32 : 1024)))) {
+        return arrow::Status::Invalid("unexpected aggregate benchmark key");
+      }
+      int64_t id = k;
+      if (n == 3) {
+        id = (k * 32 + j) * 3 + (b.has_value() ? static_cast<int>(*b) : 2);
+      } else if (n == 2) {
+        id = k * 1024 + j;
+      }
+      if (static_cast<uint64_t>(id) >= expected->size()) {
+        return arrow::Status::Invalid("aggregate benchmark key outside generated range");
+      }
+      auto& group = expected->at(static_cast<std::size_t>(id));
+      const bool empty = group.maximum == std::numeric_limits<int64_t>::min();
+      if (group.count == 0 || counts.IsNull(i) || counts.Value(i) != group.count ||
+          sums.IsNull(i) != empty || maxima.IsNull(i) != empty ||
+          (!empty && (arrow::Decimal128(sums.GetValue(i)) != arrow::Decimal128(group.sum) ||
+                      maxima.Value(i) != group.maximum))) {
+        return arrow::Status::Invalid("wrong aggregate result at generated key ", id);
+      }
+      group.count = 0;
+    }
+  }
+}
+
+struct ProgramTimes {
+  double local_ms = 0;
+  double merge_ms = 0;
+  double output_ms = 0;
+  double local_cpu_ms = 0;
+  double merge_cpu_ms = 0;
+  double output_cpu_ms = 0;
+  uint64_t partial_groups = 0;
+  uint64_t groups = 0;
+};
+
+arrow::Result<ProgramTimes> RunGroupProgram(const ProgramInput& in, exec::KeyTableKind kind,
+                                            exec::GroupTableMode mode, std::size_t lanes,
+                                            exec::MemoryBudget& budget,
+                                            std::vector<ExpectedGroup>* expected = nullptr) {
+  using Clock = std::chrono::steady_clock;
+  using Millis = std::chrono::duration<double, std::milli>;
+  const auto make = [&](bool destination) -> arrow::Result<std::unique_ptr<exec::GroupTable>> {
+    ARROW_ASSIGN_OR_RAISE(
+        auto table, exec::GroupTable::Make(in.keys, in.calls, in.batches.front()->num_columns(),
+                                           &budget, &budget, destination, lanes,
+                                           {.kind = kind, .estimate = !destination}, mode));
+    if (table->uses_batch_program() != (mode == exec::GroupTableMode::kBatch)) {
+      return arrow::Status::Invalid("aggregate benchmark selected an unexpected program");
+    }
+    return table;
+  };
+  const auto start = Clock::now();
+  const auto cpu_start = std::clock();
+  std::vector<std::unique_ptr<exec::GroupTable>> parts;
+  constexpr std::size_t kPartBatches = 4;
+  for (std::size_t i = 0; i < in.batches.size(); ++i) {
+    if (i % kPartBatches == 0) {
+      ARROW_ASSIGN_OR_RAISE(auto table, make(false));
+      parts.push_back(std::move(table));
+    }
+    ARROW_RETURN_NOT_OK(parts.back()->Consume(*in.batches[i]));
+  }
+  const auto local_done = Clock::now();
+  const auto cpu_local_done = std::clock();
+  uint64_t partial_groups = 0;
+  for (auto& part : parts) {
+    partial_groups += part->num_groups();
+    ARROW_RETURN_NOT_OK(part->Partition());
+  }
+  uint64_t groups = 0;
+  Clock::duration output_wall{};
+  std::clock_t output_cpu = 0;
+  for (std::size_t lane = 0; lane < lanes; ++lane) {
+    ARROW_ASSIGN_OR_RAISE(auto dest, make(true));
+    for (const auto& part : parts) {
+      ARROW_RETURN_NOT_OK(dest->MergePartition(*part, lane));
+    }
+    groups += dest->num_groups();
+    const auto output_start = Clock::now();
+    const auto cpu_output_start = std::clock();
+    ARROW_RETURN_NOT_OK(DrainProgramLane(*dest, in, expected));
+    output_cpu += std::clock() - cpu_output_start;
+    output_wall += Clock::now() - output_start;
+  }
+  parts.clear();
+  return ProgramTimes{
+      .local_ms = Millis(local_done - start).count(),
+      .merge_ms = Millis(Clock::now() - local_done - output_wall).count(),
+      .output_ms = Millis(output_wall).count(),
+      .local_cpu_ms = 1000.0 * static_cast<double>(cpu_local_done - cpu_start) / CLOCKS_PER_SEC,
+      .merge_cpu_ms =
+          1000.0 * static_cast<double>(std::clock() - cpu_local_done - output_cpu) / CLOCKS_PER_SEC,
+      .output_cpu_ms = 1000.0 * static_cast<double>(output_cpu) / CLOCKS_PER_SEC,
+      .partial_groups = partial_groups,
+      .groups = groups};
+}
+
+void GroupProgram(benchmark::State& state, GroupShape shape, exec::KeyTableKind kind,
+                  exec::GroupTableMode mode, GroupIds ids, std::size_t lanes) {
+  const int64_t groups = state.range(0);
+  const int64_t rows = GroupRowsFor(groups);
+  const auto in = MakeProgramInput(shape, groups, ids);
+  if (!in.ok()) {
+    state.SkipWithError(in.status().ToString());
+    return;
+  }
+  // Validate each arm and shape once outside the timed iterations.
+  static std::vector<std::string> checked;
+  if (std::ranges::find(checked, state.name()) == checked.end()) {
+    std::vector<ExpectedGroup> expected(Narrow<std::size_t>(groups));
+    for (int64_t row = 0; row < rows; ++row) {
+      auto& group = expected[GroupIdOf(row, groups, ids)];
+      ++group.count;
+      if (const auto value = ProgramValue(row); value.has_value()) {
+        group.sum += *value;
+        group.maximum = std::max(group.maximum, *value);
+      }
+    }
+    exec::MemoryBudget validation(std::nullopt);
+    const auto result = RunGroupProgram(*in, kind, mode, lanes, validation, &expected);
+    if (!result.ok() || validation.bytes_allocated() != 0 ||
+        std::ranges::any_of(expected, [](const auto& group) { return group.count != 0; })) {
+      state.SkipWithError(result.ok() ? "unmatched group or unreleased memory"
+                                      : result.status().ToString());
+      return;
+    }
+    checked.push_back(state.name());
+  }
+  exec::MemoryBudget budget(std::nullopt);
+  ProgramTimes times;
+  for (auto _ : state) {
+    const auto result = RunGroupProgram(*in, kind, mode, lanes, budget);
+    if (!result.ok()) {
+      state.SkipWithError(result.status().ToString());
+      return;
+    }
+    times.local_ms += result->local_ms;
+    times.merge_ms += result->merge_ms;
+    times.output_ms += result->output_ms;
+    times.local_cpu_ms += result->local_cpu_ms;
+    times.merge_cpu_ms += result->merge_cpu_ms;
+    times.output_cpu_ms += result->output_cpu_ms;
+    times.partial_groups = result->partial_groups;
+    times.groups = result->groups;
+    benchmark::DoNotOptimize(times.groups);
+  }
+  state.counters["local_ms"] = {times.local_ms, benchmark::Counter::kAvgIterations};
+  state.counters["merge_ms"] = {times.merge_ms, benchmark::Counter::kAvgIterations};
+  state.counters["output_ms"] = {times.output_ms, benchmark::Counter::kAvgIterations};
+  state.counters["local_cpu_ms"] = {times.local_cpu_ms, benchmark::Counter::kAvgIterations};
+  state.counters["merge_cpu_ms"] = {times.merge_cpu_ms, benchmark::Counter::kAvgIterations};
+  state.counters["output_cpu_ms"] = {times.output_cpu_ms, benchmark::Counter::kAvgIterations};
+  state.counters["pool_peak_bytes"] = static_cast<double>(budget.max_memory());
+  state.counters["partial_groups"] = static_cast<double>(times.partial_groups);
+  state.counters["groups"] = static_cast<double>(times.groups);
+  state.SetItemsProcessed(state.iterations() * rows);
+}
+
+void RegisterGroupPrograms() {
+  using enum exec::KeyTableKind;
+  using enum exec::GroupTableMode;
+  const auto add = [](GroupShape shape, const std::string& name, GroupIds ids, std::size_t lanes,
+                      std::initializer_list<int64_t> counts) {
+    for (const auto& [arm, kind, mode] :
+         {std::tuple{"Grouper", kGrouper, kSeparate}, std::tuple{"Fixed", kFixed, kSeparate},
+          std::tuple{"Batch", kFixed, kBatch}}) {
+      auto* bench = benchmark::RegisterBenchmark(
+          ("BM_GroupProgram/" + name + "/" + arm).c_str(),
+          [=](benchmark::State& state) { GroupProgram(state, shape, kind, mode, ids, lanes); });
+      bench->Unit(benchmark::kMillisecond);
+      for (int64_t groups : counts) {
+        bench->Arg(groups);
+      }
+    }
+  };
+  const std::initializer_list<int64_t> counts = {1000, 16 * 1024, 256 * 1024, 1024 * 1024,
+                                                 4 * 1024 * 1024};
+  constexpr auto kLanes = exec::GroupTable::kPartitions;
+  add(GroupShape::kInt64, "Int64", GroupIds::kRandom, kLanes, counts);
+  add(GroupShape::kInt64Int32, "Int64Int32", GroupIds::kRandom, kLanes, counts);
+  add(GroupShape::kInt64Int32Bool, "Int64Int32Bool", GroupIds::kRandom, kLanes, counts);
+  add(GroupShape::kInt64, "Int64Clustered", GroupIds::kClustered, kLanes, {256 * 1024});
+  add(GroupShape::kInt64Int32Bool, "Int64Int32BoolClustered", GroupIds::kClustered, kLanes,
+      {256 * 1024});
+  // A single destination models one large global lane without building the 31 other lanes.
+  if (std::getenv("ANTB1_BENCH_LARGE_GROUPS") != nullptr) {
+    add(GroupShape::kInt64, "Int64LargeLane", GroupIds::kPermutation, 1, {47 * 1024 * 1024});
+  }
+}
+
 // Compare the production key-table implementations, including packing, decoded uniques and
 // destruction. Fixtures and the independent string-key oracle are deliberately outside timing.
 // Shapes cover short keys, fallback, small batches, high cardinality and changing batch sizes.
@@ -1420,6 +1707,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   antb1::bench::RegisterStringKeyTables();
+  antb1::bench::RegisterGroupPrograms();
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;

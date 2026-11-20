@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,7 @@
 #include "antb1/exec/profile.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "../group_table.h"
 #include "../hash_join.h"
 #include "../key_table.h"
 #include "../part_scheduler.h"
@@ -1190,6 +1192,59 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 // ---- a GROUP BY's key table ----
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
+
+TEST_F(KeyTableBadAllocTest, StoredOutputCanRetryEveryFailedHeapAllocation) {
+  // The integer backend emits its stored keys; DOUBLE must emit the original negative zero.
+  const auto negative_zero = std::bit_cast<std::int64_t>(-0.0);
+  const auto three = std::bit_cast<std::int64_t>(3.0);
+  const auto input = Int64s({negative_zero, three, negative_zero, std::nullopt});
+  const auto expected = Int64s({negative_zero, three, std::nullopt});
+  for (const auto type : {LogicalType::kBigInt, LogicalType::kDouble}) {
+    SCOPED_TRACE(plan::ToArrow(type)->ToString());
+    const auto schema = arrow::schema({arrow::field("k", plan::ToArrow(type))});
+    const auto keys = input->View(schema->field(0)->type()).ValueOrDie();
+    const auto rows = arrow::RecordBatch::Make(schema, 4, {keys});
+    Sweep([&](std::int64_t skip) {
+      MemoryBudget budget(std::nullopt);
+      bool fired = false;
+      {
+        auto table = GroupTable::Make({testing::Column(0, "k", type)}, {}, 1, &budget, &budget,
+                                      true, GroupTable::kPartitions, {.kind = KeyTableKind::kFixed},
+                                      GroupTableMode::kBatch);
+        EXPECT_TRUE(table.ok()) << table.status();
+        if (!table.ok()) {
+          return false;
+        }
+        EXPECT_TRUE((*table)->uses_batch_program());
+        EXPECT_TRUE((*table)->Consume(*rows).ok());
+        const auto baseline = budget.bytes_allocated();
+        std::optional<arrow::Result<std::shared_ptr<arrow::RecordBatch>>> chunk;
+        {
+          const FailAllocations fail(skip);
+          chunk.emplace((*table)->NextChunk(schema));
+          fired = fail.failed() > 0;
+        }
+        if (fired) {
+          EXPECT_TRUE(chunk->status().IsOutOfMemory()) << chunk->status();
+          EXPECT_EQ(budget.bytes_allocated(), baseline);
+          chunk.emplace((*table)->NextChunk(schema));
+        }
+        EXPECT_TRUE(chunk->ok()) << chunk->status();
+        if (chunk->ok()) {
+          EXPECT_NE(**chunk, nullptr) << "the failed output advanced past its groups";
+          if (**chunk != nullptr) {
+            const auto bits = (**chunk)->column(0)->View(arrow::int64());
+            EXPECT_TRUE(bits.ok() && (*bits)->Equals(*expected));
+          }
+        }
+        const auto end = (*table)->NextChunk(schema);
+        EXPECT_TRUE(end.ok() && *end == nullptr);
+      }
+      EXPECT_EQ(budget.bytes_allocated(), 0);
+      return fired;
+    });
+  }
+}
 
 TEST_F(KeyTableBadAllocTest, ColumnKeysReleaseStorageAfterHeapFailure) {
   const std::vector<arrow::TypeHolder> types = {arrow::int64(), arrow::boolean(), arrow::int64()};

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include "antb1/exec/memory_budget.h"
 #include "antb1/plan/logical_plan.h"
 
+#include "grouped_aggregate_program.h"
 #include "key_table.h"
 
 namespace arrow::compute {
@@ -24,6 +26,9 @@ class ExecContext;
 }  // namespace arrow::compute
 
 namespace antb1::exec {
+
+// Private measurement control for ADR 0019. Ordinary operators use the separate ID/update path.
+enum class GroupTableMode : std::uint8_t { kSeparate, kBatch };
 
 // A hash of every row's key values (the columns of `keys`, normalized as a key table keeps them),
 // the same on every run and build of this Arrow version: each value's bytes through Arrow's string
@@ -75,7 +80,8 @@ class GroupTable {
   static arrow::Result<std::unique_ptr<GroupTable>> Make(
       std::vector<plan::BoundColumn> keys, std::vector<plan::AggregateCall> aggregates,
       int input_width, arrow::MemoryPool* pool, MemoryBudget* budget, bool first_keys = true,
-      std::size_t partitions = kPartitions, const KeyTableOptions& key_table = {});
+      std::size_t partitions = kPartitions, const KeyTableOptions& key_table = {},
+      GroupTableMode mode = GroupTableMode::kSeparate);
   GroupTable(const GroupTable&) = delete;
   GroupTable& operator=(const GroupTable&) = delete;
   GroupTable(GroupTable&&) = delete;
@@ -115,16 +121,15 @@ class GroupTable {
   [[nodiscard]] arrow::Result<KeySnapshot> uniques() const;
   // The state of call `i`.
   [[nodiscard]] const GroupedAggregateState& state(std::size_t i) const { return *states_.at(i); }
-  [[nodiscard]] std::size_t num_partitions() const { return partition_groups_.size(); }
+  [[nodiscard]] bool uses_batch_program() const { return program_.has_value(); }
+  [[nodiscard]] std::size_t num_partitions() const;
   // After Partition: the groups of partition `partition`, in group order.
-  [[nodiscard]] const std::vector<std::uint32_t>& partition_groups(std::size_t partition) const {
-    return partition_groups_.at(partition);
-  }
+  [[nodiscard]] std::span<const std::uint32_t> partition_groups(std::size_t partition) const;
   // Adds the groups of partition `partition` of `part` (partitioned) as Merge adds all of them.
   // Tables that merge different partitions of the same parts can run on different threads: they
   // read part only through its partitions' groups and keys, its first-seen keys and its states,
-  // never through its key table, which is single-threaded (so uniques() and PrefixHashes() must
-  // not run on a part the lanes share).
+  // either from the immutable stored-key handoff or from the partitions materialized on the
+  // producer. A lane never calls GetUniques on a shared Arrow Grouper.
   arrow::Status MergePartition(const GroupTable& part, std::size_t partition);
 
   // Folds groups `from` of `source` -- a table with the same calls over keys that include this
@@ -162,6 +167,8 @@ class GroupTable {
   // (to[i]), with part's first-seen keys, in chunks of at most kMaxMergeChunk groups.
   arrow::Status AddPartGroups(const GroupTable& part, std::span<const std::uint32_t> from,
                               std::span<const std::uint32_t> to, std::uint32_t after);
+  arrow::Status AddPartKeyRows(const GroupTable& part, std::span<const std::uint32_t> source);
+  arrow::Status ResizeStates(std::uint32_t after);
   // The same groups, from the batch of part's keys this table has just consumed (row i the keys of
   // the part group that became to[i]) rather than from part's first_keys_: what a part that keeps
   // no first-seen keys has handed over already. One Take a column a chunk, where AddPartGroups
@@ -173,6 +180,36 @@ class GroupTable {
   arrow::Status AddKeyRows(const arrow::compute::ExecBatch& keys,
                            std::span<const std::uint32_t> positions);
   arrow::Status Account();
+  // Step 3 is available only for a fixed stored-key layout and a supported aggregate program.
+  // A failed chunk can leave earlier chunks applied. A scheduler retry uses a fresh table.
+  template <class Body>
+  arrow::Status Update(const Body& body) {
+    if (!program_) {
+      return body();
+    }
+    ARROW_RETURN_NOT_OK(program_error_);
+    if (frozen_) {
+      return arrow::Status::Invalid("update of a frozen group table");
+    }
+    program_error_ = KeyTableNoBadAlloc(body);
+    return program_error_;
+  }
+  arrow::Status MergeTable(const GroupTable& part);
+  arrow::Status MergePartitionGroups(const GroupTable& part, std::size_t partition);
+  arrow::Status MergeProjectedGroups(const GroupTable& source,
+                                     const arrow::compute::ExecBatch& keys,
+                                     std::span<const std::uint32_t> from);
+  arrow::Status ConsumeRows(const arrow::RecordBatch& rows, std::vector<std::uint32_t>* group_ids);
+  arrow::Status ConsumeProgram(const arrow::RecordBatch& rows,
+                               const arrow::compute::ExecBatch& keys);
+  arrow::Status MergeStoredGroups(const GroupTable& source, std::span<const std::uint32_t> from);
+  arrow::Status FreezePartitions();
+  std::uint32_t OutputRows(std::size_t& end_chunk) const;
+  arrow::Status AppendFirstKeyColumns(std::size_t end_chunk, arrow::ArrayVector& columns);
+  arrow::Result<std::shared_ptr<arrow::RecordBatch>> NextOutputChunk(
+      const std::shared_ptr<arrow::Schema>& schema);
+  const StoredKeyTable* StoredKeys() const;
+  [[nodiscard]] bool KeepsKeyChunks() const { return keep_first_keys_ && !stored_output_; }
   // The partition of a key hash. The count is a power of two (checked in Make), so this masks
   // rather than divides: RouteRows runs it once a row, where a constant count let the compiler do
   // the same thing and a runtime one would not.
@@ -180,6 +217,7 @@ class GroupTable {
     return static_cast<std::size_t>(hash) & (partitions_ - 1);
   }
 
+  MemoryReservation memory_;  // outlives the state and key metadata containers it charges
   std::vector<plan::BoundColumn> keys_;
   std::vector<plan::AggregateCall> aggregates_;
   arrow::MemoryPool* pool_;
@@ -188,15 +226,26 @@ class GroupTable {
   std::unique_ptr<arrow::compute::ExecContext> kernels_;
   std::unique_ptr<KeyTable> key_table_;  // nullptr without keys
   std::vector<std::unique_ptr<GroupedAggregateState>> states_;
+  std::optional<GroupedAggregateProgram> program_;
+  // A failed streaming update may already have applied earlier chunks; only a fresh part can retry.
+  arrow::Status program_error_;
+  StoredKeyTable* stored_keys_ = nullptr;  // mutable until FreezePartitions hands over key_table_
+  bool stored_output_ = false;             // first-seen keys equal the stored representation
   std::vector<std::vector<std::shared_ptr<arrow::Array>>> first_keys_;  // per key, per chunk
   std::vector<std::uint32_t> chunk_groups_;  // the number of new groups of each chunk
   std::uint32_t num_groups_ = 0;
   std::size_t next_chunk_ = 0;  // NextChunk: the next chunk and the group it starts at
   std::uint32_t next_group_ = 0;
-  MemoryReservation memory_;  // the states' and chunk_groups_' containers
   // After Partition: each partition's groups, and their unique normalized keys.
   std::vector<std::vector<std::uint32_t>> partition_groups_;
   std::vector<arrow::compute::ExecBatch> partition_uniques_;
+  using StoredPartition = std::vector<std::uint32_t, arrow::stl::allocator<std::uint32_t>>;
+  struct FrozenGroups {
+    std::unique_ptr<const KeyTable> owner;
+    const StoredKeyTable* keys;
+    std::vector<StoredPartition, arrow::stl::allocator<StoredPartition>> partitions;
+  };
+  std::optional<FrozenGroups> frozen_;
 };
 
 }  // namespace antb1::exec

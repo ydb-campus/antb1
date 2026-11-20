@@ -8,12 +8,14 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -25,12 +27,15 @@
 
 #include "antb1/common/int128.h"
 #include "antb1/common/narrow.h"
+#include "antb1/exec/memory_budget.h"
 #include "antb1/plan/literal.h"
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/types.h"
 
 #include "decimal_bytes.h"
 #include "double_key.h"
+#include "group_vector.h"
+#include "grouped_aggregate_program.h"
 #include "grouped_sum_alias.h"
 #include "temporal_average.h"
 #include "variance.h"
@@ -64,21 +69,33 @@ std::int64_t VectorBytes(const Vectors&... vectors) {
 }
 
 template <class State>
-arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupIds from, GroupIds to,
-                                     std::uint32_t num_groups) {
+arrow::Result<const State*> SameState(const GroupedAggregateState& other) {
   const auto* same = dynamic_cast<const State*>(&other);
   if (same == nullptr) {
     return arrow::Status::Invalid("cannot merge states of different aggregates");
   }
+  return same;
+}
+
+arrow::Status CheckMergeGroups(GroupIds from, GroupIds to, std::uint32_t source_groups,
+                               std::uint32_t groups) {
   if (from.size() != to.size()) {
     return arrow::Status::Invalid("a merge of ", from.size(), " groups into ", to.size());
   }
   for (std::size_t i = 0; i < from.size(); ++i) {
-    if (from[i] >= other.num_groups() || to[i] >= num_groups) {
-      return arrow::Status::Invalid("a merge of group ", from[i], " of ", other.num_groups(),
-                                    " into group ", to[i], " of ", num_groups);
+    if (from[i] >= source_groups || to[i] >= groups) {
+      return arrow::Status::Invalid("a merge of group ", from[i], " of ", source_groups,
+                                    " into group ", to[i], " of ", groups);
     }
   }
+  return arrow::Status::OK();
+}
+
+template <class State>
+arrow::Result<const State*> SameKind(const GroupedAggregateState& other, GroupIds from, GroupIds to,
+                                     std::uint32_t num_groups) {
+  ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<State>(other));
+  ARROW_RETURN_NOT_OK(CheckMergeGroups(from, to, other.num_groups(), num_groups));
   return same;
 }
 
@@ -181,9 +198,36 @@ arrow::Result<std::shared_ptr<arrow::Array>> Averages(std::span<const Sum> sums,
   return builder.Finish();
 }
 
+}  // namespace
+
+// The program binds input types once per batch and checks each group map once for all calls.
+// Standalone state callers still get the checked, whole-array Consume and MergeGroups APIs.
+class BatchAggregateState : public GroupedAggregateState {
+ public:
+  virtual arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) = 0;
+  virtual arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                                     GroupIds ids) = 0;
+  virtual arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                                   GroupIds to) = 0;
+  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from, GroupIds to) final {
+    auto bounds = CheckMergeGroups(from, to, other.num_groups(), num_groups());
+    if (!bounds.ok()) {
+      // The standalone API diagnoses a different aggregate before an invalid group map.
+      // MergeRange checks concrete state types on the valid-map path as well.
+      if (typeid(*this) != typeid(other)) {
+        return arrow::Status::Invalid("cannot merge states of different aggregates");
+      }
+      return bounds;
+    }
+    return MergeRange(other, from, to);
+  }
+};
+
+namespace {
+
 // ---- COUNT(*) and COUNT(c) ----
 
-class GroupedCount final : public GroupedAggregateState {
+class GroupedCount final : public BatchAggregateState {
  public:
   // type: the argument type, or nullptr for COUNT(*).
   explicit GroupedCount(std::shared_ptr<arrow::DataType> type) : type_(std::move(type)) {}
@@ -199,6 +243,13 @@ class GroupedCount final : public GroupedAggregateState {
                                                      : "COUNT needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, type_.get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    return ReserveGroupVector(counts_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     if (values == nullptr || values->null_count() == 0) {
       for (const std::uint32_t g : ids) {
         ++counts_[g];
@@ -206,13 +257,13 @@ class GroupedCount final : public GroupedAggregateState {
       return arrow::Status::OK();
     }
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      counts_[ids[i]] += values->IsValid(static_cast<std::int64_t>(i)) ? 1 : 0;
+      counts_[ids[i]] += values->IsValid(static_cast<std::int64_t>(offset + i)) ? 1 : 0;
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedCount>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedCount>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       counts_[to[i]] += same->counts_[from[i]];
     }
@@ -234,7 +285,7 @@ class GroupedCount final : public GroupedAggregateState {
 // SUM or AVG of SMALLINT, INTEGER, BIGINT or USMALLINT in 128 bits per group; the sum of fewer
 // than 2^63 values of at most 64 bits never overflows it.
 template <class ArrowType>
-class GroupedIntegerSum final : public GroupedAggregateState {
+class GroupedIntegerSum final : public BatchAggregateState {
  public:
   using CType = ArrowType::c_type;
 
@@ -254,21 +305,28 @@ class GroupedIntegerSum final : public GroupedAggregateState {
     }
     ARROW_RETURN_NOT_OK(
         CheckRows(values, arrow::TypeTraits<ArrowType>::type_singleton().get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(sums_, groups, memory));
+    return ReserveGroupVector(counts_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const auto* data = values->data()->GetValues<CType>(1);
     const bool nulls = values->null_count() != 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      if (nulls && values->IsNull(static_cast<std::int64_t>(i))) {
+      if (nulls && values->IsNull(static_cast<std::int64_t>(offset + i))) {
         continue;
       }
-      sums_[ids[i]] += data[i];
+      sums_[ids[i]] += data[offset + i];
       ++counts_[ids[i]];
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedIntegerSum>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedIntegerSum>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       sums_[to[i]] += same->sums_[from[i]];
       counts_[to[i]] += same->counts_[from[i]];
@@ -294,7 +352,7 @@ class GroupedIntegerSum final : public GroupedAggregateState {
 // it adds zero and a group of nothing but NULLs answers 0 rather than NULL -- which is what
 // COUNT(col) answers for a row with no match. See the ungrouped SumCountsState for why a BIGINT
 // holds the total.
-class GroupedSumCounts final : public GroupedAggregateState {
+class GroupedSumCounts final : public BatchAggregateState {
  public:
   [[nodiscard]] std::uint32_t num_groups() const override {
     return static_cast<std::uint32_t>(sums_.size());
@@ -306,20 +364,26 @@ class GroupedSumCounts final : public GroupedAggregateState {
       return arrow::Status::Invalid("SUM of counts needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, arrow::int64().get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    return ReserveGroupVector(sums_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const auto* data = values->data()->GetValues<std::int64_t>(1);
     const bool nulls = values->null_count() != 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      if (nulls && values->IsNull(static_cast<std::int64_t>(i))) {
+      if (nulls && values->IsNull(static_cast<std::int64_t>(offset + i))) {
         continue;
       }
-      sums_[ids[i]] += data[i];
+      sums_[ids[i]] += data[offset + i];
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedSumCounts>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedSumCounts>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       sums_[to[i]] += same->sums_[from[i]];
     }
@@ -353,7 +417,7 @@ class GroupedSumCounts final : public GroupedAggregateState {
 };
 
 // AVG of DATE or TIMESTAMP values per group: a TIMESTAMP, averaged in 128 bits as DuckDB does.
-class GroupedTemporalAvg final : public GroupedAggregateState {
+class GroupedTemporalAvg final : public BatchAggregateState {
  public:
   [[nodiscard]] std::uint32_t num_groups() const override {
     return static_cast<std::uint32_t>(sums_.size());
@@ -368,9 +432,17 @@ class GroupedTemporalAvg final : public GroupedAggregateState {
       return arrow::Status::Invalid("AVG needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, values->type().get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(sums_, groups, memory));
+    return ReserveGroupVector(counts_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const bool nulls = values->null_count() != 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      const auto row = static_cast<std::int64_t>(i);
+      const auto row = static_cast<std::int64_t>(offset + i);
       if (nulls && values->IsNull(row)) {
         continue;
       }
@@ -380,10 +452,9 @@ class GroupedTemporalAvg final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedTemporalAvg>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedTemporalAvg>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       sums_[to[i]] += same->sums_[from[i]];
       counts_[to[i]] += same->counts_[from[i]];
@@ -425,7 +496,7 @@ Int128 HugeIntAt(const std::uint8_t* base, std::size_t row) {
 
 // SUM or AVG of a HUGEINT or DECIMAL argument (decimal128): every addition is checked. A
 // DECIMAL(p,s) sums to DECIMAL(38,s) and averages as DuckDB does.
-class GroupedHugeIntSum final : public GroupedAggregateState {
+class GroupedHugeIntSum final : public BatchAggregateState {
  public:
   GroupedHugeIntSum(bool average, plan::LogicalType input) : average_(average), input_(input) {}
 
@@ -442,6 +513,14 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, plan::ToArrow(input_).get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(sums_, groups, memory));
+    return ReserveGroupVector(counts_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const arrow::FixedSizeBinaryArray& decimals = AsDecimalValues(*values);
     // Nothing to add. Also the one case where the array is allowed to carry no values buffer, so
     // the base below would be null: the loop would skip every row and never read it, which makes
@@ -458,14 +537,13 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
     // the addition itself knows.
     // The stride is decided here, once a batch, so the loops below carry no test for it.
     const bool overflow = values->type_id() == arrow::Type::DECIMAL64
-                              ? AddAll<sizeof(std::int64_t)>(decimals, ids)
-                              : AddAll<sizeof(Int128)>(decimals, ids);
+                              ? AddAll<sizeof(std::int64_t)>(decimals, offset, ids)
+                              : AddAll<sizeof(Int128)>(decimals, offset, ids);
     return overflow ? Overflowed() : arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedHugeIntSum>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedHugeIntSum>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       ARROW_RETURN_NOT_OK(Add(to[i], same->sums_[from[i]], same->counts_[from[i]]));
     }
@@ -535,8 +613,9 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
   // so it pays no validity test per row, as KeyHashes splits them for the same reason
   // (group_table.cc).
   template <std::size_t kBytes>
-  [[nodiscard]] bool AddAll(const arrow::FixedSizeBinaryArray& values, GroupIds ids) {
-    const std::uint8_t* const base = values.GetValue(0);
+  [[nodiscard]] bool AddAll(const arrow::FixedSizeBinaryArray& values, std::size_t offset,
+                            GroupIds ids) {
+    const std::uint8_t* const base = values.GetValue(static_cast<std::int64_t>(offset));
     bool overflow = false;
     if (values.null_count() == 0) {
       for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -545,7 +624,7 @@ class GroupedHugeIntSum final : public GroupedAggregateState {
       return overflow;
     }
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      if (values.IsNull(static_cast<std::int64_t>(i))) {
+      if (values.IsNull(static_cast<std::int64_t>(offset + i))) {
         continue;
       }
       overflow |= AddAt<kBytes>(ids[i], base, i);
@@ -608,7 +687,7 @@ class GroupedSumAlias final : public GroupedAggregateState {
 };
 
 // SUM or AVG of a DOUBLE column: values are added in row order within each group.
-class GroupedDoubleSum final : public GroupedAggregateState {
+class GroupedDoubleSum final : public BatchAggregateState {
  public:
   explicit GroupedDoubleSum(bool average) : average_(average) {}
 
@@ -625,21 +704,28 @@ class GroupedDoubleSum final : public GroupedAggregateState {
       return arrow::Status::Invalid("SUM needs an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, arrow::float64().get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(sums_, groups, memory));
+    return ReserveGroupVector(counts_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const auto* data = values->data()->GetValues<double>(1);
     const bool nulls = values->null_count() != 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      if (nulls && values->IsNull(static_cast<std::int64_t>(i))) {
+      if (nulls && values->IsNull(static_cast<std::int64_t>(offset + i))) {
         continue;
       }
-      sums_[ids[i]] += data[i];
+      sums_[ids[i]] += data[offset + i];
       ++counts_[ids[i]];
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same,
-                          SameKind<GroupedDoubleSum>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedDoubleSum>(other));
     for (std::size_t i = 0; i < from.size(); ++i) {
       sums_[to[i]] += same->sums_[from[i]];
       counts_[to[i]] += same->counts_[from[i]];
@@ -795,7 +881,7 @@ struct MinMaxTraits<arrow::BinaryType> {  // byte-wise, as std::string_view comp
 // NaN best and NaN never replaces a value, so a group is NaN only when every value is NaN. Ties
 // keep the value seen first.
 template <class ArrowType>
-class GroupedMinMax final : public GroupedAggregateState {
+class GroupedMinMax final : public BatchAggregateState {
  public:
   using Traits = MinMaxTraits<ArrowType>;
   using Value = Traits::Value;
@@ -818,10 +904,18 @@ class GroupedMinMax final : public GroupedAggregateState {
       return arrow::Status::Invalid("MIN and MAX need an argument column");
     }
     ARROW_RETURN_NOT_OK(CheckRows(values, type_.get(), ids, num_groups()));
+    return ConsumeRange(values, 0, ids);
+  }
+  arrow::Status ReserveGroups(std::uint32_t groups, MemoryReservation& memory) override {
+    ARROW_RETURN_NOT_OK(ReserveGroupVector(best_, groups, memory));
+    return ReserveGroupVector(seen_, groups, memory);
+  }
+  arrow::Status ConsumeRange(const arrow::Array* values, std::size_t offset,
+                             GroupIds ids) override {
     const auto& typed = static_cast<const Traits::ArrayType&>(*values);
     const bool nulls = values->null_count() != 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
-      const auto row = static_cast<std::int64_t>(i);
+      const auto row = static_cast<std::int64_t>(offset + i);
       if (nulls && typed.IsNull(row)) {
         continue;
       }
@@ -829,9 +923,9 @@ class GroupedMinMax final : public GroupedAggregateState {
     }
     return arrow::Status::OK();
   }
-  arrow::Status MergeGroups(const GroupedAggregateState& other, GroupIds from,
-                            GroupIds to) override {
-    ARROW_ASSIGN_OR_RAISE(const auto* same, SameKind<GroupedMinMax>(other, from, to, num_groups()));
+  arrow::Status MergeRange(const GroupedAggregateState& other, GroupIds from,
+                           GroupIds to) override {
+    ARROW_ASSIGN_OR_RAISE(const auto* same, SameState<GroupedMinMax>(other));
     if (same->min_ != min_) {
       return arrow::Status::Invalid("cannot merge MIN with MAX");
     }
@@ -1123,6 +1217,148 @@ class GroupedCountDistinct final : public GroupedAggregateState {
 };
 
 }  // namespace
+
+arrow::Result<GroupedAggregateProgram> GroupedAggregateProgram::Make(
+    std::span<const plan::AggregateCall> calls,
+    std::span<const std::unique_ptr<GroupedAggregateState>> states, arrow::MemoryPool* pool) {
+  ANTB1_CHECK(calls.size() == states.size());
+  GroupedAggregateProgram program(pool);
+  // Variance requires a whole-batch numeric conversion, DISTINCT has its own grouper, and
+  // VARCHAR extrema can acquire heap storage inside an update. Keep their whole program on
+  // the existing path. Two fallible updates could report a different first failure if their
+  // chunks are interleaved, so retain call order for that case too.
+  bool has_fallible = false;
+  for (std::size_t i = 0; i < calls.size(); ++i) {
+    if (dynamic_cast<GroupedSumAlias*>(states[i].get()) != nullptr) {
+      continue;  // evaluates the owner's accumulator only during finalization
+    }
+    if (dynamic_cast<BatchAggregateState*>(states[i].get()) == nullptr) {
+      program.supported_ = false;
+      return program;
+    }
+    const auto& call = calls[i];
+    if (!call.arg.has_value()) {
+      continue;  // COUNT(*)
+    }
+    const auto input = call.arg->type;
+    const bool string_extremum =
+        (call.kind == plan::AggKind::kMin || call.kind == plan::AggKind::kMax) &&
+        input == plan::LogicalType::kVarchar;
+    const bool sums = call.kind == plan::AggKind::kSum || call.kind == plan::AggKind::kAvg;
+    const bool fallible = sums && (input == plan::LogicalType::kHugeInt ||
+                                   (input == plan::LogicalType::kDecimal &&
+                                    input.width() > plan::LogicalType::kMaxNarrowDecimalWidth) ||
+                                   input == plan::LogicalType::kDate);
+    if (string_extremum || (fallible && has_fallible)) {
+      program.supported_ = false;
+      return program;
+    }
+    has_fallible |= fallible;
+  }
+  try {
+    program.instructions_.reserve(calls.size());
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+      if (auto* state = dynamic_cast<BatchAggregateState*>(states[i].get())) {
+        const auto& call = calls[i];
+        program.instructions_.push_back(
+            {.state = state,
+             .column = call.arg ? call.arg->index : -1,
+             .input = call.arg ? std::optional(call.arg->type) : std::nullopt,
+             .kind = call.kind});
+      }
+    }
+  } catch (const arrow::stl::BadAlloc& error) {
+    return arrow::Status::OutOfMemory(error.what());
+  } catch (const std::bad_alloc&) {
+    return arrow::Status::OutOfMemory("building a grouped aggregate program");
+  }
+  return program;
+}
+
+arrow::Result<GroupedAggregateProgram::BoundBatch> GroupedAggregateProgram::Bind(
+    const arrow::RecordBatch& rows) const {
+  if (!supported_) {
+    return arrow::Status::Invalid("unsupported grouped aggregate program");
+  }
+  std::span<const std::shared_ptr<arrow::Array>> columns;
+  for (const auto& op : instructions_) {
+    if (!op.input.has_value()) {
+      continue;
+    }
+    if (op.column < 0 || op.column >= rows.num_columns()) {
+      return arrow::Status::Invalid("aggregate over a column outside its input");
+    }
+    if (columns.empty()) {
+      columns = rows.columns();
+    }
+    const auto& column = columns[static_cast<std::size_t>(op.column)];
+    const auto expected = plan::ToArrow(*op.input);
+    if (!column->type()->Equals(*expected) || column->length() != rows.num_rows()) {
+      return arrow::Status::Invalid("aggregate input is ", column->type()->ToString(), " with ",
+                                    column->length(), " rows, expected ", expected->ToString(),
+                                    " with ", rows.num_rows(), " rows");
+    }
+  }
+  return BoundBatch(*this, columns, Narrow<std::size_t>(rows.num_rows()));
+}
+
+arrow::Status GroupedAggregateProgram::BoundBatch::Consume(std::size_t offset, GroupIds ids) const {
+  if (offset > rows_ || ids.size() > rows_ - offset) {
+    return arrow::Status::Invalid("aggregate input range outside the batch");
+  }
+  if (ids.empty() || program_.instructions_.empty()) {
+    return arrow::Status::OK();
+  }
+  const auto groups = program_.instructions_.front().state->num_groups();
+  if (std::ranges::max(ids) >= groups) {
+    return arrow::Status::Invalid("group id outside the ", groups, " groups of the state");
+  }
+  for (const auto& op : program_.instructions_) {
+    ARROW_RETURN_NOT_OK(op.state->ConsumeRange(
+        op.column < 0 ? nullptr : columns_[static_cast<std::size_t>(op.column)].get(), offset,
+        ids));
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status GroupedAggregateProgram::Resize(std::uint32_t groups,
+                                              MemoryReservation& memory) const {
+  ANTB1_CHECK(supported_);
+  // A merge can publish first-seen key chunks after the corresponding states were updated.
+  // Publishing an earlier chunk must leave the already populated later groups in place.
+  if (instructions_.empty() || groups <= instructions_.front().state->num_groups()) {
+    return arrow::Status::OK();
+  }
+  for (const auto& op : instructions_) {
+    ARROW_RETURN_NOT_OK(op.state->ReserveGroups(groups, memory));
+  }
+  // Resize only after every reservation succeeds, so refusal leaves all state sizes aligned.
+  for (const auto& op : instructions_) {
+    op.state->Resize(groups);
+  }
+  return arrow::Status::OK();
+}
+
+arrow::Status GroupedAggregateProgram::MergeGroups(const GroupedAggregateProgram& source,
+                                                   GroupIds from, GroupIds to) const {
+  if (!supported_ || !source.supported_ || instructions_.size() != source.instructions_.size()) {
+    return arrow::Status::Invalid("incompatible grouped aggregate programs");
+  }
+  if (instructions_.empty()) {
+    return arrow::Status::OK();
+  }
+  ARROW_RETURN_NOT_OK(CheckMergeGroups(from, to, source.instructions_.front().state->num_groups(),
+                                       instructions_.front().state->num_groups()));
+  for (std::size_t i = 0; i < instructions_.size(); ++i) {
+    const auto& op = instructions_[i];
+    const auto& other = source.instructions_[i];
+    if (op.kind != other.kind || op.input != other.input) {
+      return arrow::Status::Invalid("incompatible grouped aggregate programs");
+    }
+    ARROW_RETURN_NOT_OK(op.state->MergeRange(*other.state, from, to));
+  }
+  return arrow::Status::OK();
+}
 
 arrow::Status GroupedAggregateState::Merge(const GroupedAggregateState& other,
                                            std::span<const std::uint32_t> group_map) {

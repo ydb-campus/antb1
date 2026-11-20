@@ -90,6 +90,7 @@ class MemoryReservation {
   arrow::Status Resize(int64_t bytes);
   void Release();
   [[nodiscard]] int64_t bytes() const { return bytes_; }
+  [[nodiscard]] MemoryBudget* budget() const { return budget_; }
 
  private:
   MemoryBudget* budget_ = nullptr;

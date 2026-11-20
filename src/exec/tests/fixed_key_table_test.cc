@@ -24,6 +24,7 @@
 #include "antb1/exec/memory_budget.h"
 
 #include "../column_key_table.h"
+#include "../group_table.h"
 #include "../key_table.h"
 #include "exec_test_util.h"
 
@@ -216,6 +217,166 @@ TEST(FixedKeyLayoutTest, ExplicitFixedKindsPreserveTheAutomaticFallback) {
 
 class ColumnKeyTableTest : public testing::ExecTest {};
 
+TEST_F(ColumnKeyTableTest, ChunkUpdatesAndStoredMergesMatchMaterializedKeys) {
+  std::vector<std::optional<std::int64_t>> ints;
+  std::vector<std::optional<std::int32_t>> small;
+  std::vector<std::optional<bool>> flags;
+  ints.reserve(941);
+  small.reserve(941);
+  flags.reserve(941);
+  for (int i = 0; i < 941; ++i) {
+    const int key = i % 301;
+    ints.emplace_back(key == 23 ? std::nullopt : std::optional<std::int64_t>(key));
+    small.emplace_back(key % 4 == 0 ? std::nullopt : std::optional<std::int32_t>(key % 17));
+    flags.emplace_back(key % 3 == 0 ? std::nullopt : std::optional<bool>(key % 3 == 1));
+  }
+  const auto numbers = Int64s(ints);
+  const auto narrow = Int32s(small);
+  const auto bits = testing::Bools(flags);
+  for (const auto& unsliced :
+       {BatchOf({numbers}), BatchOf({narrow, numbers}), BatchOf({numbers, bits, narrow})}) {
+    const auto batch = unsliced.Slice(3, 937);
+    std::vector<arrow::TypeHolder> types;
+    types.reserve(batch.values.size());
+    for (const auto& value : batch.values) {
+      types.emplace_back(value.type());
+    }
+    MemoryBudget budget(std::nullopt);
+    arrow::compute::ExecContext ctx(&budget);
+    auto baseline = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
+    auto source = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
+    auto target = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixedIdOrder});
+    ASSERT_TRUE(baseline.ok()) << baseline.status();
+    ASSERT_TRUE(source.ok()) << source.status();
+    ASSERT_TRUE(target.ok()) << target.status();
+    auto* stored = dynamic_cast<StoredKeyTable*>(source->get());
+    auto* destination = dynamic_cast<StoredKeyTable*>(target->get());
+    ASSERT_NE(stored, nullptr);
+    ASSERT_NE(destination, nullptr);
+    const auto expected = IdsOf(**baseline, batch);
+    std::size_t visited = 0;
+    const auto status = stored->ConsumeChunks(
+        batch, [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+          EXPECT_EQ(offset, visited);
+          EXPECT_EQ(after, stored->num_groups());
+          EXPECT_TRUE(std::ranges::equal(ids, std::span(expected).subspan(offset, ids.size())));
+          visited += ids.size();
+          return arrow::Status::OK();
+        });
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_EQ(visited, expected.size());
+
+    const auto unique = (*baseline)->Uniques();
+    ASSERT_TRUE(unique.ok()) << unique.status();
+    // Both validity and BOOLEAN values start in the middle of a byte.
+    const auto range = stored->StoredUniques(3, 41);
+    ASSERT_TRUE(range.ok()) << range.status();
+    const auto reference = unique->batch.Slice(3, 41);
+    for (std::size_t c = 0; c < types.size(); ++c) {
+      EXPECT_TRUE(range->batch.values[c].Equals(reference.values[c]));
+    }
+    const auto arrow_hashes = KeyHashes(reference);
+    ASSERT_TRUE(arrow_hashes.ok()) << arrow_hashes.status();
+    std::vector<std::uint64_t> hashes(41);
+    stored->RoutingHashes(3, hashes);
+    EXPECT_EQ(hashes, *arrow_hashes);
+
+    const std::array<std::uint32_t, 2> invalid{0, stored->num_groups()};
+    EXPECT_TRUE(stored->GatherStored(invalid).status().IsInvalid());
+    EXPECT_TRUE(stored->StoredUniques(stored->num_groups(), 1).status().IsInvalid());
+    const auto refused = destination->MergeStored(
+        *stored, invalid, [](std::size_t, std::span<const std::uint32_t>, std::uint32_t) {
+          ADD_FAILURE() << "invalid source selection reached a state update";
+          return arrow::Status::OK();
+        });
+    EXPECT_TRUE(refused.IsInvalid()) << refused;
+    EXPECT_EQ(destination->num_groups(), 0U);
+
+    const std::array<std::uint32_t, 5> picks{20, 0, 4, 20, 13};
+    for (const auto length : {0U, 1U, 5U}) {
+      const auto gathered = stored->GatherStored(std::span(picks).first(length));
+      ASSERT_TRUE(gathered.ok()) << gathered.status();
+      ASSERT_EQ(gathered->batch.length, length);
+      for (std::size_t c = 0; c < types.size(); ++c) {
+        const auto output = gathered->batch.values[c].make_array();
+        const auto original = unique->batch.values[c].make_array();
+        for (std::uint32_t i = 0; i < length; ++i) {
+          EXPECT_TRUE(output->RangeEquals(i, i + 1, picks[i], *original));
+        }
+      }
+    }
+
+    // The destination has groups from before this part. Merge its selected groups in reverse
+    // order with duplicates, across chunk boundaries and through a different growth policy.
+    constexpr std::size_t kSeedRows = 15;
+    const auto seed = IdsOf(**target, batch.Slice(0, kSeedRows));
+    std::map<std::uint32_t, std::uint32_t> remap;
+    for (std::size_t i = 0; i < seed.size(); ++i) {
+      remap.emplace(expected[i], seed[i]);
+    }
+    std::vector<std::uint32_t> selection;
+    selection.reserve(800);
+    for (std::uint32_t i = 0; i < 800; ++i) {
+      selection.push_back(stored->num_groups() - 1 - (i % stored->num_groups()));
+    }
+    visited = 0;
+    const auto merged = destination->MergeStored(
+        *stored, selection,
+        [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+          EXPECT_EQ(offset, visited);
+          for (std::size_t i = 0; i < ids.size(); ++i) {
+            const auto entry =
+                remap.try_emplace(selection[offset + i], static_cast<std::uint32_t>(remap.size()));
+            EXPECT_EQ(ids[i], entry.first->second);
+          }
+          visited += ids.size();
+          EXPECT_EQ(after, remap.size());
+          return arrow::Status::OK();
+        });
+    ASSERT_TRUE(merged.ok()) << merged;
+    EXPECT_EQ(visited, selection.size());
+    source->reset();
+    const auto found = destination->Lookup(batch);
+    ASSERT_TRUE(found.ok()) << found.status();
+    ASSERT_EQ((*found)->null_count(), 0);
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ((*found)->Value(static_cast<std::int64_t>(i)), remap.at(expected[i]));
+    }
+  }
+}
+
+TEST_F(ColumnKeyTableTest, BorrowedChunkIdsFitWhenTheFullIdArrayExceedsTheBudget) {
+  constexpr std::size_t kRows = 65536;
+  const auto numbers = Int64s(std::vector<std::optional<std::int64_t>>(kRows, 1));
+  for (const auto& batch : {BatchOf({numbers}), BatchOf({numbers, numbers, numbers})}) {
+    const std::vector<arrow::TypeHolder> types(batch.values.size(), arrow::int64());
+    MemoryBudget budget(65536);
+    arrow::compute::ExecContext ctx(&budget);
+    auto table = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
+    ASSERT_TRUE(table.ok()) << table.status();
+    auto* stored = dynamic_cast<StoredKeyTable*>(table->get());
+    ASSERT_NE(stored, nullptr);
+    ASSERT_TRUE(stored->Consume(batch).status().IsOutOfMemory());
+    std::size_t visited = 0;
+    const auto status = stored->ConsumeChunks(
+        batch, [&](std::size_t offset, std::span<const std::uint32_t> ids, std::uint32_t after) {
+          EXPECT_EQ(offset, visited);
+          EXPECT_EQ(after, 1U);
+          EXPECT_TRUE(std::ranges::all_of(ids, [](std::uint32_t id) { return id == 0; }));
+          visited += ids.size();
+          return arrow::Status::OK();
+        });
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(visited, kRows);
+    const auto stopped = stored->ConsumeChunks(
+        batch, [](std::size_t offset, std::span<const std::uint32_t>, std::uint32_t) {
+          EXPECT_EQ(offset, 0U);
+          return arrow::Status::Cancelled("stop at the first chunk");
+        });
+    EXPECT_TRUE(stopped.IsCancelled()) << stopped;
+  }
+}
+
 TEST_F(ColumnKeyTableTest, SchemaAndRetainedEmptyUniquesUseTheQueryBudget) {
   const std::vector<arrow::TypeHolder> types(66, arrow::boolean());
   MemoryBudget tiny(1);
@@ -225,32 +386,37 @@ TEST_F(ColumnKeyTableTest, SchemaAndRetainedEmptyUniquesUseTheQueryBudget) {
   EXPECT_TRUE(refused.status().message().contains("--memory-limit"));
   EXPECT_EQ(tiny.bytes_allocated(), 0);
 
-  arrow::ProxyMemoryPool backend(arrow::default_memory_pool());
-  MemoryBudget budget(std::nullopt, &backend);
-  arrow::compute::ExecContext ctx(&budget);
-  std::shared_ptr<arrow::ArrayData> retained;
-  {
-    auto table = MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed});
-    ASSERT_TRUE(table.ok()) << table.status();
-    const auto schema_bytes = budget.bytes_allocated();
-    auto empty = (*table)->Uniques();
-    ASSERT_TRUE(empty.ok()) << empty.status();
-    ASSERT_EQ(empty->batch.values.size(), types.size());
-    EXPECT_EQ(empty->batch.length, 0);
-    EXPECT_GT(budget.bytes_allocated(), schema_bytes);
-    retained = empty->batch.values.back().array();
-    empty->batch.values.clear();
-    const auto datum_bytes = empty->batch.values.capacity() * sizeof(arrow::Datum);
-    const auto handle_bytes = retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
+  // Both the packed and column backends return charged metadata through a wrapped pool.
+  for (const auto& shape : {std::vector<arrow::TypeHolder>{arrow::int64()}, types}) {
+    arrow::ProxyMemoryPool backend(arrow::default_memory_pool());
+    MemoryBudget budget(std::nullopt, &backend);
+    arrow::ProxyMemoryPool query_pool(&budget);
+    arrow::compute::ExecContext ctx(&query_pool);
+    std::shared_ptr<arrow::ArrayData> retained;
+    {
+      auto table = MakeKeyTable(shape, &ctx, {.kind = KeyTableKind::kFixed}, &budget);
+      ASSERT_TRUE(table.ok()) << table.status();
+      const auto schema_bytes = budget.bytes_allocated();
+      auto empty = (*table)->Uniques();
+      ASSERT_TRUE(empty.ok()) << empty.status();
+      ASSERT_EQ(empty->batch.values.size(), shape.size());
+      EXPECT_EQ(empty->batch.length, 0);
+      EXPECT_GT(budget.bytes_allocated(), schema_bytes);
+      retained = empty->batch.values.back().array();
+      empty->batch.values.clear();
+      const auto datum_bytes = empty->batch.values.capacity() * sizeof(arrow::Datum);
+      const auto handle_bytes =
+          retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
+      EXPECT_EQ(budget.bytes_allocated() - backend.bytes_allocated(),
+                static_cast<std::int64_t>(datum_bytes + handle_bytes));
+    }
+    const auto handles = retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
     EXPECT_EQ(budget.bytes_allocated() - backend.bytes_allocated(),
-              static_cast<std::int64_t>(datum_bytes + handle_bytes));
+              static_cast<std::int64_t>(handles));
+    EXPECT_EQ(retained->length, 0);
+    retained.reset();
+    EXPECT_EQ(budget.bytes_allocated(), 0);
   }
-  const auto handles = retained->buffers.capacity() * sizeof(std::shared_ptr<arrow::Buffer>);
-  EXPECT_EQ(budget.bytes_allocated() - backend.bytes_allocated(),
-            static_cast<std::int64_t>(handles));
-  EXPECT_EQ(retained->length, 0);
-  retained.reset();
-  EXPECT_EQ(budget.bytes_allocated(), 0);
 }
 
 TEST_F(ColumnKeyTableTest, WideEmptySnapshotsRefuseOneByteBelowTheirMetadataAndAllowRetry) {
