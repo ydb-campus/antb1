@@ -1,11 +1,15 @@
 #include "join_order.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -18,6 +22,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/table.h"
 
+#include "column_classes.h"
 #include "scope.h"
 
 namespace antb1::plan {
@@ -124,6 +129,19 @@ int64_t JoinRowsOf(std::span<const JoinEdge> edges, int64_t left, int64_t right,
   return empty ? 0 : std::max<int64_t>(Saturated(Int128{left} * right / divisor), 1);
 }
 
+// A later edge of a cycle contributes no new equality. Keep NULL-safe paths separate:
+// ordinary equality additionally requires the key to be non-NULL.
+class IndependentKeys {
+ public:
+  bool Add(const JoinEdge& edge) {
+    return edge.a_key == kNoColumnId ||
+           classes_[edge.null_equal ? 1U : 0U].Merge(edge.a_key, edge.b_key);
+  }
+
+ private:
+  std::array<ColumnClasses, 2> classes_;
+};
+
 // Per pair of relations, what the equalities between them divide by: the largest domain of the
 // edges between that pair (DivisorsOf). 1 when no edge connects them; `empty` when a key of theirs
 // has no value at all.
@@ -135,32 +153,27 @@ struct PairDivisors {
   [[nodiscard]] std::size_t At(std::size_t u, std::size_t v) const { return (u * n) + v; }
 };
 
-PairDivisors DivisorsOf(std::size_t n, std::span<const JoinEdge> edges) {
+PairDivisors DivisorsOf(std::size_t n, std::span<const JoinEdge> edges, const RelationSet& set) {
   PairDivisors out{
       .divisor = std::vector<int64_t>(n * n, 1), .empty = std::vector<bool>(n * n, false), .n = n};
-  std::vector<Int128> product(n * n, 0);  // 0: no edge between the pair yet
+  IndependentKeys independent;
   for (const JoinEdge& edge : edges) {
-    ANTB1_CHECK(edge.a < n);
-    ANTB1_CHECK(edge.b < n);
-    ANTB1_CHECK(edge.a != edge.b);
+    if (!set.test(edge.a) || !set.test(edge.b)) {
+      continue;
+    }
     const EdgeDivisor one = DivisorOf(edge);
     const std::size_t at = out.At(std::min(edge.a, edge.b), std::max(edge.a, edge.b));
     if (one.empty) {
       out.empty[at] = true;  // a key with no value at all: the join keeps no row
     }
+    if (!independent.Add(edge)) {
+      continue;
+    }
     // Within a pair the larger domain wins rather than the two multiplying: two keys between the
     // same two relations are one composite key, and its parts narrow together -- a foreign key
     // into a composite primary key is the common case, and multiplying there under-stated Q09's
     // largest join by 7.5x and made the search choose it first (ADR 0026's C5).
-    product[at] = std::max({product[at], Int128{1}, Int128{one.divisor}});
-  }
-  for (std::size_t u = 0; u < n; ++u) {
-    for (std::size_t v = u + 1; v < n; ++v) {
-      const std::size_t at = out.At(u, v);
-      out.divisor[at] = Saturated(std::max(product[at], Int128{1}));
-      out.divisor[out.At(v, u)] = out.divisor[at];
-      out.empty[out.At(v, u)] = out.empty[at];
-    }
+    out.divisor[at] = std::max(out.divisor[at], one.divisor);
   }
   return out;
 }
@@ -671,7 +684,7 @@ std::optional<std::size_t> FirstUnconnected(std::size_t relations,
 
 int64_t SubsetRows(std::span<const JoinRelation> relations, std::span<const JoinEdge> edges,
                    RelationSet set) {
-  const PairDivisors pairs = DivisorsOf(relations.size(), edges);
+  const PairDivisors pairs = DivisorsOf(relations.size(), edges, set);
   // In relation order, multiplying each relation's rows in and dividing by the divisor of every
   // pair it closes with a relation already taken in. Dividing as it goes keeps the running value
   // near a real cardinality, so nothing overflows in practice, and the order is fixed, so the
@@ -722,12 +735,77 @@ int64_t OrderCost(std::span<const JoinRelation> relations, std::span<const JoinE
   return Saturated(cost);
 }
 
+void InferJoinEdges(std::vector<JoinEdge>& edges) {
+  if (edges.size() < 2) {
+    return;
+  }
+  struct Member {
+    ColumnId key;
+    std::optional<int64_t> domain;
+  };
+  struct Group {
+    bool null_equal = true;
+    std::map<std::size_t, Member> members;  // one representative per relation
+    std::set<std::pair<std::size_t, std::size_t>> connected;
+  };
+  ColumnClasses classes;
+  for (const JoinEdge& edge : edges) {
+    if (edge.a_key != kNoColumnId) {
+      classes.Merge(edge.a_key, edge.b_key);
+    }
+  }
+  std::map<ColumnId, Group> groups;
+  for (const JoinEdge& edge : edges) {
+    if (edge.a_key == kNoColumnId) {
+      continue;
+    }
+    Group& group = groups[classes.Find(edge.a_key)];
+    group.null_equal = group.null_equal && edge.null_equal;
+    group.members.try_emplace(edge.a, Member{edge.a_key, edge.a_domain});
+    group.members.try_emplace(edge.b, Member{edge.b_key, edge.b_domain});
+    group.connected.emplace(std::min(edge.a, edge.b), std::max(edge.a, edge.b));
+  }
+  // In an inner block every edge must hold. One ordinary equality rules out NULL throughout its
+  // class, so any spanning tree of that class must reject NULL even if it omits the written '='.
+  for (JoinEdge& edge : edges) {
+    if (edge.null_equal && edge.a_key != kNoColumnId) {
+      edge.null_equal = groups.at(classes.Find(edge.a_key)).null_equal;
+    }
+  }
+  for (const auto& [root, group] : groups) {
+    for (auto a = group.members.begin(); a != group.members.end(); ++a) {
+      for (auto b = std::next(a); b != group.members.end(); ++b) {
+        if (!group.connected.contains({a->first, b->first})) {
+          edges.push_back(JoinEdge{.a = a->first,
+                                   .b = b->first,
+                                   .a_domain = a->second.domain,
+                                   .b_domain = b->second.domain,
+                                   .a_key = a->second.key,
+                                   .b_key = b->second.key,
+                                   .null_equal = group.null_equal});
+        }
+      }
+    }
+  }
+}
+
 std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
                                  std::span<const JoinEdge> edges, int64_t build_side_ratio,
                                  JoinOrderSearch search) {
+  const auto connected_order = [&](std::span<const JoinRelation> part,
+                                   std::span<const JoinEdge> keys) {
+    auto steps = Orderer(part, keys, build_side_ratio, search).Order();
+    // Walk the chosen tree in dependency order. Retain a written or inferred predicate exactly
+    // when the inputs and the keys already retained do not yet establish it.
+    IndependentKeys enforced;
+    for (JoinStep& step : steps) {
+      std::erase_if(step.edges, [&](std::size_t index) { return !enforced.Add(keys[index]); });
+    }
+    return steps;
+  };
   const std::size_t n = relations.size();
   if (n < 2 || !FirstUnconnected(n, edges).has_value()) {
-    return Orderer(relations, edges, build_side_ratio, search).Order();
+    return connected_order(relations, edges);
   }
   // A cross product (ADR 0040): the parts the edges connect, each ordered on its own exactly as a
   // connected block is, then crossed -- never inside a part, where the keys' estimates could not
@@ -795,7 +873,7 @@ std::vector<JoinStep> OrderJoins(std::span<const JoinRelation> relations,
       }
     }
     const std::size_t offset = steps.size();
-    for (JoinStep step : Orderer(part_relations, part_edges, build_side_ratio, search).Order()) {
+    for (JoinStep step : connected_order(part_relations, part_edges)) {
       for (JoinOperand* operand : {&step.left, &step.right}) {
         operand->index = operand->step ? offset + operand->index : members[operand->index];
       }

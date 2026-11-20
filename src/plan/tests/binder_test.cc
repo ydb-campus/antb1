@@ -4246,6 +4246,34 @@ KeySet KeyNames(const JoinNode& join) {
   return out;
 }
 
+TEST(BinderTest, JoinsTheSmallEndpointsThroughAnImpliedKey) {
+  Catalog catalog;
+  const auto schema = arrow::schema({arrow::field("k", arrow::int64())});
+  for (const auto& [name, rows] : std::vector<std::pair<std::string, int64_t>>{
+           {"alpha", 2}, {"bridge", 10'000}, {"omega", 3}}) {
+    auto table = std::make_shared<FakeTable>(schema, rows);
+    table->WithStats(0, 0, PartStats{.min = 1, .max = 2, .null_count = 0, .rows = rows});
+    ASSERT_TRUE(catalog.Register(name, table).ok());
+  }
+  for (const auto& [first, second] : std::vector<std::pair<std::string, std::string>>{
+           {"=", "="},
+           {"IS NOT DISTINCT FROM", "IS NOT DISTINCT FROM"},
+           {"IS NOT DISTINCT FROM", "="}}) {
+    auto stmt = sql::Parse("SELECT COUNT(*) FROM alpha, bridge, omega WHERE alpha.k " + first +
+                           " bridge.k AND bridge.k " + second + " omega.k");
+    ASSERT_TRUE(stmt.has_value());
+    auto plan = Bind(*stmt, catalog);
+    ASSERT_TRUE(plan.ok()) << plan.status().ToString();
+    const JoinNode* endpoints = JoinBetween(*plan->root, "alpha", "omega");
+    ASSERT_NE(endpoints, nullptr);
+    EXPECT_EQ(ScannedTables(*endpoints->left).size(), 1U);
+    EXPECT_EQ(ScannedTables(*endpoints->right).size(), 1U);
+    EXPECT_EQ(KeyNames(*endpoints), (KeySet{{"alpha.k", "omega.k"}}));
+    ASSERT_EQ(endpoints->keys.size(), 1U);
+    EXPECT_EQ(endpoints->keys.front().null_equal, first != "=" && second != "=");
+  }
+}
+
 // The columns the Filters of a subtree compare.
 std::set<std::string> FilteredColumns(const LogicalNode& node) {
   std::set<std::string> out;

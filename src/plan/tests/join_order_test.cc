@@ -1,5 +1,6 @@
 #include "../join_order.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -140,6 +141,60 @@ std::vector<std::vector<std::size_t>> Keys(const std::vector<JoinStep>& steps) {
 // FROM order on a tie, and a relation of unknown rows counts as the largest. The probe is the left
 // input of the first step rather than a step of its own: a step is a join, and there is one fewer
 // of them than there are relations.
+TEST(JoinOrderTest, TransitiveKeysConnectTheCheapPairAndChargeOnlyIndependentEqualities) {
+  const auto relations = Relations({2, 10'000, 3});
+  const JoinEdge first{
+      .a = 0, .b = 1, .a_domain = 10, .b_domain = 10, .a_key = ColumnId{1}, .b_key = ColumnId{2}};
+  const JoinEdge second{
+      .a = 1, .b = 2, .a_domain = 10, .b_domain = 10, .a_key = ColumnId{2}, .b_key = ColumnId{3}};
+  std::vector<JoinEdge> edges{first, second};
+  RelationSet all;
+  all.set(0).set(1).set(2);
+  const int64_t written_rows = SubsetRows(relations, edges, all);
+  InferJoinEdges(edges);
+  ASSERT_EQ(edges.size(), 3U);
+  EXPECT_EQ(edges.back().a_key, ColumnId{1});
+  EXPECT_EQ(edges.back().b_key, ColumnId{3});
+  EXPECT_EQ(SubsetRows(relations, edges, all), written_rows);
+  RelationSet endpoints;
+  endpoints.set(0).set(2);
+  EXPECT_EQ(SubsetRows(relations, edges, endpoints), 1);
+  const auto steps = OrderJoins(relations, edges);
+  ASSERT_EQ(steps.size(), 2U);
+  EXPECT_EQ(steps.front().edges, std::vector<std::size_t>{2});
+  EXPECT_EQ(steps.back().edges.size(), 1U);
+}
+
+TEST(JoinOrderTest, ClosurePreservesNullSemanticsAndIndependentColumnsOfOneRelation) {
+  const auto key = [](std::size_t a, std::size_t b, ColumnId left, ColumnId right, bool nulls) {
+    return JoinEdge{.a = a,
+                    .b = b,
+                    .a_domain = 8,
+                    .b_domain = 8,
+                    .a_key = left,
+                    .b_key = right,
+                    .null_equal = nulls};
+  };
+  const std::vector<JoinEdge> mixed{key(0, 1, ColumnId{1}, ColumnId{2}, false),
+                                    key(1, 2, ColumnId{2}, ColumnId{3}, true)};
+  auto edges = mixed;
+  InferJoinEdges(edges);
+  ASSERT_EQ(edges.size(), 3U);
+  EXPECT_TRUE(std::ranges::none_of(edges, &JoinEdge::null_equal));
+  edges = mixed;
+  edges.front().null_equal = true;
+  // A second column from relation zero also has to match.
+  edges.push_back(key(0, 1, ColumnId{4}, ColumnId{2}, true));
+  InferJoinEdges(edges);
+  ASSERT_EQ(edges.size(), 4U);
+  EXPECT_TRUE(edges.back().null_equal);
+  for (const auto search : {JoinOrderSearch::kCost, JoinOrderSearch::kGreedy}) {
+    const auto steps = OrderJoins(Relations({2, 800, 3}), edges, kBuildSideRatio, search);
+    ASSERT_EQ(steps.size(), 2U);
+    EXPECT_EQ(steps[0].edges.size() + steps[1].edges.size(), 3U);
+  }
+}
+
 TEST(JoinOrderTest, TheProbeIsTheLargestRelation) {
   const std::vector<JoinEdge> chain = {Edge(0, 1), Edge(1, 2), Edge(2, 3)};
   const auto steps = GreedyOrder(Relations({10, 30, 20, 30}), chain);

@@ -23,6 +23,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/sql_status.h"
 
+#include "column_classes.h"
 #include "join_order.h"
 #include "key_type.h"
 #include "strictness.h"
@@ -131,41 +132,6 @@ std::optional<KeyParts> AsKey(const Expr& expr, const std::set<ColumnId>& outer_
                   .outer_name = name_of(a_outer ? first : second, outer_expr),
                   .null_equal = null_equal};
 }
-
-// A union-find over column ids. ADR 0023 builds the classes from the equalities between two
-// columns among the WHERE conjuncts of the subquery's block; this takes only the CORRELATED ones,
-// the conjuncts of the block's top filter.
-//
-// That is narrower than the ADR and deliberately so. An inner-inner equality can only extend a
-// class that already holds an inner member, so it never gives an outer column its first inner
-// equivalent: which shapes are accepted is the same either way, and only the choice of
-// representative could differ. What it buys is two whole classes of wrong answer that cannot then
-// arise: a LEFT JOIN's ON key, which is not enforced on padded rows and would make the group key
-// non-NULL exactly where the correlation was NULL, and a conjunct of a nested dependent join,
-// which an anti join keeps the rows of where it is false. Both would be silent.
-class Classes {
- public:
-  void Merge(ColumnId a, ColumnId b) { parent_[Find(a)] = Find(b); }
-
-  ColumnId Find(ColumnId id) {
-    const auto it = parent_.find(id);
-    if (it == parent_.end()) {
-      parent_[id] = id;
-      return id;
-    }
-    if (it->second == id) {
-      return id;
-    }
-    const ColumnId root = Find(it->second);
-    parent_[id] = root;  // path compression
-    return root;
-  }
-
-  [[nodiscard]] bool Same(ColumnId a, ColumnId b) { return Find(a) == Find(b); }
-
- private:
-  std::map<ColumnId, ColumnId> parent_;
-};
 
 // How many times the aggregation's own input must exceed the outer side before restricting it to
 // the keys that side binds is worth a build and a probe (RestrictToTheOuterKeys below).
@@ -1354,8 +1320,17 @@ struct NullEqualLink {
 // Value mode's reading of the correlated filter: the classes, and the conjuncts that survive the
 // substitution. An equality of two plain columns of one type feeds a class; anything else is a
 // conjunct that has to keep reading what it reads.
+// Only correlated equalities in the block's top filter feed these classes (ADR 0023).
+//
+// That is narrower than the ADR and deliberately so. An inner-inner equality can only extend a
+// class that already holds an inner member, so it never gives an outer column its first inner
+// equivalent: which shapes are accepted is the same either way, and only the choice of
+// representative could differ. What it buys is two whole classes of wrong answer that cannot then
+// arise: a LEFT JOIN's ON key, which is not enforced on padded rows and would make the group key
+// non-NULL exactly where the correlation was NULL, and a conjunct of a nested dependent join,
+// which an anti join keeps the rows of where it is false. Both would be silent.
 struct Equivalences {
-  Classes classes;
+  ColumnClasses classes;
   std::vector<Equality> equalities;
   std::vector<NullEqualLink> links;
   // The name and type of each column a correlated conjunct names: BindBool's column_of stores them

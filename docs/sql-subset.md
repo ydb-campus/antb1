@@ -1194,11 +1194,14 @@ a part, where the estimates cannot tell it from a keyed join. A subquery conjunc
 subquery's value, that reads one stands in the block's slot above that join, as above every join of its block: a
 value is a `Join ONE-ROW` there, and the conjunct that holds it a `Compute` of what it computes and a `Filter` above.
 The relations then join in the order and tree shape a cost search chooses from footer metadata only (row counts, and
-each key's domain from the parts' integer ranges capped at
-their non-NULL rows, else their distinct-count hints; "Join order and build sides" under Semantics): every edge between
-the two inputs of a join is a key of it, so the edge that closes a cycle becomes a second key, and a join builds on its
-right input unless that input is estimated at more than `--build-side-ratio` times its left. The default is `1`,
-so the smaller estimated input is built; ties and unknown estimates retain the right input.
+each key's domain from the parts' integer ranges capped at their non-NULL rows, else their distinct-count hints).
+See "Join order and build sides" under Semantics. Within an inner block, equalities on the same bound key form a class.
+The search can join two members before visiting a third that connects them in the written predicates. It costs
+independent equalities within each subset and keeps the keys needed to enforce them in the chosen tree. A class
+compared only with `IS NOT DISTINCT FROM` matches NULLs. An `=` anywhere in the class requires all its members
+to be non-NULL. Outer joins bound each block. A join builds on its right input unless that input is estimated
+at more than `--build-side-ratio` times its left. The default is `1`. The smaller estimated input is built, and
+ties and unknown estimates retain the right input.
 An explicit `--build-side-ratio 4` restores the previous threshold. A block of more than 12
 relations, or any block under `--join-order greedy`, joins left-deep instead: the relation with the most rows (an
 unknown count counts as the most) is probed first, then the connected relation with the smallest estimate joins next.
@@ -1804,9 +1807,10 @@ are not prerequisites for using the 2.0 oracle. Intentional differences are regi
   largest relation probing and the smallest join next, which `--join-order greedy` also selects for any block.
 - The estimates behind that order account for the conjuncts routed to each relation, from the row counts, minimums,
   maximums and null counts in the Parquet footers, with a documented default factor for every condition the footers
-  cannot measure. Each join condition narrows by the larger of its two columns' distinct-value estimates; two
-  conditions between the same pair of relations narrow only once, being one composite key, while conditions to
-  different relations narrow in turn. A join builds its hash table on its right input and probes with its left; it
+  cannot measure. An equality narrows by the larger of its two columns' distinct-value estimates. A path that
+  already equates the columns within the subset supplies that constraint once. For independent equalities between
+  the same two relations, the largest divisor represents their composite key. A join builds its hash table on its
+  right input and probes with its left; it
   builds on the left instead when the right is estimated at more than `--build-side-ratio` times it (default 1; `1`
   always builds on the smaller side). The ratio changes which plan a query gets, never its answer, and an estimate
   nothing knows never moves a build -- a relation of unknown size is probed, never built. Estimates are integer

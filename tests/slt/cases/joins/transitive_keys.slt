@@ -1,0 +1,45 @@
+# Three aliases with duplicate and NULL city keys exercise bag multiplicity and comparison modes.
+query II nosort
+SELECT COUNT(*), COUNT(a.dv_city) FROM drivers a, riders b, drivers c
+WHERE a.dv_city = b.rd_city AND b.rd_city = c.dv_city
+----
+BIGINT	BIGINT
+115753	115753
+
+query II nosort
+SELECT COUNT(*), COUNT(a.dv_city) FROM drivers a, riders b, drivers c
+WHERE a.dv_city IS NOT DISTINCT FROM b.rd_city AND b.rd_city IS NOT DISTINCT FROM c.dv_city
+----
+BIGINT	BIGINT
+116265	115753
+
+query II nosort
+SELECT COUNT(*), COUNT(a.dv_city) FROM drivers a, riders b, drivers c
+WHERE a.dv_city IS NOT DISTINCT FROM b.rd_city AND b.rd_city = c.dv_city
+----
+BIGINT	BIGINT
+115753	115753
+
+# A cycle with two distinct columns from the same alias must enforce both.
+query II nosort
+SELECT COUNT(*), COUNT(c.dv_city) FROM drivers a, riders b, drivers c
+WHERE a.dv_city = b.rd_city AND b.rd_city = c.dv_city AND a.dv_id = c.dv_city
+----
+BIGINT	BIGINT
+0	0
+
+# An ON equality inside the nullable side of a left join is local to that block.
+query II nosort
+SELECT COUNT(*), COUNT(c.dv_city) FROM drivers a LEFT JOIN riders b ON a.dv_city = b.rd_city
+LEFT JOIN drivers c ON b.rd_city = c.dv_city
+----
+BIGINT	BIGINT
+115783	115753
+
+# The outer join's ON does not make a preserved column non-NULL in the enclosing inner block.
+query II nosort
+SELECT COUNT(*), COUNT(c.dv_city) FROM drivers a LEFT JOIN riders b ON a.dv_city = b.rd_city
+JOIN drivers c ON a.dv_city IS NOT DISTINCT FROM c.dv_city
+----
+BIGINT	BIGINT
+116301	116237
