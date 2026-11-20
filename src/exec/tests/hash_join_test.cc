@@ -1514,6 +1514,42 @@ TEST_F(HashJoinTest, ABuildPartRunsAgainAloneAfterOutOfMemory) {
 // build whose kind does not fit (building on the left, keys or none, residuals of a null-aware
 // anti or a one-row join), a probe without its build prepared, and Next before Open or after
 // Close.
+TEST_F(HashJoinTest, MarkedRangesReturnTheSerialBatchesEvenWhenGatheredInReverse) {
+  const auto input = KeyTable("b", 4, 50, [](int64_t i) { return i; });
+  const auto build = ScanBuild(plan::JoinKind::kSemi, input, {0});
+  ExecContext ctx = ContextOf(nullptr, 7);
+  ASSERT_TRUE(build->Prepare(ctx).ok());
+  ASSERT_TRUE(build->PrepareMarks(ctx).ok());
+  for (std::uint32_t i = 0; i < 200; ++i) {
+    if (i % 5 == 0 || i > 175) {
+      build->marks()->Mark(i);
+    }
+  }
+  auto starts = build->marks()->MarkedBatchStarts(ctx.batch_size, ctx.pool);
+  ASSERT_TRUE(starts.ok());
+  ASSERT_GT((*starts)->length(), 2);
+  BuildRowEmitter serial(input->schema(), 0, false);
+  std::vector<Batch> expected;
+  while (true) {
+    auto batch = serial.Next(*build, ctx.batch_size, ctx.pool, nullptr);
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    const auto& next = *batch;
+    if (!next.has_value()) {
+      break;
+    }
+    expected.push_back(*next);
+  }
+  ASSERT_EQ(expected.size(), (*starts)->length());
+  int64_t end = build->table()->num_rows();
+  for (int64_t i = (*starts)->length(); i > 0; --i) {
+    const int64_t begin = (*starts)->Value(i - 1);
+    auto batch = BuildRowEmitter::MarkedBatch(*build, input->schema(), begin, end, ctx);
+    ASSERT_TRUE(batch.ok()) << batch.status().ToString();
+    EXPECT_TRUE(batch->data->Equals(*expected[static_cast<std::size_t>(i - 1)].data));
+    end = begin;
+  }
+}
+
 // The guards around the marks a right-direction semi join needs (ADR 0026's C2b). The planner
 // makes them between preparing the build and running the first part, and a probe that finds none
 // would mark nothing and make the join emit no row at all -- so it fails instead of answering.

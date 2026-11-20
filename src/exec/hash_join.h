@@ -220,8 +220,10 @@ class BuildRowEmitter {
   // The next batch of `build`'s rows, or nullopt once every one is emitted. Every batch holds rows.
   arrow::Result<std::optional<Batch>> Next(JoinBuild& build, int64_t batch_size,
                                            arrow::MemoryPool* pool, ProfileNode* profile);
-  // Back to the first row.
-  void Reset();
+  // One batch of marked rows after all probes finish. Workers use independent cursors.
+  static arrow::Result<Batch> MarkedBatch(JoinBuild& build, std::shared_ptr<arrow::Schema> schema,
+                                          int64_t begin, int64_t end, const ExecContext& ctx);
+  void Reset(int64_t position = 0);
 
  private:
   // `rows` NULLs of each of the first left_width_ fields.
@@ -593,9 +595,12 @@ class PartRightJoinOperator final : public PartSink {
   // Its parts hand on rows of their own (a FULL join): they are collected per part and handed on
   // in part order before the build rows; otherwise a part that hands one on is an error.
   bool hands_on_ = false;
+  arrow::Status StartGather();
   BuildRowEmitter emitter_;
-  arrow::MemoryPool* pool_ = arrow::default_memory_pool();
-  int64_t batch_size_ = 1;
+  ExecContext context_;
+  std::shared_ptr<arrow::Int64Array> starts_;
+  int64_t next_gather_ = 0;
+  std::unique_ptr<PartScheduler<Batch>> gathers_;
   PartBatches current_;   // the batches of the part being handed on
   std::size_t next_ = 0;  // and the next of them
   bool probed_ = false;   // every part is in: the marks are final and emitting has begun
