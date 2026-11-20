@@ -1191,6 +1191,35 @@ TEST_F(JoinTableBadAllocTest, AOneRowPrepareThatRunsOutOfMemoryHoldsNothing) {
 
 class KeyTableBadAllocTest : public testing::ExecTest {};
 
+TEST_F(KeyTableBadAllocTest, ColumnKeysReleaseStorageAfterHeapFailure) {
+  const std::vector<arrow::TypeHolder> types = {arrow::int64(), arrow::boolean(), arrow::int64()};
+  const auto numbers = Int64s({1, 1, std::nullopt});
+  const arrow::compute::ExecBatch keys({numbers, testing::Bools({false, true, true}), numbers}, 3);
+  const arrow::compute::ExecBatch probes(
+      {numbers, testing::Bools({true, std::nullopt, false}), numbers}, 3);
+  Sweep([&](std::int64_t skip) {
+    MemoryBudget budget(std::nullopt);
+    arrow::compute::ExecContext ctx(&budget);
+    const auto exercise = [&] -> arrow::Status {
+      ARROW_ASSIGN_OR_RAISE(auto table, MakeKeyTable(types, &ctx, {.kind = KeyTableKind::kFixed}));
+      ARROW_RETURN_NOT_OK(table->Lookup(probes).status());
+      ARROW_RETURN_NOT_OK(table->Consume(keys).status());
+      ARROW_RETURN_NOT_OK(table->Lookup(probes).status());
+      return table->Uniques().status();
+    };
+    arrow::Status status;
+    bool fired = false;
+    {
+      const FailAllocations fail(skip);
+      status = exercise();
+      fired = fail.failed() > 0;
+    }
+    EXPECT_TRUE(fired ? status.IsOutOfMemory() : status.ok()) << status;
+    EXPECT_EQ(budget.bytes_allocated(), 0);
+    return fired;
+  });
+}
+
 // The second batch has 64 hits among its 128 rows. Count its required heap allocations on the
 // same fixed table with sizing disabled, then fail the first allocation made by the estimate.
 TEST_F(KeyTableBadAllocTest, NoHeapForTheFixedTableEstimateStillReturnsTheIds) {

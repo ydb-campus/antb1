@@ -25,6 +25,7 @@
 #include "antb1/common/check.h"
 #include "antb1/common/narrow.h"
 
+#include "column_key_table.h"
 #include "fixed_key_table.h"
 
 namespace antb1::exec {
@@ -33,7 +34,8 @@ namespace {
 // A fixed-width column with no values buffer, which the Arrow format allows when it has no rows or
 // only NULLs.
 bool LacksValues(const arrow::ArrayData& data) {
-  return data.type->byte_width() > 0 && data.buffers.size() > 1 && data.buffers[1] == nullptr;
+  return (data.type->id() == arrow::Type::BOOL || data.type->byte_width() > 0) &&
+         data.buffers.size() > 1 && data.buffers[1] == nullptr;
 }
 
 // `keys` with every such column replaced by NULLs over a zeroed values buffer: arrow's Grouper
@@ -399,6 +401,9 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
         const auto growth =
             options.kind == KeyTableKind::kFixedIdOrder ? Growth::kIdOrder : Growth::kSlotOrder;
         return MakeFixedKeyTable(std::move(*layout), growth, ctx->memory_pool(), options);
+      }
+      if (TakesColumnKeys(key_types)) {
+        return MakeColumnKeyTable(key_types, ctx->memory_pool(), options);
       }
     }
     return MakeGrouper(key_types, ctx);

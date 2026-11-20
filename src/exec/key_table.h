@@ -11,6 +11,7 @@
 #include <arrow/compute/exec.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
+#include <arrow/stl_allocator.h>
 #include <arrow/type_fwd.h>
 
 namespace arrow::compute {
@@ -61,8 +62,8 @@ enum class KeyTableKind : std::uint8_t {
   kAuto,
   kGrouper,        // arrow::compute::Grouper, for every key shape
   kPackedStrings,  // short STRING/BINARY keys; unsupported shapes use kGrouper
-  kFixed,          // candidate one/two fixed-width keys, slot-order growth; tests and benchmarks
-  kFixedIdOrder,   // same keys, id-order growth; for tests and benchmarks
+  kFixed,          // fixed-width candidates: packed one/two keys when eligible, otherwise columns
+  kFixedIdOrder,   // id-order growth for the packed layout; same column layout for other keys
 };
 
 // One ID is reserved as the fixed table's missing-key marker.
@@ -70,7 +71,7 @@ inline constexpr std::uint32_t kMaxKeyTableGroups = std::numeric_limits<std::uin
 
 struct KeyTableOptions {
   KeyTableKind kind = KeyTableKind::kAuto;
-  // Estimate from the first two nonempty input batches. Disable for merged distinct groups.
+  // Size the packed fixed-width table from its first two nonempty batches. Disable for merges.
   bool estimate = true;
   // Lower only in tests; the fixed backend rejects an additional group with OutOfMemory.
   std::uint32_t max_groups = kMaxKeyTableGroups;
@@ -82,11 +83,13 @@ arrow::Result<std::unique_ptr<KeyTable>> MakeKeyTable(
     const std::vector<arrow::TypeHolder>& key_types, arrow::compute::ExecContext* ctx,
     const KeyTableOptions& options = {});
 
-// Convert allocations of Arrow's small objects outside the query pool to the exec error model.
+// Preserve a query pool's allocation diagnostic and convert ordinary heap failures to Status.
 template <class Body>
 auto KeyTableNoBadAlloc(const Body& body) -> decltype(body()) {
   try {
     return body();
+  } catch (const arrow::stl::BadAlloc& error) {
+    return arrow::Status::OutOfMemory(error.what());
   } catch (const std::bad_alloc&) {
     return arrow::Status::OutOfMemory("out of memory in a GROUP BY's key table");
   }

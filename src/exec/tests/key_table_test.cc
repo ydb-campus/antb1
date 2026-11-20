@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -99,6 +100,10 @@ std::string KeyBytes(const arrow::ArrayVector& columns, std::int64_t row) {
       continue;
     }
     key += 'V';
+    if (column->type_id() == arrow::Type::BOOL) {
+      key += static_cast<const arrow::BooleanArray&>(*column).Value(row) ? '1' : '0';
+      continue;
+    }
     if (column->type_id() == arrow::Type::BINARY || column->type_id() == arrow::Type::STRING) {
       const auto value = static_cast<const arrow::BinaryArray&>(*column).GetView(row);
       const auto length = Narrow<std::uint64_t>(value.size());
@@ -222,11 +227,12 @@ std::shared_ptr<arrow::Array> StringKeys(
   return testing::ArrayOf<arrow::BinaryBuilder>(type, values);
 }
 
-// An int64 column of `rows` NULLs with no values buffer, which the Arrow format allows.
-std::shared_ptr<arrow::Array> NullsWithoutValues(std::int64_t rows) {
+// A fixed-width column of `rows` NULLs with no values buffer, which the Arrow format allows.
+std::shared_ptr<arrow::Array> NullsWithoutValues(
+    std::int64_t rows, const std::shared_ptr<arrow::DataType>& type = arrow::int64()) {
   auto bitmap = arrow::AllocateBitmap(rows).ValueOrDie();
   std::fill_n(bitmap->mutable_data(), bitmap->size(), 0);
-  return arrow::MakeArray(arrow::ArrayData::Make(arrow::int64(), rows, {bitmap, nullptr}, rows));
+  return arrow::MakeArray(arrow::ArrayData::Make(type, rows, {bitmap, nullptr}, rows));
 }
 
 class KeyTableTest : public testing::ExecTest, public ::testing::WithParamInterface<KeyTableKind> {
@@ -324,6 +330,10 @@ TEST_P(KeyTableTest, ColumnsWithoutAValuesBuffer) {
   const auto other = Int64s({1, 2, 1, 2, 3, 3, std::nullopt, 2});
   Check({BatchOf({all_null, other}), BatchOf({other, all_null}), BatchOf({all_null, all_null}),
          BatchOf({Int64s({std::nullopt, 1}), Int64s({1, std::nullopt})})});
+  const auto bool_null = NullsWithoutValues(12, arrow::boolean())->Slice(3, 8);
+  Check({BatchOf({bool_null, other, all_null}), BatchOf({bool_null, all_null, other}),
+         BatchOf({testing::Bools({true, false, std::nullopt}), Int64s({1, 1, 1}),
+                  Int64s({std::nullopt, std::nullopt, std::nullopt})})});
 }
 
 // Routed rows and a partition's uniques are slices: the offset applies to the values and to the
@@ -348,12 +358,15 @@ TEST_P(KeyTableTest, SlicedColumnsWithNulls) {
   Check(batches);
 }
 
-// Every fixed-width type plan::ToArrow gives a GROUP BY key (BOOLEAN, which only conditions have,
-// never is one), DOUBLE as GroupTable hands it over (normalized), each with repeats and a NULL.
+// Every fixed-width type in plan::ToArrow, DOUBLE as GroupTable hands it over (normalized).
+// Check each type, each pair, then a schema containing all of them.
 TEST_P(KeyTableTest, EveryFixedWidthKeyType) {
   constexpr auto kTwoToThe40 = std::int64_t{1'099'511'627'776};
   constexpr auto kTwoToThe50 = std::int64_t{1'125'899'906'842'624};
   const std::vector<std::pair<std::string, std::vector<arrow::compute::ExecBatch>>> cases = {
+      {"bool",
+       {BatchOf({testing::Bools({true, std::nullopt, false, true})}),
+        BatchOf({testing::Bools({false, true, std::nullopt, false})})}},
       {"int16",
        {BatchOf({testing::Int16s({3, std::nullopt, -1, 3})}),
         BatchOf({testing::Int16s({-1, 0, std::nullopt, 32767})})}},
@@ -399,6 +412,30 @@ TEST_P(KeyTableTest, EveryFixedWidthKeyType) {
       Check(pairs);
     }
   }
+  std::vector<arrow::compute::ExecBatch> mixed;
+  for (std::size_t batch = 0; batch < cases.front().second.size(); ++batch) {
+    std::vector<arrow::Datum> values;
+    values.reserve(cases.size());
+    for (const auto& entry : cases) {
+      values.push_back(entry.second[batch].values.front());
+    }
+    mixed.emplace_back(std::move(values), cases.front().second[batch].length);
+  }
+  Check(mixed);
+}
+
+// Only one of the final three columns distinguishes each row from the first. They straddle
+// the 64-column boundary, with sliced bit-packed values and validity at different bit offsets.
+TEST_P(KeyTableTest, NullsAndValuesInKeysPastTheFirstSixtyFourColumns) {
+  const auto zeros = testing::Int16s({0, 0, 0, 0, 0, 0});
+  arrow::ArrayVector columns(63, zeros);
+  columns.push_back(
+      testing::Bools({true, false, std::nullopt, false, false, false, false})->Slice(1, 6));
+  columns.push_back(Int64sOver({0, 0, std::nullopt, 0, 0, 0}, {0, 0, 99, 0, 0, 0}));
+  columns.push_back(
+      testing::Bools({true, true, false, false, false, std::nullopt, true, false})->Slice(2, 6));
+  const auto batch = BatchOf(std::move(columns));
+  Check({batch.Slice(2, 0), batch.Slice(0, 3), batch.Slice(1, 5), batch});
 }
 
 // Two keys that differ only in the second column, and pairs whose columns trade values: the
@@ -1068,6 +1105,53 @@ TEST_P(KeyTableTest, GroupTableConsumeIdsAndLookupNormalizeDoubles) {
   EXPECT_EQ((*found)->Value(1), ids[1]);
   EXPECT_TRUE((*found)->IsNull(2));
   EXPECT_EQ((*table)->num_groups(), 3U);
+}
+
+TEST_P(KeyTableTest, CompositeGroupByNormalizesDoublesAndEmitsFirstSeenKeys) {
+  MemoryBudget budget(std::nullopt);
+  auto table =
+      GroupTable::Make({Column(0, "d", LogicalType::kDouble), Column(1, "b", LogicalType::kBoolean),
+                        Column(2, "i", LogicalType::kInteger)},
+                       {{.kind = plan::AggKind::kCountStar, .type = LogicalType::kBigInt}}, 3,
+                       &budget, &budget, true, GroupTable::kPartitions, {.kind = GetParam()});
+  ASSERT_TRUE(table.ok()) << table.status();
+  const auto schema =
+      arrow::schema({arrow::field("d", arrow::float64()), arrow::field("b", arrow::boolean()),
+                     arrow::field("i", arrow::int32())});
+  const auto nan = std::bit_cast<double>(std::uint64_t{0x7ff8000000000042});
+  const auto rows = arrow::RecordBatch::Make(
+      schema, 5,
+      {Doubles({-0.0, 0.0, nan, -nan, 0.0}),
+       testing::Bools({false, false, true, true, std::nullopt}), Int32s({2, 2, 3, 3, 2})});
+  std::vector<std::uint32_t> ids;
+  ASSERT_TRUE((*table)->Consume(*rows, &ids).ok());
+  ASSERT_EQ(ids.size(), 5U);
+  EXPECT_EQ(ids[0], ids[1]);
+  EXPECT_EQ(ids[2], ids[3]);
+  const auto probe = arrow::RecordBatch::Make(
+      schema, 4,
+      {Doubles({0.0, -nan, -0.0, nan}), testing::Bools({false, true, std::nullopt, false}),
+       Int32s({2, 3, 2, 3})});
+  const auto found = (*table)->Lookup(*probe);
+  ASSERT_TRUE(found.ok()) << found.status();
+  EXPECT_EQ((*found)->null_count(), 1);
+  EXPECT_EQ((*found)->Value(0), ids[0]);
+  EXPECT_EQ((*found)->Value(1), ids[2]);
+  EXPECT_EQ((*found)->Value(2), ids[4]);
+  EXPECT_TRUE((*found)->IsNull(3));
+  const auto out = schema->AddField(3, arrow::field("count", arrow::int64())).ValueOrDie();
+  const auto emitted = (*table)->NextChunk(out);
+  ASSERT_TRUE(emitted.ok()) << emitted.status();
+  ASSERT_NE(*emitted, nullptr);
+  ASSERT_EQ((*emitted)->num_rows(), 3);
+  const auto& doubles = static_cast<const arrow::DoubleArray&>(*(*emitted)->column(0));
+  const auto& counts = static_cast<const arrow::Int64Array&>(*(*emitted)->column(3));
+  EXPECT_EQ(std::bit_cast<std::uint64_t>(doubles.Value(ids[0])),
+            std::bit_cast<std::uint64_t>(-0.0));
+  EXPECT_EQ(std::bit_cast<std::uint64_t>(doubles.Value(ids[2])), std::bit_cast<std::uint64_t>(nan));
+  EXPECT_EQ(counts.Value(ids[0]), 2);
+  EXPECT_EQ(counts.Value(ids[2]), 2);
+  EXPECT_EQ(counts.Value(ids[4]), 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(, KeyTableTest, ::testing::ValuesIn(kKinds), ParamName);

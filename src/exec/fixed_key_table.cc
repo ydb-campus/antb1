@@ -1,5 +1,6 @@
 #include "fixed_key_table.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -11,6 +12,7 @@
 
 #include "antb1/common/check.h"
 
+#include "column_key_table.h"
 #include "key_table.h"
 
 namespace antb1::exec {
@@ -53,6 +55,12 @@ std::unique_ptr<KeyTable> MakeGrowing(FixedKeyLayout layout, arrow::MemoryPool* 
 }
 
 }  // namespace
+
+bool TakesColumnKeys(const std::vector<arrow::TypeHolder>& types) {
+  return !types.empty() && std::ranges::all_of(types, [](const arrow::TypeHolder& type) {
+    return type.id() == arrow::Type::BOOL || TakesKeyType(type.id());
+  });
+}
 
 std::optional<FixedKeyLayout> FixedKeyLayoutOf(const std::vector<arrow::TypeHolder>& types) {
   if (types.empty() || types.size() > 2) {

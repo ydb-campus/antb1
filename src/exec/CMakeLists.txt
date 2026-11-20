@@ -27,6 +27,7 @@ antb1_add_module(
     outer_groups.cc
     key_table.cc
     fixed_key_table.cc
+    column_key_table.cc
     group_table.cc
     grouped_aggregate_state.cc
     group_aggregate.cc

@@ -14,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -627,9 +629,14 @@ uint64_t GroupIdOf(int64_t row, int64_t groups, GroupIds ids = GroupIds::kPermut
   return (static_cast<uint64_t>(row) * kGroupStride) % static_cast<uint64_t>(groups);
 }
 
-// Which key columns a shape groups by. The gate's four: one and two fixed-width keys, a string, and
-// a fixed-width key beside a string.
-enum class GroupShape : std::uint8_t { kInt64, kInt64Int32, kString, kInt64String };
+// The original four grouping shapes and a three-column key for the column-oriented table.
+enum class GroupShape : std::uint8_t {
+  kInt64,
+  kInt64Int32,
+  kString,
+  kInt64String,
+  kInt64Int32Bool
+};
 
 // `rows` rows of `shape`'s key columns, in 64Ki-row batches, with keys over `groups` values; an
 // empty vector if they cannot be built. Each row's keys come from one group id, so a shape's
@@ -646,6 +653,10 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
     case GroupShape::kInt64Int32:
       fields = {arrow::field("k", arrow::int64()), arrow::field("j", arrow::int32())};
       break;
+    case GroupShape::kInt64Int32Bool:
+      fields = {arrow::field("k", arrow::int64()), arrow::field("j", arrow::int32()),
+                arrow::field("b", arrow::boolean())};
+      break;
     case GroupShape::kString:
       fields = {arrow::field("s", arrow::binary())};
       break;
@@ -655,15 +666,28 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
   }
   const auto schema = arrow::schema(fields);
   const bool has_int64 = shape != GroupShape::kString;
-  const bool has_int32 = shape == GroupShape::kInt64Int32;
+  const bool has_bool = shape == GroupShape::kInt64Int32Bool;
+  const bool has_int32 = shape == GroupShape::kInt64Int32 || has_bool;
   const bool has_string = shape == GroupShape::kString || shape == GroupShape::kInt64String;
   arrow::RecordBatchVector out;
   for (int64_t start = 0; start < rows; start += kBatchSize) {
     arrow::Int64Builder keys;
     arrow::Int32Builder seconds;
+    arrow::BooleanBuilder flags;
     arrow::BinaryBuilder strings;
     for (int64_t row = start; row < start + kBatchSize; ++row) {
       const uint64_t id = GroupIdOf(row, groups, ids);
+      // The three-column shape stores the quotient and the two remainders separately.
+      // Even 1000 groups need all three columns; one in three rows has a NULL flag.
+      if (has_bool) {
+        const uint64_t flag = id % 3U;
+        if (!keys.Append(static_cast<int64_t>(id / (32U * 3U))).ok() ||
+            !seconds.Append(static_cast<int32_t>((id / 3U) % 32U)).ok() ||
+            !(flag == 2 ? flags.AppendNull() : flags.Append(flag == 1)).ok()) {
+          return {};
+        }
+        continue;
+      }
       // A two-key shape splits the id between its columns (id / 1024, id % 1024), so that from 1024
       // groups on neither column alone separates the groups and the grouper has to read both.
       if (has_int64 && !keys.Append(static_cast<int64_t>(has_int32 ? id / 1024U : id)).ok()) {
@@ -685,7 +709,7 @@ arrow::RecordBatchVector GroupInput(GroupShape shape, int64_t groups, int64_t ro
       }
       return array.ok();
     };
-    if ((has_int64 && !take(keys)) || (has_int32 && !take(seconds)) ||
+    if ((has_int64 && !take(keys)) || (has_int32 && !take(seconds)) || (has_bool && !take(flags)) ||
         (has_string && !take(strings))) {
       return {};
     }
@@ -775,11 +799,20 @@ std::vector<arrow::TypeHolder> KeyTypesOf(const arrow::RecordBatch& batch) {
   return types;
 }
 
-// Row `row`'s key: its BIGINT, and its INTEGER for the two-key shape (0 without).
-std::pair<int64_t, int32_t> KeyAt(const arrow::compute::ExecBatch& keys, int64_t row) {
+// The full key of the benchmark row, including the third column's validity bit.
+std::tuple<int64_t, int32_t, std::optional<bool>> KeyAt(const arrow::compute::ExecBatch& keys,
+                                                        int64_t row) {
   const int64_t k = keys.values[0].array()->GetValues<int64_t>(1)[row];
   const int32_t j = keys.values.size() > 1 ? keys.values[1].array()->GetValues<int32_t>(1)[row] : 0;
-  return {k, j};
+  std::optional<bool> flag;
+  if (keys.values.size() == 3) {
+    const arrow::ArrayData& data = *keys.values[2].array();
+    if (data.IsValid(row)) {
+      flag = arrow::bit_util::GetBit(data.buffers[1]->data(),
+                                     static_cast<uint64_t>(data.offset + row));
+    }
+  }
+  return {k, j, flag};
 }
 
 // The groups of the first `count` batches through a table of `kind` on `budget`, or an error.
@@ -800,13 +833,23 @@ std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t group
                           GroupIds ids_mode, exec::KeyTableKind kind) {
   exec::MemoryBudget budget(std::nullopt);
   arrow::compute::ExecContext ctx(&budget);
-  auto made = exec::MakeKeyTable(KeyTypesOf(*batches.front()), &ctx, {.kind = kind});
+  const auto types = KeyTypesOf(*batches.front());
+  auto made = exec::MakeKeyTable(types, &ctx, {.kind = kind});
   if (!made.ok()) {
     return made.status().ToString();
   }
   exec::KeyTable& table = **made;
-  // The table's id of each true group, and back: both must be one to one, and a new group must
-  // take the next id (dense, in first-seen order).
+  if (kind != exec::KeyTableKind::kGrouper) {
+    const auto oracle = exec::MakeKeyTable(types, &ctx, {.kind = exec::KeyTableKind::kGrouper});
+    if (!oracle.ok()) {
+      return oracle.status().ToString();
+    }
+    const exec::KeyTable& grouper = **oracle;
+    if (typeid(table) == typeid(grouper)) {
+      return "fixed-key benchmark selected the Arrow fallback";
+    }
+  }
+  // Check both directions of the mapping. The fixed tables also promise first-seen ID order.
   std::vector<int64_t> ours(static_cast<std::size_t>(groups), -1);
   std::vector<int64_t> theirs(static_cast<std::size_t>(groups), -1);
   int64_t row = 0;
@@ -819,13 +862,13 @@ std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t group
     for (int64_t i = 0; i < batch->num_rows(); ++i, ++row) {
       const auto truth = static_cast<std::size_t>(GroupIdOf(row, groups, ids_mode));
       const std::uint32_t id = ids->ids[static_cast<std::size_t>(i)];
-      if (id >= static_cast<std::uint64_t>(groups)) {
+      if (id >= ids->after || id >= static_cast<std::uint64_t>(groups)) {
         return "id " + std::to_string(id) + " past the group count";
       }
       int64_t& mine = ours[truth];
       int64_t& back = theirs[id];
       if (mine == -1 && back == -1) {
-        if (id != next) {
+        if (kind != exec::KeyTableKind::kGrouper && id != next) {
           return "row " + std::to_string(row) + " starts a group with id " + std::to_string(id) +
                  " where the next id is " + std::to_string(next);
         }
@@ -842,6 +885,16 @@ std::string KeyTableCheck(const arrow::RecordBatchVector& batches, int64_t group
   const auto uniques = table.Uniques();
   if (!uniques.ok()) {
     return uniques.status().ToString();
+  }
+  if (uniques->length != table.num_groups() ||
+      uniques->values.size() != static_cast<std::size_t>(batches.front()->num_columns())) {
+    return "unique keys have the wrong shape";
+  }
+  for (std::size_t c = 0; c < types.size(); ++c) {
+    const auto& column = *uniques->values[c].array();
+    if (!column.type->Equals(*types[c].type) || (c < 2 && column.GetNullCount() != 0)) {
+      return "wrong type or unexpected NULLs in unique keys";
+    }
   }
   row = 0;
   for (const auto& batch : batches) {
@@ -921,6 +974,7 @@ void KeyTableKeys(benchmark::State& state, GroupShape shape, GroupIds ids_mode,
     benchmark::DoNotOptimize(made);
   }
   state.SetItemsProcessed(state.iterations() * rows);
+  state.counters["pool_peak_bytes"] = static_cast<double>(budget.max_memory());
   state.counters["groups"] = static_cast<double>(made);
   state.counters["rows"] = static_cast<double>(rows);
   state.counters["ns_per_row"] =
@@ -945,6 +999,11 @@ ANTB1_KEY_TABLE(Int64Int32_SlotOrder, kInt64Int32, kFixed, kPermutation)
 ANTB1_KEY_TABLE(Int64Int32_IdOrder, kInt64Int32, kFixedIdOrder, kPermutation)
 ANTB1_KEY_TABLE(Int64Int32_SlotOrder_Random, kInt64Int32, kFixed, kRandom)
 ANTB1_KEY_TABLE(Int64Int32_IdOrder_Random, kInt64Int32, kFixedIdOrder, kRandom)
+// Both three-column cases include the same KeyTable adapter and budget in their timing.
+ANTB1_KEY_TABLE(Int64Int32Bool_Grouper, kInt64Int32Bool, kGrouper, kPermutation)
+ANTB1_KEY_TABLE(Int64Int32Bool_Column, kInt64Int32Bool, kFixed, kPermutation)
+ANTB1_KEY_TABLE(Int64Int32Bool_Grouper_Random, kInt64Int32Bool, kGrouper, kRandom)
+ANTB1_KEY_TABLE(Int64Int32Bool_Column_Random, kInt64Int32Bool, kFixed, kRandom)
 #undef ANTB1_KEY_TABLE
 
 // The gate's counts (1000 to 1 Mi: cached to past cache) with 4 Mi (about one row a group) and 16
@@ -979,6 +1038,13 @@ BENCHMARK(BM_KeyTable_Int64Int32_IdOrder)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmar
 BENCHMARK(BM_KeyTable_Int64Int32_SlotOrder_Random)
     ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_KeyTable_Int64Int32_IdOrder_Random)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32Bool_Grouper)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32Bool_Column)->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32Bool_Grouper_Random)
+    ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_KeyTable_Int64Int32Bool_Column_Random)
     ->ANTB1_KEY_TABLE_COUNTS->Unit(benchmark::kMillisecond);
 #undef ANTB1_KEY_TABLE_COUNTS
 

@@ -55,11 +55,59 @@ pixi run bench --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 | `BM_GroupInt64`, `BM_GroupInt64Int32`, `BM_GroupString`, `BM_GroupInt64String` | grouping every batch with one grouper, as `GroupTable::Consume` does per part, for the four key shapes of ADR 0019's gates (BIGINT; BIGINT and INT; VARCHAR; BIGINT and VARCHAR) at 1000 to 16Mi groups; the `groups` counter shows the count |
 | `BM_GroupInt64Budget`, `BM_GroupInt64Int32Budget` (and `...BudgetRandom`) | the same grouper with its buffers from an `exec::MemoryBudget`, as the engine's are, at 1000 to 4Mi groups: the baseline of step 0 below. `Random`: ids drawn at random (splitmix64), so groups repeat early as in real data, instead of the permutation the other grouping benchmarks use |
 | `BM_KeyTable_<shape>_<growth>[_Random]` | the fixed-width candidate backend through `MakeKeyTable`, including pool-budgeted buffers and returned IDs, on the same one/two-key inputs as the budgeted grouper. `SlotOrder` is the default growth policy; `IdOrder` is the diagnostic alternative. Each name checks IDs, unique keys and refused optional sizing outside timing. Compare against `BM_Group<shape>Budget[Random]` of the same run; ADR 0019 retains the 1.3x target at 1000, 16Ki, 256Ki and 1Mi groups, with 4Mi reported. This replaces the duplicate step-0 loop; its prior variants remain in PR #253's history |
+| `BM_KeyTable_Int64Int32Bool_{Grouper,Column}[_Random]` | groups 4 Mi rows by BIGINT, INTEGER and a nullable BOOLEAN. All three columns contribute to identity. Both arms use the same KeyTable interface, data and query pool. The benchmark checks group IDs, all three output columns and backend selection outside the timed loop, and reports peak pool bytes alongside CPU and wall time. |
 
 The fixed-width candidate is selected explicitly with private `KeyTableKind` options in tests and these
 microbenchmarks. Automatic query execution retains the Grouper and packed-string paths: the initial candidate
 passed the micro gate but missed ADR 0019's end-to-end gates at 32 threads. This backend is a building block for
 the later integration steps, not a default query optimization or a new runtime switch.
+
+### Grouping key layouts
+
+The private key-table factory uses the physical types presented by the execution engine. A byte-aligned
+fixed-width key here means SMALLINT, USMALLINT, INTEGER, BIGINT, DATE32, TIMESTAMP, normalized DOUBLE, DECIMAL64
+or DECIMAL128 (including HUGEINT). DECIMAL precision and scale and TIMESTAMP units are preserved in the output.
+
+| Input columns | Automatic selection | Explicit fixed candidate |
+| --- | --- | --- |
+| One or two byte-aligned fixed-width columns | Arrow Grouper | Step 1 packed words |
+| Three or more byte-aligned fixed-width columns | Arrow Grouper | Step 2 column storage |
+| Any positive number of fixed-width columns including BOOLEAN | Arrow Grouper | Step 2 column storage |
+| One or two STRING or BINARY columns | Short-string packing when eligible, with Grouper fallback | Arrow Grouper |
+| Mixed strings and numbers, other string shapes, or other Grouper-supported types | Arrow Grouper | Arrow Grouper |
+
+The column layout stores distinct keys in group-ID order. Each column keeps its own validity bitmap, and
+BOOLEAN values are bit-packed. Hash matches are checked against the full key. Both explicit fixed options use
+the same column layout. Their growth-order choice and optional sizing estimate apply to the packed layout.
+The SQL binder and input type conversions determine which of these physical types a query can supply.
+
+#### Step 2 measurements on 2026-11-20
+
+One static Release binary ran both backends on physical CPU 0 of a Xeon Gold 6338 with default NUMA placement.
+Each cell used five randomly interleaved repetitions with a 0.5 s minimum benchmark time. The untimed checks
+verified dense IDs, the stored key values and the backend used. Sampled external CPU use averaged 0.15 cores
+and peaked at 0.26. The table gives median wall nanoseconds per input row. Across cells the CPU medians were
+within 0.04 ns/row of wall time.
+
+| Target groups | Permuted Grouper | Permuted columns | Random Grouper | Random columns |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 26.45 | 22.70 | 26.76 | 36.25 |
+| 16 Ki | 26.89 | 30.54 | 27.42 | 39.45 |
+| 256 Ki | 30.74 | 44.98 | 33.30 | 66.28 |
+| 1 Mi | 38.91 | 56.19 | 48.74 | 78.87 |
+| 4 Mi | 81.07 | 100.62 | 80.24 | 109.80 |
+
+Permuted inputs visited every target group. At 4 Mi target groups, random sampling visited 2,651,659 groups.
+Peak pool usage at that size was 176.33 MiB for the Grouper and 232.75 MiB for columns on permuted input.
+On random input it was 104.33 MiB and 116.50 MiB respectively. At 256 Ki groups one permuted Grouper
+repetition reached 51.41 ns/row, compared with a 30.74 ns/row median. All five samples count toward each median.
+The column layout won one cell out of ten. Its best speedup was 1.165x, below the 1.3x activation threshold.
+Automatic execution continues to use the existing backend for this shape.
+
+To repeat the comparison in one binary, run
+`pixi run bench --benchmark_filter=BM_KeyTable_Int64Int32Bool --benchmark_repetitions=5 --benchmark_min_time=0.5s`
+with `--benchmark_enable_random_interleaving=true`. The `Grouper` arm is the automatic backend in #389 for this
+schema. The `Column` arm explicitly selects the new layout.
 
 `bench.micro.smoke` (label `bench-smoke`) runs every benchmark for one iteration (`--benchmark_dry_run`), so they
 keep building and running:
