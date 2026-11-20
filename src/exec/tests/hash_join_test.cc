@@ -1533,10 +1533,11 @@ TEST_F(HashJoinTest, MarkedRangesReturnTheSerialBatchesEvenWhenGatheredInReverse
   while (true) {
     auto batch = serial.Next(*build, ctx.batch_size, ctx.pool, nullptr);
     ASSERT_TRUE(batch.ok()) << batch.status().ToString();
-    if (!batch->has_value()) {
+    const auto& next = *batch;
+    if (!next.has_value()) {
       break;
     }
-    expected.push_back(**batch);
+    expected.push_back(*next);
   }
   ASSERT_EQ(expected.size(), (*starts)->length());
   int64_t end = build->table()->num_rows();
