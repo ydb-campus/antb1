@@ -1389,8 +1389,10 @@ For repeated aggregates that would save enough input work, the planner checks th
 result size against the 256 MiB sharing cap when group-count statistics are available. If the initial
 estimate exceeds the cap, a filter on a scan can bound combinations of grouping keys. For example, if one
 branch of an OR admits four pairs and another admits one pair, their union admits at most five.
-A fixed planning budget limits this analysis. The runtime cap and query memory budget apply to
-the actual materialized result, including variable-width columns.
+Grouping keys from other scans need table-wide bounds, and the refined size allows for output
+validity bitmaps. The sharing candidates in each planning stage use one fixed analysis budget.
+The runtime cap and query memory budget apply to the actual materialized result, including
+variable-width columns.
 
 It shows what no logical plan holds, because the physical planner is what decides it:
 

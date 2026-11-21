@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +28,7 @@
 #include "antb1/plan/logical_plan.h"
 #include "antb1/plan/optimizer.h"
 #include "antb1/plan/plan_options.h"
+#include "antb1/plan/shared_sub_plans.h"
 #include "antb1/sql/parser.h"
 
 #include "exec_test_util.h"
@@ -156,6 +158,54 @@ TEST_F(SharedBuildsTest, RecomputesWhenTheGroupEstimateExceedsTheSharedResultCap
   ASSERT_NE(run->rows, nullptr);
   ASSERT_EQ(run->rows->num_rows(), 1);
   EXPECT_EQ(static_cast<const arrow::Int64Array&>(*run->rows->column(0)->chunk(0)).Value(0), 2);
+}
+
+TEST_F(SharedBuildsTest, SpendsOneRefinementBudgetAcrossRepeatedAggregates) {
+  const auto schema =
+      arrow::schema({arrow::field("k", arrow::int64()), arrow::field("v", arrow::int64())});
+  std::vector<std::optional<int64_t>> values(8192, 0);
+  values.back() = 100'000'000;
+  const auto keys = testing::Int64s(values);
+  const auto batch = arrow::RecordBatch::Make(schema, keys->length(), {keys, keys});
+
+  // Each disjunction fits the per-filter budget, but eight of them exceed the stage budget.
+  std::string filter = "k = 0";
+  for (int i = 1; i <= 12; ++i) {
+    filter += std::format(" OR (v = {0} AND k <> {0})", i);
+  }
+  plan::Catalog catalog;
+  std::vector<std::shared_ptr<MemoryTable>> tables;
+  std::string ctes;
+  std::string joins;
+  for (int i = 0; i < 8; ++i) {
+    auto table = std::make_shared<MemoryTable>(schema, arrow::RecordBatchVector{batch}, true);
+    table->set_claimed_rows(100'000'000);
+    ASSERT_TRUE(catalog.Register(std::format("t{}", i), table).ok());
+    tables.push_back(std::move(table));
+    if (i > 0) {
+      ctes += ", ";
+      joins += std::format(" JOIN g{0} a{0} ON a0.k = a{0}.k", i);
+    } else {
+      joins = "g0 a0";
+    }
+    ctes += std::format("g{0} AS (SELECT k, v FROM t{0} WHERE {1} GROUP BY k, v)", i, filter);
+    joins += std::format(" JOIN g{0} b{0} ON a{0}.k = b{0}.k", i);
+  }
+  const auto parsed = sql::Parse(std::format("WITH {} SELECT COUNT(*) FROM {}", ctes, joins));
+  ASSERT_TRUE(parsed.has_value());
+  const auto bound = plan::Bind(*parsed, catalog, plan::BindOptions{});
+  ASSERT_TRUE(bound.ok()) << bound.status().ToString();
+  const auto groups = plan::SharedSubPlans(*bound);
+  ASSERT_EQ(groups.size(), tables.size());
+  for (const auto& group : groups) {
+    int exhausted = 0;
+    ASSERT_FALSE(plan::WorthSharing(group, exhausted));
+    ASSERT_TRUE(plan::WorthSharing(group)) << "every candidate would fit with a fresh budget";
+  }
+  const auto run = ExecutePlan(*bound, tables.front());
+  ASSERT_TRUE(run.ok()) << run.status().ToString();
+  EXPECT_EQ(tables.front()->scanned_parts().size(), 1U) << "the first aggregate was shared";
+  EXPECT_EQ(tables.back()->scanned_parts().size(), 2U) << "the last aggregate was recomputed";
 }
 
 TEST_F(SharedBuildsTest, SharedCostDoesNotExposeOverflowInExcludedGroups) {

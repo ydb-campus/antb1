@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <format>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <span>
@@ -603,13 +604,31 @@ std::optional<AggregateSize> SharedAggregateSize(const LogicalNodePtr& node) {
 }
 
 // A filter on one scan can bound several of that scan's grouping keys together. Keys from
-// other scans keep their original estimates. Compare by division so a product cannot overflow.
+// other scans need a table-wide bound. Compare by division so a product cannot overflow.
 struct GroupSizeLimit {
   std::span<const ColumnId> keys;
-  std::span<const std::optional<int64_t>> estimates;
   std::span<const ScanKeyDomain> sources;
   int64_t max_groups;
   int& remaining;
+
+  // Every tuple from this scan belongs to a row in one part. Bound it by the table rows,
+  // the product of the table-wide domains, or the per-part product times the number of
+  // parts. The latter counts the parts once even when several keys come from the same scan.
+  int64_t AfterScan(const ScanNode& scan, int64_t limit) const {
+    const auto divide = [](int64_t value, std::optional<int64_t> bound) -> int64_t {
+      return bound.has_value() ? value / std::max<int64_t>(*bound, 1) : 0;
+    };
+    int64_t by_table = limit;
+    int64_t by_part = divide(limit, scan.table->num_parts());
+    for (const auto& source : sources) {
+      if (source.scan == &scan) {
+        by_table = divide(by_table, source.max_values);
+        by_part = divide(by_part, source.max_part_values.has_value() ? source.max_part_values
+                                                                     : source.max_values);
+      }
+    }
+    return std::max({by_table, by_part, divide(limit, scan.table->exact_row_count())});
+  }
 
   bool Fits(const FilterNode& filter, const ScanNode* scan) const {
     std::array<PredicateDomainKey, kMaxPredicateDomainKeys> local;
@@ -618,13 +637,10 @@ struct GroupSizeLimit {
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (sources[i].scan == scan) {
         local[count++] = {.id = keys[i], .max_values = sources[i].max_values};
-      } else {
-        const auto& groups =
-            sources[i].max_values.has_value() ? sources[i].max_values : estimates[i];
-        if (!groups.has_value()) {
-          return false;
-        }
-        limit /= std::max<int64_t>(*groups, 1);
+      } else if (sources[i].scan == nullptr) {
+        return false;
+      } else if (!std::ranges::contains(sources.first(i), sources[i].scan, &ScanKeyDomain::scan)) {
+        limit = AfterScan(*sources[i].scan, limit);
       }
     }
     const auto bound = PredicateTupleBound(filter, std::span(local).first(count), remaining);
@@ -672,7 +688,7 @@ FilteredScan CheckFilteredGroups(const LogicalNode& node, const GroupSizeLimit& 
   return {};
 }
 
-bool FitsSharedResult(const AggregateSize& size, int& remaining) {
+bool FitsSharedResult(const AggregateSize& size, int64_t columns, int& remaining) {
   if (size.grouped == nullptr) {
     return size.fixed_row_bytes <= kMaxSharedResultBytes;
   }
@@ -695,10 +711,13 @@ bool FitsSharedResult(const AggregateSize& size, int& remaining) {
   if (GroupCountFromDomains(*group.input, estimates).value_or(0) <= limit) {
     return true;
   }
+  // Reversing the original refusal must leave room for validity buffers too. Each output
+  // batch rounds each column's bitmap up to whole bytes: one byte per row and column
+  // covers even a one-row batch, independently of which output columns turn out nullable.
+  const int64_t refined_limit = kMaxSharedResultBytes / (size.fixed_row_bytes + columns);
   return CheckFilteredGroups(*group.input, {.keys = keys,
-                                            .estimates = estimates,
                                             .sources = sources,
-                                            .max_groups = limit,
+                                            .max_groups = refined_limit,
                                             .remaining = remaining})
       .fits;
 }
@@ -764,7 +783,7 @@ bool WorthSharing(const SharedSubPlan& group, int& remaining) {
   const LogicalNodePtr& widest = group.members[group.widest];
   const auto size = SharedAggregateSize(widest);
   return size.has_value() && InputRows(*widest).value_or(0) >= kMinSharedRows &&
-         FitsSharedResult(*size, remaining);
+         FitsSharedResult(*size, std::ssize(group.columns[group.widest]), remaining);
 }
 
 bool WorthSharing(const SharedSubPlan& group) {
